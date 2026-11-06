@@ -109,6 +109,15 @@ pub const COMMAND_CLASSIFICATIONS: &[CommandClassification] = &[
         transport_note: "Local workflow capsule management",
     },
     CommandClassification {
+        command: "rules",
+        truth_source: CommandTruthSource::OfflineArtifact,
+        execution_mode: CommandExecutionMode::LocalOnly,
+        host_absent: HostAbsentBehavior::Unaffected,
+        requires_capability_token: false,
+        may_need_approval: false,
+        transport_note: "Local reactive definitions and bounded event previews; previews never invoke operations or consume dispatch state",
+    },
+    CommandClassification {
         command: "session",
         truth_source: CommandTruthSource::OfflineArtifact,
         execution_mode: CommandExecutionMode::LocalOnly,
@@ -3548,6 +3557,7 @@ pub const COMMANDS: &[&str] = &[
     "mesh",
     "connector",
     "task",
+    "rules",
     "session",
     "agent",
     "agent-bootstrap",
@@ -3698,7 +3708,7 @@ pub fn guide_payload(command: Option<&str>) -> Value {
                 "families": [
                     {
                         "name": "workflow",
-                        "commands": ["context", "mesh", "task", "session", "agent", "agent-bootstrap"],
+                        "commands": ["context", "mesh", "task", "rules", "session", "agent", "agent-bootstrap"],
                     },
                     {
                         "name": "intent",
@@ -3819,6 +3829,17 @@ fn command_contract(command: &str) -> Option<Value> {
             "Create and resume durable workflow capsules for connector jobs.",
             "A resumable capsule view over compiled intent, bindings, approvals, and execution receipts so agents can operate on a short task id instead of replaying the full workflow from scratch.",
         )),
+        "rules" => Some(json!({
+            "family": "workflow",
+            "summary": "Manage persisted reactive rules and preview bounded event files.",
+            "intended_shape": "Local TOML definitions and truthful, side-effect-free matching previews with explicit validation errors.",
+            "next_beads": ["flywheel_connectors-qnchs.8.4"],
+            "workflow_handoff": [
+                "Register [[rules]] definitions with `fwc rules add rules.toml`; tiers above safe require --allow-risky.",
+                "Preview events with `fwc rules preview --events events.jsonl`; previews never invoke operations or consume events.",
+                "Use `fwc rules test rules.toml --event '<JSON>'` to inspect one event before registration."
+            ]
+        })),
         "session" => Some(workflow_contract(
             "Track the current agent session and persist resumable context.",
             "A local session ledger over agent identity, goal, zone binding, active locks, and operation counts so context survives agent rotations.",

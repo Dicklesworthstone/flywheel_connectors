@@ -1160,6 +1160,35 @@ key derivation are not opened automatically: preserve the old file and re-import
 the credentials into the OS keychain or a new store using an independent key.
 Credential-file replacements are encrypted, synced, and atomically published.
 
+### Reactive rule definitions and previews
+
+`fwc rules` manages TOML rules and previews normalized JSONL events. These local
+commands never invoke a connector, claim live authorization, or consume event
+deduplication state. Registration above the `safe` tier requires `--allow-risky`.
+
+```toml
+[[rules]]
+name = "search-related-issues"
+trigger = { connector = "slack", type = "message.new", match = "data.text~bug|Bug" }
+action = { connector = "github", operation = "github.search_issues", input = { query = "{{event.data.text | truncate(160)}}" } }
+throttle = { max = 5, window = "1h" }
+```
+
+```bash
+fwc rules add search-rules.toml
+fwc rules list
+fwc rules test search-rules.toml --event '{"connector":"slack","event_type":"message.new","event_id":"msg-1","data":{"text":"Bug in login"}}'
+fwc rules preview --events events.jsonl --rule search-related-issues
+fwc rules disable search-related-issues
+```
+
+Use `--rules-file PATH` after `rules` for a separate rules file. Each event uses
+`connector`, `event_type`, an optional `event_id`, and string-valued `data`.
+Definitions are capped at 1 MiB, events at 256 KiB each and 16 MiB per file,
+and previews at 10,000 rule/event evaluations and 8 MiB of output. Every
+rendered action has a shared 1 MiB limit; an exceeded limit is reported as
+`input_rejected` and yields a nonzero exit status.
+
 ### Quick Start
 
 ```bash

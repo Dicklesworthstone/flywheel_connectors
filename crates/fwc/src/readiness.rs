@@ -927,6 +927,10 @@ pub const COMMAND_FAMILY_CLASSIFICATION: &[CommandFamilyEntry] = &[
         mode: CommandTruthMode::OfflineOnly,
     },
     CommandFamilyEntry {
+        name: "rules",
+        mode: CommandTruthMode::OfflineOnly,
+    },
+    CommandFamilyEntry {
         name: "history",
         mode: CommandTruthMode::OfflineOnly,
     },

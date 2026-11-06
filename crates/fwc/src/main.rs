@@ -252,6 +252,7 @@ mod replay;
 mod retry_controller;
 #[allow(dead_code)] // Smart connector auto-routing for ambiguous intents.
 mod routing;
+mod rules_cmd;
 #[allow(dead_code)]
 mod schema_nav;
 mod search;
@@ -538,6 +539,9 @@ enum Commands {
     /// Create and resume durable workflow capsules for connector jobs.
     #[command(visible_alias = "tasks")]
     Task(TaskArgs),
+
+    /// Manage reactive rules and preview matching events without execution.
+    Rules(rules_cmd::RulesArgs),
 
     /// Track the current agent session and persist resumable context.
     Session(SessionArgs),
@@ -4409,6 +4413,27 @@ fn dispatch(cli: &Cli) -> Result<DispatchOutcome> {
         Commands::Mesh(args) => mesh_dispatch(args, cli.host.as_deref())?,
         Commands::Connector(args) => connector_dispatch(args, cli.host.as_deref())?,
         Commands::Task(args) => task_dispatch(args, cli.host.as_deref())?,
+        Commands::Rules(args) => {
+            let (mut payload, exit_code) = match rules_cmd::dispatch(args) {
+                Ok(rules) => (
+                    rules.payload,
+                    if rules.rejected {
+                        CliExitCode::Validation
+                    } else {
+                        CliExitCode::Success
+                    },
+                ),
+                Err(error) => (
+                    json!({"status": "error", "command": "rules",
+                        "error": {"type": "rules-request-failed", "message": error.to_string()}}),
+                    CliExitCode::Validation,
+                ),
+            };
+            CommandEnvelope::new(CommandAvailability::OfflineArtifact, "rules")
+                .inject_into(&mut payload);
+            inject_truth_source_metadata(&mut payload, KnowledgeState::Offline);
+            DispatchOutcome { payload, exit_code }
+        }
         Commands::Session(args) => session_dispatch(args)?,
         Commands::Agent(args) => agent_dispatch(args)?,
         Commands::AgentBootstrap(args) => agent_bootstrap_dispatch(args)?,
