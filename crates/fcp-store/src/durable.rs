@@ -9,7 +9,7 @@
 //! - writable startup replays only checksum-valid WAL records and truncates any
 //!   torn or corrupt tail so a partial append cannot poison later recovery;
 //! - observational opens never create, repair, or checkpoint files, and writable
-//!   object-store handles retain exclusive OS ownership through admitted work.
+//!   store handles retain exclusive OS ownership through admitted work.
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -56,6 +56,7 @@ const WAL_VERSION_V2: u32 = 2;
 
 const DEFAULT_CHECKPOINT_AFTER_OPS: u64 = 64;
 const OBJECT_WRITER_LOCK_FILE: &str = "objects.writer.lock";
+const SYMBOL_WRITER_LOCK_FILE: &str = "symbols.writer.lock";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DurableAccess {
@@ -278,6 +279,11 @@ enum SymbolWalOp {
     DeleteSymbol { object_id: ObjectId, esi: u32 },
 }
 
+/// A durable symbol store with exclusive ownership of its snapshot and WAL.
+///
+/// Share one `Arc` within a process. Independent observational access is
+/// available through [`Self::open_read_only`]. Object and symbol stores have
+/// separate writer locks and may share a directory.
 pub struct DurableSymbolStore {
     state: ParkingRwLock<DurableSymbolState>,
     config: DurableSymbolStoreConfig,
@@ -287,6 +293,9 @@ pub struct DurableSymbolStore {
     snapshot_path: PathBuf,
     wal_path: PathBuf,
     access: DurableAccess,
+    // Mutations are synchronous once admitted, so holding the store keeps
+    // ownership alive until every WAL/checkpoint operation has returned.
+    _writer_lock: Option<File>,
 }
 
 impl DurableObjectState {
@@ -828,7 +837,10 @@ impl DurableObjectStore {
         let writer_lock = if access == DurableAccess::ReadWrite {
             fs::create_dir_all(&config.root_dir).map_err(object_io)?;
             sync_parent_dir(&config.root_dir).map_err(object_io)?;
-            Some(acquire_object_writer_lock(&config.root_dir)?)
+            Some(
+                acquire_writer_lock(&config.root_dir, OBJECT_WRITER_LOCK_FILE, "object")
+                    .map_err(object_io)?,
+            )
         } else {
             require_store_directory(&config.root_dir).map_err(object_io)?;
             None
@@ -1060,10 +1072,15 @@ impl ObjectStore for DurableObjectStore {
 }
 
 impl DurableSymbolStore {
-    /// Open or create a crash-safe durable symbol store.
+    /// Open or create a crash-safe durable symbol store with exclusive ownership.
+    ///
+    /// Other writable opens of the same directory fail until this store is
+    /// dropped. Share one `Arc` within a process; use [`Self::open_read_only`]
+    /// for independent observational access.
     ///
     /// # Errors
-    /// Returns an error if the snapshot/WAL cannot be read or synced.
+    /// Returns an error if exclusive ownership is unavailable or the
+    /// snapshot/WAL cannot be read or synced.
     pub fn open(config: DurableSymbolStoreConfig) -> Result<Self, SymbolStoreError> {
         Self::open_with_access(config, DurableAccess::ReadWrite)
     }
@@ -1085,12 +1102,17 @@ impl DurableSymbolStore {
         config: DurableSymbolStoreConfig,
         access: DurableAccess,
     ) -> Result<Self, SymbolStoreError> {
-        if access == DurableAccess::ReadWrite {
+        let writer_lock = if access == DurableAccess::ReadWrite {
             fs::create_dir_all(&config.root_dir).map_err(symbol_io)?;
             sync_parent_dir(&config.root_dir).map_err(symbol_io)?;
+            Some(
+                acquire_writer_lock(&config.root_dir, SYMBOL_WRITER_LOCK_FILE, "symbol")
+                    .map_err(symbol_io)?,
+            )
         } else {
             require_store_directory(&config.root_dir).map_err(symbol_io)?;
-        }
+            None
+        };
 
         let snapshot_path = config.root_dir.join("symbols.snapshot.json");
         let wal_path = config.root_dir.join("symbols.wal.jsonl");
@@ -1111,6 +1133,7 @@ impl DurableSymbolStore {
             snapshot_path,
             wal_path,
             access,
+            _writer_lock: writer_lock,
         })
     }
 
@@ -1352,8 +1375,8 @@ fn require_store_directory(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn acquire_object_writer_lock(root: &Path) -> Result<File, ObjectStoreError> {
-    let path = root.join(OBJECT_WRITER_LOCK_FILE);
+fn acquire_writer_lock(root: &Path, lock_file: &str, kind: &str) -> Result<File, String> {
+    let path = root.join(lock_file);
     let mut options = OpenOptions::new();
     options.read(true).write(true).create_new(true);
     #[cfg(unix)]
@@ -1364,49 +1387,45 @@ fn acquire_object_writer_lock(root: &Path) -> Result<File, ObjectStoreError> {
     let (file, created) = match options.open(&path) {
         Ok(file) => (file, true),
         Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-            let metadata = fs::symlink_metadata(&path).map_err(object_io)?;
+            let metadata = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
             if !metadata.is_file() || metadata.file_type().is_symlink() {
-                return Err(object_io("object-store writer lock must be a regular file"));
+                return Err(format!("{kind}-store writer lock must be a regular file"));
             }
             (
                 OpenOptions::new()
                     .read(true)
                     .write(true)
                     .open(&path)
-                    .map_err(object_io)?,
+                    .map_err(|error| error.to_string())?,
                 false,
             )
         }
-        Err(error) => return Err(object_io(error)),
+        Err(error) => return Err(error.to_string()),
     };
-    let opened = file.metadata().map_err(object_io)?;
+    let opened = file.metadata().map_err(|error| error.to_string())?;
     if !opened.is_file() {
-        return Err(object_io("object-store writer lock must be a regular file"));
+        return Err(format!("{kind}-store writer lock must be a regular file"));
     }
     file.try_lock().map_err(|error| {
-        object_io(format!(
-            "exclusive object-store ownership unavailable for {}: {error}",
+        format!(
+            "exclusive {kind}-store ownership unavailable for {}: {error}",
             root.display()
-        ))
+        )
     })?;
-    let named = fs::symlink_metadata(&path).map_err(object_io)?;
+    let named = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
     if !named.is_file() || named.file_type().is_symlink() {
-        return Err(object_io(
-            "object-store writer lock path changed during open",
-        ));
+        return Err(format!("{kind}-store writer lock path changed during open"));
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
         if opened.dev() != named.dev() || opened.ino() != named.ino() {
-            return Err(object_io(
-                "object-store writer lock was replaced during open",
-            ));
+            return Err(format!("{kind}-store writer lock was replaced during open"));
         }
     }
     if created {
-        file.sync_all().map_err(object_io)?;
-        sync_parent_dir(&path).map_err(object_io)?;
+        file.sync_all().map_err(|error| error.to_string())?;
+        sync_parent_dir(&path).map_err(|error| error.to_string())?;
     }
     Ok(file)
 }
@@ -2433,6 +2452,116 @@ mod tests {
             assert!(DurableSymbolStore::open_read_only(config.clone()).is_err());
             assert_eq!(stored_file_bytes(&config.root_dir), torn);
         }
+    }
+
+    #[tokio::test]
+    async fn symbol_writer_ownership_preserves_acknowledged_data_across_reopen() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut config = DurableSymbolStoreConfig::new(temp_dir.path());
+        config.checkpoint_after_ops = 0;
+        config.mac_key = Some([0x41; 32]);
+        let writer = Arc::new(DurableSymbolStore::open(config.clone()).unwrap());
+        writer.put_object_meta(test_symbol_meta(1)).await.unwrap();
+        writer.put_symbol(test_symbol(1, 0, 7)).await.unwrap();
+        let before = stored_file_bytes(temp_dir.path());
+
+        assert!(matches!(
+            DurableSymbolStore::open(config.clone()),
+            Err(SymbolStoreError::Io(reason)) if reason.contains("exclusive")
+        ));
+        assert_eq!(stored_file_bytes(temp_dir.path()), before);
+        let reader = DurableSymbolStore::open_read_only(config.clone()).unwrap();
+        assert_eq!(reader.symbol_count(&test_object_id(1)).await, 1);
+
+        // Object and symbol stores use separate files and may share a directory.
+        let objects =
+            DurableObjectStore::open(DurableObjectStoreConfig::new(temp_dir.path())).unwrap();
+        objects.put(test_object(9)).await.unwrap();
+        let retained = Arc::clone(&writer);
+        drop(writer);
+        assert!(DurableSymbolStore::open(config.clone()).is_err());
+        retained.put_symbol(test_symbol(1, 1, 8)).await.unwrap();
+        retained.checkpoint().unwrap();
+        drop(retained);
+
+        // A reader does not keep writer ownership after the writer is dropped.
+        let reopened = DurableSymbolStore::open(config).unwrap();
+        assert_eq!(reopened.symbol_count(&test_object_id(1)).await, 2);
+        assert_eq!(
+            reopened
+                .get_symbol(&test_object_id(1), 0)
+                .await
+                .unwrap()
+                .data,
+            test_symbol(1, 0, 7).data
+        );
+        assert_eq!(reader.symbol_count(&test_object_id(1)).await, 1);
+        assert!(objects.exists(&test_object_id(9)).await);
+    }
+
+    #[tokio::test]
+    async fn symbol_writer_contender_cannot_repair_an_active_wal() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut config = DurableSymbolStoreConfig::new(temp_dir.path());
+        config.checkpoint_after_ops = 0;
+        let writer = DurableSymbolStore::open(config.clone()).unwrap();
+        writer.put_object_meta(test_symbol_meta(1)).await.unwrap();
+        writer.put_symbol(test_symbol(1, 0, 7)).await.unwrap();
+        let wal_path = temp_dir.path().join("symbols.wal.jsonl");
+        let committed = fs::read(&wal_path).unwrap();
+        let mut wal = OpenOptions::new().append(true).open(&wal_path).unwrap();
+        wal.write_all(br#"{"version":1,"seq":3"#).unwrap();
+        wal.sync_all().unwrap();
+        drop(wal);
+        let unfinished = fs::read(&wal_path).unwrap();
+
+        assert!(matches!(
+            DurableSymbolStore::open(config.clone()),
+            Err(SymbolStoreError::Io(reason)) if reason.contains("exclusive")
+        ));
+        assert_eq!(fs::read(&wal_path).unwrap(), unfinished);
+        drop(writer);
+        let reopened = DurableSymbolStore::open(config).unwrap();
+        assert_eq!(fs::read(&wal_path).unwrap(), committed);
+        assert_eq!(reopened.symbol_count(&test_object_id(1)).await, 1);
+    }
+
+    #[test]
+    fn symbol_writer_ownership_is_enforced_across_processes() {
+        const CHILD_STORE: &str = "FCP_SYMBOL_WRITER_LOCK_TEST_DIR";
+        if let Some(root) = std::env::var_os(CHILD_STORE) {
+            assert!(matches!(
+                DurableSymbolStore::open(DurableSymbolStoreConfig::new(root)),
+                Err(SymbolStoreError::Io(reason)) if reason.contains("exclusive")
+            ));
+            return;
+        }
+
+        let temp_dir = TempDir::new().unwrap();
+        let _writer =
+            DurableSymbolStore::open(DurableSymbolStoreConfig::new(temp_dir.path())).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "durable::tests::symbol_writer_ownership_is_enforced_across_processes",
+                "--nocapture",
+            ])
+            .env(CHILD_STORE, temp_dir.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "child failed: {output:?}");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symbol_writer_lock_rejects_symlinks_without_touching_the_target() {
+        let temp_dir = TempDir::new().unwrap();
+        let target = temp_dir.path().join("preserved");
+        fs::write(&target, b"preserve").unwrap();
+        std::os::unix::fs::symlink(&target, temp_dir.path().join("symbols.writer.lock")).unwrap();
+        assert!(DurableSymbolStore::open(DurableSymbolStoreConfig::new(temp_dir.path())).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"preserve");
     }
 
     #[tokio::test]
