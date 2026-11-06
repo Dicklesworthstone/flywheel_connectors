@@ -167,6 +167,8 @@ use tower::ServiceExt;
 mod connector_state_transfer;
 #[path = "fcp-host/deployment_evidence.rs"]
 mod deployment_evidence;
+#[path = "fcp-host/guarded_invoke.rs"]
+mod guarded_invoke;
 #[path = "fcp-host/http_batch.rs"]
 mod http_batch;
 #[path = "fcp-host/invoke_jobs.rs"]
@@ -7163,6 +7165,7 @@ async fn verify_live_request_for_target(
                 request.connector_id, request.operation
             ))
         })?;
+    guarded_invoke::enforce_tier(request, tool.safety_tier)?;
 
     let capability_key = state.capability_verifying_key.as_ref().ok_or_else(|| {
         HostError::PreflightFailed(
@@ -8282,13 +8285,15 @@ fn invoke_audit_unavailable(phase: &'static str, error: fcp_audit::AuditError) -
     ))
 }
 
-/// Apply the larger media envelope budget only to the three local invocation
-/// surfaces. Administrative, webhook, and mesh routes retain their own limits.
+/// Apply the larger media envelope budget to ordinary and guarded local
+/// invocation surfaces. Administrative, webhook, and mesh routes retain their
+/// own limits.
 fn local_invocation_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/rpc/invoke", post(invoke_handler))
         .route("/rpc/preflight", post(preflight_handler))
         .route("/rpc/simulate", post(simulate_handler))
+        .merge(guarded_invoke::routes())
         .layer(axum::extract::DefaultBodyLimit::max(
             LOCAL_INVOCATION_HTTP_BODY_LIMIT_BYTES,
         ))
@@ -14668,6 +14673,16 @@ async fn route_invoke_with_deadline(
             return Err(map_host_error(HostError::PreflightFailed(reason)));
         }
     };
+    if let Err(error) = guarded_invoke::enforce_route(&request, decision.is_forward()) {
+        append_mesh_preflight_denial(
+            state,
+            &request,
+            asserted_principal.as_deref(),
+            &error.to_string(),
+        )
+        .map_err(map_host_error)?;
+        return Err(map_host_error(error));
+    }
     if decision.is_forward() {
         return mesh_forward_invoke(
             state,

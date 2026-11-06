@@ -137,6 +137,7 @@ pub(super) async fn revalidate(
             "connector operation catalog is ambiguous at dispatch",
         ));
     }
+    super::super::guarded_invoke::enforce_tier(request, tool.safety_tier)?;
     let verification = state
         .lifecycle
         .verify_capability_token(&CapabilityTokenVerifyRequest {

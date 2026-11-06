@@ -863,6 +863,24 @@ fn invocation_state_error(reason: &str) -> LifecycleError {
     }
 }
 
+// ── Guarded invoke RPC types ────────────────────────────────────────────────
+
+/// Exact invocation and caller-imposed safety ceiling for guarded host RPCs.
+///
+/// `/rpc/preflight/guarded` inspects this request without executing it;
+/// `/rpc/invoke/guarded` uses the ordinary authorized, owned invocation path.
+/// Both require the selected host to execute locally until mesh peers can
+/// attest support for the guard. Older hosts cannot silently ignore the
+/// ceiling because these are distinct RPC routes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostGuardedInvokeRequest {
+    /// Full request reused unchanged between guarded preflight and invocation.
+    pub request: fcp_kernel::InvokeRequest,
+    /// Highest operation tier the caller permits. `Forbidden` is rejected.
+    pub max_safety_tier: fcp_core::SafetyTier,
+}
+
 // ── Simulate RPC types ──────────────────────────────────────────────────────
 
 /// Host RPC request for a simulation (preflight + connector simulate).
