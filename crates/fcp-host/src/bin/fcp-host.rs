@@ -2163,6 +2163,7 @@ struct SubprocessRegistry {
     rate_limiters: Arc<HostRateLimiterStore>,
 }
 
+#[derive(Clone)]
 struct RegistryEntry {
     config: ConnectorConfig,
     connector: ConnectorRuntime,
@@ -2343,6 +2344,8 @@ struct RegistryState {
 }
 
 struct RegistryConfigPlan {
+    /// Generation observed under the same read lock as the current inventory.
+    source_version: u64,
     next_configs: HashMap<ConnectorId, ConnectorConfig>,
     replacement_ids: Vec<ConnectorId>,
     added: Vec<String>,
@@ -2355,6 +2358,7 @@ impl RegistryConfigPlan {
     fn new(
         current_configs: &HashMap<ConnectorId, ConnectorConfig>,
         configs: Vec<ConnectorConfig>,
+        source_version: u64,
     ) -> HostResult<Self> {
         let mut next_configs = HashMap::new();
         for config in configs {
@@ -2397,6 +2401,7 @@ impl RegistryConfigPlan {
         unchanged.sort();
 
         Ok(Self {
+            source_version,
             next_configs,
             replacement_ids,
             added,
@@ -2619,16 +2624,17 @@ impl SubprocessRegistry {
     }
 
     async fn plan_configs(&self, configs: Vec<ConnectorConfig>) -> HostResult<RegistryConfigPlan> {
-        let current_configs = {
+        let (current_configs, source_version) = {
             let state = self.state.read().await;
-            state
+            let current_configs = state
                 .connectors
                 .iter()
                 .map(|(id, entry)| (id.clone(), entry.config.clone()))
-                .collect::<HashMap<_, _>>()
+                .collect::<HashMap<_, _>>();
+            (current_configs, self.version.load(Ordering::SeqCst))
         };
 
-        RegistryConfigPlan::new(&current_configs, configs)
+        RegistryConfigPlan::new(&current_configs, configs, source_version)
     }
 
     async fn prepare_configs(
@@ -2660,39 +2666,80 @@ impl SubprocessRegistry {
         for connector_id in &plan.replacement_ids {
             validate_registry_config(&plan.next_configs[connector_id])?;
         }
-        Ok(plan.report(self.version.load(Ordering::SeqCst)))
+        Ok(plan.report(plan.source_version))
     }
 
     async fn apply_configs(
         &self,
         configs: Vec<ConnectorConfig>,
     ) -> HostResult<ConnectorInventoryApplyReport> {
-        let mut prepared = self.prepare_configs(configs).await?;
-        let changed = prepared.plan.changed();
+        let prepared = self.prepare_configs(configs).await?;
+        self.publish_configs(prepared).await
+    }
 
+    /// Runtime preparation may wait for process startup. Publish only against
+    /// the inventory it observed, leaving the complete live map intact on any
+    /// failure. A stale plan must never reuse a different runtime or erase
+    /// unrelated connectors when an expected unchanged entry disappeared.
+    async fn publish_configs(
+        &self,
+        prepared: PreparedRegistryApply,
+    ) -> HostResult<ConnectorInventoryApplyReport> {
         let mut state = self.state.write().await;
-        let mut current_entries = std::mem::take(&mut state.connectors);
+        let source_version = self.version.load(Ordering::SeqCst);
+        if source_version != prepared.plan.source_version {
+            return Err(HostError::Unavailable(
+                "connector inventory changed during preparation; reload it before retrying"
+                    .to_string(),
+            ));
+        }
+        let registry_version = if prepared.plan.changed() {
+            source_version.checked_add(1).ok_or_else(|| {
+                HostError::Unavailable("connector inventory generation is exhausted".to_string())
+            })?
+        } else {
+            source_version
+        };
+        if prepared.replacement_entries.len() != prepared.plan.replacement_ids.len()
+            || !prepared
+                .plan
+                .replacement_ids
+                .iter()
+                .all(|id| prepared.replacement_entries.contains_key(id))
+        {
+            return Err(HostError::Internal(
+                "registry apply prepared an incomplete or unexpected replacement set".to_string(),
+            ));
+        }
+
+        // Build the complete candidate before touching live state. Cloning
+        // retains the exact process handles for all unchanged entries.
         let mut next_entries = HashMap::new();
-        let next_configs = std::mem::take(&mut prepared.plan.next_configs);
-        for (connector_id, _config) in next_configs {
-            if let Some(entry) = prepared.replacement_entries.remove(&connector_id) {
-                next_entries.insert(connector_id, entry);
-            } else if let Some(existing) = current_entries.remove(&connector_id) {
-                next_entries.insert(connector_id, existing);
-            } else {
+        for (connector_id, config) in &prepared.plan.next_configs {
+            let entry = prepared
+                .replacement_entries
+                .get(connector_id)
+                .or_else(|| state.connectors.get(connector_id))
+                .ok_or_else(|| {
+                    HostError::Internal(format!(
+                        "registry apply prepared no entry for connector {connector_id}"
+                    ))
+                })?;
+            if entry.config != *config {
                 return Err(HostError::Internal(format!(
-                    "registry apply prepared no entry for connector {connector_id}"
+                    "registry apply prepared a mismatched entry for connector {connector_id}"
                 )));
             }
+            next_entries.insert(connector_id.clone(), entry.clone());
         }
-        state.connectors = next_entries;
-        drop(state);
 
-        let registry_version = if changed {
-            self.version.fetch_add(1, Ordering::SeqCst) + 1
-        } else {
-            self.version.load(Ordering::SeqCst)
-        };
+        // Governance snapshots must observe the generation of their map.
+        // Publish it before exposing a replacement runtime, under the same lock.
+        self.version.store(registry_version, Ordering::SeqCst);
+        let retired = std::mem::replace(&mut state.connectors, next_entries);
+        drop(state);
+        // Process/task destructors must not hold the registry map lock.
+        drop(retired);
 
         Ok(prepared.plan.report(registry_version))
     }
@@ -30722,6 +30769,7 @@ done"#;
                 unchanged.clone(),
                 added_a.clone(),
             ],
+            7,
         )
         .expect("plan inventory changes without executing dispatcher-test");
 
@@ -30740,7 +30788,7 @@ done"#;
             vec![added_a.id, added_b.id, updated.id],
         );
 
-        let no_change = RegistryConfigPlan::new(&current, current.values().cloned().collect())
+        let no_change = RegistryConfigPlan::new(&current, current.values().cloned().collect(), 7)
             .expect("unchanged inventory");
         assert!(!no_change.changed());
         assert!(no_change.replacement_ids.is_empty());
@@ -30749,17 +30797,209 @@ done"#;
     #[test]
     fn registry_preview_plan_rejects_duplicate_and_invalid_connector_ids() {
         let config = dispatcher_test_config("fcp.test.preview-duplicate:utility:1.0.0");
-        let error = RegistryConfigPlan::new(&HashMap::new(), vec![config.clone(), config.clone()])
-            .err()
-            .expect("duplicate connector ids must be rejected");
+        let error =
+            RegistryConfigPlan::new(&HashMap::new(), vec![config.clone(), config.clone()], 1)
+                .err()
+                .expect("duplicate connector ids must be rejected");
         assert!(error.to_string().contains("duplicate connector id"));
 
         let mut invalid = config;
         invalid.id = "not a connector id".to_string();
-        let error = RegistryConfigPlan::new(&HashMap::new(), vec![invalid])
+        let error = RegistryConfigPlan::new(&HashMap::new(), vec![invalid], 1)
             .err()
             .expect("invalid connector ids must be rejected");
         assert!(error.to_string().contains("invalid connector id"));
+    }
+
+    /// Exercise publication independently of startup. These runtime handles
+    /// cannot invoke a provider, but let tests check preservation of identity.
+    pub(super) async fn registry_publication_fixture(
+        registry: &SubprocessRegistry,
+        configs: Vec<ConnectorConfig>,
+    ) -> PreparedRegistryApply {
+        let plan = registry.plan_configs(configs).await.expect("fixture plan");
+        let replacement_entries = plan
+            .replacement_ids
+            .iter()
+            .map(|id| {
+                let config = plan.next_configs[id].clone();
+                let connector = ConnectorRuntime::UnavailableNativeProxyOnly(Arc::new(
+                    UnavailableNativeProxyOnlyConnector::new(
+                        &config,
+                        NativeProxyOnlySandboxSupport::current(),
+                    )
+                    .expect("fixture runtime"),
+                ));
+                (
+                    id.clone(),
+                    RegistryEntry {
+                        config,
+                        connector,
+                        manifest_constraints: ManifestOperationConstraintCatalog::default(),
+                    },
+                )
+            })
+            .collect();
+        PreparedRegistryApply {
+            plan,
+            replacement_entries,
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn registry_publication_rejects_stale_plan_without_erasing_current_inventory() {
+        let registry = empty_registry(1);
+        let removed = dispatcher_test_config("fcp.test.publish-removed:utility:1.0.0");
+        let survivor = dispatcher_test_config("fcp.test.publish-survivor:utility:1.0.0");
+        registry
+            .publish_configs(
+                registry_publication_fixture(&registry, vec![removed.clone(), survivor.clone()])
+                    .await,
+            )
+            .await
+            .unwrap();
+        let stale = registry
+            .prepare_configs(vec![removed, survivor.clone()])
+            .await
+            .unwrap();
+        registry
+            .apply_configs(vec![survivor.clone()])
+            .await
+            .unwrap();
+
+        let error = registry.publish_configs(stale).await.unwrap_err();
+        assert!(error.to_string().contains("changed during preparation"));
+        assert_eq!(registry.inventory().await, vec![survivor]);
+        assert_eq!(registry.version(), 3);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn registry_publication_rejects_stale_plan_after_same_id_replacement() {
+        let registry = empty_registry(1);
+        let original = dispatcher_test_config("fcp.test.publish-replaced:utility:1.0.0");
+        registry
+            .publish_configs(registry_publication_fixture(&registry, vec![original.clone()]).await)
+            .await
+            .unwrap();
+        let stale = registry
+            .prepare_configs(vec![original.clone()])
+            .await
+            .unwrap();
+        let mut replacement = original;
+        replacement.allowed_zones = vec![ZoneId::owner().to_string()];
+        registry
+            .publish_configs(
+                registry_publication_fixture(&registry, vec![replacement.clone()]).await,
+            )
+            .await
+            .unwrap();
+
+        assert!(registry.publish_configs(stale).await.is_err());
+        assert_eq!(registry.inventory().await, vec![replacement]);
+        assert_eq!(registry.version(), 3);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn registry_publication_missing_or_mismatched_entry_is_atomic() {
+        let registry = empty_registry(1);
+        let original = dispatcher_test_config("fcp.test.publish-existing:utility:1.0.0");
+        let added = dispatcher_test_config("fcp.test.publish-added:utility:1.0.0");
+        registry
+            .publish_configs(registry_publication_fixture(&registry, vec![original.clone()]).await)
+            .await
+            .unwrap();
+        let missing = PreparedRegistryApply {
+            plan: registry
+                .plan_configs(vec![original.clone(), added.clone()])
+                .await
+                .unwrap(),
+            replacement_entries: HashMap::new(),
+        };
+        let error = registry.publish_configs(missing).await.unwrap_err();
+        assert!(error.to_string().contains("replacement set"));
+        assert_eq!(registry.inventory().await, vec![original.clone()]);
+        assert_eq!(registry.version(), 2);
+
+        let mut mismatched =
+            registry_publication_fixture(&registry, vec![original.clone(), added.clone()]).await;
+        mismatched
+            .replacement_entries
+            .get_mut(&added.id.parse::<ConnectorId>().unwrap())
+            .unwrap()
+            .config
+            .allowed_zones = vec![ZoneId::owner().to_string()];
+        let error = registry.publish_configs(mismatched).await.unwrap_err();
+        assert!(error.to_string().contains("mismatched entry"));
+        assert_eq!(registry.inventory().await, vec![original]);
+        assert_eq!(registry.version(), 2);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn registry_publication_rejects_unplanned_runtime_replacement() {
+        let registry = empty_registry(1);
+        let config = dispatcher_test_config("fcp.test.publish-unplanned:utility:1.0.0");
+        registry
+            .publish_configs(registry_publication_fixture(&registry, vec![config.clone()]).await)
+            .await
+            .unwrap();
+        let mut prepared = registry
+            .prepare_configs(vec![config.clone()])
+            .await
+            .unwrap();
+        let id = config.id.parse::<ConnectorId>().unwrap();
+        prepared.replacement_entries.insert(
+            id.clone(),
+            registry.state.read().await.connectors[&id].clone(),
+        );
+
+        let error = registry.publish_configs(prepared).await.unwrap_err();
+        assert!(error.to_string().contains("replacement set"));
+        assert_eq!(registry.inventory().await, vec![config]);
+        assert_eq!(registry.version(), 2);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn registry_publication_preserves_unchanged_runtime_and_generation() {
+        let registry = empty_registry(1);
+        let config = dispatcher_test_config("fcp.test.publish-unchanged:utility:1.0.0");
+        registry
+            .publish_configs(registry_publication_fixture(&registry, vec![config.clone()]).await)
+            .await
+            .unwrap();
+        let id = config.id.parse::<ConnectorId>().unwrap();
+        let original = registry.state.read().await.connectors[&id]
+            .connector
+            .clone();
+        let report = registry.apply_configs(vec![config]).await.unwrap();
+        let state = registry.state.read().await;
+        match (&original, &state.connectors[&id].connector) {
+            (
+                ConnectorRuntime::UnavailableNativeProxyOnly(original),
+                ConnectorRuntime::UnavailableNativeProxyOnly(current),
+            ) => assert!(Arc::ptr_eq(original, current)),
+            _ => panic!("fixture runtime changed"),
+        }
+        assert_eq!(report.registry_version, 2);
+        assert_eq!(report.unchanged, vec![id.to_string()]);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn registry_publication_refuses_generation_exhaustion_before_mutation() {
+        let registry = empty_registry(u64::MAX);
+        let config = dispatcher_test_config("fcp.test.publish-overflow:utility:1.0.0");
+        let prepared = registry_publication_fixture(&registry, vec![config]).await;
+        let error = registry.publish_configs(prepared).await.unwrap_err();
+        assert!(error.to_string().contains("generation is exhausted"));
+        assert!(registry.inventory().await.is_empty());
+        assert_eq!(registry.version(), u64::MAX);
+        assert_eq!(
+            registry
+                .apply_configs(Vec::new())
+                .await
+                .unwrap()
+                .registry_version,
+            u64::MAX
+        );
     }
 
     #[fcp_async_core::runtime::test(flavor = "multi_thread")]
