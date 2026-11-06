@@ -110,12 +110,12 @@ pub const COMMAND_CLASSIFICATIONS: &[CommandClassification] = &[
     },
     CommandClassification {
         command: "rules",
-        truth_source: CommandTruthSource::OfflineArtifact,
-        execution_mode: CommandExecutionMode::LocalOnly,
-        host_absent: HostAbsentBehavior::Unaffected,
-        requires_capability_token: false,
-        may_need_approval: false,
-        transport_note: "Local reactive definitions and bounded event previews; previews never invoke operations or consume dispatch state",
+        truth_source: CommandTruthSource::Hybrid,
+        execution_mode: CommandExecutionMode::Mutating,
+        host_absent: HostAbsentBehavior::FailFast,
+        requires_capability_token: true,
+        may_need_approval: true,
+        transport_note: "Definitions, tests, previews and run --dry-run stay local; live run requires guarded host admission and durable replay protection, with no mesh forwarding",
     },
     CommandClassification {
         command: "session",
@@ -3831,12 +3831,14 @@ fn command_contract(command: &str) -> Option<Value> {
         )),
         "rules" => Some(json!({
             "family": "workflow",
-            "summary": "Manage persisted reactive rules and preview bounded event files.",
-            "intended_shape": "Local TOML definitions and truthful, side-effect-free matching previews with explicit validation errors.",
+            "summary": "Manage reactive rules, preview events, and execute bounded batches through guarded host admission.",
+            "intended_shape": "Local TOML definitions and previews, plus live execution with frozen authority, host-enforced safety ceilings, persistent throttles and durable replay protection.",
             "next_beads": ["flywheel_connectors-qnchs.8.4"],
             "workflow_handoff": [
                 "Register [[rules]] definitions with `fwc rules add rules.toml`; tiers above safe require --allow-risky.",
                 "Preview events with `fwc rules preview --events events.jsonl`; previews never invoke operations or consume events.",
+                "Execute a finite batch with `fwc rules run --events events.jsonl --capability-token-file token.cbor --host <host>`; use --rule-capability-token-file RULE=PATH for separately authorized rules.",
+                "Unknown outcomes remain reserved across restarts; inspect the recorded request on the selected host before deciding whether to repeat an effect.",
                 "Use `fwc rules test rules.toml --event '<JSON>'` to inspect one event before registration."
             ]
         })),

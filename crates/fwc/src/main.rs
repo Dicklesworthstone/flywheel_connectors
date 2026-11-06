@@ -253,6 +253,7 @@ mod retry_controller;
 #[allow(dead_code)] // Smart connector auto-routing for ambiguous intents.
 mod routing;
 mod rules_cmd;
+mod rules_host;
 #[allow(dead_code)]
 mod schema_nav;
 mod search;
@@ -333,9 +334,10 @@ use fcp_host::{
     DiscoveryFilter as HostDiscoveryFilter, DiscoveryResponse as HostDiscoveryResponse,
     DoctorReport as HostDoctorReport, DoctorRequest as HostDoctorRequest,
     EventQueryRequest as HostEventQueryRequest, EventQueryResponse as HostEventQueryResponse,
-    HostEvent as HostAdminEvent, HostEventKind, HostHealthResponse, HostPreflightRequest,
-    HostSimulateRequest, HostSimulateResponse, IntrospectionResponse as HostIntrospectionResponse,
-    LifecycleTransitionRequest, LifecycleTransitionResponse, ManagedConnectorConfig,
+    HostEvent as HostAdminEvent, HostEventKind, HostGuardedInvokeRequest, HostHealthResponse,
+    HostPreflightRequest, HostSimulateRequest, HostSimulateResponse,
+    IntrospectionResponse as HostIntrospectionResponse, LifecycleTransitionRequest,
+    LifecycleTransitionResponse, ManagedConnectorConfig,
     PreflightResponse as HostPreflightResponse, RuntimeNetworkEnforcement, SimulatePhase,
     ToolDescriptor as HostToolDescriptor,
 };
@@ -3688,7 +3690,8 @@ fn mcp_tool_call_response(
         }
     };
 
-    match invoke_dispatch_host_controlled("invoke", &invoke_args, host, None, Some(&control)) {
+    match invoke_dispatch_host_controlled("invoke", &invoke_args, host, None, Some(&control), None)
+    {
         Ok(dispatch) => {
             let mut structured_content = dispatch.payload;
             let message = structured_content["message"]
@@ -4413,27 +4416,7 @@ fn dispatch(cli: &Cli) -> Result<DispatchOutcome> {
         Commands::Mesh(args) => mesh_dispatch(args, cli.host.as_deref())?,
         Commands::Connector(args) => connector_dispatch(args, cli.host.as_deref())?,
         Commands::Task(args) => task_dispatch(args, cli.host.as_deref())?,
-        Commands::Rules(args) => {
-            let (mut payload, exit_code) = match rules_cmd::dispatch(args) {
-                Ok(rules) => (
-                    rules.payload,
-                    if rules.rejected {
-                        CliExitCode::Validation
-                    } else {
-                        CliExitCode::Success
-                    },
-                ),
-                Err(error) => (
-                    json!({"status": "error", "command": "rules",
-                        "error": {"type": "rules-request-failed", "message": error.to_string()}}),
-                    CliExitCode::Validation,
-                ),
-            };
-            CommandEnvelope::new(CommandAvailability::OfflineArtifact, "rules")
-                .inject_into(&mut payload);
-            inject_truth_source_metadata(&mut payload, KnowledgeState::Offline);
-            DispatchOutcome { payload, exit_code }
-        }
+        Commands::Rules(args) => rules_host::dispatch(args, cli.host.as_deref())?,
         Commands::Session(args) => session_dispatch(args)?,
         Commands::Agent(args) => agent_dispatch(args)?,
         Commands::AgentBootstrap(args) => agent_bootstrap_dispatch(args)?,
@@ -5408,7 +5391,7 @@ impl std::fmt::Display for HostReadTimeout {
 
 impl std::error::Error for HostReadTimeout {}
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct HostAdminClient {
     client: BlockingClient,
     base_url: String,
@@ -5894,6 +5877,36 @@ impl HostAdminClient {
             // secrets. The stable identity is sufficient for safe inspection.
             invocation_cmd::InvokeOutcomeUnknown::from_request(request, &self.endpoint, &error)
                 .into()
+        })
+    }
+
+    fn preflight_guarded(
+        &self,
+        request: &HostGuardedInvokeRequest,
+    ) -> Result<HostPreflightResponse> {
+        self.post_json_with_timeout("/rpc/preflight/guarded", request, self.read_timeout)
+    }
+
+    fn invoke_guarded(&self, request: &HostGuardedInvokeRequest) -> Result<InvokeResponse> {
+        self.post_json_with_timeout(
+            "/rpc/invoke/guarded",
+            request,
+            host_invoke_http_timeout(request.request.deadline_ms),
+        )
+        .and_then(|response: InvokeResponse| {
+            anyhow::ensure!(
+                response.id == request.request.id,
+                "host returned a guarded invoke response for a different request"
+            );
+            Ok(response)
+        })
+        .map_err(|error| {
+            invocation_cmd::InvokeOutcomeUnknown::from_request(
+                &request.request,
+                &self.endpoint,
+                &error,
+            )
+            .into()
         })
     }
 
@@ -25175,7 +25188,7 @@ fn invoke_dispatch_host(
     host: &ResolvedHostConfig,
     simulation: Option<&SimulateArgs>,
 ) -> Result<DispatchOutcome> {
-    invoke_dispatch_host_controlled(command, args, host, simulation, None)
+    invoke_dispatch_host_controlled(command, args, host, simulation, None, None)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -25185,11 +25198,19 @@ fn invoke_dispatch_host_controlled(
     host: &ResolvedHostConfig,
     simulation: Option<&SimulateArgs>,
     control: Option<&serve_mcp_host::McpInvocationControl>,
+    mut guard: Option<&mut rules_host::InvocationGuard<'_>>,
 ) -> Result<DispatchOutcome> {
+    anyhow::ensure!(
+        guard.is_none() || (simulation.is_none() && control.is_none()),
+        "guarded rule execution cannot use simulation or MCP invocation control"
+    );
     if let Some(control) = control {
         control.checkpoint()?;
     }
-    let auth = match resolve_live_auth(&args.auth) {
+    let auth = match guard.as_deref().map_or_else(
+        || resolve_live_auth(&args.auth),
+        |guard| Ok(guard.auth.clone()),
+    ) {
         Ok(auth) => auth,
         Err(error) => {
             return Ok(live_auth_dispatch(
@@ -25206,7 +25227,11 @@ fn invoke_dispatch_host_controlled(
         }
     };
 
-    let mut client = HostAdminClient::new(&host.endpoint)?;
+    let mut client = if let Some(guard) = guard.as_deref() {
+        guard.client.clone()
+    } else {
+        HostAdminClient::new(&host.endpoint)?
+    };
     if let Some(control) = control {
         control.checkpoint()?;
         // MCP shutdown must be able to drain preparation as well as invocation.
@@ -25302,6 +25327,16 @@ fn invoke_dispatch_host_controlled(
     if let Some(control) = control {
         control.checkpoint()?;
         control.validate_authority(&auth, &zone, effective_principal.as_deref())?;
+    }
+    if let Some(guard) = guard.as_deref() {
+        guard.validate_target(
+            &host.endpoint,
+            connector.summary.id.as_str(),
+            &operation.name,
+            &zone,
+            effective_principal.as_deref(),
+            operation.safety_tier,
+        )?;
     }
 
     let mut payload = json!({
@@ -25502,6 +25537,27 @@ fn invoke_dispatch_host_controlled(
         return Ok(DispatchOutcome { payload, exit_code });
     }
 
+    let invoke_request = InvokeRequest {
+        r#type: "invoke".to_owned(),
+        id: request_id.clone(),
+        connector_id: connector_id.clone(),
+        operation: operation_id,
+        zone_id: zone_id.clone(),
+        input: prepared_payload.clone(),
+        capability_token: auth.capability_token.clone(),
+        holder_proof: holder_proof.clone(),
+        context: None,
+        idempotency_key: args.idempotency_key.clone(),
+        lease_seq: args.lease_seq,
+        deadline_ms: args.deadline_ms,
+        correlation_id: None,
+        provenance: None,
+        approval_tokens: auth.approval_tokens.clone(),
+    };
+    let guarded_request = guard.as_deref().map(|guard| HostGuardedInvokeRequest {
+        request: invoke_request.clone(),
+        max_safety_tier: guard.max_safety_tier,
+    });
     let preflight_request = HostPreflightRequest {
         holder_proof: holder_proof.clone(),
         request_id: request_id.clone(),
@@ -25514,7 +25570,9 @@ fn invoke_dispatch_host_controlled(
         capability_token: Some(auth.capability_token.clone()),
         approval_tokens: auth.approval_tokens.clone(),
     };
-    let preflight: HostPreflightResponse = if let Some(control) = control {
+    let preflight: HostPreflightResponse = if let Some(request) = &guarded_request {
+        client.preflight_guarded(request)?
+    } else if let Some(control) = control {
         control.checkpoint()?;
         client.post_json_with_timeout("/rpc/preflight", &preflight_request, client.read_timeout)?
     } else {
@@ -25564,25 +25622,15 @@ fn invoke_dispatch_host_controlled(
         });
     }
 
-    let invoke_request = InvokeRequest {
-        r#type: "invoke".to_owned(),
-        id: request_id,
-        connector_id,
-        operation: operation_id,
-        zone_id,
-        input: prepared_payload.clone(),
-        capability_token: auth.capability_token,
-        holder_proof,
-        context: None,
-        idempotency_key: args.idempotency_key.clone(),
-        lease_seq: args.lease_seq,
-        deadline_ms: args.deadline_ms,
-        correlation_id: None,
-        provenance: None,
-        approval_tokens: auth.approval_tokens,
-    };
+    if let Some(guard) = guard.as_deref_mut() {
+        // Successful fsync of the pending attempt is the last fallible step
+        // before dispatch. Never send the request if reservation fails.
+        guard.reserve(&invoke_request)?;
+    }
     let started_at = std::time::Instant::now();
-    let invocation = if let Some(control) = control {
+    let invocation = if let Some(request) = &guarded_request {
+        client.invoke_guarded(request)
+    } else if let Some(control) = control {
         control.invoke(&client, &invoke_request)
     } else {
         client.invoke(&invoke_request)

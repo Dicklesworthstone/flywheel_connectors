@@ -1160,11 +1160,12 @@ key derivation are not opened automatically: preserve the old file and re-import
 the credentials into the OS keychain or a new store using an independent key.
 Credential-file replacements are encrypted, synced, and atomically published.
 
-### Reactive rule definitions and previews
+### Reactive rules and guarded execution
 
-`fwc rules` manages TOML rules and previews normalized JSONL events. These local
-commands never invoke a connector, claim live authorization, or consume event
-deduplication state. Registration above the `safe` tier requires `--allow-risky`.
+`fwc rules` manages TOML rules, previews normalized JSONL events, and executes
+finite event batches through the selected host. Registration above the `safe`
+tier requires `--allow-risky`; the rule's `safety_tier` is a ceiling, and ordinary
+capability, policy, approval, and deployment checks still apply at execution.
 
 ```toml
 [[rules]]
@@ -1179,6 +1180,8 @@ fwc rules add search-rules.toml
 fwc rules list
 fwc rules test search-rules.toml --event '{"connector":"slack","event_type":"message.new","event_id":"msg-1","data":{"text":"Bug in login"}}'
 fwc rules preview --events events.jsonl --rule search-related-issues
+fwc --host http://127.0.0.1:8787 rules run --events events.jsonl --capability-token-file github.cbor
+fwc rules run --events events.jsonl --dry-run
 fwc rules disable search-related-issues
 ```
 
@@ -1188,6 +1191,46 @@ Definitions are capped at 1 MiB, events at 256 KiB each and 16 MiB per file,
 and previews at 10,000 rule/event evaluations and 8 MiB of output. Every
 rendered action has a shared 1 MiB limit; an exceeded limit is reported as
 `input_rejected` and yields a nonzero exit status.
+
+Live runs validate the complete event batch and resolve every enabled rule's
+target and credentials before starting any action. Default credentials may cover
+one connector; use `--rule-capability-token-file RULE=PATH` for other rules and
+`--rule-holder-key-file RULE=PATH` for their holder-bound capabilities. A rule
+with its own capability never inherits the default holder key. Supply real
+approval tokens with `--approval-token-file` when required. The resolved host,
+zone, principal, canonical connector and operation stay fixed for the batch.
+
+Each action uses `/rpc/preflight/guarded` followed by `/rpc/invoke/guarded`. The
+host checks the registered ceiling against live operation metadata at admission
+and dispatch. Guarded execution requires these endpoints and stays on the
+selected host; it refuses mesh forwarding to peers whose ceiling enforcement is
+not established. The default action deadline is 30 seconds, configurable with
+`--deadline-ms` up to 60 seconds. A run is a bounded JSONL batch, not a background
+subscription or continuous event daemon.
+
+The runner holds the rules-file lock and persists checksummed execution records
+in `<rules-file>.state.jsonl`. It syncs a pending reservation before dispatch,
+then records the result. Restarts preserve throttle and circuit-breaker state.
+Pending or unknown outcomes remain reserved indefinitely and are never retried
+automatically; a lost response stops the batch with request IDs and partial
+results retained. Inspect those requests with `fwc invocation REQUEST_ID --host
+HOST` and the required admin credentials. There is no automatic reconciliation
+or clearing of uncertain attempts. A corrupt complete journal record blocks
+further execution. Recovery can discard an unterminated final append only after
+validating the preceding complete records; an interrupted settlement leaves its
+pending reservation intact and becomes an unknown outcome before further work.
+
+Completed and failed attempts are retained for at least 24 hours and at least
+the rule's throttle window. Editing a throttle or safety ceiling does not make
+an already attempted event new. Changing an action or its execution scope can
+create a distinct effect identity. Widening a throttle window into execution
+history that has already been discarded is refused until that history leaves the
+window. State is limited to 10,000 retained attempts
+and 1,024 rule runtimes; capacity exhaustion refuses additional dispatch. The
+complete rendered batch is capped at 16 MiB, and the append journal at 64 MiB.
+Definitions, tests, previews, and `run --dry-run` remain local and consume no
+dispatch state. Keep the definitions and their state journal together when
+moving or backing up a runner.
 
 ### Quick Start
 
