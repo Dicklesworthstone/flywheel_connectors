@@ -1,8 +1,9 @@
 //! FCP Linear Connector implementation.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::{Duration as StdDuration, Instant};
 
 use chrono::Utc;
 use fcp_prelude::{
@@ -24,6 +25,11 @@ use crate::{
 };
 
 const MAX_LINEAR_WEBHOOK_SKEW_MS: u64 = 60_000;
+const MAX_LINEAR_WEBHOOK_REPLAY_RECEIPTS: usize = 10_000;
+// A timestamp accepted at the future edge remains valid for two skew windows.
+// The extra millisecond covers the inclusive timestamp acceptance boundary.
+const LINEAR_WEBHOOK_REPLAY_RETENTION: StdDuration =
+    StdDuration::from_millis(2 * MAX_LINEAR_WEBHOOK_SKEW_MS + 1);
 const MANIFEST_TOML: &str = include_str!("../manifest.toml");
 
 /// Parsed and validated Linear connector configuration.
@@ -188,6 +194,121 @@ impl DoctorResult {
     }
 }
 
+#[derive(Debug)]
+struct AcceptedWebhookDelivery {
+    delivery_id: Uuid,
+    payload_fingerprint: [u8; 32],
+    webhook_timestamp: i64,
+    accepted_at: Instant,
+}
+
+/// Bounded replay protection for host-verified Linear deliveries.
+///
+/// Both indexes are updated together under the connector's replay mutex. The
+/// payload index prevents an unsigned `Linear-Delivery` header from being
+/// changed to admit the same authenticated payload again. Only fixed-size
+/// identities are retained; neither payloads nor attacker-sized strings are
+/// kept in the replay cache.
+#[derive(Debug, Default)]
+struct WebhookReplayReceipts {
+    delivery_ids: BTreeSet<Uuid>,
+    payload_fingerprints: BTreeSet<[u8; 32]>,
+    accepted: VecDeque<AcceptedWebhookDelivery>,
+    verification_time_ms: Option<i64>,
+}
+
+impl WebhookReplayReceipts {
+    fn record(
+        &mut self,
+        delivery_id: Uuid,
+        payload_fingerprint: [u8; 32],
+        webhook_timestamp: i64,
+        now_ms: i64,
+        accepted_at: Instant,
+    ) -> FcpResult<()> {
+        // Once a signed timestamp has expired, a wall-clock rollback must not
+        // make it admissible again after its receipt has been reclaimed. Only
+        // trusted local time advances this watermark, never provider data.
+        let verification_time_ms = self
+            .verification_time_ms
+            .map_or(now_ms, |previous| previous.max(now_ms));
+        self.verification_time_ms = Some(verification_time_ms);
+        if verification_time_ms.abs_diff(webhook_timestamp) > MAX_LINEAR_WEBHOOK_SKEW_MS {
+            return Err(FcpError::InvalidRequest {
+                code: 1003,
+                message: format!(
+                    "payload.webhookTimestamp is outside the accepted {MAX_LINEAR_WEBHOOK_SKEW_MS}ms replay window"
+                ),
+            });
+        }
+
+        // Provider timestamps must never control eviction: a newer (possibly
+        // future-dated) delivery can otherwise erase still-valid older ones.
+        // The production caller samples Instant while holding the mutex, so
+        // this queue is ordered by local monotonic acceptance time. A stalled
+        // or regressed wall clock also cannot discard a still-valid payload:
+        // reclaim only after BOTH its local retention and signed validity end.
+        while self.accepted.front().is_some_and(|receipt| {
+            accepted_at.saturating_duration_since(receipt.accepted_at)
+                >= LINEAR_WEBHOOK_REPLAY_RETENTION
+                && verification_time_ms > receipt.webhook_timestamp
+                && verification_time_ms.abs_diff(receipt.webhook_timestamp)
+                    > MAX_LINEAR_WEBHOOK_SKEW_MS
+        }) {
+            if let Some(expired) = self.accepted.pop_front() {
+                self.delivery_ids.remove(&expired.delivery_id);
+                self.payload_fingerprints
+                    .remove(&expired.payload_fingerprint);
+            }
+        }
+
+        if self.delivery_ids.contains(&delivery_id) {
+            return Err(FcpError::InvalidRequest {
+                code: 1003,
+                message: "delivery_id has already been processed within the replay window".into(),
+            });
+        }
+        if self.payload_fingerprints.contains(&payload_fingerprint) {
+            return Err(FcpError::InvalidRequest {
+                code: 1003,
+                message: "webhook payload has already been processed within the replay window"
+                    .into(),
+            });
+        }
+        if self.accepted.len() >= MAX_LINEAR_WEBHOOK_REPLAY_RECEIPTS {
+            return Err(FcpError::ResourceExhausted {
+                resource: "Linear webhook replay receipts; retry after active receipts expire"
+                    .into(),
+            });
+        }
+
+        self.delivery_ids.insert(delivery_id);
+        self.payload_fingerprints.insert(payload_fingerprint);
+        self.accepted.push_back(AcceptedWebhookDelivery {
+            delivery_id,
+            payload_fingerprint,
+            webhook_timestamp,
+            accepted_at,
+        });
+        Ok(())
+    }
+}
+
+fn webhook_payload_fingerprint(payload: &serde_json::Value) -> FcpResult<[u8; 32]> {
+    // Hash the complete host-verified payload, including provider fields not
+    // represented by WebhookPayload. Canonical object ordering also prevents a
+    // forwarding layer's JSON key ordering from creating a fresh replay key.
+    let mut canonical_payload = payload.clone();
+    canonical_payload.sort_all_objects();
+    let encoded = serde_json::to_vec(&canonical_payload).map_err(|_| FcpError::Internal {
+        message: "Failed to fingerprint Linear webhook payload".into(),
+    })?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"fcp.linear.webhook.payload.v1\0");
+    hasher.update(encoded);
+    Ok(hasher.finalize().into())
+}
+
 /// FCP Linear Connector.
 pub struct LinearConnector {
     base: Arc<BaseConnector>,
@@ -195,7 +316,7 @@ pub struct LinearConnector {
     client: Option<LinearClient>,
     verifier: Option<CapabilityVerifier>,
     session_id: Option<SessionId>,
-    webhook_replay_receipts: Mutex<BTreeMap<Uuid, i64>>,
+    webhook_replay_receipts: Mutex<WebhookReplayReceipts>,
 }
 
 impl LinearConnector {
@@ -208,7 +329,7 @@ impl LinearConnector {
             client: None,
             verifier: None,
             session_id: None,
-            webhook_replay_receipts: Mutex::new(BTreeMap::new()),
+            webhook_replay_receipts: Mutex::new(WebhookReplayReceipts::default()),
         }
     }
 
@@ -224,26 +345,27 @@ impl LinearConnector {
         format!("sha256:{}", hex::encode(hasher.finalize()))
     }
 
-    fn record_webhook_delivery(&self, delivery_id: Uuid, webhook_timestamp: i64) -> FcpResult<()> {
-        let max_skew_ms =
-            i64::try_from(MAX_LINEAR_WEBHOOK_SKEW_MS).expect("webhook skew fits in i64");
-        let min_allowed_timestamp = webhook_timestamp - max_skew_ms;
+    fn record_webhook_delivery(
+        &self,
+        delivery_id: Uuid,
+        payload_fingerprint: [u8; 32],
+        webhook_timestamp: i64,
+    ) -> FcpResult<()> {
         let mut receipts = self
             .webhook_replay_receipts
             .lock()
             .map_err(|_| FcpError::Internal {
                 message: "webhook replay cache poisoned".into(),
             })?;
-        receipts.retain(|_, seen_timestamp| *seen_timestamp >= min_allowed_timestamp);
-        if receipts.contains_key(&delivery_id) {
-            return Err(FcpError::InvalidRequest {
-                code: 1003,
-                message: "delivery_id has already been processed within the replay window".into(),
-            });
-        }
-        receipts.insert(delivery_id, webhook_timestamp);
+        let result = receipts.record(
+            delivery_id,
+            payload_fingerprint,
+            webhook_timestamp,
+            Utc::now().timestamp_millis(),
+            Instant::now(),
+        );
         drop(receipts);
-        Ok(())
+        result
     }
 
     /// Handle configure method.
@@ -1269,16 +1391,11 @@ impl LinearConnector {
             code: 1003,
             message: "payload.webhookTimestamp is required for replay protection".into(),
         })?;
-        let skew_ms = Utc::now().timestamp_millis().abs_diff(webhook_timestamp);
-        if skew_ms > MAX_LINEAR_WEBHOOK_SKEW_MS {
-            return Err(FcpError::InvalidRequest {
-                code: 1003,
-                message: format!(
-                    "payload.webhookTimestamp is outside the accepted {MAX_LINEAR_WEBHOOK_SKEW_MS}ms replay window"
-                ),
-            });
-        }
-        self.record_webhook_delivery(delivery_id, webhook_timestamp)?;
+        self.record_webhook_delivery(
+            delivery_id,
+            webhook_payload_fingerprint(payload_value)?,
+            webhook_timestamp,
+        )?;
 
         let topic = payload.resource_type.to_topic(payload.action);
         let idempotency_key = format!("linear.webhook.{}", delivery_id.as_hyphenated());
@@ -2016,6 +2133,330 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_webhook_payload_fingerprint_is_canonical_and_preserves_unknown_fields() {
+        let first: serde_json::Value = serde_json::from_str(
+            r#"{"data":{"id":"issue-1","labels":[{"name":"bug","id":"label-1"}]},"updatedFrom":{"title":"old"},"webhookId":"hook-1"}"#,
+        )
+        .unwrap();
+        let reordered: serde_json::Value = serde_json::from_str(
+            r#"{"webhookId":"hook-1","updatedFrom":{"title":"old"},"data":{"labels":[{"id":"label-1","name":"bug"}],"id":"issue-1"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            webhook_payload_fingerprint(&first).unwrap(),
+            webhook_payload_fingerprint(&reordered).unwrap()
+        );
+
+        // updatedFrom is provider evidence that the typed WebhookPayload does
+        // not retain. It still distinguishes authenticated payloads.
+        let mut changed = first.clone();
+        changed["updatedFrom"]["title"] = json!("different old title");
+        assert_ne!(
+            webhook_payload_fingerprint(&first).unwrap(),
+            webhook_payload_fingerprint(&changed).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_webhook_replay_timestamp_boundaries_and_extremes() {
+        let mut receipts = WebhookReplayReceipts::default();
+        let now: i64 = 1_000_000;
+        let accepted_at = Instant::now();
+        for (id, timestamp) in [(1, now - 60_000), (2, now + 60_000)] {
+            receipts
+                .record(
+                    Uuid::from_u128(id),
+                    Sha256::digest(timestamp.to_le_bytes()).into(),
+                    timestamp,
+                    now,
+                    accepted_at,
+                )
+                .unwrap();
+        }
+        for timestamp in [now - 60_001, now + 60_001, i64::MIN, i64::MAX] {
+            let error = receipts
+                .record(Uuid::new_v4(), [9; 32], timestamp, now, accepted_at)
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                FcpError::InvalidRequest { ref message, .. }
+                    if message.contains("replay window")
+            ));
+        }
+        assert_eq!(receipts.accepted.len(), 2);
+        assert_eq!(receipts.delivery_ids.len(), 2);
+        assert_eq!(receipts.payload_fingerprints.len(), 2);
+    }
+
+    #[test]
+    fn test_webhook_replay_provider_timestamps_cannot_evict_live_receipts() {
+        let mut receipts = WebhookReplayReceipts::default();
+        let now = 1_000_000;
+        let accepted_at = Instant::now();
+        let old_delivery = Uuid::from_u128(1);
+        receipts
+            .record(old_delivery, [1; 32], now - 59_000, now, accepted_at)
+            .unwrap();
+        receipts
+            .record(
+                Uuid::from_u128(2),
+                [2; 32],
+                now + 59_000,
+                now + 1,
+                accepted_at + StdDuration::from_millis(1),
+            )
+            .unwrap();
+
+        for delivery_id in [old_delivery, Uuid::from_u128(3)] {
+            let error = receipts
+                .record(
+                    delivery_id,
+                    [1; 32],
+                    now - 59_000,
+                    now + 2,
+                    accepted_at + StdDuration::from_millis(2),
+                )
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                FcpError::InvalidRequest { ref message, .. }
+                    if message.contains("already been processed")
+            ));
+        }
+        assert_eq!(receipts.accepted.len(), 2);
+        assert!(!receipts.delivery_ids.contains(&Uuid::from_u128(3)));
+        assert_eq!(receipts.accepted[0].accepted_at, accepted_at);
+    }
+
+    #[test]
+    fn test_webhook_replay_survives_clock_stall_and_rollback_after_expiration() {
+        let mut receipts = WebhookReplayReceipts::default();
+        let now = 1_000_000;
+        let accepted_at = Instant::now();
+        let delivery_id = Uuid::from_u128(1);
+        let timestamp = now + 60_000;
+        receipts
+            .record(delivery_id, [1; 32], timestamp, now, accepted_at)
+            .unwrap();
+
+        // Wall time has stalled while monotonic retention has fully elapsed.
+        // The signed payload remains valid, so its receipt must remain too.
+        let later = accepted_at + StdDuration::from_secs(180);
+        let duplicate = receipts
+            .record(Uuid::from_u128(2), [1; 32], timestamp, now, later)
+            .unwrap_err();
+        assert!(matches!(
+            duplicate,
+            FcpError::InvalidRequest { ref message, .. }
+                if message.contains("already been processed")
+        ));
+        assert_eq!(receipts.accepted.len(), 1);
+        assert_eq!(receipts.accepted[0].accepted_at, accepted_at);
+
+        // Advancing beyond signed validity permits safe reclamation.
+        let after_expiry = now + 120_001;
+        receipts
+            .record(
+                Uuid::from_u128(2),
+                [2; 32],
+                after_expiry,
+                after_expiry,
+                later + StdDuration::from_millis(1),
+            )
+            .unwrap();
+        assert_eq!(receipts.accepted.len(), 1);
+        assert!(!receipts.delivery_ids.contains(&delivery_id));
+        assert!(!receipts.payload_fingerprints.contains(&[1; 32]));
+
+        // Rolling UTC back cannot authorize the now-forgotten signed payload.
+        let expired = receipts
+            .record(
+                delivery_id,
+                [1; 32],
+                timestamp,
+                now,
+                later + StdDuration::from_millis(2),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            expired,
+            FcpError::InvalidRequest { ref message, .. }
+                if message.contains("replay window")
+        ));
+        assert_eq!(receipts.verification_time_ms, Some(after_expiry));
+        assert_eq!(receipts.accepted.len(), 1);
+    }
+
+    #[test]
+    fn test_webhook_replay_capacity_fails_closed_and_duplicates_do_not_refresh() {
+        let mut receipts = WebhookReplayReceipts::default();
+        let now = 1_000_000;
+        let accepted_at = Instant::now();
+        let timestamp = now + 60_000;
+        for index in 0..MAX_LINEAR_WEBHOOK_REPLAY_RECEIPTS {
+            receipts
+                .record(
+                    Uuid::from_u128(u128::try_from(index).unwrap()),
+                    Sha256::digest(index.to_le_bytes()).into(),
+                    timestamp,
+                    now,
+                    accepted_at,
+                )
+                .unwrap();
+        }
+
+        let rejected_id = Uuid::new_v4();
+        let rejected_fingerprint = [255; 32];
+        let capacity_error = receipts
+            .record(
+                rejected_id,
+                rejected_fingerprint,
+                timestamp,
+                now + 60_000,
+                accepted_at + StdDuration::from_secs(60),
+            )
+            .unwrap_err();
+        assert!(matches!(capacity_error, FcpError::ResourceExhausted { .. }));
+        assert!(!receipts.delivery_ids.contains(&rejected_id));
+        assert!(
+            !receipts
+                .payload_fingerprints
+                .contains(&rejected_fingerprint)
+        );
+
+        let first_fingerprint = Sha256::digest(0_usize.to_le_bytes()).into();
+        // Both duplicate indexes must take precedence over capacity, and
+        // neither failed alias may consume the other index or refresh expiry.
+        for (delivery_id, fingerprint) in [
+            (Uuid::nil(), rejected_fingerprint),
+            (rejected_id, first_fingerprint),
+        ] {
+            let error = receipts
+                .record(
+                    delivery_id,
+                    fingerprint,
+                    timestamp,
+                    now + 120_000,
+                    accepted_at + StdDuration::from_secs(120),
+                )
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                FcpError::InvalidRequest { ref message, .. }
+                    if message.contains("already been processed")
+            ));
+        }
+        assert_eq!(receipts.accepted[0].accepted_at, accepted_at);
+        assert_eq!(receipts.accepted.len(), MAX_LINEAR_WEBHOOK_REPLAY_RECEIPTS);
+        assert_eq!(
+            receipts.delivery_ids.len(),
+            MAX_LINEAR_WEBHOOK_REPLAY_RECEIPTS
+        );
+        assert_eq!(
+            receipts.payload_fingerprints.len(),
+            MAX_LINEAR_WEBHOOK_REPLAY_RECEIPTS
+        );
+
+        // The failed candidate was not partially recorded, and duplicate
+        // attempts did not extend the original receipts' acceptance times.
+        receipts
+            .record(
+                rejected_id,
+                rejected_fingerprint,
+                now + 120_001,
+                now + 120_001,
+                accepted_at + LINEAR_WEBHOOK_REPLAY_RETENTION,
+            )
+            .unwrap();
+        assert_eq!(receipts.accepted.len(), 1);
+        assert_eq!(receipts.delivery_ids.len(), 1);
+        assert_eq!(receipts.payload_fingerprints.len(), 1);
+        assert_eq!(receipts.accepted[0].delivery_id, rejected_id);
+    }
+
+    #[test]
+    fn test_webhook_replay_concurrent_payload_aliases_are_admitted_once() {
+        let connector = Arc::new(LinearConnector::new());
+        let barrier = Arc::new(std::sync::Barrier::new(12));
+        let timestamp = Utc::now().timestamp_millis();
+        let fingerprint = webhook_payload_fingerprint(&json!({
+            "webhookTimestamp": timestamp,
+            "data": { "id": "issue-1" }
+        }))
+        .unwrap();
+        let workers: Vec<_> = (0..12)
+            .map(|_| {
+                let connector = Arc::clone(&connector);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    connector.record_webhook_delivery(Uuid::new_v4(), fingerprint, timestamp)
+                })
+            })
+            .collect();
+        let mut accepted = 0;
+        for worker in workers {
+            match worker.join().unwrap() {
+                Ok(()) => accepted += 1,
+                Err(FcpError::InvalidRequest { message, .. }) => {
+                    assert!(message.contains("already been processed"));
+                }
+                Err(error) => panic!("unexpected admission error: {error:?}"),
+            }
+        }
+        assert_eq!(accepted, 1);
+        let receipts = connector.webhook_replay_receipts.lock().unwrap();
+        assert_eq!(receipts.accepted.len(), 1);
+        assert_eq!(receipts.delivery_ids.len(), 1);
+        assert_eq!(receipts.payload_fingerprints.len(), 1);
+    }
+
+    #[test]
+    fn test_webhook_replay_concurrent_admission_cannot_exceed_capacity() {
+        let connector = Arc::new(LinearConnector::new());
+        let timestamp = Utc::now().timestamp_millis();
+        for index in 0..MAX_LINEAR_WEBHOOK_REPLAY_RECEIPTS - 1 {
+            connector
+                .record_webhook_delivery(
+                    Uuid::from_u128(u128::try_from(index).unwrap()),
+                    Sha256::digest(index.to_le_bytes()).into(),
+                    timestamp,
+                )
+                .unwrap();
+        }
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let workers: Vec<_> = (0..8)
+            .map(|index| {
+                let connector = Arc::clone(&connector);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    connector.record_webhook_delivery(Uuid::new_v4(), [index; 32], timestamp)
+                })
+            })
+            .collect();
+        let mut accepted = 0;
+        for worker in workers {
+            match worker.join().unwrap() {
+                Ok(()) => accepted += 1,
+                Err(FcpError::ResourceExhausted { .. }) => {}
+                Err(error) => panic!("unexpected admission error: {error:?}"),
+            }
+        }
+        assert_eq!(accepted, 1);
+        let receipts = connector.webhook_replay_receipts.lock().unwrap();
+        assert_eq!(receipts.accepted.len(), MAX_LINEAR_WEBHOOK_REPLAY_RECEIPTS);
+        assert_eq!(
+            receipts.delivery_ids.len(),
+            MAX_LINEAR_WEBHOOK_REPLAY_RECEIPTS
+        );
+        assert_eq!(
+            receipts.payload_fingerprints.len(),
+            MAX_LINEAR_WEBHOOK_REPLAY_RECEIPTS
+        );
+    }
+
     #[fcp_async_core::runtime::test]
     async fn test_process_webhook_requires_verified_signature() {
         let mut connector = LinearConnector::new();
@@ -2174,6 +2615,104 @@ mod tests {
             }
             other => panic!("Expected InvalidRequest, got: {other:?}"),
         }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn test_process_webhook_rejects_payload_alias_and_timestamp_reordering() {
+        let mut connector = LinearConnector::new();
+        let signing_key = Ed25519SigningKey::generate();
+        connector
+            .handle_handshake(json!({
+                "protocol_version": "1.0.0",
+                "zone": "z:work",
+                "host_public_key": signing_key.verifying_key().to_bytes(),
+                "nonce": vec![0u8; 32],
+                "capabilities_requested": ["linear.process_webhook"]
+            }))
+            .await
+            .unwrap();
+        let token = generate_valid_token(
+            &signing_key,
+            "linear.process_webhook",
+            connector.instance_id(),
+        );
+        let now = Utc::now().timestamp_millis();
+        let original = json!({
+            "delivery_id": Uuid::new_v4().to_string(),
+            "signature_validated": true,
+            "payload": {
+                "action": "update",
+                "type": "Issue",
+                "createdAt": "2026-03-07T00:00:00Z",
+                "webhookTimestamp": now - 45_000,
+                "webhookId": "hook-shared-across-updates",
+                "data": { "id": "issue-1", "title": "first update" }
+            }
+        });
+        connector
+            .handle_invoke(json!({
+                "operation": "linear.process_webhook",
+                "input": original.clone(),
+                "capability_token": token.clone()
+            }))
+            .await
+            .unwrap();
+
+        let mut future_delivery = original.clone();
+        future_delivery["delivery_id"] = json!(Uuid::new_v4().to_string());
+        future_delivery["payload"]["webhookTimestamp"] = json!(now + 45_000);
+        future_delivery["payload"]["data"]["title"] = json!("second update");
+        let second = connector
+            .handle_invoke(json!({
+                "operation": "linear.process_webhook",
+                "input": future_delivery,
+                "capability_token": token.clone()
+            }))
+            .await
+            .unwrap();
+        assert_eq!(second["event"]["data"]["title"], "second update");
+        assert_eq!(second["event"]["webhook_id"], "hook-shared-across-updates");
+
+        let mut alias = original.clone();
+        alias["delivery_id"] = json!(Uuid::new_v4().to_string());
+        for replay in [original, alias.clone()] {
+            let error = connector
+                .handle_invoke(json!({
+                    "operation": "linear.process_webhook",
+                    "input": replay,
+                    "capability_token": token.clone()
+                }))
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                FcpError::InvalidRequest { ref message, .. }
+                    if message.contains("already been processed")
+            ));
+        }
+
+        // A refused alias does not reserve its public delivery ID. A distinct
+        // authenticated payload with the same webhookId remains admissible.
+        alias["payload"]["data"]["title"] = json!("third update");
+        let third = connector
+            .handle_invoke(json!({
+                "operation": "linear.process_webhook",
+                "input": alias,
+                "capability_token": token
+            }))
+            .await
+            .unwrap();
+        assert_eq!(third["event"]["data"]["title"], "third update");
+        assert_eq!(third["event"]["webhook_id"], "hook-shared-across-updates");
+        assert_eq!(
+            connector
+                .webhook_replay_receipts
+                .lock()
+                .unwrap()
+                .accepted
+                .len(),
+            3
+        );
     }
 
     #[fcp_async_core::runtime::test]

@@ -88,6 +88,28 @@ The current Linear README slice documents the existing runtime surface:
 - runtime/manifest drift around auth headers, approval metadata, endpoint policy, event streaming, rate-limit pools, and simulation
 - mock-only GraphQL and connector integration tests
 
+### Webhook Replay Protection
+
+The host must verify `Linear-Signature` against the raw request body before
+forwarding parsed JSON with `signature_validated = true`. The connector checks
+the signed `payload.webhookTimestamp` in milliseconds against an inclusive
+60-second skew window, as specified by the
+[Linear webhook security guidance](https://linear.app/developers/webhooks).
+
+Replay admission atomically checks both the forwarded `Linear-Delivery` UUID
+and a SHA-256 fingerprint of the complete, canonically ordered payload. Changing
+the unsigned delivery header or JSON object key order cannot admit the same
+payload again. Distinct updates with a shared `webhookId` remain admissible.
+
+The in-memory cache retains at most 10,000 fixed-size receipts. Each receipt
+remains for at least 120,001 milliseconds of local monotonic time and until its
+signed timestamp has expired. Verification time never moves backward, so a
+wall-clock rollback cannot revive an expired delivery; clock stalls preserve
+still-valid receipts. Capacity exhaustion returns `ResourceExhausted` without
+evicting active protection, and rejected duplicates do not extend retention.
+This protection is local to the connector process and is not durable across
+restarts.
+
 ## Auth And Zone Boundary
 
 - Authentication mechanisms: direct `api_key` value or host credential reference.
@@ -195,7 +217,9 @@ The verification surface captures:
 - runtime operation inventory and policy metadata
 - deterministic WireMock GraphQL coverage
 - auth, provider error, retry, lifecycle, simulation, introspection, self-check, doctor, and capability-token coverage
-- webhook replay, timestamp, signature-validation, and resource-scope behavior
+- webhook replay under timestamp reordering, changed delivery IDs, concurrent
+  admission, capacity exhaustion, and clock stalls/rollback, plus timestamp,
+  signature-validation, and resource-scope behavior
 - sync-planning behavior without provider egress
 - formatting, check, test, and clippy proof through `rch`
 - UBS on changed files before commit

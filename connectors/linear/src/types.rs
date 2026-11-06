@@ -202,7 +202,7 @@ pub struct WebhookPayload {
     /// Organization ID (present on org-level webhooks).
     #[serde(default)]
     pub organization_id: Option<String>,
-    /// Webhook ID for deduplication.
+    /// Provider webhook identifier; the delivery ID is forwarded separately.
     #[serde(default)]
     pub webhook_id: Option<String>,
     /// Millisecond timestamp used for replay-window validation.
