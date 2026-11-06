@@ -17,7 +17,8 @@ use fcp_prelude::{
 
 use super::super::{
     AppState, authoritative_persisted_capability_rejection_reason, capability_token_b64,
-    claims_principal, enforce_live_capability_constraints, enforce_live_deployment_tier,
+    claims_principal, enforce_connector_allow_lists, enforce_live_capability_constraints,
+    enforce_live_deployment_tier, enforce_operation_network_constraint_dispatch,
     live_constraint_resource_uri, request_input_hash, verify_approval_tokens,
     verify_live_hybrid_owner_capability, verify_live_revocation_cascade,
 };
@@ -97,8 +98,28 @@ fn check_policy(
 /// ordinary durable outcome/audit path records an undispatched host refusal.
 /// Catalog, policy and token state are fresh observations, not an atomic global
 /// snapshot. Connector-side instance and effect-time enforcement still apply.
-pub(super) async fn revalidate(state: &AppState, request: &InvokeRequest) -> HostResult<()> {
+pub(super) async fn revalidate(
+    state: &AppState,
+    request: &InvokeRequest,
+    admitted_generation: u64,
+) -> HostResult<()> {
+    state.registry.require_generation(admitted_generation)?;
     check_current_token(state, request)?;
+    let inventory = state
+        .registry
+        .allow_list_snapshot(&request.connector_id)
+        .await
+        .ok_or_else(|| refusal("connector was removed before dispatch"))?;
+    enforce_connector_allow_lists(&inventory, request)
+        .map_err(|_| refusal("current connector inventory denied dispatch"))?;
+    enforce_operation_network_constraint_dispatch(&inventory, request)
+        .map_err(|_| refusal("current manifest network constraints denied dispatch"))?;
+    state
+        .registry
+        .enforce_runtime_network_policy(request)
+        .await
+        .map_err(|_| refusal("current runtime network policy denied dispatch"))?;
+    state.registry.require_generation(admitted_generation)?;
     let introspection = state
         .discovery
         .introspect(&request.connector_id)
@@ -197,7 +218,8 @@ pub(super) async fn revalidate(state: &AppState, request: &InvokeRequest) -> Hos
     // A previously admitted job cannot retain expired deployment authority.
     enforce_live_deployment_tier(state, request, tool.safety_tier)
         .map_err(|_| refusal("current deployment does not permit this operation tier"))?;
-    require_live_times(&claims, chrono::Utc::now().timestamp())
+    require_live_times(&claims, chrono::Utc::now().timestamp())?;
+    state.registry.require_generation(admitted_generation)
 }
 
 #[cfg(test)]

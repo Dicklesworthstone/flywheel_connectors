@@ -38,7 +38,8 @@ pub(super) async fn revalidate_dispatch_authority(
     state: &super::AppState,
     request: &fcp_kernel::InvokeRequest,
 ) -> HostResult<()> {
-    dispatch_authority::revalidate(state, request).await
+    let generation = state.registry.version.load(Ordering::SeqCst);
+    dispatch_authority::revalidate(state, request, generation).await
 }
 
 #[must_use]
@@ -416,6 +417,9 @@ pub(super) fn execute<'a>(
             correlation_id: request.correlation_id.as_ref().map(ToString::to_string),
             occurred_at: u64::try_from(chrono::Utc::now().timestamp()).unwrap_or_default(),
         };
+        // Consuming admission, quota and runtime selection must belong to one
+        // inventory generation. A publication requires fresh admission.
+        let registry_generation = state.registry.version.load(Ordering::SeqCst);
         let preflight = match before_deadline(
             deadline,
             super::evaluate_live_admission(
@@ -441,6 +445,10 @@ pub(super) fn execute<'a>(
                 .unwrap_or_else(|| "preflight denied invoke request".to_string());
             append_deny(state, &audit, &reason)?;
             return Err(HostError::PreflightFailed(reason));
+        }
+        if let Err(error) = state.registry.require_generation(registry_generation) {
+            append_deny(state, &audit, &error.to_string())?;
+            return Err(error);
         }
 
         // Preflight verified this exact token. Persist its authoritative
@@ -472,10 +480,13 @@ pub(super) fn execute<'a>(
                     &job_state,
                     request,
                     asserted_principal,
-                    started_at,
-                    deadline,
                     job_audit,
-                    relay,
+                    AdmittedInvocationContext {
+                        started_at,
+                        deadline,
+                        relay,
+                        registry_generation,
+                    },
                 )
                 .await
             }) {
@@ -580,12 +591,13 @@ async fn dispatch(
     request: fcp_kernel::InvokeRequest,
     deadline: Instant,
     relay: Option<fcp_host::RelayCancellationBinding>,
+    registry_generation: u64,
 ) -> (HostResult<InvokeResponse>, bool) {
     let target = before_deadline(
         deadline,
         state
             .registry
-            .cancellation_target(&request.connector_id, deadline),
+            .cancellation_target(&request.connector_id, deadline, registry_generation),
         "runtime selection",
     )
     .await
@@ -630,8 +642,9 @@ async fn dispatch(
         async move {
             // Admission may have waited for durable storage and runtime selection.
             // Revalidate without spending another quota permit, before any IO.
-            dispatch_authority::revalidate(state, &request).await?;
+            dispatch_authority::revalidate(state, &request, registry_generation).await?;
             super::recheck_admitted_holder_proof(state, &request)?;
+            state.registry.require_generation(registry_generation)?;
             if Instant::now() >= deadline {
                 return Err(HostError::Unavailable(
                     "invocation deadline expired before connector dispatch".to_string(),
@@ -648,10 +661,14 @@ async fn dispatch(
                 super::ConnectorRuntime::NativeWarmPool(pool) => {
                     pool.invoke_with_termination(request, warm_capture).await
                 }
-                super::ConnectorRuntime::Wasi(wasi) => match wasi_capture {
-                    Some(capture) => capture.invoke(wasi.invoke(request)).await,
-                    None => wasi.invoke(request).await,
-                },
+                super::ConnectorRuntime::Wasi(wasi) => {
+                    let fence = state.registry.inventory_fence(registry_generation);
+                    let operation = wasi.invoke_with_inventory_fence(request, Some(&fence));
+                    match wasi_capture {
+                        Some(capture) => capture.invoke(operation).await,
+                        None => operation.await,
+                    }
+                }
                 runtime => runtime.invoke(request).await,
             }
         },
@@ -737,15 +754,28 @@ async fn persist_finalization(
     }
 }
 
+/// Preserve the original execution budget and inventory authority through
+/// durable admission and ownership transfer to the host task.
+struct AdmittedInvocationContext {
+    started_at: Instant,
+    deadline: Instant,
+    relay: Option<fcp_host::RelayCancellationBinding>,
+    registry_generation: u64,
+}
+
 async fn run_owned(
     state: &std::sync::Arc<super::AppState>,
     request: fcp_kernel::InvokeRequest,
     asserted_principal: Option<String>,
-    started_at: Instant,
-    deadline: Instant,
     audit: fcp_host::InvokeAuditContext,
-    relay: Option<fcp_host::RelayCancellationBinding>,
+    admitted: AdmittedInvocationContext,
 ) -> HostResult<InvokeResponse> {
+    let AdmittedInvocationContext {
+        started_at,
+        deadline,
+        relay,
+        registry_generation,
+    } = admitted;
     let remaining_ms = u64::try_from(
         deadline
             .saturating_duration_since(Instant::now())
@@ -790,7 +820,8 @@ async fn run_owned(
     };
 
     state.invoke_jobs.bind_attempt(&ticket)?;
-    let (source_result, dispatched) = dispatch(state, request.clone(), deadline, relay).await;
+    let (source_result, dispatched) =
+        dispatch(state, request.clone(), deadline, relay, registry_generation).await;
     let duration_ms = super::elapsed_millis(started_at);
     let terminal = terminal_observation(&source_result, dispatched, deadline, duration_ms);
     let finalize_by = finalization_deadline(deadline);
@@ -925,7 +956,292 @@ async fn run_owned(
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    struct DispatchFixture {
+        state: Arc<crate::AppState>,
+        request: fcp_kernel::InvokeRequest,
+        invoke_count: Arc<AtomicUsize>,
+        block_catalog: Arc<AtomicBool>,
+        catalog_entered: oneshot::Receiver<()>,
+        release_catalog: oneshot::Sender<()>,
+        block_invoke: Arc<AtomicBool>,
+        invoke_queued: oneshot::Receiver<()>,
+        release_invoke: oneshot::Sender<()>,
+    }
+
+    fn dispatch_fixture() -> DispatchFixture {
+        use crate::tests::{
+            dispatcher_app_state, dispatcher_introspection, dispatcher_registry_with_connector,
+            dispatcher_test_config, dispatcher_test_connector, test_capability_token,
+        };
+        use fcp_core::{ConnectorId, OperationId, RequestId, SafetyTier, ZoneId};
+
+        const CONNECTOR: &str = "fcp.test.dispatch-generation:utility:1.0.0";
+        const OPERATION: &str = "test.echo";
+        const CAPABILITY: &str = "cap.test.echo";
+        let signing_key = fcp_crypto::ed25519::Ed25519SigningKey::generate();
+        let (runner_tx, mut runner_rx) =
+            fcp_async_core::channel::mpsc::channel::<crate::ConnectorRpcRequest>(8);
+        let (entered_tx, catalog_entered) = oneshot::channel();
+        let (release_catalog, release_rx) = oneshot::channel();
+        let (queued_tx, invoke_queued) = oneshot::channel();
+        let (release_invoke, release_invoke_rx) = oneshot::channel();
+        let block_catalog = Arc::new(AtomicBool::new(false));
+        let catalog_gate = Arc::clone(&block_catalog);
+        let block_invoke = Arc::new(AtomicBool::new(false));
+        let invoke_gate = Arc::clone(&block_invoke);
+        let invoke_count = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&invoke_count);
+        let runner_task = task::spawn(async move {
+            let mut entered_tx = Some(entered_tx);
+            let mut release_rx = Some(release_rx);
+            let mut queued_tx = Some(queued_tx);
+            let mut release_invoke_rx = Some(release_invoke_rx);
+            while let Some(call) = runner_rx.recv().await {
+                if call.method == "invoke" && invoke_gate.swap(false, Ordering::SeqCst) {
+                    queued_tx.take().unwrap().send(()).unwrap();
+                    release_invoke_rx.take().unwrap().await.unwrap();
+                }
+                if !call.rpc.try_begin() {
+                    let _ = call.response_tx.send(Err(call.rpc.stop_error()));
+                    continue;
+                }
+                let result = match call.method.as_str() {
+                    "introspect" => {
+                        if catalog_gate.swap(false, Ordering::SeqCst) {
+                            entered_tx.take().unwrap().send(()).unwrap();
+                            release_rx.take().unwrap().await.unwrap();
+                        }
+                        serde_json::to_value(dispatcher_introspection(
+                            OPERATION,
+                            CAPABILITY,
+                            SafetyTier::Safe,
+                        ))
+                        .unwrap()
+                    }
+                    "health" => serde_json::json!({
+                        "status": { "state": "ready" },
+                        "uptime_ms": 0,
+                    }),
+                    "invoke" => {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        let request: fcp_kernel::InvokeRequest =
+                            serde_json::from_value(call.params).unwrap();
+                        serde_json::to_value(InvokeResponse::ok(
+                            request.id,
+                            serde_json::json!({ "dispatched": true }),
+                        ))
+                        .unwrap()
+                    }
+                    method => panic!("unexpected fixture method {method}"),
+                };
+                assert!(call.rpc.try_settle_reply());
+                let _ = call
+                    .response_tx
+                    .send(Ok(serde_json::json!({ "result": result })));
+            }
+        });
+        let connector = dispatcher_test_connector(CONNECTOR, runner_tx, runner_task);
+        let registry = dispatcher_registry_with_connector(
+            CONNECTOR,
+            connector,
+            dispatcher_test_config(CONNECTOR),
+        );
+        let state = dispatcher_app_state(
+            registry,
+            Arc::new(fcp_host::HostAdminStateStore::new()),
+            Some(signing_key.verifying_key()),
+            HashMap::from([(ZoneId::work(), crate::host_runtime_policy(ZoneId::work()))]),
+        );
+        let request = fcp_kernel::InvokeRequest {
+            r#type: "invoke".to_owned(),
+            id: RequestId::random(),
+            connector_id: ConnectorId::from_static(CONNECTOR),
+            operation: OperationId::from_static(OPERATION),
+            zone_id: ZoneId::work(),
+            input: serde_json::json!({ "value": "private-dispatch-fixture" }),
+            capability_token: test_capability_token(
+                &signing_key,
+                CAPABILITY,
+                OPERATION,
+                ZoneId::work().as_str(),
+            ),
+            holder_proof: None,
+            context: None,
+            idempotency_key: None,
+            lease_seq: None,
+            deadline_ms: Some(10_000),
+            correlation_id: None,
+            provenance: None,
+            approval_tokens: Vec::new(),
+        };
+        DispatchFixture {
+            state,
+            request,
+            invoke_count,
+            block_catalog,
+            catalog_entered,
+            release_catalog,
+            block_invoke,
+            invoke_queued,
+            release_invoke,
+        }
+    }
+
+    async fn publish_dispatch_fixture_change(state: &crate::AppState, change: &str) {
+        let mut inventory = state.registry.inventory().await;
+        match change {
+            "zone" => inventory[0].allowed_zones = vec![fcp_core::ZoneId::owner().to_string()],
+            "operation" => inventory[0].allowed_operations = vec!["test.other".to_string()],
+            "deny-empty" => inventory[0].enforce_empty_allow_lists = true,
+            "manifest" => inventory[0].enforce_operation_network_constraints = true,
+            "runtime" => {
+                inventory[0].runtime_network_enforcement =
+                    crate::RuntimeNetworkEnforcement::HostEgressProxy;
+            }
+            "replace" => inventory[0].binary = "replacement-runtime".to_string(),
+            "remove" => inventory.clear(),
+            "unrelated" => {
+                inventory.push(crate::tests::dispatcher_test_config(
+                    "fcp.test.other:utility:1.0.0",
+                ));
+            }
+            _ => panic!("unknown fixture change {change}"),
+        }
+        let replacement =
+            crate::tests::registry_publication_fixture(&state.registry, inventory).await;
+        state.registry.publish_configs(replacement).await.unwrap();
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn dispatch_generation_keeps_unchanged_authorized_invocation_working() {
+        let fixture = dispatch_fixture();
+        let generation = fixture.state.registry.version.load(Ordering::SeqCst);
+        let preflight =
+            crate::evaluate_live_preflight(&fixture.state, &fixture.request, None).await;
+        assert!(preflight.allowed, "{:?}", preflight.reason);
+        let (result, dispatched) = dispatch(
+            &fixture.state,
+            fixture.request,
+            Instant::now() + Duration::from_secs(10),
+            None,
+            generation,
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+        assert!(dispatched);
+        assert_eq!(fixture.invoke_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn dispatch_generation_fences_replaced_or_removed_runtime_after_selection() {
+        for change in [
+            "zone",
+            "operation",
+            "deny-empty",
+            "manifest",
+            "runtime",
+            "replace",
+            "remove",
+        ] {
+            let fixture = dispatch_fixture();
+            let generation = fixture.state.registry.version.load(Ordering::SeqCst);
+            let preflight =
+                crate::evaluate_live_preflight(&fixture.state, &fixture.request, None).await;
+            assert!(preflight.allowed, "{change}: {:?}", preflight.reason);
+            fixture.block_catalog.store(true, Ordering::SeqCst);
+            let state = Arc::clone(&fixture.state);
+            let request = fixture.request;
+            let pending = task::spawn(async move {
+                dispatch(
+                    &state,
+                    request,
+                    Instant::now() + Duration::from_secs(10),
+                    None,
+                    generation,
+                )
+                .await
+            });
+            // Runtime selection completed; publishing must not wait for its
+            // external catalog response or authorize the captured old runtime.
+            fixture.catalog_entered.await.unwrap();
+            publish_dispatch_fixture_change(&fixture.state, change).await;
+            fixture.release_catalog.send(()).unwrap();
+            let (result, dispatched) = pending.await.unwrap();
+            let error = result.expect_err("publication must fence the captured runtime");
+            assert!(
+                error.to_string().contains("inventory changed"),
+                "{change}: {error}"
+            );
+            assert!(!dispatched, "{change}: stale authority reached dispatch");
+            assert_eq!(fixture.invoke_count.load(Ordering::SeqCst), 0, "{change}");
+            assert!(!error.to_string().contains("private-dispatch-fixture"));
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn dispatch_generation_cannot_change_during_consuming_preflight() {
+        let fixture = dispatch_fixture();
+        let state = Arc::clone(&fixture.state);
+        let request = fixture.request;
+        let operation_id = request.id.to_string();
+        fixture.block_catalog.store(true, Ordering::SeqCst);
+        let pending = task::spawn(async move { execute(&state, request, None, None, None).await });
+        fixture.catalog_entered.await.unwrap();
+        publish_dispatch_fixture_change(&fixture.state, "unrelated").await;
+        fixture.release_catalog.send(()).unwrap();
+        let error = pending
+            .await
+            .unwrap()
+            .expect_err("preflight generation changed");
+        assert!(error.to_string().contains("inventory changed"), "{error}");
+        assert_eq!(fixture.invoke_count.load(Ordering::SeqCst), 0);
+        assert!(!fixture.state.invoke_jobs.is_active(&operation_id));
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn dispatch_generation_fences_invoke_waiting_for_native_actor_selection() {
+        for change in ["zone", "operation", "replace", "remove"] {
+            let fixture = dispatch_fixture();
+            let generation = fixture.state.registry.version.load(Ordering::SeqCst);
+            let preflight =
+                crate::evaluate_live_preflight(&fixture.state, &fixture.request, None).await;
+            assert!(preflight.allowed, "{change}: {:?}", preflight.reason);
+            fixture.block_invoke.store(true, Ordering::SeqCst);
+            let state = Arc::clone(&fixture.state);
+            let request = fixture.request;
+            let pending = task::spawn(async move {
+                dispatch(
+                    &state,
+                    request,
+                    Instant::now() + Duration::from_secs(10),
+                    None,
+                    generation,
+                )
+                .await
+            });
+            // Outer checks passed and the effect RPC reached the actor queue,
+            // but the physical ticket has not been selected yet.
+            fixture.invoke_queued.await.unwrap();
+            publish_dispatch_fixture_change(&fixture.state, change).await;
+            fixture.release_invoke.send(()).unwrap();
+            let (result, dispatched) = pending.await.unwrap();
+            let error = result.expect_err("stale queued invoke must not be selected");
+            assert!(
+                error.to_string().contains("inventory changed"),
+                "{change}: {error}"
+            );
+            // Preserve conservative ownership/outcome tracking for session
+            // work already handed to the runtime before this effect refusal.
+            assert!(
+                dispatched,
+                "{change}: fixture did not reach the runtime queue"
+            );
+            assert_eq!(fixture.invoke_count.load(Ordering::SeqCst), 0, "{change}");
+            assert!(!error.to_string().contains("private-dispatch-fixture"));
+        }
+    }
 
     fn reply() -> InvokeResponse {
         InvokeResponse::ok(

@@ -20,7 +20,9 @@ use fcp_host::{
 };
 use futures_util::future::{Either, select};
 
-use super::{CONNECTOR_RPC_IO_TIMEOUT, ConnectorProcessRunner, ConnectorRpcRequest};
+use super::{
+    CONNECTOR_RPC_IO_TIMEOUT, ConnectorProcessRunner, ConnectorRpcRequest, InventoryDispatchFence,
+};
 
 #[path = "native_invocation.rs"]
 mod invocation;
@@ -68,6 +70,7 @@ struct RpcState {
     phase: RpcPhase,
     cancel_requested: bool,
     transport_retired: bool,
+    inventory_rejected: bool,
 }
 
 /// One physical request, never a lookup of whichever command is running now.
@@ -75,6 +78,7 @@ struct RpcState {
 pub(super) struct NativeRpc {
     deadline: Instant,
     state: Arc<Mutex<RpcState>>,
+    inventory_fence: Option<InventoryDispatchFence>,
     // Notification only: selection and settlement still consult the state lock.
     cancellation: CancellationToken,
 }
@@ -97,7 +101,9 @@ impl NativeRpc {
                 phase: RpcPhase::Queued,
                 cancel_requested: false,
                 transport_retired: false,
+                inventory_rejected: false,
             })),
+            inventory_fence: None,
             cancellation: CancellationToken::new(),
         }
     }
@@ -138,11 +144,21 @@ impl NativeRpc {
         matches!(state.phase, RpcPhase::Active)
     }
 
-    /// Linearizes actor selection against queue abandonment and expiration.
+    /// Linearizes actor selection against queue abandonment, expiration and
+    /// inventory publication. Already active work is never revoked by this gate.
     #[must_use]
     pub(super) fn try_begin(&self) -> bool {
         let mut state = self.state.lock().expect("native RPC state lock");
         if !matches!(state.phase, RpcPhase::Queued) {
+            return false;
+        }
+        if self
+            .inventory_fence
+            .as_ref()
+            .is_some_and(|fence| !fence.is_current())
+        {
+            state.inventory_rejected = true;
+            state.phase = RpcPhase::Settled;
             return false;
         }
         if state.cancel_requested || Instant::now() >= self.deadline {
@@ -229,8 +245,18 @@ impl NativeRpc {
         matches!(state.phase, RpcPhase::Settled)
     }
 
-    fn stop_error(&self) -> std::io::Error {
-        if Instant::now() >= self.deadline {
+    pub(super) fn stop_error(&self) -> std::io::Error {
+        if self
+            .state
+            .lock()
+            .expect("native RPC state lock")
+            .inventory_rejected
+        {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "connector inventory changed after admission; queued RPC was not dispatched",
+            )
+        } else if Instant::now() >= self.deadline {
             std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "connector RPC absolute queue and IO deadline expired",
@@ -384,6 +410,7 @@ struct InvocationCommands {
 
 struct InvocationState {
     deadline: Instant,
+    inventory_fence: OnceLock<InventoryDispatchFence>,
     commands: Mutex<InvocationCommands>,
     cancellation: CancellationToken,
     waiter_finished: AtomicBool,
@@ -403,6 +430,7 @@ impl NativeInvocationTermination {
         Self {
             state: Arc::new(InvocationState {
                 deadline,
+                inventory_fence: OnceLock::new(),
                 commands: Mutex::new(InvocationCommands {
                     stop_requested: false,
                     rpcs: Vec::new(),
@@ -413,6 +441,22 @@ impl NativeInvocationTermination {
                 retirement_deadline: OnceLock::new(),
             }),
         }
+    }
+
+    /// Bind before handing the invocation to a runtime. Every later session
+    /// and effect ticket retains this generation, including warm workers.
+    pub(super) fn bind_inventory_fence(&self, fence: InventoryDispatchFence) {
+        assert!(
+            self.state.inventory_fence.set(fence).is_ok(),
+            "native invocation inventory authority cannot be rebound"
+        );
+    }
+
+    pub(super) fn require_current_inventory(&self) -> HostResult<()> {
+        self.state
+            .inventory_fence
+            .get()
+            .map_or(Ok(()), InventoryDispatchFence::require_current)
     }
 
     pub(super) fn bind_registration(
@@ -456,7 +500,8 @@ impl NativeInvocationTermination {
                 .deadline
                 .min(deadline_after(Instant::now(), CONNECTOR_RPC_IO_TIMEOUT))
         };
-        let rpc = NativeRpc::new(deadline);
+        let mut rpc = NativeRpc::new(deadline);
+        rpc.inventory_fence = self.state.inventory_fence.get().cloned();
         let mut commands = self.state.commands.lock().expect("native invocation lock");
         let cancel = commands.stop_requested
             || self.state.waiter_finished.load(Ordering::SeqCst)
@@ -593,6 +638,84 @@ impl Drop for NativeInvocationWaiter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inventory_publication_rejects_queued_tickets_without_revoking_active_work() {
+        use std::sync::atomic::AtomicU64;
+
+        for active_method in ["handshake", "invoke"] {
+            let version = Arc::new(AtomicU64::new(7));
+            let invocation =
+                NativeInvocationTermination::new(invocation_deadline(Instant::now(), None));
+            invocation.bind_inventory_fence(InventoryDispatchFence {
+                version: Arc::clone(&version),
+                admitted_generation: 7,
+            });
+            let active = invocation.register_rpc_for_method(active_method);
+            assert!(active.try_begin());
+            let queued = invocation.register_rpc_for_method("invoke");
+
+            version.store(8, Ordering::SeqCst);
+            assert!(!active.is_cancelled());
+            assert!(active.try_settle_reply());
+            assert!(!active.transport_retired());
+            assert!(!invocation.is_cancel_requested());
+            assert!(invocation.require_current_inventory().is_err());
+            assert!(!queued.try_begin());
+            assert!(queued.is_settled());
+            assert_eq!(
+                queued.stop_error().kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+            assert!(
+                queued
+                    .stop_error()
+                    .to_string()
+                    .contains("inventory changed")
+            );
+
+            // An earlier handshake cannot authorize a later effect ticket
+            // after the inventory that admitted it has been replaced.
+            let later = invocation.register_rpc_for_method("invoke");
+            assert!(!later.try_begin());
+            assert!(later.is_settled());
+            let fresh = NativeInvocationTermination::new(invocation_deadline(Instant::now(), None));
+            fresh.bind_inventory_fence(InventoryDispatchFence {
+                version: Arc::clone(&version),
+                admitted_generation: 8,
+            });
+            let next = fresh.register_rpc_for_method("invoke");
+            assert!(next.try_begin());
+            assert!(next.try_settle_reply());
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn inventory_publication_refuses_obsolete_warm_fallback_before_process_spawn() {
+        use std::sync::atomic::AtomicU64;
+
+        let version = Arc::new(AtomicU64::new(1));
+        let invocation =
+            NativeInvocationTermination::new(invocation_deadline(Instant::now(), None));
+        invocation.bind_inventory_fence(InventoryDispatchFence {
+            version: Arc::clone(&version),
+            admitted_generation: 1,
+        });
+        version.store(2, Ordering::SeqCst);
+        let config = crate::tests::dispatcher_test_config("fcp.test.revoked-warm:utility:1.0.0");
+        let error = crate::SubprocessConnector::spawn_with_placement_and_termination(
+            config,
+            Arc::new(crate::ResilienceLayer::default()),
+            None,
+            crate::PlacementOperationClass::BulkPrewarm,
+            Some(&invocation),
+        )
+        .await
+        .err()
+        .expect("obsolete worker must be refused before trying the unavailable executable");
+        assert!(error.to_string().contains("inventory changed"), "{error}");
+        assert!(!invocation.is_cancel_requested());
+    }
 
     #[test]
     fn production_registration_preserves_invocation_deadline_and_lifecycle_cap() {

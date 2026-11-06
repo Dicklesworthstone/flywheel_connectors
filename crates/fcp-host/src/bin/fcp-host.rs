@@ -609,6 +609,11 @@ impl SubprocessConnector {
         // subprocess. Connector-supplied request fields cannot raise them.
         let response_limits =
             native_rpc_response_limits(&config, &load_manifest_operation_constraints(&config)?);
+        // A warm checkout can wait for health checks before falling back to a
+        // cold worker. Do not launch a binary/env whose authority was replaced.
+        if let Some(termination) = termination {
+            termination.require_current_inventory()?;
+        }
         let mut runner = ConnectorProcessRunner::spawn(&config.binary, &config.args, &config.env)
             .await
             .map_err(|err| HostError::Internal(format!("spawn failed: {err}")))?;
@@ -1344,9 +1349,11 @@ impl NativeWarmPoolConnector {
         request: InvokeRequest,
         termination: &WarmPoolTermination,
     ) -> HostResult<InvokeResponse> {
+        termination.invocation.require_current_inventory()?;
         let checkout = self
             .checkout_with_termination(&request.zone_id, Some(&termination.invocation))
             .await?;
+        termination.invocation.require_current_inventory()?;
         if termination.is_cancel_requested() {
             return Err(HostError::RegistryError(
                 "warm-pool invocation cancelled before worker dispatch".into(),
@@ -1862,6 +1869,14 @@ impl WasiConnector {
     }
 
     async fn invoke(&self, request: InvokeRequest) -> HostResult<InvokeResponse> {
+        self.invoke_with_inventory_fence(request, None).await
+    }
+
+    async fn invoke_with_inventory_fence(
+        &self,
+        request: InvokeRequest,
+        inventory_fence: Option<&InventoryDispatchFence>,
+    ) -> HostResult<InvokeResponse> {
         let request_id = request.id.to_string();
         let (runner, wasi_config) =
             self.runner_for_operation(&request.operation, &request_id, &request.zone_id)?;
@@ -1887,6 +1902,11 @@ impl WasiConnector {
             "dispatching connector through WASI sandbox"
         );
 
+        // Loading/validation can be expensive. Recheck before instantiation
+        // can execute guest code, without retaining a registry map lock.
+        if let Some(fence) = inventory_fence {
+            fence.require_current()?;
+        }
         let result = runner
             .execute(&validated.component, &wasi_config.args)
             .await
@@ -2161,6 +2181,31 @@ struct SubprocessRegistry {
     version: Arc<AtomicU64>,
     capability_verifying_key: Option<[u8; PUBLIC_KEY_SIZE]>,
     rate_limiters: Arc<HostRateLimiterStore>,
+}
+
+/// Runtime queues can outlive registry selection. Retain the generation that
+/// authorized the invocation and check it again at actual runtime activation.
+/// Already active work retains its existing cancellation/settlement semantics.
+#[derive(Clone)]
+struct InventoryDispatchFence {
+    version: Arc<AtomicU64>,
+    admitted_generation: u64,
+}
+
+impl InventoryDispatchFence {
+    fn is_current(&self) -> bool {
+        self.version.load(Ordering::SeqCst) == self.admitted_generation
+    }
+
+    fn require_current(&self) -> HostResult<()> {
+        if !self.is_current() {
+            return Err(HostError::PreflightFailed(
+                "connector inventory changed after admission; retry against current configuration"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -2563,6 +2608,7 @@ impl SubprocessRegistry {
         &self,
         connector_id: &ConnectorId,
         native_deadline: Instant,
+        admitted_generation: u64,
     ) -> HostResult<(
         CancellationScope,
         ConnectorRuntime,
@@ -2571,6 +2617,7 @@ impl SubprocessRegistry {
         Option<NativeInvocationTermination>,
     )> {
         let state = self.state.read().await;
+        self.require_generation(admitted_generation)?;
         let entry = state
             .connectors
             .get(connector_id)
@@ -2595,11 +2642,15 @@ impl SubprocessRegistry {
                 // Cancel only commands registered by this logical invocation.
                 // A queued caller must never abort another active native RPC.
                 let capture = NativeInvocationTermination::new(native_deadline);
+                capture.bind_inventory_fence(self.inventory_fence(admitted_generation));
                 scope = scope.with_terminator(capture.terminator());
                 native_capture = Some(capture);
             }
             ConnectorRuntime::NativeWarmPool(_) => {
                 let capture = WarmPoolTermination::new(native_deadline);
+                capture
+                    .invocation
+                    .bind_inventory_fence(self.inventory_fence(admitted_generation));
                 scope = scope.with_terminator(capture.terminator());
                 native_capture = Some(capture.invocation.clone());
                 warm_pool = Some(capture);
@@ -2614,6 +2665,19 @@ impl SubprocessRegistry {
             ConnectorRuntime::UnavailableNativeProxyOnly(_) => {}
         }
         Ok((scope, runtime, warm_pool, wasi_capture, native_capture))
+    }
+
+    /// Check after asynchronous authority lookups and at each runtime handoff.
+    /// A configuration publication never retargets already admitted authority.
+    fn require_generation(&self, admitted_generation: u64) -> HostResult<()> {
+        self.inventory_fence(admitted_generation).require_current()
+    }
+
+    fn inventory_fence(&self, admitted_generation: u64) -> InventoryDispatchFence {
+        InventoryDispatchFence {
+            version: Arc::clone(&self.version),
+            admitted_generation,
+        }
     }
 
     async fn first_zone_envelope_error(&self) -> Option<HostError> {
@@ -6864,6 +6928,48 @@ const CANCEL_SELF_CONNECTOR_ID: &str = "fcp.host.cancel-self:test:1.0.0";
 const CANCEL_SELF_CAPABILITY_ID: &str = "host.cancel-self";
 const CANCEL_SELF_OPERATION_ID: &str = "host.cancel-self";
 
+/// Reuse operator-owned inventory restrictions at admission and after waits.
+/// Connector-reported catalogs cannot widen these zone/operation boundaries.
+fn enforce_connector_allow_lists(
+    snapshot: &AllowListSnapshot,
+    request: &InvokeRequest,
+) -> HostResult<()> {
+    let allowed = &snapshot.allowed_zones;
+    require_allowed_zones_configured(&request.connector_id, allowed)?;
+    if !allowed.iter().any(|zone| zone == request.zone_id.as_str()) {
+        return Err(HostError::PreflightFailed(format!(
+            "connector `{}` is not bound to zone `{}` (allowed: [{}])",
+            request.connector_id,
+            request.zone_id.as_str(),
+            allowed.join(", ")
+        )));
+    }
+
+    let allowed_ops = &snapshot.allowed_operations;
+    if allowed_ops.is_empty() {
+        if snapshot.enforce_empty_allow_lists {
+            return Err(HostError::PreflightFailed(format!(
+                "connector `{}` has no `allowed_operations` and is configured \
+                 enforce_empty_allow_lists=true; deny-all (br-v2kt4)",
+                request.connector_id
+            )));
+        }
+        // Empty operations without deny-all still require signed capability
+        // and connector catalog checks in the rest of the admission pipeline.
+    } else if !allowed_ops
+        .iter()
+        .any(|op| op == request.operation.as_str())
+    {
+        return Err(HostError::PreflightFailed(format!(
+            "connector `{}` does not allow operation `{}` (allowed: [{}])",
+            request.connector_id,
+            request.operation.as_str(),
+            allowed_ops.join(", ")
+        )));
+    }
+    Ok(())
+}
+
 fn enforce_operation_network_constraint_dispatch(
     snapshot: &AllowListSnapshot,
     request: &InvokeRequest,
@@ -7034,60 +7140,7 @@ async fn verify_live_request_for_target(
         .allow_list_snapshot(&request.connector_id)
         .await;
     if let Some(snapshot) = &allow_snapshot {
-        let allowed = &snapshot.allowed_zones;
-        require_allowed_zones_configured(&request.connector_id, allowed)?;
-        if !allowed.iter().any(|zone| zone == request.zone_id.as_str()) {
-            return Err(HostError::PreflightFailed(format!(
-                "connector `{}` is not bound to zone `{}` (allowed: [{}])",
-                request.connector_id,
-                request.zone_id.as_str(),
-                allowed.join(", ")
-            )));
-        }
-    }
-
-    // br-ike8x: operator-pinned operation gate. The pre-existing
-    // operation check (against `introspection.tools` further down)
-    // trusts the connector's runtime self-report — a malicious or
-    // drifted connector binary that adds new operations under a
-    // permissive `tool.capability` would pass that gate even if the
-    // operator never approved those ops in the manifest. The
-    // ConnectorManifestCheck in `crates/fcp-host/src/enforcement.rs`
-    // was designed for exactly this purpose but was never wired
-    // into the production invoke path. Mirror the `allowed_zones`
-    // shape directly here: when the operator pins a non-empty
-    // `allowed_operations` set on the ManagedConnectorConfig, the
-    // host gateway rejects requests whose `operation` is not in it.
-    // Empty preserves pre-pinning behavior for back-compat.
-    // br-v2kt4: same explicit fail-closed shape for empty allowed_operations.
-    // br-l9tt6: re-uses the snapshot captured above so both gates
-    // decide against the same atomic read.
-    if let Some(snapshot) = &allow_snapshot {
-        let allowed_ops = &snapshot.allowed_operations;
-        if allowed_ops.is_empty() {
-            if snapshot.enforce_empty_allow_lists {
-                return Err(HostError::PreflightFailed(format!(
-                    "connector `{}` has no `allowed_operations` and is configured \
-                     enforce_empty_allow_lists=true; deny-all (br-v2kt4)",
-                    request.connector_id
-                )));
-            }
-            // Empty allowed_operations with the legacy flag disabled falls
-            // through to the connector introspection operation check.
-        } else if !allowed_ops
-            .iter()
-            .any(|op| op == request.operation.as_str())
-        {
-            return Err(HostError::PreflightFailed(format!(
-                "connector `{}` does not allow operation `{}` (allowed: [{}])",
-                request.connector_id,
-                request.operation.as_str(),
-                allowed_ops.join(", ")
-            )));
-        }
-    }
-
-    if let Some(snapshot) = &allow_snapshot {
+        enforce_connector_allow_lists(snapshot, request)?;
         enforce_operation_network_constraint_dispatch(snapshot, request)?;
     }
     state
@@ -17453,7 +17506,7 @@ deny_ptrace = true
         })
     }
 
-    fn dispatcher_introspection(
+    pub(super) fn dispatcher_introspection(
         operation_id: &'static str,
         capability_id: &str,
         safety_tier: SafetyTier,
