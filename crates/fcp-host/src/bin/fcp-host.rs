@@ -35,9 +35,7 @@ use base64::Engine;
 use chrono::{DateTime, SecondsFormat, Utc};
 use fcp_async_core::channel::{mpsc, oneshot};
 use fcp_async_core::hyper_bridge::{HyperExecutor, HyperIo};
-use fcp_async_core::io::{
-    AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
-};
+use fcp_async_core::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use fcp_async_core::net::TcpListener;
 #[cfg(unix)]
 use fcp_async_core::net::UnixListener;
@@ -173,10 +171,10 @@ mod http_batch;
 mod invoke_jobs;
 #[path = "fcp-host/mesh_cancel.rs"]
 mod mesh_cancel;
-#[path = "fcp-host/native_framing.rs"]
-mod native_framing;
 #[path = "fcp-host/native_events.rs"]
 mod native_events;
+#[path = "fcp-host/native_framing.rs"]
+mod native_framing;
 #[path = "fcp-host/native_rpc.rs"]
 mod native_rpc;
 #[path = "fcp-host/native_stream.rs"]
@@ -2613,10 +2611,7 @@ impl SubprocessRegistry {
         })
     }
 
-    async fn plan_configs(
-        &self,
-        configs: Vec<ConnectorConfig>,
-    ) -> HostResult<RegistryConfigPlan> {
+    async fn plan_configs(&self, configs: Vec<ConnectorConfig>) -> HostResult<RegistryConfigPlan> {
         let current_configs = {
             let state = self.state.read().await;
             state
@@ -5754,7 +5749,7 @@ const DEPLOYMENT_TIER_DENIED_AUDIT_EVENT_TYPE: &str = "deployment_tier.denied";
 fn current_deployment_classification() -> DeploymentClassification {
     // The host binary does not yet have live mesh quorum signals wired into
     // AppState. Classify the production boundary as single-host Evaluation so
-    // Risky/Dangerous dispatch fails closed until those signals exist.
+    // Risky/Dangerous/Critical dispatch fails closed until those signals exist.
     classify_deployment_mode(MeshQuorumSignals::single_host_evaluation())
 }
 
@@ -26425,18 +26420,40 @@ deny_ptrace = true
 
     #[fcp_async_core::runtime::test(flavor = "multi_thread")]
     async fn invoke_handler_admit_safety_denies_risky_evaluation_before_dispatch() {
+        assert_invoke_handler_admit_safety_denies_evaluation_before_dispatch(
+            SafetyTier::Risky,
+            Some(ApprovalMode::None),
+        )
+        .await;
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn invoke_handler_admit_safety_denies_critical_without_approval_metadata() {
+        // The connector's optional approval declaration cannot substitute for
+        // deployment evidence, even with a valid capability and zone policy.
+        for requires_approval in [None, Some(ApprovalMode::None)] {
+            assert_invoke_handler_admit_safety_denies_evaluation_before_dispatch(
+                SafetyTier::Critical,
+                requires_approval,
+            )
+            .await;
+        }
+    }
+
+    async fn assert_invoke_handler_admit_safety_denies_evaluation_before_dispatch(
+        safety_tier: SafetyTier,
+        requires_approval: Option<ApprovalMode>,
+    ) {
         let connector_id = "fcp.test.admit-safety:utility:1.0.0";
-        let operation_id = "test.risky";
-        let capability_id = "cap.test.risky";
+        let operation_id = "test.requires_mesh";
+        let capability_id = "cap.test.requires_mesh";
         let signing_key = fcp_crypto::ed25519::Ed25519SigningKey::generate();
         let invoke_count = Arc::new(AtomicU64::new(0));
 
-        let introspection = serde_json::to_value(dispatcher_introspection(
-            operation_id,
-            capability_id,
-            SafetyTier::Risky,
-        ))
-        .expect("test introspection should serialize");
+        let mut introspection = dispatcher_introspection(operation_id, capability_id, safety_tier);
+        introspection.operations[0].requires_approval = requires_approval;
+        let introspection =
+            serde_json::to_value(introspection).expect("test introspection should serialize");
         let (runner_tx, mut runner_rx) = mpsc::channel::<ConnectorRpcRequest>(8);
         let runner_invoke_count = Arc::clone(&invoke_count);
         let runner_task = task::spawn(async move {
@@ -26511,6 +26528,15 @@ deny_ptrace = true
             Arc::clone(&budget),
         ));
         let lifecycle = Arc::new(HostAdminStateStore::new());
+        register_test_capability_issuer(
+            lifecycle.as_ref(),
+            &signing_key,
+            connector_id,
+            capability_id,
+            operation_id,
+            ZoneId::work().as_str(),
+        )
+        .await;
         let state = Arc::new(AppState {
             registry: Arc::clone(&registry),
             doctor: DoctorService::new(Arc::clone(&registry)),
@@ -26530,7 +26556,10 @@ deny_ptrace = true
             approval_verifying_key: None,
             admin_bearer_token: None,
             connectors_file: None,
-            zone_policies: Arc::new(RwLock::new(HashMap::new())),
+            zone_policies: Arc::new(RwLock::new(HashMap::from([(
+                ZoneId::work(),
+                host_runtime_policy(ZoneId::work()),
+            )]))),
             telemetry_config: default_host_telemetry_config(),
             invoke_audit: Arc::new(fcp_host::InvokeAuditChain::new()),
             invoke_jobs: Arc::new(invoke_jobs::InvocationJobs::new()),
@@ -26545,7 +26574,7 @@ deny_ptrace = true
             connector_id: connector_key,
             operation: OperationId::from_static(operation_id),
             zone_id: ZoneId::work(),
-            input: json!({ "message": "risky operation should be blocked in evaluation" }),
+            input: json!({ "message": "operation requires verified mesh evidence" }),
             capability_token: test_capability_token(
                 &signing_key,
                 capability_id,
@@ -26564,12 +26593,18 @@ deny_ptrace = true
 
         let (status, message) = invoke_handler(State(state), HeaderMap::new(), Json(request))
             .await
-            .expect_err("Risky invoke must be denied in Evaluation before dispatch");
+            .expect_err("Effectful invoke must be denied in Evaluation before dispatch");
 
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert!(message.contains("deployment tier admission denied"));
         assert!(message.contains("tier_requires_mesh_active"));
         assert!(message.contains("insufficient_mesh_quorum"));
+        let (_, refusal) = message
+            .split_once("deployment tier admission denied: ")
+            .expect("denial must contain the structured deployment refusal");
+        let refusal: Value = serde_json::from_str(refusal).expect("deployment refusal is JSON");
+        assert_eq!(refusal["tier"], json!(safety_tier));
+        assert_eq!(refusal["mode"], "evaluation");
         assert_eq!(
             invoke_count.load(Ordering::SeqCst),
             0,

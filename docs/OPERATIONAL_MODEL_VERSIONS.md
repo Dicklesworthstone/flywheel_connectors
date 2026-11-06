@@ -55,6 +55,26 @@ today, not as the architecture contributors should optimize around long term.
 4. Use `--offline` explicitly when you want artifact-backed data.
 5. Do not assume mesh-native features are available.
 
+### Deployment Admission
+
+Truth precedence does not establish execution authority. A host classified as
+`Evaluation` admits only `Safe` operations through its deployment gate. `Risky`,
+`Dangerous`, and `Critical` operations return `TIER_REQUIRES_MESH_ACTIVE` with the
+underlying reason, such as insufficient healthy peers, an unreachable lease
+coordinator, stale revocation evidence, or rejected signal signatures.
+`Forbidden` operations are refused in every deployment mode.
+
+`Critical` has no evaluation exemption: an omitted approval declaration,
+`ApprovalMode::None`, or an approval token cannot establish a healthy mesh.
+Passing deployment admission in `MeshActive` also does not satisfy the separate
+policy, approval, quorum, or elevation requirements of an operation.
+
+The current `fcp-host` binary remains in `Evaluation` until live mesh health,
+lease-coordinator, and revocation-freshness signals are integrated into its
+deployment classifier. Configuring peers or selecting V2 truth precedence does
+not promote it. A deployment refusal must be resolved with verified runtime
+evidence rather than by relabeling an operation or disabling approval metadata.
+
 ---
 
 ## V2: Mesh-Native Truth Precedence (Operational Default, Hybrid Execution)

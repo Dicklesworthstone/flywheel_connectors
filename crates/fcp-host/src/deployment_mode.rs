@@ -4,8 +4,8 @@
 //! host-first single-active-control-plane model is being deprecated
 //! as the production default; once the C.4 mesh-failover proof
 //! lands, fcp-host SHOULD refuse to dispatch operations whose
-//! [`SafetyTier`] is `Risky` or `Dangerous` outside a verified-mesh
-//! deployment context.
+//! [`SafetyTier`] is `Risky`, `Dangerous`, or `Critical` outside a
+//! verified-mesh deployment context.
 //!
 //! This module ships the runtime classifier + admission contract:
 //!
@@ -24,8 +24,8 @@
 //!    [`DeploymentClassification`] receipt that records the inputs
 //!    and the reason the classifier produced its verdict.
 //! 4. [`admit_safety_tier`] — admission predicate that refuses
-//!    [`SafetyTier::Risky`] and [`SafetyTier::Dangerous`] in
-//!    `Evaluation` mode, returning a structured
+//!    [`SafetyTier::Risky`], [`SafetyTier::Dangerous`], and
+//!    [`SafetyTier::Critical`] in `Evaluation` mode, returning a structured
 //!    [`DeploymentTierRefusal`].
 //! 5. [`evaluation_mode_boot_warning`] — canonical operator-visible
 //!    warning string emitted on every health-check while in
@@ -54,7 +54,7 @@
 //!
 //! - ✅ Boot log records `DeploymentMode` and reason — see
 //!   [`DeploymentClassification::boot_log_line`].
-//! - ✅ Risky/Dangerous invocations in Evaluation mode return
+//! - ✅ Risky/Dangerous/Critical invocations in Evaluation mode return
 //!   structured denial — see [`DeploymentTierRefusal`].
 //! - ⏳ README §Limitations bullet edit + deployment runbook update
 //!   are documentation tasks that follow the code landing here.
@@ -323,14 +323,13 @@ pub fn requested_truth_precedence_from_env(
 /// callers should treat it as a snapshot — re-classify whenever the
 /// underlying health probe reports a state change so a peer loss
 /// flips the mode back to `Evaluation` and any in-flight Risky /
-/// Dangerous operation is refused on its next dispatch attempt.
+/// Dangerous / Critical operation is refused on its next dispatch attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeploymentMode {
-    /// Single-host or insufficient-mesh-quorum deployment. Risky
-    /// and Dangerous safety tiers are refused; only Safe and
-    /// Critical (which has its own quorum/elevation gating) and
-    /// Forbidden (always refused) flow through admission.
+    /// Single-host or insufficient-mesh-quorum deployment. Only Safe
+    /// operations pass deployment admission. Risky, Dangerous, and
+    /// Critical require verified mesh evidence; Forbidden always refuses.
     Evaluation,
     /// Mesh control plane is live with at least
     /// [`MIN_HEALTHY_MESH_PEERS_FOR_ACTIVE`] healthy peers and
@@ -346,8 +345,8 @@ impl DeploymentMode {
         matches!(self, Self::MeshActive)
     }
 
-    /// Whether this mode is restricted to evaluation (Safe/Critical
-    /// modulo per-tier policies; Risky/Dangerous refused).
+    /// Whether this mode restricts deployment admission to Safe operations
+    /// modulo their other policies.
     #[must_use]
     pub const fn is_evaluation(&self) -> bool {
         matches!(self, Self::Evaluation)
@@ -379,7 +378,7 @@ pub struct MeshQuorumSignals {
     /// Whether the local revocation snapshot is within the
     /// configured freshness SLA (`RevocationSlaChecker`). `false`
     /// here forces Evaluation regardless of peer count because
-    /// stale revocations cannot reliably gate Risky/Dangerous ops.
+    /// stale revocations cannot reliably gate Risky/Dangerous/Critical ops.
     pub revocation_snapshot_fresh: bool,
 }
 
@@ -559,7 +558,7 @@ pub enum DeploymentClassificationReason {
     LeaseCoordinatorUnreachable,
     /// Local revocation snapshot is stale beyond the configured
     /// freshness SLA. Implies [`DeploymentMode::Evaluation`]
-    /// because Risky/Dangerous ops cannot be reliably gated under
+    /// because Risky/Dangerous/Critical ops cannot be reliably gated under
     /// stale revocation data.
     RevocationSnapshotStale,
     /// Healthy peer count meets [`MIN_HEALTHY_MESH_PEERS_FOR_ACTIVE`],
@@ -823,7 +822,7 @@ pub const fn classify_deployment_mode_with_min_peers(
 }
 
 /// Structured refusal returned by [`admit_safety_tier`] when a
-/// Risky / Dangerous invocation arrives while the host is in
+/// Risky / Dangerous / Critical invocation arrives while the host is in
 /// [`DeploymentMode::Evaluation`].
 ///
 /// Operator-visible (echoed in API errors and audit-log denials);
@@ -865,14 +864,14 @@ pub enum DeploymentTierRefusal {
 /// | Safe      | ALLOW                   | ALLOW                    |
 /// | Risky     | REFUSE (`TierRequires…`)| ALLOW                    |
 /// | Dangerous | REFUSE (`TierRequires…`)| ALLOW                    |
-/// | Critical  | ALLOW (own gating[^1]) | ALLOW (own gating[^1])   |
+/// | Critical  | REFUSE (`TierRequires…`)| ALLOW (own gating[^1])   |
 /// | Forbidden | REFUSE (`TierForbidden`)| REFUSE (`TierForbidden`) |
 ///
-/// [^1]: `Critical` carries its own quorum/elevation requirements
-/// downstream (`ApprovalScope` + `ApprovalToken`); this admission
-/// does NOT additionally gate it on deployment mode because
-/// quorum-elevation already requires mesh participation by
-/// construction.
+/// [^1]: Passing deployment admission does not satisfy an operation's
+/// separate quorum/elevation or approval requirements. In particular,
+/// optional approval metadata is not evidence that a Critical operation
+/// has verified mesh authority. Critical must fail closed in Evaluation
+/// even when the connector omits or disables its approval requirement.
 ///
 /// # Errors
 ///
@@ -888,11 +887,11 @@ pub const fn admit_safety_tier(
     if classification.mode.is_mesh_active() {
         return Ok(());
     }
-    // Evaluation mode: refuse Risky and Dangerous; allow Safe and
-    // Critical (Critical's own quorum/elevation gating handles it).
+    // Approval metadata cannot stand in for verified deployment evidence.
+    // Critical must not bypass a gate that already refuses lower-risk tiers.
     match tier {
-        SafetyTier::Safe | SafetyTier::Critical => Ok(()),
-        SafetyTier::Risky | SafetyTier::Dangerous => {
+        SafetyTier::Safe => Ok(()),
+        SafetyTier::Risky | SafetyTier::Dangerous | SafetyTier::Critical => {
             Err(DeploymentTierRefusal::TierRequiresMeshActive {
                 tier,
                 mode: classification.mode,
@@ -1203,14 +1202,39 @@ mod tests {
     }
 
     #[test]
-    fn admit_safety_tier_allows_critical_in_evaluation() {
-        // Critical has its own quorum/elevation gating; deployment
-        // mode does NOT additionally gate it because the
-        // quorum-elevation path already requires mesh by
-        // construction.
-        let class = classify_deployment_mode(MeshQuorumSignals::single_host_evaluation());
+    fn admit_safety_tier_refuses_critical_for_every_evaluation_cause() {
+        for signals in [
+            MeshQuorumSignals::single_host_evaluation(),
+            MeshQuorumSignals {
+                healthy_peer_count: 3,
+                lease_coordinator_reachable: Some(false),
+                revocation_snapshot_fresh: true,
+            },
+            MeshQuorumSignals {
+                healthy_peer_count: 3,
+                lease_coordinator_reachable: Some(true),
+                revocation_snapshot_fresh: false,
+            },
+        ] {
+            let class = classify_deployment_mode(signals);
+            assert_eq!(class.mode, DeploymentMode::Evaluation);
+            assert_eq!(
+                admit_safety_tier(&class, SafetyTier::Critical),
+                Err(DeploymentTierRefusal::TierRequiresMeshActive {
+                    tier: SafetyTier::Critical,
+                    mode: DeploymentMode::Evaluation,
+                    reason: class.reason,
+                }),
+                "Critical must retain the actual deployment failure reason"
+            );
+        }
+    }
+
+    #[test]
+    fn admit_safety_tier_allows_critical_in_mesh_active() {
+        let class = classify_deployment_mode(MeshQuorumSignals::fully_active(3));
         admit_safety_tier(&class, SafetyTier::Critical)
-            .expect("Critical admits regardless of deployment mode");
+            .expect("Critical passes the deployment gate in MeshActive");
     }
 
     #[test]
@@ -1618,9 +1642,9 @@ mod tests {
     }
 
     #[test]
-    fn signed_signals_admit_safety_tier_refuses_risky_when_signature_invalid() {
+    fn signed_signals_admit_safety_tier_refuses_effectful_tiers_when_signature_invalid() {
         // End-to-end: an attacker presenting forged signals MUST NOT
-        // be able to admit a Risky operation through the
+        // be able to admit an effectful operation through the
         // (signed-classifier + admit_safety_tier) chain.
         let attacker_signed = fully_active_signed_by_a();
         // Resolver returns the WRONG key (signature won't verify).
@@ -1628,11 +1652,19 @@ mod tests {
             classify_deployment_mode_verified_or_evaluation(&attacker_signed, |_| {
                 Some(signing_key_b().verifying_key())
             });
-        let refusal = admit_safety_tier(&classification, SafetyTier::Risky)
-            .expect_err("Risky MUST be refused under unverified signals");
-        assert!(matches!(
-            refusal,
-            DeploymentTierRefusal::TierRequiresMeshActive { .. }
-        ));
+        for tier in [
+            SafetyTier::Risky,
+            SafetyTier::Dangerous,
+            SafetyTier::Critical,
+        ] {
+            assert_eq!(
+                admit_safety_tier(&classification, tier),
+                Err(DeploymentTierRefusal::TierRequiresMeshActive {
+                    tier,
+                    mode: DeploymentMode::Evaluation,
+                    reason: DeploymentClassificationReason::SignedSignalsRejected,
+                })
+            );
+        }
     }
 }

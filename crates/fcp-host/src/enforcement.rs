@@ -1383,10 +1383,10 @@ pub enum MissingFieldPolicy {
 /// hardened by br-298px).
 ///
 /// Composes the [`admit_safety_tier`] predicate hr0rr.1 (`CrimsonWolf`,
-/// commit 26d7919dd). Refuses `Risky` and `Dangerous` tiers when
+/// commit 26d7919dd). Refuses `Risky`, `Dangerous`, and `Critical` tiers when
 /// the host is in `DeploymentMode::Evaluation` (insufficient mesh
-/// quorum). Always refuses `Forbidden`. Always allows `Safe` and
-/// `Critical` (Critical's own quorum/elevation gating handles it).
+/// quorum). Always refuses `Forbidden`. Allows `Safe` through this gate;
+/// all tiers remain subject to their other policy and approval checks.
 ///
 /// ## Missing-field policy
 ///
@@ -5771,7 +5771,7 @@ mod tests {
     // Pin the per-(mode × tier) admission matrix at the pipeline-check
     // boundary. CrimsonWolf's hr0rr.1 (commit 26d7919dd) shipped the
     // admit_safety_tier predicate; nsrx3 wires it in as
-    // EnforcementCheckId::DeploymentTier so a Risky/Dangerous request
+    // EnforcementCheckId::DeploymentTier so a Risky/Dangerous/Critical request
     // arriving while the host is in Evaluation mode is REFUSED before
     // dispatch. Slot is canonical: right after CapabilityVerify.
     //
@@ -5914,13 +5914,22 @@ mod tests {
     }
 
     #[test]
-    fn deployment_tier_check_allows_critical_in_evaluation() {
-        // Critical carries its own quorum/elevation gating downstream;
-        // DeploymentTier MUST NOT block it.
+    fn deployment_tier_check_refuses_critical_in_evaluation() {
+        // An optional downstream approval check cannot establish mesh health.
         let check = DeploymentTierCheck::new();
         let ctx = ctx_with_tier_and_mode(SafetyTier::Critical, evaluation_classification());
         let outcome = check.check(&ctx, &EnforcementConfig::default());
-        assert!(matches!(outcome, CheckOutcome::Allow));
+        match outcome {
+            CheckOutcome::Deny {
+                reason_code,
+                explanation,
+            } => {
+                assert_eq!(reason_code, "TIER_REQUIRES_MESH_ACTIVE");
+                assert!(explanation.contains("Critical"));
+                assert!(explanation.contains("InsufficientMeshQuorum"));
+            }
+            other => panic!("expected Deny, got {other:?}"),
+        }
     }
 
     #[test]

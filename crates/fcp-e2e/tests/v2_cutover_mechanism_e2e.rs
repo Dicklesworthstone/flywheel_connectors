@@ -251,12 +251,13 @@ fn v2_cutover_mechanism_admit_safety_tier_agrees_with_pipeline_outcome() {
         (SafetyTier::Risky, mesh_active_classification(), true),
         (SafetyTier::Dangerous, evaluation_classification(), false),
         (SafetyTier::Dangerous, mesh_active_classification(), true),
-        (SafetyTier::Critical, evaluation_classification(), true),
+        (SafetyTier::Critical, evaluation_classification(), false),
         (SafetyTier::Critical, mesh_active_classification(), true),
         (SafetyTier::Forbidden, evaluation_classification(), false),
         (SafetyTier::Forbidden, mesh_active_classification(), false),
     ];
 
+    let pipeline = EnforcementPipeline::default();
     for (tier, classification, expected_admit) in cases {
         let admit_result = admit_safety_tier(&classification, tier);
         let admitted = admit_result.is_ok();
@@ -264,6 +265,19 @@ fn v2_cutover_mechanism_admit_safety_tier_agrees_with_pipeline_outcome() {
             admitted, expected_admit,
             "admit_safety_tier({tier:?}, mode={:?}) wrong",
             classification.mode
+        );
+        let ctx = ctx_with_tier_and_mode(tier, classification);
+        let decision = pipeline.evaluate(&ctx);
+        let record = decision
+            .checks_run
+            .iter()
+            .find(|record| record.name == "deployment_tier")
+            .expect("deployment_tier check must run before dispatch");
+        assert_eq!(
+            matches!(record.outcome, CheckOutcome::Allow),
+            expected_admit,
+            "pipeline deployment_tier disagrees for {tier:?}: {:?}",
+            record.outcome
         );
     }
 
