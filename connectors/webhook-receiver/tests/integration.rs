@@ -1071,6 +1071,124 @@ async fn events_ingest_source_allowlist_accepts_cidr_and_denies_other_sources() 
 }
 
 #[fcp_async_core::runtime::test]
+async fn events_ingest_mixed_family_source_allowlist_is_order_independent() {
+    let mut c = setup_connector().await;
+    for (index, sources) in [
+        ["203.0.113.0/24", "2001:db8::/32"],
+        ["2001:db8::/32", "203.0.113.0/24"],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let path = format!("/hooks/dual-stack-{index}");
+        let created = c
+            .handle_invoke(json!({
+                "operation_id": "webhook.endpoints.create",
+                "input": {
+                    "path": path,
+                    "provider": "github",
+                    "signing_secret": "dual-stack-secret",
+                    "allowed_sources": sources
+                }
+            }))
+            .await
+            .unwrap();
+        for (source, denied_source) in [
+            ("203.0.113.10", "198.51.100.10"),
+            ("2001:db8:1234::10", "2001:db9::10"),
+        ] {
+            let body = json!({"id": format!("delivery-{source}")}).to_string();
+            let mut input = json!({
+                "method": "POST",
+                "path": path,
+                "headers": {
+                    "Content-Type": "application/json",
+                    "X-Hub-Signature-256": format!(
+                        "sha256={}", hmac_sha256_hex("dual-stack-secret", &body)
+                    )
+                },
+                "body": body,
+                "source_ip": denied_source
+            });
+            assert_external_status(
+                c.handle_invoke(json!({
+                    "operation_id": "webhook.events.ingest", "input": input
+                }))
+                .await,
+                403,
+            );
+            // A source-policy rejection must not consume the authenticated
+            // delivery identity before a permitted retry reaches verification.
+            input["source_ip"] = json!(source);
+            let accepted = c
+                .handle_invoke(json!({
+                    "operation_id": "webhook.events.ingest", "input": input
+                }))
+                .await
+                .unwrap();
+            assert_eq!(accepted["accepted"], true);
+            assert_eq!(accepted["event"]["event_id"], format!("delivery-{source}"));
+        }
+        let recent = c
+            .handle_invoke(json!({
+                "operation_id": "webhook.events.recent",
+                "input": {"endpoint_id": created["endpoint_id"]}
+            }))
+            .await
+            .unwrap();
+        assert_eq!(recent["events"].as_array().unwrap().len(), 2);
+        assert!(recent["events"].as_array().unwrap().iter().all(|event| {
+            event["signature_valid"] == true && event["source_ip_hash"].is_string()
+        }));
+    }
+}
+
+#[fcp_async_core::runtime::test]
+async fn endpoints_create_rejects_invalid_source_policy_without_registering_endpoint() {
+    let mut c = setup_connector().await;
+    for invalid in [
+        "203.0.113.0/33",
+        "2001:db8::/129",
+        "203.0.113.0/256",
+        "203.0.113.0/-1",
+        "203.0.113.0/24/1",
+        "hooks.example.com",
+        "not-an-address",
+    ] {
+        assert_external_status(
+            c.handle_invoke(json!({
+                "operation_id": "webhook.endpoints.create",
+                "input": {
+                    "path": "/hooks/source-policy",
+                    "signing_secret": "secret",
+                    "allowed_sources": ["203.0.113.0/24", invalid]
+                }
+            }))
+            .await,
+            400,
+        );
+        let listed = c
+            .handle_invoke(json!({
+                "operation_id": "webhook.endpoints.list", "input": {}
+            }))
+            .await
+            .unwrap();
+        assert!(listed["endpoints"].as_array().unwrap().is_empty());
+    }
+    // Invalid policy must not reserve the endpoint path or any store capacity.
+    c.handle_invoke(json!({
+        "operation_id": "webhook.endpoints.create",
+        "input": {
+            "path": "/hooks/source-policy",
+            "signing_secret": "secret",
+            "allowed_sources": ["203.0.113.0/24", "2001:db8::/32"]
+        }
+    }))
+    .await
+    .unwrap();
+}
+
+#[fcp_async_core::runtime::test]
 async fn events_ingest_rejects_non_post_method() {
     let mut c = setup_connector().await;
     assert_external_status(

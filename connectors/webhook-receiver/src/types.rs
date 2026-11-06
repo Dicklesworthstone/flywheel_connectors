@@ -1,8 +1,84 @@
 //! Webhook Receiver types.
 
+use std::{net::IpAddr, str::FromStr};
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+/// A validated source address or CIDR range. Address families stay distinct:
+/// a range for one family is a non-match for the other, not an invalid policy.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum SourceIpRange {
+    V4 { network: u32, mask: u32 },
+    V6 { network: u128, mask: u128 },
+}
+
+impl FromStr for SourceIpRange {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let value = value.trim();
+        let (address, prefix) = value
+            .split_once('/')
+            .map_or((value, None), |(address, prefix)| (address, Some(prefix)));
+        let address = address
+            .parse::<IpAddr>()
+            .map_err(|_| "must be an IP address or CIDR range")?;
+        let width = if address.is_ipv4() { 32 } else { 128 };
+        let prefix = match prefix {
+            Some(prefix) => {
+                if prefix.is_empty() || !prefix.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return Err("CIDR prefix must be an unsigned decimal integer");
+                }
+                prefix
+                    .parse::<u8>()
+                    .ok()
+                    .filter(|prefix| *prefix <= width)
+                    .ok_or("CIDR prefix exceeds the address-family width")?
+            }
+            None => width,
+        };
+        Ok(match address {
+            IpAddr::V4(address) => {
+                let mask = if prefix == 0 {
+                    0
+                } else {
+                    u32::MAX << (32 - prefix)
+                };
+                Self::V4 {
+                    network: u32::from(address) & mask,
+                    mask,
+                }
+            }
+            IpAddr::V6(address) => {
+                let mask = if prefix == 0 {
+                    0
+                } else {
+                    u128::MAX << (128 - prefix)
+                };
+                Self::V6 {
+                    network: u128::from(address) & mask,
+                    mask,
+                }
+            }
+        })
+    }
+}
+
+impl SourceIpRange {
+    pub(crate) fn contains(self, address: IpAddr) -> bool {
+        match (self, address) {
+            (Self::V4 { network, mask }, IpAddr::V4(address)) => {
+                u32::from(address) & mask == network
+            }
+            (Self::V6 { network, mask }, IpAddr::V6(address)) => {
+                u128::from(address) & mask == network
+            }
+            _ => false,
+        }
+    }
+}
 
 /// Supported webhook provider presets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -217,12 +293,10 @@ impl WebhookEndpoint {
             issues.push("signature algorithm is empty".to_string());
         }
 
-        if self
-            .allowed_sources
-            .iter()
-            .any(|cidr| cidr.trim().is_empty())
-        {
-            issues.push("allowed_sources contains an empty CIDR entry".to_string());
+        for (index, source) in self.allowed_sources.iter().enumerate() {
+            if let Err(reason) = source.parse::<SourceIpRange>() {
+                issues.push(format!("allowed_sources[{index}] {reason}"));
+            }
         }
 
         if self.provider != WebhookProvider::Generic {
@@ -342,6 +416,78 @@ mod tests {
             "X-Signature".into(),
             "hmac-sha256".into(),
         )
+    }
+
+    #[test]
+    fn source_ip_ranges_cover_prefix_boundaries_and_exact_addresses() {
+        for (pattern, included, excluded) in [
+            ("203.0.113.9", "203.0.113.9", "203.0.113.10"),
+            ("203.0.113.9/32", "203.0.113.9", "203.0.113.8"),
+            ("203.0.113.9/31", "203.0.113.8", "203.0.113.10"),
+            (" 203.0.113.9/24 ", "203.0.113.255", "203.0.112.255"),
+            ("128.0.0.1/1", "255.255.255.255", "127.255.255.255"),
+            ("203.0.113.9/0", "0.0.0.0", "::"),
+            ("2001:db8::9", "2001:0db8:0:0:0:0:0:9", "2001:db8::a"),
+            ("2001:db8::9/128", "2001:db8::9", "2001:db8::8"),
+            ("2001:db8::9/127", "2001:db8::8", "2001:db8::a"),
+            ("2001:db8::9/32", "2001:db8:ffff::1", "2001:db9::1"),
+            ("8000::1/1", "ffff:ffff::1", "7fff:ffff::1"),
+            ("2001:db8::9/0", "::", "0.0.0.0"),
+        ] {
+            let range = pattern.parse::<SourceIpRange>().unwrap();
+            assert!(range.contains(included.parse().unwrap()), "{pattern}");
+            assert!(!range.contains(excluded.parse().unwrap()), "{pattern}");
+        }
+    }
+
+    #[test]
+    fn source_ip_ranges_do_not_widen_across_address_families() {
+        let ipv4 = "0.0.0.0/0".parse::<SourceIpRange>().unwrap();
+        let ipv6 = "::/0".parse::<SourceIpRange>().unwrap();
+        assert!(!ipv4.contains("2001:db8::1".parse().unwrap()));
+        assert!(!ipv4.contains("::ffff:203.0.113.1".parse().unwrap()));
+        assert!(!ipv6.contains("203.0.113.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn source_ip_ranges_reject_malformed_and_out_of_range_prefixes() {
+        for pattern in [
+            "",
+            " ",
+            "hooks.example.com",
+            "203.0.113.999",
+            "203.0.113.0/33",
+            "203.0.113.0/128",
+            "2001:db8::/129",
+            "::/256",
+            "203.0.113.0/-1",
+            "203.0.113.0/+1",
+            "203.0.113.0/",
+            "203.0.113.0/24/1",
+            "203.0.113.0/ 24",
+            "203.0.113.0 /24",
+            "203.0.113.0/255.255.255.0",
+            "203.0.113.0:443",
+            "[2001:db8::1]",
+        ] {
+            assert!(pattern.parse::<SourceIpRange>().is_err(), "{pattern}");
+        }
+    }
+
+    #[test]
+    fn endpoint_validation_checks_every_source_range() {
+        let mut endpoint = generic_endpoint();
+        endpoint.allowed_sources = vec![
+            "203.0.113.0/24".into(),
+            "2001:db8::/129".into(),
+            "not-an-address".into(),
+        ];
+        let issues = endpoint.validation_issues();
+        assert_eq!(issues.len(), 2);
+        assert!(issues[0].contains("allowed_sources[1]"));
+        assert!(issues[1].contains("allowed_sources[2]"));
+        endpoint.allowed_sources = vec!["203.0.113.0/24".into(), "2001:db8::/32".into()];
+        assert!(endpoint.validation_issues().is_empty());
     }
 
     #[test]

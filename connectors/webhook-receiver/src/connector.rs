@@ -37,7 +37,7 @@ use tracing::{info, instrument};
 use crate::{
     client::{DEFAULT_PUBLIC_BASE_URL, WebhookStore},
     error::WebhookReceiverError,
-    types::{WebhookEndpoint, WebhookEvent, WebhookProvider},
+    types::{SourceIpRange, WebhookEndpoint, WebhookEvent, WebhookProvider},
 };
 
 const INGRESS_LISTENER_STATUS: &str = "deferred";
@@ -1683,69 +1683,24 @@ fn enforce_source_allowlist(
         .map_err(|_| WebhookReceiverError::Forbidden {
             message: "source_ip is not a valid IP address".into(),
         })?;
-    for source in &endpoint.allowed_sources {
-        if source_pattern_matches_ip(source, ip)? {
-            return Ok(());
-        }
-    }
-    Err(WebhookReceiverError::Forbidden {
-        message: "source_ip is not in endpoint allowed_sources".into(),
-    })
-}
-
-fn source_pattern_matches_ip(pattern: &str, ip: IpAddr) -> Result<bool, WebhookReceiverError> {
-    let pattern = pattern.trim();
-    if let Some((addr, prefix)) = pattern.split_once('/') {
-        let base = addr
-            .parse::<IpAddr>()
-            .map_err(|_| WebhookReceiverError::InvalidInput {
-                message: format!("invalid allowed_sources CIDR: {pattern}"),
-            })?;
-        let prefix = prefix
-            .parse::<u8>()
-            .map_err(|_| WebhookReceiverError::InvalidInput {
-                message: format!("invalid allowed_sources CIDR prefix: {pattern}"),
-            })?;
-        return ip_in_cidr(ip, base, prefix).ok_or_else(|| WebhookReceiverError::InvalidInput {
-            message: format!("allowed_sources CIDR family does not match request IP: {pattern}"),
-        });
-    }
-    let exact = pattern
-        .parse::<IpAddr>()
-        .map_err(|_| WebhookReceiverError::InvalidInput {
-            message: format!("invalid allowed_sources IP address: {pattern}"),
+    let mut allowed = false;
+    // Creation validates the complete policy. Check every entry here as well:
+    // imported or directly constructed endpoint state must not allow a match
+    // to hide a malformed trailing range.
+    for (index, source) in endpoint.allowed_sources.iter().enumerate() {
+        let range = source.parse::<SourceIpRange>().map_err(|reason| {
+            WebhookReceiverError::InvalidInput {
+                message: format!("allowed_sources[{index}] {reason}"),
+            }
         })?;
-    Ok(exact == ip)
-}
-
-fn ip_in_cidr(ip: IpAddr, base: IpAddr, prefix: u8) -> Option<bool> {
-    match (ip, base) {
-        (IpAddr::V4(ip), IpAddr::V4(base)) if prefix <= 32 => {
-            let mask = ipv4_mask(prefix);
-            Some((u32::from(ip) & mask) == (u32::from(base) & mask))
-        }
-        (IpAddr::V6(ip), IpAddr::V6(base)) if prefix <= 128 => {
-            let mask = ipv6_mask(prefix);
-            Some((u128::from(ip) & mask) == (u128::from(base) & mask))
-        }
-        (IpAddr::V4(_), IpAddr::V4(_)) | (IpAddr::V6(_), IpAddr::V6(_)) => Some(false),
-        _ => None,
+        allowed |= range.contains(ip);
     }
-}
-
-const fn ipv4_mask(prefix: u8) -> u32 {
-    if prefix == 0 {
-        0
+    if allowed {
+        Ok(())
     } else {
-        u32::MAX << (32 - prefix)
-    }
-}
-
-const fn ipv6_mask(prefix: u8) -> u128 {
-    if prefix == 0 {
-        0
-    } else {
-        u128::MAX << (128 - prefix)
+        Err(WebhookReceiverError::Forbidden {
+            message: "source_ip is not in endpoint allowed_sources".into(),
+        })
     }
 }
 
@@ -2781,6 +2736,23 @@ fn operations_info() -> Vec<OperationInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_allowlist_rejects_malformed_policy_even_after_an_allowed_match() {
+        let endpoint = WebhookEndpoint::new(
+            "/hooks/policy".into(),
+            "secret".into(),
+            vec!["203.0.113.0/24".into(), "2001:db8::/129".into()],
+            "https://hooks.flywheel.test",
+            WebhookProvider::Generic,
+            "X-Signature".into(),
+            "hmac-sha256".into(),
+        );
+        assert!(matches!(
+            enforce_source_allowlist(&endpoint, Some("203.0.113.10".into())),
+            Err(WebhookReceiverError::InvalidInput { .. })
+        ));
+    }
 
     const TWILIO_FORM_URL: &str = "https://example.com/myapp.php?foo=1&bar=2";
     const TWILIO_FORM_BODY: &str = "CallSid=CA1234567890ABCDE&Caller=%2B14158675310&Digits=1234&From=%2B14158675310&To=%2B18005551212";

@@ -120,6 +120,7 @@ The current Webhook Receiver README slice documents the existing runtime surface
 - Recent-events limit defaults to `50` and is capped at `100`.
 - Endpoint paths must start with `/`.
 - Endpoint paths must be unique among active endpoints.
+- Source allowlists accept exact IPv4/IPv6 addresses and CIDR ranges. Every entry is validated before endpoint creation; malformed addresses and prefixes outside `0..=32` (IPv4) or `0..=128` (IPv6) are rejected. Mixed-family lists are a union: a range for another address family is a non-match, so list ordering does not block permitted deliveries. IPv4-mapped IPv6 addresses remain IPv6 and require a matching IPv6 entry.
 - Endpoint provider values are `generic`, `github`, `stripe`, `slack`, and `twilio`.
 - Generated secrets use URL-safe random bytes with provider prefixes:
   - generic: `whsec_`
