@@ -6,8 +6,9 @@
 //! - checkpoints are written to a temp file in the target directory, `sync_all()`ed,
 //!   atomically renamed into place, and the containing directory is fsynced on
 //!   platforms that support directory sync;
-//! - writable startup replays only checksum-valid WAL records and truncates any
-//!   torn or corrupt tail so a partial append cannot poison later recovery;
+//! - writable startup replays only checksum-valid WAL records and truncates an
+//!   incomplete final append; authenticated malformed complete records fail
+//!   closed without discarding their contents or any later records;
 //! - observational opens never create, repair, or checkpoint files, and writable
 //!   store handles retain exclusive OS ownership through admitted work.
 
@@ -75,8 +76,8 @@ enum DurableAccess {
 /// memory: a torn write or adversarial single-line WAL cannot exhaust
 /// memory by withholding the trailing newline.
 ///
-/// Records exceeding this cap are treated as torn (truncated and
-/// discarded), matching the existing behavior for unparseable records.
+/// Records exceeding this cap fail closed when a MAC key is configured.
+/// Legacy unkeyed stores treat them as torn tails and truncate them.
 const MAX_WAL_RECORD_BYTES: usize = 512 * 1024 * 1024;
 
 /// Maximum bytes the snapshot recovery loop will load.
@@ -1485,6 +1486,7 @@ fn load_durable_object_state(
         mac_key,
         allow_legacy_unauth,
         access,
+        MAX_WAL_RECORD_BYTES,
     )
     .map_err(object_io_durable)?;
     let mut last_seq = last_snapshot_seq;
@@ -1535,6 +1537,7 @@ fn load_durable_symbol_state(
         mac_key,
         allow_legacy_unauth,
         access,
+        MAX_WAL_RECORD_BYTES,
     )
     .map_err(symbol_io_durable)?;
     let mut last_seq = last_snapshot_seq;
@@ -1558,7 +1561,7 @@ fn load_durable_symbol_state(
 ///   before `delim` for `n > 0` — caller still treats as torn via the
 ///   parse step, since the envelope will not deserialize)
 /// - `(n, true)` — `max_bytes` was reached without seeing `delim`;
-///   caller should treat the record as torn and stop scanning
+///   caller must stop scanning and apply its oversized-record policy
 /// - `(0, false)` — clean EOF, no more records
 fn read_until_bounded<R: BufRead>(
     reader: &mut R,
@@ -1741,6 +1744,7 @@ fn read_wal_records<T>(
     mac_key: Option<&[u8; 32]>,
     allow_legacy_unauth: bool,
     access: DurableAccess,
+    max_record_bytes: usize,
 ) -> Result<Vec<WalEnvelope<T>>, DurableIoError>
 where
     T: Serialize + DeserializeOwned,
@@ -1767,22 +1771,45 @@ where
     loop {
         raw.clear();
         let (bytes_read, hit_cap) =
-            read_until_bounded(&mut reader, b'\n', &mut raw, MAX_WAL_RECORD_BYTES)
+            read_until_bounded(&mut reader, b'\n', &mut raw, max_record_bytes)
                 .map_err(|error| format!("read wal {}: {error}", path.display()))?;
         if bytes_read == 0 {
             break;
         }
-        if hit_cap || raw.last() != Some(&b'\n') {
-            // Adversarial or torn record larger than `MAX_WAL_RECORD_BYTES`
-            // — treat as a truncation point so recovery cannot be made to
-            // OOM by a single oversized line. The on-disk file is then
-            // truncated to the prior valid prefix, mirroring the behavior
-            // for unparseable records.
+        if hit_cap {
+            // A bounded reader cannot establish that the remaining bytes are
+            // an incomplete final append. In authenticated mode, truncation
+            // here would let an oversized replacement erase acknowledged
+            // records without ever reaching MAC verification.
+            if mac_key.is_some() {
+                return Err(DurableIoError::Tampered {
+                    path: path.display().to_string(),
+                    reason: format!(
+                        "authenticated wal record at byte {valid_prefix_len} exceeds {max_record_bytes} bytes"
+                    ),
+                });
+            }
+            truncated = true;
+            break;
+        }
+        if raw.last() != Some(&b'\n') {
+            // Only an unterminated EOF suffix is a recoverable interrupted
+            // append in authenticated mode. Complete invalid records must
+            // remain on disk for diagnosis instead of silently rolling back
+            // every acknowledged operation that follows them.
             truncated = true;
             break;
         }
 
         let Ok(envelope) = serde_json::from_slice::<WalEnvelope<T>>(&raw) else {
+            if mac_key.is_some() {
+                return Err(DurableIoError::Tampered {
+                    path: path.display().to_string(),
+                    reason: format!(
+                        "malformed authenticated wal record at byte {valid_prefix_len}"
+                    ),
+                });
+            }
             truncated = true;
             break;
         };
@@ -3416,30 +3443,43 @@ mod tests {
     #[fcp_async_core::runtime::test]
     async fn durable_object_store_truncates_torn_wal_tail() {
         let temp_dir = TempDir::new().expect("temp dir");
-        let mut config = DurableObjectStoreConfig::new(temp_dir.path().join("objects"));
-        config.checkpoint_after_ops = 0;
+        for mac_key in [None, Some(TEST_MAC_KEY)] {
+            let mut config = DurableObjectStoreConfig::new(
+                temp_dir
+                    .path()
+                    .join(format!("objects-{}", mac_key.is_some())),
+            );
+            config.checkpoint_after_ops = 0;
+            config.mac_key = mac_key;
 
-        let store = DurableObjectStore::open(config.clone()).expect("open store");
-        store.put(test_object(7)).await.expect("put object");
-        drop(store);
+            let store = DurableObjectStore::open(config.clone()).expect("open store");
+            store.put(test_object(7)).await.expect("put object");
+            drop(store);
 
-        let wal_path = config.root_dir.join("objects.wal.jsonl");
-        let valid_len = fs::metadata(&wal_path).expect("wal metadata").len();
-        let mut wal = OpenOptions::new()
-            .append(true)
-            .open(&wal_path)
-            .expect("open wal");
-        wal.write_all(br#"{"version":1,"seq":"broken"#)
-            .expect("append torn tail");
-        wal.sync_all().expect("sync torn tail");
-        drop(wal);
+            let wal_path = config.root_dir.join("objects.wal.jsonl");
+            let committed = fs::read(&wal_path).unwrap();
+            let mut wal = OpenOptions::new()
+                .append(true)
+                .open(&wal_path)
+                .expect("open wal");
+            wal.write_all(br#"{"version":2,"seq":"broken"#)
+                .expect("append torn tail");
+            wal.sync_all().expect("sync torn tail");
+            drop(wal);
 
-        let reopened = DurableObjectStore::open(config).expect("reopen store");
-        assert!(reopened.exists(&test_object_id(7)).await);
-        let truncated_len = fs::metadata(&wal_path)
-            .expect("wal metadata after reopen")
-            .len();
-        assert_eq!(truncated_len, valid_len, "corrupt tail should be truncated");
+            let before = fs::read(&wal_path).unwrap();
+            assert!(DurableObjectStore::open_read_only(config.clone()).is_err());
+            assert_eq!(fs::read(&wal_path).unwrap(), before);
+
+            let reopened = DurableObjectStore::open(config.clone()).expect("reopen store");
+            assert!(reopened.exists(&test_object_id(7)).await);
+            assert_eq!(fs::read(&wal_path).unwrap(), committed);
+            reopened.put(test_object(8)).await.unwrap();
+            drop(reopened);
+            let recovered = DurableObjectStore::open(config).unwrap();
+            assert!(recovered.exists(&test_object_id(7)).await);
+            assert!(recovered.exists(&test_object_id(8)).await);
+        }
     }
 
     #[fcp_async_core::runtime::test]
@@ -3934,6 +3974,185 @@ mod tests {
         config.mac_key = mac_key;
         config.allow_legacy_unauth = allow_legacy_unauth;
         config
+    }
+
+    fn malformed_wal_record_bytes(
+        original: &[u8],
+        record_index: usize,
+        malformed_json: bool,
+    ) -> Vec<u8> {
+        let mut records: Vec<_> = original
+            .split_inclusive(|byte| *byte == b'\n')
+            .map(<[u8]>::to_vec)
+            .collect();
+        if malformed_json {
+            records[record_index][0] = b'!';
+        } else {
+            // Valid JSON with an invalid envelope must fail just as safely as
+            // invalid JSON. Neither may bypass authentication by failing to
+            // deserialize before the MAC check.
+            let mut envelope: serde_json::Value =
+                serde_json::from_slice(&records[record_index]).unwrap();
+            envelope.as_object_mut().unwrap().remove("op");
+            records[record_index] = serde_json::to_vec(&envelope).unwrap();
+            records[record_index].push(b'\n');
+        }
+        records.concat()
+    }
+
+    #[tokio::test]
+    async fn authenticated_object_wal_rejects_malformed_complete_records_without_truncation() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = dgbtx_object_config(temp_dir.path(), Some(TEST_MAC_KEY), false);
+        let store = DurableObjectStore::open(config.clone()).unwrap();
+        for seed in 1..=3 {
+            store.put(test_object(seed)).await.unwrap();
+        }
+        let wal_path = store.wal_path.clone();
+        drop(store);
+        let original = fs::read(&wal_path).unwrap();
+
+        for record_index in 0..3 {
+            for malformed_json in [false, true] {
+                let corrupt = malformed_wal_record_bytes(&original, record_index, malformed_json);
+                fs::write(&wal_path, &corrupt).unwrap();
+                let before = stored_file_bytes(&config.root_dir);
+                for allow_legacy_unauth in [false, true] {
+                    let mut recovery_config = config.clone();
+                    recovery_config.allow_legacy_unauth = allow_legacy_unauth;
+                    for access in [DurableAccess::ReadOnly, DurableAccess::ReadWrite] {
+                        let result = if access == DurableAccess::ReadOnly {
+                            DurableObjectStore::open_read_only(recovery_config.clone())
+                        } else {
+                            DurableObjectStore::open(recovery_config.clone())
+                        };
+                        assert!(matches!(
+                            result,
+                            Err(ObjectStoreError::TamperedAuditEnvelope { reason, .. })
+                                if reason.contains("malformed authenticated wal record")
+                        ));
+                        assert_eq!(stored_file_bytes(&config.root_dir), before);
+                    }
+                }
+            }
+        }
+
+        // Once the damaged fixture is restored, every acknowledged operation
+        // remains recoverable, including those after the malformed record.
+        fs::write(&wal_path, &original).unwrap();
+        let recovered = DurableObjectStore::open(config).unwrap();
+        for seed in 1..=3 {
+            assert_eq!(
+                recovered.get(&test_object_id(seed)).await.unwrap().body,
+                test_object(seed).body
+            );
+        }
+        assert_eq!(fs::read(&wal_path).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn authenticated_symbol_wal_rejects_malformed_complete_records_without_truncation() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = dgbtx_symbol_config(temp_dir.path(), Some(TEST_MAC_KEY), false);
+        let store = DurableSymbolStore::open(config.clone()).unwrap();
+        store.put_object_meta(test_symbol_meta(1)).await.unwrap();
+        store.put_symbol(test_symbol(1, 0, 7)).await.unwrap();
+        store.put_symbol(test_symbol(1, 1, 8)).await.unwrap();
+        let wal_path = store.wal_path.clone();
+        drop(store);
+        let original = fs::read(&wal_path).unwrap();
+
+        for record_index in 0..3 {
+            for malformed_json in [false, true] {
+                let corrupt = malformed_wal_record_bytes(&original, record_index, malformed_json);
+                fs::write(&wal_path, &corrupt).unwrap();
+                let before = stored_file_bytes(&config.root_dir);
+                for allow_legacy_unauth in [false, true] {
+                    let mut recovery_config = config.clone();
+                    recovery_config.allow_legacy_unauth = allow_legacy_unauth;
+                    for access in [DurableAccess::ReadOnly, DurableAccess::ReadWrite] {
+                        let result = if access == DurableAccess::ReadOnly {
+                            DurableSymbolStore::open_read_only(recovery_config.clone())
+                        } else {
+                            DurableSymbolStore::open(recovery_config.clone())
+                        };
+                        assert!(matches!(
+                            result,
+                            Err(SymbolStoreError::TamperedAuditEnvelope { reason, .. })
+                                if reason.contains("malformed authenticated wal record")
+                        ));
+                        assert_eq!(stored_file_bytes(&config.root_dir), before);
+                    }
+                }
+            }
+        }
+
+        fs::write(&wal_path, &original).unwrap();
+        let recovered = DurableSymbolStore::open(config).unwrap();
+        assert_eq!(recovered.symbol_count(&test_object_id(1)).await, 2);
+        for (esi, source_node) in [(0, 7), (1, 8)] {
+            assert_eq!(
+                recovered
+                    .get_symbol(&test_object_id(1), esi)
+                    .await
+                    .unwrap()
+                    .data,
+                test_symbol(1, esi, source_node).data
+            );
+        }
+        assert_eq!(fs::read(&wal_path).unwrap(), original);
+    }
+
+    #[test]
+    fn authenticated_wal_rejects_oversized_records_without_truncation() {
+        let temp_dir = TempDir::new().unwrap();
+        for mac_key in [None, Some(TEST_MAC_KEY)] {
+            for access in [DurableAccess::ReadOnly, DurableAccess::ReadWrite] {
+                let wal_path = temp_dir.path().join(format!(
+                    "{}-{}.wal.jsonl",
+                    mac_key.is_some(),
+                    access == DurableAccess::ReadOnly
+                ));
+                append_wal_record(
+                    &wal_path,
+                    1,
+                    &ObjectWalOp::Delete {
+                        object_id: test_object_id(1),
+                    },
+                    mac_key.as_ref(),
+                )
+                .unwrap();
+                let original = fs::read(&wal_path).unwrap();
+                let cap = original.len() + 1;
+                let mut oversized = original.clone();
+                oversized.extend(std::iter::repeat_n(b'x', cap + 1));
+                oversized.push(b'\n');
+                fs::write(&wal_path, &oversized).unwrap();
+
+                let result = read_wal_records::<ObjectWalOp>(
+                    &wal_path,
+                    0,
+                    mac_key.as_ref(),
+                    false,
+                    access,
+                    cap,
+                );
+                if mac_key.is_some() {
+                    assert!(matches!(
+                        result,
+                        Err(DurableIoError::Tampered { reason, .. })
+                            if reason.contains("exceeds")
+                    ));
+                    assert_eq!(fs::read(&wal_path).unwrap(), oversized);
+                } else if access == DurableAccess::ReadOnly {
+                    assert!(matches!(result, Err(DurableIoError::Other(_))));
+                    assert_eq!(fs::read(&wal_path).unwrap(), oversized);
+                } else {
+                    assert_eq!(result.unwrap().len(), 1);
+                    assert_eq!(fs::read(&wal_path).unwrap(), original);
+                }
+            }
+        }
     }
 
     /// Forge a Delete record with a recomputed unkeyed checksum. Without
