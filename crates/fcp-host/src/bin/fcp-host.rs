@@ -2177,6 +2177,9 @@ impl ConnectorRuntime {
 #[derive(Clone)]
 struct SubprocessRegistry {
     state: Arc<RwLock<RegistryState>>,
+    // Serialize managed-file, registry, and lifecycle changes together, including
+    // rollback. Invocation and ordinary registry reads never take this gate.
+    inventory_transaction: Arc<futures_util::lock::Mutex<()>>,
     resilience: Arc<ResilienceLayer>,
     version: Arc<AtomicU64>,
     capability_verifying_key: Option<[u8; PUBLIC_KEY_SIZE]>,
@@ -2575,6 +2578,7 @@ impl SubprocessRegistry {
         }
         Ok(Self {
             state: Arc::new(RwLock::new(RegistryState { connectors: map })),
+            inventory_transaction: Arc::new(futures_util::lock::Mutex::new(())),
             resilience,
             version: Arc::new(AtomicU64::new(1)),
             capability_verifying_key,
@@ -8868,6 +8872,7 @@ async fn signal_handler_loop(
 /// lifecycle state with the updated inventory.
 #[cfg(unix)]
 async fn reload_connectors(state: &AppState) -> Result<usize, HostError> {
+    let _transaction = state.registry.inventory_transaction.lock().await;
     let loaded = load_connector_configs()?;
     let count = loaded.configs.len();
 
@@ -11090,6 +11095,7 @@ async fn connector_inventory_apply_handler(
         ))
     })?;
 
+    let _transaction = state.registry.inventory_transaction.lock().await;
     let previous_configs = read_connector_configs_file(&connectors_file).map_err(map_host_error)?;
     let mut next_configs = previous_configs.clone();
     let previous = previous_configs
@@ -11387,6 +11393,8 @@ fn next_inventory_with_config(
     Ok(inventory)
 }
 
+// The caller retains the inventory transaction gate through this entire rollback.
+// Reacquiring it here would deadlock the enclosing administrative mutation.
 async fn rollback_connector_inventory(
     state: &AppState,
     connectors_file: &std::path::Path,
@@ -11426,6 +11434,7 @@ async fn apply_connector_config_payload(
     created_by: Option<String>,
     change_reason: Option<String>,
 ) -> Result<ConnectorConfigApplyResponse, HostError> {
+    let _transaction = state.registry.inventory_transaction.lock().await;
     let current_context = load_connector_config_context(state, connector_id).await?;
     ensure_expected_config_revision(
         connector_id,
@@ -17435,6 +17444,7 @@ deny_ptrace = true
         );
         Arc::new(SubprocessRegistry {
             state: Arc::new(RwLock::new(RegistryState { connectors })),
+            inventory_transaction: Arc::new(futures_util::lock::Mutex::new(())),
             resilience: Arc::new(ResilienceLayer::default()),
             version: Arc::new(AtomicU64::new(1)),
             capability_verifying_key: None,
@@ -17458,6 +17468,7 @@ deny_ptrace = true
         }
         Arc::new(SubprocessRegistry {
             state: Arc::new(RwLock::new(RegistryState { connectors })),
+            inventory_transaction: Arc::new(futures_util::lock::Mutex::new(())),
             resilience: Arc::new(ResilienceLayer::default()),
             version: Arc::new(AtomicU64::new(1)),
             capability_verifying_key: None,
@@ -26663,6 +26674,7 @@ deny_ptrace = true
         );
         let registry = Arc::new(SubprocessRegistry {
             state: Arc::new(RwLock::new(RegistryState { connectors })),
+            inventory_transaction: Arc::new(futures_util::lock::Mutex::new(())),
             resilience: Arc::new(ResilienceLayer::default()),
             version: Arc::new(AtomicU64::new(1)),
             capability_verifying_key: None,
@@ -27248,6 +27260,7 @@ deny_ptrace = true
         );
         let registry = Arc::new(SubprocessRegistry {
             state: Arc::new(RwLock::new(RegistryState { connectors })),
+            inventory_transaction: Arc::new(futures_util::lock::Mutex::new(())),
             resilience: Arc::new(ResilienceLayer::default()),
             version: Arc::new(AtomicU64::new(1)),
             capability_verifying_key: None,
@@ -31169,6 +31182,152 @@ done"#;
         );
     }
 
+    #[fcp_async_core::runtime::test]
+    async fn inventory_mutation_reads_file_after_the_preceding_transaction() {
+        let directory = tempfile::tempdir().expect("inventory transaction directory");
+        let inventory_path = directory.path().join("connectors.json");
+        write_connector_configs_file(&inventory_path, &[]).expect("empty inventory file");
+        let registry = Arc::new(empty_registry(1));
+        let mut state = dispatcher_app_state(
+            Arc::clone(&registry),
+            Arc::new(HostAdminStateStore::new()),
+            None,
+            HashMap::new(),
+        );
+        Arc::get_mut(&mut state).unwrap().connectors_file = Some(inventory_path.clone());
+        let config = dispatcher_test_config("fcp.test.transaction-install:utility:1.0.0");
+
+        // Cloning the registry must retain the same administrative gate.
+        let cloned_registry = registry.as_ref().clone();
+        let preceding_transaction = cloned_registry.inventory_transaction.lock().await;
+        let mut pending = Box::pin(connector_inventory_apply_handler(
+            State(Arc::clone(&state)),
+            Json(ConnectorInventoryMutationRequest {
+                kind: ConnectorInventoryMutationKind::Install,
+                dry_run: true,
+                connector: config.clone(),
+            }),
+        ));
+        assert!(futures_util::poll!(pending.as_mut()).is_pending());
+        // The administrative gate must not stall ordinary registry reads.
+        let mut read = Box::pin(registry.inventory());
+        assert!(matches!(
+            futures_util::poll!(read.as_mut()),
+            std::task::Poll::Ready(inventory) if inventory.is_empty()
+        ));
+        drop(read);
+
+        write_connector_configs_file(&inventory_path, std::slice::from_ref(&config))
+            .expect("preceding transaction writes inventory");
+        registry
+            .publish_configs(registry_publication_fixture(&registry, vec![config.clone()]).await)
+            .await
+            .expect("preceding transaction publishes inventory");
+        drop(preceding_transaction);
+
+        let error = pending
+            .await
+            .expect_err("waiting install must see the preceding transaction's connector");
+        assert!(error.1.contains("already present"), "{}", error.1);
+        assert_eq!(
+            read_connector_configs_file(&inventory_path).expect("managed inventory"),
+            vec![config.clone()]
+        );
+        assert_eq!(registry.inventory().await, vec![config]);
+        assert!(registry.inventory_transaction.try_lock().is_some());
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn config_mutation_validates_revision_after_the_preceding_transaction() {
+        let registry = Arc::new(empty_registry(1));
+        let mut config = dispatcher_test_config("fcp.test.transaction-config:utility:1.0.0");
+        let connector_id = config.id.parse::<ConnectorId>().unwrap();
+        registry
+            .publish_configs(registry_publication_fixture(&registry, vec![config.clone()]).await)
+            .await
+            .expect("initial inventory");
+        let lifecycle = Arc::new(HostAdminStateStore::new());
+        lifecycle
+            .reconcile_registered_connectors(&registry.list().await)
+            .await
+            .expect("initial lifecycle state");
+        let initial = lifecycle
+            .append_config_revision(&connector_id, json!({}), None, None)
+            .await
+            .expect("initial revision");
+        let state = dispatcher_app_state(
+            Arc::clone(&registry),
+            Arc::clone(&lifecycle),
+            None,
+            HashMap::new(),
+        );
+
+        let preceding_transaction = registry.inventory_transaction.lock().await;
+        let mut pending = Box::pin(apply_connector_config_payload(
+            &state,
+            &connector_id,
+            json!({}),
+            Some(initial.revision_id),
+            None,
+            None,
+        ));
+        assert!(futures_util::poll!(pending.as_mut()).is_pending());
+
+        config.config = Some(json!({"version": 2}));
+        registry
+            .publish_configs(registry_publication_fixture(&registry, vec![config.clone()]).await)
+            .await
+            .expect("preceding transaction publishes config");
+        let newer = lifecycle
+            .append_config_revision(&connector_id, json!({"version": 2}), None, None)
+            .await
+            .expect("preceding transaction commits revision");
+        drop(preceding_transaction);
+
+        let error = pending
+            .await
+            .expect_err("revision must be checked after the preceding transaction commits");
+        assert!(
+            error.to_string().contains(&format!(
+                "config revision {}, expected {}",
+                newer.revision_id, initial.revision_id
+            )),
+            "{error}"
+        );
+        assert_eq!(registry.inventory().await, vec![config]);
+        assert_eq!(
+            lifecycle
+                .connector_state(&connector_id)
+                .await
+                .unwrap()
+                .active_config_revision_id,
+            Some(newer.revision_id)
+        );
+        assert!(registry.inventory_transaction.try_lock().is_some());
+    }
+
+    #[cfg(unix)]
+    #[fcp_async_core::runtime::test]
+    async fn config_reload_waits_for_the_managed_inventory_transaction() {
+        let registry = Arc::new(empty_registry(1));
+        let state = dispatcher_app_state(
+            Arc::clone(&registry),
+            Arc::new(HostAdminStateStore::new()),
+            None,
+            HashMap::new(),
+        );
+        let preceding_transaction = registry.inventory_transaction.lock().await;
+        let mut pending = Box::pin(reload_connectors(&state));
+        assert!(futures_util::poll!(pending.as_mut()).is_pending());
+
+        // Cancellation while waiting must not consume or poison the gate.
+        drop(pending);
+        drop(preceding_transaction);
+        assert!(registry.inventory_transaction.try_lock().is_some());
+        assert!(registry.inventory().await.is_empty());
+        assert_eq!(registry.version(), 1);
+    }
+
     #[fcp_async_core::runtime::test(flavor = "multi_thread")]
     async fn subprocess_registry_apply_configs_reconciles_live_inventory() {
         if maybe_compiled_test_connector_binary().is_none() {
@@ -33511,6 +33670,7 @@ done"#;
     fn empty_registry(version: u64) -> SubprocessRegistry {
         SubprocessRegistry {
             state: Arc::new(RwLock::new(RegistryState::default())),
+            inventory_transaction: Arc::new(futures_util::lock::Mutex::new(())),
             resilience: Arc::new(ResilienceLayer::default()),
             version: Arc::new(AtomicU64::new(version)),
             capability_verifying_key: None,
