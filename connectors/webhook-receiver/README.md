@@ -1,7 +1,8 @@
 # Webhook Receiver Connector V3 Contract
 
-> **Status**: authenticated host-forwarded intake with signed endpoint approvals
+> **Status**: authenticated host-forwarded intake with signed endpoint approvals and an opt-in host HTTP adapter
 > **Bead**: `flywheel_connectors-yin4m`
+> **Host HTTP adapter bead**: `flywheel_connectors-whing1`
 > **Parent**: `flywheel_connectors-4kw5f`
 > **Verification script**: none tracked; use the commands below
 > **GitHub webhook signature guide**: https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries
@@ -14,6 +15,8 @@
 This document fixes the operator-facing contract for `fcp.webhook-receiver`. The connector currently exposes a host-forwarded webhook ingestion surface implemented in this crate: endpoint create/list/delete/rotate, verified event ingestion, recent event replay, health reporting, and provider-specific signature checks for generic, GitHub, Stripe, Slack, and Twilio-style deliveries.
 
 The connector is intentionally a bounded in-process webhook intake buffer. It is not a public HTTP server, durable event bus, queue service, retry worker, webhook delivery sender, subscription manager, provider API client, secret vault, or general ingress gateway.
+
+`fcp-host` provides an opt-in HTTP adapter at `POST /webhooks/{*path}`. It forwards the original provider body through the normal host invocation path to `webhook.events.ingest`, using an explicitly configured receiver, zone, public URL, and capability. See [Generic webhook HTTP ingress](../../docs/configuration/webhook_receiver_ingress.md) for configuration, proxy requirements, resource limits, and provider response limitations.
 
 ## Current Runtime Snapshot
 
@@ -39,6 +42,7 @@ Important runtime truths the contract preserves:
 - Non-local hosts must use `https`.
 - `localhost`, `127.0.0.1`, and `::1` are treated as local and may use `http`.
 - Local hosts are valid for tests but reported as not publicly routable.
+- For the host HTTP adapter, both the connector and host must use the same explicit `public_base_url`, such as `https://hooks.example.test/webhooks`. An endpoint registered as `/github` receives deliveries at `/webhooks/github`.
 - `max_body_bytes` defaults to `1048576` and is capped at `16777216`.
 - `body_timeout_ms` defaults to `15000` and is capped at `120000`.
 - `rate_limit_window_ms` defaults to `60000` and has a minimum of `1`.
@@ -52,7 +56,7 @@ Important runtime truths the contract preserves:
 - Every configure attempt invalidates prior authority and clears endpoints, signing secrets, events, dedup IDs, and ingress state. Configuration replaces the previous intake namespace; preserve required endpoint configuration outside this process before reconfiguring.
 - Handshake requires a canonical `HandshakeRequest`, accepts protocol `2.0` or `2.0.0`, negotiates only manifest-declared capabilities, rejects forbidden zones, echoes the nonce, and returns a fresh actual `instance_id`. Empty requested capabilities grant no access. Failed handshakes revoke the previous session.
 - Rehandshake within the same zone rotates instance authority. Switching zones requires reconfiguration so prior-zone secrets and payloads cannot cross the boundary.
-- `health()` returns a canonical `HealthSnapshot` with `details.configured`, `details.handshaken`, and `details.instance_id`, enabling the host to prepare an instance-bound session. Ready means local authenticated intake is available; public ingress remains separately reported as unbound.
+- `health()` returns a canonical `HealthSnapshot` with `details.configured`, `details.handshaken`, and `details.instance_id`, enabling the host to prepare an instance-bound session. Ready means local authenticated intake is available. Public ingress remains separately reported as unbound because the connector cannot attest the host route, proxy, DNS, or TLS mapping.
 - The JSON-RPC transport returns a canonical `InvokeResponse` with the invocation ID inside the outer JSON-RPC response, including typed operation errors.
 - `doctor()` is degraded in the current no-native-listener build because native ingress listener and gateway binding checks fail non-critically.
 - `self_check()` is degraded for local/non-public base URLs and for the current unbound gateway-ingress mode.
@@ -62,17 +66,17 @@ Important runtime truths the contract preserves:
 
 This README documents runtime truth and keeps current drift visible:
 
-- Runtime has no native HTTP listener. Host-forwarded ingress through `webhook.events.ingest` is the only available delivery path.
+- The connector has no native HTTP listener. The optional host HTTP adapter forwards deliveries through `webhook.events.ingest`; endpoint creation alone does not activate that route.
 - Manifest optional capabilities include `network.dns`, `network.egress`, and `tls.sni`, but runtime opens no outbound sockets and no inbound listener.
 - Manifest and introspection both mark endpoint creation and rotation as policy-approved and deletion as interactive approval. All three require valid signed execution evidence at dispatch.
 - Manifest says endpoint metadata, signing secrets, and deduplication state are stored under singleton-writer state. Runtime stores them in process memory only.
-- `doctor()` currently cannot reach `ok` in the no-native-listener build because ingress listener and gateway binding remain deferred.
-- `self_check()` currently cannot reach `ok` unless future gateway binding/native-listener support is added.
+- `doctor()` currently cannot reach `ok` in the no-native-listener build because it reports no connector-owned listener or verified gateway binding.
+- `self_check()` currently cannot reach `ok` without evidence of gateway binding. Enabling the host adapter does not change this connector-local claim automatically.
 - Endpoint creation and rotation return signing secrets in the response; endpoint listing only returns `signing_secret_configured`.
 - The connector hashes source IPs in recent-event output but stores verified event data in memory until retention eviction or shutdown.
 - There is no dedicated tracked verification shell script for this connector.
 
-Remaining work includes durable endpoint/secrets/event state, a host HTTP ingress adapter, alignment of manifest network capabilities with the no-native-listener runtime, and a live provider verification bundle.
+Remaining work includes durable endpoint/secrets/event state, verified external ingress-binding evidence, alignment of manifest network capabilities with the no-native-listener runtime, and a live provider verification bundle.
 
 ## First-Slice Scope
 
@@ -81,6 +85,7 @@ The current Webhook Receiver README slice documents the existing runtime surface
 - endpoint lifecycle management
 - in-process endpoint secret generation and rotation
 - host-forwarded event ingestion through `webhook.events.ingest`
+- optional bounded HTTP delivery through the host's `/webhooks/{*path}` adapter
 - provider-specific signature verification for generic HMAC, GitHub, Stripe, Slack, and Twilio styles
 - content-type policy, body-size policy, rate limiting, in-flight limiting, deduplication, and redaction behavior
 - lifecycle, health, doctor, self-check, simulation, introspection, and shutdown behavior
@@ -110,6 +115,13 @@ The current Webhook Receiver README slice documents the existing runtime surface
 
 - No native listener is started by this connector.
 - Host-forwarded ingress operation: `webhook.events.ingest`.
+- The host HTTP adapter is absent unless `FCP_HOST_WEBHOOK_INGRESS_CONFIG_FILE` selects a valid explicit binding. Its body, timeout, and concurrency limits are separate from the connector's own limits; both apply.
+- Intake remains `Risky` and requires fresh [signed deployment evidence](../../docs/configuration/deployment_evidence.md) for its zone to pass the host's deployment gate. The manifest's singleton-writer ownership and lease fences remain separate requirements; the [ingress guide](../../docs/configuration/webhook_receiver_ingress.md#deployment-admission-and-singleton-ownership) describes their configuration.
+- The host binding names an absolute `capability_token_file`. The host reloads its bounded base64 content for each admitted delivery, allowing authority for the actual prepared receiver instance to be renewed without restarting the host. Unavailable or invalid authority fails closed with `503`; there is no stale-token fallback.
+- The adapter preserves raw body bytes and path/query spelling, constructs signature URLs from the configured public base, and takes the source IP only from the TCP connection. `Forwarded` and `X-Forwarded-*` never establish client identity or FCP authority. Behind a reverse proxy, source allowlists and rate keys see the proxy's address.
+- The invocation is the operator's fixed intake command in the configured zone. Its provenance retains the public-input taint and a public-origin payload receipt in the chain; the adapter neither elevates provider data nor creates approval evidence. Normal host policy remains in force.
+- Each HTTP attempt receives fresh host-generated invocation and delivery identities. Provider metadata cannot choose a host idempotency key; the receiver's authenticated-content replay check still rejects accepted payload retries with `409`.
+- Provider-facing HTTP responses contain only `accepted`, `status_code`, and `reason_code`. Endpoint IDs, payloads, signature diagnostics, capability material, and source hashes remain outside that public response.
 - Endpoint limit: `100`.
 - Event retention limit: `1000` events per endpoint.
 - Retained event data is also capped at `16 MiB` per endpoint and `64 MiB` across the connector, measured as serialized complete events. These are data budgets; allocator and parsed-JSON overhead are additional. The oldest arrivals are evicted when either budget is reached.
@@ -156,7 +168,7 @@ The current Webhook Receiver README slice documents the existing runtime surface
 | slack | `X-Slack-Signature` | `slack-signature-v0` | Requires `X-Slack-Request-Timestamp`, signs `v0:{timestamp}:{raw_body}`, enforces tolerance |
 | twilio | `X-Twilio-Signature` | `twilio-hmac-sha1` | Form: Base64 HMAC-SHA1 over the exact URL plus sorted field names and values. JSON: HMAC-SHA1 over the exact URL, with its `bodySHA256` binding the raw body. |
 
-Twilio adapters should pass the original body and externally visible URL. The URL's scheme, host, effective port, and path must match the configured endpoint; query parameters remain part of the exact signed URL. Configure `public_base_url` to the provider-visible origin when a reverse proxy is involved.
+Twilio adapters should pass the original body and externally visible URL. The URL's scheme, host, effective port, and path must match the configured endpoint; query parameters remain part of the exact signed URL. Configure `public_base_url` to the provider-visible base, including `/webhooks` when using the host HTTP adapter.
 
 Native form bodies decode percent escapes and `+` spaces with strict UTF-8 validation. Repeated values are sorted and deduplicated to match Twilio's signing rules; stored fields are strings or arrays of distinct strings. An optional `params` object must describe that same authenticated field set and cannot replace a different body or payload. Form intake accepts at most `1024` fields and bounds the expanded canonical signing data to `16 MiB` before copying repeated names and values; the configured body-size limit still applies.
 
@@ -168,6 +180,8 @@ Public event ID precedence:
 - headers: `X-GitHub-Delivery`, `X-Request-ID`, `Stripe-Request-Id`, `X-Slack-Request-Id`
 - payload fields: `id`, `event_id`, `eventId`, `delivery_id`; `MessageSid`, `SmsSid`, and `CallSid` are also considered for non-Twilio providers
 - fallback: `evt_` plus a redacted hash of endpoint ID and raw body; Twilio forms use the normalized authenticated payload so equivalent field ordering and percent escapes deduplicate
+
+The host HTTP adapter supplies its own fresh `delivery_id`, so HTTP deliveries use that first branch. Provider IDs remain untrusted metadata in stored, redacted headers or payloads; authenticated-content digests provide replay denial across HTTP attempts.
 
 Twilio resource SIDs identify a message or call, not an individual delivery. Without an explicit delivery ID, successive status callbacks for one SID receive distinct IDs when their payload changes, while equivalent retries remain duplicates.
 
@@ -185,7 +199,7 @@ For Twilio, the identity hashes the exact verified signing string: signed URL/qu
 | `webhook.endpoints.list` | List endpoint summaries without secrets | `webhook.endpoints.read` | `Safe` | `Low` | `Strict` | none |
 | `webhook.endpoints.delete` | Delete endpoint, events, and dedup IDs | `webhook.endpoints.write` | `Dangerous` | `High` | `Strict` | `endpoint_id` |
 | `webhook.endpoints.rotate_secret` | Replace endpoint signing secret | `webhook.endpoints.write` | `Risky` | `High` | `None` | `endpoint_id`; optional `signing_secret` |
-| `webhook.events.ingest` | Verify and record one host-forwarded delivery | `webhook.events.write` | `Risky` | `Medium` | `BestEffort` | `path`, headers, body or payload |
+| `webhook.events.ingest` | Verify and record one host-forwarded delivery | `webhook.events.write` | `Risky` | `High` | `Strict` | `path`, headers, body or payload |
 | `webhook.events.recent` | Return recent verified events | `webhook.events.read` | `Safe` | `Low` | `Strict` | optional `endpoint_id`, `limit`, `since_ts` |
 | `webhook.health` | Return config, endpoint, event, and ingress state | `webhook.endpoints.read` | `Safe` | `Low` | `Strict` | none |
 
@@ -193,11 +207,11 @@ For Twilio, the identity hashes the exact verified signing string: signed URL/qu
 
 The current implementation does not include:
 
-- native HTTP listener startup, TLS termination, DNS management, public tunnel provisioning, gateway binding, or direct provider subscription setup
+- connector-owned HTTP listener startup, TLS termination, DNS management, public tunnel provisioning, automatic gateway registration, or direct provider subscription setup
 - durable event queueing, durable replay, dead-letter queues, retry workers, cursor persistence, or cross-process deduplication
 - outbound provider API calls, provider webhook registration, provider secret rotation through remote APIs, or provider-specific subscription discovery
-- arbitrary content-type support, streaming body reads, multipart handling, file upload persistence, or large body storage
-- response customization for providers, webhook delivery sending, retry callback endpoints, or bidirectional webhook workflows
+- arbitrary content-type support, multipart handling, file upload persistence, or large body storage; the host adapter collects accepted UTF-8 bodies with bounded streaming reads
+- response customization for providers, Slack URL-verification challenge responses, Twilio TwiML responses, webhook delivery sending, retry callback endpoints, or bidirectional webhook workflows
 - per-endpoint zone routing, per-endpoint data retention policy, or secret vault integration
 - long-term audit storage, PII classification, payload redaction beyond selected headers, or encrypted local persistence
 
@@ -232,14 +246,19 @@ The deterministic integration evidence is anchored on connector-local tests cove
 - independent signed approvals with expiry, request/input binding, signature, and scope denial checks
 - failed handshake/configuration invalidation and cross-zone state isolation
 
+The host adapter adds request-translation unit tests, bounded runtime tests, and `crates/fcp-host/tests/webhook_receiver_ingress.rs`. The latter uses the real receiver, canonical handshakes, signed capabilities and independent endpoint approvals, and a real loopback HTTP connection. It covers exact GitHub/Stripe/Slack/Twilio payload authentication, replay denial, FCP scope rejection, source allowlists, and redacted public replies. Added test coverage is not a claim that those commands or live-provider callbacks have passed; record actual results when running the verification bundle.
+
 ## Source Notes
 
 - `connectors/webhook-receiver/src/connector.rs` defines configuration parsing, lifecycle handlers, endpoint operations, ingest dispatch, introspection, simulation, health, doctor, and self-check.
-- `connectors/webhook-receiver/src/client.rs` defines in-memory endpoint/event storage, signature verification, body parsing, rate limiting, in-flight accounting, source filtering, event ID extraction, and redaction behavior.
+- `connectors/webhook-receiver/src/client.rs` defines bounded in-memory endpoint/event storage and replay-identity retention. Signature verification, body parsing, rate limiting, source filtering, event ID extraction, and redaction live in `connector.rs`.
 - `connectors/webhook-receiver/src/types.rs` defines endpoint, event, provider, signature, config, and introspection shapes.
 - `connectors/webhook-receiver/src/error.rs` defines connector error classes and FCP error conversion.
 - `connectors/webhook-receiver/manifest.toml` defines the manifest operation catalog, ingress/network intent, sandbox boundary, zone policy, approval intent, and state intent.
 - `connectors/webhook-receiver/tests/integration.rs` contains the runtime contract proof surface.
+- `crates/fcp-host/src/webhook_ingress.rs` defines HTTP request translation, explicit binding validation, and public response mapping.
+- `crates/fcp-host/src/bin/fcp-host/webhook_ingress.rs` owns startup configuration, bounded body collection, deadlines, concurrent admission, and dispatch through normal host authority.
+- `crates/fcp-host/tests/webhook_receiver_ingress.rs` exercises the shared host translation against the real receiver and signed provider fixtures.
 
 ## Verification Bundle
 
@@ -261,11 +280,24 @@ rch exec -- cargo clippy -p fcp-webhook-receiver --all-targets -- -D warnings
 rch exec -- cargo fmt --check
 ```
 
+For the host HTTP adapter, run its focused checks as well:
+
+```bash
+rch exec -- cargo test -p fcp-host --lib webhook_ingress::
+rch exec -- cargo test -p fcp-host --bin fcp-host webhook_runtime_
+rch exec -- cargo test -p fcp-host --bin fcp-host webhook_ingress_admission_
+rch exec -- cargo test -p fcp-host --test webhook_receiver_ingress
+```
+
+These are verification commands, not stored passing results or live-provider evidence.
+
 ## Operator Guidance
 
-- Treat this connector as a host-forwarded in-memory webhook receiver, not as a public listener.
+- Configure the optional host HTTP adapter using the [ingress guide](../../docs/configuration/webhook_receiver_ingress.md). The connector itself remains a host-forwarded in-memory receiver.
 - Use production `https` public base URLs for non-local endpoints.
 - Keep endpoint secrets in a credential manager; endpoint create and rotate responses expose the active secret once.
 - Configure an independent approval public key and provide a signed execution approval for endpoint creation, deletion, and secret rotation.
 - Do not rely on `doctor()` or `self_check()` reaching `ok` in the current no-native-listener build.
 - Keep event retention expectations low; events and deduplication IDs are process-memory state.
+- Expose only the configured `/webhooks/` route through a TLS-terminating reverse proxy, preserving the raw path, query, and body. Do not expose host administration or unrelated RPC routes as part of that mapping.
+- Confirm that the provider accepts the adapter's minimal HTTP acknowledgment. Slack subscription challenges and Twilio flows requiring TwiML need additional response handling.

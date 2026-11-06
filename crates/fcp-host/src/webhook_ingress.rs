@@ -238,7 +238,7 @@ impl WebhookIngressConfig {
     /// The peer IP must come from the HTTP connection, never a forwarding header.
     /// The configured public base and raw suffix/query construct the signed URL.
     ///
-    /// Every attempt receives a new host-controlled request, idempotency and
+    /// Every attempt receives a new OS-random request, idempotency and
     /// delivery identity. Unsigned provider delivery labels cannot occupy the
     /// host's idempotency cache or the receiver's public-ID replay index. The
     /// receiver still rejects retries using its authenticated-content digest.
@@ -282,8 +282,13 @@ impl WebhookIngressConfig {
             }
         }
 
-        let id = RequestId::random();
-        let delivery_id = format!("webhook-http-{id}");
+        // RequestId::random() is a process-local counter. Durable delivery
+        // identities must also remain distinct after a host process restart.
+        let delivery_id = format!(
+            "webhook-http-{}",
+            hex::encode(fcp_crypto::aead::XChaCha20Nonce::generate().as_bytes())
+        );
+        let id = RequestId::new(delivery_id.clone());
         let mut signed_url = format!("{}{path}", self.public_base_url);
         if let Some(query) = uri.query() {
             signed_url.push('?');
@@ -1073,6 +1078,13 @@ mod tests {
         assert_ne!(first.id, second.id);
         assert_ne!(first.idempotency_key, second.idempotency_key);
         assert_ne!(first.input["delivery_id"], second.input["delivery_id"]);
+        for attempt in [&first, &second] {
+            let delivery = attempt.input["delivery_id"].as_str().unwrap();
+            let nonce = delivery.strip_prefix("webhook-http-").unwrap();
+            assert_eq!(hex::decode(nonce).unwrap().len(), 24);
+            assert_eq!(attempt.id.0, delivery);
+            assert_eq!(attempt.idempotency_key.as_deref(), Some(delivery));
+        }
         assert_ne!(first.input["delivery_id"], "public-chosen-id");
         assert_ne!(
             first.idempotency_key.as_deref(),

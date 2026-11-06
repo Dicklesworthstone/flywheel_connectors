@@ -95,6 +95,10 @@ fcp-testkit = { path = "../fcp-testkit" }
 fcp-crypto-pq = { path = "../fcp-crypto-pq" }
 fcp-browser = { path = "../../connectors/browser", features = ["test-support"] }
 fcp-telegram = { path = "../../connectors/telegram", features = ["test-support"] }
+fcp-webhook-receiver = { path = "../../connectors/webhook-receiver" }
+hmac.workspace = true
+sha1 = "0.10"
+sha2.workspace = true
 rcgen = "0.14.7"
 insta.workspace = true
 criterion.workspace = true

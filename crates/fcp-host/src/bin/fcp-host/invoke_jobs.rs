@@ -32,6 +32,15 @@ pub(super) const SHUTDOWN_GRACE: Duration = Duration::from_secs(65);
 
 pub(super) type ForwardResult = Result<InvokeResponse, (axum::http::StatusCode, String)>;
 
+/// Apply the same current-authority fence before forwarding an already admitted
+/// local operation. Remote-only operations remain the executor's responsibility.
+pub(super) async fn revalidate_dispatch_authority(
+    state: &super::AppState,
+    request: &fcp_kernel::InvokeRequest,
+) -> HostResult<()> {
+    dispatch_authority::revalidate(state, request).await
+}
+
 #[must_use]
 pub(super) fn finalization_deadline(execution_deadline: Instant) -> Instant {
     execution_deadline

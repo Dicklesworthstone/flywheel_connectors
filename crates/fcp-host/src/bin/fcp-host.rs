@@ -165,6 +165,8 @@ use tower::ServiceExt;
 
 #[path = "fcp-host/connector_state_transfer.rs"]
 mod connector_state_transfer;
+#[path = "fcp-host/deployment_evidence.rs"]
+mod deployment_evidence;
 #[path = "fcp-host/http_batch.rs"]
 mod http_batch;
 #[path = "fcp-host/invoke_jobs.rs"]
@@ -181,6 +183,11 @@ mod native_rpc;
 mod native_stream;
 #[path = "fcp-host/session.rs"]
 mod session;
+#[path = "fcp-host/webhook_ingress.rs"]
+mod webhook_ingress;
+#[cfg(test)]
+#[path = "fcp-host/webhook_ingress_admission_tests.rs"]
+mod webhook_ingress_admission_tests;
 
 use native_rpc::{NativeInvocationTermination, NativeRpc, invocation_deadline};
 
@@ -4850,7 +4857,11 @@ async fn serve_tcp(
             futures_util::future::Either::Left((result, _)) => match result {
                 Ok((stream, addr)) => {
                     tracing::debug!(transport = "tcp", remote_addr = %addr, "accepted connection");
-                    spawn_http_connection(HyperIo::new(stream), app.clone());
+                    spawn_http_connection(
+                        HyperIo::new(stream),
+                        app.clone()
+                            .layer(axum::Extension(webhook_ingress::PeerAddress(addr))),
+                    );
                 }
                 Err(err) => handle_accept_error(err).await,
             },
@@ -4911,6 +4922,8 @@ struct AppState {
     rollout: Arc<RolloutController<SubprocessRegistry, HostAdminStateStore>>,
     supply_chain: Arc<SupplyChainGate>,
     capability_verifying_key: Option<Ed25519VerifyingKey>,
+    /// Fresh, process-bound evidence for one independently attested zone.
+    deployment_evidence: Option<Arc<deployment_evidence::DeploymentEvidenceService>>,
     revocation_cascade: Arc<RevocationCascadeVerifier>,
     hybrid_owner_verifier: Option<Arc<HybridOwnerProductionVerifier>>,
     approval_verifying_key: Option<Ed25519VerifyingKey>,
@@ -5746,11 +5759,11 @@ fn enforce_live_capability_constraints(
 
 const DEPLOYMENT_TIER_DENIED_AUDIT_EVENT_TYPE: &str = "deployment_tier.denied";
 
-fn current_deployment_classification() -> DeploymentClassification {
-    // The host binary does not yet have live mesh quorum signals wired into
-    // AppState. Classify the production boundary as single-host Evaluation so
-    // Risky/Dangerous/Critical dispatch fails closed until those signals exist.
-    classify_deployment_mode(MeshQuorumSignals::single_host_evaluation())
+fn current_deployment_classification(state: &AppState, zone: &ZoneId) -> DeploymentClassification {
+    state.deployment_evidence.as_ref().map_or_else(
+        || classify_deployment_mode(MeshQuorumSignals::single_host_evaluation()),
+        |evidence| evidence.classification(zone),
+    )
 }
 
 fn select_host_truth_precedence_boot_from_env_values(
@@ -6768,8 +6781,12 @@ async fn enforce_hrw_lease_route(
     Ok(())
 }
 
-fn enforce_live_deployment_tier(request: &InvokeRequest, tier: SafetyTier) -> HostResult<()> {
-    let classification = current_deployment_classification();
+fn enforce_live_deployment_tier(
+    state: &AppState,
+    request: &InvokeRequest,
+    tier: SafetyTier,
+) -> HostResult<()> {
+    let classification = current_deployment_classification(state, &request.zone_id);
     match admit_safety_tier(&classification, tier) {
         Ok(()) => Ok(()),
         Err(refusal) => {
@@ -7093,7 +7110,7 @@ async fn verify_live_request_for_target(
     verify_live_revocation_cascade(state, &request.capability_token, verified_claims)?;
     verify_live_hybrid_owner_capability(state, request)?;
 
-    enforce_live_deployment_tier(request, tool.safety_tier)?;
+    enforce_live_deployment_tier(state, request, tool.safety_tier)?;
 
     let connector_declares_singleton_writer = allow_snapshot
         .as_ref()
@@ -8175,6 +8192,8 @@ fn local_invocation_routes() -> Router<Arc<AppState>> {
 
 async fn async_main(telemetry_config: TelemetryConfig) -> HostResult<()> {
     let bind_target = resolve_bind_target()?;
+    let webhook_ingress_config = webhook_ingress::from_env()?;
+    let deployment_evidence = deployment_evidence::from_env()?.map(Arc::new);
     let capability_verifying_key = resolve_verifying_key(
         "FCP_HOST_CAPABILITY_PUBLIC_KEY",
         "FCP_HOST_CAPABILITY_PUBLIC_KEY_FILE",
@@ -8184,6 +8203,12 @@ async fn async_main(telemetry_config: TelemetryConfig) -> HostResult<()> {
         "FCP_HOST_APPROVAL_PUBLIC_KEY_FILE",
     )?
     .or_else(|| capability_verifying_key.clone());
+    if let Some(evidence) = &deployment_evidence {
+        evidence.validate_key_separation(
+            capability_verifying_key.as_ref(),
+            approval_verifying_key.as_ref(),
+        )?;
+    }
 
     let loaded_configs = load_connector_configs()?;
     if loaded_configs.configs.is_empty() {
@@ -8262,6 +8287,7 @@ async fn async_main(telemetry_config: TelemetryConfig) -> HostResult<()> {
         rollout,
         supply_chain,
         capability_verifying_key,
+        deployment_evidence,
         revocation_cascade: Arc::new(RevocationCascadeVerifier::default()),
         hybrid_owner_verifier,
         approval_verifying_key,
@@ -8486,12 +8512,20 @@ async fn async_main(telemetry_config: TelemetryConfig) -> HostResult<()> {
         // immediate fix is to deny the spoofed-header path.
         .route("/rpc/cancel", post(cancel_handler))
         .route("/rpc/operations/cancel", post(cancel_handler))
+        .route(
+            "/rpc/admin/deployment/challenge",
+            get(deployment_evidence::challenge_handler),
+        )
         .route_layer(from_fn_with_state(
             Arc::clone(&state),
             admin_auth_middleware,
         ));
 
     let app = Router::new()
+        .merge(webhook_ingress::routes(
+            Arc::clone(&state),
+            webhook_ingress_config,
+        ))
         .route(
             BLUEBUBBLES_INGRESS_ROUTE,
             post(bluebubbles_webhook_ingress_handler),
@@ -15004,7 +15038,17 @@ async fn run_mesh_forward_job(
             return Err(error);
         }
         last_target = candidate.clone();
-        let prepared = (|| {
+        let prepared = async {
+            if registered_locally {
+                before_invoke_route_deadline(
+                    deadline,
+                    invoke_jobs::revalidate_dispatch_authority(state, request),
+                    "mesh dispatch authority",
+                )
+                .await
+                .and_then(std::convert::identity)
+                .map_err(map_host_error)?;
+            }
             state
                 .invoke_audit
                 .append(
@@ -15046,7 +15090,7 @@ async fn run_mesh_forward_job(
                 asserted_principal: asserted_principal.map(str::to_owned),
                 origin_attempt_id: Some(ticket.attempt_id),
             })
-        })();
+        }.await;
         let body = match prepared {
             Ok(body) => body,
             Err(error) => {
@@ -17346,6 +17390,7 @@ deny_ptrace = true
             )),
             supply_chain: Arc::new(SupplyChainGate::default()),
             capability_verifying_key,
+            deployment_evidence: None,
             revocation_cascade: Arc::new(RevocationCascadeVerifier::default()),
             hybrid_owner_verifier: None,
             approval_verifying_key: None,
@@ -19165,6 +19210,7 @@ deny_ptrace = true
             rollout,
             supply_chain: Arc::new(SupplyChainGate::default()),
             capability_verifying_key: None,
+            deployment_evidence: None,
             revocation_cascade: Arc::new(RevocationCascadeVerifier::default()),
             hybrid_owner_verifier: None,
             approval_verifying_key: None,
@@ -26551,6 +26597,7 @@ deny_ptrace = true
             )),
             supply_chain: Arc::new(SupplyChainGate::default()),
             capability_verifying_key: Some(signing_key.verifying_key()),
+            deployment_evidence: None,
             revocation_cascade: Arc::new(RevocationCascadeVerifier::default()),
             hybrid_owner_verifier: None,
             approval_verifying_key: None,
@@ -27126,6 +27173,7 @@ deny_ptrace = true
             )),
             supply_chain: Arc::new(SupplyChainGate::default()),
             capability_verifying_key: Some(signing_key.verifying_key()),
+            deployment_evidence: None,
             revocation_cascade: Arc::new(cascade),
             hybrid_owner_verifier: None,
             approval_verifying_key: None,
@@ -32853,6 +32901,7 @@ done"#;
             )),
             supply_chain: Arc::new(SupplyChainGate::default()),
             capability_verifying_key: None,
+            deployment_evidence: None,
             revocation_cascade: Arc::new(RevocationCascadeVerifier::default()),
             hybrid_owner_verifier: None,
             approval_verifying_key: None,
@@ -32894,6 +32943,7 @@ done"#;
             )),
             supply_chain: Arc::new(SupplyChainGate::default()),
             capability_verifying_key: None,
+            deployment_evidence: None,
             revocation_cascade: Arc::new(RevocationCascadeVerifier::default()),
             hybrid_owner_verifier: None,
             approval_verifying_key: None,
@@ -32940,6 +32990,7 @@ done"#;
             )),
             supply_chain: Arc::new(SupplyChainGate::default()),
             capability_verifying_key: None,
+            deployment_evidence: None,
             revocation_cascade: Arc::new(RevocationCascadeVerifier::default()),
             hybrid_owner_verifier: None,
             approval_verifying_key: None,
@@ -32986,6 +33037,7 @@ done"#;
             )),
             supply_chain: Arc::new(SupplyChainGate::default()),
             capability_verifying_key: None,
+            deployment_evidence: None,
             revocation_cascade: Arc::new(RevocationCascadeVerifier::default()),
             hybrid_owner_verifier: None,
             approval_verifying_key: None,
@@ -33049,6 +33101,7 @@ done"#;
             )),
             supply_chain: Arc::new(SupplyChainGate::default()),
             capability_verifying_key: None,
+            deployment_evidence: None,
             revocation_cascade: Arc::new(RevocationCascadeVerifier::default()),
             hybrid_owner_verifier: None,
             approval_verifying_key: None,
@@ -33099,6 +33152,7 @@ done"#;
             )),
             supply_chain: Arc::new(SupplyChainGate::default()),
             capability_verifying_key: None,
+            deployment_evidence: None,
             revocation_cascade: Arc::new(RevocationCascadeVerifier::default()),
             hybrid_owner_verifier: None,
             approval_verifying_key: None,
@@ -33214,6 +33268,7 @@ done"#;
             rollout,
             supply_chain: Arc::new(SupplyChainGate::default()),
             capability_verifying_key: None,
+            deployment_evidence: None,
             revocation_cascade: Arc::new(RevocationCascadeVerifier::default()),
             hybrid_owner_verifier: None,
             approval_verifying_key: None,
@@ -33270,6 +33325,7 @@ done"#;
             rollout: Arc::clone(&rollout),
             supply_chain: Arc::new(SupplyChainGate::default()),
             capability_verifying_key: None,
+            deployment_evidence: None,
             revocation_cascade: Arc::new(RevocationCascadeVerifier::default()),
             hybrid_owner_verifier: None,
             approval_verifying_key: None,
@@ -33672,6 +33728,7 @@ done"#;
             )),
             supply_chain: Arc::new(SupplyChainGate::default()),
             capability_verifying_key: None,
+            deployment_evidence: None,
             revocation_cascade: Arc::new(RevocationCascadeVerifier::default()),
             hybrid_owner_verifier: None,
             approval_verifying_key: None,

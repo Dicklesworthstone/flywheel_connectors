@@ -164,8 +164,6 @@ pub(super) async fn revalidate(state: &AppState, request: &InvokeRequest) -> Hos
     let principal = claims_principal(&claims)
         .filter(|principal| !principal.trim().is_empty())
         .ok_or_else(|| refusal("verified dispatch principal is missing"))?;
-    enforce_live_deployment_tier(request, tool.safety_tier)
-        .map_err(|_| refusal("current deployment does not permit this operation tier"))?;
     let now_ms = u64::try_from(chrono::Utc::now().timestamp_millis())
         .map_err(|_| refusal("policy dispatch clock is invalid"))?;
     check_policy(
@@ -195,6 +193,10 @@ pub(super) async fn revalidate(state: &AppState, request: &InvokeRequest) -> Hos
     )?;
     enforce_live_capability_constraints(request, &claims, principal, resource_uri.as_deref())
         .map_err(|_| refusal("capability constraints rejected the request at dispatch"))?;
+    // Re-read authenticated health evidence after all catalog/policy waits.
+    // A previously admitted job cannot retain expired deployment authority.
+    enforce_live_deployment_tier(state, request, tool.safety_tier)
+        .map_err(|_| refusal("current deployment does not permit this operation tier"))?;
     require_live_times(&claims, chrono::Utc::now().timestamp())
 }
 
