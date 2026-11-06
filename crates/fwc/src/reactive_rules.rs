@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Utc};
+use fcp_core::SafetyTier;
 use serde::{Deserialize, Serialize};
 
 // ── Event Trigger ─────────────────────────────────────────────────
@@ -125,6 +126,10 @@ pub struct Rule {
     pub trigger: EventTrigger,
     /// What to do when triggered.
     pub action: RuleAction,
+    /// Maximum operation safety tier permitted by this rule. The executor must
+    /// verify this ceiling against live operation metadata before dispatch.
+    #[serde(default = "default_safety_tier")]
+    pub safety_tier: SafetyTier,
     /// Throttle settings.
     #[serde(default)]
     pub throttle: RuleThrottle,
@@ -137,6 +142,10 @@ const fn default_true() -> bool {
     true
 }
 
+const fn default_safety_tier() -> SafetyTier {
+    SafetyTier::Safe
+}
+
 impl Rule {
     /// Create a new rule.
     pub fn new(name: impl Into<String>, trigger: EventTrigger, action: RuleAction) -> Self {
@@ -145,6 +154,7 @@ impl Rule {
             description: String::new(),
             trigger,
             action,
+            safety_tier: default_safety_tier(),
             throttle: RuleThrottle::default(),
             enabled: true,
         }
@@ -162,6 +172,12 @@ impl Rule {
         self
     }
 
+    /// Builder: set the maximum permitted operation safety tier.
+    pub const fn with_safety_tier(mut self, safety_tier: SafetyTier) -> Self {
+        self.safety_tier = safety_tier;
+        self
+    }
+
     /// Builder: set enabled.
     pub const fn with_enabled(mut self, enabled: bool) -> Self {
         self.enabled = enabled;
@@ -172,7 +188,7 @@ impl Rule {
 // ── Event Data ────────────────────────────────────────────────────
 
 /// An incoming event that may trigger rules.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct IncomingEvent {
     /// Source connector.
     pub connector: String,
@@ -182,8 +198,10 @@ pub struct IncomingEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event_id: Option<String>,
     /// Event data as key-value pairs.
+    #[serde(default)]
     pub data: BTreeMap<String, String>,
     /// When the event was received.
+    #[serde(default = "Utc::now")]
     pub received_at: DateTime<Utc>,
 }
 
@@ -219,29 +237,30 @@ impl IncomingEvent {
 
     /// A stable identity for duplicate suppression.
     ///
-    /// When an upstream event ID is present it is used directly; otherwise a
-    /// deterministic hash of the connector, event type, and payload fields is
-    /// derived so retries of the same event collapse to the same key.
+    /// An upstream event ID is scoped to its connector and event type. Without
+    /// an ID, payload fields supply the identity. Length framing keeps embedded
+    /// separators unambiguous; receive time never changes a replay's identity.
     pub fn dedup_identity(&self) -> String {
+        let mut hasher =
+            blake3::Hasher::new_derive_key("flywheel_connectors.reactive_rules.event.v1");
+        hash_field(&mut hasher, &self.connector);
+        hash_field(&mut hasher, &self.event_type);
+
         if let Some(event_id) = self
             .event_id
             .as_deref()
             .filter(|event_id| !event_id.is_empty())
         {
-            return format!("id:{event_id}");
+            hash_field(&mut hasher, "upstream_id");
+            hash_field(&mut hasher, event_id);
+            return format!("id:{}", hasher.finalize().to_hex());
         }
 
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(self.connector.as_bytes());
-        hasher.update(&[0]);
-        hasher.update(self.event_type.as_bytes());
-        hasher.update(&[0]);
-
+        hash_field(&mut hasher, "payload");
+        hasher.update(&(self.data.len() as u64).to_le_bytes());
         for (key, value) in &self.data {
-            hasher.update(key.as_bytes());
-            hasher.update(&[0]);
-            hasher.update(value.as_bytes());
-            hasher.update(&[0]);
+            hash_field(&mut hasher, key);
+            hash_field(&mut hasher, value);
         }
 
         format!("hash:{}", hasher.finalize().to_hex())
@@ -267,7 +286,9 @@ pub struct MatchResult {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionOutcome {
-    /// Action executed successfully.
+    /// Rule matched and passed local checks; no operation has been dispatched.
+    Ready,
+    /// An executor confirmed that the operation completed successfully.
     Executed,
     /// Rule matched but throttled.
     Throttled,
@@ -286,6 +307,7 @@ pub enum ExecutionOutcome {
 impl fmt::Display for ExecutionOutcome {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Ready => f.write_str("ready"),
             Self::Executed => f.write_str("executed"),
             Self::Throttled => f.write_str("throttled"),
             Self::CircuitBroken => f.write_str("circuit_broken"),
@@ -300,7 +322,7 @@ impl fmt::Display for ExecutionOutcome {
 // ── Throttle State ────────────────────────────────────────────────
 
 /// Tracks trigger history for throttle enforcement.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ThrottleState {
     /// Rule name.
     pub rule_name: String,
@@ -329,7 +351,9 @@ impl ThrottleState {
 
     /// Count triggers within the given window from now.
     pub fn count_in_window(&self, window: Duration) -> usize {
-        let cutoff = Utc::now() - window;
+        let cutoff = Utc::now()
+            .checked_sub_signed(window)
+            .unwrap_or(DateTime::<Utc>::MIN_UTC);
         self.triggers.iter().filter(|t| **t >= cutoff).count()
     }
 
@@ -344,7 +368,9 @@ impl ThrottleState {
 
     /// Prune old triggers outside the window.
     pub fn prune(&mut self, window: Duration) {
-        let cutoff = Utc::now() - window;
+        let cutoff = Utc::now()
+            .checked_sub_signed(window)
+            .unwrap_or(DateTime::<Utc>::MIN_UTC);
         self.triggers.retain(|t| *t >= cutoff);
     }
 }
@@ -352,7 +378,7 @@ impl ThrottleState {
 // ── Circuit Breaker ───────────────────────────────────────────────
 
 /// Circuit breaker state for a rule.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CircuitState {
     /// Normal operation.
@@ -374,7 +400,7 @@ impl fmt::Display for CircuitState {
 }
 
 /// Circuit breaker for automatic rule disabling on errors.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CircuitBreaker {
     /// Current state.
     pub state: CircuitState,
@@ -420,21 +446,21 @@ impl CircuitBreaker {
 
     /// Record a successful execution.
     pub fn record_success(&mut self) {
-        self.total_executions += 1;
+        self.total_executions = self.total_executions.saturating_add(1);
         self.error_count = 0;
-        if self.state == CircuitState::HalfOpen {
-            self.state = CircuitState::Closed;
-            self.opened_at = None;
-        }
+        // A successful probe closes an elapsed Open circuit even if the
+        // executor did not explicitly transition it to HalfOpen first.
+        self.state = CircuitState::Closed;
+        self.opened_at = None;
     }
 
     /// Record a failed execution.
     pub fn record_failure(&mut self) {
-        self.total_executions += 1;
-        self.total_errors += 1;
-        self.error_count += 1;
+        self.total_executions = self.total_executions.saturating_add(1);
+        self.total_errors = self.total_errors.saturating_add(1);
+        self.error_count = self.error_count.saturating_add(1);
 
-        if self.error_count >= self.error_threshold {
+        if self.state != CircuitState::Closed || self.error_count >= self.error_threshold {
             self.state = CircuitState::Open;
             self.opened_at = Some(Utc::now());
         }
@@ -456,8 +482,8 @@ impl CircuitBreaker {
         if self.total_executions == 0 {
             return 0;
         }
-        (self.total_errors * 100)
-            .checked_div(self.total_executions)
+        (u128::from(self.total_errors) * 100)
+            .checked_div(u128::from(self.total_executions))
             .and_then(|v| u8::try_from(v).ok())
             .unwrap_or(100)
     }
@@ -484,38 +510,50 @@ impl RuleDedupCache {
         Self::default()
     }
 
-    /// Check whether this `(rule, event)` pair was seen recently and record it.
-    ///
-    /// Returns `true` when the event is still inside the dedup window and
-    /// should be suppressed.
-    pub fn check_and_record(&mut self, rule: &Rule, event: &IncomingEvent) -> bool {
-        self.check_and_record_at(rule, event, Utc::now())
+    /// Check for a prior dispatch without consuming the event or changing state.
+    pub fn contains(&self, rule: &Rule, event: &IncomingEvent) -> bool {
+        self.contains_at(rule, event, Utc::now())
     }
 
-    /// Test-only/time-aware variant of [`Self::check_and_record`].
-    pub fn check_and_record_at(
+    /// Time-aware variant of [`Self::contains`].
+    pub fn contains_at(&self, rule: &Rule, event: &IncomingEvent, now: DateTime<Utc>) -> bool {
+        self.entries
+            .get(&dispatch_identity(&rule.name, event))
+            .is_some_and(|expires_at| *expires_at >= now)
+    }
+
+    /// Reserve a dispatch identity at the executor's attempt boundary.
+    ///
+    /// Returns `true` only for a newly recorded attempt. A duplicate does not
+    /// extend its window. Callers must durably retain this reservation before
+    /// dispatch when replay across process restarts must be suppressed, and
+    /// retain it when a failed request has an uncertain external outcome.
+    pub fn record_dispatch(&mut self, rule: &Rule, event: &IncomingEvent) -> bool {
+        self.record_dispatch_at(rule, event, Utc::now())
+    }
+
+    /// Time-aware variant of [`Self::record_dispatch`].
+    pub fn record_dispatch_at(
         &mut self,
         rule: &Rule,
         event: &IncomingEvent,
         now: DateTime<Utc>,
     ) -> bool {
         self.prune_expired_at(now);
-
-        let key = dedup_cache_key(&rule.name, event);
-        if self
-            .entries
-            .get(&key)
-            .is_some_and(|expires_at| *expires_at >= now)
-        {
-            return true;
+        if self.contains_at(rule, event, now) {
+            return false;
         }
 
         let window = rule
             .throttle
             .window_duration()
             .unwrap_or_else(|| Duration::hours(1));
-        self.entries.insert(key, now + window);
-        false
+        let expires_at = now
+            .checked_add_signed(window)
+            .unwrap_or(DateTime::<Utc>::MAX_UTC);
+        self.entries
+            .insert(dispatch_identity(&rule.name, event), expires_at);
+        true
     }
 
     /// Remove expired dedup entries using the current time.
@@ -539,8 +577,19 @@ impl RuleDedupCache {
     }
 }
 
-fn dedup_cache_key(rule_name: &str, event: &IncomingEvent) -> String {
-    format!("{rule_name}:{}", event.dedup_identity())
+/// Stable, length-framed identity for one rule and one source-scoped event.
+/// Executors may use the same identity to bind their invocation evidence.
+pub fn dispatch_identity(rule_name: &str, event: &IncomingEvent) -> String {
+    let mut hasher =
+        blake3::Hasher::new_derive_key("flywheel_connectors.reactive_rules.dispatch.v1");
+    hash_field(&mut hasher, rule_name);
+    hash_field(&mut hasher, &event.dedup_identity());
+    hasher.finalize().to_hex().to_string()
+}
+
+fn hash_field(hasher: &mut blake3::Hasher, value: &str) {
+    hasher.update(&(value.len() as u64).to_le_bytes());
+    hasher.update(value.as_bytes());
 }
 
 // ── Event Matching ────────────────────────────────────────────────
@@ -586,56 +635,62 @@ fn evaluate_match_expr(event: &IncomingEvent, expr: &str) -> bool {
 
 /// Render template strings with event data.
 ///
-/// Replaces `{{event.data.field}}` and `{{event.connector}}` etc.
+/// Replaces `{{event.data.field}}`, `{{event.connector}}`, and
+/// `{{event.event_type}}` in one pass over the original template. Inserted data
+/// is always literal, even if it contains template syntax. The optional
+/// `truncate(N)` filter counts Unicode scalar values rather than UTF-8 bytes.
 pub fn render_template(template: &str, event: &IncomingEvent) -> String {
-    let mut result = template.to_string();
+    let mut result = String::with_capacity(template.len());
+    let mut remaining = template;
 
-    // Replace {{event.connector}}
-    result = result.replace("{{event.connector}}", &event.connector);
-    result = result.replace("{{event.event_type}}", &event.event_type);
-
-    // Replace {{event.data.field}} patterns
-    for (key, value) in &event.data {
-        let placeholder = format!("{{{{event.data.{key}}}}}");
-        result = result.replace(&placeholder, value);
-    }
-
-    // Handle truncate filter: {{event.data.field | truncate(N)}}
-    while let Some(start) = result.find("{{event.data.") {
-        let Some(end) = result[start..].find("}}") else {
-            break;
+    while let Some(start) = remaining.find("{{") {
+        result.push_str(&remaining[..start]);
+        let after_open = &remaining[start + 2..];
+        let Some(end) = after_open.find("}}") else {
+            result.push_str(&remaining[start..]);
+            return result;
         };
-        let full = &result[start..start + end + 2];
+        let expression = after_open[..end].trim();
+        let literal = &remaining[start..start + end + 4];
+        remaining = &after_open[end + 2..];
 
-        // Check for truncate filter
-        if let Some(inner) = full.strip_prefix("{{").and_then(|s| s.strip_suffix("}}")) {
-            if let Some((field_part, filter_part)) = inner.split_once('|') {
-                let trimmed = field_part.trim();
-                let field = trimmed.strip_prefix("event.data.").unwrap_or(trimmed);
-                let filter = filter_part.trim();
-
-                if let Some(limit_str) = filter
+        match expression {
+            "event.connector" => result.push_str(&event.connector),
+            "event.event_type" => result.push_str(&event.event_type),
+            _ => {
+                let Some(data_expression) = expression.strip_prefix("event.data.") else {
+                    result.push_str(literal);
+                    continue;
+                };
+                let (field, filter) = data_expression
+                    .split_once('|')
+                    .map_or((data_expression.trim(), None), |(field, filter)| {
+                        (field.trim(), Some(filter.trim()))
+                    });
+                let value = event.data.get(field).map_or("", String::as_str);
+                let Some(filter) = filter else {
+                    result.push_str(value);
+                    continue;
+                };
+                let Some(limit) = filter
                     .strip_prefix("truncate(")
-                    .and_then(|s| s.strip_suffix(')'))
-                {
-                    if let Ok(limit) = limit_str.parse::<usize>() {
-                        let value = event.data.get(field).map_or("", String::as_str);
-                        let truncated = if value.len() > limit {
-                            format!("{}...", &value[..limit])
-                        } else {
-                            value.to_string()
-                        };
-                        result = result.replacen(full, &truncated, 1);
-                        continue;
-                    }
+                    .and_then(|value| value.strip_suffix(')'))
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                else {
+                    // Unrecognized data filters do not expand the value.
+                    continue;
+                };
+                if let Some((boundary, _)) = value.char_indices().nth(limit) {
+                    result.push_str(&value[..boundary]);
+                    result.push_str("...");
+                } else {
+                    result.push_str(value);
                 }
             }
         }
-
-        // If we couldn't process this placeholder, replace with empty to avoid infinite loop
-        result = result.replacen(full, "", 1);
     }
 
+    result.push_str(remaining);
     result
 }
 
@@ -653,7 +708,9 @@ pub fn render_action_inputs(
 
 // ── Rule Evaluation ───────────────────────────────────────────────
 
-/// Evaluate a rule against an event, checking match + throttle + circuit breaker.
+/// Evaluate local match, throttle, and circuit checks without executing an
+/// action or consuming state. `Ready` still requires host metadata, authority,
+/// safety-tier validation, and an explicit executor dispatch.
 pub fn evaluate_rule(
     rule: &Rule,
     event: &IncomingEvent,
@@ -664,13 +721,15 @@ pub fn evaluate_rule(
     evaluate_rule_internal(rule, event, throttle_state, circuit_breaker, None, dry_run)
 }
 
-/// Evaluate a rule with duplicate suppression for replay-safe automation.
+/// Evaluate a rule with duplicate suppression, without recording an attempt.
+/// The executor calls [`RuleDedupCache::record_dispatch`] only after completing
+/// admission checks and immediately before attempting the operation.
 pub fn evaluate_rule_with_dedup(
     rule: &Rule,
     event: &IncomingEvent,
     throttle_state: &ThrottleState,
     circuit_breaker: &CircuitBreaker,
-    dedup_cache: &mut RuleDedupCache,
+    dedup_cache: &RuleDedupCache,
     dry_run: bool,
 ) -> (ExecutionOutcome, MatchResult) {
     evaluate_rule_internal(
@@ -688,7 +747,7 @@ fn evaluate_rule_internal(
     event: &IncomingEvent,
     throttle_state: &ThrottleState,
     circuit_breaker: &CircuitBreaker,
-    dedup_cache: Option<&mut RuleDedupCache>,
+    dedup_cache: Option<&RuleDedupCache>,
     dry_run: bool,
 ) -> (ExecutionOutcome, MatchResult) {
     let rule_name = rule.name.clone();
@@ -719,16 +778,17 @@ fn evaluate_rule_internal(
         );
     }
 
-    // Suppress duplicate events before any side effects or counters.
+    // A preview, denied dispatch, or delayed event must remain eligible for a
+    // future real attempt. Only the executor records dispatch identities.
     if let Some(cache) = dedup_cache
-        && cache.check_and_record(rule, event)
+        && cache.contains(rule, event)
     {
         return (
             ExecutionOutcome::Duplicate,
             MatchResult {
                 rule_name,
                 matched: true,
-                reason: "event already processed for this rule".to_string(),
+                reason: "event already dispatched for this rule".to_string(),
                 rendered_inputs: None,
             },
         );
@@ -779,13 +839,12 @@ fn evaluate_rule_internal(
         );
     }
 
-    // Execute
     (
-        ExecutionOutcome::Executed,
+        ExecutionOutcome::Ready,
         MatchResult {
             rule_name,
             matched: true,
-            reason: "matched and executed".to_string(),
+            reason: "matched; awaiting authorized dispatch".to_string(),
             rendered_inputs: Some(rendered),
         },
     )
@@ -1013,14 +1072,14 @@ fn parse_window(s: &str) -> Option<Duration> {
         |stripped| (stripped, 's'),
     );
     let num: i64 = num_str.parse().ok()?;
-    if num < 0 {
+    if num <= 0 {
         return None;
     }
     match unit {
-        's' => Some(Duration::seconds(num)),
-        'm' => Some(Duration::minutes(num)),
-        'h' => Some(Duration::hours(num)),
-        'd' => Some(Duration::days(num)),
+        's' => Duration::try_seconds(num),
+        'm' => Duration::try_minutes(num),
+        'h' => Duration::try_hours(num),
+        'd' => Duration::try_days(num),
         _ => None,
     }
 }
@@ -1046,6 +1105,9 @@ pub fn validate_rule(rule: &Rule) -> Vec<String> {
     }
     if rule.action.operation.is_empty() {
         errors.push("action operation is required".to_string());
+    }
+    if rule.safety_tier == SafetyTier::Forbidden {
+        errors.push("forbidden is not a valid rule safety ceiling".to_string());
     }
     if rule.throttle.max == 0 {
         errors.push("throttle max must be > 0".to_string());
@@ -1196,6 +1258,28 @@ mod tests {
         let json = serde_json::to_value(&r).unwrap();
         assert_eq!(json["name"], "bug-to-issue");
         assert_eq!(json["enabled"], true);
+        assert_eq!(json["safety_tier"], "safe");
+    }
+
+    #[test]
+    fn rule_safety_ceiling_defaults_safe_and_preserves_explicit_tier() {
+        let mut json = serde_json::to_value(sample_rule()).unwrap();
+        json.as_object_mut().unwrap().remove("safety_tier");
+        let defaulted: Rule = serde_json::from_value(json).unwrap();
+        assert_eq!(defaulted.safety_tier, SafetyTier::Safe);
+
+        let configured = sample_rule().with_safety_tier(SafetyTier::Risky);
+        let serialized = toml::to_string(&configured).unwrap();
+        let decoded: Rule = toml::from_str(&serialized).unwrap();
+        assert_eq!(decoded.safety_tier, SafetyTier::Risky);
+        assert!(validate_rule(&decoded).is_empty());
+
+        let forbidden = sample_rule().with_safety_tier(SafetyTier::Forbidden);
+        assert!(
+            validate_rule(&forbidden)
+                .iter()
+                .any(|error| error.contains("safety ceiling"))
+        );
     }
 
     // ── IncomingEvent ─────────────────────────────────────────────
@@ -1221,7 +1305,8 @@ mod tests {
     fn event_with_event_id() {
         let event = sample_event().with_event_id("evt-123");
         assert_eq!(event.event_id.as_deref(), Some("evt-123"));
-        assert_eq!(event.dedup_identity(), "id:evt-123");
+        assert!(event.dedup_identity().starts_with("id:"));
+        assert!(!event.dedup_identity().contains("evt-123"));
     }
 
     #[test]
@@ -1237,10 +1322,68 @@ mod tests {
         assert_eq!(event_a.dedup_identity(), event_b.dedup_identity());
     }
 
+    #[test]
+    fn event_deserialization_defaults_optional_feed_fields() {
+        let event: IncomingEvent = serde_json::from_value(serde_json::json!({
+            "connector": "slack",
+            "event_type": "message.new"
+        }))
+        .unwrap();
+        assert_eq!(event.connector, "slack");
+        assert_eq!(event.event_type, "message.new");
+        assert!(event.event_id.is_none());
+        assert!(event.data.is_empty());
+
+        let restored: IncomingEvent =
+            serde_json::from_value(serde_json::to_value(&event).unwrap()).unwrap();
+        assert_eq!(restored.received_at, event.received_at);
+        assert_eq!(restored.dedup_identity(), event.dedup_identity());
+    }
+
+    #[test]
+    fn event_upstream_identity_is_scoped_and_ignores_replayed_payload_changes() {
+        let first = sample_event().with_event_id("evt-42");
+        let changed_payload = first.clone().with_data("text", "later representation");
+        assert_eq!(first.dedup_identity(), changed_payload.dedup_identity());
+
+        let mut other_connector = first.clone();
+        other_connector.connector = "discord".to_owned();
+        assert_ne!(first.dedup_identity(), other_connector.dedup_identity());
+
+        let mut other_type = first.clone();
+        other_type.event_type = "message.updated".to_owned();
+        assert_ne!(first.dedup_identity(), other_type.dedup_identity());
+    }
+
+    #[test]
+    fn event_and_dispatch_identities_frame_embedded_separators() {
+        let first = IncomingEvent::new("a\0b", "c");
+        let second = IncomingEvent::new("a", "b\0c");
+        assert_ne!(first.dedup_identity(), second.dedup_identity());
+
+        let first = IncomingEvent::new("a", "b").with_data("c", "d\0e");
+        let second = IncomingEvent::new("a", "b").with_data("c\0d", "e");
+        assert_ne!(first.dedup_identity(), second.dedup_identity());
+
+        let first = IncomingEvent::new("a", "b").with_data("c", "d\0e\0f");
+        let second = IncomingEvent::new("a", "b")
+            .with_data("c", "d")
+            .with_data("e", "f");
+        assert_ne!(first.dedup_identity(), second.dedup_identity());
+
+        let first = sample_event().with_event_id("b:id:c");
+        let second = sample_event().with_event_id("c");
+        assert_ne!(
+            dispatch_identity("a", &first),
+            dispatch_identity("a:id:b", &second)
+        );
+    }
+
     // ── ExecutionOutcome ──────────────────────────────────────────
 
     #[test]
     fn outcome_display() {
+        assert_eq!(ExecutionOutcome::Ready.to_string(), "ready");
         assert_eq!(ExecutionOutcome::Executed.to_string(), "executed");
         assert_eq!(ExecutionOutcome::Throttled.to_string(), "throttled");
         assert_eq!(
@@ -1365,6 +1508,66 @@ mod tests {
         assert_eq!(result, "short");
     }
 
+    #[test]
+    fn template_values_are_literal_even_when_they_contain_template_syntax() {
+        let event = IncomingEvent::new("{{event.data.secret}}", "{{event.data.secret}}")
+            .with_data("a", "{{event.data.secret}}")
+            .with_data("secret", "must not be substituted");
+        assert_eq!(
+            render_template("{{event.data.a}}", &event),
+            "{{event.data.secret}}"
+        );
+        assert_eq!(
+            render_template("{{event.connector}} / {{event.event_type}}", &event),
+            "{{event.data.secret}} / {{event.data.secret}}"
+        );
+    }
+
+    #[test]
+    fn template_self_referential_data_does_not_reenter_the_parser() {
+        let expression = "{{event.data.text | truncate(100)}}";
+        let event = IncomingEvent::new("slack", "message.new").with_data("text", expression);
+        assert_eq!(render_template(expression, &event), expression);
+        assert_eq!(render_template("{{event.data.text}}", &event), expression);
+    }
+
+    #[test]
+    fn template_truncate_uses_unicode_boundaries() {
+        let event = IncomingEvent::new("slack", "message.new").with_data("text", "é🧵猫");
+        assert_eq!(
+            render_template("{{event.data.text | truncate(1)}}", &event),
+            "é..."
+        );
+        assert_eq!(
+            render_template("{{event.data.text | truncate(2)}}", &event),
+            "é🧵..."
+        );
+        assert_eq!(
+            render_template("{{event.data.text | truncate(3)}}", &event),
+            "é🧵猫"
+        );
+        assert_eq!(
+            render_template("{{event.data.text | truncate(0)}}", &event),
+            "..."
+        );
+    }
+
+    #[test]
+    fn template_unclosed_expression_and_unknown_namespace_remain_literal() {
+        let event = sample_event();
+        assert_eq!(
+            render_template("π {{other.value}} {{event.data.text", &event),
+            "π {{other.value}} {{event.data.text"
+        );
+        assert_eq!(
+            render_template(
+                "{{ event.data.user }}: {{event.data.text | unknown}}",
+                &event
+            ),
+            "alice: "
+        );
+    }
+
     // ── render_action_inputs ──────────────────────────────────────
 
     #[test]
@@ -1434,9 +1637,9 @@ mod tests {
         let mut cache = RuleDedupCache::new();
         let now = Utc::now();
 
-        assert!(!cache.check_and_record_at(&rule, &event, now));
-        assert!(cache.check_and_record_at(&rule, &event, now + Duration::minutes(9)));
-        assert!(!cache.check_and_record_at(&rule, &event, now + Duration::minutes(11)));
+        assert!(cache.record_dispatch_at(&rule, &event, now));
+        assert!(!cache.record_dispatch_at(&rule, &event, now + Duration::minutes(9)));
+        assert!(cache.record_dispatch_at(&rule, &event, now + Duration::minutes(11)));
     }
 
     #[test]
@@ -1446,7 +1649,7 @@ mod tests {
         let mut cache = RuleDedupCache::new();
         let now = Utc::now();
 
-        assert!(!cache.check_and_record_at(&rule, &event, now));
+        assert!(cache.record_dispatch_at(&rule, &event, now));
         assert_eq!(cache.len(), 1);
 
         cache.prune_expired_at(now + Duration::minutes(6));
@@ -1507,6 +1710,44 @@ mod tests {
     }
 
     #[test]
+    fn circuit_success_after_elapsed_open_closes_without_explicit_half_open() {
+        let mut cb = CircuitBreaker::new(1, Duration::zero());
+        cb.record_failure();
+        assert_eq!(cb.state, CircuitState::Open);
+        assert!(cb.allows_execution());
+        cb.record_success();
+        assert_eq!(cb.state, CircuitState::Closed);
+        assert!(cb.opened_at.is_none());
+        assert_eq!(cb.error_count, 0);
+    }
+
+    #[test]
+    fn execution_state_survives_serialization_and_saturated_counters() {
+        let mut throttle = ThrottleState::new("rule");
+        throttle.record_trigger();
+        let restored: ThrottleState =
+            serde_json::from_value(serde_json::to_value(&throttle).unwrap()).unwrap();
+        assert_eq!(restored.rule_name, throttle.rule_name);
+        assert_eq!(restored.triggers, throttle.triggers);
+
+        let mut cb = CircuitBreaker::new(1, Duration::minutes(1));
+        cb.total_executions = u64::MAX;
+        cb.total_errors = u64::MAX;
+        cb.error_count = u32::MAX;
+        cb.record_failure();
+        assert_eq!(cb.error_rate(), 100);
+        let mut restored: CircuitBreaker =
+            serde_json::from_value(serde_json::to_value(&cb).unwrap()).unwrap();
+        assert_eq!(restored.state, CircuitState::Open);
+        assert_eq!(restored.opened_at, cb.opened_at);
+        assert_eq!(restored.reset_timeout, cb.reset_timeout);
+        assert_eq!(restored.error_count, u32::MAX);
+        restored.record_success();
+        assert_eq!(restored.total_executions, u64::MAX);
+        assert_eq!(restored.state, CircuitState::Closed);
+    }
+
+    #[test]
     fn circuit_error_rate() {
         let mut cb = CircuitBreaker::new(10, Duration::minutes(5));
         for _ in 0..7 {
@@ -1534,15 +1775,16 @@ mod tests {
     // ── evaluate_rule ─────────────────────────────────────────────
 
     #[test]
-    fn eval_rule_executes() {
+    fn eval_rule_is_ready_without_claiming_execution() {
         let rule = sample_rule();
         let event = sample_event();
         let state = ThrottleState::new("bug-to-issue");
         let cb = CircuitBreaker::default();
         let (outcome, result) = evaluate_rule(&rule, &event, &state, &cb, false);
-        assert_eq!(outcome, ExecutionOutcome::Executed);
+        assert_eq!(outcome, ExecutionOutcome::Ready);
         assert!(result.matched);
         assert!(result.rendered_inputs.is_some());
+        assert_eq!(result.reason, "matched; awaiting authorized dispatch");
     }
 
     #[test]
@@ -1610,14 +1852,67 @@ mod tests {
         let mut dedup = RuleDedupCache::new();
 
         let (first_outcome, _) =
-            evaluate_rule_with_dedup(&rule, &event, &state, &cb, &mut dedup, false);
-        assert_eq!(first_outcome, ExecutionOutcome::Executed);
+            evaluate_rule_with_dedup(&rule, &event, &state, &cb, &dedup, false);
+        assert_eq!(first_outcome, ExecutionOutcome::Ready);
+        assert!(dedup.record_dispatch(&rule, &event));
 
         let (second_outcome, result) =
-            evaluate_rule_with_dedup(&rule, &event, &state, &cb, &mut dedup, false);
+            evaluate_rule_with_dedup(&rule, &event, &state, &cb, &dedup, false);
         assert_eq!(second_outcome, ExecutionOutcome::Duplicate);
         assert!(result.matched);
-        assert!(result.reason.contains("already processed"));
+        assert!(result.reason.contains("already dispatched"));
+    }
+
+    #[test]
+    fn eval_rule_dry_run_and_ready_do_not_consume_dispatch_state() {
+        let rule = sample_rule();
+        let event = sample_event().with_event_id("preview-then-run");
+        let state = ThrottleState::new(&rule.name);
+        let cb = CircuitBreaker::default();
+        let mut dedup = RuleDedupCache::new();
+
+        for (dry_run, expected) in [
+            (true, ExecutionOutcome::DryRun),
+            (false, ExecutionOutcome::Ready),
+            (false, ExecutionOutcome::Ready),
+        ] {
+            let (outcome, result) =
+                evaluate_rule_with_dedup(&rule, &event, &state, &cb, &dedup, dry_run);
+            assert_eq!(outcome, expected);
+            assert!(result.rendered_inputs.is_some());
+            assert!(dedup.is_empty());
+            assert!(state.triggers.is_empty());
+            assert_eq!(cb.total_executions, 0);
+        }
+
+        assert!(dedup.record_dispatch(&rule, &event));
+        assert!(!dedup.record_dispatch(&rule, &event));
+        let (outcome, _) = evaluate_rule_with_dedup(&rule, &event, &state, &cb, &dedup, false);
+        assert_eq!(outcome, ExecutionOutcome::Duplicate);
+    }
+
+    #[test]
+    fn eval_rule_throttled_or_circuit_broken_event_remains_eligible() {
+        let rule = sample_rule().with_throttle(RuleThrottle::new(1, "1h"));
+        let event = sample_event().with_event_id("retry-after-admission");
+        let mut throttled = ThrottleState::new(&rule.name);
+        throttled.record_trigger();
+        let empty = ThrottleState::new(&rule.name);
+        let cb = CircuitBreaker::default();
+        let mut open = CircuitBreaker::new(1, Duration::hours(1));
+        open.record_failure();
+        let dedup = RuleDedupCache::new();
+
+        for (state, breaker, expected) in [
+            (&throttled, &cb, ExecutionOutcome::Throttled),
+            (&empty, &open, ExecutionOutcome::CircuitBroken),
+            (&empty, &cb, ExecutionOutcome::Ready),
+        ] {
+            let (outcome, _) =
+                evaluate_rule_with_dedup(&rule, &event, state, breaker, &dedup, false);
+            assert_eq!(outcome, expected);
+            assert!(dedup.is_empty());
+        }
     }
 
     // ── RuleSet ───────────────────────────────────────────────────
@@ -1885,14 +2180,35 @@ mod tests {
 
     #[test]
     fn parse_window_zero() {
-        assert_eq!(parse_window("0s"), Some(Duration::seconds(0)));
-        assert_eq!(parse_window("0m"), Some(Duration::minutes(0)));
+        assert_eq!(parse_window("0s"), None);
+        assert_eq!(parse_window("0m"), None);
     }
 
     #[test]
     fn parse_window_large_value() {
         assert_eq!(parse_window("365d"), Some(Duration::days(365)));
         assert_eq!(parse_window("9999s"), Some(Duration::seconds(9999)));
+    }
+
+    #[test]
+    fn parse_window_rejects_overflow_and_nonpositive_values_without_panicking() {
+        for window in [
+            "9223372036854775807s",
+            "9223372036854775807m",
+            "9223372036854775807h",
+            "9223372036854775807d",
+            "18446744073709551615d",
+            "0s",
+            "-1d",
+        ] {
+            assert_eq!(parse_window(window), None, "window {window}");
+            let rule = sample_rule().with_throttle(RuleThrottle::new(1, window));
+            assert!(
+                validate_rule(&rule)
+                    .iter()
+                    .any(|error| error.contains("throttle window"))
+            );
+        }
     }
 
     #[test]
@@ -2134,6 +2450,7 @@ mod tests {
     #[test]
     fn outcome_all_variants_serde() {
         let variants = [
+            ExecutionOutcome::Ready,
             ExecutionOutcome::Executed,
             ExecutionOutcome::Throttled,
             ExecutionOutcome::CircuitBroken,
@@ -2172,7 +2489,6 @@ mod tests {
         cb.try_half_open();
         assert_eq!(cb.state, CircuitState::HalfOpen);
         // Failure in half-open should re-open
-        cb.record_failure();
         cb.record_failure();
         assert_eq!(cb.state, CircuitState::Open);
     }
@@ -2302,9 +2618,9 @@ mod tests {
         let mut cache = RuleDedupCache::new();
         let now = Utc::now();
 
-        assert!(!cache.check_and_record_at(&rule_a, &event, now));
+        assert!(cache.record_dispatch_at(&rule_a, &event, now));
         // Different rule, same event — should NOT be suppressed
-        assert!(!cache.check_and_record_at(&rule_b, &event, now));
+        assert!(cache.record_dispatch_at(&rule_b, &event, now));
     }
 
     #[test]
@@ -2315,8 +2631,8 @@ mod tests {
         let mut cache = RuleDedupCache::new();
         let now = Utc::now();
 
-        assert!(!cache.check_and_record_at(&rule, &e1, now));
-        assert!(!cache.check_and_record_at(&rule, &e2, now));
+        assert!(cache.record_dispatch_at(&rule, &e1, now));
+        assert!(cache.record_dispatch_at(&rule, &e2, now));
     }
 
     #[test]
@@ -2330,10 +2646,10 @@ mod tests {
         assert_eq!(cache.len(), 0);
         assert!(cache.is_empty());
 
-        cache.check_and_record_at(&rule, &e1, now);
+        cache.record_dispatch_at(&rule, &e1, now);
         assert_eq!(cache.len(), 1);
 
-        cache.check_and_record_at(&rule, &e2, now);
+        cache.record_dispatch_at(&rule, &e2, now);
         assert_eq!(cache.len(), 2);
         assert!(!cache.is_empty());
     }
@@ -2344,7 +2660,7 @@ mod tests {
         let event = sample_event().with_event_id("evt-serde");
         let mut cache = RuleDedupCache::new();
         let now = Utc::now();
-        cache.check_and_record_at(&rule, &event, now);
+        cache.record_dispatch_at(&rule, &event, now);
 
         let json = serde_json::to_string(&cache).unwrap();
         let cache2: RuleDedupCache = serde_json::from_str(&json).unwrap();
@@ -2463,13 +2779,17 @@ mod tests {
     }
 
     #[test]
-    fn eval_rule_executed_has_rendered_content() {
+    fn eval_rule_ready_has_rendered_content() {
         let rule = sample_rule();
         let event = sample_event();
         let state = ThrottleState::new("bug-to-issue");
         let cb = CircuitBreaker::default();
-        let (outcome, _) = evaluate_rule(&rule, &event, &state, &cb, false);
-        assert_eq!(outcome, ExecutionOutcome::Executed);
+        let (outcome, result) = evaluate_rule(&rule, &event, &state, &cb, false);
+        assert_eq!(outcome, ExecutionOutcome::Ready);
+        assert_eq!(
+            result.rendered_inputs.unwrap()["title"],
+            "Bug: Found a bug in login"
+        );
     }
 
     #[test]
@@ -2506,7 +2826,7 @@ mod tests {
     }
 
     #[test]
-    fn eval_rule_with_match_expr_executes() {
+    fn eval_rule_with_match_expr_is_ready() {
         let trigger = EventTrigger::new("slack", "message.new").with_match("data.text~bug|Bug");
         let action = RuleAction::new("github", "create_issue");
         let rule = Rule::new("expr-rule", trigger, action);
@@ -2514,7 +2834,7 @@ mod tests {
         let state = ThrottleState::new("expr-rule");
         let cb = CircuitBreaker::default();
         let (outcome, _) = evaluate_rule(&rule, &event, &state, &cb, false);
-        assert_eq!(outcome, ExecutionOutcome::Executed);
+        assert_eq!(outcome, ExecutionOutcome::Ready);
     }
 
     #[test]
@@ -2537,15 +2857,16 @@ mod tests {
         let cb = CircuitBreaker::default();
         let mut dedup = RuleDedupCache::new();
 
-        let (first, _) = evaluate_rule_with_dedup(&rule, &event, &state, &cb, &mut dedup, false);
-        assert_eq!(first, ExecutionOutcome::Executed);
+        let (first, _) = evaluate_rule_with_dedup(&rule, &event, &state, &cb, &dedup, false);
+        assert_eq!(first, ExecutionOutcome::Ready);
+        assert!(dedup.record_dispatch(&rule, &event));
 
         // Same event content => same hash => duplicate
         let event2 = IncomingEvent::new("slack", "message.new")
             .with_data("text", "Found a bug in login")
             .with_data("user", "alice")
             .with_data("channel", "general");
-        let (second, _) = evaluate_rule_with_dedup(&rule, &event2, &state, &cb, &mut dedup, false);
+        let (second, _) = evaluate_rule_with_dedup(&rule, &event2, &state, &cb, &dedup, false);
         assert_eq!(second, ExecutionOutcome::Duplicate);
     }
 
@@ -2682,6 +3003,7 @@ mod tests {
                 input: BTreeMap::new(),
             },
             throttle: RuleThrottle::new(0, "xyz"),
+            safety_tier: SafetyTier::Safe,
             enabled: true,
         };
         let errors = validate_rule(&r);
