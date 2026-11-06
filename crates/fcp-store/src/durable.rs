@@ -6,6 +6,8 @@
 //! - checkpoints are written to a temp file in the target directory, `sync_all()`ed,
 //!   atomically renamed into place, and the containing directory is fsynced on
 //!   platforms that support directory sync;
+//! - writers enforce the recovery size limits before appending a record or
+//!   publishing a checkpoint, preserving the previous recovery chain on refusal;
 //! - writable startup replays only checksum-valid WAL records and truncates an
 //!   incomplete final append; authenticated malformed complete records fail
 //!   closed without discarding their contents or any later records;
@@ -15,7 +17,7 @@
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::ErrorKind;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -65,7 +67,7 @@ enum DurableAccess {
     ReadWrite,
 }
 
-/// Maximum bytes the WAL recovery loop will buffer for a single record.
+/// Maximum encoded bytes in a WAL record, including its final newline.
 ///
 /// The serialized envelope contains a `StoredObject` whose body is a raw
 /// `Vec<u8>` (capped at `fcp_cbor::MAX_CANONICAL_OBJECT_BYTES` = 64 MiB).
@@ -78,14 +80,16 @@ enum DurableAccess {
 ///
 /// Records exceeding this cap fail closed when a MAC key is configured.
 /// Legacy unkeyed stores treat them as torn tails and truncate them.
+/// The writer enforces the same cap before opening the WAL for append.
 const MAX_WAL_RECORD_BYTES: usize = 512 * 1024 * 1024;
 
-/// Maximum bytes the snapshot recovery loop will load.
+/// Maximum encoded bytes in a snapshot, enforced by both writer and reader.
 ///
 /// Same reasoning as `MAX_WAL_RECORD_BYTES` applied to a full
 /// `ObjectSnapshot` / `SymbolSnapshot` payload, scaled for the typical
 /// number of objects per checkpoint. Larger snapshots are rejected with
-/// a clear error rather than OOM-killing the recovery process.
+/// a clear error rather than OOM-killing the recovery process. An oversized
+/// checkpoint must never replace a readable snapshot or clear its WAL.
 const MAX_SNAPSHOT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
@@ -912,6 +916,7 @@ impl DurableObjectStore {
                     &wal_path,
                     last_seq,
                     mac_key.as_ref(),
+                    MAX_SNAPSHOT_BYTES,
                 )?;
                 ops_since_checkpoint.store(0, Ordering::SeqCst);
                 Ok(())
@@ -927,14 +932,26 @@ impl DurableObjectStore {
         wal_path: &Path,
         last_seq: u64,
         mac_key: Option<&[u8; 32]>,
+        max_snapshot_bytes: u64,
     ) -> Result<(), ObjectStoreError> {
         let snapshot = state.to_snapshot();
-        write_snapshot(snapshot_path, last_seq, &snapshot, mac_key).map_err(object_io_durable)?;
+        write_snapshot(
+            snapshot_path,
+            last_seq,
+            &snapshot,
+            mac_key,
+            max_snapshot_bytes,
+        )
+        .map_err(object_io_durable)?;
         clear_wal(wal_path).map_err(object_io)?;
         Ok(())
     }
 
-    async fn record_mutation(&self, op: ObjectWalOp) -> Result<(), ObjectStoreError> {
+    async fn record_mutation(
+        &self,
+        op: ObjectWalOp,
+        max_record_bytes: usize,
+    ) -> Result<(), ObjectStoreError> {
         self.require_writable()?;
         let config = self.config.clone();
         let snapshot_path = self.snapshot_path.clone();
@@ -956,9 +973,18 @@ impl DurableObjectStore {
                 let seq = last_seq.load(Ordering::SeqCst).checked_add(1).ok_or_else(|| {
                     ObjectStoreError::Io("durable object WAL sequence is exhausted".to_string())
                 })?;
-                if let Err(error) = append_wal_record(&wal_path, seq, &op, config.mac_key.as_ref()) {
+                if let Err(error) = append_wal_record(
+                    &wal_path,
+                    seq,
+                    &op,
+                    config.mac_key.as_ref(),
+                    max_record_bytes,
+                ) {
+                    let needs_recovery = !matches!(error, DurableIoError::RejectedBeforeWrite(_));
                     let error = object_io_durable(error);
-                    state.write_fence = Some(error.to_string());
+                    if needs_recovery {
+                        state.write_fence = Some(error.to_string());
+                    }
                     return Err(error);
                 }
                 last_seq.store(seq, Ordering::SeqCst);
@@ -976,6 +1002,7 @@ impl DurableObjectStore {
                             &wal_path,
                             seq,
                             config.mac_key.as_ref(),
+                            MAX_SNAPSHOT_BYTES,
                         ) {
                             tracing::warn!(error = %error, "durable object checkpoint failed after WAL sync");
                         } else {
@@ -1007,7 +1034,7 @@ impl ObjectStore for DurableObjectStore {
     }
 
     async fn put(&self, object: StoredObject) -> Result<(), ObjectStoreError> {
-        self.record_mutation(ObjectWalOp::Put(Box::new(object)))
+        self.record_mutation(ObjectWalOp::Put(Box::new(object)), MAX_WAL_RECORD_BYTES)
             .await
     }
 
@@ -1026,7 +1053,7 @@ impl ObjectStore for DurableObjectStore {
     }
 
     async fn delete(&self, id: &ObjectId) -> Result<(), ObjectStoreError> {
-        self.record_mutation(ObjectWalOp::Delete { object_id: *id })
+        self.record_mutation(ObjectWalOp::Delete { object_id: *id }, MAX_WAL_RECORD_BYTES)
             .await
     }
 
@@ -1058,10 +1085,13 @@ impl ObjectStore for DurableObjectStore {
         id: &ObjectId,
         retention: RetentionClass,
     ) -> Result<(), ObjectStoreError> {
-        self.record_mutation(ObjectWalOp::SetRetention {
-            object_id: *id,
-            retention,
-        })
+        self.record_mutation(
+            ObjectWalOp::SetRetention {
+                object_id: *id,
+                retention,
+            },
+            MAX_WAL_RECORD_BYTES,
+        )
         .await
     }
 
@@ -1159,12 +1189,16 @@ impl DurableSymbolStore {
         self.require_writable()?;
         let _guard = self.write_guard.lock();
         let last_seq = self.last_seq.load(Ordering::SeqCst);
-        self.checkpoint_locked(last_seq)?;
+        self.checkpoint_locked(last_seq, MAX_SNAPSHOT_BYTES)?;
         self.ops_since_checkpoint.store(0, Ordering::SeqCst);
         Ok(())
     }
 
-    fn checkpoint_locked(&self, last_seq: u64) -> Result<(), SymbolStoreError> {
+    fn checkpoint_locked(
+        &self,
+        last_seq: u64,
+        max_snapshot_bytes: u64,
+    ) -> Result<(), SymbolStoreError> {
         let snapshot = {
             let state = self.state.read();
             state.ensure_writable()?;
@@ -1175,13 +1209,18 @@ impl DurableSymbolStore {
             last_seq,
             &snapshot,
             self.config.mac_key.as_ref(),
+            max_snapshot_bytes,
         )
         .map_err(symbol_io_durable)?;
         clear_wal(&self.wal_path).map_err(symbol_io)?;
         Ok(())
     }
 
-    fn record_mutation(&self, op: SymbolWalOp) -> Result<(), SymbolStoreError> {
+    fn record_mutation(
+        &self,
+        op: SymbolWalOp,
+        max_record_bytes: usize,
+    ) -> Result<(), SymbolStoreError> {
         self.require_writable()?;
         let _guard = self.write_guard.lock();
         {
@@ -1201,11 +1240,18 @@ impl DurableSymbolStore {
                 .ok_or_else(|| {
                     SymbolStoreError::Io("durable symbol WAL sequence is exhausted".to_owned())
                 })?;
-            if let Err(error) =
-                append_wal_record(&self.wal_path, seq, &op, self.config.mac_key.as_ref())
-            {
+            if let Err(error) = append_wal_record(
+                &self.wal_path,
+                seq,
+                &op,
+                self.config.mac_key.as_ref(),
+                max_record_bytes,
+            ) {
+                let needs_recovery = !matches!(error, DurableIoError::RejectedBeforeWrite(_));
                 let error = symbol_io_durable(error);
-                self.state.write().write_fence = Some(error.to_string());
+                if needs_recovery {
+                    self.state.write().write_fence = Some(error.to_string());
+                }
                 return Err(error);
             }
             self.last_seq.store(seq, Ordering::SeqCst);
@@ -1221,7 +1267,7 @@ impl DurableSymbolStore {
                     .saturating_add(1);
                 self.ops_since_checkpoint.store(ops, Ordering::SeqCst);
                 if ops >= self.config.checkpoint_after_ops {
-                    if let Err(error) = self.checkpoint_locked(seq) {
+                    if let Err(error) = self.checkpoint_locked(seq, MAX_SNAPSHOT_BYTES) {
                         tracing::warn!(error = %error, "durable symbol checkpoint failed after WAL sync");
                     } else {
                         self.ops_since_checkpoint.store(0, Ordering::SeqCst);
@@ -1245,14 +1291,17 @@ impl DurableSymbolStore {
 #[async_trait]
 impl SymbolStore for DurableSymbolStore {
     async fn put_symbol(&self, symbol: StoredSymbol) -> Result<(), SymbolStoreError> {
-        self.record_mutation(SymbolWalOp::PutSymbol(PersistentStoredSymbol {
-            meta: symbol.meta,
-            data: symbol.data.to_vec(),
-        }))
+        self.record_mutation(
+            SymbolWalOp::PutSymbol(PersistentStoredSymbol {
+                meta: symbol.meta,
+                data: symbol.data.to_vec(),
+            }),
+            MAX_WAL_RECORD_BYTES,
+        )
     }
 
     async fn put_object_meta(&self, meta: ObjectSymbolMeta) -> Result<(), SymbolStoreError> {
-        self.record_mutation(SymbolWalOp::PutObjectMeta(meta))
+        self.record_mutation(SymbolWalOp::PutObjectMeta(meta), MAX_WAL_RECORD_BYTES)
     }
 
     async fn get_symbol(
@@ -1319,16 +1368,22 @@ impl SymbolStore for DurableSymbolStore {
     }
 
     async fn delete_object(&self, object_id: &ObjectId) -> Result<(), SymbolStoreError> {
-        self.record_mutation(SymbolWalOp::DeleteObject {
-            object_id: *object_id,
-        })
+        self.record_mutation(
+            SymbolWalOp::DeleteObject {
+                object_id: *object_id,
+            },
+            MAX_WAL_RECORD_BYTES,
+        )
     }
 
     async fn delete_symbol(&self, object_id: &ObjectId, esi: u32) -> Result<(), SymbolStoreError> {
-        self.record_mutation(SymbolWalOp::DeleteSymbol {
-            object_id: *object_id,
-            esi,
-        })
+        self.record_mutation(
+            SymbolWalOp::DeleteSymbol {
+                object_id: *object_id,
+                esi,
+            },
+            MAX_WAL_RECORD_BYTES,
+        )
     }
 
     async fn get_distribution(&self, object_id: &ObjectId) -> Option<SymbolDistribution> {
@@ -1472,13 +1527,17 @@ fn load_durable_object_state(
     allow_legacy_unauth: bool,
     access: DurableAccess,
 ) -> Result<(DurableObjectState, u64), ObjectStoreError> {
-    let (mut state, last_snapshot_seq) =
-        match read_snapshot::<ObjectSnapshot>(snapshot_path, mac_key, allow_legacy_unauth)
-            .map_err(object_io_durable)?
-        {
-            Some((snapshot, seq)) => (DurableObjectState::from_snapshot(snapshot, verifier)?, seq),
-            None => (DurableObjectState::default(), 0),
-        };
+    let (mut state, last_snapshot_seq) = match read_snapshot::<ObjectSnapshot>(
+        snapshot_path,
+        mac_key,
+        allow_legacy_unauth,
+        MAX_SNAPSHOT_BYTES,
+    )
+    .map_err(object_io_durable)?
+    {
+        Some((snapshot, seq)) => (DurableObjectState::from_snapshot(snapshot, verifier)?, seq),
+        None => (DurableObjectState::default(), 0),
+    };
 
     let records = read_wal_records::<ObjectWalOp>(
         wal_path,
@@ -1523,13 +1582,17 @@ fn load_durable_symbol_state(
     allow_legacy_unauth: bool,
     access: DurableAccess,
 ) -> Result<(DurableSymbolState, u64), SymbolStoreError> {
-    let (mut state, last_snapshot_seq) =
-        match read_snapshot::<SymbolSnapshot>(snapshot_path, mac_key, allow_legacy_unauth)
-            .map_err(symbol_io_durable)?
-        {
-            Some((snapshot, seq)) => (DurableSymbolState::from_snapshot(snapshot)?, seq),
-            None => (DurableSymbolState::default(), 0),
-        };
+    let (mut state, last_snapshot_seq) = match read_snapshot::<SymbolSnapshot>(
+        snapshot_path,
+        mac_key,
+        allow_legacy_unauth,
+        MAX_SNAPSHOT_BYTES,
+    )
+    .map_err(symbol_io_durable)?
+    {
+        Some((snapshot, seq)) => (DurableSymbolState::from_snapshot(snapshot)?, seq),
+        None => (DurableSymbolState::default(), 0),
+    };
 
     let records = read_wal_records::<SymbolWalOp>(
         wal_path,
@@ -1607,7 +1670,13 @@ fn read_until_bounded<R: BufRead>(
 /// (bead flywheel_connectors-dgbtx).
 #[derive(Debug)]
 enum DurableIoError {
-    Tampered { path: String, reason: String },
+    Tampered {
+        path: String,
+        reason: String,
+    },
+    /// Serialization was refused before any file was opened for writing.
+    /// Unlike an uncertain append, this cannot leave a partial WAL tail.
+    RejectedBeforeWrite(String),
     Other(String),
 }
 
@@ -1623,7 +1692,9 @@ fn object_io_durable(error: DurableIoError) -> ObjectStoreError {
         DurableIoError::Tampered { path, reason } => {
             ObjectStoreError::TamperedAuditEnvelope { path, reason }
         }
-        DurableIoError::Other(s) => ObjectStoreError::Io(s),
+        DurableIoError::RejectedBeforeWrite(s) | DurableIoError::Other(s) => {
+            ObjectStoreError::Io(s)
+        }
     }
 }
 
@@ -1633,7 +1704,9 @@ fn symbol_io_durable(error: DurableIoError) -> SymbolStoreError {
         DurableIoError::Tampered { path, reason } => {
             SymbolStoreError::TamperedAuditEnvelope { path, reason }
         }
-        DurableIoError::Other(s) => SymbolStoreError::Io(s),
+        DurableIoError::RejectedBeforeWrite(s) | DurableIoError::Other(s) => {
+            SymbolStoreError::Io(s)
+        }
     }
 }
 
@@ -1641,6 +1714,7 @@ fn read_snapshot<T>(
     path: &Path,
     mac_key: Option<&[u8; 32]>,
     allow_legacy_unauth: bool,
+    max_snapshot_bytes: u64,
 ) -> Result<Option<(T, u64)>, DurableIoError>
 where
     T: Serialize + DeserializeOwned,
@@ -1651,16 +1725,16 @@ where
         Err(error) => return Err(format!("open snapshot {}: {error}", path.display()).into()),
     };
 
-    // Reject snapshot files larger than `MAX_SNAPSHOT_BYTES` before
+    // Reject snapshot files larger than the writer's limit before
     // allocating to avoid OOM on a corrupted or adversarial file.
     let metadata = file
         .metadata()
         .map_err(|error| format!("stat snapshot {}: {error}", path.display()))?;
-    if metadata.len() > MAX_SNAPSHOT_BYTES {
+    if metadata.len() > max_snapshot_bytes {
         return Err(DurableIoError::Other(format!(
             "snapshot {} exceeds {} bytes (got {})",
             path.display(),
-            MAX_SNAPSHOT_BYTES,
+            max_snapshot_bytes,
             metadata.len()
         )));
     }
@@ -1669,14 +1743,14 @@ where
     // concurrent checkpoint replacement. Bound the actual read as well as the
     // metadata check so concurrent growth cannot bypass the allocation limit.
     let mut bytes = Vec::new();
-    file.take(MAX_SNAPSHOT_BYTES.saturating_add(1))
+    file.take(max_snapshot_bytes.saturating_add(1))
         .read_to_end(&mut bytes)
         .map_err(|error| format!("read snapshot {}: {error}", path.display()))?;
-    if bytes.len() as u64 > MAX_SNAPSHOT_BYTES {
+    if bytes.len() as u64 > max_snapshot_bytes {
         return Err(DurableIoError::Other(format!(
             "snapshot {} grew beyond {} bytes",
             path.display(),
-            MAX_SNAPSHOT_BYTES
+            max_snapshot_bytes
         )));
     }
     let envelope: SnapshotEnvelope<T> = serde_json::from_slice(&bytes)
@@ -1961,35 +2035,48 @@ fn append_wal_record<T>(
     seq: u64,
     op: &T,
     mac_key: Option<&[u8; 32]>,
+    max_record_bytes: usize,
 ) -> Result<(), DurableIoError>
 where
     T: Serialize,
 {
-    let (version, checksum) = if let Some(key) = mac_key {
-        let mac = keyed_mac_json(key, &(WAL_VERSION_V2, seq, op))
-            .map_err(|error| format!("serialize wal mac {}: {error}", path.display()))?;
-        (WAL_VERSION_V2, mac)
+    let version = if mac_key.is_some() {
+        WAL_VERSION_V2
     } else {
-        let cs = checksum_json(&(WAL_VERSION_V1, seq, op))
-            .map_err(|error| format!("serialize wal checksum {}: {error}", path.display()))?;
-        (WAL_VERSION_V1, cs)
+        WAL_VERSION_V1
     };
+    let checksum = hash_json_bounded(mac_key, &(version, seq, op), max_record_bytes as u64)
+        .map_err(|error| {
+            DurableIoError::RejectedBeforeWrite(format!(
+                "serialize wal checksum {}: {error}",
+                path.display()
+            ))
+        })?;
     let envelope = WalEnvelope {
         version,
         seq,
         checksum,
         op,
     };
-    let mut bytes = serde_json::to_vec(&envelope)
-        .map_err(|error| format!("serialize wal {}: {error}", path.display()))?;
-    bytes.push(b'\n');
+    // A record that recovery would reject must never enter the WAL. Include
+    // the delimiter in the budget, and finish serialization before append IO.
+    let mut encoded = BoundedWriter::new(Vec::new(), max_record_bytes as u64);
+    serde_json::to_writer(&mut encoded, &envelope).map_err(|error| {
+        DurableIoError::RejectedBeforeWrite(format!("serialize wal {}: {error}", path.display()))
+    })?;
+    encoded.write_all(b"\n").map_err(|error| {
+        DurableIoError::RejectedBeforeWrite(format!(
+            "terminate wal record {}: {error}",
+            path.display()
+        ))
+    })?;
 
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
         .map_err(|error| format!("open wal {}: {error}", path.display()))?;
-    file.write_all(&bytes)
+    file.write_all(&encoded.inner)
         .map_err(|error| format!("write wal {}: {error}", path.display()))?;
     file.sync_all()
         .map_err(|error| format!("sync wal {}: {error}", path.display()))?;
@@ -2002,27 +2089,42 @@ fn write_snapshot<T>(
     last_seq: u64,
     payload: &T,
     mac_key: Option<&[u8; 32]>,
+    max_snapshot_bytes: u64,
 ) -> Result<(), DurableIoError>
 where
-    T: Serialize + Clone,
+    T: Serialize,
 {
-    let (version, checksum) = if let Some(key) = mac_key {
-        let mac = keyed_mac_json(key, &(SNAPSHOT_VERSION_V2, last_seq, payload))
-            .map_err(|error| format!("serialize snapshot mac {}: {error}", path.display()))?;
-        (SNAPSHOT_VERSION_V2, mac)
+    let version = if mac_key.is_some() {
+        SNAPSHOT_VERSION_V2
     } else {
-        let cs = checksum_json(&(SNAPSHOT_VERSION_V1, last_seq, payload))
-            .map_err(|error| format!("serialize snapshot checksum {}: {error}", path.display()))?;
-        (SNAPSHOT_VERSION_V1, cs)
+        SNAPSHOT_VERSION_V1
     };
+    let checksum = hash_json_bounded(mac_key, &(version, last_seq, payload), max_snapshot_bytes)
+        .map_err(|error| {
+            DurableIoError::RejectedBeforeWrite(format!(
+                "serialize snapshot checksum {}: {error}",
+                path.display()
+            ))
+        })?;
     let envelope = SnapshotEnvelope {
         version,
         last_seq,
         checksum,
-        payload: payload.clone(),
+        payload,
     };
-    let bytes = serde_json::to_vec(&envelope)
-        .map_err(|error| format!("serialize snapshot {}: {error}", path.display()))?;
+    // Check the complete envelope, not only its authenticated payload, before
+    // creating a temp file. Oversized checkpoints leave the readable snapshot
+    // and WAL untouched and do not accumulate multi-gigabyte orphan files.
+    serde_json::to_writer(
+        BoundedWriter::new(std::io::sink(), max_snapshot_bytes),
+        &envelope,
+    )
+    .map_err(|error| {
+        DurableIoError::RejectedBeforeWrite(format!(
+            "serialize snapshot {}: {error}",
+            path.display()
+        ))
+    })?;
 
     let file_name = path
         .file_name()
@@ -2031,8 +2133,16 @@ where
     let temp_file_name = format!("{file_name}.tmp.{}.{}", std::process::id(), last_seq);
     let (temp_path, mut file) =
         open_unique_snapshot_temp_file(path, &temp_file_name).map_err(DurableIoError::Other)?;
-    file.write_all(&bytes)
-        .map_err(|error| format!("write temp snapshot {}: {error}", temp_path.display()))?;
+    {
+        // Stream the borrowed snapshot rather than cloning its full payload
+        // and allocating another complete JSON representation in memory.
+        let mut encoded = BoundedWriter::new(BufWriter::new(&mut file), max_snapshot_bytes);
+        serde_json::to_writer(&mut encoded, &envelope)
+            .map_err(|error| format!("write temp snapshot {}: {error}", temp_path.display()))?;
+        encoded
+            .flush()
+            .map_err(|error| format!("flush temp snapshot {}: {error}", temp_path.display()))?;
+    }
     file.sync_all()
         .map_err(|error| format!("sync temp snapshot {}: {error}", temp_path.display()))?;
     drop(file);
@@ -2090,9 +2200,71 @@ fn clear_wal(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Stop serialization before the next write would cross the recovery limit.
+/// Used for hashing, pre-publication size checks, and the actual encoded bytes.
+struct BoundedWriter<W> {
+    inner: W,
+    max_bytes: u64,
+    written: u64,
+}
+
+impl<W> BoundedWriter<W> {
+    const fn new(inner: W, max_bytes: u64) -> Self {
+        Self {
+            inner,
+            max_bytes,
+            written: 0,
+        }
+    }
+}
+
+impl<W: Write> Write for BoundedWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() as u64 > self.max_bytes.saturating_sub(self.written) {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "serialized durable envelope exceeds {} bytes",
+                    self.max_bytes
+                ),
+            ));
+        }
+        let written = self.inner.write(bytes)?;
+        self.written += written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+struct JsonHashWriter(blake3::Hasher);
+
+impl Write for JsonHashWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn hash_json_bounded<T: Serialize>(
+    mac_key: Option<&[u8; 32]>,
+    value: &T,
+    max_bytes: u64,
+) -> Result<[u8; 32], serde_json::Error> {
+    let hasher = mac_key.map_or_else(blake3::Hasher::new, blake3::Hasher::new_keyed);
+    let mut encoded = BoundedWriter::new(JsonHashWriter(hasher), max_bytes);
+    serde_json::to_writer(&mut encoded, value)?;
+    Ok(*encoded.inner.0.finalize().as_bytes())
+}
+
 fn checksum_json<T: Serialize>(value: &T) -> Result<[u8; 32], serde_json::Error> {
-    let bytes = serde_json::to_vec(value)?;
-    Ok(*blake3::hash(&bytes).as_bytes())
+    hash_json_bounded(None, value, u64::MAX)
 }
 
 /// Compute a keyed BLAKE3 MAC over the JSON serialization of `value`
@@ -2108,8 +2280,7 @@ fn keyed_mac_json<T: Serialize>(
     mac_key: &[u8; 32],
     value: &T,
 ) -> Result<[u8; 32], serde_json::Error> {
-    let bytes = serde_json::to_vec(value)?;
-    Ok(*blake3::keyed_hash(mac_key, &bytes).as_bytes())
+    hash_json_bounded(Some(mac_key), value, u64::MAX)
 }
 
 /// Constant-time MAC comparison. Prevents an attacker who can observe
@@ -2249,6 +2420,320 @@ mod tests {
                 (path, bytes)
             })
             .collect()
+    }
+
+    /// Retain the original buffered encoding as an independent, small fixture
+    /// oracle for the streaming writer and its on-disk authentication bytes.
+    fn snapshot_fixture_bytes<T: Serialize>(
+        seq: u64,
+        payload: &T,
+        mac_key: Option<&[u8; 32]>,
+    ) -> Vec<u8> {
+        let version = if mac_key.is_some() {
+            SNAPSHOT_VERSION_V2
+        } else {
+            SNAPSHOT_VERSION_V1
+        };
+        let authenticated = serde_json::to_vec(&(version, seq, payload)).unwrap();
+        let checksum = mac_key.map_or_else(
+            || *blake3::hash(&authenticated).as_bytes(),
+            |key| *blake3::keyed_hash(key, &authenticated).as_bytes(),
+        );
+        serde_json::to_vec(&SnapshotEnvelope {
+            version,
+            last_seq: seq,
+            checksum,
+            payload,
+        })
+        .unwrap()
+    }
+
+    fn wal_fixture_bytes<T: Serialize>(seq: u64, op: &T, mac_key: Option<&[u8; 32]>) -> Vec<u8> {
+        let version = if mac_key.is_some() {
+            WAL_VERSION_V2
+        } else {
+            WAL_VERSION_V1
+        };
+        let authenticated = serde_json::to_vec(&(version, seq, op)).unwrap();
+        let checksum = mac_key.map_or_else(
+            || *blake3::hash(&authenticated).as_bytes(),
+            |key| *blake3::keyed_hash(key, &authenticated).as_bytes(),
+        );
+        let mut bytes = serde_json::to_vec(&WalEnvelope {
+            version,
+            seq,
+            checksum,
+            op,
+        })
+        .unwrap();
+        bytes.push(b'\n');
+        bytes
+    }
+
+    #[test]
+    fn durable_envelope_bounds_include_metadata_and_wal_newline() {
+        let temp_dir = TempDir::new().unwrap();
+        let payload = serde_json::json!({
+            "text": "quote: \" newline: \n unicode: λ",
+            "bytes": [0, 1, 255],
+            "nested": { "empty": [], "enabled": true },
+        });
+        for mac_key in [None, Some(TEST_MAC_KEY)] {
+            let root = temp_dir.path().join(mac_key.is_some().to_string());
+            fs::create_dir(&root).unwrap();
+            let snapshot_path = root.join("snapshot.json");
+            let snapshot_bytes = snapshot_fixture_bytes(1, &payload, mac_key.as_ref());
+            let snapshot_cap = snapshot_bytes.len() as u64;
+            write_snapshot(&snapshot_path, 1, &payload, mac_key.as_ref(), snapshot_cap).unwrap();
+            assert_eq!(fs::read(&snapshot_path).unwrap(), snapshot_bytes);
+            let (recovered, seq) = read_snapshot::<serde_json::Value>(
+                &snapshot_path,
+                mac_key.as_ref(),
+                false,
+                snapshot_cap,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(recovered, payload);
+            assert_eq!(seq, 1);
+            assert!(
+                read_snapshot::<serde_json::Value>(
+                    &snapshot_path,
+                    mac_key.as_ref(),
+                    false,
+                    snapshot_cap - 1,
+                )
+                .is_err()
+            );
+
+            let wal_path = root.join("wal.jsonl");
+            let wal_bytes = wal_fixture_bytes(1, &payload, mac_key.as_ref());
+            append_wal_record(&wal_path, 1, &payload, mac_key.as_ref(), wal_bytes.len()).unwrap();
+            assert_eq!(fs::read(&wal_path).unwrap(), wal_bytes);
+            let records = read_wal_records::<serde_json::Value>(
+                &wal_path,
+                0,
+                mac_key.as_ref(),
+                false,
+                DurableAccess::ReadWrite,
+                wal_bytes.len(),
+            )
+            .unwrap();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].op, payload);
+
+            let before = stored_file_bytes(&root);
+            assert!(matches!(
+                write_snapshot(&snapshot_path, 1, &payload, mac_key.as_ref(), snapshot_cap - 1),
+                Err(DurableIoError::RejectedBeforeWrite(reason)) if reason.contains("exceeds")
+            ));
+            // The JSON envelope itself fits. Only its final newline crosses
+            // this cap; appending it would produce a record recovery refuses.
+            let next_cap = wal_fixture_bytes(2, &payload, mac_key.as_ref()).len() - 1;
+            assert!(matches!(
+                append_wal_record(&wal_path, 2, &payload, mac_key.as_ref(), next_cap),
+                Err(DurableIoError::RejectedBeforeWrite(reason)) if reason.contains("exceeds")
+            ));
+            assert_eq!(stored_file_bytes(&root), before);
+        }
+    }
+
+    #[test]
+    fn durable_writer_limits_stop_streaming_payload_before_file_creation() {
+        use std::cell::Cell;
+
+        struct HugeSequence(Cell<usize>);
+
+        impl Serialize for HugeSequence {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                use serde::ser::SerializeSeq;
+
+                let mut seq = serializer.serialize_seq(Some(1_000_000))?;
+                for _ in 0..1_000_000 {
+                    self.0.set(self.0.get() + 1);
+                    seq.serialize_element(&u64::MAX)?;
+                }
+                seq.end()
+            }
+        }
+
+        let temp_dir = TempDir::new().unwrap();
+        let payload = HugeSequence(Cell::new(0));
+        for mac_key in [None, Some(TEST_MAC_KEY)] {
+            for snapshot in [false, true] {
+                payload.0.set(0);
+                let path = temp_dir
+                    .path()
+                    .join(format!("{snapshot}-{}", mac_key.is_some()));
+                let result = if snapshot {
+                    write_snapshot(&path, 1, &payload, mac_key.as_ref(), 128)
+                } else {
+                    append_wal_record(&path, 1, &payload, mac_key.as_ref(), 128)
+                };
+                assert!(matches!(
+                    result,
+                    Err(DurableIoError::RejectedBeforeWrite(_))
+                ));
+                assert!(
+                    payload.0.get() < 16,
+                    "serializer must stop at the small budget"
+                );
+                assert!(!path.exists());
+                assert!(stored_file_bytes(temp_dir.path()).is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_object_checkpoint_and_wal_refusals_preserve_recovery_chain() {
+        let temp_dir = TempDir::new().unwrap();
+        for mac_key in [None, Some(TEST_MAC_KEY)] {
+            let mut config =
+                DurableObjectStoreConfig::new(temp_dir.path().join(mac_key.is_some().to_string()));
+            config.mac_key = mac_key;
+            config.checkpoint_after_ops = 0;
+            let store = DurableObjectStore::open(config.clone()).unwrap();
+            store.put(test_object(1)).await.unwrap();
+            store.checkpoint().await.unwrap();
+            store.put(test_object(2)).await.unwrap();
+            let before = stored_file_bytes(&config.root_dir);
+            let used = store.storage_used().await;
+            let op = ObjectWalOp::Put(Box::new(test_object(3)));
+            let wal_cap = wal_fixture_bytes(3, &op, mac_key.as_ref()).len() - 1;
+            assert!(matches!(
+                store.record_mutation(op, wal_cap).await,
+                Err(ObjectStoreError::Io(reason)) if reason.contains("exceeds")
+            ));
+            assert_eq!(store.last_seq.load(Ordering::SeqCst), 2);
+            assert_eq!(store.storage_used().await, used);
+            assert!(!store.exists(&test_object_id(3)).await);
+
+            {
+                let state = store.state.lock().await;
+                assert!(state.write_fence.is_none());
+                let cap = snapshot_fixture_bytes(2, &state.to_snapshot(), mac_key.as_ref()).len()
+                    as u64
+                    - 1;
+                assert!(matches!(
+                    DurableObjectStore::checkpoint_state(
+                        &state,
+                        &store.snapshot_path,
+                        &store.wal_path,
+                        2,
+                        mac_key.as_ref(),
+                        cap,
+                    ),
+                    Err(ObjectStoreError::Io(reason)) if reason.contains("exceeds")
+                ));
+            }
+            assert_eq!(stored_file_bytes(&config.root_dir), before);
+            let observer = DurableObjectStore::open_read_only(config.clone()).unwrap();
+            for seed in [1, 2] {
+                assert_eq!(
+                    observer.get(&test_object_id(seed)).await.unwrap().body,
+                    test_object(seed).body
+                );
+            }
+            assert!(!observer.exists(&test_object_id(3)).await);
+            drop(observer);
+
+            // A proven pre-write refusal does not fence the live store. A
+            // later valid mutation remains replayable across both recovery
+            // and a subsequent successful checkpoint.
+            store.put(test_object(3)).await.unwrap();
+            drop(store);
+            let recovered = DurableObjectStore::open(config.clone()).unwrap();
+            for seed in [1, 2, 3] {
+                assert_eq!(
+                    recovered.get(&test_object_id(seed)).await.unwrap().body,
+                    test_object(seed).body
+                );
+            }
+            recovered.checkpoint().await.unwrap();
+            drop(recovered);
+            let recovered = DurableObjectStore::open(config).unwrap();
+            assert_eq!(recovered.last_seq.load(Ordering::SeqCst), 3);
+            for seed in [1, 2, 3] {
+                assert!(recovered.exists(&test_object_id(seed)).await);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_symbol_checkpoint_and_wal_refusals_preserve_recovery_chain() {
+        let temp_dir = TempDir::new().unwrap();
+        for mac_key in [None, Some(TEST_MAC_KEY)] {
+            let mut config =
+                DurableSymbolStoreConfig::new(temp_dir.path().join(mac_key.is_some().to_string()));
+            config.mac_key = mac_key;
+            config.checkpoint_after_ops = 0;
+            let store = DurableSymbolStore::open(config.clone()).unwrap();
+            store.put_object_meta(test_symbol_meta(1)).await.unwrap();
+            store.put_symbol(test_symbol(1, 0, 7)).await.unwrap();
+            store.checkpoint().unwrap();
+            store.put_symbol(test_symbol(1, 1, 7)).await.unwrap();
+            let before = stored_file_bytes(&config.root_dir);
+            let used = store.storage_used().await;
+            let symbol = test_symbol(1, 2, 7);
+            let op = SymbolWalOp::PutSymbol(PersistentStoredSymbol {
+                meta: symbol.meta,
+                data: symbol.data.to_vec(),
+            });
+            let wal_cap = wal_fixture_bytes(4, &op, mac_key.as_ref()).len() - 1;
+            assert!(matches!(
+                store.record_mutation(op, wal_cap),
+                Err(SymbolStoreError::Io(reason)) if reason.contains("exceeds")
+            ));
+            assert_eq!(store.last_seq.load(Ordering::SeqCst), 3);
+            assert_eq!(store.storage_used().await, used);
+            assert_eq!(store.symbol_count(&test_object_id(1)).await, 2);
+            assert!(store.state.read().write_fence.is_none());
+
+            {
+                let _guard = store.write_guard.lock();
+                let cap =
+                    snapshot_fixture_bytes(3, &store.state.read().to_snapshot(), mac_key.as_ref())
+                        .len() as u64
+                        - 1;
+                assert!(matches!(
+                    store.checkpoint_locked(3, cap),
+                    Err(SymbolStoreError::Io(reason)) if reason.contains("exceeds")
+                ));
+            }
+            assert_eq!(stored_file_bytes(&config.root_dir), before);
+            let observer = DurableSymbolStore::open_read_only(config.clone()).unwrap();
+            for esi in [0, 1] {
+                assert_eq!(
+                    observer
+                        .get_symbol(&test_object_id(1), esi)
+                        .await
+                        .unwrap()
+                        .data,
+                    test_symbol(1, esi, 7).data
+                );
+            }
+            assert_eq!(observer.symbol_count(&test_object_id(1)).await, 2);
+            drop(observer);
+
+            store.put_symbol(test_symbol(1, 2, 7)).await.unwrap();
+            drop(store);
+            let recovered = DurableSymbolStore::open(config.clone()).unwrap();
+            for esi in [0, 1, 2] {
+                assert_eq!(
+                    recovered
+                        .get_symbol(&test_object_id(1), esi)
+                        .await
+                        .unwrap()
+                        .data,
+                    test_symbol(1, esi, 7).data
+                );
+            }
+            recovered.checkpoint().unwrap();
+            drop(recovered);
+            let recovered = DurableSymbolStore::open(config).unwrap();
+            assert_eq!(recovered.last_seq.load(Ordering::SeqCst), 4);
+            assert_eq!(recovered.symbol_count(&test_object_id(1)).await, 3);
+        }
     }
 
     #[tokio::test]
@@ -2821,6 +3306,7 @@ mod tests {
                             data: uncertain.data.to_vec(),
                         }),
                         config.mac_key.as_ref(),
+                        MAX_WAL_RECORD_BYTES,
                     )
                     .unwrap();
                 } else {
@@ -2950,6 +3436,7 @@ mod tests {
                     }],
                 },
                 config.mac_key.as_ref(),
+                MAX_SNAPSHOT_BYTES,
             )
             .unwrap();
 
@@ -2976,10 +3463,14 @@ mod tests {
                 let reopened = DurableSymbolStore::open(config.clone()).unwrap();
                 assert_eq!(reopened.symbol_count(&test_object_id(1)).await, 2);
                 reopened.checkpoint().unwrap();
-                let (_, last_seq) =
-                    read_snapshot::<SymbolSnapshot>(&snapshot_path, config.mac_key.as_ref(), false)
-                        .unwrap()
-                        .unwrap();
+                let (_, last_seq) = read_snapshot::<SymbolSnapshot>(
+                    &snapshot_path,
+                    config.mac_key.as_ref(),
+                    false,
+                    MAX_SNAPSHOT_BYTES,
+                )
+                .unwrap()
+                .unwrap();
                 assert_eq!(last_seq, u64::MAX);
                 assert!(fs::read(&reopened.wal_path).unwrap().is_empty());
                 assert!(matches!(
@@ -3010,6 +3501,7 @@ mod tests {
                     objects: vec![test_object(1)],
                 },
                 config.mac_key.as_ref(),
+                MAX_SNAPSHOT_BYTES,
             )
             .unwrap();
 
@@ -3035,10 +3527,14 @@ mod tests {
                 let reopened = DurableObjectStore::open(config.clone()).unwrap();
                 assert_eq!(reopened.list_zone(&test_zone()).await.len(), 2);
                 reopened.checkpoint().await.unwrap();
-                let (_, last_seq) =
-                    read_snapshot::<ObjectSnapshot>(&snapshot_path, config.mac_key.as_ref(), false)
-                        .unwrap()
-                        .unwrap();
+                let (_, last_seq) = read_snapshot::<ObjectSnapshot>(
+                    &snapshot_path,
+                    config.mac_key.as_ref(),
+                    false,
+                    MAX_SNAPSHOT_BYTES,
+                )
+                .unwrap()
+                .unwrap();
                 assert_eq!(last_seq, u64::MAX);
                 assert!(fs::read(&reopened.wal_path).unwrap().is_empty());
                 assert!(matches!(
@@ -3624,7 +4120,8 @@ mod tests {
                 symbols: Vec::new(),
             }],
         };
-        write_snapshot(&snapshot_path, 1, &snapshot, None).expect("write invalid snapshot");
+        write_snapshot(&snapshot_path, 1, &snapshot, None, MAX_SNAPSHOT_BYTES)
+            .expect("write invalid snapshot");
 
         match DurableSymbolStore::open(config) {
             Err(SymbolStoreError::InvalidSymbol { .. }) => {}
@@ -3653,7 +4150,14 @@ mod tests {
             meta: test_symbol(10, 0, 5).meta,
             data: vec![0xAB; 7],
         };
-        append_wal_record(&wal_path, 2, &SymbolWalOp::PutSymbol(forged), None).expect("append wal");
+        append_wal_record(
+            &wal_path,
+            2,
+            &SymbolWalOp::PutSymbol(forged),
+            None,
+            MAX_WAL_RECORD_BYTES,
+        )
+        .expect("append wal");
 
         match DurableSymbolStore::open(config) {
             Err(SymbolStoreError::InvalidSymbol { reason }) => {
@@ -3696,7 +4200,8 @@ mod tests {
                 symbols: vec![invalid_symbol],
             }],
         };
-        write_snapshot(&snapshot_path, 0, &snapshot, None).expect("write snapshot");
+        write_snapshot(&snapshot_path, 0, &snapshot, None, MAX_SNAPSHOT_BYTES)
+            .expect("write snapshot");
 
         let reopened = DurableSymbolStore::open(config).expect("open symbol store");
         assert_eq!(
@@ -4120,6 +4625,7 @@ mod tests {
                         object_id: test_object_id(1),
                     },
                     mac_key.as_ref(),
+                    MAX_WAL_RECORD_BYTES,
                 )
                 .unwrap();
                 let original = fs::read(&wal_path).unwrap();
@@ -4496,7 +5002,8 @@ mod tests {
         // covers a different payload (omitting object 11).
         let snapshot_path = config.root_dir.join("objects.snapshot.json");
         let empty_snapshot = ObjectSnapshot { objects: vec![] };
-        write_snapshot(&snapshot_path, 1, &empty_snapshot, None).expect("write forged V1 snapshot");
+        write_snapshot(&snapshot_path, 1, &empty_snapshot, None, MAX_SNAPSHOT_BYTES)
+            .expect("write forged V1 snapshot");
 
         match DurableObjectStore::open(config) {
             Err(ObjectStoreError::TamperedAuditEnvelope { reason, .. }) => {
