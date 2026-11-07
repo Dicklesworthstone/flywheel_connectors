@@ -98,6 +98,16 @@ Security is enforced by the type system, the binary boundary, the protocol, or c
 
 If a capability is not granted, it cannot be invoked. If a zone is not bound, the host refuses to start the subprocess. If `allowed_zones` is empty, connector RPC fails closed before invoke, introspection, or health probes reach connector code. If `cidr_deny` is malformed, the sandbox rejects the manifest at runtime rather than silently degrading. If a webhook signing secret is empty or shorter than the threshold, the webhook layer refuses to verify. At every boundary, absence of explicit configuration is treated as denial, never as a permissive default.
 
+When an inventory entry configures `manifest_path`, the admitted manifest also
+binds each operation's capability, risk level, safety tier, approval requirement,
+idempotency class, and input/output schemas. The host compares the runtime catalog
+against that contract before authorization and again immediately before dispatch.
+Undeclared or duplicate operations and changed contracts are refused. An omitted
+runtime approval field matches only a manifest declaring no approval requirement.
+The admitted inventory snapshot remains authoritative until a new generation is
+applied; editing the manifest file alone cannot replace it. Install matching
+connector binaries and manifests together.
+
 ### 3. Truthfulness Over Convenience
 
 `fwc` classifies every answer by its source rather than collapsing runtime state into a fake "live" answer. If the host is unreachable and the operator did not pass `--offline`, `fwc` refuses rather than falling back to stale artifact data silently. Offline answers carry provenance markers and stale-data caveats. Placeholder runtime data, guessed `simulate` support, and local file-edit side channels are bugs, not convenience features.

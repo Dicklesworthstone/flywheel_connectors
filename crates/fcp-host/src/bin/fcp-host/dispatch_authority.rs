@@ -17,11 +17,11 @@ use fcp_prelude::{
 };
 
 use super::super::{
-    AppState, authoritative_persisted_capability_rejection_reason, capability_token_b64,
-    claims_principal, enforce_connector_allow_lists, enforce_live_capability_constraints,
-    enforce_live_deployment_tier, enforce_operation_network_constraint_dispatch,
-    live_constraint_resource_uri, request_input_hash, verify_approval_tokens,
-    verify_live_hybrid_owner_capability, verify_live_revocation_cascade,
+    AppState, admitted_operation_tool, authoritative_persisted_capability_rejection_reason,
+    capability_token_b64, claims_principal, enforce_connector_allow_lists,
+    enforce_live_capability_constraints, enforce_live_deployment_tier,
+    enforce_operation_network_constraint_dispatch, live_constraint_resource_uri, request_input_hash,
+    verify_approval_tokens, verify_live_hybrid_owner_capability, verify_live_revocation_cascade,
 };
 
 fn refusal(message: &str) -> HostError {
@@ -126,18 +126,12 @@ pub(super) async fn revalidate(
         .introspect(&request.connector_id)
         .await
         .map_err(|_| refusal("connector operation catalog unavailable at dispatch"))?;
-    let mut matching = introspection
-        .tools
-        .iter()
-        .filter(|tool| tool.name == request.operation.as_str());
-    let tool = matching
-        .next()
-        .ok_or_else(|| refusal("connector no longer exposes the admitted operation"))?;
-    if matching.next().is_some() {
-        return Err(refusal(
-            "connector operation catalog is ambiguous at dispatch",
-        ));
-    }
+    let tool = admitted_operation_tool(
+        Some(&inventory),
+        &request.connector_id,
+        request.operation.as_str(),
+        &introspection.tools,
+    )?;
     super::super::guarded_invoke::enforce_tier(request, tool.safety_tier)?;
     let verification = state
         .lifecycle

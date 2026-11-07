@@ -2538,9 +2538,37 @@ struct ManifestOperationConstraintCatalog {
     state_model: Option<ConnectorStateKind>,
     manifest_digest: Option<[u8; 32]>,
     manifest_bytes: u64,
-    declared_operations: HashSet<String>,
+    // Keep the operation contract from the admitted inventory generation.
+    // A runtime catalog is an observation, never authority to weaken it.
+    // Snapshots share schemas instead of cloning every operation per invoke.
+    operation_authorities: Arc<BTreeMap<String, ManifestOperationAuthority>>,
     network_constraints: HashMap<String, NetworkConstraints>,
     event_authorities: BTreeMap<String, fcp_manifest::EventSection>,
+}
+
+#[derive(Debug, Clone)]
+struct ManifestOperationAuthority {
+    capability: fcp_prelude::CapabilityId,
+    risk_level: fcp_prelude::RiskLevel,
+    safety_tier: SafetyTier,
+    approval_mode: ApprovalMode,
+    idempotency: fcp_kernel::IdempotencyClass,
+    input_schema: Value,
+    output_schema: Value,
+}
+
+impl From<&fcp_manifest::OperationSection> for ManifestOperationAuthority {
+    fn from(operation: &fcp_manifest::OperationSection) -> Self {
+        Self {
+            capability: operation.capability.clone(),
+            risk_level: operation.risk_level,
+            safety_tier: operation.safety_tier,
+            approval_mode: operation.requires_approval.into(),
+            idempotency: operation.idempotency,
+            input_schema: operation.input_schema.clone(),
+            output_schema: operation.output_schema.clone(),
+        }
+    }
 }
 
 impl ManifestOperationConstraintCatalog {
@@ -2560,12 +2588,12 @@ impl ManifestOperationConstraintCatalog {
             }
             None => ConnectorStateKind::Stateless,
         };
-        let declared_operations = manifest
+        let operation_authorities = manifest
             .provides
             .operations
-            .keys()
-            .cloned()
-            .collect::<HashSet<_>>();
+            .iter()
+            .map(|(id, operation)| (id.clone(), ManifestOperationAuthority::from(operation)))
+            .collect();
         let network_constraints = manifest
             .provides
             .operations
@@ -2582,10 +2610,64 @@ impl ManifestOperationConstraintCatalog {
             state_model: Some(state_model),
             manifest_digest: None,
             manifest_bytes: 0,
-            declared_operations,
+            operation_authorities: Arc::new(operation_authorities),
             network_constraints,
             event_authorities: manifest.provides.events.clone(),
         })
+    }
+
+    fn operation_authority(
+        &self,
+        connector_id: &ConnectorId,
+        operation: &str,
+    ) -> HostResult<Option<&ManifestOperationAuthority>> {
+        if self.source.is_none() {
+            // Manifest-less inventory has no admitted manifest authority.
+            // Its existing capability, policy and inventory gates still apply.
+            return Ok(None);
+        }
+        self.operation_authorities
+            .get(operation)
+            .map(Some)
+            .ok_or_else(|| {
+                HostError::PreflightFailed(format!(
+                    "connector `{connector_id}` admitted manifest does not declare operation `{operation}`"
+                ))
+            })
+    }
+
+    fn enforce_tool_authority(
+        &self,
+        connector_id: &ConnectorId,
+        tool: &ToolDescriptor,
+    ) -> HostResult<()> {
+        let Some(authority) = self.operation_authority(connector_id, &tool.name)? else {
+            return Ok(());
+        };
+        let mismatch = if tool.capability != authority.capability {
+            Some("capability")
+        } else if tool.risk_level != authority.risk_level {
+            Some("risk_level")
+        } else if tool.safety_tier != authority.safety_tier {
+            Some("safety_tier")
+        } else if tool.approval_mode.unwrap_or(ApprovalMode::None) != authority.approval_mode {
+            Some("requires_approval")
+        } else if tool.idempotency != authority.idempotency {
+            Some("idempotency")
+        } else if tool.input_schema != authority.input_schema {
+            Some("input_schema")
+        } else if tool.output_schema != authority.output_schema {
+            Some("output_schema")
+        } else {
+            None
+        };
+        if let Some(field) = mismatch {
+            return Err(HostError::PreflightFailed(format!(
+                "connector `{connector_id}` operation `{}` runtime {field} does not match the admitted manifest; apply a matching connector binary and manifest together",
+                tool.name,
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -7397,7 +7479,39 @@ fn enforce_connector_allow_lists(
             allowed_ops.join(", ")
         )));
     }
+    let _ = snapshot
+        .manifest_constraints
+        .operation_authority(&request.connector_id, request.operation.as_str())?;
     Ok(())
+}
+
+/// Select one unambiguous runtime operation and bind its security semantics to
+/// the manifest admitted with the inventory. Used before admission, before
+/// dispatch, and when runtime schemas influence mesh placement. Reading a
+/// mutable manifest path here would let file edits silently replace authority.
+fn admitted_operation_tool<'a>(
+    snapshot: Option<&AllowListSnapshot>,
+    connector_id: &ConnectorId,
+    operation: &str,
+    tools: &'a [ToolDescriptor],
+) -> HostResult<&'a ToolDescriptor> {
+    let mut matching = tools.iter().filter(|tool| tool.name == operation);
+    let tool = matching.next().ok_or_else(|| {
+        HostError::InvalidFilter(format!(
+            "connector `{connector_id}` does not expose operation `{operation}`"
+        ))
+    })?;
+    if matching.next().is_some() {
+        return Err(HostError::PreflightFailed(format!(
+            "connector `{connector_id}` operation catalog is ambiguous for `{operation}`"
+        )));
+    }
+    if let Some(snapshot) = snapshot {
+        snapshot
+            .manifest_constraints
+            .enforce_tool_authority(connector_id, tool)?;
+    }
+    Ok(tool)
 }
 
 fn enforce_operation_network_constraint_dispatch(
@@ -7417,8 +7531,8 @@ fn enforce_operation_network_constraint_dispatch(
     let operation = request.operation.as_str();
     if !snapshot
         .manifest_constraints
-        .declared_operations
-        .contains(operation)
+        .operation_authorities
+        .contains_key(operation)
     {
         return Err(HostError::PreflightFailed(format!(
             "connector `{}` manifest `{source}` does not declare operation `{operation}`; deny-all",
@@ -7579,16 +7693,12 @@ async fn verify_live_request_for_target(
         .await?;
 
     let introspection = state.discovery.introspect(&request.connector_id).await?;
-    let tool = introspection
-        .tools
-        .iter()
-        .find(|tool| tool.name == request.operation.as_str())
-        .ok_or_else(|| {
-            HostError::InvalidFilter(format!(
-                "connector `{}` does not expose operation `{}`",
-                request.connector_id, request.operation
-            ))
-        })?;
+    let tool = admitted_operation_tool(
+        allow_snapshot.as_ref(),
+        &request.connector_id,
+        request.operation.as_str(),
+        &introspection.tools,
+    )?;
     guarded_invoke::enforce_tier(request, tool.safety_tier)?;
 
     let capability_key = state.capability_verifying_key.as_ref().ok_or_else(|| {
@@ -15248,11 +15358,18 @@ async fn mesh_route_decision(
                     snapshot.allowed_operations.join(", ")
                 )));
             }
+            let _ = snapshot
+                .manifest_constraints
+                .operation_authority(connector_id, operation)?;
             if !singleton_writer {
                 let introspection = state.discovery.introspect(connector_id).await?;
-                singleton_writer = introspection.tools.iter().any(|tool| {
-                    tool.name == operation && operation_requires_hrw_lease(tool, false)
-                });
+                let tool = admitted_operation_tool(
+                    Some(snapshot),
+                    connector_id,
+                    operation,
+                    &introspection.tools,
+                )?;
+                singleton_writer = operation_requires_hrw_lease(tool, false);
             }
         }
         if !singleton_writer {
@@ -17707,6 +17824,350 @@ deny_ptrace = true
         assert_eq!(op_a.port_allow, vec![443]);
         assert_eq!(op_b.host_allow, vec!["api-b.example"]);
         assert_eq!(op_b.port_allow, vec![8443]);
+    }
+
+    fn append_test_manifest_operations(mut raw: String, operations: &str) -> String {
+        raw.push('\n');
+        raw.push_str(operations);
+        let mut manifest = ConnectorManifest::parse_str_unchecked(&raw).expect("operation fixture");
+        for operation in manifest.provides.operations.values() {
+            if !manifest.capabilities.required.contains(&operation.capability)
+                && !manifest.capabilities.optional.contains(&operation.capability)
+            {
+                manifest
+                    .capabilities
+                    .optional
+                    .push(operation.capability.clone());
+            }
+        }
+        manifest.manifest.interface_hash = manifest
+            .compute_interface_hash()
+            .expect("operation interface hash");
+        let raw = toml::to_string(&manifest).expect("serialize operation authority fixture");
+        ConnectorManifest::parse_str(&raw).expect("valid operation authority fixture");
+        raw
+    }
+
+    const MANIFEST_AUTHORITY_TEST_CONNECTOR: &str = "fcp.test.manifest-authority:utility:1.0.0";
+
+    fn manifest_authority_fixture(safety_tier: &str, approval_mode: &str) -> String {
+        append_test_manifest_operations(
+            state_policy_test_manifest_for(
+                MANIFEST_AUTHORITY_TEST_CONNECTOR,
+                Some("stateless"),
+                false,
+            ),
+            &format!(
+                r#"
+[provides.operations."test.echo"]
+description = "Manifest-authorized test operation"
+capability = "cap.test.echo"
+risk_level = "high"
+safety_tier = {safety_tier:?}
+requires_approval = {approval_mode:?}
+idempotency = "strict"
+input_schema = {{ type = "object" }}
+output_schema = {{ type = "object" }}
+"#
+            ),
+        )
+    }
+
+    async fn manifest_authority_dispatcher(
+        manifest_path: &StdPath,
+        catalogs: Vec<Introspection>,
+        signing_key: &fcp_crypto::ed25519::Ed25519SigningKey,
+    ) -> (Arc<AppState>, Arc<AtomicU64>, Arc<AtomicU64>) {
+        let lifecycle = Arc::new(HostAdminStateStore::new());
+        register_test_capability_issuer(
+            lifecycle.as_ref(),
+            signing_key,
+            MANIFEST_AUTHORITY_TEST_CONNECTOR,
+            "cap.test.echo",
+            "test.echo",
+            ZoneId::work().as_str(),
+        )
+        .await;
+        let invokes = Arc::new(AtomicU64::new(0));
+        let introspects = Arc::new(AtomicU64::new(0));
+        let observed_invokes = Arc::clone(&invokes);
+        let observed_introspects = Arc::clone(&introspects);
+        let mut catalogs = catalogs.into_iter();
+        let mut catalog = serde_json::to_value(catalogs.next().expect("initial catalog"))
+            .expect("serialize initial catalog");
+        let (runner_tx, mut runner_rx) = mpsc::channel::<ConnectorRpcRequest>(8);
+        let runner_task = task::spawn(async move {
+            while let Some(rpc) = runner_rx.recv().await {
+                assert!(rpc.rpc.try_begin());
+                let result = match rpc.method.as_str() {
+                    "introspect" => {
+                        observed_introspects.fetch_add(1, Ordering::SeqCst);
+                        let result = catalog.clone();
+                        if let Some(next) = catalogs.next() {
+                            catalog = serde_json::to_value(next).expect("next catalog");
+                        }
+                        result
+                    }
+                    "health" => dispatcher_health_result(),
+                    "invoke" => {
+                        observed_invokes.fetch_add(1, Ordering::SeqCst);
+                        let request: InvokeRequest =
+                            serde_json::from_value(rpc.params).expect("invoke request");
+                        serde_json::to_value(InvokeResponse::ok(
+                            request.id,
+                            json!({ "executed": true }),
+                        ))
+                        .expect("invoke response")
+                    }
+                    method => panic!("unexpected operation authority fixture method: {method}"),
+                };
+                assert!(rpc.rpc.try_settle_reply());
+                let _ = rpc.response_tx.send(Ok(json!({ "result": result })));
+            }
+        });
+        let mut config = dispatcher_test_config(MANIFEST_AUTHORITY_TEST_CONNECTOR);
+        config.manifest_path = Some(manifest_path.to_string_lossy().into_owned());
+        let registry = dispatcher_registry_with_connector(
+            MANIFEST_AUTHORITY_TEST_CONNECTOR,
+            dispatcher_test_connector(MANIFEST_AUTHORITY_TEST_CONNECTOR, runner_tx, runner_task),
+            config,
+        );
+        let state = dispatcher_app_state(
+            registry,
+            lifecycle,
+            Some(signing_key.verifying_key()),
+            HashMap::from([(ZoneId::work(), host_runtime_policy(ZoneId::work()))]),
+        );
+        (state, invokes, introspects)
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn manifest_authority_rejects_runtime_contract_changes_before_dispatch() {
+        type CatalogMutation = fn(&mut Introspection);
+        let cases: [(&str, &str, &str, CatalogMutation); 9] = [
+            ("capability", "safe", "none", |catalog| {
+                catalog.operations[0].capability =
+                    CapabilityId::from_static("cap.test.substituted");
+            }),
+            ("risk_level", "safe", "none", |catalog| {
+                catalog.operations[0].risk_level = RiskLevel::Low;
+            }),
+            ("safety_tier", "dangerous", "none", |_| {}),
+            ("requires_approval", "safe", "interactive", |catalog| {
+                catalog.operations[0].requires_approval = None;
+            }),
+            ("idempotency", "safe", "none", |catalog| {
+                catalog.operations[0].idempotency = IdempotencyClass::None;
+            }),
+            ("input_schema", "safe", "none", |catalog| {
+                catalog.operations[0].input_schema = json!({});
+            }),
+            ("output_schema", "safe", "none", |catalog| {
+                catalog.operations[0].output_schema = json!({});
+            }),
+            ("does not declare", "safe", "none", |catalog| {
+                catalog.operations[0].id = OperationId::from_static("test.undeclared");
+            }),
+            ("ambiguous", "safe", "none", |catalog| {
+                catalog.operations.push(catalog.operations[0].clone());
+            }),
+        ];
+        for (reason, safety_tier, approval_mode, mutate) in cases {
+            let directory = tempfile::tempdir().expect("manifest authority directory");
+            let path = directory.path().join("manifest.toml");
+            std::fs::write(&path, manifest_authority_fixture(safety_tier, approval_mode))
+                .expect("write admitted manifest");
+            let signing_key = fcp_crypto::ed25519::Ed25519SigningKey::generate();
+            let mut catalog =
+                dispatcher_introspection("test.echo", "cap.test.echo", SafetyTier::Safe);
+            mutate(&mut catalog);
+            let mut request = warm_pool_test_invoke_request(
+                MANIFEST_AUTHORITY_TEST_CONNECTOR,
+                &signing_key,
+                "manifest-authority-private-input",
+            );
+            // Even a valid token for the runtime's substituted capability must
+            // not replace the capability admitted by the manifest.
+            let operation = &catalog.operations[0];
+            request.operation = operation.id.clone();
+            request.capability_token = test_capability_token(
+                &signing_key,
+                operation.capability.as_str(),
+                operation.id.as_str(),
+                ZoneId::work().as_str(),
+            );
+            let request_id = request.id.to_string();
+            let (state, invokes, _) =
+                manifest_authority_dispatcher(&path, vec![catalog], &signing_key).await;
+            let (status, message) =
+                invoke_handler(State(Arc::clone(&state)), HeaderMap::new(), Json(request))
+                    .await
+                    .expect_err("runtime contract drift must not dispatch");
+            assert_eq!(status, StatusCode::FORBIDDEN, "{reason}: {message}");
+            assert!(message.contains(reason), "{reason}: {message}");
+            assert!(!message.contains("manifest-authority-private-input"));
+            assert_eq!(invokes.load(Ordering::SeqCst), 0, "{reason}");
+            assert!(
+                state
+                    .lifecycle
+                    .invocation_record(&request_id, None)
+                    .await
+                    .is_none(),
+                "{reason}: a rejected contract must not create a durable execution admission"
+            );
+        }
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn manifest_authority_accepts_matching_explicit_and_implicit_no_approval() {
+        for approval_mode in [None, Some(ApprovalMode::None)] {
+            let directory = tempfile::tempdir().expect("manifest authority directory");
+            let path = directory.path().join("manifest.toml");
+            std::fs::write(&path, manifest_authority_fixture("safe", "none"))
+                .expect("write admitted manifest");
+            let signing_key = fcp_crypto::ed25519::Ed25519SigningKey::generate();
+            let mut catalog =
+                dispatcher_introspection("test.echo", "cap.test.echo", SafetyTier::Safe);
+            catalog.operations[0].requires_approval = approval_mode;
+            let (state, invokes, introspects) =
+                manifest_authority_dispatcher(&path, vec![catalog], &signing_key).await;
+            let request = warm_pool_test_invoke_request(
+                MANIFEST_AUTHORITY_TEST_CONNECTOR,
+                &signing_key,
+                "matching manifest",
+            );
+            let Json(response) =
+                invoke_handler(State(Arc::clone(&state)), HeaderMap::new(), Json(request))
+                    .await
+                    .expect("matching operation must execute");
+            assert_eq!(response.status, InvokeStatus::Ok);
+            assert_eq!(invokes.load(Ordering::SeqCst), 1);
+            assert_eq!(introspects.load(Ordering::SeqCst), 2);
+        }
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn manifest_authority_rechecks_catalog_after_durable_admission() {
+        let directory = tempfile::tempdir().expect("manifest authority directory");
+        let path = directory.path().join("manifest.toml");
+        std::fs::write(&path, manifest_authority_fixture("safe", "none"))
+            .expect("write admitted manifest");
+        let signing_key = fcp_crypto::ed25519::Ed25519SigningKey::generate();
+        let initial = dispatcher_introspection("test.echo", "cap.test.echo", SafetyTier::Safe);
+        let mut changed = initial.clone();
+        changed.operations[0].risk_level = RiskLevel::Low;
+        let (state, invokes, introspects) =
+            manifest_authority_dispatcher(&path, vec![initial, changed], &signing_key).await;
+        let request = warm_pool_test_invoke_request(
+            MANIFEST_AUTHORITY_TEST_CONNECTOR,
+            &signing_key,
+            "catalog changes after preflight",
+        );
+        let request_id = request.id.to_string();
+        let (status, message) =
+            invoke_handler(State(Arc::clone(&state)), HeaderMap::new(), Json(request))
+                .await
+                .expect_err("a preflight allow cannot excuse later runtime contract drift");
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(
+            message.contains("runtime risk_level does not match the admitted manifest"),
+            "{message}"
+        );
+        assert_eq!(introspects.load(Ordering::SeqCst), 2);
+        assert_eq!(invokes.load(Ordering::SeqCst), 0);
+        let record = state
+            .lifecycle
+            .invocation_record(&request_id, None)
+            .await
+            .expect("the original durable admission remains inspectable");
+        assert_eq!(
+            record.terminal.expect("undispatched terminal").outcome,
+            fcp_host::InvocationOutcome::HostError
+        );
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn manifest_authority_ignores_unadmitted_file_replacements() {
+        let directory = tempfile::tempdir().expect("manifest authority directory");
+        let path = directory.path().join("manifest.toml");
+        std::fs::write(&path, manifest_authority_fixture("dangerous", "none"))
+            .expect("write admitted manifest");
+        let signing_key = fcp_crypto::ed25519::Ed25519SigningKey::generate();
+        let catalog = dispatcher_introspection("test.echo", "cap.test.echo", SafetyTier::Safe);
+        let (state, invokes, _) =
+            manifest_authority_dispatcher(&path, vec![catalog], &signing_key).await;
+        // The replacement is itself valid and agrees with the lying runtime,
+        // but it has never been admitted as a new inventory generation.
+        std::fs::write(&path, manifest_authority_fixture("safe", "none"))
+            .expect("replace on-disk manifest");
+        let request = warm_pool_test_invoke_request(
+            MANIFEST_AUTHORITY_TEST_CONNECTOR,
+            &signing_key,
+            "retain admitted authority",
+        );
+        let (status, message) = invoke_handler(State(state), HeaderMap::new(), Json(request))
+            .await
+            .expect_err("on-disk replacement must not weaken the admitted manifest");
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(
+            message.contains("runtime safety_tier does not match the admitted manifest"),
+            "{message}"
+        );
+        assert_eq!(invokes.load(Ordering::SeqCst), 0);
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn manifest_authority_rejects_schema_drift_before_mesh_placement() {
+        use fcp_host::mesh_routing::{MeshRouter, MeshRoutingSettings};
+
+        let directory = tempfile::tempdir().expect("manifest authority directory");
+        let path = directory.path().join("manifest.toml");
+        std::fs::write(&path, manifest_authority_fixture("safe", "none"))
+            .expect("write admitted manifest");
+        let signing_key = fcp_crypto::ed25519::Ed25519SigningKey::generate();
+        let mut catalog = dispatcher_introspection("test.echo", "cap.test.echo", SafetyTier::Safe);
+        catalog.operations[0].input_schema["x-fcp-state-model"] = json!("singleton_writer");
+        let (state, invokes, _) =
+            manifest_authority_dispatcher(&path, vec![catalog], &signing_key).await;
+        let router = MeshRouter::new(MeshRoutingSettings {
+            node_id: TailscaleNodeId::new("manifest-authority-node"),
+            signing_key: fcp_crypto::ed25519::Ed25519SigningKey::generate(),
+            peers_json: "[]".to_owned(),
+            forward_timeout: Duration::from_secs(5),
+        })
+        .expect("local routing fixture");
+        let error = mesh_route_decision(
+            &state,
+            &router,
+            &ConnectorId::from_static(MANIFEST_AUTHORITY_TEST_CONNECTOR),
+            Some(&ZoneId::work()),
+            Some("test.echo"),
+        )
+        .await
+        .expect_err("runtime-only schema hints cannot alter manifest-backed mesh placement");
+        assert!(
+            error.to_string().contains("runtime input_schema does not match the admitted manifest"),
+            "{error}"
+        );
+        assert_eq!(invokes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn manifest_authority_distinguishes_absent_and_empty_manifests() {
+        let request = operation_network_request("op.a");
+        let absent =
+            operation_network_snapshot(false, ManifestOperationConstraintCatalog::default());
+        enforce_connector_allow_lists(&absent, &request)
+            .expect("manifest-less inventory keeps its capability and policy admission path");
+
+        let mut manifest = two_operation_network_manifest();
+        manifest.provides.operations.clear();
+        let catalog = ManifestOperationConstraintCatalog::from_manifest(&manifest, "empty-manifest")
+            .expect("empty operation catalog");
+        let empty = operation_network_snapshot(false, catalog);
+        let error = enforce_connector_allow_lists(&empty, &request)
+            .expect_err("an admitted empty manifest must not authorize runtime-only operations");
+        assert!(error.to_string().contains("does not declare operation"), "{error}");
     }
 
     #[test]
@@ -26008,6 +26469,25 @@ deny_ptrace = true
             Some("singleton_writer"),
             false,
         );
+        let raw = std::fs::read_to_string(&manifest_path).expect("singleton fixture manifest");
+        std::fs::write(
+            &manifest_path,
+            append_test_manifest_operations(
+                raw,
+                r#"
+[provides.operations."test.singleton"]
+description = "Manifest-authorized singleton test operation"
+capability = "cap.test.singleton"
+risk_level = "high"
+safety_tier = "safe"
+requires_approval = "none"
+idempotency = "strict"
+input_schema = { type = "object", required = ["lease_seq"], properties = { lease_seq = { type = "integer" }, message = { type = "string" } } }
+output_schema = { type = "object" }
+"#,
+            ),
+        )
+        .expect("write singleton operation authority");
         let operation_id = "test.singleton";
         let capability_id = "cap.test.singleton";
         let signing_key = fcp_crypto::ed25519::Ed25519SigningKey::generate();
