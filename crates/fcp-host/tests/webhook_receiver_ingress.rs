@@ -741,3 +741,52 @@ async fn real_loopback_http_preserves_signature_bytes_and_ignores_forwarded_auth
         hex::encode(&Sha256::digest(b"127.0.0.1")[..16])
     );
 }
+
+#[fcp_async_core::runtime::test]
+async fn real_loopback_http_completes_signed_slack_url_verification() {
+    let mut receiver = SignedReceiver::new().await;
+    receiver
+        .create_endpoint("/slack", "slack", &["127.0.0.1/32"])
+        .await;
+    let state = LoopbackState {
+        config: receiver.ingress(),
+        receiver: Arc::new(Mutex::new(Some(receiver))),
+    };
+    let body = "{\n \"type\":\"url_verification\",\"challenge\":\"challenge-A\",\"token\":\"private-legacy-token\"\n}\n";
+    let timestamp = Utc::now().timestamp();
+    let signature = sha256_signature(&format!("v0:{timestamp}:{body}"));
+    let request_for = |raw: &str| {
+        format!(
+            "POST /webhooks/slack HTTP/1.1\r\nHost: hooks.flywheel.test\r\nContent-Type: application/json\r\nX-Slack-Signature: v0={signature}\r\nX-Slack-Request-Timestamp: {timestamp}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{raw}",
+            raw.len(),
+        )
+    };
+    for _ in 0..2 {
+        let response = loopback_exchange(state.clone(), request_for(body)).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let (headers, response_body) = response.split_once("\r\n\r\n").expect("HTTP body");
+        assert!(
+            headers
+                .to_ascii_lowercase()
+                .contains("content-type: application/json")
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(response_body).expect("JSON verification response"),
+            json!({"challenge": "challenge-A"})
+        );
+        assert!(!response.contains("private-legacy-token"));
+    }
+
+    let tampered = body.replace("challenge-A", "challenge-B");
+    let rejected = loopback_exchange(state.clone(), request_for(&tampered)).await;
+    assert!(rejected.starts_with("HTTP/1.1 401"), "{rejected}");
+    assert!(!rejected.contains("challenge-B"));
+    assert!(!rejected.contains("private-legacy-token"));
+    let mut receiver = state
+        .receiver
+        .lock()
+        .await
+        .take()
+        .expect("receiver restored after completed exchanges");
+    assert!(receiver.events().await.is_empty());
+}

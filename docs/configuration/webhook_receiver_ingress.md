@@ -4,7 +4,8 @@
 forward them to the `webhook.events.ingest` operation of the webhook receiver.
 The host supplies the FCP authority and applies its normal invocation checks.
 The receiver independently verifies the provider signature before retaining
-the event in its bounded in-memory store.
+an ordinary event in its bounded in-memory store or answering a Slack
+URL-verification challenge.
 
 This is an opt-in host adapter, tracked by `flywheel_connectors-whing1`.
 The connector still opens no socket. It does not persist endpoints, secrets,
@@ -285,11 +286,12 @@ Every HTTP attempt receives fresh host-generated invocation, idempotency,
 and delivery identities. Provider delivery-ID headers cannot occupy the
 host's idempotency cache or select the receiver's public-ID replay identity.
 After signature verification, the receiver's separate authenticated-content
-digest rejects previously accepted payloads even when the HTTP attempt has
-a new host identity.
+digest rejects previously accepted ordinary event payloads even when the HTTP
+attempt has a new host identity. Slack URL verification has the control-exchange
+behavior described below.
 
-Public replies contain only `accepted`, `status_code`, and `reason_code`.
-An accepted delivery returns:
+Ordinary event replies contain only `accepted`, `status_code`, and `reason_code`.
+An accepted event delivery returns:
 
 ```json
 {
@@ -301,6 +303,7 @@ An accepted delivery returns:
 
 | HTTP status | Meaning |
 | --- | --- |
+| `200` | Authenticated Slack URL verification completed; the response contains only `challenge`. |
 | `202` | The receiver verified and retained this delivery in its current in-memory store. |
 | `400`, `414`, `431` | Malformed or ambiguous request, excessive request target, or excessive headers. |
 | `401` | Provider signature validation failed. |
@@ -319,11 +322,38 @@ the provider handles that status and use authenticated recent-event reads
 for investigation. A `202` does not imply durable queueing, external consumer
 processing, or persistence across restart.
 
-This first adapter returns a minimal acknowledgment, not provider-specific
-response content. Slack URL-verification challenges and Twilio flows that
-require TwiML responses are not implemented. Signature support alone does
-not establish that every subscription or interactive callback workflow is
-ready for live use.
+### Slack Events API URL verification
+
+Configure the receiver endpoint with provider `slack` and its actual signing
+secret. A Slack `url_verification` request passes the same FCP capability,
+resource, zone, instance, deployment, source, body, and rate checks as ordinary
+intake. The receiver verifies the fresh `v0` signature over the original raw
+body before interpreting its challenge; the deprecated payload token is never
+an authentication fallback.
+
+A successful verification returns HTTP `200` with JSON containing exactly:
+
+```json
+{"challenge": "the-authenticated-challenge"}
+```
+
+The challenge must be a nonempty string of at most `4096` UTF-8 bytes and
+contain no control characters. Its exact value, including ordinary whitespace,
+is preserved. The host returns only this bounded field from a successful,
+request-bound canonical receiver response. Other payload fields, tokens,
+event metadata, capability data, and receiver diagnostics are not reflected.
+
+URL verification is a control exchange. It creates no retained business event
+and reserves no event replay identity, so fresh signed registration retries
+can succeed. Ordinary Slack event deliveries keep their existing `202`
+acknowledgment and `409` replay rejection. Provider headers alone cannot select
+this reply: a generic or GitHub endpoint receives no Slack verification behavior
+from a challenge-shaped payload.
+
+See Slack's [URL-verification contract](https://docs.slack.dev/reference/events/url_verification/).
+Twilio flows that require TwiML and arbitrary provider-specific response
+formats remain unsupported. This exchange does not provide automatic
+subscription provisioning or every interactive callback workflow.
 
 ## Readiness and verification
 
@@ -362,5 +392,5 @@ receiver.
 These commands describe added verification coverage, not recorded passing
 results. Record their actual outputs and any dependency or environment
 blockers separately. Live callback proof, durable receiver state, provider
-subscription provisioning, and provider-specific response handling remain
-separate work.
+subscription provisioning, and response formats beyond the Slack verification
+exchange remain separate work.

@@ -39,6 +39,10 @@ struct LiveReceiver {
 
 impl LiveReceiver {
     async fn new() -> Self {
+        Self::with_provider("github").await
+    }
+
+    async fn with_provider(provider: &str) -> Self {
         let signing_key = Ed25519SigningKey::generate();
         let approval_key = Ed25519SigningKey::generate();
         let mut receiver = WebhookReceiverConnector::new();
@@ -73,7 +77,14 @@ impl LiveReceiver {
             .expect("receiver establishes its actual bound instance");
         let instance: InstanceId =
             serde_json::from_value(handshake["instance_id"].clone()).expect("receiver instance id");
-        provision_endpoint(&mut receiver, &signing_key, &approval_key, &instance).await;
+        provision_endpoint(
+            &mut receiver,
+            &signing_key,
+            &approval_key,
+            &instance,
+            provider,
+        )
+        .await;
 
         let invocations = Arc::new(AtomicUsize::new(0));
         let observed_invocations = Arc::clone(&invocations);
@@ -259,6 +270,35 @@ impl LiveReceiver {
             .expect("translate provider delivery")
     }
 
+    fn slack_request(&self, body: &str, signed_body: &str) -> InvokeRequest {
+        let timestamp = Utc::now().timestamp().to_string();
+        let mut hmac = Hmac::<Sha256>::new_from_slice(PROVIDER_SECRET.as_bytes()).unwrap();
+        hmac.update(format!("v0:{timestamp}:{signed_body}").as_bytes());
+        let signature = format!("v0={}", hex::encode(hmac.finalize().into_bytes()));
+        let headers = HeaderMap::from_iter([
+            (
+                axum::http::header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            ),
+            (
+                axum::http::HeaderName::from_static("x-slack-signature"),
+                HeaderValue::from_str(&signature).unwrap(),
+            ),
+            (
+                axum::http::HeaderName::from_static("x-slack-request-timestamp"),
+                HeaderValue::from_str(&timestamp).unwrap(),
+            ),
+        ]);
+        self.binding
+            .build_request(
+                &headers,
+                &"/webhooks/host-admission".parse().unwrap(),
+                body,
+                Some("192.0.2.57".parse().unwrap()),
+            )
+            .expect("translate signed Slack verification")
+    }
+
     async fn dispatch(
         &self,
         request: InvokeRequest,
@@ -278,10 +318,11 @@ async fn provision_endpoint(
     signing_key: &Ed25519SigningKey,
     approval_key: &Ed25519SigningKey,
     instance: &InstanceId,
+    provider: &str,
 ) {
     let input = json!({
         "path": ENDPOINT_PATH,
-        "provider": "github",
+        "provider": provider,
         "signing_secret": PROVIDER_SECRET,
     });
     let id = RequestId::random();
@@ -435,6 +476,38 @@ async fn webhook_ingress_admission_accepts_fixed_command_with_live_signed_eviden
         public,
         json!({"accepted": true, "status_code": 202, "reason_code": "accepted"})
     );
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn webhook_ingress_admission_round_trips_authenticated_slack_verification() {
+    let mut fixture = LiveReceiver::with_provider("slack").await;
+    let body = r#"{"type":"url_verification","challenge":"slack-registration-challenge","token":"private-legacy-token"}"#;
+    fixture
+        .dispatch(fixture.slack_request(body, body))
+        .await
+        .expect_err("a provider challenge cannot bypass live deployment admission");
+    assert_eq!(fixture.invocations.load(Ordering::SeqCst), 0);
+    let _evidence_directory = fixture.enable_live_evidence();
+
+    for _ in 0..2 {
+        let response = fixture
+            .dispatch(fixture.slack_request(body, body))
+            .await
+            .expect("live host admits authenticated verification and retries");
+        let (status, public) = response_for(&response);
+        assert_eq!(status, StatusCode::OK, "{response:?}");
+        assert_eq!(public, json!({"challenge": "slack-registration-challenge"}));
+        assert!(!public.to_string().contains("private-legacy-token"));
+    }
+    let tampered = body.replace("slack-registration-challenge", "attacker-challenge");
+    let response = fixture
+        .dispatch(fixture.slack_request(&tampered, body))
+        .await
+        .expect("host forwards authorized command for independent provider verification");
+    let (status, public) = response_for(&response);
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(public["reason_code"], "signature_invalid");
+    assert!(public.get("challenge").is_none());
 }
 
 #[fcp_async_core::runtime::test(flavor = "multi_thread")]

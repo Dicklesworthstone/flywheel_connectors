@@ -45,6 +45,9 @@ pub const MAX_WEBHOOK_INGRESS_TARGET_BYTES: usize = 8192;
 const WEBHOOK_PREFIX: &str = "/webhooks";
 const RECEIVER_ID: &str = "fcp.webhook-receiver";
 const MAX_PUBLIC_BASE_URL_BYTES: usize = 2048;
+// A verification challenge is a bounded control reply, never an arbitrary
+// receiver-selected HTTP response or a reflection of the unverified request.
+const MAX_SLACK_CHALLENGE_BYTES: usize = 4096;
 
 /// Immutable, validated operator authority and resource limits for intake.
 ///
@@ -423,21 +426,19 @@ impl WebhookIngressError {
 /// A duplicate remains 409: a conflict is not proof of fresh delivery success.
 /// FCP authority/lifecycle failures describe unusable host provisioning and are
 /// 503; malformed outcomes and unrelated external failures are 502.
+/// A successfully authenticated Slack URL-verification result may return only
+/// its bounded challenge as HTTP 200 JSON. No other provider data is reflected.
 #[must_use]
 pub fn response_for(response: &InvokeResponse) -> (StatusCode, Value) {
     if response.r#type != "response" {
         return WebhookIngressError::InvalidResponse.response();
     }
     match response.status {
-        InvokeStatus::Ok
-            if response.error.is_none()
-                && response.result.as_ref().is_some_and(|result| {
-                    result.get("accepted").and_then(Value::as_bool) == Some(true)
-                        && result.get("status_code").and_then(Value::as_u64) == Some(202)
-                }) =>
-        {
-            public_response(StatusCode::ACCEPTED, true, "accepted")
-        }
+        InvokeStatus::Ok if response.error.is_none() => response
+            .result
+            .as_ref()
+            .and_then(admitted_response)
+            .unwrap_or_else(|| WebhookIngressError::InvalidResponse.response()),
         InvokeStatus::Error if response.result.is_none() => {
             let Some(error) = &response.error else {
                 return WebhookIngressError::InvalidResponse.response();
@@ -475,6 +476,35 @@ pub fn response_for(response: &InvokeResponse) -> (StatusCode, Value) {
             public_response(status, false, reason)
         }
         _ => WebhookIngressError::InvalidResponse.response(),
+    }
+}
+
+fn admitted_response(result: &Value) -> Option<(StatusCode, Value)> {
+    if result.get("accepted").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    match result.get("status_code").and_then(Value::as_u64)? {
+        202 if result.get("verification").is_none() => {
+            Some(public_response(StatusCode::ACCEPTED, true, "accepted"))
+        }
+        200 => {
+            let verification = result.get("verification")?.as_object()?;
+            if verification.len() != 3
+                || verification.get("provider")?.as_str()? != "slack"
+                || verification.get("kind")?.as_str()? != "url_verification"
+            {
+                return None;
+            }
+            let challenge = verification.get("challenge")?.as_str()?;
+            if challenge.is_empty()
+                || challenge.len() > MAX_SLACK_CHALLENGE_BYTES
+                || challenge.chars().any(char::is_control)
+            {
+                return None;
+            }
+            Some((StatusCode::OK, json!({ "challenge": challenge })))
+        }
+        _ => None,
     }
 }
 
@@ -1372,6 +1402,92 @@ mod tests {
             body,
             json!({"accepted":true,"status_code":202,"reason_code":"accepted"})
         );
+    }
+
+    fn slack_verification_result(challenge: Value) -> Value {
+        json!({
+            "accepted": true,
+            "status_code": 200,
+            "verification": {
+                "provider": "slack",
+                "kind": "url_verification",
+                "challenge": challenge,
+            },
+        })
+    }
+
+    #[test]
+    fn slack_verification_returns_only_authenticated_bounded_challenge() {
+        for challenge in ["a".to_owned(), "x".repeat(MAX_SLACK_CHALLENGE_BYTES)] {
+            let mut result = slack_verification_result(json!(challenge));
+            result["token"] = json!("private-legacy-token");
+            result["ingest_log"] = json!({"secret": "private-signature-evidence"});
+            result["event"] = json!({"payload": "private-event"});
+            let (status, body) = response_for(&InvokeResponse::ok(RequestId::random(), result));
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body, json!({"challenge": challenge}));
+            assert!(!body.to_string().contains("private-"));
+        }
+    }
+
+    #[test]
+    fn malformed_verification_cannot_select_a_public_response() {
+        for challenge in [
+            Value::Null,
+            json!(true),
+            json!(42),
+            json!({"challenge": "nested"}),
+            json!(""),
+            json!("x".repeat(MAX_SLACK_CHALLENGE_BYTES + 1)),
+            json!("é".repeat(MAX_SLACK_CHALLENGE_BYTES / 2 + 1)),
+            json!("challenge\nresponse"),
+            json!("challenge\u{0085}response"),
+        ] {
+            let response =
+                InvokeResponse::ok(RequestId::random(), slack_verification_result(challenge));
+            let (status, body) = response_for(&response);
+            assert_eq!(status, StatusCode::BAD_GATEWAY);
+            assert_eq!(body["reason_code"], "invalid_receiver_response");
+            assert!(body.get("challenge").is_none());
+        }
+        for (pointer, replacement) in [
+            ("/accepted", json!(false)),
+            ("/status_code", json!(202)),
+            ("/verification", Value::Null),
+            ("/verification/provider", json!("github")),
+            ("/verification/kind", json!("redirect")),
+            ("/verification/challenge", json!(["challenge"])),
+        ] {
+            let mut result = slack_verification_result(json!("private-challenge"));
+            *result.pointer_mut(pointer).expect("fixture field") = replacement;
+            let (status, body) = response_for(&InvokeResponse::ok(RequestId::random(), result));
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "{pointer}");
+            assert!(!body.to_string().contains("private-challenge"));
+        }
+        let mut result = slack_verification_result(json!("challenge"));
+        result["verification"]["headers"] = json!({"location": "https://attacker.test"});
+        assert_eq!(
+            response_for(&InvokeResponse::ok(RequestId::random(), result)).0,
+            StatusCode::BAD_GATEWAY,
+        );
+    }
+
+    #[test]
+    fn verification_requires_a_successful_canonical_invocation() {
+        let mut response = InvokeResponse::ok(
+            RequestId::random(),
+            slack_verification_result(json!("private-challenge")),
+        );
+        response.error = Some(FcpError::InvalidSignature);
+        let (status, body) = response_for(&response);
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(body.get("challenge").is_none());
+        response.error = None;
+        response.status = InvokeStatus::Error;
+        assert_eq!(response_for(&response).0, StatusCode::BAD_GATEWAY);
+        response.status = InvokeStatus::Ok;
+        response.r#type = "event".to_owned();
+        assert_eq!(response_for(&response).0, StatusCode::BAD_GATEWAY);
     }
 
     #[test]

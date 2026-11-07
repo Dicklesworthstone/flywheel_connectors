@@ -237,6 +237,17 @@ fn hmac_sha1_base64(secret: &str, data: &str) -> String {
     STANDARD.encode(mac.finalize().into_bytes())
 }
 
+fn slack_signature_headers(secret: &str, body: &str, timestamp: i64) -> serde_json::Value {
+    json!({
+        "Content-Type": "application/json",
+        "X-Slack-Request-Timestamp": timestamp.to_string(),
+        "X-Slack-Signature": format!(
+            "v0={}",
+            hmac_sha256_hex(secret, &format!("v0:{timestamp}:{body}"))
+        )
+    })
+}
+
 fn unix_seconds() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1399,6 +1410,381 @@ async fn events_ingest_accepts_slack_signature() {
 
     assert_eq!(accepted["event"]["provider"], "slack");
     assert_eq!(accepted["ingest_log"]["signature"]["timestamp"], timestamp);
+}
+
+#[fcp_async_core::runtime::test]
+async fn slack_url_verification_retries_do_not_store_events_or_consume_replay_ids() {
+    let mut c = setup_connector().await;
+    let endpoint = create_endpoint(&mut c, "/hooks/slack", "slack", "slack_secret").await;
+    let timestamp = unix_seconds();
+    let prior_body = r#"{"event_id":"EvPrior","type":"event_callback"}"#;
+    ingest(
+        &mut c,
+        "/hooks/slack",
+        slack_signature_headers("slack_secret", prior_body, timestamp),
+        prior_body,
+        "prior-delivery",
+    )
+    .await
+    .unwrap();
+    let recent_request = json!({
+        "operation_id": "webhook.events.recent",
+        "input": { "endpoint_id": endpoint["endpoint_id"] }
+    });
+    let before = c.handle_invoke(recent_request.clone()).await.unwrap();
+    let body = r#"{ "token": "deprecated-private-token", "challenge": " exact/challenge+value= ", "type": "url_verification" }"#;
+
+    // The same signed request can be retried, including with a newly signed
+    // timestamp. Neither public nor authenticated event identities are spent.
+    for attempt_timestamp in [timestamp, timestamp, timestamp - 1] {
+        let result = ingest(
+            &mut c,
+            "/hooks/slack",
+            slack_signature_headers("slack_secret", body, attempt_timestamp),
+            body,
+            "control-delivery",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result,
+            json!({
+                "accepted": true,
+                "status_code": 200,
+                "verification": {
+                    "provider": "slack",
+                    "kind": "url_verification",
+                    "challenge": " exact/challenge+value= "
+                }
+            })
+        );
+    }
+    assert_eq!(
+        c.handle_invoke(recent_request.clone()).await.unwrap(),
+        before
+    );
+    let listed = c
+        .handle_invoke(json!({"operation_id": "webhook.endpoints.list"}))
+        .await
+        .unwrap();
+    assert_eq!(listed["endpoints"][0]["event_count"], 1);
+
+    // A normal event can still use the control request's delivery ID, and its
+    // authenticated body remains protected from retries under unsigned aliases.
+    let body =
+        r#"{"event_id":"EvAfter","type":"event_callback","challenge":"not-a-control-exchange"}"#;
+    let accepted = ingest(
+        &mut c,
+        "/hooks/slack",
+        slack_signature_headers("slack_secret", body, timestamp),
+        body,
+        "control-delivery",
+    )
+    .await
+    .unwrap();
+    assert_eq!(accepted["status_code"], 202);
+    assert_eq!(accepted["event"]["event_id"], "control-delivery");
+    assert!(accepted.get("verification").is_none());
+    assert_external_status(
+        ingest(
+            &mut c,
+            "/hooks/slack",
+            slack_signature_headers("slack_secret", body, timestamp - 1),
+            body,
+            "different-unsigned-alias",
+        )
+        .await,
+        409,
+    );
+    let recent = c.handle_invoke(recent_request).await.unwrap();
+    assert_eq!(recent["events"].as_array().unwrap().len(), 2);
+    assert!(recent["events"].as_array().unwrap().iter().all(|event| {
+        event["payload"]["type"] == "event_callback" && event["payload"].get("token").is_none()
+    }));
+}
+
+#[fcp_async_core::runtime::test]
+async fn slack_url_verification_requires_fresh_signature_over_exact_body() {
+    let mut c = setup_connector().await;
+    create_endpoint(&mut c, "/hooks/slack", "slack", "slack_secret").await;
+    let timestamp = unix_seconds();
+    let body =
+        r#"{ "type": "url_verification", "challenge": "original", "token": "slack_secret" }"#;
+    let headers = slack_signature_headers("slack_secret", body, timestamp);
+    let reserialized = serde_json::from_str::<serde_json::Value>(body)
+        .unwrap()
+        .to_string();
+    assert_ne!(reserialized, body);
+    let attempts = [
+        (json!({"Content-Type": "application/json"}), body.to_owned()),
+        (headers.clone(), body.replace("original", "tampered")),
+        (headers.clone(), reserialized),
+        (
+            slack_signature_headers("wrong-secret", body, timestamp),
+            body.to_owned(),
+        ),
+        (
+            slack_signature_headers("slack_secret", body, timestamp - 3600),
+            body.to_owned(),
+        ),
+        (
+            slack_signature_headers("slack_secret", body, timestamp + 3600),
+            body.to_owned(),
+        ),
+        // Malformed challenges are checked only after provider authentication.
+        (
+            headers.clone(),
+            r#"{"type":"url_verification","challenge":null}"#.to_owned(),
+        ),
+    ];
+    for (headers, attempted_body) in attempts {
+        assert_external_status(
+            ingest(&mut c, "/hooks/slack", headers, &attempted_body, "control").await,
+            401,
+        );
+    }
+    assert_eq!(
+        ingest(&mut c, "/hooks/slack", headers, body, "control")
+            .await
+            .unwrap()["verification"]["challenge"],
+        "original"
+    );
+    assert_eq!(
+        c.handle_invoke(json!({"operation_id": "webhook.events.recent"}))
+            .await
+            .unwrap()["events"],
+        json!([])
+    );
+}
+
+#[fcp_async_core::runtime::test]
+async fn slack_url_verification_validates_challenge_utf8_bytes_and_controls() {
+    let mut c = setup_connector().await;
+    create_endpoint(&mut c, "/hooks/slack", "slack", "slack_secret").await;
+    let timestamp = unix_seconds();
+    let invalid_challenges = [
+        None,
+        Some(json!(null)),
+        Some(json!(42)),
+        Some(json!(true)),
+        Some(json!(["challenge"])),
+        Some(json!({"challenge": "nested"})),
+        Some(json!("")),
+        Some(json!("line\nbreak")),
+        Some(json!("carriage\rreturn")),
+        Some(json!("null\u{0}byte")),
+        Some(json!("unicode\u{85}control")),
+        Some(json!("x".repeat(4097))),
+        Some(json!("é".repeat(2049))),
+    ];
+    for challenge in invalid_challenges {
+        let mut payload = json!({"type": "url_verification"});
+        if let Some(challenge) = challenge {
+            payload["challenge"] = challenge;
+        }
+        let body = payload.to_string();
+        assert_external_status(
+            ingest(
+                &mut c,
+                "/hooks/slack",
+                slack_signature_headers("slack_secret", &body, timestamp),
+                &body,
+                "control",
+            )
+            .await,
+            400,
+        );
+    }
+    for challenge in [" préservé/+ = ".to_owned(), "é".repeat(2048)] {
+        let body = json!({"type": "url_verification", "challenge": challenge}).to_string();
+        let accepted = ingest(
+            &mut c,
+            "/hooks/slack",
+            slack_signature_headers("slack_secret", &body, timestamp),
+            &body,
+            "control",
+        )
+        .await
+        .unwrap();
+        assert_eq!(accepted["verification"]["challenge"], challenge);
+    }
+    assert_eq!(
+        c.handle_invoke(json!({"operation_id": "webhook.events.recent"}))
+            .await
+            .unwrap()["events"],
+        json!([])
+    );
+}
+
+#[fcp_async_core::runtime::test]
+async fn slack_url_verification_requires_the_configured_slack_provider() {
+    let mut c = setup_connector().await;
+    // Even the Slack signature scheme does not turn a generic endpoint into
+    // Slack. The endpoint's approved provider selects the control semantics.
+    c.handle_invoke(json!({
+        "operation_id": "webhook.endpoints.create",
+        "input": {
+            "path": "/hooks/generic-slack-signature",
+            "provider": "generic",
+            "signing_secret": "shared-secret",
+            "signature_header": "X-Slack-Signature",
+            "signature_algorithm": "slack-signature-v0"
+        }
+    }))
+    .await
+    .unwrap();
+    create_endpoint(&mut c, "/hooks/generic", "generic", "shared-secret").await;
+    create_endpoint(&mut c, "/hooks/github", "github", "shared-secret").await;
+    let timestamp = unix_seconds();
+    let body = r#"{"type":"url_verification","challenge":"not-for-slack"}"#;
+    for path in [
+        "/hooks/generic-slack-signature",
+        "/hooks/generic",
+        "/hooks/github",
+    ] {
+        let mut headers = slack_signature_headers("shared-secret", body, timestamp);
+        headers["X-Signature"] = json!(hmac_sha256_hex("shared-secret", body));
+        headers["X-Hub-Signature-256"] =
+            json!(format!("sha256={}", hmac_sha256_hex("shared-secret", body)));
+        let accepted = ingest(&mut c, path, headers, body, "delivery")
+            .await
+            .unwrap();
+        assert_eq!(accepted["status_code"], 202);
+        assert!(accepted.get("verification").is_none());
+        assert!(accepted.get("event").is_some());
+    }
+    assert_eq!(
+        c.handle_invoke(json!({"operation_id": "webhook.events.recent"}))
+            .await
+            .unwrap()["events"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+}
+
+#[fcp_async_core::runtime::test]
+async fn slack_url_verification_preserves_source_and_rate_admission() {
+    let mut c = setup_connector_with_config(json!({
+        "public_base_url": "https://hooks.flywheel.test",
+        "rate_limit_max": 1,
+        "rate_limit_window_ms": 60_000
+    }))
+    .await;
+    c.handle_invoke(json!({
+        "operation_id": "webhook.endpoints.create",
+        "input": {
+            "path": "/hooks/slack",
+            "provider": "slack",
+            "signing_secret": "slack_secret",
+            "allowed_sources": ["203.0.113.0/24"]
+        }
+    }))
+    .await
+    .unwrap();
+    let body = r#"{"type":"url_verification","challenge":"bounded"}"#;
+    let mut params = json!({
+        "operation_id": "webhook.events.ingest",
+        "input": {
+            "path": "/hooks/slack",
+            "headers": slack_signature_headers("slack_secret", body, unix_seconds()),
+            "body": body,
+            "source_ip": "198.51.100.10",
+            "client_id": "control-client"
+        }
+    });
+    assert_external_status(c.handle_invoke(params.clone()).await, 403);
+    params["input"]["source_ip"] = json!("203.0.113.10");
+    assert_eq!(
+        c.handle_invoke(params.clone()).await.unwrap()["status_code"],
+        200
+    );
+    assert_external_status(c.handle_invoke(params).await, 429);
+    assert_eq!(
+        c.handle_invoke(json!({"operation_id": "webhook.events.recent"}))
+            .await
+            .unwrap()["events"],
+        json!([])
+    );
+}
+
+#[fcp_async_core::runtime::test]
+async fn slack_url_verification_preserves_fcp_authority_resource_and_usage_limits() {
+    let mut c = setup_connector().await;
+    let endpoint = create_endpoint(&mut c, "/hooks/slack", "slack", "slack_secret").await;
+    let body = r#"{"type":"url_verification","challenge":"authorized"}"#;
+    let params = json!({
+        "operation_id": "webhook.events.ingest",
+        "input": {
+            "path": "/hooks/slack",
+            "headers": slack_signature_headers("slack_secret", body, unix_seconds()),
+            "body": body
+        }
+    });
+    assert!(c.inner.handle_invoke(params.clone()).await.is_err());
+    let request = c.request(params.clone()).unwrap();
+    let mut unsigned = request.clone();
+    unsigned.capability_token = CapabilityToken::from_raw(vec![]);
+    assert!(c.inner.handle_invoke(json!(unsigned)).await.is_err());
+    let mut wrong_zone = request.clone();
+    wrong_zone.zone_id = ZoneId::public();
+    assert!(c.inner.handle_invoke(json!(wrong_zone)).await.is_err());
+
+    let now = Utc::now();
+    let issue_token = |constraints: &CapabilityConstraints, token_id: &[u8]| {
+        CapabilityToken::from_raw(
+            CapabilityTokenBuilder::new()
+                .capability_id("webhook.events.write")
+                .zone_id("z:work")
+                .principal("user:webhook-test")
+                .operations(&["webhook.events.ingest"])
+                .issuer("node:webhook-test")
+                .target_instance(&c.instance_id)
+                .token_id(token_id)
+                .validity(now, now + Duration::hours(1))
+                .try_constraints_cbor(&fcp_cbor::to_canonical_cbor(constraints).unwrap())
+                .unwrap()
+                .sign(&c.key)
+                .unwrap(),
+        )
+    };
+    let denied_token = issue_token(
+        &CapabilityConstraints {
+            resource_allow: vec!["*".into()],
+            resource_deny: vec![endpoint["url"].as_str().unwrap().into()],
+            ..Default::default()
+        },
+        b"denied-slack-challenge",
+    );
+    let limited_token = issue_token(
+        &CapabilityConstraints {
+            resource_allow: vec![endpoint["url"].as_str().unwrap().into()],
+            max_calls: Some(1),
+            ..Default::default()
+        },
+        b"limited-slack-challenge",
+    );
+    let mut denied = request.clone();
+    denied.capability_token = denied_token;
+    assert!(c.inner.handle_invoke(json!(denied)).await.is_err());
+    let mut limited = request;
+    limited.capability_token = limited_token;
+    assert_eq!(
+        c.inner.handle_invoke(json!(limited.clone())).await.unwrap()["status_code"],
+        200
+    );
+    limited.id = RequestId::random();
+    assert!(c.inner.handle_invoke(json!(limited)).await.is_err());
+    // Failed authority checks and an exhausted token do not create events or
+    // stop a separately authorized fresh retry of the control exchange.
+    assert_eq!(c.handle_invoke(params).await.unwrap()["status_code"], 200);
+    assert_eq!(
+        c.handle_invoke(json!({"operation_id": "webhook.events.recent"}))
+            .await
+            .unwrap()["events"],
+        json!([])
+    );
 }
 
 #[fcp_async_core::runtime::test]

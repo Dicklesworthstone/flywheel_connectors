@@ -8,6 +8,7 @@
 > **GitHub webhook signature guide**: https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries
 > **Stripe webhook signature guide**: https://docs.stripe.com/webhooks/signature
 > **Slack request verification guide**: https://docs.slack.dev/authentication/verifying-requests-from-slack/
+> **Slack URL verification**: https://docs.slack.dev/reference/events/url_verification/
 > **Twilio webhook security guide**: https://www.twilio.com/docs/usage/webhooks/webhooks-security
 
 ## Purpose
@@ -16,7 +17,7 @@ This document fixes the operator-facing contract for `fcp.webhook-receiver`. The
 
 The connector is intentionally a bounded in-process webhook intake buffer. It is not a public HTTP server, durable event bus, queue service, retry worker, webhook delivery sender, subscription manager, provider API client, secret vault, or general ingress gateway.
 
-`fcp-host` provides an opt-in HTTP adapter at `POST /webhooks/{*path}`. It forwards the original provider body through the normal host invocation path to `webhook.events.ingest`, using an explicitly configured receiver, zone, public URL, and capability. See [Generic webhook HTTP ingress](../../docs/configuration/webhook_receiver_ingress.md) for configuration, proxy requirements, resource limits, and provider response limitations.
+`fcp-host` provides an opt-in HTTP adapter at `POST /webhooks/{*path}`. It forwards the original provider body through the normal host invocation path to `webhook.events.ingest`, using an explicitly configured receiver, zone, public URL, and capability. Authenticated Slack URL-verification requests receive HTTP `200` containing only their challenge. See [Generic webhook HTTP ingress](../../docs/configuration/webhook_receiver_ingress.md) for configuration, proxy requirements, resource limits, and provider response limitations.
 
 ## Current Runtime Snapshot
 
@@ -120,8 +121,8 @@ The current Webhook Receiver README slice documents the existing runtime surface
 - The host binding names an absolute `capability_token_file`. The host reloads its bounded base64 content for each admitted delivery, allowing authority for the actual prepared receiver instance to be renewed without restarting the host. Unavailable or invalid authority fails closed with `503`; there is no stale-token fallback.
 - The adapter preserves raw body bytes and path/query spelling, constructs signature URLs from the configured public base, and takes the source IP only from the TCP connection. `Forwarded` and `X-Forwarded-*` never establish client identity or FCP authority. Behind a reverse proxy, source allowlists and rate keys see the proxy's address.
 - The invocation is the operator's fixed intake command in the configured zone. Its provenance retains the public-input taint and a public-origin payload receipt in the chain; the adapter neither elevates provider data nor creates approval evidence. Normal host policy remains in force.
-- Each HTTP attempt receives fresh host-generated invocation and delivery identities. Provider metadata cannot choose a host idempotency key; the receiver's authenticated-content replay check still rejects accepted payload retries with `409`.
-- Provider-facing HTTP responses contain only `accepted`, `status_code`, and `reason_code`. Endpoint IDs, payloads, signature diagnostics, capability material, and source hashes remain outside that public response.
+- Each HTTP attempt receives fresh host-generated invocation and delivery identities. Provider metadata cannot choose a host idempotency key; the receiver's authenticated-content replay check rejects ordinary event retries with `409`. Authenticated Slack URL-verification retries return the challenge again without creating events or reserving event replay identities.
+- Ordinary provider-facing HTTP responses contain only `accepted`, `status_code`, and `reason_code`. Successful Slack URL verification returns only the authenticated `challenge`. Endpoint IDs, other payload fields, signature diagnostics, capability material, and source hashes remain outside these public responses.
 - Endpoint limit: `100`.
 - Event retention limit: `1000` events per endpoint.
 - Retained event data is also capped at `16 MiB` per endpoint and `64 MiB` across the connector, measured as serialized complete events. These are data budgets; allocator and parsed-JSON overhead are additional. The oldest arrivals are evicted when either budget is reached.
@@ -187,7 +188,7 @@ Twilio resource SIDs identify a message or call, not an individual delivery. Wit
 
 Replay checks also use a separate identity derived after successful signature verification. Input delivery/request IDs and the listed transport headers remain public metadata; changing or removing them cannot make previously accepted authenticated content new. Reusing a public ID still returns `409`, even when authenticated content differs.
 
-For generic, GitHub, Stripe, and Slack, the authenticated identity hashes the exact raw body. Stripe and Slack timestamps are excluded, so a retry re-signed at another valid timestamp remains a duplicate. Identical authenticated content is conservatively treated as the same delivery within an endpoint, even if a sender assigns a fresh public ID.
+For ordinary events from generic, GitHub, Stripe, and Slack endpoints, the authenticated identity hashes the exact raw body. Stripe and Slack timestamps are excluded, so a retry re-signed at another valid timestamp remains a duplicate. Identical authenticated content is conservatively treated as the same delivery within an endpoint, even if a sender assigns a fresh public ID.
 
 For Twilio, the identity hashes the exact verified signing string: signed URL/query plus canonical form fields, or the signed JSON URL carrying its validated body hash. Equivalent form encodings and ambiguous name/value boundaries that produce the same signed bytes are duplicates. A different signed URL/query may distinguish callbacks, but public-ID checks still apply; the fallback public ID does not include that URL/query.
 
@@ -199,7 +200,7 @@ For Twilio, the identity hashes the exact verified signing string: signed URL/qu
 | `webhook.endpoints.list` | List endpoint summaries without secrets | `webhook.endpoints.read` | `Safe` | `Low` | `Strict` | none |
 | `webhook.endpoints.delete` | Delete endpoint, events, and dedup IDs | `webhook.endpoints.write` | `Dangerous` | `High` | `Strict` | `endpoint_id` |
 | `webhook.endpoints.rotate_secret` | Replace endpoint signing secret | `webhook.endpoints.write` | `Risky` | `High` | `None` | `endpoint_id`; optional `signing_secret` |
-| `webhook.events.ingest` | Verify and record one host-forwarded delivery | `webhook.events.write` | `Risky` | `High` | `Strict` | `path`, headers, body or payload |
+| `webhook.events.ingest` | Verify and record one host-forwarded delivery, or answer a signed Slack URL-verification challenge | `webhook.events.write` | `Risky` | `High` | `Strict` | `path`, headers, body or payload |
 | `webhook.events.recent` | Return recent verified events | `webhook.events.read` | `Safe` | `Low` | `Strict` | optional `endpoint_id`, `limit`, `since_ts` |
 | `webhook.health` | Return config, endpoint, event, and ingress state | `webhook.endpoints.read` | `Safe` | `Low` | `Strict` | none |
 
@@ -211,7 +212,7 @@ The current implementation does not include:
 - durable event queueing, durable replay, dead-letter queues, retry workers, cursor persistence, or cross-process deduplication
 - outbound provider API calls, provider webhook registration, provider secret rotation through remote APIs, or provider-specific subscription discovery
 - arbitrary content-type support, multipart handling, file upload persistence, or large body storage; the host adapter collects accepted UTF-8 bodies with bounded streaming reads
-- response customization for providers, Slack URL-verification challenge responses, Twilio TwiML responses, webhook delivery sending, retry callback endpoints, or bidirectional webhook workflows
+- arbitrary response customization for providers, Twilio TwiML responses, webhook delivery sending, retry callback endpoints, or bidirectional webhook workflows
 - per-endpoint zone routing, per-endpoint data retention policy, or secret vault integration
 - long-term audit storage, PII classification, payload redaction beyond selected headers, or encrypted local persistence
 
@@ -300,4 +301,5 @@ These are verification commands, not stored passing results or live-provider evi
 - Do not rely on `doctor()` or `self_check()` reaching `ok` in the current no-native-listener build.
 - Keep event retention expectations low; events and deduplication IDs are process-memory state.
 - Expose only the configured `/webhooks/` route through a TLS-terminating reverse proxy, preserving the raw path, query, and body. Do not expose host administration or unrelated RPC routes as part of that mapping.
-- Confirm that the provider accepts the adapter's minimal HTTP acknowledgment. Slack subscription challenges and Twilio flows requiring TwiML need additional response handling.
+- Slack Events API URL verification is supported for endpoints configured with provider `slack` and `slack-signature-v0`. The receiver verifies the fresh signature over the exact raw body and applies normal FCP, resource, source, body, and rate admission before returning the challenge. The deprecated payload token grants no authority. Challenges must be nonempty strings of at most `4096` UTF-8 bytes with no control characters; their exact content is preserved. Fresh signed verification retries succeed without creating events or consuming event replay identities.
+- Confirm that ordinary callbacks accept the adapter's minimal HTTP acknowledgment. Twilio flows requiring TwiML and arbitrary provider response formats still need additional response handling.

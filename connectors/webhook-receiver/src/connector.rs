@@ -64,6 +64,7 @@ const MAX_INGRESS_HEADERS: usize = 100;
 const MAX_INGRESS_HEADER_BYTES: usize = 32 * 1024;
 const MAX_CLIENT_ID_BYTES: usize = 1024;
 const MAX_FORM_FIELDS: usize = 1024;
+const MAX_SLACK_CHALLENGE_BYTES: usize = 4096;
 const MANIFEST: &str = include_str!("../manifest.toml");
 const MAX_INVOKE_RESPONSE_BYTES: u64 = 32 * 1024 * 1024;
 
@@ -1266,6 +1267,40 @@ impl WebhookReceiverConnector {
         let authenticated_rate =
             self.ingress_state
                 .enforce_rate_limit("authenticated", rate_key, config, now_ms)?;
+
+        // URL verification is a signed control exchange, not an event delivery.
+        // Only the configured Slack verifier can authorize this response. Keep
+        // it after ordinary FCP, source, signature, freshness and rate admission,
+        // but before deriving or retaining either replay identity. Slack can
+        // repeat a fresh authenticated challenge without creating an event.
+        if endpoint.provider == WebhookProvider::Slack
+            && endpoint.signature_algorithm == "slack-signature-v0"
+            && body.payload.get("type").and_then(Value::as_str) == Some("url_verification")
+        {
+            let challenge = body
+                .payload
+                .get("challenge")
+                .and_then(Value::as_str)
+                .filter(|challenge| {
+                    !challenge.is_empty()
+                        && challenge.len() <= MAX_SLACK_CHALLENGE_BYTES
+                        && !challenge.chars().any(char::is_control)
+                })
+                .ok_or_else(|| WebhookReceiverError::InvalidInput {
+                    message: format!(
+                        "Slack URL-verification challenge must be a non-empty string of at most {MAX_SLACK_CHALLENGE_BYTES} UTF-8 bytes without control characters"
+                    ),
+                })?;
+            return Ok(json!({
+                "accepted": true,
+                "status_code": 200,
+                "verification": {
+                    "provider": "slack",
+                    "kind": "url_verification",
+                    "challenge": challenge,
+                },
+            }));
+        }
 
         let event_id =
             event_id_for_ingest(input, headers, &body.payload, endpoint, &body.raw_body)?;
@@ -2684,22 +2719,50 @@ fn operations_info() -> Vec<OperationInfo> {
             }),
             json!({
                 "type": "object",
-                "required": ["accepted", "status_code", "event", "ingest_log", "event_caps", "ingress_binding"],
-                "properties": {
-                    "accepted": { "type": "boolean" },
-                    "status_code": { "type": "integer" },
-                    "event": { "type": "object" },
-                    "ingest_log": { "type": "object" },
-                    "event_caps": { "type": "object" },
-                    "ingress_binding": { "type": "object" }
-                }
+                "oneOf": [
+                    {
+                        "required": ["accepted", "status_code", "event", "ingest_log", "event_caps", "ingress_binding"],
+                        "properties": {
+                            "accepted": { "const": true },
+                            "status_code": { "const": 202 },
+                            "event": { "type": "object" },
+                            "ingest_log": { "type": "object" },
+                            "event_caps": { "type": "object" },
+                            "ingress_binding": { "type": "object" }
+                        },
+                        "not": { "required": ["verification"] }
+                    },
+                    {
+                        "required": ["accepted", "status_code", "verification"],
+                        "additionalProperties": false,
+                        "properties": {
+                            "accepted": { "const": true },
+                            "status_code": { "const": 200 },
+                            "verification": {
+                                "type": "object",
+                                "required": ["provider", "kind", "challenge"],
+                                "additionalProperties": false,
+                                "properties": {
+                                    "provider": { "const": "slack" },
+                                    "kind": { "const": "url_verification" },
+                                    "challenge": {
+                                        "type": "string",
+                                        "minLength": 1,
+                                        "maxLength": MAX_SLACK_CHALLENGE_BYTES,
+                                        "description": "Authenticated challenge; at most 4096 UTF-8 bytes with no control characters"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                ]
             }),
             "webhook.events.write",
             RiskLevel::High,
             SafetyTier::Risky,
             IdempotencyClass::Strict,
             AgentHint {
-                when_to_use: "Handle an HTTP webhook request already accepted into an FCP host or gateway request region. The connector verifies route, source, signature, body limits, rate limits, and replay before recording the event.".into(),
+                when_to_use: "Handle an HTTP webhook request already accepted into an FCP host or gateway request region. The connector verifies route, source, signature, body limits, rate limits, and replay before recording an event. A signed Slack URL-verification exchange returns its bounded challenge without retaining it as an event.".into(),
                 common_mistakes: vec![
                     "Calling this operation with a reserialized body that no longer matches the provider signature.".into(),
                     "Forwarding signature, authorization, or cookie headers into downstream event history.".into(),

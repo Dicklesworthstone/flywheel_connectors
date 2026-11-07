@@ -406,6 +406,56 @@ mod tests {
     }
 
     #[fcp_async_core::runtime::test]
+    async fn webhook_runtime_returns_verification_only_after_bound_receiver_success() {
+        let runtime = runtime(1024, 15_000, 8);
+        let raw =
+            r#"{"type":"url_verification","challenge":"untrusted-input","token":"private-token"}"#;
+        for matching_request in [true, false] {
+            let (status, body) = runtime
+                .receive(request(Body::from(raw)), |invocation, _| async move {
+                    assert_eq!(invocation.input["body"], raw);
+                    Ok(InvokeResponse::ok(
+                        if matching_request {
+                            invocation.id
+                        } else {
+                            RequestId::new("unrelated-invocation")
+                        },
+                        json!({
+                            "accepted": true,
+                            "status_code": 200,
+                            "verification": {
+                                "provider": "slack",
+                                "kind": "url_verification",
+                                "challenge": "authenticated-output",
+                            },
+                            "token": "private-token",
+                        }),
+                    ))
+                })
+                .await;
+            if matching_request {
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(body, json!({"challenge": "authenticated-output"}));
+            } else {
+                assert_eq!(status, StatusCode::BAD_GATEWAY);
+                assert!(body.get("challenge").is_none());
+            }
+            assert!(!body.to_string().contains("untrusted-input"));
+            assert!(!body.to_string().contains("private-token"));
+        }
+        let (status, body) = runtime
+            .receive(request(Body::from(raw)), |invocation, _| async move {
+                Ok(InvokeResponse::error(
+                    invocation.id,
+                    fcp_core::FcpError::InvalidSignature,
+                ))
+            })
+            .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body.get("challenge").is_none());
+    }
+
+    #[fcp_async_core::runtime::test]
     async fn webhook_runtime_preserves_bytes_and_uses_only_observed_peer_identity() {
         let runtime = runtime(1024, 15_000, 8);
         let raw = "{ \"message\" : \"unchanged\" }\n";
