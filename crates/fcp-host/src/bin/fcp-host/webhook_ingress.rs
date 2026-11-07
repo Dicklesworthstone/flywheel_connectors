@@ -126,8 +126,7 @@ fn read_holder_key(path: &StdPath) -> Result<fcp_crypto::Ed25519SigningKey, Webh
         hex::decode_to_slice(encoded, &mut *secret)
             .map_err(|_| WebhookIngressError::Unavailable)?;
     }
-    fcp_crypto::Ed25519SigningKey::from_bytes(&secret)
-        .map_err(|_| WebhookIngressError::Unavailable)
+    fcp_crypto::Ed25519SigningKey::from_bytes(&secret).map_err(|_| WebhookIngressError::Unavailable)
 }
 
 /// The binding is fixed at startup. Authority is provisioned after the receiver

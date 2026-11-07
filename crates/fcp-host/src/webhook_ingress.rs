@@ -927,7 +927,10 @@ mod tests {
             (holder_token(None, Some(b"jti")), Some(key.clone())),
             (holder_token(Some(""), Some(b"jti")), Some(key.clone())),
             (holder_token(Some("node:ingress"), None), Some(key.clone())),
-            (holder_token(Some("node:ingress"), Some(b"")), Some(key.clone())),
+            (
+                holder_token(Some("node:ingress"), Some(b"")),
+                Some(key.clone()),
+            ),
         ] {
             assert!(matches!(
                 config.clone().with_execution_authority(token, key),
@@ -950,16 +953,13 @@ mod tests {
                 Err(WebhookIngressError::Unavailable)
             ));
         }
-        let malformed_claims = CwtClaims::new()
-            .token_id(b"malformed-holder-jti")
-            .custom(
-                fcp_crypto::cose::fcp2_claims::HOLDER_NODE,
-                ciborium::Value::Integer(7.into()),
-            );
-        let issuer = Ed25519SigningKey::from_bytes(&[58; 32]).unwrap();
-        let malformed = CapabilityToken::from_raw(
-            CoseToken::sign(&issuer, &malformed_claims).unwrap(),
+        let malformed_claims = CwtClaims::new().token_id(b"malformed-holder-jti").custom(
+            fcp_crypto::cose::fcp2_claims::HOLDER_NODE,
+            ciborium::Value::Integer(7.into()),
         );
+        let issuer = Ed25519SigningKey::from_bytes(&[58; 32]).unwrap();
+        let malformed =
+            CapabilityToken::from_raw(CoseToken::sign(&issuer, &malformed_claims).unwrap());
         for signer in [None, Some(key)] {
             assert!(matches!(
                 config
@@ -1005,8 +1005,7 @@ mod tests {
             )
             .unwrap();
         let next_token = holder_token(Some("node:successor"), Some(b"next-jti"));
-        let without_replacement_key =
-            original.clone().with_capability_token(next_token.clone());
+        let without_replacement_key = original.clone().with_capability_token(next_token.clone());
         assert!(matches!(
             request(&without_replacement_key, "/webhooks/github"),
             Err(WebhookIngressError::Unavailable)

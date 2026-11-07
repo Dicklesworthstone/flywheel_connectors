@@ -548,6 +548,7 @@ fn emit_placement_plan(plan: &LocalPlacementPlan) {
 }
 
 impl SubprocessConnector {
+    #[cfg(test)]
     async fn spawn(
         config: ConnectorConfig,
         resilience: Arc<ResilienceLayer>,
@@ -562,6 +563,7 @@ impl SubprocessConnector {
         .await
     }
 
+    #[cfg(test)]
     async fn spawn_with_placement(
         config: ConnectorConfig,
         resilience: Arc<ResilienceLayer>,
@@ -574,16 +576,18 @@ impl SubprocessConnector {
             capability_verifying_key,
             placement_operation_class,
             None,
+            None,
         )
         .await
     }
 
     async fn spawn_with_placement_and_termination(
-        config: ConnectorConfig,
+        mut config: ConnectorConfig,
         resilience: Arc<ResilienceLayer>,
         capability_verifying_key: Option<[u8; PUBLIC_KEY_SIZE]>,
         placement_operation_class: PlacementOperationClass,
         termination: Option<&NativeInvocationTermination>,
+        admitted_manifest: Option<&ManifestOperationConstraintCatalog>,
     ) -> HostResult<Self> {
         if termination.is_some_and(NativeInvocationTermination::is_cancel_requested) {
             return Err(HostError::RegistryError(
@@ -609,8 +613,17 @@ impl SubprocessConnector {
 
         // Pin response budgets from host-owned policy before starting the
         // subprocess. Connector-supplied request fields cannot raise them.
-        let response_limits =
-            native_rpc_response_limits(&config, &load_manifest_operation_constraints(&config)?);
+        let loaded_manifest;
+        let manifest = match admitted_manifest {
+            Some(manifest) => manifest,
+            None => {
+                loaded_manifest = load_manifest_operation_constraints(&config)?;
+                &loaded_manifest
+            }
+        };
+        let state_policy = ConnectorStatePolicy::resolve(&config, manifest)?;
+        state_policy.require_admitted_manifest(&config)?;
+        let response_limits = native_rpc_response_limits(&config, manifest);
         // A warm checkout can wait for health checks before falling back to a
         // cold worker. Do not launch a binary/env whose authority was replaced.
         if let Some(termination) = termination {
@@ -641,7 +654,7 @@ impl SubprocessConnector {
             handshaken_zone: futures_util::lock::Mutex::new(None),
         };
 
-        if let Some(config_payload) = config.config {
+        if let Some(config_payload) = config.config.take() {
             if let Some(termination) = termination {
                 connector
                     .configure_with_termination(config_payload, Some(termination))
@@ -651,6 +664,7 @@ impl SubprocessConnector {
             }
         }
 
+        state_policy.require_admitted_manifest(&config)?;
         Ok(connector)
     }
 
@@ -1145,6 +1159,8 @@ struct NativeWarmPoolCheckout {
 
 struct NativeWarmPoolConnector {
     config: ConnectorConfig,
+    state_policy: ConnectorStatePolicy,
+    manifest_constraints: ManifestOperationConstraintCatalog,
     connector_id: ConnectorId,
     control: Arc<SubprocessConnector>,
     resilience: Arc<ResilienceLayer>,
@@ -1160,17 +1176,27 @@ struct NativeWarmPoolConnector {
 impl NativeWarmPoolConnector {
     async fn spawn(
         config: ConnectorConfig,
+        admitted: &ValidatedConnectorConfig,
         resilience: Arc<ResilienceLayer>,
         capability_verifying_key: Option<[u8; PUBLIC_KEY_SIZE]>,
     ) -> HostResult<Arc<Self>> {
+        let state_policy = admitted.state_policy;
+        // This gate also protects callers below registry preparation. Once a
+        // pool exists, all replenishment uses this same immutable admission.
+        state_policy.require_parallel_workers(&config.id)?;
+        state_policy.require_current_manifest(&config)?;
         let control = Arc::new(
-            SubprocessConnector::spawn(
+            SubprocessConnector::spawn_with_placement_and_termination(
                 config.clone(),
                 Arc::clone(&resilience),
                 capability_verifying_key,
+                PlacementOperationClass::LifecycleCritical,
+                None,
+                Some(&admitted.manifest_constraints),
             )
             .await?,
         );
+        state_policy.require_current_manifest(&config)?;
         let connector_id = control.summary.id.clone();
         let per_connector_max_idle = usize::try_from(config.prewarm.max_idle)
             .unwrap_or(usize::MAX)
@@ -1179,6 +1205,8 @@ impl NativeWarmPoolConnector {
             .saturating_mul(u64::from(config.prewarm.max_idle.max(1)));
         let connector = Arc::new(Self {
             config,
+            state_policy,
+            manifest_constraints: admitted.manifest_constraints.clone(),
             connector_id,
             control,
             resilience,
@@ -1364,6 +1392,7 @@ impl NativeWarmPoolConnector {
                 "warm-pool invocation cancelled before worker dispatch".into(),
             ));
         }
+        self.state_policy.require_current_manifest(&self.config)?;
         tracing::info!(
             event = WARM_POOL_EVIDENCE_EVENT,
             action = if checkout.warm_checkout {
@@ -1446,6 +1475,7 @@ impl NativeWarmPoolConnector {
 
     async fn simulate(&self, request: SimulateRequest) -> HostResult<SimulateResponse> {
         let checkout = self.checkout(&request.zone_id).await?;
+        self.state_policy.require_current_manifest(&self.config)?;
         let mut entry = checkout.entry;
         let response = entry.connector.simulate(request).await;
         match response {
@@ -1495,6 +1525,7 @@ impl NativeWarmPoolConnector {
         zone: &ZoneId,
         termination: Option<&NativeInvocationTermination>,
     ) -> HostResult<NativeWarmPoolCheckout> {
+        self.state_policy.require_current_manifest(&self.config)?;
         let key = self.warm_pool_key(zone);
         self.apply_retention().await;
         if let Some(entry) = self.take_pool_entry(&key).await
@@ -1568,6 +1599,7 @@ impl NativeWarmPoolConnector {
         zone: &ZoneId,
         termination: Option<&NativeInvocationTermination>,
     ) -> HostResult<NativeWarmPoolEntry> {
+        self.state_policy.require_current_manifest(&self.config)?;
         let connector = Arc::new(
             SubprocessConnector::spawn_with_placement_and_termination(
                 self.config.clone(),
@@ -1575,9 +1607,11 @@ impl NativeWarmPoolConnector {
                 self.capability_verifying_key,
                 PlacementOperationClass::BulkPrewarm,
                 termination,
+                Some(&self.manifest_constraints),
             )
             .await?,
         );
+        self.state_policy.require_current_manifest(&self.config)?;
         if let Some(termination) = termination {
             connector
                 .ensure_handshake_with_termination(zone, Some(termination))
@@ -1686,7 +1720,7 @@ impl NativeWarmPoolConnector {
     fn warm_pool_key(&self, zone: &ZoneId) -> WarmPoolKey {
         WarmPoolKey::new(
             self.connector_id.as_str(),
-            native_warm_pool_manifest_hash(&self.config),
+            native_warm_pool_manifest_hash(&self.config, self.state_policy.manifest_digest.as_ref()),
             self.config.runtime_network_enforcement.as_str(),
             zone.as_str(),
             native_warm_pool_credential_profile_class(&self.config),
@@ -1704,7 +1738,10 @@ fn prewarm_health_state(snapshot: &HealthSnapshot) -> PrewarmHealthState {
     }
 }
 
-fn native_warm_pool_manifest_hash(config: &ConnectorConfig) -> String {
+fn native_warm_pool_manifest_hash(
+    config: &ConnectorConfig,
+    admitted_manifest_digest: Option<&[u8; 32]>,
+) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(config.id.as_bytes());
     hasher.update(config.binary.as_bytes());
@@ -1714,9 +1751,9 @@ fn native_warm_pool_manifest_hash(config: &ConnectorConfig) -> String {
     hasher.update(config.runtime_network_enforcement.as_str().as_bytes());
     if let Some(path) = &config.manifest_path {
         hasher.update(path.as_bytes());
-        if let Ok(bytes) = std::fs::read(path) {
-            hasher.update(&bytes);
-        }
+    }
+    if let Some(digest) = admitted_manifest_digest {
+        hasher.update(digest);
     }
     format!("blake3:{}", hasher.finalize().to_hex())
 }
@@ -1756,13 +1793,14 @@ struct WasiConnector {
 }
 
 impl WasiConnector {
-    fn new(config: ConnectorConfig) -> HostResult<Self> {
+    fn new(config: ConnectorConfig, state_policy: ConnectorStatePolicy) -> HostResult<Self> {
         if config.runtime_network_enforcement != RuntimeNetworkEnforcement::WasiSandbox {
             return Err(HostError::InvalidFilter(format!(
                 "WASI connector runtime requires wasi_sandbox enforcement, got {}",
                 config.runtime_network_enforcement.as_str()
             )));
         }
+        state_policy.reject_stateful_wasi(&config.id)?;
         Ok(Self {
             summary: connector_summary_from_config(&config)?,
             config,
@@ -2091,11 +2129,15 @@ enum ConnectorRuntime {
 impl ConnectorRuntime {
     async fn spawn(
         config: ConnectorConfig,
+        admitted: &ValidatedConnectorConfig,
         resilience: Arc<ResilienceLayer>,
         capability_verifying_key: Option<[u8; PUBLIC_KEY_SIZE]>,
     ) -> HostResult<Self> {
+        let state_policy = admitted.state_policy;
+        state_policy.require_admitted_manifest(&config)?;
+        validate_production_prewarm_policy(&config, state_policy)?;
         if config.runtime_network_enforcement == RuntimeNetworkEnforcement::WasiSandbox {
-            return Ok(Self::Wasi(Arc::new(WasiConnector::new(config)?)));
+            return Ok(Self::Wasi(Arc::new(WasiConnector::new(config, state_policy)?)));
         }
         let support = NativeProxyOnlySandboxSupport::current();
         if let NativeProxyOnlySandboxDecision::Deny { deny_reason } =
@@ -2122,12 +2164,25 @@ impl ConnectorRuntime {
         }
         if config.prewarm.strategy == PrewarmStrategy::WarmPool {
             return Ok(Self::NativeWarmPool(
-                NativeWarmPoolConnector::spawn(config, resilience, capability_verifying_key)
-                    .await?,
+                NativeWarmPoolConnector::spawn(
+                    config,
+                    admitted,
+                    resilience,
+                    capability_verifying_key,
+                )
+                .await?,
             ));
         }
         Ok(Self::Native(Arc::new(
-            SubprocessConnector::spawn(config, resilience, capability_verifying_key).await?,
+            SubprocessConnector::spawn_with_placement_and_termination(
+                config,
+                resilience,
+                capability_verifying_key,
+                PlacementOperationClass::LifecycleCritical,
+                None,
+                Some(&admitted.manifest_constraints),
+            )
+            .await?,
         )))
     }
 
@@ -2228,6 +2283,238 @@ struct RegistryEntry {
     config: ConnectorConfig,
     connector: ConnectorRuntime,
     manifest_constraints: ManifestOperationConstraintCatalog,
+    state_policy: ConnectorStatePolicy,
+}
+
+fn validate_state_policy_replacement(
+    connector_id: &ConnectorId,
+    current: &RegistryEntry,
+    candidate: ConnectorStatePolicy,
+) -> HostResult<()> {
+    let current_policy = current.state_policy;
+    if current_policy.is_stateful()
+        && (candidate.model != current_policy.model
+            || (current_policy.manifest_digest.is_some() && candidate.manifest_digest.is_none()))
+    {
+        return Err(HostError::InvalidFilter(format!(
+            "connector '{connector_id}' cannot discard or change its admitted '{}' state authority during inventory replacement; preserve its manifest and state model until an explicit canonical state migration is supported",
+            current_policy.model.as_str()
+        )));
+    }
+    if (current_policy.is_stateful() || candidate.is_stateful())
+        && !matches!(
+            &current.connector,
+            ConnectorRuntime::UnavailableNativeProxyOnly(_)
+        )
+    {
+        return Err(HostError::InvalidFilter(format!(
+            "connector '{connector_id}' stateful runtime replacement requires quiescence and canonical state handoff; the active runtime is preserved because that handoff is not implemented"
+        )));
+    }
+    Ok(())
+}
+
+/// Frozen when an inventory generation is prepared. Runtime admission must not
+/// rediscover state semantics from a mutable manifest file or process settings.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ConnectorStatePolicy {
+    model: ConnectorStateKind,
+    manifest_digest: Option<[u8; 32]>,
+    manifest_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum ConnectorStateKind {
+    #[default]
+    Unknown,
+    Stateless,
+    SingletonWriter,
+    Crdt,
+}
+
+impl ConnectorStateKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Stateless => "stateless",
+            Self::SingletonWriter => "singleton_writer",
+            Self::Crdt => "crdt",
+        }
+    }
+}
+
+impl ConnectorStatePolicy {
+    fn resolve(
+        config: &ConnectorConfig,
+        manifest: &ManifestOperationConstraintCatalog,
+    ) -> HostResult<Self> {
+        let mut declared = manifest.state_model;
+        let mut check_declaration = |source: &str, value: &str| -> HostResult<()> {
+            let model = match value.trim() {
+                "stateless" => ConnectorStateKind::Stateless,
+                "singleton_writer" => ConnectorStateKind::SingletonWriter,
+                "crdt" => ConnectorStateKind::Crdt,
+                value => {
+                    return Err(HostError::InvalidFilter(format!(
+                        "connector '{}' has invalid state model '{value}' in {source}",
+                        config.id
+                    )));
+                }
+            };
+            if let Some(expected) = declared
+                && model != expected
+            {
+                return Err(HostError::InvalidFilter(format!(
+                    "connector '{}' has conflicting state model '{}' in {source}; the admitted state model is '{}'",
+                    config.id,
+                    model.as_str(),
+                    expected.as_str()
+                )));
+            }
+            declared = Some(model);
+            Ok(())
+        };
+        for name in [
+            "FCP_CONNECTOR_STATE_MODEL",
+            "FCP_HOST_CONNECTOR_STATE_MODEL",
+        ] {
+            if let Some(value) = config.env.get(name) {
+                check_declaration(name, value)?;
+            }
+        }
+        if let Some(payload) = config.config.as_ref() {
+            for pointer in ["/state/model", "/state_model", "/stateModel"] {
+                if let Some(value) = payload.pointer(pointer) {
+                    let value = value.as_str().ok_or_else(|| {
+                        HostError::InvalidFilter(format!(
+                            "connector '{}' state model at config{pointer} must be a string",
+                            config.id
+                        ))
+                    })?;
+                    check_declaration(pointer, value)?;
+                }
+            }
+        }
+        Ok(Self {
+            model: declared.unwrap_or_default(),
+            manifest_digest: manifest.manifest_digest,
+            manifest_bytes: manifest.manifest_bytes,
+        })
+    }
+
+    const fn is_singleton_writer(self) -> bool {
+        matches!(self.model, ConnectorStateKind::SingletonWriter)
+    }
+
+    const fn is_stateful(self) -> bool {
+        matches!(
+            self.model,
+            ConnectorStateKind::SingletonWriter | ConnectorStateKind::Crdt
+        )
+    }
+
+    fn require_parallel_workers(self, connector_id: &str) -> HostResult<()> {
+        if self.manifest_digest.is_none() || self.model != ConnectorStateKind::Stateless {
+            return Err(HostError::InvalidFilter(format!(
+                "connector '{connector_id}' requested warm_pool prewarm, but parallel workers require a validated stateless manifest; singleton_writer and CRDT workers have no coordinated state recovery and publication boundary"
+            )));
+        }
+        Ok(())
+    }
+
+    fn manifest_matches_admission(self, config: &ConnectorConfig) -> HostResult<bool> {
+        let Some(expected) = self.manifest_digest else {
+            return Err(HostError::PreflightFailed(format!(
+                "connector '{}' has no admitted manifest for parallel workers",
+                config.id
+            )));
+        };
+        let unavailable = || {
+            HostError::PreflightFailed(format!(
+                "connector '{}' admitted manifest is unavailable; refusing runtime startup or worker checkout",
+                config.id
+            ))
+        };
+        let path = config.manifest_path.as_deref().ok_or_else(unavailable)?;
+        let metadata = std::fs::metadata(path).map_err(|_| unavailable())?;
+        if !metadata.is_file() {
+            return Err(unavailable());
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // A concurrent replacement with a FIFO must not block a runtime
+            // thread between the metadata check and open.
+            options.custom_flags(libc::O_NONBLOCK);
+        }
+        let file = options.open(path).map_err(|_| unavailable())?;
+        let metadata = file.metadata().map_err(|_| unavailable())?;
+        if !metadata.is_file() {
+            return Err(unavailable());
+        }
+        if metadata.len() != self.manifest_bytes {
+            return Ok(false);
+        }
+        // Stream at most the admitted length plus one byte. Allocation is
+        // constant even if the file grows after metadata was checked.
+        let mut input = std::io::Read::take(file, self.manifest_bytes.saturating_add(1));
+        let mut hasher = blake3::Hasher::new();
+        let mut buffer = [0_u8; 8192];
+        let mut total = 0_u64;
+        loop {
+            let read = match std::io::Read::read(&mut input, &mut buffer) {
+                Ok(read) => read,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return Err(unavailable()),
+            };
+            if read == 0 {
+                break;
+            }
+            total = total.saturating_add(read as u64);
+            if total > self.manifest_bytes {
+                return Ok(false);
+            }
+            hasher.update(&buffer[..read]);
+        }
+        Ok(total == self.manifest_bytes && hasher.finalize().as_bytes() == &expected)
+    }
+
+    fn require_current_manifest(self, config: &ConnectorConfig) -> HostResult<()> {
+        if !self.manifest_matches_admission(config)? {
+            return Err(HostError::PreflightFailed(format!(
+                "connector '{}' manifest changed after state admission; apply a new inventory generation before runtime startup or worker checkout",
+                config.id
+            )));
+        }
+        Ok(())
+    }
+
+    fn require_admitted_manifest(self, config: &ConnectorConfig) -> HostResult<()> {
+        // Legacy on-demand inventory may still have unresolved state authority.
+        // It is never evidence of statelessness or permission to create a pool.
+        if self.manifest_digest.is_some() {
+            self.require_current_manifest(config)?;
+        }
+        Ok(())
+    }
+
+    fn reject_stateful_wasi(self, connector_id: &str) -> HostResult<()> {
+        if self.is_stateful() {
+            return Err(HostError::InvalidFilter(format!(
+                "connector '{connector_id}' declares '{}' state, but WASI starts a fresh instance for every invocation; stateful execution requires a persistent native on_demand runtime until canonical WASI state recovery and publication are wired",
+                self.model.as_str()
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ValidatedConnectorConfig {
+    manifest_constraints: ManifestOperationConstraintCatalog,
+    state_policy: ConnectorStatePolicy,
 }
 
 /// br-l9tt6: atomic snapshot of a connector's allow-list governance
@@ -2248,13 +2535,31 @@ struct AllowListSnapshot {
 #[derive(Debug, Clone, Default)]
 struct ManifestOperationConstraintCatalog {
     source: Option<String>,
+    state_model: Option<ConnectorStateKind>,
+    manifest_digest: Option<[u8; 32]>,
+    manifest_bytes: u64,
     declared_operations: HashSet<String>,
     network_constraints: HashMap<String, NetworkConstraints>,
     event_authorities: BTreeMap<String, fcp_manifest::EventSection>,
 }
 
 impl ManifestOperationConstraintCatalog {
-    fn from_manifest(manifest: &ConnectorManifest, source: impl Into<String>) -> Self {
+    fn from_manifest(manifest: &ConnectorManifest, source: impl Into<String>) -> HostResult<Self> {
+        let state_model = match manifest.connector.state.as_ref() {
+            Some(state) => match state.to_state_model().map_err(|error| {
+                HostError::InvalidFilter(format!("invalid connector manifest state: {error}"))
+            })? {
+                fcp_manifest::ConnectorStateModel::Stateless => ConnectorStateKind::Stateless,
+                fcp_manifest::ConnectorStateModel::SingletonWriter => {
+                    ConnectorStateKind::SingletonWriter
+                }
+                fcp_manifest::ConnectorStateModel::Crdt { .. } => ConnectorStateKind::Crdt,
+            },
+            None if manifest.connector.singleton_writer.unwrap_or(false) => {
+                ConnectorStateKind::SingletonWriter
+            }
+            None => ConnectorStateKind::Stateless,
+        };
         let declared_operations = manifest
             .provides
             .operations
@@ -2272,12 +2577,15 @@ impl ManifestOperationConstraintCatalog {
                     .map(|constraints| (operation.clone(), constraints))
             })
             .collect::<HashMap<_, _>>();
-        Self {
+        Ok(Self {
             source: Some(source.into()),
+            state_model: Some(state_model),
+            manifest_digest: None,
+            manifest_bytes: 0,
             declared_operations,
             network_constraints,
             event_authorities: manifest.provides.events.clone(),
-        }
+        })
     }
 }
 
@@ -2299,10 +2607,19 @@ fn load_manifest_operation_constraints(
             config.id, path
         ))
     })?;
-    Ok(ManifestOperationConstraintCatalog::from_manifest(
+    if manifest.connector.id.as_str() != config.id.as_str() {
+        return Err(HostError::InvalidFilter(format!(
+            "manifest connector id '{}' does not match managed connector '{}'",
+            manifest.connector.id, config.id
+        )));
+    }
+    let mut catalog = ManifestOperationConstraintCatalog::from_manifest(
         &manifest,
         path.to_string(),
-    ))
+    )?;
+    catalog.manifest_digest = Some(*blake3::hash(raw.as_bytes()).as_bytes());
+    catalog.manifest_bytes = raw.len() as u64;
+    Ok(catalog)
 }
 
 fn native_rpc_response_limits(
@@ -2319,7 +2636,10 @@ fn native_rpc_response_limits(
     limits
 }
 
-fn validate_production_prewarm_policy(config: &ConnectorConfig) -> HostResult<()> {
+fn validate_production_prewarm_policy(
+    config: &ConnectorConfig,
+    state_policy: ConnectorStatePolicy,
+) -> HostResult<()> {
     if let Err(error) = config.prewarm.validate() {
         return Err(HostError::InvalidFilter(format!(
             "invalid prewarm policy for connector '{}': {error}",
@@ -2338,7 +2658,7 @@ fn validate_production_prewarm_policy(config: &ConnectorConfig) -> HostResult<()
                     config.id
                 )));
             }
-            Ok(())
+            state_policy.require_parallel_workers(&config.id)
         }
         PrewarmStrategy::Zygote => Err(HostError::InvalidFilter(format!(
             "connector '{}' requested zygote prewarm, but zygote startup is rejected until \
@@ -2353,11 +2673,11 @@ fn validate_production_prewarm_policy(config: &ConnectorConfig) -> HostResult<()
 ///
 /// Preview callers intentionally do not test executable availability, connector RPCs,
 /// or runtime health: those checks belong to an actual apply.
-fn validate_registry_config(
-    config: &ConnectorConfig,
-) -> HostResult<ManifestOperationConstraintCatalog> {
+fn validate_registry_config(config: &ConnectorConfig) -> HostResult<ValidatedConnectorConfig> {
     connector_summary_from_config(config)?;
-    validate_production_prewarm_policy(config)?;
+    let manifest_constraints = load_manifest_operation_constraints(config)?;
+    let state_policy = ConnectorStatePolicy::resolve(config, &manifest_constraints)?;
+    validate_production_prewarm_policy(config, state_policy)?;
     validate_runtime_network_claim(
         &config.id,
         config.runtime_network_enforcement,
@@ -2365,10 +2685,15 @@ fn validate_registry_config(
         &config.operation_network_constraints,
         config.config.as_ref(),
     )?;
-    let manifest_constraints = load_manifest_operation_constraints(config)?;
     let hrw_routing = current_hrw_lease_routing_config()?;
-    enforce_hrw_singleton_writer_launch_route(config, hrw_routing.as_ref())?;
-    Ok(manifest_constraints)
+    enforce_hrw_singleton_writer_launch_route(config, state_policy, hrw_routing.as_ref())?;
+    if config.runtime_network_enforcement == RuntimeNetworkEnforcement::WasiSandbox {
+        state_policy.reject_stateful_wasi(&config.id)?;
+    }
+    Ok(ValidatedConnectorConfig {
+        manifest_constraints,
+        state_policy,
+    })
 }
 
 async fn build_registry_entry(
@@ -2376,13 +2701,33 @@ async fn build_registry_entry(
     resilience: Arc<ResilienceLayer>,
     capability_verifying_key: Option<[u8; PUBLIC_KEY_SIZE]>,
 ) -> HostResult<RegistryEntry> {
-    let manifest_constraints = validate_registry_config(&config)?;
-    let connector =
-        ConnectorRuntime::spawn(config.clone(), resilience, capability_verifying_key).await?;
+    let admitted = validate_registry_config(&config)?;
+    build_registry_entry_with_admission(config, admitted, resilience, capability_verifying_key)
+        .await
+}
+
+async fn build_registry_entry_with_admission(
+    config: ConnectorConfig,
+    admitted: ValidatedConnectorConfig,
+    resilience: Arc<ResilienceLayer>,
+    capability_verifying_key: Option<[u8; PUBLIC_KEY_SIZE]>,
+) -> HostResult<RegistryEntry> {
+    let connector = ConnectorRuntime::spawn(
+        config.clone(),
+        &admitted,
+        resilience,
+        capability_verifying_key,
+    )
+    .await?;
+    let ValidatedConnectorConfig {
+        manifest_constraints,
+        state_policy,
+    } = admitted;
     Ok(RegistryEntry {
         config,
         connector,
         manifest_constraints,
+        state_policy,
     })
 }
 
@@ -2607,6 +2952,31 @@ impl SubprocessRegistry {
             .collect()
     }
 
+    async fn state_policy_snapshot(
+        &self,
+        connector_id: &ConnectorId,
+    ) -> Option<(ConnectorConfig, ConnectorStatePolicy)> {
+        let state = self.state.read().await;
+        state
+            .connectors
+            .get(connector_id)
+            .map(|entry| (entry.config.clone(), entry.state_policy))
+    }
+
+    async fn advertised_connectors(&self) -> Vec<fcp_mesh::invoke_route::AdvertisedConnector> {
+        let state = self.state.read().await;
+        state
+            .connectors
+            .values()
+            .map(|entry| fcp_mesh::invoke_route::AdvertisedConnector {
+                singleton_writer: entry.state_policy.is_singleton_writer(),
+                summary_json: None,
+                zones: entry.config.allowed_zones.clone(),
+                connector_id: entry.config.id.clone(),
+            })
+            .collect()
+    }
+
     async fn zone_envelope_status(&self, connector_id: &ConnectorId) -> HostResult<()> {
         let state = self.state.read().await;
         let entry = state
@@ -2704,17 +3074,51 @@ impl SubprocessRegistry {
     }
 
     async fn plan_configs(&self, configs: Vec<ConnectorConfig>) -> HostResult<RegistryConfigPlan> {
-        let (current_configs, source_version) = {
+        let (current_configs, current_state_policies, source_version) = {
             let state = self.state.read().await;
             let current_configs = state
                 .connectors
                 .iter()
                 .map(|(id, entry)| (id.clone(), entry.config.clone()))
                 .collect::<HashMap<_, _>>();
-            (current_configs, self.version.load(Ordering::SeqCst))
+            let current_state_policies = state
+                .connectors
+                .iter()
+                .map(|(id, entry)| (id.clone(), entry.state_policy))
+                .collect::<HashMap<_, _>>();
+            (
+                current_configs,
+                current_state_policies,
+                self.version.load(Ordering::SeqCst),
+            )
         };
 
-        RegistryConfigPlan::new(&current_configs, configs, source_version)
+        let mut plan = RegistryConfigPlan::new(&current_configs, configs, source_version)?;
+        let mut changed_manifests = HashSet::new();
+        for (connector_id, config) in &plan.next_configs {
+            if current_configs.get(connector_id) == Some(config)
+                && let Some(policy) = current_state_policies.get(connector_id)
+                && policy.manifest_digest.is_some()
+                && !policy.manifest_matches_admission(config)?
+            {
+                // An explicit preview/apply must observe file changes even
+                // when the managed path is unchanged. Do not alter the active
+                // policy here: preparation validates a new snapshot, and only
+                // successful publication may replace the admitted authority.
+                // Failed integrity reads propagate above; they must never
+                // manufacture a replacement of an otherwise unchanged runtime.
+                changed_manifests.insert(connector_id.to_string());
+                plan.updated.push(connector_id.to_string());
+                plan.replacement_ids.push(connector_id.clone());
+            }
+        }
+        if !changed_manifests.is_empty() {
+            plan.unchanged.retain(|id| !changed_manifests.contains(id));
+            plan.updated.sort();
+            plan.replacement_ids
+                .sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        }
+        Ok(plan)
     }
 
     async fn prepare_configs(
@@ -2724,8 +3128,11 @@ impl SubprocessRegistry {
         let plan = self.plan_configs(configs).await?;
         let mut replacement_entries = HashMap::new();
         for connector_id in &plan.replacement_ids {
-            let entry = build_registry_entry(
+            let admitted = validate_registry_config(&plan.next_configs[connector_id])?;
+            self.require_state_policy_replacement(connector_id, admitted.state_policy).await?;
+            let entry = build_registry_entry_with_admission(
                 plan.next_configs[connector_id].clone(),
+                admitted,
                 Arc::clone(&self.resilience),
                 self.capability_verifying_key,
             )
@@ -2738,13 +3145,26 @@ impl SubprocessRegistry {
         })
     }
 
+    async fn require_state_policy_replacement(
+        &self,
+        connector_id: &ConnectorId,
+        candidate: ConnectorStatePolicy,
+    ) -> HostResult<()> {
+        let state = self.state.read().await;
+        let Some(current) = state.connectors.get(connector_id) else {
+            return Ok(());
+        };
+        validate_state_policy_replacement(connector_id, current, candidate)
+    }
+
     async fn preview_configs(
         &self,
         configs: Vec<ConnectorConfig>,
     ) -> HostResult<ConnectorInventoryApplyReport> {
         let plan = self.plan_configs(configs).await?;
         for connector_id in &plan.replacement_ids {
-            validate_registry_config(&plan.next_configs[connector_id])?;
+            let admitted = validate_registry_config(&plan.next_configs[connector_id])?;
+            self.require_state_policy_replacement(connector_id, admitted.state_policy).await?;
         }
         Ok(plan.report(plan.source_version))
     }
@@ -2796,6 +3216,11 @@ impl SubprocessRegistry {
         // retains the exact process handles for all unchanged entries.
         let mut next_entries = HashMap::new();
         for (connector_id, config) in &prepared.plan.next_configs {
+            if let Some(replacement) = prepared.replacement_entries.get(connector_id)
+                && let Some(current) = state.connectors.get(connector_id)
+            {
+                validate_state_policy_replacement(connector_id, current, replacement.state_policy)?;
+            }
             let entry = prepared
                 .replacement_entries
                 .get(connector_id)
@@ -2863,7 +3288,7 @@ impl SubprocessRegistry {
             AllowListSnapshot {
                 allowed_zones: cfg.allowed_zones.clone(),
                 allowed_operations: cfg.allowed_operations.clone(),
-                singleton_writer: connector_config_declares_singleton_writer(cfg),
+                singleton_writer: entry.state_policy.is_singleton_writer(),
                 enforce_operation_network_constraints: cfg.enforce_operation_network_constraints,
                 enforce_empty_allow_lists: cfg.enforce_empty_allow_lists,
                 manifest_constraints: entry.manifest_constraints.clone(),
@@ -3940,12 +4365,13 @@ async fn connector_state_canonical_status_from_config(
 
 async fn connector_lease_durable_evidence_from_config(
     config: &ConnectorConfig,
+    state_policy: ConnectorStatePolicy,
     connector_id: &ConnectorId,
     zone: &ZoneId,
     state_root: &StdPath,
 ) -> ConnectorLeaseDurableEvidence {
     let mut evidence = ConnectorLeaseDurableEvidence::default();
-    if !connector_config_declares_singleton_writer(config) {
+    if !state_policy.is_singleton_writer() {
         evidence.warnings.push(format!(
             "Connector `{connector_id}` does not declare singleton_writer state, so no durable singleton-writer lease object is expected."
         ));
@@ -4164,19 +4590,18 @@ async fn connector_lease_yield_flush_context_for_registered_connector(
     connector_id: &ConnectorId,
     zone: &ZoneId,
 ) -> Result<HostConnectorLeaseYieldFlushContext, String> {
-    let inventory = state.registry.inventory().await;
-    let config = find_connector_inventory_entry(&inventory, connector_id)
+    let (config, state_policy) = state.registry.state_policy_snapshot(connector_id).await
         .ok_or_else(|| format!("connector `{connector_id}` is not present in the host registry"))?;
-    if !connector_config_declares_singleton_writer(config) {
+    if !state_policy.is_singleton_writer() {
         return Err(format!(
             "connector `{connector_id}` does not declare singleton_writer state; refusing lease-yield flush"
         ));
     }
 
     let state_root =
-        configured_connector_state_root(config).unwrap_or_else(connector_state_root_dir);
+        configured_connector_state_root(&config).unwrap_or_else(connector_state_root_dir);
     let object_store_dir = connector_state_canonical_object_store_dir(&state_root, connector_id);
-    let object_id_key = configured_connector_state_object_id_key(config)?.ok_or_else(|| {
+    let object_id_key = configured_connector_state_object_id_key(&config)?.ok_or_else(|| {
         format!(
             "Cannot flush connector-state for `{connector_id}` before lease yield because neither `{}` nor `{}` is configured.",
             FCP_HOST_CONNECTOR_STATE_OBJECT_ID_KEY_ENV, CONNECTOR_STATE_OBJECT_ID_KEY_ENV
@@ -4568,27 +4993,6 @@ fn sanitize_state_path_segment(value: &str) -> String {
     } else {
         segment
     }
-}
-
-fn connector_config_declares_singleton_writer(config: &ConnectorConfig) -> bool {
-    let env_declares = config
-        .env
-        .get("FCP_CONNECTOR_STATE_MODEL")
-        .or_else(|| config.env.get("FCP_HOST_CONNECTOR_STATE_MODEL"))
-        .is_some_and(|value| value.trim() == "singleton_writer");
-    if env_declares {
-        return true;
-    }
-
-    let Some(payload) = config.config.as_ref() else {
-        return false;
-    };
-    let model = payload
-        .pointer("/state/model")
-        .or_else(|| payload.pointer("/state_model"))
-        .or_else(|| payload.pointer("/stateModel"))
-        .and_then(Value::as_str);
-    model == Some("singleton_writer")
 }
 
 struct ConnectorProcessRunner {
@@ -6592,6 +6996,7 @@ fn parse_hrw_launch_zone_id(
 fn connector_lease_query_zone_id(
     connector_id: &ConnectorId,
     config: &ConnectorConfig,
+    state_policy: ConnectorStatePolicy,
     query_zone: Option<&str>,
     action: &str,
 ) -> HostResult<ZoneId> {
@@ -6603,7 +7008,7 @@ fn connector_lease_query_zone_id(
         });
     }
 
-    if !connector_config_declares_singleton_writer(config) {
+    if !state_policy.is_singleton_writer() {
         return Ok(ZoneId::work());
     }
 
@@ -6624,24 +7029,33 @@ fn connector_lease_query_zone_id(
 fn connector_lease_status_zone_id(
     connector_id: &ConnectorId,
     config: &ConnectorConfig,
+    state_policy: ConnectorStatePolicy,
     query_zone: Option<&str>,
 ) -> HostResult<ZoneId> {
-    connector_lease_query_zone_id(connector_id, config, query_zone, "status")
+    connector_lease_query_zone_id(connector_id, config, state_policy, query_zone, "status")
 }
 
 fn connector_lease_flush_before_yield_zone_id(
     connector_id: &ConnectorId,
     config: &ConnectorConfig,
+    state_policy: ConnectorStatePolicy,
     query_zone: Option<&str>,
 ) -> HostResult<ZoneId> {
-    connector_lease_query_zone_id(connector_id, config, query_zone, "flush-before-yield")
+    connector_lease_query_zone_id(
+        connector_id,
+        config,
+        state_policy,
+        query_zone,
+        "flush-before-yield",
+    )
 }
 
 fn enforce_hrw_singleton_writer_launch_route(
     config: &ConnectorConfig,
+    state_policy: ConnectorStatePolicy,
     routing: Option<&HrwLeaseRoutingConfig>,
 ) -> HostResult<()> {
-    if !connector_config_declares_singleton_writer(config) {
+    if !state_policy.is_singleton_writer() {
         return Ok(());
     }
     let Some(routing) = routing else {
@@ -10860,10 +11274,9 @@ async fn connector_lease_status_handler(
     Query(query): Query<ConnectorLeaseStatusQuery>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let connector_id = parse_connector_id(&connector_id)?;
-    let inventory = state.registry.inventory().await;
-    let config = find_connector_inventory_entry(&inventory, &connector_id)
+    let (config, state_policy) = state.registry.state_policy_snapshot(&connector_id).await
         .ok_or_else(|| map_host_error(HostError::ConnectorNotFound(connector_id.to_string())))?;
-    let zone = connector_lease_status_zone_id(&connector_id, config, query.zone.as_deref())
+    let zone = connector_lease_status_zone_id(&connector_id, &config, state_policy, query.zone.as_deref())
         .map_err(map_host_error)?;
     let started_at = Instant::now();
     tracing::debug!(
@@ -10874,10 +11287,15 @@ async fn connector_lease_status_handler(
     );
     let routing = current_hrw_lease_routing_config().map_err(map_host_error)?;
     let state_root =
-        configured_connector_state_root(config).unwrap_or_else(connector_state_root_dir);
-    let durable =
-        connector_lease_durable_evidence_from_config(config, &connector_id, &zone, &state_root)
-            .await;
+        configured_connector_state_root(&config).unwrap_or_else(connector_state_root_dir);
+    let durable = connector_lease_durable_evidence_from_config(
+        &config,
+        state_policy,
+        &connector_id,
+        &zone,
+        &state_root,
+    )
+    .await;
     let payload = connector_lease_status_payload(&connector_id, &zone, routing.as_ref(), &durable);
     let holder_node_id_hash = payload
         .get("holder_node_id_hash")
@@ -10900,11 +11318,10 @@ async fn connector_lease_flush_before_yield_handler(
     Query(query): Query<ConnectorLeaseFlushBeforeYieldQuery>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let connector_id = parse_connector_id(&connector_id)?;
-    let inventory = state.registry.inventory().await;
-    let config = find_connector_inventory_entry(&inventory, &connector_id)
+    let (config, state_policy) = state.registry.state_policy_snapshot(&connector_id).await
         .ok_or_else(|| map_host_error(HostError::ConnectorNotFound(connector_id.to_string())))?;
     let zone =
-        connector_lease_flush_before_yield_zone_id(&connector_id, config, query.zone.as_deref())
+        connector_lease_flush_before_yield_zone_id(&connector_id, &config, state_policy, query.zone.as_deref())
             .map_err(map_host_error)?;
     let started_at = Instant::now();
     tracing::debug!(
@@ -10980,18 +11397,7 @@ async fn mesh_inventory_handler(
     let started_at = Instant::now();
     // Reading the configured registry does not run connector health checks or
     // spawn a child. A read of topology must not consume invocation capacity.
-    let local_connectors = state
-        .registry
-        .inventory()
-        .await
-        .into_iter()
-        .map(|config| fcp_mesh::invoke_route::AdvertisedConnector {
-            singleton_writer: connector_config_declares_singleton_writer(&config),
-            summary_json: None,
-            zones: config.allowed_zones,
-            connector_id: config.id,
-        })
-        .collect();
+    let local_connectors = state.registry.advertised_connectors().await;
     let inventory = match state.mesh.as_ref() {
         Some(router) => router.inventory(local_connectors).await,
         None => fcp_host::mesh_routing::MeshInventoryResponse::local_only(local_connectors),
@@ -15965,14 +16371,12 @@ async fn local_mesh_advertised_connectors(
         .collect();
     state
         .registry
-        .inventory()
+        .advertised_connectors()
         .await
         .into_iter()
-        .map(|config| fcp_mesh::invoke_route::AdvertisedConnector {
-            singleton_writer: connector_config_declares_singleton_writer(&config),
-            summary_json: summaries.get(&config.id).cloned(),
-            zones: config.allowed_zones.clone(),
-            connector_id: config.id,
+        .map(|mut connector| {
+            connector.summary_json = summaries.get(&connector.connector_id).cloned();
+            connector
         })
         .collect()
 }
@@ -17288,7 +17692,7 @@ deny_ptrace = true
         let catalog = ManifestOperationConstraintCatalog::from_manifest(
             &manifest,
             "inline-test-manifest".to_string(),
-        );
+        ).expect("valid manifest state");
 
         let op_a = catalog
             .network_constraints
@@ -17310,7 +17714,7 @@ deny_ptrace = true
         let mut catalog = ManifestOperationConstraintCatalog::from_manifest(
             &two_operation_network_manifest(),
             "inline-test-manifest".to_string(),
-        );
+        ).expect("valid manifest state");
         catalog
             .network_constraints
             .get_mut("op.a")
@@ -17361,7 +17765,7 @@ deny_ptrace = true
         let mut catalog = ManifestOperationConstraintCatalog::from_manifest(
             &manifest,
             "inline-test-manifest".to_string(),
-        );
+        ).expect("valid manifest state");
         catalog.network_constraints.remove("op.b");
         let snapshot = operation_network_snapshot(true, catalog);
         let request = operation_network_request("op.b");
@@ -17383,7 +17787,7 @@ deny_ptrace = true
         let catalog = ManifestOperationConstraintCatalog::from_manifest(
             &manifest,
             "inline-test-manifest".to_string(),
-        );
+        ).expect("valid manifest state");
         let snapshot = operation_network_snapshot(true, catalog);
         let request = operation_network_request("op.b");
 
@@ -17463,13 +17867,18 @@ deny_ptrace = true
         config: ConnectorConfig,
     ) -> Arc<SubprocessRegistry> {
         let connector_key = ConnectorId::from_static(connector_id);
+        let manifest_constraints =
+            load_manifest_operation_constraints(&config).expect("fixture manifest constraints");
+        let state_policy = ConnectorStatePolicy::resolve(&config, &manifest_constraints)
+            .expect("fixture state policy");
         let mut connectors = HashMap::new();
         connectors.insert(
             connector_key,
             RegistryEntry {
                 config,
                 connector: ConnectorRuntime::Native(connector),
-                manifest_constraints: ManifestOperationConstraintCatalog::default(),
+                manifest_constraints,
+                state_policy,
             },
         );
         Arc::new(SubprocessRegistry {
@@ -17487,12 +17896,17 @@ deny_ptrace = true
     ) -> Arc<SubprocessRegistry> {
         let mut connectors = HashMap::new();
         for (connector_id, connector, config) in entries {
+            let manifest_constraints = load_manifest_operation_constraints(&config)
+                .expect("fixture manifest constraints");
+            let state_policy = ConnectorStatePolicy::resolve(&config, &manifest_constraints)
+                .expect("fixture state policy");
             connectors.insert(
                 ConnectorId::from_static(connector_id),
                 RegistryEntry {
                     config,
                     connector: ConnectorRuntime::Native(connector),
-                    manifest_constraints: ManifestOperationConstraintCatalog::default(),
+                    manifest_constraints,
+                    state_policy,
                 },
             );
         }
@@ -22831,7 +23245,8 @@ deny_ptrace = true
                 ManagedPortConstraint::Template("${matrix_homeserver_port}".to_string()),
             ),
         );
-        let invalid_connector = WasiConnector::new(invalid_config).expect("WASI connector");
+        let invalid_connector = WasiConnector::new(invalid_config, ConnectorStatePolicy::default())
+            .expect("WASI connector");
         let dynamic_err = invalid_connector
             .wasi_config_for_operation(
                 &request.operation,
@@ -25586,6 +26001,13 @@ deny_ptrace = true
     #[fcp_async_core::runtime::test(flavor = "multi_thread")]
     async fn invoke_handler_hrw_lease_refuses_non_holder_and_admits_elected_holder() {
         let connector_id = "fcp.test.hrw-lease-refuse:utility:1.0.0";
+        let manifest_directory = tempfile::tempdir().expect("manifest state directory");
+        let manifest_path = write_state_policy_test_manifest_for(
+            manifest_directory.path(),
+            connector_id,
+            Some("singleton_writer"),
+            false,
+        );
         let operation_id = "test.singleton";
         let capability_id = "cap.test.singleton";
         let signing_key = fcp_crypto::ed25519::Ed25519SigningKey::generate();
@@ -25649,12 +26071,12 @@ deny_ptrace = true
                 cancellation_deadline_ms: None,
                 id: connector_id.to_string(),
                 binary: "dispatcher-test".to_string(),
-                manifest_path: None,
+                manifest_path: Some(manifest_path.clone()),
                 name: Some("HRW Lease Refuse Test Connector".to_string()),
                 description: None,
                 args: Vec::new(),
                 env: BTreeMap::new(),
-                config: Some(json!({ "state": { "model": "singleton_writer" } })),
+                config: None,
                 categories: vec!["test".to_string()],
                 version: None,
                 allowed_zones: vec![ZoneId::work().as_str().to_string()],
@@ -25665,6 +26087,20 @@ deny_ptrace = true
                 prewarm: Default::default(),
                 operation_network_constraints: BTreeMap::new(),
             },
+        );
+        // Neither a later file edit nor absent legacy hints may weaken a
+        // running generation's manifest-only singleton declaration.
+        std::fs::write(
+            &manifest_path,
+            state_policy_test_manifest_for(connector_id, Some("stateless"), false),
+        )
+        .expect("replace on-disk manifest");
+        assert!(
+            registry
+                .allow_list_snapshot(&ConnectorId::from_static(connector_id))
+                .await
+                .expect("registered policy")
+                .singleton_writer
         );
         let state = dispatcher_app_state(
             registry,
@@ -26537,7 +26973,7 @@ deny_ptrace = true
         let connector_id = "fcp.test.hrw-launch-admit:utility:1.0.0";
         let operation_id = "test.singleton";
         let mut config = dispatcher_test_config(connector_id);
-        config.runtime_network_enforcement = RuntimeNetworkEnforcement::WasiSandbox;
+        config.runtime_network_enforcement = RuntimeNetworkEnforcement::HostEgressProxy;
         config.allowed_operations = vec![operation_id.to_string()];
         config.operation_network_constraints.insert(
             operation_id.to_string(),
@@ -26568,7 +27004,10 @@ deny_ptrace = true
             .await
             .expect("elected holder should build singleton_writer registry entry");
         assert_eq!(entry.config.id, connector_id);
-        assert!(matches!(entry.connector, ConnectorRuntime::Wasi(_)));
+        assert!(matches!(
+            entry.connector,
+            ConnectorRuntime::UnavailableNativeProxyOnly(_)
+        ));
     }
 
     #[fcp_async_core::runtime::test(flavor = "multi_thread")]
@@ -26700,6 +27139,7 @@ deny_ptrace = true
                 },
                 connector: ConnectorRuntime::Native(connector),
                 manifest_constraints: ManifestOperationConstraintCatalog::default(),
+                state_policy: ConnectorStatePolicy::default(),
             },
         );
         let registry = Arc::new(SubprocessRegistry {
@@ -27286,6 +27726,7 @@ deny_ptrace = true
                 },
                 connector: ConnectorRuntime::Native(connector),
                 manifest_constraints: ManifestOperationConstraintCatalog::default(),
+                state_policy: ConnectorStatePolicy::default(),
             },
         );
         let registry = Arc::new(SubprocessRegistry {
@@ -30169,6 +30610,111 @@ done"#;
         }
     }
 
+    fn state_policy_test_manifest(model: Option<&str>, legacy_singleton: bool) -> String {
+        state_policy_test_manifest_for("fcp.webhook-receiver", model, legacy_singleton)
+    }
+
+    fn state_policy_test_manifest_for(
+        connector_id: &str,
+        model: Option<&str>,
+        legacy_singleton: bool,
+    ) -> String {
+        let original = include_str!("../../../../connectors/webhook-receiver/manifest.toml");
+        let state_start = original
+            .find("[connector.state]")
+            .expect("receiver state section");
+        let state_end = original.find("[zones]").expect("receiver zones section");
+        let mut raw = original[..state_start].replacen(
+            "id = \"fcp.webhook-receiver\"",
+            &format!("id = {connector_id:?}"),
+            1,
+        );
+        if legacy_singleton {
+            raw.push_str("singleton_writer = true\n\n");
+        }
+        if let Some(model) = model {
+            raw.push_str(&format!(
+                "[connector.state]\nmodel = \"{model}\"\nstate_schema_version = \"1\"\n"
+            ));
+            if model == "crdt" {
+                raw.push_str("crdt_type = \"lww_map\"\n");
+            }
+            raw.push('\n');
+        }
+        raw.push_str(&original[state_end..]);
+        let manifest = ConnectorManifest::parse_str_unchecked(&raw).expect("fixture manifest");
+        let hash = manifest
+            .compute_interface_hash()
+            .expect("fixture interface hash");
+        let raw = raw.replace(
+            &manifest.manifest.interface_hash.to_string(),
+            &hash.to_string(),
+        );
+        ConnectorManifest::parse_str(&raw).expect("fixture satisfies full manifest validation");
+        raw
+    }
+
+    fn write_state_policy_test_manifest(
+        directory: &StdPath,
+        model: Option<&str>,
+        legacy_singleton: bool,
+    ) -> String {
+        write_state_policy_test_manifest_for(
+            directory,
+            "fcp.webhook-receiver",
+            model,
+            legacy_singleton,
+        )
+    }
+
+    fn write_state_policy_test_manifest_for(
+        directory: &StdPath,
+        connector_id: &str,
+        model: Option<&str>,
+        legacy_singleton: bool,
+    ) -> String {
+        let path = directory.join("manifest.toml");
+        std::fs::write(
+            &path,
+            state_policy_test_manifest_for(connector_id, model, legacy_singleton),
+        )
+        .expect("write state policy manifest");
+        path.to_string_lossy().into_owned()
+    }
+
+    fn stateless_warm_pool_test_policy() -> ConnectorStatePolicy {
+        let raw = state_policy_test_manifest(Some("stateless"), false);
+        let manifest = ConnectorManifest::parse_str(&raw).expect("validated stateless manifest");
+        let mut catalog = ManifestOperationConstraintCatalog::from_manifest(&manifest, "fixture")
+            .expect("valid state model");
+        catalog.manifest_digest = Some(*blake3::hash(raw.as_bytes()).as_bytes());
+        catalog.manifest_bytes = raw.len() as u64;
+        ConnectorStatePolicy::resolve(&dispatcher_test_config("fcp.webhook-receiver"), &catalog)
+            .expect("stateless fixture policy")
+    }
+
+    fn configure_stateless_pool_test_manifest(
+        config: &mut ConnectorConfig,
+    ) -> (tempfile::TempDir, ValidatedConnectorConfig) {
+        let directory = tempfile::tempdir().expect("pool manifest directory");
+        config.manifest_path = Some(write_state_policy_test_manifest_for(
+            directory.path(),
+            &config.id,
+            Some("stateless"),
+            false,
+        ));
+        let catalog = load_manifest_operation_constraints(config).expect("validated pool manifest");
+        let policy =
+            ConnectorStatePolicy::resolve(config, &catalog).expect("stateless pool policy");
+        (
+            directory,
+            ValidatedConnectorConfig {
+                manifest_constraints: catalog,
+                state_policy: policy,
+            },
+        )
+    }
+
     async fn subprocess_handshake_count(connector: &SubprocessConnector) -> u64 {
         let report = connector
             .self_check()
@@ -30207,8 +30753,11 @@ done"#;
             Duration::from_millis(50),
         );
 
+        let (manifest_directory, state_policy) =
+            configure_stateless_pool_test_manifest(&mut config);
         let connector = NativeWarmPoolConnector::spawn(
             config,
+            &state_policy,
             Arc::new(ResilienceLayer::default()),
             Some(signing_key.verifying_key().to_bytes()),
         )
@@ -30250,6 +30799,53 @@ done"#;
         let pooled_after_second = only_native_warm_pool_entry(&connector).await;
         assert!(Arc::ptr_eq(&prewarmed, &pooled_after_second));
         assert_eq!(subprocess_handshake_count(&pooled_after_second).await, 1);
+
+        let admitted_key = connector.warm_pool_key(&ZoneId::work());
+        std::fs::write(
+            manifest_directory.path().join("manifest.toml"),
+            state_policy_test_manifest_for(connector_id, Some("singleton_writer"), false),
+        )
+        .expect("replace admitted manifest with a stateful declaration");
+        assert_eq!(connector.warm_pool_key(&ZoneId::work()), admitted_key);
+        let error = connector
+            .checkout(&ZoneId::work())
+            .await
+            .err()
+            .expect("manifest drift must refuse existing warm workers");
+        assert!(
+            error
+                .to_string()
+                .contains("manifest changed after state admission"),
+            "{error}"
+        );
+        connector.entries.lock().await.clear();
+        let error = connector
+            .maintain_min_idle()
+            .await
+            .expect_err("manifest drift must refuse replacement workers");
+        assert!(
+            error
+                .to_string()
+                .contains("manifest changed after state admission"),
+            "{error}"
+        );
+        assert!(connector.entries.lock().await.is_empty());
+        std::fs::rename(
+            manifest_directory.path().join("manifest.toml"),
+            manifest_directory.path().join("retired-manifest.toml"),
+        )
+        .expect("make the admitted manifest unavailable");
+        let error = connector
+            .checkout(&ZoneId::work())
+            .await
+            .err()
+            .expect("an unavailable manifest must not become implicit stateless authority");
+        assert!(
+            error
+                .to_string()
+                .contains("admitted manifest is unavailable"),
+            "{error}"
+        );
     }
 
     #[fcp_async_core::runtime::test(flavor = "multi_thread")]
@@ -30277,8 +30873,11 @@ done"#;
             Duration::from_millis(50),
         );
 
+        let (_manifest_directory, state_policy) =
+            configure_stateless_pool_test_manifest(&mut config);
         let connector = NativeWarmPoolConnector::spawn(
             config,
+            &state_policy,
             Arc::new(ResilienceLayer::default()),
             Some(signing_key.verifying_key().to_bytes()),
         )
@@ -30344,8 +30943,11 @@ done"#;
             Duration::from_millis(50),
         );
 
+        let (_manifest_directory, state_policy) =
+            configure_stateless_pool_test_manifest(&mut config);
         let connector = NativeWarmPoolConnector::spawn(
             config,
+            &state_policy,
             Arc::new(ResilienceLayer::default()),
             Some(signing_key.verifying_key().to_bytes()),
         )
@@ -30404,8 +31006,11 @@ done"#;
             Duration::from_millis(50),
         );
 
+        let (_manifest_directory, state_policy) =
+            configure_stateless_pool_test_manifest(&mut config);
         let connector = NativeWarmPoolConnector::spawn(
             config,
+            &state_policy,
             Arc::new(ResilienceLayer::default()),
             Some(signing_key.verifying_key().to_bytes()),
         )
@@ -30458,8 +31063,11 @@ done"#;
             Duration::from_millis(50),
         );
 
+        let (_manifest_directory, state_policy) =
+            configure_stateless_pool_test_manifest(&mut config);
         let connector = NativeWarmPoolConnector::spawn(
             config,
+            &state_policy,
             Arc::new(ResilienceLayer::default()),
             Some(signing_key.verifying_key().to_bytes()),
         )
@@ -30919,6 +31527,10 @@ done"#;
             .iter()
             .map(|id| {
                 let config = plan.next_configs[id].clone();
+                let manifest_constraints = load_manifest_operation_constraints(&config)
+                    .expect("fixture manifest constraints");
+                let state_policy = ConnectorStatePolicy::resolve(&config, &manifest_constraints)
+                    .expect("fixture state policy");
                 let connector = ConnectorRuntime::UnavailableNativeProxyOnly(Arc::new(
                     UnavailableNativeProxyOnlyConnector::new(
                         &config,
@@ -30931,7 +31543,8 @@ done"#;
                     RegistryEntry {
                         config,
                         connector,
-                        manifest_constraints: ManifestOperationConstraintCatalog::default(),
+                        manifest_constraints,
+                        state_policy,
                     },
                 )
             })
@@ -32757,7 +33370,8 @@ done"#;
     #[test]
     fn production_prewarm_policy_accepts_default_on_demand() {
         let config = dispatcher_test_config("fcp.test.prewarm-default:utility:1.0.0");
-        validate_production_prewarm_policy(&config).expect("default on-demand prewarm is valid");
+        validate_production_prewarm_policy(&config, ConnectorStatePolicy::default())
+            .expect("default on-demand prewarm is valid");
     }
 
     #[test]
@@ -32770,11 +33384,11 @@ done"#;
             Duration::from_millis(50),
         );
 
-        validate_production_prewarm_policy(&config)
+        validate_production_prewarm_policy(&config, stateless_warm_pool_test_policy())
             .expect("native warm_pool prewarm has a wired production checkout path");
 
         config.runtime_network_enforcement = RuntimeNetworkEnforcement::WasiSandbox;
-        let error = validate_production_prewarm_policy(&config)
+        let error = validate_production_prewarm_policy(&config, stateless_warm_pool_test_policy())
             .expect_err("WASI warm_pool must fail closed before WASI checkout is wired");
         let message = error.to_string();
         assert!(message.contains("warm_pool"), "unexpected error: {message}");
@@ -32796,13 +33410,538 @@ done"#;
             checkout_timeout: Duration::from_millis(50),
         };
 
-        let error = validate_production_prewarm_policy(&config)
+        let error = validate_production_prewarm_policy(&config, ConnectorStatePolicy::default())
             .expect_err("zygote must fail closed without a security proof");
         let message = error.to_string();
         assert!(
             message.contains("zygote prewarm requires a security proof"),
             "unexpected error: {message}"
         );
+    }
+
+    fn state_policy_test_routing() -> HrwLeaseRoutingConfig {
+        let connector_id = ConnectorId::from_static("fcp.webhook-receiver");
+        let eligible_nodes = vec![
+            TailscaleNodeId::new("state-node-a"),
+            TailscaleNodeId::new("state-node-b"),
+            TailscaleNodeId::new("state-node-c"),
+        ];
+        let subject = singleton_writer_connector_lease_subject_id(&connector_id, &ZoneId::work());
+        let local_node =
+            fcp_mesh::planner::select_lease_holder(&ZoneId::work(), &subject, &eligible_nodes)
+                .expect("elected state holder");
+        HrwLeaseRoutingConfig {
+            local_node,
+            eligible_nodes,
+            current_lease_seq: Some(7),
+        }
+    }
+
+    fn state_policy_inventory_config(
+        manifest_path: String,
+        runtime: RuntimeNetworkEnforcement,
+    ) -> ConnectorConfig {
+        let mut config = dispatcher_test_config("fcp.webhook-receiver");
+        config.manifest_path = Some(manifest_path);
+        config.runtime_network_enforcement = runtime;
+        config.allowed_operations = vec!["webhook.events.poll".to_string()];
+        config.operation_network_constraints.insert(
+            "webhook.events.poll".into(),
+            runtime_network_test_constraints(
+                "api.example.test",
+                ManagedPortConstraint::Static(443),
+            ),
+        );
+        config
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn registry_state_policy_admits_only_proven_stateless_warm_pools() {
+        let directory = tempfile::tempdir().expect("manifest directory");
+        let registry = empty_registry(1);
+        let mut config = dispatcher_test_config("fcp.webhook-receiver");
+        config.binary = directory
+            .path()
+            .join("must-not-spawn")
+            .display()
+            .to_string();
+        config.prewarm = fcp_host::ConnectorPrewarmConfig::warm_pool(
+            1,
+            2,
+            Duration::from_secs(30),
+            Duration::from_millis(50),
+        );
+        let _guard = set_test_hrw_lease_routing_override(None);
+
+        for model in [Some("singleton_writer"), Some("crdt"), None] {
+            config.manifest_path = model.map(|model| {
+                write_state_policy_test_manifest(directory.path(), Some(model), false)
+            });
+            let preview = registry
+                .preview_configs(vec![config.clone()])
+                .await
+                .expect_err("unsafe pool must fail during preview");
+            assert!(
+                preview.to_string().contains("validated stateless manifest"),
+                "{preview}"
+            );
+            let apply = registry
+                .apply_configs(vec![config.clone()])
+                .await
+                .expect_err("unsafe pool must fail before process creation");
+            assert!(
+                apply.to_string().contains("validated stateless manifest"),
+                "{apply}"
+            );
+            let manifest_constraints = load_manifest_operation_constraints(&config).unwrap();
+            let state_policy =
+                ConnectorStatePolicy::resolve(&config, &manifest_constraints).unwrap();
+            if model.is_none() {
+                assert_eq!(state_policy.model, ConnectorStateKind::Unknown);
+            }
+            let admitted = ValidatedConnectorConfig {
+                manifest_constraints,
+                state_policy,
+            };
+            let error = NativeWarmPoolConnector::spawn(
+                config.clone(),
+                &admitted,
+                Arc::new(ResilienceLayer::default()),
+                None,
+            )
+            .await
+            .err()
+            .expect("pool entrypoint independently requires stateless authority");
+            assert!(
+                error.to_string().contains("validated stateless manifest"),
+                "{error}"
+            );
+            assert!(registry.inventory().await.is_empty());
+            assert_eq!(registry.version(), 1);
+        }
+
+        // A validated manifest retains the schema's default when its optional
+        // state section is absent; a missing manifest does not get that default.
+        for model in [Some("stateless"), None] {
+            config.manifest_path = Some(write_state_policy_test_manifest(
+                directory.path(),
+                model,
+                false,
+            ));
+            let preview = registry
+                .preview_configs(vec![config.clone()])
+                .await
+                .expect("known stateless manifests admit native pool planning");
+            assert_eq!(preview.added, vec![config.id.clone()]);
+            let apply = registry
+                .apply_configs(vec![config.clone()])
+                .await
+                .expect_err("stateless pool reaches actual executable preparation");
+            assert!(apply.to_string().contains("spawn failed"), "{apply}");
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn registry_state_policy_rejects_conflicting_hints_and_requires_hrw_authority() {
+        let directory = tempfile::tempdir().expect("manifest directory");
+        let registry = empty_registry(1);
+        let mut base = dispatcher_test_config("fcp.webhook-receiver");
+        base.manifest_path = Some(write_state_policy_test_manifest(
+            directory.path(),
+            Some("singleton_writer"),
+            false,
+        ));
+        let _guard = set_test_hrw_lease_routing_override(None);
+        let mut unrelated = base.clone();
+        unrelated.id = "fcp.unrelated".into();
+        let error = registry
+            .preview_configs(vec![unrelated])
+            .await
+            .expect_err("state authority belongs to the manifest's connector identity");
+        assert!(
+            error
+                .to_string()
+                .contains("does not match managed connector"),
+            "{error}"
+        );
+        let mut candidates = Vec::new();
+        for name in [
+            "FCP_CONNECTOR_STATE_MODEL",
+            "FCP_HOST_CONNECTOR_STATE_MODEL",
+        ] {
+            let mut config = base.clone();
+            config.env.insert(name.to_string(), "stateless".to_string());
+            candidates.push(config);
+        }
+        for payload in [
+            json!({"state": {"model": "stateless"}}),
+            json!({"state_model": "stateless"}),
+            json!({"stateModel": "stateless"}),
+        ] {
+            let mut config = base.clone();
+            config.config = Some(payload);
+            candidates.push(config);
+        }
+        let mut legacy_conflict = base.clone();
+        legacy_conflict.manifest_path = None;
+        legacy_conflict
+            .env
+            .insert("FCP_CONNECTOR_STATE_MODEL".into(), "stateless".into());
+        legacy_conflict.env.insert(
+            "FCP_HOST_CONNECTOR_STATE_MODEL".into(),
+            "singleton_writer".into(),
+        );
+        candidates.push(legacy_conflict);
+        for config in candidates {
+            let error = registry
+                .preview_configs(vec![config.clone()])
+                .await
+                .expect_err("state declarations must agree before runtime preparation");
+            assert!(
+                error.to_string().contains("conflicting state model"),
+                "{error}"
+            );
+            let error = registry
+                .apply_configs(vec![config])
+                .await
+                .expect_err("a config hint cannot weaken manifest authority");
+            assert!(
+                error.to_string().contains("conflicting state model"),
+                "{error}"
+            );
+        }
+        for payload in [
+            json!({"state_model": null}),
+            json!({"state_model": "unknown"}),
+        ] {
+            let mut config = base.clone();
+            config.config = Some(payload);
+            let error = registry
+                .preview_configs(vec![config])
+                .await
+                .expect_err("malformed state declarations fail closed");
+            assert!(error.to_string().contains("state model"), "{error}");
+        }
+        for (model, legacy) in [(Some("singleton_writer"), false), (None, true)] {
+            base.manifest_path = Some(write_state_policy_test_manifest(
+                directory.path(),
+                model,
+                legacy,
+            ));
+            let error = registry
+                .apply_configs(vec![base.clone()])
+                .await
+                .expect_err("manifest-only singleton requires configured HRW authority");
+            assert!(
+                error.to_string().contains("LeaseRoutingConfigMissing"),
+                "{error}"
+            );
+        }
+        assert!(registry.inventory().await.is_empty());
+        assert_eq!(registry.version(), 1);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn registry_state_policy_freezes_and_preserves_stateful_authority() {
+        let directory = tempfile::tempdir().expect("manifest directory");
+        let connector_id = ConnectorId::from_static("fcp.webhook-receiver");
+        let path =
+            write_state_policy_test_manifest(directory.path(), Some("singleton_writer"), false);
+        let config =
+            state_policy_inventory_config(path.clone(), RuntimeNetworkEnforcement::HostEgressProxy);
+        let _guard = set_test_hrw_lease_routing_override(Some(state_policy_test_routing()));
+        // Strict native execution is unavailable: this exercises production
+        // preparation/publication without starting a provider subprocess.
+        let registry = SubprocessRegistry::from_configs(vec![config.clone()], None)
+            .await
+            .expect("manifest-only singleton is admitted for the selected holder");
+        assert!(
+            registry
+                .allow_list_snapshot(&connector_id)
+                .await
+                .unwrap()
+                .singleton_writer
+        );
+        assert!(registry.advertised_connectors().await[0].singleton_writer);
+
+        std::fs::write(&path, state_policy_test_manifest(Some("stateless"), false)).unwrap();
+        assert!(
+            registry
+                .allow_list_snapshot(&connector_id)
+                .await
+                .unwrap()
+                .singleton_writer
+        );
+        assert!(
+            registry
+                .state_policy_snapshot(&connector_id)
+                .await
+                .unwrap()
+                .1
+                .is_singleton_writer()
+        );
+
+        let mut removed = config.clone();
+        removed.manifest_path = None;
+        let mut legacy_only = removed.clone();
+        legacy_only.env.insert(
+            "FCP_CONNECTOR_STATE_MODEL".into(),
+            "singleton_writer".into(),
+        );
+        for candidate in [config.clone(), removed, legacy_only] {
+            let preview = registry
+                .preview_configs(vec![candidate.clone()])
+                .await
+                .expect_err("preview must retain existing state authority");
+            assert!(
+                preview.to_string().contains("cannot discard or change"),
+                "{preview}"
+            );
+            let apply = registry
+                .apply_configs(vec![candidate])
+                .await
+                .expect_err("apply must retain existing state authority before creating a runtime");
+            assert!(
+                apply.to_string().contains("cannot discard or change"),
+                "{apply}"
+            );
+        }
+
+        let replacement = format!(
+            "{}\n# new admitted generation\n",
+            state_policy_test_manifest(Some("singleton_writer"), false)
+        );
+        std::fs::write(&path, replacement).unwrap();
+        let prepared = registry
+            .prepare_configs(vec![config.clone()])
+            .await
+            .expect("same state authority may be explicitly re-admitted");
+        assert_eq!(prepared.plan.updated, vec![config.id.clone()]);
+        assert!(prepared.plan.unchanged.is_empty());
+        let old = registry
+            .state_policy_snapshot(&connector_id)
+            .await
+            .unwrap()
+            .1;
+        let next = prepared.replacement_entries[&connector_id].state_policy;
+        assert_ne!(old.manifest_digest, next.manifest_digest);
+        registry
+            .publish_configs(prepared)
+            .await
+            .expect("publish new generation");
+        assert!(
+            registry
+                .allow_list_snapshot(&connector_id)
+                .await
+                .unwrap()
+                .singleton_writer
+        );
+        assert!(registry.advertised_connectors().await[0].singleton_writer);
+        let unchanged = registry.apply_configs(vec![config.clone()]).await.unwrap();
+        assert_eq!(unchanged.unchanged, vec![config.id.clone()]);
+        let version = registry.version();
+        std::fs::rename(&path, directory.path().join("retired-manifest.toml")).unwrap();
+        let error = registry
+            .apply_configs(vec![config.clone()])
+            .await
+            .expect_err("missing admitted manifests cannot silently keep an unchanged plan");
+        assert!(
+            error
+                .to_string()
+                .contains("admitted manifest is unavailable"),
+            "{error}"
+        );
+        assert_eq!(registry.version(), version);
+        assert!(registry.advertised_connectors().await[0].singleton_writer);
+        std::fs::rename(directory.path().join("retired-manifest.toml"), &path).unwrap();
+        let restored = registry
+            .apply_configs(vec![config])
+            .await
+            .expect("restored identical authority must not restart the runtime");
+        assert_eq!(restored.unchanged, vec![connector_id.to_string()]);
+        assert_eq!(restored.registry_version, version);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn registry_state_policy_rejects_stateful_wasi_and_drift_before_native_spawn() {
+        let directory = tempfile::tempdir().expect("manifest directory");
+        let registry = empty_registry(1);
+        let path =
+            write_state_policy_test_manifest(directory.path(), Some("singleton_writer"), false);
+        let mut config =
+            state_policy_inventory_config(path.clone(), RuntimeNetworkEnforcement::WasiSandbox);
+        let _guard = set_test_hrw_lease_routing_override(Some(state_policy_test_routing()));
+        for model in ["singleton_writer", "crdt"] {
+            std::fs::write(&path, state_policy_test_manifest(Some(model), false)).unwrap();
+            let preview = registry
+                .preview_configs(vec![config.clone()])
+                .await
+                .expect_err("WASI cannot recover and publish connector state");
+            assert!(
+                preview
+                    .to_string()
+                    .contains("fresh instance for every invocation"),
+                "{preview}"
+            );
+            let apply = registry
+                .apply_configs(vec![config.clone()])
+                .await
+                .expect_err("stateful WASI must not be registered as executable");
+            assert!(
+                apply.to_string().contains("persistent native on_demand"),
+                "{apply}"
+            );
+        }
+        std::fs::write(&path, state_policy_test_manifest(None, false)).unwrap();
+        registry
+            .apply_configs(vec![config.clone()])
+            .await
+            .expect("documented stateless WASI default");
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n# revised stateless manifest\n",
+                state_policy_test_manifest(None, false)
+            ),
+        )
+        .unwrap();
+        let report = registry
+            .apply_configs(vec![config.clone()])
+            .await
+            .expect("same-path stateless manifest updates are re-admitted by ordinary apply");
+        assert_eq!(report.updated, vec![config.id.clone()]);
+
+        config.runtime_network_enforcement = RuntimeNetworkEnforcement::NativeUnmediated;
+        config.binary = directory
+            .path()
+            .join("must-not-spawn")
+            .display()
+            .to_string();
+        let admitted =
+            validate_registry_config(&config).expect("admitted native stateless manifest");
+        let before = std::fs::read_to_string(&path).unwrap();
+        let same_length = before.replacen(
+            "Webhook Receiver Connector",
+            "Webhook Receiver ConnectoX",
+            1,
+        );
+        assert_eq!(same_length.len(), before.len());
+        assert_ne!(same_length, before);
+        std::fs::write(&path, same_length).unwrap();
+        let error = ConnectorRuntime::spawn(
+            config,
+            &admitted,
+            Arc::new(ResilienceLayer::default()),
+            None,
+        )
+        .await
+        .err()
+        .expect("a changed manifest must be refused before actual native spawn");
+        assert!(
+            error
+                .to_string()
+                .contains("manifest changed after state admission"),
+            "{error}"
+        );
+        assert!(!error.to_string().contains("spawn failed"), "{error}");
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn registry_state_policy_preserves_live_runtime_before_stateful_replacement() {
+        let _guard = set_test_hrw_lease_routing_override(Some(state_policy_test_routing()));
+        for (current_model, candidate_model, expected) in [
+            (
+                "singleton_writer",
+                "singleton_writer",
+                "requires quiescence and canonical state handoff",
+            ),
+            (
+                "crdt",
+                "crdt",
+                "requires quiescence and canonical state handoff",
+            ),
+            (
+                "stateless",
+                "singleton_writer",
+                "requires quiescence and canonical state handoff",
+            ),
+            (
+                "stateless",
+                "crdt",
+                "requires quiescence and canonical state handoff",
+            ),
+            ("singleton_writer", "stateless", "cannot discard or change"),
+        ] {
+            let directory = tempfile::tempdir().expect("live state replacement directory");
+            let connector_id = "fcp.webhook-receiver";
+            let mut config = dispatcher_test_config(connector_id);
+            let path =
+                write_state_policy_test_manifest(directory.path(), Some(current_model), false);
+            config.manifest_path = Some(path.clone());
+            let requests = Arc::new(AtomicU64::new(0));
+            let observed_requests = Arc::clone(&requests);
+            let (runner_tx, mut runner_rx) = mpsc::channel::<ConnectorRpcRequest>(4);
+            let runner_task = task::spawn(async move {
+                while let Some(request) = runner_rx.recv().await {
+                    observed_requests.fetch_add(1, Ordering::SeqCst);
+                    let _ = request.response_tx.send(Ok(json!({
+                        "error": { "message": "replacement admission must not touch the live runtime" }
+                    })));
+                }
+            });
+            let connector = dispatcher_test_connector(connector_id, runner_tx, runner_task);
+            let registry = dispatcher_registry_with_connector(
+                connector_id,
+                Arc::clone(&connector),
+                config.clone(),
+            );
+            let version = registry.version();
+            std::fs::write(
+                &path,
+                state_policy_test_manifest(Some(candidate_model), false),
+            )
+            .unwrap();
+            let mut candidate = config.clone();
+            candidate.binary = directory
+                .path()
+                .join("must-not-spawn")
+                .display()
+                .to_string();
+
+            let preview = registry
+                .preview_configs(vec![candidate.clone()])
+                .await
+                .expect_err("preview must refuse overlapping stateful runtimes");
+            assert!(preview.to_string().contains(expected), "{preview}");
+            let preparation = registry
+                .prepare_configs(vec![candidate.clone()])
+                .await
+                .err()
+                .expect("preparation must refuse before touching the candidate executable");
+            assert!(preparation.to_string().contains(expected), "{preparation}");
+            assert!(
+                !preparation.to_string().contains("spawn failed"),
+                "{preparation}"
+            );
+
+            // Even a manually constructed prepared entry cannot bypass the
+            // same check at the authoritative publication write lock.
+            let prepared = registry_publication_fixture(&registry, vec![candidate]).await;
+            let publication = registry
+                .publish_configs(prepared)
+                .await
+                .expect_err("publication must preserve the active stateful generation");
+            assert!(publication.to_string().contains(expected), "{publication}");
+            assert_eq!(registry.version(), version);
+            assert_eq!(registry.inventory().await, vec![config]);
+            assert_eq!(requests.load(Ordering::SeqCst), 0);
+            let state = registry.state.read().await;
+            let entry = &state.connectors[&ConnectorId::from_static(connector_id)];
+            let ConnectorRuntime::Native(retained) = &entry.connector else {
+                panic!("replacement changed the live runtime");
+            };
+            assert!(Arc::ptr_eq(retained, &connector));
+        }
     }
 
     #[derive(Clone, Copy)]
@@ -35211,7 +36350,10 @@ done"#;
         config.config = Some(json!({ "state": { "model": "singleton_writer" } }));
         config.allowed_zones = vec!["z:work".to_owned(), "z:community".to_owned()];
 
-        let error = connector_lease_status_zone_id(&connector_id, &config, None)
+        let state_policy =
+            ConnectorStatePolicy::resolve(&config, &ManifestOperationConstraintCatalog::default())
+                .expect("valid singleton state");
+        let error = connector_lease_status_zone_id(&connector_id, &config, state_policy, None)
             .expect_err("multi-zone singleton_writer status should require explicit zone");
 
         assert!(

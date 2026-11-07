@@ -38,6 +38,48 @@ durable-lease, capability, policy, or approval checks. Deploy the callback
 binding with the receiver's actual ownership and session; endpoint creation
 requires its own capability and signed execution approval.
 
+### Manifest authority and runtime lifecycle
+
+The host freezes the validated manifest's state model in the published
+registry generation. The managed connector ID must exactly match the
+manifest's `connector.id`; a configured state-model hint that conflicts with
+the manifest is rejected. The receiver's declared `singleton_writer` model
+therefore selects the existing HRW ownership and request-fencing checks even
+when no legacy configuration hint names that model.
+
+Runtime admission follows that state evidence:
+
+- Native warm pools require a validated manifest whose effective model is
+  `stateless`, including the manifest schema default when the state section
+  is omitted.
+  Singleton-writer, CRDT, and unknown-state registrations cannot start
+  independent warm-pool replicas.
+- Explicitly stateful WASI registrations are refused.
+- Legacy on-demand registrations whose state remains unknown retain their
+  existing supported path. Unknown state does not establish statelessness
+  or authorize a warm pool.
+
+Normal explicit inventory preview/apply compares manifest content, so an edit
+at the same path is detected. Active policy changes only through publication
+of a validated generation. Unreadable or invalid manifest evidence, and
+attempts to downgrade or remove established stateful policy, fail closed
+while retaining the published generation.
+
+Hot replacement of an executable native process, warm pool, or WASI runtime
+is refused before spawning a replacement when either the current or proposed
+state model is singleton-writer or CRDT. This includes same-model configuration
+and manifest edits: the active runtime remains intact until verified quiescence
+and canonical state handoff are supported. An inert
+`UnavailableNativeProxyOnly` registration has no live connector state and may
+accept otherwise valid same-model metadata or manifest updates. Explicit
+connector removal and shutdown have separate lifecycle semantics.
+
+These checks do not issue a signed canonical writer lease or create a durable
+receiver checkpoint. The configured HRW sequence remains request-fencing
+input checked by normal admission. Endpoint secrets, retained events, replay
+identities, and cursors still disappear on receiver restart or reconfiguration;
+canonical persistence and state transfer remain incomplete.
+
 ## Configure the host binding
 
 Set `FCP_HOST_WEBHOOK_INGRESS_CONFIG_FILE` to a JSON configuration file before

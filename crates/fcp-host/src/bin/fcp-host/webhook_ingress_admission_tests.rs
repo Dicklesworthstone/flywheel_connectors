@@ -455,7 +455,10 @@ async fn webhook_ingress_admission_verifies_provisioned_holder_against_signed_me
     let membership = tempfile::tempdir().expect("signed membership directory");
     Arc::get_mut(&mut fixture.host)
         .expect("host has not started owned invocations")
-        .mesh = Some(Arc::new(tests::holder_test_router(membership.path(), &holder)));
+        .mesh = Some(Arc::new(tests::holder_test_router(
+        membership.path(),
+        &holder,
+    )));
 
     let bearer = tests::test_capability_token_for_instance(
         &fixture.signing_key,

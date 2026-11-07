@@ -837,6 +837,7 @@ mod tests {
             None,
             crate::PlacementOperationClass::BulkPrewarm,
             Some(&invocation),
+            None,
         )
         .await
         .err()
@@ -915,6 +916,7 @@ mod tests {
             None,
             crate::PlacementOperationClass::BulkPrewarm,
             Some(&invocation),
+            None,
         )
         .await
         .err()
