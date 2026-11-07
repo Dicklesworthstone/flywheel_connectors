@@ -27823,7 +27823,19 @@ fn replay_dispatch(args: &ReplayArgs, explicit_host: Option<&str>) -> Result<Dis
     // Preview is strictly offline, including when --host was supplied.
     let host = if args.dry_run {
         None
-    } else if let Some(host) = resolve_host_config(explicit_host)? {
+    } else if let Some(mut host) = resolve_host_config(explicit_host)? {
+        host.endpoint = match normalize_host_endpoint(&host.endpoint) {
+            Ok(endpoint) => endpoint,
+            Err(_) => {
+                return Ok(replay_refusal(
+                    args,
+                    &entry,
+                    "invalid-replay-host",
+                    "Live replay requires a valid host endpoint without embedded credentials, query strings, or fragments.",
+                    CliExitCode::Transport,
+                ));
+            }
+        };
         Some(host)
     } else {
         return Ok(replay_refusal(
@@ -60100,6 +60112,115 @@ require_attestation_types = ["in-toto"]"#,
             assert_eq!(exit_code, CliExitCode::Validation.into(), "{payload}");
             assert_eq!(payload["error"]["type"], expected);
         }
+    }
+
+    #[test]
+    fn replay_live_rejects_credential_bearing_hosts_without_echoing_them() {
+        let (_root, entry_id, _guard) = seed_live_replay_entry(super::history::OpStatus::Success);
+        for (host, secret) in [
+            ("http://replay-user-secret@127.0.0.1:1", "replay-user-secret"),
+            (
+                "http://user:replay-password-secret@127.0.0.1:1",
+                "replay-password-secret",
+            ),
+            (
+                "http://127.0.0.1:1?token=replay-query-secret",
+                "replay-query-secret",
+            ),
+            (
+                "http://127.0.0.1:1#replay-fragment-secret",
+                "replay-fragment-secret",
+            ),
+        ] {
+            let (exit_code, payload) = execute_json(&[
+                "fwc",
+                "--json",
+                "--host",
+                host,
+                "replay",
+                &entry_id,
+                "--input",
+                r#"{"owner":"octocat","repo":"hello-world","title":"original"}"#,
+            ]);
+            assert_eq!(exit_code, CliExitCode::Transport.into(), "{payload}");
+            assert_eq!(payload["error"]["type"], "invalid-replay-host");
+            assert!(!payload.to_string().contains(secret));
+            assert!(payload["replay"]["host"].is_null());
+
+            // Offline preview does not parse, contact, or repeat the selected endpoint.
+            let (exit_code, payload) = execute_json(&[
+                "fwc",
+                "--json",
+                "--host",
+                host,
+                "replay",
+                &entry_id,
+                "--dry-run",
+            ]);
+            assert_eq!(exit_code, CliExitCode::Success.into(), "{payload}");
+            assert_eq!(payload["_truth_source"], "offline");
+            assert!(!payload.to_string().contains(secret));
+        }
+    }
+
+    #[test]
+    fn replay_live_preserves_unknown_outcome_identity_without_retrying() {
+        let (_root, entry_id, _guard) = seed_live_replay_entry(super::history::OpStatus::Success);
+        let capability_token = test_capability_token_arg();
+        let original = json!({"owner":"octocat","repo":"hello-world","title":"original"});
+        let idempotency_key = "replay-unconfirmed-test";
+        let request_id = derive_live_request_id(
+            "fcp.github:enterprise:v1",
+            "issues.create",
+            "z:work",
+            &original,
+            Some(idempotency_key),
+            None,
+        )
+        .expect("replay request identity");
+        let (host, server) = spawn_mock_host(
+            mock_github_host_routes(StdBTreeMap::from([
+                (
+                    "POST /rpc/preflight".to_owned(),
+                    mock_preflight_response_json(true),
+                ),
+                (
+                    "POST /rpc/invoke".to_owned(),
+                    json!({"unexpected": "replay-host-body-secret"}),
+                ),
+            ])),
+            4,
+        );
+        let (exit_code, payload) = execute_json(&[
+            "fwc",
+            "--json",
+            "--host",
+            &host,
+            "replay",
+            &entry_id,
+            "--input",
+            &original.to_string(),
+            "--idempotency-key",
+            idempotency_key,
+            "--capability-token",
+            &capability_token,
+        ]);
+        server.join().expect("unknown replay outcome mock host");
+        assert_eq!(exit_code, CliExitCode::Transport.into(), "{payload}");
+        assert_eq!(payload["command"], "replay");
+        assert_eq!(payload["availability"]["command"], "replay");
+        assert_eq!(payload["error"]["type"], "invoke-outcome-unknown");
+        assert_eq!(payload["outcome"], "outcome_unknown");
+        assert_eq!(payload["request_id"], request_id.to_string());
+        assert_eq!(payload["inspection"]["operation_id"], request_id.to_string());
+        assert_eq!(payload["inspection"]["host_endpoint"], host);
+        assert_eq!(payload["replay_source"], entry_id);
+        assert_eq!(payload["replay"]["host"], host);
+        assert_eq!(payload["replay"]["idempotency_key"], idempotency_key);
+        assert_eq!(payload["automatic_retry_allowed"], false);
+        assert_eq!(payload["replay"]["automatic_retry_allowed"], false);
+        assert!(!payload.to_string().contains("replay-host-body-secret"));
+        assert_eq!(super::cli_history_store().unwrap().count().unwrap(), 1);
     }
 
     #[test]
