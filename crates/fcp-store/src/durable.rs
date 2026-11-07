@@ -11,6 +11,8 @@
 //! - writable startup replays only checksum-valid WAL records and truncates an
 //!   incomplete final append; authenticated malformed complete records fail
 //!   closed without discarding their contents or any later records;
+//! - recovery applies one WAL record at a time, so historical overwritten or
+//!   deleted data does not accumulate in memory alongside the recovered state;
 //! - observational opens never create, repair, or checkpoint files, and writable
 //!   store handles retain exclusive OS ownership through admitted work.
 
@@ -1542,38 +1544,29 @@ fn load_durable_object_state(
         None => (DurableObjectState::default(), 0),
     };
 
-    let records = read_wal_records::<ObjectWalOp>(
+    let mut last_seq = last_snapshot_seq;
+    replay_wal_records::<ObjectWalOp, ObjectStoreError>(
         wal_path,
         last_snapshot_seq,
         mac_key,
         allow_legacy_unauth,
         access,
         MAX_WAL_RECORD_BYTES,
+        |record| {
+            // Keep the recovered state private until the entire WAL passes
+            // validation. The record is consumed before the next is decoded.
+            // Verify content IDs before duplicate/structural checks so forged
+            // objects cannot hide behind a weaker AlreadyExists error.
+            if let (Some(verifier), ObjectWalOp::Put(object)) = (verifier, &record.op) {
+                verifier.verify(object)?;
+            }
+            state.validate_mutation(&record.op, u64::MAX)?;
+            state.apply_loaded_mutation(record.op)?;
+            last_seq = record.seq;
+            Ok(())
+        },
     )
-    .map_err(object_io_durable)?;
-    let mut last_seq = last_snapshot_seq;
-    for record in records {
-        last_seq = record.seq;
-        // Mirror the runtime mutation path: validate the record's
-        // structure (size cap + canonical-CBOR-encodable header) before
-        // applying. Closes the WAL replay trust gap documented in bead
-        // flywheel_connectors-4g0qr — `apply_loaded_mutation` alone
-        // skips the structural check that `record_mutation` enforces
-        // on the live write path.
-        //
-        // Order matters: run the content-id verifier BEFORE
-        // `validate_mutation`'s duplicate-id check. A forged record
-        // that happens to reuse a legit id would otherwise surface as
-        // `AlreadyExists` (a correct but weaker signal) and hide the
-        // real defect — the attacker substituted `(header, body)` for
-        // the claimed id. The verifier failure is the more specific,
-        // more actionable diagnosis.
-        if let (Some(verifier), ObjectWalOp::Put(object)) = (verifier, &record.op) {
-            verifier.verify(object)?;
-        }
-        state.validate_mutation(&record.op, u64::MAX)?;
-        state.apply_loaded_mutation(record.op)?;
-    }
+    .map_err(|error| error.into_store_error(object_io_durable))?;
 
     Ok((state, last_seq))
 }
@@ -1597,24 +1590,24 @@ fn load_durable_symbol_state(
         None => (DurableSymbolState::default(), 0),
     };
 
-    let records = read_wal_records::<SymbolWalOp>(
+    let mut last_seq = last_snapshot_seq;
+    replay_wal_records::<SymbolWalOp, SymbolStoreError>(
         wal_path,
         last_snapshot_seq,
         mac_key,
         allow_legacy_unauth,
         access,
         MAX_WAL_RECORD_BYTES,
+        |record| {
+            // Authentication does not establish semantic validity: metadata,
+            // symbol sizes, zones and conflicting bytes still need checking.
+            state.validate_mutation(&record.op, u64::MAX)?;
+            state.apply_loaded_mutation(record.op)?;
+            last_seq = record.seq;
+            Ok(())
+        },
     )
-    .map_err(symbol_io_durable)?;
-    let mut last_seq = last_snapshot_seq;
-    for record in records {
-        last_seq = record.seq;
-        // A WAL checksum only proves the record was not torn mid-write. It
-        // does not prove the symbol payload still matches the object metadata,
-        // so replay must re-run semantic validation before mutating state.
-        state.validate_mutation(&record.op, u64::MAX)?;
-        state.apply_loaded_mutation(record.op)?;
-    }
+    .map_err(|error| error.into_store_error(symbol_io_durable))?;
 
     Ok((state, last_seq))
 }
@@ -1686,6 +1679,35 @@ enum DurableIoError {
 impl From<String> for DurableIoError {
     fn from(value: String) -> Self {
         Self::Other(value)
+    }
+}
+
+/// Preserve store-specific semantic failures while streaming authenticated WAL
+/// records. In particular, a rejected mutation must not trigger tail repair.
+#[derive(Debug)]
+enum WalReplayError<E> {
+    Io(DurableIoError),
+    Apply(E),
+}
+
+impl<E> From<DurableIoError> for WalReplayError<E> {
+    fn from(error: DurableIoError) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl<E> From<String> for WalReplayError<E> {
+    fn from(error: String) -> Self {
+        Self::Io(DurableIoError::Other(error))
+    }
+}
+
+impl<E> WalReplayError<E> {
+    fn into_store_error(self, map_io: impl FnOnce(DurableIoError) -> E) -> E {
+        match self {
+            Self::Io(error) => map_io(error),
+            Self::Apply(error) => error,
+        }
     }
 }
 
@@ -1814,21 +1836,26 @@ where
     }
 }
 
+/// Authenticate and apply records in order without retaining the whole WAL.
+/// The callback must only change unpublished recovery state: a later invalid
+/// record makes the entire open fail. Repair happens only after all complete
+/// records have passed both envelope and semantic validation.
 #[allow(clippy::too_many_lines)]
-fn read_wal_records<T>(
+fn replay_wal_records<T, E>(
     path: &Path,
     min_seq: u64,
     mac_key: Option<&[u8; 32]>,
     allow_legacy_unauth: bool,
     access: DurableAccess,
     max_record_bytes: usize,
-) -> Result<Vec<WalEnvelope<T>>, DurableIoError>
+    mut apply: impl FnMut(WalEnvelope<T>) -> Result<(), E>,
+) -> Result<(), WalReplayError<E>>
 where
     T: Serialize + DeserializeOwned,
 {
     let file = match File::open(path) {
         Ok(file) => file,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(format!("open wal {}: {error}", path.display()).into()),
     };
     let observed_len = file
@@ -1842,7 +1869,6 @@ where
     let mut valid_prefix_len = 0_u64;
     let mut last_seq_in_file = 0_u64;
     let mut expected_next_seq = min_seq.saturating_add(1);
-    let mut records = Vec::new();
     let mut truncated = false;
 
     loop {
@@ -1864,7 +1890,7 @@ where
                     reason: format!(
                         "authenticated wal record at byte {valid_prefix_len} exceeds {max_record_bytes} bytes"
                     ),
-                });
+                }.into());
             }
             truncated = true;
             break;
@@ -1885,7 +1911,8 @@ where
                     reason: format!(
                         "malformed authenticated wal record at byte {valid_prefix_len}"
                     ),
-                });
+                }
+                .into());
             }
             truncated = true;
             break;
@@ -1987,7 +2014,8 @@ where
                         "wal seq regression: {} <= last seen {}",
                         envelope.seq, last_seq_in_file
                     ),
-                });
+                }
+                .into());
             }
             truncated = true;
             break;
@@ -2003,9 +2031,10 @@ where
                     path.display(),
                     expected_next_seq,
                     envelope.seq
-                )));
+                ))
+                .into());
             }
-            records.push(envelope);
+            apply(envelope).map_err(WalReplayError::Apply)?;
             expected_next_seq = expected_next_seq.saturating_add(1);
         }
     }
@@ -2016,7 +2045,7 @@ where
                 "read-only WAL view has an incomplete or invalid tail at {} byte {}; retry after the writer completes or recovers",
                 path.display(),
                 valid_prefix_len
-            )));
+            )).into());
         }
         let file = OpenOptions::new()
             .write(true)
@@ -2030,7 +2059,7 @@ where
             .map_err(|error| format!("sync wal dir {}: {error}", path.display()))?;
     }
 
-    Ok(records)
+    Ok(())
 }
 
 fn append_wal_record<T>(
@@ -2520,13 +2549,18 @@ mod tests {
             let wal_bytes = wal_fixture_bytes(1, &payload, mac_key.as_ref());
             append_wal_record(&wal_path, 1, &payload, mac_key.as_ref(), wal_bytes.len()).unwrap();
             assert_eq!(fs::read(&wal_path).unwrap(), wal_bytes);
-            let records = read_wal_records::<serde_json::Value>(
+            let mut records = Vec::new();
+            replay_wal_records::<serde_json::Value, DurableIoError>(
                 &wal_path,
                 0,
                 mac_key.as_ref(),
                 false,
                 DurableAccess::ReadWrite,
                 wal_bytes.len(),
+                |record| {
+                    records.push(record);
+                    Ok(())
+                },
             )
             .unwrap();
             assert_eq!(records.len(), 1);
@@ -2545,6 +2579,230 @@ mod tests {
                 Err(DurableIoError::RejectedBeforeWrite(reason)) if reason.contains("exceeds")
             ));
             assert_eq!(stored_file_bytes(&root), before);
+        }
+    }
+
+    #[test]
+    fn wal_recovery_retains_at_most_one_decoded_record() {
+        use std::cell::Cell;
+
+        thread_local! {
+            static LIVE_RECORDS: Cell<usize> = const { Cell::new(0) };
+            static PEAK_RECORDS: Cell<usize> = const { Cell::new(0) };
+        }
+
+        #[derive(Serialize)]
+        struct TrackedRecord(u64);
+
+        impl<'de> Deserialize<'de> for TrackedRecord {
+            fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                let value = u64::deserialize(deserializer)?;
+                let live = LIVE_RECORDS.with(|count| {
+                    count.set(count.get() + 1);
+                    count.get()
+                });
+                PEAK_RECORDS.with(|peak| peak.set(peak.get().max(live)));
+                Ok(Self(value))
+            }
+        }
+
+        impl Drop for TrackedRecord {
+            fn drop(&mut self) {
+                LIVE_RECORDS.with(|count| count.set(count.get() - 1));
+            }
+        }
+
+        let temp_dir = TempDir::new().unwrap();
+        for mac_key in [None, Some(TEST_MAC_KEY)] {
+            let path = temp_dir.path().join(format!("{}.jsonl", mac_key.is_some()));
+            let mut file = File::create(&path).unwrap();
+            for seq in 1..=256_u64 {
+                file.write_all(&wal_fixture_bytes(seq, &seq, mac_key.as_ref()))
+                    .unwrap();
+            }
+            file.sync_all().unwrap();
+            drop(file);
+
+            for access in [DurableAccess::ReadOnly, DurableAccess::ReadWrite] {
+                PEAK_RECORDS.with(|peak| peak.set(0));
+                let mut last_seq = 64;
+                replay_wal_records::<TrackedRecord, DurableIoError>(
+                    &path,
+                    last_seq,
+                    mac_key.as_ref(),
+                    false,
+                    access,
+                    MAX_WAL_RECORD_BYTES,
+                    |record| {
+                        assert_eq!(LIVE_RECORDS.with(Cell::get), 1);
+                        assert_eq!(record.seq, last_seq + 1);
+                        assert_eq!(record.op.0, record.seq);
+                        last_seq = record.seq;
+                        Ok(())
+                    },
+                )
+                .unwrap();
+                assert_eq!(last_seq, 256);
+                assert_eq!(LIVE_RECORDS.with(Cell::get), 0);
+                assert_eq!(PEAK_RECORDS.with(Cell::get), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_recovery_preserves_churned_object_and_symbol_state() {
+        let temp_dir = TempDir::new().unwrap();
+        for mac_key in [None, Some(TEST_MAC_KEY)] {
+            let root = temp_dir.path().join(mac_key.is_some().to_string());
+            let mut object_config = DurableObjectStoreConfig::new(&root);
+            object_config.mac_key = mac_key;
+            object_config.checkpoint_after_ops = 0;
+            object_config.max_bytes = 2 * DurableObjectState::object_size(&test_object(1));
+            let mut symbol_config = DurableSymbolStoreConfig::new(&root);
+            symbol_config.mac_key = mac_key;
+            symbol_config.checkpoint_after_ops = 0;
+            symbol_config.max_bytes = 2 * DurableSymbolState::symbol_size(&test_symbol(1, 0, 7));
+
+            let objects = DurableObjectStore::open(object_config.clone()).unwrap();
+            let symbols = DurableSymbolStore::open(symbol_config.clone()).unwrap();
+            objects.put(test_object(1)).await.unwrap();
+            objects.checkpoint().await.unwrap();
+            symbols.put_object_meta(test_symbol_meta(1)).await.unwrap();
+            symbols.put_symbol(test_symbol(1, 0, 7)).await.unwrap();
+            symbols.checkpoint().unwrap();
+
+            // The log grows while the live state and quota stay small. Each
+            // historical payload must be released when its delete is replayed.
+            for seed in 2..=65 {
+                objects.put(test_object(seed)).await.unwrap();
+                objects.delete(&test_object_id(seed)).await.unwrap();
+                symbols
+                    .put_object_meta(test_symbol_meta(seed))
+                    .await
+                    .unwrap();
+                symbols.put_symbol(test_symbol(seed, 0, 7)).await.unwrap();
+                symbols
+                    .delete_symbol(&test_object_id(seed), 0)
+                    .await
+                    .unwrap();
+                symbols.delete_object(&test_object_id(seed)).await.unwrap();
+            }
+            objects.put(test_object(100)).await.unwrap();
+            symbols.put_symbol(test_symbol(1, 1, 8)).await.unwrap();
+            drop(objects);
+            drop(symbols);
+            let before = stored_file_bytes(&root);
+
+            for access in [DurableAccess::ReadOnly, DurableAccess::ReadWrite] {
+                let objects =
+                    DurableObjectStore::open_with_access(object_config.clone(), None, access)
+                        .unwrap();
+                let symbols =
+                    DurableSymbolStore::open_with_access(symbol_config.clone(), access).unwrap();
+                assert_eq!(objects.last_seq.load(Ordering::SeqCst), 130);
+                assert_eq!(symbols.last_seq.load(Ordering::SeqCst), 259);
+                assert_eq!(
+                    objects.get(&test_object_id(100)).await.unwrap().body,
+                    test_object(100).body
+                );
+                assert!(!objects.exists(&test_object_id(65)).await);
+                assert_eq!(
+                    objects.state.lock().await.used_bytes,
+                    object_config.max_bytes
+                );
+                assert_eq!(symbols.symbol_count(&test_object_id(1)).await, 2);
+                assert_eq!(symbols.state.read().used_bytes, symbol_config.max_bytes);
+                assert_eq!(stored_file_bytes(&root), before);
+            }
+
+            // A replayed head must remain writable without reusing a sequence.
+            let objects = DurableObjectStore::open(object_config.clone()).unwrap();
+            objects.delete(&test_object_id(100)).await.unwrap();
+            objects.checkpoint().await.unwrap();
+            drop(objects);
+            let symbols = DurableSymbolStore::open(symbol_config.clone()).unwrap();
+            symbols.delete_symbol(&test_object_id(1), 1).await.unwrap();
+            symbols.checkpoint().unwrap();
+            drop(symbols);
+            let objects = DurableObjectStore::open(object_config).unwrap();
+            let symbols = DurableSymbolStore::open(symbol_config).unwrap();
+            assert_eq!(objects.last_seq.load(Ordering::SeqCst), 131);
+            assert_eq!(symbols.last_seq.load(Ordering::SeqCst), 260);
+            assert!(!objects.exists(&test_object_id(100)).await);
+            assert_eq!(symbols.symbol_count(&test_object_id(1)).await, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn object_semantic_recovery_failure_preserves_torn_wal_and_typed_error() {
+        let temp_dir = TempDir::new().unwrap();
+        for mac_key in [None, Some(TEST_MAC_KEY)] {
+            let mut config =
+                DurableObjectStoreConfig::new(temp_dir.path().join(mac_key.is_some().to_string()));
+            config.mac_key = mac_key;
+            config.checkpoint_after_ops = 0;
+            let store = DurableObjectStore::open(config.clone()).unwrap();
+            store.put(test_object(1)).await.unwrap();
+            let wal_path = store.wal_path.clone();
+            drop(store);
+            let mut file = OpenOptions::new().append(true).open(&wal_path).unwrap();
+            file.write_all(&wal_fixture_bytes(
+                2,
+                &ObjectWalOp::Delete {
+                    object_id: test_object_id(99),
+                },
+                mac_key.as_ref(),
+            ))
+            .unwrap();
+            file.write_all(b"{\"version\":").unwrap();
+            file.sync_all().unwrap();
+            drop(file);
+            let before = stored_file_bytes(&config.root_dir);
+
+            for access in [DurableAccess::ReadOnly, DurableAccess::ReadWrite] {
+                assert!(matches!(
+                    DurableObjectStore::open_with_access(config.clone(), None, access),
+                    Err(ObjectStoreError::NotFound(id)) if id == test_object_id(99)
+                ));
+                assert_eq!(stored_file_bytes(&config.root_dir), before);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn symbol_semantic_recovery_failure_preserves_torn_wal_and_typed_error() {
+        let temp_dir = TempDir::new().unwrap();
+        for mac_key in [None, Some(TEST_MAC_KEY)] {
+            let mut config =
+                DurableSymbolStoreConfig::new(temp_dir.path().join(mac_key.is_some().to_string()));
+            config.mac_key = mac_key;
+            config.checkpoint_after_ops = 0;
+            let store = DurableSymbolStore::open(config.clone()).unwrap();
+            store.put_object_meta(test_symbol_meta(1)).await.unwrap();
+            let wal_path = store.wal_path.clone();
+            drop(store);
+            let mut file = OpenOptions::new().append(true).open(&wal_path).unwrap();
+            file.write_all(&wal_fixture_bytes(
+                2,
+                &SymbolWalOp::PutSymbol(PersistentStoredSymbol {
+                    meta: test_symbol(1, 0, 7).meta,
+                    data: vec![1; 64],
+                }),
+                mac_key.as_ref(),
+            ))
+            .unwrap();
+            file.write_all(b"{\"version\":").unwrap();
+            file.sync_all().unwrap();
+            drop(file);
+            let before = stored_file_bytes(&config.root_dir);
+
+            for access in [DurableAccess::ReadOnly, DurableAccess::ReadWrite] {
+                assert!(matches!(
+                    DurableSymbolStore::open_with_access(config.clone(), access),
+                    Err(SymbolStoreError::InvalidSymbol { reason }) if reason.contains("Symbol size mismatch")
+                ));
+                assert_eq!(stored_file_bytes(&config.root_dir), before);
+            }
         }
     }
 
@@ -4765,14 +5023,20 @@ mod tests {
                 oversized.push(b'\n');
                 fs::write(&wal_path, &oversized).unwrap();
 
-                let result = read_wal_records::<ObjectWalOp>(
+                let mut replayed = 0;
+                let result = replay_wal_records::<ObjectWalOp, DurableIoError>(
                     &wal_path,
                     0,
                     mac_key.as_ref(),
                     false,
                     access,
                     cap,
-                );
+                    |_| {
+                        replayed += 1;
+                        Ok(())
+                    },
+                )
+                .map_err(|error| error.into_store_error(std::convert::identity));
                 if mac_key.is_some() {
                     assert!(matches!(
                         result,
@@ -4784,7 +5048,8 @@ mod tests {
                     assert!(matches!(result, Err(DurableIoError::Other(_))));
                     assert_eq!(fs::read(&wal_path).unwrap(), oversized);
                 } else {
-                    assert_eq!(result.unwrap().len(), 1);
+                    result.unwrap();
+                    assert_eq!(replayed, 1);
                     assert_eq!(fs::read(&wal_path).unwrap(), original);
                 }
             }
