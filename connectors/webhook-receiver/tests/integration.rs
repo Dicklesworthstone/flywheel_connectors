@@ -2211,6 +2211,20 @@ async fn events_poll_pages_verified_events_without_disclosing_other_endpoints_or
     assert_eq!(first_page["endpoint_id"], first["endpoint_id"]);
     assert_eq!(first_page["has_more"], true);
     assert_eq!(first_page["retention"]["history_truncated"], false);
+    assert_eq!(
+        c.handle_invoke(json!({
+            "operation_id": "webhook.events.poll",
+            "input": {
+                "endpoint_id": first["endpoint_id"],
+                "cursor": first_page["start_cursor"],
+                "limit": 2
+            }
+        }))
+        .await
+        .unwrap(),
+        first_page,
+        "the first page must have an authenticated retry position before effects"
+    );
     let events = first_page["events"].as_array().unwrap();
     assert_eq!(events.len(), 2);
     assert_eq!(events[0]["event_id"], "poll-0");

@@ -68,6 +68,9 @@ const EVENT_CURSOR_BYTES: usize = EVENT_CURSOR_PAYLOAD_BYTES + 32;
 pub struct WebhookEventPage {
     /// Arrival sequence and retained event for each selected delivery.
     pub events: Vec<(u64, WebhookEvent)>,
+    /// Exact position used for this page. Persist before effects so an initial
+    /// earliest/latest read can be retried with ordinary gap detection.
+    pub start_cursor: String,
     /// Opaque continuation scoped to this endpoint and receiver lifetime.
     pub next_cursor: String,
     /// Whether a retained event remains beyond this page.
@@ -605,6 +608,7 @@ impl WebhookStore {
 
         Ok(WebhookEventPage {
             events,
+            start_cursor: self.encode_event_cursor(endpoint_id, start_sequence),
             next_cursor: self.encode_event_cursor(endpoint_id, continuation_sequence),
             has_more,
             oldest_available_sequence,
@@ -1130,6 +1134,7 @@ mod tests {
             .poll_events(&ep.endpoint_id, Some(&initial_cursor), 1, 1024, false)
             .unwrap();
         assert_eq!(first_page.events[0].0, 0);
+        assert_eq!(first_page.start_cursor, initial_cursor);
         assert!(!first_page.history_truncated);
 
         // Add one more; oldest should be evicted
@@ -1830,6 +1835,56 @@ mod tests {
             store.poll_events(&endpoint.endpoint_id, Some(&cursor), 1, 1024, false),
             Err(WebhookReceiverError::InvalidInput { .. })
         ));
+    }
+
+    #[test]
+    fn poll_events_initial_page_has_a_recoverable_position_before_consumer_effects() {
+        let mut store = WebhookStore::new();
+        let endpoint = store
+            .create_endpoint("/initial-page".into(), "secret".into(), vec![])
+            .unwrap();
+        for index in 0..MAX_EVENTS_PER_ENDPOINT {
+            store
+                .record_event(sized_event(
+                    &endpoint.endpoint_id,
+                    &format!("initial-{index}"),
+                    512,
+                ))
+                .unwrap();
+        }
+        let first = store
+            .poll_events(&endpoint.endpoint_id, None, 1, 1024, false)
+            .unwrap();
+        let retried = store
+            .poll_events(
+                &endpoint.endpoint_id,
+                Some(&first.start_cursor),
+                1,
+                1024,
+                false,
+            )
+            .unwrap();
+        assert_eq!(retried.events[0].1.event_id, "initial-0");
+        assert_eq!(retried.start_cursor, first.start_cursor);
+        assert_eq!(retried.next_cursor, first.next_cursor);
+        store
+            .record_event(sized_event(&endpoint.endpoint_id, "new-delivery", 512))
+            .unwrap();
+        assert!(matches!(
+            store.poll_events(
+                &endpoint.endpoint_id,
+                Some(&first.start_cursor),
+                1,
+                1024,
+                false
+            ),
+            Err(WebhookReceiverError::ReplayGap { .. })
+        ));
+        let latest = store
+            .poll_events(&endpoint.endpoint_id, None, 1, 1024, true)
+            .unwrap();
+        assert_eq!(latest.start_cursor, latest.next_cursor);
+        assert!(latest.events.is_empty());
     }
 
     #[test]

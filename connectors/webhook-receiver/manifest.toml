@@ -5,7 +5,7 @@ min_mesh_version = "2.0.0"
 min_protocol = "fcp2-sym/2.0"
 protocol_features = []
 max_datagram_bytes = 65000
-interface_hash = "blake3-256:fcp.interface.v2:5a34f7dc6ee021ef6842fa53191d1bc9e65bb647fda7cf550237e399237895b1"
+interface_hash = "blake3-256:fcp.interface.v2:25f1e136a14d1786a27525d4c0b4eb1bb1be1a77b0b547476f74c6ffb438c505"
 
 [connector]
 id = "fcp.webhook-receiver"
@@ -599,7 +599,7 @@ default = 1048576
 
 [provides.operations."webhook.events.poll".output_schema]
 type = "object"
-required = ["endpoint_id", "events", "next_cursor", "has_more", "serialized_event_bytes", "retention"]
+required = ["endpoint_id", "events", "start_cursor", "next_cursor", "has_more", "serialized_event_bytes", "retention"]
 additionalProperties = false
 
 [provides.operations."webhook.events.poll".output_schema.properties.endpoint_id]
@@ -623,6 +623,11 @@ headers = { type = "object", additionalProperties = { type = "string" } }
 payload = {}
 signature_valid = { type = "boolean" }
 source_ip_hash = { type = ["string", "null"] }
+
+[provides.operations."webhook.events.poll".output_schema.properties.start_cursor]
+type = "string"
+minLength = 1
+maxLength = 128
 
 [provides.operations."webhook.events.poll".output_schema.properties.next_cursor]
 type = "string"

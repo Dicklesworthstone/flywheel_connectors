@@ -1238,6 +1238,7 @@ impl WebhookReceiverConnector {
         Ok(json!({
             "endpoint_id": endpoint_id,
             "events": events,
+            "start_cursor": page.start_cursor,
             "next_cursor": page.next_cursor,
             "has_more": page.has_more,
             "serialized_event_bytes": page.serialized_event_bytes,
@@ -2763,7 +2764,7 @@ fn operations_info() -> Vec<OperationInfo> {
             }),
             json!({
                 "type": "object",
-                "required": ["endpoint_id", "events", "next_cursor", "has_more", "serialized_event_bytes", "retention"],
+                "required": ["endpoint_id", "events", "start_cursor", "next_cursor", "has_more", "serialized_event_bytes", "retention"],
                 "additionalProperties": false,
                 "properties": {
                     "endpoint_id": { "type": "string" },
@@ -2786,6 +2787,7 @@ fn operations_info() -> Vec<OperationInfo> {
                             }
                         }
                     },
+                    "start_cursor": { "type": "string", "minLength": 1, "maxLength": MAX_EVENT_CURSOR_BYTES },
                     "next_cursor": { "type": "string", "minLength": 1, "maxLength": MAX_EVENT_CURSOR_BYTES },
                     "has_more": { "type": "boolean" },
                     "serialized_event_bytes": { "type": "integer", "minimum": 0, "maximum": MAX_RETAINED_EVENT_BYTES_PER_ENDPOINT },
