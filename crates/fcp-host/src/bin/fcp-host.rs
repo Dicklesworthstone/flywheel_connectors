@@ -27860,7 +27860,7 @@ deny_ptrace = true
         );
     }
 
-    fn holder_test_router(
+    pub(super) fn holder_test_router(
         directory: &std::path::Path,
         holder_key: &fcp_crypto::ed25519::Ed25519SigningKey,
     ) -> fcp_host::mesh_routing::MeshRouter {

@@ -97,13 +97,57 @@ Provision the capability through the deployment's authorization integration for:
 - The current instance and other constraints required by normal host and
   receiver admission.
 
-The adapter does not create holder proofs. Use a capability without a
-`holder_node` requirement, while retaining the required receiver instance
-binding and least-privilege operation/resource constraints.
+Capabilities with a `holder_node` requirement are supported through an
+explicit operator-owned signing key, as described below. Bearer capabilities
+remain supported when no holder key is configured. Both forms retain the
+required receiver instance binding and least-privilege operation/resource
+constraints.
 
 Normal expiry, revocation, principal, resource, zone, policy, and instance
 checks still apply. Parsing the configured token does not establish authority.
 Provider request headers never supply this capability or replace its scope.
+
+### Holder-bound capabilities
+
+For a capability that names a `holder_node`, add this optional field to the
+host binding configuration:
+
+```json
+"holder_key_file": "/etc/fcp/webhook-ingress.holder.key"
+```
+
+The path must be absolute. The file contains the holder's Ed25519 secret key as
+exactly 32 raw bytes or 64 hexadecimal digits, with optional surrounding
+whitespace for hexadecimal text. It must be a regular file no larger than
+128 bytes. Provision the actual node key whose public key appears in the
+owner-authenticated mesh membership for the token's holder; the adapter does
+not generate or enroll an identity. Keep this file readable only by the
+operator and host process. Inline signing material is not a configuration
+option.
+
+Each admitted callback reloads both the capability and configured key. A
+holder-bound token needs a nonempty token JTI and a usable key. A key configured
+for a bearer token, a missing or malformed key, or an incomplete holder
+signing context returns `503` before the provider body is read. The files may
+be absent at startup so the operator can provision authority for the prepared
+receiver instance. A failed refresh never reuses a previous token or signer.
+Temporary file buffers and parsed signing keys are cleared when dropped.
+
+The adapter signs the canonical FCP holder proof over the fresh host-generated
+request ID, the fixed `webhook.events.ingest` operation, and the current
+capability's JTI. Token claims select this signing context only: the ordinary
+host path verifies the capability and resolves the holder's public key from
+current owner-authenticated mesh membership, with another holder check before
+dispatch. A wrong or retired node key cannot gain authority by producing a
+well-formed signature. Provider headers and bodies cannot choose the holder,
+signing key, JTI, or proof.
+
+Publish replacement capability and key files by atomic replacement of each
+file. Coordinate node-key changes with the deployment's signed membership
+update; a mismatched token/key/membership combination is refused rather than
+falling back. Capability renewal with the same holder still produces proofs
+bound to the new token JTI. This signing authority does not mint a lease or
+replace the existing singleton-writer ownership and configured-fence checks.
 
 ### Prepare authority for the current process
 
@@ -153,8 +197,8 @@ temporary file beside the configured capability file, then atomically replace
 the configured file. Subsequent admitted callbacks read the new token without
 a host restart. Do not expose the raw issuance response in public logs.
 
-The connector, zone, public base, limits, and capability-file path are fixed
-at startup. Changes to those settings require a host restart. After process
+The connector, zone, public base, limits, and capability/key-file paths are
+fixed at startup. Changes to those settings require a host restart. After process
 replacement, reconfiguration, or any change that invalidates the receiver's
 instance, prepare the current session and replace the capability file with
 newly issued authority. A returned instance is a snapshot, not a lease;
@@ -266,10 +310,10 @@ head before collection and bounds streaming or chunked bodies even when
 `Content-Length` is absent. Oversized declared bodies are rejected before
 collection. Bodies must be UTF-8 for the receiver's raw-body contract.
 
-Capability-file loading, body collection, and invocation share one deadline.
-The invocation receives only the remaining budget. Capability and deployment
-evidence files use synchronous bounded regular-file reads on trusted local
-storage. Elapsed read time counts against that budget, but the deadline cannot
+Capability/key-file loading, body collection, and invocation share one
+deadline. The invocation receives only the remaining budget. Capability,
+holder-key, and deployment evidence files use synchronous bounded regular-file
+reads on trusted local storage. Elapsed read time counts against that budget, but the deadline cannot
 preempt blocked storage. A timeout does not prove that an already admitted
 operation had no effect; inspect recent events with an authorized FCP read
 when a delivery outcome is uncertain.
@@ -390,14 +434,16 @@ Focused verification commands are:
 ```bash
 rch exec -- cargo test -p fcp-host --lib webhook_ingress::
 rch exec -- cargo test -p fcp-host --bin fcp-host webhook_runtime_
+rch exec -- cargo test -p fcp-host --bin fcp-host webhook_holder_
 rch exec -- cargo test -p fcp-host --bin fcp-host webhook_ingress_admission_
 rch exec -- cargo test -p fcp-host --test webhook_receiver_ingress
 rch exec -- cargo test -p fcp-webhook-receiver
 ```
 
 The shared-module tests cover binding validation, signed-byte preservation,
-authority separation, limits, and response redaction. The runtime tests
-cover streaming body bounds, deadlines, concurrent admission, and failures
+authority separation, holder-proof binding and rotation, limits, and response
+redaction. The runtime tests cover streaming body bounds, deadlines, concurrent
+admission, bounded signing-key parsing, token/key replacement, and failures
 before dispatch. The integration suite uses the real receiver with signed
 FCP capabilities, separate signed endpoint approvals, provider HMACs, and
 a real loopback HTTP connection. Its loopback harness exercises shared
@@ -407,7 +453,9 @@ and subprocess integration coverage.
 A separate host-admission regression drives the real receiver through the
 normal invocation route using a native RPC bridge and a host-first inventory
 without `manifest_path`. It exercises the capability, policy, and deployment
-boundaries. That fixture does not establish deployment of the checked-in
+boundaries, including holder proofs checked against owner-signed mesh
+membership and rejection of wrong keys or proofs reused across requests or
+tokens. That fixture does not establish deployment of the checked-in
 singleton manifest, HRW ownership, durable lease state, or manifest network
 enforcement. Those operational requirements still apply to a manifest-backed
 receiver.

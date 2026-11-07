@@ -9,9 +9,11 @@ use std::fmt;
 use std::net::IpAddr;
 
 use axum::http::{HeaderMap, StatusCode, Uri};
+use fcp_crypto::Ed25519SigningKey;
 use fcp_prelude::{
-    CapabilityToken, ConnectorId, CorrelationId, FcpError, InvokeRequest, InvokeResponse,
-    InvokeStatus, OperationId, Provenance, ProvenanceStep, RequestId, ZoneId,
+    CapabilityToken, ConnectorId, CorrelationId, FcpError, HolderProof, InvokeRequest,
+    InvokeResponse, InvokeStatus, OperationId, Provenance, ProvenanceStep, RequestId,
+    TailscaleNodeId, ZoneId,
 };
 use serde_json::{Map, Value, json};
 use thiserror::Error;
@@ -59,10 +61,18 @@ pub struct WebhookIngressConfig {
     connector_id: ConnectorId,
     zone_id: ZoneId,
     capability_token: Option<CapabilityToken>,
+    holder_signer: Option<WebhookHolderSigner>,
     public_base_url: String,
     max_body_bytes: usize,
     timeout_ms: u64,
     max_in_flight: usize,
+}
+
+#[derive(Clone)]
+struct WebhookHolderSigner {
+    key: Ed25519SigningKey,
+    holder_node: TailscaleNodeId,
+    token_jti: Vec<u8>,
 }
 
 impl fmt::Debug for WebhookIngressConfig {
@@ -72,6 +82,10 @@ impl fmt::Debug for WebhookIngressConfig {
             .field("connector_id", &self.connector_id)
             .field("zone_id", &self.zone_id)
             .field("capability_token", &"[redacted]")
+            .field(
+                "holder_signer",
+                &self.holder_signer.as_ref().map(|_| "[redacted]"),
+            )
             .field("public_base_url", &self.public_base_url)
             .field("max_body_bytes", &self.max_body_bytes)
             .field("timeout_ms", &self.timeout_ms)
@@ -161,6 +175,7 @@ impl WebhookIngressConfig {
             connector_id,
             zone_id,
             capability_token: None,
+            holder_signer: None,
             public_base_url,
             max_body_bytes,
             timeout_ms,
@@ -175,7 +190,87 @@ impl WebhookIngressConfig {
     #[must_use]
     pub fn with_capability_token(mut self, capability_token: CapabilityToken) -> Self {
         self.capability_token = Some(capability_token);
+        // A proof context is bound to one token's holder and JTI. Replacing the
+        // token must never retain the previous signing context.
+        self.holder_signer = None;
         self
+    }
+
+    /// Supply one attempt's capability and optional operator-owned holder key.
+    ///
+    /// Unverified claims select signing context only. The ordinary host path
+    /// still verifies the token and resolves the holder's public key from
+    /// owner-authenticated membership, including immediately before dispatch.
+    /// No signing key is generated or inferred from provider request data.
+    ///
+    /// # Errors
+    /// Rejects malformed claims, a holder-bound token without a key or nonempty
+    /// JTI, and a key supplied for a bearer token. Errors expose no key material.
+    pub fn with_execution_authority(
+        self,
+        capability_token: CapabilityToken,
+        holder_key: Option<Ed25519SigningKey>,
+    ) -> Result<Self, WebhookIngressError> {
+        let claims = capability_token
+            .raw()
+            .claims_unverified()
+            .map_err(|_| WebhookIngressError::Unavailable)?;
+        let holder_signer = match (claims.get_holder_node(), holder_key) {
+            (Some(holder), Some(key)) => {
+                let holder_node = TailscaleNodeId::try_new(holder)
+                    .map_err(|_| WebhookIngressError::Unavailable)?;
+                let token_jti = claims
+                    .get_jti()
+                    .filter(|jti| !jti.is_empty())
+                    .ok_or(WebhookIngressError::Unavailable)?;
+                Some(WebhookHolderSigner {
+                    key,
+                    holder_node,
+                    token_jti: token_jti.to_vec(),
+                })
+            }
+            (None, None)
+                if claims
+                    .get(fcp_crypto::cose::fcp2_claims::HOLDER_NODE)
+                    .is_none() =>
+            {
+                None
+            }
+            _ => return Err(WebhookIngressError::Unavailable),
+        };
+        let mut config = self.with_capability_token(capability_token);
+        config.holder_signer = holder_signer;
+        Ok(config)
+    }
+
+    fn holder_proof_for(
+        &self,
+        request_id: &RequestId,
+        operation: &OperationId,
+    ) -> Result<Option<HolderProof>, WebhookIngressError> {
+        if let Some(signer) = &self.holder_signer {
+            let signable = HolderProof::signable_bytes(request_id, operation, &signer.token_jti);
+            return Ok(Some(HolderProof::new(
+                signer.key.sign(&signable).to_bytes(),
+                signer.holder_node.clone(),
+            )));
+        }
+        let claims = self
+            .capability_token
+            .as_ref()
+            .ok_or(WebhookIngressError::Unavailable)?
+            .raw()
+            .claims_unverified()
+            .map_err(|_| WebhookIngressError::Unavailable)?;
+        // A present but non-text holder claim is malformed, not bearer
+        // authority. Token-only replacement cannot bypass this requirement.
+        if claims
+            .get(fcp_crypto::cose::fcp2_claims::HOLDER_NODE)
+            .is_some()
+        {
+            return Err(WebhookIngressError::Unavailable);
+        }
+        Ok(None)
     }
 
     /// Receiver identity selected by the operator.
@@ -253,7 +348,8 @@ impl WebhookIngressConfig {
     /// Normal zone policy still decides whether this command may run.
     ///
     /// # Errors
-    /// Returns request-head failures or an oversized-body admission failure.
+    /// Returns request-head failures, an oversized-body failure, or unavailable
+    /// authority when a holder-bound capability has no matching signing context.
     pub fn build_request(
         &self,
         headers: &HeaderMap,
@@ -292,6 +388,8 @@ impl WebhookIngressConfig {
             hex::encode(fcp_crypto::aead::XChaCha20Nonce::generate().as_bytes())
         );
         let id = RequestId::new(delivery_id.clone());
+        let operation = OperationId::from_static(WEBHOOK_INGRESS_OPERATION);
+        let holder_proof = self.holder_proof_for(&id, &operation)?;
         let mut signed_url = format!("{}{path}", self.public_base_url);
         if let Some(query) = uri.query() {
             signed_url.push('?');
@@ -333,11 +431,11 @@ impl WebhookIngressConfig {
             r#type: "invoke".to_string(),
             id,
             connector_id: self.connector_id.clone(),
-            operation: OperationId::from_static(WEBHOOK_INGRESS_OPERATION),
+            operation,
             zone_id: self.zone_id.clone(),
             input,
             capability_token: capability_token.clone(),
-            holder_proof: None,
+            holder_proof,
             context: None,
             idempotency_key: Some(delivery_id),
             lease_seq: None,
@@ -747,6 +845,215 @@ mod tests {
             .not_before(now)
             .expiration(now + chrono::Duration::hours(1));
         CapabilityToken::from_raw(CoseToken::sign(&signing_key, &claims).unwrap())
+    }
+
+    fn holder_token(holder: Option<&str>, jti: Option<&[u8]>) -> CapabilityToken {
+        let mut claims = CwtClaims::new()
+            .capability_id("webhook.events.write")
+            .zone_id("z:work")
+            .operations(&[WEBHOOK_INGRESS_OPERATION]);
+        if let Some(holder) = holder {
+            claims = claims.holder_node(holder);
+        }
+        if let Some(jti) = jti {
+            claims = claims.token_id(jti);
+        }
+        let issuer = Ed25519SigningKey::from_bytes(&[58; 32]).unwrap();
+        CapabilityToken::from_raw(CoseToken::sign(&issuer, &claims).unwrap())
+    }
+
+    #[test]
+    fn holder_proofs_bind_each_fresh_delivery_operation_and_current_token() {
+        let holder_key = Ed25519SigningKey::from_bytes(&[59; 32]).unwrap();
+        let verifier = holder_key.verifying_key();
+        let config = config("https://hooks.example.test/webhooks")
+            .unwrap()
+            .with_execution_authority(
+                holder_token(Some("node:ingress"), Some(b"ingress-token-one")),
+                Some(holder_key),
+            )
+            .unwrap();
+        let headers = HeaderMap::from_iter([
+            (
+                HeaderName::from_static("x-fcp-holder-proof"),
+                HeaderValue::from_static("public-forged-proof"),
+            ),
+            (
+                HeaderName::from_static("x-fcp-lease-seq"),
+                HeaderValue::from_static("999999"),
+            ),
+        ]);
+        let uri = "/webhooks/github".parse().unwrap();
+        let body = r#"{"holder_node":"node:attacker","lease_seq":999999}"#;
+        let first = config.build_request(&headers, &uri, body, None).unwrap();
+        let second = config.build_request(&headers, &uri, body, None).unwrap();
+        let proof = first.holder_proof.as_ref().unwrap();
+        assert_eq!(proof.holder_node.as_str(), "node:ingress");
+        assert_eq!(first.input["body"], body);
+        assert!(first.input["headers"].get("x-fcp-holder-proof").is_none());
+        assert!(first.input["headers"].get("x-fcp-lease-seq").is_none());
+        assert!(first.lease_seq.is_none());
+        let signature = fcp_crypto::Ed25519Signature::from_bytes(&proof.signature);
+        let signable =
+            HolderProof::signable_bytes(&first.id, &first.operation, b"ingress-token-one");
+        verifier.verify(&signable, &signature).unwrap();
+        let wrong_key = Ed25519SigningKey::from_bytes(&[60; 32]).unwrap();
+        assert!(
+            wrong_key
+                .verifying_key()
+                .verify(&signable, &signature)
+                .is_err()
+        );
+        for changed in [
+            HolderProof::signable_bytes(&second.id, &first.operation, b"ingress-token-one"),
+            HolderProof::signable_bytes(
+                &first.id,
+                &OperationId::from_static("webhook.endpoints.create"),
+                b"ingress-token-one",
+            ),
+            HolderProof::signable_bytes(&first.id, &first.operation, b"ingress-token-two"),
+        ] {
+            assert!(verifier.verify(&changed, &signature).is_err());
+        }
+        assert_ne!(proof.signature, second.holder_proof.unwrap().signature);
+    }
+
+    #[test]
+    fn holder_authority_requires_an_explicit_key_holder_and_nonempty_jti() {
+        let config = config("https://hooks.example.test/webhooks").unwrap();
+        let key = Ed25519SigningKey::from_bytes(&[59; 32]).unwrap();
+        for (token, key) in [
+            (holder_token(Some("node:ingress"), Some(b"jti")), None),
+            (holder_token(None, Some(b"jti")), Some(key.clone())),
+            (holder_token(Some(""), Some(b"jti")), Some(key.clone())),
+            (holder_token(Some("node:ingress"), None), Some(key.clone())),
+            (holder_token(Some("node:ingress"), Some(b"")), Some(key.clone())),
+        ] {
+            assert!(matches!(
+                config.clone().with_execution_authority(token, key),
+                Err(WebhookIngressError::Unavailable)
+            ));
+        }
+        let oversized_holder = "n".repeat(129);
+        for holder in [
+            "Node:ingress",
+            "node holder",
+            "node\ncontrol",
+            "node:é",
+            oversized_holder.as_str(),
+        ] {
+            assert!(matches!(
+                config.clone().with_execution_authority(
+                    holder_token(Some(holder), Some(b"jti")),
+                    Some(key.clone()),
+                ),
+                Err(WebhookIngressError::Unavailable)
+            ));
+        }
+        let malformed_claims = CwtClaims::new()
+            .token_id(b"malformed-holder-jti")
+            .custom(
+                fcp_crypto::cose::fcp2_claims::HOLDER_NODE,
+                ciborium::Value::Integer(7.into()),
+            );
+        let issuer = Ed25519SigningKey::from_bytes(&[58; 32]).unwrap();
+        let malformed = CapabilityToken::from_raw(
+            CoseToken::sign(&issuer, &malformed_claims).unwrap(),
+        );
+        for signer in [None, Some(key)] {
+            assert!(matches!(
+                config
+                    .clone()
+                    .with_execution_authority(malformed.clone(), signer),
+                Err(WebhookIngressError::Unavailable)
+            ));
+        }
+        assert!(matches!(
+            request(
+                &config.clone().with_capability_token(malformed),
+                "/webhooks/github",
+            ),
+            Err(WebhookIngressError::Unavailable)
+        ));
+        let without_key = config
+            .clone()
+            .with_capability_token(holder_token(Some("node:ingress"), Some(b"jti")));
+        assert!(matches!(
+            request(&without_key, "/webhooks/github"),
+            Err(WebhookIngressError::Unavailable)
+        ));
+        let bearer = config
+            .with_execution_authority(holder_token(None, Some(b"jti")), None)
+            .unwrap();
+        assert!(
+            request(&bearer, "/webhooks/github")
+                .unwrap()
+                .holder_proof
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn holder_context_is_cleared_on_capability_replacement_and_rebound_on_rotation() {
+        let first_key = Ed25519SigningKey::from_bytes(&[59; 32]).unwrap();
+        let next_key = Ed25519SigningKey::from_bytes(&[60; 32]).unwrap();
+        let original = config("https://hooks.example.test/webhooks")
+            .unwrap()
+            .with_execution_authority(
+                holder_token(Some("node:ingress"), Some(b"first-jti")),
+                Some(first_key.clone()),
+            )
+            .unwrap();
+        let next_token = holder_token(Some("node:successor"), Some(b"next-jti"));
+        let without_replacement_key =
+            original.clone().with_capability_token(next_token.clone());
+        assert!(matches!(
+            request(&without_replacement_key, "/webhooks/github"),
+            Err(WebhookIngressError::Unavailable)
+        ));
+        let rotated = original
+            .clone()
+            .with_execution_authority(next_token, Some(next_key.clone()))
+            .unwrap();
+        let invocation = request(&rotated, "/webhooks/github").unwrap();
+        let proof = invocation.holder_proof.unwrap();
+        assert_eq!(proof.holder_node.as_str(), "node:successor");
+        let signature = fcp_crypto::Ed25519Signature::from_bytes(&proof.signature);
+        let bytes = HolderProof::signable_bytes(&invocation.id, &invocation.operation, b"next-jti");
+        next_key.verifying_key().verify(&bytes, &signature).unwrap();
+        assert!(
+            first_key
+                .verifying_key()
+                .verify(&bytes, &signature)
+                .is_err()
+        );
+        let bearer = original.with_capability_token(holder_token(None, Some(b"bearer-jti")));
+        assert!(
+            request(&bearer, "/webhooks/github")
+                .unwrap()
+                .holder_proof
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn holder_authority_debug_redacts_key_and_token_context() {
+        let key = Ed25519SigningKey::from_bytes(&[59; 32]).unwrap();
+        let config = config("https://hooks.example.test/webhooks")
+            .unwrap()
+            .with_execution_authority(
+                holder_token(
+                    Some("node:private-ingress-holder"),
+                    Some(b"private-token-jti"),
+                ),
+                Some(key.clone()),
+            )
+            .unwrap();
+        let debug = format!("{config:?}");
+        assert!(debug.contains("[redacted]"));
+        assert!(!debug.contains("private-ingress-holder"));
+        assert!(!debug.contains("private-token-jti"));
+        assert!(!debug.contains(&hex::encode(key.to_bytes())));
     }
 
     fn policy_input(request: InvokeRequest, capability: &str) -> PolicySimulationInput {

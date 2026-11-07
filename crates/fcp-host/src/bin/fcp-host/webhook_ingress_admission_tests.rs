@@ -447,6 +447,78 @@ async fn webhook_ingress_admission_rejects_untrusted_or_wrong_scope_capabilities
 }
 
 #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn webhook_ingress_admission_verifies_provisioned_holder_against_signed_membership() {
+    let mut fixture = LiveReceiver::new().await;
+    let _evidence_directory = fixture.enable_live_evidence();
+    let holder = Ed25519SigningKey::generate();
+    let other_key = Ed25519SigningKey::generate();
+    let membership = tempfile::tempdir().expect("signed membership directory");
+    Arc::get_mut(&mut fixture.host)
+        .expect("host has not started owned invocations")
+        .mesh = Some(Arc::new(tests::holder_test_router(membership.path(), &holder)));
+
+    let bearer = tests::test_capability_token_for_instance(
+        &fixture.signing_key,
+        "webhook.events.write",
+        WEBHOOK_INGRESS_OPERATION,
+        "z:work",
+        &fixture.instance,
+    );
+    let claims = bearer
+        .raw()
+        .claims_unverified()
+        .unwrap()
+        .holder_node("holder-client")
+        .token_id(b"webhook-holder-token");
+    let token = fcp_core::CapabilityToken::from_raw(
+        fcp_crypto::cose::CoseToken::sign(&fixture.signing_key, &claims).unwrap(),
+    );
+
+    // Parsing the token selects signing context only. A well-formed but wrong
+    // local key must still fail the actual owner-authenticated host admission.
+    fixture.binding = fixture
+        .binding
+        .clone()
+        .with_execution_authority(token.clone(), Some(other_key))
+        .unwrap();
+    let wrong_key = fixture.request(61);
+    fixture.binding = fixture
+        .binding
+        .clone()
+        .with_execution_authority(token, Some(holder))
+        .unwrap();
+    let mut changed_request = fixture.request(62);
+    changed_request.id = RequestId::new("public-replayed-holder-proof");
+    let mut changed_token = fixture.request(63);
+    changed_token.capability_token = fcp_core::CapabilityToken::from_raw(
+        fcp_crypto::cose::CoseToken::sign(
+            &fixture.signing_key,
+            &claims.clone().token_id(b"replacement-webhook-token"),
+        )
+        .unwrap(),
+    );
+
+    for invocation in [wrong_key, changed_request, changed_token] {
+        let (status, detail) = fixture
+            .dispatch(invocation)
+            .await
+            .expect_err("a proof cannot authorize another key, request, or token");
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(detail.contains("holder_proof rejected"), "{detail}");
+        assert_eq!(fixture.invocations.load(Ordering::SeqCst), 0);
+    }
+
+    let response = fixture
+        .dispatch(fixture.request(64))
+        .await
+        .expect("current holder proof passes the ordinary invocation route");
+    let (status, public) = response_for(&response);
+    assert_eq!(status, StatusCode::ACCEPTED, "{response:?}");
+    assert_eq!(public["accepted"], true);
+    assert_eq!(fixture.invocations.load(Ordering::SeqCst), 1);
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
 async fn webhook_ingress_admission_accepts_fixed_command_with_live_signed_evidence() {
     let mut fixture = LiveReceiver::new().await;
     let _evidence_directory = fixture.enable_live_evidence();

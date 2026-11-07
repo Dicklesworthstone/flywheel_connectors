@@ -18,6 +18,7 @@ use super::*;
 const CONFIG_ENV: &str = "FCP_HOST_WEBHOOK_INGRESS_CONFIG_FILE";
 const MAX_CONFIG_BYTES: usize = 64 * 1024;
 const MAX_TOKEN_BYTES: usize = 32 * 1024;
+const MAX_HOLDER_KEY_BYTES: usize = 128;
 
 /// Only the TCP accept loop creates this extension. Forwarded headers never do.
 #[derive(Clone, Copy)]
@@ -30,6 +31,8 @@ struct FileConfig {
     zone_id: ZoneId,
     public_base_url: String,
     capability_token_file: PathBuf,
+    #[serde(default)]
+    holder_key_file: Option<PathBuf>,
     #[serde(default = "default_max_body_bytes")]
     max_body_bytes: usize,
     #[serde(default = "default_timeout_ms")]
@@ -54,7 +57,7 @@ fn invalid_config(message: &str) -> HostError {
     HostError::InvalidFilter(format!("webhook ingress: {message}"))
 }
 
-fn read_bounded(path: &StdPath, maximum: usize) -> HostResult<Vec<u8>> {
+fn read_bounded(path: &StdPath, maximum: usize) -> HostResult<zeroize::Zeroizing<Vec<u8>>> {
     let metadata =
         std::fs::metadata(path).map_err(|_| invalid_config("cannot read configured file"))?;
     if !metadata.is_file() || metadata.len() > maximum as u64 {
@@ -71,7 +74,7 @@ fn read_bounded(path: &StdPath, maximum: usize) -> HostResult<Vec<u8>> {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NONBLOCK);
     }
-    let file = options
+    let mut file = options
         .open(path)
         .map_err(|_| invalid_config("cannot open configured file"))?;
     let metadata = file
@@ -82,14 +85,49 @@ fn read_bounded(path: &StdPath, maximum: usize) -> HostResult<Vec<u8>> {
             "configured file is not a bounded regular file",
         ));
     }
-    let mut bytes = Vec::new();
-    file.take(maximum as u64 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| invalid_config("cannot read configured file"))?;
-    if bytes.len() > maximum {
-        return Err(invalid_config("configured file exceeds its byte limit"));
+    // Allocate the entire bound, including an overflow sentinel, before any
+    // secret bytes arrive. A growing Vec can leave earlier copies in freed
+    // allocations that its final zeroizing wrapper cannot clear.
+    let capacity = maximum
+        .checked_add(1)
+        .ok_or_else(|| invalid_config("configured file byte limit is invalid"))?;
+    let mut bytes = zeroize::Zeroizing::new(vec![0_u8; capacity]);
+    let mut length = 0;
+    loop {
+        match file.read(&mut bytes[length..]) {
+            Ok(0) => break,
+            Ok(read) => {
+                length += read;
+                if length > maximum {
+                    return Err(invalid_config("configured file exceeds its byte limit"));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return Err(invalid_config("cannot read configured file")),
+        }
     }
+    bytes.truncate(length);
     Ok(bytes)
+}
+
+fn read_holder_key(path: &StdPath) -> Result<fcp_crypto::Ed25519SigningKey, WebhookIngressError> {
+    let bytes =
+        read_bounded(path, MAX_HOLDER_KEY_BYTES).map_err(|_| WebhookIngressError::Unavailable)?;
+    let mut secret = zeroize::Zeroizing::new([0_u8; 32]);
+    if bytes.len() == secret.len() {
+        secret.copy_from_slice(&bytes);
+    } else {
+        let encoded = std::str::from_utf8(&bytes)
+            .map_err(|_| WebhookIngressError::Unavailable)?
+            .trim();
+        if encoded.len() != 64 {
+            return Err(WebhookIngressError::Unavailable);
+        }
+        hex::decode_to_slice(encoded, &mut *secret)
+            .map_err(|_| WebhookIngressError::Unavailable)?;
+    }
+    fcp_crypto::Ed25519SigningKey::from_bytes(&secret)
+        .map_err(|_| WebhookIngressError::Unavailable)
 }
 
 /// The binding is fixed at startup. Authority is provisioned after the receiver
@@ -97,12 +135,20 @@ fn read_bounded(path: &StdPath, maximum: usize) -> HostResult<Vec<u8>> {
 pub(super) struct ConfiguredIngress {
     binding: WebhookIngressConfig,
     token_file: PathBuf,
+    holder_key_file: Option<PathBuf>,
 }
 
 impl FileConfig {
     fn into_config(self) -> HostResult<ConfiguredIngress> {
         if !self.capability_token_file.is_absolute() {
             return Err(invalid_config("capability_token_file must be absolute"));
+        }
+        if self
+            .holder_key_file
+            .as_ref()
+            .is_some_and(|path| !path.is_absolute())
+        {
+            return Err(invalid_config("holder_key_file must be absolute"));
         }
         let binding = WebhookIngressConfig::without_capability_token(
             self.connector_id,
@@ -116,6 +162,7 @@ impl FileConfig {
         Ok(ConfiguredIngress {
             binding,
             token_file: self.capability_token_file,
+            holder_key_file: self.holder_key_file,
         })
     }
 }
@@ -136,6 +183,7 @@ pub(super) fn from_env() -> HostResult<Option<ConfiguredIngress>> {
 struct IngressRuntime {
     config: WebhookIngressConfig,
     token_file: Option<PathBuf>,
+    holder_key_file: Option<PathBuf>,
     active: AtomicUsize,
 }
 
@@ -145,6 +193,7 @@ impl IngressRuntime {
         Self {
             config,
             token_file: None,
+            holder_key_file: None,
             active: AtomicUsize::new(0),
         }
     }
@@ -153,6 +202,7 @@ impl IngressRuntime {
         Self {
             config: config.binding,
             token_file: Some(config.token_file),
+            holder_key_file: config.holder_key_file,
             active: AtomicUsize::new(0),
         }
     }
@@ -166,9 +216,18 @@ impl IngressRuntime {
         let text = std::str::from_utf8(&bytes).map_err(|_| WebhookIngressError::Unavailable)?;
         let token = capability_token_from_cbor_b64(text, CONFIG_ENV)
             .map_err(|_| WebhookIngressError::Unavailable)?;
+        let holder_key = self
+            .holder_key_file
+            .as_deref()
+            .map(read_holder_key)
+            .transpose()?;
         // Never cache authority: removal, corruption and expiry must not fall
-        // back to a previously accepted token. Normal host admission verifies it.
-        Ok(self.config.clone().with_capability_token(token))
+        // back to a previously accepted token or signer. Normal host admission
+        // verifies the capability and current membership's holder key. Validate
+        // signing context before reading potentially large provider bodies.
+        self.config
+            .clone()
+            .with_execution_authority(token, holder_key)
     }
 
     fn admit(&self) -> Result<IngressPermit<'_>, WebhookIngressError> {
@@ -403,6 +462,25 @@ mod tests {
                 "ingest_log": { "signature": "private-authentication-evidence" },
             }),
         )
+    }
+
+    fn publish_holder_token(path: &StdPath, holder: Option<&str>, jti: Option<&[u8]>) {
+        let issuer = fcp_crypto::Ed25519SigningKey::from_bytes(&[71; 32]).unwrap();
+        let mut claims = fcp_crypto::cose::CwtClaims::new()
+            .capability_id("webhook.events.write")
+            .zone_id("z:work")
+            .operations(&["webhook.events.ingest"]);
+        if let Some(holder) = holder {
+            claims = claims.holder_node(holder);
+        }
+        if let Some(jti) = jti {
+            claims = claims.token_id(jti);
+        }
+        let token = fcp_crypto::cose::CoseToken::sign(&issuer, &claims).unwrap();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(token.to_cbor().unwrap());
+        let next = path.with_extension("next");
+        std::fs::write(&next, encoded).unwrap();
+        std::fs::rename(next, path).unwrap();
     }
 
     #[fcp_async_core::runtime::test]
@@ -724,6 +802,8 @@ mod tests {
             json!({}),
             json!({"capability_token_b64": "token", "capability_token_file": "/tmp/token"}),
             json!({"capability_token_file": "relative-token"}),
+            json!({"capability_token_file": "/tmp/token", "holder_key_file": "relative-key"}),
+            json!({"capability_token_file": "/tmp/token", "holder_key": "inline-private-key"}),
         ] {
             let mut value = json!({
                 "connector_id": "fcp.webhook-receiver",
@@ -759,6 +839,7 @@ mod tests {
             zone_id: ZoneId::work(),
             public_base_url: "https://hooks.example.test/webhooks".to_owned(),
             capability_token_file: token_file.clone(),
+            holder_key_file: None,
             max_body_bytes: 1024,
             timeout_ms: 15_000,
             max_in_flight: 1,
@@ -819,6 +900,146 @@ mod tests {
     }
 
     #[test]
+    fn webhook_holder_keys_accept_bounded_raw_or_hex_material_and_fail_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("holder.key");
+        let secret = [72_u8; 32];
+        for encoded in [
+            secret.to_vec(),
+            format!("{}\n", hex::encode(secret)).into_bytes(),
+        ] {
+            std::fs::write(&path, encoded).unwrap();
+            let key = read_holder_key(&path).unwrap();
+            assert_eq!(key.to_bytes(), secret);
+        }
+        for invalid in [
+            Vec::new(),
+            b"private-invalid-holder-key".to_vec(),
+            vec![b'g'; 64],
+            vec![0xff; 64],
+            vec![b'a'; MAX_HOLDER_KEY_BYTES + 1],
+        ] {
+            std::fs::write(&path, invalid).unwrap();
+            let error = read_holder_key(&path).unwrap_err();
+            assert!(matches!(error, WebhookIngressError::Unavailable));
+            assert!(!error.to_string().contains("private-"));
+        }
+        assert!(read_holder_key(directory.path()).is_err());
+        assert!(read_holder_key(&directory.path().join("absent")).is_err());
+    }
+
+    #[fcp_async_core::runtime::test]
+    #[allow(clippy::too_many_lines)]
+    async fn webhook_holder_authority_rotates_token_key_and_proof_for_each_admission() {
+        let directory = tempfile::tempdir().unwrap();
+        let token_file = directory.path().join("capability.b64");
+        let key_file = directory.path().join("holder.key");
+        let config = FileConfig {
+            connector_id: ConnectorId::from_static("fcp.webhook-receiver"),
+            zone_id: ZoneId::work(),
+            public_base_url: "https://hooks.example.test/webhooks".to_owned(),
+            capability_token_file: token_file.clone(),
+            holder_key_file: Some(key_file.clone()),
+            max_body_bytes: 1024,
+            timeout_ms: 15_000,
+            max_in_flight: 1,
+        }
+        .into_config()
+        .expect("authority may be provisioned after startup");
+        let runtime = IngressRuntime::configured(config);
+        publish_holder_token(
+            &token_file,
+            Some("node:initial-holder"),
+            Some(b"initial-jti"),
+        );
+        let unread_body = || {
+            Body::from_stream(stream::poll_fn(
+                |_| -> Poll<Option<Result<Bytes, Infallible>>> {
+                    panic!("unavailable holder authority must reject before reading the body")
+                },
+            ))
+        };
+        let (status, _) = runtime
+            .receive(request(unread_body()), |_, _| async {
+                panic!("missing holder key")
+            })
+            .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+
+        for (holder, jti, secret) in [
+            (
+                "node:initial-holder",
+                b"initial-jti".as_slice(),
+                [72_u8; 32],
+            ),
+            ("node:successor", b"successor-jti".as_slice(), [73_u8; 32]),
+        ] {
+            let key = fcp_crypto::Ed25519SigningKey::from_bytes(&secret).unwrap();
+            publish_holder_token(&token_file, Some(holder), Some(jti));
+            let next = key_file.with_extension("next");
+            std::fs::write(&next, hex::encode(secret)).unwrap();
+            std::fs::rename(next, &key_file).unwrap();
+            let verifier = key.verifying_key();
+            let (status, _) = runtime
+                .receive(request(Body::from("{}")), |invocation, _| async move {
+                    let proof = invocation
+                        .holder_proof
+                        .as_ref()
+                        .expect("current holder proof");
+                    assert_eq!(proof.holder_node.as_str(), holder);
+                    let bytes = fcp_core::HolderProof::signable_bytes(
+                        &invocation.id,
+                        &invocation.operation,
+                        jti,
+                    );
+                    verifier
+                        .verify(
+                            &bytes,
+                            &fcp_crypto::Ed25519Signature::from_bytes(&proof.signature),
+                        )
+                        .expect("proof uses current key, request ID and token JTI");
+                    Ok(accepted(invocation))
+                })
+                .await;
+            assert_eq!(status, StatusCode::ACCEPTED);
+        }
+
+        for invalid in [Vec::new(), b"private-broken-key".to_vec(), vec![b'a'; 129]] {
+            std::fs::write(&key_file, invalid).unwrap();
+            let (status, public) = runtime
+                .receive(request(unread_body()), |_, _| async {
+                    panic!("invalid replacement must never reuse a previous signer")
+                })
+                .await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert!(!public.to_string().contains("private-"));
+        }
+        std::fs::rename(&key_file, key_file.with_extension("withdrawn")).unwrap();
+        let (status, _) = runtime
+            .receive(request(unread_body()), |_, _| async {
+                panic!("withdrawn key")
+            })
+            .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+
+        std::fs::write(&key_file, hex::encode([73_u8; 32])).unwrap();
+        for (holder, jti) in [
+            (None, Some(b"bearer-jti".as_slice())),
+            (Some("node:successor"), None),
+            (Some("node:successor"), Some(b"".as_slice())),
+        ] {
+            publish_holder_token(&token_file, holder, jti);
+            let (status, _) = runtime
+                .receive(request(unread_body()), |_, _| async {
+                    panic!("invalid signing context")
+                })
+                .await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        }
+        assert_eq!(runtime.active.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
     fn webhook_config_file_reads_are_bounded_and_errors_do_not_echo_content() {
         let directory = tempfile::tempdir().expect("temp directory");
         let path = directory.path().join("ingress.json");
@@ -827,7 +1048,7 @@ mod tests {
         assert!(!error.to_string().contains("private-configuration"));
         assert!(read_bounded(directory.path(), 1024).is_err());
         assert_eq!(
-            read_bounded(&path, 1024).expect("bounded file"),
+            read_bounded(&path, 1024).expect("bounded file").as_slice(),
             b"private-configuration"
         );
     }
