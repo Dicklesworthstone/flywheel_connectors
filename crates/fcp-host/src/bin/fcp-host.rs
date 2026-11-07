@@ -13124,6 +13124,34 @@ async fn cancel_self_handler(
     Ok(Json(response))
 }
 
+/// Give each HTTP admission its own restart-safe durable invocation identity.
+/// Provider delivery IDs are untrusted correlation data; provider authentication
+/// and deduplication must run before those IDs can suppress another delivery.
+fn webhook_ingress_attempt_id(provider: &str) -> RequestId {
+    RequestId::new(format!(
+        "{provider}-webhook-{}",
+        hex::encode(fcp_crypto::aead::XChaCha20Nonce::generate().as_bytes())
+    ))
+}
+
+async fn assign_webhook_ingress_lease(
+    state: &AppState,
+    request: &mut InvokeRequest,
+) -> HostResult<()> {
+    // Public headers and provider data never select a lease or its epoch.
+    // Canonical invoke admission still verifies ownership and the active fence.
+    if state
+        .registry
+        .allow_list_snapshot(&request.connector_id)
+        .await
+        .is_some_and(|snapshot| snapshot.singleton_writer)
+    {
+        request.lease_seq =
+            current_hrw_lease_routing_config()?.and_then(|routing| routing.current_lease_seq);
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 struct BlueBubblesIngressConfig {
     connector_id: ConnectorId,
@@ -13166,9 +13194,12 @@ async fn bluebubbles_webhook_ingress_handler(
         }
     };
 
-    let request =
+    let mut request =
         bluebubbles_ingress_invoke_request(&config, &headers, &uri, body_value, body.len())
             .map_err(map_host_error)?;
+    assign_webhook_ingress_lease(state.as_ref(), &mut request)
+        .await
+        .map_err(map_host_error)?;
 
     // External webhook headers are intentionally not forwarded to invoke_handler.
     // The public provider authenticates with BlueBubbles callback auth; FCP
@@ -13282,9 +13313,11 @@ fn bluebubbles_ingress_invoke_request(
     body_size_bytes: usize,
 ) -> HostResult<InvokeRequest> {
     let input = bluebubbles_ingress_input(config, headers, uri, body, body_size_bytes)?;
+    let id = webhook_ingress_attempt_id("bluebubbles");
+    let idempotency_key = Some(id.to_string());
     Ok(InvokeRequest {
         r#type: "invoke".to_string(),
-        id: RequestId::random(),
+        id,
         connector_id: config.connector_id.clone(),
         operation: OperationId::from_static(BLUEBUBBLES_INGRESS_OPERATION),
         zone_id: config.zone_id.clone(),
@@ -13292,7 +13325,7 @@ fn bluebubbles_ingress_invoke_request(
         capability_token: config.capability_token.clone(),
         holder_proof: None,
         context: None,
-        idempotency_key: Some(format!("bluebubbles-webhook-{}", RequestId::random())),
+        idempotency_key,
         lease_seq: None,
         deadline_ms: Some(config.timeout_ms),
         correlation_id: Some(CorrelationId::new()),
@@ -13460,7 +13493,7 @@ async fn telegram_webhook_ingress_handler_with_config(
 
     let delivery_id = telegram_webhook_ingress_delivery_id(&headers);
     let received_at = Utc::now().timestamp();
-    let request = telegram_webhook_ingress_invoke_request(
+    let mut request = telegram_webhook_ingress_invoke_request(
         &config,
         &headers,
         payload.to_string(),
@@ -13468,6 +13501,9 @@ async fn telegram_webhook_ingress_handler_with_config(
         received_at,
     )
     .map_err(map_host_error)?;
+    assign_webhook_ingress_lease(state.as_ref(), &mut request)
+        .await
+        .map_err(map_host_error)?;
 
     // External Telegram headers are not forwarded wholesale. The connector sees
     // only the raw Update payload plus the optional Telegram secret-token header
@@ -13558,9 +13594,11 @@ fn telegram_webhook_ingress_invoke_request(
     received_at: i64,
 ) -> HostResult<InvokeRequest> {
     let input = telegram_webhook_ingress_input(headers, payload, &delivery_id, received_at);
+    let id = webhook_ingress_attempt_id("telegram");
+    let idempotency_key = Some(id.to_string());
     Ok(InvokeRequest {
         r#type: "invoke".to_string(),
-        id: RequestId::random(),
+        id,
         connector_id: config.connector_id.clone(),
         operation: OperationId::from_static(TELEGRAM_WEBHOOK_INGRESS_OPERATION),
         zone_id: config.zone_id.clone(),
@@ -13568,7 +13606,7 @@ fn telegram_webhook_ingress_invoke_request(
         capability_token: config.capability_token.clone(),
         holder_proof: None,
         context: None,
-        idempotency_key: Some(delivery_id),
+        idempotency_key,
         lease_seq: None,
         deadline_ms: Some(config.timeout_ms),
         correlation_id: Some(CorrelationId::new()),
@@ -13605,7 +13643,7 @@ fn telegram_webhook_ingress_input(
 fn telegram_webhook_ingress_delivery_id(headers: &HeaderMap) -> String {
     header_value(headers, TELEGRAM_WEBHOOK_DELIVERY_ID_HEADER)
         .map(str::to_string)
-        .unwrap_or_else(|| format!("telegram-webhook-{}", RequestId::random()))
+        .unwrap_or_else(|| webhook_ingress_attempt_id("telegram").to_string())
 }
 
 fn telegram_webhook_ingress_status_from_output(output: &Value, fallback: StatusCode) -> StatusCode {
@@ -32847,6 +32885,57 @@ done"#;
         }
     }
 
+    fn assert_webhook_ingress_attempt_identity(request: &InvokeRequest, provider: &str) {
+        let id = request.id.to_string();
+        let prefix = format!("{provider}-webhook-");
+        let random = id
+            .strip_prefix(prefix.as_str())
+            .expect("host ingress attempt prefix");
+        assert_eq!(
+            hex::decode(random).expect("OS-random attempt bytes").len(),
+            24,
+            "durable invocation identities must not use the process-local request counter"
+        );
+        assert_eq!(request.idempotency_key.as_deref(), Some(id.as_str()));
+    }
+
+    #[test]
+    fn bluebubbles_ingress_invocations_have_independent_host_identities() {
+        let config = test_bluebubbles_ingress_config();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-fcp-delivery-id",
+            HeaderValue::from_static("provider-delivery"),
+        );
+        let uri: Uri = BLUEBUBBLES_INGRESS_ROUTE.parse().expect("ingress URI");
+        let first = bluebubbles_ingress_invoke_request(
+            &config,
+            &headers,
+            &uri,
+            json!({"type": "new-message"}),
+            24,
+        )
+        .expect("first ingress attempt");
+        let retry = bluebubbles_ingress_invoke_request(
+            &config,
+            &headers,
+            &uri,
+            json!({"type": "new-message"}),
+            24,
+        )
+        .expect("retried ingress attempt");
+
+        assert_eq!(first.input, retry.input);
+        assert_ne!(first.id, retry.id);
+        for request in [&first, &retry] {
+            assert_webhook_ingress_attempt_identity(request, "bluebubbles");
+            assert_eq!(request.connector_id, config.connector_id);
+            assert_eq!(request.zone_id, config.zone_id);
+            assert!(request.holder_proof.is_none());
+            assert!(request.lease_seq.is_none());
+        }
+    }
+
     #[test]
     fn bluebubbles_ingress_input_preserves_host_route_contract() {
         let config = test_bluebubbles_ingress_config();
@@ -33263,7 +33352,8 @@ done"#;
         );
         assert_eq!(request.zone_id.to_string(), "z:community");
         assert_eq!(request.deadline_ms, Some(1500));
-        assert_eq!(request.idempotency_key.as_deref(), Some("delivery-2008"));
+        assert_webhook_ingress_attempt_identity(&request, "telegram");
+        assert_ne!(request.idempotency_key.as_deref(), Some("delivery-2008"));
         assert_eq!(request.input["payload"], payload);
         assert_eq!(request.input["secret_token"], "telegram-webhook-fixture");
         assert_eq!(request.input["delivery_id"], "delivery-2008");
@@ -33283,7 +33373,89 @@ done"#;
         );
 
         let generated = telegram_webhook_ingress_delivery_id(&HeaderMap::new());
-        assert!(generated.starts_with("telegram-webhook-"));
+        let random = generated
+            .strip_prefix("telegram-webhook-")
+            .expect("host delivery prefix");
+        assert_eq!(
+            hex::decode(random).expect("random delivery bytes").len(),
+            24
+        );
+        assert_ne!(
+            generated,
+            telegram_webhook_ingress_delivery_id(&HeaderMap::new())
+        );
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn telegram_webhook_ingress_provider_retries_survive_durable_history_restart() {
+        let directory = tempfile::tempdir().expect("durable invocation directory");
+        let path = directory.path().join("webhook-invocations.json");
+        let config = test_telegram_webhook_ingress_config();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            TELEGRAM_WEBHOOK_SECRET_HEADER,
+            HeaderValue::from_static("telegram-webhook-fixture"),
+        );
+        let payload = json!({"update_id": 2009}).to_string();
+        let first = telegram_webhook_ingress_invoke_request(
+            &config,
+            &headers,
+            payload.clone(),
+            "same-provider-delivery".to_string(),
+            1700000023,
+        )
+        .expect("first ingress attempt");
+        let admission = |request: &InvokeRequest| fcp_host::InvocationAdmission {
+            operation_id: request.id.to_string(),
+            connector_id: request.connector_id.to_string(),
+            operation: request.operation.to_string(),
+            zone_id: request.zone_id.to_string(),
+            principal: "webhook-ingress".to_string(),
+            correlation_id: request.correlation_id.as_ref().map(ToString::to_string),
+            deadline_at: Utc::now() + chrono::Duration::seconds(60),
+            idempotency: fcp_host::InvocationIdempotency::from_request(request, "webhook-ingress")
+                .expect("principal-scoped binding"),
+            transport_idempotency: fcp_host::InvocationIdempotency::from_relay_request(
+                request, None,
+            )
+            .expect("transport binding"),
+        };
+        let store = HostAdminStateStore::with_state_path(path.clone()).expect("open journal");
+        let first_ticket = store
+            .admit_invocation(admission(&first))
+            .await
+            .expect("persist first attempt");
+        drop(store);
+
+        // An interrupted admission must remain queryable after recovery. It
+        // must not prevent a new HTTP attempt from reaching authenticated
+        // provider deduplication, even with the same delivery ID and a new time.
+        let reopened = HostAdminStateStore::with_state_path(path).expect("recover journal");
+        let retry = telegram_webhook_ingress_invoke_request(
+            &config,
+            &headers,
+            payload,
+            "same-provider-delivery".to_string(),
+            1700000024,
+        )
+        .expect("retried ingress attempt");
+        assert_eq!(first.input["delivery_id"], retry.input["delivery_id"]);
+        assert_ne!(first.input["received_at"], retry.input["received_at"]);
+        assert_ne!(first.id, retry.id);
+        assert_webhook_ingress_attempt_identity(&retry, "telegram");
+        let retry_ticket = reopened
+            .admit_invocation(admission(&retry))
+            .await
+            .expect("provider correlation must not fence a fresh ingress attempt");
+        assert!(retry_ticket.attempt_id > first_ticket.attempt_id);
+        let retained = reopened
+            .invocation_record(&first.id.to_string(), Some(first_ticket.attempt_id))
+            .await
+            .expect("interrupted attempt remains queryable");
+        assert_eq!(
+            retained.terminal.expect("recovered outcome").outcome,
+            fcp_host::InvocationOutcome::OutcomeUnknown
+        );
     }
 
     #[test]
@@ -33323,7 +33495,7 @@ done"#;
     }
 
     #[fcp_async_core::runtime::test(flavor = "multi_thread")]
-    async fn telegram_webhook_ingress_reaches_real_telegram_connector() {
+    async fn telegram_webhook_ingress_reaches_real_singleton_connector_and_authenticates_retries() {
         let loopback = HostTelegramLoopbackServer::start();
         let state_root = tempfile::tempdir().expect("host connector state tempdir");
         let mut telegram = TelegramConnector::new();
@@ -33345,13 +33517,14 @@ done"#;
         let instance_id = telegram.instance_id();
         let telegram = Arc::new(Mutex::new(telegram));
         let observed_zone_dir = Arc::new(StdMutex::new(None::<String>));
+        let observed_invocations = Arc::new(StdMutex::new(Vec::<InvokeRequest>::new()));
         let (runner_tx, mut runner_rx) =
             mpsc::channel::<ConnectorRpcRequest>(CONNECTOR_RPC_QUEUE_CAPACITY);
         let runner_task = task::spawn(async {});
 
         let signing_key = fcp_crypto::ed25519::Ed25519SigningKey::generate();
         let connector_id = ConnectorId::from_static("fcp.telegram");
-        let zone_id: ZoneId = "z:community".parse().expect("community zone should parse");
+        let zone_id = ZoneId::work();
         let expected_zone_dir =
             connector_zone_state_dir(state_root.path(), &connector_id, &zone_id)
                 .to_string_lossy()
@@ -33385,7 +33558,12 @@ done"#;
             cancellation_deadline_ms: None,
             id: connector_id.to_string(),
             binary: "in-process-telegram-test".to_string(),
-            manifest_path: None,
+            manifest_path: Some(
+                StdPath::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../connectors/telegram/manifest.toml")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
             name: Some("Telegram".to_string()),
             description: Some("Telegram webhook ingress test connector".to_string()),
             args: Vec::new(),
@@ -33403,11 +33581,35 @@ done"#;
         };
         let registry =
             dispatcher_registry_with_connector("fcp.telegram", subprocess, connector_config);
+        assert!(
+            registry
+                .allow_list_snapshot(&connector_id)
+                .await
+                .expect("Telegram manifest policy")
+                .singleton_writer
+        );
+        let eligible_nodes = vec![
+            TailscaleNodeId::new("telegram-host-a"),
+            TailscaleNodeId::new("telegram-host-b"),
+            TailscaleNodeId::new("telegram-host-c"),
+        ];
+        let subject_id = singleton_writer_connector_lease_subject_id(&connector_id, &zone_id);
+        let local_node =
+            fcp_mesh::planner::select_lease_holder(&zone_id, &subject_id, &eligible_nodes)
+                .expect("Telegram singleton holder");
+        let _lease_guard = set_test_hrw_lease_routing_override(Some(HrwLeaseRoutingConfig {
+            local_node,
+            eligible_nodes,
+            current_lease_seq: Some(42),
+        }));
         let mut zone_policies = HashMap::new();
         zone_policies.insert(zone_id.clone(), host_runtime_policy(zone_id.clone()));
         let state = dispatcher_app_state(
             registry,
-            Arc::new(HostAdminStateStore::default()),
+            Arc::new(
+                HostAdminStateStore::with_state_path(state_root.path().join("host-state.json"))
+                    .expect("durable host invocation history"),
+            ),
             Some(signing_key.verifying_key()),
             zone_policies,
         );
@@ -33433,6 +33635,11 @@ done"#;
         headers.insert(
             TELEGRAM_WEBHOOK_DELIVERY_ID_HEADER,
             HeaderValue::from_static("telegram-delivery-host-2010"),
+        );
+        headers.insert("x-fcp-lease-seq", HeaderValue::from_static("9999"));
+        headers.insert(
+            "x-principal",
+            HeaderValue::from_static("untrusted-provider"),
         );
         let payload = json!({
             "update_id": 2010,
@@ -33461,6 +33668,7 @@ done"#;
         let handler_done_for_runner = Arc::clone(&handler_done);
         let telegram_for_runner = Arc::clone(&telegram);
         let observed_zone_dir_for_runner = Arc::clone(&observed_zone_dir);
+        let observed_invocations_for_runner = Arc::clone(&observed_invocations);
         let runner = async move {
             loop {
                 match fcp_async_core::time::timeout(Duration::from_millis(10), runner_rx.recv())
@@ -33492,12 +33700,15 @@ done"#;
                                     connector.handle_introspect().await,
                                 )),
                                 "invoke" => {
-                                    let result =
-                                        match serde_json::from_value::<InvokeRequest>(
-                                            request.params,
-                                        ) {
-                                            Ok(invoke_request) => {
-                                                FcpConnector::invoke(&*connector, invoke_request)
+                                    let result = match serde_json::from_value::<InvokeRequest>(
+                                        request.params,
+                                    ) {
+                                        Ok(invoke_request) => {
+                                            observed_invocations_for_runner
+                                                .lock()
+                                                .expect("observed invocations lock")
+                                                .push(invoke_request.clone());
+                                            FcpConnector::invoke(&*connector, invoke_request)
                                                     .await
                                                     .and_then(|response| {
                                                         serde_json::to_value(response).map_err(
@@ -33508,16 +33719,14 @@ done"#;
                                                             },
                                                         )
                                                     })
-                                            }
-                                            Err(error) => {
-                                                Err(fcp_core::FcpError::InvalidRequest {
-                                                    code: 1003,
-                                                    message: format!(
-                                                        "invalid Telegram invoke request: {error}"
-                                                    ),
-                                                })
-                                            }
-                                        };
+                                        }
+                                        Err(error) => Err(fcp_core::FcpError::InvalidRequest {
+                                            code: 1003,
+                                            message: format!(
+                                                "invalid Telegram invoke request: {error}"
+                                            ),
+                                        }),
+                                    };
                                     Ok(telegram_connector_rpc_result(result))
                                 }
                                 "shutdown" => Ok(telegram_connector_rpc_result(
@@ -33539,7 +33748,26 @@ done"#;
             }
         };
         let handler = async {
-            let result = telegram_webhook_ingress_handler_with_config(
+            let mut rejected_headers = headers.clone();
+            rejected_headers.insert(
+                TELEGRAM_WEBHOOK_SECRET_HEADER,
+                HeaderValue::from_static("incorrect-webhook-secret"),
+            );
+            let rejected = telegram_webhook_ingress_handler_with_config(
+                Arc::clone(&state),
+                rejected_headers,
+                Bytes::from(payload.clone()),
+                config.clone(),
+            )
+            .await;
+            let accepted = telegram_webhook_ingress_handler_with_config(
+                Arc::clone(&state),
+                headers.clone(),
+                Bytes::from(payload.clone()),
+                config.clone(),
+            )
+            .await;
+            let duplicate = telegram_webhook_ingress_handler_with_config(
                 state,
                 headers,
                 Bytes::from(payload),
@@ -33547,11 +33775,23 @@ done"#;
             )
             .await;
             handler_done.store(true, Ordering::SeqCst);
-            result
+            (rejected, accepted, duplicate)
         };
-        let (handler_result, ()) = futures_util::future::join(handler, runner).await;
+        let ((rejected, accepted, duplicate), ()) =
+            futures_util::future::join(handler, runner).await;
+        let rejected_status = match rejected {
+            Ok((status, Json(body))) => {
+                assert_eq!(body["accepted"], false);
+                status
+            }
+            Err((status, _)) => status,
+        };
+        assert!(
+            !rejected_status.is_success(),
+            "invalid provider secret must fail"
+        );
         let (status, Json(body)) =
-            handler_result.expect("host Telegram ingress should reach connector");
+            accepted.expect("rejected-secret attempt must not poison valid provider delivery");
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["accepted"], true);
@@ -33575,6 +33815,35 @@ done"#;
                 .as_deref(),
             Some(expected_zone_dir.as_str())
         );
+        let (duplicate_status, Json(duplicate_body)) =
+            duplicate.expect("duplicate delivery must reach connector deduplication");
+        assert_eq!(duplicate_status, StatusCode::OK);
+        assert_eq!(duplicate_body["accepted"], true);
+        assert_eq!(duplicate_body["event_emitted"], false);
+        assert_eq!(duplicate_body["secret_verified"], true);
+        assert_eq!(duplicate_body["reason"], "duplicate_update");
+        assert_eq!(duplicate_body["delivery_id"], "telegram-delivery-host-2010");
+        {
+            let requests = observed_invocations
+                .lock()
+                .expect("observed invocations lock");
+            assert_eq!(
+                requests.len(),
+                3,
+                "every HTTP attempt must reach provider auth"
+            );
+            let mut request_ids = HashSet::new();
+            for request in requests.iter() {
+                assert_webhook_ingress_attempt_identity(request, "telegram");
+                assert!(request_ids.insert(request.id.to_string()));
+                assert_eq!(
+                    request.lease_seq,
+                    Some(42),
+                    "lease sequence must come from the host"
+                );
+                assert_eq!(request.input["delivery_id"], "telegram-delivery-host-2010");
+            }
+        }
 
         let event = fcp_async_core::time::timeout(Duration::from_secs(3), event_rx.recv())
             .await
@@ -33589,6 +33858,12 @@ done"#;
                 "telegram:chat:208214988".to_string(),
                 "telegram:user:208214988".to_string(),
             ]
+        );
+        assert!(
+            fcp_async_core::time::timeout(Duration::from_millis(100), event_rx.recv())
+                .await
+                .is_err(),
+            "rejected and duplicate deliveries must not emit another event"
         );
 
         let get_updates_path = host_telegram_token_path("getUpdates");

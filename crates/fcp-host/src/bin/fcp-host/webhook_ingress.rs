@@ -392,18 +392,9 @@ async fn receive(
     let (status, body) = service
         .runtime
         .receive(request, |mut invocation, deadline| async move {
-            // The active fencing sequence is host-owned configuration. Public
-            // headers and provider data never select a lease or its epoch.
-            if host
-                .registry
-                .allow_list_snapshot(&invocation.connector_id)
+            assign_webhook_ingress_lease(host.as_ref(), &mut invocation)
                 .await
-                .is_some_and(|snapshot| snapshot.singleton_writer)
-            {
-                invocation.lease_seq = current_hrw_lease_routing_config()
-                    .map_err(map_host_error)?
-                    .and_then(|routing| routing.current_lease_seq);
-            }
+                .map_err(map_host_error)?;
             // No outer provider headers reach principal or capability admission.
             route_invoke_with_deadline(host, invocation, None, Some(deadline)).await
         })

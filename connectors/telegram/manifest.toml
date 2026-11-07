@@ -5,7 +5,7 @@ min_mesh_version = "2.0.0"
 min_protocol = "fcp2-sym/2.0"
 protocol_features = ["streaming"]
 max_datagram_bytes = 65000
-interface_hash = "blake3-256:fcp.interface.v2:7c0e4da3553e48d30c16a72778598bce3712ea793920992486eb44ea5889d9d0"
+interface_hash = "blake3-256:fcp.interface.v2:076ed21c1f3dbdb9ec1c8d476ce9c6dd25ac6e950ef3343209e0e451d8a18b4e"
 
 [connector]
 id = "fcp.telegram"
@@ -754,6 +754,9 @@ type = "string"
 
 [provides.operations."telegram.ingest_webhook_update".output_schema.properties.resource_uris]
 type = "array"
+
+[provides.operations."telegram.ingest_webhook_update".output_schema.properties.resource_uris.items]
+type = "string"
 
 [provides.operations."telegram.ingest_webhook_update".output_schema.properties.reason]
 type = "string"
