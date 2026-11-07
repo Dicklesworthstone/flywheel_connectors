@@ -155,6 +155,37 @@ fwc audit tail --zone z:work
 fwc supply-chain verify github
 ```
 
+
+### Replay an operation from history
+
+`fwc replay` (also `fwc clone`) can execute a new invocation through the selected
+host. History retains input hashes and summaries, so supply the original JSON
+with `--file`, `--input`, or `--stdin`. The original payload must match the recorded
+hash before `--set` applies intentional changes; summaries are never treated as
+recoverable inputs. Reads are bounded to 16 MiB.
+
+```bash
+fwc replay <entry-id> --dry-run --file original-input.json
+fwc --host http://127.0.0.1:8787 replay <entry-id> \
+  --file original-input.json --set title="Follow-up issue" \
+  --capability-token-file current-capability.cbor
+```
+
+Live replay retains the source connector, operation, and zone unless `--zone`
+explicitly selects another zone. It performs current schema validation,
+capability and approval checks, and host preflight, and preserves the invocation's
+failure status. Use `--holder-key-file`, `--approval-token-file`, `--lease-seq`, and
+`--deadline-ms` when required by the current operation. `--skip-preflight` is
+rejected for live execution. An entry without a recorded zone requires `--zone`.
+
+Each replay gets a fresh invocation identity; an explicit `--idempotency-key`
+identifies that replay attempt and must differ from the source key. A source
+recorded as an error, timeout, or rate-limit failure cannot be replayed blindly,
+because its side effects may already have committed. Inspect and reconcile the
+original invocation first. Replay neither retries uncertain effects automatically
+nor adds raw input persistence. `--dry-run` remains offline and reports whether
+the original input was actually supplied and matched.
+
 ---
 
 ## Architecture

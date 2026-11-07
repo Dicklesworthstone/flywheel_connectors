@@ -3000,6 +3000,18 @@ struct ReplayArgs {
     /// History entry ID to replay.
     entry_id: String,
 
+    /// Original JSON payload. Its hash must match the history entry before overrides.
+    #[arg(long, conflicts_with_all = ["file", "stdin"])]
+    input: Option<String>,
+
+    /// Read the original JSON payload from a file (history never stores full inputs).
+    #[arg(long, conflicts_with_all = ["input", "stdin"])]
+    file: Option<PathBuf>,
+
+    /// Read the original JSON payload from stdin.
+    #[arg(long, conflicts_with_all = ["input", "file"])]
+    stdin: bool,
+
     /// Override specific input fields as `key=value` pairs.
     #[arg(long = "set", value_name = "KEY=VALUE")]
     set: Vec<String>,
@@ -3008,13 +3020,29 @@ struct ReplayArgs {
     #[arg(long, default_value_t = false)]
     dry_run: bool,
 
-    /// Skip re-preflighting (dangerous).
+    /// Preview the legacy skip-preflight flag; live replay always requires preflight.
     #[arg(long, default_value_t = false)]
     skip_preflight: bool,
 
     /// Override the execution zone.
     #[arg(long)]
     zone: Option<String>,
+
+    /// Optional principal identity for live preflight and invocation.
+    #[arg(long)]
+    principal: Option<String>,
+
+    /// Identity of this new replay attempt; defaults to a fresh key, never the source key.
+    #[arg(long)]
+    idempotency_key: Option<String>,
+
+    /// Expected singleton-writer lease sequence from live lease status.
+    #[arg(long)]
+    lease_seq: Option<u64>,
+
+    /// Optional invocation deadline in milliseconds.
+    #[arg(long)]
+    deadline_ms: Option<u64>,
 
     /// Live authentication tokens.
     #[command(flatten)]
@@ -25711,7 +25739,7 @@ fn invoke_dispatch_host_controlled(
         ],
     });
 
-    let envelope = CommandEnvelope::new(CommandAvailability::LiveRuntime, "invoke");
+    let envelope = CommandEnvelope::new(CommandAvailability::LiveRuntime, command);
     envelope.inject_into(&mut payload);
     inject_truth_source_metadata(&mut payload, knowledge_state);
     Ok(DispatchOutcome {
@@ -27665,9 +27693,90 @@ fn history_offline_payload(args: &HistoryArgs) -> Result<DispatchOutcome> {
 
 // ── Replay dispatch ─────────────────────────────────────────────────────────
 
-fn replay_dispatch(args: &ReplayArgs, _explicit_host: Option<&str>) -> Result<DispatchOutcome> {
-    let store = cli_history_store()?;
+/// History is an index of hashes and summaries, never an input recovery source.
+/// Bound reads before parsing; retain the input in memory through dispatch so a
+/// mutable file cannot change the payload after its history hash was checked.
+const MAX_REPLAY_INPUT_BYTES: usize = 16 * 1024 * 1024;
 
+fn replay_original_input(args: &ReplayArgs) -> Result<Option<Value>> {
+    let sources = usize::from(args.input.is_some())
+        + usize::from(args.file.is_some())
+        + usize::from(args.stdin);
+    anyhow::ensure!(sources <= 1, "choose exactly one replay input source");
+    if sources == 0 {
+        return Ok(None);
+    }
+
+    let bytes = if let Some(input) = &args.input {
+        anyhow::ensure!(
+            input.len() <= MAX_REPLAY_INPUT_BYTES,
+            "original replay input exceeds the 16 MiB limit"
+        );
+        input.as_bytes().to_vec()
+    } else {
+        let reader: Box<dyn Read> = if let Some(path) = &args.file {
+            Box::new(std::fs::File::open(path).context("cannot open original replay input")?)
+        } else {
+            Box::new(std::io::stdin())
+        };
+        let mut bytes = Vec::new();
+        reader
+            .take((MAX_REPLAY_INPUT_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .context("cannot read original replay input")?;
+        anyhow::ensure!(
+            bytes.len() <= MAX_REPLAY_INPUT_BYTES,
+            "original replay input exceeds the 16 MiB limit"
+        );
+        bytes
+    };
+    // Parser diagnostics can echo values from the input.
+    let input = serde_json::from_slice(&bytes)
+        .map_err(|_| anyhow::anyhow!("original replay input must be a complete JSON document"))?;
+    Ok(Some(input))
+}
+
+fn replay_source_payload(args: &ReplayArgs, entry: &history::HistoryEntry) -> Value {
+    json!({
+        "command": "replay",
+        "mode": if args.dry_run { "dry-run" } else { "live" },
+        "replay_source": entry.entry_id,
+        "original_entry": {
+            "entry_id": entry.entry_id,
+            "connector_id": entry.connector_id,
+            "operation_id": entry.operation_id,
+            "zone": entry.zone,
+            "status": entry.status,
+            "input_hash": entry.input_hash,
+        },
+        "effective_zone": args.zone.as_ref().or(entry.zone.as_ref()),
+        "preflight_required": true,
+        "execution_semantics": "new_invocation",
+        "automatic_retry_allowed": false,
+    })
+}
+
+fn replay_refusal(
+    args: &ReplayArgs,
+    entry: &history::HistoryEntry,
+    error_type: &str,
+    message: &str,
+    exit_code: CliExitCode,
+) -> DispatchOutcome {
+    let mut payload = replay_source_payload(args, entry);
+    payload["status"] = json!("error");
+    payload["error"] = json!({ "type": error_type, "message": message });
+    payload["next_actions"] = json!([
+        format!("fwc history {}", entry.entry_id),
+        format!("fwc replay {} --dry-run --file <original-input.json>", entry.entry_id),
+    ]);
+    CommandEnvelope::new(CommandAvailability::Unavailable, "replay").inject_into(&mut payload);
+    inject_truth_source_metadata(&mut payload, KnowledgeState::Offline);
+    DispatchOutcome { payload, exit_code }
+}
+
+fn replay_dispatch(args: &ReplayArgs, explicit_host: Option<&str>) -> Result<DispatchOutcome> {
+    let store = cli_history_store()?;
     let entry = match store.get(&args.entry_id)? {
         Some(entry) => entry,
         None => {
@@ -27679,137 +27788,208 @@ fn replay_dispatch(args: &ReplayArgs, _explicit_host: Option<&str>) -> Result<Di
                         "type": "not-found",
                         "message": format!("No history entry with ID '{}'.", args.entry_id),
                     },
-                    "next_actions": [
-                        "fwc history",
-                        "fwc history --connector <slug>",
-                    ],
+                    "next_actions": ["fwc history", "fwc history --connector <slug>"],
                 }),
                 exit_code: CliExitCode::UnknownCommand,
             });
         }
     };
 
-    // Parse --set overrides into key=value pairs.
+    // Validate paths even for a metadata-only preview. Live coercion and schema
+    // validation use the same descriptor as ordinary invocation.
     let mut overrides = std::collections::BTreeMap::new();
-    let mut override_errors = Vec::new();
     for item in &args.set {
-        if let Some((key, val)) = item.split_once('=') {
-            overrides.insert(key.to_owned(), val.to_owned());
-        } else {
-            override_errors.push(json!({
-                "raw": item,
-                "reason": "Expected KEY=VALUE format.",
-            }));
+        let Ok((path, value)) = parse_invoke_binding(item) else {
+            return Ok(replay_refusal(
+                args,
+                &entry,
+                "invalid-override",
+                "Each --set override must use PATH=VALUE syntax.",
+                CliExitCode::Validation,
+            ));
+        };
+        if parse_invoke_path(&path).is_err() {
+            return Ok(replay_refusal(
+                args,
+                &entry,
+                "invalid-override",
+                "A --set override contains an invalid payload path.",
+                CliExitCode::Validation,
+            ));
         }
+        overrides.insert(path, value);
     }
 
-    if !override_errors.is_empty() {
-        return Ok(DispatchOutcome {
-            payload: json!({
-                "status": "error",
-                "command": "replay",
-                "error": {
-                    "type": "invalid-override",
-                    "message": "One or more --set values could not be parsed.",
-                    "details": override_errors,
-                },
-                "next_actions": [
-                    "fwc replay <entry_id> --set key=value",
-                ],
-            }),
-            exit_code: CliExitCode::Validation,
-        });
+    // Preview is strictly offline, including when --host was supplied.
+    let host = if args.dry_run {
+        None
+    } else if let Some(host) = resolve_host_config(explicit_host)? {
+        Some(host)
+    } else {
+        return Ok(replay_refusal(
+            args,
+            &entry,
+            "host-required",
+            "Live replay requires an fcp-host connection. Select --host or use --dry-run.",
+            CliExitCode::Transport,
+        ));
+    };
+
+    let input = match replay_original_input(args) {
+        Ok(input) => input,
+        Err(_) => {
+            return Ok(replay_refusal(
+                args,
+                &entry,
+                "invalid-replay-input",
+                "Provide one readable, complete original JSON payload of at most 16 MiB with --input, --file, or --stdin.",
+                CliExitCode::Validation,
+            ));
+        }
+    };
+    if input
+        .as_ref()
+        .is_some_and(|input| history::content_hash(input) != entry.input_hash)
+    {
+        return Ok(replay_refusal(
+            args,
+            &entry,
+            "replay-input-mismatch",
+            "The supplied original payload does not match the history input hash. Supply the original input, then use --set for intentional changes.",
+            CliExitCode::Validation,
+        ));
     }
-
-    // Compute reused vs overridden fields.
-    let original_fields: Vec<String> = vec![
-        "connector_id".to_owned(),
-        "operation_id".to_owned(),
-        "zone".to_owned(),
-        "input_hash".to_owned(),
-    ];
-    let overridden_fields: Vec<String> = overrides.keys().cloned().collect();
-    let reused_fields: Vec<String> = original_fields
-        .iter()
-        .filter(|f| !overrides.contains_key(f.as_str()))
-        .cloned()
-        .collect();
-
-    let effective_zone = args
-        .zone
-        .clone()
-        .or_else(|| entry.zone.clone())
-        .unwrap_or_else(|| "z:work".to_owned());
 
     if args.dry_run {
-        let envelope = CommandEnvelope::new(CommandAvailability::OfflineArtifact, "replay");
-        let mut payload = json!({
-            "status": "ok",
-            "command": "replay",
-            "mode": "dry-run",
-            "replay_source": args.entry_id,
-            "original_entry": {
-                "entry_id": entry.entry_id,
-                "connector_id": entry.connector_id,
-                "operation_id": entry.operation_id,
-                "zone": entry.zone,
-                "status": entry.status,
-                "input_hash": entry.input_hash,
-                "input_summary": entry.input_summary,
-            },
-            "effective_zone": effective_zone,
-            "overrides": overrides,
-            "reused_fields": reused_fields,
-            "overridden_fields": overridden_fields,
-            "skip_preflight": args.skip_preflight,
-            "message": format!(
-                "Dry-run: would replay operation `{}` from connector `{}` (entry `{}`).",
-                entry.operation_id, entry.connector_id, entry.entry_id,
-            ),
-            "next_actions": [
-                format!("fwc replay {}", args.entry_id),
-                format!("fwc replay {} --set key=value", args.entry_id),
-            ],
+        let mut payload = replay_source_payload(args, &entry);
+        payload["status"] = json!("ok");
+        payload["input_available"] = json!(input.is_some());
+        payload["original_input_hash_verified"] = json!(input.is_some());
+        payload["overridden_fields"] = json!(overrides.keys().collect::<Vec<_>>());
+        payload["overrides"] = json!(overrides);
+        payload["reused_fields"] = json!(["connector_id", "operation_id"]);
+        payload["skip_preflight"] = json!(args.skip_preflight);
+        payload["message"] = json!(if input.is_some() {
+            "Original input matches the history hash. Live replay creates a new invocation after current schema validation, authorization, and preflight."
+        } else {
+            "Metadata-only preview: history contains hashes and summaries, not recoverable input. Supply the original payload before live replay."
         });
-        envelope.inject_into(&mut payload);
+        payload["next_actions"] = json!([
+            format!("fwc replay {} --file <original-input.json> --host <endpoint> --capability-token-file <token.cbor>", args.entry_id),
+        ]);
+        CommandEnvelope::new(CommandAvailability::OfflineArtifact, "replay")
+            .inject_into(&mut payload);
+        inject_truth_source_metadata(&mut payload, KnowledgeState::Offline);
         return Ok(DispatchOutcome {
             payload,
             exit_code: CliExitCode::Success,
         });
     }
 
-    // Live replay: requires host.
-    let envelope = CommandEnvelope::new(CommandAvailability::Unavailable, "replay");
-    let mut payload = json!({
-        "status": "error",
-        "command": "replay",
-        "mode": "live",
-        "replay_source": args.entry_id,
-        "original_entry": {
-            "entry_id": entry.entry_id,
-            "connector_id": entry.connector_id,
-            "operation_id": entry.operation_id,
-            "zone": entry.zone,
-            "status": entry.status,
-        },
-        "effective_zone": effective_zone,
-        "overrides": overrides,
-        "reused_fields": reused_fields,
-        "overridden_fields": overridden_fields,
-        "error": {
-            "type": "host-required",
-            "message": "Live replay requires an fcp-host connection. Use --dry-run to preview.",
-        },
-        "next_actions": [
-            format!("fwc replay {} --dry-run", args.entry_id),
-            "fwc replay <entry_id> --host http://127.0.0.1:8787".to_owned(),
-        ],
+    let Some(input) = input else {
+        return Ok(replay_refusal(
+            args,
+            &entry,
+            "replay-input-required",
+            "History summaries cannot reconstruct an invocation. Supply the original JSON payload with --input, --file, or --stdin.",
+            CliExitCode::Validation,
+        ));
+    };
+    if args.skip_preflight {
+        return Ok(replay_refusal(
+            args,
+            &entry,
+            "replay-preflight-required",
+            "Live replay cannot skip current schema, capability, approval, and host preflight checks.",
+            CliExitCode::Validation,
+        ));
+    }
+    if matches!(
+        entry.status,
+        history::OpStatus::Error | history::OpStatus::Timeout | history::OpStatus::RateLimited
+    ) {
+        return Ok(replay_refusal(
+            args,
+            &entry,
+            "replay-source-outcome-uncertain",
+            "The source history entry does not prove whether its effects committed. Reconcile the original invocation with host evidence before creating another effect.",
+            CliExitCode::PolicyDenied,
+        ));
+    }
+    let Some(zone) = args.zone.clone().or_else(|| entry.zone.clone()) else {
+        return Ok(replay_refusal(
+            args,
+            &entry,
+            "replay-zone-required",
+            "The source has no recorded zone. Select --zone explicitly before replaying it.",
+            CliExitCode::Validation,
+        ));
+    };
+    if args
+        .idempotency_key
+        .as_ref()
+        .is_some_and(|key| key.trim().is_empty() || entry.idempotency_key.as_ref() == Some(key))
+    {
+        return Ok(replay_refusal(
+            args,
+            &entry,
+            "invalid-replay-idempotency-key",
+            "Replay creates a new invocation; its idempotency key must be nonempty and different from the source invocation's key.",
+            CliExitCode::Validation,
+        ));
+    }
+    let idempotency_key = args
+        .idempotency_key
+        .clone()
+        .unwrap_or_else(|| format!("replay-{}", RequestId::random()));
+    let request = InvokeArgs {
+        connector: entry.connector_id.clone(),
+        operation: entry.operation_id.clone(),
+        input: Some(serde_json::to_string(&input)?),
+        file: None,
+        stdin: false,
+        set: args.set.clone(),
+        zone: Some(zone.clone()),
+        principal: args.principal.clone(),
+        idempotency_key: Some(idempotency_key.clone()),
+        lease_seq: args.lease_seq,
+        deadline_ms: args.deadline_ms,
+        auth: args.auth.clone(),
+    };
+    let host = host.context("live replay requires a resolved host")?;
+    let mut outcome = match invoke_dispatch_host("invoke", &request, &host, None) {
+        Ok(outcome) => outcome,
+        Err(_) => replay_refusal(
+            args,
+            &entry,
+            "replay-execution-unconfirmed",
+            "Live replay could not confirm completion. Inspect the selected host using the retained invocation identity before retrying; no automatic retry was attempted.",
+            CliExitCode::Transport,
+        ),
+    };
+    // Keep the primitive's valid invoke guidance, then identify its wrapper.
+    outcome.payload["command"] = json!("replay");
+    if let Some(availability) = outcome.payload.get_mut("availability")
+        && let Some(envelope) = availability.as_object_mut()
+    {
+        envelope.insert("command".to_owned(), json!("replay"));
+    }
+    outcome.payload["replay_source"] = json!(entry.entry_id);
+    outcome.payload["mode"] = json!("live");
+    outcome.payload["replay"] = json!({
+        "source_entry_id": entry.entry_id,
+        "source_input_hash": entry.input_hash,
+        "original_input_hash_verified": true,
+        "execution_semantics": "new_invocation",
+        "host": host.endpoint,
+        "connector_id": entry.connector_id,
+        "operation_id": entry.operation_id,
+        "zone": zone,
+        "idempotency_key": idempotency_key,
+        "preflight_required": true,
+        "automatic_retry_allowed": false,
     });
-    envelope.inject_into(&mut payload);
-    Ok(DispatchOutcome {
-        payload,
-        exit_code: CliExitCode::Transport,
-    })
+    Ok(outcome)
 }
 
 // ── Compare dispatch ────────────────────────────────────────────────────────
@@ -59720,6 +59900,268 @@ require_attestation_types = ["in-toto"]"#,
     }
 
     // ── Replay tests ────────────────────────────────────────────────────
+
+    fn seed_live_replay_entry(
+        status: super::history::OpStatus,
+    ) -> (TempDir, String, super::HistoryPathOverrideGuard) {
+        let root = TempDir::new().expect("replay history directory");
+        let guard = super::install_test_history_path(root.path().join("history.jsonl"));
+        super::append_history_entry(
+            status,
+            "fcp.github:enterprise:v1",
+            "issues.create",
+            Some("z:work"),
+            &json!({"owner":"octocat","repo":"hello-world","title":"original"}),
+            None,
+            None,
+            Some("original-operation-key"),
+            1,
+        )
+        .expect("source history");
+        let entry = super::cli_history_store()
+            .unwrap()
+            .query(&super::history::HistoryFilter::new())
+            .unwrap()
+            .remove(0);
+        (root, entry.entry_id, guard)
+    }
+
+    #[test]
+    fn replay_live_uses_selected_host_and_new_invocation_identities() {
+        let (_root, entry_id, _guard) = seed_live_replay_entry(super::history::OpStatus::Success);
+        let capability_token = test_capability_token_arg();
+        let original = json!({"owner":"octocat","repo":"hello-world","title":"original"});
+        let (host, server) = spawn_mock_host(
+            mock_github_host_routes(StdBTreeMap::from([
+                (
+                    "POST /rpc/preflight".to_owned(),
+                    mock_preflight_response_json(true),
+                ),
+                (
+                    "POST /rpc/invoke".to_owned(),
+                    mock_invoke_response_json(json!({"number": 43})),
+                ),
+            ])),
+            8,
+        );
+        let mut keys = Vec::new();
+        for _ in 0..2 {
+            let (exit_code, payload) = execute_json(&[
+                "fwc",
+                "--json",
+                "--host",
+                &host,
+                "replay",
+                &entry_id,
+                "--input",
+                &original.to_string(),
+                "--set",
+                "title=replayed",
+                "--capability-token",
+                &capability_token,
+                "--lease-seq",
+                "7",
+                "--deadline-ms",
+                "1234",
+            ]);
+            assert_eq!(exit_code, CliExitCode::Success.into(), "{payload}");
+            assert_eq!(payload["command"], "replay");
+            assert_eq!(payload["availability"]["command"], "replay");
+            assert_eq!(payload["phase"], "execution");
+            assert_eq!(payload["replay_source"], entry_id);
+            assert_eq!(payload["replay"]["host"], host);
+            assert_eq!(payload["replay"]["original_input_hash_verified"], true);
+            assert_eq!(payload["replay"]["execution_semantics"], "new_invocation");
+            assert_eq!(payload["preflight"]["allowed"], true);
+            assert_eq!(payload["input_authoring"]["payload"]["title"], "replayed");
+            assert_eq!(payload["request"]["zone"], "z:work");
+            assert_eq!(payload["request"]["lease_seq"], 7);
+            assert_eq!(payload["request"]["deadline_ms"], 1234);
+            assert_ne!(payload["request"]["idempotency_key"], "original-operation-key");
+            keys.push(payload["request"]["idempotency_key"].clone());
+        }
+        server.join().expect("replay mock host");
+        assert_ne!(keys[0], keys[1]);
+        let history = super::cli_history_store()
+            .unwrap()
+            .query(&super::history::HistoryFilter::new())
+            .unwrap();
+        assert_eq!(history.len(), 3);
+        assert_eq!(
+            history[0].input_hash,
+            super::history::content_hash(
+                &json!({"owner":"octocat","repo":"hello-world","title":"replayed"})
+            )
+        );
+    }
+
+    #[test]
+    fn replay_live_preserves_preflight_denial_without_invocation() {
+        let (_root, entry_id, _guard) = seed_live_replay_entry(super::history::OpStatus::Denied);
+        let capability_token = test_capability_token_arg();
+        let (host, server) = spawn_mock_host(
+            mock_github_host_routes(StdBTreeMap::from([(
+                "POST /rpc/preflight".to_owned(),
+                mock_preflight_response_json(false),
+            )])),
+            3,
+        );
+        let (exit_code, payload) = execute_json(&[
+            "fwc",
+            "--json",
+            "--host",
+            &host,
+            "replay",
+            &entry_id,
+            "--input",
+            r#"{"owner":"octocat","repo":"hello-world","title":"original"}"#,
+            "--capability-token",
+            &capability_token,
+        ]);
+        server.join().expect("denial mock host");
+        assert_eq!(exit_code, CliExitCode::PolicyDenied.into(), "{payload}");
+        assert_eq!(payload["phase"], "preflight");
+        assert_eq!(payload["preflight"]["allowed"], false);
+        assert_eq!(payload["replay_source"], entry_id);
+    }
+
+    #[test]
+    fn replay_live_requires_matching_original_input_before_host_io() {
+        let (_root, entry_id, _guard) = seed_live_replay_entry(super::history::OpStatus::Success);
+        for (input, expected) in [
+            (None, "replay-input-required"),
+            (Some("{}"), "replay-input-mismatch"),
+            (Some("not-json-secret"), "invalid-replay-input"),
+        ] {
+            let mut argv = vec![
+                "fwc",
+                "--json",
+                "--host",
+                "http://127.0.0.1:1",
+                "replay",
+                &entry_id,
+            ];
+            if let Some(input) = input {
+                argv.extend(["--input", input]);
+            }
+            let (exit_code, payload) = execute_json(&argv);
+            assert_eq!(exit_code, CliExitCode::Validation.into(), "{payload}");
+            assert_eq!(payload["error"]["type"], expected);
+            assert!(!payload.to_string().contains("not-json-secret"));
+        }
+    }
+
+    #[test]
+    fn replay_live_refuses_uncertain_source_outcomes_before_host_io() {
+        for status in [
+            super::history::OpStatus::Error,
+            super::history::OpStatus::Timeout,
+            super::history::OpStatus::RateLimited,
+        ] {
+            let (_root, entry_id, _guard) = seed_live_replay_entry(status);
+            let (exit_code, payload) = execute_json(&[
+                "fwc",
+                "--json",
+                "--host",
+                "http://127.0.0.1:1",
+                "replay",
+                &entry_id,
+                "--input",
+                r#"{"owner":"octocat","repo":"hello-world","title":"original"}"#,
+            ]);
+            assert_eq!(exit_code, CliExitCode::PolicyDenied.into(), "{payload}");
+            assert_eq!(payload["error"]["type"], "replay-source-outcome-uncertain");
+            assert_eq!(payload["automatic_retry_allowed"], false);
+        }
+    }
+
+    #[test]
+    fn replay_live_refuses_preflight_bypass_and_source_key_reuse() {
+        let (_root, entry_id, _guard) = seed_live_replay_entry(super::history::OpStatus::Success);
+        for (extra, expected) in [
+            (vec!["--skip-preflight"], "replay-preflight-required"),
+            (
+                vec!["--idempotency-key", "original-operation-key"],
+                "invalid-replay-idempotency-key",
+            ),
+        ] {
+            let mut argv = vec![
+                "fwc",
+                "--json",
+                "--host",
+                "http://127.0.0.1:1",
+                "replay",
+                &entry_id,
+                "--input",
+                r#"{"owner":"octocat","repo":"hello-world","title":"original"}"#,
+            ];
+            argv.extend(extra);
+            let (exit_code, payload) = execute_json(&argv);
+            assert_eq!(exit_code, CliExitCode::Validation.into(), "{payload}");
+            assert_eq!(payload["error"]["type"], expected);
+        }
+    }
+
+    #[test]
+    fn replay_preview_checks_file_hash_without_contacting_selected_host() {
+        let (root, entry_id, _guard) = seed_live_replay_entry(super::history::OpStatus::Success);
+        let path = root.path().join("original.json");
+        std::fs::write(
+            &path,
+            r#"{"owner":"octocat","repo":"hello-world","title":"original"}"#,
+        )
+        .unwrap();
+        let (exit_code, payload) = execute_json(&[
+            "fwc",
+            "--json",
+            "--host",
+            "http://127.0.0.1:1",
+            "replay",
+            &entry_id,
+            "--dry-run",
+            "--file",
+            path.to_str().unwrap(),
+        ]);
+        assert_eq!(exit_code, CliExitCode::Success.into(), "{payload}");
+        assert_eq!(payload["original_input_hash_verified"], true);
+        assert_eq!(payload["_truth_source"], "offline");
+        let (exit_code, payload) =
+            execute_json(&["fwc", "--json", "replay", &entry_id, "--dry-run"]);
+        assert_eq!(exit_code, CliExitCode::Success.into());
+        assert_eq!(payload["input_available"], false);
+    }
+
+    #[test]
+    fn replay_input_read_is_bounded_and_override_paths_are_validated() {
+        let (root, entry_id, _guard) = seed_live_replay_entry(super::history::OpStatus::Success);
+        let path = root.path().join("oversized.json");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len((super::MAX_REPLAY_INPUT_BYTES + 1) as u64)
+            .unwrap();
+        let (exit_code, payload) = execute_json(&[
+            "fwc",
+            "--json",
+            "replay",
+            &entry_id,
+            "--dry-run",
+            "--file",
+            path.to_str().unwrap(),
+        ]);
+        assert_eq!(exit_code, CliExitCode::Validation.into());
+        assert_eq!(payload["error"]["type"], "invalid-replay-input");
+        let (exit_code, payload) = execute_json(&[
+            "fwc",
+            "--json",
+            "replay",
+            &entry_id,
+            "--dry-run",
+            "--set",
+            "nested..field=value",
+        ]);
+        assert_eq!(exit_code, CliExitCode::Validation.into());
+        assert_eq!(payload["error"]["type"], "invalid-override");
+    }
+
 
     #[test]
     fn replay_dry_run_shows_original_entry_info() {
