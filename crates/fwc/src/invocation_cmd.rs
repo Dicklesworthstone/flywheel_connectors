@@ -46,7 +46,7 @@ pub(crate) struct InvocationArgs {
 }
 
 #[derive(Clone, Copy, Debug)]
-enum LookupFailure {
+pub(crate) enum LookupFailure {
     InvalidRequest,
     MissingHost,
     InvalidHost,
@@ -60,7 +60,7 @@ enum LookupFailure {
 }
 
 impl LookupFailure {
-    fn description(self) -> (&'static str, &'static str, CliExitCode) {
+    pub(crate) fn description(self) -> (&'static str, &'static str, CliExitCode) {
         match self {
             Self::InvalidRequest => (
                 "invalid-invocation-query",
@@ -121,6 +121,14 @@ impl LookupFailure {
     }
 }
 
+impl std::fmt::Display for LookupFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.description().1)
+    }
+}
+
+impl std::error::Error for LookupFailure {}
+
 pub(crate) fn dispatch(
     args: &InvocationArgs,
     explicit_host: Option<&str>,
@@ -161,7 +169,9 @@ pub(crate) fn dispatch(
     }
 }
 
-fn read_admin_token(path: Option<&std::path::Path>) -> std::result::Result<String, LookupFailure> {
+pub(crate) fn read_admin_token(
+    path: Option<&std::path::Path>,
+) -> std::result::Result<String, LookupFailure> {
     let value = if let Some(path) = path {
         let file = std::fs::File::open(path).map_err(|_| LookupFailure::InvalidCredential)?;
         let mut value = String::new();
@@ -193,7 +203,7 @@ fn read_admin_token(path: Option<&std::path::Path>) -> std::result::Result<Strin
     Ok(token.to_owned())
 }
 
-fn query_invocation(
+pub(crate) fn query_invocation(
     client: &HostAdminClient,
     request: &InvocationQueryRequest,
     token: &str,

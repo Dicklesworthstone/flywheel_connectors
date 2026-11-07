@@ -9,6 +9,7 @@ use anyhow::{Context, Result, ensure};
 use chrono::{DateTime, Duration, Utc};
 use clap::{Args, Subcommand};
 use fcp_core::{EventEnvelope, Provenance, ProvenanceStep, SafetyTier};
+use fcp_host::{InvocationIdempotency, InvocationOutcome, InvocationQueryResponse};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -84,6 +85,21 @@ enum RulesCommand {
     Consume(RulesConsumeOptions),
     /// Process one webhook page and commit its cursor only after every action succeeds.
     Poll(RulesPollOptions),
+    /// Settle one uncertain action only from matching durable host completion evidence.
+    Reconcile(RulesReconcileOptions),
+}
+
+#[derive(Args, Clone, Debug)]
+pub(crate) struct RulesReconcileOptions {
+    /// Exact request ID retained by an uncertain rule action.
+    #[arg(value_name = "REQUEST_ID")]
+    pub(crate) request_id: String,
+    /// Select one exact host attempt; otherwise inspect the latest retained attempt.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    pub(crate) attempt_id: Option<u64>,
+    /// Host admin credential; defaults to FCP_HOST_ADMIN_BEARER_TOKEN.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) admin_token_file: Option<PathBuf>,
 }
 
 #[derive(Args, Clone, Debug)]
@@ -219,6 +235,13 @@ impl RulesArgs {
         }
     }
 
+    pub(crate) fn reconcile_options(&self) -> Option<&RulesReconcileOptions> {
+        match &self.command {
+            RulesCommand::Reconcile(options) => Some(options),
+            _ => None,
+        }
+    }
+
     pub(crate) fn execution_options(&self) -> Option<&RulesExecutionOptions> {
         match &self.command {
             RulesCommand::Run(options) if !options.dry_run => Some(&options.execution),
@@ -270,6 +293,17 @@ pub(crate) trait RulePollingSource {
         limit: u32,
         max_bytes: usize,
     ) -> Result<WebhookPollPage>;
+}
+
+/// Reads payload-free execution evidence from the exact selected host. This
+/// interface cannot invoke an action, acknowledge a source, or clear a record.
+pub(crate) trait RuleReconciler {
+    fn host(&self) -> &str;
+    fn query(
+        &mut self,
+        request_id: &str,
+        attempt_id: Option<u64>,
+    ) -> Result<InvocationQueryResponse>;
 }
 
 /// The host bridge must freeze all authority during `prepare`, then perform
@@ -379,6 +413,9 @@ pub(crate) fn dispatch(args: &RulesArgs) -> Result<RulesOutput> {
         RulesCommand::Run(_) => anyhow::bail!("live rules require the host execution bridge"),
         RulesCommand::Consume(_) => anyhow::bail!("stream rules require the native stream bridge"),
         RulesCommand::Poll(_) => anyhow::bail!("webhook rules require the polling source bridge"),
+        RulesCommand::Reconcile(_) => {
+            anyhow::bail!("rule reconciliation requires the host evidence bridge")
+        }
         RulesCommand::Test { .. } => unreachable!("test returned before opening the store"),
     }
 }
@@ -615,6 +652,256 @@ fn preview_output(command: &str, rules: &RuleSet, events: &[IncomingEvent]) -> R
         result.payload["status"] = json!("invalid");
     }
     Ok(result)
+}
+
+/// Reconcile one retained action without dispatching or advancing source progress.
+/// Rule identity contains the original host, zone, principal and resolved target;
+/// recomputing it from authenticated evidence also rejects edited definitions.
+pub(crate) fn reconcile<R: RuleReconciler>(
+    args: &RulesArgs,
+    reconciler: &mut R,
+) -> Result<RulesOutput> {
+    let options = args
+        .reconcile_options()
+        .context("expected rules reconcile")?;
+    ensure!(
+        valid_request_id(&options.request_id) && options.attempt_id != Some(0),
+        "invalid rule reconciliation request identity"
+    );
+    let store = args
+        .rules_file
+        .as_ref()
+        .map_or_else(RuleSetStore::default_path, RuleSetStore::new);
+    let path = canonical_rules_path(store.path(), false)?;
+    let _lock = lock_rules(&path)?;
+    let rules = load_rules(&path, false)?;
+    let state_path = companion_path(&path, ".state.jsonl");
+    let (state, sequence) = load_run_state(&state_path)?;
+    let mut matching = state
+        .attempts
+        .iter()
+        .filter(|(_, attempt)| attempt.request_id == options.request_id);
+    let (key, attempt) = matching
+        .next()
+        .context("the request ID has no retained rule action; missing history never authorizes replay")?;
+    ensure!(
+        matching.next().is_none(),
+        "the request ID identifies multiple rule actions; reconciliation is ambiguous"
+    );
+    ensure!(
+        attempt.status != AttemptStatus::Failed,
+        "a definitive failed action cannot be replaced by reconciliation"
+    );
+    let rule_name = &state
+        .rules
+        .get(&attempt.rule_key)
+        .context("the retained action has no rule runtime")?
+        .throttle
+        .rule_name;
+    let rule = rules
+        .get(rule_name)
+        .context("the original rule definition is required for reconciliation")?;
+    let response = reconciler.query(&options.request_id, options.attempt_id)?;
+    let evidence = verify_completion(
+        reconciler.host(),
+        options,
+        rule,
+        key,
+        attempt,
+        &response,
+    )?;
+    let previous = attempt.status;
+    let pinned = attempt.retain_until == DateTime::<Utc>::MAX_UTC;
+    let key = key.clone();
+    let rule_name = rule_name.clone();
+    if previous == AttemptStatus::Completed && pinned {
+        return Ok(reconciliation_output(
+            &options.request_id,
+            &rule_name,
+            &key,
+            previous,
+            &evidence,
+            true,
+            false,
+        ));
+    }
+    // No preparation/pruning occurs here: unrelated reservations, throttle
+    // history and source frontiers remain exactly as recovered from disk.
+    let mut journal = RunJournal::open(&state_path, state, sequence)?;
+    Ok(commit_reconciliation(
+        &options.request_id,
+        &rule_name,
+        &key,
+        previous,
+        evidence,
+        &mut journal,
+    ))
+}
+
+#[allow(clippy::too_many_lines)]
+fn verify_completion(
+    host: &str,
+    options: &RulesReconcileOptions,
+    rule: &Rule,
+    key: &str,
+    attempt: &RecordedAttempt,
+    response: &InvocationQueryResponse,
+) -> Result<CompletionEvidence> {
+    ensure!(
+        response.mesh_invocation.is_none() && !response.host_job_active,
+        "reconciliation requires completed executor-local evidence, not forwarding or active work"
+    );
+    let record = response.invocation.as_ref().context(
+        "the host did not retain this invocation; missing history never proves completion or permits replay",
+    )?;
+    ensure!(
+        record.ticket.operation_id == options.request_id
+            && record.admission.operation_id == options.request_id
+            && attempt.request_id == options.request_id
+            && record.ticket.attempt_id > 0
+            && options
+                .attempt_id
+                .is_none_or(|id| id == record.ticket.attempt_id),
+        "host completion evidence does not match the retained request and attempt"
+    );
+    let scope = ExecutionScope {
+        host: host.to_owned(),
+        zone: record.admission.zone_id.clone(),
+        principal: Some(record.admission.principal.clone()),
+        connector: record.admission.connector_id.clone(),
+        operation: record.admission.operation.clone(),
+    };
+    validate_scope(&scope)?;
+    ensure!(
+        rule_identity(rule, &scope)? == attempt.rule_key,
+        "host evidence does not match the original rule, host, zone, principal and target"
+    );
+    let binding = record
+        .admission
+        .idempotency
+        .as_ref()
+        .context("host evidence has no authorized idempotency binding")?;
+    let expected_scope = InvocationIdempotency::scope_digest_for(
+        &scope.zone.parse::<fcp_core::ZoneId>()?,
+        &record.admission.principal,
+        &scope.connector.parse::<fcp_core::ConnectorId>()?,
+        &scope.operation.parse::<fcp_core::OperationId>()?,
+        &format!("fwc-rule:{key}"),
+    )?;
+    ensure!(
+        binding.scope_digest == expected_scope && valid_digest(&binding.effect_digest),
+        "host evidence does not bind the retained rule idempotency key"
+    );
+    let terminal = record
+        .terminal
+        .as_ref()
+        .context("the host has no terminal observation; the action remains reserved")?;
+    let finalization = record
+        .finalization
+        .as_ref()
+        .context("host completion finalization is not retained")?;
+    let finished_at = record
+        .finished_at
+        .context("host completion time is not retained")?;
+    ensure!(
+        record.durable
+            && terminal.outcome == InvocationOutcome::Succeeded
+            && (200..300).contains(&terminal.http_status)
+            && finished_at >= record.admitted_at
+            && finalization.budget_recorded
+            && finalization.sampling_completed != Some(false)
+            && (finalization.sampling_operation_id.is_none()
+                || finalization.sampling_completed == Some(true))
+            && finalization
+                .response_http_status
+                .is_some_and(|status| (200..300).contains(&status))
+            && (terminal.receipt_id.is_none() || finalization.receipt_recorded),
+        "the host has not durably finalized a successful action; the reservation is unchanged"
+    );
+    let evidence = CompletionEvidence {
+        host_attempt_id: record.ticket.attempt_id,
+        scope_digest: binding.scope_digest.clone(),
+        effect_digest: binding.effect_digest.clone(),
+        finished_at,
+        reconciled_at: attempt.reconciliation.as_ref().map_or_else(
+            || Utc::now().max(attempt.started_at),
+            |previous| Utc::now().max(previous.reconciled_at).max(attempt.started_at),
+        ),
+    };
+    evidence.validate()?;
+    if let Some(previous) = &attempt.reconciliation {
+        ensure!(
+            previous.same_completion(&evidence),
+            "host completion evidence changed since the retained reconciliation"
+        );
+    }
+    Ok(evidence)
+}
+
+fn commit_reconciliation<W: JournalWriter>(
+    request_id: &str,
+    rule_name: &str,
+    key: &str,
+    previous: AttemptStatus,
+    evidence: CompletionEvidence,
+    journal: &mut RunJournal<W>,
+) -> RulesOutput {
+    let persisted = journal
+        .append(JournalEntry::Reconciled {
+            key: key.to_owned(),
+            request_id: request_id.to_owned(),
+            evidence: evidence.clone(),
+        })
+        .is_ok();
+    reconciliation_output(
+        request_id,
+        rule_name,
+        key,
+        previous,
+        &evidence,
+        persisted,
+        journal.poisoned,
+    )
+}
+
+fn reconciliation_output(
+    request_id: &str,
+    rule_name: &str,
+    key: &str,
+    previous: AttemptStatus,
+    evidence: &CompletionEvidence,
+    persisted: bool,
+    persistence_unknown: bool,
+) -> RulesOutput {
+    let mut result = output(
+        "reconcile",
+        json!({
+            "results": [{
+                "rule": rule_name, "request_id": request_id,
+                "idempotency_key": format!("fwc-rule:{key}"),
+                "previous_outcome": previous,
+                "outcome": if !persisted {"reconciliation_uncommitted"}
+                    else if previous == AttemptStatus::Completed {"already_completed"}
+                    else {"reconciled"},
+                "state_persisted": persisted,
+                "persistence_unknown": persistence_unknown,
+                "automatic_retry_allowed": false,
+                "evidence": evidence,
+            }],
+            "attempted": 0, "executed": 0,
+            "source_progress_unchanged": true,
+            "next_action": if persisted {
+                "Retry the original rules run, consume or poll command; completed actions are suppressed and source progress is checked normally."
+            } else {
+                "Resolve the local journal write failure and repeat reconciliation; no source progress or retry authority was granted."
+            },
+        }),
+    );
+    result.rejected = !persisted;
+    if result.rejected {
+        result.payload["status"] = json!("error");
+    }
+    result
 }
 
 /// Run one finite batch. Every definition, input and execution scope is prepared
@@ -1406,6 +1693,39 @@ struct RecordedAttempt {
     started_at: DateTime<Utc>,
     retain_until: DateTime<Utc>,
     status: AttemptStatus,
+    /// Payload-free evidence retained across journal compaction. Omitting the
+    /// absent field preserves the checksums of pre-reconciliation journals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reconciliation: Option<CompletionEvidence>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CompletionEvidence {
+    host_attempt_id: u64,
+    scope_digest: String,
+    effect_digest: String,
+    finished_at: DateTime<Utc>,
+    reconciled_at: DateTime<Utc>,
+}
+
+impl CompletionEvidence {
+    fn same_completion(&self, other: &Self) -> bool {
+        self.host_attempt_id == other.host_attempt_id
+            && self.scope_digest == other.scope_digest
+            && self.effect_digest == other.effect_digest
+            && self.finished_at == other.finished_at
+    }
+
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            self.host_attempt_id > 0
+                && valid_digest(&self.scope_digest)
+                && valid_digest(&self.effect_digest),
+            "invalid persisted rule completion evidence"
+        );
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1499,6 +1819,14 @@ impl RunState {
                     && attempt.retain_until >= attempt.started_at,
                 "invalid persisted rule attempt"
             );
+            if let Some(evidence) = &attempt.reconciliation {
+                evidence.validate()?;
+                ensure!(
+                    attempt.status == AttemptStatus::Completed
+                        && evidence.reconciled_at >= attempt.started_at,
+                    "reconciliation evidence requires a completed retained action"
+                );
+            }
         }
         for (key, source) in &self.sources {
             source.validate(key)?;
@@ -1627,7 +1955,8 @@ impl RunState {
                         && self.rules.contains_key(&attempt.rule_key)
                         && valid_request_id(&attempt.request_id)
                         && attempt.retain_until >= attempt.started_at
-                        && attempt.status == AttemptStatus::Pending,
+                        && attempt.status == AttemptStatus::Pending
+                        && attempt.reconciliation.is_none(),
                     "invalid or duplicate rule attempt reservation"
                 );
             }
@@ -1639,6 +1968,25 @@ impl RunState {
                             .get(key)
                             .is_some_and(|attempt| attempt.status == AttemptStatus::Pending),
                     "rule settlement has no pending reservation"
+                );
+            }
+            JournalEntry::Reconciled {
+                key,
+                request_id,
+                evidence,
+            } => {
+                evidence.validate()?;
+                ensure!(
+                    self.attempts.get(key).is_some_and(|attempt| {
+                        attempt.status != AttemptStatus::Failed
+                            && attempt.request_id == *request_id
+                            && attempt.reconciliation.as_ref().is_none_or(|previous| {
+                                previous.same_completion(evidence)
+                                    && evidence.reconciled_at >= previous.reconciled_at
+                            })
+                            && evidence.reconciled_at >= attempt.started_at
+                    }),
+                    "reconciliation requires the exact unresolved or completed rule reservation"
                 );
             }
             JournalEntry::SourcePending { keys } => {
@@ -1734,6 +2082,34 @@ impl RunState {
                 status,
                 finished_at,
             } => self.settle(&key, status, finished_at),
+            JournalEntry::Reconciled { key, evidence, .. } => {
+                let attempt = self
+                    .attempts
+                    .get_mut(&key)
+                    .context("missing reconciled rule action")?;
+                let runtime = self
+                    .rules
+                    .get_mut(&attempt.rule_key)
+                    .context("missing reconciled rule runtime")?;
+                if attempt.status == AttemptStatus::Pending {
+                    // A crash-interrupted reservation has no settlement count
+                    // yet. Unknown outcomes already counted their local error.
+                    runtime.circuit.total_executions =
+                        runtime.circuit.total_executions.saturating_add(1);
+                }
+                // This is evidence about earlier work, not a fresh successful
+                // probe: never clear later circuit failures or reset throttles.
+                // Stream records stay pinned until an actual source ACK/cursor
+                // commit; finite file-run retention starts again at settlement.
+                let until = evidence
+                    .reconciled_at
+                    .checked_add_signed(runtime.window.max(Duration::days(1)))
+                    .unwrap_or(DateTime::<Utc>::MAX_UTC);
+                attempt.retain_until = attempt.retain_until.max(until);
+                attempt.status = AttemptStatus::Completed;
+                attempt.reconciliation = Some(evidence);
+                Ok(())
+            }
             JournalEntry::SourcePending { keys } => {
                 for key in keys {
                     self.attempts
@@ -1820,6 +2196,13 @@ enum JournalEntry {
         key: String,
         status: AttemptStatus,
         finished_at: DateTime<Utc>,
+    },
+    /// Explicit completion proof changes neither source progress nor retry
+    /// authority. It settles an uncertain action or renews completion retention.
+    Reconciled {
+        key: String,
+        request_id: String,
+        evidence: CompletionEvidence,
     },
     /// A newly observed delivery pins earlier records until its own source ACK.
     SourcePending {
@@ -2165,6 +2548,7 @@ fn execute_batch<E: RuleExecutor, W: JournalWriter>(
                                     .unwrap_or(DateTime::<Utc>::MAX_UTC)
                             },
                             status: AttemptStatus::Pending,
+                            reconciliation: None,
                         },
                     })?;
                     admitted = Some(request_id.to_owned());
@@ -4528,6 +4912,521 @@ mod tests {
             ),
             0,
         );
+    }
+
+    struct FakeReconciler {
+        host: String,
+        response: InvocationQueryResponse,
+        queries: Vec<(String, Option<u64>)>,
+    }
+
+    impl RuleReconciler for FakeReconciler {
+        fn host(&self) -> &str {
+            &self.host
+        }
+
+        fn query(
+            &mut self,
+            request_id: &str,
+            attempt_id: Option<u64>,
+        ) -> Result<InvocationQueryResponse> {
+            self.queries.push((request_id.to_owned(), attempt_id));
+            Ok(self.response.clone())
+        }
+    }
+
+    fn completion_response(
+        request_id: &str,
+        key: &str,
+        scope: &ExecutionScope,
+    ) -> InvocationQueryResponse {
+        use fcp_host::{
+            InvocationAdmission, InvocationFinalization, InvocationRecord, InvocationTerminal,
+            InvocationTicket,
+        };
+
+        let now = Utc::now();
+        let principal = scope.principal.clone().unwrap();
+        InvocationQueryResponse {
+            invocation: Some(InvocationRecord {
+                ticket: InvocationTicket {
+                    operation_id: request_id.to_owned(),
+                    attempt_id: 7,
+                },
+                admission: InvocationAdmission {
+                    operation_id: request_id.to_owned(),
+                    connector_id: scope.connector.clone(),
+                    operation: scope.operation.clone(),
+                    zone_id: scope.zone.clone(),
+                    principal: principal.clone(),
+                    correlation_id: None,
+                    deadline_at: now + Duration::seconds(30),
+                    idempotency: Some(InvocationIdempotency {
+                        scope_digest: InvocationIdempotency::scope_digest_for(
+                            &scope.zone.parse().unwrap(),
+                            &principal,
+                            &scope.connector.parse().unwrap(),
+                            &scope.operation.parse().unwrap(),
+                            &format!("fwc-rule:{key}"),
+                        )
+                        .unwrap(),
+                        effect_digest: "d".repeat(64),
+                    }),
+                    transport_idempotency: None,
+                },
+                admitted_at: now,
+                terminal: Some(InvocationTerminal {
+                    outcome: InvocationOutcome::Succeeded,
+                    receipt_id: Some("private-receipt-reference".into()),
+                    duration_ms: 17,
+                    http_status: 200,
+                }),
+                finished_at: Some(now),
+                finalization: Some(InvocationFinalization {
+                    budget_recorded: true,
+                    receipt_recorded: true,
+                    audit_event_id: Some("private-audit-reference".into()),
+                    response_http_status: Some(200),
+                    ..Default::default()
+                }),
+                durable: true,
+            }),
+            mesh_invocation: None,
+            host_job_active: false,
+        }
+    }
+
+    fn reconciliation_fixture(
+        args: &RulesArgs,
+        executor: &FakeExecutor,
+    ) -> (RulesArgs, FakeReconciler, String) {
+        let (state, _) = load_run_state(&executor.state_path).unwrap();
+        let (key, attempt) = state.attempts.iter().next().unwrap();
+        let reconcile_args = RulesArgs {
+            rules_file: args.rules_file.clone(),
+            command: RulesCommand::Reconcile(RulesReconcileOptions {
+                request_id: attempt.request_id.clone(),
+                attempt_id: Some(7),
+                admin_token_file: None,
+            }),
+        };
+        let reconciler = FakeReconciler {
+            host: executor.scope.host.clone(),
+            response: completion_response(&attempt.request_id, key, &executor.scope),
+            queries: Vec::new(),
+        };
+        (reconcile_args, reconciler, key.clone())
+    }
+
+    #[test]
+    fn reconciliation_extension_preserves_existing_attempt_serialization_and_checksum() {
+        let legacy = br#"{"rule_key":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","request_id":"original-request","started_at":"2026-11-01T00:00:00Z","retain_until":"2026-11-02T00:00:00Z","status":"pending"}"#;
+        let attempt: RecordedAttempt = serde_json::from_slice(legacy).unwrap();
+        assert!(attempt.reconciliation.is_none());
+        assert_eq!(serde_json::to_vec(&attempt).unwrap(), legacy.to_vec());
+        let record = JournalRecord::new(
+            1,
+            JournalEntry::Reserved {
+                key: "b".repeat(64),
+                attempt,
+            },
+        )
+        .unwrap();
+        let legacy_record = br#"[1,1,{"type":"reserved","key":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","attempt":{"rule_key":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","request_id":"original-request","started_at":"2026-11-01T00:00:00Z","retain_until":"2026-11-02T00:00:00Z","status":"pending"}}]"#;
+        let mut hasher =
+            blake3::Hasher::new_derive_key("flywheel_connectors.reactive_rules.journal.v1");
+        hasher.update(legacy_record);
+        assert_eq!(record.digest, hasher.finalize().to_hex().to_string());
+    }
+
+    #[test]
+    fn reconcile_unknown_action_durably_without_dispatch_or_counter_reset() {
+        let (_temp, args, mut executor) = fixture(vec![rule()], &[event("one")]);
+        executor.replies.push_back(FakeReply::ErrorAfterAdmission);
+        assert!(run(&args, &mut executor).unwrap().rejected);
+        let (before, _) = load_run_state(&executor.state_path).unwrap();
+        let (reconcile_args, mut evidence, key) = reconciliation_fixture(&args, &executor);
+        let result = reconcile(&reconcile_args, &mut evidence).unwrap();
+        assert!(!result.rejected);
+        assert_eq!(result.payload["data"]["executed"], 0);
+        assert_eq!(result.payload["data"]["source_progress_unchanged"], true);
+        assert_eq!(result.payload["data"]["results"][0]["outcome"], "reconciled");
+        assert_eq!(result.payload["data"]["results"][0]["automatic_retry_allowed"], false);
+        assert!(!result.payload.to_string().contains("private-"));
+        assert_eq!(executor.calls, 1);
+        let (after, _) = load_run_state(&executor.state_path).unwrap();
+        assert_eq!(after.attempts[&key].status, AttemptStatus::Completed);
+        assert!(after.attempts[&key].reconciliation.is_some());
+        assert_eq!(
+            serde_json::to_value(&after.rules).unwrap(),
+            serde_json::to_value(&before.rules).unwrap(),
+        );
+        assert_eq!(
+            serde_json::to_value(&after.sources).unwrap(),
+            serde_json::to_value(&before.sources).unwrap(),
+        );
+        let second = reconcile(&reconcile_args, &mut evidence).unwrap();
+        assert_eq!(second.payload["data"]["results"][0]["outcome"], "already_completed");
+        let (reconfirmed, _) = load_run_state(&executor.state_path).unwrap();
+        assert_eq!(
+            serde_json::to_value(&reconfirmed.rules).unwrap(),
+            serde_json::to_value(&after.rules).unwrap(),
+        );
+        assert!(reconfirmed.attempts[&key].retain_until >= after.attempts[&key].retain_until);
+        let mut replay = FakeExecutor::new(executor.state_path);
+        assert!(!run(&args, &mut replay).unwrap().rejected);
+        assert_eq!(replay.calls, 0);
+    }
+
+    #[test]
+    fn reconcile_pending_crash_counts_once_and_preserves_existing_circuit_failures() {
+        let (_temp, args, mut executor) = fixture(vec![rule()], &[event("one")]);
+        executor.replies.push_back(FakeReply::CrashAfterAdmission);
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = run(&args, &mut executor);
+            }))
+            .is_err()
+        );
+        let (mut state, sequence) = load_run_state(&executor.state_path).unwrap();
+        let rule_key = state.attempts.values().next().unwrap().rule_key.clone();
+        for _ in 0..5 {
+            state.rules.get_mut(&rule_key).unwrap().circuit.record_failure();
+        }
+        let circuit = serde_json::to_value(&state.rules[&rule_key].circuit).unwrap();
+        drop(RunJournal::open(&executor.state_path, state, sequence).unwrap());
+        let (reconcile_args, mut evidence, key) = reconciliation_fixture(&args, &executor);
+        assert!(!reconcile(&reconcile_args, &mut evidence).unwrap().rejected);
+        let (after, _) = load_run_state(&executor.state_path).unwrap();
+        assert_eq!(after.attempts[&key].status, AttemptStatus::Completed);
+        let mut expected = circuit;
+        expected["total_executions"] = json!(6);
+        assert_eq!(serde_json::to_value(&after.rules[&rule_key].circuit).unwrap(), expected);
+    }
+
+    #[test]
+    fn reconcile_requires_complete_durable_success_with_the_exact_authorized_key() {
+        fn record(response: &mut InvocationQueryResponse) -> &mut fcp_host::InvocationRecord {
+            response.invocation.as_mut().unwrap()
+        }
+        fn finalization(
+            response: &mut InvocationQueryResponse,
+        ) -> &mut fcp_host::InvocationFinalization {
+            record(response).finalization.as_mut().unwrap()
+        }
+
+        let mutations: &[fn(&mut InvocationQueryResponse)] = &[
+            |response| response.invocation = None,
+            |response| response.host_job_active = true,
+            |response| record(response).durable = false,
+            |response| record(response).ticket.attempt_id = 0,
+            |response| record(response).ticket.attempt_id = 8,
+            |response| record(response).ticket.operation_id = "other".into(),
+            |response| record(response).admission.operation_id = "other".into(),
+            |response| record(response).admission.zone_id = "z:private".into(),
+            |response| record(response).admission.principal = "another".into(),
+            |response| record(response).admission.connector_id = "fcp.slack".into(),
+            |response| record(response).admission.operation = "github.write".into(),
+            |response| record(response).admission.idempotency = None,
+            |response| {
+                record(response).admission.idempotency.as_mut().unwrap().scope_digest =
+                    "a".repeat(64);
+            },
+            |response| {
+                record(response).admission.idempotency.as_mut().unwrap().effect_digest =
+                    "not-a-digest".into();
+            },
+            |response| record(response).terminal = None,
+            |response| {
+                record(response).terminal.as_mut().unwrap().outcome =
+                    InvocationOutcome::OutcomeUnknown;
+            },
+            |response| {
+                record(response).terminal.as_mut().unwrap().outcome =
+                    InvocationOutcome::ConnectorError;
+            },
+            |response| record(response).terminal.as_mut().unwrap().http_status = 500,
+            |response| record(response).finished_at = None,
+            |response| {
+                let retained = record(response);
+                retained.finished_at = Some(retained.admitted_at - Duration::seconds(1));
+            },
+            |response| record(response).finalization = None,
+            |response| finalization(response).budget_recorded = false,
+            |response| finalization(response).receipt_recorded = false,
+            |response| finalization(response).sampling_completed = Some(false),
+            |response| {
+                finalization(response).sampling_operation_id = Some("unfinished-child".into());
+            },
+            |response| finalization(response).response_http_status = None,
+            |response| finalization(response).response_http_status = Some(502),
+        ];
+        for (index, mutate) in mutations.iter().enumerate() {
+            let (_temp, args, mut executor) = fixture(vec![rule()], &[event("one")]);
+            executor.replies.push_back(FakeReply::Unknown);
+            assert!(run(&args, &mut executor).unwrap().rejected);
+            let bytes = fs::read(&executor.state_path).unwrap();
+            let (reconcile_args, mut evidence, _) = reconciliation_fixture(&args, &executor);
+            mutate(&mut evidence.response);
+            assert!(reconcile(&reconcile_args, &mut evidence).is_err(), "case {index}");
+            assert_eq!(fs::read(&executor.state_path).unwrap(), bytes, "case {index}");
+            assert_eq!(executor.calls, 1);
+        }
+    }
+
+    #[test]
+    fn reconcile_rejects_another_host_or_edited_effect_but_allows_limit_and_enable_edits() {
+        for change in 0..4 {
+            let (_temp, args, mut executor) = fixture(vec![rule()], &[event("one")]);
+            executor.replies.push_back(FakeReply::Unknown);
+            run(&args, &mut executor).unwrap();
+            let (reconcile_args, mut evidence, _) = reconciliation_fixture(&args, &executor);
+            let path = args.rules_file.as_ref().unwrap();
+            let mut rules = load_rules(path, false).unwrap();
+            match change {
+                0 => evidence.host = "http://another-host".into(),
+                1 => rules.rules[0].action.operation = "github.create_issue".into(),
+                2 => rules.rules[0].trigger.match_expr = Some("data.text~different".into()),
+                _ => {
+                    rules.rules[0].throttle.max = 9;
+                    rules.rules[0].enabled = false;
+                    rules.rules[0].safety_tier = SafetyTier::Risky;
+                }
+            }
+            save_rules(path, &rules).unwrap();
+            let bytes = fs::read(&executor.state_path).unwrap();
+            if change == 3 {
+                assert!(!reconcile(&reconcile_args, &mut evidence).unwrap().rejected);
+            } else {
+                assert!(reconcile(&reconcile_args, &mut evidence).is_err());
+                assert_eq!(fs::read(&executor.state_path).unwrap(), bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn reconcile_missing_failed_ambiguous_and_corrupt_local_history_never_queries_the_host() {
+        for case in 0..4 {
+            let (_temp, args, mut executor) = fixture(vec![rule()], &[event("one")]);
+            executor.replies.push_back(if case == 1 {
+                FakeReply::Failed
+            } else {
+                FakeReply::Unknown
+            });
+            run(&args, &mut executor).unwrap();
+            let (mut reconcile_args, mut evidence, key) = reconciliation_fixture(&args, &executor);
+            match case {
+                0 => {
+                    let RulesCommand::Reconcile(options) = &mut reconcile_args.command else {
+                        unreachable!()
+                    };
+                    options.request_id = "not-retained".into();
+                }
+                1 => {}
+                2 => {
+                    let (mut state, sequence) = load_run_state(&executor.state_path).unwrap();
+                    state.attempts.insert("a".repeat(64), state.attempts[&key].clone());
+                    drop(RunJournal::open(&executor.state_path, state, sequence).unwrap());
+                }
+                _ => {
+                    let mut file = OpenOptions::new()
+                        .append(true)
+                        .open(&executor.state_path)
+                        .unwrap();
+                    file.write_all(b"corrupt-complete-record\n").unwrap();
+                }
+            }
+            let bytes = fs::read(&executor.state_path).unwrap();
+            assert!(reconcile(&reconcile_args, &mut evidence).is_err());
+            assert!(evidence.queries.is_empty());
+            assert_eq!(fs::read(&executor.state_path).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn reconcile_preserves_native_ack_retention_until_the_original_consumer_resumes() {
+        let (_temp, args, mut executor, mut source) =
+            consume_fixture(vec![native_event("cursor-1", 1)]);
+        executor.replies.push_back(FakeReply::Unknown);
+        assert!(consume(&args, &mut executor, &mut source).unwrap().rejected);
+        let (reconcile_args, mut evidence, key) = reconciliation_fixture(&args, &executor);
+        assert!(!reconcile(&reconcile_args, &mut evidence).unwrap().rejected);
+        assert!(source.acknowledgements.is_empty());
+        let (state, _) = load_run_state(&executor.state_path).unwrap();
+        assert_eq!(state.attempts[&key].retain_until, DateTime::<Utc>::MAX_UTC);
+        let mut retry = FakeExecutor::new(executor.state_path.clone());
+        assert!(!consume(&args, &mut retry, &mut source).unwrap().rejected);
+        assert_eq!(retry.calls, 0);
+        assert_eq!(source.acknowledgements, vec![vec!["cursor-1"]]);
+        let (settled, _) = load_run_state(&executor.state_path).unwrap();
+        assert!(settled.attempts[&key].retain_until < DateTime::<Utc>::MAX_UTC);
+        assert!(settled.attempts[&key].reconciliation.is_some());
+    }
+
+    #[test]
+    fn reconcile_unblocks_a_webhook_page_without_repeating_its_completed_effect() {
+        let (_temp, args, mut executor, mut source) =
+            poll_fixture(vec![polled_event("first"), polled_event("second")]);
+        executor.replies.push_back(FakeReply::Unknown);
+        assert!(poll(&args, &mut executor, &mut source).unwrap().rejected);
+        let (before, _) = load_run_state(&executor.state_path).unwrap();
+        let (reconcile_args, mut evidence, key) = reconciliation_fixture(&args, &executor);
+        assert!(!reconcile(&reconcile_args, &mut evidence).unwrap().rejected);
+        let (after, _) = load_run_state(&executor.state_path).unwrap();
+        assert_eq!(
+            serde_json::to_value(&before.sources).unwrap(),
+            serde_json::to_value(&after.sources).unwrap(),
+        );
+        assert_eq!(after.attempts[&key].retain_until, DateTime::<Utc>::MAX_UTC);
+        assert_eq!(source.cursors.len(), 1);
+        let mut retry = FakeExecutor::new(executor.state_path.clone());
+        let result = poll(&args, &mut retry, &mut source).unwrap();
+        assert!(!result.rejected);
+        assert_eq!(retry.calls, 1);
+        assert_eq!(result.payload["data"]["source"]["committed_events"], 2);
+        assert_eq!(result.payload["data"]["results"][0]["outcome"], "duplicate");
+        let (completed, _) = load_run_state(&executor.state_path).unwrap();
+        assert!(completed.attempts[&key].retain_until < DateTime::<Utc>::MAX_UTC);
+    }
+
+    #[test]
+    fn reconcile_sync_failure_fences_writes_and_never_claims_a_durable_promotion() {
+        let (_temp, args, mut executor) = fixture(vec![rule()], &[event("one")]);
+        executor.replies.push_back(FakeReply::Unknown);
+        run(&args, &mut executor).unwrap();
+        let (reconcile_args, source, key) = reconciliation_fixture(&args, &executor);
+        let (state, sequence) = load_run_state(&executor.state_path).unwrap();
+        let options = reconcile_args.reconcile_options().unwrap();
+        let proof = verify_completion(
+            &source.host,
+            options,
+            &rule(),
+            &key,
+            &state.attempts[&key],
+            &source.response,
+        )
+        .unwrap();
+        let RunJournal {
+            state,
+            writer,
+            sequence,
+            bytes,
+            poisoned,
+        } = RunJournal::open(&executor.state_path, state, sequence).unwrap();
+        let mut journal = RunJournal {
+            state,
+            writer: FailSyncWriter {
+                file: writer,
+                syncs: 0,
+                fail_at: 1,
+            },
+            sequence,
+            bytes,
+            poisoned,
+        };
+        let result = commit_reconciliation(
+            &options.request_id,
+            &rule().name,
+            &key,
+            AttemptStatus::Unknown,
+            proof.clone(),
+            &mut journal,
+        );
+        assert!(result.rejected);
+        assert_eq!(result.payload["data"]["results"][0]["state_persisted"], false);
+        assert_eq!(result.payload["data"]["results"][0]["persistence_unknown"], true);
+        assert_eq!(journal.state.attempts[&key].status, AttemptStatus::Unknown);
+        assert!(journal.poisoned);
+        assert!(
+            journal
+                .append(JournalEntry::Reconciled {
+                    key: key.clone(),
+                    request_id: options.request_id.clone(),
+                    evidence: proof,
+                })
+                .is_err()
+        );
+        // A complete appended record may survive; recovery preserves its
+        // completion proof, while the failed writer never claimed certainty.
+        let (recovered, _) = load_run_state(&executor.state_path).unwrap();
+        assert_eq!(recovered.attempts[&key].status, AttemptStatus::Completed);
+    }
+
+    #[test]
+    fn reconcile_extends_file_event_retention_and_keeps_proof_through_compaction() {
+        let (_temp, args, mut executor) = fixture(vec![rule()], &[event("one")]);
+        executor.replies.push_back(FakeReply::Unknown);
+        run(&args, &mut executor).unwrap();
+        let (mut state, sequence) = load_run_state(&executor.state_path).unwrap();
+        let attempt = state.attempts.values_mut().next().unwrap();
+        attempt.started_at = Utc::now() - Duration::days(5);
+        attempt.retain_until = Utc::now() - Duration::days(4);
+        drop(RunJournal::open(&executor.state_path, state, sequence).unwrap());
+        let (reconcile_args, mut evidence, key) = reconciliation_fixture(&args, &executor);
+        assert!(!reconcile(&reconcile_args, &mut evidence).unwrap().rejected);
+        let (state, sequence) = load_run_state(&executor.state_path).unwrap();
+        let attempt = &state.attempts[&key];
+        let proof = attempt.reconciliation.clone().unwrap();
+        assert!(attempt.retain_until >= proof.reconciled_at + Duration::days(1));
+        drop(RunJournal::open(&executor.state_path, state, sequence).unwrap());
+        let (compacted, _) = load_run_state(&executor.state_path).unwrap();
+        assert_eq!(compacted.attempts[&key].reconciliation.as_ref(), Some(&proof));
+        let mut changed = evidence.response.clone();
+        changed
+            .invocation
+            .as_mut()
+            .unwrap()
+            .admission
+            .idempotency
+            .as_mut()
+            .unwrap()
+            .effect_digest = "a".repeat(64);
+        evidence.response = changed;
+        assert!(reconcile(&reconcile_args, &mut evidence).is_err());
+    }
+
+    #[test]
+    fn reconcile_renews_expired_completed_records_before_the_next_file_run() {
+        let (_temp, args, mut executor) = fixture(vec![rule()], &[event("one")]);
+        assert!(!run(&args, &mut executor).unwrap().rejected);
+        let (mut state, sequence) = load_run_state(&executor.state_path).unwrap();
+        let attempt = state.attempts.values_mut().next().unwrap();
+        attempt.started_at = Utc::now() - Duration::days(5);
+        attempt.retain_until = Utc::now() - Duration::days(4);
+        drop(RunJournal::open(&executor.state_path, state, sequence).unwrap());
+        let (reconcile_args, mut evidence, key) = reconciliation_fixture(&args, &executor);
+        let result = reconcile(&reconcile_args, &mut evidence).unwrap();
+        assert!(!result.rejected);
+        assert_eq!(result.payload["data"]["results"][0]["outcome"], "already_completed");
+        let (state, _) = load_run_state(&executor.state_path).unwrap();
+        assert!(state.attempts[&key].retain_until > Utc::now());
+        let mut retry = FakeExecutor::new(executor.state_path);
+        assert!(!run(&args, &mut retry).unwrap().rejected);
+        assert_eq!(retry.calls, 0);
+    }
+
+    #[test]
+    fn reconcile_cli_has_no_action_or_retry_authority() {
+        #[derive(clap::Parser)]
+        struct Command {
+            #[command(flatten)]
+            rules: RulesArgs,
+        }
+        let parse = |tail: &[&str]| {
+            let mut args = vec!["rules", "reconcile", "request-one"];
+            args.extend_from_slice(tail);
+            <Command as clap::Parser>::try_parse_from(args)
+        };
+        let parsed = parse(&["--admin-token-file", "admin.token", "--attempt-id", "7"]).unwrap();
+        let options = parsed.rules.reconcile_options().unwrap();
+        assert_eq!(options.request_id, "request-one");
+        assert_eq!(options.attempt_id, Some(7));
+        assert_eq!(options.admin_token_file, Some(PathBuf::from("admin.token")));
+        assert!(parsed.rules.execution_options().is_none());
+        assert!(parse(&["--attempt-id", "0"]).is_err());
+        assert!(parse(&["--capability-token", "not-action-authority"]).is_err());
+        assert!(parse(&["--retry"]).is_err());
+        assert!(parse(&["--force"]).is_err());
     }
 
     #[test]

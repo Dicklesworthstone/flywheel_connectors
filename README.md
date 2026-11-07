@@ -1257,9 +1257,33 @@ then records the result. Restarts preserve throttle and circuit-breaker state.
 Pending or unknown outcomes remain reserved indefinitely and are never retried
 automatically; a lost response stops the batch with request IDs and partial
 results retained. Inspect those requests with `fwc invocation REQUEST_ID --host
-HOST` and the required admin credentials. There is no automatic reconciliation
-or clearing of uncertain attempts. A corrupt complete journal record blocks
-further execution. Recovery can discard an unterminated final append only after
+HOST` and the required admin credentials. Uncertain attempts are never cleared
+or retried automatically.
+
+If the original host retained a durable, successfully finalized invocation,
+reconcile its exact request ID with the local reservation:
+
+```bash
+fwc --host ORIGINAL_HOST rules reconcile REQUEST_ID \
+  --admin-token-file admin.token
+# Add --attempt-id N to select one exact retained host attempt.
+```
+
+Reconciliation checks the original rule definition, canonical host, zone,
+verified principal, target operation, and authorized idempotency binding. It
+requires successful durable completion, including the host's finalization
+obligations. Missing or pruned history, forwarding records, ephemeral records,
+failed or unknown outcomes, and mismatched evidence leave the reservation intact.
+The original action and trigger must still be defined; throttle, safety-ceiling,
+and enable/disable edits do not change that effect identity.
+
+A successful reconciliation syncs payload-free completion evidence to the rules
+journal. It invokes no action, acknowledges no source event, and advances no
+cursor. Rerun the original `rules run`, `consume`, or `poll` command to suppress
+the proven completed action and resume normal source progress. Source retention,
+throttle history, and circuit failures are preserved.
+
+A corrupt complete journal record blocks further execution. Recovery can discard an unterminated final append only after
 validating the preceding complete records; an interrupted settlement leaves its
 pending reservation intact and becomes an unknown outcome before further work.
 

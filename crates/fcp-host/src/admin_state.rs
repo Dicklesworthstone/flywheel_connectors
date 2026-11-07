@@ -537,25 +537,51 @@ impl InvocationIdempotency {
         let Some(key) = request.idempotency_key.as_deref() else {
             return Ok(None);
         };
-        validate_invocation_metadata(verified_principal, "verified principal")?;
-        request.validate_idempotency_key().map_err(|_| {
-            HostError::InvalidFilter("invalid invocation idempotency key".to_string())
-        })?;
-        let scope_digest = invocation_idempotency_digest(
-            "fcp.host.invocation.scope.v1",
-            &(
-                request.zone_id.as_str(),
-                verified_principal,
-                request.connector_id.as_str(),
-                request.operation.as_str(),
-                key,
-            ),
+        let scope_digest = Self::scope_digest_for(
+            &request.zone_id,
+            verified_principal,
+            &request.connector_id,
+            &request.operation,
+            key,
         )?;
         let effect_digest = invocation_effect_digest(request)?;
         Ok(Some(Self {
             scope_digest,
             effect_digest,
         }))
+    }
+
+    /// Compute the exact authorized-key binding without retaining an input or token.
+    ///
+    /// Reconciliation clients may compare this digest with durable invocation
+    /// metadata. A matching key binding alone is not completion evidence and
+    /// does not authorize retrying, replaying a result, or changing an effect.
+    ///
+    /// # Errors
+    /// Rejects invalid principal metadata, oversized keys or noncanonical data.
+    pub fn scope_digest_for(
+        zone: &fcp_core::ZoneId,
+        verified_principal: &str,
+        connector: &ConnectorId,
+        operation: &OperationId,
+        key: &str,
+    ) -> HostResult<String> {
+        validate_invocation_metadata(verified_principal, "verified principal")?;
+        if key.len() > fcp_core::MAX_IDEMPOTENCY_KEY_LEN {
+            return Err(HostError::InvalidFilter(
+                "invalid invocation idempotency key".to_string(),
+            ));
+        }
+        invocation_idempotency_digest(
+            "fcp.host.invocation.scope.v1",
+            &(
+                zone.as_str(),
+                verified_principal,
+                connector.as_str(),
+                operation.as_str(),
+                key,
+            ),
+        )
     }
 
     /// Bind an opaque transport alias without interpreting capability claims.
@@ -6060,6 +6086,39 @@ mod tests {
             duration_ms: 17,
             http_status: 200,
         }
+    }
+
+    #[test]
+    fn invocation_idempotency_scope_digest_matches_admission_without_input_or_credentials() {
+        let request = keyed_invocation_request("scope-only");
+        let binding = InvocationIdempotency::from_request(&request, "owner")
+            .unwrap()
+            .unwrap();
+        let scope = |principal: &str, key: &str| {
+            InvocationIdempotency::scope_digest_for(
+                &request.zone_id,
+                principal,
+                &request.connector_id,
+                &request.operation,
+                key,
+            )
+        };
+        assert_eq!(
+            scope("owner", request.idempotency_key.as_deref().unwrap()).unwrap(),
+            binding.scope_digest,
+        );
+        assert_ne!(
+            scope("other", request.idempotency_key.as_deref().unwrap()).unwrap(),
+            binding.scope_digest,
+        );
+        assert_ne!(
+            scope("owner", "another-key").unwrap(),
+            binding.scope_digest,
+        );
+        assert!(scope("", "key").is_err());
+        assert!(scope("owner\nspoofed", "key").is_err());
+        assert!(scope("owner", &"x".repeat(fcp_core::MAX_IDEMPOTENCY_KEY_LEN + 1)).is_err());
+        assert!(scope("owner", &"x".repeat(fcp_core::MAX_IDEMPOTENCY_KEY_LEN)).is_ok());
     }
 
     #[test]

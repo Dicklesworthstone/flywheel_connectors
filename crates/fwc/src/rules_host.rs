@@ -11,11 +11,13 @@ use fcp_core::{EventEnvelope, InvokeResponse, InvokeStatus, Provenance, RequestI
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::json;
 
+use crate::invocation_cmd::{LookupFailure, query_invocation, read_admin_token};
 use crate::native_events::{NativeStreamClient, NativeStreamConfig, StreamFailure};
 use crate::reactive_rules::Rule;
 use crate::rules_cmd::{
     self, ExecutionScope, InvocationResult, RuleEventBatch, RuleEventSource, RuleExecutor,
-    RulePollingSource, RulesArgs, RulesExecutionOptions, RulesPollOptions,
+    RulePollingSource, RuleReconciler, RulesArgs, RulesExecutionOptions, RulesPollOptions,
+    RulesReconcileOptions,
 };
 use crate::webhook_events::{self, PollStart, WebhookFailure, WebhookPollPage, WebhookSourceScope};
 use crate::{
@@ -27,8 +29,15 @@ use crate::{
 };
 
 pub(crate) fn dispatch(args: &RulesArgs, explicit_host: Option<&str>) -> Result<DispatchOutcome> {
-    let live = args.execution_options().is_some();
-    let result = if let Some(options) = args.execution_options() {
+    let live = args.execution_options().is_some() || args.reconcile_options().is_some();
+    let result = if let Some(options) = args.reconcile_options() {
+        (|| {
+            let host = resolve_host_config(explicit_host)?
+                .context("rule reconciliation requires the original host or --host")?;
+            let mut reconciler = HostRuleReconciler::new(&host, options)?;
+            rules_cmd::reconcile(args, &mut reconciler)
+        })()
+    } else if let Some(options) = args.execution_options() {
         (|| {
             let host = resolve_host_config(explicit_host)?
                 .context("live rules require a configured host or --host")?;
@@ -102,6 +111,9 @@ pub(crate) fn dispatch(args: &RulesArgs, explicit_host: Option<&str>) -> Result<
             } else if let Some(failure) = error.downcast_ref::<StreamFailure>() {
                 let (kind, _, code) = failure.details();
                 (kind, code)
+            } else if let Some(failure) = error.downcast_ref::<LookupFailure>() {
+                let (kind, _, code) = failure.description();
+                (kind, code)
             } else {
                 ("rules-request-failed", CliExitCode::Validation)
             };
@@ -139,12 +151,61 @@ fn has_uncertain_results(payload: &serde_json::Value) -> bool {
             .as_array()
             .is_some_and(|results| {
                 results.iter().any(|result| {
+                    let reconciled = matches!(
+                        result["outcome"].as_str(),
+                        Some("reconciled" | "already_completed")
+                    ) && result["state_persisted"] == true;
                     result["outcome"] == "outcome_unknown"
-                        || result["previous_outcome"] == "pending"
-                        || result["previous_outcome"] == "unknown"
+                        || (!reconciled
+                            && (result["previous_outcome"] == "pending"
+                                || result["previous_outcome"] == "unknown"))
                         || result["state_persisted"] == false
                 })
             })
+}
+
+/// Reuses the protected invocation-inspection transport. No action authority,
+/// provider input, connector discovery or source acknowledgement is involved.
+struct HostRuleReconciler {
+    endpoint: String,
+    client: HostAdminClient,
+    token: String,
+}
+
+impl HostRuleReconciler {
+    fn new(host: &ResolvedHostConfig, options: &RulesReconcileOptions) -> Result<Self> {
+        let endpoint = canonical_host(&host.endpoint)
+            .map_err(|_| anyhow::anyhow!("invalid reconciliation host endpoint"))?;
+        let client = HostAdminClient::new(&endpoint)
+            .map_err(|_| anyhow::anyhow!("could not construct the reconciliation host client"))?;
+        let token = read_admin_token(options.admin_token_file.as_deref())?;
+        Ok(Self {
+            endpoint,
+            client,
+            token,
+        })
+    }
+}
+
+impl RuleReconciler for HostRuleReconciler {
+    fn host(&self) -> &str {
+        &self.endpoint
+    }
+
+    fn query(
+        &mut self,
+        request_id: &str,
+        attempt_id: Option<u64>,
+    ) -> Result<fcp_host::InvocationQueryResponse> {
+        Ok(query_invocation(
+            &self.client,
+            &fcp_host::InvocationQueryRequest {
+                operation_id: request_id.to_owned(),
+                attempt_id,
+            },
+            &self.token,
+        )?)
+    }
 }
 
 struct NativeRuleSource(NativeStreamClient);
@@ -855,6 +916,129 @@ mod tests {
             respond(&mut socket, request);
         });
         (client, server)
+    }
+
+    #[test]
+    fn reconciled_result_truth_requires_a_confirmed_journal_write() {
+        for previous in ["pending", "unknown"] {
+            for outcome in ["reconciled", "already_completed"] {
+                let result = json!({
+                    "outcome": outcome, "previous_outcome": previous,
+                    "state_persisted": true,
+                });
+                assert!(!has_uncertain_results(&json!({"data": {"results": [result.clone()]}})));
+                let mut failed = result;
+                failed["state_persisted"] = json!(false);
+                assert!(has_uncertain_results(&json!({"data": {"results": [failed]}})));
+            }
+        }
+    }
+
+    #[test]
+    fn reconciliation_bridge_uses_only_the_selected_protected_host_query() {
+        use std::io::{BufRead, BufReader, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let mut reader = HostRuleReconciler {
+            endpoint: endpoint.clone(),
+            client: HostAdminClient::new(&endpoint).unwrap(),
+            token: "private-admin-token".into(),
+        };
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut line = String::new();
+            let mut input = BufReader::new(&mut socket);
+            input.read_line(&mut line).unwrap();
+            assert_eq!(line, "POST /rpc/admin/invocations HTTP/1.1\r\n");
+            let mut headers = BTreeMap::new();
+            loop {
+                line.clear();
+                assert!(input.read_line(&mut line).unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+                let (name, value) = line.split_once(':').unwrap();
+                headers.insert(name.to_ascii_lowercase(), value.trim().to_owned());
+            }
+            assert_eq!(headers["authorization"], "Bearer private-admin-token");
+            assert_eq!(headers["x-fcp-zone"], "z:owner");
+            let length: usize = headers["content-length"].parse().unwrap();
+            assert!(length < 1024);
+            let mut body = vec![0; length];
+            input.read_exact(&mut body).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+                json!({"operation_id": "retained-request", "attempt_id": 7}),
+            );
+            drop(input);
+            let response = br#"{"invocation":null,"mesh_invocation":null,"host_job_active":false}"#;
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                response.len(),
+            ).unwrap();
+            socket.write_all(response).unwrap();
+        });
+        assert_eq!(reader.host(), endpoint);
+        let response = reader.query("retained-request", Some(7)).unwrap();
+        assert!(response.invocation.is_none());
+        assert!(!response.host_job_active);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn reconciliation_bridge_refuses_redirects_and_redacts_remote_error_bodies() {
+        use std::io::Write;
+
+        for status in [302, 401, 403, 500] {
+            let (client, server) = source_http_server(move |socket, _| {
+                let secret = "private-host-error-and-bearer-material";
+                let _ = write!(
+                    socket,
+                    "HTTP/1.1 {status} Error\r\nLocation: http://127.0.0.1:1/other\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{secret}",
+                    secret.len(),
+                );
+            });
+            let mut reader = HostRuleReconciler {
+                endpoint: client.endpoint.clone(),
+                client,
+                token: "private-admin-token".into(),
+            };
+            let error = reader.query("retained-request", None).unwrap_err();
+            assert!(matches!(
+                error.downcast_ref::<LookupFailure>(),
+                Some(LookupFailure::Http(actual)) if *actual == status
+            ));
+            assert!(!error.to_string().contains("private-"));
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn reconciliation_bridge_bounds_and_validates_the_complete_host_response() {
+        use std::io::Write;
+
+        for response in [
+            "HTTP/1.1 200 OK\r\nContent-Length: 524289\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\nnot-json!",
+        ] {
+            let (client, server) = source_http_server(move |socket, _| {
+                let _ = socket.write_all(response.as_bytes());
+            });
+            let mut reader = HostRuleReconciler {
+                endpoint: client.endpoint.clone(),
+                client,
+                token: "private-admin-token".into(),
+            };
+            let error = reader.query("retained-request", Some(7)).unwrap_err();
+            assert!(matches!(
+                error.downcast_ref::<LookupFailure>(),
+                Some(LookupFailure::ResponseTooLarge | LookupFailure::InvalidResponse)
+            ));
+            server.join().unwrap();
+        }
     }
 
     #[test]
