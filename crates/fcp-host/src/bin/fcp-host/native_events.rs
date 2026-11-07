@@ -278,7 +278,7 @@ impl EventService {
                 "holder-bound capabilities require a supported holder-proof transport",
             ));
         }
-        verify_live_revocation_cascade(&self.host, &auth.capability_token, claims)?;
+        verify_live_revocation_cascade(&self.host, &auth.zone_id, &auth.capability_token, claims)?;
         let request = InvokeRequest {
             r#type: "invoke".into(),
             id: RequestId::new(auth.request_id.clone()),

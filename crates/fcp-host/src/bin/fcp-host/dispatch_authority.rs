@@ -20,8 +20,9 @@ use super::super::{
     AppState, admitted_operation_tool, authoritative_persisted_capability_rejection_reason,
     capability_token_b64, claims_principal, enforce_connector_allow_lists,
     enforce_live_capability_constraints, enforce_live_deployment_tier,
-    enforce_operation_network_constraint_dispatch, live_constraint_resource_uri, request_input_hash,
-    verify_approval_tokens, verify_live_hybrid_owner_capability, verify_live_revocation_cascade,
+    enforce_operation_network_constraint_dispatch, live_constraint_resource_uri,
+    request_input_hash, verify_approval_tokens, verify_live_hybrid_owner_capability,
+    verify_live_revocation_cascade,
 };
 
 fn refusal(message: &str) -> HostError {
@@ -69,7 +70,7 @@ fn check_current_token(state: &AppState, request: &InvokeRequest) -> HostResult<
         state.capability_verifying_key.as_ref(),
         chrono::Utc::now().timestamp(),
     )?;
-    verify_live_revocation_cascade(state, &request.capability_token, &claims)?;
+    verify_live_revocation_cascade(state, &request.zone_id, &request.capability_token, &claims)?;
     verify_live_hybrid_owner_capability(state, request)?;
     Ok(claims)
 }
@@ -214,6 +215,9 @@ pub(super) async fn revalidate(
     // A previously admitted job cannot retain expired deployment authority.
     enforce_live_deployment_tier(state, request, tool.safety_tier)
         .map_err(|_| refusal("current deployment does not permit this operation tier"))?;
+    // Admission may have waited on catalog, policy, and durable token state.
+    // Read the configured revocation feed again at this final handoff fence.
+    verify_live_revocation_cascade(state, &request.zone_id, &request.capability_token, &claims)?;
     require_live_times(&claims, chrono::Utc::now().timestamp())?;
     state.registry.require_generation(admitted_generation)?;
     Ok(tool.safety_tier)
@@ -318,6 +322,102 @@ mod tests {
         let diagnostic = error.to_string();
         assert!(!diagnostic.contains("private-subject-marker"));
         assert!(!diagnostic.contains("2000"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn live_revocation_feed_refreshes_between_admission_and_dispatch() {
+        use fcp_evidence::CascadeHop;
+        use fcp_host::{
+            RUNTIME_REVOCATION_SCHEMA, RuntimeKeyRevocation, RuntimeRevocationConfig,
+            RuntimeRevocationService, RuntimeRevocationSnapshot, RuntimeRevocationZoneConfig,
+        };
+        use std::sync::Arc;
+
+        let directory = tempfile::tempdir().expect("private fixture directory");
+        let root = directory.path().canonicalize().expect("real fixture path");
+        let source = root.join("snapshot.json");
+        let owner = Ed25519SigningKey::generate();
+        let node = fcp_crypto::KeyId::from_bytes([91; 8]);
+        let now = chrono::Utc::now().timestamp();
+        let now_ms = u64::try_from(now).expect("current clock") * 1000;
+        let mut snapshot = RuntimeRevocationSnapshot {
+            schema: RUNTIME_REVOCATION_SCHEMA.to_owned(),
+            zone_id: ZoneId::work(),
+            generation: 1,
+            issued_at_ms: now_ms,
+            expires_at_ms: now_ms + 60_000,
+            issuance_to_node: vec![(key().key_id(), node.clone())],
+            node_to_owner: vec![(node, owner.key_id())],
+            tokens: Vec::new(),
+            keys: Vec::new(),
+        };
+        let publish = |value: &RuntimeRevocationSnapshot| {
+            std::fs::write(
+                &source,
+                serde_json::to_vec(&value.sign(&owner).expect("owner signature"))
+                    .expect("signed JSON"),
+            )
+            .expect("publish snapshot");
+        };
+        publish(&snapshot);
+        let service = RuntimeRevocationService::open(RuntimeRevocationConfig {
+            zones: vec![RuntimeRevocationZoneConfig {
+                zone_id: ZoneId::work(),
+                owner_public_key_hex: hex::encode(owner.verifying_key().to_bytes()),
+                snapshot_file: source.clone(),
+                checkpoint_file: root.join("checkpoint.json"),
+            }],
+        })
+        .expect("configured feed");
+        let mut state = (*crate::tests::cancel_route_test_state()).clone();
+        state.capability_verifying_key = Some(key().verifying_key());
+        state.runtime_revocation = Some(Arc::new(service));
+        let mut request = policy_input().invoke_request;
+        let live_claims = claims()
+            .custom(
+                cwt_claims::EXP,
+                ciborium::Value::Integer((now + 3600).into()),
+            )
+            .custom(cwt_claims::NBF, ciborium::Value::Integer((now - 1).into()));
+        request.capability_token = token(&live_claims);
+        let admitted = check_current_token(&state, &request).expect("initial live authority");
+        verify_live_revocation_cascade(
+            &state,
+            &request.zone_id,
+            &request.capability_token,
+            &admitted,
+        )
+        .expect("shared admission verifier");
+
+        request.zone_id = ZoneId::public();
+        assert!(check_current_token(&state, &request).is_err());
+        request.zone_id = ZoneId::work();
+        let offline = directory.path().join("snapshot.offline");
+        std::fs::rename(&source, &offline).expect("source disappears after admission");
+        assert!(check_current_token(&state, &request).is_err());
+        std::fs::rename(&offline, &source).expect("restore source");
+        check_current_token(&state, &request).expect("source recovered");
+
+        snapshot.generation = 2;
+        snapshot.keys.push(RuntimeKeyRevocation {
+            kid: key().key_id(),
+            hop: CascadeHop::IssuerKey,
+            revoked_at_ms: now_ms,
+        });
+        publish(&snapshot);
+        let refusal = check_current_token(&state, &request)
+            .expect_err("revoked issuer cannot dispatch previously admitted work");
+        assert!(refusal.to_string().contains("revoked at hop"));
+        assert!(
+            verify_live_revocation_cascade(
+                &state,
+                &request.zone_id,
+                &request.capability_token,
+                &admitted,
+            )
+            .is_err()
+        );
     }
 
     const POLICY_NOW_MS: u64 = 1_500_000;

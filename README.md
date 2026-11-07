@@ -108,6 +108,13 @@ The admitted inventory snapshot remains authoritative until a new generation is
 applied; editing the manifest file alone cannot replace it. Install matching
 connector binaries and manifests together.
 
+For continuously renewed revocation, configure an independently pinned owner-signed
+feed for each served zone with `FCP_HOST_REVOCATION_CONFIG_FILE`. The host checks
+current evidence at admission and dispatch, including issuer and ancestor key
+revocations, and retains rollback protection on durable local storage. Missing,
+stale, conflicting, or invalid configured evidence refuses authorization. See
+[signed revocation feed setup and recovery](docs/configuration/runtime_revocation.md).
+
 ### 3. Truthfulness Over Convenience
 
 `fwc` classifies every answer by its source rather than collapsing runtime state into a fake "live" answer. If the host is unreachable and the operator did not pass `--offline`, `fwc` refuses rather than falling back to stale artifact data silently. Offline answers carry provenance markers and stale-data caveats. Placeholder runtime data, guessed `simulate` support, and local file-edit side channels are bugs, not convenience features.

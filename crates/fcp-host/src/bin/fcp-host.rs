@@ -5538,6 +5538,7 @@ struct AppState {
     /// Fresh, process-bound evidence for one independently attested zone.
     deployment_evidence: Option<Arc<deployment_evidence::DeploymentEvidenceService>>,
     revocation_cascade: Arc<RevocationCascadeVerifier>,
+    runtime_revocation: Option<Arc<fcp_host::RuntimeRevocationService>>,
     hybrid_owner_verifier: Option<Arc<HybridOwnerProductionVerifier>>,
     approval_verifying_key: Option<Ed25519VerifyingKey>,
     admin_bearer_token: Option<Arc<str>>,
@@ -6195,11 +6196,15 @@ fn revocation_cascade_issuer_kid(token: &fcp_core::CapabilityToken) -> HostResul
 
 fn verify_live_revocation_cascade(
     state: &AppState,
+    zone: &ZoneId,
     token: &fcp_core::CapabilityToken,
     claims: &fcp_crypto::cose::CwtClaims,
 ) -> HostResult<()> {
     let token_id = revocation_cascade_token_id(token, claims)?;
     let issuer_kid = revocation_cascade_issuer_kid(token)?;
+    if let Some(revocations) = &state.runtime_revocation {
+        revocations.verify(zone, token_id, issuer_kid.clone())?;
+    }
     state
         .revocation_cascade
         .verify(token_id, issuer_kid)
@@ -7748,7 +7753,12 @@ async fn verify_live_request_for_target(
     // issuer-chain hops through the bounded fcp-evidence cascade walker before
     // the live request can proceed into holder proof or persisted token-state
     // validation.
-    verify_live_revocation_cascade(state, &request.capability_token, verified_claims)?;
+    verify_live_revocation_cascade(
+        state,
+        &request.zone_id,
+        &request.capability_token,
+        verified_claims,
+    )?;
     verify_live_hybrid_owner_capability(state, request)?;
 
     enforce_live_deployment_tier(state, request, tool.safety_tier)?;
@@ -8837,6 +8847,7 @@ async fn async_main(telemetry_config: TelemetryConfig) -> HostResult<()> {
     let bind_target = resolve_bind_target()?;
     let webhook_ingress_config = webhook_ingress::from_env()?;
     let deployment_evidence = deployment_evidence::from_env()?.map(Arc::new);
+    let runtime_revocation = fcp_host::RuntimeRevocationService::from_env()?.map(Arc::new);
     let capability_verifying_key = resolve_verifying_key(
         "FCP_HOST_CAPABILITY_PUBLIC_KEY",
         "FCP_HOST_CAPABILITY_PUBLIC_KEY_FILE",
@@ -8937,6 +8948,7 @@ async fn async_main(telemetry_config: TelemetryConfig) -> HostResult<()> {
         capability_verifying_key,
         deployment_evidence,
         revocation_cascade: Arc::new(RevocationCascadeVerifier::default()),
+        runtime_revocation,
         hybrid_owner_verifier,
         approval_verifying_key,
         admin_bearer_token: resolve_admin_bearer_token()?,
@@ -13813,7 +13825,7 @@ async fn authorize_host_egress_context(
             HostError::PreflightFailed(format!("host-egress capability token rejected: {error}"))
         })?;
     let verified_claims = verified_token.claims();
-    verify_live_revocation_cascade(state, &capability_token, verified_claims)?;
+    verify_live_revocation_cascade(state, &zone_id, &capability_token, verified_claims)?;
     if let Some(expected_holder) = verified_claims.get_holder_node() {
         return Err(HostError::PreflightFailed(format!(
             "host-egress capability token is holder-bound to `{expected_holder}`, but host-egress requests do not carry holder_proof"
@@ -18446,6 +18458,7 @@ output_schema = {{ type = "object" }}
             capability_verifying_key,
             deployment_evidence: None,
             revocation_cascade: Arc::new(RevocationCascadeVerifier::default()),
+            runtime_revocation: None,
             hybrid_owner_verifier: None,
             approval_verifying_key: None,
             admin_bearer_token: None,
@@ -20266,6 +20279,7 @@ output_schema = {{ type = "object" }}
             capability_verifying_key: None,
             deployment_evidence: None,
             revocation_cascade: Arc::new(RevocationCascadeVerifier::default()),
+            runtime_revocation: None,
             hybrid_owner_verifier: None,
             approval_verifying_key: None,
             admin_bearer_token: None,
@@ -27699,6 +27713,7 @@ output_schema = { type = "object" }
             capability_verifying_key: Some(signing_key.verifying_key()),
             deployment_evidence: None,
             revocation_cascade: Arc::new(RevocationCascadeVerifier::default()),
+            runtime_revocation: None,
             hybrid_owner_verifier: None,
             approval_verifying_key: None,
             admin_bearer_token: None,
@@ -28277,6 +28292,7 @@ output_schema = { type = "object" }
             capability_verifying_key: Some(signing_key.verifying_key()),
             deployment_evidence: None,
             revocation_cascade: Arc::new(cascade),
+            runtime_revocation: None,
             hybrid_owner_verifier: None,
             approval_verifying_key: None,
             admin_bearer_token: None,
@@ -35279,6 +35295,7 @@ done"#;
             capability_verifying_key: None,
             deployment_evidence: None,
             revocation_cascade: Arc::new(RevocationCascadeVerifier::default()),
+            runtime_revocation: None,
             hybrid_owner_verifier: None,
             approval_verifying_key: None,
             admin_bearer_token: Some(Arc::<str>::from("topsecret".to_string())),
@@ -35321,6 +35338,7 @@ done"#;
             capability_verifying_key: None,
             deployment_evidence: None,
             revocation_cascade: Arc::new(RevocationCascadeVerifier::default()),
+            runtime_revocation: None,
             hybrid_owner_verifier: None,
             approval_verifying_key: None,
             admin_bearer_token: Some(Arc::<str>::from("topsecret".to_string())),
@@ -35368,6 +35386,7 @@ done"#;
             capability_verifying_key: None,
             deployment_evidence: None,
             revocation_cascade: Arc::new(RevocationCascadeVerifier::default()),
+            runtime_revocation: None,
             hybrid_owner_verifier: None,
             approval_verifying_key: None,
             admin_bearer_token: Some(Arc::<str>::from("topsecret".to_string())),
@@ -35415,6 +35434,7 @@ done"#;
             capability_verifying_key: None,
             deployment_evidence: None,
             revocation_cascade: Arc::new(RevocationCascadeVerifier::default()),
+            runtime_revocation: None,
             hybrid_owner_verifier: None,
             approval_verifying_key: None,
             admin_bearer_token: Some(Arc::<str>::from("topsecret".to_string())),
@@ -35479,6 +35499,7 @@ done"#;
             capability_verifying_key: None,
             deployment_evidence: None,
             revocation_cascade: Arc::new(RevocationCascadeVerifier::default()),
+            runtime_revocation: None,
             hybrid_owner_verifier: None,
             approval_verifying_key: None,
             admin_bearer_token: Some(Arc::<str>::from("topsecret".to_string())),
@@ -35530,6 +35551,7 @@ done"#;
             capability_verifying_key: None,
             deployment_evidence: None,
             revocation_cascade: Arc::new(RevocationCascadeVerifier::default()),
+            runtime_revocation: None,
             hybrid_owner_verifier: None,
             approval_verifying_key: None,
             admin_bearer_token: Some(Arc::<str>::from("topsecret".to_string())),
@@ -35647,6 +35669,7 @@ done"#;
             capability_verifying_key: None,
             deployment_evidence: None,
             revocation_cascade: Arc::new(RevocationCascadeVerifier::default()),
+            runtime_revocation: None,
             hybrid_owner_verifier: None,
             approval_verifying_key: None,
             admin_bearer_token: None,
@@ -35704,6 +35727,7 @@ done"#;
             capability_verifying_key: None,
             deployment_evidence: None,
             revocation_cascade: Arc::new(RevocationCascadeVerifier::default()),
+            runtime_revocation: None,
             hybrid_owner_verifier: None,
             approval_verifying_key: None,
             admin_bearer_token: None,
@@ -36107,6 +36131,7 @@ done"#;
             capability_verifying_key: None,
             deployment_evidence: None,
             revocation_cascade: Arc::new(RevocationCascadeVerifier::default()),
+            runtime_revocation: None,
             hybrid_owner_verifier: None,
             approval_verifying_key: None,
             admin_bearer_token: Some(Arc::<str>::from("topsecret".to_string())),
