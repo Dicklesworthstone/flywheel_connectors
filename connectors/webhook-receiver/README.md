@@ -154,11 +154,11 @@ The current Webhook Receiver README slice documents the existing runtime surface
 - Source IP is read from `source_ip`, `remote_addr`, or `client_ip`.
 - Client rate keys combine endpoint path and `client_id`, source IP, or `unknown-client`.
 - Client identities are capped at `1024` bytes, and each authentication stage retains at most `4096` fixed-size client-key digests. Live rate windows are never evicted to admit a new client; expired windows are reclaimed using monotonic time.
-- Headers are capped at `100` entries and `32 KiB` of names and values. Case-insensitive duplicate header names are rejected before signature verification.
+- Headers are capped at `100` entries and `32 KiB` of names and values, with at most `256` bytes per name. Invalid HTTP header names, control characters in values other than tabs, and case-insensitive duplicate names are rejected before signature verification or replay admission.
 - Rate limiting is applied before and after signature verification.
 - Body timeout/cancellation inputs reject the ingest as timed out.
 - Duplicate events are rejected per endpoint when either the public event ID or authenticated replay identity has already been accepted.
-- Stored headers redact the endpoint signature header plus authorization, cookie, signature, secret, and token-style headers.
+- Stored headers redact the endpoint signature header plus authorization, cookie, signature, secret, token, `api-key`, and `api_key`-style headers before retaining events or exposing them to polling consumers.
 - Recent-event and polling output hash source IPs before returning them.
 
 ## Cursor-Based Event Consumption

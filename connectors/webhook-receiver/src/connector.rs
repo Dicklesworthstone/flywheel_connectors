@@ -26,7 +26,7 @@ use fcp_prelude::{
 use fcp_sdk::prelude::{StandaloneInvocation, StandaloneSession};
 use hmac::{Hmac, Mac};
 use rand::RngCore;
-use reqwest::Url;
+use reqwest::{Url, header::HeaderName};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha1::Sha1;
@@ -66,6 +66,7 @@ const DEFAULT_SIGNATURE_TOLERANCE_SECONDS: i64 = 300;
 const MAX_SIGNATURE_TOLERANCE_SECONDS: i64 = 24 * 60 * 60;
 const MAX_RATE_LIMIT_CLIENTS: usize = 4096;
 const MAX_INGRESS_HEADERS: usize = 100;
+const MAX_INGRESS_HEADER_NAME_BYTES: usize = 256;
 const MAX_INGRESS_HEADER_BYTES: usize = 32 * 1024;
 const MAX_CLIENT_ID_BYTES: usize = 1024;
 const MAX_FORM_FIELDS: usize = 1024;
@@ -1583,6 +1584,26 @@ fn parse_headers(
                 message: format!("webhook headers exceed {MAX_INGRESS_HEADER_BYTES} bytes"),
             });
         }
+        if key.len() > MAX_INGRESS_HEADER_NAME_BYTES {
+            return Err(WebhookReceiverError::PayloadTooLarge {
+                message: format!("HTTP header names exceed {MAX_INGRESS_HEADER_NAME_BYTES} bytes"),
+            });
+        }
+        if HeaderName::from_bytes(key.as_bytes()).is_err() {
+            return Err(WebhookReceiverError::InvalidInput {
+                message: "HTTP header names must be valid non-empty tokens".into(),
+            });
+        }
+        // Validate before trimming: otherwise leading or trailing CR/LF can be
+        // erased here, and malformed metadata can poison a retained poll page.
+        if value
+            .chars()
+            .any(|character| character != '\t' && character.is_control())
+        {
+            return Err(WebhookReceiverError::InvalidInput {
+                message: "HTTP header values must not contain control characters except tabs".into(),
+            });
+        }
         if parsed
             .insert(key.to_ascii_lowercase(), value.trim().to_string())
             .is_some()
@@ -2387,6 +2408,8 @@ fn is_sensitive_header(key: &str, endpoint: &WebhookEndpoint) -> bool {
         || lower.contains("signature")
         || lower.contains("secret")
         || lower.contains("token")
+        || lower.contains("api-key")
+        || lower.contains("api_key")
 }
 
 fn request_region_bool(input: &serde_json::Value, field: &str) -> bool {
@@ -3447,6 +3470,78 @@ mod tests {
         let valid =
             parse_headers(&json!({"headers": {"Content-Type": " application/json "}})).unwrap();
         assert_eq!(valid["content-type"], "application/json");
+        let name = "x".repeat(MAX_INGRESS_HEADER_NAME_BYTES);
+        let valid = parse_headers(&json!({"headers": {(&name): "value"}})).unwrap();
+        assert_eq!(valid[&name], "value");
+        assert!(matches!(
+            parse_headers(&json!({"headers": {(name + "x"): "value"}})),
+            Err(WebhookReceiverError::PayloadTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn ingress_headers_reject_invalid_names_and_controls_before_normalization() {
+        for name in ["", "x bad", "x:bad", "x\r\nbad", "x-\u{e9}"] {
+            let input = json!({"headers": {(name): "value"}});
+            assert!(matches!(
+                parse_headers(&input),
+                Err(WebhookReceiverError::InvalidInput { message })
+                    if message == "HTTP header names must be valid non-empty tokens"
+            ));
+        }
+        for value in [
+            "\rsecret-value",
+            "secret-value\n",
+            "secret\0value",
+            "secret\u{7f}value",
+            "secret\u{85}value",
+        ] {
+            let input = json!({"headers": {"x-metadata": value}});
+            assert!(matches!(
+                parse_headers(&input),
+                Err(WebhookReceiverError::InvalidInput { message })
+                    if message == "HTTP header values must not contain control characters except tabs"
+            ));
+        }
+        let valid = parse_headers(&json!({"headers": {
+            "X-Metadata": " \tfirst\tsecond \t",
+            "X-Label": "caf\u{e9}",
+        }}))
+        .unwrap();
+        assert_eq!(valid["x-metadata"], "first\tsecond");
+        assert_eq!(valid["x-label"], "caf\u{e9}");
+    }
+
+    #[test]
+    fn retained_headers_redact_api_credentials_and_custom_signature_headers() {
+        let endpoint = WebhookEndpoint::new(
+            "/hooks/metadata".into(),
+            "endpoint-secret".into(),
+            vec![],
+            "https://hooks.example.com",
+            WebhookProvider::Generic,
+            "X-Proof".into(),
+            "hmac-sha256".into(),
+        );
+        let headers = BTreeMap::from([
+            ("content-type".into(), "application/json".into()),
+            ("x-delivery-id".into(), "delivery-1".into()),
+            ("x-proof".into(), "custom-signature".into()),
+            ("authorization".into(), "Bearer secret".into()),
+            ("set-cookie".into(), "session=secret".into()),
+            ("x-signature".into(), "signature-secret".into()),
+            ("x-secret".into(), "secret-value".into()),
+            ("x-access-token".into(), "token-secret".into()),
+            ("X-API-Key".into(), "api-key-secret".into()),
+            ("x_api_key".into(), "api-key-underscore-secret".into()),
+        ]);
+        assert_eq!(
+            redacted_event_headers(&headers, &endpoint),
+            HashMap::from([
+                ("content-type".into(), "application/json".into()),
+                ("x-delivery-id".into(), "delivery-1".into()),
+            ])
+        );
     }
 
     #[test]

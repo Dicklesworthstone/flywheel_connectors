@@ -808,6 +808,9 @@ async fn events_ingest_github_signature_records_redacted_event() {
             "Content-Type": "application/json",
             "X-Hub-Signature-256": signature,
             "Authorization": "Bearer secret",
+            "X-API-Key": "must-not-retain-api-key",
+            "X_API_KEY": "must-not-retain-underscore-key",
+            "X-Delivery-Metadata": "first\tsecond",
             "X-GitHub-Delivery": "delivery-github-1"
         }),
         body,
@@ -843,7 +846,106 @@ async fn events_ingest_github_signature_records_redacted_event() {
     assert_eq!(events[0]["headers"]["content-type"], "application/json");
     assert!(events[0]["headers"].get("authorization").is_none());
     assert!(events[0]["headers"].get("x-hub-signature-256").is_none());
+    assert!(events[0]["headers"].get("x-api-key").is_none());
+    assert!(events[0]["headers"].get("x_api_key").is_none());
+    assert_eq!(events[0]["headers"]["x-delivery-metadata"], "first\tsecond");
+    for output in [&accepted, &recent] {
+        let serialized = output.to_string();
+        assert!(!serialized.contains("must-not-retain-api-key"));
+        assert!(!serialized.contains("must-not-retain-underscore-key"));
+    }
     assert!(events[0]["source_ip_hash"].as_str().is_some());
+}
+
+#[fcp_async_core::runtime::test]
+async fn events_ingest_invalid_headers_do_not_consume_replay_identity_or_poll_position() {
+    let mut c = setup_connector().await;
+    let created = create_endpoint(&mut c, "/hooks/invalid-headers", "generic", "secret").await;
+    let endpoint_id = created["endpoint_id"].as_str().unwrap();
+    let body = r#"{"id":"valid-after-invalid-metadata"}"#;
+    let headers = json!({
+        "Content-Type": "application/json",
+        "X-Signature": hmac_sha256_hex("secret", body)
+    });
+    let initial = c
+        .handle_invoke(json!({
+            "operation_id": "webhook.events.poll",
+            "input": {"endpoint_id": endpoint_id}
+        }))
+        .await
+        .unwrap();
+
+    for (name, value) in [
+        ("x bad", "value"),
+        ("x:bad", "value"),
+        ("x-metadata", "\rhidden-before-trim"),
+        ("x-metadata", "hidden-before-trim\n"),
+        ("x-metadata", "nul\0byte"),
+        ("x-metadata", "control\u{85}byte"),
+    ] {
+        let mut malformed = headers.clone();
+        malformed[name] = json!(value);
+        assert_external_status(
+            ingest(
+                &mut c,
+                "/hooks/invalid-headers",
+                malformed,
+                body,
+                "same-delivery",
+            )
+            .await,
+            400,
+        );
+    }
+    let mut oversized = headers.clone();
+    oversized
+        .as_object_mut()
+        .unwrap()
+        .insert("x".repeat(257), json!("value"));
+    assert_external_status(
+        ingest(
+            &mut c,
+            "/hooks/invalid-headers",
+            oversized,
+            body,
+            "same-delivery",
+        )
+        .await,
+        413,
+    );
+    let after_invalid = c
+        .handle_invoke(json!({
+            "operation_id": "webhook.events.poll",
+            "input": {"endpoint_id": endpoint_id, "cursor": initial["next_cursor"]}
+        }))
+        .await
+        .unwrap();
+    assert!(after_invalid["events"].as_array().unwrap().is_empty());
+    assert_eq!(after_invalid["next_cursor"], initial["next_cursor"]);
+
+    let accepted = ingest(
+        &mut c,
+        "/hooks/invalid-headers",
+        headers,
+        body,
+        "same-delivery",
+    )
+    .await
+    .unwrap();
+    assert_eq!(accepted["status_code"], 202);
+    let page = c
+        .handle_invoke(json!({
+            "operation_id": "webhook.events.poll",
+            "input": {"endpoint_id": endpoint_id, "cursor": initial["next_cursor"]}
+        }))
+        .await
+        .unwrap();
+    assert_eq!(page["events"].as_array().unwrap().len(), 1);
+    assert_eq!(page["events"][0]["event_id"], "same-delivery");
+    assert_eq!(
+        page["events"][0]["sequence"],
+        initial["retention"]["next_sequence"]
+    );
 }
 
 #[fcp_async_core::runtime::test]
@@ -2180,7 +2282,9 @@ async fn events_poll_pages_verified_events_without_disclosing_other_endpoints_or
             json!({
                 "Content-Type": "application/json",
                 "X-Hub-Signature-256": hmac_sha256_hex("poll-secret", &body),
-                "Authorization": "Bearer must-not-leak"
+                "Authorization": "Bearer must-not-leak",
+                "X-API-Key": "must-not-leak-api-key",
+                "X_API_KEY": "must-not-leak-underscore-key"
             }),
             &body,
             &format!("poll-{index}"),
@@ -2235,6 +2339,8 @@ async fn events_poll_pages_verified_events_without_disclosing_other_endpoints_or
         assert!(event["source_ip_hash"].as_str().is_some());
         assert!(event["headers"].get("authorization").is_none());
         assert!(event["headers"].get("x-hub-signature-256").is_none());
+        assert!(event["headers"].get("x-api-key").is_none());
+        assert!(event["headers"].get("x_api_key").is_none());
         assert_eq!(event["signature_valid"], true);
         assert_eq!(event["endpoint_id"], first["endpoint_id"]);
     }
@@ -2251,6 +2357,9 @@ async fn events_poll_pages_verified_events_without_disclosing_other_endpoints_or
     assert_eq!(last_page["events"][0]["event_id"], "poll-2");
     assert_eq!(last_page["has_more"], false);
     assert_eq!(c.handle_invoke(resume).await.unwrap(), last_page);
+    for page in [&first_page, &last_page] {
+        assert!(!page.to_string().contains("must-not-leak"));
+    }
     assert_external_status(
         c.handle_invoke(json!({
             "operation_id": "webhook.events.poll",
