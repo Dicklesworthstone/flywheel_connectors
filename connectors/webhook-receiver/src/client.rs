@@ -8,7 +8,10 @@ use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Write};
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
+use rand::RngCore as _;
+use subtle::ConstantTimeEq as _;
 use tracing::debug;
 
 use crate::{
@@ -50,8 +53,57 @@ pub const DEFAULT_EVENTS_LIMIT: usize = 50;
 /// Maximum limit for recent events query.
 pub const MAX_EVENTS_LIMIT: usize = 100;
 
+/// Maximum encoded cursor length accepted by event polling.
+pub const MAX_EVENT_CURSOR_BYTES: usize = 128;
+
 /// Default public base URL used before the connector is explicitly configured.
 pub const DEFAULT_PUBLIC_BASE_URL: &str = "http://localhost:8080";
+
+const EVENT_CURSOR_VERSION: u8 = 1;
+const EVENT_CURSOR_PAYLOAD_BYTES: usize = 1 + 16 + 32 + 8;
+const EVENT_CURSOR_BYTES: usize = EVENT_CURSOR_PAYLOAD_BYTES + 32;
+
+/// A bounded page in monotonic arrival order for one endpoint.
+#[derive(Debug)]
+pub struct WebhookEventPage {
+    /// Arrival sequence and retained event for each selected delivery.
+    pub events: Vec<(u64, WebhookEvent)>,
+    /// Opaque continuation scoped to this endpoint and receiver lifetime.
+    pub next_cursor: String,
+    /// Whether a retained event remains beyond this page.
+    pub has_more: bool,
+    /// First sequence still retained for this endpoint, if any.
+    pub oldest_available_sequence: Option<u64>,
+    /// Global arrival frontier; the next accepted delivery receives this sequence.
+    pub next_sequence: u64,
+    /// Whether any event body has been evicted from this endpoint.
+    pub history_truncated: bool,
+    /// Stored event JSON bytes selected, excluding page metadata and wire framing.
+    pub serialized_event_bytes: usize,
+}
+
+struct CursorIdentity {
+    epoch: [u8; 16],
+    key: [u8; 32],
+}
+
+impl CursorIdentity {
+    fn new() -> Self {
+        let mut epoch = [0; 16];
+        let mut key = [0; 32];
+        rand::rngs::OsRng.fill_bytes(&mut epoch);
+        rand::rngs::OsRng.fill_bytes(&mut key);
+        Self { epoch, key }
+    }
+}
+
+impl std::fmt::Debug for CursorIdentity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CursorIdentity")
+            .finish_non_exhaustive()
+    }
+}
 
 #[derive(Debug)]
 struct RetainedEvent {
@@ -64,12 +116,17 @@ struct RetainedEvent {
 struct EventBuffer {
     events: VecDeque<RetainedEvent>,
     serialized_bytes: usize,
+    highest_evicted_sequence: Option<u64>,
 }
 
 impl EventBuffer {
     fn evict_oldest(&mut self) {
         if let Some(event) = self.events.pop_front() {
             self.serialized_bytes -= event.serialized_bytes;
+            self.highest_evicted_sequence = Some(
+                self.highest_evicted_sequence
+                    .map_or(event.sequence, |sequence| sequence.max(event.sequence)),
+            );
         }
     }
 }
@@ -115,6 +172,8 @@ pub struct WebhookStore {
     authenticated_deliveries: HashMap<String, HashSet<[u8; 32]>>,
     /// Monotonic arrival order, independent of caller-supplied event timestamps.
     next_event_sequence: u64,
+    /// Authentication material for bounded, endpoint-scoped replay cursors.
+    cursor_identity: CursorIdentity,
 }
 
 impl WebhookStore {
@@ -127,6 +186,7 @@ impl WebhookStore {
             event_ids: HashMap::new(),
             authenticated_deliveries: HashMap::new(),
             next_event_sequence: 0,
+            cursor_identity: CursorIdentity::new(),
         }
     }
 
@@ -449,6 +509,165 @@ impl WebhookStore {
         Ok(all_events.into_iter().cloned().collect())
     }
 
+    /// Poll retained deliveries in arrival order without timestamp ambiguity.
+    ///
+    /// An initial poll starts at the oldest retained event, or at the current
+    /// frontier when `start_at_latest` is true. Continuing a cursor never skips
+    /// unread evictions: a cursor at or below the endpoint's eviction watermark
+    /// returns [`WebhookReceiverError::ReplayGap`]. Polling does not consume
+    /// events or change the independent delivery replay-protection indexes.
+    pub fn poll_events(
+        &self,
+        endpoint_id: &str,
+        cursor: Option<&str>,
+        limit: usize,
+        max_bytes: usize,
+        start_at_latest: bool,
+    ) -> WebhookReceiverResult<WebhookEventPage> {
+        if endpoint_id.trim().is_empty()
+            || !(1..=MAX_EVENTS_LIMIT).contains(&limit)
+            || !(1..=MAX_RETAINED_EVENT_BYTES_PER_ENDPOINT).contains(&max_bytes)
+            || (cursor.is_some() && start_at_latest)
+        {
+            return Err(WebhookReceiverError::InvalidInput {
+                message: format!(
+                    "Event polling requires an endpoint, limit 1..={MAX_EVENTS_LIMIT}, max_bytes 1..={MAX_RETAINED_EVENT_BYTES_PER_ENDPOINT}, and no start override with a cursor"
+                ),
+            });
+        }
+
+        // Recognize an expired receiver epoch even if reconfiguration removed
+        // the old endpoint. Current-epoch cursors still require the exact scope.
+        let resumed_sequence = cursor
+            .map(|cursor| self.decode_event_cursor(endpoint_id, cursor))
+            .transpose()?;
+        self.get_endpoint(endpoint_id)?;
+        let buffer =
+            self.events
+                .get(endpoint_id)
+                .ok_or_else(|| WebhookReceiverError::Internal {
+                    message: "Webhook endpoint event buffer is unavailable".into(),
+                })?;
+        if resumed_sequence.is_some_and(|sequence| {
+            buffer
+                .highest_evicted_sequence
+                .is_some_and(|evicted| sequence <= evicted)
+        }) {
+            return Err(WebhookReceiverError::ReplayGap {
+                endpoint_id: endpoint_id.to_owned(),
+            });
+        }
+        let oldest_available_sequence = buffer.events.front().map(|event| event.sequence);
+        let start_sequence = resumed_sequence.unwrap_or_else(|| {
+            if start_at_latest {
+                self.next_event_sequence
+            } else {
+                oldest_available_sequence.unwrap_or(self.next_event_sequence)
+            }
+        });
+        let mut events = Vec::with_capacity(limit.min(buffer.events.len()));
+        let mut serialized_event_bytes = 0;
+        let mut has_more = false;
+        let mut continuation_sequence = self.next_event_sequence;
+        for retained in buffer
+            .events
+            .iter()
+            .filter(|retained| retained.sequence >= start_sequence)
+        {
+            if events.len() == limit {
+                has_more = true;
+                break;
+            }
+            if retained.serialized_bytes > max_bytes - serialized_event_bytes {
+                if events.is_empty() {
+                    return Err(WebhookReceiverError::PayloadTooLarge {
+                        message: format!(
+                            "Next webhook event requires {} serialized bytes; increase max_bytes beyond the current {max_bytes}-byte page budget",
+                            retained.serialized_bytes
+                        ),
+                    });
+                }
+                has_more = true;
+                break;
+            }
+            serialized_event_bytes += retained.serialized_bytes;
+            // Admission never assigns u64::MAX: it reserves the next sequence
+            // before recording the event, so this increment cannot overflow.
+            continuation_sequence = retained.sequence + 1;
+            events.push((retained.sequence, retained.event.clone()));
+        }
+        if !has_more {
+            // Other endpoints may have advanced the global sequence since the
+            // last matching delivery. An exhausted poll catches up to that
+            // frontier without claiming or consuming any future event.
+            continuation_sequence = self.next_event_sequence;
+        }
+
+        Ok(WebhookEventPage {
+            events,
+            next_cursor: self.encode_event_cursor(endpoint_id, continuation_sequence),
+            has_more,
+            oldest_available_sequence,
+            next_sequence: self.next_event_sequence,
+            history_truncated: buffer.highest_evicted_sequence.is_some(),
+            serialized_event_bytes,
+        })
+    }
+
+    fn encode_event_cursor(&self, endpoint_id: &str, next_sequence: u64) -> String {
+        let mut bytes = [0; EVENT_CURSOR_BYTES];
+        bytes[0] = EVENT_CURSOR_VERSION;
+        bytes[1..17].copy_from_slice(&self.cursor_identity.epoch);
+        bytes[17..49].copy_from_slice(blake3::hash(endpoint_id.as_bytes()).as_bytes());
+        bytes[49..EVENT_CURSOR_PAYLOAD_BYTES].copy_from_slice(&next_sequence.to_be_bytes());
+        let tag = blake3::keyed_hash(
+            &self.cursor_identity.key,
+            &bytes[..EVENT_CURSOR_PAYLOAD_BYTES],
+        );
+        bytes[EVENT_CURSOR_PAYLOAD_BYTES..].copy_from_slice(tag.as_bytes());
+        URL_SAFE_NO_PAD.encode(bytes)
+    }
+
+    fn decode_event_cursor(&self, endpoint_id: &str, cursor: &str) -> WebhookReceiverResult<u64> {
+        let invalid = || WebhookReceiverError::InvalidInput {
+            message: "webhook_cursor_invalid".into(),
+        };
+        if cursor.is_empty() || cursor.len() > MAX_EVENT_CURSOR_BYTES {
+            return Err(invalid());
+        }
+        let bytes = URL_SAFE_NO_PAD.decode(cursor).map_err(|_| invalid())?;
+        if bytes.len() != EVENT_CURSOR_BYTES || bytes[0] != EVENT_CURSOR_VERSION {
+            return Err(invalid());
+        }
+        // Old stores have different MAC keys, so their tags cannot be
+        // authenticated here. A foreign epoch only produces a fail-closed
+        // expiry response; it never authorizes a position or reveals events.
+        if bytes[1..17] != self.cursor_identity.epoch {
+            return Err(WebhookReceiverError::ExpiredCursor);
+        }
+        let expected = blake3::keyed_hash(
+            &self.cursor_identity.key,
+            &bytes[..EVENT_CURSOR_PAYLOAD_BYTES],
+        );
+        if !bool::from(
+            expected
+                .as_bytes()
+                .as_slice()
+                .ct_eq(&bytes[EVENT_CURSOR_PAYLOAD_BYTES..]),
+        ) || bytes[17..49] != *blake3::hash(endpoint_id.as_bytes()).as_bytes()
+        {
+            return Err(invalid());
+        }
+        let sequence_bytes: [u8; 8] = bytes[49..EVENT_CURSOR_PAYLOAD_BYTES]
+            .try_into()
+            .map_err(|_| invalid())?;
+        let next_sequence = u64::from_be_bytes(sequence_bytes);
+        if next_sequence > self.next_event_sequence {
+            return Err(invalid());
+        }
+        Ok(next_sequence)
+    }
+
     /// Get the number of registered endpoints.
     pub fn endpoint_count(&self) -> usize {
         self.endpoints.len()
@@ -532,6 +751,7 @@ impl WebhookStore {
         self.event_ids.clear();
         self.authenticated_deliveries.clear();
         self.next_event_sequence = 0;
+        self.cursor_identity = CursorIdentity::new();
     }
 }
 
@@ -893,6 +1113,10 @@ mod tests {
         let ep = store
             .create_endpoint("/hooks/test".into(), "s".into(), vec![])
             .unwrap();
+        let initial_cursor = store
+            .poll_events(&ep.endpoint_id, None, 1, 1024, false)
+            .unwrap()
+            .next_cursor;
 
         // Fill to capacity
         for i in 0..MAX_EVENTS_PER_ENDPOINT {
@@ -902,6 +1126,11 @@ mod tests {
             store.record_event(event).unwrap();
         }
         assert_eq!(store.total_event_count(), MAX_EVENTS_PER_ENDPOINT);
+        let first_page = store
+            .poll_events(&ep.endpoint_id, Some(&initial_cursor), 1, 1024, false)
+            .unwrap();
+        assert_eq!(first_page.events[0].0, 0);
+        assert!(!first_page.history_truncated);
 
         // Add one more; oldest should be evicted
         let mut new_event =
@@ -917,6 +1146,46 @@ mod tests {
         let ids: Vec<&str> = events.iter().map(|e| e.event_id.as_str()).collect();
         assert!(!ids.contains(&"evt_0"));
         assert!(ids.contains(&"evt_new"));
+        assert!(matches!(
+            store.poll_events(&ep.endpoint_id, Some(&initial_cursor), 1, 1024, false),
+            Err(WebhookReceiverError::ReplayGap { .. })
+        ));
+        // A cursor that consumed the evicted prefix still reads without a gap.
+        let continued = store
+            .poll_events(
+                &ep.endpoint_id,
+                Some(&first_page.next_cursor),
+                1,
+                1024,
+                false,
+            )
+            .unwrap();
+        assert_eq!(continued.events[0].0, 1);
+        assert_eq!(continued.oldest_available_sequence, Some(1));
+        assert!(continued.history_truncated);
+        store
+            .record_event(WebhookEvent::new(
+                ep.endpoint_id.clone(),
+                json!({}),
+                true,
+                None,
+            ))
+            .unwrap();
+        assert!(matches!(
+            store.poll_events(
+                &ep.endpoint_id,
+                Some(&first_page.next_cursor),
+                1,
+                1024,
+                false
+            ),
+            Err(WebhookReceiverError::ReplayGap { .. })
+        ));
+        let restarted = store
+            .poll_events(&ep.endpoint_id, None, 1, 1024, false)
+            .unwrap();
+        assert_eq!(restarted.events[0].0, 2);
+        assert!(restarted.history_truncated);
     }
 
     #[test]
@@ -1195,6 +1464,10 @@ mod tests {
         let endpoint = store
             .create_endpoint("/events".into(), "secret".into(), vec![])
             .unwrap();
+        let initial_cursor = store
+            .poll_events(&endpoint.endpoint_id, None, 1, 1024, false)
+            .unwrap()
+            .next_cursor;
         let half_limit = MAX_RETAINED_EVENT_BYTES_PER_ENDPOINT / 2;
         store
             .record_event(sized_event(&endpoint.endpoint_id, "first", half_limit))
@@ -1212,6 +1485,21 @@ mod tests {
         assert_eq!(store.total_event_count(), 2);
         assert_eq!(store.retained_event_bytes(), half_limit + 1024);
         assert_eq!(store.replay_event_count(), 3);
+        assert!(matches!(
+            store.poll_events(
+                &endpoint.endpoint_id,
+                Some(&initial_cursor),
+                1,
+                half_limit,
+                false
+            ),
+            Err(WebhookReceiverError::ReplayGap { .. })
+        ));
+        let retention = store
+            .poll_events(&endpoint.endpoint_id, None, 1, 1024, true)
+            .unwrap();
+        assert!(retention.history_truncated);
+        assert_eq!(retention.oldest_available_sequence, Some(1));
         let mut replay = WebhookEvent::new(endpoint.endpoint_id.clone(), json!({}), true, None);
         replay.event_id = "first".into();
         assert!(matches!(
@@ -1240,11 +1528,18 @@ mod tests {
     fn global_byte_retention_evicts_by_arrival_order_and_keeps_other_endpoints() {
         let mut store = WebhookStore::new();
         let mut endpoint_ids = Vec::new();
+        let mut cursors = Vec::new();
         let count = MAX_RETAINED_EVENT_BYTES_TOTAL / MAX_RETAINED_EVENT_BYTES_PER_ENDPOINT + 1;
         for index in 0..count {
             let endpoint = store
                 .create_endpoint(format!("/events-{index}"), "secret".into(), vec![])
                 .unwrap();
+            cursors.push(
+                store
+                    .poll_events(&endpoint.endpoint_id, None, 1, 1024, false)
+                    .unwrap()
+                    .next_cursor,
+            );
             let mut event = sized_event(
                 &endpoint.endpoint_id,
                 "delivery",
@@ -1273,12 +1568,551 @@ mod tests {
             );
         }
         assert_eq!(store.replay_event_count(), count);
+        assert!(matches!(
+            store.poll_events(&endpoint_ids[0], Some(&cursors[0]), 1, 1024, false),
+            Err(WebhookReceiverError::ReplayGap { .. })
+        ));
+        let empty = store
+            .poll_events(&endpoint_ids[0], None, 1, 1024, false)
+            .unwrap();
+        assert!(empty.events.is_empty());
+        assert!(empty.history_truncated);
+        assert_eq!(empty.oldest_available_sequence, None);
+        assert_eq!(empty.next_sequence, count as u64);
+        // Eviction from the first endpoint does not invalidate another scope.
+        assert!(matches!(
+            store.poll_events(&endpoint_ids[1], Some(&cursors[1]), 1, 1024, false),
+            Err(WebhookReceiverError::PayloadTooLarge { .. })
+        ));
         let mut replay = WebhookEvent::new(endpoint_ids[0].clone(), json!({}), true, None);
         replay.event_id = "delivery".into();
         assert!(matches!(
             store.record_event(replay),
             Err(WebhookReceiverError::DuplicateEvent { .. })
         ));
+    }
+
+    #[test]
+    fn poll_events_pages_by_arrival_despite_tied_and_out_of_order_timestamps() {
+        let mut store = WebhookStore::new();
+        let endpoint = store
+            .create_endpoint("/poll".into(), "secret".into(), vec![])
+            .unwrap();
+        let initial_cursor = store
+            .poll_events(&endpoint.endpoint_id, None, 2, 4096, false)
+            .unwrap()
+            .next_cursor;
+        let timestamp = Utc::now();
+        for (index, seconds) in [30, 30, -10, 90, -60].into_iter().enumerate() {
+            let mut event = WebhookEvent::new(
+                endpoint.endpoint_id.clone(),
+                json!({"index": index}),
+                true,
+                None,
+            );
+            event.event_id = format!("delivery-{index}");
+            event.received_at = timestamp + chrono::Duration::seconds(seconds);
+            store.record_event(event).unwrap();
+        }
+
+        let first = store
+            .poll_events(&endpoint.endpoint_id, Some(&initial_cursor), 2, 4096, false)
+            .unwrap();
+        assert_eq!(
+            first.events.iter().map(|(seq, _)| *seq).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(first.events[0].1.event_id, "delivery-0");
+        assert_eq!(first.events[1].1.event_id, "delivery-1");
+        assert!(first.has_more);
+        assert!(!first.history_truncated);
+        assert_eq!(first.oldest_available_sequence, Some(0));
+        assert_eq!(first.next_sequence, 5);
+        let repeated = store
+            .poll_events(&endpoint.endpoint_id, Some(&initial_cursor), 2, 4096, false)
+            .unwrap();
+        assert_eq!(repeated.next_cursor, first.next_cursor);
+        assert_eq!(
+            repeated.serialized_event_bytes,
+            first.serialized_event_bytes
+        );
+        assert_eq!(
+            serde_json::to_value(repeated.events).unwrap(),
+            serde_json::to_value(&first.events).unwrap()
+        );
+
+        let second = store
+            .poll_events(
+                &endpoint.endpoint_id,
+                Some(&first.next_cursor),
+                2,
+                4096,
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            second
+                .events
+                .iter()
+                .map(|(seq, _)| *seq)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        assert!(second.has_more);
+        let last = store
+            .poll_events(
+                &endpoint.endpoint_id,
+                Some(&second.next_cursor),
+                2,
+                4096,
+                false,
+            )
+            .unwrap();
+        assert_eq!(last.events.len(), 1);
+        assert_eq!(last.events[0].0, 4);
+        assert_eq!(last.events[0].1.event_id, "delivery-4");
+        assert!(!last.has_more);
+        let exhausted = store
+            .poll_events(
+                &endpoint.endpoint_id,
+                Some(&last.next_cursor),
+                2,
+                4096,
+                false,
+            )
+            .unwrap();
+        assert!(exhausted.events.is_empty());
+        assert_eq!(exhausted.serialized_event_bytes, 0);
+        assert!(!exhausted.has_more);
+        assert_eq!(exhausted.next_cursor, last.next_cursor);
+    }
+
+    #[test]
+    fn poll_events_scope_and_frontier_follow_interleaved_endpoint_arrivals() {
+        let mut store = WebhookStore::new();
+        let first = store
+            .create_endpoint("/first".into(), "secret".into(), vec![])
+            .unwrap();
+        let other = store
+            .create_endpoint("/other".into(), "secret".into(), vec![])
+            .unwrap();
+        for (index, endpoint_id) in [
+            &first.endpoint_id,
+            &other.endpoint_id,
+            &first.endpoint_id,
+            &other.endpoint_id,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut event = WebhookEvent::new(endpoint_id.clone(), json!({}), true, None);
+            event.event_id = format!("delivery-{index}");
+            store.record_event(event).unwrap();
+        }
+        let first_page = store
+            .poll_events(&first.endpoint_id, None, 1, 4096, false)
+            .unwrap();
+        assert_eq!(first_page.events[0].0, 0);
+        assert!(first_page.has_more);
+        assert!(matches!(
+            store.poll_events(
+                &other.endpoint_id,
+                Some(&first_page.next_cursor),
+                1,
+                4096,
+                false
+            ),
+            Err(WebhookReceiverError::InvalidInput { .. })
+        ));
+        let second_page = store
+            .poll_events(
+                &first.endpoint_id,
+                Some(&first_page.next_cursor),
+                1,
+                4096,
+                false,
+            )
+            .unwrap();
+        assert_eq!(second_page.events[0].0, 2);
+        assert!(!second_page.has_more);
+        assert_eq!(second_page.next_sequence, 4);
+        assert_eq!(
+            store
+                .decode_event_cursor(&first.endpoint_id, &second_page.next_cursor)
+                .unwrap(),
+            4
+        );
+
+        store
+            .record_event(WebhookEvent::new(other.endpoint_id, json!({}), true, None))
+            .unwrap();
+        let exhausted = store
+            .poll_events(
+                &first.endpoint_id,
+                Some(&second_page.next_cursor),
+                1,
+                4096,
+                false,
+            )
+            .unwrap();
+        assert!(exhausted.events.is_empty());
+        assert!(!exhausted.has_more);
+        assert_eq!(exhausted.next_sequence, 5);
+        assert_eq!(
+            store
+                .decode_event_cursor(&first.endpoint_id, &exhausted.next_cursor)
+                .unwrap(),
+            5
+        );
+        assert_ne!(exhausted.next_cursor, second_page.next_cursor);
+    }
+
+    #[test]
+    fn poll_cursors_reject_current_epoch_tampering_future_positions_and_oversized_input() {
+        let mut store = WebhookStore::new();
+        let endpoint = store
+            .create_endpoint("/poll".into(), "secret".into(), vec![])
+            .unwrap();
+        let cursor = store
+            .poll_events(&endpoint.endpoint_id, None, 1, 1024, false)
+            .unwrap()
+            .next_cursor;
+        assert!(cursor.len() <= MAX_EVENT_CURSOR_BYTES);
+        for index in [
+            0,
+            17,
+            48,
+            49,
+            56,
+            EVENT_CURSOR_PAYLOAD_BYTES,
+            EVENT_CURSOR_BYTES - 1,
+        ] {
+            let mut bytes = URL_SAFE_NO_PAD.decode(&cursor).unwrap();
+            bytes[index] ^= 1;
+            let modified = URL_SAFE_NO_PAD.encode(bytes);
+            assert!(
+                matches!(
+                    store.poll_events(&endpoint.endpoint_id, Some(&modified), 1, 1024, false),
+                    Err(WebhookReceiverError::InvalidInput { .. })
+                ),
+                "tampered byte {index}"
+            );
+        }
+        let future = store.encode_event_cursor(&endpoint.endpoint_id, 1);
+        for malformed in [
+            String::new(),
+            "%%%".into(),
+            "a".repeat(MAX_EVENT_CURSOR_BYTES + 1),
+            URL_SAFE_NO_PAD.encode([0; EVENT_CURSOR_BYTES - 1]),
+            format!("{cursor}="),
+            future,
+        ] {
+            assert!(matches!(
+                store.poll_events(&endpoint.endpoint_id, Some(&malformed), 1, 1024, false),
+                Err(WebhookReceiverError::InvalidInput { .. })
+            ));
+        }
+        let mut foreign_epoch = URL_SAFE_NO_PAD.decode(&cursor).unwrap();
+        foreign_epoch[1] ^= 1;
+        assert!(matches!(
+            store.poll_events(
+                &endpoint.endpoint_id,
+                Some(&URL_SAFE_NO_PAD.encode(foreign_epoch)),
+                1,
+                1024,
+                false
+            ),
+            Err(WebhookReceiverError::ExpiredCursor)
+        ));
+        // A matching epoch alone cannot authorize a cursor with a different key.
+        store.cursor_identity.key[0] ^= 1;
+        assert!(matches!(
+            store.poll_events(&endpoint.endpoint_id, Some(&cursor), 1, 1024, false),
+            Err(WebhookReceiverError::InvalidInput { .. })
+        ));
+    }
+
+    #[test]
+    fn poll_events_byte_budget_returns_complete_events_and_no_empty_retry_loop() {
+        let mut store = WebhookStore::new();
+        let endpoint = store
+            .create_endpoint("/poll".into(), "secret".into(), vec![])
+            .unwrap();
+        for (event_id, size) in [("first", 512), ("second", 1024), ("third", 768)] {
+            store
+                .record_event(sized_event(&endpoint.endpoint_id, event_id, size))
+                .unwrap();
+        }
+        assert!(matches!(
+            store.poll_events(&endpoint.endpoint_id, None, 100, 511, false),
+            Err(WebhookReceiverError::PayloadTooLarge { .. })
+        ));
+        let first = store
+            .poll_events(&endpoint.endpoint_id, None, 100, 512, false)
+            .unwrap();
+        assert_eq!(first.events.len(), 1);
+        assert_eq!(first.events[0].1.event_id, "first");
+        assert_eq!(first.serialized_event_bytes, 512);
+        assert!(first.has_more);
+        assert!(matches!(
+            store.poll_events(
+                &endpoint.endpoint_id,
+                Some(&first.next_cursor),
+                100,
+                1023,
+                false
+            ),
+            Err(WebhookReceiverError::PayloadTooLarge { .. })
+        ));
+        let second = store
+            .poll_events(
+                &endpoint.endpoint_id,
+                Some(&first.next_cursor),
+                100,
+                1024,
+                false,
+            )
+            .unwrap();
+        assert_eq!(second.events.len(), 1);
+        assert_eq!(second.events[0].1.event_id, "second");
+        assert_eq!(second.serialized_event_bytes, 1024);
+        assert!(second.has_more);
+        let exact = store
+            .poll_events(&endpoint.endpoint_id, None, 100, 1536, false)
+            .unwrap();
+        assert_eq!(exact.events.len(), 2);
+        assert_eq!(exact.serialized_event_bytes, 1536);
+        assert_eq!(exact.next_cursor, second.next_cursor);
+        assert!(exact.has_more);
+        let last = store
+            .poll_events(
+                &endpoint.endpoint_id,
+                Some(&exact.next_cursor),
+                100,
+                768,
+                false,
+            )
+            .unwrap();
+        assert_eq!(last.events[0].1.event_id, "third");
+        assert_eq!(last.serialized_event_bytes, 768);
+        assert!(!last.has_more);
+        assert_eq!(store.total_event_count(), 3);
+        assert_eq!(store.replay_event_count(), 3);
+        assert_eq!(store.retained_event_bytes(), 2304);
+    }
+
+    #[test]
+    fn poll_events_latest_empty_and_argument_boundaries_are_explicit() {
+        let mut store = WebhookStore::new();
+        let endpoint = store
+            .create_endpoint("/poll".into(), "secret".into(), vec![])
+            .unwrap();
+        let empty = store
+            .poll_events(&endpoint.endpoint_id, None, 100, 1, false)
+            .unwrap();
+        assert!(empty.events.is_empty());
+        assert!(!empty.has_more);
+        assert!(!empty.history_truncated);
+        assert_eq!(empty.oldest_available_sequence, None);
+        assert_eq!(empty.next_sequence, 0);
+        assert_eq!(empty.serialized_event_bytes, 0);
+        store
+            .record_event(sized_event(&endpoint.endpoint_id, "existing", 512))
+            .unwrap();
+        let latest = store
+            .poll_events(&endpoint.endpoint_id, None, 1, 1, true)
+            .unwrap();
+        assert!(latest.events.is_empty());
+        assert!(!latest.has_more);
+        assert_eq!(latest.oldest_available_sequence, Some(0));
+        assert_eq!(latest.next_sequence, 1);
+        store
+            .record_event(sized_event(&endpoint.endpoint_id, "new", 512))
+            .unwrap();
+        let arrival = store
+            .poll_events(
+                &endpoint.endpoint_id,
+                Some(&latest.next_cursor),
+                1,
+                512,
+                false,
+            )
+            .unwrap();
+        assert_eq!(arrival.events.len(), 1);
+        assert_eq!(arrival.events[0].0, 1);
+        assert_eq!(arrival.events[0].1.event_id, "new");
+        let retained = store
+            .poll_events(
+                &endpoint.endpoint_id,
+                Some(&empty.next_cursor),
+                100,
+                1024,
+                false,
+            )
+            .unwrap();
+        assert_eq!(retained.events.len(), 2);
+        for (limit, max_bytes) in [
+            (0, 1),
+            (MAX_EVENTS_LIMIT + 1, 1),
+            (1, 0),
+            (1, MAX_RETAINED_EVENT_BYTES_PER_ENDPOINT + 1),
+        ] {
+            assert!(matches!(
+                store.poll_events(&endpoint.endpoint_id, None, limit, max_bytes, false),
+                Err(WebhookReceiverError::InvalidInput { .. })
+            ));
+        }
+        assert!(matches!(
+            store.poll_events(
+                &endpoint.endpoint_id,
+                Some(&latest.next_cursor),
+                1,
+                1024,
+                true
+            ),
+            Err(WebhookReceiverError::InvalidInput { .. })
+        ));
+        assert!(matches!(
+            store.poll_events(" ", None, 1, 1024, false),
+            Err(WebhookReceiverError::InvalidInput { .. })
+        ));
+        assert!(matches!(
+            store.poll_events("unknown", None, 1, 1024, false),
+            Err(WebhookReceiverError::EndpointNotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn poll_cursors_survive_secret_rotation_but_expire_on_clear_and_restart() {
+        let mut store = WebhookStore::new();
+        let endpoint = store
+            .create_endpoint("/poll".into(), "secret".into(), vec![])
+            .unwrap();
+        let initial = store
+            .poll_events(&endpoint.endpoint_id, None, 1, 1024, false)
+            .unwrap();
+        store
+            .rotate_endpoint_secret(&endpoint.endpoint_id, "rotated".into())
+            .unwrap();
+        let rotated = store
+            .poll_events(
+                &endpoint.endpoint_id,
+                Some(&initial.next_cursor),
+                1,
+                1024,
+                false,
+            )
+            .unwrap();
+        assert_eq!(rotated.next_cursor, initial.next_cursor);
+        let restarted = WebhookStore::new();
+        assert!(matches!(
+            restarted.poll_events(
+                &endpoint.endpoint_id,
+                Some(&initial.next_cursor),
+                1,
+                1024,
+                false
+            ),
+            Err(WebhookReceiverError::ExpiredCursor)
+        ));
+        store.clear();
+        assert!(matches!(
+            store.poll_events(
+                &endpoint.endpoint_id,
+                Some(&initial.next_cursor),
+                1,
+                1024,
+                false
+            ),
+            Err(WebhookReceiverError::ExpiredCursor)
+        ));
+        let replacement = store
+            .create_endpoint("/poll".into(), "replacement".into(), vec![])
+            .unwrap();
+        assert!(matches!(
+            store.poll_events(
+                &replacement.endpoint_id,
+                Some(&initial.next_cursor),
+                1,
+                1024,
+                false
+            ),
+            Err(WebhookReceiverError::ExpiredCursor)
+        ));
+        let current = store
+            .poll_events(&replacement.endpoint_id, None, 1, 1024, false)
+            .unwrap();
+        assert_ne!(current.next_cursor, initial.next_cursor);
+        store.delete_endpoint(&replacement.endpoint_id).unwrap();
+        assert!(matches!(
+            store.poll_events(
+                &replacement.endpoint_id,
+                Some(&current.next_cursor),
+                1,
+                1024,
+                false
+            ),
+            Err(WebhookReceiverError::EndpointNotFound { .. })
+        ));
+        let recreated = store
+            .create_endpoint("/poll".into(), "replacement".into(), vec![])
+            .unwrap();
+        assert!(matches!(
+            store.poll_events(
+                &recreated.endpoint_id,
+                Some(&current.next_cursor),
+                1,
+                1024,
+                false
+            ),
+            Err(WebhookReceiverError::InvalidInput { .. })
+        ));
+    }
+
+    #[test]
+    fn poll_events_does_not_consume_deliveries_or_authenticated_replay_claims() {
+        let mut store = WebhookStore::new();
+        let endpoint = store
+            .create_endpoint("/poll".into(), "secret".into(), vec![])
+            .unwrap();
+        let event = sized_event(&endpoint.endpoint_id, "original", 512);
+        store
+            .record_authenticated_event(event.clone(), [7; 32])
+            .unwrap();
+        for _ in 0..3 {
+            let page = store
+                .poll_events(&endpoint.endpoint_id, None, 1, 512, false)
+                .unwrap();
+            assert_eq!(page.events[0].1.event_id, "original");
+            assert_eq!(page.next_sequence, 1);
+        }
+        assert!(matches!(
+            store.record_authenticated_event(event.clone(), [8; 32]),
+            Err(WebhookReceiverError::DuplicateEvent { .. })
+        ));
+        let mut alias = event;
+        alias.event_id = "unsigned-alias".into();
+        assert!(matches!(
+            store.record_authenticated_event(alias, [7; 32]),
+            Err(WebhookReceiverError::DuplicateEvent { .. })
+        ));
+        assert_eq!(store.total_event_count(), 1);
+        assert_eq!(store.replay_event_count(), 1);
+        assert_eq!(
+            store.authenticated_deliveries[&endpoint.endpoint_id].len(),
+            1
+        );
+        assert_eq!(store.next_event_sequence, 1);
+    }
+
+    #[test]
+    fn cursor_authentication_key_is_redacted_from_store_debug() {
+        let mut store = WebhookStore::new();
+        store.cursor_identity.key = [83; 32];
+        let debug = format!("{store:?}");
+        assert!(debug.contains("CursorIdentity"));
+        assert!(!debug.contains(&format!("{:?}", store.cursor_identity.key)));
+        assert!(!debug.contains(&URL_SAFE_NO_PAD.encode(store.cursor_identity.key)));
     }
 
     #[test]

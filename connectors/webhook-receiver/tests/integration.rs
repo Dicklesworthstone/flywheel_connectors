@@ -99,7 +99,7 @@ impl SignedConnector {
             | "webhook.endpoints.delete"
             | "webhook.endpoints.rotate_secret" => "webhook.endpoints.write",
             "webhook.endpoints.list" | "webhook.health" => "webhook.endpoints.read",
-            "webhook.events.recent" => "webhook.events.read",
+            "webhook.events.recent" | "webhook.events.poll" => "webhook.events.read",
             "webhook.events.ingest" => "webhook.events.write",
             _ => operation,
         };
@@ -2165,6 +2165,283 @@ async fn events_ingest_twilio_accepts_status_changes_but_rejects_equivalent_form
     assert_eq!(statuses, vec!["delivered", "sent"]);
 }
 
+// -- Authenticated cursor replay --
+
+#[fcp_async_core::runtime::test]
+async fn events_poll_pages_verified_events_without_disclosing_other_endpoints_or_secrets() {
+    let mut c = setup_connector().await;
+    let first = create_endpoint(&mut c, "/poll", "github", "poll-secret").await;
+    let second = create_endpoint(&mut c, "/other-poll", "github", "other-secret").await;
+    for index in 0..3 {
+        let body = json!({"index": index}).to_string();
+        ingest(
+            &mut c,
+            "/poll",
+            json!({
+                "Content-Type": "application/json",
+                "X-Hub-Signature-256": hmac_sha256_hex("poll-secret", &body),
+                "Authorization": "Bearer must-not-leak"
+            }),
+            &body,
+            &format!("poll-{index}"),
+        )
+        .await
+        .unwrap();
+    }
+    let other_body = r#"{"private":"other endpoint"}"#;
+    ingest(
+        &mut c,
+        "/other-poll",
+        json!({
+            "Content-Type": "application/json",
+            "X-Hub-Signature-256": hmac_sha256_hex("other-secret", other_body)
+        }),
+        other_body,
+        "other-poll",
+    )
+    .await
+    .unwrap();
+    let first_page = c
+        .handle_invoke(json!({
+            "operation_id": "webhook.events.poll",
+            "input": {"endpoint_id": first["endpoint_id"], "limit": 2}
+        }))
+        .await
+        .unwrap();
+    assert_eq!(first_page["endpoint_id"], first["endpoint_id"]);
+    assert_eq!(first_page["has_more"], true);
+    assert_eq!(first_page["retention"]["history_truncated"], false);
+    let events = first_page["events"].as_array().unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0]["event_id"], "poll-0");
+    assert_eq!(events[1]["event_id"], "poll-1");
+    assert!(events[0]["sequence"].as_u64() < events[1]["sequence"].as_u64());
+    for event in events {
+        assert!(event.get("source_ip").is_none());
+        assert!(event["source_ip_hash"].as_str().is_some());
+        assert!(event["headers"].get("authorization").is_none());
+        assert!(event["headers"].get("x-hub-signature-256").is_none());
+        assert_eq!(event["signature_valid"], true);
+        assert_eq!(event["endpoint_id"], first["endpoint_id"]);
+    }
+    let resume = json!({
+        "operation_id": "webhook.events.poll",
+        "input": {
+            "endpoint_id": first["endpoint_id"],
+            "cursor": first_page["next_cursor"],
+            "limit": 2
+        }
+    });
+    let last_page = c.handle_invoke(resume.clone()).await.unwrap();
+    assert_eq!(last_page["events"].as_array().unwrap().len(), 1);
+    assert_eq!(last_page["events"][0]["event_id"], "poll-2");
+    assert_eq!(last_page["has_more"], false);
+    assert_eq!(c.handle_invoke(resume).await.unwrap(), last_page);
+    assert_external_status(
+        c.handle_invoke(json!({
+            "operation_id": "webhook.events.poll",
+            "input": {"endpoint_id": second["endpoint_id"], "cursor": first_page["next_cursor"]}
+        }))
+        .await,
+        400,
+    );
+}
+
+#[fcp_async_core::runtime::test]
+async fn events_poll_rejects_invalid_parameters_and_tampered_cursors() {
+    let mut c = setup_connector().await;
+    let endpoint = create_endpoint(&mut c, "/poll-invalid", "github", "poll-secret").await;
+    let empty = c
+        .handle_invoke(json!({
+            "operation_id": "webhook.events.poll",
+            "input": {"endpoint_id": endpoint["endpoint_id"]}
+        }))
+        .await
+        .unwrap();
+    assert_eq!(empty["events"], json!([]));
+    assert_eq!(empty["retention"]["oldest_available_sequence"], json!(null));
+    let cursor = empty["next_cursor"].as_str().unwrap();
+    let mut tampered = cursor.as_bytes().to_vec();
+    let tag_position = tampered.len() - 2;
+    tampered[tag_position] = if tampered[tag_position] == b'A' {
+        b'B'
+    } else {
+        b'A'
+    };
+    for input in [
+        json!({}),
+        json!({"endpoint_id": ""}),
+        json!({"endpoint_id": endpoint["endpoint_id"], "limit": 0}),
+        json!({"endpoint_id": endpoint["endpoint_id"], "limit": 101}),
+        json!({"endpoint_id": endpoint["endpoint_id"], "limit": -1}),
+        json!({"endpoint_id": endpoint["endpoint_id"], "max_bytes": 0}),
+        json!({"endpoint_id": endpoint["endpoint_id"], "max_bytes": 16_777_217}),
+        json!({"endpoint_id": endpoint["endpoint_id"], "max_bytes": "100"}),
+        json!({"endpoint_id": endpoint["endpoint_id"], "start": "yesterday"}),
+        json!({"endpoint_id": endpoint["endpoint_id"], "cursor": null}),
+        json!({"endpoint_id": endpoint["endpoint_id"], "cursor": cursor, "start": "earliest"}),
+        json!({"endpoint_id": endpoint["endpoint_id"], "cursor": String::from_utf8(tampered).unwrap()}),
+        json!({"endpoint_id": endpoint["endpoint_id"], "extra": true}),
+    ] {
+        assert_external_status(
+            c.handle_invoke(json!({"operation_id": "webhook.events.poll", "input": input}))
+                .await,
+            400,
+        );
+    }
+}
+
+#[fcp_async_core::runtime::test]
+async fn events_poll_latest_survives_rehandshake_but_expires_after_reconfiguration() {
+    let mut c = setup_connector().await;
+    let endpoint = create_endpoint(&mut c, "/poll-latest", "github", "poll-secret").await;
+    let initial = c
+        .handle_invoke(json!({
+            "operation_id": "webhook.events.poll",
+            "input": {"endpoint_id": endpoint["endpoint_id"], "start": "latest"}
+        }))
+        .await
+        .unwrap();
+    assert_eq!(initial["events"], json!([]));
+    let body = r#"{"new":true}"#;
+    ingest(
+        &mut c,
+        "/poll-latest",
+        json!({
+            "Content-Type": "application/json",
+            "X-Hub-Signature-256": hmac_sha256_hex("poll-secret", body)
+        }),
+        body,
+        "poll-after-latest",
+    )
+    .await
+    .unwrap();
+    let params = json!({
+        "operation_id": "webhook.events.poll",
+        "input": {"endpoint_id": endpoint["endpoint_id"], "cursor": initial["next_cursor"]}
+    });
+    let stale_authority = c.request(params.clone()).unwrap();
+    c.handshake().await;
+    assert!(c.inner.handle_invoke(json!(stale_authority)).await.is_err());
+    let resumed = c.handle_invoke(params.clone()).await.unwrap();
+    assert_eq!(resumed["events"][0]["event_id"], "poll-after-latest");
+    assert_external_status(
+        c.handle_invoke(json!({
+            "operation_id": "webhook.events.poll",
+            "input": {"endpoint_id": endpoint["endpoint_id"], "max_bytes": 1}
+        }))
+        .await,
+        413,
+    );
+    c.inner
+        .handle_configure(json!({"public_base_url": "https://hooks.flywheel.test"}))
+        .await
+        .unwrap();
+    c.handshake().await;
+    let error = c.handle_invoke(params).await.unwrap_err();
+    assert!(matches!(error, FcpError::External {
+        status_code: Some(410), retryable: false, ref message, ..
+    } if message == "webhook_cursor_expired"));
+}
+
+#[fcp_async_core::runtime::test]
+async fn events_poll_reports_unread_retention_gap_and_allows_explicit_restart() {
+    let mut c = setup_connector_with_config(json!({
+        "public_base_url": "https://hooks.flywheel.test", "rate_limit_max": 10_000
+    }))
+    .await;
+    let endpoint = create_endpoint(&mut c, "/poll-gap", "github", "poll-secret").await;
+    let initial = c
+        .handle_invoke(json!({
+            "operation_id": "webhook.events.poll",
+            "input": {"endpoint_id": endpoint["endpoint_id"], "start": "latest"}
+        }))
+        .await
+        .unwrap();
+    for index in 0..=fcp_webhook_receiver::client::MAX_EVENTS_PER_ENDPOINT {
+        let body = json!({"index": index}).to_string();
+        ingest(
+            &mut c,
+            "/poll-gap",
+            json!({
+                "Content-Type": "application/json",
+                "X-Hub-Signature-256": hmac_sha256_hex("poll-secret", &body)
+            }),
+            &body,
+            &format!("gap-{index}"),
+        )
+        .await
+        .unwrap();
+    }
+    let error = c
+        .handle_invoke(json!({
+            "operation_id": "webhook.events.poll",
+            "input": {"endpoint_id": endpoint["endpoint_id"], "cursor": initial["next_cursor"]}
+        }))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, FcpError::External {
+        status_code: Some(410), retryable: false, ref message, ..
+    } if message == "webhook_replay_gap"));
+    let restarted = c
+        .handle_invoke(json!({
+            "operation_id": "webhook.events.poll",
+            "input": {"endpoint_id": endpoint["endpoint_id"], "start": "earliest", "limit": 1}
+        }))
+        .await
+        .unwrap();
+    assert_eq!(restarted["retention"]["history_truncated"], true);
+    assert_eq!(restarted["events"][0]["event_id"], "gap-1");
+    assert_eq!(restarted["has_more"], true);
+}
+
+#[fcp_async_core::runtime::test]
+async fn events_poll_binds_signed_authority_to_actual_endpoint_before_cursor_processing() {
+    let mut c = setup_connector().await;
+    let allowed = create_endpoint(&mut c, "/poll-allowed", "github", "secret-one").await;
+    let denied = create_endpoint(&mut c, "/poll-denied", "github", "secret-two").await;
+    let constraints = CapabilityConstraints {
+        resource_allow: vec![allowed["url"].as_str().unwrap().into()],
+        resource_deny: vec![denied["url"].as_str().unwrap().into()],
+        ..Default::default()
+    };
+    let now = Utc::now();
+    let token = CapabilityToken::from_raw(
+        CapabilityTokenBuilder::new()
+            .capability_id("webhook.events.read")
+            .zone_id("z:work")
+            .principal("user:webhook-test")
+            .operations(&["webhook.events.poll"])
+            .issuer("node:webhook-test")
+            .target_instance(&c.instance_id)
+            .token_id(b"scoped-webhook-poll")
+            .validity(now, now + Duration::hours(1))
+            .try_constraints_cbor(&fcp_cbor::to_canonical_cbor(&constraints).unwrap())
+            .unwrap()
+            .sign(&c.key)
+            .unwrap(),
+    );
+    let mut request = c
+        .request(json!({
+            "operation_id": "webhook.events.poll",
+            "input": {"endpoint_id": denied["endpoint_id"], "cursor": "not-a-cursor"}
+        }))
+        .unwrap();
+    request.capability_token = token;
+    let before = c.inner.handle_health().await.unwrap()["requests"].clone();
+    assert!(c.inner.handle_invoke(json!(request.clone())).await.is_err());
+    assert_eq!(c.inner.handle_health().await.unwrap()["requests"], before);
+    request.id = RequestId::random();
+    request.input = json!({"endpoint_id": allowed["endpoint_id"]});
+    assert!(c.inner.handle_invoke(json!(request.clone())).await.is_ok());
+    request.id = RequestId::random();
+    request.zone_id = ZoneId::private();
+    assert!(c.inner.handle_invoke(json!(request.clone())).await.is_err());
+    request.zone_id = ZoneId::work();
+    request.operation = OperationId::from_static("webhook.events.recent");
+    assert!(c.inner.handle_invoke(json!(request)).await.is_err());
+}
+
 // -- Unknown operation / Simulate --
 
 #[fcp_async_core::runtime::test]
@@ -2189,6 +2466,7 @@ async fn simulate_known_operations() {
         "webhook.endpoints.delete",
         "webhook.endpoints.list",
         "webhook.events.recent",
+        "webhook.events.poll",
         "webhook.events.ingest",
     ] {
         let result = c
@@ -2641,7 +2919,7 @@ async fn authority_typed_health_and_introspection_support_host_preparation() {
     assert_eq!(health["instance_id"], health["details"]["instance_id"]);
     let catalog: fcp_prelude::Introspection =
         serde_json::from_value(c.inner.handle_introspect().await.unwrap()).unwrap();
-    assert_eq!(catalog.operations.len(), 7);
+    assert_eq!(catalog.operations.len(), 8);
     let operation = catalog
         .operations
         .iter()
@@ -2664,6 +2942,7 @@ async fn authority_missing_token_cannot_read_events_or_mutate_endpoints() {
     for operation in [
         "webhook.endpoints.list",
         "webhook.events.recent",
+        "webhook.events.poll",
         "webhook.endpoints.create",
     ] {
         let request = c

@@ -32,6 +32,14 @@ pub enum WebhookReceiverError {
         event_id: String,
     },
 
+    /// Retention removed an event that the polling cursor has not passed.
+    #[error("Webhook replay gap for endpoint {endpoint_id}; restart polling explicitly")]
+    ReplayGap { endpoint_id: String },
+
+    /// Polling cursors cannot cross receiver reset or restart boundaries.
+    #[error("Webhook cursor expired with its receiver state; restart polling explicitly")]
+    ExpiredCursor,
+
     /// Invalid input
     #[error("Invalid input: {message}")]
     InvalidInput { message: String },
@@ -84,6 +92,8 @@ impl WebhookReceiverError {
             Self::EndpointNotFound { .. }
             | Self::DuplicatePath { .. }
             | Self::DuplicateEvent { .. }
+            | Self::ReplayGap { .. }
+            | Self::ExpiredCursor
             | Self::InvalidInput { .. }
             | Self::Unauthorized { .. }
             | Self::Forbidden { .. }
@@ -133,6 +143,20 @@ impl WebhookReceiverError {
                 service: "webhook-receiver".into(),
                 message: format!("Event already recorded for endpoint {endpoint_id}: {event_id}"),
                 status_code: Some(409),
+                retryable: false,
+                retry_after: None,
+            },
+            Self::ReplayGap { .. } => FcpError::External {
+                service: "webhook-receiver".into(),
+                message: "webhook_replay_gap".into(),
+                status_code: Some(410),
+                retryable: false,
+                retry_after: None,
+            },
+            Self::ExpiredCursor => FcpError::External {
+                service: "webhook-receiver".into(),
+                message: "webhook_cursor_expired".into(),
+                status_code: Some(410),
                 retryable: false,
                 retry_after: None,
             },
@@ -479,6 +503,41 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn polling_gaps_and_expired_cursors_have_stable_nonretryable_reasons() {
+        for (error, reason) in [
+            (
+                WebhookReceiverError::ReplayGap {
+                    endpoint_id: "ep_private".into(),
+                },
+                "webhook_replay_gap",
+            ),
+            (
+                WebhookReceiverError::ExpiredCursor,
+                "webhook_cursor_expired",
+            ),
+        ] {
+            assert!(!error.is_retryable());
+            assert_eq!(error.retry_after(), None);
+            match error.to_fcp_error() {
+                FcpError::External {
+                    service,
+                    message,
+                    status_code,
+                    retryable,
+                    retry_after,
+                } => {
+                    assert_eq!(service, "webhook-receiver");
+                    assert_eq!(message, reason);
+                    assert_eq!(status_code, Some(410));
+                    assert!(!retryable);
+                    assert_eq!(retry_after, None);
+                }
+                other => panic!("expected External, got {other:?}"),
+            }
+        }
     }
 
     #[test]

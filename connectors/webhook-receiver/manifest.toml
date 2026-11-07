@@ -5,7 +5,7 @@ min_mesh_version = "2.0.0"
 min_protocol = "fcp2-sym/2.0"
 protocol_features = []
 max_datagram_bytes = 65000
-interface_hash = "blake3-256:fcp.interface.v2:9568be35f86644de398c59912ccc2e57c87d9076f0f3f5bb54e9585d9a12f949"
+interface_hash = "blake3-256:fcp.interface.v2:5a34f7dc6ee021ef6842fa53191d1bc9e65bb647fda7cf550237e399237895b1"
 
 [connector]
 id = "fcp.webhook-receiver"
@@ -558,6 +558,105 @@ common_mistakes = [
 examples = ['{"endpoint_id": "ep_abc123", "limit": 20}']
 related = ["webhook.endpoints.list"]
 
+[provides.operations."webhook.events.poll"]
+description = "Replay webhook events in arrival order with scoped cursors and loss detection"
+capability = "webhook.events.read"
+risk_level = "low"
+safety_tier = "safe"
+requires_approval = "none"
+idempotency = "strict"
+
+[provides.operations."webhook.events.poll".input_schema]
+type = "object"
+required = ["endpoint_id"]
+additionalProperties = false
+not = { required = ["cursor", "start"] }
+
+[provides.operations."webhook.events.poll".input_schema.properties.endpoint_id]
+type = "string"
+minLength = 1
+
+[provides.operations."webhook.events.poll".input_schema.properties.cursor]
+type = "string"
+minLength = 1
+maxLength = 128
+
+[provides.operations."webhook.events.poll".input_schema.properties.start]
+type = "string"
+enum = ["earliest", "latest"]
+
+[provides.operations."webhook.events.poll".input_schema.properties.limit]
+type = "integer"
+minimum = 1
+maximum = 100
+default = 50
+
+[provides.operations."webhook.events.poll".input_schema.properties.max_bytes]
+type = "integer"
+minimum = 1
+maximum = 16777216
+default = 1048576
+
+[provides.operations."webhook.events.poll".output_schema]
+type = "object"
+required = ["endpoint_id", "events", "next_cursor", "has_more", "serialized_event_bytes", "retention"]
+additionalProperties = false
+
+[provides.operations."webhook.events.poll".output_schema.properties.endpoint_id]
+type = "string"
+
+[provides.operations."webhook.events.poll".output_schema.properties.events]
+type = "array"
+maxItems = 100
+
+[provides.operations."webhook.events.poll".output_schema.properties.events.items]
+type = "object"
+required = ["sequence", "event_id", "endpoint_id", "received_at", "headers", "payload", "signature_valid", "source_ip_hash"]
+additionalProperties = false
+
+[provides.operations."webhook.events.poll".output_schema.properties.events.items.properties]
+sequence = { type = "integer", minimum = 0 }
+event_id = { type = "string" }
+endpoint_id = { type = "string" }
+received_at = { type = "string" }
+headers = { type = "object", additionalProperties = { type = "string" } }
+payload = {}
+signature_valid = { type = "boolean" }
+source_ip_hash = { type = ["string", "null"] }
+
+[provides.operations."webhook.events.poll".output_schema.properties.next_cursor]
+type = "string"
+minLength = 1
+maxLength = 128
+
+[provides.operations."webhook.events.poll".output_schema.properties.has_more]
+type = "boolean"
+
+[provides.operations."webhook.events.poll".output_schema.properties.serialized_event_bytes]
+type = "integer"
+minimum = 0
+maximum = 16777216
+
+[provides.operations."webhook.events.poll".output_schema.properties.retention]
+type = "object"
+required = ["oldest_available_sequence", "next_sequence", "history_truncated"]
+additionalProperties = false
+
+[provides.operations."webhook.events.poll".output_schema.properties.retention.properties]
+oldest_available_sequence = { type = ["integer", "null"], minimum = 0 }
+next_sequence = { type = "integer", minimum = 0 }
+history_truncated = { type = "boolean" }
+
+[provides.operations."webhook.events.poll".ai_hints]
+when_to_use = "Consume retained events for one endpoint in arrival order, resuming from the returned cursor."
+common_mistakes = [
+    "Sending start with a continuation cursor; start selects only the first page.",
+    "Treating a 410 replay gap or expired cursor as successful delivery; recovery must be explicit.",
+    "Assuming cursors or event bodies survive receiver restart; retention is in-memory.",
+]
+examples = ['{"endpoint_id":"ep_abc123","start":"earliest","limit":50}']
+related = ["webhook.events.recent", "webhook.endpoints.list"]
+
 [provides.operations."webhook.health"]
 description = "Report authenticated connector readiness and ingress diagnostics"
 capability = "webhook.endpoints.read"
@@ -627,6 +726,7 @@ scope = "credential"
 [rate_limits.operation_pools]
 "webhook.endpoints.rotate_secret" = ["webhook.endpoints.write"]
 "webhook.events.recent" = ["webhook.events.read"]
+"webhook.events.poll" = ["webhook.events.read"]
 "webhook.endpoints.delete" = ["webhook.endpoints.write"]
 "webhook.endpoints.create" = ["webhook.endpoints.write"]
 "webhook.events.ingest" = ["webhook.events.write"]

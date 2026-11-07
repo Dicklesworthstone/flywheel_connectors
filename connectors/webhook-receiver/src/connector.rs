@@ -35,7 +35,10 @@ use subtle::ConstantTimeEq;
 use tracing::{info, instrument};
 
 use crate::{
-    client::{DEFAULT_PUBLIC_BASE_URL, WebhookStore},
+    client::{
+        DEFAULT_EVENTS_LIMIT, DEFAULT_PUBLIC_BASE_URL, MAX_EVENT_CURSOR_BYTES, MAX_EVENTS_LIMIT,
+        MAX_RETAINED_EVENT_BYTES_PER_ENDPOINT, WebhookStore,
+    },
     error::WebhookReceiverError,
     types::{SourceIpRange, WebhookEndpoint, WebhookEvent, WebhookProvider},
 };
@@ -48,6 +51,8 @@ const GATEWAY_BINDING_STATUS: &str = "unbound";
 const GATEWAY_BINDING_MESSAGE: &str =
     "No host or gateway HTTP adapter binding is reported by this connector instance.";
 const WEBHOOK_EVENTS_INGEST_OPERATION: &str = "webhook.events.ingest";
+const WEBHOOK_EVENTS_POLL_OPERATION: &str = "webhook.events.poll";
+const DEFAULT_EVENT_PAGE_BYTES: usize = 1024 * 1024;
 const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
 const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_BODY_TIMEOUT_MS: u64 = 15_000;
@@ -833,6 +838,9 @@ impl WebhookReceiverConnector {
             "webhook.events.recent" => self
                 .invoke_events_recent(input)
                 .map_err(|e| e.to_fcp_error()),
+            WEBHOOK_EVENTS_POLL_OPERATION => {
+                self.invoke_events_poll(input).map_err(|e| e.to_fcp_error())
+            }
             WEBHOOK_EVENTS_INGEST_OPERATION => self
                 .invoke_events_ingest(input)
                 .map_err(|e| e.to_fcp_error()),
@@ -904,6 +912,7 @@ impl WebhookReceiverConnector {
             "webhook.endpoints.delete"
                 | "webhook.endpoints.rotate_secret"
                 | "webhook.events.recent"
+                | WEBHOOK_EVENTS_POLL_OPERATION
         ) && let Some(id) = input.get("endpoint_id").and_then(Value::as_str)
         {
             return vec![
@@ -1164,6 +1173,80 @@ impl WebhookReceiverConnector {
             .collect();
 
         Ok(json!({ "events": events_json }))
+    }
+
+    fn invoke_events_poll(&self, input: &Value) -> Result<Value, WebhookReceiverError> {
+        let fields = input
+            .as_object()
+            .ok_or_else(|| WebhookReceiverError::InvalidInput {
+                message: "webhook.events.poll input must be an object".into(),
+            })?;
+        if fields.keys().any(|field| {
+            !matches!(
+                field.as_str(),
+                "endpoint_id" | "cursor" | "start" | "limit" | "max_bytes"
+            )
+        }) {
+            return Err(WebhookReceiverError::InvalidInput {
+                message: "webhook.events.poll input contains an unknown field".into(),
+            });
+        }
+        let endpoint_id = require_str(input, "endpoint_id")?;
+        if endpoint_id.is_empty() {
+            return Err(WebhookReceiverError::InvalidInput {
+                message: "endpoint_id must not be empty".into(),
+            });
+        }
+        let cursor = optional_str(input, "cursor")?;
+        let start = optional_str(input, "start")?;
+        if cursor.is_some() && start.is_some() {
+            return Err(WebhookReceiverError::InvalidInput {
+                message: "start is only valid without a cursor".into(),
+            });
+        }
+        let start_at_latest = match start {
+            None | Some("earliest") => false,
+            Some("latest") => true,
+            Some(_) => {
+                return Err(WebhookReceiverError::InvalidInput {
+                    message: "start must be earliest or latest".into(),
+                });
+            }
+        };
+        let limit = optional_usize_field(input, "limit")?.unwrap_or(DEFAULT_EVENTS_LIMIT);
+        let max_bytes =
+            optional_usize_field(input, "max_bytes")?.unwrap_or(DEFAULT_EVENT_PAGE_BYTES);
+        let page =
+            self.store
+                .poll_events(endpoint_id, cursor, limit, max_bytes, start_at_latest)?;
+        let events = page
+            .events
+            .iter()
+            .map(|(sequence, event)| {
+                json!({
+                    "sequence": sequence,
+                    "event_id": event.event_id,
+                    "endpoint_id": event.endpoint_id,
+                    "received_at": event.received_at.to_rfc3339(),
+                    "headers": event.headers,
+                    "payload": event.payload,
+                    "signature_valid": event.signature_valid,
+                    "source_ip_hash": event.source_ip.as_deref().map(redacted_hash),
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(json!({
+            "endpoint_id": endpoint_id,
+            "events": events,
+            "next_cursor": page.next_cursor,
+            "has_more": page.has_more,
+            "serialized_event_bytes": page.serialized_event_bytes,
+            "retention": {
+                "oldest_available_sequence": page.oldest_available_sequence,
+                "next_sequence": page.next_sequence,
+                "history_truncated": page.history_truncated,
+            },
+        }))
     }
 
     fn invoke_events_ingest(
@@ -2663,6 +2746,80 @@ fn operations_info() -> Vec<OperationInfo> {
             },
         ),
         op_info(
+            WEBHOOK_EVENTS_POLL_OPERATION,
+            "Replay webhook events in arrival order with scoped cursors and loss detection",
+            json!({
+                "type": "object",
+                "required": ["endpoint_id"],
+                "additionalProperties": false,
+                "properties": {
+                    "endpoint_id": { "type": "string", "minLength": 1 },
+                    "cursor": { "type": "string", "minLength": 1, "maxLength": MAX_EVENT_CURSOR_BYTES },
+                    "start": { "type": "string", "enum": ["earliest", "latest"] },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": MAX_EVENTS_LIMIT, "default": DEFAULT_EVENTS_LIMIT },
+                    "max_bytes": { "type": "integer", "minimum": 1, "maximum": MAX_RETAINED_EVENT_BYTES_PER_ENDPOINT, "default": DEFAULT_EVENT_PAGE_BYTES }
+                },
+                "not": { "required": ["cursor", "start"] }
+            }),
+            json!({
+                "type": "object",
+                "required": ["endpoint_id", "events", "next_cursor", "has_more", "serialized_event_bytes", "retention"],
+                "additionalProperties": false,
+                "properties": {
+                    "endpoint_id": { "type": "string" },
+                    "events": {
+                        "type": "array",
+                        "maxItems": MAX_EVENTS_LIMIT,
+                        "items": {
+                            "type": "object",
+                            "required": ["sequence", "event_id", "endpoint_id", "received_at", "headers", "payload", "signature_valid", "source_ip_hash"],
+                            "additionalProperties": false,
+                            "properties": {
+                                "sequence": { "type": "integer", "minimum": 0 },
+                                "event_id": { "type": "string" },
+                                "endpoint_id": { "type": "string" },
+                                "received_at": { "type": "string" },
+                                "headers": { "type": "object", "additionalProperties": { "type": "string" } },
+                                "payload": {},
+                                "signature_valid": { "type": "boolean" },
+                                "source_ip_hash": { "type": ["string", "null"] }
+                            }
+                        }
+                    },
+                    "next_cursor": { "type": "string", "minLength": 1, "maxLength": MAX_EVENT_CURSOR_BYTES },
+                    "has_more": { "type": "boolean" },
+                    "serialized_event_bytes": { "type": "integer", "minimum": 0, "maximum": MAX_RETAINED_EVENT_BYTES_PER_ENDPOINT },
+                    "retention": {
+                        "type": "object",
+                        "required": ["oldest_available_sequence", "next_sequence", "history_truncated"],
+                        "additionalProperties": false,
+                        "properties": {
+                            "oldest_available_sequence": { "type": ["integer", "null"], "minimum": 0 },
+                            "next_sequence": { "type": "integer", "minimum": 0 },
+                            "history_truncated": { "type": "boolean" }
+                        }
+                    }
+                }
+            }),
+            "webhook.events.read",
+            RiskLevel::Low,
+            SafetyTier::Safe,
+            IdempotencyClass::Strict,
+            AgentHint {
+                when_to_use: "Consume retained events for one endpoint in arrival order, resuming from the returned cursor.".into(),
+                common_mistakes: vec![
+                    "Sending start with a continuation cursor; start selects only the first page.".into(),
+                    "Treating a 410 replay gap or expired cursor as successful delivery; recovery must be explicit.".into(),
+                    "Assuming cursors or event bodies survive receiver restart; retention is in-memory.".into(),
+                ],
+                examples: vec![r#"{"endpoint_id":"ep_abc123","start":"earliest","limit":50}"#.into()],
+                related: vec![
+                    CapabilityId::from_static("webhook.events.recent"),
+                    CapabilityId::from_static("webhook.endpoints.list"),
+                ],
+            },
+        ),
+        op_info(
             "webhook.events.recent",
             "Get recent webhook events",
             json!({
@@ -3334,9 +3491,9 @@ mod tests {
     }
 
     #[test]
-    fn operations_info_has_7_operations() {
+    fn operations_info_has_8_operations() {
         let ops = operations_info();
-        assert_eq!(ops.len(), 7);
+        assert_eq!(ops.len(), 8);
     }
 
     #[test]
@@ -3409,6 +3566,7 @@ mod tests {
         assert!(ids.contains(&"webhook.endpoints.delete"));
         assert!(ids.contains(&"webhook.endpoints.list"));
         assert!(ids.contains(&"webhook.events.recent"));
+        assert!(ids.contains(&WEBHOOK_EVENTS_POLL_OPERATION));
         assert!(ids.contains(&WEBHOOK_EVENTS_INGEST_OPERATION));
     }
 

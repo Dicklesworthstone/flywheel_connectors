@@ -13,7 +13,7 @@
 
 ## Purpose
 
-This document fixes the operator-facing contract for `fcp.webhook-receiver`. The connector currently exposes a host-forwarded webhook ingestion surface implemented in this crate: endpoint create/list/delete/rotate, verified event ingestion, recent event replay, health reporting, and provider-specific signature checks for generic, GitHub, Stripe, Slack, and Twilio-style deliveries.
+This document fixes the operator-facing contract for `fcp.webhook-receiver`. The connector currently exposes a host-forwarded webhook ingestion surface implemented in this crate: endpoint create/list/delete/rotate, verified event ingestion, cursor-based replay with retention-loss detection, recent event inspection, health reporting, and provider-specific signature checks for generic, GitHub, Stripe, Slack, and Twilio-style deliveries.
 
 The connector is intentionally a bounded in-process webhook intake buffer. It is not a public HTTP server, durable event bus, queue service, retry worker, webhook delivery sender, subscription manager, provider API client, secret vault, or general ingress gateway.
 
@@ -29,6 +29,7 @@ The current crate exposes these operations:
 - `webhook.endpoints.rotate_secret`
 - `webhook.events.ingest`
 - `webhook.events.recent`
+- `webhook.events.poll`
 - `webhook.health`
 
 Important runtime truths the contract preserves:
@@ -74,7 +75,7 @@ This README documents runtime truth and keeps current drift visible:
 - `doctor()` currently cannot reach `ok` in the no-native-listener build because it reports no connector-owned listener or verified gateway binding.
 - `self_check()` currently cannot reach `ok` without evidence of gateway binding. Enabling the host adapter does not change this connector-local claim automatically.
 - Endpoint creation and rotation return signing secrets in the response; endpoint listing only returns `signing_secret_configured`.
-- The connector hashes source IPs in recent-event output but stores verified event data in memory until retention eviction or shutdown.
+- The connector hashes source IPs in recent-event and polling output but stores verified event data in memory until retention eviction or shutdown.
 - There is no dedicated tracked verification shell script for this connector.
 
 Remaining work includes durable endpoint/secrets/event state, verified external ingress-binding evidence, alignment of manifest network capabilities with the no-native-listener runtime, and a live provider verification bundle.
@@ -86,6 +87,7 @@ The current Webhook Receiver README slice documents the existing runtime surface
 - endpoint lifecycle management
 - in-process endpoint secret generation and rotation
 - host-forwarded event ingestion through `webhook.events.ingest`
+- bounded cursor-based replay through `webhook.events.poll`, including explicit unread-history gap detection
 - optional bounded HTTP delivery through the host's `/webhooks/{*path}` adapter
 - provider-specific signature verification for generic HMAC, GitHub, Stripe, Slack, and Twilio styles
 - content-type policy, body-size policy, rate limiting, in-flight limiting, deduplication, and redaction behavior
@@ -157,7 +159,51 @@ The current Webhook Receiver README slice documents the existing runtime surface
 - Body timeout/cancellation inputs reject the ingest as timed out.
 - Duplicate events are rejected per endpoint when either the public event ID or authenticated replay identity has already been accepted.
 - Stored headers redact the endpoint signature header plus authorization, cookie, signature, secret, and token-style headers.
-- Recent-event output hashes source IPs before returning them.
+- Recent-event and polling output hash source IPs before returning them.
+
+## Cursor-Based Event Consumption
+
+Use `webhook.events.poll` to consume one endpoint's retained deliveries in arrival order. The existing `webhook.events.recent` operation remains a timestamp-based inspection query. Polling requires the signed `webhook.events.read` capability for the requested operation and the actual endpoint URL; possession of a cursor grants no authority. Every page passes normal zone, instance, resource, and signed usage checks.
+
+An initial invocation can read from the earliest retained event:
+
+```json
+{
+  "endpoint_id": "ep_abc123",
+  "start": "earliest",
+  "limit": 50,
+  "max_bytes": 1048576
+}
+```
+
+`start` defaults to `earliest`. Use `start: "latest"` to obtain an empty page and a cursor at the current arrival frontier, then poll for subsequent deliveries. To continue either mode, send the exact same `endpoint_id` and returned `next_cursor`, omitting `start`:
+
+```json
+{
+  "endpoint_id": "ep_abc123",
+  "cursor": "<next_cursor from the previous successful page>",
+  "limit": 50,
+  "max_bytes": 1048576
+}
+```
+
+Each response contains `endpoint_id`, `events`, `next_cursor`, `has_more`, `serialized_event_bytes`, and `retention`. Events add a monotonic `sequence` to the existing redacted event shape. Sequence ordering follows acceptance, so equal or out-of-order provider timestamps cannot reorder or skip deliveries. Sequence values are global to the receiver and can have gaps for a particular endpoint. Stored sensitive headers remain suppressed, and output includes only `source_ip_hash` for the source address.
+
+The retention object reports `oldest_available_sequence` (or `null` when empty), the global `next_sequence` frontier, and `history_truncated`. The last flag records whether this endpoint has ever lost retained event bodies to count or byte eviction. Starting from `earliest` deliberately reads what remains; it does not establish that earlier history was delivered.
+
+Process the page successfully before saving `next_cursor` as consumer progress. Polling never acknowledges, deletes, or reserves events and never clears delivery replay protection. Reusing a cursor returns the same retained prefix while it remains available, subject to the requested page limits. An empty page still returns a cursor for the current frontier. `has_more` indicates retained work at the time of the call; consumers should poll again after reaching it rather than treating it as a closed stream.
+
+| Condition | Result and recovery |
+| --- | --- |
+| Normal page | Up to `limit` events; persist `next_cursor` after processing. |
+| Unread events were evicted | Nonretryable `410` with `webhook_replay_gap`; reconcile missing deliveries, then deliberately select a new starting position. |
+| Receiver lifetime changed | Nonretryable `410` with `webhook_cursor_expired`; restore application progress from an external source or deliberately restart consumption. |
+| Malformed, modified, wrong-endpoint, or future cursor | `400`, except a different encoded lifetime is reported as expired. No events are returned. |
+| First unread event exceeds `max_bytes` | `413`; increase the byte budget before retrying the same cursor. |
+
+`limit` defaults to `50` and must be `1..=100`. `max_bytes` defaults to `1 MiB` and must be `1..=16 MiB`. It bounds the sum of complete stored-event JSON sizes; the response envelope, sequence fields, redaction representation, and transport framing are additional. A later event that would exceed the byte budget ends the page with `has_more: true`. The connector clones only the selected page. Cursor inputs are bounded to `128` encoded bytes and authenticated with a per-store secret.
+
+Retention remains in memory: at most `1000` event bodies per endpoint, `16 MiB` per endpoint, and `64 MiB` shared across the receiver. Eviction from any of these limits is tracked for gap detection. Configure, shutdown, and process restart invalidate all prior cursors; a successful same-zone rehandshake preserves cursors and event bodies while rotating invocation authority. This operation does not add durable queueing or exactly-once downstream processing.
 
 ## Signature And Event ID Behavior
 

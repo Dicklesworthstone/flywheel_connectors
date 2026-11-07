@@ -355,6 +355,29 @@ Twilio flows that require TwiML and arbitrary provider-specific response
 formats remain unsupported. This exchange does not provide automatic
 subscription provisioning or every interactive callback workflow.
 
+## Consuming accepted events
+
+Use the authenticated FCP operation `webhook.events.poll` to consume deliveries
+for a specific endpoint. The public HTTP ingress route does not expose event
+reads. Begin with `{"endpoint_id":"ep_abc123","start":"earliest"}` to read
+retained history or `start: "latest"` to subscribe from the current frontier.
+Continue with the returned `next_cursor` and the same endpoint, omitting
+`start`. Each page still requires a valid instance-bound `webhook.events.read`
+capability authorizing `webhook.events.poll` and the endpoint URL.
+
+Pages are ordered by arrival sequence and bounded by event count and stored
+event bytes. Save the returned cursor only after successfully processing the
+page. A `410` with `webhook_replay_gap` means unread event bodies were evicted;
+`webhook_cursor_expired` means the receiver lifetime changed. Neither outcome
+silently skips missing deliveries. Recover explicitly before selecting a new
+start position. A `413` means the first unread event exceeds the requested
+byte budget; retry the same cursor with a larger budget within the `16 MiB`
+maximum. See the [complete replay contract](../../connectors/webhook-receiver/README.md#cursor-based-event-consumption).
+
+Polling preserves redaction and does not delete events or change ingress
+deduplication. Event bodies, replay identities, and cursors still live only in
+memory; HTTP `202` does not promise they will survive a receiver restart.
+
 ## Readiness and verification
 
 The receiver's `health`, `doctor`, and `self_check` continue to report no
