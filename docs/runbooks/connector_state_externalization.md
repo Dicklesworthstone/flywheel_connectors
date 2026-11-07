@@ -27,9 +27,10 @@ offline-inspection warnings.
 
 ## Retain an Exact Root on Another Host
 
-`fwc connector state pull` transfers a granted `ConnectorStateRoot` and its
-validated state ancestry from a configured donor into a recipient's durable,
-host-owned replica store. Select the exact root from trusted operator evidence;
+`fwc connector state pull` transfers a granted `ConnectorStateRoot`, its
+validated state ancestry, and the payload objects referenced by that ancestry
+from a configured donor into a recipient's durable, host-owned replica store.
+Select the exact root from trusted operator evidence;
 the command does not discover `latest` or establish that this root is fresh.
 Neither a mesh peer signature nor possession of a grant ID authorizes transfer
 without the matching local grant on each host.
@@ -94,8 +95,9 @@ Donor `node-a`, exporting only the selected root to `node-b`:
 The optional `source_mac_key_hex` must match that source's authenticated
 envelopes; omit it or set it to `null` for a source written without a MAC.
 The source is captured as a read-only view at startup, without acquiring a
-second writer or repairing its WAL. The selected root and all required state
-objects must already be present in that captured view. Missing objects fail
+second writer or repairing its WAL. The selected root, all required state
+objects, and their referenced payloads must already be present in that captured
+view. Missing objects fail
 the transfer; subsequent source writes do not refresh the view. Restart the
 host to reload source state, grants, expiry, or writer pins.
 
@@ -181,7 +183,8 @@ automatic retries.
 
 CLI defaults are 4096 objects, 4194304 canonical bytes, and 4194304 wire bytes.
 All three requested limits must fit both grants, so specify narrower limits
-when the grants are smaller. Objects include the root; canonical bytes include
+when the grants are smaller. Objects include the root, every state in its
+ancestry, and every distinct referenced payload; canonical bytes include
 object headers and bodies; wire bytes cover the complete inner JSON export
 response. These are separate limits, and JSON encoding can exceed the
 canonical byte count.
@@ -200,10 +203,27 @@ duplicate or older comparable root was verified without replacing its current
 root; the requested root is not a claim about the replica's current head.
 Conflicting branches are rejected.
 
-This operation transfers root/state-object ancestry only. It does not transfer
-connector snapshots, lease authority, execution results or operation receipts,
-activate live connector state, resolve uncertain invocations, or resume
-execution. Its metadata also makes no mesh-wide availability or freshness
+Payload transfer follows `header.refs` from authenticated signed state objects
+and then transitively from their referenced objects. Shared objects count once.
+Each object must have a valid zone-keyed content ID in the granted zone;
+foreign-zone references, missing dependencies, unrelated extra objects, and
+reference paths deeper than 64 payload objects are rejected. Extra references
+on the unsigned root cannot expand transfer authority. Encrypted payloads remain
+opaque: replication validates and retains their exact bytes without decrypting
+them or inferring plaintext state from them.
+
+The recipient validates the entire bundle before changing storage. It retains
+payloads and signed state objects before publishing the selected root, using
+its own retention policy. A failed or cancelled transfer can leave verified
+dependencies behind without publishing a new root. Inspection and export use
+the same dependency traversal and resource accounting, so a root with missing
+payloads cannot be reported as a complete retained replica.
+
+The operation excludes state lease references, connector snapshots, and other
+canonical state histories. It does not discover unreferenced execution results
+or receipts, grant lease authority, activate live connector state, resolve
+uncertain invocations, or resume execution. Its metadata also makes no
+mesh-wide availability or freshness
 claim.
 
 ## Rollback
