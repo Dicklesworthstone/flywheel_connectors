@@ -342,6 +342,7 @@ pub struct PipelineMetadata {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PipelineStep {
     pub id: String,
     pub operation: String,
@@ -354,6 +355,25 @@ pub struct PipelineStep {
     pub depends_on: Vec<String>,
     #[serde(default)]
     pub condition: Option<String>,
+    /// Continue independent steps only after a definite input, policy, or connector failure.
+    #[serde(default)]
+    pub on_error: PipelineErrorPolicy,
+}
+
+/// Failure handling supported by the live pipeline executor.
+///
+/// A skipped failure remains visible and makes the run unsuccessful. Dependent
+/// steps cannot run without a successful prerequisite. Authoring errors,
+/// unavailable preflight, and uncertain invoke outcomes always stop execution;
+/// this policy never authorizes retries or fallback effects.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PipelineErrorPolicy {
+    /// Stop before dispatching any later step.
+    #[default]
+    Abort,
+    /// Retain the failed outcome and continue independent steps.
+    Skip,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -400,6 +420,7 @@ pub struct PlannedPipelineStep {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lease_seq: Option<u64>,
     pub depends_on: Vec<String>,
+    pub on_error: PipelineErrorPolicy,
     pub input: Value,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub unresolved_templates: Vec<String>,
@@ -1469,6 +1490,7 @@ pub fn build_pipeline_plan(
             operation: step.operation.clone(),
             lease_seq: step.lease_seq,
             depends_on: step.depends_on.clone(),
+            on_error: step.on_error,
             input: rendered_input.value,
             unresolved_templates: rendered_input.unresolved,
             condition,
@@ -2752,6 +2774,75 @@ depends_on = ["second"]
         let serialized = serde_json::to_value(&plan).unwrap();
         assert_eq!(serialized["steps"][0]["lease_seq"], 42);
         assert!(serialized["steps"][2].get("lease_seq").is_none());
+    }
+
+    #[test]
+    fn pipeline_plan_preserves_explicit_failure_policy_and_defaults_to_abort() {
+        let definition = parse_pipeline_definition(
+            r#"
+[pipeline]
+name = "failure-policy"
+
+[[steps]]
+id = "default"
+operation = "github.search_issues"
+
+[[steps]]
+id = "abort"
+operation = "github.search_issues"
+on_error = "abort"
+
+[[steps]]
+id = "skip"
+operation = "github.search_issues"
+on_error = "skip"
+"#,
+        )
+        .unwrap();
+        assert!(validate_pipeline_definition(&definition).valid);
+        let plan = build_pipeline_plan(&definition, &BTreeMap::new()).unwrap();
+        let serialized = serde_json::to_value(&plan).unwrap();
+        for (index, expected) in [
+            PipelineErrorPolicy::Abort,
+            PipelineErrorPolicy::Abort,
+            PipelineErrorPolicy::Skip,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(definition.steps[index].on_error, expected);
+            assert_eq!(plan.steps[index].on_error, expected);
+            assert_eq!(
+                serialized["steps"][index]["on_error"],
+                serde_json::to_value(expected).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn pipeline_definition_rejects_unsupported_error_policies_and_unknown_step_fields() {
+        for field in [
+            "on_error = \"retry\"",
+            "on_error = \"retry(3)\"",
+            "on_error = \"fallback(notify)\"",
+            "on_error = \"continue\"",
+            "on_error = { retry = 3 }",
+            "on_error = false",
+            "trigger = \"on_error(first)\"",
+            "on_erorr = \"abort\"",
+            "timeout = 1",
+        ] {
+            let content = format!(
+                "[pipeline]\nname = \"invalid-policy\"\n[[steps]]\nid = \"first\"\noperation = \"github.search_issues\"\n{field}\n"
+            );
+            let error = parse_pipeline_definition(&content).unwrap_err();
+            assert!(error.contains("invalid pipeline TOML"), "{field}: {error}");
+            if field.starts_with("on_error = \"") {
+                assert!(error.contains("abort") && error.contains("skip"), "{error}");
+            } else if !field.starts_with("on_error") {
+                assert!(error.contains("unknown field"), "{field}: {error}");
+            }
+        }
     }
 
     #[test]

@@ -30276,6 +30276,9 @@ fn execute_live_pipeline_plan(
         if !valid {
             error_steps += 1;
             step_statuses.insert(step.id.clone(), "error");
+            if step.on_error == pipe::PipelineErrorPolicy::Abort {
+                stopped_after = Some(step.id.clone());
+            }
             step_results.push(json!({
                 "id": &step.id,
                 "operation": &step.operation,
@@ -30286,6 +30289,8 @@ fn execute_live_pipeline_plan(
                 },
                 "status": "error",
                 "reason": "invalid-input-payload",
+                "on_error": step.on_error,
+                "invoke_attempted": false,
                 "depends_on": &step.depends_on,
                 "condition": condition_evaluation.map(|allowed| {
                     json!({
@@ -30393,6 +30398,9 @@ fn execute_live_pipeline_plan(
         if !preflight.allowed {
             denied_steps += 1;
             step_statuses.insert(step.id.clone(), "denied");
+            if step.on_error == pipe::PipelineErrorPolicy::Abort {
+                stopped_after = Some(step.id.clone());
+            }
             let reason = preflight
                 .reason
                 .clone()
@@ -30418,6 +30426,8 @@ fn execute_live_pipeline_plan(
                     "name": &resolved.connector.summary.name,
                 },
                 "status": "denied",
+                "on_error": step.on_error,
+                "invoke_attempted": false,
                 "mode": if mode == PipelinePlanMode::DryRun { "preflight" } else { "invoke" },
                 "depends_on": &step.depends_on,
                 "condition": condition_evaluation.map(|allowed| {
@@ -30575,6 +30585,9 @@ fn execute_live_pipeline_plan(
             InvokeStatus::Error => {
                 error_steps += 1;
                 step_statuses.insert(step.id.clone(), "error");
+                if step.on_error == pipe::PipelineErrorPolicy::Abort {
+                    stopped_after = Some(step.id.clone());
+                }
                 step_results.push(json!({
                     "id": &step.id,
                     "operation": &step.operation,
@@ -30584,6 +30597,8 @@ fn execute_live_pipeline_plan(
                         "name": &resolved.connector.summary.name,
                     },
                     "status": "error",
+                    "on_error": step.on_error,
+                    "invoke_attempted": true,
                     "mode": if mode == PipelinePlanMode::DryRun {
                         "dry-run-read"
                     } else {
@@ -49621,6 +49636,296 @@ input = { text = "{{steps.again.output.title}}" }
         routes[3].1["tools"][0]["idempotency"] = json!("none");
         routes[3].1["tools"][0]["idempotent"] = json!(false);
         routes
+    }
+
+    fn workflow_failure_policy_fixture(
+        directory: &Path,
+        policy: Option<&str>,
+        invalid_input: bool,
+    ) -> PathBuf {
+        let path = directory.join("failure-policy.toml");
+        let policy = policy.map_or_else(String::new, |policy| format!("on_error = \"{policy}\""));
+        let failed_input = if invalid_input { "42" } else { "\"failed\"" };
+        fs::write(
+            &path,
+            format!(
+                r#"
+[pipeline]
+name = "failure-policy"
+
+[[steps]]
+id = "before"
+operation = "github.search_issues"
+input = {{ query = "before" }}
+
+[[steps]]
+id = "failed"
+operation = "github.search_issues"
+depends_on = ["before"]
+input = {{ query = {failed_input} }}
+{policy}
+
+[[steps]]
+id = "dependent"
+operation = "github.search_issues"
+depends_on = ["failed"]
+input = {{ query = "dependent" }}
+
+[[steps]]
+id = "independent"
+operation = "github.search_issues"
+depends_on = ["before"]
+input = {{ query = "independent" }}
+"#
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn execute_pipeline_failure_policy_controls_only_later_independent_steps() {
+        let token = test_capability_token_arg();
+        for mode in ["run", "dry-run"] {
+            for failure_kind in ["input", "denied", "connector"] {
+                for policy in [None, Some("abort"), Some("skip")] {
+                    let tempdir = TempDir::new().unwrap();
+                    let _history =
+                        super::install_test_history_path(tempdir.path().join("history.jsonl"));
+                    let path = workflow_failure_policy_fixture(
+                        tempdir.path(),
+                        policy,
+                        failure_kind == "input",
+                    );
+                    let mut routes = pipe_mock_catalog(false);
+                    routes.truncate(2);
+                    routes.extend([
+                        (
+                            "POST /rpc/preflight".to_owned(),
+                            mock_preflight_response_json(true),
+                        ),
+                        (
+                            "POST /rpc/invoke".to_owned(),
+                            mock_invoke_response_json(json!({"value": "retained first result"})),
+                        ),
+                    ]);
+                    if failure_kind != "input" {
+                        routes.push((
+                            "POST /rpc/preflight".to_owned(),
+                            mock_preflight_response_json(failure_kind != "denied"),
+                        ));
+                    }
+                    if failure_kind == "connector" {
+                        routes.push((
+                            "POST /rpc/invoke".to_owned(),
+                            serde_json::to_value(InvokeResponse::error(
+                                RequestId::random(),
+                                fcp_core::FcpError::Internal {
+                                    message: "provider failure".to_owned(),
+                                },
+                            ))
+                            .unwrap(),
+                        ));
+                    }
+                    if policy == Some("skip") {
+                        routes.extend([
+                            (
+                                "POST /rpc/preflight".to_owned(),
+                                mock_preflight_response_json(true),
+                            ),
+                            (
+                                "POST /rpc/invoke".to_owned(),
+                                mock_invoke_response_json(json!({"independent": true})),
+                            ),
+                        ]);
+                    }
+                    let expected_requests = routes.len();
+                    let (host, server, request_log) =
+                        spawn_mock_host_sequence_with_body_log(routes);
+                    let (exit_code, payload) = execute_json(&[
+                        "fwc",
+                        "--json",
+                        "--host",
+                        &host,
+                        "pipeline",
+                        mode,
+                        &path.display().to_string(),
+                        "--capability-token",
+                        &token,
+                    ]);
+                    server
+                        .join()
+                        .expect("pipeline policy mock host should finish");
+                    let expected_exit = if failure_kind == "denied" {
+                        CliExitCode::PolicyDenied
+                    } else {
+                        CliExitCode::Connector
+                    };
+                    assert_eq!(
+                        exit_code,
+                        expected_exit.into(),
+                        "{mode}/{failure_kind}/{policy:?}: {payload}"
+                    );
+                    let execution = &payload["execution"];
+                    assert_eq!(
+                        execution["outputs"]["before"]["value"],
+                        "retained first result"
+                    );
+                    assert_eq!(execution["steps"][0]["status"], "ok");
+                    assert_eq!(execution["steps"][1]["on_error"], policy.unwrap_or("abort"));
+                    assert_eq!(
+                        payload["plan"]["steps"][1]["on_error"],
+                        policy.unwrap_or("abort")
+                    );
+                    assert_eq!(
+                        execution["steps"][1]["invoke_attempted"],
+                        failure_kind == "connector"
+                    );
+                    assert_eq!(execution["steps"][2]["status"], "blocked");
+                    assert!(execution["outputs"].get("failed").is_none());
+                    assert!(execution["outputs"].get("dependent").is_none());
+                    assert_eq!(
+                        execution["skipped_steps"], 0,
+                        "a failed step must remain a failure"
+                    );
+                    if policy == Some("skip") {
+                        assert_eq!(execution["executed_steps"], 2);
+                        assert_eq!(execution["blocked_steps"], 1);
+                        assert_eq!(execution["steps"][2]["reason"], "dependency-failed");
+                        assert_eq!(execution["steps"][3]["status"], "ok");
+                        assert_eq!(execution["outputs"]["independent"]["independent"], true);
+                    } else {
+                        assert_eq!(execution["executed_steps"], 1);
+                        assert_eq!(execution["blocked_steps"], 2);
+                        assert_eq!(execution["steps"][3]["status"], "blocked");
+                        assert_eq!(execution["steps"][3]["reason"], "execution-stopped");
+                        assert_eq!(execution["steps"][3]["blocked_by"], json!(["failed"]));
+                        assert_eq!(execution["steps"][3]["attempted"], false);
+                    }
+                    let requests = request_log.lock().unwrap();
+                    assert_eq!(requests.len(), expected_requests);
+                    let invoked_inputs = requests
+                        .iter()
+                        .filter(|(route, _)| route == "POST /rpc/invoke")
+                        .map(|(_, body)| {
+                            serde_json::from_str::<Value>(body).unwrap()["input"]["query"].clone()
+                        })
+                        .collect::<Vec<_>>();
+                    assert!(!invoked_inputs.contains(&json!("dependent")));
+                    assert_eq!(
+                        invoked_inputs.contains(&json!("independent")),
+                        policy == Some("skip")
+                    );
+                    assert!(!payload.to_string().contains(&token));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn execute_pipeline_skip_never_continues_after_uncertain_host_results() {
+        for failed_phase in ["preflight", "invoke"] {
+            let tempdir = TempDir::new().unwrap();
+            let _history = super::install_test_history_path(tempdir.path().join("history.jsonl"));
+            let path = workflow_failure_policy_fixture(tempdir.path(), Some("skip"), false);
+            let token = test_capability_token_arg();
+            let mut routes = pipe_mock_catalog(false);
+            routes.truncate(2);
+            routes.extend([
+                (
+                    "POST /rpc/preflight".to_owned(),
+                    mock_preflight_response_json(true),
+                ),
+                (
+                    "POST /rpc/invoke".to_owned(),
+                    mock_invoke_response_json(json!({"value": "retained first result"})),
+                ),
+            ]);
+            if failed_phase == "invoke" {
+                routes.push((
+                    "POST /rpc/preflight".to_owned(),
+                    mock_preflight_response_json(true),
+                ));
+            }
+            routes.push((
+                format!("POST /rpc/{failed_phase}"),
+                json!({"invalid_response": "private-reflected-diagnostic"}),
+            ));
+            let expected_requests = routes.len();
+            let (host, server, request_log) = spawn_mock_host_sequence_with_body_log(routes);
+            let (exit_code, payload) = execute_json(&[
+                "fwc",
+                "--json",
+                "--host",
+                &host,
+                "pipeline",
+                "run",
+                &path.display().to_string(),
+                "--capability-token",
+                &token,
+            ]);
+            server
+                .join()
+                .expect("uncertain pipeline mock host should finish");
+            assert_eq!(exit_code, CliExitCode::Transport.into(), "{payload}");
+            assert_eq!(payload["failed_step"], "failed");
+            assert_eq!(payload["automatic_retry_allowed"], false);
+            assert_eq!(payload["execution"]["executed_steps"], 1);
+            assert_eq!(payload["execution"]["blocked_steps"], 2);
+            assert_eq!(
+                payload["execution"]["outputs"]["before"]["value"],
+                "retained first result"
+            );
+            assert_eq!(payload["execution"]["steps"][3]["status"], "blocked");
+            assert_eq!(payload["execution"]["steps"][3]["attempted"], false);
+            if failed_phase == "invoke" {
+                assert_eq!(payload["outcome"], "outcome_unknown");
+                assert_eq!(
+                    payload["execution"]["steps"][1]["status"],
+                    "outcome_unknown"
+                );
+                assert!(payload["inspection"]["operation_id"].is_string());
+            }
+            assert_eq!(request_log.lock().unwrap().len(), expected_requests);
+            assert!(!payload.to_string().contains("private-reflected-diagnostic"));
+            assert!(!payload.to_string().contains(&token));
+        }
+    }
+
+    #[test]
+    fn execute_pipeline_rejects_unsupported_step_policies_before_host_discovery() {
+        for field in [
+            "on_error = \"retry(3)\"",
+            "on_error = \"fallback(notify)\"",
+            "trigger = \"on_error(first)\"",
+            "on_erorr = \"abort\"",
+        ] {
+            let tempdir = TempDir::new().unwrap();
+            let path = tempdir.path().join("unsupported.toml");
+            fs::write(
+                &path,
+                format!(
+                    "[pipeline]\nname = \"unsupported\"\n[[steps]]\nid = \"first\"\noperation = \"github.search_issues\"\n{field}\n"
+                ),
+            )
+            .unwrap();
+            let (exit_code, payload) = execute_json(&[
+                "fwc",
+                "--json",
+                "--host",
+                "http://127.0.0.1:1",
+                "pipeline",
+                "run",
+                &path.display().to_string(),
+            ]);
+            assert_eq!(
+                exit_code,
+                CliExitCode::Validation.into(),
+                "{field}: {payload}"
+            );
+            assert_eq!(payload["error"]["type"], "invalid-pipeline-toml");
+            assert!(payload["execution"].is_null());
+        }
     }
 
     #[test]
