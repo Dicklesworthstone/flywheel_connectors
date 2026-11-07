@@ -25551,7 +25551,7 @@ fn invoke_dispatch_host_controlled(
         lease_seq: args.lease_seq,
         deadline_ms: args.deadline_ms,
         correlation_id: None,
-        provenance: None,
+        provenance: guard.as_deref().and_then(|guard| guard.provenance.cloned()),
         approval_tokens: auth.approval_tokens.clone(),
     };
     let guarded_request = guard.as_deref().map(|guard| HostGuardedInvokeRequest {

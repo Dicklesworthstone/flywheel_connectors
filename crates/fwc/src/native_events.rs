@@ -4,7 +4,7 @@
 //! losing an HTTP response must never release provider credit. Stable request
 //! and stream identities make explicit retries safe after an uncertain result.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
 use std::io::Read;
 use std::path::PathBuf;
@@ -128,6 +128,180 @@ struct AckArgs {
     cursors: Vec<String>,
 }
 
+/// Exact retained source for a bounded in-process consumer. The stream
+/// capability is independent of any authority used to execute derived actions.
+#[derive(Clone, Debug)]
+pub(crate) struct NativeStreamConfig {
+    pub(crate) connector: String,
+    pub(crate) zone: String,
+    pub(crate) topic: String,
+    pub(crate) request_id: String,
+    pub(crate) stream_id: String,
+    pub(crate) capability_token_file: PathBuf,
+    pub(crate) timeout_seconds: u64,
+}
+
+pub(crate) struct NativeEventBatch {
+    pub(crate) events: Vec<EventEnvelope>,
+    pub(crate) closed: bool,
+    pub(crate) wait_expired: bool,
+}
+
+pub(crate) struct NativeAckResult {
+    /// Durable acknowledgement can succeed even when the original provider
+    /// instance is absent. Never reinterpret this as a failed durable ACK.
+    pub(crate) upstream_notified: bool,
+}
+
+#[derive(Clone)]
+struct RetainedBinding {
+    principal: String,
+    window_size: u32,
+}
+
+impl RetainedBinding {
+    fn from_stream(stream: &StreamMetadata) -> Self {
+        Self {
+            principal: stream.binding.principal.clone(),
+            window_size: stream.window_size,
+        }
+    }
+
+    fn check(&self, stream: &StreamMetadata) -> std::result::Result<(), Failure> {
+        if self.principal != stream.binding.principal || self.window_size != stream.window_size {
+            return Err(Failure::InvalidResponse);
+        }
+        Ok(())
+    }
+}
+
+/// A single selected host and loaded capability for one retained stream.
+///
+/// Polling never acknowledges. An acknowledgement must be an exact subset of
+/// the last validated poll, so processing code cannot accidentally release
+/// credit for an event it did not receive. Failed ACKs retain those pairs for
+/// explicit retry; starting another poll invalidates the old local batch.
+pub(crate) struct NativeStreamClient {
+    client: HostAdminClient,
+    auth: Authority,
+    stream_id: String,
+    timeout: Duration,
+    binding: Option<RetainedBinding>,
+    delivered: BTreeMap<String, u64>,
+}
+
+impl NativeStreamClient {
+    pub(crate) fn new(
+        config: NativeStreamConfig,
+        explicit_host: Option<&str>,
+    ) -> std::result::Result<Self, StreamFailure> {
+        if !valid_stream_id(&config.stream_id) {
+            return Err(Failure::InvalidRequest);
+        }
+        let auth = load_authority(&AuthorityArgs {
+            connector: config.connector,
+            zone: config.zone,
+            topic: config.topic,
+            request_id: config.request_id,
+            capability_token_file: config.capability_token_file,
+            timeout_seconds: config.timeout_seconds,
+        })?;
+        let host = resolve_host_config(explicit_host)
+            .map_err(|_| Failure::InvalidHost)?
+            .ok_or(Failure::MissingHost)?;
+        let client = HostAdminClient::new(&host.endpoint).map_err(|_| Failure::InvalidHost)?;
+        Ok(Self {
+            client,
+            auth,
+            stream_id: config.stream_id,
+            timeout: Duration::from_secs(config.timeout_seconds),
+            binding: None,
+            delivered: BTreeMap::new(),
+        })
+    }
+
+    pub(crate) fn endpoint(&self) -> &str {
+        &self.client.endpoint
+    }
+
+    pub(crate) fn stream_id(&self) -> &str {
+        &self.stream_id
+    }
+
+    pub(crate) fn connector(&self) -> &str {
+        self.auth.connector_id.as_str()
+    }
+
+    pub(crate) fn zone(&self) -> &str {
+        self.auth.zone_id.as_str()
+    }
+
+    pub(crate) fn topic(&self) -> &str {
+        &self.auth.topic
+    }
+
+    pub(crate) fn poll(
+        &mut self,
+        batch_size: u32,
+        wait_seconds: u64,
+    ) -> std::result::Result<NativeEventBatch, StreamFailure> {
+        self.delivered.clear();
+        let batch = poll_response(
+            &self.client,
+            &self.auth,
+            &self.stream_id,
+            batch_size,
+            wait_seconds,
+            self.timeout,
+            self.binding.as_ref(),
+        )?;
+        if self.binding.is_none() {
+            self.binding = Some(RetainedBinding::from_stream(&batch.response.stream));
+        }
+        for event in &batch.response.events {
+            self.delivered.insert(event.cursor.clone(), event.seq);
+        }
+        Ok(NativeEventBatch {
+            events: batch.response.events,
+            closed: batch.response.stream.closed,
+            wait_expired: batch.wait_expired,
+        })
+    }
+
+    pub(crate) fn ack(
+        &mut self,
+        seqs: &[u64],
+        cursors: &[String],
+    ) -> std::result::Result<NativeAckResult, StreamFailure> {
+        validate_ack_pairs(seqs, cursors)?;
+        if !seqs
+            .iter()
+            .zip(cursors)
+            .all(|(seq, cursor)| self.delivered.get(cursor) == Some(seq))
+        {
+            return Err(Failure::InvalidRequest);
+        }
+        let ack = EventAck::new(&self.auth.topic, seqs.to_vec()).with_cursors(cursors.to_vec());
+        let response = acknowledge(
+            &self.client,
+            &self.auth,
+            &self.stream_id,
+            &ack,
+            self.timeout,
+        )?;
+        self.binding
+            .as_ref()
+            .ok_or(Failure::InvalidRequest)?
+            .check(&response.stream)?;
+        for cursor in cursors {
+            self.delivered.remove(cursor);
+        }
+        Ok(NativeAckResult {
+            upstream_notified: response.upstream_notified,
+        })
+    }
+}
+
 impl StreamCommand {
     fn auth(&self) -> &AuthorityArgs {
         match self {
@@ -216,8 +390,8 @@ struct CloseResponse {
     upstream_notified: bool,
 }
 
-#[derive(Clone, Copy, Debug)]
-enum Failure {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StreamFailure {
     InvalidRequest,
     MissingHost,
     InvalidHost,
@@ -229,8 +403,10 @@ enum Failure {
     ResponseTooLarge,
 }
 
+use StreamFailure as Failure;
+
 impl Failure {
-    fn details(self) -> (&'static str, &'static str, CliExitCode) {
+    pub(crate) fn details(self) -> (&'static str, &'static str, CliExitCode) {
         match self {
             Self::InvalidRequest => (
                 "invalid-stream-request",
@@ -302,6 +478,14 @@ impl Failure {
     }
 }
 
+impl std::fmt::Display for StreamFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.details().1)
+    }
+}
+
+impl std::error::Error for StreamFailure {}
+
 pub(crate) fn dispatch(args: &StreamsArgs, explicit_host: Option<&str>) -> Result<DispatchOutcome> {
     let command = &args.command;
     let auth = match authority(command) {
@@ -352,14 +536,7 @@ fn valid_stream_id(value: &str) -> bool {
 }
 
 fn authority(command: &StreamCommand) -> std::result::Result<Authority, Failure> {
-    let args = command.auth();
-    if !bounded_identity(&args.request_id, 128)
-        || !bounded_identity(&args.topic, 256)
-        || args.topic.chars().any(char::is_whitespace)
-        || args.topic.contains('*')
-        || !(1..=90).contains(&args.timeout_seconds)
-        || command.stream_id().is_some_and(|id| !valid_stream_id(id))
-    {
+    if command.stream_id().is_some_and(|id| !valid_stream_id(id)) {
         return Err(Failure::InvalidRequest);
     }
     match command {
@@ -373,6 +550,18 @@ fn authority(command: &StreamCommand) -> std::result::Result<Authority, Failure>
         }
         StreamCommand::Ack(args) => validate_ack_pairs(&args.seqs, &args.cursors)?,
         _ => {}
+    }
+    load_authority(command.auth())
+}
+
+fn load_authority(args: &AuthorityArgs) -> std::result::Result<Authority, Failure> {
+    if !bounded_identity(&args.request_id, 128)
+        || !bounded_identity(&args.topic, 256)
+        || args.topic.chars().any(char::is_whitespace)
+        || args.topic.contains('*')
+        || !(1..=90).contains(&args.timeout_seconds)
+    {
+        return Err(Failure::InvalidRequest);
     }
     let connector_id = args
         .connector
@@ -471,18 +660,7 @@ fn execute(
         StreamCommand::Ack(args) => {
             let ack =
                 EventAck::new(&auth.topic, args.seqs.clone()).with_cursors(args.cursors.clone());
-            let response: AckResponse = post(
-                client,
-                "/rpc/streams/ack",
-                &json!({
-                    "auth": auth, "stream_id": args.retained.stream_id, "ack": ack,
-                }),
-                timeout,
-            )?;
-            check_stream(&response.stream, auth, Some(&args.retained.stream_id))?;
-            if !response.acknowledged {
-                return Err(Failure::InvalidResponse);
-            }
+            let response = acknowledge(client, auth, &args.retained.stream_id, &ack, timeout)?;
             let mut payload = encode(response)?;
             payload["ack"] = encode(ack)?;
             Ok(payload)
@@ -511,10 +689,67 @@ fn poll(
     args: &PollArgs,
     timeout: Duration,
 ) -> std::result::Result<Value, Failure> {
-    let deadline =
-        (args.wait_seconds > 0).then(|| Instant::now() + Duration::from_secs(args.wait_seconds));
-    let body =
-        json!({ "auth": auth, "stream_id": args.retained.stream_id, "limit": args.batch_size });
+    let batch = poll_response(
+        client,
+        auth,
+        &args.retained.stream_id,
+        args.batch_size,
+        args.wait_seconds,
+        timeout,
+        None,
+    )?;
+    let ack = if batch.response.events.is_empty() {
+        None
+    } else {
+        Some(
+            EventAck::new(
+                &auth.topic,
+                batch
+                    .response
+                    .events
+                    .iter()
+                    .map(|event| event.seq)
+                    .collect(),
+            )
+            .with_cursors(
+                batch
+                    .response
+                    .events
+                    .iter()
+                    .map(|event| event.cursor.clone())
+                    .collect(),
+            ),
+        )
+    };
+    let mut payload = encode(batch.response)?;
+    payload["acknowledged"] = json!(false);
+    payload["wait_expired"] = json!(batch.wait_expired);
+    if let Some(ack) = ack {
+        payload["ack_request"] = encode(ack)?;
+    }
+    Ok(payload)
+}
+
+struct PolledResponse {
+    response: PollResponse,
+    wait_expired: bool,
+}
+
+fn poll_response(
+    client: &HostAdminClient,
+    auth: &Authority,
+    stream_id: &str,
+    batch_size: u32,
+    wait_seconds: u64,
+    timeout: Duration,
+    expected_binding: Option<&RetainedBinding>,
+) -> std::result::Result<PolledResponse, Failure> {
+    if !valid_stream_id(stream_id) || !(1..=64).contains(&batch_size) || wait_seconds > 60 {
+        return Err(Failure::InvalidRequest);
+    }
+    let deadline = (wait_seconds > 0).then(|| Instant::now() + Duration::from_secs(wait_seconds));
+    let body = json!({ "auth": auth, "stream_id": stream_id, "limit": batch_size });
+    let mut binding = expected_binding.cloned();
     loop {
         let remaining = deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
         let response: PollResponse = post(
@@ -523,29 +758,11 @@ fn poll(
             &body,
             remaining.map_or(timeout, |remaining| timeout.min(remaining)),
         )?;
-        check_stream(&response.stream, auth, Some(&args.retained.stream_id))?;
-        if response.events.len() > args.batch_size as usize
-            || response.events.len() > response.stream.pending_events
-        {
-            return Err(Failure::InvalidResponse);
-        }
-        let mut seqs = Vec::new();
-        let mut cursors = Vec::new();
-        for event in &response.events {
-            // Original pending payloads retain their original instance after
-            // reattachment. Validate source scope, not old-instance equality.
-            if event.topic != auth.topic
-                || event.data.connector_id != auth.connector_id
-                || event.data.zone_id != auth.zone_id
-                || !event.requires_ack
-            {
-                return Err(Failure::InvalidResponse);
-            }
-            seqs.push(event.seq);
-            cursors.push(event.cursor.clone());
-        }
-        if !seqs.is_empty() {
-            validate_ack_pairs(&seqs, &cursors).map_err(|_| Failure::InvalidResponse)?;
+        check_poll(&response, auth, stream_id, batch_size)?;
+        if let Some(binding) = &binding {
+            binding.check(&response.stream)?;
+        } else {
+            binding = Some(RetainedBinding::from_stream(&response.stream));
         }
         let wait_expired = deadline.is_some_and(|deadline| Instant::now() >= deadline);
         if !response.events.is_empty()
@@ -553,14 +770,10 @@ fn poll(
             || deadline.is_none()
             || wait_expired
         {
-            let mut payload = encode(response)?;
-            payload["acknowledged"] = json!(false);
-            payload["wait_expired"] = json!(wait_expired);
-            if !seqs.is_empty() {
-                payload["ack_request"] =
-                    encode(EventAck::new(&auth.topic, seqs).with_cursors(cursors))?;
-            }
-            return Ok(payload);
+            return Ok(PolledResponse {
+                response,
+                wait_expired,
+            });
         }
         let remaining = deadline
             .expect("bounded wait")
@@ -569,12 +782,66 @@ fn poll(
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             // Preserve the last confirmed empty batch instead of starting a
             // zero-budget request when the waiting interval consumes the deadline.
-            let mut payload = encode(response)?;
-            payload["acknowledged"] = json!(false);
-            payload["wait_expired"] = json!(true);
-            return Ok(payload);
+            return Ok(PolledResponse {
+                response,
+                wait_expired: true,
+            });
         }
     }
+}
+
+fn check_poll(
+    response: &PollResponse,
+    auth: &Authority,
+    stream_id: &str,
+    batch_size: u32,
+) -> std::result::Result<(), Failure> {
+    check_stream(&response.stream, auth, Some(stream_id))?;
+    if response.events.len() > batch_size as usize
+        || response.events.len() > response.stream.pending_events
+    {
+        return Err(Failure::InvalidResponse);
+    }
+    let mut seqs = Vec::new();
+    let mut cursors = Vec::new();
+    for event in &response.events {
+        // Original pending payloads retain their original instance after
+        // reattachment. Validate source scope, not old-instance equality.
+        if event.topic != auth.topic
+            || event.data.connector_id != auth.connector_id
+            || event.data.zone_id != auth.zone_id
+            || !event.requires_ack
+        {
+            return Err(Failure::InvalidResponse);
+        }
+        seqs.push(event.seq);
+        cursors.push(event.cursor.clone());
+    }
+    if !seqs.is_empty() {
+        validate_ack_pairs(&seqs, &cursors).map_err(|_| Failure::InvalidResponse)?;
+    }
+    Ok(())
+}
+
+fn acknowledge(
+    client: &HostAdminClient,
+    auth: &Authority,
+    stream_id: &str,
+    ack: &EventAck,
+    timeout: Duration,
+) -> std::result::Result<AckResponse, Failure> {
+    validate_ack_pairs(&ack.seqs, &ack.cursors)?;
+    let response: AckResponse = post(
+        client,
+        "/rpc/streams/ack",
+        &json!({ "auth": auth, "stream_id": stream_id, "ack": ack }),
+        timeout,
+    )?;
+    check_stream(&response.stream, auth, Some(stream_id))?;
+    if !response.acknowledged {
+        return Err(Failure::InvalidResponse);
+    }
+    Ok(response)
 }
 
 fn encode(value: impl Serialize) -> std::result::Result<Value, Failure> {
@@ -786,6 +1053,296 @@ mod tests {
         ];
         argv.extend(extra.iter().map(|arg| (*arg).to_owned()));
         TestCli::try_parse_from(argv).unwrap().streams
+    }
+
+    fn consumer_config(file: &std::path::Path) -> NativeStreamConfig {
+        NativeStreamConfig {
+            connector: "fcp.telegram".to_owned(),
+            zone: "z:work".to_owned(),
+            topic: TOPIC.to_owned(),
+            request_id: "consumer-stable-1".to_owned(),
+            stream_id: STREAM.to_owned(),
+            capability_token_file: file.to_owned(),
+            timeout_seconds: 3,
+        }
+    }
+
+    #[test]
+    fn native_consumer_freezes_authority_and_only_acknowledges_delivered_pairs() {
+        let file = credential();
+        let mut second = event();
+        second["cursor"] = json!("provider-8");
+        second["data"]["instance_id"] = json!("inst_current");
+        let mut pending = metadata(false, 2, 0);
+        pending["window_size"] = json!(2);
+        let mut partial = metadata(false, 1, 1);
+        partial["window_size"] = json!(2);
+        let mut settled = metadata(false, 0, 2);
+        settled["window_size"] = json!(2);
+        let (endpoint, task) = host(vec![
+            json!({"stream":pending,"events":[event(),second]}),
+            json!({"stream":partial,"acknowledged":true,"upstream_notified":false}),
+            json!({"stream":settled,"acknowledged":true,"upstream_notified":true}),
+        ]);
+        let mut client =
+            NativeStreamClient::new(consumer_config(file.path()), Some(&endpoint)).unwrap();
+        assert_eq!(client.endpoint(), endpoint);
+        assert_eq!(client.stream_id(), STREAM);
+        assert_eq!(client.connector(), "fcp.telegram");
+        assert_eq!(client.zone(), "z:work");
+        assert_eq!(client.topic(), TOPIC);
+        assert!(matches!(
+            client.ack(&[7], &["provider-7".to_owned()]),
+            Err(Failure::InvalidRequest)
+        ));
+        let batch = client.poll(2, 0).unwrap();
+        assert_eq!(batch.events.len(), 2);
+        assert!(!batch.closed);
+        assert!(!batch.wait_expired);
+        assert_eq!(
+            batch.events[0].data.instance_id.as_str(),
+            "inst_predecessor"
+        );
+
+        // File replacement cannot silently switch the caller of an already
+        // prepared batch. A future consumer must explicitly load new authority.
+        std::fs::write(file.path(), "REPLACEMENT_CREDENTIAL_SENTINEL").unwrap();
+        for (seqs, cursors) in [
+            (vec![8], vec!["provider-8".to_owned()]),
+            (vec![7], vec!["undelivered-cursor".to_owned()]),
+            (
+                vec![7, 7],
+                vec!["provider-7".to_owned(), "provider-7".to_owned()],
+            ),
+        ] {
+            assert!(matches!(
+                client.ack(&seqs, &cursors),
+                Err(Failure::InvalidRequest)
+            ));
+        }
+        assert!(
+            !client
+                .ack(&[7], &["provider-8".to_owned()])
+                .unwrap()
+                .upstream_notified
+        );
+        assert!(matches!(
+            client.ack(&[7], &["provider-8".to_owned()]),
+            Err(Failure::InvalidRequest)
+        ));
+        assert!(
+            client
+                .ack(&[7], &["provider-7".to_owned()])
+                .unwrap()
+                .upstream_notified
+        );
+
+        let requests = task.join().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0].path, "/rpc/streams/poll");
+        for request in &requests {
+            assert_eq!(request.body["auth"], requests[0].body["auth"]);
+            assert_eq!(request.body["stream_id"], STREAM);
+            assert_eq!(request.body["auth"]["connector_id"], "fcp.telegram");
+            assert_eq!(request.body["auth"]["zone_id"], "z:work");
+            assert_eq!(request.body["auth"]["topic"], TOPIC);
+            assert_eq!(request.body["auth"]["request_id"], "consumer-stable-1");
+            assert!(
+                !request
+                    .body
+                    .to_string()
+                    .contains("REPLACEMENT_CREDENTIAL_SENTINEL")
+            );
+        }
+        assert_eq!(requests[1].body["ack"]["seqs"], json!([7]));
+        assert_eq!(requests[1].body["ack"]["cursors"], json!(["provider-8"]));
+        assert_eq!(requests[2].body["ack"]["seqs"], json!([7]));
+        assert_eq!(requests[2].body["ack"]["cursors"], json!(["provider-7"]));
+    }
+
+    #[test]
+    fn native_consumer_rejects_changed_binding_and_invalidates_old_poll_pairs() {
+        for (field, value) in [
+            ("/binding/principal", json!("agent:mallory")),
+            ("/binding/connector_id", json!("fcp.slack")),
+            ("/binding/zone_id", json!("z:private")),
+            ("/binding/topic", json!("telegram.callback_query")),
+            ("/window_size", json!(2)),
+            ("/stream_id", json!("another-stream")),
+            ("/durable", json!(false)),
+        ] {
+            let file = credential();
+            let mut changed = metadata(false, 1, 0);
+            *changed.pointer_mut(field).unwrap() = value;
+            let (endpoint, task) = host(vec![
+                json!({"stream":metadata(false,1,0),"events":[event()]}),
+                json!({"stream":changed,"events":[event()]}),
+            ]);
+            let mut client =
+                NativeStreamClient::new(consumer_config(file.path()), Some(&endpoint)).unwrap();
+            assert_eq!(client.poll(1, 0).unwrap().events.len(), 1);
+            assert!(matches!(client.poll(1, 0), Err(Failure::InvalidResponse)));
+            assert!(matches!(
+                client.ack(&[7], &["provider-7".to_owned()]),
+                Err(Failure::InvalidRequest)
+            ));
+            assert!(
+                task.join()
+                    .unwrap()
+                    .iter()
+                    .all(|request| request.path == "/rpc/streams/poll")
+            );
+        }
+    }
+
+    #[test]
+    fn native_consumer_ack_rejects_changed_binding_without_claiming_settlement() {
+        for (field, value) in [
+            ("/binding/principal", json!("agent:mallory")),
+            ("/window_size", json!(2)),
+        ] {
+            let file = credential();
+            let mut changed = metadata(false, 0, 1);
+            *changed.pointer_mut(field).unwrap() = value;
+            let (endpoint, task) = host(vec![
+                json!({"stream":metadata(false,1,0),"events":[event()]}),
+                json!({"stream":changed,"acknowledged":true,"upstream_notified":true}),
+            ]);
+            let mut client =
+                NativeStreamClient::new(consumer_config(file.path()), Some(&endpoint)).unwrap();
+            client.poll(1, 0).unwrap();
+            assert!(matches!(
+                client.ack(&[7], &["provider-7".to_owned()]),
+                Err(Failure::InvalidResponse)
+            ));
+            assert_eq!(client.delivered.get("provider-7"), Some(&7));
+            assert_eq!(task.join().unwrap().len(), 2);
+        }
+    }
+
+    #[test]
+    fn native_consumer_rejects_unacknowledgeable_or_cross_scope_events() {
+        for (field, value) in [
+            ("/data/connector_id", json!("fcp.slack")),
+            ("/data/zone_id", json!("z:private")),
+            ("/topic", json!("telegram.callback_query")),
+            ("/requires_ack", json!(false)),
+            ("/cursor", json!("")),
+            ("/cursor", json!("x".repeat(1025))),
+            ("/cursor", json!("cursor\nforged")),
+        ] {
+            let file = credential();
+            let mut changed = event();
+            *changed.pointer_mut(field).unwrap() = value;
+            let (endpoint, task) = host(vec![
+                json!({"stream":metadata(false,1,0),"events":[changed]}),
+            ]);
+            let mut client =
+                NativeStreamClient::new(consumer_config(file.path()), Some(&endpoint)).unwrap();
+            assert!(matches!(client.poll(1, 0), Err(Failure::InvalidResponse)));
+            assert!(client.delivered.is_empty());
+            assert_eq!(task.join().unwrap()[0].path, "/rpc/streams/poll");
+        }
+    }
+
+    #[test]
+    fn native_consumer_validates_configuration_and_poll_limits_before_transport() {
+        let file = credential();
+        let original = consumer_config(file.path());
+        let mut invalid = original.clone();
+        invalid.stream_id = "../../other-stream".to_owned();
+        assert!(matches!(
+            NativeStreamClient::new(invalid, Some("http://127.0.0.1:1")),
+            Err(Failure::InvalidRequest)
+        ));
+        for seconds in [0, 91, u64::MAX] {
+            let mut invalid = original.clone();
+            invalid.timeout_seconds = seconds;
+            assert!(matches!(
+                NativeStreamClient::new(invalid, Some("http://127.0.0.1:1")),
+                Err(Failure::InvalidRequest)
+            ));
+        }
+        let mut client = NativeStreamClient::new(original, Some("http://127.0.0.1:1")).unwrap();
+        for (batch_size, wait_seconds) in [(0, 0), (65, 0), (1, 61), (1, u64::MAX)] {
+            assert!(matches!(
+                client.poll(batch_size, wait_seconds),
+                Err(Failure::InvalidRequest)
+            ));
+        }
+    }
+
+    #[test]
+    fn native_consumer_lost_ack_response_preserves_exact_retry_identity() {
+        let file = credential();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let task = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for step in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                requests.push(read_request(&mut stream));
+                if step == 1 {
+                    // The host may have committed this ACK. Dropping the
+                    // response cannot cause an automatic retry or data loss.
+                    continue;
+                }
+                let response = if step == 0 {
+                    json!({"stream":metadata(false,1,0),"events":[event()]})
+                } else {
+                    json!({"stream":metadata(false,0,1),"acknowledged":true,"upstream_notified":false})
+                };
+                let body = response.to_string();
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+            requests
+        });
+        let mut client =
+            NativeStreamClient::new(consumer_config(file.path()), Some(&endpoint)).unwrap();
+        client.poll(1, 0).unwrap();
+        let cursors = ["provider-7".to_owned()];
+        assert!(matches!(
+            client.ack(&[7], &cursors),
+            Err(Failure::Transport)
+        ));
+        assert_eq!(client.delivered.get("provider-7"), Some(&7));
+        assert!(!client.ack(&[7], &cursors).unwrap().upstream_notified);
+        assert!(client.delivered.is_empty());
+        let requests = task.join().unwrap();
+        assert_eq!(requests[1].path, "/rpc/streams/ack");
+        assert_eq!(requests[2].path, "/rpc/streams/ack");
+        assert_eq!(requests[1].body, requests[2].body);
+    }
+
+    #[test]
+    fn native_consumer_errors_never_echo_credential_bearing_host_bodies() {
+        let file = credential();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let task = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_request(&mut stream);
+            let body = format!("SERVER_SECRET_ECHO {}", request.body);
+            write!(
+                stream,
+                "HTTP/1.1 403 Forbidden\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+            request
+        });
+        let mut client =
+            NativeStreamClient::new(consumer_config(file.path()), Some(&endpoint)).unwrap();
+        let error = match client.poll(1, 0) {
+            Ok(_) => panic!("host denied stream authority"),
+            Err(error) => error,
+        };
+        assert_eq!(error.details().0, "stream-authority-denied");
+        assert_eq!(error.details().2, CliExitCode::PolicyDenied);
+        assert!(!error.to_string().contains("SERVER_SECRET_ECHO"));
+        assert!(!error.to_string().contains("capability_token"));
+        assert!(client.delivered.is_empty());
+        assert_eq!(task.join().unwrap().path, "/rpc/streams/poll");
     }
 
     #[test]

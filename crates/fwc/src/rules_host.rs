@@ -5,12 +5,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, ensure};
-use fcp_core::SafetyTier;
+use fcp_core::{EventEnvelope, Provenance, SafetyTier};
 use serde_json::json;
 
+use crate::native_events::{NativeStreamClient, NativeStreamConfig, StreamFailure};
 use crate::reactive_rules::Rule;
 use crate::rules_cmd::{
-    self, ExecutionScope, InvocationResult, RuleExecutor, RulesArgs, RulesRunOptions,
+    self, ExecutionScope, InvocationResult, RuleEventBatch, RuleEventSource, RuleExecutor,
+    RulesArgs, RulesExecutionOptions,
 };
 use crate::{
     CliExitCode, CommandAvailability, CommandEnvelope, DispatchOutcome, HostAdminClient,
@@ -20,13 +22,36 @@ use crate::{
 };
 
 pub(crate) fn dispatch(args: &RulesArgs, explicit_host: Option<&str>) -> Result<DispatchOutcome> {
-    let live = args.run_options().is_some_and(|options| !options.dry_run);
-    let result = if let Some(options) = args.run_options().filter(|options| !options.dry_run) {
+    let live = args.execution_options().is_some();
+    let result = if let Some(options) = args.execution_options() {
         (|| {
             let host = resolve_host_config(explicit_host)?
                 .context("live rules require a configured host or --host")?;
             let mut executor = HostRuleExecutor::new(host, options)?;
-            rules_cmd::run(args, &mut executor)
+            if let Some(options) = args.consume_options() {
+                let mut source = NativeRuleSource(NativeStreamClient::new(
+                    NativeStreamConfig {
+                        connector: options.connector.clone(),
+                        zone: options.source_zone.clone(),
+                        topic: options.topic.clone(),
+                        request_id: options.request_id.clone(),
+                        stream_id: options.stream_id.clone(),
+                        capability_token_file: options.stream_capability_token_file.clone(),
+                        timeout_seconds: options.stream_timeout_seconds,
+                    },
+                    Some(&executor.host.endpoint),
+                )?);
+                ensure!(
+                    source.0.stream_id() == options.stream_id
+                        && source.0.connector() == options.connector
+                        && source.0.zone() == options.source_zone
+                        && source.0.topic() == options.topic,
+                    "native source scope changed during preparation"
+                );
+                rules_cmd::consume(args, &mut executor, &mut source)
+            } else {
+                rules_cmd::run(args, &mut executor)
+            }
         })()
     } else {
         rules_cmd::dispatch(args)
@@ -63,21 +88,30 @@ pub(crate) fn dispatch(args: &RulesArgs, explicit_host: Option<&str>) -> Result<
                 },
             )
         }
-        Err(error) => (
-            json!({"status": "error", "command": "rules",
-                "error": {"type": "rules-request-failed", "message": error.to_string()}}),
-            CliExitCode::Validation,
-            if live {
-                CommandAvailability::Unavailable
-            } else {
-                CommandAvailability::OfflineArtifact
-            },
-            if live {
-                None
-            } else {
-                Some(KnowledgeState::Offline)
-            },
-        ),
+        Err(error) => {
+            let (kind, exit_code) = error.downcast_ref::<StreamFailure>().map_or(
+                ("rules-request-failed", CliExitCode::Validation),
+                |error| {
+                    let (kind, _, code) = error.details();
+                    (kind, code)
+                },
+            );
+            (
+                json!({"status": "error", "command": "rules",
+                    "error": {"type": kind, "message": error.to_string()}}),
+                exit_code,
+                if live {
+                    CommandAvailability::Unavailable
+                } else {
+                    CommandAvailability::OfflineArtifact
+                },
+                if live {
+                    None
+                } else {
+                    Some(KnowledgeState::Offline)
+                },
+            )
+        }
     };
     CommandEnvelope::new(availability, "rules").inject_into(&mut payload);
     if let Some(truth) = truth {
@@ -89,16 +123,44 @@ pub(crate) fn dispatch(args: &RulesArgs, explicit_host: Option<&str>) -> Result<
 }
 
 fn has_uncertain_results(payload: &serde_json::Value) -> bool {
-    payload["data"]["results"]
-        .as_array()
-        .is_some_and(|results| {
-            results.iter().any(|result| {
-                result["outcome"] == "outcome_unknown"
-                    || result["previous_outcome"] == "pending"
-                    || result["previous_outcome"] == "unknown"
-                    || result["state_persisted"] == false
+    payload["data"]["source"]["acknowledgement_unknown"] == true
+        || payload["data"]["source"]["ack_state_persisted"] == false
+        || payload["data"]["results"]
+            .as_array()
+            .is_some_and(|results| {
+                results.iter().any(|result| {
+                    result["outcome"] == "outcome_unknown"
+                        || result["previous_outcome"] == "pending"
+                        || result["previous_outcome"] == "unknown"
+                        || result["state_persisted"] == false
+                })
             })
+}
+
+struct NativeRuleSource(NativeStreamClient);
+
+impl RuleEventSource for NativeRuleSource {
+    fn host(&self) -> &str {
+        self.0.endpoint()
+    }
+
+    fn poll(&mut self, limit: u32, wait_seconds: u64) -> Result<RuleEventBatch> {
+        let batch = self.0.poll(limit, wait_seconds)?;
+        Ok(RuleEventBatch {
+            events: batch.events,
+            closed: batch.closed,
+            wait_expired: batch.wait_expired,
         })
+    }
+
+    fn acknowledge(&mut self, events: &[EventEnvelope]) -> Result<bool> {
+        let seqs = events.iter().map(|event| event.seq).collect::<Vec<_>>();
+        let cursors = events
+            .iter()
+            .map(|event| event.cursor.clone())
+            .collect::<Vec<_>>();
+        Ok(self.0.ack(&seqs, &cursors)?.upstream_notified)
+    }
 }
 
 struct PreparedRule {
@@ -109,12 +171,12 @@ struct PreparedRule {
 struct HostRuleExecutor {
     host: ResolvedHostConfig,
     client: HostAdminClient,
-    options: RulesRunOptions,
+    options: RulesExecutionOptions,
     prepared: BTreeMap<String, PreparedRule>,
 }
 
 impl HostRuleExecutor {
-    fn new(mut host: ResolvedHostConfig, options: &RulesRunOptions) -> Result<Self> {
+    fn new(mut host: ResolvedHostConfig, options: &RulesExecutionOptions) -> Result<Self> {
         host.endpoint = canonical_host(&host.endpoint)?;
         let client = HostAdminClient::new(&host.endpoint)?;
         Ok(Self {
@@ -321,6 +383,7 @@ impl RuleExecutor for HostRuleExecutor {
         rule: &Rule,
         inputs: &BTreeMap<String, String>,
         idempotency_key: &str,
+        provenance: Option<&Provenance>,
         admit: &mut dyn FnMut(&str, &str) -> Result<()>,
     ) -> Result<InvocationResult> {
         let prepared = self
@@ -346,6 +409,7 @@ impl RuleExecutor for HostRuleExecutor {
             client: &self.client,
             scope: &prepared.scope,
             max_safety_tier: rule.safety_tier,
+            provenance,
             admit,
         };
         let outcome = invoke_dispatch_host_controlled(
@@ -370,6 +434,7 @@ pub(crate) struct InvocationGuard<'a> {
     pub(crate) client: &'a HostAdminClient,
     scope: &'a ExecutionScope,
     pub(crate) max_safety_tier: SafetyTier,
+    pub(crate) provenance: Option<&'a Provenance>,
     admit: &'a mut dyn FnMut(&str, &str) -> Result<()>,
 }
 
@@ -398,7 +463,8 @@ impl InvocationGuard<'_> {
         ensure!(
             request.connector_id.as_str() == self.scope.connector
                 && request.operation.as_str() == self.scope.operation
-                && request.zone_id.as_str() == self.scope.zone,
+                && request.zone_id.as_str() == self.scope.zone
+                && request.provenance.as_ref() == self.provenance,
             "prepared rule request changed before reservation"
         );
         let key = request
@@ -429,6 +495,12 @@ mod tests {
             {"outcome": "executed", "state_persisted": true},
             {"outcome": "duplicate", "previous_outcome": "completed"}
         ]}})));
+        assert!(has_uncertain_results(&json!({
+            "data": {"source": {"acknowledgement_unknown": true}}
+        })));
+        assert!(has_uncertain_results(&json!({
+            "data": {"source": {"ack_state_persisted": false}}
+        })));
     }
 
     #[test]

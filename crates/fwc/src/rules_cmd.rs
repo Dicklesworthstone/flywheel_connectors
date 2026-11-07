@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, ensure};
 use chrono::{DateTime, Duration, Utc};
 use clap::{Args, Subcommand};
-use fcp_core::SafetyTier;
+use fcp_core::{EventEnvelope, Provenance, ProvenanceStep, SafetyTier};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -75,6 +75,8 @@ enum RulesCommand {
     },
     /// Execute a finite event batch through live host admission and durable replay protection.
     Run(RulesRunOptions),
+    /// Process a bounded batch from an existing durable native stream and acknowledge settled work.
+    Consume(RulesConsumeOptions),
 }
 
 #[derive(Args, Clone, Debug)]
@@ -88,6 +90,43 @@ pub(crate) struct RulesRunOptions {
     /// Preview without contacting a host or recording attempts.
     #[arg(long)]
     pub(crate) dry_run: bool,
+    #[command(flatten)]
+    pub(crate) execution: RulesExecutionOptions,
+}
+
+#[derive(Args, Clone, Debug)]
+pub(crate) struct RulesConsumeOptions {
+    /// Exact source connector ID; rule triggers must use this canonical ID.
+    #[arg(long)]
+    pub(crate) connector: String,
+    #[arg(long)]
+    pub(crate) source_zone: String,
+    #[arg(long)]
+    pub(crate) topic: String,
+    /// Existing stream returned by `fwc streams open`.
+    #[arg(long)]
+    pub(crate) stream_id: String,
+    /// Stable subscription request identity; reuse on retries.
+    #[arg(long)]
+    pub(crate) request_id: String,
+    /// Subscription authority is separate from every action capability.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) stream_capability_token_file: PathBuf,
+    #[arg(long)]
+    pub(crate) rule: Option<String>,
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=64))]
+    pub(crate) max_events: u32,
+    /// Wait for the first batch; this command never runs an unbounded event loop.
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u64).range(0..=60))]
+    pub(crate) wait_seconds: u64,
+    #[arg(long, default_value_t = 70, value_parser = clap::value_parser!(u64).range(1..=90))]
+    pub(crate) stream_timeout_seconds: u64,
+    #[command(flatten)]
+    pub(crate) execution: RulesExecutionOptions,
+}
+
+#[derive(Args, Clone, Debug)]
+pub(crate) struct RulesExecutionOptions {
     #[arg(long)]
     pub(crate) zone: Option<String>,
     #[arg(long)]
@@ -123,6 +162,21 @@ impl RulesArgs {
             _ => None,
         }
     }
+
+    pub(crate) fn consume_options(&self) -> Option<&RulesConsumeOptions> {
+        match &self.command {
+            RulesCommand::Consume(options) => Some(options),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn execution_options(&self) -> Option<&RulesExecutionOptions> {
+        match &self.command {
+            RulesCommand::Run(options) if !options.dry_run => Some(&options.execution),
+            RulesCommand::Consume(options) => Some(&options.execution),
+            _ => None,
+        }
+    }
 }
 
 /// Resolved execution identity. This contains no credential material.
@@ -141,6 +195,20 @@ pub(crate) struct InvocationResult {
     pub(crate) success: bool,
 }
 
+pub(crate) struct RuleEventBatch {
+    pub(crate) events: Vec<EventEnvelope>,
+    pub(crate) closed: bool,
+    pub(crate) wait_expired: bool,
+}
+
+/// Polling never releases source credit. Only a confirmed acknowledgement of
+/// exact delivered sequence/cursor pairs may release retained action records.
+pub(crate) trait RuleEventSource {
+    fn host(&self) -> &str;
+    fn poll(&mut self, limit: u32, wait_seconds: u64) -> Result<RuleEventBatch>;
+    fn acknowledge(&mut self, events: &[EventEnvelope]) -> Result<bool>;
+}
+
 /// The host bridge must freeze all authority during `prepare`, then perform
 /// ordinary live preflight before calling `admit` immediately before invoke.
 /// A failed `admit` must prevent the invoke. Returning an error after admission
@@ -153,6 +221,7 @@ pub(crate) trait RuleExecutor {
         rule: &Rule,
         inputs: &BTreeMap<String, String>,
         idempotency_key: &str,
+        provenance: Option<&Provenance>,
         admit: &mut dyn FnMut(&str, &str) -> Result<()>,
     ) -> Result<InvocationResult>;
 }
@@ -245,6 +314,7 @@ pub(crate) fn dispatch(args: &RulesArgs) -> Result<RulesOutput> {
             preview_output("run", &rules, &events)
         }
         RulesCommand::Run(_) => anyhow::bail!("live rules require the host execution bridge"),
+        RulesCommand::Consume(_) => anyhow::bail!("stream rules require the native stream bridge"),
         RulesCommand::Test { .. } => unreachable!("test returned before opening the store"),
     }
 }
@@ -533,7 +603,300 @@ pub(crate) fn run<E: RuleExecutor>(args: &RulesArgs, executor: &mut E) -> Result
         &identities,
         executor,
         &mut journal,
+        None,
     ))
+}
+
+/// Consume one bounded batch from a retained stream. Authority and the entire
+/// batch are validated before effects. Only a fully settled prefix is ACKed;
+/// throttled, rejected, failed and uncertain work remains in source custody.
+#[allow(clippy::too_many_lines)]
+pub(crate) fn consume<E: RuleExecutor, S: RuleEventSource>(
+    args: &RulesArgs,
+    executor: &mut E,
+    source: &mut S,
+) -> Result<RulesOutput> {
+    let options = args.consume_options().context("expected rules consume")?;
+    ensure!(
+        (1..=64).contains(&options.max_events) && options.wait_seconds <= 60,
+        "invalid stream batch bounds"
+    );
+    let source_zone = options.source_zone.parse::<fcp_core::ZoneId>()?;
+    let source_connector = options.connector.parse::<fcp_core::ConnectorId>()?;
+    ensure!(
+        source_zone.as_str() == options.source_zone
+            && source_connector.as_str() == options.connector,
+        "stream source identifiers must be canonical"
+    );
+    let store = args
+        .rules_file
+        .as_ref()
+        .map_or_else(RuleSetStore::default_path, RuleSetStore::new);
+    let path = canonical_rules_path(store.path(), false)?;
+    let _lock = lock_rules(&path)?;
+    let mut rules = selected_rules(&path, options.rule.as_deref())?;
+    // A typo or alias must not turn all retained events into acknowledged
+    // no-matches. Source scope is explicit and never inferred from a payload.
+    ensure!(
+        rules.rules.iter().any(|rule| rule.enabled
+            && rule.trigger.connector == options.connector
+            && rule.trigger.event_type == options.topic),
+        "no enabled rule has the exact canonical source connector and topic"
+    );
+    rules.rules.retain(|rule| {
+        rule.enabled
+            && rule.trigger.connector == options.connector
+            && rule.trigger.event_type == options.topic
+    });
+    let scopes = executor.prepare(&rules.rules)?;
+    ensure!(
+        scopes.len() == rules.len(),
+        "host preparation returned incomplete rule scopes"
+    );
+    let mut identities = BTreeMap::new();
+    for rule in &rules.rules {
+        let scope = scopes
+            .get(&rule.name)
+            .context("missing prepared stream rule scope")?;
+        validate_scope(scope)?;
+        ensure!(
+            scope.host == source.host() && scope.zone == options.source_zone,
+            "stream actions must use the source host and zone"
+        );
+        identities.insert(rule.name.clone(), rule_identity(rule, scope)?);
+    }
+    let state_path = companion_path(&path, ".state.jsonl");
+    let (mut state, sequence) = load_run_state(&state_path)?;
+    state.prepare(&rules.rules, &identities, Utc::now())?;
+    let mut journal = RunJournal::open(&state_path, state, sequence)?;
+    let received = source.poll(options.max_events, options.wait_seconds)?;
+    ensure!(
+        received.events.len() <= options.max_events as usize,
+        "source exceeded its batch bound"
+    );
+    let mut seen = BTreeSet::new();
+    let mut events = Vec::with_capacity(received.events.len());
+    let mut provenance = Vec::with_capacity(received.events.len());
+    for envelope in &received.events {
+        ensure!(
+            envelope.requires_ack
+                && envelope.data.connector_id == source_connector
+                && envelope.data.zone_id == source_zone
+                && envelope.topic == options.topic
+                && !envelope.cursor.is_empty()
+                && envelope.cursor.len() <= 1024
+                && !envelope.cursor.chars().any(char::is_control)
+                && seen.insert(&envelope.cursor),
+            "invalid or repeated source event scope or cursor"
+        );
+        let event = normalize_stream_event(source.host(), envelope)?;
+        provenance.push(
+            Provenance::tainted(source_zone.clone()).with_step(ProvenanceStep {
+                timestamp_ms: u64::try_from(envelope.timestamp.timestamp_millis()).unwrap_or(0),
+                zone: source_zone.clone(),
+                actor: options.connector.clone(),
+                action: options.topic.clone(),
+                resource: event
+                    .event_id
+                    .clone()
+                    .context("missing normalized source identity")?,
+            }),
+        );
+        events.push(event);
+    }
+    let batch = prepare_batch(&rules, &events)?;
+    // A new subscription can redeliver a cursor whose previous source ACK
+    // released its replay retention. Pin every retained attempt before
+    // effects or ACK, including records after a possible early batch stop.
+    let pending_keys = batch
+        .iter()
+        .map(|item| {
+            attempt_identity(
+                &identities[&rules.rules[item.rule].name],
+                &events[item.event],
+            )
+        })
+        .filter(|key| {
+            journal
+                .state
+                .attempts
+                .get(key)
+                .is_some_and(|attempt| attempt.retain_until < DateTime::<Utc>::MAX_UTC)
+        })
+        .collect::<BTreeSet<_>>();
+    if !pending_keys.is_empty() {
+        journal.append(JournalEntry::SourcePending {
+            keys: pending_keys.into_iter().collect(),
+        })?;
+    }
+    let mut result = execute_batch(
+        &rules,
+        &events,
+        &batch,
+        &identities,
+        executor,
+        &mut journal,
+        Some(&provenance),
+    );
+    let ack_count = settled_event_prefix(&result.payload, rules.len(), events.len());
+    let mut acknowledged = false;
+    let mut upstream_notified = false;
+    let mut acknowledgement_unknown = false;
+    let mut ack_state_persisted = true;
+    if ack_count > 0 {
+        match source.acknowledge(&received.events[..ack_count]) {
+            Ok(notified) => {
+                acknowledged = true;
+                upstream_notified = notified;
+                let keys = batch
+                    .iter()
+                    .filter(|item| item.event < ack_count)
+                    .map(|item| {
+                        attempt_identity(
+                            &identities[&rules.rules[item.rule].name],
+                            &events[item.event],
+                        )
+                    })
+                    .filter(|key| {
+                        journal
+                            .state
+                            .attempts
+                            .get(key)
+                            .is_some_and(|attempt| attempt.status == AttemptStatus::Completed)
+                    })
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                if !keys.is_empty() {
+                    ack_state_persisted = journal
+                        .append(JournalEntry::SourceAcknowledged {
+                            keys,
+                            acknowledged_at: Utc::now(),
+                        })
+                        .is_ok();
+                }
+            }
+            Err(_) => acknowledgement_unknown = true,
+        }
+    }
+    result.payload["subcommand"] = json!("consume");
+    result.payload["data"]["source"] = json!({
+        "stream_id": options.stream_id, "request_id": options.request_id,
+        "connector": options.connector, "zone": options.source_zone, "topic": options.topic,
+        "closed": received.closed, "wait_expired": received.wait_expired,
+        "acknowledged": acknowledged, "acknowledged_events": if acknowledged {ack_count} else {0},
+        "unacknowledged_events": events.len() - if acknowledged {ack_count} else {0},
+        "upstream_notified": upstream_notified, "acknowledgement_unknown": acknowledgement_unknown,
+        "ack_state_persisted": ack_state_persisted,
+    });
+    if ack_count > 0 {
+        result.payload["data"]["source"]["ack_request"] = json!({
+            "topic": options.topic,
+            "seqs": received.events[..ack_count].iter().map(|event| event.seq).collect::<Vec<_>>(),
+            "cursors": received.events[..ack_count].iter().map(|event| &event.cursor).collect::<Vec<_>>(),
+        });
+    }
+    result.rejected |= ack_count < events.len() || acknowledgement_unknown || !ack_state_persisted;
+    if result.rejected {
+        result.payload["status"] = json!("error");
+    }
+    Ok(result)
+}
+
+fn normalize_stream_event(host: &str, envelope: &EventEnvelope) -> Result<IncomingEvent> {
+    ensure!(
+        serde_json::to_vec(envelope)?.len() <= MAX_EVENT_BYTES,
+        "source event exceeds its byte limit"
+    );
+    let object = envelope
+        .data
+        .payload
+        .as_object()
+        .context("source event payload must be an object")?;
+    let mut data = BTreeMap::new();
+    for (key, value) in object {
+        flatten_stream_field(key, value, 0, &mut data)?;
+    }
+    // The host journal identifies provider events by cursor within this scope.
+    // Native sequence numbers and instance IDs may change after reattachment.
+    let mut hasher =
+        blake3::Hasher::new_derive_key("flywheel_connectors.reactive_rules.native_event.v1");
+    hasher.update(&serde_json::to_vec(&(
+        host,
+        &envelope.data.connector_id,
+        &envelope.data.zone_id,
+        &envelope.topic,
+        &envelope.cursor,
+    ))?);
+    let event = IncomingEvent {
+        connector: envelope.data.connector_id.to_string(),
+        event_type: envelope.topic.clone(),
+        event_id: Some(format!("native:{}", hasher.finalize().to_hex())),
+        data,
+        received_at: envelope.timestamp,
+    };
+    validate_event(&event)?;
+    ensure!(
+        serde_json::to_vec(&event)?.len() <= MAX_EVENT_BYTES,
+        "normalized source event exceeds its byte limit"
+    );
+    Ok(event)
+}
+
+fn flatten_stream_field(
+    path: &str,
+    value: &Value,
+    depth: usize,
+    data: &mut BTreeMap<String, String>,
+) -> Result<()> {
+    ensure!(
+        depth <= 16
+            && path.len() <= 4096
+            && !path.is_empty()
+            && !path.chars().any(char::is_control),
+        "source event field exceeds its nesting or name limit"
+    );
+    if let Value::Object(fields) = value {
+        for (key, value) in fields {
+            ensure!(!key.is_empty(), "source event has an empty field name");
+            flatten_stream_field(&format!("{path}.{key}"), value, depth + 1, data)?;
+        }
+    } else {
+        ensure!(data.len() < 1024, "source event has too many fields");
+        let value = value
+            .as_str()
+            .map_or_else(|| value.to_string(), str::to_owned);
+        ensure!(
+            data.insert(path.to_owned(), value).is_none(),
+            "source event has ambiguous flattened fields"
+        );
+    }
+    Ok(())
+}
+
+fn settled_event_prefix(payload: &Value, rules: usize, events: usize) -> usize {
+    let Some(results) = payload["data"]["results"].as_array() else {
+        return 0;
+    };
+    if rules == 0 {
+        return 0;
+    }
+    (0..events)
+        .take_while(|index| {
+            let Some(rows) = results.get(index * rules..(index + 1) * rules) else {
+                return false;
+            };
+            rows.iter().all(|row| {
+                row["event"] == index + 1
+                    && match row["outcome"].as_str() {
+                        Some("no_match") => true,
+                        Some("executed") => row["state_persisted"] == true,
+                        Some("duplicate") => row["previous_outcome"] == "completed",
+                        _ => false,
+                    }
+            })
+        })
+        .count()
 }
 
 struct PlannedEvaluation {
@@ -842,6 +1205,29 @@ impl RunState {
                     "rule settlement has no pending reservation"
                 );
             }
+            JournalEntry::SourcePending { keys } => {
+                let unique: BTreeSet<_> = keys.iter().collect();
+                ensure!(
+                    !keys.is_empty()
+                        && keys.len() <= MAX_EVALUATIONS
+                        && unique.len() == keys.len()
+                        && keys.iter().all(|key| self.attempts.contains_key(key)),
+                    "pending source delivery requires distinct existing action records"
+                );
+            }
+            JournalEntry::SourceAcknowledged { keys, .. } => {
+                let unique: BTreeSet<_> = keys.iter().collect();
+                ensure!(
+                    !keys.is_empty()
+                        && keys.len() <= MAX_EVALUATIONS
+                        && unique.len() == keys.len()
+                        && keys.iter().all(|key| self
+                            .attempts
+                            .get(key)
+                            .is_some_and(|attempt| attempt.status == AttemptStatus::Completed)),
+                    "source acknowledgement requires distinct completed action records"
+                );
+            }
         }
         Ok(())
     }
@@ -872,6 +1258,35 @@ impl RunState {
                 status,
                 finished_at,
             } => self.settle(&key, status, finished_at),
+            JournalEntry::SourcePending { keys } => {
+                for key in keys {
+                    self.attempts
+                        .get_mut(&key)
+                        .context("missing pending source action")?
+                        .retain_until = DateTime::<Utc>::MAX_UTC;
+                }
+                Ok(())
+            }
+            JournalEntry::SourceAcknowledged {
+                keys,
+                acknowledged_at,
+            } => {
+                for key in keys {
+                    let attempt = self
+                        .attempts
+                        .get_mut(&key)
+                        .context("missing acknowledged action")?;
+                    let runtime = self
+                        .rules
+                        .get(&attempt.rule_key)
+                        .context("missing acknowledged rule runtime")?;
+                    attempt.retain_until = acknowledged_at
+                        .max(attempt.started_at)
+                        .checked_add_signed(runtime.window.max(Duration::days(1)))
+                        .unwrap_or(DateTime::<Utc>::MAX_UTC);
+                }
+                Ok(())
+            }
             JournalEntry::Checkpoint { .. } => unreachable!("checkpoint rejected before mutation"),
         }
     }
@@ -916,6 +1331,15 @@ enum JournalEntry {
         key: String,
         status: AttemptStatus,
         finished_at: DateTime<Utc>,
+    },
+    /// A newly observed delivery pins earlier records until its own source ACK.
+    SourcePending {
+        keys: Vec<String>,
+    },
+    /// Only a confirmed durable source ACK releases indefinite replay retention.
+    SourceAcknowledged {
+        keys: Vec<String>,
+        acknowledged_at: DateTime<Utc>,
     },
 }
 
@@ -1145,6 +1569,7 @@ fn execute_batch<E: RuleExecutor, W: JournalWriter>(
     identities: &BTreeMap<String, String>,
     executor: &mut E,
     journal: &mut RunJournal<W>,
+    provenance: Option<&[Provenance]>,
 ) -> RulesOutput {
     let mut results = Vec::with_capacity(batch.len());
     let mut executed = 0usize;
@@ -1161,10 +1586,13 @@ fn execute_batch<E: RuleExecutor, W: JournalWriter>(
             results.push(result);
             continue;
         }
-        let Some(inputs) = &evaluation.inputs else {
+        // A retained native cursor keeps its earlier outcome even if a new
+        // delivery no longer matches the data predicate. In particular, a
+        // payload change must not turn an unknown effect into an ACKable no-match.
+        if evaluation.inputs.is_none() && provenance.is_none() {
             results.push(result);
             continue;
-        };
+        }
         let Some(rule_key) = identities.get(&rule.name) else {
             result["outcome"] = json!("admission_failed");
             results.push(result);
@@ -1184,6 +1612,10 @@ fn execute_batch<E: RuleExecutor, W: JournalWriter>(
             results.push(result);
             continue;
         }
+        let Some(inputs) = &evaluation.inputs else {
+            results.push(result);
+            continue;
+        };
         let Some(runtime) = journal.state.rules.get(rule_key) else {
             result["outcome"] = json!("admission_failed");
             results.push(result);
@@ -1209,6 +1641,7 @@ fn execute_batch<E: RuleExecutor, W: JournalWriter>(
             rule,
             inputs,
             &idempotency_key,
+            provenance.and_then(|sources| sources.get(evaluation.event)),
             &mut |request_id, actual_key| {
                 let reservation = (|| {
                     ensure!(
@@ -1226,9 +1659,13 @@ fn execute_batch<E: RuleExecutor, W: JournalWriter>(
                             rule_key: rule_key.clone(),
                             request_id: request_id.to_owned(),
                             started_at,
-                            retain_until: started_at
-                                .checked_add_signed(retention)
-                                .unwrap_or(DateTime::<Utc>::MAX_UTC),
+                            retain_until: if provenance.is_some() {
+                                DateTime::<Utc>::MAX_UTC
+                            } else {
+                                started_at
+                                    .checked_add_signed(retention)
+                                    .unwrap_or(DateTime::<Utc>::MAX_UTC)
+                            },
                             status: AttemptStatus::Pending,
                         },
                     })?;
@@ -1349,18 +1786,20 @@ mod tests {
             rule: None,
             max_events: 1000,
             dry_run: false,
-            zone: None,
-            principal: None,
-            deadline_ms: Some(30_000),
-            lease_seq: None,
-            capability_token: None,
-            capability_token_file: None,
-            holder_key_file: None,
-            approval_token: Vec::new(),
-            approval_token_file: Vec::new(),
-            rule_capability_token: Vec::new(),
-            rule_capability_token_file: Vec::new(),
-            rule_holder_key_file: Vec::new(),
+            execution: RulesExecutionOptions {
+                zone: None,
+                principal: None,
+                deadline_ms: Some(30_000),
+                lease_seq: None,
+                capability_token: None,
+                capability_token_file: None,
+                holder_key_file: None,
+                approval_token: Vec::new(),
+                approval_token_file: Vec::new(),
+                rule_capability_token: Vec::new(),
+                rule_capability_token_file: Vec::new(),
+                rule_holder_key_file: Vec::new(),
+            },
         }
     }
 
@@ -1413,6 +1852,7 @@ mod tests {
         replies: VecDeque<FakeReply>,
         omit_scope: bool,
         inputs: Vec<BTreeMap<String, String>>,
+        provenance: Vec<Option<Provenance>>,
     }
 
     impl FakeExecutor {
@@ -1425,6 +1865,7 @@ mod tests {
                 replies: VecDeque::new(),
                 omit_scope: false,
                 inputs: Vec::new(),
+                provenance: Vec::new(),
             }
         }
     }
@@ -1446,6 +1887,7 @@ mod tests {
             _rule: &Rule,
             inputs: &BTreeMap<String, String>,
             key: &str,
+            provenance: Option<&Provenance>,
             admit: &mut dyn FnMut(&str, &str) -> Result<()>,
         ) -> Result<InvocationResult> {
             assert_eq!(
@@ -1478,6 +1920,7 @@ mod tests {
             assert_eq!(persisted.request_id, request_id);
             self.calls += 1;
             self.inputs.push(inputs.clone());
+            self.provenance.push(provenance.cloned());
             match reply {
                 FakeReply::CrashAfterAdmission => {
                     panic!("simulated process interruption after durable admission")
@@ -2189,7 +2632,15 @@ mod tests {
             bytes,
             poisoned,
         };
-        let result = execute_batch(&rules, &events, &batch, &identities, executor, &mut journal);
+        let result = execute_batch(
+            &rules,
+            &events,
+            &batch,
+            &identities,
+            executor,
+            &mut journal,
+            None,
+        );
         assert!(journal.poisoned);
         result
     }
@@ -2603,6 +3054,494 @@ mod tests {
         dispatch(&args).unwrap();
         assert!(!load_rules(&path, false).unwrap().rules[0].enabled);
         assert!(fs::symlink_metadata(&alias).unwrap().is_symlink());
+    }
+
+    #[test]
+    fn consume_cli_keeps_source_and_action_authority_separate() {
+        #[derive(clap::Parser)]
+        struct Command {
+            #[command(flatten)]
+            rules: RulesArgs,
+        }
+
+        let parse = |extra: &[&str]| {
+            let mut args = vec![
+                "fwc",
+                "consume",
+                "--connector",
+                "fcp.slack",
+                "--source-zone",
+                "z:work",
+                "--topic",
+                "message.new",
+                "--stream-id",
+                "stream-1",
+                "--request-id",
+                "subscription-1",
+                "--stream-capability-token-file",
+                "source.cbor",
+            ];
+            args.extend_from_slice(extra);
+            <Command as clap::Parser>::try_parse_from(args)
+        };
+        let parsed = parse(&["--capability-token-file", "action.cbor"]).unwrap();
+        let options = parsed.rules.consume_options().unwrap();
+        assert_eq!(
+            options.stream_capability_token_file,
+            PathBuf::from("source.cbor")
+        );
+        assert_eq!(
+            options.execution.capability_token_file,
+            Some(PathBuf::from("action.cbor"))
+        );
+        assert_eq!(options.max_events, 1);
+        assert_eq!(options.stream_timeout_seconds, 70);
+        assert_eq!(options.execution.deadline_ms, Some(30_000));
+        assert!(parsed.rules.execution_options().is_some());
+        assert!(parse(&["--max-events", "65"]).is_err());
+        assert!(parse(&["--wait-seconds", "61"]).is_err());
+        assert!(parse(&["--stream-timeout-seconds", "0"]).is_err());
+        assert!(parse(&["--dry-run"]).is_err());
+    }
+
+    fn native_event(cursor: &str, seq: u64) -> EventEnvelope {
+        serde_json::from_value(json!({
+            "topic": "message.new", "timestamp": "2026-11-06T00:00:00Z", "seq": seq,
+            "cursor": cursor, "requires_ack": true,
+            "data": {"connector_id": "fcp.slack", "instance_id": "inst_original", "zone_id": "z:work",
+                "principal": {"kind": "provider_user", "id": "user-1", "trust": "untrusted", "display": null},
+                "payload": {"text": "private-source-text", "issue": {"number": 42}}}
+        })).unwrap()
+    }
+
+    struct FakeSource {
+        events: Vec<EventEnvelope>,
+        acknowledgements: Vec<Vec<String>>,
+        fail_ack: bool,
+        polls: usize,
+        state_path: PathBuf,
+    }
+
+    impl RuleEventSource for FakeSource {
+        fn host(&self) -> &str {
+            "http://127.0.0.1:8787"
+        }
+
+        fn poll(&mut self, _limit: u32, _wait_seconds: u64) -> Result<RuleEventBatch> {
+            self.polls += 1;
+            Ok(RuleEventBatch {
+                events: self.events.clone(),
+                closed: false,
+                wait_expired: false,
+            })
+        }
+
+        fn acknowledge(&mut self, events: &[EventEnvelope]) -> Result<bool> {
+            // Read the real persisted journal at the source ACK boundary.
+            load_run_state(&self.state_path)?;
+            self.acknowledgements
+                .push(events.iter().map(|event| event.cursor.clone()).collect());
+            if self.fail_ack {
+                anyhow::bail!("private source transport failure with bearer material");
+            }
+            Ok(false)
+        }
+    }
+
+    fn consume_fixture(
+        events: Vec<EventEnvelope>,
+    ) -> (tempfile::TempDir, RulesArgs, FakeExecutor, FakeSource) {
+        let mut definition = rule();
+        definition.trigger.connector = "fcp.slack".into();
+        let (temp, mut args, executor) = fixture(vec![definition], &[]);
+        args.command = RulesCommand::Consume(RulesConsumeOptions {
+            connector: "fcp.slack".into(),
+            source_zone: "z:work".into(),
+            topic: "message.new".into(),
+            stream_id: "stream-1".into(),
+            request_id: "subscription-1".into(),
+            stream_capability_token_file: temp.path().join("source.cbor"),
+            rule: None,
+            max_events: 64,
+            wait_seconds: 0,
+            stream_timeout_seconds: 70,
+            execution: run_options(PathBuf::new()).execution,
+        });
+        let source = FakeSource {
+            events,
+            acknowledgements: Vec::new(),
+            fail_ack: false,
+            polls: 0,
+            state_path: executor.state_path.clone(),
+        };
+        (temp, args, executor, source)
+    }
+
+    #[test]
+    fn consume_settles_before_ack_and_preserves_provenance_and_replay_identity() {
+        let (_temp, args, mut executor, mut source) =
+            consume_fixture(vec![native_event("cursor-1", 1)]);
+        let result = consume(&args, &mut executor, &mut source).unwrap();
+        assert!(!result.rejected);
+        assert_eq!(executor.calls, 1);
+        assert_eq!(executor.inputs[0]["query"], "private-source-text");
+        let provenance = executor.provenance[0].as_ref().unwrap();
+        assert_eq!(provenance.origin_zone.as_str(), "z:work");
+        assert!(provenance.is_tainted());
+        assert!(!provenance.elevated);
+        assert_eq!(provenance.chain[0].actor, "fcp.slack");
+        assert_eq!(source.acknowledgements, vec![vec!["cursor-1"]]);
+        assert_eq!(result.payload["data"]["source"]["acknowledged_events"], 1);
+        assert_eq!(result.payload["data"]["source"]["upstream_notified"], false);
+        assert!(!result.payload.to_string().contains("private-source-text"));
+        let (state, _) = load_run_state(&executor.state_path).unwrap();
+        assert!(state.attempts.values().all(|attempt| {
+            attempt.status == AttemptStatus::Completed
+                && attempt.retain_until < DateTime::<Utc>::MAX_UTC
+        }));
+        let mut restarted = FakeExecutor::new(executor.state_path.clone());
+        let replay = consume(&args, &mut restarted, &mut source).unwrap();
+        assert!(!replay.rejected);
+        assert_eq!(restarted.calls, 0);
+        assert_eq!(
+            replay.payload["data"]["results"][0]["previous_outcome"],
+            "completed"
+        );
+    }
+
+    #[test]
+    fn consume_lost_ack_retains_success_indefinitely_and_retry_only_acknowledges() {
+        let (_temp, args, mut executor, mut source) =
+            consume_fixture(vec![native_event("cursor-1", 1)]);
+        source.fail_ack = true;
+        let result = consume(&args, &mut executor, &mut source).unwrap();
+        assert!(result.rejected);
+        assert_eq!(
+            result.payload["data"]["source"]["acknowledgement_unknown"],
+            true
+        );
+        assert_eq!(
+            result.payload["data"]["source"]["ack_request"]["seqs"],
+            json!([1])
+        );
+        assert!(!result.payload.to_string().contains("bearer material"));
+        let (mut state, _) = load_run_state(&executor.state_path).unwrap();
+        assert!(
+            state
+                .attempts
+                .values()
+                .all(|attempt| { attempt.retain_until == DateTime::<Utc>::MAX_UTC })
+        );
+        let definitions = selected_rules(args.rules_file.as_ref().unwrap(), None).unwrap();
+        let identities = BTreeMap::from([(
+            "search".to_owned(),
+            rule_identity(&definitions.rules[0], &execution_scope()).unwrap(),
+        )]);
+        state
+            .prepare(
+                &definitions.rules,
+                &identities,
+                Utc::now() + Duration::days(40),
+            )
+            .unwrap();
+        assert_eq!(
+            state.attempts.len(),
+            1,
+            "pending source ACK outlives normal dedup retention"
+        );
+        source.fail_ack = false;
+        let mut restarted = FakeExecutor::new(executor.state_path.clone());
+        assert!(
+            !consume(&args, &mut restarted, &mut source)
+                .unwrap()
+                .rejected
+        );
+        assert_eq!(restarted.calls, 0);
+    }
+
+    #[test]
+    fn consume_new_delivery_repins_completed_duplicates_before_a_lost_ack() {
+        let (_temp, mut args, mut executor, mut source) =
+            consume_fixture(vec![native_event("cursor-1", 1)]);
+        let path = args.rules_file.as_ref().unwrap();
+        let mut definitions = load_rules(path, false).unwrap();
+        definitions.rules[0].trigger.match_expr = Some("data.text~private-source-text".into());
+        save_rules(path, &definitions).unwrap();
+        assert!(!consume(&args, &mut executor, &mut source).unwrap().rejected);
+        let (state, _) = load_run_state(&executor.state_path).unwrap();
+        assert!(state.attempts.values().all(|attempt| {
+            attempt.status == AttemptStatus::Completed
+                && attempt.retain_until < DateTime::<Utc>::MAX_UTC
+        }));
+
+        // A closed, drained subscription may be replaced by a new stream that
+        // delivers the same provider cursor under a different native sequence.
+        let RulesCommand::Consume(options) = &mut args.command else {
+            unreachable!();
+        };
+        options.stream_id = "stream-2".into();
+        options.request_id = "subscription-2".into();
+        source.events[0].seq = 7;
+        source.events[0].data.payload["text"] = json!("no longer matches the predicate");
+        source.fail_ack = true;
+        let mut restarted = FakeExecutor::new(executor.state_path.clone());
+        let replay = consume(&args, &mut restarted, &mut source).unwrap();
+        assert!(replay.rejected);
+        assert_eq!(restarted.calls, 0);
+        assert_eq!(
+            replay.payload["data"]["results"][0]["previous_outcome"],
+            "completed"
+        );
+        assert_eq!(
+            replay.payload["data"]["source"]["ack_request"]["seqs"],
+            json!([7])
+        );
+
+        let (mut state, _) = load_run_state(&executor.state_path).unwrap();
+        assert!(
+            state
+                .attempts
+                .values()
+                .all(|attempt| { attempt.retain_until == DateTime::<Utc>::MAX_UTC })
+        );
+        let definitions = selected_rules(args.rules_file.as_ref().unwrap(), None).unwrap();
+        let identities = BTreeMap::from([(
+            "search".to_owned(),
+            rule_identity(&definitions.rules[0], &execution_scope()).unwrap(),
+        )]);
+        state
+            .prepare(
+                &definitions.rules,
+                &identities,
+                Utc::now() + Duration::days(40),
+            )
+            .unwrap();
+        assert_eq!(state.attempts.len(), 1);
+        source.fail_ack = false;
+        let mut recovered = FakeExecutor::new(executor.state_path.clone());
+        assert!(
+            !consume(&args, &mut recovered, &mut source)
+                .unwrap()
+                .rejected
+        );
+        assert_eq!(recovered.calls, 0);
+    }
+
+    #[test]
+    fn consume_failures_and_unknown_outcomes_never_acknowledge() {
+        for reply in [
+            FakeReply::Failed,
+            FakeReply::Unknown,
+            FakeReply::Rejected,
+            FakeReply::ErrorAfterAdmission,
+        ] {
+            let (_temp, args, mut executor, mut source) =
+                consume_fixture(vec![native_event("cursor-1", 1)]);
+            let path = args.rules_file.as_ref().unwrap();
+            let mut definitions = load_rules(path, false).unwrap();
+            definitions.rules[0].trigger.match_expr = Some("data.text~private-source-text".into());
+            save_rules(path, &definitions).unwrap();
+            executor.replies.push_back(reply);
+            let result = consume(&args, &mut executor, &mut source).unwrap();
+            assert!(result.rejected);
+            assert!(source.acknowledgements.is_empty());
+            assert_eq!(result.payload["data"]["source"]["unacknowledged_events"], 1);
+            let (state, _) = load_run_state(&executor.state_path).unwrap();
+            assert!(
+                state
+                    .attempts
+                    .values()
+                    .all(|attempt| { attempt.retain_until == DateTime::<Utc>::MAX_UTC })
+            );
+            if !matches!(reply, FakeReply::Rejected) {
+                source.events[0].data.payload["text"] = json!("no longer matches the predicate");
+                let mut restarted = FakeExecutor::new(executor.state_path.clone());
+                let replay = consume(&args, &mut restarted, &mut source).unwrap();
+                assert!(replay.rejected);
+                assert_eq!(restarted.calls, 0);
+                assert_eq!(replay.payload["data"]["results"][0]["outcome"], "duplicate");
+                assert!(source.acknowledgements.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn consume_only_acknowledges_settled_prefix_when_a_later_event_is_throttled() {
+        let (_temp, args, mut executor, mut source) =
+            consume_fixture(vec![native_event("first", 1), native_event("second", 2)]);
+        let path = args.rules_file.as_ref().unwrap();
+        let mut definitions = load_rules(path, false).unwrap();
+        definitions.rules[0].throttle.max = 1;
+        save_rules(path, &definitions).unwrap();
+        let result = consume(&args, &mut executor, &mut source).unwrap();
+        assert!(result.rejected);
+        assert_eq!(executor.calls, 1);
+        assert_eq!(result.payload["data"]["results"][1]["outcome"], "throttled");
+        assert_eq!(source.acknowledgements, vec![vec!["first"]]);
+    }
+
+    #[test]
+    fn consume_acknowledges_completed_prefix_before_later_unknown_effect() {
+        let (_temp, args, mut executor, mut source) =
+            consume_fixture(vec![native_event("first", 1), native_event("second", 2)]);
+        executor
+            .replies
+            .extend([FakeReply::Success, FakeReply::Unknown]);
+        let result = consume(&args, &mut executor, &mut source).unwrap();
+        assert!(result.rejected);
+        assert_eq!(result.payload["data"]["source"]["acknowledged_events"], 1);
+        assert_eq!(source.acknowledgements, vec![vec!["first"]]);
+        let (state, _) = load_run_state(&executor.state_path).unwrap();
+        assert!(
+            state
+                .attempts
+                .values()
+                .filter(|attempt| attempt.status.uncertain())
+                .all(|attempt| attempt.retain_until == DateTime::<Utc>::MAX_UTC)
+        );
+    }
+
+    #[test]
+    fn consume_requires_all_actions_for_an_event_to_settle() {
+        let (_temp, args, mut executor, mut source) =
+            consume_fixture(vec![native_event("cursor-1", 1)]);
+        let path = args.rules_file.as_ref().unwrap();
+        let mut definitions = load_rules(path, false).unwrap();
+        let mut second = definitions.rules[0].clone();
+        second.name = "second-action".into();
+        definitions.rules.push(second);
+        save_rules(path, &definitions).unwrap();
+        executor
+            .replies
+            .extend([FakeReply::Success, FakeReply::Failed]);
+        assert!(consume(&args, &mut executor, &mut source).unwrap().rejected);
+        assert!(source.acknowledgements.is_empty());
+        let mut restarted = FakeExecutor::new(executor.state_path.clone());
+        assert!(
+            consume(&args, &mut restarted, &mut source)
+                .unwrap()
+                .rejected
+        );
+        assert_eq!(restarted.calls, 0);
+        assert!(source.acknowledgements.is_empty());
+    }
+
+    #[test]
+    fn consume_nonmatching_event_can_be_acknowledged_without_invocation() {
+        let (_temp, args, mut executor, mut source) =
+            consume_fixture(vec![native_event("cursor-1", 1)]);
+        let path = args.rules_file.as_ref().unwrap();
+        let mut definitions = load_rules(path, false).unwrap();
+        definitions.rules[0].trigger.match_expr = Some("data.text~not-present".into());
+        save_rules(path, &definitions).unwrap();
+        assert!(!consume(&args, &mut executor, &mut source).unwrap().rejected);
+        assert_eq!(executor.calls, 0);
+        assert_eq!(source.acknowledgements, vec![vec!["cursor-1"]]);
+    }
+
+    #[test]
+    fn consume_rejects_wrong_target_scope_before_polling() {
+        for wrong_host in [false, true] {
+            let (_temp, args, mut executor, mut source) =
+                consume_fixture(vec![native_event("cursor-1", 1)]);
+            if wrong_host {
+                executor.scope.host = "http://other-host".into();
+            } else {
+                executor.scope.zone = "z:private".into();
+            }
+            assert!(consume(&args, &mut executor, &mut source).is_err());
+            assert_eq!(source.polls, 0);
+            assert_eq!(executor.calls, 0);
+        }
+    }
+
+    #[test]
+    fn consume_rejects_alias_only_rules_without_consuming_source_events() {
+        let (_temp, args, mut executor, mut source) =
+            consume_fixture(vec![native_event("cursor-1", 1)]);
+        save_rules(
+            args.rules_file.as_ref().unwrap(),
+            &RuleSet {
+                rules: vec![rule()],
+            },
+        )
+        .unwrap();
+        assert!(consume(&args, &mut executor, &mut source).is_err());
+        assert_eq!(source.polls, 0);
+        assert_eq!(executor.prepare_calls, 0);
+    }
+
+    #[test]
+    fn consume_validates_entire_source_batch_before_any_effect() {
+        for invalid_kind in 0..4 {
+            let (_temp, args, mut executor, mut source) =
+                consume_fixture(vec![native_event("first", 1), native_event("second", 2)]);
+            match invalid_kind {
+                0 => source.events[1].data.zone_id = "z:private".parse().unwrap(),
+                1 => source.events[1].cursor = "first".into(),
+                2 => source.events[1].data.payload = json!({"a.b": "flat", "a": {"b": "nested"}}),
+                _ => source.events[1].data.payload = json!({"text": "x".repeat(MAX_EVENT_BYTES)}),
+            }
+            assert!(consume(&args, &mut executor, &mut source).is_err());
+            assert_eq!(executor.calls, 0);
+            assert!(source.acknowledgements.is_empty());
+        }
+    }
+
+    #[test]
+    fn native_event_identity_is_scoped_and_normalization_preserves_nested_values() {
+        let envelope = native_event("cursor-1", 1);
+        let normalized = normalize_stream_event("http://host", &envelope).unwrap();
+        assert_eq!(normalized.data["issue.number"], "42");
+        let mut replay = envelope.clone();
+        replay.timestamp += Duration::days(1);
+        replay.seq = 77;
+        replay.data.instance_id = serde_json::from_value(json!("inst_restarted")).unwrap();
+        replay.data.payload = json!({"text": "changed provider payload"});
+        assert_eq!(
+            normalized.dedup_identity(),
+            normalize_stream_event("http://host", &replay)
+                .unwrap()
+                .dedup_identity(),
+        );
+        assert_ne!(
+            normalized.dedup_identity(),
+            normalize_stream_event("http://another-host", &envelope)
+                .unwrap()
+                .dedup_identity(),
+        );
+        replay.cursor = "another-cursor".into();
+        assert_ne!(
+            normalized.dedup_identity(),
+            normalize_stream_event("http://host", &replay)
+                .unwrap()
+                .dedup_identity(),
+        );
+    }
+
+    #[test]
+    fn acknowledgement_prefix_rejects_unsettled_or_missing_results() {
+        for row in [
+            json!({"outcome":"throttled"}),
+            json!({"outcome":"disabled"}),
+            json!({"outcome":"duplicate", "previous_outcome":"unknown"}),
+            json!({"outcome":"executed", "state_persisted":false}),
+        ] {
+            let mut row = row;
+            row["event"] = json!(1);
+            assert_eq!(
+                settled_event_prefix(&json!({"data":{"results":[row]}}), 1, 1),
+                0,
+            );
+        }
+        assert_eq!(
+            settled_event_prefix(
+                &json!({"data":{"results":[{"event":1,"outcome":"no_match"}]}}),
+                2,
+                1,
+            ),
+            0,
+        );
     }
 
     #[test]

@@ -1163,7 +1163,8 @@ Credential-file replacements are encrypted, synced, and atomically published.
 ### Reactive rules and guarded execution
 
 `fwc rules` manages TOML rules, previews normalized JSONL events, and executes
-finite event batches through the selected host. Registration above the `safe`
+JSONL batches or retained native stream deliveries through the selected host.
+Registration above the `safe`
 tier requires `--allow-risky`; the rule's `safety_tier` is a ceiling, and ordinary
 capability, policy, approval, and deployment checks still apply at execution.
 
@@ -1205,8 +1206,9 @@ host checks the registered ceiling against live operation metadata at admission
 and dispatch. Guarded execution requires these endpoints and stays on the
 selected host; it refuses mesh forwarding to peers whose ceiling enforcement is
 not established. The default action deadline is 30 seconds, configurable with
-`--deadline-ms` up to 60 seconds. A run is a bounded JSONL batch, not a background
-subscription or continuous event daemon.
+`--deadline-ms` up to 60 seconds. `run` reads a bounded JSONL file; `consume`
+processes one bounded batch from an existing native stream. Neither command
+starts a background subscription or continuous event daemon.
 
 The runner holds the rules-file lock and persists checksummed execution records
 in `<rules-file>.state.jsonl`. It syncs a pending reservation before dispatch,
@@ -1231,6 +1233,74 @@ complete rendered batch is capped at 16 MiB, and the append journal at 64 MiB.
 Definitions, tests, previews, and `run --dry-run` remain local and consume no
 dispatch state. Keep the definitions and their state journal together when
 moving or backing up a runner.
+
+#### Consuming durable connector events
+
+`fwc rules consume` connects a retained native event stream to the same guarded
+action runner. Open the stream using `fwc streams open`, then supply its exact
+stream ID and stable subscription request ID. Source credentials are explicit
+and separate from action credentials. Rules must use the source's exact canonical
+connector ID and topic; aliases do not match a native source. For example:
+
+```toml
+[[rules]]
+name = "search-message-issues"
+trigger = { connector = "fcp.telegram", type = "telegram.message.new", match = "data.text~bug|Bug" }
+action = { connector = "github", operation = "github.search_issues", input = { query = "{{event.data.text | truncate(160)}}" } }
+throttle = { max = 5, window = "1h" }
+```
+
+After registering that definition and opening a `telegram.message.new` stream
+in `z:work`, process a batch with:
+
+```bash
+fwc --host http://127.0.0.1:8787 rules consume \
+  --connector fcp.telegram --source-zone z:work --topic telegram.message.new \
+  --stream-id '<returned-stream-id>' --request-id consumer-subscription-001 \
+  --stream-capability-token-file telegram-capability.cbor \
+  --zone z:work --capability-token-file github-capability.cbor \
+  --max-events 8 --wait-seconds 20
+```
+
+The command polls at most 64 events (default 1), waits up to 60 seconds for the
+first batch, and returns. Each source HTTP request has a separate
+`--stream-timeout-seconds` bound of 1–90 seconds, default 70. A source response
+is capped at 2 MiB; each event and its normalized form are capped at 256 KiB.
+Nested object fields become dotted template names such as `event.data.issue.title`;
+scalar strings are preserved, and other leaf values use JSON text. Ambiguous
+flattened paths, excessive depth, and more than 1,024 fields are rejected before
+any action starts.
+
+Actions must stay on the source host and in the source zone. The runner carries
+the event origin as tainted, unelevated provenance into both guarded preflight
+and invocation, so ordinary host policy still decides whether that source may
+trigger an operation. Capability tokens, approvals and safety ceilings remain
+required. Source authority never authorizes an action.
+
+Only a fully settled prefix of the returned events is acknowledged. For each
+event, every selected matching rule must have succeeded durably, already have
+a recorded success, or have produced no match. Throttled or circuit-broken
+rules, policy denials, connector failures, uncertain responses, and failed
+local persistence leave that event and the remaining suffix unacknowledged.
+The command reports partial action results and exits unsuccessfully when work
+remains unresolved. Use a dedicated subscription for each intended rule set;
+`--rule NAME` deliberately limits processing to that rule.
+
+Stream-triggered attempts remain retained without expiration until the host
+confirms a durable source acknowledgement. A lost ACK response therefore cannot
+age a successful action out of the replay ledger. Repeating `consume` with the
+same identities suppresses completed actions and can acknowledge their retained
+events. Failed and uncertain actions are never retried automatically.
+After a confirmed ACK, successful records return to the normal minimum
+24-hour/throttle-window retention policy. The existing 10,000-attempt state
+limit still fails closed rather than discarding unresolved work.
+
+Output includes `data.source.ack_request` for the eligible prefix, so an
+uncertain acknowledgement or `upstream_notified: false` can be reconciled
+explicitly using `fwc streams ack` with the same source identities and exact
+sequence/cursor pairs. `acknowledged: true` records durable host custody even
+when the original provider instance could not yet be notified. No event payloads
+or capability tokens are written into the action journal.
 
 ### Quick Start
 
@@ -3101,7 +3171,7 @@ required = true
 Notes on the actual schema:
 
 - `[pipeline]` carries `name`, `description`, `version`.
-- Each `[[steps]]` table carries an `id`, a dotted `operation` (`<connector>.<operation>`), an `input` table, and an optional `depends_on` array naming sibling step IDs. Per-step `continue_on_error` is supported.
+- Each `[[steps]]` table carries an `id`, a dotted `operation` (`<connector>.<operation>`), an `input` table, and an optional `depends_on` array naming sibling step IDs. Per-step `on_error = "abort"` is the default; `on_error = "skip"` permits later independent steps after a definite input, policy, or connector failure while preserving the unsuccessful overall result. Dependents remain blocked, and uncertain execution always stops. Unsupported retry/fallback/trigger controls and unknown step fields are rejected before host discovery.
 - Parameters are declared as `[params.<name>]` tables with `type` and `required` fields.
 - Template substitution uses double-brace `{{...}}` syntax. Step outputs are referenced as `{{steps.<id>.output.<json_path>}}`; parameters are referenced as `{{params.<name>}}`.
 
