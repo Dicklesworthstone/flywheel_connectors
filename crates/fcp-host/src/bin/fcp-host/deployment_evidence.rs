@@ -4,6 +4,8 @@
 //! quorum from a configured peer list or mint a healthy snapshot itself.
 
 use std::io::Read;
+#[cfg(unix)]
+use std::io::Write;
 use std::sync::Mutex as StdMutex;
 
 use fcp_host::{
@@ -15,6 +17,8 @@ use super::*;
 
 const CONFIG_ENV: &str = "FCP_HOST_DEPLOYMENT_EVIDENCE_CONFIG_FILE";
 const MAX_FILE_BYTES: usize = 64 * 1024;
+const MAX_STARTUP_TIMEOUT_MS: u64 = 60_000;
+const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -23,6 +27,63 @@ struct FileConfig {
     zone_id: ZoneId,
     attester_public_key_hex: String,
     evidence_file: PathBuf,
+    startup_challenge_file: Option<PathBuf>,
+    startup_timeout_ms: Option<u64>,
+}
+
+/// An explicit, bounded rendezvous with an independent local health observer.
+/// The publication path must be new for every launch; this host never removes
+/// or replaces a previous process's descriptor.
+struct StartupBootstrap {
+    challenge_file: PathBuf,
+    timeout: Duration,
+}
+
+impl StartupBootstrap {
+    fn from_fields(
+        challenge_file: Option<PathBuf>,
+        timeout_ms: Option<u64>,
+        evidence_file: &StdPath,
+    ) -> HostResult<Option<Self>> {
+        let (challenge_file, timeout_ms) = match (challenge_file, timeout_ms) {
+            (None, None) => return Ok(None),
+            (Some(path), Some(timeout)) => (path, timeout),
+            _ => {
+                return Err(invalid_config(
+                    "startup_challenge_file and startup_timeout_ms must be configured together",
+                ));
+            }
+        };
+        if !cfg!(unix) {
+            return Err(invalid_config(
+                "protected startup challenge publication requires Unix file permissions",
+            ));
+        }
+        if !challenge_file.is_absolute()
+            || challenge_file.file_name().is_none()
+            || challenge_file
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir))
+        {
+            return Err(invalid_config(
+                "startup_challenge_file must be an absolute file path without parent traversal",
+            ));
+        }
+        if challenge_file == evidence_file {
+            return Err(invalid_config(
+                "startup challenge and signed evidence require different files",
+            ));
+        }
+        if !(1..=MAX_STARTUP_TIMEOUT_MS).contains(&timeout_ms) {
+            return Err(invalid_config(
+                "startup_timeout_ms must be between 1 and 60000",
+            ));
+        }
+        Ok(Some(Self {
+            challenge_file,
+            timeout: Duration::from_millis(timeout_ms),
+        }))
+    }
 }
 
 fn invalid_config(message: &str) -> HostError {
@@ -35,12 +96,12 @@ fn read_bounded(path: &StdPath) -> HostResult<Vec<u8>> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NONBLOCK);
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
     }
     // Check both sides of open: the path may be atomically replaced by its
     // publisher, and a FIFO replacement must not block the Unix runtime.
-    let metadata =
-        std::fs::metadata(path).map_err(|_| invalid_config("cannot inspect configured file"))?;
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|_| invalid_config("cannot inspect configured file"))?;
     if !metadata.is_file() || metadata.len() > MAX_FILE_BYTES as u64 {
         return Err(invalid_config("expected a bounded regular file"));
     }
@@ -63,21 +124,165 @@ fn read_bounded(path: &StdPath) -> HostResult<Vec<u8>> {
     Ok(bytes)
 }
 
+/// The observer must run as the host's Unix user (or a trusted local root).
+/// Validate every ancestor, require a private final directory, and never open
+/// an existing destination. Inode checks fence path replacement before any
+/// challenge bytes are written. Same-UID and root mutation of these protected
+/// directories remains inside the local operator trust boundary.
+#[cfg(unix)]
+fn publish_startup_challenge(
+    path: &StdPath,
+    challenge: &DeploymentEvidenceChallenge,
+) -> HostResult<()> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| invalid_config("startup challenge requires a parent directory"))?;
+    let mut ancestors = parent.ancestors().collect::<Vec<_>>();
+    ancestors.reverse();
+    let mut inspected = Vec::with_capacity(ancestors.len());
+    for ancestor in ancestors {
+        let metadata = std::fs::symlink_metadata(ancestor)
+            .map_err(|_| invalid_config("cannot inspect startup challenge directory"))?;
+        if !metadata.is_dir() {
+            return Err(invalid_config(
+                "startup challenge ancestors must be directories, never symlinks",
+            ));
+        }
+        // A root-owned sticky ancestor such as /tmp cannot replace another
+        // user's private child. Other shared writable ancestors are rejected.
+        if metadata.mode() & 0o022 != 0 && !(metadata.uid() == 0 && metadata.mode() & 0o1000 != 0) {
+            return Err(invalid_config(
+                "startup challenge ancestors must not be writable by other users",
+            ));
+        }
+        inspected.push((ancestor, metadata));
+    }
+    let (_, parent_metadata) = inspected
+        .last()
+        .ok_or_else(|| invalid_config("startup challenge requires a private directory"))?;
+    if parent_metadata.mode() & 0o077 != 0 {
+        return Err(invalid_config(
+            "startup challenge parent must be a private owner-only directory",
+        ));
+    }
+    let parent_file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(parent)
+        .map_err(|_| invalid_config("cannot open startup challenge directory"))?;
+    let opened_parent = parent_file
+        .metadata()
+        .map_err(|_| invalid_config("cannot inspect opened startup challenge directory"))?;
+    if opened_parent.dev() != parent_metadata.dev() || opened_parent.ino() != parent_metadata.ino()
+    {
+        return Err(invalid_config("startup challenge directory changed"));
+    }
+    let bytes = serde_json::to_vec(challenge)
+        .map_err(|_| invalid_config("cannot encode startup challenge"))?;
+    if bytes.len() > MAX_FILE_BYTES {
+        return Err(invalid_config("startup challenge exceeds its byte limit"));
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|_| {
+            invalid_config("cannot create startup challenge; use a new nonexisting file per launch")
+        })?;
+    let created = file
+        .metadata()
+        .map_err(|_| invalid_config("cannot inspect created startup challenge"))?;
+    // A newly created file's owner is the filesystem identity of this host.
+    // Read it from the handle instead of trusting an environment-provided UID.
+    if !created.is_file()
+        || created.nlink() != 1
+        || created.mode() & 0o777 != 0o600
+        || parent_metadata.uid() != created.uid()
+    {
+        return Err(invalid_config(
+            "startup challenge requires an owner-only regular file in a host-owned directory",
+        ));
+    }
+    for (ancestor, before) in &inspected {
+        if before.uid() != 0 && before.uid() != created.uid() {
+            return Err(invalid_config(
+                "startup challenge ancestors must be owned by this host user or root",
+            ));
+        }
+        let after = std::fs::symlink_metadata(ancestor)
+            .map_err(|_| invalid_config("startup challenge directory disappeared"))?;
+        if !after.is_dir()
+            || before.dev() != after.dev()
+            || before.ino() != after.ino()
+            || before.uid() != after.uid()
+            || before.mode() != after.mode()
+        {
+            return Err(invalid_config("startup challenge directory changed"));
+        }
+    }
+    validate_startup_file_identity(path, &created)?;
+    file.write_all(&bytes)
+        .and_then(|()| file.flush())
+        .and_then(|()| file.sync_all())
+        .and_then(|()| parent_file.sync_all())
+        .map_err(|_| invalid_config("cannot durably publish startup challenge"))?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_startup_file_identity(path: &StdPath, created: &std::fs::Metadata) -> HostResult<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let published = std::fs::symlink_metadata(path)
+        .map_err(|_| invalid_config("startup challenge path disappeared"))?;
+    if !published.is_file()
+        || published.dev() != created.dev()
+        || published.ino() != created.ino()
+        || published.uid() != created.uid()
+        || published.nlink() != 1
+        || published.mode() & 0o777 != 0o600
+    {
+        return Err(invalid_config("startup challenge path changed"));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn publish_startup_challenge(
+    _path: &StdPath,
+    _challenge: &DeploymentEvidenceChallenge,
+) -> HostResult<()> {
+    Err(invalid_config(
+        "protected startup challenge publication requires Unix file permissions",
+    ))
+}
+
 impl FileConfig {
     fn into_service(self, min_healthy_peers: u32) -> HostResult<DeploymentEvidenceService> {
+        let startup = StartupBootstrap::from_fields(
+            self.startup_challenge_file,
+            self.startup_timeout_ms,
+            &self.evidence_file,
+        )?;
         let bytes: [u8; 32] = hex::decode(&self.attester_public_key_hex)
             .ok()
             .and_then(|bytes| bytes.try_into().ok())
             .ok_or_else(|| invalid_config("attester key must be 32 bytes of hexadecimal"))?;
         let key = Ed25519VerifyingKey::from_bytes(&bytes)
             .map_err(|_| invalid_config("attester public key is invalid"))?;
-        DeploymentEvidenceService::new(
+        let mut service = DeploymentEvidenceService::new(
             self.subject,
             self.zone_id,
             key,
             self.evidence_file,
             min_healthy_peers,
-        )
+        )?;
+        service.startup = startup;
+        Ok(service)
     }
 }
 
@@ -88,6 +293,7 @@ pub(super) struct DeploymentEvidenceService {
     evidence_file: PathBuf,
     min_healthy_peers: u32,
     verifier: StdMutex<DeploymentEvidenceVerifier>,
+    startup: Option<StartupBootstrap>,
 }
 
 impl DeploymentEvidenceService {
@@ -116,6 +322,7 @@ impl DeploymentEvidenceService {
             evidence_file,
             min_healthy_peers,
             verifier: StdMutex::new(verifier),
+            startup: None,
         })
     }
 
@@ -138,6 +345,57 @@ impl DeploymentEvidenceService {
             ));
         }
         Ok(())
+    }
+
+    /// Publish only after validating the independent trust root, then obtain
+    /// current-process evidence before the ordinary HTTP listener is bound.
+    /// With no opt-in, preserve the historical single-host startup behavior.
+    pub(super) async fn startup_signals(
+        &self,
+        capability_key: Option<&Ed25519VerifyingKey>,
+        approval_key: Option<&Ed25519VerifyingKey>,
+    ) -> HostResult<MeshQuorumSignals> {
+        self.validate_key_separation(capability_key, approval_key)?;
+        let Some(startup) = &self.startup else {
+            return Ok(MeshQuorumSignals::single_host_evaluation());
+        };
+        publish_startup_challenge(&startup.challenge_file, self.challenge())?;
+        tracing::info!(
+            event = "deployment_evidence_startup_challenge_published",
+            timeout_ms = startup.timeout.as_millis(),
+            min_healthy_peers = self.min_healthy_peers,
+            "published protected process challenge; waiting for independent signed evidence"
+        );
+        let deadline = Instant::now() + startup.timeout;
+        loop {
+            if let Some((classification, evidence_deadline)) =
+                self.classification_with_deadline(&self.zone_id)
+            {
+                if classification.mode.is_mesh_active()
+                    && Instant::now() < evidence_deadline
+                    && Instant::now() < deadline
+                {
+                    tracing::info!(
+                        event = "deployment_evidence_startup_verified",
+                        healthy_peers = classification.signals.healthy_peer_count,
+                        "fresh process-bound deployment evidence is ready for boot policy"
+                    );
+                    return Ok(classification.signals);
+                }
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                // Never reuse a previously observed snapshot after a wait or
+                // malformed replacement. The existing boot policy decides
+                // whether these Evaluation signals mean degrade or refuse.
+                tracing::warn!(
+                    event = "deployment_evidence_startup_timeout",
+                    "startup evidence deadline expired; applying boot policy with Evaluation signals"
+                );
+                return Ok(MeshQuorumSignals::single_host_evaluation());
+            }
+            fcp_async_core::time::sleep(remaining.min(STARTUP_POLL_INTERVAL)).await;
+        }
     }
 
     pub(super) fn classification(&self, zone: &ZoneId) -> DeploymentClassification {
@@ -320,6 +578,385 @@ mod tests {
         let bytes = serde_json::to_vec(&evidence).expect("evidence JSON");
         std::fs::write(&service.evidence_file, &bytes).expect("publish health evidence");
         bytes
+    }
+
+    fn file_config(directory: &StdPath, key: &Ed25519SigningKey) -> FileConfig {
+        FileConfig {
+            subject: "host-evidence-test".to_owned(),
+            zone_id: ZoneId::work(),
+            attester_public_key_hex: hex::encode(key.verifying_key().to_bytes()),
+            evidence_file: directory.join("evidence.json"),
+            startup_challenge_file: None,
+            startup_timeout_ms: None,
+        }
+    }
+
+    #[cfg(unix)]
+    fn bootstrap_service(
+        directory: &StdPath,
+        key: &Ed25519SigningKey,
+        timeout_ms: u64,
+        min_peers: u32,
+    ) -> DeploymentEvidenceService {
+        // On macOS, the system temporary directory can begin with a symlink
+        // such as /var. The protected path explicitly uses its real ancestry.
+        let directory = directory.canonicalize().expect("real temporary directory");
+        let mut config = file_config(&directory, key);
+        config.startup_challenge_file = Some(directory.join("challenge.json"));
+        config.startup_timeout_ms = Some(timeout_ms);
+        config.into_service(min_peers).expect("bootstrap config")
+    }
+
+    #[test]
+    fn startup_configuration_requires_paired_bounded_distinct_absolute_paths() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let key = Ed25519SigningKey::generate();
+        let base = serde_json::json!({
+            "subject": "host-evidence-test",
+            "zone_id": "z:work",
+            "attester_public_key_hex": hex::encode(key.verifying_key().to_bytes()),
+            "evidence_file": directory.path().join("evidence.json"),
+        });
+        let default: FileConfig = serde_json::from_value(base.clone()).expect("old config shape");
+        assert!(
+            default
+                .into_service(2)
+                .expect("default service")
+                .startup
+                .is_none()
+        );
+        let challenge =
+            serde_json::to_value(directory.path().join("challenge.json")).expect("challenge path");
+        for (path, timeout) in [
+            (challenge.clone(), serde_json::Value::Null),
+            (serde_json::Value::Null, serde_json::json!(100)),
+            (challenge.clone(), serde_json::json!(0)),
+            (
+                challenge.clone(),
+                serde_json::json!(MAX_STARTUP_TIMEOUT_MS + 1),
+            ),
+            (serde_json::json!("relative.json"), serde_json::json!(100)),
+            (base["evidence_file"].clone(), serde_json::json!(100)),
+            (
+                serde_json::to_value(directory.path().join("..").join("challenge.json"))
+                    .expect("parent traversal path"),
+                serde_json::json!(100),
+            ),
+        ] {
+            let mut candidate = base.clone();
+            candidate["startup_challenge_file"] = path;
+            candidate["startup_timeout_ms"] = timeout;
+            let config: FileConfig = serde_json::from_value(candidate).expect("config shape");
+            assert!(config.into_service(2).is_err());
+        }
+        let mut valid = base;
+        valid["startup_challenge_file"] = challenge;
+        valid["startup_timeout_ms"] = serde_json::json!(MAX_STARTUP_TIMEOUT_MS);
+        let config: FileConfig = serde_json::from_value(valid).expect("config shape");
+        assert_eq!(config.into_service(2).is_ok(), cfg!(unix));
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn startup_without_opt_in_preserves_evaluation_even_with_valid_evidence() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let key = Ed25519SigningKey::generate();
+        let service = file_config(directory.path(), &key)
+            .into_service(2)
+            .expect("service");
+        publish(&service, &key, 1, MeshQuorumSignals::fully_active(2));
+        assert_eq!(
+            service
+                .startup_signals(None, None)
+                .await
+                .expect("default startup"),
+            MeshQuorumSignals::single_host_evaluation(),
+        );
+        assert_eq!(
+            service.classification(&ZoneId::work()).mode,
+            DeploymentMode::MeshActive
+        );
+    }
+
+    #[cfg(unix)]
+    #[fcp_async_core::runtime::test]
+    async fn startup_authenticates_published_process_challenge_and_never_caches_authority() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let key = Ed25519SigningKey::generate();
+        let service = Arc::new(bootstrap_service(directory.path(), &key, 5_000, 3));
+        let capability = Ed25519SigningKey::generate().verifying_key();
+        let approval = Ed25519SigningKey::generate().verifying_key();
+        let challenge_file = service
+            .startup
+            .as_ref()
+            .expect("bootstrap")
+            .challenge_file
+            .clone();
+        let expected = service.challenge().clone();
+        let evidence_file = service.evidence_file.clone();
+        let observer = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let challenge: DeploymentEvidenceChallenge = loop {
+                if let Ok(bytes) = read_bounded(&challenge_file) {
+                    if let Ok(challenge) = serde_json::from_slice(&bytes) {
+                        break challenge;
+                    }
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "host did not publish its challenge"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            };
+            assert_eq!(
+                challenge, expected,
+                "publish the existing verifier's binding"
+            );
+            assert_eq!(
+                std::fs::metadata(&challenge_file)
+                    .expect("challenge metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+            let now = u64::try_from(Utc::now().timestamp_millis()).expect("current time");
+            let signed = SignedDeploymentEvidence::sign(
+                &challenge,
+                MeshQuorumSignals::fully_active(3),
+                1,
+                now,
+                now + 30_000,
+                &key,
+            )
+            .expect("independent observation");
+            std::fs::write(
+                evidence_file,
+                serde_json::to_vec(&signed).expect("signed evidence"),
+            )
+            .expect("publish evidence");
+        });
+        let signals = service
+            .startup_signals(Some(&capability), Some(&approval))
+            .await
+            .expect("bootstrap");
+        observer.join().expect("independent observer");
+        let resolution = select_host_truth_precedence_boot_from_env_values(
+            signals,
+            Some("v2"),
+            Some("refuse-boot"),
+            None,
+            Some("3"),
+        )
+        .expect("verified V2 startup");
+        assert_eq!(resolution.classification.mode, DeploymentMode::MeshActive);
+        assert!(!resolution.selection.insufficient_peers);
+        assert_eq!(
+            resolution.selection.effective,
+            fcp_policy::OperationalModelVersion::V2MeshNative
+        );
+
+        let guard = DeploymentDispatchGuard::new(
+            Some(Arc::clone(&service)),
+            ZoneId::work(),
+            SafetyTier::Risky,
+        );
+        guard.refresh().expect("fresh authority at dispatch");
+        std::fs::write(&service.evidence_file, b"withdrawn").expect("withdraw authority");
+        assert!(
+            guard.refresh().is_err(),
+            "boot success must not authorize later execution"
+        );
+        assert_eq!(
+            service.classification(&ZoneId::work()).mode,
+            DeploymentMode::Evaluation
+        );
+    }
+
+    #[cfg(unix)]
+    #[fcp_async_core::runtime::test]
+    async fn startup_rejects_keys_before_creating_any_challenge_file() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let key = Ed25519SigningKey::generate();
+        let service = bootstrap_service(directory.path(), &key, 1, 2);
+        let challenge_file = &service.startup.as_ref().expect("bootstrap").challenge_file;
+        let health = key.verifying_key();
+        for (capability, approval) in [(Some(&health), None), (None, Some(&health))] {
+            assert!(service.startup_signals(capability, approval).await.is_err());
+            assert!(
+                !challenge_file.exists(),
+                "key rejection must precede publication"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[fcp_async_core::runtime::test]
+    async fn startup_timeout_rejects_invalid_stale_wrong_zone_and_previous_process_evidence() {
+        for invalid_kind in 0..8 {
+            let directory = tempfile::tempdir().expect("temporary directory");
+            let key = Ed25519SigningKey::generate();
+            let service = bootstrap_service(directory.path(), &key, 1, 2);
+            let mut descriptor = service.challenge().clone();
+            if invalid_kind == 1 {
+                descriptor.zone_id = ZoneId::owner();
+            } else if invalid_kind == 2 {
+                let previous = self::service(directory.path().join("previous.json"), &key);
+                descriptor = previous.challenge().clone();
+            }
+            let now = u64::try_from(Utc::now().timestamp_millis()).expect("current time");
+            let (issued, expires) = if invalid_kind == 3 {
+                (now - 30_000, now - 1)
+            } else {
+                (now, now + 30_000)
+            };
+            let mut observed_signals = MeshQuorumSignals::fully_active(2);
+            if invalid_kind == 6 {
+                observed_signals.revocation_snapshot_fresh = false;
+            } else if invalid_kind == 7 {
+                observed_signals.lease_coordinator_reachable = Some(false);
+            }
+            let mut signed = SignedDeploymentEvidence::sign(
+                &descriptor,
+                observed_signals,
+                1,
+                issued,
+                expires,
+                &key,
+            )
+            .expect("signed observation");
+            if invalid_kind == 4 {
+                signed.quorum.signals.healthy_peer_count += 1;
+            }
+            let bytes = if invalid_kind == 0 {
+                b"malformed evidence".to_vec()
+            } else {
+                serde_json::to_vec(&signed).expect("evidence JSON")
+            };
+            if invalid_kind != 5 {
+                std::fs::write(&service.evidence_file, bytes).expect("invalid evidence");
+            }
+            let signals = service
+                .startup_signals(None, None)
+                .await
+                .expect("bounded wait");
+            assert_eq!(signals, MeshQuorumSignals::single_host_evaluation());
+            assert!(
+                select_host_truth_precedence_boot_from_env_values(
+                    signals,
+                    Some("v2"),
+                    Some("refuse-boot"),
+                    None,
+                    None,
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[fcp_async_core::runtime::test]
+    async fn startup_timeout_honors_operator_threshold_and_existing_degrade_policy() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let key = Ed25519SigningKey::generate();
+        let service = bootstrap_service(directory.path(), &key, 1, 3);
+        publish(&service, &key, 1, MeshQuorumSignals::fully_active(2));
+        let signals = service
+            .startup_signals(None, None)
+            .await
+            .expect("bounded wait");
+        assert_eq!(signals, MeshQuorumSignals::single_host_evaluation());
+        assert!(
+            select_host_truth_precedence_boot_from_env_values(
+                signals,
+                Some("v2"),
+                Some("refuse-boot"),
+                None,
+                Some("3"),
+            )
+            .is_err()
+        );
+        let degraded = select_host_truth_precedence_boot_from_env_values(
+            signals,
+            Some("v2"),
+            Some("degrade-to-v1"),
+            None,
+            Some("3"),
+        )
+        .expect("explicit degrade policy still applies");
+        assert_eq!(
+            degraded.selection.effective,
+            fcp_policy::OperationalModelVersion::V1HostFirst
+        );
+    }
+
+    #[cfg(unix)]
+    #[fcp_async_core::runtime::test]
+    async fn startup_publication_never_overwrites_existing_files_or_follows_symlinks() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let key = Ed25519SigningKey::generate();
+        let service = bootstrap_service(directory.path(), &key, 1, 2);
+        let challenge_file = &service.startup.as_ref().expect("bootstrap").challenge_file;
+        std::fs::write(challenge_file, b"unrelated operator file").expect("existing file");
+        assert!(service.startup_signals(None, None).await.is_err());
+        assert_eq!(
+            std::fs::read(challenge_file).expect("preserved file"),
+            b"unrelated operator file"
+        );
+
+        let linked_directory = tempfile::tempdir().expect("temporary directory");
+        let linked = bootstrap_service(linked_directory.path(), &key, 1, 2);
+        let linked_challenge = &linked.startup.as_ref().expect("bootstrap").challenge_file;
+        std::os::unix::fs::symlink(challenge_file, linked_challenge).expect("symlink");
+        assert!(linked.startup_signals(None, None).await.is_err());
+        assert!(
+            read_bounded(linked_challenge).is_err(),
+            "evidence reads reject symlinks too"
+        );
+        assert_eq!(
+            std::fs::read(challenge_file).expect("preserved target"),
+            b"unrelated operator file"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_publication_rejects_insecure_parents_symlink_ancestors_and_fifos() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let key = Ed25519SigningKey::generate();
+        let service = bootstrap_service(directory.path(), &key, 1, 2);
+        let challenge_file = &service.startup.as_ref().expect("bootstrap").challenge_file;
+        let parent = challenge_file.parent().expect("parent");
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755))
+            .expect("open permissions");
+        assert!(publish_startup_challenge(challenge_file, service.challenge()).is_err());
+        assert!(!challenge_file.exists());
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+            .expect("restore private directory");
+        let alias_directory = tempfile::tempdir().expect("alias parent");
+        let alias = alias_directory
+            .path()
+            .canonicalize()
+            .expect("canonical alias parent")
+            .join("linked");
+        std::os::unix::fs::symlink(parent, &alias).expect("directory symlink");
+        assert!(
+            publish_startup_challenge(&alias.join("challenge.json"), service.challenge()).is_err()
+        );
+        assert!(!challenge_file.exists());
+        let status = std::process::Command::new("mkfifo")
+            .arg(challenge_file)
+            .status()
+            .expect("POSIX mkfifo");
+        assert!(status.success());
+        assert!(publish_startup_challenge(challenge_file, service.challenge()).is_err());
+        assert!(
+            read_bounded(challenge_file).is_err(),
+            "FIFO intake must fail without blocking"
+        );
     }
 
     #[test]

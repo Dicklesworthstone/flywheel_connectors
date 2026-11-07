@@ -52,7 +52,7 @@ for the running process. Changing them requires a host restart and new
 evidence for that process.
 
 Both configuration and evidence files are limited to 64 KiB and must be
-regular files. `evidence_file` must be absolute. Use trusted local storage
+regular files, not symlinks. `evidence_file` must be absolute. Use trusted local storage
 and a publisher-controlled directory. Unknown configuration fields, malformed
 configuration, invalid keys, and invalid binding settings reject startup.
 They do not silently disable a partially configured verifier.
@@ -61,6 +61,83 @@ The evidence file may be absent at startup so the attester can first obtain
 the running process's challenge. Missing evidence keeps the deployment gate
 closed for higher-tier operations. If the configuration environment variable
 is absent, the host remains in `Evaluation` for this admission boundary.
+
+## Supply evidence before boot policy (optional)
+
+On Unix, an independent local observer can obtain the process challenge before
+the HTTP listener starts. Configure both `startup_challenge_file` and
+`startup_timeout_ms` to enable this startup exchange:
+
+```json
+{
+  "subject": "host:hooks-1",
+  "zone_id": "z:work",
+  "attester_public_key_hex": "<64 hexadecimal characters for the trusted Ed25519 public key>",
+  "evidence_file": "/run/fcp/hooks-1/deployment-evidence.json",
+  "startup_challenge_file": "/run/fcp/hooks-1/challenge-launch-7f1c90bd.json",
+  "startup_timeout_ms": 15000
+}
+```
+
+The launch suffix above is illustrative. The operator or service supervisor
+must select a **new, nonexistent challenge filename for every host launch** and
+give that exact path to the observer. The host does not generate a filename,
+remove an old descriptor, or overwrite an existing file. It creates the file
+with `create_new(true)` and mode `0600`, then flushes and syncs the descriptor
+and its containing directory. An existing file, symlink, FIFO, or changed path
+causes startup to fail rather than reusing a previous process's challenge.
+
+The two startup fields are optional as a pair. Supplying only one rejects
+configuration. `startup_timeout_ms` must be an integer from `1` through `60000`
+inclusive. `startup_challenge_file` must be an absolute file path with no `..`
+components and must identify a different file from `evidence_file`. Configuring
+this exchange on a non-Unix platform rejects startup; omit both fields there.
+
+Provision the challenge's parent directory before launching the host. It must
+be owned by the host's Unix user and private to that user; use mode `0700`.
+Every ancestor must be a real directory owned by that user or root, without
+group or other write permission. A root-owned sticky ancestor such as `/tmp`
+is permitted, but the final parent still needs the private ownership and mode.
+Symlink ancestors are rejected, including platform aliases such as `/var` when
+it is a symlink; configure the real directory path. The observer must run as
+the same Unix user as the host, or as trusted root, to read the `0600` descriptor.
+Its signing key remains independent of the host's capability and approval keys.
+
+The startup sequence is:
+
+1. Start the observer so it is ready to read the newly chosen challenge path.
+2. Start the host with the paired fields. After checking key separation, it
+   publishes the current process's challenge before applying boot policy or
+   binding the normal HTTP listener.
+3. The observer reads and parses the complete descriptor, retrying a briefly
+   incomplete read while publication finishes. It then measures actual peer,
+   coordinator, and revocation health and signs those observations using the
+   procedure below. It publishes the resulting envelope to `evidence_file`.
+4. The host verifies the same process, zone, signatures, freshness, generation,
+   and minimum-peer requirements used for live admission. Fresh evidence that
+   classifies the deployment as mesh-active supplies the ordinary boot-policy
+   decision, including a requested V2 `refuse-boot` configuration.
+
+The host polls for evidence until the configured timeout. Missing, malformed,
+forged, stale, differently bound, or unhealthy observations cannot satisfy the
+startup exchange. If no usable mesh-active observation arrives in time, the
+host supplies `Evaluation` signals to the existing boot policy: a requested V2
+`refuse-boot` configuration refuses boot, while `degrade-to-v1` can start in V1.
+Invalid configuration or a failed challenge publication is a startup error,
+independent of that timeout policy.
+
+The timeout starts after challenge publication. Publication and evidence reads
+use synchronous filesystem I/O on trusted local storage; the polling deadline
+cannot preempt a blocked filesystem operation. File-size bounds and nonblocking
+Unix open flags do not make remote or stalled storage safe for a strict startup
+latency budget.
+
+The startup descriptor and the protected HTTP endpoint below expose the same
+challenge for this process. After the listener starts, the observer can use the
+HTTP endpoint for its normal refresh workflow. Continue publishing short-lived
+observations: successful startup does not cache permanent authority, and live
+dispatch still rechecks current evidence. Neither startup success nor later
+evidence automatically changes a running process's selected truth precedence.
 
 ## Obtain the running process challenge
 
@@ -189,11 +266,12 @@ A health attester's single signature is not a substitute for an operation's
 quorum signatures or a quorum-issued connector lease. Configuring this feature
 does not establish durable connector storage.
 
-Boot truth-precedence selection still starts from `Evaluation` observations
-and uses the existing boot-policy settings. Evidence for the post-start process
-challenge affects per-invocation admission only. It cannot satisfy an earlier
-`refuse-boot` decision or automatically transition the running process to V2
-truth precedence. See the [single-host runbook](../runbooks/v2_mesh_native_single_host.md)
+Without the paired startup fields, boot truth-precedence selection still starts
+from `Evaluation` observations; evidence obtained through the HTTP endpoint then
+affects per-invocation admission only. The optional startup exchange above can
+instead supply verified observations before a `refuse-boot` decision. Existing
+boot-policy settings still choose the operational model, and boot success does
+not replace live freshness checks. See the [single-host runbook](../runbooks/v2_mesh_native_single_host.md)
 for boot behavior and [mesh invocation routing](../runbooks/mesh_invoke_routing.md)
 for authenticated routing and executor checks.
 
@@ -209,11 +287,13 @@ Focused verification commands are:
 
 ```bash
 rch exec -- cargo test -p fcp-host --lib deployment_evidence::
-rch exec -- cargo test -p fcp-host --bin fcp-host deployment_evidence_runtime_
+rch exec -- cargo test -p fcp-host --bin fcp-host deployment_evidence::tests
 ```
 
 The implementation adds signature, freshness, process/zone binding, generation,
-and live-admission regressions. Added tests do not establish that an external
+and live-admission regressions. The host tests also cover protected startup
+publication, independent signing, timeout and boot-policy outcomes, and renewed
+admission after startup. Added tests do not establish that an external
 observer reports correct health or that a production mesh has been deployed.
 Record actual command output when running the relevant library and host tests;
 the documentation itself is not a passing result or live deployment proof.

@@ -5921,8 +5921,9 @@ fn read_optional_trimmed_truth_precedence_env(
     })
 }
 
-fn current_truth_precedence_boot_resolution()
--> Result<TruthPrecedenceBootResolution, TruthPrecedenceBootError> {
+fn current_truth_precedence_boot_resolution(
+    signals: MeshQuorumSignals,
+) -> Result<TruthPrecedenceBootResolution, TruthPrecedenceBootError> {
     let default_env = read_optional_trimmed_truth_precedence_env(TRUTH_PRECEDENCE_DEFAULT_ENV)?;
     let insufficient_peers_behavior_env =
         read_optional_trimmed_truth_precedence_env(V2_INSUFFICIENT_PEERS_BEHAVIOR_ENV)?;
@@ -5930,7 +5931,6 @@ fn current_truth_precedence_boot_resolution()
         read_optional_trimmed_truth_precedence_env(V2_DEFAULT_GRADUATED_ENV)?;
     let min_healthy_peers_env =
         read_optional_trimmed_truth_precedence_env(V2_MIN_HEALTHY_MESH_PEERS_ENV)?;
-    let signals = MeshQuorumSignals::single_host_evaluation();
     select_host_truth_precedence_boot_from_env_values(
         signals,
         default_env.as_deref(),
@@ -8322,18 +8322,23 @@ async fn async_main(telemetry_config: TelemetryConfig) -> HostResult<()> {
         "FCP_HOST_APPROVAL_PUBLIC_KEY_FILE",
     )?
     .or_else(|| capability_verifying_key.clone());
-    if let Some(evidence) = &deployment_evidence {
-        evidence.validate_key_separation(
-            capability_verifying_key.as_ref(),
-            approval_verifying_key.as_ref(),
-        )?;
-    }
-
     let loaded_configs = load_connector_configs()?;
     if loaded_configs.configs.is_empty() {
         tracing::warn!("no connectors configured; doctor self-checks will fail");
     }
-    let truth_precedence_boot = match current_truth_precedence_boot_resolution() {
+    let startup_signals = match &deployment_evidence {
+        Some(evidence) => {
+            evidence
+                .startup_signals(
+                    capability_verifying_key.as_ref(),
+                    approval_verifying_key.as_ref(),
+                )
+                .await?
+        }
+        None => MeshQuorumSignals::single_host_evaluation(),
+    };
+
+    let truth_precedence_boot = match current_truth_precedence_boot_resolution(startup_signals) {
         Ok(resolution) => resolution,
         Err(error) => {
             emit_truth_precedence_boot_error(&error);
