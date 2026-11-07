@@ -1302,6 +1302,83 @@ sequence/cursor pairs. `acknowledged: true` records durable host custody even
 when the original provider instance could not yet be notified. No event payloads
 or capability tokens are written into the action journal.
 
+#### Polling retained webhook deliveries
+
+`fwc rules poll` reads one bounded page from the webhook receiver and runs
+matching rules through the same guarded action executor. It keeps a durable
+cursor per named consumer in the existing rules state journal. This connects
+authenticated webhook ingress to reactive actions without opening a public
+event-reading endpoint.
+
+Use the receiver's exact connector ID and the synthetic event type
+`webhook.received`. Provider fields are under `event.data.payload.*`, separate from
+verified delivery metadata such as `event.data.endpoint_id`,
+`event.data.event_id`, and `event.data.sequence`. For example:
+
+```toml
+[[rules]]
+name = "search-webhook-issues"
+trigger = { connector = "fcp.webhook-receiver", type = "webhook.received", match = "data.payload.action~opened" }
+action = { connector = "github", operation = "github.search_issues", input = { query = "{{event.data.payload.issue.title | truncate(160)}}" } }
+throttle = { max = 5, window = "1h" }
+```
+
+After registering the rule and provisioning a receiver endpoint, process a page
+with source and action capabilities supplied separately:
+
+```bash
+fwc --host http://127.0.0.1:8787 rules poll \
+  --connector fcp.webhook-receiver --source-zone z:work \
+  --endpoint-id '<registered-endpoint-id>' --consumer github-issue-hooks \
+  --source-capability-token-file webhook-read-capability.cbor \
+  --zone z:work --capability-token-file github-capability.cbor \
+  --max-events 50 --max-bytes 1048576
+```
+
+The first call starts at the earliest retained delivery by default. Supply
+`--start latest` on the first call to deliberately start after the current
+backlog. Later calls with the same consumer resume its saved cursor; an explicit
+`--start` is rejected once that checkpoint exists. The consumer is bound to
+the source host, zone, endpoint, and selected rule identities. Keep its name and
+rule selection stable across retries. A new consumer is an independent effect
+stream and can execute actions for deliveries processed by another consumer.
+Rule throttle and circuit state remain shared, so changing consumer names does
+not bypass them.
+
+The runner validates the entire page before any action and durably records its
+starting cursor before the first effect. It advances to the next cursor only
+when every event in the page is settled: all selected matching rules must have
+a durable success, an existing recorded success, or no match. The cursor advance
+and release of completed action reservations are one checksummed journal record.
+A throttle, denial, failed action, uncertain response, or persistence failure
+keeps the page pending. Retrying the same consumer suppresses completed actions.
+Pending or unknown effects remain reserved indefinitely; they are never retried
+automatically. A cursor write whose durability is unknown is reported as
+`data.source.cursor_commit_unknown: true`, without claiming a committed cursor.
+
+Source reads use guarded host admission with a safe tier ceiling. Actions must
+remain on that host and in that zone, and carry tainted, unelevated source
+provenance. Source credentials do not authorize actions. Use
+`--source-holder-key-file` and `--source-lease-seq` when the receiver's
+capability binding or singleton writer fencing requires them. Action holder
+keys, approvals, and lease sequences retain their separate execution flags.
+
+Each call reads at most 64 events (default 50). The retained-event byte budget
+is 1 byte to 16 MiB (default 1 MiB); each normalized rule event is limited to
+256 KiB. Source preflight, response reading, and validation share a
+`--source-timeout-seconds` deadline of 1–60 seconds, default 30. The HTTP
+envelope is bounded, redirects are refused, and remote error bodies are omitted.
+Malformed pages, ambiguous flattened fields, unverified signatures, private
+headers, and raw source IP fields prevent the entire page from executing.
+
+Output reports committed and uncommitted events, cursor advancement, whether
+more retained events are available, and the receiver's retention bounds. A lost
+receiver epoch or an evicted saved position stops with an explicit cursor-expired
+or replay-gap error. The consumer journal persists progress; it does not make
+the receiver's currently volatile backlog durable. Reconcile missing deliveries
+before choosing a new consumer or deliberately starting after retained history.
+No source payloads or capability tokens are stored in the cursor/action journal.
+
 ### Quick Start
 
 ```bash

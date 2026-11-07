@@ -254,6 +254,7 @@ mod retry_controller;
 mod routing;
 mod rules_cmd;
 mod rules_host;
+mod webhook_events;
 #[allow(dead_code)]
 mod schema_nav;
 mod search;

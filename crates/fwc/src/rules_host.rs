@@ -2,21 +2,26 @@
 //! frozen for the whole batch; the host independently enforces the tier ceiling.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Read;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
-use fcp_core::{EventEnvelope, Provenance, SafetyTier};
+use fcp_core::{EventEnvelope, InvokeResponse, InvokeStatus, Provenance, RequestId, SafetyTier};
+use serde::{Serialize, de::DeserializeOwned};
 use serde_json::json;
 
 use crate::native_events::{NativeStreamClient, NativeStreamConfig, StreamFailure};
 use crate::reactive_rules::Rule;
 use crate::rules_cmd::{
     self, ExecutionScope, InvocationResult, RuleEventBatch, RuleEventSource, RuleExecutor,
-    RulesArgs, RulesExecutionOptions,
+    RulePollingSource, RulesArgs, RulesExecutionOptions, RulesPollOptions,
 };
+use crate::webhook_events::{self, PollStart, WebhookFailure, WebhookPollPage, WebhookSourceScope};
 use crate::{
     CliExitCode, CommandAvailability, CommandEnvelope, DispatchOutcome, HostAdminClient,
-    InvokeArgs, InvokeRequest, KnowledgeState, LiveAuthArgs, ResolvedHostConfig, ResolvedLiveAuth,
+    HostGuardedInvokeRequest, HostPreflightResponse, InvokeArgs, InvokeRequest, KnowledgeState,
+    LiveAuthArgs, ResolvedHostConfig, ResolvedLiveAuth,
     inject_truth_source_metadata, invoke_dispatch_host_controlled, normalize_host_endpoint,
     resolve_host_config, resolve_host_tool, resolve_live_auth, resolved_zone,
 };
@@ -28,7 +33,10 @@ pub(crate) fn dispatch(args: &RulesArgs, explicit_host: Option<&str>) -> Result<
             let host = resolve_host_config(explicit_host)?
                 .context("live rules require a configured host or --host")?;
             let mut executor = HostRuleExecutor::new(host, options)?;
-            if let Some(options) = args.consume_options() {
+            if let Some(options) = args.poll_options() {
+                let mut source = WebhookRuleSource::new(&executor.host, options)?;
+                rules_cmd::poll(args, &mut executor, &mut source)
+            } else if let Some(options) = args.consume_options() {
                 let mut source = NativeRuleSource(NativeStreamClient::new(
                     NativeStreamConfig {
                         connector: options.connector.clone(),
@@ -89,13 +97,14 @@ pub(crate) fn dispatch(args: &RulesArgs, explicit_host: Option<&str>) -> Result<
             )
         }
         Err(error) => {
-            let (kind, exit_code) = error.downcast_ref::<StreamFailure>().map_or(
-                ("rules-request-failed", CliExitCode::Validation),
-                |error| {
-                    let (kind, _, code) = error.details();
-                    (kind, code)
-                },
-            );
+            let (kind, exit_code) = if let Some(failure) = error.downcast_ref::<WebhookFailure>() {
+                (failure.details().0, webhook_failure_exit(*failure))
+            } else if let Some(failure) = error.downcast_ref::<StreamFailure>() {
+                let (kind, _, code) = failure.details();
+                (kind, code)
+            } else {
+                ("rules-request-failed", CliExitCode::Validation)
+            };
             (
                 json!({"status": "error", "command": "rules",
                     "error": {"type": kind, "message": error.to_string()}}),
@@ -125,6 +134,7 @@ pub(crate) fn dispatch(args: &RulesArgs, explicit_host: Option<&str>) -> Result<
 fn has_uncertain_results(payload: &serde_json::Value) -> bool {
     payload["data"]["source"]["acknowledgement_unknown"] == true
         || payload["data"]["source"]["ack_state_persisted"] == false
+        || payload["data"]["source"]["cursor_commit_unknown"] == true
         || payload["data"]["results"]
             .as_array()
             .is_some_and(|results| {
@@ -160,6 +170,253 @@ impl RuleEventSource for NativeRuleSource {
             .map(|event| event.cursor.clone())
             .collect::<Vec<_>>();
         Ok(self.0.ack(&seqs, &cursors)?.upstream_notified)
+    }
+}
+
+const WEBHOOK_POLL_OPERATION: &str = "webhook.events.poll";
+const WEBHOOK_SOURCE_ENVELOPE_BYTES: usize = 256 * 1024;
+
+/// Reads the receiver's authenticated operation without passing source payloads
+/// through ordinary invoke history or borrowing any action credentials.
+struct WebhookRuleSource {
+    scope: WebhookSourceScope,
+    client: HostAdminClient,
+    auth: ResolvedLiveAuth,
+    lease_seq: Option<u64>,
+    timeout: Duration,
+}
+
+impl WebhookRuleSource {
+    fn new(host: &ResolvedHostConfig, options: &RulesPollOptions) -> Result<Self> {
+        if options.connector != "fcp.webhook-receiver"
+            || options.endpoint_id.is_empty()
+            || options.endpoint_id.len() > 512
+            || options.endpoint_id.trim() != options.endpoint_id
+            || options.endpoint_id.chars().any(char::is_control)
+            || !(1..=60).contains(&options.source_timeout_seconds)
+        {
+            return Err(WebhookFailure::InvalidRequest.into());
+        }
+        let zone = options
+            .source_zone
+            .parse::<fcp_core::ZoneId>()
+            .map_err(|_| WebhookFailure::InvalidRequest)?;
+        let auth = resolve_live_auth(&LiveAuthArgs {
+            capability_token_file: Some(options.source_capability_token_file.clone()),
+            holder_key_file: options.source_holder_key_file.clone(),
+            ..LiveAuthArgs::default()
+        })
+        .map_err(|_| WebhookFailure::Credential)?;
+        let client = HostAdminClient::new(&host.endpoint).map_err(|_| WebhookFailure::Transport)?;
+        Ok(Self {
+            scope: WebhookSourceScope {
+                host: host.endpoint.clone(),
+                connector: options.connector.clone(),
+                zone: zone.to_string(),
+                endpoint_id: options.endpoint_id.clone(),
+            },
+            client,
+            auth,
+            lease_seq: options.source_lease_seq,
+            timeout: Duration::from_secs(options.source_timeout_seconds),
+        })
+    }
+}
+
+impl RulePollingSource for WebhookRuleSource {
+    fn scope(&self) -> &WebhookSourceScope {
+        &self.scope
+    }
+
+    fn poll(
+        &mut self,
+        cursor: Option<&str>,
+        start: PollStart,
+        limit: u32,
+        max_bytes: usize,
+    ) -> Result<WebhookPollPage> {
+        let started = Instant::now();
+        if !(1..=64).contains(&limit) || !(1..=16 * 1024 * 1024).contains(&max_bytes) {
+            return Err(WebhookFailure::InvalidRequest.into());
+        }
+        let mut input = json!({
+            "endpoint_id": self.scope.endpoint_id,
+            "limit": limit,
+            "max_bytes": max_bytes,
+        });
+        if let Some(cursor) = cursor {
+            input["cursor"] = json!(cursor);
+        } else {
+            input["start"] = json!(match start {
+                PollStart::Earliest => "earliest",
+                PollStart::Latest => "latest",
+            });
+        }
+        // Each read gets a fresh identity: caching a prior empty response under
+        // a stable consumer key would prevent that consumer from seeing arrivals.
+        let request_id = RequestId::new(format!("req_webhook_poll_{}", uuid::Uuid::new_v4()));
+        let request = HostGuardedInvokeRequest {
+            max_safety_tier: SafetyTier::Safe,
+            request: InvokeRequest {
+                r#type: "invoke".to_owned(),
+                id: request_id.clone(),
+                connector_id: self
+                    .scope
+                    .connector
+                    .parse()
+                    .map_err(|_| WebhookFailure::InvalidRequest)?,
+                operation: WEBHOOK_POLL_OPERATION
+                    .parse()
+                    .map_err(|_| WebhookFailure::InvalidRequest)?,
+                zone_id: self
+                    .scope
+                    .zone
+                    .parse()
+                    .map_err(|_| WebhookFailure::InvalidRequest)?,
+                input,
+                capability_token: self.auth.capability_token.clone(),
+                holder_proof: self
+                    .auth
+                    .holder_proof_for(&request_id, WEBHOOK_POLL_OPERATION)
+                    .map_err(|_| WebhookFailure::Credential)?,
+                context: None,
+                idempotency_key: Some(format!("webhook-poll:{request_id}")),
+                lease_seq: self.lease_seq,
+                deadline_ms: Some(
+                    u64::try_from(self.timeout.as_millis())
+                        .map_err(|_| WebhookFailure::InvalidRequest)?,
+                ),
+                correlation_id: None,
+                provenance: None,
+                approval_tokens: Vec::new(),
+            },
+        };
+        let preflight: HostPreflightResponse = webhook_source_post(
+            &self.client,
+            "/rpc/preflight/guarded",
+            &request,
+            source_remaining(started, self.timeout)?,
+            WEBHOOK_SOURCE_ENVELOPE_BYTES,
+        )?;
+        if !preflight.allowed {
+            return Err(WebhookFailure::Denied.into());
+        }
+        let response: InvokeResponse = webhook_source_post(
+            &self.client,
+            "/rpc/invoke/guarded",
+            &request,
+            source_remaining(started, self.timeout)?,
+            max_bytes
+                .checked_add(WEBHOOK_SOURCE_ENVELOPE_BYTES)
+                .ok_or(WebhookFailure::InvalidRequest)?,
+        )?;
+        source_remaining(started, self.timeout)?;
+        if response.r#type != "response" || response.id != request_id {
+            return Err(WebhookFailure::InvalidResponse.into());
+        }
+        let value = match (response.status, response.result, response.error) {
+            (InvokeStatus::Ok, Some(value), None) => value,
+            (InvokeStatus::Error, None, Some(error)) => {
+                return Err(WebhookFailure::from_fcp_error(&error).into());
+            }
+            _ => return Err(WebhookFailure::InvalidResponse.into()),
+        };
+        let page =
+            webhook_events::decode_page(&self.scope, cursor, start, limit, max_bytes, value)?;
+        source_remaining(started, self.timeout)?;
+        Ok(page)
+    }
+}
+
+fn source_remaining(started: Instant, timeout: Duration) -> Result<Duration> {
+    timeout
+        .checked_sub(started.elapsed())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| WebhookFailure::Timeout.into())
+}
+
+/// The generic admin decoder can reflect remote error bodies and buffer an
+/// unbounded response. A webhook source instead bounds the complete envelope
+/// and reports only static errors, including failures during body consumption.
+fn webhook_source_post<B: Serialize, T: DeserializeOwned>(
+    client: &HostAdminClient,
+    path: &str,
+    body: &B,
+    timeout: Duration,
+    max_response_bytes: usize,
+) -> Result<T> {
+    if timeout.is_zero() {
+        return Err(WebhookFailure::Timeout.into());
+    }
+    let body = serde_json::to_vec(body).map_err(|_| WebhookFailure::InvalidRequest)?;
+    if body.len() > WEBHOOK_SOURCE_ENVELOPE_BYTES || max_response_bytes == 0 {
+        return Err(WebhookFailure::InvalidRequest.into());
+    }
+    let response = client
+        .client
+        .post(format!("{}{path}", client.base_url))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .timeout(timeout)
+        .body(body)
+        .send()
+        .map_err(|error| {
+            if error.is_timeout() {
+                WebhookFailure::Timeout
+            } else {
+                WebhookFailure::Transport
+            }
+        })?;
+    if !response.status().is_success() {
+        return Err(WebhookFailure::Http(response.status().as_u16()).into());
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > u64::try_from(max_response_bytes).unwrap_or(u64::MAX))
+    {
+        return Err(WebhookFailure::ResponseTooLarge.into());
+    }
+    let read_limit = max_response_bytes
+        .checked_add(1)
+        .and_then(|limit| u64::try_from(limit).ok())
+        .ok_or(WebhookFailure::InvalidRequest)?;
+    let mut bytes = Vec::with_capacity(max_response_bytes.min(64 * 1024));
+    response
+        .take(read_limit)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::TimedOut
+                || error
+                    .get_ref()
+                    .and_then(|cause| cause.downcast_ref::<reqwest::Error>())
+                    .is_some_and(reqwest::Error::is_timeout)
+            {
+                WebhookFailure::Timeout
+            } else {
+                WebhookFailure::Transport
+            }
+        })?;
+    if bytes.len() > max_response_bytes {
+        return Err(WebhookFailure::ResponseTooLarge.into());
+    }
+    serde_json::from_slice(&bytes).map_err(|_| WebhookFailure::InvalidResponse.into())
+}
+
+const fn webhook_failure_exit(failure: WebhookFailure) -> CliExitCode {
+    match failure {
+        WebhookFailure::InvalidRequest => CliExitCode::Validation,
+        WebhookFailure::Credential | WebhookFailure::Denied | WebhookFailure::Http(401 | 403) => {
+            CliExitCode::PolicyDenied
+        }
+        WebhookFailure::Transport
+        | WebhookFailure::Timeout
+        | WebhookFailure::InvalidResponse
+        | WebhookFailure::ResponseTooLarge
+        | WebhookFailure::Http(300..=399) => CliExitCode::Transport,
+        WebhookFailure::Http(_)
+        | WebhookFailure::ReplayGap
+        | WebhookFailure::CursorExpired
+        | WebhookFailure::PageTooLarge
+        | WebhookFailure::SourceUnavailable => CliExitCode::Connector,
     }
 }
 
@@ -501,6 +758,9 @@ mod tests {
         assert!(has_uncertain_results(&json!({
             "data": {"source": {"ack_state_persisted": false}}
         })));
+        assert!(has_uncertain_results(&json!({
+            "data": {"source": {"cursor_commit_unknown": true}}
+        })));
     }
 
     #[test]
@@ -551,5 +811,257 @@ mod tests {
             canonical_host("https://example.com/a").unwrap(),
             canonical_host("https://example.com/b").unwrap()
         );
+    }
+
+    fn source_http_server<F>(respond: F) -> (HostAdminClient, std::thread::JoinHandle<()>)
+    where
+        F: FnOnce(&mut std::net::TcpStream, serde_json::Value) + Send + 'static,
+    {
+        use std::io::{BufRead, BufReader};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let client = HostAdminClient::new(&endpoint).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let request = {
+                let mut reader = BufReader::new(&mut socket);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert!(line.starts_with("POST /rpc/"));
+                let mut length = None;
+                let mut header_bytes = line.len();
+                loop {
+                    line.clear();
+                    assert!(reader.read_line(&mut line).unwrap() > 0);
+                    header_bytes += line.len();
+                    assert!(header_bytes < 64 * 1024);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        length = Some(value.trim().parse::<usize>().unwrap());
+                    }
+                }
+                let length = length.expect("source POST must use a bounded serialized body");
+                assert!(length <= WEBHOOK_SOURCE_ENVELOPE_BYTES);
+                let mut bytes = vec![0; length];
+                reader.read_exact(&mut bytes).unwrap();
+                serde_json::from_slice(&bytes).unwrap()
+            };
+            respond(&mut socket, request);
+        });
+        (client, server)
+    }
+
+    #[test]
+    fn webhook_transport_reads_complete_bounded_json() {
+        use std::io::Write;
+
+        let (client, server) = source_http_server(|socket, request| {
+            assert_eq!(request, json!({"cursor": "opaque"}));
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{{\"ok\":true}}"
+            )
+            .unwrap();
+        });
+        let value: serde_json::Value = webhook_source_post(
+            &client,
+            "/rpc/invoke/guarded",
+            &json!({"cursor": "opaque"}),
+            Duration::from_secs(2),
+            11,
+        )
+        .unwrap();
+        assert_eq!(value, json!({"ok": true}));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn webhook_transport_bounds_declared_and_streamed_response_bodies() {
+        use std::io::Write;
+
+        for response in [
+            "HTTP/1.1 200 OK\r\nContent-Length: 4096\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n01234567890123456789012345678901234",
+        ] {
+            let (client, server) = source_http_server(move |socket, _| {
+                let _ = socket.write_all(response.as_bytes());
+            });
+            let error = webhook_source_post::<_, serde_json::Value>(
+                &client,
+                "/rpc/invoke/guarded",
+                &json!({}),
+                Duration::from_secs(2),
+                32,
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<WebhookFailure>(),
+                Some(&WebhookFailure::ResponseTooLarge)
+            );
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn webhook_transport_never_follows_redirects_or_reflects_error_bodies() {
+        use std::io::Write;
+
+        for status in [302, 403, 500] {
+            let (client, server) = source_http_server(move |socket, _| {
+                let secret = "private-provider-payload-or-capability";
+                let _ = write!(
+                    socket,
+                    "HTTP/1.1 {status} Error\r\nLocation: http://127.0.0.1:1/private\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{secret}",
+                    secret.len()
+                );
+            });
+            let error = webhook_source_post::<_, serde_json::Value>(
+                &client,
+                "/rpc/invoke/guarded",
+                &json!({"capability_token": "private-source-authority"}),
+                Duration::from_secs(2),
+                1024,
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<WebhookFailure>(),
+                Some(&WebhookFailure::Http(status))
+            );
+            assert!(!error.to_string().contains("private-"));
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn webhook_transport_rejects_malformed_json_without_body_disclosure() {
+        use std::io::Write;
+
+        let (client, server) = source_http_server(|socket, _| {
+            let _ = socket.write_all(
+                b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nprivate-provider-payload",
+            );
+        });
+        let error = webhook_source_post::<_, serde_json::Value>(
+            &client,
+            "/rpc/invoke/guarded",
+            &json!({}),
+            Duration::from_secs(2),
+            1024,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<WebhookFailure>(),
+            Some(&WebhookFailure::InvalidResponse)
+        );
+        assert!(!error.to_string().contains("private-provider"));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn webhook_transport_deadline_includes_body_consumption() {
+        use std::io::Write;
+
+        let (client, server) = source_http_server(|socket, _| {
+            let _ = socket.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n",
+            );
+            std::thread::sleep(Duration::from_millis(750));
+            let _ = socket.write_all(b"{\"ok\":true}");
+        });
+        let error = webhook_source_post::<_, serde_json::Value>(
+            &client,
+            "/rpc/invoke/guarded",
+            &json!({}),
+            Duration::from_millis(500),
+            1024,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<WebhookFailure>(),
+            Some(&WebhookFailure::Timeout)
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn webhook_poll_uses_one_deadline_across_source_phases() {
+        let started = Instant::now().checked_sub(Duration::from_secs(2)).unwrap();
+        let error = source_remaining(started, Duration::from_secs(1)).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<WebhookFailure>(),
+            Some(&WebhookFailure::Timeout)
+        );
+        assert!(source_remaining(Instant::now(), Duration::from_secs(1)).is_ok());
+    }
+
+    #[test]
+    fn webhook_poll_preflight_uses_only_source_authority_and_stops_on_denial() {
+        use std::io::Write;
+
+        for cursor in [None, Some("saved_source_cursor")] {
+            let source_capability = fcp_core::CapabilityToken::test_token();
+            let expected_capability = serde_json::to_value(&source_capability).unwrap();
+            let (client, server) = source_http_server(move |socket, body| {
+                let guarded: HostGuardedInvokeRequest = serde_json::from_value(body).unwrap();
+                assert_eq!(guarded.max_safety_tier, SafetyTier::Safe);
+                let request = guarded.request;
+                assert_eq!(request.connector_id.as_str(), "fcp.webhook-receiver");
+                assert_eq!(request.operation.as_str(), WEBHOOK_POLL_OPERATION);
+                assert_eq!(request.zone_id.as_str(), "z:work");
+                assert_eq!(
+                    serde_json::to_value(request.capability_token).unwrap(),
+                    expected_capability
+                );
+                assert!(request.approval_tokens.is_empty());
+                assert!(request.provenance.is_none());
+                assert_eq!(request.lease_seq, Some(17));
+                assert_eq!(request.input["endpoint_id"], "endpoint-one");
+                assert_eq!(request.input["limit"], 4);
+                assert_eq!(request.input["max_bytes"], 4096);
+                if let Some(cursor) = cursor {
+                    assert_eq!(request.input["cursor"], cursor);
+                    assert!(request.input.get("start").is_none());
+                } else {
+                    assert_eq!(request.input["start"], "earliest");
+                    assert!(request.input.get("cursor").is_none());
+                }
+                let response = serde_json::to_vec(&HostPreflightResponse::denied(
+                    "private-source-policy-detail",
+                ))
+                .unwrap();
+                write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    response.len()
+                )
+                .unwrap();
+                socket.write_all(&response).unwrap();
+            });
+            let mut source = WebhookRuleSource {
+                scope: WebhookSourceScope {
+                    host: client.endpoint.clone(),
+                    connector: "fcp.webhook-receiver".into(),
+                    zone: "z:work".into(),
+                    endpoint_id: "endpoint-one".into(),
+                },
+                client,
+                auth: ResolvedLiveAuth::for_test_token(source_capability),
+                lease_seq: Some(17),
+                timeout: Duration::from_secs(2),
+            };
+            let error = source.poll(cursor, PollStart::Earliest, 4, 4096).unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<WebhookFailure>(),
+                Some(&WebhookFailure::Denied)
+            );
+            assert!(!error.to_string().contains("private-source-policy-detail"));
+            server.join().unwrap();
+        }
     }
 }

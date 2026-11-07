@@ -3831,7 +3831,7 @@ fn command_contract(command: &str) -> Option<Value> {
         )),
         "rules" => Some(json!({
             "family": "workflow",
-            "summary": "Manage reactive rules, preview events, and consume bounded file or native-stream batches through guarded host admission.",
+            "summary": "Manage reactive rules, preview events, and consume bounded file, native-stream, or webhook polling batches through guarded host admission.",
             "intended_shape": "Local TOML definitions and previews, plus live execution with frozen authority, host-enforced safety ceilings, persistent throttles and durable replay protection.",
             "next_beads": ["flywheel_connectors-qnchs.8.4"],
             "workflow_handoff": [
@@ -3839,7 +3839,8 @@ fn command_contract(command: &str) -> Option<Value> {
                 "Preview events with `fwc rules preview --events events.jsonl`; previews never invoke operations or consume events.",
                 "Execute a finite batch with `fwc rules run --events events.jsonl --capability-token-file token.cbor --host <host>`; use --rule-capability-token-file RULE=PATH for separately authorized rules.",
                 "Consume an existing durable stream with `fwc rules consume --connector <canonical-id> --source-zone <zone> --topic <topic> --stream-id <id> --request-id <stable-id> --stream-capability-token-file source.cbor --capability-token-file action.cbor --zone <zone> --host <host>`; only settled events are acknowledged.",
-                "Unknown action and source-acknowledgement outcomes remain reserved across restarts; inspect the recorded request on the selected host before deciding whether to repeat an effect.",
+                "Poll retained webhooks with `fwc rules poll --connector fcp.webhook-receiver --source-zone <zone> --endpoint-id <id> --consumer <stable-name> --source-capability-token-file source.cbor --capability-token-file action.cbor --zone <zone> --host <host>`; only fully settled pages advance the durable consumer cursor.",
+                "Unknown action, source acknowledgement, and cursor persistence outcomes remain reserved across restarts; inspect the recorded request on the selected host before deciding whether to repeat an effect.",
                 "Use `fwc rules test rules.toml --event '<JSON>'` to inspect one event before registration."
             ]
         })),

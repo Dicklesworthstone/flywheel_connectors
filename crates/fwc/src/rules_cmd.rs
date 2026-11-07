@@ -16,6 +16,9 @@ use crate::reactive_rules::{
     CircuitBreaker, ExecutionOutcome, IncomingEvent, Rule, RuleDedupCache, RuleSet, RuleSetStore,
     ThrottleState, evaluate_rule_with_dedup, matches_trigger, render_action_inputs, validate_rule,
 };
+use crate::webhook_events::{
+    PollStart, WEBHOOK_EVENT_TOPIC, WebhookPollPage, WebhookSourceScope,
+};
 
 const MAX_RULES_BYTES: u64 = 1024 * 1024;
 const MAX_EVENTS_BYTES: u64 = 16 * 1024 * 1024;
@@ -28,6 +31,8 @@ const MAX_RUN_STATE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_RUN_JOURNAL_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_RUN_ATTEMPTS: usize = 10_000;
 const MAX_RUNTIME_RULES: usize = 1024;
+const MAX_POLL_SOURCES: usize = 1024;
+const MAX_POLL_CURSOR_BYTES: usize = 128;
 const RUN_STATE_VERSION: u32 = 1;
 
 #[derive(Args, Debug)]
@@ -77,6 +82,8 @@ enum RulesCommand {
     Run(RulesRunOptions),
     /// Process a bounded batch from an existing durable native stream and acknowledge settled work.
     Consume(RulesConsumeOptions),
+    /// Process one webhook page and commit its cursor only after every action succeeds.
+    Poll(RulesPollOptions),
 }
 
 #[derive(Args, Clone, Debug)]
@@ -126,6 +133,41 @@ pub(crate) struct RulesConsumeOptions {
 }
 
 #[derive(Args, Clone, Debug)]
+pub(crate) struct RulesPollOptions {
+    /// Exact webhook receiver connector ID admitted by the selected host.
+    #[arg(long)]
+    pub(crate) connector: String,
+    #[arg(long)]
+    pub(crate) source_zone: String,
+    #[arg(long)]
+    pub(crate) endpoint_id: String,
+    /// Stable consumer name; reuse it for every page and retry of this rule set.
+    #[arg(long)]
+    pub(crate) consumer: String,
+    /// Source read authority is separate from every action capability.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) source_capability_token_file: PathBuf,
+    #[arg(long, value_name = "PATH")]
+    pub(crate) source_holder_key_file: Option<PathBuf>,
+    /// Source singleton fence; never inherits an action connector's lease.
+    #[arg(long)]
+    pub(crate) source_lease_seq: Option<u64>,
+    #[arg(long)]
+    pub(crate) rule: Option<String>,
+    /// Initial position for a new consumer only; defaults to earliest retained.
+    #[arg(long, value_enum)]
+    pub(crate) start: Option<PollStart>,
+    #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u32).range(1..=64))]
+    pub(crate) max_events: u32,
+    #[arg(long, default_value_t = 1_048_576, value_parser = clap::value_parser!(u64).range(1..=16_777_216))]
+    pub(crate) max_bytes: u64,
+    #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=60))]
+    pub(crate) source_timeout_seconds: u64,
+    #[command(flatten)]
+    pub(crate) execution: RulesExecutionOptions,
+}
+
+#[derive(Args, Clone, Debug)]
 pub(crate) struct RulesExecutionOptions {
     #[arg(long)]
     pub(crate) zone: Option<String>,
@@ -170,10 +212,18 @@ impl RulesArgs {
         }
     }
 
+    pub(crate) fn poll_options(&self) -> Option<&RulesPollOptions> {
+        match &self.command {
+            RulesCommand::Poll(options) => Some(options),
+            _ => None,
+        }
+    }
+
     pub(crate) fn execution_options(&self) -> Option<&RulesExecutionOptions> {
         match &self.command {
             RulesCommand::Run(options) if !options.dry_run => Some(&options.execution),
             RulesCommand::Consume(options) => Some(&options.execution),
+            RulesCommand::Poll(options) => Some(&options.execution),
             _ => None,
         }
     }
@@ -207,6 +257,19 @@ pub(crate) trait RuleEventSource {
     fn host(&self) -> &str;
     fn poll(&mut self, limit: u32, wait_seconds: u64) -> Result<RuleEventBatch>;
     fn acknowledge(&mut self, events: &[EventEnvelope]) -> Result<bool>;
+}
+
+/// Reading a page never acknowledges or removes source events. The runner owns
+/// its cursor and commits progress only after all derived effects have settled.
+pub(crate) trait RulePollingSource {
+    fn scope(&self) -> &WebhookSourceScope;
+    fn poll(
+        &mut self,
+        cursor: Option<&str>,
+        start: PollStart,
+        limit: u32,
+        max_bytes: usize,
+    ) -> Result<WebhookPollPage>;
 }
 
 /// The host bridge must freeze all authority during `prepare`, then perform
@@ -315,6 +378,7 @@ pub(crate) fn dispatch(args: &RulesArgs) -> Result<RulesOutput> {
         }
         RulesCommand::Run(_) => anyhow::bail!("live rules require the host execution bridge"),
         RulesCommand::Consume(_) => anyhow::bail!("stream rules require the native stream bridge"),
+        RulesCommand::Poll(_) => anyhow::bail!("webhook rules require the polling source bridge"),
         RulesCommand::Test { .. } => unreachable!("test returned before opening the store"),
     }
 }
@@ -803,6 +867,307 @@ pub(crate) fn consume<E: RuleExecutor, S: RuleEventSource>(
     Ok(result)
 }
 
+/// Execute one bounded webhook page. The saved source cursor is an input to
+/// every retry, including a partially processed first page. Retention gaps or
+/// expired receiver cursors remain explicit errors; neither resets progress.
+pub(crate) fn poll<E: RuleExecutor, S: RulePollingSource>(
+    args: &RulesArgs,
+    executor: &mut E,
+    source: &mut S,
+) -> Result<RulesOutput> {
+    let options = args.poll_options().context("expected rules poll")?;
+    ensure!(
+        (1..=64).contains(&options.max_events)
+            && (1..=16_777_216).contains(&options.max_bytes)
+            && (1..=60).contains(&options.source_timeout_seconds)
+            && valid_request_id(&options.consumer),
+        "invalid webhook polling bounds or consumer name"
+    );
+    let source_scope = source.scope().clone();
+    validate_poll_scope(&source_scope)?;
+    ensure!(
+        source_scope.connector == options.connector
+            && source_scope.zone == options.source_zone
+            && source_scope.endpoint_id == options.endpoint_id,
+        "webhook source scope changed during preparation"
+    );
+    let store = args
+        .rules_file
+        .as_ref()
+        .map_or_else(RuleSetStore::default_path, RuleSetStore::new);
+    let path = canonical_rules_path(store.path(), false)?;
+    let _lock = lock_rules(&path)?;
+    let mut rules = selected_rules(&path, options.rule.as_deref())?;
+    ensure!(
+        rules.rules.iter().any(|rule| rule.enabled
+            && rule.trigger.connector == options.connector
+            && rule.trigger.event_type == WEBHOOK_EVENT_TOPIC),
+        "no enabled rule has the exact canonical webhook source and event topic"
+    );
+    rules.rules.retain(|rule| {
+        rule.enabled
+            && rule.trigger.connector == options.connector
+            && rule.trigger.event_type == WEBHOOK_EVENT_TOPIC
+    });
+    let scopes = executor.prepare(&rules.rules)?;
+    ensure!(
+        scopes.len() == rules.len(),
+        "host preparation returned incomplete webhook rule scopes"
+    );
+    let mut identities = BTreeMap::new();
+    for rule in &rules.rules {
+        let scope = scopes
+            .get(&rule.name)
+            .context("missing prepared webhook rule scope")?;
+        validate_scope(scope)?;
+        ensure!(
+            scope.host == source_scope.host && scope.zone == source_scope.zone,
+            "webhook actions must use the source host and zone"
+        );
+        identities.insert(rule.name.clone(), rule_identity(rule, scope)?);
+    }
+    let state_path = companion_path(&path, ".state.jsonl");
+    let (mut state, sequence) = load_run_state(&state_path)?;
+    let source_key = poll_source_identity(&options.consumer, &source_scope)?;
+    let rule_keys = identities.values().cloned().collect::<BTreeSet<_>>();
+    let cursor = match state.sources.get(&source_key) {
+        Some(retained) => {
+            ensure!(
+                options.start.is_none(),
+                "--start is only valid for a new webhook consumer"
+            );
+            ensure!(
+                retained.source == source_scope && retained.rule_keys == rule_keys,
+                "webhook consumer rule selection or execution scope changed; use a new consumer name"
+            );
+            Some(retained.cursor.clone())
+        }
+        None => {
+            ensure!(
+                state.sources.len() < MAX_POLL_SOURCES,
+                "webhook consumer checkpoint capacity reached"
+            );
+            None
+        }
+    };
+    state.prepare(&rules.rules, &identities, Utc::now())?;
+    let mut journal = RunJournal::open(&state_path, state, sequence)?;
+    let page = source.poll(
+        cursor.as_deref(),
+        options.start.unwrap_or(PollStart::Earliest),
+        options.max_events,
+        usize::try_from(options.max_bytes).context("webhook page byte limit is too large")?,
+    )?;
+    ensure!(
+        source.scope() == &source_scope,
+        "webhook source scope changed during polling"
+    );
+    execute_polled_page(
+        options,
+        &rules,
+        &source_scope,
+        &identities,
+        page,
+        executor,
+        &mut journal,
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+fn execute_polled_page<E: RuleExecutor, W: JournalWriter>(
+    options: &RulesPollOptions,
+    rules: &RuleSet,
+    source: &WebhookSourceScope,
+    identities: &BTreeMap<String, String>,
+    mut page: WebhookPollPage,
+    executor: &mut E,
+    journal: &mut RunJournal<W>,
+) -> Result<RulesOutput> {
+    let source_key = poll_source_identity(&options.consumer, source)?;
+    let retained = journal.state.sources.get(&source_key);
+    ensure!(
+        valid_poll_cursor(&page.start_cursor)
+            && valid_poll_cursor(&page.next_cursor)
+            && page.events.len() <= options.max_events as usize
+            && page.serialized_event_bytes as u64 <= options.max_bytes
+            && (!page.has_more || !page.events.is_empty())
+            && (page.events.is_empty() == (page.serialized_event_bytes == 0))
+            && page
+                .oldest_available_sequence
+                .is_none_or(|sequence| sequence < page.next_sequence),
+        "invalid webhook page bounds or cursor metadata"
+    );
+    if let Some(retained) = retained {
+        ensure!(
+            page.start_cursor == retained.cursor,
+            "webhook page did not start at the retained consumer cursor"
+        );
+    } else if matches!(options.start, Some(PollStart::Latest)) {
+        ensure!(
+            page.events.is_empty() && page.start_cursor == page.next_cursor,
+            "latest webhook bootstrap returned historical events"
+        );
+    }
+    ensure!(
+        page.events.is_empty()
+            || (page.oldest_available_sequence.is_some() && page.start_cursor != page.next_cursor),
+        "webhook event page has no valid continuation"
+    );
+    let mut seen = BTreeSet::new();
+    let mut normalized_bytes = 0usize;
+    let mut provenance = Vec::with_capacity(page.events.len());
+    let zone = source.zone.parse::<fcp_core::ZoneId>()?;
+    for event in &mut page.events {
+        validate_event(event)?;
+        let event_id = event
+            .event_id
+            .as_deref()
+            .context("webhook event has no stable source identity")?;
+        ensure!(
+            event.connector == source.connector
+                && event.event_type == WEBHOOK_EVENT_TOPIC
+                && !event_id.is_empty()
+                && seen.insert(event_id.to_owned()),
+            "invalid or repeated webhook event scope or identity"
+        );
+        // Consumers own independent effect streams. Sharing attempt records
+        // would let one advanced consumer release replay retention still
+        // needed by another consumer's unfinished page. Rule identities stay
+        // unchanged, so naming a consumer does not reset throttle or circuit.
+        let mut hasher = blake3::Hasher::new_derive_key(
+            "flywheel_connectors.reactive_rules.poll_consumer_event.v1",
+        );
+        hasher.update(&serde_json::to_vec(&(&source_key, event_id))?);
+        let event_id = format!("webhook-poll:{}", hasher.finalize().to_hex());
+        event.event_id = Some(event_id.clone());
+        let event_bytes = serde_json::to_vec(&*event)?.len();
+        normalized_bytes = normalized_bytes.saturating_add(event_bytes);
+        ensure!(
+            event_bytes <= MAX_EVENT_BYTES && normalized_bytes as u64 <= MAX_EVENTS_BYTES,
+            "normalized webhook page exceeds its byte limit"
+        );
+        provenance.push(Provenance::tainted(zone.clone()).with_step(ProvenanceStep {
+            timestamp_ms: u64::try_from(event.received_at.timestamp_millis()).unwrap_or(0),
+            zone: zone.clone(),
+            actor: source.connector.clone(),
+            action: WEBHOOK_EVENT_TOPIC.into(),
+            resource: event_id,
+        }));
+    }
+    // Render the entire page before persisting a new checkpoint or invoking
+    // anything. A bad later event must not permit an earlier side effect.
+    let batch = prepare_batch(rules, &page.events)?;
+    let initial = retained.is_none();
+    let checkpoint = SourceCursorState {
+        consumer: options.consumer.clone(),
+        source: source.clone(),
+        rule_keys: identities.values().cloned().collect(),
+        cursor: page.start_cursor.clone(),
+    };
+    if initial {
+        journal.append(JournalEntry::SourceCursor {
+            key: source_key.clone(),
+            checkpoint: checkpoint.clone(),
+            previous_cursor: None,
+            completed_keys: Vec::new(),
+            committed_at: Utc::now(),
+        })?;
+    }
+    let pending_keys = batch
+        .iter()
+        .map(|item| {
+            attempt_identity(
+                &identities[&rules.rules[item.rule].name],
+                &page.events[item.event],
+            )
+        })
+        .filter(|key| {
+            journal
+                .state
+                .attempts
+                .get(key)
+                .is_some_and(|attempt| attempt.retain_until < DateTime::<Utc>::MAX_UTC)
+        })
+        .collect::<BTreeSet<_>>();
+    if !pending_keys.is_empty() {
+        journal.append(JournalEntry::SourcePending {
+            keys: pending_keys.into_iter().collect(),
+        })?;
+    }
+    let mut result = execute_batch(
+        rules,
+        &page.events,
+        &batch,
+        identities,
+        executor,
+        journal,
+        Some(&provenance),
+    );
+    let settled = settled_event_prefix(&result.payload, rules.len(), page.events.len());
+    let complete = settled == page.events.len() && !result.rejected;
+    let mut cursor_committed = false;
+    if complete {
+        let completed_keys = batch
+            .iter()
+            .map(|item| {
+                attempt_identity(
+                    &identities[&rules.rules[item.rule].name],
+                    &page.events[item.event],
+                )
+            })
+            .filter(|key| {
+                journal
+                    .state
+                    .attempts
+                    .get(key)
+                    .is_some_and(|attempt| attempt.status == AttemptStatus::Completed)
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        // An unchanged empty page already has its durable frontier. Every
+        // actual advance and replay-retention release shares one synced record.
+        cursor_committed = if page.next_cursor == page.start_cursor && completed_keys.is_empty() {
+            true
+        } else {
+            journal
+                .append(JournalEntry::SourceCursor {
+                    key: source_key,
+                    checkpoint: SourceCursorState {
+                        cursor: page.next_cursor.clone(),
+                        ..checkpoint
+                    },
+                    previous_cursor: Some(page.start_cursor.clone()),
+                    completed_keys,
+                    committed_at: Utc::now(),
+                })
+                .is_ok()
+        };
+    }
+    let cursor_commit_unknown = complete && !cursor_committed && journal.poisoned;
+    result.payload["subcommand"] = json!("poll");
+    result.payload["data"]["source"] = json!({
+        "kind": "webhook_poll", "host": source.host, "connector": source.connector,
+        "zone": source.zone, "endpoint_id": source.endpoint_id, "consumer": options.consumer,
+        "topic": WEBHOOK_EVENT_TOPIC, "checkpoint_initialized": initial,
+        "cursor_committed": cursor_committed,
+        "cursor_advanced": cursor_committed && page.next_cursor != page.start_cursor,
+        "cursor_commit_unknown": cursor_commit_unknown,
+        "committed_cursor": if cursor_commit_unknown {None} else if cursor_committed {Some(&page.next_cursor)} else {Some(&page.start_cursor)},
+        "committed_events": if cursor_committed {page.events.len()} else {0},
+        "uncommitted_events": if cursor_committed {0} else {page.events.len()},
+        "settled_prefix_events": settled, "has_more": page.has_more,
+        "serialized_event_bytes": page.serialized_event_bytes,
+        "retention": {"oldest_available_sequence": page.oldest_available_sequence,
+            "next_sequence": page.next_sequence, "history_truncated": page.history_truncated},
+    });
+    result.rejected |= !complete || !cursor_committed;
+    if result.rejected {
+        result.payload["status"] = json!("error");
+    }
+    Ok(result)
+}
+
 fn normalize_stream_event(host: &str, envelope: &EventEnvelope) -> Result<IncomingEvent> {
     ensure!(
         serde_json::to_vec(envelope)?.len() <= MAX_EVENT_BYTES,
@@ -843,7 +1208,7 @@ fn normalize_stream_event(host: &str, envelope: &EventEnvelope) -> Result<Incomi
     Ok(event)
 }
 
-fn flatten_stream_field(
+pub(crate) fn flatten_stream_field(
     path: &str,
     value: &Value,
     depth: usize,
@@ -963,6 +1328,40 @@ fn validate_scope(scope: &ExecutionScope) -> Result<()> {
     Ok(())
 }
 
+fn validate_poll_scope(scope: &WebhookSourceScope) -> Result<()> {
+    ensure!(
+        !scope.host.trim().is_empty()
+            && scope.host.len() <= 4096
+            && !scope.host.chars().any(char::is_control)
+            && !scope.endpoint_id.trim().is_empty()
+            && scope.endpoint_id.len() <= 1024
+            && !scope.endpoint_id.chars().any(char::is_control),
+        "invalid webhook source host or endpoint"
+    );
+    let connector = scope.connector.parse::<fcp_core::ConnectorId>()?;
+    let zone = scope.zone.parse::<fcp_core::ZoneId>()?;
+    ensure!(
+        connector.as_str() == scope.connector && zone.as_str() == scope.zone,
+        "webhook source identifiers must be canonical"
+    );
+    Ok(())
+}
+
+fn valid_poll_cursor(cursor: &str) -> bool {
+    !cursor.is_empty()
+        && cursor.len() <= MAX_POLL_CURSOR_BYTES
+        && cursor
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn poll_source_identity(consumer: &str, source: &WebhookSourceScope) -> Result<String> {
+    let mut hasher =
+        blake3::Hasher::new_derive_key("flywheel_connectors.reactive_rules.poll_source.v1");
+    hasher.update(&serde_json::to_vec(&(consumer, source))?);
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
 fn rule_identity(rule: &Rule, scope: &ExecutionScope) -> Result<String> {
     // Retuning a throttle, changing a safety ceiling, or toggling a rule does
     // not make its old effects new. Only its action/trigger and resolved scope
@@ -1020,17 +1419,51 @@ struct RuntimeRule {
     forgotten_through: Option<DateTime<Utc>>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SourceCursorState {
+    consumer: String,
+    source: WebhookSourceScope,
+    /// Changing the selected actions must never inherit another rule set's
+    /// progress. Throttle and safety edits retain their stable rule identity.
+    rule_keys: BTreeSet<String>,
+    cursor: String,
+}
+
+impl SourceCursorState {
+    fn validate(&self, key: &str) -> Result<()> {
+        validate_poll_scope(&self.source)?;
+        ensure!(
+            valid_request_id(&self.consumer)
+                && valid_digest(key)
+                && poll_source_identity(&self.consumer, &self.source)? == key
+                && !self.rule_keys.is_empty()
+                && self.rule_keys.len() <= MAX_RULES
+                && self.rule_keys.iter().all(|key| valid_digest(key))
+                && valid_poll_cursor(&self.cursor),
+            "invalid persisted webhook source cursor"
+        );
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RunState {
     attempts: BTreeMap<String, RecordedAttempt>,
     rules: BTreeMap<String, RuntimeRule>,
+    // Omitting an empty new field preserves the canonical JSON covered by
+    // checksums on existing run/consume journal checkpoints.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    sources: BTreeMap<String, SourceCursorState>,
 }
 
 impl RunState {
     fn validate(&self) -> Result<()> {
         ensure!(
-            self.attempts.len() <= MAX_RUN_ATTEMPTS && self.rules.len() <= MAX_RUNTIME_RULES,
+            self.attempts.len() <= MAX_RUN_ATTEMPTS
+                && self.rules.len() <= MAX_RUNTIME_RULES
+                && self.sources.len() <= MAX_POLL_SOURCES,
             "rules execution state exceeds its entry limit"
         );
         let mut total_triggers = 0usize;
@@ -1066,6 +1499,9 @@ impl RunState {
                     && attempt.retain_until >= attempt.started_at,
                 "invalid persisted rule attempt"
             );
+        }
+        for (key, source) in &self.sources {
+            source.validate(key)?;
         }
         Ok(())
     }
@@ -1228,6 +1664,46 @@ impl RunState {
                     "source acknowledgement requires distinct completed action records"
                 );
             }
+            JournalEntry::SourceCursor {
+                key,
+                checkpoint,
+                previous_cursor,
+                completed_keys,
+                ..
+            } => {
+                checkpoint.validate(key)?;
+                if let Some(previous) = self.sources.get(key) {
+                    ensure!(
+                        previous.consumer == checkpoint.consumer
+                            && previous.source == checkpoint.source
+                            && previous.rule_keys == checkpoint.rule_keys
+                            && previous_cursor.as_deref() == Some(previous.cursor.as_str()),
+                        "webhook cursor update does not match its retained consumer and position"
+                    );
+                } else {
+                    ensure!(
+                        self.sources.len() < MAX_POLL_SOURCES
+                            && previous_cursor.is_none()
+                            && completed_keys.is_empty(),
+                        "new webhook consumer requires an initial cursor before effects"
+                    );
+                }
+                let unique: BTreeSet<_> = completed_keys.iter().collect();
+                ensure!(
+                    completed_keys.len() <= MAX_EVALUATIONS
+                        && unique.len() == completed_keys.len()
+                        && checkpoint
+                            .rule_keys
+                            .iter()
+                            .all(|key| self.rules.contains_key(key))
+                        && completed_keys.iter().all(|key| self
+                            .attempts
+                            .get(key)
+                            .is_some_and(|attempt| attempt.status == AttemptStatus::Completed
+                                && checkpoint.rule_keys.contains(&attempt.rule_key))),
+                    "webhook cursor may release only its completed action records"
+                );
+            }
         }
         Ok(())
     }
@@ -1270,25 +1746,38 @@ impl RunState {
             JournalEntry::SourceAcknowledged {
                 keys,
                 acknowledged_at,
+            } => self.release_completed(&keys, acknowledged_at),
+            JournalEntry::SourceCursor {
+                key,
+                checkpoint,
+                completed_keys,
+                committed_at,
+                ..
             } => {
-                for key in keys {
-                    let attempt = self
-                        .attempts
-                        .get_mut(&key)
-                        .context("missing acknowledged action")?;
-                    let runtime = self
-                        .rules
-                        .get(&attempt.rule_key)
-                        .context("missing acknowledged rule runtime")?;
-                    attempt.retain_until = acknowledged_at
-                        .max(attempt.started_at)
-                        .checked_add_signed(runtime.window.max(Duration::days(1)))
-                        .unwrap_or(DateTime::<Utc>::MAX_UTC);
-                }
+                self.release_completed(&completed_keys, committed_at)?;
+                self.sources.insert(key, checkpoint);
                 Ok(())
             }
             JournalEntry::Checkpoint { .. } => unreachable!("checkpoint rejected before mutation"),
         }
+    }
+
+    fn release_completed(&mut self, keys: &[String], committed_at: DateTime<Utc>) -> Result<()> {
+        for key in keys {
+            let attempt = self
+                .attempts
+                .get_mut(key)
+                .context("missing completed source action")?;
+            let runtime = self
+                .rules
+                .get(&attempt.rule_key)
+                .context("missing completed source rule runtime")?;
+            attempt.retain_until = committed_at
+                .max(attempt.started_at)
+                .checked_add_signed(runtime.window.max(Duration::days(1)))
+                .unwrap_or(DateTime::<Utc>::MAX_UTC);
+        }
+        Ok(())
     }
 
     fn settle(&mut self, key: &str, status: AttemptStatus, at: DateTime<Utc>) -> Result<()> {
@@ -1340,6 +1829,15 @@ enum JournalEntry {
     SourceAcknowledged {
         keys: Vec<String>,
         acknowledged_at: DateTime<Utc>,
+    },
+    /// Cursor progress and completed-action retention change in one synced
+    /// record. A partial page or uncertain write cannot release either early.
+    SourceCursor {
+        key: String,
+        checkpoint: SourceCursorState,
+        previous_cursor: Option<String>,
+        completed_keys: Vec<String>,
+        committed_at: DateTime<Utc>,
     },
 }
 
@@ -1853,6 +2351,7 @@ mod tests {
         omit_scope: bool,
         inputs: Vec<BTreeMap<String, String>>,
         provenance: Vec<Option<Provenance>>,
+        expected_source_cursor: Option<String>,
     }
 
     impl FakeExecutor {
@@ -1866,6 +2365,7 @@ mod tests {
                 omit_scope: false,
                 inputs: Vec::new(),
                 provenance: Vec::new(),
+                expected_source_cursor: None,
             }
         }
     }
@@ -1912,6 +2412,10 @@ mod tests {
             // Read the actual journal through the production recovery path at
             // the effect boundary, not an in-memory flag in the test executor.
             let (state, _) = load_run_state(&self.state_path)?;
+            if let Some(cursor) = &self.expected_source_cursor {
+                assert_eq!(state.sources.len(), 1);
+                assert_eq!(&state.sources.values().next().unwrap().cursor, cursor);
+            }
             let persisted = state
                 .attempts
                 .get(key.strip_prefix("fwc-rule:").unwrap())
@@ -3102,6 +3606,488 @@ mod tests {
         assert!(parse(&["--wait-seconds", "61"]).is_err());
         assert!(parse(&["--stream-timeout-seconds", "0"]).is_err());
         assert!(parse(&["--dry-run"]).is_err());
+    }
+
+    #[test]
+    fn poll_cli_requires_consumer_and_separate_source_authority() {
+        #[derive(clap::Parser)]
+        struct Command {
+            #[command(flatten)]
+            rules: RulesArgs,
+        }
+        let parse = |extra: &[&str]| {
+            let mut args = vec![
+                "fwc",
+                "poll",
+                "--connector",
+                "fcp.webhook-receiver",
+                "--source-zone",
+                "z:work",
+                "--endpoint-id",
+                "wh_endpoint",
+                "--source-capability-token-file",
+                "source.cbor",
+            ];
+            args.extend_from_slice(extra);
+            <Command as clap::Parser>::try_parse_from(args)
+        };
+        assert!(parse(&[]).is_err());
+        let parsed = parse(&[
+            "--consumer",
+            "issues",
+            "--capability-token-file",
+            "action.cbor",
+            "--source-holder-key-file",
+            "source.key",
+            "--source-lease-seq",
+            "7",
+            "--lease-seq",
+            "11",
+        ])
+        .unwrap();
+        let options = parsed.rules.poll_options().unwrap();
+        assert_eq!(options.consumer, "issues");
+        assert_eq!(options.source_capability_token_file, PathBuf::from("source.cbor"));
+        assert_eq!(options.source_holder_key_file, Some(PathBuf::from("source.key")));
+        assert_eq!(options.source_lease_seq, Some(7));
+        assert_eq!(options.execution.lease_seq, Some(11));
+        assert_eq!(options.execution.capability_token_file, Some(PathBuf::from("action.cbor")));
+        assert_eq!(options.max_events, 50);
+        assert_eq!(options.max_bytes, 1_048_576);
+        assert_eq!(options.source_timeout_seconds, 30);
+        assert!(options.start.is_none());
+        assert!(parsed.rules.execution_options().is_some());
+        for extra in [
+            vec!["--max-events", "65"],
+            vec!["--max-bytes", "0"],
+            vec!["--max-bytes", "16777217"],
+            vec!["--source-timeout-seconds", "61"],
+            vec!["--start", "reset"],
+            vec!["--dry-run"],
+        ] {
+            let mut flags = vec!["--consumer", "issues"];
+            flags.extend(extra);
+            assert!(parse(&flags).is_err());
+        }
+    }
+
+    fn polling_scope() -> WebhookSourceScope {
+        WebhookSourceScope {
+            host: execution_scope().host,
+            connector: "fcp.webhook-receiver".into(),
+            zone: "z:work".into(),
+            endpoint_id: "wh_endpoint".into(),
+        }
+    }
+
+    fn polled_event(id: &str) -> IncomingEvent {
+        IncomingEvent::new("fcp.webhook-receiver", WEBHOOK_EVENT_TOPIC)
+            .with_event_id(id)
+            .with_data("payload.text", "private-webhook-payload")
+            .with_data("endpoint_id", "wh_endpoint")
+    }
+
+    fn webhook_page(events: Vec<IncomingEvent>) -> WebhookPollPage {
+        WebhookPollPage {
+            serialized_event_bytes: events.len() * 128,
+            oldest_available_sequence: (!events.is_empty()).then_some(0),
+            next_sequence: events.len() as u64,
+            events,
+            start_cursor: "cursor_start".into(),
+            next_cursor: "cursor_next".into(),
+            has_more: false,
+            history_truncated: false,
+        }
+    }
+
+    struct FakePollingSource {
+        scope: WebhookSourceScope,
+        page: WebhookPollPage,
+        cursors: Vec<Option<String>>,
+        fail: Option<&'static str>,
+    }
+
+    impl RulePollingSource for FakePollingSource {
+        fn scope(&self) -> &WebhookSourceScope {
+            &self.scope
+        }
+
+        fn poll(
+            &mut self,
+            cursor: Option<&str>,
+            _start: PollStart,
+            _limit: u32,
+            _max_bytes: usize,
+        ) -> Result<WebhookPollPage> {
+            self.cursors.push(cursor.map(str::to_owned));
+            if let Some(reason) = self.fail {
+                anyhow::bail!(reason);
+            }
+            Ok(self.page.clone())
+        }
+    }
+
+    fn poll_fixture(
+        events: Vec<IncomingEvent>,
+    ) -> (tempfile::TempDir, RulesArgs, FakeExecutor, FakePollingSource) {
+        let mut definition = rule();
+        definition.trigger.connector = "fcp.webhook-receiver".into();
+        definition.trigger.event_type = WEBHOOK_EVENT_TOPIC.into();
+        definition.action.input.insert("query".into(), "{{event.data.payload.text}}".into());
+        let (temp, mut args, executor) = fixture(vec![definition], &[]);
+        args.command = RulesCommand::Poll(RulesPollOptions {
+            connector: "fcp.webhook-receiver".into(),
+            source_zone: "z:work".into(),
+            endpoint_id: "wh_endpoint".into(),
+            consumer: "issues".into(),
+            source_capability_token_file: temp.path().join("source.cbor"),
+            source_holder_key_file: None,
+            source_lease_seq: None,
+            rule: None,
+            start: None,
+            max_events: 50,
+            max_bytes: 1_048_576,
+            source_timeout_seconds: 30,
+            execution: run_options(PathBuf::new()).execution,
+        });
+        let source = FakePollingSource {
+            scope: polling_scope(),
+            page: webhook_page(events),
+            cursors: Vec::new(),
+            fail: None,
+        };
+        (temp, args, executor, source)
+    }
+
+    #[test]
+    fn poll_persists_start_before_effects_and_commits_only_the_completed_page() {
+        let (_temp, args, mut executor, mut source) =
+            poll_fixture(vec![polled_event("first"), polled_event("second")]);
+        executor.expected_source_cursor = Some("cursor_start".into());
+        let result = poll(&args, &mut executor, &mut source).unwrap();
+        assert!(!result.rejected);
+        assert_eq!(executor.calls, 2);
+        assert_eq!(executor.inputs[0]["query"], "private-webhook-payload");
+        assert!(executor.provenance.iter().all(|provenance| {
+            let provenance = provenance.as_ref().unwrap();
+            provenance.is_tainted()
+                && !provenance.elevated
+                && provenance.origin_zone == fcp_core::ZoneId::work()
+        }));
+        assert_eq!(result.payload["data"]["source"]["cursor_committed"], true);
+        assert_eq!(result.payload["data"]["source"]["committed_events"], 2);
+        assert!(result.payload["data"]["source"].get("acknowledged").is_none());
+        let (state, _) = load_run_state(&executor.state_path).unwrap();
+        assert_eq!(state.sources.values().next().unwrap().cursor, "cursor_next");
+        assert!(state.attempts.values().all(|attempt| {
+            attempt.status == AttemptStatus::Completed
+                && attempt.retain_until < DateTime::<Utc>::MAX_UTC
+        }));
+        let persisted = fs::read_to_string(&executor.state_path).unwrap();
+        for private in ["private-webhook-payload", "source.cbor", "private-connector-response"] {
+            assert!(!persisted.contains(private));
+        }
+        source.page = webhook_page(Vec::new());
+        source.page.start_cursor = "cursor_next".into();
+        source.page.next_cursor = "cursor_frontier".into();
+        let mut restarted = FakeExecutor::new(executor.state_path.clone());
+        assert!(!poll(&args, &mut restarted, &mut source).unwrap().rejected);
+        assert_eq!(restarted.calls, 0);
+        assert_eq!(source.cursors, vec![None, Some("cursor_next".into())]);
+        let (state, _) = load_run_state(&executor.state_path).unwrap();
+        assert_eq!(state.sources.values().next().unwrap().cursor, "cursor_frontier");
+    }
+
+    #[test]
+    fn poll_partial_page_replays_from_saved_start_without_repeating_completed_actions() {
+        let (_temp, args, mut executor, mut source) =
+            poll_fixture(vec![polled_event("first"), polled_event("second")]);
+        executor.replies.extend([FakeReply::Success, FakeReply::Rejected]);
+        let result = poll(&args, &mut executor, &mut source).unwrap();
+        assert!(result.rejected);
+        assert_eq!(result.payload["data"]["source"]["committed_events"], 0);
+        assert_eq!(result.payload["data"]["source"]["settled_prefix_events"], 1);
+        assert_eq!(executor.calls, 1);
+        let (mut state, sequence) = load_run_state(&executor.state_path).unwrap();
+        assert_eq!(state.sources.values().next().unwrap().cursor, "cursor_start");
+        assert_eq!(state.attempts.values().next().unwrap().retain_until, DateTime::<Utc>::MAX_UTC);
+        // Pending-page evidence must survive even after ordinary completed
+        // action retention and the rule's throttle window would have expired.
+        for attempt in state.attempts.values_mut() {
+            attempt.started_at = Utc::now() - Duration::days(400);
+        }
+        drop(RunJournal::open(&executor.state_path, state, sequence).unwrap());
+        let mut restarted = FakeExecutor::new(executor.state_path.clone());
+        restarted.expected_source_cursor = Some("cursor_start".into());
+        let replay = poll(&args, &mut restarted, &mut source).unwrap();
+        assert!(!replay.rejected);
+        assert_eq!(restarted.calls, 1);
+        assert_eq!(replay.payload["data"]["results"][0]["outcome"], "duplicate");
+        assert_eq!(source.cursors, vec![None, Some("cursor_start".into())]);
+        let (state, _) = load_run_state(&executor.state_path).unwrap();
+        assert_eq!(state.sources.values().next().unwrap().cursor, "cursor_next");
+        assert!(state.attempts.values().all(|attempt| attempt.retain_until < DateTime::<Utc>::MAX_UTC));
+    }
+
+    #[test]
+    fn poll_failed_or_uncertain_actions_keep_the_page_and_replay_records() {
+        for reply in [FakeReply::Failed, FakeReply::Unknown, FakeReply::ErrorAfterAdmission] {
+            let (_temp, args, mut executor, mut source) =
+                poll_fixture(vec![polled_event("first"), polled_event("second")]);
+            executor.replies.extend([FakeReply::Success, reply]);
+            let result = poll(&args, &mut executor, &mut source).unwrap();
+            assert!(result.rejected);
+            assert_eq!(result.payload["data"]["source"]["cursor_committed"], false);
+            let (state, _) = load_run_state(&executor.state_path).unwrap();
+            assert_eq!(state.sources.values().next().unwrap().cursor, "cursor_start");
+            assert!(state.attempts.values().all(|attempt| attempt.retain_until == DateTime::<Utc>::MAX_UTC));
+            let mut restarted = FakeExecutor::new(executor.state_path.clone());
+            assert!(poll(&args, &mut restarted, &mut source).unwrap().rejected);
+            assert_eq!(restarted.calls, 0);
+        }
+    }
+
+    #[test]
+    fn poll_retention_gap_and_expired_cursor_never_reset_the_consumer() {
+        for reason in ["webhook_replay_gap", "webhook_cursor_expired"] {
+            let (_temp, args, mut executor, mut source) = poll_fixture(vec![polled_event("first")]);
+            executor.replies.push_back(FakeReply::Rejected);
+            assert!(poll(&args, &mut executor, &mut source).unwrap().rejected);
+            source.fail = Some(reason);
+            let mut restarted = FakeExecutor::new(executor.state_path.clone());
+            assert!(poll(&args, &mut restarted, &mut source).is_err());
+            assert_eq!(restarted.calls, 0);
+            assert_eq!(source.cursors, vec![None, Some("cursor_start".into())]);
+            let (state, _) = load_run_state(&executor.state_path).unwrap();
+            assert_eq!(state.sources.values().next().unwrap().cursor, "cursor_start");
+        }
+    }
+
+    #[test]
+    fn poll_validates_the_entire_page_before_starting_any_action() {
+        for fault in 0..7 {
+            let (_temp, args, mut executor, mut source) =
+                poll_fixture(vec![polled_event("first"), polled_event("second")]);
+            match fault {
+                0 => source.page.events[1].connector = "fcp.other".into(),
+                1 => source.page.events[1].event_type = "other.topic".into(),
+                2 => source.page.events[1].event_id = Some("first".into()),
+                3 => source.page.events[1].event_id = None,
+                4 => source.page.next_cursor.clear(),
+                5 => source.page.serialized_event_bytes = 16_777_217,
+                _ => { source.page.events[1].data.insert("payload.large".into(), "x".repeat(MAX_EVENT_BYTES)); }
+            }
+            assert!(poll(&args, &mut executor, &mut source).is_err());
+            assert_eq!(executor.calls, 0);
+            let (state, _) = load_run_state(&executor.state_path).unwrap();
+            assert!(state.sources.is_empty());
+            assert!(state.attempts.is_empty());
+        }
+    }
+
+    #[test]
+    fn poll_binds_consumer_to_selected_rules_and_rejects_repeated_start() {
+        let (_temp, mut args, mut executor, mut source) = poll_fixture(vec![polled_event("first")]);
+        assert!(!poll(&args, &mut executor, &mut source).unwrap().rejected);
+        let RulesCommand::Poll(options) = &mut args.command else { unreachable!() };
+        options.start = Some(PollStart::Latest);
+        let mut restarted = FakeExecutor::new(executor.state_path.clone());
+        assert!(poll(&args, &mut restarted, &mut source).is_err());
+        assert_eq!(source.cursors.len(), 1);
+        let RulesCommand::Poll(options) = &mut args.command else { unreachable!() };
+        options.start = None;
+        let path = args.rules_file.as_ref().unwrap();
+        let mut definitions = load_rules(path, false).unwrap();
+        definitions.rules[0].action.input.insert("query".into(), "changed action".into());
+        save_rules(path, &definitions).unwrap();
+        let mut changed = FakeExecutor::new(executor.state_path.clone());
+        assert!(poll(&args, &mut changed, &mut source).is_err());
+        assert_eq!(source.cursors.len(), 1);
+        assert_eq!(changed.calls, 0);
+        let RulesCommand::Poll(options) = &mut args.command else { unreachable!() };
+        options.consumer = "new-action-consumer".into();
+        let mut explicit = FakeExecutor::new(executor.state_path.clone());
+        assert!(!poll(&args, &mut explicit, &mut source).unwrap().rejected);
+        assert_eq!(explicit.calls, 1);
+        let (state, _) = load_run_state(&executor.state_path).unwrap();
+        assert_eq!(state.sources.len(), 2);
+    }
+
+    #[test]
+    fn poll_latest_bootstrap_and_empty_pages_commit_without_actions() {
+        let (_temp, mut args, mut executor, mut source) = poll_fixture(Vec::new());
+        let RulesCommand::Poll(options) = &mut args.command else { unreachable!() };
+        options.start = Some(PollStart::Latest);
+        source.page.next_cursor = source.page.start_cursor.clone();
+        let result = poll(&args, &mut executor, &mut source).unwrap();
+        assert!(!result.rejected);
+        assert_eq!(executor.calls, 0);
+        assert_eq!(result.payload["data"]["source"]["checkpoint_initialized"], true);
+        assert_eq!(result.payload["data"]["source"]["cursor_committed"], true);
+        assert_eq!(result.payload["data"]["source"]["cursor_advanced"], false);
+        let (state, _) = load_run_state(&executor.state_path).unwrap();
+        assert_eq!(state.sources.values().next().unwrap().cursor, "cursor_start");
+    }
+
+    #[test]
+    fn poll_refuses_target_scope_changes_before_reading_source_data() {
+        for different_host in [false, true] {
+            let (_temp, args, mut executor, mut source) = poll_fixture(vec![polled_event("first")]);
+            if different_host {
+                executor.scope.host = "http://other-host".into();
+            } else {
+                executor.scope.zone = "z:private".into();
+            }
+            assert!(poll(&args, &mut executor, &mut source).is_err());
+            assert!(source.cursors.is_empty());
+            assert_eq!(executor.calls, 0);
+        }
+    }
+
+    #[test]
+    fn poll_consumers_do_not_release_each_others_unfinished_page_records() {
+        let (_temp, mut args, mut executor, mut source) =
+            poll_fixture(vec![polled_event("first"), polled_event("second")]);
+        executor.replies.extend([FakeReply::Success, FakeReply::Rejected]);
+        let first = poll(&args, &mut executor, &mut source).unwrap();
+        assert!(first.rejected);
+        let first_key = first.payload["data"]["results"][0]["idempotency_key"]
+            .as_str().unwrap().strip_prefix("fwc-rule:").unwrap().to_owned();
+        let RulesCommand::Poll(options) = &mut args.command else { unreachable!() };
+        options.consumer = "independent".into();
+        let mut second = FakeExecutor::new(executor.state_path.clone());
+        let completed = poll(&args, &mut second, &mut source).unwrap();
+        assert!(!completed.rejected);
+        assert_eq!(second.calls, 2, "a new consumer deliberately starts an independent effect stream");
+        assert_ne!(first.payload["data"]["results"][0]["idempotency_key"],
+            completed.payload["data"]["results"][0]["idempotency_key"]);
+        let (state, _) = load_run_state(&executor.state_path).unwrap();
+        assert_eq!(state.rules.len(), 1, "consumers share the rule's throttle and circuit");
+        assert_eq!(state.attempts.len(), 3);
+        assert_eq!(state.attempts[&first_key].retain_until, DateTime::<Utc>::MAX_UTC);
+        assert_eq!(state.sources[&poll_source_identity("issues", &polling_scope()).unwrap()].cursor, "cursor_start");
+        assert_eq!(state.sources[&poll_source_identity("independent", &polling_scope()).unwrap()].cursor, "cursor_next");
+        let RulesCommand::Poll(options) = &mut args.command else { unreachable!() };
+        options.consumer = "issues".into();
+        let mut resumed = FakeExecutor::new(executor.state_path.clone());
+        assert!(!poll(&args, &mut resumed, &mut source).unwrap().rejected);
+        assert_eq!(resumed.calls, 1, "the original consumer suppresses its completed first action");
+    }
+
+    #[test]
+    fn poll_new_consumer_cannot_reset_a_rules_throttle() {
+        let (_temp, mut args, mut executor, mut source) = poll_fixture(vec![polled_event("first")]);
+        let path = args.rules_file.as_ref().unwrap();
+        let mut definitions = load_rules(path, false).unwrap();
+        definitions.rules[0].throttle.max = 1;
+        save_rules(path, &definitions).unwrap();
+        assert!(!poll(&args, &mut executor, &mut source).unwrap().rejected);
+        let RulesCommand::Poll(options) = &mut args.command else { unreachable!() };
+        options.consumer = "new-name".into();
+        let mut second = FakeExecutor::new(executor.state_path.clone());
+        let result = poll(&args, &mut second, &mut source).unwrap();
+        assert!(result.rejected);
+        assert_eq!(second.calls, 0);
+        assert_eq!(result.payload["data"]["results"][0]["outcome"], "throttled");
+        let (state, _) = load_run_state(&executor.state_path).unwrap();
+        assert_eq!(state.rules.len(), 1);
+        assert_eq!(state.attempts.len(), 1);
+        assert_eq!(state.sources[&poll_source_identity("new-name", &polling_scope()).unwrap()].cursor, "cursor_start");
+    }
+
+    fn poll_with_sync_failure(
+        args: &RulesArgs,
+        executor: &mut FakeExecutor,
+        page: WebhookPollPage,
+        fail_at: usize,
+    ) -> (Result<RulesOutput>, RunJournal<FailSyncWriter>) {
+        let rules = selected_rules(args.rules_file.as_ref().unwrap(), None).unwrap();
+        let scopes = executor.prepare(&rules.rules).unwrap();
+        let identities = rules.rules.iter().map(|rule| {
+            (rule.name.clone(), rule_identity(rule, &scopes[&rule.name]).unwrap())
+        }).collect();
+        let mut state = RunState::default();
+        state.prepare(&rules.rules, &identities, Utc::now()).unwrap();
+        let RunJournal { state, writer, sequence, bytes, poisoned } =
+            RunJournal::open(&executor.state_path, state, 0).unwrap();
+        let mut journal = RunJournal {
+            state,
+            writer: FailSyncWriter { file: writer, syncs: 0, fail_at },
+            sequence,
+            bytes,
+            poisoned,
+        };
+        let result = execute_polled_page(
+            args.poll_options().unwrap(), &rules, &polling_scope(), &identities,
+            page, executor, &mut journal,
+        );
+        (result, journal)
+    }
+
+    #[test]
+    fn poll_initial_cursor_failure_prevents_every_effect() {
+        let (_temp, args, mut executor, source) = poll_fixture(vec![polled_event("first")]);
+        let (result, journal) = poll_with_sync_failure(&args, &mut executor, source.page, 1);
+        assert!(result.is_err());
+        assert_eq!(executor.calls, 0);
+        assert!(journal.poisoned);
+        assert!(journal.state.attempts.is_empty());
+        assert!(journal.state.sources.is_empty());
+    }
+
+    #[test]
+    fn poll_cursor_commit_failure_preserves_effect_evidence_and_atomic_recovery() {
+        let (_temp, args, mut executor, mut source) = poll_fixture(vec![polled_event("first")]);
+        let (result, journal) = poll_with_sync_failure(&args, &mut executor, source.page.clone(), 4);
+        let result = result.unwrap();
+        assert!(result.rejected);
+        assert_eq!(executor.calls, 1);
+        assert_eq!(result.payload["data"]["results"][0]["outcome"], "executed");
+        assert_eq!(result.payload["data"]["source"]["cursor_committed"], false);
+        assert_eq!(result.payload["data"]["source"]["cursor_commit_unknown"], true);
+        assert!(result.payload["data"]["source"]["committed_cursor"].is_null());
+        assert!(journal.poisoned);
+        assert_eq!(journal.state.sources.values().next().unwrap().cursor, "cursor_start");
+        assert_eq!(journal.state.attempts.values().next().unwrap().retain_until, DateTime::<Utc>::MAX_UTC);
+        drop(journal);
+        // A complete final record recovers progress and retention together,
+        // even though this process could not know whether its sync succeeded.
+        let (complete, _) = load_run_state(&executor.state_path).unwrap();
+        assert_eq!(complete.sources.values().next().unwrap().cursor, "cursor_next");
+        assert!(complete.attempts.values().next().unwrap().retain_until < DateTime::<Utc>::MAX_UTC);
+        // An interrupted final record recovers neither change. Earlier
+        // completed action evidence stays pinned and suppresses retransmission.
+        let bytes = fs::read(&executor.state_path).unwrap();
+        fs::write(&executor.state_path, &bytes[..bytes.len() - 2]).unwrap();
+        let (interrupted, _) = load_run_state(&executor.state_path).unwrap();
+        assert_eq!(interrupted.sources.values().next().unwrap().cursor, "cursor_start");
+        assert_eq!(interrupted.attempts.values().next().unwrap().retain_until, DateTime::<Utc>::MAX_UTC);
+        let mut restarted = FakeExecutor::new(executor.state_path.clone());
+        assert!(!poll(&args, &mut restarted, &mut source).unwrap().rejected);
+        assert_eq!(restarted.calls, 0);
+        assert_eq!(source.cursors, vec![Some("cursor_start".into())]);
+    }
+
+    #[test]
+    fn poll_source_extension_preserves_existing_journal_checksums() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.jsonl");
+        // Canonical checkpoint bytes from before the optional sources map.
+        let payload = br#"[1,0,{"type":"checkpoint","state":{"attempts":{},"rules":{}}}]"#;
+        let mut hasher = blake3::Hasher::new_derive_key("flywheel_connectors.reactive_rules.journal.v1");
+        hasher.update(payload);
+        let record = json!({
+            "version": 1, "sequence": 0,
+            "entry": {"type": "checkpoint", "state": {"attempts": {}, "rules": {}}},
+            "digest": hasher.finalize().to_hex().to_string(),
+        });
+        let mut bytes = serde_json::to_vec(&record).unwrap();
+        bytes.push(b'\n');
+        fs::write(&path, bytes).unwrap();
+        let (state, sequence) = load_run_state(&path).unwrap();
+        assert_eq!(sequence, 0);
+        assert!(state.sources.is_empty());
+        assert_eq!(serde_json::to_value(state).unwrap(), json!({"attempts": {}, "rules": {}}));
     }
 
     fn native_event(cursor: &str, seq: u64) -> EventEnvelope {
