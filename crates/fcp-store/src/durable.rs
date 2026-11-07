@@ -38,7 +38,7 @@ use crate::object_id_verifier::ObjectIdVerifier;
 use crate::object_store::{MemoryObjectStoreConfig, ObjectStore};
 use crate::symbol_store::{
     MemorySymbolStoreConfig, ObjectSymbolMeta, StoredSymbol, SymbolMeta, SymbolStore,
-    validate_source_symbols,
+    initial_symbol_map_capacity, validate_source_symbols,
 };
 
 /// Legacy unkeyed envelope version. Reads accept it only when
@@ -698,12 +698,15 @@ impl DurableSymbolState {
         }
 
         let object_id = meta.object_id;
-        let source_symbols = meta.source_symbols;
+        // This path serves both live admission and WAL replay. A valid high-K
+        // object may remain sparse indefinitely; reserve a bounded map now and
+        // grow it only as actual symbols arrive, just like the memory store.
+        let capacity = initial_symbol_map_capacity(meta.source_symbols);
         self.objects.insert(
             object_id,
             DurableObjectSymbols {
                 meta,
-                symbols: HashMap::with_capacity(source_symbols as usize),
+                symbols: HashMap::with_capacity(capacity),
             },
         );
         Ok(())
@@ -2377,6 +2380,13 @@ mod tests {
             source_symbols: 4,
             first_symbol_at: 100,
         }
+    }
+
+    fn high_k_symbol_meta(seed: u8) -> ObjectSymbolMeta {
+        let mut meta = test_symbol_meta(seed);
+        meta.source_symbols = 56_403;
+        meta.oti.transfer_length = u64::from(meta.source_symbols) * u64::from(meta.oti.symbol_size);
+        meta
     }
 
     fn test_symbol(seed: u8, esi: u32, source_node: u64) -> StoredSymbol {
@@ -4363,6 +4373,126 @@ mod tests {
             1,
             "valid symbol must remain after the tolerated apply"
         );
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn durable_symbol_sparse_high_k_metadata_stays_bounded_across_recovery() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        for (index, mac_key) in [None, Some([0xA7; 32])].into_iter().enumerate() {
+            let mut config = DurableSymbolStoreConfig::new(temp_dir.path().join(index.to_string()));
+            config.checkpoint_after_ops = 0;
+            config.mac_key = mac_key;
+            let empty = high_k_symbol_meta(1);
+            let sparse = high_k_symbol_meta(2);
+            let reserved_capacity = HashMap::<u32, StoredSymbol>::with_capacity(
+                initial_symbol_map_capacity(empty.source_symbols),
+            )
+            .capacity();
+            assert!(reserved_capacity < usize::try_from(empty.source_symbols).unwrap());
+
+            let store = DurableSymbolStore::open(config.clone()).unwrap();
+            for meta in [&empty, &sparse] {
+                store.put_object_meta(meta.clone()).await.unwrap();
+                let state = store.state.read();
+                let object = state.objects.get(&meta.object_id).unwrap();
+                assert_eq!(object.meta, *meta);
+                assert!(object.symbols.is_empty());
+                assert_eq!(object.symbols.capacity(), reserved_capacity);
+            }
+            // Repeated metadata must preserve both the bounded map and symbols.
+            store.put_symbol(test_symbol(2, 0, 7)).await.unwrap();
+            store.put_symbol(test_symbol(2, 56_402, 8)).await.unwrap();
+            store.put_object_meta(sparse.clone()).await.unwrap();
+            assert!(!store.snapshot_path.exists());
+            drop(store);
+
+            // First recover from the WAL; then recover the same sparse state
+            // from a checkpoint. Exercise legacy and authenticated envelopes.
+            for checkpointed in [false, true] {
+                let recovered = DurableSymbolStore::open(config.clone()).unwrap();
+                for (meta, count) in [(&empty, 0), (&sparse, 2)] {
+                    let state = recovered.state.read();
+                    let object = state.objects.get(&meta.object_id).unwrap();
+                    assert_eq!(object.meta, *meta);
+                    assert_eq!(object.symbols.len(), count);
+                    assert!(object.symbols.capacity() <= reserved_capacity);
+                    if checkpointed && count == 0 {
+                        assert_eq!(object.symbols.capacity(), 0);
+                    }
+                }
+                assert_eq!(recovered.storage_used().await, 2 * (128 + 64));
+                assert!(!recovered.can_reconstruct(&sparse.object_id).await);
+                for (esi, node) in [(0, 7), (56_402, 8)] {
+                    let symbol = recovered.get_symbol(&sparse.object_id, esi).await.unwrap();
+                    assert_eq!(symbol.data, test_symbol(2, esi, node).data);
+                    assert_eq!(symbol.meta.source_node, Some(node));
+                }
+                recovered.checkpoint().unwrap();
+            }
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn durable_symbol_map_grows_past_eager_bound_without_losing_symbols() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let mut config = DurableSymbolStoreConfig::new(temp_dir.path().join("symbols"));
+        config.checkpoint_after_ops = 0;
+        config.mac_key = Some([0xB8; 32]);
+        let meta = high_k_symbol_meta(3);
+        let store = DurableSymbolStore::open(config.clone()).unwrap();
+        store.put_object_meta(meta.clone()).await.unwrap();
+        let initial_capacity = store.state.read().objects[&meta.object_id]
+            .symbols
+            .capacity();
+        let count = u32::try_from(initial_capacity + 1).unwrap();
+        for esi in 0..count {
+            store.put_symbol(test_symbol(3, esi, 7)).await.unwrap();
+        }
+        assert!(
+            store.state.read().objects[&meta.object_id]
+                .symbols
+                .capacity()
+                > initial_capacity
+        );
+        assert_eq!(store.symbol_count(&meta.object_id).await, count);
+        let used = u64::from(count) * (128 + 64);
+        assert_eq!(store.storage_used().await, used);
+
+        store.put_symbol(test_symbol(3, 0, 7)).await.unwrap();
+        let mut conflicting = test_symbol(3, 0, 7);
+        conflicting.data = Bytes::from(vec![0xFF; 128]);
+        assert!(matches!(
+            store.put_symbol(conflicting).await,
+            Err(SymbolStoreError::InvalidSymbol { .. })
+        ));
+        assert_eq!(store.storage_used().await, used);
+        drop(store);
+
+        // Growth is an allocation policy, not a symbol-count limit. Preserve
+        // all accepted symbols through both recovery formats and deletions.
+        for checkpointed in [false, true] {
+            let recovered = DurableSymbolStore::open(config.clone()).unwrap();
+            assert_eq!(recovered.symbol_count(&meta.object_id).await, count);
+            assert_eq!(recovered.storage_used().await, used);
+            assert_eq!(
+                recovered.get_object_meta(&meta.object_id).await.unwrap(),
+                meta
+            );
+            for esi in [0, count - 1] {
+                let symbol = recovered.get_symbol(&meta.object_id, esi).await.unwrap();
+                assert_eq!(symbol.data, test_symbol(3, esi, 7).data);
+            }
+            if checkpointed {
+                recovered
+                    .delete_symbol(&meta.object_id, count - 1)
+                    .await
+                    .unwrap();
+                assert_eq!(recovered.symbol_count(&meta.object_id).await, count - 1);
+                assert_eq!(recovered.storage_used().await, used - (128 + 64));
+            } else {
+                recovered.checkpoint().unwrap();
+            }
+        }
     }
 
     #[fcp_async_core::runtime::test]

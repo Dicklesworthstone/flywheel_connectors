@@ -35,9 +35,21 @@ const MAX_SOURCE_SYMBOLS: u32 = 56_403;
 /// but has not received any symbols yet.
 ///
 /// The symbol map still grows normally as symbols arrive; this only bounds
-/// eager allocation while `put_object_meta` holds the global `objects.write()`
-/// lock.
+/// eager allocation during metadata admission and durable WAL recovery.
 const MAX_EAGER_SYMBOL_MAP_CAPACITY: usize = 1_024;
+
+/// Bound an empty symbol map's reservation independently of the advertised K.
+///
+/// Both live stores and durable replay use this policy so sparse, valid high-K
+/// metadata cannot allocate a full reconstruction buffer before symbols arrive.
+/// Metadata validation remains a separate admission requirement.
+pub(crate) fn initial_symbol_map_capacity(source_symbols: u32) -> usize {
+    let bounded_source_symbols = source_symbols.min(MAX_SOURCE_SYMBOLS);
+    let bounded_source_symbols =
+        usize::try_from(bounded_source_symbols).expect("MAX_SOURCE_SYMBOLS fits in usize");
+
+    bounded_source_symbols.min(MAX_EAGER_SYMBOL_MAP_CAPACITY)
+}
 
 /// Validate that object metadata declares a source-symbol count supported by
 /// the paired `RaptorQ` codec.
@@ -235,14 +247,6 @@ impl MemorySymbolStore {
         u32::try_from(symbol_count).map_or(true, |count| count >= source_symbols)
     }
 
-    fn initial_symbol_map_capacity(source_symbols: u32) -> usize {
-        let bounded_source_symbols = source_symbols.min(MAX_SOURCE_SYMBOLS);
-        let bounded_source_symbols =
-            usize::try_from(bounded_source_symbols).expect("MAX_SOURCE_SYMBOLS fits in usize");
-
-        bounded_source_symbols.min(MAX_EAGER_SYMBOL_MAP_CAPACITY)
-    }
-
     fn symbol_matches_meta(meta: &ObjectSymbolMeta, symbol: &StoredSymbol) -> bool {
         symbol.meta.object_id == meta.object_id
             && symbol.meta.zone_id == meta.zone_id
@@ -412,7 +416,7 @@ impl SymbolStore for MemorySymbolStore {
         // valid sparse high-K object burn a large allocation while the global
         // object map is write-locked. HashMap growth preserves overwrite,
         // duplicate, and reconstruction semantics once symbols arrive.
-        let capacity = Self::initial_symbol_map_capacity(meta.source_symbols);
+        let capacity = initial_symbol_map_capacity(meta.source_symbols);
         objects.insert(
             meta.object_id,
             RwLock::new(ObjectSymbols {
@@ -2211,14 +2215,14 @@ mod tests {
 
     #[test]
     fn initial_symbol_map_capacity_caps_sparse_metadata() {
-        assert_eq!(MemorySymbolStore::initial_symbol_map_capacity(100), 100);
-        assert_eq!(MemorySymbolStore::initial_symbol_map_capacity(1_000), 1_000);
+        assert_eq!(initial_symbol_map_capacity(100), 100);
+        assert_eq!(initial_symbol_map_capacity(1_000), 1_000);
         assert_eq!(
-            MemorySymbolStore::initial_symbol_map_capacity(10_000),
+            initial_symbol_map_capacity(10_000),
             MAX_EAGER_SYMBOL_MAP_CAPACITY
         );
         assert_eq!(
-            MemorySymbolStore::initial_symbol_map_capacity(MAX_SOURCE_SYMBOLS),
+            initial_symbol_map_capacity(MAX_SOURCE_SYMBOLS),
             MAX_EAGER_SYMBOL_MAP_CAPACITY
         );
     }
