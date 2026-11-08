@@ -5,7 +5,7 @@ min_mesh_version = "2.0.0"
 min_protocol = "fcp2-sym/2.0"
 protocol_features = []
 max_datagram_bytes = 65000
-interface_hash = "blake3-256:fcp.interface.v2:25f1e136a14d1786a27525d4c0b4eb1bb1be1a77b0b547476f74c6ffb438c505"
+interface_hash = "blake3-256:fcp.interface.v2:29e73fbee8e8a78d460315e90ecc0b4e71631f64e844f2a17a66c1c1adcbf43b"
 
 [connector]
 id = "fcp.webhook-receiver"
@@ -464,6 +464,19 @@ type = "string"
 minLength = 1
 maxLength = 4096
 description = "Authenticated challenge; at most 4096 UTF-8 bytes with no control characters"
+
+[[provides.operations."webhook.events.ingest".output_schema.oneOf]]
+required = ["accepted", "status_code", "duplicate"]
+additionalProperties = false
+
+[provides.operations."webhook.events.ingest".output_schema.oneOf.properties.accepted]
+const = true
+
+[provides.operations."webhook.events.ingest".output_schema.oneOf.properties.status_code]
+const = 200
+
+[provides.operations."webhook.events.ingest".output_schema.oneOf.properties.duplicate]
+const = true
 
 [provides.operations."webhook.events.ingest".network_constraints]
 host_allow = ["localhost.localdomain"]

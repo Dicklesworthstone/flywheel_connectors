@@ -413,8 +413,9 @@ Every HTTP attempt receives fresh host-generated invocation, idempotency,
 and delivery identities. Provider delivery-ID headers cannot occupy the
 host's idempotency cache or select the receiver's public-ID replay identity.
 After signature verification, the receiver's separate authenticated-content
-digest rejects previously accepted ordinary event payloads even when the HTTP
-attempt has a new host identity. Slack URL verification has the control-exchange
+digest recognizes previously accepted ordinary event payloads even when the HTTP
+attempt has a new host identity. It confirms prior acceptance without creating
+another event or reserving the retry's delivery identity. Slack URL verification has the control-exchange
 behavior described below.
 
 Ordinary event replies contain only `accepted`, `status_code`, and `reason_code`.
@@ -430,24 +431,29 @@ An accepted event delivery returns:
 
 | HTTP status | Meaning |
 | --- | --- |
-| `200` | Authenticated Slack URL verification completed; the response contains only `challenge`. |
+| `200` | Previously accepted authenticated content was confirmed with `reason_code: "already_accepted"`, or authenticated Slack URL verification completed with only `challenge`. |
 | `202` | The receiver verified and committed this delivery to its configured encrypted local store. Explicit development mode may use volatile storage instead. |
 | `400`, `414`, `431` | Malformed or ambiguous request, excessive request target, or excessive headers. |
 | `401` | Provider signature validation failed. |
 | `403` | The receiver's source policy denied the delivery. |
 | `404` | The receiver endpoint is unknown; an entirely disabled host route also returns HTTP 404. |
 | `405`, `415` | Unsupported method or content type. |
-| `409` | The receiver rejected an already accepted delivery as a duplicate. |
+| `409` | New authenticated content conflicts with an already accepted public delivery ID. |
 | `413` | The body exceeds an active host or receiver limit. |
 | `429` | Host concurrent admission or receiver rate capacity is exhausted. |
 | `502`, `503` | Receiver response failure or unavailable host/receiver authority. Public replies omit internal diagnostics. |
 | `504` | The adapter's request budget expired. |
 | `507` | Receiver replay capacity is exhausted; operator recovery is required. |
 
-A duplicate remains `409`, not a fresh-success acknowledgment. Confirm how
-the provider handles that status and use authenticated recent-event reads
-for investigation. A `202` does not imply durable queueing, external consumer
-processing, or persistence across restart.
+A valid retry after a lost acknowledgment returns
+`{"accepted":true,"status_code":200,"reason_code":"already_accepted"}`.
+Every retry still passes current authority, source, freshness, signature, body,
+and rate checks. The receiver checks that its live durable writer still owns the
+committed journal before confirming acceptance; missing, replaced, or fenced
+storage fails closed. Retained authenticated identities survive event-body
+eviction and durable reopening. This acknowledgment adds no event or journal
+record and does not imply that an external consumer has processed the delivery.
+Ordinary `202` responses confirm local durable acceptance when storage is configured.
 
 ### Slack Events API URL verification
 
@@ -473,7 +479,9 @@ event metadata, capability data, and receiver diagnostics are not reflected.
 URL verification is a control exchange. It creates no retained business event
 and reserves no event replay identity, so fresh signed registration retries
 can succeed. Ordinary Slack event deliveries keep their existing `202`
-acknowledgment and `409` replay rejection. Provider headers alone cannot select
+acknowledgment; a fresh signed retry of accepted content earns `200`, and new
+authenticated content conflicting with a retained public ID returns `409`.
+Provider headers alone cannot select
 this reply: a generic or GitHub endpoint receives no Slack verification behavior
 from a challenge-shaped payload.
 
@@ -502,8 +510,9 @@ byte budget; retry the same cursor with a larger budget within the `16 MiB`
 maximum. See the [complete replay contract](../../connectors/webhook-receiver/README.md#cursor-based-event-consumption).
 
 Polling preserves redaction and does not delete events or change ingress
-deduplication. Event bodies, replay identities, and cursors still live only in
-memory; HTTP `202` does not promise they will survive a receiver restart.
+deduplication. The configured encrypted store preserves retained event bodies,
+replay identities, and cursors across receiver restart. Explicit development
+mode with `allow_ephemeral_ingest: true` has no restart guarantee.
 
 ## Readiness and verification
 

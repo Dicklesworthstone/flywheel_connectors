@@ -339,7 +339,8 @@ impl WebhookIngressConfig {
     /// Every attempt receives a new OS-random request, idempotency and
     /// delivery identity. Unsigned provider delivery labels cannot occupy the
     /// host's idempotency cache or the receiver's public-ID replay index. The
-    /// receiver still rejects retries using its authenticated-content digest.
+    /// receiver confirms previously accepted authenticated-content digests
+    /// without recording another event or reserving the retry's unsigned ID.
     ///
     /// The operator's fixed intake command originates in the configured zone;
     /// the provider supplies only opaque payload data. Public-input taint is
@@ -521,7 +522,8 @@ impl WebhookIngressError {
 ///
 /// Only the receiver's positive admission contract earns a successful response.
 /// Known receiver error statuses are mapped without reflecting their messages.
-/// A duplicate remains 409: a conflict is not proof of fresh delivery success.
+/// Only an explicit authenticated duplicate outcome earns an idempotent 200.
+/// A receiver conflict remains 409; an unsigned ID match does not prove success.
 /// FCP authority/lifecycle failures describe unusable host provisioning and are
 /// 503; malformed outcomes and unrelated external failures are 502.
 /// A successfully authenticated Slack URL-verification result may return only
@@ -582,8 +584,16 @@ fn admitted_response(result: &Value) -> Option<(StatusCode, Value)> {
         return None;
     }
     match result.get("status_code").and_then(Value::as_u64)? {
-        202 if result.get("verification").is_none() => {
+        202 if result.get("verification").is_none() && result.get("duplicate").is_none() => {
             Some(public_response(StatusCode::ACCEPTED, true, "accepted"))
+        }
+        200 if result.get("duplicate").is_some() => {
+            if result.get("duplicate").and_then(Value::as_bool) != Some(true)
+                || result.as_object()?.len() != 3
+            {
+                return None;
+            }
+            Some(public_response(StatusCode::OK, true, "already_accepted"))
         }
         200 => {
             let verification = result.get("verification")?.as_object()?;
@@ -1708,6 +1718,47 @@ mod tests {
             body,
             json!({"accepted":true,"status_code":202,"reason_code":"accepted"})
         );
+    }
+
+    #[test]
+    fn authenticated_duplicate_returns_only_fixed_success_fields() {
+        let response = InvokeResponse::ok(
+            RequestId::random(),
+            json!({"accepted": true, "status_code": 200, "duplicate": true}),
+        );
+        let (status, body) = response_for(&response);
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            json!({"accepted": true, "status_code": 200, "reason_code": "already_accepted"}),
+        );
+        // An ordinary receiver conflict still proves no accepted content.
+        assert_eq!(response_for(&receiver_error(409)).0, StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn malformed_duplicate_outcomes_cannot_acknowledge_or_reflect_metadata() {
+        for result in [
+            json!({"accepted": true, "status_code": 200, "duplicate": false}),
+            json!({"accepted": true, "status_code": 200, "duplicate": "true"}),
+            json!({"accepted": true, "status_code": 202, "duplicate": true}),
+            json!({"accepted": false, "status_code": 200, "duplicate": true}),
+            json!({"accepted": true, "status_code": 200, "duplicate": true,
+                "event": {"payload": "private-duplicate-payload"}}),
+            json!({"accepted": true, "status_code": 200, "duplicate": true,
+                "verification": {"provider": "slack", "kind": "url_verification",
+                    "challenge": "private-duplicate-challenge"}}),
+        ] {
+            let (status, body) = response_for(&InvokeResponse::ok(RequestId::random(), result));
+            assert_eq!(status, StatusCode::BAD_GATEWAY);
+            assert!(!body.to_string().contains("private-duplicate"));
+        }
+        let mut inconsistent = InvokeResponse::ok(
+            RequestId::random(),
+            json!({"accepted": true, "status_code": 200, "duplicate": true}),
+        );
+        inconsistent.error = Some(FcpError::InvalidSignature);
+        assert_eq!(response_for(&inconsistent).0, StatusCode::BAD_GATEWAY);
     }
 
     fn slack_verification_result(challenge: Value) -> Value {

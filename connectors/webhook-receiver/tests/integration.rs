@@ -351,6 +351,13 @@ fn assert_external_status(result: Result<serde_json::Value, FcpError>, expected_
     );
 }
 
+fn assert_already_accepted(result: Result<serde_json::Value, FcpError>) {
+    assert_eq!(
+        result.expect("authenticated retry should confirm prior acceptance"),
+        json!({"accepted": true, "status_code": 200, "duplicate": true}),
+    );
+}
+
 // -- Lifecycle --
 
 #[fcp_async_core::runtime::test]
@@ -628,7 +635,8 @@ async fn durable_receiver_restores_secrets_events_cursors_and_authenticated_repl
         .await
         .unwrap();
     assert_eq!(recovered_page, first_page);
-    assert_external_status(
+    let committed_journal = std::fs::read(fixture.directory.join("state.journal")).unwrap();
+    assert_already_accepted(
         ingest(
             &mut reopened,
             "/recover",
@@ -637,7 +645,11 @@ async fn durable_receiver_restores_secrets_events_cursors_and_authenticated_repl
             "different-unsigned-delivery-id",
         )
         .await,
-        409,
+    );
+    assert_eq!(
+        std::fs::read(fixture.directory.join("state.journal")).unwrap(),
+        committed_journal,
+        "confirming a recovered delivery must not append a new event or alias",
     );
     let second_body = r#"{"event":"accepted-after-restart"}"#;
     ingest(
@@ -829,6 +841,18 @@ async fn durable_receiver_fences_reads_and_writes_when_journal_identity_changes(
         .mode(0o600)
         .open(&journal)
         .unwrap();
+    assert!(
+        ingest(
+            &mut c,
+            "/fence",
+            github_signature_headers("fence-secret", body),
+            body,
+            "first-retry-after-journal-replacement",
+        )
+        .await
+        .is_err(),
+        "a duplicate must detect lost durable state before acknowledging from memory",
+    );
     let refused_body = r#"{"event":"must-not-publish"}"#;
     assert!(
         ingest(
@@ -845,6 +869,18 @@ async fn durable_receiver_fences_reads_and_writes_when_journal_identity_changes(
     assert_eq!(health["storage"]["fenced"], true);
     assert_eq!(health["storage"]["event_ingest_enabled"], false);
     assert_eq!(health["status"]["state"], "degraded");
+    assert!(
+        ingest(
+            &mut c,
+            "/fence",
+            github_signature_headers("fence-secret", body),
+            body,
+            "retry-of-committed-event",
+        )
+        .await
+        .is_err(),
+        "a retained digest must not acknowledge through a fenced writer",
+    );
     for operation in ["webhook.endpoints.list", "webhook.events.recent"] {
         assert!(
             c.handle_invoke(json!({"operation_id": operation, "input": {}}))
@@ -1401,7 +1437,7 @@ async fn events_ingest_invalid_headers_do_not_consume_replay_identity_or_poll_po
 }
 
 #[fcp_async_core::runtime::test]
-async fn events_ingest_duplicate_delivery_is_rejected_without_recording_second_event() {
+async fn events_ingest_duplicate_delivery_is_acknowledged_without_recording_second_event() {
     let mut c = setup_connector().await;
     let created = create_endpoint(&mut c, "/hooks/dupe", "generic", "secret").await;
     let endpoint_id = created["endpoint_id"].as_str().unwrap();
@@ -1420,10 +1456,7 @@ async fn events_ingest_duplicate_delivery_is_rejected_without_recording_second_e
     )
     .await
     .unwrap();
-    assert_external_status(
-        ingest(&mut c, "/hooks/dupe", headers, body, "delivery-dupe").await,
-        409,
-    );
+    assert_already_accepted(ingest(&mut c, "/hooks/dupe", headers, body, "delivery-dupe").await);
 
     let recent = c
         .handle_invoke(json!({
@@ -1433,6 +1466,88 @@ async fn events_ingest_duplicate_delivery_is_rejected_without_recording_second_e
         .await
         .unwrap();
     assert_eq!(recent["events"].as_array().unwrap().len(), 1);
+}
+
+#[fcp_async_core::runtime::test]
+async fn authenticated_retries_do_not_reserve_aliases_or_confirm_conflicting_content() {
+    let mut c = setup_connector().await;
+    let endpoint = create_endpoint(&mut c, "/retry-proof", "github", "proof-secret").await;
+    let first_body = r#"{"event":"first-accepted-content"}"#;
+    let first_headers = github_signature_headers("proof-secret", first_body);
+    // The caller can lose this response without losing the accepted delivery.
+    drop(
+        ingest(
+            &mut c,
+            "/retry-proof",
+            first_headers.clone(),
+            first_body,
+            "original",
+        )
+        .await
+        .unwrap(),
+    );
+    let before = c
+        .handle_invoke(json!({
+            "operation_id": "webhook.events.poll",
+            "input": {"endpoint_id": endpoint["endpoint_id"]}
+        }))
+        .await
+        .unwrap();
+    assert_already_accepted(
+        ingest(
+            &mut c,
+            "/retry-proof",
+            first_headers,
+            first_body,
+            "unsigned-alias",
+        )
+        .await,
+    );
+    let after = c
+        .handle_invoke(json!({
+            "operation_id": "webhook.events.poll",
+            "input": {"endpoint_id": endpoint["endpoint_id"]}
+        }))
+        .await
+        .unwrap();
+    assert_eq!(
+        after, before,
+        "confirmation cannot change events, bytes or cursors"
+    );
+
+    let second_body = r#"{"event":"different-signed-content"}"#;
+    let second_headers = github_signature_headers("proof-secret", second_body);
+    assert_external_status(
+        ingest(
+            &mut c,
+            "/retry-proof",
+            second_headers.clone(),
+            second_body,
+            "original",
+        )
+        .await,
+        409,
+    );
+    let accepted = ingest(
+        &mut c,
+        "/retry-proof",
+        second_headers,
+        second_body,
+        "unsigned-alias",
+    )
+    .await
+    .unwrap();
+    assert_eq!(accepted["status_code"], 202);
+    assert_eq!(accepted["event"]["event_id"], "unsigned-alias");
+    let final_page = c
+        .handle_invoke(json!({
+            "operation_id": "webhook.events.poll",
+            "input": {"endpoint_id": endpoint["endpoint_id"]}
+        }))
+        .await
+        .unwrap();
+    assert_eq!(final_page["events"].as_array().unwrap().len(), 2);
+    assert_eq!(final_page["retention"]["next_sequence"], 2);
 }
 
 #[fcp_async_core::runtime::test]
@@ -1500,12 +1615,11 @@ async fn events_ingest_authenticated_body_cannot_be_replayed_with_unsigned_ids()
         for field in ["delivery_id", "event_id", "request_id"] {
             let mut attempt = input.clone();
             attempt[field] = json!(format!("changed-{field}"));
-            assert_external_status(
+            assert_already_accepted(
                 c.handle_invoke(json!({
                     "operation_id": "webhook.events.ingest", "input": attempt
                 }))
                 .await,
-                409,
             );
         }
         for header in [
@@ -1516,24 +1630,22 @@ async fn events_ingest_authenticated_body_cannot_be_replayed_with_unsigned_ids()
         ] {
             let mut attempt = input.clone();
             attempt["headers"][header] = json!(format!("changed-{header}"));
-            assert_external_status(
+            assert_already_accepted(
                 c.handle_invoke(json!({
                     "operation_id": "webhook.events.ingest", "input": attempt
                 }))
                 .await,
-                409,
             );
         }
         // Removing all unsigned aliases must not revive the signed payload ID.
-        assert_external_status(
+        assert_already_accepted(
             c.handle_invoke(json!({
                 "operation_id": "webhook.events.ingest", "input": input
             }))
             .await,
-            409,
         );
         if matches!(provider, "stripe" | "slack") {
-            assert_external_status(
+            assert_already_accepted(
                 ingest(
                     &mut c,
                     &path,
@@ -1542,9 +1654,32 @@ async fn events_ingest_authenticated_body_cannot_be_replayed_with_unsigned_ids()
                     "resigned-retry",
                 )
                 .await,
-                409,
+            );
+            assert_external_status(
+                ingest(
+                    &mut c,
+                    &path,
+                    signed_headers(timestamp - 3600),
+                    body,
+                    "stale-authenticated-retry",
+                )
+                .await,
+                401,
             );
         }
+        // A known digest is not authority: each retry still needs a current
+        // provider signature, including after an earlier successful delivery.
+        assert_external_status(
+            ingest(
+                &mut c,
+                &path,
+                json!({"Content-Type": "application/json"}),
+                body,
+                "unsigned-retry",
+            )
+            .await,
+            401,
+        );
         let recent = c
             .handle_invoke(json!({
                 "operation_id": "webhook.events.recent",
@@ -2039,7 +2174,7 @@ async fn slack_url_verification_retries_do_not_store_events_or_consume_replay_id
     assert_eq!(accepted["status_code"], 202);
     assert_eq!(accepted["event"]["event_id"], "control-delivery");
     assert!(accepted.get("verification").is_none());
-    assert_external_status(
+    assert_already_accepted(
         ingest(
             &mut c,
             "/hooks/slack",
@@ -2048,7 +2183,6 @@ async fn slack_url_verification_retries_do_not_store_events_or_consume_replay_id
             "different-unsigned-alias",
         )
         .await,
-        409,
     );
     let recent = c.handle_invoke(recent_request).await.unwrap();
     assert_eq!(recent["events"].as_array().unwrap().len(), 2);
@@ -2278,9 +2412,9 @@ async fn slack_url_verification_preserves_fcp_authority_resource_and_usage_limit
     });
     assert!(c.inner.handle_invoke(params.clone()).await.is_err());
     let request = c.request(params.clone()).unwrap();
-    let mut unsigned = request.clone();
-    unsigned.capability_token = CapabilityToken::from_raw(vec![]);
-    assert!(c.inner.handle_invoke(json!(unsigned)).await.is_err());
+    let mut unsigned = serde_json::to_value(&request).unwrap();
+    unsigned["capability_token"] = json!("");
+    assert!(c.inner.handle_invoke(unsigned).await.is_err());
     let mut wrong_zone = request.clone();
     wrong_zone.zone_id = ZoneId::public();
     assert!(c.inner.handle_invoke(json!(wrong_zone)).await.is_err());
@@ -2510,7 +2644,7 @@ async fn events_ingest_twilio_json_binds_raw_bytes_and_rejects_content_type_swit
         .unwrap();
     assert_eq!(accepted["status_code"], 202);
 
-    assert_external_status(
+    assert_already_accepted(
         c.handle_invoke(json!({
             "operation_id": "webhook.events.ingest",
             "input": {
@@ -2525,7 +2659,6 @@ async fn events_ingest_twilio_json_binds_raw_bytes_and_rejects_content_type_swit
             }
         }))
         .await,
-        409,
     );
 
     for (content_type, body) in [
@@ -2599,10 +2732,9 @@ async fn events_ingest_twilio_replay_identity_matches_signed_form_bytes_and_url(
     for (index, body) in ["AB=C", "A=%42C&A=BC"].into_iter().enumerate() {
         input["body"] = json!(body);
         input["delivery_id"] = json!(format!("changed-unsigned-id-{index}"));
-        assert_external_status(
+        assert_already_accepted(
             c.handle_invoke(json!({"operation_id": "webhook.events.ingest", "input": input}))
                 .await,
-            409,
         );
     }
 
@@ -2636,7 +2768,7 @@ async fn events_ingest_twilio_replay_identity_matches_signed_form_bytes_and_url(
 }
 
 #[fcp_async_core::runtime::test]
-async fn events_ingest_twilio_accepts_status_changes_but_rejects_equivalent_form_retries() {
+async fn events_ingest_twilio_accepts_status_changes_and_confirms_equivalent_form_retries() {
     let mut c = setup_connector_with_config(json!({
         "public_base_url": "https://example.com"
     }))
@@ -2678,7 +2810,7 @@ async fn events_ingest_twilio_accepts_status_changes_but_rejects_equivalent_form
         "12345",
         &format!("{url}MessageSidSM123MessageStatusdeliveredTo+15551234567"),
     );
-    assert_external_status(
+    assert_already_accepted(
         c.handle_invoke(json!({
             "operation_id": "webhook.events.ingest",
             "input": {
@@ -2694,7 +2826,6 @@ async fn events_ingest_twilio_accepts_status_changes_but_rejects_equivalent_form
             }
         }))
         .await,
-        409,
     );
 
     let recent = c
@@ -2968,6 +3099,28 @@ async fn events_poll_reports_unread_retention_gap_and_allows_explicit_restart() 
     assert_eq!(restarted["retention"]["history_truncated"], true);
     assert_eq!(restarted["events"][0]["event_id"], "gap-1");
     assert_eq!(restarted["has_more"], true);
+    let evicted_body = json!({"index": 0}).to_string();
+    assert_already_accepted(
+        ingest(
+            &mut c,
+            "/poll-gap",
+            github_signature_headers("poll-secret", &evicted_body),
+            &evicted_body,
+            "retry-after-body-eviction",
+        )
+        .await,
+    );
+    let after_retry = c
+        .handle_invoke(json!({
+            "operation_id": "webhook.events.poll",
+            "input": {"endpoint_id": endpoint["endpoint_id"], "start": "earliest", "limit": 1}
+        }))
+        .await
+        .unwrap();
+    assert_eq!(
+        after_retry, restarted,
+        "retry must not resurrect an evicted body"
+    );
 }
 
 #[fcp_async_core::runtime::test]

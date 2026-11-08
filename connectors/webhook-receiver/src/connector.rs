@@ -36,8 +36,9 @@ use tracing::{info, instrument};
 
 use crate::{
     client::{
-        DEFAULT_EVENTS_LIMIT, DEFAULT_PUBLIC_BASE_URL, MAX_EVENT_CURSOR_BYTES, MAX_EVENTS_LIMIT,
-        MAX_RETAINED_EVENT_BYTES_PER_ENDPOINT, WebhookStore,
+        AuthenticatedAdmission, DEFAULT_EVENTS_LIMIT, DEFAULT_PUBLIC_BASE_URL,
+        MAX_EVENT_CURSOR_BYTES, MAX_EVENTS_LIMIT, MAX_RETAINED_EVENT_BYTES_PER_ENDPOINT,
+        WebhookStore,
     },
     error::WebhookReceiverError,
     persistence::DurableStoreConfig,
@@ -1511,8 +1512,20 @@ impl WebhookReceiverConnector {
             signature_valid: true,
             source_ip: source_ip.clone(),
         };
-        self.store
-            .record_authenticated_event(event, signature.replay_digest)?;
+        if self
+            .store
+            .admit_authenticated_event(event, signature.replay_digest)?
+            == AuthenticatedAdmission::AlreadyAccepted
+        {
+            // The retained digest proves prior acceptance even when its event
+            // body has been evicted. Do not invent the original ID or time from
+            // this retry's unsigned metadata or publish another event.
+            return Ok(json!({
+                "accepted": true,
+                "status_code": 200,
+                "duplicate": true,
+            }));
+        }
 
         Ok(json!({
             "accepted": true,
@@ -3047,6 +3060,15 @@ fn operations_info() -> Vec<OperationInfo> {
                                     }
                                 }
                             }
+                        }
+                    },
+                    {
+                        "required": ["accepted", "status_code", "duplicate"],
+                        "additionalProperties": false,
+                        "properties": {
+                            "accepted": { "const": true },
+                            "status_code": { "const": 200 },
+                            "duplicate": { "const": true }
                         }
                     }
                 ]

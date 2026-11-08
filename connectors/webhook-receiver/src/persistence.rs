@@ -219,7 +219,9 @@ mod native {
                 store_id.copy_from_slice(&bytes[8..24]);
                 let expected = identity_bytes(&master_key, &store_id, &scope);
                 if !bool::from(expected.ct_eq(&bytes)) {
-                    return Err(unavailable("store key, zone, namespace or identity does not match"));
+                    return Err(unavailable(
+                        "store key, zone, namespace or identity does not match",
+                    ));
                 }
                 store_id
             };
@@ -278,14 +280,27 @@ mod native {
             self.fenced
         }
 
+        /// Confirm the acknowledged state still belongs to this live writer.
+        /// Duplicate acknowledgements do not append a record, so they must
+        /// explicitly detect replaced or missing storage before using memory.
+        pub(crate) fn verify_current(&mut self) -> WebhookReceiverResult<()> {
+            if self.fenced {
+                return Err(unavailable("writer is fenced until the store is reopened"));
+            }
+            let result = self.check_identity();
+            if result.is_err() {
+                self.fenced = true;
+            }
+            result
+        }
+
         pub(crate) const fn zone(&self) -> &ZoneId {
             &self.zone
         }
 
         pub(crate) fn needs_checkpoint(&self) -> bool {
             self.mutations >= CHECKPOINT_MUTATIONS
-                || self.frames.bytes.saturating_sub(self.checkpoint_bytes)
-                    >= CHECKPOINT_DELTA_BYTES
+                || self.frames.bytes.saturating_sub(self.checkpoint_bytes) >= CHECKPOINT_DELTA_BYTES
         }
 
         pub(crate) fn append(&mut self, record: &PersistedRecord) -> WebhookReceiverResult<()> {
@@ -293,7 +308,9 @@ mod native {
                 return Err(unavailable("writer is fenced until the store is reopened"));
             }
             if is_checkpoint_record(record) {
-                return Err(unavailable("checkpoint records require a complete checkpoint"));
+                return Err(unavailable(
+                    "checkpoint records require a complete checkpoint",
+                ));
             }
             let result = (|| {
                 self.check_identity()?;
@@ -385,7 +402,9 @@ mod native {
                 || header[8..24] != self.store_id
                 || header[40..] != self.scope
             {
-                return Err(unavailable("journal format, store identity or scope does not match"));
+                return Err(unavailable(
+                    "journal format, store identity or scope does not match",
+                ));
             }
             let mut frames = FrameState::from_header(header);
             let mut recovered = StoreRecovery::new(public_base_url);
@@ -403,7 +422,9 @@ mod native {
                 if !(NONCE_BYTES + TAG_BYTES..=MAX_FRAME_BYTES).contains(&frame_length)
                     || frame_length as u64 > length - frames.bytes - 4
                 {
-                    return Err(unavailable("journal frame is incomplete or exceeds its bound"));
+                    return Err(unavailable(
+                        "journal frame is incomplete or exceeds its bound",
+                    ));
                 }
                 let mut frame = vec![0; frame_length];
                 self.file
@@ -471,7 +492,9 @@ mod native {
                 .len()
                 != self.frames.bytes
             {
-                return Err(unavailable("journal length changed outside the owned writer"));
+                return Err(unavailable(
+                    "journal length changed outside the owned writer",
+                ));
             }
             Ok(())
         }
@@ -504,13 +527,17 @@ mod native {
                 .map_err(|_| unavailable("receiver state could not be encoded"))?,
         );
         if plaintext.len() > MAX_FRAME_BYTES - NONCE_BYTES - TAG_BYTES {
-            return Err(unavailable("receiver state record exceeds its encoded byte bound"));
+            return Err(unavailable(
+                "receiver state record exceeds its encoded byte bound",
+            ));
         }
         let frame = XChaCha20Poly1305Cipher::new(key)
             .encrypt_with_random_nonce(&plaintext, &state.associated_data(ordinal))
             .map_err(|_| unavailable("receiver state encryption failed"))?;
         if state.bytes.saturating_add(4 + frame.len() as u64) > byte_limit {
-            return Err(unavailable("durable journal exceeds its recovery byte bound"));
+            return Err(unavailable(
+                "durable journal exceeds its recovery byte bound",
+            ));
         }
         let length = u32::try_from(frame.len())
             .map_err(|_| unavailable("receiver state frame length is unrepresentable"))?
@@ -576,7 +603,9 @@ mod native {
         }
         let trimmed = bytes.strip_suffix(b"\n").unwrap_or(&bytes);
         if trimmed.len() != 64 {
-            return Err(unavailable("key file must contain 32 raw bytes or 64 hex characters"));
+            return Err(unavailable(
+                "key file must contain 32 raw bytes or 64 hex characters",
+            ));
         }
         let mut decoded = Zeroizing::new([0; 32]);
         hex::decode_to_slice(trimmed, decoded.as_mut())
@@ -592,7 +621,9 @@ mod native {
                 .components()
                 .any(|part| matches!(part, Component::ParentDir | Component::CurDir))
         {
-            return Err(unavailable("storage paths must be absolute without traversal"));
+            return Err(unavailable(
+                "storage paths must be absolute without traversal",
+            ));
         }
         Ok(())
     }
@@ -617,7 +648,9 @@ mod native {
         let metadata = fs::symlink_metadata(path)
             .map_err(|_| unavailable("durable store directory is missing"))?;
         if !metadata.is_dir() || metadata.mode() & 0o077 != 0 {
-            return Err(unavailable("durable store requires an owner-only directory"));
+            return Err(unavailable(
+                "durable store requires an owner-only directory",
+            ));
         }
         // The anonymous empty probe establishes the process's filesystem UID,
         // including when privileges would otherwise allow another user's files.
@@ -628,7 +661,9 @@ mod native {
             .map_err(|_| unavailable("filesystem writer identity is unavailable"))?
             .uid();
         if metadata.uid() != owner {
-            return Err(unavailable("private store directory belongs to another user"));
+            return Err(unavailable(
+                "private store directory belongs to another user",
+            ));
         }
         let ancestors = inspect_directories(path, Some(owner))?;
         let directory = OpenOptions::new()
@@ -685,7 +720,9 @@ mod native {
                 || (metadata.mode() & 0o022 != 0
                     && !(metadata.uid() == 0 && metadata.mode() & 0o1000 != 0))
             {
-                return Err(unavailable("storage ancestors must be trusted directories without links"));
+                return Err(unavailable(
+                    "storage ancestors must be trusted directories without links",
+                ));
             }
             result.push(DirectoryAnchor {
                 path: path.to_path_buf(),
@@ -717,7 +754,9 @@ mod native {
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(path)
-            .map_err(|_| unavailable("durable file is missing, already initialized or inaccessible"))?;
+            .map_err(|_| {
+                unavailable("durable file is missing, already initialized or inaccessible")
+            })?;
         verify_named_file(&file, path, owner)?;
         Ok(file)
     }
@@ -726,8 +765,8 @@ mod native {
         let opened = file
             .metadata()
             .map_err(|_| unavailable("durable file metadata is unavailable"))?;
-        let named = fs::symlink_metadata(path)
-            .map_err(|_| unavailable("durable file disappeared"))?;
+        let named =
+            fs::symlink_metadata(path).map_err(|_| unavailable("durable file disappeared"))?;
         if !opened.is_file()
             || !named.is_file()
             || opened.uid() != owner
@@ -736,7 +775,9 @@ mod native {
             || named.mode() != opened.mode()
             || !same_file(&opened, &named)
         {
-            return Err(unavailable("durable files must remain private, singly linked and unchanged"));
+            return Err(unavailable(
+                "durable files must remain private, singly linked and unchanged",
+            ));
         }
         Ok(())
     }
@@ -816,14 +857,28 @@ mod native {
                 .unwrap();
             let cursor = page.start_cursor;
             let journal = fs::read(config.directory.join(JOURNAL_NAME)).unwrap();
-            for private in [SECRET, "provider-body-private-sentinel", "accepted-original-id"] {
-                assert!(!journal.windows(private.len()).any(|bytes| bytes == private.as_bytes()));
+            for private in [
+                SECRET,
+                "provider-body-private-sentinel",
+                "accepted-original-id",
+            ] {
+                assert!(
+                    !journal
+                        .windows(private.len())
+                        .any(|bytes| bytes == private.as_bytes())
+                );
             }
             drop(store);
 
             let mut recovered = WebhookStore::open_durable(&reopen(&config), BASE).unwrap();
             assert_eq!(recovered.durable_zone(), Some(&ZoneId::work()));
-            assert_eq!(recovered.get_endpoint(&endpoint.endpoint_id).unwrap().signing_secret, SECRET);
+            assert_eq!(
+                recovered
+                    .get_endpoint(&endpoint.endpoint_id)
+                    .unwrap()
+                    .signing_secret,
+                SECRET
+            );
             let page = recovered
                 .poll_events(&endpoint.endpoint_id, Some(&cursor), 10, 4096, false)
                 .unwrap();
@@ -842,7 +897,10 @@ mod native {
                 ),
                 Err(WebhookReceiverError::DuplicateEvent { .. })
             ));
-            assert_eq!(fs::read(config.directory.join(JOURNAL_NAME)).unwrap(), journal);
+            assert_eq!(
+                fs::read(config.directory.join(JOURNAL_NAME)).unwrap(),
+                journal
+            );
         }
 
         #[test]
@@ -866,7 +924,11 @@ mod native {
                     .unwrap();
             }
             let checkpointed = fs::read(config.directory.join(JOURNAL_NAME)).unwrap();
-            assert_ne!(&checkpointed[24..40], &initial[24..40], "checkpoint changed file epoch");
+            assert_ne!(
+                &checkpointed[24..40],
+                &initial[24..40],
+                "checkpoint changed file epoch"
+            );
             assert!(checkpointed.len() < 4 * 1024 * 1024);
             drop(store);
 
@@ -911,8 +973,15 @@ mod native {
             ] {
                 let error = WebhookStore::open_durable(&scope, base).unwrap_err();
                 assert!(matches!(error, WebhookReceiverError::Persistence { .. }));
-                assert!(!error.to_string().contains(&root.path().to_string_lossy().to_string()));
-                assert_eq!(fs::read(config.directory.join(JOURNAL_NAME)).unwrap(), before);
+                assert!(
+                    !error
+                        .to_string()
+                        .contains(&root.path().to_string_lossy().to_string())
+                );
+                assert_eq!(
+                    fs::read(config.directory.join(JOURNAL_NAME)).unwrap(),
+                    before
+                );
             }
             assert!(WebhookStore::open_durable(&reopen(&config), BASE).is_ok());
         }
@@ -936,7 +1005,9 @@ mod native {
         fn durable_journal_corrupt_and_partial_frames_fail_without_repair() {
             let (_root, config) = fixture();
             let mut store = WebhookStore::open_durable(&config, BASE).unwrap();
-            store.create_endpoint("/hooks/test".into(), SECRET.into(), vec![]).unwrap();
+            store
+                .create_endpoint("/hooks/test".into(), SECRET.into(), vec![])
+                .unwrap();
             drop(store);
             let path = config.directory.join(JOURNAL_NAME);
             let original = fs::read(&path).unwrap();
@@ -951,7 +1022,11 @@ mod native {
             for bad in [tampered, truncated, partial_length, oversized] {
                 fs::write(&path, &bad).unwrap();
                 assert!(WebhookStore::open_durable(&reopen(&config), BASE).is_err());
-                assert_eq!(fs::read(&path).unwrap(), bad, "recovery must not discard evidence");
+                assert_eq!(
+                    fs::read(&path).unwrap(),
+                    bad,
+                    "recovery must not discard evidence"
+                );
             }
             fs::write(&path, &original).unwrap();
             assert!(WebhookStore::open_durable(&reopen(&config), BASE).is_ok());
@@ -968,7 +1043,9 @@ mod native {
             // The same regular file identity remains, but this descriptor cannot
             // append. Even a definite write failure conservatively fences it.
             journal.file = File::open(&path).unwrap();
-            let record = PersistedRecord::EndpointDeleted { endpoint_id: "not-committed".into() };
+            let record = PersistedRecord::EndpointDeleted {
+                endpoint_id: "not-committed".into(),
+            };
             assert!(journal.append(&record).is_err());
             assert!(journal.is_fenced());
             assert!(journal.append(&record).is_err());
@@ -987,14 +1064,21 @@ mod native {
             fs::set_permissions(&config.key_file, fs::Permissions::from_mode(0o600)).unwrap();
             let alias = root.path().join("key-link");
             symlink(&config.key_file, &alias).unwrap();
-            let alias_config = DurableStoreConfig { key_file: alias, ..config.clone() };
+            let alias_config = DurableStoreConfig {
+                key_file: alias,
+                ..config.clone()
+            };
             assert!(WebhookStore::open_durable(&alias_config, BASE).is_err());
 
             let mut store = WebhookStore::open_durable(&config, BASE).unwrap();
             let path = config.directory.join(JOURNAL_NAME);
             fs::rename(&path, config.directory.join("preserved.journal")).unwrap();
             private_key(&path, b"replacement-file");
-            assert!(store.create_endpoint("/hooks/test".into(), SECRET.into(), vec![]).is_err());
+            assert!(
+                store
+                    .create_endpoint("/hooks/test".into(), SECRET.into(), vec![])
+                    .is_err()
+            );
             assert!(store.is_fenced());
             assert_eq!(store.endpoint_snapshots().len(), 0);
             assert_eq!(fs::read(path).unwrap(), b"replacement-file");
@@ -1004,7 +1088,10 @@ mod native {
         fn durable_journal_accepts_private_hex_key_and_redacts_debug_state() {
             let (root, mut config) = fixture();
             config.key_file = root.path().join("hex.key");
-            private_key(&config.key_file, format!("{}\n", "4f".repeat(32)).as_bytes());
+            private_key(
+                &config.key_file,
+                format!("{}\n", "4f".repeat(32)).as_bytes(),
+            );
             let mut memory = WebhookStore::new();
             memory.set_public_base_url(BASE).unwrap();
             let journal = DurableJournal::open(&config, BASE, &mut memory).unwrap();
@@ -1032,11 +1119,19 @@ impl DurableJournal {
         _base: &str,
         _store: &mut crate::client::WebhookStore,
     ) -> WebhookReceiverResult<Self> {
-        Err(unavailable("protected durable receiver storage requires Unix"))
+        Err(unavailable(
+            "protected durable receiver storage requires Unix",
+        ))
     }
 
     pub(crate) const fn is_fenced(&self) -> bool {
         true
+    }
+
+    pub(crate) fn verify_current(&mut self) -> WebhookReceiverResult<()> {
+        Err(unavailable(
+            "protected durable receiver storage requires Unix",
+        ))
     }
 
     pub(crate) const fn zone(&self) -> &ZoneId {
@@ -1051,10 +1146,17 @@ impl DurableJournal {
         &mut self,
         _record: &crate::client::PersistedRecord,
     ) -> WebhookReceiverResult<()> {
-        Err(unavailable("protected durable receiver storage requires Unix"))
+        Err(unavailable(
+            "protected durable receiver storage requires Unix",
+        ))
     }
 
-    pub(crate) fn checkpoint(&mut self, _store: &crate::client::WebhookStore) -> WebhookReceiverResult<()> {
-        Err(unavailable("protected durable receiver storage requires Unix"))
+    pub(crate) fn checkpoint(
+        &mut self,
+        _store: &crate::client::WebhookStore,
+    ) -> WebhookReceiverResult<()> {
+        Err(unavailable(
+            "protected durable receiver storage requires Unix",
+        ))
     }
 }

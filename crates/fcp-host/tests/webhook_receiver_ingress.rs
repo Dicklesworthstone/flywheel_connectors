@@ -422,7 +422,8 @@ async fn provider_signatures_use_exact_http_bodies_and_retries_cannot_duplicate_
         let retry = translated(&config, &delivery, &delivery.raw);
         assert_ne!(retry.idempotency_key.as_deref(), Some(first_key.as_str()));
         let (status, public) = response_for(&fixture.invoke(retry).await);
-        assert_eq!(status, StatusCode::CONFLICT, "{} replay", delivery.provider);
+        assert_eq!(status, StatusCode::OK, "{} retry", delivery.provider);
+        assert_eq!(public["reason_code"], "already_accepted");
         assert_public_response_redacted(&public);
         let events = fixture.events().await;
         assert_eq!(
@@ -724,7 +725,8 @@ async fn real_loopback_http_preserves_signature_bytes_and_ignores_forwarded_auth
     assert!(!response.contains("ingest_log"));
     assert!(!response.contains("attacker-token"));
     let retry = loopback_exchange(state.clone(), request).await;
-    assert!(retry.starts_with("HTTP/1.1 409"), "{retry}");
+    assert!(retry.starts_with("HTTP/1.1 200"), "{retry}");
+    assert!(retry.contains("already_accepted"), "{retry}");
     let mut receiver = state
         .receiver
         .lock()

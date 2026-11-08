@@ -145,6 +145,14 @@ pub struct WebhookEventPage {
     pub serialized_event_bytes: usize,
 }
 
+/// Result of admitting a provider-authenticated delivery. A retry is confirmed
+/// only by its previously accepted authenticated digest, never an unsigned ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AuthenticatedAdmission {
+    Recorded,
+    AlreadyAccepted,
+}
+
 struct CursorIdentity {
     epoch: [u8; 16],
     key: [u8; 32],
@@ -466,6 +474,40 @@ impl WebhookStore {
         replay_digest: [u8; 32],
     ) -> WebhookReceiverResult<()> {
         self.record_event_inner(event, Some(replay_digest))
+    }
+
+    /// Positively acknowledge previously accepted authenticated content without
+    /// adding an event or reserving the retry's unsigned delivery ID. The caller
+    /// must perform fresh provider signature and request admission first.
+    pub(crate) fn admit_authenticated_event(
+        &mut self,
+        event: WebhookEvent,
+        replay_digest: [u8; 32],
+    ) -> WebhookReceiverResult<AuthenticatedAdmission> {
+        if self.is_fenced() {
+            return Err(WebhookReceiverError::Persistence {
+                message: "writer is fenced until the store is reopened".into(),
+            });
+        }
+        self.get_endpoint(&event.endpoint_id)?;
+        if event.event_id.len() > MAX_EVENT_ID_BYTES {
+            return Err(WebhookReceiverError::InvalidInput {
+                message: format!("Webhook delivery ID exceeds {MAX_EVENT_ID_BYTES} bytes"),
+            });
+        }
+        validate_event_payload_depth(&event.payload)?;
+        if let Some(journal) = &mut self.journal {
+            journal.verify_current()?;
+        }
+        if self
+            .authenticated_deliveries
+            .get(&event.endpoint_id)
+            .is_some_and(|digests| digests.contains(&replay_digest))
+        {
+            return Ok(AuthenticatedAdmission::AlreadyAccepted);
+        }
+        self.record_authenticated_event(event, replay_digest)?;
+        Ok(AuthenticatedAdmission::Recorded)
     }
 
     fn record_event_inner(
@@ -1691,7 +1733,7 @@ mod tests {
             .unwrap();
         assert_eq!(restored_page.next_cursor, current_page.next_cursor);
         assert!(restored_page.history_truncated);
-        let mut retry = WebhookEvent::new(first.endpoint_id, json!({}), true, None);
+        let mut retry = WebhookEvent::new(first.endpoint_id.clone(), json!({}), true, None);
         retry.event_id = "delivery-0".into();
         assert!(matches!(
             recovered.record_authenticated_event(retry.clone(), [42; 32]),
@@ -1700,10 +1742,26 @@ mod tests {
         retry.event_id = "changed-unsigned-delivery-id".into();
         assert!(matches!(
             recovered.record_authenticated_event(
-                retry,
+                retry.clone(),
                 *blake3::hash(&0_usize.to_le_bytes()).as_bytes()
             ),
             Err(WebhookReceiverError::DuplicateEvent { .. })
+        ));
+        let replay_count = recovered.replay_event_count();
+        let retained_bytes = recovered.retained_event_bytes();
+        let next_sequence = recovered.next_event_sequence;
+        assert_eq!(
+            recovered
+                .admit_authenticated_event(retry, *blake3::hash(&0_usize.to_le_bytes()).as_bytes())
+                .unwrap(),
+            AuthenticatedAdmission::AlreadyAccepted
+        );
+        assert_eq!(recovered.replay_event_count(), replay_count);
+        assert_eq!(recovered.retained_event_bytes(), retained_bytes);
+        assert_eq!(recovered.next_event_sequence, next_sequence);
+        assert!(matches!(
+            recovered.poll_events(&first.endpoint_id, Some(&old_cursor), 1, 4096, false),
+            Err(WebhookReceiverError::ReplayGap { .. })
         ));
     }
 
