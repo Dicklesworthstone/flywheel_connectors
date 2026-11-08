@@ -25,6 +25,56 @@ state file as authoritative. The command reports `schema_version: "1.0.0"`,
 `canonical_storage`, cache marker evidence, and any live-host downgrade or
 offline-inspection warnings.
 
+## Inspect Authenticated Canonical Stores
+
+The host's canonical state explanation, durable lease status, and
+flush-before-yield barrier read the writer's existing `fcp-store` data. A store
+written with authenticated V2 WAL or snapshot envelopes requires its MAC key
+on these read paths as well as its object-ID derivation key. Object and symbol
+stores may use different MAC keys; the host never derives either from the
+object-ID key or substitutes one store's key for the other.
+
+Configure keys in the connector's managed inventory **`env` map**. These are
+per-connector declarations, not ambient variables read from the host shell:
+
+```json
+{
+  "env": {
+    "FCP_CONNECTOR_STATE": "/srv/fcp/state",
+    "FCP_HOST_CONNECTOR_STATE_OBJECT_ID_KEY": "<REDACTED_OBJECT_ID_KEY_64_HEX>",
+    "FCP_HOST_CONNECTOR_STATE_OBJECT_MAC_KEY": "<REDACTED_OBJECT_STORE_MAC_KEY_64_HEX>",
+    "FCP_HOST_CONNECTOR_STATE_SYMBOL_MAC_KEY": "<REDACTED_SYMBOL_STORE_MAC_KEY_64_HEX>"
+  }
+}
+```
+
+The object MAC authenticates
+`<state-root>/<sanitized-connector-id>/store/objects`; the symbol MAC
+authenticates the sibling `symbols` directory. Each value is exactly 32 bytes
+encoded as 64 hexadecimal digits, optionally prefixed with `hex:` or `0x`.
+Surrounding whitespace is accepted. The connector-prefixed aliases
+`FCP_CONNECTOR_STATE_OBJECT_MAC_KEY` and `FCP_CONNECTOR_STATE_SYMBOL_MAC_KEY`
+are also accepted. If both aliases for one store are supplied, they must
+decode to the same key. Blank, malformed, and conflicting declarations are
+rejected during static inventory validation before preparing a runtime.
+
+The MACs must match the keys used by the store's writer. This configuration
+does not enable authenticated writes, rotate a key, or migrate existing data.
+With a MAC configured, an unauthenticated V1 envelope is refused; with no MAC
+configured, an authenticated V2 envelope is refused. An absent declaration
+continues to support existing unkeyed stores. The host never retries a failed
+authenticated open without its key. Configure an object MAC independently
+when only the object store exists; a symbol store is not required for lease
+inspection or the yield barrier.
+
+These operations open stores read-only, including while a writer holds its
+exclusive lock. They do not repair WAL tails, create snapshots, acquire writer
+ownership, or alter the persisted bytes. Wrong or missing keys leave canonical
+state unproven, and the yield barrier fails rather than reporting a successful
+flush. Canonical-state key values are redacted from inventory mutation
+responses; configuration snapshots, revision history, and diffs also redact
+MAC and object-ID key fields. A redacted response is not reusable key material.
+
 ## Retain an Exact Root on Another Host
 
 `fwc connector state pull` transfers a granted `ConnectorStateRoot`, its

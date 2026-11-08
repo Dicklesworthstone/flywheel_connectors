@@ -216,10 +216,12 @@ pub struct ConnectorInventoryMutationResponse {
     pub dry_run: bool,
     /// Managed connectors file written by the host.
     pub connectors_file: String,
-    /// Previous connector entry when this was an update.
+    /// Previous connector entry when this was an update. Canonical-state
+    /// object-ID and MAC keys in the environment are redacted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous: Option<ManagedConnectorConfig>,
-    /// Current persisted connector entry.
+    /// Current persisted connector entry with canonical-state environment keys
+    /// redacted. This projection must not be replayed as raw configuration.
     pub current: ManagedConnectorConfig,
     /// Total connector count after the mutation.
     pub inventory_size: usize,
@@ -6082,6 +6084,8 @@ fn should_redact_config_key(key: &str) -> bool {
         "refresh_token",
         "client_secret",
         "private_key",
+        "mac_key",
+        "object_id_key",
     ]
     .iter()
     .any(|needle| normalized.contains(needle))
@@ -7661,6 +7665,72 @@ mod tests {
                 && entry.before == Some(Value::String("alpha".to_string()))
                 && entry.after == Some(Value::String("beta".to_string()))
         }));
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn canonical_state_keys_are_redacted_from_config_views_and_revisions() {
+        let before = serde_json::json!({
+            "env": {
+                "FCP_HOST_CONNECTOR_STATE_OBJECT_MAC_KEY": "object-mac-before-sentinel",
+                "FCP_CONNECTOR_STATE_SYMBOL_MAC_KEY": "symbol-mac-before-sentinel",
+                "FCP_CONNECTOR_STATE_OBJECT_ID_KEY": "object-id-before-sentinel"
+            },
+            "source_mac_key_hex": "source-mac-before-sentinel",
+            "object_id_key_hex": "replica-id-before-sentinel",
+            "public_writer_key": "public-key"
+        });
+        let after = serde_json::json!({
+            "env": {
+                "FCP_HOST_CONNECTOR_STATE_OBJECT_MAC_KEY": "object-mac-after-sentinel",
+                "FCP_CONNECTOR_STATE_SYMBOL_MAC_KEY": "symbol-mac-after-sentinel",
+                "FCP_CONNECTOR_STATE_OBJECT_ID_KEY": "object-id-after-sentinel"
+            },
+            "source_mac_key_hex": "source-mac-after-sentinel",
+            "object_id_key_hex": "replica-id-after-sentinel",
+            "public_writer_key": "public-key"
+        });
+        let snapshot = SanitizedConnectorConfig::from_payload(before.clone()).unwrap();
+        assert!(snapshot.contains_inline_secrets);
+        assert!(!snapshot.is_replayable());
+        assert_eq!(snapshot.redacted_fields.len(), 5);
+        assert_eq!(snapshot.payload["public_writer_key"], "public-key");
+        assert!(
+            !serde_json::to_string(&snapshot)
+                .unwrap()
+                .contains("sentinel")
+        );
+
+        let diff = diff_sanitized_config_values(&before, &after).unwrap();
+        assert_eq!(
+            diff.len(),
+            5,
+            "key rotations must remain visible as changes"
+        );
+        for entry in &diff {
+            assert_eq!(entry.kind, ConfigDiffKind::Changed);
+            assert_eq!(
+                entry.before.as_ref().and_then(Value::as_str),
+                Some(REDACTED_CONFIG_VALUE)
+            );
+            assert_eq!(
+                entry.after.as_ref().and_then(Value::as_str),
+                Some(REDACTED_CONFIG_VALUE)
+            );
+        }
+        assert!(!serde_json::to_string(&diff).unwrap().contains("sentinel"));
+
+        let store = HostAdminStateStore::new();
+        let revision = store
+            .append_config_revision(&connector_id(), after, None, None)
+            .await
+            .unwrap();
+        assert!(revision.contains_inline_secrets);
+        assert_eq!(revision.redacted_fields.len(), 5);
+        assert!(
+            !serde_json::to_string(&revision)
+                .unwrap()
+                .contains("sentinel")
+        );
     }
 
     #[fcp_async_core::runtime::test]

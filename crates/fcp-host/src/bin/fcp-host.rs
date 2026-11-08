@@ -202,6 +202,10 @@ type ConnectorConfig = ManagedConnectorConfig;
 const CONNECTOR_STATE_DIR_ENV: &str = "FCP_CONNECTOR_STATE";
 const CONNECTOR_STATE_OBJECT_ID_KEY_ENV: &str = "FCP_CONNECTOR_STATE_OBJECT_ID_KEY";
 const FCP_HOST_CONNECTOR_STATE_OBJECT_ID_KEY_ENV: &str = "FCP_HOST_CONNECTOR_STATE_OBJECT_ID_KEY";
+const CONNECTOR_STATE_OBJECT_MAC_KEY_ENV: &str = "FCP_CONNECTOR_STATE_OBJECT_MAC_KEY";
+const FCP_HOST_CONNECTOR_STATE_OBJECT_MAC_KEY_ENV: &str = "FCP_HOST_CONNECTOR_STATE_OBJECT_MAC_KEY";
+const CONNECTOR_STATE_SYMBOL_MAC_KEY_ENV: &str = "FCP_CONNECTOR_STATE_SYMBOL_MAC_KEY";
+const FCP_HOST_CONNECTOR_STATE_SYMBOL_MAC_KEY_ENV: &str = "FCP_HOST_CONNECTOR_STATE_SYMBOL_MAC_KEY";
 const FCP_CONFIG_DIR_ENV: &str = "FCP_CONFIG_DIR";
 const CONNECTOR_STATE_CANONICAL_STORE_DIR: &str = "store";
 const CONNECTOR_STATE_CANONICAL_OBJECTS_DIR: &str = "objects";
@@ -2772,6 +2776,18 @@ fn validate_production_prewarm_policy(
 /// or runtime health: those checks belong to an actual apply.
 fn validate_registry_config(config: &ConnectorConfig) -> HostResult<ValidatedConnectorConfig> {
     connector_summary_from_config(config)?;
+    for env_keys in [
+        [
+            FCP_HOST_CONNECTOR_STATE_OBJECT_MAC_KEY_ENV,
+            CONNECTOR_STATE_OBJECT_MAC_KEY_ENV,
+        ],
+        [
+            FCP_HOST_CONNECTOR_STATE_SYMBOL_MAC_KEY_ENV,
+            CONNECTOR_STATE_SYMBOL_MAC_KEY_ENV,
+        ],
+    ] {
+        configured_connector_state_mac_key(config, env_keys).map_err(HostError::InvalidFilter)?;
+    }
     let manifest_constraints = load_manifest_operation_constraints(config)?;
     let state_policy = ConnectorStatePolicy::resolve(config, &manifest_constraints)?;
     validate_production_prewarm_policy(config, state_policy)?;
@@ -4136,6 +4152,68 @@ fn parse_connector_state_object_id_key(raw: &str) -> Result<ObjectIdKey, String>
     Ok(ObjectIdKey::from_bytes(key))
 }
 
+/// MAC keys authenticate durable envelopes independently of object-ID derivation.
+/// All configured aliases must agree; a malformed, empty, or conflicting key
+/// never falls back to an unkeyed store or another declaration.
+fn configured_connector_state_mac_key(
+    config: &ConnectorConfig,
+    env_keys: [&str; 2],
+) -> Result<Option<[u8; 32]>, String> {
+    let mut configured = None;
+    for env_key in env_keys {
+        let Some(raw) = config.env.get(env_key) else {
+            continue;
+        };
+        let encoded = raw.trim();
+        let encoded = encoded
+            .strip_prefix("hex:")
+            .or_else(|| encoded.strip_prefix("0x"))
+            .unwrap_or(encoded);
+        let mut key = [0_u8; 32];
+        hex::decode_to_slice(encoded, &mut key).map_err(|_| {
+            format!("connector state MAC key `{env_key}` must contain exactly 32 bytes of hex")
+        })?;
+        if configured.is_some_and(|previous| previous != key) {
+            return Err(format!(
+                "connector state MAC key declarations `{}` and `{}` must match",
+                env_keys[0], env_keys[1]
+            ));
+        }
+        configured = Some(key);
+    }
+    Ok(configured)
+}
+
+fn configured_connector_state_object_store_config(
+    config: &ConnectorConfig,
+    directory: &StdPath,
+) -> Result<fcp_store::DurableObjectStoreConfig, String> {
+    let mut store = fcp_store::DurableObjectStoreConfig::new(directory);
+    store.mac_key = configured_connector_state_mac_key(
+        config,
+        [
+            FCP_HOST_CONNECTOR_STATE_OBJECT_MAC_KEY_ENV,
+            CONNECTOR_STATE_OBJECT_MAC_KEY_ENV,
+        ],
+    )?;
+    Ok(store)
+}
+
+fn configured_connector_state_symbol_store_config(
+    config: &ConnectorConfig,
+    directory: &StdPath,
+) -> Result<fcp_store::DurableSymbolStoreConfig, String> {
+    let mut store = fcp_store::DurableSymbolStoreConfig::new(directory);
+    store.mac_key = configured_connector_state_mac_key(
+        config,
+        [
+            FCP_HOST_CONNECTOR_STATE_SYMBOL_MAC_KEY_ENV,
+            CONNECTOR_STATE_SYMBOL_MAC_KEY_ENV,
+        ],
+    )?;
+    Ok(store)
+}
+
 fn connector_state_root_dir() -> PathBuf {
     if let Some(path) = non_empty_os_env(CONNECTOR_STATE_DIR_ENV) {
         return PathBuf::from(path);
@@ -4413,7 +4491,7 @@ async fn connector_state_canonical_status_from_config(
         )
     })?;
     let object_store = fcp_store::DurableObjectStore::open_read_only(
-        fcp_store::DurableObjectStoreConfig::new(&object_store_dir),
+        configured_connector_state_object_store_config(config, &object_store_dir)?,
     )
     .map_err(|error| {
         format!(
@@ -4431,7 +4509,7 @@ async fn connector_state_canonical_status_from_config(
     let symbol_store_dir = connector_state_canonical_symbol_store_dir(state_root, connector_id);
     if symbol_store_dir.exists() {
         let symbol_store = fcp_store::DurableSymbolStore::open_read_only(
-            fcp_store::DurableSymbolStoreConfig::new(&symbol_store_dir),
+            configured_connector_state_symbol_store_config(config, &symbol_store_dir)?,
         )
         .map_err(|error| {
             format!(
@@ -4505,9 +4583,15 @@ async fn connector_lease_durable_evidence_from_config(
         }
     };
 
-    let object_store = match fcp_store::DurableObjectStore::open_read_only(
-        fcp_store::DurableObjectStoreConfig::new(&object_store_dir),
-    ) {
+    let store_config =
+        match configured_connector_state_object_store_config(config, &object_store_dir) {
+            Ok(store_config) => store_config,
+            Err(error) => {
+                evidence.warnings.push(error);
+                return evidence;
+            }
+        };
+    let object_store = match fcp_store::DurableObjectStore::open_read_only(store_config) {
         Ok(store) => store,
         Err(error) => {
             evidence.warnings.push(format!(
@@ -4710,7 +4794,7 @@ async fn connector_lease_yield_flush_context_for_registered_connector(
         )
     })?;
     let object_store = fcp_store::DurableObjectStore::open_read_only(
-        fcp_store::DurableObjectStoreConfig::new(&object_store_dir),
+        configured_connector_state_object_store_config(&config, &object_store_dir)?,
     )
     .map_err(|error| {
         format!(
@@ -11794,8 +11878,8 @@ async fn connector_inventory_apply_handler(
         kind: request.kind,
         dry_run: request.dry_run,
         connectors_file: connectors_file.display().to_string(),
-        previous,
-        current,
+        previous: previous.map(redact_connector_state_inventory_keys),
+        current: redact_connector_state_inventory_keys(current),
         inventory_size: current_inventory.len(),
         apply,
         admin_state: admin_state.unwrap_or_else(|| StartupReconciliationReport {
@@ -11807,6 +11891,25 @@ async fn connector_inventory_apply_handler(
             entries: Vec::new(),
         }),
     }))
+}
+
+/// Inventory responses must not disclose canonical-store authentication keys.
+/// Work on the response copy; registry and persisted configuration retain the
+/// operator's original values. Redacted copies cannot authenticate a store.
+fn redact_connector_state_inventory_keys(mut config: ConnectorConfig) -> ConnectorConfig {
+    for env_key in [
+        FCP_HOST_CONNECTOR_STATE_OBJECT_ID_KEY_ENV,
+        CONNECTOR_STATE_OBJECT_ID_KEY_ENV,
+        FCP_HOST_CONNECTOR_STATE_OBJECT_MAC_KEY_ENV,
+        CONNECTOR_STATE_OBJECT_MAC_KEY_ENV,
+        FCP_HOST_CONNECTOR_STATE_SYMBOL_MAC_KEY_ENV,
+        CONNECTOR_STATE_SYMBOL_MAC_KEY_ENV,
+    ] {
+        if let Some(value) = config.env.get_mut(env_key) {
+            *value = "[REDACTED]".to_owned();
+        }
+    }
+    config
 }
 
 #[derive(Debug, Clone)]
@@ -32430,6 +32533,66 @@ done"#;
     }
 
     #[fcp_async_core::runtime::test]
+    async fn canonical_state_mac_key_inventory_preview_redacts_both_configurations() {
+        let directory = tempfile::tempdir().unwrap();
+        let inventory_path = directory.path().join("connectors.json");
+        let mut original = dispatcher_test_config("fcp.test.store-key-preview:utility:1.0.0");
+        let names = [
+            FCP_HOST_CONNECTOR_STATE_OBJECT_ID_KEY_ENV,
+            CONNECTOR_STATE_OBJECT_ID_KEY_ENV,
+            FCP_HOST_CONNECTOR_STATE_OBJECT_MAC_KEY_ENV,
+            CONNECTOR_STATE_OBJECT_MAC_KEY_ENV,
+            FCP_HOST_CONNECTOR_STATE_SYMBOL_MAC_KEY_ENV,
+            CONNECTOR_STATE_SYMBOL_MAC_KEY_ENV,
+        ];
+        for name in names {
+            original
+                .env
+                .insert(name.to_owned(), hex::encode([0xA1; 32]));
+        }
+        write_connector_configs_file(&inventory_path, std::slice::from_ref(&original)).unwrap();
+        let before = std::fs::read(&inventory_path).unwrap();
+        let registry = Arc::new(empty_registry(1));
+        registry
+            .publish_configs(registry_publication_fixture(&registry, vec![original.clone()]).await)
+            .await
+            .unwrap();
+        let mut state = dispatcher_app_state(
+            Arc::clone(&registry),
+            Arc::new(HostAdminStateStore::new()),
+            None,
+            HashMap::new(),
+        );
+        Arc::get_mut(&mut state).unwrap().connectors_file = Some(inventory_path.clone());
+        let mut candidate = original.clone();
+        for name in names {
+            candidate
+                .env
+                .insert(name.to_owned(), hex::encode([0xB2; 32]));
+        }
+        let Json(response) = connector_inventory_apply_handler(
+            State(state),
+            Json(ConnectorInventoryMutationRequest {
+                kind: ConnectorInventoryMutationKind::Update,
+                dry_run: true,
+                connector: candidate,
+            }),
+        )
+        .await
+        .unwrap();
+        let previous = response.previous.as_ref().expect("previous configuration");
+        for name in names {
+            assert_eq!(previous.env[name], "[REDACTED]");
+            assert_eq!(response.current.env[name], "[REDACTED]");
+        }
+        let rendered = serde_json::to_string(&response).unwrap();
+        assert!(!rendered.contains(&hex::encode([0xA1; 32])));
+        assert!(!rendered.contains(&hex::encode([0xB2; 32])));
+        assert_eq!(registry.inventory().await, vec![original]);
+        assert_eq!(std::fs::read(&inventory_path).unwrap(), before);
+    }
+
+    #[fcp_async_core::runtime::test]
     async fn inventory_mutation_reads_file_after_the_preceding_transaction() {
         let directory = tempfile::tempdir().expect("inventory transaction directory");
         let inventory_path = directory.path().join("connectors.json");
@@ -37377,6 +37540,423 @@ done"#;
             "local_cache_path should use managed state root: {payload}"
         );
         Ok(())
+    }
+
+    #[test]
+    fn canonical_state_mac_key_configuration_is_explicit_and_store_scoped() {
+        let mut config = dispatcher_test_config("fcp.test.store-mac-config:utility:1.0.0");
+        config.env.insert(
+            CONNECTOR_STATE_OBJECT_ID_KEY_ENV.to_owned(),
+            hex::encode([0xC7; 32]),
+        );
+        let directory = StdPath::new("unused-canonical-store");
+        assert_eq!(
+            configured_connector_state_object_store_config(&config, directory)
+                .unwrap()
+                .mac_key,
+            None,
+            "object-ID derivation material must never be reused implicitly as a MAC key"
+        );
+        config.env.insert(
+            CONNECTOR_STATE_OBJECT_MAC_KEY_ENV.to_owned(),
+            format!(" hex:{} ", hex::encode([0xA1; 32])),
+        );
+        config.env.insert(
+            FCP_HOST_CONNECTOR_STATE_OBJECT_MAC_KEY_ENV.to_owned(),
+            format!("0x{}", hex::encode_upper([0xA1; 32])),
+        );
+        config.env.insert(
+            FCP_HOST_CONNECTOR_STATE_SYMBOL_MAC_KEY_ENV.to_owned(),
+            hex::encode([0xB2; 32]),
+        );
+        let objects = configured_connector_state_object_store_config(&config, directory).unwrap();
+        let symbols = configured_connector_state_symbol_store_config(&config, directory).unwrap();
+        assert_eq!(objects.mac_key, Some([0xA1; 32]));
+        assert_eq!(symbols.mac_key, Some([0xB2; 32]));
+        assert!(!objects.allow_legacy_unauth);
+        assert!(!symbols.allow_legacy_unauth);
+    }
+
+    #[test]
+    fn canonical_state_mac_key_validation_rejects_invalid_or_conflicting_aliases() {
+        for names in [
+            [
+                FCP_HOST_CONNECTOR_STATE_OBJECT_MAC_KEY_ENV,
+                CONNECTOR_STATE_OBJECT_MAC_KEY_ENV,
+            ],
+            [
+                FCP_HOST_CONNECTOR_STATE_SYMBOL_MAC_KEY_ENV,
+                CONNECTOR_STATE_SYMBOL_MAC_KEY_ENV,
+            ],
+        ] {
+            for invalid in [
+                String::new(),
+                "   ".to_owned(),
+                "invalid-key-sentinel".to_owned(),
+                hex::encode([0xA1; 31]),
+                hex::encode([0xA1; 33]),
+            ] {
+                for invalid_name in names {
+                    let mut config =
+                        dispatcher_test_config("fcp.test.invalid-store-mac:utility:1.0.0");
+                    for name in names {
+                        config.env.insert(name.to_owned(), hex::encode([0xA1; 32]));
+                    }
+                    config.env.insert(invalid_name.to_owned(), invalid.clone());
+                    let error = validate_registry_config(&config)
+                        .expect_err("invalid key must fail static admission before any runtime")
+                        .to_string();
+                    assert!(error.contains(invalid_name));
+                    assert!(!error.contains("invalid-key-sentinel"));
+                    assert!(!error.contains(&hex::encode([0xA1; 32])));
+                }
+            }
+            let mut config = dispatcher_test_config("fcp.test.conflict-store-mac:utility:1.0.0");
+            config
+                .env
+                .insert(names[0].to_owned(), hex::encode([0xA1; 32]));
+            config
+                .env
+                .insert(names[1].to_owned(), hex::encode([0xB2; 32]));
+            let error = validate_registry_config(&config)
+                .expect_err("conflicting aliases cannot silently select different store keys")
+                .to_string();
+            assert!(error.contains("must match"));
+            assert!(!error.contains(&hex::encode([0xA1; 32])));
+            assert!(!error.contains(&hex::encode([0xB2; 32])));
+        }
+    }
+
+    const CANONICAL_STATE_MAC_TEST_CONNECTOR: &str = "fcp.test.authenticated-state:utility:1.0.0";
+
+    struct CanonicalStateMacFixture {
+        config: ConnectorConfig,
+        connector_id: ConnectorId,
+        zone: ZoneId,
+        state_root: PathBuf,
+        root_object_id: ObjectId,
+        head_object_id: ObjectId,
+        lease_object_id: ObjectId,
+        // Keep writer ownership alive: inspection must not acquire a second
+        // writer, compact a WAL, or otherwise interfere with the running store.
+        _objects: Arc<fcp_store::DurableObjectStore>,
+        _symbols: fcp_store::DurableSymbolStore,
+        _directory: tempfile::TempDir,
+    }
+
+    impl CanonicalStateMacFixture {
+        async fn new(authenticated: bool, checkpointed: bool) -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let state_root = directory.path().join("canonical-state");
+            let connector_id = ConnectorId::from_static(CANONICAL_STATE_MAC_TEST_CONNECTOR);
+            let zone = ZoneId::work();
+            let object_id_key = ObjectIdKey::from_bytes([0xC7; 32]);
+            let object_path =
+                connector_state_canonical_object_store_dir(&state_root, &connector_id);
+            let mut object_config = fcp_store::DurableObjectStoreConfig::new(&object_path);
+            object_config.mac_key = authenticated.then_some([0xA1; 32]);
+            object_config.checkpoint_after_ops = 0;
+            let objects = Arc::new(fcp_store::DurableObjectStore::open(object_config).unwrap());
+            let object_store: Arc<dyn fcp_store::ObjectStore> = objects.clone();
+            let lease = durable_core_lease_for_test(
+                &zone,
+                singleton_writer_connector_lease_subject_id(&connector_id, &zone),
+                TailscaleNodeId::new("node-alpha"),
+                10,
+                current_unix_secs_u64().saturating_add(300),
+                test_signature_set(&["node-alpha", "node-beta"]),
+            );
+            let stored_lease = stored_core_lease_for_test(&lease, &object_id_key);
+            let lease_object_id = stored_lease.object_id;
+            object_store.put(stored_lease).await.unwrap();
+            let state_store = fcp_store::FcpStoreConnectorStateStore::new(
+                object_store,
+                object_id_key,
+                connector_id.clone(),
+                zone.clone(),
+            )
+            .with_snapshot_every_entries(0)
+            .with_snapshot_every_secs(0);
+            let (authorization, signing_key) =
+                connector_state_write_authorization_for_test_with_key(&connector_id, &zone);
+            let appended = fcp_core::ConnectorStateStore::append_object(
+                &state_store,
+                &connector_id,
+                &authorization,
+                sign_durable_connector_state_object_for_test(
+                    durable_connector_state_object_for_test(
+                        &connector_id,
+                        &zone,
+                        0,
+                        None,
+                        lease_object_id,
+                    ),
+                    &signing_key,
+                ),
+            )
+            .await
+            .unwrap();
+            let fcp_core::ConnectorStateAppendOutcome::Committed {
+                object_id: head_object_id,
+                root_object_id,
+                ..
+            } = appended
+            else {
+                panic!("fresh canonical state must commit");
+            };
+            let symbol_path =
+                connector_state_canonical_symbol_store_dir(&state_root, &connector_id);
+            let mut symbol_config = fcp_store::DurableSymbolStoreConfig::new(&symbol_path);
+            symbol_config.mac_key = authenticated.then_some([0xB2; 32]);
+            symbol_config.checkpoint_after_ops = 0;
+            let symbols = fcp_store::DurableSymbolStore::open(symbol_config).unwrap();
+            fcp_store::SymbolStore::put_object_meta(
+                &symbols,
+                fcp_store::ObjectSymbolMeta {
+                    object_id: root_object_id,
+                    zone_id: zone.clone(),
+                    oti: fcp_store::ObjectTransmissionInfo {
+                        transfer_length: 4,
+                        symbol_size: 4,
+                        source_blocks: 1,
+                        sub_blocks: 1,
+                        alignment: 4,
+                        payload_hash: None,
+                    },
+                    source_symbols: 1,
+                    first_symbol_at: 1_800_200_000,
+                },
+            )
+            .await
+            .unwrap();
+            fcp_store::SymbolStore::put_symbol(
+                &symbols,
+                fcp_store::StoredSymbol {
+                    meta: fcp_store::SymbolMeta {
+                        object_id: root_object_id,
+                        esi: 0,
+                        zone_id: zone.clone(),
+                        source_node: Some(10),
+                        stored_at: 1_800_200_001,
+                    },
+                    data: b"root".to_vec().into(),
+                },
+            )
+            .await
+            .unwrap();
+            if checkpointed {
+                objects.checkpoint().await.unwrap();
+                symbols.checkpoint().unwrap();
+            }
+            let mut config = dispatcher_test_config(CANONICAL_STATE_MAC_TEST_CONNECTOR);
+            for (name, value) in [
+                (CONNECTOR_STATE_DIR_ENV, state_root.display().to_string()),
+                (
+                    CONNECTOR_STATE_OBJECT_ID_KEY_ENV,
+                    hex::encode(object_id_key.as_bytes()),
+                ),
+                (CONNECTOR_STATE_OBJECT_MAC_KEY_ENV, hex::encode([0xA1; 32])),
+                (CONNECTOR_STATE_SYMBOL_MAC_KEY_ENV, hex::encode([0xB2; 32])),
+                ("FCP_CONNECTOR_STATE_MODEL", "singleton_writer".to_owned()),
+            ] {
+                config.env.insert(name.to_owned(), value);
+            }
+            Self {
+                config,
+                connector_id,
+                zone,
+                state_root,
+                root_object_id,
+                head_object_id,
+                lease_object_id,
+                _objects: objects,
+                _symbols: symbols,
+                _directory: directory,
+            }
+        }
+
+        fn app_state(&self, config: ConnectorConfig) -> Arc<AppState> {
+            dispatcher_app_state(
+                runtime_network_test_registry(CANONICAL_STATE_MAC_TEST_CONNECTOR, config),
+                Arc::new(HostAdminStateStore::new()),
+                None,
+                HashMap::new(),
+            )
+        }
+
+        fn files(&self) -> BTreeMap<PathBuf, (Vec<u8>, std::time::SystemTime)> {
+            let mut files = BTreeMap::new();
+            for directory in [
+                connector_state_canonical_object_store_dir(&self.state_root, &self.connector_id),
+                connector_state_canonical_symbol_store_dir(&self.state_root, &self.connector_id),
+            ] {
+                for entry in std::fs::read_dir(directory).unwrap() {
+                    let entry = entry.unwrap();
+                    files.insert(
+                        entry.path(),
+                        (
+                            std::fs::read(entry.path()).unwrap(),
+                            entry.metadata().unwrap().modified().unwrap(),
+                        ),
+                    );
+                }
+            }
+            files
+        }
+
+        async fn assert_readable(&self, config: &ConnectorConfig) {
+            let status = connector_state_canonical_status_from_config(
+                config,
+                &self.connector_id,
+                Some(&self.zone),
+                &self.state_root,
+            )
+            .await
+            .unwrap()
+            .expect("canonical status");
+            assert_eq!(status.root_object_id, Some(self.root_object_id));
+            assert_eq!(status.head_object_id, Some(self.head_object_id));
+            assert_eq!(status.last_canonical_seq, Some(0));
+            assert_eq!(status.mesh_replica_count, Some(1));
+            let evidence = connector_lease_durable_evidence_from_config(
+                config,
+                ConnectorStatePolicy {
+                    model: ConnectorStateKind::SingletonWriter,
+                    ..Default::default()
+                },
+                &self.connector_id,
+                &self.zone,
+                &self.state_root,
+            )
+            .await;
+            assert_eq!(evidence.source, Some("canonical-fcp-store-lease-object"));
+            assert_eq!(evidence.lease_object_id, Some(self.lease_object_id));
+            assert_eq!(evidence.validation_status, Some("valid"));
+            let state = self.app_state(config.clone());
+            let context = connector_lease_yield_flush_context_for_registered_connector(
+                &state,
+                &self.connector_id,
+                &self.zone,
+            )
+            .await
+            .unwrap();
+            assert_eq!(context.flush.root_object_id, Some(self.root_object_id));
+            assert_eq!(context.flush.head_object_id, Some(self.head_object_id));
+            assert_eq!(context.flush.lease_object_id, Some(self.lease_object_id));
+            assert_eq!(context.flush.last_canonical_seq, Some(0));
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn canonical_state_mac_key_authenticated_reads_preserve_wal_and_snapshot() {
+        for checkpointed in [false, true] {
+            let fixture = CanonicalStateMacFixture::new(true, checkpointed).await;
+            let before = fixture.files();
+            fixture.assert_readable(&fixture.config).await;
+            assert_eq!(
+                fixture.files(),
+                before,
+                "inspection must not mutate live storage"
+            );
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn canonical_state_mac_key_missing_or_wrong_keys_fail_without_fallback() {
+        for checkpointed in [false, true] {
+            let fixture = CanonicalStateMacFixture::new(true, checkpointed).await;
+            let before = fixture.files();
+            for name in [
+                CONNECTOR_STATE_OBJECT_MAC_KEY_ENV,
+                CONNECTOR_STATE_SYMBOL_MAC_KEY_ENV,
+            ] {
+                for wrong_key in [None, Some(hex::encode([0xF0; 32]))] {
+                    let mut config = fixture.config.clone();
+                    config.env.remove(name);
+                    if let Some(wrong_key) = wrong_key {
+                        config.env.insert(name.to_owned(), wrong_key);
+                    }
+                    let error = connector_state_canonical_status_from_config(
+                        &config,
+                        &fixture.connector_id,
+                        Some(&fixture.zone),
+                        &fixture.state_root,
+                    )
+                    .await
+                    .expect_err("authenticated storage requires the correct explicit key");
+                    for secret in [0xA1, 0xB2, 0xC7, 0xF0] {
+                        assert!(!error.contains(&hex::encode([secret; 32])));
+                    }
+                    if name == CONNECTOR_STATE_OBJECT_MAC_KEY_ENV {
+                        let evidence = connector_lease_durable_evidence_from_config(
+                            &config,
+                            ConnectorStatePolicy {
+                                model: ConnectorStateKind::SingletonWriter,
+                                ..Default::default()
+                            },
+                            &fixture.connector_id,
+                            &fixture.zone,
+                            &fixture.state_root,
+                        )
+                        .await;
+                        assert!(evidence.source.is_none());
+                        assert!(evidence.lease_object_id.is_none());
+                        assert!(!evidence.warnings.is_empty());
+                        let state = fixture.app_state(config);
+                        let error = connector_lease_yield_flush_context_for_registered_connector(
+                            &state,
+                            &fixture.connector_id,
+                            &fixture.zone,
+                        )
+                        .await
+                        .err()
+                        .expect("unauthenticated state must never satisfy the yield barrier");
+                        for secret in [0xA1, 0xB2, 0xC7, 0xF0] {
+                            let encoded = hex::encode([secret; 32]);
+                            assert!(!error.contains(&encoded));
+                            assert!(
+                                evidence
+                                    .warnings
+                                    .iter()
+                                    .all(|warning| !warning.contains(&encoded))
+                            );
+                        }
+                    }
+                    assert_eq!(
+                        fixture.files(),
+                        before,
+                        "failed reads must not repair storage"
+                    );
+                }
+            }
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn canonical_state_mac_key_configuration_refuses_unauthenticated_downgrade() {
+        for checkpointed in [false, true] {
+            let fixture = CanonicalStateMacFixture::new(false, checkpointed).await;
+            let before = fixture.files();
+            assert!(
+                connector_state_canonical_status_from_config(
+                    &fixture.config,
+                    &fixture.connector_id,
+                    Some(&fixture.zone),
+                    &fixture.state_root,
+                )
+                .await
+                .is_err()
+            );
+            let mut legacy = fixture.config.clone();
+            legacy.env.remove(CONNECTOR_STATE_OBJECT_MAC_KEY_ENV);
+            legacy.env.remove(CONNECTOR_STATE_SYMBOL_MAC_KEY_ENV);
+            fixture.assert_readable(&legacy).await;
+            assert_eq!(
+                fixture.files(),
+                before,
+                "host reads never migrate durable envelopes"
+            );
+        }
     }
 
     #[fcp_async_core::runtime::test]
