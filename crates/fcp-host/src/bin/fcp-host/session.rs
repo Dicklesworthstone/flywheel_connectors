@@ -1,4 +1,4 @@
-//! Native connector authority preparation for instance-bound capability tokens.
+//! Connector authority preparation for instance-bound capability tokens.
 //!
 //! This endpoint is a control-plane read/negotiation, NOT token issuance.
 //! The ordinary invoke path continues to enforce signatures, policy, leases,
@@ -11,6 +11,9 @@ use fcp_core::CapabilityId;
 #[serde(deny_unknown_fields)]
 pub(super) struct PrepareSessionRequest {
     zone_id: ZoneId,
+    /// Required for a WASI guest, whose retained sandbox is operation-isolated.
+    #[serde(default)]
+    operation_id: Option<OperationId>,
 }
 
 #[derive(Debug, Serialize)]
@@ -18,6 +21,8 @@ pub(super) struct PreparedSession {
     connector_id: ConnectorId,
     zone_id: ZoneId,
     pub(super) instance_id: InstanceId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) operation_id: Option<OperationId>,
     protocol_version: &'static str,
 }
 
@@ -128,7 +133,7 @@ pub(super) fn prepared_from_health(
     let invalid = || {
         failure(
             StatusCode::BAD_GATEWAY,
-            "connector did not report a ready, authenticated native instance",
+            "connector did not report a ready, authenticated instance",
         )
     };
     let snapshot: HealthSnapshot = serde_json::from_value(value.clone()).map_err(|_| invalid())?;
@@ -162,13 +167,15 @@ pub(super) fn prepared_from_health(
         connector_id,
         zone_id,
         instance_id,
+        operation_id: None,
         protocol_version: "2.0",
     })
 }
 
 /// POST /rpc/admin/connectors/{connector_id}/session
 ///
-/// Uses the on-demand native executor, not a warm-pool control process.
+/// Uses the on-demand native executor or the selected retained WASI guest,
+/// never a warm-pool control process. WASI preparation requires operation_id.
 /// Instance identity is a snapshot, not a lease: reconfiguration or process
 /// replacement can invalidate it before the issuer signs its token.
 /// One end-to-end deadline includes registry and session admission. Expiration
@@ -188,15 +195,21 @@ pub(super) async fn prepare_handler(
     within_preparation_deadline(
         started,
         PREPARATION_TIMEOUT,
-        prepare_session(state.as_ref(), connector_id, request.zone_id),
+        prepare_session_for_operation(
+            state.as_ref(),
+            connector_id,
+            request.zone_id,
+            request.operation_id,
+        ),
     )
     .await
 }
 
-async fn prepare_session(
+pub(super) async fn prepare_session_for_operation(
     state: &AppState,
     connector_id: ConnectorId,
     zone_id: ZoneId,
+    operation_id: Option<OperationId>,
 ) -> Result<(HeaderMap, Json<PreparedSession>), HttpFailure> {
     let connector = {
         let registry = state.registry.state.read().await;
@@ -206,33 +219,44 @@ async fn prepare_session(
             .ok_or_else(|| failure(StatusCode::NOT_FOUND, "connector is not registered"))?;
         require_zone(&entry.config.allowed_zones, &zone_id)?;
         match &entry.connector {
-            ConnectorRuntime::Native(native) => Arc::clone(native),
+            ConnectorRuntime::Native(_) | ConnectorRuntime::Wasi(_) => entry.connector.clone(),
             _ => {
                 return Err(failure(
                     StatusCode::CONFLICT,
-                    "on-demand native connector required; warm-pool and WASI sessions unsupported",
+                    "on-demand native or WASI connector required; warm-pool sessions unsupported",
                 ));
             }
         }
     };
-    if connector.capability_verifying_key.is_none() {
-        return Err(failure(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "host capability verification is not configured",
-        ));
-    }
-    // This holds the same connector session lock through handshake + health.
-    // Failed or cancelled preparation cannot publish cached authority.
-    let health = connector
-        .rpc_in_handshaken_zone(&zone_id, "health", json!({}))
-        .await
-        .map_err(|_| {
-            failure(
-                StatusCode::BAD_GATEWAY,
-                "connector session preparation failed; no instance authority was returned",
-            )
-        })?;
-    let prepared = prepared_from_health(connector_id.clone(), zone_id.clone(), health)?;
+    let prepared =
+        match &connector {
+            ConnectorRuntime::Native(native) => {
+                if native.capability_verifying_key.is_none() {
+                    return Err(failure(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "host capability verification is not configured",
+                    ));
+                }
+                // Same lock through handshake + health; never read a control
+                // process and pretend it identifies a different executor.
+                let health = native.rpc_in_handshaken_zone(&zone_id, "health", json!({}))
+                .await.map_err(|_| failure(StatusCode::BAD_GATEWAY,
+                    "connector session preparation failed; no instance authority was returned"))?;
+                prepared_from_health(connector_id.clone(), zone_id.clone(), health)?
+            }
+            ConnectorRuntime::Wasi(wasi) => {
+                let operation = operation_id.as_ref().ok_or_else(|| {
+                    failure(
+                        StatusCode::BAD_REQUEST,
+                        "operation_id is required to prepare an isolated WASI session",
+                    )
+                })?;
+                wasi.prepare_session(&zone_id, operation)
+                    .await
+                    .map_err(map_host_error)?
+            }
+            _ => unreachable!("runtime form was checked while selecting the connector"),
+        };
     // Ensure the process wasn't replaced during I/O. No registry lock is
     // held across subprocess I/O, and no snapshot can guarantee future life.
     {
@@ -244,9 +268,16 @@ async fn prepare_session(
             )
         })?;
         require_zone(&entry.config.allowed_zones, &zone_id)?;
-        if !matches!(&entry.connector, ConnectorRuntime::Native(current)
-            if Arc::ptr_eq(current, &connector))
-        {
+        let current = match (&entry.connector, &connector) {
+            (ConnectorRuntime::Native(current), ConnectorRuntime::Native(selected)) => {
+                Arc::ptr_eq(current, selected)
+            }
+            (ConnectorRuntime::Wasi(current), ConnectorRuntime::Wasi(selected)) => {
+                Arc::ptr_eq(current, selected)
+            }
+            _ => false,
+        };
+        if !current {
             return Err(failure(
                 StatusCode::CONFLICT,
                 "connector changed during session preparation",
@@ -282,15 +313,11 @@ mod deadline_tests {
         let dropped = Arc::new(AtomicBool::new(false));
         let guard = DropProbe(Arc::clone(&dropped));
         let budget = Duration::from_secs(1);
-        let result = within_preparation_deadline(
-            Instant::now() - budget,
-            budget,
-            async {
-                let _guard = guard;
-                polled.store(true, Ordering::SeqCst);
-                Ok(())
-            },
-        )
+        let result = within_preparation_deadline(Instant::now() - budget, budget, async {
+            let _guard = guard;
+            polled.store(true, Ordering::SeqCst);
+            Ok(())
+        })
         .await;
         assert_eq!(result.unwrap_err(), preparation_timed_out());
         assert!(!polled.load(Ordering::SeqCst));
@@ -343,20 +370,20 @@ mod deadline_tests {
         let session = futures_util::lock::Mutex::new(None::<ZoneId>);
         let owner = session.lock().await;
         let entered = AtomicBool::new(false);
-        let result = within_preparation_deadline(
-            Instant::now(),
-            Duration::from_millis(25),
-            async {
+        let result =
+            within_preparation_deadline(Instant::now(), Duration::from_millis(25), async {
                 let mut zone = session.lock().await;
                 entered.store(true, Ordering::SeqCst);
                 *zone = Some(ZoneId::work());
                 Ok(())
-            },
-        )
-        .await;
+            })
+            .await;
         assert_eq!(result.unwrap_err(), preparation_timed_out());
         assert!(!entered.load(Ordering::SeqCst));
-        assert!(session.try_lock().is_none(), "waiter must not unlock its owner");
+        assert!(
+            session.try_lock().is_none(),
+            "waiter must not unlock its owner"
+        );
         assert!(owner.is_none());
         drop(owner);
         within_preparation_deadline(Instant::now(), PREPARATION_TIMEOUT, async {
@@ -398,7 +425,10 @@ mod deadline_tests {
         drop(preparation);
         assert!(rpc.is_settled());
         let discarded = receiver.recv().await.unwrap();
-        assert!(!discarded.rpc.try_begin(), "abandoned preparation must not execute later");
+        assert!(
+            !discarded.rpc.try_begin(),
+            "abandoned preparation must not execute later"
+        );
         let next = NativeRpc::for_io();
         assert!(next.try_begin());
         rpc.cancel();
@@ -421,7 +451,10 @@ mod deadline_tests {
     async fn preparation_timeout_retires_a_selected_real_native_process() {
         let runner = ConnectorProcessRunner::spawn(
             "/bin/sh",
-            &["-c".into(), "IFS= read -r request || exit 1; exec sleep 30".into()],
+            &[
+                "-c".into(),
+                "IFS= read -r request || exit 1; exec sleep 30".into(),
+            ],
             &BTreeMap::new(),
         )
         .await
@@ -447,18 +480,15 @@ mod deadline_tests {
         })
         .await
         .expect("production dispatcher must select the blocked health RPC");
-        let result = within_preparation_deadline(
-            Instant::now(),
-            Duration::from_millis(25),
-            async move {
+        let result =
+            within_preparation_deadline(Instant::now(), Duration::from_millis(25), async move {
                 let _waiter = waiter;
                 response_rx
                     .await
                     .map_err(|_| failure(StatusCode::BAD_GATEWAY, "reply channel closed"))?
                     .map_err(|_| failure(StatusCode::BAD_GATEWAY, "RPC failed"))
-            },
-        )
-        .await;
+            })
+            .await;
         assert_eq!(result.unwrap_err(), preparation_timed_out());
         fcp_async_core::time::timeout(Duration::from_secs(3), async {
             while !rpc.is_settled() {

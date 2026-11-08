@@ -140,6 +140,14 @@ fn preparation_is_exactly_zone_scoped() {
         );
     }
     serde_json::from_value::<PrepareSessionRequest>(json!({"zone_id": "z:work"})).unwrap();
+    let wasi = serde_json::from_value::<PrepareSessionRequest>(json!({
+        "zone_id": "z:work", "operation_id": "compute.echo",
+    }))
+    .unwrap();
+    assert_eq!(
+        wasi.operation_id,
+        Some(OperationId::from_static("compute.echo"))
+    );
     for field in [
         "instance_id",
         "host_public_key",
@@ -161,6 +169,10 @@ fn returns_actual_healthy_instance_not_a_token_or_guess() {
     assert_eq!(response["zone_id"], "z:work");
     assert_eq!(response["protocol_version"], "2.0");
     assert!(response.get("capability_token").is_none());
+    assert!(
+        response.get("operation_id").is_none(),
+        "native preparation shape stays unchanged"
+    );
 }
 
 #[test]

@@ -189,6 +189,12 @@ impl LiveAuthorityDispatchGuard {
         self.0.effect_started.store(true, Ordering::Release);
     }
 
+    /// Record a selected runtime's refusal. A previously selected effect still
+    /// prevents this marker from being treated as proof of non-execution.
+    pub(super) fn record_dispatch_refusal(&self) {
+        self.0.rejected.store(true, Ordering::Release);
+    }
+
     /// Positive local proof of refusal before any effect ticket was selected.
     pub(super) fn refused_before_effect(&self) -> bool {
         self.0.rejected.load(Ordering::Acquire) && !self.0.effect_started.load(Ordering::Acquire)

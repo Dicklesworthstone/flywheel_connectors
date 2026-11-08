@@ -187,6 +187,8 @@ mod native_rpc;
 mod native_stream;
 #[path = "fcp-host/session.rs"]
 mod session;
+#[path = "fcp-host/wasi_connector.rs"]
+mod wasi_connector;
 #[path = "fcp-host/webhook_ingress.rs"]
 mod webhook_ingress;
 #[cfg(test)]
@@ -1730,7 +1732,10 @@ impl NativeWarmPoolConnector {
     fn warm_pool_key(&self, zone: &ZoneId) -> WarmPoolKey {
         WarmPoolKey::new(
             self.connector_id.as_str(),
-            native_warm_pool_manifest_hash(&self.config, self.state_policy.manifest_digest.as_ref()),
+            native_warm_pool_manifest_hash(
+                &self.config,
+                self.state_policy.manifest_digest.as_ref(),
+            ),
             self.config.runtime_network_enforcement.as_str(),
             zone.as_str(),
             native_warm_pool_credential_profile_class(&self.config),
@@ -1799,11 +1804,20 @@ fn duration_ms(duration: Duration) -> u64 {
 struct WasiConnector {
     summary: ConnectorSummary,
     config: ConnectorConfig,
+    state_policy: ConnectorStatePolicy,
+    manifest: ManifestOperationConstraintCatalog,
+    capability_verifying_key: Option<[u8; PUBLIC_KEY_SIZE]>,
+    sessions: wasi_connector::WasiSessions,
     component_bytes: StdMutex<Option<Arc<Vec<u8>>>>,
 }
 
 impl WasiConnector {
-    fn new(config: ConnectorConfig, state_policy: ConnectorStatePolicy) -> HostResult<Self> {
+    fn new(
+        config: ConnectorConfig,
+        state_policy: ConnectorStatePolicy,
+        manifest: ManifestOperationConstraintCatalog,
+        capability_verifying_key: Option<[u8; PUBLIC_KEY_SIZE]>,
+    ) -> HostResult<Self> {
         if config.runtime_network_enforcement != RuntimeNetworkEnforcement::WasiSandbox {
             return Err(HostError::InvalidFilter(format!(
                 "WASI connector runtime requires wasi_sandbox enforcement, got {}",
@@ -1814,6 +1828,10 @@ impl WasiConnector {
         Ok(Self {
             summary: connector_summary_from_config(&config)?,
             config,
+            state_policy,
+            manifest,
+            capability_verifying_key,
+            sessions: wasi_connector::WasiSessions::default(),
             component_bytes: StdMutex::new(None),
         })
     }
@@ -1821,7 +1839,7 @@ impl WasiConnector {
     fn wasi_env_for_operation(
         &self,
         operation: &OperationId,
-        request_id: &str,
+        _request_id: &str,
         zone_id: &ZoneId,
     ) -> HashMap<String, String> {
         let mut env = self
@@ -1832,7 +1850,9 @@ impl WasiConnector {
             .collect::<HashMap<_, _>>();
         env.insert("FCP_CONNECTOR_ID".to_string(), self.summary.id.to_string());
         env.insert("FCP_OPERATION_ID".to_string(), operation.to_string());
-        env.insert("FCP_REQUEST_ID".to_string(), request_id.to_string());
+        // A retained guest handles many requests. The actual identity travels
+        // only in each FCP message, never a stale process environment value.
+        env.remove("FCP_REQUEST_ID");
         env.insert("FCP_ZONE_ID".to_string(), zone_id.as_str().to_string());
         env
     }
@@ -1863,18 +1883,27 @@ impl WasiConnector {
                 ))
             })?;
 
-        let mut base = WasiConfig {
-            env_vars: self.wasi_env_for_operation(operation, request_id, zone_id),
-            args: self.config.args.clone(),
-            ..WasiConfig::default()
+        let state_dir = configured_connector_state_root(&self.config)
+            .map(|state_root| {
+                prepare_connector_zone_state_dir(&state_root, &self.summary.id, zone_id)
+            })
+            .transpose()?;
+        let mut base = if let Some(sandbox) = self.manifest.sandbox.as_ref() {
+            let policy = fcp_sandbox::CompiledPolicy::from_manifest(sandbox, state_dir.clone())
+                .map_err(|_| {
+                    HostError::InvalidFilter("admitted WASI sandbox policy is invalid".into())
+                })?;
+            WasiConfig::from_policy(&policy).map_err(|_| {
+                HostError::InvalidFilter("admitted WASI sandbox policy is unavailable".into())
+            })?
+        } else {
+            WasiConfig {
+                state_dir,
+                ..WasiConfig::default()
+            }
         };
-        if let Some(state_root) = configured_connector_state_root(&self.config) {
-            base.state_dir = Some(prepare_connector_zone_state_dir(
-                &state_root,
-                &self.summary.id,
-                zone_id,
-            )?);
-        }
+        base.env_vars = self.wasi_env_for_operation(operation, request_id, zone_id);
+        base.args = self.config.args.clone();
 
         wasi_config_for_operation_network_policy(
             base,
@@ -1922,7 +1951,8 @@ impl WasiConnector {
     }
 
     async fn invoke(&self, request: InvokeRequest) -> HostResult<InvokeResponse> {
-        self.invoke_with_dispatch_guards(request, None, None, None).await
+        self.invoke_with_dispatch_guards(request, None, None, None)
+            .await
     }
 
     async fn invoke_with_dispatch_guards(
@@ -1932,98 +1962,49 @@ impl WasiConnector {
         deployment_guard: Option<&deployment_evidence::DeploymentDispatchGuard>,
         authority_guard: Option<&live_authority::LiveAuthorityDispatchGuard>,
     ) -> HostResult<InvokeResponse> {
-        let request_id = request.id.to_string();
-        let (runner, wasi_config) =
-            self.runner_for_operation(&request.operation, &request_id, &request.zone_id)?;
-        let wasm_bytes = self.component_bytes(&request.operation)?;
-        let validated = runner
-            .load_and_validate(wasm_bytes.as_ref())
-            .map_err(|err| {
-                HostError::RegistryError(format!(
-                    "failed to load WASI connector component `{}` for `{}` operation `{}`: {err}",
-                    self.config.binary, self.summary.id, request.operation
-                ))
-            })?;
-
-        tracing::info!(
-            event = "wasi_connector_invoke",
-            connector_id = %self.summary.id,
-            operation = %request.operation,
-            zone_id = %request.zone_id,
-            request_id = %request_id,
-            execution_mode = RuntimeNetworkEnforcement::WasiSandbox.as_str(),
-            block_direct_network = wasi_config.block_direct_network,
-            network_constraints_configured = wasi_config.network_constraints.is_some(),
-            "dispatching connector through WASI sandbox"
-        );
-
-        // Loading/validation can be expensive. Recheck before instantiation
-        // can execute guest code, without retaining a registry map lock.
-        let deployment_permit = deployment_guard
-            .map(deployment_evidence::DeploymentDispatchGuard::refresh)
-            .transpose()?;
-        let authority_permit = authority_guard
-            .map(live_authority::LiveAuthorityDispatchGuard::refresh)
-            .transpose()?;
-        if let Some(fence) = inventory_fence {
-            fence.require_current()?;
-        }
-        if let Some(permit) = deployment_permit {
-            permit.require_current()?;
-        }
-        if let Some(permit) = authority_permit {
-            permit.require_current()?;
-        }
-        if let Some(guard) = authority_guard {
-            guard.mark_effect_started();
-        }
-        let result = runner
-            .execute(&validated.component, &wasi_config.args)
+        self.invoke_prepared(request, inventory_fence, deployment_guard, authority_guard)
             .await
-            .map_err(|err| {
-                HostError::RegistryError(format!(
-                    "WASI connector `{}` operation `{}` failed: {err}",
-                    self.summary.id, request.operation
-                ))
-            })?;
+    }
 
-        Ok(InvokeResponse::ok(
-            request.id,
-            json!({
-                "execution_mode": RuntimeNetworkEnforcement::WasiSandbox.as_str(),
-                "connector_id": self.summary.id.to_string(),
-                "operation": request.operation.to_string(),
-                "component_manifest_present": validated.has_manifest,
-                "exit_code": result.exit_code,
-                "duration_ms": result.duration.as_millis() as u64,
-                "fuel_consumed": result.fuel_consumed,
-            }),
+    async fn simulate(&self, _request: SimulateRequest) -> HostResult<SimulateResponse> {
+        Err(HostError::PreflightFailed(
+            "WASI guest simulation is not supported; use host preflight to inspect invocation policy".into(),
         ))
     }
 
-    async fn simulate(&self, request: SimulateRequest) -> HostResult<SimulateResponse> {
-        let request_id = request.id.to_string();
-        let (_runner, _config) =
-            self.runner_for_operation(&request.operation, &request_id, &request.zone_id)?;
-        Ok(SimulateResponse::allowed(request.id))
-    }
-
     fn introspect(&self) -> HostResult<Introspection> {
-        Err(HostError::RegistryError(format!(
-            "WASI connector `{}` does not expose host-side introspection yet",
-            self.summary.id
-        )))
+        self.admitted_introspection()
     }
 
     fn summary_snapshot(&self) -> ConnectorSummary {
         let mut summary = self.summary.clone();
-        summary.health = ConnectorHealth::healthy();
+        summary.health = if self.sessions.has_ready_session() {
+            ConnectorHealth::healthy()
+        } else {
+            ConnectorHealth::unavailable("WASI operation session has not been prepared")
+        };
+        if let Ok(catalog) = self.introspect() {
+            summary.tool_count = u32::try_from(catalog.operations.len()).unwrap_or(u32::MAX);
+            summary.max_safety_tier = catalog
+                .operations
+                .iter()
+                .map(|operation| operation.safety_tier)
+                .max_by_key(|tier| tier.level())
+                .unwrap_or(SafetyTier::Safe);
+        }
         summary.last_health_check = Some(chrono::Utc::now());
         summary
     }
 
     fn self_check(&self) -> HostResult<SelfCheckReport> {
-        Ok(SelfCheckReport::ok())
+        Ok(if self.sessions.has_ready_session() {
+            SelfCheckReport::ok()
+        } else {
+            SelfCheckReport::degraded(
+                "wasi_session_unprepared",
+                "Prepare an operation session before issuing an instance-bound token",
+            )
+        })
     }
 }
 
@@ -2157,7 +2138,12 @@ impl ConnectorRuntime {
         state_policy.require_admitted_manifest(&config)?;
         validate_production_prewarm_policy(&config, state_policy)?;
         if config.runtime_network_enforcement == RuntimeNetworkEnforcement::WasiSandbox {
-            return Ok(Self::Wasi(Arc::new(WasiConnector::new(config, state_policy)?)));
+            return Ok(Self::Wasi(Arc::new(WasiConnector::new(
+                config,
+                state_policy,
+                admitted.manifest_constraints.clone(),
+                capability_verifying_key,
+            )?)));
         }
         let support = NativeProxyOnlySandboxSupport::current();
         if let NativeProxyOnlySandboxDecision::Deny { deny_reason } =
@@ -2523,7 +2509,7 @@ impl ConnectorStatePolicy {
     fn reject_stateful_wasi(self, connector_id: &str) -> HostResult<()> {
         if self.is_stateful() {
             return Err(HostError::InvalidFilter(format!(
-                "connector '{connector_id}' declares '{}' state, but WASI starts a fresh instance for every invocation; stateful execution requires a persistent native on_demand runtime until canonical WASI state recovery and publication are wired",
+                "connector '{connector_id}' declares '{}' state, but retained WASI sessions have no canonical state recovery or publication; stateful execution requires a persistent native on_demand runtime until those boundaries are wired",
                 self.model.as_str()
             )));
         }
@@ -2564,10 +2550,14 @@ struct ManifestOperationConstraintCatalog {
     operation_authorities: Arc<BTreeMap<String, ManifestOperationAuthority>>,
     network_constraints: HashMap<String, NetworkConstraints>,
     event_authorities: BTreeMap<String, fcp_manifest::EventSection>,
+    sandbox: Option<fcp_manifest::SandboxSection>,
 }
 
 #[derive(Debug, Clone)]
 struct ManifestOperationAuthority {
+    description: String,
+    ai_hints: fcp_core::AgentHint,
+    rate_limit: Option<fcp_core::RateLimit>,
     capability: fcp_prelude::CapabilityId,
     risk_level: fcp_prelude::RiskLevel,
     safety_tier: SafetyTier,
@@ -2580,6 +2570,12 @@ struct ManifestOperationAuthority {
 impl From<&fcp_manifest::OperationSection> for ManifestOperationAuthority {
     fn from(operation: &fcp_manifest::OperationSection) -> Self {
         Self {
+            description: operation.description.clone(),
+            ai_hints: operation.ai_hints.clone(),
+            rate_limit: operation
+                .rate_limit
+                .as_ref()
+                .map(|limit| limit.as_inner().clone()),
             capability: operation.capability.clone(),
             risk_level: operation.risk_level,
             safety_tier: operation.safety_tier,
@@ -2633,6 +2629,7 @@ impl ManifestOperationConstraintCatalog {
             operation_authorities: Arc::new(operation_authorities),
             network_constraints,
             event_authorities: manifest.provides.events.clone(),
+            sandbox: Some(manifest.sandbox.clone()),
         })
     }
 
@@ -2715,10 +2712,8 @@ fn load_manifest_operation_constraints(
             manifest.connector.id, config.id
         )));
     }
-    let mut catalog = ManifestOperationConstraintCatalog::from_manifest(
-        &manifest,
-        path.to_string(),
-    )?;
+    let mut catalog =
+        ManifestOperationConstraintCatalog::from_manifest(&manifest, path.to_string())?;
     catalog.manifest_digest = Some(*blake3::hash(raw.as_bytes()).as_bytes());
     catalog.manifest_bytes = raw.len() as u64;
     Ok(catalog)
@@ -3231,7 +3226,8 @@ impl SubprocessRegistry {
         let mut replacement_entries = HashMap::new();
         for connector_id in &plan.replacement_ids {
             let admitted = validate_registry_config(&plan.next_configs[connector_id])?;
-            self.require_state_policy_replacement(connector_id, admitted.state_policy).await?;
+            self.require_state_policy_replacement(connector_id, admitted.state_policy)
+                .await?;
             let entry = build_registry_entry_with_admission(
                 plan.next_configs[connector_id].clone(),
                 admitted,
@@ -3266,7 +3262,8 @@ impl SubprocessRegistry {
         let plan = self.plan_configs(configs).await?;
         for connector_id in &plan.replacement_ids {
             let admitted = validate_registry_config(&plan.next_configs[connector_id])?;
-            self.require_state_policy_replacement(connector_id, admitted.state_policy).await?;
+            self.require_state_policy_replacement(connector_id, admitted.state_policy)
+                .await?;
         }
         Ok(plan.report(plan.source_version))
     }
@@ -4692,7 +4689,10 @@ async fn connector_lease_yield_flush_context_for_registered_connector(
     connector_id: &ConnectorId,
     zone: &ZoneId,
 ) -> Result<HostConnectorLeaseYieldFlushContext, String> {
-    let (config, state_policy) = state.registry.state_policy_snapshot(connector_id).await
+    let (config, state_policy) = state
+        .registry
+        .state_policy_snapshot(connector_id)
+        .await
         .ok_or_else(|| format!("connector `{connector_id}` is not present in the host registry"))?;
     if !state_policy.is_singleton_writer() {
         return Err(format!(
@@ -11419,10 +11419,14 @@ async fn connector_lease_status_handler(
     Query(query): Query<ConnectorLeaseStatusQuery>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let connector_id = parse_connector_id(&connector_id)?;
-    let (config, state_policy) = state.registry.state_policy_snapshot(&connector_id).await
+    let (config, state_policy) = state
+        .registry
+        .state_policy_snapshot(&connector_id)
+        .await
         .ok_or_else(|| map_host_error(HostError::ConnectorNotFound(connector_id.to_string())))?;
-    let zone = connector_lease_status_zone_id(&connector_id, &config, state_policy, query.zone.as_deref())
-        .map_err(map_host_error)?;
+    let zone =
+        connector_lease_status_zone_id(&connector_id, &config, state_policy, query.zone.as_deref())
+            .map_err(map_host_error)?;
     let started_at = Instant::now();
     tracing::debug!(
         event = "connector_lease_status_request",
@@ -11463,11 +11467,18 @@ async fn connector_lease_flush_before_yield_handler(
     Query(query): Query<ConnectorLeaseFlushBeforeYieldQuery>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let connector_id = parse_connector_id(&connector_id)?;
-    let (config, state_policy) = state.registry.state_policy_snapshot(&connector_id).await
+    let (config, state_policy) = state
+        .registry
+        .state_policy_snapshot(&connector_id)
+        .await
         .ok_or_else(|| map_host_error(HostError::ConnectorNotFound(connector_id.to_string())))?;
-    let zone =
-        connector_lease_flush_before_yield_zone_id(&connector_id, &config, state_policy, query.zone.as_deref())
-            .map_err(map_host_error)?;
+    let zone = connector_lease_flush_before_yield_zone_id(
+        &connector_id,
+        &config,
+        state_policy,
+        query.zone.as_deref(),
+    )
+    .map_err(map_host_error)?;
     let started_at = Instant::now();
     tracing::debug!(
         event = "connector_lease_flush_before_yield_request",
@@ -17895,7 +17906,8 @@ deny_ptrace = true
         let catalog = ManifestOperationConstraintCatalog::from_manifest(
             &manifest,
             "inline-test-manifest".to_string(),
-        ).expect("valid manifest state");
+        )
+        .expect("valid manifest state");
 
         let op_a = catalog
             .network_constraints
@@ -17917,8 +17929,14 @@ deny_ptrace = true
         raw.push_str(operations);
         let mut manifest = ConnectorManifest::parse_str_unchecked(&raw).expect("operation fixture");
         for operation in manifest.provides.operations.values() {
-            if !manifest.capabilities.required.contains(&operation.capability)
-                && !manifest.capabilities.optional.contains(&operation.capability)
+            if !manifest
+                .capabilities
+                .required
+                .contains(&operation.capability)
+                && !manifest
+                    .capabilities
+                    .optional
+                    .contains(&operation.capability)
             {
                 manifest
                     .capabilities
@@ -18061,8 +18079,11 @@ output_schema = {{ type = "object" }}
         for (reason, safety_tier, approval_mode, mutate) in cases {
             let directory = tempfile::tempdir().expect("manifest authority directory");
             let path = directory.path().join("manifest.toml");
-            std::fs::write(&path, manifest_authority_fixture(safety_tier, approval_mode))
-                .expect("write admitted manifest");
+            std::fs::write(
+                &path,
+                manifest_authority_fixture(safety_tier, approval_mode),
+            )
+            .expect("write admitted manifest");
             let signing_key = fcp_crypto::ed25519::Ed25519SigningKey::generate();
             let mut catalog =
                 dispatcher_introspection("test.echo", "cap.test.echo", SafetyTier::Safe);
@@ -18232,7 +18253,9 @@ output_schema = {{ type = "object" }}
         .await
         .expect_err("runtime-only schema hints cannot alter manifest-backed mesh placement");
         assert!(
-            error.to_string().contains("runtime input_schema does not match the admitted manifest"),
+            error
+                .to_string()
+                .contains("runtime input_schema does not match the admitted manifest"),
             "{error}"
         );
         assert_eq!(invokes.load(Ordering::SeqCst), 0);
@@ -18248,12 +18271,16 @@ output_schema = {{ type = "object" }}
 
         let mut manifest = two_operation_network_manifest();
         manifest.provides.operations.clear();
-        let catalog = ManifestOperationConstraintCatalog::from_manifest(&manifest, "empty-manifest")
-            .expect("empty operation catalog");
+        let catalog =
+            ManifestOperationConstraintCatalog::from_manifest(&manifest, "empty-manifest")
+                .expect("empty operation catalog");
         let empty = operation_network_snapshot(false, catalog);
         let error = enforce_connector_allow_lists(&empty, &request)
             .expect_err("an admitted empty manifest must not authorize runtime-only operations");
-        assert!(error.to_string().contains("does not declare operation"), "{error}");
+        assert!(
+            error.to_string().contains("does not declare operation"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -18261,7 +18288,8 @@ output_schema = {{ type = "object" }}
         let mut catalog = ManifestOperationConstraintCatalog::from_manifest(
             &two_operation_network_manifest(),
             "inline-test-manifest".to_string(),
-        ).expect("valid manifest state");
+        )
+        .expect("valid manifest state");
         catalog
             .network_constraints
             .get_mut("op.a")
@@ -18312,7 +18340,8 @@ output_schema = {{ type = "object" }}
         let mut catalog = ManifestOperationConstraintCatalog::from_manifest(
             &manifest,
             "inline-test-manifest".to_string(),
-        ).expect("valid manifest state");
+        )
+        .expect("valid manifest state");
         catalog.network_constraints.remove("op.b");
         let snapshot = operation_network_snapshot(true, catalog);
         let request = operation_network_request("op.b");
@@ -18334,7 +18363,8 @@ output_schema = {{ type = "object" }}
         let catalog = ManifestOperationConstraintCatalog::from_manifest(
             &manifest,
             "inline-test-manifest".to_string(),
-        ).expect("valid manifest state");
+        )
+        .expect("valid manifest state");
         let snapshot = operation_network_snapshot(true, catalog);
         let request = operation_network_request("op.b");
 
@@ -18443,8 +18473,8 @@ output_schema = {{ type = "object" }}
     ) -> Arc<SubprocessRegistry> {
         let mut connectors = HashMap::new();
         for (connector_id, connector, config) in entries {
-            let manifest_constraints = load_manifest_operation_constraints(&config)
-                .expect("fixture manifest constraints");
+            let manifest_constraints =
+                load_manifest_operation_constraints(&config).expect("fixture manifest constraints");
             let state_policy = ConnectorStatePolicy::resolve(&config, &manifest_constraints)
                 .expect("fixture state policy");
             connectors.insert(
@@ -23620,7 +23650,7 @@ output_schema = {{ type = "object" }}
     }
 
     #[fcp_async_core::runtime::test(flavor = "multi_thread")]
-    async fn br_p3pd4_wasi_runtime_invokes_component_with_per_operation_config() {
+    async fn br_p3pd4_wasi_runtime_rejects_unprepared_run_only_component() {
         let connector_id = "fcp.test.p3pd4-wasi-component:utility:1.0.0";
         let operation_id = "test.echo";
         let tempdir = tempfile::tempdir().expect("tempdir");
@@ -23643,16 +23673,11 @@ output_schema = {{ type = "object" }}
             .expect("WASI registry");
         let request = runtime_network_test_request(connector_id, operation_id);
 
-        let response = registry
+        let error = registry
             .invoke(request)
             .await
-            .expect("minimal component invokes through WASI path");
-        assert_eq!(response.status, InvokeStatus::Ok);
-        let result = response.result.expect("WASI response result");
-        assert_eq!(result["execution_mode"], "wasi_sandbox");
-        assert_eq!(result["connector_id"], connector_id);
-        assert_eq!(result["operation"], operation_id);
-        assert_eq!(result["exit_code"], 0);
+            .expect_err("a run-only component cannot fabricate an FCP operation result");
+        assert!(error.to_string().contains("not prepared"));
     }
 
     #[fcp_async_core::runtime::test(flavor = "multi_thread")]
@@ -23796,8 +23821,13 @@ output_schema = {{ type = "object" }}
                 ManagedPortConstraint::Template("${matrix_homeserver_port}".to_string()),
             ),
         );
-        let invalid_connector = WasiConnector::new(invalid_config, ConnectorStatePolicy::default())
-            .expect("WASI connector");
+        let invalid_connector = WasiConnector::new(
+            invalid_config,
+            ConnectorStatePolicy::default(),
+            ManifestOperationConstraintCatalog::default(),
+            None,
+        )
+        .expect("WASI connector");
         let dynamic_err = invalid_connector
             .wasi_config_for_operation(
                 &request.operation,
@@ -31188,7 +31218,7 @@ done"#;
         state_policy_test_manifest_for("fcp.webhook-receiver", model, legacy_singleton)
     }
 
-    fn state_policy_test_manifest_for(
+    pub(super) fn state_policy_test_manifest_for(
         connector_id: &str,
         model: Option<&str>,
         legacy_singleton: bool,
@@ -34892,19 +34922,13 @@ done"#;
     fn production_prewarm_wasi_config(
         connector_id: &'static str,
         operation_id: &'static str,
-        component_path: &std::path::Path,
+        directory: &std::path::Path,
     ) -> ConnectorConfig {
-        let mut config = dispatcher_test_config(connector_id);
-        config.runtime_network_enforcement = RuntimeNetworkEnforcement::WasiSandbox;
-        config.allowed_operations.push(operation_id.to_string());
-        config.binary = component_path.to_string_lossy().into_owned();
-        config.operation_network_constraints.insert(
-            operation_id.to_string(),
-            runtime_network_test_constraints(
-                "api.example.test",
-                ManagedPortConstraint::Static(443),
-            ),
-        );
+        let mut config = wasi_connector::write_test_fixture(directory, connector_id);
+        config.allowed_operations = vec![operation_id.to_string()];
+        config
+            .operation_network_constraints
+            .retain(|operation, _| operation == operation_id);
         config
     }
 
@@ -34939,10 +34963,11 @@ done"#;
             cargo_target_dir: target_dir.to_string(),
             cargo_target_dir_class: prewarm_evidence_target_dir_class(target_dir).to_string(),
             cargo_target_dir_hash: prewarm_blake3_hash(target_dir),
-            connector_fixture_id: "fcp-host:wasi-minimal-command-component".to_string(),
-            host_boundary: "fcp-host::SubprocessRegistry::from_configs::WasiConnector::invoke"
-                .to_string(),
-            manifest_hash: prewarm_blake3_hash("fcp-host:wasi-minimal-command-component:v1"),
+            connector_fixture_id: "fcp-host:wasi-fcp-dispatch-component".to_string(),
+            host_boundary:
+                "fcp-host::SubprocessRegistry::from_configs::WasiConnector::prepare_session::invoke"
+                    .to_string(),
+            manifest_hash: prewarm_blake3_hash("fcp-host:wasi-fcp-dispatch-component:v1"),
             zone: prewarm_blake3_hash(ZoneId::work().as_str()),
             strategy: scenario.strategy.to_string(),
             pool_state: scenario.pool_state.to_string(),
@@ -35048,21 +35073,50 @@ done"#;
         let connector_id = "fcp.test.prewarm-production-soak:utility:1.0.0";
         let operation_id = "test.echo";
         let tempdir = tempfile::tempdir().expect("tempdir");
-        let component_path = tempdir.path().join("prewarm-production-soak.wat");
-        write_minimal_wasi_component(&component_path);
-
-        let config = production_prewarm_wasi_config(connector_id, operation_id, &component_path);
+        let config = production_prewarm_wasi_config(connector_id, operation_id, tempdir.path());
+        let signing_key = fcp_crypto::ed25519::Ed25519SigningKey::generate();
         let mut samples = Vec::new();
         for _ in 0..3 {
             let started = Instant::now();
-            let registry = SubprocessRegistry::from_configs(vec![config.clone()], None)
+            let registry = SubprocessRegistry::from_configs(
+                vec![config.clone()],
+                Some(signing_key.verifying_key().to_bytes()),
+            )
+            .await
+            .expect("WASI registry uses production host config validation");
+            let connector = {
+                let state = registry.state.read().await;
+                let entry = state
+                    .connectors
+                    .get(&ConnectorId::from_static(connector_id))
+                    .unwrap();
+                let ConnectorRuntime::Wasi(connector) = &entry.connector else {
+                    panic!("WASI runtime selected")
+                };
+                Arc::clone(connector)
+            };
+            let prepared = connector
+                .prepare_session(&ZoneId::work(), &OperationId::from_static(operation_id))
                 .await
-                .expect("WASI registry uses production host config validation");
+                .expect("prepare actual guest instance");
+            let mut request = runtime_network_test_request(connector_id, operation_id);
+            request.input = json!({"message": "measured FCP dispatch"});
+            request.capability_token = test_capability_token_for_instance(
+                &signing_key,
+                "cap.test.echo",
+                operation_id,
+                "z:work",
+                &prepared.instance_id,
+            );
             let response = registry
-                .invoke(runtime_network_test_request(connector_id, operation_id))
+                .invoke(request)
                 .await
-                .expect("WASI connector invokes through fcp-sandbox runner");
+                .expect("prepared WASI connector returns a real FCP response");
             assert_eq!(response.status, InvokeStatus::Ok);
+            assert_eq!(
+                response.result.unwrap(),
+                json!({"echo": {"message": "measured FCP dispatch"}, "calls": 1})
+            );
             samples.push(
                 u64::try_from(started.elapsed().as_millis())
                     .unwrap_or(u64::MAX)

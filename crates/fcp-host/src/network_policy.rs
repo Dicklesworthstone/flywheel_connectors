@@ -309,8 +309,8 @@ impl ManagedNetworkConstraints {
     /// # Errors
     ///
     /// Returns [`HostError::InvalidFilter`] when placeholders are unsupported,
-    /// required connector config is missing or malformed, host/port allow-lists
-    /// are empty, SPKI pins are invalid, or a resolved host violates the
+    /// required connector config is missing or malformed, exactly one of the
+    /// host/port allow-lists is empty, SPKI pins are invalid, or a resolved host violates the
     /// declared locality/canonicalization policy.
     pub fn resolve(&self, connector_config: Option<&Value>) -> HostResult<NetworkConstraints> {
         let matrix_url = matrix_homeserver_url(connector_config);
@@ -360,14 +360,12 @@ impl ManagedNetworkConstraints {
             }
         }
 
-        if host_allow.is_empty() {
+        // Two empty allow-lists are an explicit deny-all policy for compute
+        // and local-file operations. A partially empty policy is usually a
+        // configuration mistake and must not acquire an implicit default.
+        if host_allow.is_empty() != port_allow.is_empty() {
             return Err(HostError::InvalidFilter(
-                "operation network policy host_allow must not be empty".to_string(),
-            ));
-        }
-        if port_allow.is_empty() {
-            return Err(HostError::InvalidFilter(
-                "operation network policy port_allow must not be empty".to_string(),
+                "operation network policy host_allow and port_allow must both be empty for deny-all, or both be non-empty".to_string(),
             ));
         }
 
@@ -1166,6 +1164,67 @@ mod tests {
         .expect_err("host egress proxy mode must not be mislabeled as WASI");
 
         assert!(err.to_string().contains("wasi_sandbox"));
+    }
+
+    #[test]
+    fn explicit_deny_all_policy_admits_compute_and_denies_http_and_tcp() {
+        let mut managed = static_constraints();
+        managed.host_allow.clear();
+        managed.port_allow.clear();
+        let operations = vec!["compute.echo".to_string()];
+        let policies = BTreeMap::from([("compute.echo".to_string(), managed.clone())]);
+        validate_runtime_network_claim(
+            "fcp.compute",
+            RuntimeNetworkEnforcement::WasiSandbox,
+            &operations,
+            &policies,
+            None,
+        )
+        .expect("both empty lists explicitly deny all egress");
+        let constraints = managed.resolve(None).unwrap();
+        let config = wasi_config_for_operation_network_policy(
+            WasiConfig::default(),
+            RuntimeNetworkEnforcement::WasiSandbox,
+            constraints.clone(),
+        )
+        .unwrap();
+        assert!(config.block_direct_network);
+        let guard = EgressGuard::new();
+        let http = EgressRequest::Http(EgressHttpRequest {
+            url: "https://api.example.test/data".into(),
+            method: "GET".into(),
+            headers: Vec::new(),
+            body: None,
+            credential_id: None,
+        });
+        let tcp = EgressRequest::TcpConnect(EgressTcpConnectRequest {
+            host: "api.example.test".into(),
+            port: 443,
+            tls: true,
+            sni_override: None,
+            credential_id: None,
+        });
+        assert!(guard.evaluate(&http, &constraints).is_err());
+        assert!(guard.evaluate(&tcp, &constraints).is_err());
+
+        let mut missing_port = static_constraints();
+        missing_port.port_allow.clear();
+        assert!(missing_port.resolve(None).is_err());
+        let mut missing_host = static_constraints();
+        missing_host.host_allow.clear();
+        assert!(missing_host.resolve(None).is_err());
+        managed.require_sni = false;
+        assert!(
+            validate_runtime_network_claim(
+                "fcp.compute",
+                RuntimeNetworkEnforcement::WasiSandbox,
+                &operations,
+                &BTreeMap::from([("compute.echo".into(), managed)]),
+                None,
+            )
+            .is_err(),
+            "deny-all must not bypass the normal strict claim flags"
+        );
     }
 
     #[test]

@@ -91,6 +91,7 @@ libc = "0.2"
 mach2 = "0.4"
 
 [dev-dependencies]
+toml.workspace = true
 fcp-testkit = { path = "../fcp-testkit" }
 fcp-crypto-pq = { path = "../fcp-crypto-pq" }
 fcp-browser = { path = "../../connectors/browser", features = ["test-support"] }
