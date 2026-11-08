@@ -169,8 +169,13 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Self {
+        Self::with_zones(vec![ZoneId::work(), ZoneId::private()]).await
+    }
+
+    async fn with_zones(zones: Vec<ZoneId>) -> Self {
         let directory = tempfile::tempdir().unwrap();
-        let config = write_fixture(directory.path(), CONNECTOR);
+        let mut config = write_fixture(directory.path(), CONNECTOR);
+        config.allowed_zones = zones.iter().map(ToString::to_string).collect();
         let key = Ed25519SigningKey::generate();
         let registry = Arc::new(
             SubprocessRegistry::from_configs(vec![config], Some(key.verifying_key().to_bytes()))
@@ -188,7 +193,7 @@ impl Fixture {
             };
             Arc::clone(connector)
         };
-        let policies = [ZoneId::work(), ZoneId::private()]
+        let policies = zones
             .into_iter()
             .map(|zone| (zone.clone(), host_runtime_policy(zone)))
             .collect();
@@ -269,6 +274,279 @@ impl Fixture {
             .invoke_prepared(request, None, None, None)
             .await
     }
+
+    async fn retire(
+        &self,
+        zone: ZoneId,
+        operation: &'static str,
+        expected: &InstanceId,
+    ) -> Result<session::RetiredSession, (StatusCode, String)> {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer wasi-fixture-admin"),
+        );
+        let (headers, Json(retired)) = session::retire_handler(
+            State(Arc::clone(&self.host)),
+            Path(CONNECTOR.to_string()),
+            headers,
+            Json(
+                serde_json::from_value(json!({
+                    "zone_id": zone, "operation_id": operation, "expected_instance_id": expected,
+                }))
+                .unwrap(),
+            ),
+        )
+        .await?;
+        assert_eq!(headers.get(CACHE_CONTROL).unwrap(), "no-store");
+        Ok(retired)
+    }
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn wasi_conditional_retirement_preserves_other_sessions_and_replacements() {
+    let fixture = Fixture::new().await;
+    let echo = fixture.prepare(ZoneId::work(), ECHO).await;
+    let other = fixture.prepare(ZoneId::work(), OTHER).await;
+    let unauthorized = session::retire_handler(
+        State(Arc::clone(&fixture.host)),
+        Path(CONNECTOR.to_string()),
+        HeaderMap::new(),
+        Json(
+            serde_json::from_value(json!({
+                "zone_id": "z:work", "operation_id": ECHO, "expected_instance_id": echo.instance_id,
+            }))
+            .unwrap(),
+        ),
+    )
+    .await;
+    assert!(unauthorized.is_err());
+    assert!(
+        fixture
+            .retire(ZoneId::public(), ECHO, &echo.instance_id)
+            .await
+            .is_err()
+    );
+    assert!(
+        fixture
+            .retire(ZoneId::work(), "test.undeclared", &echo.instance_id)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        fixture
+            .retire(ZoneId::work(), ECHO, &InstanceId::new())
+            .await
+            .unwrap_err()
+            .0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        fixture.prepare(ZoneId::work(), ECHO).await.instance_id,
+        echo.instance_id,
+        "rejected retirement must preserve the exact guest"
+    );
+
+    let retired = fixture
+        .retire(ZoneId::work(), ECHO, &echo.instance_id)
+        .await
+        .unwrap();
+    assert!(retired.retired);
+    assert_eq!(retired.retired_instance_id, Some(echo.instance_id.clone()));
+    let absent = fixture
+        .retire(ZoneId::work(), ECHO, &echo.instance_id)
+        .await
+        .unwrap();
+    assert!(!absent.retired);
+    assert!(absent.retired_instance_id.is_none());
+    assert!(
+        fixture
+            .invoke(fixture.request(&echo.instance_id, ZoneId::work(), ECHO, json!({})))
+            .await
+            .is_err()
+    );
+    let unaffected = fixture
+        .invoke(fixture.request(
+            &other.instance_id,
+            ZoneId::work(),
+            OTHER,
+            json!({"unaffected": true}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(unaffected.result.unwrap()["calls"], 1);
+
+    let replacement = fixture.prepare(ZoneId::work(), ECHO).await;
+    assert_ne!(replacement.instance_id, echo.instance_id);
+    assert_eq!(
+        fixture
+            .retire(ZoneId::work(), ECHO, &echo.instance_id)
+            .await
+            .unwrap_err()
+            .0,
+        StatusCode::CONFLICT,
+        "lost-response retry must never destroy a replacement"
+    );
+    assert!(
+        fixture
+            .invoke(fixture.request(&echo.instance_id, ZoneId::work(), ECHO, json!({})))
+            .await
+            .is_err()
+    );
+    let response = fixture
+        .invoke(fixture.request(
+            &replacement.instance_id,
+            ZoneId::work(),
+            ECHO,
+            json!({"fresh": true}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.result.unwrap()["calls"], 1);
+    let never_prepared = fixture
+        .retire(ZoneId::private(), ECHO, &InstanceId::new())
+        .await
+        .unwrap();
+    assert!(!never_prepared.retired);
+    assert!(
+        fixture
+            .connector
+            .sessions
+            .existing_slot(&ZoneId::private(), &OperationId::from_static(ECHO))
+            .unwrap()
+            .is_none(),
+        "retirement must not create a slot or guest"
+    );
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn queued_wasi_retirement_cancellation_and_inventory_change_leave_guest_intact() {
+    for cancel in [true, false] {
+        let fixture = Fixture::new().await;
+        let prepared = fixture.prepare(ZoneId::work(), ECHO).await;
+        let slot = fixture
+            .connector
+            .sessions
+            .existing_slot(&ZoneId::work(), &OperationId::from_static(ECHO))
+            .unwrap()
+            .unwrap();
+        let owner = slot.guest.lock().await;
+        let mut retirement = Box::pin(fixture.retire(ZoneId::work(), ECHO, &prepared.instance_id));
+        assert!(futures_util::poll!(retirement.as_mut()).is_pending());
+        if cancel {
+            drop(retirement);
+            drop(owner);
+        } else {
+            fixture.host.registry.version.fetch_add(1, Ordering::SeqCst);
+            drop(owner);
+            assert!(
+                retirement.await.is_err(),
+                "inventory changed while waiting for the selected runtime"
+            );
+        }
+        let generation = fixture.host.registry.version.load(Ordering::SeqCst);
+        let fence = fixture.host.registry.inventory_fence(generation);
+        assert!(
+            fixture
+                .connector
+                .retire_session(
+                    &ZoneId::work(),
+                    &OperationId::from_static(ECHO),
+                    &prepared.instance_id,
+                    &fence,
+                    Instant::now()
+                )
+                .await
+                .is_err(),
+            "an expired retirement must not select a guest even when the lock is ready"
+        );
+        let response = fixture
+            .invoke(fixture.request(
+                &prepared.instance_id,
+                ZoneId::work(),
+                ECHO,
+                json!({"still_alive": true}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.result.unwrap()["calls"], 1);
+        assert_eq!(
+            fixture.prepare(ZoneId::work(), ECHO).await.instance_id,
+            prepared.instance_id
+        );
+    }
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn retiring_wasi_session_reclaims_capacity_only_after_existing_owners_release_slot() {
+    let zones = vec![
+        ZoneId::work(),
+        ZoneId::private(),
+        "z:retire-a".parse().unwrap(),
+        "z:retire-b".parse().unwrap(),
+        "z:retire-c".parse().unwrap(),
+    ];
+    let fixture = Fixture::with_zones(zones.clone()).await;
+    let mut prepared = Vec::new();
+    for zone in &zones[..4] {
+        for operation in [ECHO, OTHER] {
+            prepared.push(fixture.prepare(zone.clone(), operation).await);
+        }
+    }
+    let extra = OperationId::from_static(ECHO);
+    assert!(
+        fixture
+            .connector
+            .prepare_session(&zones[4], &extra)
+            .await
+            .is_err()
+    );
+    let pinned = fixture
+        .connector
+        .sessions
+        .existing_slot(&zones[0], &extra)
+        .unwrap()
+        .unwrap();
+    assert!(
+        fixture
+            .retire(zones[0].clone(), ECHO, &prepared[0].instance_id)
+            .await
+            .unwrap()
+            .retired
+    );
+    let current = fixture
+        .connector
+        .sessions
+        .existing_slot(&zones[0], &extra)
+        .unwrap()
+        .unwrap();
+    assert!(
+        Arc::ptr_eq(&pinned, &current),
+        "retirement must preserve the lock referenced by existing callers"
+    );
+    drop(current);
+    assert!(
+        fixture
+            .connector
+            .prepare_session(&zones[4], &extra)
+            .await
+            .is_err(),
+        "an empty slot with an existing owner is not available for reclamation"
+    );
+    drop(pinned);
+    fixture.prepare(zones[4].clone(), ECHO).await;
+    assert_eq!(
+        fixture.connector.sessions.slots.lock().unwrap().len(),
+        MAX_RESIDENT_SESSIONS
+    );
+    assert!(
+        fixture
+            .connector
+            .sessions
+            .existing_slot(&zones[0], &extra)
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[fcp_async_core::runtime::test(flavor = "multi_thread")]

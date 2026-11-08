@@ -977,6 +977,21 @@ Reconnecting ──(max retries)────> Unhealthy
 
 `StreamHealthTracker` drives transitions and produces `StreamHealthSnapshot` structs with `last_heartbeat_ms_ago`, `last_ack_ms_ago`, `reconnect_count`, `messages_received`, and `uptime_ms`. The tracker maps to `fcp_core::ConnectorHealth` for external reporting.
 
+### WASI request/response connectors
+
+Stateless WASI components can implement the versioned `fcp-dispatch` interface
+to receive complete FCP requests and return typed responses. The host discovers
+operations from the admitted manifest and retains a separate guest for each
+operation and zone. Prepare the guest through the protected connector session
+endpoint before issuing a capability for its actual instance ID.
+
+The same endpoint supports conditional `DELETE` with `expected_instance_id` to
+retire that guest and release its resident slot. A retry cannot retire a newly
+prepared replacement. Compute-only operations can declare an explicit deny-all
+network policy. See [WASI connector configuration and lifecycle](docs/configuration/wasi_connectors.md)
+for the component ABI, preparation and retirement requests, failure handling,
+resource limits, and currently supported execution scope.
+
 ### Native event consumers and durable acknowledgements
 
 The native host continuously reads connector stdout, separating event notifications
@@ -1022,8 +1037,10 @@ its standard base64 encoding. Its subject must own the retained stream, and its
 grants must match the manifest's capability, subscription operation, exact topic
 resource, zone, and authorized connector instance. The host rechecks revocation
 and zone policy on every request. Stream IDs and asserted principal headers do
-not authorize access. Holder-bound tokens require a separate proof transport and
-are rejected by these routes.
+not authorize access. Holder-bound tokens also include `auth.holder_proof`, signed
+over the stable request ID, the manifest subscription operation, and the token
+JTI. The executor verifies the holder key against current owner-signed mesh
+membership independently of any relay's transport signature.
 
 For Telegram, prepare the actual instance through the protected
 `POST /rpc/admin/connectors/{connector_id}/session` route, then have the trusted

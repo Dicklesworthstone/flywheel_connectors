@@ -176,6 +176,58 @@ fn returns_actual_healthy_instance_not_a_token_or_guess() {
 }
 
 #[test]
+fn retirement_requires_exact_instance_and_rejects_caller_authority_fields() {
+    let valid = json!({"zone_id": "z:work", "operation_id": "fixture.get",
+        "expected_instance_id": InstanceId::new()});
+    serde_json::from_value::<RetireSessionRequest>(valid.clone()).unwrap();
+    for field in ["zone_id", "operation_id", "expected_instance_id"] {
+        let mut missing = valid.clone();
+        missing.as_object_mut().unwrap().remove(field);
+        assert!(serde_json::from_value::<RetireSessionRequest>(missing).is_err());
+    }
+    let mut extra = valid;
+    extra["host_public_key"] = json!("caller-controlled-key");
+    assert!(serde_json::from_value::<RetireSessionRequest>(extra).is_err());
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn native_session_retirement_is_unsupported_without_connector_io() {
+    let fixture = dispatcher();
+    let calls = Arc::clone(&fixture.calls);
+    let config = crate::tests::dispatcher_test_config("fcp.fixture");
+    let registry = crate::tests::dispatcher_registry_with_connector(
+        "fcp.fixture",
+        Arc::new(fixture.connector),
+        config,
+    );
+    let mut host = crate::tests::dispatcher_app_state(
+        registry,
+        Arc::new(HostAdminStateStore::new()),
+        None,
+        HashMap::new(),
+    );
+    Arc::get_mut(&mut host).unwrap().admin_bearer_token = Some(Arc::from("fixture-admin"));
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::AUTHORIZATION,
+        HeaderValue::from_static("Bearer fixture-admin"),
+    );
+    let result = retire_handler(
+        State(host),
+        Path("fcp.fixture".into()),
+        headers,
+        Json(
+            serde_json::from_value(json!({"zone_id": "z:work", "operation_id": "fixture.get",
+            "expected_instance_id": InstanceId::new()}))
+            .unwrap(),
+        ),
+    )
+    .await;
+    assert_eq!(result.unwrap_err().0, StatusCode::CONFLICT);
+    assert!(calls.lock().unwrap().is_empty());
+}
+
+#[test]
 fn refuses_fabricated_readiness_legacy_health_and_conflicting_identity() {
     for state in [
         json!({"state": "starting"}),

@@ -124,6 +124,55 @@ instance authority. The sandbox environment and filesystem/network context stay
 fixed for that pair. `FCP_REQUEST_ID` is removed from the retained environment;
 each actual request ID arrives in its FCP message.
 
+## Retire an idle session explicitly
+
+Use the protected DELETE route to release one prepared guest without replacing
+the connector's inventory or restarting the host. Supply the exact instance ID
+returned by preparation:
+
+```http
+DELETE /rpc/admin/connectors/fcp.compute/session
+Authorization: Bearer <configured-admin-token>
+Content-Type: application/json
+
+{
+  "zone_id": "z:work",
+  "operation_id": "compute.echo",
+  "expected_instance_id": "<actual-instance-returned-by-preparation>"
+}
+```
+
+Successful retirement returns `Cache-Control: no-store` and:
+
+```json
+{
+  "connector_id": "fcp.compute",
+  "zone_id": "z:work",
+  "operation_id": "compute.echo",
+  "retired": true,
+  "retired_instance_id": "<the-exact-retired-instance>"
+}
+```
+
+An already absent guest returns `retired: false` without creating a session.
+If the slot contains a different instance, the host returns HTTP 409 and leaves
+it intact. The required `expected_instance_id` makes a lost-response retry safe
+even if someone prepared a replacement in the meantime. Do not substitute the
+replacement's ID unless retiring that replacement is your intended action.
+
+Retirement waits for the selected session's current call to finish, subject to
+the bounded admin deadline. Cancelling the wait leaves its owner untouched.
+The host checks current inventory after waiting and takes only the exact named
+guest. Other operations and zones retain their own sessions. Queued calls keep
+the same slot lock and then observe either its absence or the identity of a
+subsequently prepared guest; retirement cannot split the slot into two active
+locks. Native and warm-pool runtimes reject this endpoint.
+
+An old instance-bound capability no longer reaches a guest after retirement.
+Future work requires explicit preparation and authority for the new instance.
+Retirement does not change any recorded invocation outcome or authorize a retry
+of an earlier operation with unknown effects.
+
 ## Failure and resource behavior
 
 Calls to one session are serialized. After waiting for its lock, the host
@@ -143,9 +192,11 @@ cancellation after guest entry retires only the affected session.
 
 Each connector has at most eight resident operation/zone slots. Empty retired
 slots with no owner or waiter can be reclaimed. Healthy sessions are not evicted
-to make room; applying a replacement inventory configuration or restarting the
-host releases its resident guests. Preparation itself has the existing bounded
-admin RPC deadline.
+to make room; explicitly retire one with the conditional DELETE route when its
+slot is no longer needed. Existing callers must release their slot references
+before that empty slot can be reclaimed for another pair. Applying a replacement
+inventory configuration or restarting the host also releases its resident
+guests. Preparation and retirement have the existing bounded admin RPC deadline.
 
 This path currently supports stateless request/response components. Stateful
 WASI connectors remain refused until canonical state recovery is integrated.

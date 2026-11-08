@@ -9015,7 +9015,7 @@ async fn async_main(telemetry_config: TelemetryConfig) -> HostResult<()> {
         )
         .route(
             "/rpc/admin/connectors/{connector_id}/session",
-            post(session::prepare_handler),
+            post(session::prepare_handler).delete(session::retire_handler),
         )
         .route(
             "/rpc/admin/connectors/{connector_id}/state/explain",
@@ -34621,7 +34621,7 @@ done"#;
             assert!(
                 preview
                     .to_string()
-                    .contains("fresh instance for every invocation"),
+                    .contains("retained WASI sessions have no canonical state recovery"),
                 "{preview}"
             );
             let apply = registry

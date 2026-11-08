@@ -31,6 +31,12 @@ struct PreparedGuest {
     ready: Arc<AtomicBool>,
 }
 
+pub(super) enum SessionRetirement {
+    Absent,
+    Retired(InstanceId),
+    InstanceChanged,
+}
+
 impl Drop for PreparedGuest {
     fn drop(&mut self) {
         self.ready.store(false, Ordering::Release);
@@ -92,6 +98,20 @@ async fn call<T: serde::Serialize, R: DeserializeOwned>(
 }
 
 impl WasiSessions {
+    fn existing_slot(
+        &self,
+        zone: &ZoneId,
+        operation: &OperationId,
+    ) -> HostResult<Option<Arc<SessionSlot>>> {
+        let slots = self
+            .slots
+            .lock()
+            .map_err(|_| HostError::Internal("WASI session registry is unavailable".into()))?;
+        Ok(slots
+            .get(&(zone.to_string(), operation.to_string()))
+            .map(Arc::clone))
+    }
+
     fn slot(
         &self,
         zone: &ZoneId,
@@ -133,6 +153,44 @@ impl WasiSessions {
 }
 
 impl WasiConnector {
+    pub(super) async fn retire_session(
+        &self,
+        zone: &ZoneId,
+        operation: &OperationId,
+        expected_instance: &InstanceId,
+        fence: &InventoryDispatchFence,
+        deadline: Instant,
+    ) -> HostResult<SessionRetirement> {
+        self.operation_authority(zone, operation)?;
+        let require_current = || {
+            if Instant::now() >= deadline {
+                return Err(HostError::Unavailable(
+                    "WASI session retirement deadline expired before selection".into(),
+                ));
+            }
+            fence.require_current()
+        };
+        let Some(slot) = self.sessions.existing_slot(zone, operation)? else {
+            require_current()?;
+            return Ok(SessionRetirement::Absent);
+        };
+        let mut held = slot.guest.lock().await;
+        // Inventory and time may have changed while another call owned this
+        // guest. Check before taking it, not after retirement has happened.
+        require_current()?;
+        let Some(guest) = held.as_ref() else {
+            return Ok(SessionRetirement::Absent);
+        };
+        if &guest.instance_id != expected_instance {
+            return Ok(SessionRetirement::InstanceChanged);
+        }
+        let instance_id = guest.instance_id.clone();
+        // No awaited operation follows selection. Existing waiters keep this
+        // exact slot; only normal unowned-empty reclamation may remove it.
+        drop(held.take());
+        Ok(SessionRetirement::Retired(instance_id))
+    }
+
     pub(super) fn admitted_introspection(&self) -> HostResult<Introspection> {
         if self.manifest.source.is_none() || self.manifest.operation_authorities.is_empty() {
             return Err(unavailable(

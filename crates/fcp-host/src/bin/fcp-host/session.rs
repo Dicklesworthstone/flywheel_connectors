@@ -1,6 +1,6 @@
-//! Connector authority preparation for instance-bound capability tokens.
+//! Connector authority preparation and conditional WASI session retirement.
 //!
-//! This endpoint is a control-plane read/negotiation, NOT token issuance.
+//! These protected control-plane endpoints do not issue capability tokens.
 //! The ordinary invoke path continues to enforce signatures, policy, leases,
 //! approval, revocation and admission independently.
 
@@ -24,6 +24,25 @@ pub(super) struct PreparedSession {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) operation_id: Option<OperationId>,
     protocol_version: &'static str,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RetireSessionRequest {
+    zone_id: ZoneId,
+    operation_id: OperationId,
+    /// Retrying an old retirement must not destroy a newly prepared instance.
+    expected_instance_id: InstanceId,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct RetiredSession {
+    connector_id: ConnectorId,
+    zone_id: ZoneId,
+    operation_id: OperationId,
+    pub(super) retired: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) retired_instance_id: Option<InstanceId>,
 }
 
 type HttpFailure = (StatusCode, String);
@@ -56,6 +75,29 @@ async fn within_preparation_deadline<T>(
     // to the timer. Never return authority obtained after the total deadline.
     if started.elapsed() >= budget {
         return Err(preparation_timed_out());
+    }
+    result
+}
+
+async fn within_retirement_deadline<T>(
+    deadline: Instant,
+    retirement: impl std::future::Future<Output = Result<T, HttpFailure>>,
+) -> Result<T, HttpFailure> {
+    let expired = || {
+        failure(
+            StatusCode::GATEWAY_TIMEOUT,
+            "connector session retirement deadline expired; retry only the same expected_instance_id",
+        )
+    };
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(expired());
+    }
+    let result = fcp_async_core::time::timeout(remaining, retirement)
+        .await
+        .map_err(|_| expired())?;
+    if Instant::now() >= deadline {
+        return Err(expired());
     }
     result
 }
@@ -287,6 +329,57 @@ pub(super) async fn prepare_session_for_operation(
     let mut response_headers = HeaderMap::new();
     response_headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
     Ok((response_headers, Json(prepared)))
+}
+
+/// DELETE /rpc/admin/connectors/{connector_id}/session
+///
+/// Retires only the named WASI instance after its current owner releases the
+/// session lock. Waiting cancellation leaves that owner alone. The empty slot
+/// stays registered while existing owners/waiters reference it, so preparation
+/// and invoke cannot split into two locks for the same operation and zone.
+pub(super) async fn retire_handler(
+    State(state): State<Arc<AppState>>,
+    Path(connector_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<RetireSessionRequest>,
+) -> Result<(HeaderMap, Json<RetiredSession>), HttpFailure> {
+    let deadline = Instant::now() + PREPARATION_TIMEOUT;
+    validate_admin_authorization(state.as_ref(), &headers).map_err(map_host_error)?;
+    let connector_id = parse_connector_id(&connector_id)?;
+    within_retirement_deadline(deadline, async {
+        let (connector, fence) = {
+            let registry = state.registry.state.read().await;
+            let entry = registry.connectors.get(&connector_id)
+                .ok_or_else(|| failure(StatusCode::NOT_FOUND, "connector is not registered"))?;
+            require_zone(&entry.config.allowed_zones, &request.zone_id)?;
+            let ConnectorRuntime::Wasi(connector) = &entry.connector else {
+                return Err(failure(StatusCode::CONFLICT,
+                    "explicit session retirement is supported only for WASI connectors"));
+            };
+            let generation = state.registry.version.load(Ordering::SeqCst);
+            (Arc::clone(connector), state.registry.inventory_fence(generation))
+        };
+        let retired_instance_id = match connector.retire_session(
+            &request.zone_id, &request.operation_id, &request.expected_instance_id,
+            &fence, deadline,
+        ).await.map_err(map_host_error)? {
+            wasi_connector::SessionRetirement::Absent => None,
+            wasi_connector::SessionRetirement::Retired(instance) => Some(instance),
+            wasi_connector::SessionRetirement::InstanceChanged => return Err(failure(
+                StatusCode::CONFLICT,
+                "prepared WASI instance does not match expected_instance_id; no session was retired",
+            )),
+        };
+        let mut response_headers = HeaderMap::new();
+        response_headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        Ok((response_headers, Json(RetiredSession {
+            connector_id,
+            zone_id: request.zone_id,
+            operation_id: request.operation_id,
+            retired: retired_instance_id.is_some(),
+            retired_instance_id,
+        })))
+    }).await
 }
 
 #[cfg(test)]
