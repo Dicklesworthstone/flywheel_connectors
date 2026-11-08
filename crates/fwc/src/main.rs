@@ -197,7 +197,6 @@ mod host_integration_streaming;
 mod identifier;
 mod intent;
 mod invocation_cmd;
-mod native_events;
 #[allow(dead_code)]
 mod json_diff;
 #[allow(dead_code)] // Install, verify, update, pin, unpin, rollback with supply-chain evidence.
@@ -212,6 +211,7 @@ mod mcp_resources;
 mod mesh_cmd;
 #[allow(dead_code)] // Mesh context, targeting, placement, and rollout.
 mod mesh_targeting;
+mod native_events;
 mod net_cmd;
 #[allow(dead_code)] // Connector scaffolding command.
 mod new_cmd;
@@ -254,7 +254,6 @@ mod retry_controller;
 mod routing;
 mod rules_cmd;
 mod rules_host;
-mod webhook_events;
 #[allow(dead_code)]
 mod schema_nav;
 mod search;
@@ -290,6 +289,7 @@ mod truth;
 #[allow(dead_code)] // Idempotent undo for reversible operations.
 mod undo;
 mod validate;
+mod webhook_events;
 mod workflow;
 #[allow(dead_code)]
 mod zone_scope;
@@ -5841,7 +5841,20 @@ impl HostAdminClient {
     }
 
     fn preflight(&self, request: &HostPreflightRequest) -> Result<HostPreflightResponse> {
-        self.post_json("/rpc/preflight", request)
+        self.post_read_json("/rpc/preflight", request)
+    }
+
+    fn workflow_preflight(
+        &self,
+        request: &HostPreflightRequest,
+        budget: pipe::budget::ExecutionBudget,
+    ) -> Result<HostPreflightResponse> {
+        let timeout = budget.preflight_timeout(self.read_timeout, std::time::Instant::now())?;
+        let result = self.post_json_with_timeout("/rpc/preflight", request, timeout);
+        // Parsing and a ready response may consume the final fraction of the
+        // budget without the transport noticing. Never dispatch on late success.
+        budget.remaining_ms(std::time::Instant::now())?;
+        result
     }
 
     fn simulate(&self, request: &HostSimulateRequest) -> Result<HostSimulateResponse> {
@@ -8465,10 +8478,16 @@ fn schema_dispatch_host(args: &SchemaArgs, host: &str) -> Result<DispatchOutcome
                 catalog::DiscoveryDataSource::LiveHostIntrospection,
             );
             envelope.inject_into(&mut payload);
-            return resolve_live_read_outcome("schema", args.require_source, "operation-schema", DispatchOutcome {
-                payload,
-                exit_code: CliExitCode::Success,
-            }, evidence);
+            return resolve_live_read_outcome(
+                "schema",
+                args.require_source,
+                "operation-schema",
+                DispatchOutcome {
+                    payload,
+                    exit_code: CliExitCode::Success,
+                },
+                evidence,
+            );
         }
 
         let example_strs = if args.examples {
@@ -14331,11 +14350,9 @@ fn show_dispatch(args: &ShowArgs, host: Option<&str>) -> Result<DispatchOutcome>
 
     match resolution {
         Ok(resolved) => {
-            if let Some(outcome) = enforce_required_truth_source(
-                "show",
-                args.require_source,
-                resolved.knowledge_state,
-            ) {
+            if let Some(outcome) =
+                enforce_required_truth_source("show", args.require_source, resolved.knowledge_state)
+            {
                 return Ok(outcome);
             }
             Ok(DispatchOutcome {
@@ -27768,7 +27785,10 @@ fn replay_refusal(
     payload["error"] = json!({ "type": error_type, "message": message });
     payload["next_actions"] = json!([
         format!("fwc history {}", entry.entry_id),
-        format!("fwc replay {} --dry-run --file <original-input.json>", entry.entry_id),
+        format!(
+            "fwc replay {} --dry-run --file <original-input.json>",
+            entry.entry_id
+        ),
     ]);
     CommandEnvelope::new(CommandAvailability::Unavailable, "replay").inject_into(&mut payload);
     inject_truth_source_metadata(&mut payload, KnowledgeState::Offline);
@@ -27886,9 +27906,10 @@ fn replay_dispatch(args: &ReplayArgs, explicit_host: Option<&str>) -> Result<Dis
         } else {
             "Metadata-only preview: history contains hashes and summaries, not recoverable input. Supply the original payload before live replay."
         });
-        payload["next_actions"] = json!([
-            format!("fwc replay {} --file <original-input.json> --host <endpoint> --capability-token-file <token.cbor>", args.entry_id),
-        ]);
+        payload["next_actions"] = json!([format!(
+            "fwc replay {} --file <original-input.json> --host <endpoint> --capability-token-file <token.cbor>",
+            args.entry_id
+        ),]);
         CommandEnvelope::new(CommandAvailability::OfflineArtifact, "replay")
             .inject_into(&mut payload);
         inject_truth_source_metadata(&mut payload, KnowledgeState::Offline);
@@ -29893,6 +29914,41 @@ fn pipeline_execution_failure(
     DispatchOutcome { payload, exit_code }
 }
 
+fn pipeline_deadline_failure(
+    command: &str,
+    step: &pipe::PlannedPipelineStep,
+    phase: &str,
+    request: Option<&InvokeRequest>,
+    preflight: Option<Value>,
+) -> (Value, DispatchOutcome) {
+    let mut record = json!({
+        "id": &step.id,
+        "operation": &step.operation,
+        "status": "error",
+        "reason": "deadline-exceeded",
+        "phase": phase,
+        "timeout_ms": step.timeout_ms,
+        "invoke_attempted": false,
+        "automatic_retry_allowed": false,
+    });
+    if let Some(request) = request {
+        record["request_id"] = json!(request.id.to_string());
+        record["idempotency_key"] = json!(request.idempotency_key);
+    }
+    if let Some(preflight) = preflight {
+        record["preflight"] = preflight;
+    }
+    let failure = pipeline_execution_failure(
+        command,
+        &step.id,
+        phase,
+        "pipeline-deadline-exceeded",
+        "The workflow or step execution deadline expired before invocation. Earlier outcomes are retained; this step was not invoked and later steps were stopped.",
+        CliExitCode::Transport,
+    );
+    (record, failure)
+}
+
 fn finish_pipeline_dispatch(
     mut payload: Value,
     execution: &LivePipelineExecutionResult,
@@ -30137,7 +30193,10 @@ fn parse_workflow_step_bindings(
                 message: format!("{flag} has an empty value for step `{step_id}`."),
             });
         }
-        if bindings.insert(step_id.to_owned(), value.to_owned()).is_some() {
+        if bindings
+            .insert(step_id.to_owned(), value.to_owned())
+            .is_some()
+        {
             return Err(LiveAuthError::InvalidWorkflowAuth {
                 message: format!("{flag} was specified more than once for step `{step_id}`."),
             });
@@ -30188,11 +30247,12 @@ fn resolve_workflow_auth(
 
     let mut default_connectors = BTreeSet::new();
     for step in &plan.steps {
-        let resolved = operations.get(&step.operation).ok_or_else(|| {
-            LiveAuthError::InvalidWorkflowAuth {
-                message: format!("Step `{}` is missing resolved live metadata.", step.id),
-            }
-        })?;
+        let resolved =
+            operations
+                .get(&step.operation)
+                .ok_or_else(|| LiveAuthError::InvalidWorkflowAuth {
+                    message: format!("Step `{}` is missing resolved live metadata.", step.id),
+                })?;
         if !inline.contains_key(&step.id) && !files.contains_key(&step.id) {
             default_connectors.insert(resolved.connector.summary.id.as_str());
         }
@@ -30232,7 +30292,9 @@ fn resolve_workflow_auth(
                 }
             })?
         } else {
-            default_auth.clone().ok_or(LiveAuthError::MissingCapabilityToken)?
+            default_auth
+                .clone()
+                .ok_or(LiveAuthError::MissingCapabilityToken)?
         };
         auth_by_step.insert(step.id.clone(), auth);
     }
@@ -30307,6 +30369,8 @@ fn execute_live_pipeline_plan(
     let run_key = requested_run_key.map_or_else(|| RequestId::random().to_string(), str::to_owned);
     let mut failure = None;
     let mut stopped_after = None::<String>;
+    let run_budget =
+        pipe::budget::ExecutionBudget::start(plan.timeout_ms, std::time::Instant::now());
 
     for step_id in &plan.execution_order {
         let step = steps_by_id.get(step_id.as_str()).ok_or_else(|| {
@@ -30330,6 +30394,18 @@ fn execute_live_pipeline_plan(
                 "blocked_by": [failed_step],
                 "attempted": false,
             }));
+            continue;
+        }
+
+        let step_budget = run_budget.for_step(step.timeout_ms, std::time::Instant::now());
+        if step_budget.remaining_ms(std::time::Instant::now()).is_err() {
+            error_steps += 1;
+            step_statuses.insert(step.id.clone(), "error");
+            stopped_after = Some(step.id.clone());
+            let (record, outcome) =
+                pipeline_deadline_failure(command, step, "input-authoring", None, None);
+            step_results.push(record);
+            failure = Some(outcome);
             continue;
         }
 
@@ -30419,6 +30495,16 @@ fn execute_live_pipeline_plan(
                 continue;
             }
         };
+        if step_budget.remaining_ms(std::time::Instant::now()).is_err() {
+            error_steps += 1;
+            step_statuses.insert(step.id.clone(), "error");
+            stopped_after = Some(step.id.clone());
+            let (record, outcome) =
+                pipeline_deadline_failure(command, step, "input-authoring", None, None);
+            step_results.push(record);
+            failure = Some(outcome);
+            continue;
+        }
         if condition_evaluation == Some(false) {
             skipped_steps += 1;
             step_statuses.insert(step.id.clone(), "skipped");
@@ -30466,6 +30552,17 @@ fn execute_live_pipeline_plan(
         };
         let (valid, validation_errors) =
             validate_payload_against_schema(&rendered_input, &resolved.operation.input_schema);
+        if step_budget.remaining_ms(std::time::Instant::now()).is_err() {
+            error_steps += 1;
+            step_statuses.insert(step.id.clone(), "error");
+            stopped_after = Some(step.id.clone());
+            let (mut record, outcome) =
+                pipeline_deadline_failure(command, step, "input-authoring", None, None);
+            record["validation"] = json!({"valid": valid, "errors": validation_errors});
+            step_results.push(record);
+            failure = Some(outcome);
+            continue;
+        }
         if !valid {
             error_steps += 1;
             step_statuses.insert(step.id.clone(), "error");
@@ -30524,7 +30621,7 @@ fn execute_live_pipeline_plan(
                 None,
             )
         });
-        let invoke_request = match prepared_request {
+        let mut invoke_request = match prepared_request {
             Ok(request) => request,
             Err(_) => {
                 error_steps += 1;
@@ -30561,11 +30658,26 @@ fn execute_live_pipeline_plan(
             capability_token: Some(auth.capability_token.clone()),
             approval_tokens: auth.approval_tokens.clone(),
         };
-        let preflight = match client.preflight(&preflight_request) {
+        let preflight = match client.workflow_preflight(&preflight_request, step_budget) {
             Ok(response) => response,
-            Err(_) => {
+            Err(error) => {
                 error_steps += 1;
                 stopped_after = Some(step.id.clone());
+                if error
+                    .downcast_ref::<pipe::budget::DeadlineExpired>()
+                    .is_some()
+                {
+                    let (record, outcome) = pipeline_deadline_failure(
+                        command,
+                        step,
+                        "preflight",
+                        Some(&invoke_request),
+                        None,
+                    );
+                    step_results.push(record);
+                    failure = Some(outcome);
+                    continue;
+                }
                 step_results.push(json!({
                     "id": &step.id,
                     "operation": &step.operation,
@@ -30685,6 +30797,24 @@ fn execute_live_pipeline_plan(
             continue;
         }
 
+        invoke_request.deadline_ms =
+            match step_budget.invocation_timeout_ms(std::time::Instant::now()) {
+                Ok(remaining) => remaining,
+                Err(_) => {
+                    error_steps += 1;
+                    stopped_after = Some(step.id.clone());
+                    let (record, outcome) = pipeline_deadline_failure(
+                        command,
+                        step,
+                        "dispatch",
+                        Some(&invoke_request),
+                        Some(preflight_value),
+                    );
+                    step_results.push(record);
+                    failure = Some(outcome);
+                    continue;
+                }
+            };
         let started_at = std::time::Instant::now();
         let response = match client.invoke(&invoke_request) {
             Ok(response) => response,
@@ -30712,6 +30842,7 @@ fn execute_live_pipeline_plan(
                     "reason": "invoke-outcome-unknown",
                     "request_id": request_id.to_string(),
                     "idempotency_key": idempotency_key,
+                    "deadline_ms": invoke_request.deadline_ms,
                     "preflight": preflight_value,
                     "invoke_attempted": true,
                     "automatic_retry_allowed": false,
@@ -30721,6 +30852,8 @@ fn execute_live_pipeline_plan(
                 continue;
             }
         };
+        let execution_deadline_elapsed =
+            step_budget.remaining_ms(std::time::Instant::now()).is_err();
         let latency_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
         let response_value = serde_json::to_value(&response)?;
         let history_status = match response.status {
@@ -30771,6 +30904,7 @@ fn execute_live_pipeline_plan(
                     "input": rendered_input,
                     "request_id": request_id.to_string(),
                     "idempotency_key": idempotency_key,
+                    "deadline_ms": invoke_request.deadline_ms,
                     "preflight": preflight_value,
                     "response": response_value,
                 }));
@@ -30778,8 +30912,20 @@ fn execute_live_pipeline_plan(
             InvokeStatus::Error => {
                 error_steps += 1;
                 step_statuses.insert(step.id.clone(), "error");
-                if step.on_error == pipe::PipelineErrorPolicy::Abort {
+                if step.on_error == pipe::PipelineErrorPolicy::Abort || execution_deadline_elapsed {
                     stopped_after = Some(step.id.clone());
+                }
+                if execution_deadline_elapsed {
+                    let mut expired = pipeline_execution_failure(
+                        command,
+                        &step.id,
+                        "invoke",
+                        "pipeline-deadline-exceeded",
+                        "The execution deadline elapsed before a failed invocation result arrived. That result and earlier outcomes are retained; later steps were not attempted.",
+                        CliExitCode::Transport,
+                    );
+                    expired.payload["invoke_attempted"] = json!(true);
+                    failure = Some(expired);
                 }
                 step_results.push(json!({
                     "id": &step.id,
@@ -30792,6 +30938,7 @@ fn execute_live_pipeline_plan(
                     "status": "error",
                     "on_error": step.on_error,
                     "invoke_attempted": true,
+                    "execution_deadline_elapsed": execution_deadline_elapsed,
                     "mode": if mode == PipelinePlanMode::DryRun {
                         "dry-run-read"
                     } else {
@@ -30807,6 +30954,7 @@ fn execute_live_pipeline_plan(
                     "input": rendered_input,
                     "request_id": request_id.to_string(),
                     "idempotency_key": idempotency_key,
+                    "deadline_ms": invoke_request.deadline_ms,
                     "preflight": preflight_value,
                     "response": response_value,
                 }));
@@ -36773,10 +36921,14 @@ max_state_replication_staleness_secs = 120
                     )
                 });
                 let body = bind_mock_invoke_response(&key, body, &request_body);
-                let headers = response_headers.get(&key).map_or_else(String::new, |headers| {
-                    headers.iter().map(|(name, value)| format!("{name}: {value}\r\n"))
-                        .collect::<String>()
-                });
+                let headers = response_headers
+                    .get(&key)
+                    .map_or_else(String::new, |headers| {
+                        headers
+                            .iter()
+                            .map(|(name, value)| format!("{name}: {value}\r\n"))
+                            .collect::<String>()
+                    });
 
                 write!(
                     stream,
@@ -36912,6 +37064,17 @@ max_state_replication_staleness_secs = 120
     fn spawn_mock_host_sequence_with_body_log(
         routes: Vec<(String, Value)>,
     ) -> (String, thread::JoinHandle<()>, MockHostRequestLog) {
+        spawn_mock_host_sequence_with_timing(
+            routes
+                .into_iter()
+                .map(|(route, body)| (route, body, Duration::ZERO))
+                .collect(),
+        )
+    }
+
+    fn spawn_mock_host_sequence_with_timing(
+        routes: Vec<(String, Value, Duration)>,
+    ) -> (String, thread::JoinHandle<()>, MockHostRequestLog) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("mock host should bind");
         listener
             .set_nonblocking(true)
@@ -36923,10 +37086,11 @@ max_state_replication_staleness_secs = 120
         let expected_requests = routes.len();
         let responses = routes
             .into_iter()
-            .map(|(key, value)| {
+            .map(|(key, value, delay)| {
                 (
                     key,
                     serde_json::to_string(&value).expect("mock response should serialize"),
+                    delay,
                 )
             })
             .collect::<Vec<_>>();
@@ -36994,7 +37158,7 @@ max_state_replication_staleness_secs = 120
                 let method = parts.next().expect("request method should exist");
                 let path = parts.next().expect("request path should exist");
                 let key = format!("{method} {path}");
-                let Some((expected_key, body)) = responses.get(served) else {
+                let Some((expected_key, body, delay)) = responses.get(served) else {
                     panic!("missing expected mock response for request {}", served + 1);
                 };
                 assert_eq!(
@@ -37009,14 +37173,21 @@ max_state_replication_staleness_secs = 120
                     .expect("mock host request log lock")
                     .push((key, body_text));
 
-                write!(
+                if !delay.is_zero() {
+                    thread::sleep(*delay);
+                }
+                let written = write!(
                     stream,
                     "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
                     body.len(),
                     body
-                )
-                .expect("mock host should write response");
-                stream.flush().expect("mock host should flush response");
+                );
+                // An intentionally late reply may encounter a client that
+                // already enforced its deadline and closed the connection.
+                if delay.is_zero() {
+                    written.expect("mock host should write response");
+                    stream.flush().expect("mock host should flush response");
+                }
                 served += 1;
             }
 
@@ -40372,7 +40543,13 @@ deny_ptrace = true
                 assert_eq!(route["failed_attempts"].as_array().unwrap().len(), 1);
             }
             assert_eq!(payload["decision_trace"]["selected_source"], "mesh-backed");
-            assert_eq!(payload["decision_trace"]["attempts"].as_array().unwrap().len(), 1);
+            assert_eq!(
+                payload["decision_trace"]["attempts"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1
+            );
             assert_eq!(payload["read_provenance"]["replication_proven"], false);
             let schema: Value = serde_json::from_str(if suffix[0] == "show" {
                 include_str!("../schemas/show.schema.json")
@@ -40893,7 +41070,10 @@ deny_ptrace = true
             serde_json::from_str(&resolved.text).expect("json output should parse cleanly");
 
         assert_eq!(resolved.exit_code, CliExitCode::Transport.into());
-        assert_eq!(resolved_payload["resolution"]["stop_reason"], "primitive-error");
+        assert_eq!(
+            resolved_payload["resolution"]["stop_reason"],
+            "primitive-error"
+        );
         assert_eq!(resolved_payload["error"]["type"], "missing-host-endpoint");
         assert_eq!(
             resolved_payload["task"]["resolution"]["draft_bindings"]["payload_json"],
@@ -40986,7 +41166,10 @@ deny_ptrace = true
         assert_eq!(resolved.exit_code, CliExitCode::Transport.into());
         assert_eq!(resolved_payload["status"], "error");
         assert_eq!(resolved_payload["task"]["capsule_status"], "needs-answer");
-        assert_eq!(resolved_payload["resolution"]["stop_reason"], "primitive-error");
+        assert_eq!(
+            resolved_payload["resolution"]["stop_reason"],
+            "primitive-error"
+        );
         assert_eq!(
             resolved_payload["task"]["resolution"]["draft_bindings"]["payload_json"],
             "{\"content\":\"Summary\"}"
@@ -50015,6 +50198,275 @@ input = {{ query = "independent" }}
         }
     }
 
+    fn workflow_budget_fixture(directory: &Path, run_ms: u64, second_ms: u64) -> PathBuf {
+        let path = directory.join("execution-budgets.toml");
+        fs::write(
+            &path,
+            format!(
+                r#"
+[pipeline]
+name = "execution-budgets"
+timeout_ms = {run_ms}
+
+[[steps]]
+id = "first"
+operation = "github.search_issues"
+timeout_ms = 5000
+input = {{ query = "first" }}
+
+[[steps]]
+id = "second"
+operation = "github.search_issues"
+depends_on = ["first"]
+timeout_ms = {second_ms}
+on_error = "skip"
+input = {{ query = "second" }}
+
+[[steps]]
+id = "independent"
+operation = "github.search_issues"
+depends_on = ["first"]
+input = {{ query = "independent" }}
+"#
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn execute_pipeline_deadline_spends_preflight_time_and_preserves_partial_results() {
+        for mode in ["run", "dry-run"] {
+            let tempdir = TempDir::new().unwrap();
+            let _history = super::install_test_history_path(tempdir.path().join("history.jsonl"));
+            let path = workflow_budget_fixture(tempdir.path(), 20_000, 100);
+            let token = test_capability_token_arg();
+            let routes = pipe_mock_catalog(false)
+                .into_iter()
+                .take(2)
+                .map(|(path, body)| (path, body, Duration::ZERO))
+                .chain([
+                    (
+                        "POST /rpc/preflight".to_owned(),
+                        mock_preflight_response_json(true),
+                        Duration::from_millis(150),
+                    ),
+                    (
+                        "POST /rpc/invoke".to_owned(),
+                        mock_invoke_response_json(json!({"retained": true})),
+                        Duration::ZERO,
+                    ),
+                    (
+                        "POST /rpc/preflight".to_owned(),
+                        mock_preflight_response_json(true),
+                        Duration::from_millis(400),
+                    ),
+                ])
+                .collect();
+            let (host, server, log) = spawn_mock_host_sequence_with_timing(routes);
+            let (exit, payload) = execute_json(&[
+                "fwc",
+                "--json",
+                "--host",
+                &host,
+                "pipeline",
+                mode,
+                &path.display().to_string(),
+                "--capability-token",
+                &token,
+            ]);
+            server.join().unwrap();
+            assert_eq!(exit, CliExitCode::Transport.into(), "{mode}: {payload}");
+            assert_eq!(payload["error"]["type"], "pipeline-deadline-exceeded");
+            assert_eq!(payload["failed_step"], "second");
+            assert_eq!(payload["phase"], "preflight");
+            assert_eq!(payload["automatic_retry_allowed"], false);
+            assert_eq!(payload["execution"]["outputs"]["first"]["retained"], true);
+            assert_eq!(payload["execution"]["steps"][1]["invoke_attempted"], false);
+            assert_eq!(payload["execution"]["steps"][2]["status"], "blocked");
+            assert_eq!(payload["execution"]["steps"][2]["attempted"], false);
+            let log = log.lock().unwrap();
+            let invokes = log
+                .iter()
+                .filter(|(path, _)| path == "POST /rpc/invoke")
+                .collect::<Vec<_>>();
+            assert_eq!(invokes.len(), 1);
+            let request: Value = serde_json::from_str(&invokes[0].1).unwrap();
+            let remaining = request["deadline_ms"].as_u64().unwrap();
+            assert!((1..=4850).contains(&remaining), "{request}");
+            assert_eq!(payload["execution"]["steps"][0]["deadline_ms"], remaining);
+            assert!(!payload.to_string().contains(&token));
+        }
+    }
+
+    #[test]
+    fn execute_pipeline_deadline_does_not_reset_after_finalization_response() {
+        let tempdir = TempDir::new().unwrap();
+        let _history = super::install_test_history_path(tempdir.path().join("history.jsonl"));
+        let path = workflow_budget_fixture(tempdir.path(), 1_000, 5_000);
+        let token = test_capability_token_arg();
+        let routes = pipe_mock_catalog(false)
+            .into_iter()
+            .take(2)
+            .map(|(path, body)| (path, body, Duration::ZERO))
+            .chain([
+                (
+                    "POST /rpc/preflight".to_owned(),
+                    mock_preflight_response_json(true),
+                    Duration::ZERO,
+                ),
+                (
+                    "POST /rpc/invoke".to_owned(),
+                    mock_invoke_response_json(json!({"committed": true})),
+                    Duration::from_millis(1_200),
+                ),
+            ])
+            .collect();
+        let (host, server, log) = spawn_mock_host_sequence_with_timing(routes);
+        let (exit, payload) = execute_json(&[
+            "fwc",
+            "--json",
+            "--host",
+            &host,
+            "pipeline",
+            "run",
+            &path.display().to_string(),
+            "--capability-token",
+            &token,
+        ]);
+        server.join().unwrap();
+        assert_eq!(exit, CliExitCode::Transport.into(), "{payload}");
+        assert_eq!(payload["error"]["type"], "pipeline-deadline-exceeded");
+        assert_eq!(payload["failed_step"], "second");
+        assert_eq!(payload["phase"], "input-authoring");
+        assert_eq!(payload["execution"]["outputs"]["first"]["committed"], true);
+        assert_eq!(payload["execution"]["executed_steps"], 1);
+        assert_eq!(payload["execution"]["steps"][1]["invoke_attempted"], false);
+        assert_eq!(payload["execution"]["steps"][2]["attempted"], false);
+        let log = log.lock().unwrap();
+        assert_eq!(
+            log.len(),
+            4,
+            "no second preflight or invocation may be sent"
+        );
+        let request: Value = serde_json::from_str(&log[3].1).unwrap();
+        assert!((1..=1_000).contains(&request["deadline_ms"].as_u64().unwrap()));
+    }
+
+    #[test]
+    fn execute_pipeline_deadline_stops_after_late_definite_error_despite_skip() {
+        let tempdir = TempDir::new().unwrap();
+        let _history = super::install_test_history_path(tempdir.path().join("history.jsonl"));
+        let path = workflow_budget_fixture(tempdir.path(), 20_000, 300);
+        let token = test_capability_token_arg();
+        let failed = serde_json::to_value(InvokeResponse::error(
+            RequestId::random(),
+            fcp_core::FcpError::Internal {
+                message: "definite provider failure".to_owned(),
+            },
+        ))
+        .unwrap();
+        let routes = pipe_mock_catalog(false)
+            .into_iter()
+            .take(2)
+            .map(|(path, body)| (path, body, Duration::ZERO))
+            .chain([
+                (
+                    "POST /rpc/preflight".to_owned(),
+                    mock_preflight_response_json(true),
+                    Duration::ZERO,
+                ),
+                (
+                    "POST /rpc/invoke".to_owned(),
+                    mock_invoke_response_json(json!({"retained": true})),
+                    Duration::ZERO,
+                ),
+                (
+                    "POST /rpc/preflight".to_owned(),
+                    mock_preflight_response_json(true),
+                    Duration::ZERO,
+                ),
+                (
+                    "POST /rpc/invoke".to_owned(),
+                    failed,
+                    Duration::from_millis(500),
+                ),
+            ])
+            .collect();
+        let (host, server, log) = spawn_mock_host_sequence_with_timing(routes);
+        let (exit, payload) = execute_json(&[
+            "fwc",
+            "--json",
+            "--host",
+            &host,
+            "pipeline",
+            "run",
+            &path.display().to_string(),
+            "--capability-token",
+            &token,
+        ]);
+        server.join().unwrap();
+        assert_eq!(exit, CliExitCode::Transport.into(), "{payload}");
+        assert_eq!(payload["failed_step"], "second");
+        assert_eq!(payload["phase"], "invoke");
+        assert_eq!(payload["error"]["type"], "pipeline-deadline-exceeded");
+        assert_eq!(payload["invoke_attempted"], true);
+        assert_eq!(payload["automatic_retry_allowed"], false);
+        assert_eq!(payload["execution"]["outputs"]["first"]["retained"], true);
+        let failed = &payload["execution"]["steps"][1];
+        assert_eq!(failed["status"], "error");
+        assert_eq!(failed["invoke_attempted"], true);
+        assert_eq!(failed["execution_deadline_elapsed"], true);
+        assert!(
+            failed["response"]
+                .to_string()
+                .contains("definite provider failure")
+        );
+        assert_eq!(payload["execution"]["steps"][2]["status"], "blocked");
+        assert_eq!(log.lock().unwrap().len(), 6);
+    }
+
+    #[test]
+    fn workflow_and_unconfigured_preflight_deadlines_cover_stalled_bodies() {
+        for configured in [false, true] {
+            for hold_body in [false, true] {
+                let held = hold_host_response_json(hold_body, mock_preflight_response_json(true));
+                let request = HostPreflightRequest {
+                    request_id: RequestId::random(),
+                    connector_id: "fcp.github:enterprise:v1".parse().unwrap(),
+                    operation: "github.search_issues".to_owned(),
+                    params: Some(json!({"query": "secret-preflight-input"})),
+                    principal: None,
+                    zone_id: Some(ZoneId::work()),
+                    capability_token: None,
+                    holder_proof: None,
+                    lease_seq: None,
+                    approval_tokens: Vec::new(),
+                };
+                let result = if configured {
+                    let budget =
+                        super::pipe::budget::ExecutionBudget::start(Some(75), Instant::now());
+                    held.client.workflow_preflight(&request, budget)
+                } else {
+                    held.client.preflight(&request)
+                };
+                let _ = held.release.send(());
+                held.server.join().unwrap();
+                let error = result.expect_err("preflight must have a bounded read");
+                if configured {
+                    assert!(
+                        error
+                            .downcast_ref::<super::pipe::budget::DeadlineExpired>()
+                            .is_some()
+                    );
+                } else {
+                    assert!(error.downcast_ref::<super::HostReadTimeout>().is_some());
+                }
+                assert!(!error.to_string().contains("secret-preflight-input"));
+            }
+        }
+    }
+
     #[test]
     fn execute_pipeline_skip_never_continues_after_uncertain_host_results() {
         for failed_phase in ["preflight", "invoke"] {
@@ -50082,6 +50534,26 @@ input = {{ query = "independent" }}
             assert_eq!(request_log.lock().unwrap().len(), expected_requests);
             assert!(!payload.to_string().contains("private-reflected-diagnostic"));
             assert!(!payload.to_string().contains(&token));
+        }
+    }
+
+    #[test]
+    fn execute_pipeline_deadline_rejects_invalid_limits_before_host_discovery() {
+        for (run_ms, step_ms) in [(0, 1), (1, 0), (86_400_001, 1), (1, 60_001)] {
+            let tempdir = TempDir::new().unwrap();
+            let path = workflow_budget_fixture(tempdir.path(), run_ms, step_ms);
+            let (exit, payload) = execute_json(&[
+                "fwc",
+                "--json",
+                "--host",
+                "http://127.0.0.1:1",
+                "pipeline",
+                "run",
+                &path.display().to_string(),
+            ]);
+            assert_eq!(exit, CliExitCode::Validation.into(), "{payload}");
+            assert!(payload.to_string().contains("timeout_ms"));
+            assert!(payload["execution"].is_null());
         }
     }
 
@@ -50429,7 +50901,12 @@ input = {{ query = "independent" }}
             assert_eq!(requests.len(), 10);
             let mut request_ids = std::collections::BTreeSet::new();
             let selected = [
-                (&fetch, "fcp.github:enterprise:v1", "github.search_issues", 41),
+                (
+                    &fetch,
+                    "fcp.github:enterprise:v1",
+                    "github.search_issues",
+                    41,
+                ),
                 (
                     if use_default { &fetch } else { &again },
                     "fcp.github:enterprise:v1",
@@ -50530,10 +51007,7 @@ input = {{ query = "independent" }}
             (
                 "default-holder-must-not-be-inherited",
                 true,
-                vec![
-                    "--step-capability-token".to_owned(),
-                    token_binding.clone(),
-                ],
+                vec!["--step-capability-token".to_owned(), token_binding.clone()],
             ),
             (
                 "invalid-later-token",
@@ -50577,8 +51051,14 @@ input = {{ query = "independent" }}
             args.extend(overrides);
             let (exit_code, payload) =
                 execute_json(&args.iter().map(String::as_str).collect::<Vec<_>>());
-            server.join().expect("workflow validation mock host should finish");
-            assert_eq!(exit_code, CliExitCode::Validation.into(), "{case}: {payload}");
+            server
+                .join()
+                .expect("workflow validation mock host should finish");
+            assert_eq!(
+                exit_code,
+                CliExitCode::Validation.into(),
+                "{case}: {payload}"
+            );
             assert_eq!(
                 payload["error"]["type"],
                 if supply_default {
@@ -59989,7 +60469,10 @@ require_attestation_types = ["in-toto"]"#,
             assert_eq!(payload["request"]["zone"], "z:work");
             assert_eq!(payload["request"]["lease_seq"], 7);
             assert_eq!(payload["request"]["deadline_ms"], 1234);
-            assert_ne!(payload["request"]["idempotency_key"], "original-operation-key");
+            assert_ne!(
+                payload["request"]["idempotency_key"],
+                "original-operation-key"
+            );
             keys.push(payload["request"]["idempotency_key"].clone());
         }
         server.join().expect("replay mock host");
@@ -60118,7 +60601,10 @@ require_attestation_types = ["in-toto"]"#,
     fn replay_live_rejects_credential_bearing_hosts_without_echoing_them() {
         let (_root, entry_id, _guard) = seed_live_replay_entry(super::history::OpStatus::Success);
         for (host, secret) in [
-            ("http://replay-user-secret@127.0.0.1:1", "replay-user-secret"),
+            (
+                "http://replay-user-secret@127.0.0.1:1",
+                "replay-user-secret",
+            ),
             (
                 "http://user:replay-password-secret@127.0.0.1:1",
                 "replay-password-secret",
@@ -60212,7 +60698,10 @@ require_attestation_types = ["in-toto"]"#,
         assert_eq!(payload["error"]["type"], "invoke-outcome-unknown");
         assert_eq!(payload["outcome"], "outcome_unknown");
         assert_eq!(payload["request_id"], request_id.to_string());
-        assert_eq!(payload["inspection"]["operation_id"], request_id.to_string());
+        assert_eq!(
+            payload["inspection"]["operation_id"],
+            request_id.to_string()
+        );
         assert_eq!(payload["inspection"]["host_endpoint"], host);
         assert_eq!(payload["replay_source"], entry_id);
         assert_eq!(payload["replay"]["host"], host);
@@ -60282,7 +60771,6 @@ require_attestation_types = ["in-toto"]"#,
         assert_eq!(exit_code, CliExitCode::Validation.into());
         assert_eq!(payload["error"]["type"], "invalid-override");
     }
-
 
     #[test]
     fn replay_dry_run_shows_original_entry_info() {

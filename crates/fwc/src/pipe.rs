@@ -14,6 +14,9 @@ use serde_json::{Map, Value};
 
 use crate::readiness::RateLimitSummary;
 
+#[path = "workflow_budget.rs"]
+pub mod budget;
+
 // ── Map expression types ────────────────────────────────────────────────
 
 /// A single field mapping rule.
@@ -339,6 +342,9 @@ pub struct PipelineMetadata {
     pub description: Option<String>,
     #[serde(default)]
     pub version: Option<String>,
+    /// Total execution budget after discovery and credential resolution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -346,6 +352,9 @@ pub struct PipelineMetadata {
 pub struct PipelineStep {
     pub id: String,
     pub operation: String,
+    /// Budget shared by input preparation, preflight and invocation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
     /// Expected singleton-writer fencing sequence for this operation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lease_seq: Option<u64>,
@@ -416,6 +425,8 @@ pub struct PipelineParamBinding {
 pub struct PlannedPipelineStep {
     pub id: String,
     pub operation: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
     /// Explicit lease evidence preserved from the step definition.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lease_seq: Option<u64>,
@@ -433,6 +444,8 @@ pub struct PlannedPipelineStep {
 #[derive(Debug, Clone, Serialize)]
 pub struct PipelinePlan {
     pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1296,12 +1309,33 @@ pub fn validate_pipeline_definition(definition: &PipelineDefinition) -> Pipeline
         errors.push("pipeline.name must not be empty".to_owned());
     }
 
+    if definition
+        .pipeline
+        .timeout_ms
+        .is_some_and(|value| !(1..=budget::MAX_WORKFLOW_TIMEOUT_MS).contains(&value))
+    {
+        errors.push(format!(
+            "pipeline.timeout_ms must be between 1 and {} milliseconds",
+            budget::MAX_WORKFLOW_TIMEOUT_MS
+        ));
+    }
+
     if definition.steps.is_empty() {
         errors.push("pipeline must declare at least one [[steps]] entry".to_owned());
     }
 
     let mut seen_step_ids = BTreeSet::new();
     for step in &definition.steps {
+        if step
+            .timeout_ms
+            .is_some_and(|value| !(1..=budget::MAX_STEP_TIMEOUT_MS).contains(&value))
+        {
+            errors.push(format!(
+                "step `{}` timeout_ms must be between 1 and {} milliseconds",
+                step.id,
+                budget::MAX_STEP_TIMEOUT_MS
+            ));
+        }
         if step.id.trim().is_empty() {
             errors.push("every pipeline step needs a non-empty id".to_owned());
         }
@@ -1459,7 +1493,11 @@ pub fn build_pipeline_plan(
     definition: &PipelineDefinition,
     params: &BTreeMap<String, PipelineParamBinding>,
 ) -> Result<PipelinePlan, String> {
-    let execution_order = compute_execution_order(definition)?;
+    let validation = validate_pipeline_definition(definition);
+    if !validation.valid {
+        return Err(validation.errors.join("; "));
+    }
+    let execution_order = validation.execution_order;
     let steps_by_id = definition
         .steps
         .iter()
@@ -1488,6 +1526,7 @@ pub fn build_pipeline_plan(
         steps.push(PlannedPipelineStep {
             id: step.id.clone(),
             operation: step.operation.clone(),
+            timeout_ms: step.timeout_ms,
             lease_seq: step.lease_seq,
             depends_on: step.depends_on.clone(),
             on_error: step.on_error,
@@ -1500,6 +1539,7 @@ pub fn build_pipeline_plan(
 
     Ok(PipelinePlan {
         name: definition.pipeline.name.clone(),
+        timeout_ms: definition.pipeline.timeout_ms,
         description: definition.pipeline.description.clone(),
         version: definition.pipeline.version.clone(),
         step_count: definition.steps.len(),
@@ -2816,6 +2856,76 @@ on_error = "skip"
                 serialized["steps"][index]["on_error"],
                 serde_json::to_value(expected).unwrap()
             );
+        }
+    }
+
+    #[test]
+    fn pipeline_plan_preserves_run_and_step_execution_budgets() {
+        let definition = parse_pipeline_definition(
+            r#"
+[pipeline]
+name = "bounded"
+timeout_ms = 90000
+
+[[steps]]
+id = "first"
+operation = "github.search_issues"
+timeout_ms = 1500
+
+[[steps]]
+id = "second"
+operation = "github.search_issues"
+depends_on = ["first"]
+"#,
+        )
+        .unwrap();
+        let plan = build_pipeline_plan(&definition, &BTreeMap::new()).unwrap();
+        assert_eq!(plan.timeout_ms, Some(90_000));
+        assert_eq!(plan.steps[0].timeout_ms, Some(1_500));
+        assert_eq!(plan.steps[1].timeout_ms, None);
+        let json = serde_json::to_value(&plan).unwrap();
+        assert_eq!(json["timeout_ms"], 90_000);
+        assert_eq!(json["steps"][0]["timeout_ms"], 1_500);
+        assert!(json["steps"][1].get("timeout_ms").is_none());
+    }
+
+    #[test]
+    fn pipeline_execution_budget_limits_are_validated_before_planning() {
+        for (run, step, valid) in [
+            (1, 1, true),
+            (86_400_000, 60_000, true),
+            (0, 1, false),
+            (1, 0, false),
+            (86_400_001, 1, false),
+            (1, 60_001, false),
+        ] {
+            let definition = parse_pipeline_definition(&format!(
+                "[pipeline]\nname = \"bounded\"\ntimeout_ms = {run}\n[[steps]]\nid = \"first\"\noperation = \"github.search_issues\"\ntimeout_ms = {step}\n"
+            ))
+            .unwrap();
+            let validation = validate_pipeline_definition(&definition);
+            assert_eq!(validation.valid, valid, "{run}/{step}: {validation:?}");
+            assert_eq!(
+                build_pipeline_plan(&definition, &BTreeMap::new()).is_ok(),
+                valid
+            );
+        }
+        for invalid in ["-1", "1.5", "true", "\"100\""] {
+            for field in ["pipeline", "step"] {
+                let content = if field == "pipeline" {
+                    format!(
+                        "[pipeline]\nname = \"invalid\"\ntimeout_ms = {invalid}\n[[steps]]\nid = \"one\"\noperation = \"github.search_issues\"\n"
+                    )
+                } else {
+                    format!(
+                        "[pipeline]\nname = \"invalid\"\n[[steps]]\nid = \"one\"\noperation = \"github.search_issues\"\ntimeout_ms = {invalid}\n"
+                    )
+                };
+                assert!(
+                    parse_pipeline_definition(&content).is_err(),
+                    "{field}/{invalid}"
+                );
+            }
         }
     }
 

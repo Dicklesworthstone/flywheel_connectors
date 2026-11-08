@@ -3345,10 +3345,12 @@ The on-disk schema lives in `crates/fwc/src/pipeline*.rs`. The example below use
 name = "notify-on-new-issues"
 description = "Watch a GitHub repo and post new issues to Slack"
 version = "0.1.0"
+timeout_ms = 90000
 
 [[steps]]
 id = "list_existing"
 operation = "github.search_issues"
+timeout_ms = 15000
 input = { owner = "{{params.owner}}", repo = "{{params.repo}}", state = "open" }
 
 [[steps]]
@@ -3378,12 +3380,28 @@ required = true
 
 Notes on the actual schema:
 
-- `[pipeline]` carries `name`, `description`, `version`.
+- `[pipeline]` carries `name`, `description`, `version`, and an optional `timeout_ms` execution budget from 1 to 86,400,000 milliseconds. This budget begins after discovery and credential resolution and is shared across every step.
 - Each `[[steps]]` table carries an `id`, a dotted `operation` (`<connector>.<operation>`), an `input` table, and an optional `depends_on` array naming sibling step IDs. Per-step `on_error = "abort"` is the default; `on_error = "skip"` permits later independent steps after a definite input, policy, or connector failure while preserving the unsuccessful overall result. Dependents remain blocked, and uncertain execution always stops. Unsupported retry/fallback/trigger controls and unknown step fields are rejected before host discovery.
+- A step can set `timeout_ms` from 1 to 60,000 milliseconds. Its input preparation, host preflight, and invocation share the earlier of this step deadline and the remaining workflow deadline. Successful preflight never renews the budget. Every preflight also has the configured `FWC_HOST_READ_TIMEOUT_MS` read bound, including workflows with no explicit execution budget. Unspecified budgets retain the host's normal invocation ceiling.
 - Parameters are declared as `[params.<name>]` tables with `type` and `required` fields.
 - Template substitution uses double-brace `{{...}}` syntax. Step outputs are referenced as `{{steps.<id>.output.<json_path>}}`; parameters are referenced as `{{params.<name>}}`.
 
 Pipelines are validated with `fwc pipeline validate <file>`, dry-run with `fwc pipeline dry-run`, and executed with `fwc pipeline run`.
+
+An execution deadline exhausted before dispatch stops further execution even
+with `on_error = "skip"`. A failed invocation result received after its deadline
+also stops the workflow while retaining the actual response.
+Output retains earlier results, records whether the expired step was invoked,
+and identifies later steps as blocked. The invoke request carries only the
+remaining execution milliseconds, capped at the host's 60-second limit. Its
+HTTP response can use the normal additional 10-second transport allowance for
+host finalization and response delivery. A terminal success delivered during
+that allowance is retained, but it never permits another step to start after
+the workflow deadline. A lost or timed-out invoke response
+still has an unknown outcome and requires inspection before retrying. These
+budgets apply to live pipeline and recipe execution, including reads performed
+by dry-run. They do not turn a timeout into proof that an external effect was
+undone.
 
 ### Recipes
 
