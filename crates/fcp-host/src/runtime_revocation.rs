@@ -12,7 +12,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use fcp_crypto::{
     Ed25519SigningKey, Ed25519VerifyingKey, KeyId, PqSigningPolicy, SignedEnvelope,
@@ -179,6 +179,35 @@ pub struct RuntimeRevocationService {
     feeds: Vec<Mutex<Feed>>,
 }
 
+/// Freshness bound from one just-authenticated revocation observation.
+///
+/// This is only a permit for the immediately following dispatch. A later RPC
+/// must refresh the source again. Both clocks constrain its lifetime so waiting
+/// for runtime ownership cannot extend authority after clock adjustments.
+#[derive(Debug)]
+pub struct RuntimeRevocationPermit {
+    deadline: Instant,
+    expires_at_ms: u64,
+}
+
+impl RuntimeRevocationPermit {
+    /// Check freshness without file access or signature verification.
+    #[must_use]
+    pub fn is_current(&self) -> bool {
+        Instant::now() < self.deadline && now_ms().is_ok_and(|now| now < self.expires_at_ms)
+    }
+
+    /// # Errors
+    /// Refuses an observation that expired while awaiting runtime ownership.
+    pub fn require_current(&self) -> HostResult<()> {
+        if self.is_current() {
+            Ok(())
+        } else {
+            Err(invalid("dispatch observation expired"))
+        }
+    }
+}
+
 type TokenIndex = HashMap<ObjectId, u64>;
 type KeyIndex = HashMap<(KeyId, CascadeHop), u64>;
 
@@ -239,12 +268,27 @@ impl RuntimeRevocationService {
     /// Denies unconfigured zones, unavailable sources, stale or equivocal state,
     /// incomplete chains, and every directly or transitively revoked authority.
     pub fn verify(&self, zone: &ZoneId, token_id: ObjectId, issuer: KeyId) -> HostResult<()> {
+        self.verify_for_dispatch(zone, token_id, issuer).map(|_| ())
+    }
+
+    /// Refresh authority and retain its authenticated deadline across a short
+    /// runtime-selection wait. This does not reserve a token use or replay nonce.
+    ///
+    /// # Errors
+    /// Returns the same authority failures as [`Self::verify`].
+    pub fn verify_for_dispatch(
+        &self,
+        zone: &ZoneId,
+        token_id: ObjectId,
+        issuer: KeyId,
+    ) -> HostResult<RuntimeRevocationPermit> {
         for feed in &self.feeds {
             let mut feed = feed.lock().map_err(|_| invalid("feed state is poisoned"))?;
             if &feed.config.zone_id == zone {
                 let snapshot = feed.refresh()?;
                 let (tokens, keys) = indexes(&snapshot.tokens, &snapshot.keys)?;
                 let chain = snapshot.chain(feed.owner.key_id());
+                let observed_at = Instant::now();
                 let clock = feed.require_fresh(&snapshot)?;
                 check_revocation_chain(
                     token_id,
@@ -271,7 +315,15 @@ impl RuntimeRevocationService {
                     },
                 )
                 .map_err(|error| invalid(&error.to_string()))?;
-                return Ok(());
+                let deadline = observed_at
+                    .checked_add(Duration::from_millis(snapshot.expires_at_ms - clock))
+                    .ok_or_else(|| invalid("dispatch deadline is invalid"))?;
+                let permit = RuntimeRevocationPermit {
+                    deadline,
+                    expires_at_ms: snapshot.expires_at_ms,
+                };
+                permit.require_current()?;
+                return Ok(permit);
             }
         }
         Err(invalid("request zone has no configured owner feed"))

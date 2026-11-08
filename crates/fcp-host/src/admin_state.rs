@@ -8,7 +8,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use blake3::hash;
 use chrono::{DateTime, Utc};
@@ -3346,6 +3347,40 @@ struct LegacyHostLifecycleSnapshot {
     pinned_versions: HashMap<ConnectorId, Version>,
 }
 
+/// Process-local fence for capability revocations after verified admission.
+///
+/// Capture before verifying persisted token authority, then require it again
+/// after verification and immediately before execution. It carries no token or
+/// payload, and does not change when unrelated admin records are written.
+#[derive(Clone, Debug)]
+pub struct CapabilityRevocationFence {
+    generation: Arc<AtomicU64>,
+    admitted_generation: u64,
+}
+
+impl CapabilityRevocationFence {
+    /// Whether no token revocation began after this fence was captured.
+    #[must_use]
+    pub fn is_current(&self) -> bool {
+        self.admitted_generation != u64::MAX
+            && self.generation.load(Ordering::Acquire) == self.admitted_generation
+    }
+
+    /// Refuse stale or uncertain revocation authority without exposing a token.
+    ///
+    /// # Errors
+    /// Returns a preflight failure if the admitted generation is no longer current.
+    pub fn require_current(&self) -> HostResult<()> {
+        if self.is_current() {
+            Ok(())
+        } else {
+            Err(HostError::PreflightFailed(
+                "capability revocation authority changed after admission".to_string(),
+            ))
+        }
+    }
+}
+
 /// Durable host-side admin-state store.
 pub struct HostAdminStateStore {
     state: RwLock<HostAdminStateSnapshot>,
@@ -3353,6 +3388,7 @@ pub struct HostAdminStateStore {
     // A failed write may already have replaced the on-disk snapshot. Continuing
     // from the older RAM image could reuse an admitted generation or erase it.
     persistence_failed: AtomicBool,
+    capability_revocation_generation: Arc<AtomicU64>,
 }
 
 impl Default for HostAdminStateStore {
@@ -3369,6 +3405,7 @@ impl HostAdminStateStore {
             state: RwLock::new(HostAdminStateSnapshot::default()),
             state_path: None,
             persistence_failed: AtomicBool::new(false),
+            capability_revocation_generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -3430,10 +3467,34 @@ impl HostAdminStateStore {
             state: RwLock::new(state),
             state_path,
             persistence_failed: AtomicBool::new(false),
+            capability_revocation_generation: Arc::new(AtomicU64::new(0)),
         })
     }
 
+    /// Capture before persisted capability verification, not after it.
+    #[must_use]
+    pub fn capability_revocation_fence(&self) -> CapabilityRevocationFence {
+        CapabilityRevocationFence {
+            generation: Arc::clone(&self.capability_revocation_generation),
+            admitted_generation: self
+                .capability_revocation_generation
+                .load(Ordering::Acquire),
+        }
+    }
+
     async fn apply_mutation<T, F>(&self, mutate: F) -> Result<T, LifecycleError>
+    where
+        F: FnOnce(&mut HostAdminStateSnapshot) -> Result<T, LifecycleError>,
+    {
+        self.apply_mutation_with_revocation_fence(mutate, false)
+            .await
+    }
+
+    async fn apply_mutation_with_revocation_fence<T, F>(
+        &self,
+        mutate: F,
+        revokes_authority: bool,
+    ) -> Result<T, LifecycleError>
     where
         F: FnOnce(&mut HostAdminStateSnapshot) -> Result<T, LifecycleError>,
     {
@@ -3443,6 +3504,10 @@ impl HostAdminStateStore {
         // futures that call this must stay `Send`.
         let mut state = self.state.write().await;
         if self.persistence_failed.load(Ordering::Acquire) {
+            if revokes_authority {
+                self.capability_revocation_generation
+                    .store(u64::MAX, Ordering::Release);
+            }
             return Err(invocation_state_error(
                 "admin-state writes are fenced after a persistence failure; reopen the store before admitting more work",
             ));
@@ -3450,10 +3515,29 @@ impl HostAdminStateStore {
         let mut snapshot = state.clone();
         let result = mutate(&mut snapshot)?;
 
+        if revokes_authority
+            && self
+                .capability_revocation_generation
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
+                    generation.checked_add(1).filter(|next| *next != u64::MAX)
+                })
+                .is_err()
+        {
+            self.capability_revocation_generation
+                .store(u64::MAX, Ordering::Release);
+            return Err(invocation_state_error(
+                "capability revocation generation exhausted",
+            ));
+        }
+
         // There is no await after mutation begins: caller cancellation cannot
         // interrupt file sync, replacement, directory sync or RAM publication.
         if let Err(error) = persist_admin_state_snapshot(self.state_path.as_deref(), &snapshot) {
             self.persistence_failed.store(true, Ordering::Release);
+            if revokes_authority {
+                self.capability_revocation_generation
+                    .store(u64::MAX, Ordering::Release);
+            }
             return Err(error);
         }
 
@@ -4967,26 +5051,29 @@ impl HostAdminStateStore {
         let mut was_revoked = false;
 
         let journal_sequence = self
-            .apply_mutation(|snapshot| {
-                if let Some(record) = snapshot
-                    .issued_tokens
-                    .iter_mut()
-                    .find(|t| t.token_id == request.token_id && !t.revoked)
-                {
-                    record.revoked = true;
-                    record.revocation_reason.clone_from(&request.reason);
-                    record.revoked_at = Some(now);
-                    was_revoked = true;
-                }
+            .apply_mutation_with_revocation_fence(
+                |snapshot| {
+                    if let Some(record) = snapshot
+                        .issued_tokens
+                        .iter_mut()
+                        .find(|t| t.token_id == request.token_id && !t.revoked)
+                    {
+                        record.revoked = true;
+                        record.revocation_reason.clone_from(&request.reason);
+                        record.revoked_at = Some(now);
+                        was_revoked = true;
+                    }
 
-                Ok(snapshot.append_journal(
-                    &auth_connector_id,
-                    AdminStateMutation::DesiredStateSet {
-                        desired_state: DesiredRuntimeState::Disabled,
-                    },
-                    Some(format!("token_revoke:{}", request.token_id)),
-                ))
-            })
+                    Ok(snapshot.append_journal(
+                        &auth_connector_id,
+                        AdminStateMutation::DesiredStateSet {
+                            desired_state: DesiredRuntimeState::Disabled,
+                        },
+                        Some(format!("token_revoke:{}", request.token_id)),
+                    ))
+                },
+                true,
+            )
             .await?;
 
         let message = if was_revoked {
@@ -6111,10 +6198,7 @@ mod tests {
             scope("other", request.idempotency_key.as_deref().unwrap()).unwrap(),
             binding.scope_digest,
         );
-        assert_ne!(
-            scope("owner", "another-key").unwrap(),
-            binding.scope_digest,
-        );
+        assert_ne!(scope("owner", "another-key").unwrap(), binding.scope_digest,);
         assert!(scope("", "key").is_err());
         assert!(scope("owner\nspoofed", "key").is_err());
         assert!(scope("owner", &"x".repeat(fcp_core::MAX_IDEMPOTENCY_KEY_LEN + 1)).is_err());
@@ -6989,6 +7073,80 @@ mod tests {
                 .admit_invocation(invocation_admission("fresh"))
                 .await
                 .is_ok()
+        );
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn capability_revocation_fence_ignores_unrelated_writes_and_rejects_revocation() {
+        let store = HostAdminStateStore::new();
+        let admitted = store.capability_revocation_fence();
+        let issued = store
+            .issue_capability_token(&basic_issuance_request(), &test_signing_key())
+            .await
+            .unwrap();
+        store
+            .set_desired_state(
+                &ConnectorId::from_static("fcp.test:fence:1.0.0"),
+                DesiredRuntimeState::Enabled,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            admitted.is_current(),
+            "issuance and lifecycle bookkeeping are not revocations"
+        );
+        let result = store
+            .revoke_token(&TokenRevocationRequest {
+                token_id: issued.token_id.clone(),
+                reason: Some("operator revoked".to_string()),
+            })
+            .await
+            .unwrap();
+        assert!(result.revoked);
+        assert!(!admitted.is_current());
+        assert!(admitted.require_current().is_err());
+        assert!(store.capability_revocation_fence().is_current());
+        let checked = store
+            .verify_capability_token(&CapabilityTokenVerifyRequest {
+                token_cbor_b64: issued.token_cbor_b64.unwrap(),
+                operation_id: None,
+                connector_id: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            !checked.valid,
+            "a fresh fence does not authorize a revoked token"
+        );
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn failed_token_revocation_fences_existing_and_future_dispatch_authority() {
+        let directory = tempfile::tempdir().unwrap();
+        let obstruction = directory.path().join("not-a-directory");
+        std::fs::write(&obstruction, b"preserve this obstruction").unwrap();
+        let mut store = HostAdminStateStore::new();
+        let issued = store
+            .issue_capability_token(&basic_issuance_request(), &test_signing_key())
+            .await
+            .unwrap();
+        let admitted = store.capability_revocation_fence();
+        store.state_path = Some(obstruction.join("state.json"));
+        assert!(
+            store
+                .revoke_token(&TokenRevocationRequest {
+                    token_id: issued.token_id,
+                    reason: None,
+                })
+                .await
+                .is_err()
+        );
+        assert!(!admitted.is_current());
+        assert!(!store.capability_revocation_fence().is_current());
+        assert_eq!(
+            std::fs::read(&obstruction).unwrap(),
+            b"preserve this obstruction"
         );
     }
 

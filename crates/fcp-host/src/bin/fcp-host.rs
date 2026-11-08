@@ -173,6 +173,8 @@ mod guarded_invoke;
 mod http_batch;
 #[path = "fcp-host/invoke_jobs.rs"]
 mod invoke_jobs;
+#[path = "fcp-host/live_authority.rs"]
+mod live_authority;
 #[path = "fcp-host/mesh_cancel.rs"]
 mod mesh_cancel;
 #[path = "fcp-host/native_events.rs"]
@@ -628,6 +630,7 @@ impl SubprocessConnector {
         // cold worker. Do not launch a binary/env whose authority was replaced.
         if let Some(termination) = termination {
             termination.require_current_deployment()?;
+            termination.require_current_authority()?;
             termination.require_current_inventory()?;
         }
         let mut runner = ConnectorProcessRunner::spawn(&config.binary, &config.args, &config.env)
@@ -757,6 +760,11 @@ impl SubprocessConnector {
             .await
             .map_err(|error| map_resilience_error(&connector_id, method, error));
         if let Err(error) = result {
+            if rpc.authority_rejected() {
+                return Err(HostError::PreflightFailed(
+                    "live capability, approval or revocation authority rejected queued RPC before dispatch".to_string(),
+                ));
+            }
             rpc.cancel();
             if !rpc.is_settled() || rpc.transport_retired() {
                 return Err(HostError::RegistryError(format!(
@@ -1382,11 +1390,13 @@ impl NativeWarmPoolConnector {
     ) -> HostResult<InvokeResponse> {
         termination.invocation.require_current_deployment()?;
         termination.invocation.require_current_inventory()?;
+        termination.invocation.require_current_authority()?;
         let checkout = self
             .checkout_with_termination(&request.zone_id, Some(&termination.invocation))
             .await?;
         termination.invocation.require_current_deployment()?;
         termination.invocation.require_current_inventory()?;
+        termination.invocation.require_current_authority()?;
         if termination.is_cancel_requested() {
             return Err(HostError::RegistryError(
                 "warm-pool invocation cancelled before worker dispatch".into(),
@@ -1912,7 +1922,7 @@ impl WasiConnector {
     }
 
     async fn invoke(&self, request: InvokeRequest) -> HostResult<InvokeResponse> {
-        self.invoke_with_dispatch_guards(request, None, None).await
+        self.invoke_with_dispatch_guards(request, None, None, None).await
     }
 
     async fn invoke_with_dispatch_guards(
@@ -1920,6 +1930,7 @@ impl WasiConnector {
         request: InvokeRequest,
         inventory_fence: Option<&InventoryDispatchFence>,
         deployment_guard: Option<&deployment_evidence::DeploymentDispatchGuard>,
+        authority_guard: Option<&live_authority::LiveAuthorityDispatchGuard>,
     ) -> HostResult<InvokeResponse> {
         let request_id = request.id.to_string();
         let (runner, wasi_config) =
@@ -1951,11 +1962,20 @@ impl WasiConnector {
         let deployment_permit = deployment_guard
             .map(deployment_evidence::DeploymentDispatchGuard::refresh)
             .transpose()?;
+        let authority_permit = authority_guard
+            .map(live_authority::LiveAuthorityDispatchGuard::refresh)
+            .transpose()?;
         if let Some(fence) = inventory_fence {
             fence.require_current()?;
         }
         if let Some(permit) = deployment_permit {
             permit.require_current()?;
+        }
+        if let Some(permit) = authority_permit {
+            permit.require_current()?;
+        }
+        if let Some(guard) = authority_guard {
+            guard.mark_effect_started();
         }
         let result = runner
             .execute(&validated.component, &wasi_config.args)

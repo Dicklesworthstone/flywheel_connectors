@@ -81,6 +81,30 @@ fn revoke_token(snapshot: &mut RuntimeRevocationSnapshot, value: u32) {
 }
 
 #[test]
+fn dispatch_permit_retains_both_clock_bounds_after_verification() {
+    let fixture = Fixture::new();
+    let service = fixture.open().unwrap();
+    let mut permit = service
+        .verify_for_dispatch(&ZoneId::work(), token(1), fixture.issuer.clone())
+        .unwrap();
+    assert!(permit.is_current());
+    permit.deadline = Instant::now();
+    assert!(
+        !permit.is_current(),
+        "wall-clock rollback cannot extend a monotonic permit"
+    );
+    assert!(permit.require_current().is_err());
+    let mut permit = service
+        .verify_for_dispatch(&ZoneId::work(), token(1), fixture.issuer.clone())
+        .unwrap();
+    permit.expires_at_ms = now_ms().unwrap();
+    assert!(
+        !permit.is_current(),
+        "a forward wall-clock expiry must also win"
+    );
+}
+
+#[test]
 fn signed_feed_enforces_exact_zone_complete_chain_and_direct_revocation() {
     let fixture = Fixture::new();
     let service = fixture.open().unwrap();

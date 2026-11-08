@@ -22,7 +22,7 @@ use futures_util::future::{Either, select};
 
 use super::{
     CONNECTOR_RPC_IO_TIMEOUT, ConnectorProcessRunner, ConnectorRpcRequest, InventoryDispatchFence,
-    deployment_evidence::DeploymentDispatchGuard,
+    deployment_evidence::DeploymentDispatchGuard, live_authority::LiveAuthorityDispatchGuard,
 };
 
 #[path = "native_invocation.rs"]
@@ -73,6 +73,7 @@ struct RpcState {
     transport_retired: bool,
     inventory_rejected: bool,
     deployment_rejected: bool,
+    authority_rejected: bool,
 }
 
 /// One physical request, never a lookup of whichever command is running now.
@@ -82,6 +83,8 @@ pub(super) struct NativeRpc {
     state: Arc<Mutex<RpcState>>,
     inventory_fence: Option<InventoryDispatchFence>,
     deployment_guard: Option<DeploymentDispatchGuard>,
+    authority_guard: Option<LiveAuthorityDispatchGuard>,
+    effect_rpc: bool,
     // Notification only: selection and settlement still consult the state lock.
     cancellation: CancellationToken,
 }
@@ -106,9 +109,12 @@ impl NativeRpc {
                 transport_retired: false,
                 inventory_rejected: false,
                 deployment_rejected: false,
+                authority_rejected: false,
             })),
             inventory_fence: None,
             deployment_guard: None,
+            authority_guard: None,
+            effect_rpc: false,
             cancellation: CancellationToken::new(),
         }
     }
@@ -142,6 +148,13 @@ impl NativeRpc {
             .transport_retired
     }
 
+    pub(super) fn authority_rejected(&self) -> bool {
+        self.state
+            .lock()
+            .expect("native RPC state lock")
+            .authority_rejected
+    }
+
     #[cfg(test)]
     #[must_use]
     pub(super) fn is_active(&self) -> bool {
@@ -150,8 +163,8 @@ impl NativeRpc {
     }
 
     /// Linearizes actor selection against queue abandonment, expiration and
-    /// inventory publication and live deployment authority. Already active work
-    /// is never revoked by this gate.
+    /// inventory publication and live deployment/capability authority. Already
+    /// active work is never revoked by this gate.
     #[must_use]
     pub(super) fn try_begin(&self) -> bool {
         {
@@ -167,6 +180,11 @@ impl NativeRpc {
             .deployment_guard
             .as_ref()
             .map(DeploymentDispatchGuard::refresh)
+            .transpose();
+        let authority_permit = self
+            .authority_guard
+            .as_ref()
+            .map(LiveAuthorityDispatchGuard::refresh)
             .transpose();
         let mut state = self.state.lock().expect("native RPC state lock");
         if !matches!(state.phase, RpcPhase::Queued) {
@@ -194,6 +212,19 @@ impl NativeRpc {
             state.deployment_rejected = true;
             state.phase = RpcPhase::Settled;
             return false;
+        }
+        if !authority_permit
+            .as_ref()
+            .is_ok_and(|permit| permit.as_ref().is_none_or(|permit| permit.is_current()))
+        {
+            state.authority_rejected = true;
+            state.phase = RpcPhase::Settled;
+            return false;
+        }
+        if self.effect_rpc
+            && let Some(guard) = &self.authority_guard
+        {
+            guard.mark_effect_started();
         }
         state.phase = RpcPhase::Active;
         true
@@ -276,11 +307,20 @@ impl NativeRpc {
     }
 
     pub(super) fn stop_error(&self) -> std::io::Error {
-        let (inventory_rejected, deployment_rejected) = {
+        let (inventory_rejected, deployment_rejected, authority_rejected) = {
             let state = self.state.lock().expect("native RPC state lock");
-            (state.inventory_rejected, state.deployment_rejected)
+            (
+                state.inventory_rejected,
+                state.deployment_rejected,
+                state.authority_rejected,
+            )
         };
-        if inventory_rejected {
+        if authority_rejected {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "live capability, approval or revocation authority rejected queued RPC before dispatch",
+            )
+        } else if inventory_rejected {
             std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 "connector inventory changed after admission; queued RPC was not dispatched",
@@ -446,6 +486,7 @@ struct InvocationState {
     deadline: Instant,
     inventory_fence: OnceLock<InventoryDispatchFence>,
     deployment_guard: OnceLock<DeploymentDispatchGuard>,
+    authority_guard: OnceLock<LiveAuthorityDispatchGuard>,
     commands: Mutex<InvocationCommands>,
     cancellation: CancellationToken,
     waiter_finished: AtomicBool,
@@ -467,6 +508,7 @@ impl NativeInvocationTermination {
                 deadline,
                 inventory_fence: OnceLock::new(),
                 deployment_guard: OnceLock::new(),
+                authority_guard: OnceLock::new(),
                 commands: Mutex::new(InvocationCommands {
                     stop_requested: false,
                     rpcs: Vec::new(),
@@ -506,6 +548,20 @@ impl NativeInvocationTermination {
 
     pub(super) fn require_current_deployment(&self) -> HostResult<()> {
         if let Some(guard) = self.state.deployment_guard.get() {
+            guard.refresh()?.require_current()?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn bind_authority_guard(&self, guard: LiveAuthorityDispatchGuard) {
+        assert!(
+            self.state.authority_guard.set(guard).is_ok(),
+            "native invocation capability authority cannot be rebound"
+        );
+    }
+
+    pub(super) fn require_current_authority(&self) -> HostResult<()> {
+        if let Some(guard) = self.state.authority_guard.get() {
             guard.refresh()?.require_current()?;
         }
         Ok(())
@@ -555,6 +611,8 @@ impl NativeInvocationTermination {
         let mut rpc = NativeRpc::new(deadline);
         rpc.inventory_fence = self.state.inventory_fence.get().cloned();
         rpc.deployment_guard = self.state.deployment_guard.get().cloned();
+        rpc.authority_guard = self.state.authority_guard.get().cloned();
+        rpc.effect_rpc = method == "invoke";
         let mut commands = self.state.commands.lock().expect("native invocation lock");
         let cancel = commands.stop_requested
             || self.state.waiter_finished.load(Ordering::SeqCst)
@@ -1671,7 +1729,8 @@ mod queue_shutdown_tests {
     fn close_settles_backlog_without_cancelling_a_retry_or_settling_active_work() {
         let (sender, receiver) = mpsc::channel(3);
         let mut queue = NativeRpcQueue(receiver);
-        let invocation = NativeInvocationTermination::new(invocation_deadline(Instant::now(), None));
+        let invocation =
+            NativeInvocationTermination::new(invocation_deadline(Instant::now(), None));
         let queued = invocation.register_rpc();
         let cancelled = NativeRpc::for_io();
         cancelled.cancel();
@@ -1687,18 +1746,33 @@ mod queue_shutdown_tests {
         let active = NativeRpc::for_io();
         assert!(active.try_begin());
         active.reject_queued();
-        assert!(!active.is_settled(), "queue rejection cannot release process custody");
+        assert!(
+            !active.is_settled(),
+            "queue rejection cannot release process custody"
+        );
         queue.close();
         assert!(sender.is_closed());
         assert!(sender.is_empty());
         assert!(queued.is_settled() && cancelled.is_settled() && expired.is_settled());
-        assert_eq!(queued_response.try_recv().unwrap().unwrap_err().kind(), ErrorKind::BrokenPipe);
-        assert_eq!(cancelled_response.try_recv().unwrap().unwrap_err().kind(), ErrorKind::Interrupted);
-        assert_eq!(expired_response.try_recv().unwrap().unwrap_err().kind(), ErrorKind::TimedOut);
+        assert_eq!(
+            queued_response.try_recv().unwrap().unwrap_err().kind(),
+            ErrorKind::BrokenPipe
+        );
+        assert_eq!(
+            cancelled_response.try_recv().unwrap().unwrap_err().kind(),
+            ErrorKind::Interrupted
+        );
+        assert_eq!(
+            expired_response.try_recv().unwrap().unwrap_err().kind(),
+            ErrorKind::TimedOut
+        );
         assert!(!queued.transport_retired());
         assert!(!invocation.is_cancel_requested());
         let retry = invocation.register_rpc();
-        assert!(retry.try_begin(), "a rejected worker must not poison the logical invoke");
+        assert!(
+            retry.try_begin(),
+            "a rejected worker must not poison the logical invoke"
+        );
         assert!(retry.try_settle_reply());
         assert!(active.try_settle_reply());
         queue.close();
@@ -1719,14 +1793,19 @@ mod queue_shutdown_tests {
         assert!(futures_util::poll!(send.as_mut()).is_pending());
         drop(queue);
         let failure = fcp_async_core::time::timeout(Duration::from_secs(1), send)
-            .await.unwrap().unwrap_err();
+            .await
+            .unwrap()
+            .unwrap_err();
         assert!(!failure.0.rpc.is_active());
         drop(failure);
         drop(waiter);
         assert!(waiting.is_settled());
         assert!(waiting_response.await.is_err());
         assert!(buffered.is_settled());
-        assert_eq!(buffered_response.await.unwrap().unwrap_err().kind(), ErrorKind::BrokenPipe);
+        assert_eq!(
+            buffered_response.await.unwrap().unwrap_err().kind(),
+            ErrorKind::BrokenPipe
+        );
         assert!(sender.is_closed());
     }
 
@@ -1735,19 +1814,33 @@ mod queue_shutdown_tests {
     async fn dropping_an_unpolled_dispatcher_settles_and_replies_to_queued_work() {
         let runner = ConnectorProcessRunner::spawn(
             "/bin/sh",
-            &["-c".to_owned(), "IFS= read -r request || exit 0; exit 1".to_owned()],
+            &[
+                "-c".to_owned(),
+                "IFS= read -r request || exit 0; exit 1".to_owned(),
+            ],
             &std::collections::BTreeMap::new(),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
         let (sender, receiver) = mpsc::channel(1);
         let rpc = NativeRpc::for_io();
         let (queued, response) = request(&rpc);
         sender.try_send(queued).unwrap();
         let actor = run_dispatcher(runner, receiver);
         drop(actor);
-        assert!(rpc.is_settled(), "cleanup must not require the first actor poll");
-        assert!(!rpc.transport_retired(), "undispatched work never owned the child");
+        assert!(
+            rpc.is_settled(),
+            "cleanup must not require the first actor poll"
+        );
+        assert!(
+            !rpc.transport_retired(),
+            "undispatched work never owned the child"
+        );
         assert!(sender.is_closed());
-        assert_eq!(response.await.unwrap().unwrap_err().kind(), ErrorKind::BrokenPipe);
+        assert_eq!(
+            response.await.unwrap().unwrap_err().kind(),
+            ErrorKind::BrokenPipe
+        );
     }
 
     #[cfg(unix)]
@@ -1757,15 +1850,21 @@ mod queue_shutdown_tests {
 
         let directory = tempfile::tempdir().unwrap();
         let ready = directory.path().join("selected");
-        let environment = std::collections::BTreeMap::from([
-            ("NATIVE_RPC_SELECTED".to_owned(), ready.to_string_lossy().into_owned()),
-        ]);
+        let environment = std::collections::BTreeMap::from([(
+            "NATIVE_RPC_SELECTED".to_owned(),
+            ready.to_string_lossy().into_owned(),
+        )]);
         let runner = ConnectorProcessRunner::spawn(
             "/bin/sh",
-            &["-c".to_owned(),
-                "IFS= read -r request || exit 1; : > \"$NATIVE_RPC_SELECTED\"; exec sleep 30".to_owned()],
+            &[
+                "-c".to_owned(),
+                "IFS= read -r request || exit 1; : > \"$NATIVE_RPC_SELECTED\"; exec sleep 30"
+                    .to_owned(),
+            ],
             &environment,
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
         let (sender, receiver) = mpsc::channel(2);
         let actor = fcp_async_core::task::try_spawn(run_dispatcher(runner, receiver)).unwrap();
         let active = NativeRpc::for_io();
@@ -1776,15 +1875,21 @@ mod queue_shutdown_tests {
             while !ready.exists() {
                 fcp_async_core::time::sleep(Duration::from_millis(5)).await;
             }
-        }).await.expect("fixture must receive the selected command");
+        })
+        .await
+        .expect("fixture must receive the selected command");
 
         let controller = Arc::new(CancellationController::new());
-        let invocation = NativeInvocationTermination::new(invocation_deadline(Instant::now(), None));
-        let registration = controller.track_operation(
-            "queue-retirement", Some("owner"),
-            CancellationScope::new("native", ConnectorArchetype::RequestResponse)
-                .with_terminator(invocation.terminator()),
-        ).unwrap();
+        let invocation =
+            NativeInvocationTermination::new(invocation_deadline(Instant::now(), None));
+        let registration = controller
+            .track_operation(
+                "queue-retirement",
+                Some("owner"),
+                CancellationScope::new("native", ConnectorArchetype::RequestResponse)
+                    .with_terminator(invocation.terminator()),
+            )
+            .unwrap();
         invocation.bind_registration(&controller, registration);
         let queued = invocation.register_rpc();
         let (queued_request, queued_response) = request(&queued);
@@ -1799,21 +1904,35 @@ mod queue_shutdown_tests {
         active.cancel();
 
         let failure = fcp_async_core::time::timeout(Duration::from_secs(3), queued_response)
-            .await.unwrap().unwrap().unwrap_err();
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
         assert_eq!(failure.kind(), ErrorKind::BrokenPipe);
         fcp_async_core::time::timeout(Duration::from_secs(5), actor)
-            .await.unwrap().unwrap();
+            .await
+            .unwrap()
+            .unwrap();
         assert!(queued.is_settled() && no_receiver.is_settled());
         assert!(!queued.transport_retired() && !no_receiver.transport_retired());
         assert!(!invocation.is_cancel_requested());
         assert!(sender.is_closed());
         assert!(selected_response.await.unwrap().is_err());
         assert!(active.transport_retired());
-        assert!(active.is_settled(), "active custody requires observed child exit");
-        drop(NativeInvocationWaiter { invocation, returned: true });
-        controller.track_operation(
-            "queue-retirement", Some("replacement"),
-            CancellationScope::new("replacement", ConnectorArchetype::RequestResponse),
-        ).expect("undispatched backlog must not strand its operation registration");
+        assert!(
+            active.is_settled(),
+            "active custody requires observed child exit"
+        );
+        drop(NativeInvocationWaiter {
+            invocation,
+            returned: true,
+        });
+        controller
+            .track_operation(
+                "queue-retirement",
+                Some("replacement"),
+                CancellationScope::new("replacement", ConnectorArchetype::RequestResponse),
+            )
+            .expect("undispatched backlog must not strand its operation registration");
     }
 }

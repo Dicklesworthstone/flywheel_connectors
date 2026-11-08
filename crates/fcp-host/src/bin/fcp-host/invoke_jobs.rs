@@ -25,6 +25,7 @@ use futures_util::stream::{FuturesUnordered, StreamExt};
 
 #[path = "dispatch_authority.rs"]
 mod dispatch_authority;
+pub(super) use dispatch_authority::verified_claims_at as verified_dispatch_claims_at;
 
 const MAX_OWNED_INVOCATIONS: usize = 256;
 pub(super) const FINALIZATION_GRACE: Duration = Duration::from_secs(5);
@@ -638,14 +639,25 @@ async fn dispatch(
         started: std::sync::Arc::clone(&started),
     };
     let dispatch_started = std::sync::Arc::clone(&started);
+    let authority_observation = std::sync::Arc::new(std::sync::OnceLock::<
+        super::live_authority::LiveAuthorityDispatchGuard,
+    >::new());
+    let authority_capture = std::sync::Arc::clone(&authority_observation);
     let request_id = request.id.clone();
     let result = before_deadline(
         deadline,
         async move {
             // Admission may have waited for durable storage and runtime selection.
             // Revalidate without spending another quota permit, before any IO.
+            let lifecycle_fence = state.lifecycle.capability_revocation_fence();
             let tier = dispatch_authority::revalidate(state, &request, registry_generation).await?;
             super::recheck_admitted_holder_proof(state, &request)?;
+            let authority_guard = super::live_authority::LiveAuthorityDispatchGuard::new(
+                state,
+                &request,
+                lifecycle_fence,
+            )?;
+            let _ = authority_capture.set(authority_guard.clone());
             state.registry.require_generation(registry_generation)?;
             if Instant::now() >= deadline {
                 return Err(HostError::Unavailable(
@@ -660,6 +672,7 @@ async fn dispatch(
             if let Some(capture) = native_capture.as_ref() {
                 // Warm-pool captures share this same logical invocation state.
                 capture.bind_deployment_guard(deployment_guard.clone());
+                capture.bind_authority_guard(authority_guard.clone());
             }
             dispatch_started.store(true, std::sync::atomic::Ordering::SeqCst);
             match runtime {
@@ -678,6 +691,7 @@ async fn dispatch(
                         request,
                         Some(&fence),
                         Some(&deployment_guard),
+                        Some(&authority_guard),
                     );
                     match wasi_capture {
                         Some(capture) => capture.invoke(operation).await,
@@ -700,7 +714,10 @@ async fn dispatch(
             Ok(response)
         }
     });
-    let dispatched = started.load(std::sync::atomic::Ordering::SeqCst);
+    let dispatched = started.load(std::sync::atomic::Ordering::SeqCst)
+        && !authority_observation
+            .get()
+            .is_some_and(|guard| guard.refused_before_effect());
     // before_deadline has dropped the dispatch future before this guard probes
     // settlement. Incomplete native retirement remains owned by the reaper.
     drop(registration);
@@ -975,6 +992,7 @@ mod tests {
 
     struct DispatchFixture {
         state: Arc<crate::AppState>,
+        signing_key: fcp_crypto::ed25519::Ed25519SigningKey,
         request: fcp_kernel::InvokeRequest,
         invoke_count: Arc<AtomicUsize>,
         block_catalog: Arc<AtomicBool>,
@@ -1093,6 +1111,7 @@ mod tests {
         };
         DispatchFixture {
             state,
+            signing_key,
             request,
             invoke_count,
             block_catalog,
@@ -1147,6 +1166,276 @@ mod tests {
         assert!(result.is_ok(), "{result:?}");
         assert!(dispatched);
         assert_eq!(fixture.invoke_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(unix)]
+    #[fcp_async_core::runtime::test]
+    async fn live_authority_rejects_revoked_or_unavailable_feed_after_native_queue_wait() {
+        use fcp_evidence::CascadeHop;
+        use fcp_host::{
+            RUNTIME_REVOCATION_SCHEMA, RuntimeKeyRevocation, RuntimeRevocationConfig,
+            RuntimeRevocationService, RuntimeRevocationSnapshot, RuntimeRevocationZoneConfig,
+            RuntimeTokenRevocation,
+        };
+        for change in ["token", "issuer", "missing", "malformed", "stale"] {
+            let mut fixture = dispatch_fixture();
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().canonicalize().unwrap();
+            let source = root.join("snapshot.json");
+            let owner = fcp_crypto::ed25519::Ed25519SigningKey::generate();
+            let node = fcp_crypto::KeyId::from_bytes([91; 8]);
+            let now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap();
+            let mut snapshot = RuntimeRevocationSnapshot {
+                schema: RUNTIME_REVOCATION_SCHEMA.to_owned(),
+                zone_id: fcp_core::ZoneId::work(),
+                generation: 1,
+                issued_at_ms: now - 1000,
+                expires_at_ms: now + 60_000,
+                issuance_to_node: vec![(fixture.signing_key.key_id(), node.clone())],
+                node_to_owner: vec![(node, owner.key_id())],
+                tokens: vec![],
+                keys: vec![],
+            };
+            let publish = |snapshot: &RuntimeRevocationSnapshot| {
+                std::fs::write(
+                    &source,
+                    serde_json::to_vec(&snapshot.sign(&owner).unwrap()).unwrap(),
+                )
+                .unwrap();
+            };
+            publish(&snapshot);
+            let service = RuntimeRevocationService::open(RuntimeRevocationConfig {
+                zones: vec![RuntimeRevocationZoneConfig {
+                    zone_id: fcp_core::ZoneId::work(),
+                    owner_public_key_hex: hex::encode(owner.verifying_key().to_bytes()),
+                    snapshot_file: source.clone(),
+                    checkpoint_file: root.join("checkpoint.json"),
+                }],
+            })
+            .unwrap();
+            Arc::get_mut(&mut fixture.state).unwrap().runtime_revocation = Some(Arc::new(service));
+            let claims = fixture
+                .request
+                .capability_token
+                .raw()
+                .verify(&fixture.signing_key.verifying_key())
+                .unwrap();
+            let token_id =
+                crate::revocation_cascade_token_id(&fixture.request.capability_token, &claims)
+                    .unwrap();
+            let preflight =
+                crate::evaluate_live_preflight(&fixture.state, &fixture.request, None).await;
+            assert!(preflight.allowed, "{change}: {:?}", preflight.reason);
+            fixture.block_invoke.store(true, Ordering::SeqCst);
+            let state = Arc::clone(&fixture.state);
+            let generation = state.registry.version.load(Ordering::SeqCst);
+            let request = fixture.request;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let pending =
+                task::spawn(
+                    async move { dispatch(&state, request, deadline, None, generation).await },
+                );
+            fixture.invoke_queued.await.unwrap();
+            snapshot.generation = 2;
+            match change {
+                "token" => {
+                    snapshot.tokens.push(RuntimeTokenRevocation {
+                        token_id,
+                        revoked_at_ms: now - 1000,
+                    });
+                    publish(&snapshot);
+                }
+                "issuer" => {
+                    snapshot.keys.push(RuntimeKeyRevocation {
+                        kid: fixture.signing_key.key_id(),
+                        hop: CascadeHop::IssuerKey,
+                        revoked_at_ms: now - 1000,
+                    });
+                    publish(&snapshot);
+                }
+                "missing" => std::fs::rename(&source, root.join("withdrawn.json")).unwrap(),
+                "malformed" => std::fs::write(&source, b"invalid replacement").unwrap(),
+                "stale" => {
+                    let now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap();
+                    snapshot.issued_at_ms = now - 2;
+                    snapshot.expires_at_ms = now - 1;
+                    publish(&snapshot);
+                }
+                _ => unreachable!(),
+            }
+            fixture.release_invoke.send(()).unwrap();
+            let (result, dispatched) = pending.await.unwrap();
+            assert!(
+                matches!(&result, Err(HostError::PreflightFailed(_))),
+                "{change}: {result:?}"
+            );
+            assert!(
+                !dispatched,
+                "{change}: no effect ticket reached the connector"
+            );
+            assert_eq!(fixture.invoke_count.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                terminal_observation(&result, dispatched, deadline, 0).outcome,
+                fcp_host::InvocationOutcome::HostError
+            );
+            assert!(
+                !result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("private-dispatch-fixture")
+            );
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn live_authority_rejects_lifecycle_revocation_after_native_queue_wait() {
+        let fixture = dispatch_fixture();
+        fixture.block_invoke.store(true, Ordering::SeqCst);
+        let state = Arc::clone(&fixture.state);
+        let generation = state.registry.version.load(Ordering::SeqCst);
+        let request = fixture.request;
+        let pending = task::spawn(async move {
+            dispatch(
+                &state,
+                request,
+                Instant::now() + Duration::from_secs(10),
+                None,
+                generation,
+            )
+            .await
+        });
+        fixture.invoke_queued.await.unwrap();
+        // Every published revocation changes authority, even when the target
+        // was issued elsewhere and this host has no issuance row for it.
+        fixture
+            .state
+            .lifecycle
+            .revoke_token(&fcp_host::TokenRevocationRequest {
+                token_id: "revoked-after-queue".to_string(),
+                reason: None,
+            })
+            .await
+            .unwrap();
+        fixture.release_invoke.send(()).unwrap();
+        let (result, dispatched) = pending.await.unwrap();
+        assert!(matches!(result, Err(HostError::PreflightFailed(_))));
+        assert!(!dispatched);
+        assert_eq!(fixture.invoke_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn live_authority_expiry_after_native_queue_wait_never_reaches_connector() {
+        for approval in [false, true] {
+            let mut fixture = dispatch_fixture();
+            let now = chrono::Utc::now();
+            let expires = now.timestamp() + 2;
+            if approval {
+                let key = fcp_crypto::ed25519::Ed25519SigningKey::generate();
+                Arc::get_mut(&mut fixture.state)
+                    .unwrap()
+                    .approval_verifying_key = Some(key.verifying_key());
+                let mut token = fcp_core::ApprovalToken::approved(
+                    "queued-approval",
+                    u64::try_from(now.timestamp_millis()).unwrap() - 1000,
+                    u64::try_from(expires).unwrap() * 1000,
+                    "owner:test",
+                    fcp_core::ApprovalScope::Execution(fcp_core::ExecutionScope {
+                        connector_id: fixture.request.connector_id.to_string(),
+                        method_pattern: fixture.request.operation.to_string(),
+                        request_object_id: None,
+                        input_hash: None,
+                        input_constraints: vec![],
+                    }),
+                    fixture.request.zone_id.clone(),
+                    None,
+                );
+                token.signature = Some(
+                    key.sign(&crate::approval_token_signing_bytes(&token).unwrap())
+                        .to_bytes()
+                        .to_vec(),
+                );
+                fixture.request.approval_tokens.push(token);
+            } else {
+                let claims = fixture
+                    .request
+                    .capability_token
+                    .raw()
+                    .verify(&fixture.signing_key.verifying_key())
+                    .unwrap()
+                    .custom(
+                        fcp_crypto::cose::cwt_claims::EXP,
+                        ciborium::Value::Integer(expires.into()),
+                    );
+                fixture.request.capability_token = fcp_core::CapabilityToken::from_raw(
+                    fcp_crypto::cose::CoseToken::sign(&fixture.signing_key, &claims).unwrap(),
+                );
+            }
+            fixture.block_invoke.store(true, Ordering::SeqCst);
+            let state = Arc::clone(&fixture.state);
+            let generation = state.registry.version.load(Ordering::SeqCst);
+            let request = fixture.request;
+            let pending = task::spawn(async move {
+                dispatch(
+                    &state,
+                    request,
+                    Instant::now() + Duration::from_secs(10),
+                    None,
+                    generation,
+                )
+                .await
+            });
+            fixture.invoke_queued.await.unwrap();
+            while chrono::Utc::now().timestamp() < expires {
+                fcp_async_core::time::sleep(Duration::from_millis(20)).await;
+            }
+            fixture.release_invoke.send(()).unwrap();
+            let (result, dispatched) = pending.await.unwrap();
+            assert!(
+                matches!(&result, Err(HostError::PreflightFailed(_))),
+                "approval={approval}: {result:?}"
+            );
+            assert!(!dispatched);
+            assert_eq!(fixture.invoke_count.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn live_authority_does_not_relabel_an_already_selected_effect_as_undispatched() {
+        let fixture = dispatch_fixture();
+        let guard = crate::live_authority::LiveAuthorityDispatchGuard::new(
+            &fixture.state,
+            &fixture.request,
+            fixture.state.lifecycle.capability_revocation_fence(),
+        )
+        .unwrap();
+        let invocation =
+            crate::NativeInvocationTermination::new(Instant::now() + Duration::from_secs(10));
+        invocation.bind_authority_guard(guard.clone());
+        let active = invocation.register_rpc_for_method("invoke");
+        assert!(active.try_begin());
+        fixture
+            .state
+            .lifecycle
+            .revoke_token(&fcp_host::TokenRevocationRequest {
+                token_id: "later-revocation".to_string(),
+                reason: None,
+            })
+            .await
+            .unwrap();
+        let queued = invocation.register_rpc_for_method("invoke");
+        assert!(!queued.try_begin());
+        assert!(!guard.refused_before_effect());
+        assert!(
+            active.try_settle_reply(),
+            "active work retains its definite response boundary"
+        );
+        let unknown: HostResult<InvokeResponse> =
+            Err(HostError::Unavailable("lost response".to_string()));
+        assert_eq!(
+            terminal_observation(&unknown, !guard.refused_before_effect(), Instant::now(), 0)
+                .outcome,
+            fcp_host::InvocationOutcome::OutcomeUnknown
+        );
     }
 
     #[fcp_async_core::runtime::test]

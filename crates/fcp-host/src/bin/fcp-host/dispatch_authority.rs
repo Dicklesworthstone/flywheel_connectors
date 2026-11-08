@@ -31,7 +31,7 @@ fn refusal(message: &str) -> HostError {
 
 /// Verify the signature before consulting any claim, including its clock bounds.
 /// Required expiry and a present-but-malformed not-before claim fail closed.
-fn verified_claims_at(
+pub(in super::super) fn verified_claims_at(
     token: &CapabilityToken,
     key: Option<&Ed25519VerifyingKey>,
     now: i64,
