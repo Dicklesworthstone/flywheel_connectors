@@ -57,6 +57,8 @@ pub const DEFAULT_MESH_ADVERTISEMENT_MAX_AGE_MS: u64 = 5 * 60_000;
 pub const MAX_MESH_FORWARD_BODY_BYTES: usize = 8 * 1024 * 1024;
 /// Hard cap on the JSON body of a forwarded cancellation request.
 pub const MAX_MESH_CANCELLATION_BODY_BYTES: usize = 16 * 1024;
+/// Hard cap on a forwarded durable event consumer request, including its token.
+pub const MAX_MESH_STREAM_BODY_BYTES: usize = 64 * 1024;
 /// Hard cap on connectors listed in one advertisement.
 pub const MAX_ADVERTISED_CONNECTORS: usize = 4096;
 
@@ -478,6 +480,27 @@ pub enum MeshForwardBody {
         /// Exact JSON-encoded bounded state-export request signed by the origin.
         request_json: String,
     },
+    /// Open or resume a durable event consumer on an explicitly pinned executor.
+    /// The executor independently verifies the event capability and ownership.
+    StreamOpen {
+        /// Exact JSON request, including the capability and executor binding.
+        request_json: String,
+    },
+    /// Read retained events without acknowledging them or changing executor.
+    StreamPoll {
+        /// Exact JSON request, including the capability and retained stream id.
+        request_json: String,
+    },
+    /// Durably acknowledge delivered events on their original executor.
+    StreamAck {
+        /// Exact JSON request, including capability, stream id and cursor pairs.
+        request_json: String,
+    },
+    /// Close a retained consumer on its original executor.
+    StreamClose {
+        /// Exact JSON request, including the capability and retained stream id.
+        request_json: String,
+    },
 }
 
 impl MeshForwardBody {
@@ -494,6 +517,10 @@ impl MeshForwardBody {
             Self::Status { .. } => "status",
             Self::SelfCheck { .. } => "self_check",
             Self::ConnectorStateExport { .. } => "connector_state_export",
+            Self::StreamOpen { .. } => "stream_open",
+            Self::StreamPoll { .. } => "stream_poll",
+            Self::StreamAck { .. } => "stream_ack",
+            Self::StreamClose { .. } => "stream_close",
         }
     }
 
@@ -539,7 +566,11 @@ impl MeshForwardBody {
             } => {
                 out.field(connector_id.as_bytes()).field(zone_id.as_bytes());
             }
-            Self::ConnectorStateExport { request_json } => {
+            Self::ConnectorStateExport { request_json }
+            | Self::StreamOpen { request_json }
+            | Self::StreamPoll { request_json }
+            | Self::StreamAck { request_json }
+            | Self::StreamClose { request_json } => {
                 out.field(request_json.as_bytes());
             }
         }
@@ -567,9 +598,12 @@ impl MeshForwardBody {
                 connector_id,
                 zone_id,
             } => connector_id.len().saturating_add(zone_id.len()),
-            Self::Cancel { request_json, .. } | Self::ConnectorStateExport { request_json } => {
-                request_json.len()
-            }
+            Self::Cancel { request_json, .. }
+            | Self::ConnectorStateExport { request_json }
+            | Self::StreamOpen { request_json }
+            | Self::StreamPoll { request_json }
+            | Self::StreamAck { request_json }
+            | Self::StreamClose { request_json } => request_json.len(),
         }
     }
 
@@ -589,10 +623,13 @@ impl MeshForwardBody {
                 detail: "attempt id must be nonzero".to_owned(),
             });
         }
-        let limit = if matches!(self, Self::Cancel { .. }) {
-            MAX_MESH_CANCELLATION_BODY_BYTES
-        } else {
-            MAX_MESH_FORWARD_BODY_BYTES
+        let limit = match self {
+            Self::Cancel { .. } => MAX_MESH_CANCELLATION_BODY_BYTES,
+            Self::StreamOpen { .. }
+            | Self::StreamPoll { .. }
+            | Self::StreamAck { .. }
+            | Self::StreamClose { .. } => MAX_MESH_STREAM_BODY_BYTES,
+            _ => MAX_MESH_FORWARD_BODY_BYTES,
         };
         let len = self.body_len();
         if len > limit {
@@ -1825,6 +1862,124 @@ mod tests {
             ),
             Err(MeshForwardError::BodyTooLarge { .. })
         ));
+    }
+
+    fn stream_bodies(request_json: &str) -> [MeshForwardBody; 4] {
+        [
+            MeshForwardBody::StreamOpen {
+                request_json: request_json.to_owned(),
+            },
+            MeshForwardBody::StreamPoll {
+                request_json: request_json.to_owned(),
+            },
+            MeshForwardBody::StreamAck {
+                request_json: request_json.to_owned(),
+            },
+            MeshForwardBody::StreamClose {
+                request_json: request_json.to_owned(),
+            },
+        ]
+    }
+
+    #[test]
+    fn stream_forwards_bind_method_executor_authority_and_retained_cursor() {
+        let mesh = Mesh::new(&["node-a", "node-b"]);
+        let payload = serde_json::json!({
+            "auth": {
+                "request_id": "consume-1",
+                "connector_id": "fcp.events:utility:1.0.0",
+                "zone_id": "z:work",
+                "topic": "messages",
+                "capability_token": "signed-consumer-authority"
+            },
+            "executor_node": "node-b",
+            "stream_id": "retained-consumer",
+            "ack": { "cursors": ["cursor-42"], "seqs": [42] }
+        });
+        let request_json = serde_json::to_string(&payload).unwrap();
+        for (index, body) in stream_bodies(&request_json).into_iter().enumerate() {
+            let envelope = MeshForwardEnvelope::sign(
+                mesh.key("node-a"),
+                node("node-a"),
+                node("node-b"),
+                NOW,
+                body,
+            )
+            .unwrap();
+            envelope
+                .verify(&mesh.directory("node-b"), NOW, 30_000)
+                .unwrap();
+            let decoded: MeshForwardEnvelope =
+                serde_json::from_str(&serde_json::to_string(&envelope).unwrap()).unwrap();
+            assert_eq!(decoded, envelope);
+            for (pointer, replacement) in [
+                ("/auth/request_id", serde_json::json!("consume-other")),
+                (
+                    "/auth/connector_id",
+                    serde_json::json!("fcp.other:utility:1.0.0"),
+                ),
+                ("/auth/zone_id", serde_json::json!("z:private")),
+                ("/auth/topic", serde_json::json!("private-messages")),
+                (
+                    "/auth/capability_token",
+                    serde_json::json!("other-authority"),
+                ),
+                ("/executor_node", serde_json::json!("node-c")),
+                ("/stream_id", serde_json::json!("another-consumer")),
+                ("/ack/cursors/0", serde_json::json!("cursor-43")),
+                ("/ack/seqs/0", serde_json::json!(43)),
+            ] {
+                let mut changed = payload.clone();
+                *changed.pointer_mut(pointer).unwrap() = replacement;
+                let mut tampered = envelope.clone();
+                tampered.body =
+                    stream_bodies(&serde_json::to_string(&changed).unwrap())[index].clone();
+                assert!(matches!(
+                    tampered.verify(&mesh.directory("node-b"), NOW, 30_000),
+                    Err(MeshForwardError::SignatureInvalid { .. })
+                ));
+            }
+            for other in stream_bodies(&request_json) {
+                if other.method() != envelope.body.method() {
+                    let mut changed = envelope.clone();
+                    changed.body = other;
+                    assert!(matches!(
+                        changed.verify(&mesh.directory("node-b"), NOW, 30_000),
+                        Err(MeshForwardError::SignatureInvalid { .. })
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stream_forwards_enforce_the_consumer_request_byte_limit() {
+        let mesh = Mesh::new(&["node-a", "node-b"]);
+        for body in stream_bodies(&"x".repeat(MAX_MESH_STREAM_BODY_BYTES)) {
+            MeshForwardEnvelope::sign(
+                mesh.key("node-a"),
+                node("node-a"),
+                node("node-b"),
+                NOW,
+                body,
+            )
+            .expect("exact stream request limit is accepted");
+        }
+        for body in stream_bodies(&"x".repeat(MAX_MESH_STREAM_BODY_BYTES + 1)) {
+            assert!(matches!(
+                MeshForwardEnvelope::sign(
+                    mesh.key("node-a"),
+                    node("node-a"),
+                    node("node-b"),
+                    NOW,
+                    body,
+                ),
+                Err(MeshForwardError::BodyTooLarge {
+                    limit: MAX_MESH_STREAM_BODY_BYTES,
+                    ..
+                })
+            ));
+        }
     }
 
     #[test]

@@ -9,6 +9,9 @@ use base64::Engine as _;
 use fcp_core::{EventData, EventEnvelope, InstanceId, Principal, TrustLevel};
 use tower::util::ServiceExt;
 
+#[path = "native_event_mesh_tests.rs"]
+mod mesh_tests;
+
 const CONNECTOR: &str = "fcp.test.native-events:streaming:1.0.0";
 const CAPABILITY: &str = "events.read";
 const OPERATION: &str = "events.subscribe";
@@ -116,6 +119,10 @@ async fn fixture() -> Fixture {
             event(),
         )
         .unwrap();
+    let host = Arc::new(AppState {
+        native_events: Arc::new(EventService::new(Some(Arc::clone(&journal)))),
+        ..(*host).clone()
+    });
     Fixture {
         host,
         journal,
@@ -182,11 +189,7 @@ fn acknowledgement() -> EventAck {
 }
 
 fn app(fixture: &Fixture) -> Router {
-    routes(
-        Arc::clone(&fixture.host),
-        Some(Arc::clone(&fixture.journal)),
-    )
-    .with_state(Arc::clone(&fixture.host))
+    routes(Arc::clone(&fixture.host)).with_state(Arc::clone(&fixture.host))
 }
 
 async fn send(app: Router, path: &str, body: Value) -> (StatusCode, String) {

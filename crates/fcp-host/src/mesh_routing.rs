@@ -127,6 +127,15 @@ const CANCELLATION_FORWARD_LIMITS: MeshForwardLimits = MeshForwardLimits {
     max_request_bytes: 128 * 1024,
     max_response_bytes: 4 * MAX_REPLY_BYTES,
 };
+// Invocations and subscription renewals can wait for consumer credit. Polling
+// and settling that credit must remain possible when either work class is full.
+// Each lane retains the normal transport's worst-case reply reservation.
+const STREAM_FORWARD_LIMITS: MeshForwardLimits = MeshForwardLimits {
+    max_in_flight: 4,
+    max_per_peer: 2,
+    max_request_bytes: 512 * 1024,
+    max_response_bytes: 4 * MAX_REPLY_BYTES,
+};
 
 /// Continuous origin authority for one already admitted cancellation envelope.
 /// The guard carries no cancellation capability; the executor must verify that
@@ -148,10 +157,10 @@ pub struct MeshStateTransferPeer {
     snapshot: PeerSnapshot,
 }
 
-fn require_confidential_state_endpoint(endpoint: &str) -> Result<(), MeshForwardError> {
+fn require_confidential_endpoint(endpoint: &str) -> Result<(), MeshForwardError> {
     let endpoint = url::Url::parse(endpoint).map_err(|_| MeshForwardError::Malformed {
-        field: "state_transfer_endpoint",
-        detail: "state transfer requires a valid peer endpoint".to_owned(),
+        field: "confidential_peer_endpoint",
+        detail: "confidential forwarding requires a valid peer endpoint".to_owned(),
     })?;
     let local_http = endpoint.scheme() == "http"
         && match endpoint.host() {
@@ -163,8 +172,8 @@ fn require_confidential_state_endpoint(endpoint: &str) -> Result<(), MeshForward
         Ok(())
     } else {
         Err(MeshForwardError::Malformed {
-            field: "state_transfer_endpoint",
-            detail: "state transfer requires HTTPS or literal loopback HTTP".to_owned(),
+            field: "confidential_peer_endpoint",
+            detail: "confidential forwarding requires HTTPS or literal loopback HTTP".to_owned(),
         })
     }
 }
@@ -424,6 +433,8 @@ pub struct MeshRouter {
     advertisements: PeerDiscovery,
     forwards: ForwardControl,
     cancellations: ForwardControl,
+    stream_polls: ForwardControl,
+    stream_settlements: ForwardControl,
     client: reqwest::Client,
     membership: Option<DirectoryGuard>,
 }
@@ -440,6 +451,8 @@ impl std::fmt::Debug for MeshRouter {
             .field("peer_count", &self.directory().len())
             .field("forward_limits", &self.forwards.limits())
             .field("cancellation_limits", &self.cancellations.limits())
+            .field("stream_poll_limits", &self.stream_polls.limits())
+            .field("stream_settlement_limits", &self.stream_settlements.limits())
             .field("durable_replay", &self.durable_replay.is_some())
             .field("owner_signed_membership", &self.membership.is_some())
             .finish_non_exhaustive()
@@ -471,6 +484,8 @@ impl MeshRouter {
     ) -> HostResult<Self> {
         let forwards = ForwardControl::new(limits)?;
         let cancellations = ForwardControl::new(CANCELLATION_FORWARD_LIMITS)?;
+        let stream_polls = ForwardControl::new(STREAM_FORWARD_LIMITS)?;
+        let stream_settlements = ForwardControl::new(STREAM_FORWARD_LIMITS)?;
         let directory = MeshPeerDirectory::from_json(settings.node_id, &settings.peers_json)
             .map_err(|error| HostError::InvalidFilter(error.to_string()))?;
         let empty_directory = MeshPeerDirectory::from_configs(directory.local_node().clone(), &[])
@@ -500,6 +515,8 @@ impl MeshRouter {
             advertisements: PeerDiscovery::new(),
             forwards,
             cancellations,
+            stream_polls,
+            stream_settlements,
             client,
             membership: None,
         })
@@ -824,7 +841,7 @@ impl MeshRouter {
             .directory()
             .peer(node_id)
             .ok_or_else(|| MeshForwardError::UnknownPeer(node_id.as_str().to_owned()))?;
-        require_confidential_state_endpoint(&peer.endpoint)?;
+        require_confidential_endpoint(&peer.endpoint)?;
         self.ensure_current_peer(&snapshot)?;
         Ok(MeshStateTransferPeer {
             node_id: node_id.clone(),
@@ -1035,8 +1052,15 @@ impl MeshRouter {
                 detail: "peer is not in the local mesh directory".to_owned(),
             });
         };
-        if matches!(&body, MeshForwardBody::ConnectorStateExport { .. }) {
-            require_confidential_state_endpoint(&peer.endpoint).map_err(|error| {
+        if matches!(
+            &body,
+            MeshForwardBody::ConnectorStateExport { .. }
+                | MeshForwardBody::StreamOpen { .. }
+                | MeshForwardBody::StreamPoll { .. }
+                | MeshForwardBody::StreamAck { .. }
+                | MeshForwardBody::StreamClose { .. }
+        ) {
+            require_confidential_endpoint(&peer.endpoint).map_err(|error| {
                 MeshForwardFailure::NotDelivered {
                     peer: peer_label.clone(),
                     detail: error.to_string(),
@@ -1059,13 +1083,18 @@ impl MeshRouter {
                 peer: peer_label.clone(),
                 detail: format!("envelope serialization failed: {error}"),
             })?;
-        // Cancellation can still reach an executor while invocation slots are
-        // occupied. Its small, fixed lane keeps identical authentication and
-        // replay rules, and reserves reply headroom before sending.
-        let control = if matches!(&envelope.body, MeshForwardBody::Cancel { .. }) {
-            &self.cancellations
-        } else {
-            &self.forwards
+        // Keep cancellation and consumer progress independent from invocations
+        // and subscription opens, which can be waiting for those very controls.
+        // Poll pressure cannot consume acknowledgement/close capacity either.
+        // Every lane preserves the same peer authentication, replay rules and
+        // pre-send reply reservation; none introduces a waiter queue.
+        let control = match &envelope.body {
+            MeshForwardBody::Cancel { .. } => &self.cancellations,
+            MeshForwardBody::StreamPoll { .. } => &self.stream_polls,
+            MeshForwardBody::StreamAck { .. } | MeshForwardBody::StreamClose { .. } => {
+                &self.stream_settlements
+            }
+            _ => &self.forwards,
         };
         control
             .execute(&peer_label, payload.len(), || {
@@ -1263,7 +1292,7 @@ mod tests {
             "http://127.0.0.1:8765",
             "http://[::1]:8765",
         ] {
-            require_confidential_state_endpoint(endpoint).unwrap();
+            require_confidential_endpoint(endpoint).unwrap();
         }
         for endpoint in [
             "http://100.64.0.2:8765",
@@ -1275,7 +1304,7 @@ mod tests {
             "file:///tmp/state",
         ] {
             assert!(
-                require_confidential_state_endpoint(endpoint).is_err(),
+                require_confidential_endpoint(endpoint).is_err(),
                 "{endpoint}"
             );
         }
@@ -1501,7 +1530,195 @@ mod tests {
     }
 
     #[test]
-    fn generic_forward_cannot_bypass_state_transfer_confidentiality() {
+    fn stream_poll_and_settlement_reach_peer_under_invoke_and_poll_saturation() {
+        use std::future::{Future, pending};
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::task::{Context, Waker};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let local_key = Ed25519SigningKey::generate();
+        let peer_key = Ed25519SigningKey::generate();
+        let receiver_directory = MeshPeerDirectory::from_json(
+            TailscaleNodeId::new("node-b"),
+            &peers_json(&[("node-a", &local_key)]),
+        )
+        .unwrap();
+        let router = MeshRouter::with_forward_limits(
+            MeshRoutingSettings {
+                node_id: TailscaleNodeId::new("node-a"),
+                signing_key: local_key,
+                peers_json: serde_json::json!([{
+                    "node_id": "node-b",
+                    "endpoint": endpoint,
+                    "public_key_hex": hex::encode(peer_key.verifying_key().to_bytes()),
+                }])
+                .to_string(),
+                forward_timeout: Duration::from_secs(5),
+            },
+            MeshForwardLimits {
+                max_in_flight: 1,
+                max_per_peer: 1,
+                max_request_bytes: 1024,
+                max_response_bytes: MAX_REPLY_BYTES,
+            },
+        )
+        .unwrap();
+        let server = std::thread::spawn(move || {
+            for method in ["stream_poll", "stream_ack", "stream_close"] {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let mut socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "{method} never reached peer");
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("peer accept failed: {error}"),
+                    }
+                };
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                socket
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(socket.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert!(line.contains(MESH_FORWARD_ROUTE));
+                let mut content_length = None;
+                let mut header_bytes = line.len();
+                loop {
+                    line.clear();
+                    assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                    header_bytes += line.len();
+                    assert!(header_bytes <= 16 * 1024);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        content_length = Some(value.trim().parse::<usize>().unwrap());
+                    }
+                }
+                let len = content_length.expect("bounded content-length request");
+                assert!(len <= 128 * 1024);
+                let mut payload = vec![0; len];
+                reader.read_exact(&mut payload).unwrap();
+                let envelope: MeshForwardEnvelope = serde_json::from_slice(&payload).unwrap();
+                envelope
+                    .verify(
+                        &receiver_directory,
+                        unix_now_ms(),
+                        DEFAULT_MESH_FORWARD_MAX_SKEW_MS,
+                    )
+                    .unwrap();
+                assert_eq!(envelope.body.method(), method);
+                let reply = MeshForwardReply::sign(
+                    &peer_key,
+                    TailscaleNodeId::new("node-b"),
+                    &envelope,
+                    200,
+                    "{\"accepted\":true}".to_owned(),
+                );
+                let body = serde_json::to_vec(&reply).unwrap();
+                write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len(),
+                )
+                .unwrap();
+                socket.write_all(&body).unwrap();
+            }
+        });
+
+        let target = TailscaleNodeId::new("node-b");
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut bulk = Box::pin(router.forwards.execute("node-b", 1, pending));
+        assert!(bulk.as_mut().poll(&mut cx).is_pending());
+        let open = MeshForwardBody::StreamOpen {
+            request_json: "{}".to_owned(),
+        };
+        let refused = fcp_async_core::runtime::block_on_sync(router.forward(&target, open))
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            matches!(refused, MeshForwardFailure::NotDelivered { detail, .. }
+            if detail.contains("router_in_flight_limit"))
+        );
+
+        let poll = || MeshForwardBody::StreamPoll {
+            request_json: "{}".to_owned(),
+        };
+        let reply = fcp_async_core::runtime::block_on_sync(router.forward(&target, poll()))
+            .unwrap()
+            .unwrap();
+        assert!(reply.is_success());
+        let mut first_poll = Box::pin(router.stream_polls.execute("node-b", 1, pending));
+        let mut second_poll = Box::pin(router.stream_polls.execute("node-b", 1, pending));
+        assert!(first_poll.as_mut().poll(&mut cx).is_pending());
+        assert!(second_poll.as_mut().poll(&mut cx).is_pending());
+        let refused = fcp_async_core::runtime::block_on_sync(router.forward(&target, poll()))
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            matches!(refused, MeshForwardFailure::NotDelivered { detail, .. }
+            if detail.contains("peer_in_flight_limit"))
+        );
+
+        let ack = || MeshForwardBody::StreamAck {
+            request_json: "{}".to_owned(),
+        };
+        let mut first_ack = Box::pin(router.stream_settlements.execute("node-b", 1, pending));
+        let mut second_ack = Box::pin(router.stream_settlements.execute("node-b", 1, pending));
+        assert!(first_ack.as_mut().poll(&mut cx).is_pending());
+        assert!(second_ack.as_mut().poll(&mut cx).is_pending());
+        let refused = fcp_async_core::runtime::block_on_sync(router.forward(&target, ack()))
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            matches!(refused, MeshForwardFailure::NotDelivered { detail, .. }
+            if detail.contains("peer_in_flight_limit"))
+        );
+        drop(first_ack);
+        drop(second_ack);
+        for body in [
+            ack(),
+            MeshForwardBody::StreamClose {
+                request_json: "{}".to_owned(),
+            },
+        ] {
+            let reply = fcp_async_core::runtime::block_on_sync(router.forward(&target, body))
+                .unwrap()
+                .unwrap();
+            assert!(reply.is_success());
+        }
+        assert_eq!(router.forward_usage().unwrap().in_flight, 1);
+        assert_eq!(router.stream_polls.snapshot().unwrap().in_flight, 2);
+        assert_eq!(
+            router.stream_settlements.snapshot().unwrap(),
+            MeshForwardUsage::default()
+        );
+        assert_eq!(
+            router.cancellation_usage().unwrap(),
+            MeshForwardUsage::default()
+        );
+        drop(first_poll);
+        drop(second_poll);
+        drop(bulk);
+        assert_eq!(
+            router.stream_polls.snapshot().unwrap(),
+            MeshForwardUsage::default()
+        );
+        assert_eq!(router.forward_usage().unwrap(), MeshForwardUsage::default());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn generic_forward_cannot_bypass_state_or_stream_confidentiality() {
         let local_key = Ed25519SigningKey::generate();
         let peer_key = Ed25519SigningKey::generate();
         let router = MeshRouter::new(MeshRoutingSettings {
@@ -1516,17 +1733,32 @@ mod tests {
             forward_timeout: Duration::from_secs(5),
         })
         .unwrap();
-        let result = fcp_async_core::runtime::block_on_sync(router.forward(
-            &TailscaleNodeId::new("node-b"),
+        for body in [
             MeshForwardBody::ConnectorStateExport {
                 request_json: "{}".to_owned(),
             },
-        ))
-        .unwrap();
-        assert!(
-            matches!(result, Err(MeshForwardFailure::NotDelivered { detail, .. }) if detail.contains("HTTPS"))
-        );
-        assert_eq!(router.forward_usage().unwrap().in_flight, 0);
+            MeshForwardBody::StreamOpen {
+                request_json: "{}".to_owned(),
+            },
+            MeshForwardBody::StreamPoll {
+                request_json: "{}".to_owned(),
+            },
+            MeshForwardBody::StreamAck {
+                request_json: "{}".to_owned(),
+            },
+            MeshForwardBody::StreamClose {
+                request_json: "{}".to_owned(),
+            },
+        ] {
+            let result = fcp_async_core::runtime::block_on_sync(
+                router.forward(&TailscaleNodeId::new("node-b"), body),
+            )
+            .unwrap();
+            assert!(
+                matches!(result, Err(MeshForwardFailure::NotDelivered { detail, .. }) if detail.contains("HTTPS"))
+            );
+            assert_eq!(router.forward_usage().unwrap().in_flight, 0);
+        }
     }
 
     fn write_key_file(dir: &tempfile::TempDir, key: &Ed25519SigningKey) -> String {

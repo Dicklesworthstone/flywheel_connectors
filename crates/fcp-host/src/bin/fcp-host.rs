@@ -5572,6 +5572,8 @@ struct AppState {
     mesh: Option<Arc<fcp_host::mesh_routing::MeshRouter>>,
     /// Startup-configured exact-root grants and retained replica store ownership.
     connector_state_replication: Option<Arc<fcp_host::ConnectorStateReplicationService>>,
+    /// Shared durable event custody for local and authenticated mesh consumers.
+    native_events: Arc<native_events::EventService>,
 }
 
 impl AppState {
@@ -8960,6 +8962,7 @@ async fn async_main(telemetry_config: TelemetryConfig) -> HostResult<()> {
         started_at: Instant::now(),
         mesh: mesh_router,
         connector_state_replication,
+        native_events: Arc::new(native_events::EventService::new(event_journal)),
     });
 
     // fcp_async_core aborts tasks when their handles are dropped. Keep the
@@ -9208,7 +9211,7 @@ async fn async_main(telemetry_config: TelemetryConfig) -> HostResult<()> {
         // flywheel_connectors-qeapt.
         .route("/rpc/introspect/{connector_id}", get(introspect_handler))
         .merge(local_invocation_routes())
-        .merge(native_events::routes(Arc::clone(&state), event_journal))
+        .merge(native_events::routes(Arc::clone(&state)))
         .route("/rpc/egress/http", post(host_egress_http_handler))
         .route("/rpc/egress/tcp", post(host_egress_tcp_handler))
         // /rpc/cancel and /rpc/operations/cancel moved into
@@ -16281,9 +16284,13 @@ fn mesh_query_response_bindings(
         MeshForwardBody::Preflight { .. } => Ok(Vec::new()),
         MeshForwardBody::Invoke { .. }
         | MeshForwardBody::Cancel { .. }
-        | MeshForwardBody::ConnectorStateExport { .. } => {
+        | MeshForwardBody::ConnectorStateExport { .. }
+        | MeshForwardBody::StreamOpen { .. }
+        | MeshForwardBody::StreamPoll { .. }
+        | MeshForwardBody::StreamAck { .. }
+        | MeshForwardBody::StreamClose { .. } => {
             Err(map_host_error(HostError::Internal(
-                "invoke, cancellation and exact-root state transfer must not use read-only mesh failover"
+                "invoke, cancellation, state transfer and event streams must not use read-only mesh failover"
                     .to_string(),
             )))
         }
@@ -16418,6 +16425,15 @@ async fn mesh_forward_handler(
         MeshForwardBody::ConnectorStateExport { request_json } => {
             connector_state_transfer::export_reply(&state, &router, &envelope, request_json).await
         }
+        MeshForwardBody::StreamOpen { request_json }
+        | MeshForwardBody::StreamPoll { request_json }
+        | MeshForwardBody::StreamAck { request_json }
+        | MeshForwardBody::StreamClose { request_json } => mesh_reply_body(
+            state
+                .native_events
+                .execute_forward(&state, envelope.body.method(), request_json)
+                .await,
+        ),
         MeshForwardBody::Invoke {
             request_json,
             asserted_principal,
@@ -18469,6 +18485,7 @@ output_schema = {{ type = "object" }}
             invoke_jobs: Arc::new(invoke_jobs::InvocationJobs::new()),
             started_at: Instant::now(),
             connector_state_replication: None,
+            native_events: Arc::new(native_events::EventService::new(None)),
             mesh: None,
         })
     }
@@ -20290,6 +20307,7 @@ output_schema = {{ type = "object" }}
             invoke_jobs: Arc::new(invoke_jobs::InvocationJobs::new()),
             started_at: Instant::now(),
             connector_state_replication: None,
+            native_events: Arc::new(native_events::EventService::new(None)),
             mesh: None,
         })
     }
@@ -27727,6 +27745,7 @@ output_schema = { type = "object" }
             invoke_jobs: Arc::new(invoke_jobs::InvocationJobs::new()),
             started_at: Instant::now(),
             connector_state_replication: None,
+            native_events: Arc::new(native_events::EventService::new(None)),
             mesh: None,
         });
 
@@ -28303,6 +28322,7 @@ output_schema = { type = "object" }
             invoke_jobs: Arc::new(invoke_jobs::InvocationJobs::new()),
             started_at: Instant::now(),
             connector_state_replication: None,
+            native_events: Arc::new(native_events::EventService::new(None)),
             mesh: None,
         });
         let token_id = [0x5a; 32];
@@ -35306,6 +35326,7 @@ done"#;
             invoke_jobs: Arc::new(invoke_jobs::InvocationJobs::new()),
             started_at: Instant::now(),
             connector_state_replication: None,
+            native_events: Arc::new(native_events::EventService::new(None)),
             mesh: None,
         };
 
@@ -35349,6 +35370,7 @@ done"#;
             invoke_jobs: Arc::new(invoke_jobs::InvocationJobs::new()),
             started_at: Instant::now(),
             connector_state_replication: None,
+            native_events: Arc::new(native_events::EventService::new(None)),
             mesh: None,
         };
 
@@ -35397,6 +35419,7 @@ done"#;
             invoke_jobs: Arc::new(invoke_jobs::InvocationJobs::new()),
             started_at: Instant::now(),
             connector_state_replication: None,
+            native_events: Arc::new(native_events::EventService::new(None)),
             mesh: None,
         };
 
@@ -35445,6 +35468,7 @@ done"#;
             invoke_jobs: Arc::new(invoke_jobs::InvocationJobs::new()),
             started_at: Instant::now(),
             connector_state_replication: None,
+            native_events: Arc::new(native_events::EventService::new(None)),
             mesh: None,
         };
 
@@ -35510,6 +35534,7 @@ done"#;
             invoke_jobs: Arc::new(invoke_jobs::InvocationJobs::new()),
             started_at: Instant::now(),
             connector_state_replication: None,
+            native_events: Arc::new(native_events::EventService::new(None)),
             mesh: None,
         };
 
@@ -35562,6 +35587,7 @@ done"#;
             invoke_jobs: Arc::new(invoke_jobs::InvocationJobs::new()),
             started_at: Instant::now(),
             connector_state_replication: None,
+            native_events: Arc::new(native_events::EventService::new(None)),
             mesh: None,
         };
 
@@ -35680,6 +35706,7 @@ done"#;
             invoke_jobs: Arc::new(invoke_jobs::InvocationJobs::new()),
             started_at: Instant::now(),
             connector_state_replication: None,
+            native_events: Arc::new(native_events::EventService::new(None)),
             mesh: None,
         };
         let cloned = state.clone();
@@ -35738,6 +35765,7 @@ done"#;
             invoke_jobs: Arc::new(invoke_jobs::InvocationJobs::new()),
             started_at: Instant::now(),
             connector_state_replication: None,
+            native_events: Arc::new(native_events::EventService::new(None)),
             mesh: None,
         });
         let version = semver::Version::new(1, 2, 0);
@@ -36142,6 +36170,7 @@ done"#;
             invoke_jobs: Arc::new(invoke_jobs::InvocationJobs::new()),
             started_at: Instant::now(),
             connector_state_replication: None,
+            native_events: Arc::new(native_events::EventService::new(None)),
             mesh: None,
         })
     }

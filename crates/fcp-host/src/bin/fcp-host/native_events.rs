@@ -6,20 +6,23 @@
 //! is released only after the consumer decision has reached durable storage.
 
 use super::*;
-use fcp_core::{CapabilityId, EventAck, SubscribeResponse};
+use fcp_core::{CapabilityId, EventAck, SubscribeResponse, TailscaleNodeId};
 use fcp_host::{NativeEventAdmission, NativeEventBinding, NativeEventJournal};
 
 const JOURNAL_ENV: &str = "FCP_HOST_EVENT_JOURNAL_FILE";
 const JOURNAL_MAX_BYTES_ENV: &str = "FCP_HOST_EVENT_JOURNAL_MAX_BYTES";
-const REQUEST_BYTES: usize = 64 * 1024;
+const REQUEST_BYTES: usize = fcp_mesh::invoke_route::MAX_MESH_STREAM_BODY_BYTES;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
+#[path = "native_event_mesh.rs"]
+mod mesh;
 
 #[cfg(all(test, unix))]
 #[path = "native_events_tests.rs"]
 mod tests;
 
 /// No Debug implementation: request bodies carry bearer capabilities.
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StreamAuthority {
     request_id: String,
@@ -29,10 +32,12 @@ struct StreamAuthority {
     capability_token: fcp_core::CapabilityToken,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct OpenRequest {
     auth: StreamAuthority,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    executor_node: Option<TailscaleNodeId>,
     #[serde(default)]
     stream_id: Option<String>,
     #[serde(default = "default_window")]
@@ -43,10 +48,12 @@ const fn default_window() -> u32 {
     1
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PollRequest {
     auth: StreamAuthority,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    executor_node: Option<TailscaleNodeId>,
     stream_id: String,
     #[serde(default = "default_limit")]
     limit: usize,
@@ -56,18 +63,22 @@ const fn default_limit() -> usize {
     1
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AckRequest {
     auth: StreamAuthority,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    executor_node: Option<TailscaleNodeId>,
     stream_id: String,
     ack: EventAck,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CloseRequest {
     auth: StreamAuthority,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    executor_node: Option<TailscaleNodeId>,
     stream_id: String,
 }
 
@@ -95,8 +106,7 @@ impl Drop for Attachment {
     }
 }
 
-struct EventService {
-    host: Arc<AppState>,
+pub(super) struct EventService {
     journal: Option<Arc<NativeEventJournal>>,
     attachments: futures_util::lock::Mutex<HashMap<ConnectorId, Attachment>>,
 }
@@ -141,24 +151,37 @@ pub(super) fn open_journal() -> HostResult<Option<Arc<NativeEventJournal>>> {
     .transpose()
 }
 
-pub(super) fn routes(
-    host: Arc<AppState>,
-    journal: Option<Arc<NativeEventJournal>>,
-) -> Router<Arc<AppState>> {
+pub(super) fn routes(host: Arc<AppState>) -> Router<Arc<AppState>> {
     Router::new()
         .route("/rpc/streams/open", post(open_handler))
         .route("/rpc/streams/poll", post(poll_handler))
         .route("/rpc/streams/ack", post(ack_handler))
         .route("/rpc/streams/close", post(close_handler))
         .layer(axum::extract::DefaultBodyLimit::max(REQUEST_BYTES))
-        .with_state(Arc::new(EventService {
-            host,
-            journal,
-            attachments: futures_util::lock::Mutex::new(HashMap::new()),
-        }))
+        .with_state(host)
 }
 
 impl EventService {
+    pub(super) fn new(journal: Option<Arc<NativeEventJournal>>) -> Self {
+        Self {
+            journal,
+            attachments: futures_util::lock::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Dispatch only on the executor selected in the authenticated peer request.
+    /// The peer envelope authenticates the relay; local capability and custody
+    /// admission remain mandatory for every operation.
+    pub(super) async fn execute_forward(
+        &self,
+        host: &Arc<AppState>,
+        method: &str,
+        request_json: &str,
+    ) -> Result<Value, (StatusCode, String)> {
+        let request = mesh::Request::decode(method, request_json)?;
+        mesh::dispatch(self, host, request, true).await
+    }
+
     fn journal(&self) -> HostResult<&Arc<NativeEventJournal>> {
         self.journal.as_ref().ok_or_else(|| {
             unavailable("native consumer delivery requires FCP_HOST_EVENT_JOURNAL_FILE or a persistent host lifecycle store")
@@ -167,7 +190,7 @@ impl EventService {
 
     /// Authentication does not call the connector: an invocation can be
     /// waiting for exactly the acknowledgement this consumer is submitting.
-    async fn authorize(&self, auth: &StreamAuthority) -> HostResult<Admission> {
+    async fn authorize(&self, host: &AppState, auth: &StreamAuthority) -> HostResult<Admission> {
         self.journal()?;
         if auth.request_id.is_empty()
             || auth.request_id.len() > 128
@@ -177,9 +200,9 @@ impl EventService {
         {
             return Err(invalid("invalid stream request identity or topic"));
         }
-        let generation = self.host.registry.version.load(Ordering::Acquire);
+        let generation = host.registry.version.load(Ordering::Acquire);
         let (config, connector, declaration) = {
-            let state = self.host.registry.state.read().await;
+            let state = host.registry.state.read().await;
             let entry = state
                 .connectors
                 .get(&auth.connector_id)
@@ -247,8 +270,7 @@ impl EventService {
         let operation: OperationId = operation
             .parse()
             .map_err(|_| denied("invalid manifest subscription operation"))?;
-        let key = self
-            .host
+        let key = host
             .capability_verifying_key
             .as_ref()
             .ok_or_else(|| denied("host capability verification key is unavailable"))?;
@@ -278,7 +300,7 @@ impl EventService {
                 "holder-bound capabilities require a supported holder-proof transport",
             ));
         }
-        verify_live_revocation_cascade(&self.host, &auth.zone_id, &auth.capability_token, claims)?;
+        verify_live_revocation_cascade(host, &auth.zone_id, &auth.capability_token, claims)?;
         let request = InvokeRequest {
             r#type: "invoke".into(),
             id: RequestId::new(auth.request_id.clone()),
@@ -296,9 +318,8 @@ impl EventService {
             provenance: None,
             approval_tokens: Vec::new(),
         };
-        verify_live_hybrid_owner_capability(&self.host, &request)?;
-        let persisted = self
-            .host
+        verify_live_hybrid_owner_capability(host, &request)?;
+        let persisted = host
             .lifecycle
             .verify_capability_token(&CapabilityTokenVerifyRequest {
                 token_cbor_b64: capability_token_b64(&auth.capability_token)?,
@@ -320,7 +341,7 @@ impl EventService {
         }
         enforce_live_capability_constraints(&request, claims, &principal, Some(&resource_uri))?;
         let policy = simulate_policy_decision(&PolicySimulationInput {
-            zone_policy: self.host.lookup_zone_policy(&auth.zone_id).await?,
+            zone_policy: host.lookup_zone_policy(&auth.zone_id).await?,
             invoke_request: request.clone(),
             transport: TransportMode::Lan,
             checkpoint_fresh: true,
@@ -341,7 +362,7 @@ impl EventService {
         if policy.decision == Decision::Deny {
             return Err(denied("zone policy denied event consumption"));
         }
-        if generation != self.host.registry.version.load(Ordering::Acquire) {
+        if generation != host.registry.version.load(Ordering::Acquire) {
             return Err(denied(
                 "connector inventory changed during event authorization; retry",
             ));
@@ -364,12 +385,12 @@ impl EventService {
 
     fn verify_instance(
         &self,
+        host: &AppState,
         auth: &StreamAuthority,
         admission: &Admission,
         instance: &InstanceId,
     ) -> HostResult<()> {
-        let key = self
-            .host
+        let key = host
             .capability_verifying_key
             .as_ref()
             .ok_or_else(|| denied("host event verification key is unavailable"))?;
@@ -388,6 +409,7 @@ impl EventService {
 
     fn authorize_retained(
         &self,
+        host: &AppState,
         auth: &StreamAuthority,
         admission: &Admission,
         stream_id: &str,
@@ -396,12 +418,12 @@ impl EventService {
         if retained.binding != admission.binding {
             return Err(denied("event stream belongs to another consumer or scope"));
         }
-        self.verify_instance(auth, admission, &retained.instance_id)?;
+        self.verify_instance(host, auth, admission, &retained.instance_id)?;
         Ok(retained.instance_id)
     }
 
-    async fn open(&self, request: OpenRequest) -> HostResult<Value> {
-        let admission = self.authorize(&request.auth).await?;
+    async fn open(&self, host: &AppState, request: OpenRequest) -> HostResult<Value> {
+        let admission = self.authorize(host, &request.auth).await?;
         if admission.enforce_operation_network_constraints {
             return Err(denied(
                 "native streaming cannot bypass strict per-operation egress enforcement",
@@ -426,8 +448,7 @@ impl EventService {
             provenance: None,
             approval_tokens: Vec::new(),
         };
-        self.host
-            .registry
+        host.registry
             .enforce_runtime_network_policy(&network_request)
             .await?;
         let stream_id = match request.stream_id {
@@ -478,9 +499,9 @@ impl EventService {
             .map_err(|_| unavailable("connector did not prove its ready native instance"))?
             .instance_id
         };
-        self.verify_instance(&request.auth, &admission, &instance_id)?;
+        self.verify_instance(host, &request.auth, &admission, &instance_id)?;
         let mut attachments = self.attachments.lock().await;
-        if admission.generation != self.host.registry.version.load(Ordering::Acquire) {
+        if admission.generation != host.registry.version.load(Ordering::Acquire) {
             return Err(denied("connector changed before event attachment; retry"));
         }
         if let Some(old) = attachments.get(&admission.binding.connector_id)
@@ -618,7 +639,7 @@ impl EventService {
         };
         if current.closed
             || current.instance_id != stream.instance_id
-            || admission.generation != self.host.registry.version.load(Ordering::Acquire)
+            || admission.generation != host.registry.version.load(Ordering::Acquire)
             || !still_attached
         {
             // Close can race a queued subscription RPC. Cancel any producer
@@ -637,9 +658,10 @@ impl EventService {
         )
     }
 
-    async fn poll(&self, request: PollRequest) -> HostResult<Value> {
-        let admitted = self.authorize(&request.auth).await?;
-        let instance = self.authorize_retained(&request.auth, &admitted, &request.stream_id)?;
+    async fn poll(&self, host: &AppState, request: PollRequest) -> HostResult<Value> {
+        let admitted = self.authorize(host, &request.auth).await?;
+        let instance =
+            self.authorize_retained(host, &request.auth, &admitted, &request.stream_id)?;
         let batch = self.journal()?.poll(
             &request.stream_id,
             &admitted.binding,
@@ -649,9 +671,10 @@ impl EventService {
         serde_json::to_value(batch).map_err(|_| unavailable("event batch could not be encoded"))
     }
 
-    async fn acknowledge(&self, request: AckRequest) -> HostResult<Value> {
-        let admitted = self.authorize(&request.auth).await?;
-        let instance = self.authorize_retained(&request.auth, &admitted, &request.stream_id)?;
+    async fn acknowledge(&self, host: &AppState, request: AckRequest) -> HostResult<Value> {
+        let admitted = self.authorize(host, &request.auth).await?;
+        let instance =
+            self.authorize_retained(host, &request.auth, &admitted, &request.stream_id)?;
         // This synchronization is the custody handoff. No connector ACK may
         // precede it, even when the consumer retries after a lost response.
         let native_ack = self.journal()?.acknowledge(
@@ -702,9 +725,10 @@ impl EventService {
         )
     }
 
-    async fn close(&self, request: CloseRequest) -> HostResult<Value> {
-        let admitted = self.authorize(&request.auth).await?;
-        let instance = self.authorize_retained(&request.auth, &admitted, &request.stream_id)?;
+    async fn close(&self, host: &AppState, request: CloseRequest) -> HostResult<Value> {
+        let admitted = self.authorize(host, &request.auth).await?;
+        let instance =
+            self.authorize_retained(host, &request.auth, &admitted, &request.stream_id)?;
         let stream = self
             .journal()?
             .close(&request.stream_id, &admitted.binding, &instance)?;
@@ -730,38 +754,58 @@ impl EventService {
     }
 }
 
-async fn bounded<T>(
-    future: impl std::future::Future<Output = HostResult<T>>,
-) -> Result<T, (StatusCode, String)> {
-    fcp_async_core::time::timeout(REQUEST_TIMEOUT, future).await
-        .map_err(|_| map_host_error(unavailable("event request deadline expired; retry with the original stream and event identities")))?
-        .map_err(map_host_error)
-}
-
 async fn open_handler(
-    State(service): State<Arc<EventService>>,
+    State(host): State<Arc<AppState>>,
     Json(request): Json<OpenRequest>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    bounded(service.open(request)).await.map(Json)
+    mesh::dispatch(
+        &host.native_events,
+        &host,
+        mesh::Request::Open(request),
+        false,
+    )
+    .await
+    .map(Json)
 }
 
 async fn poll_handler(
-    State(service): State<Arc<EventService>>,
+    State(host): State<Arc<AppState>>,
     Json(request): Json<PollRequest>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    bounded(service.poll(request)).await.map(Json)
+    mesh::dispatch(
+        &host.native_events,
+        &host,
+        mesh::Request::Poll(request),
+        false,
+    )
+    .await
+    .map(Json)
 }
 
 async fn ack_handler(
-    State(service): State<Arc<EventService>>,
+    State(host): State<Arc<AppState>>,
     Json(request): Json<AckRequest>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    bounded(service.acknowledge(request)).await.map(Json)
+    mesh::dispatch(
+        &host.native_events,
+        &host,
+        mesh::Request::Ack(request),
+        false,
+    )
+    .await
+    .map(Json)
 }
 
 async fn close_handler(
-    State(service): State<Arc<EventService>>,
+    State(host): State<Arc<AppState>>,
     Json(request): Json<CloseRequest>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    bounded(service.close(request)).await.map(Json)
+    mesh::dispatch(
+        &host.native_events,
+        &host,
+        mesh::Request::Close(request),
+        false,
+    )
+    .await
+    .map(Json)
 }
