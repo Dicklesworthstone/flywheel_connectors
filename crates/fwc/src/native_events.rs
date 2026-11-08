@@ -12,7 +12,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use clap::{Args, Subcommand};
-use fcp_core::{CapabilityToken, ConnectorId, EventAck, EventEnvelope, InstanceId, ZoneId};
+use fcp_core::{
+    CapabilityToken, ConnectorId, EventAck, EventEnvelope, InstanceId, TailscaleNodeId, ZoneId,
+};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -65,6 +67,10 @@ struct AuthorityArgs {
     /// Stable request identity. Reuse it when retrying an open whose response was lost.
     #[arg(long, value_name = "REQUEST_ID")]
     request_id: String,
+
+    /// Exact mesh node that owns this durable journal; reuse the open response's executor_node.
+    #[arg(long, value_name = "NODE_ID")]
+    executor_node: Option<TailscaleNodeId>,
 
     /// Read the signed capability from a regular file containing base64, JSON, or COSE CBOR.
     #[arg(long, value_name = "PATH")]
@@ -137,6 +143,7 @@ pub(crate) struct NativeStreamConfig {
     pub(crate) topic: String,
     pub(crate) request_id: String,
     pub(crate) stream_id: String,
+    pub(crate) executor_node: Option<TailscaleNodeId>,
     pub(crate) capability_token_file: PathBuf,
     pub(crate) timeout_seconds: u64,
 }
@@ -157,25 +164,34 @@ pub(crate) struct NativeAckResult {
 struct RetainedBinding {
     principal: String,
     window_size: u32,
+    executor_node: Option<TailscaleNodeId>,
 }
 
 impl RetainedBinding {
-    fn from_stream(stream: &StreamMetadata) -> Self {
+    fn from_stream(stream: &StreamMetadata, executor_node: Option<TailscaleNodeId>) -> Self {
         Self {
             principal: stream.binding.principal.clone(),
             window_size: stream.window_size,
+            executor_node,
         }
     }
 
-    fn check(&self, stream: &StreamMetadata) -> std::result::Result<(), Failure> {
-        if self.principal != stream.binding.principal || self.window_size != stream.window_size {
+    fn check(
+        &self,
+        stream: &StreamMetadata,
+        executor_node: Option<&TailscaleNodeId>,
+    ) -> std::result::Result<(), Failure> {
+        if self.principal != stream.binding.principal
+            || self.window_size != stream.window_size
+            || self.executor_node.as_ref() != executor_node
+        {
             return Err(Failure::InvalidResponse);
         }
         Ok(())
     }
 }
 
-/// A single selected host and loaded capability for one retained stream.
+/// A single selected gateway, journal executor and loaded capability for one retained stream.
 ///
 /// Polling never acknowledges. An acknowledgement must be an exact subset of
 /// the last validated poll, so processing code cannot accidentally release
@@ -203,6 +219,7 @@ impl NativeStreamClient {
             zone: config.zone,
             topic: config.topic,
             request_id: config.request_id,
+            executor_node: config.executor_node,
             capability_token_file: config.capability_token_file,
             timeout_seconds: config.timeout_seconds,
         })?;
@@ -240,6 +257,13 @@ impl NativeStreamClient {
         &self.auth.topic
     }
 
+    pub(crate) fn executor_node(&self) -> Option<&TailscaleNodeId> {
+        self.binding
+            .as_ref()
+            .and_then(|binding| binding.executor_node.as_ref())
+            .or(self.auth.executor_node.as_ref())
+    }
+
     pub(crate) fn poll(
         &mut self,
         batch_size: u32,
@@ -253,11 +277,8 @@ impl NativeStreamClient {
             batch_size,
             wait_seconds,
             self.timeout,
-            self.binding.as_ref(),
+            &mut self.binding,
         )?;
-        if self.binding.is_none() {
-            self.binding = Some(RetainedBinding::from_stream(&batch.response.stream));
-        }
         for event in &batch.response.events {
             self.delivered.insert(event.cursor.clone(), event.seq);
         }
@@ -287,12 +308,13 @@ impl NativeStreamClient {
             &self.auth,
             &self.stream_id,
             &ack,
+            self.executor_node(),
             self.timeout,
         )?;
         self.binding
             .as_ref()
             .ok_or(Failure::InvalidRequest)?
-            .check(&response.stream)?;
+            .check(&response.stream, response.executor_node.as_ref())?;
         for cursor in cursors {
             self.delivered.remove(cursor);
         }
@@ -342,6 +364,9 @@ struct Authority {
     zone_id: ZoneId,
     topic: String,
     capability_token: CapabilityToken,
+    // Routing is a top-level host request field, never capability authority.
+    #[serde(skip)]
+    executor_node: Option<TailscaleNodeId>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -366,6 +391,7 @@ struct StreamMetadata {
 
 #[derive(Deserialize, Serialize)]
 struct OpenResponse {
+    executor_node: Option<TailscaleNodeId>,
     stream: StreamMetadata,
     attached: bool,
     replay_supported: bool,
@@ -373,12 +399,14 @@ struct OpenResponse {
 
 #[derive(Deserialize, Serialize)]
 struct PollResponse {
+    executor_node: Option<TailscaleNodeId>,
     stream: StreamMetadata,
     events: Vec<EventEnvelope>,
 }
 
 #[derive(Deserialize, Serialize)]
 struct AckResponse {
+    executor_node: Option<TailscaleNodeId>,
     stream: StreamMetadata,
     acknowledged: bool,
     upstream_notified: bool,
@@ -386,6 +414,7 @@ struct AckResponse {
 
 #[derive(Deserialize, Serialize)]
 struct CloseResponse {
+    executor_node: Option<TailscaleNodeId>,
     stream: StreamMetadata,
     upstream_notified: bool,
 }
@@ -455,7 +484,7 @@ impl Failure {
             ),
             Self::InvalidResponse => (
                 "invalid-stream-response",
-                "The host response did not match the requested stream scope or canonical event contract.",
+                "The host response did not match the requested journal executor, stream scope, or canonical event contract.",
                 CliExitCode::Transport,
             ),
             Self::ResponseTooLarge => (
@@ -568,6 +597,12 @@ fn load_authority(args: &AuthorityArgs) -> std::result::Result<Authority, Failur
         .parse()
         .map_err(|_| Failure::InvalidRequest)?;
     let zone_id = args.zone.parse().map_err(|_| Failure::InvalidRequest)?;
+    let executor_node = args
+        .executor_node
+        .as_ref()
+        .map(|node| node.as_str().parse::<TailscaleNodeId>())
+        .transpose()
+        .map_err(|_| Failure::InvalidRequest)?;
     let metadata =
         std::fs::metadata(&args.capability_token_file).map_err(|_| Failure::Credential)?;
     if !metadata.is_file() || metadata.len() > MAX_TOKEN_BYTES {
@@ -592,6 +627,7 @@ fn load_authority(args: &AuthorityArgs) -> std::result::Result<Authority, Failur
         zone_id,
         topic: args.topic.clone(),
         capability_token,
+        executor_node,
     })
 }
 
@@ -631,6 +667,25 @@ fn check_stream(
     Ok(())
 }
 
+fn check_executor(
+    expected: Option<&TailscaleNodeId>,
+    actual: Option<&TailscaleNodeId>,
+) -> std::result::Result<(), Failure> {
+    if expected.is_some_and(|expected| Some(expected) != actual) {
+        return Err(Failure::InvalidResponse);
+    }
+    Ok(())
+}
+
+fn routed_request(mut body: Value, executor_node: Option<&TailscaleNodeId>) -> Value {
+    // Omission preserves the local request contract for older hosts that deny
+    // unknown fields. A known executor is always sent explicitly thereafter.
+    if let Some(executor_node) = executor_node {
+        body["executor_node"] = json!(executor_node);
+    }
+    body
+}
+
 fn execute(
     command: &StreamCommand,
     auth: &Authority,
@@ -642,11 +697,13 @@ fn execute(
             let response: OpenResponse = post(
                 client,
                 "/rpc/streams/open",
-                &json!({
-                    "auth": auth, "stream_id": args.stream_id, "window_size": args.window_size,
-                }),
+                &routed_request(
+                    json!({"auth": auth, "stream_id": args.stream_id, "window_size": args.window_size}),
+                    auth.executor_node.as_ref(),
+                ),
                 timeout,
             )?;
+            check_executor(auth.executor_node.as_ref(), response.executor_node.as_ref())?;
             check_stream(&response.stream, auth, args.stream_id.as_deref())?;
             if !response.attached
                 || response.stream.closed
@@ -660,7 +717,14 @@ fn execute(
         StreamCommand::Ack(args) => {
             let ack =
                 EventAck::new(&auth.topic, args.seqs.clone()).with_cursors(args.cursors.clone());
-            let response = acknowledge(client, auth, &args.retained.stream_id, &ack, timeout)?;
+            let response = acknowledge(
+                client,
+                auth,
+                &args.retained.stream_id,
+                &ack,
+                auth.executor_node.as_ref(),
+                timeout,
+            )?;
             let mut payload = encode(response)?;
             payload["ack"] = encode(ack)?;
             Ok(payload)
@@ -669,11 +733,13 @@ fn execute(
             let response: CloseResponse = post(
                 client,
                 "/rpc/streams/close",
-                &json!({
-                    "auth": auth, "stream_id": args.stream_id,
-                }),
+                &routed_request(
+                    json!({"auth": auth, "stream_id": args.stream_id}),
+                    auth.executor_node.as_ref(),
+                ),
                 timeout,
             )?;
+            check_executor(auth.executor_node.as_ref(), response.executor_node.as_ref())?;
             check_stream(&response.stream, auth, Some(&args.stream_id))?;
             if !response.stream.closed {
                 return Err(Failure::InvalidResponse);
@@ -689,6 +755,7 @@ fn poll(
     args: &PollArgs,
     timeout: Duration,
 ) -> std::result::Result<Value, Failure> {
+    let mut binding = None;
     let batch = poll_response(
         client,
         auth,
@@ -696,7 +763,7 @@ fn poll(
         args.batch_size,
         args.wait_seconds,
         timeout,
-        None,
+        &mut binding,
     )?;
     let ack = if batch.response.events.is_empty() {
         None
@@ -742,15 +809,23 @@ fn poll_response(
     batch_size: u32,
     wait_seconds: u64,
     timeout: Duration,
-    expected_binding: Option<&RetainedBinding>,
+    binding: &mut Option<RetainedBinding>,
 ) -> std::result::Result<PolledResponse, Failure> {
     if !valid_stream_id(stream_id) || !(1..=64).contains(&batch_size) || wait_seconds > 60 {
         return Err(Failure::InvalidRequest);
     }
     let deadline = (wait_seconds > 0).then(|| Instant::now() + Duration::from_secs(wait_seconds));
-    let body = json!({ "auth": auth, "stream_id": stream_id, "limit": batch_size });
-    let mut binding = expected_binding.cloned();
     loop {
+        // The first unpinned request selects the local journal. Once its
+        // executor is known, every retry and ACK stays with that same node.
+        let executor_node = binding
+            .as_ref()
+            .and_then(|binding| binding.executor_node.as_ref())
+            .or(auth.executor_node.as_ref());
+        let body = routed_request(
+            json!({"auth": auth, "stream_id": stream_id, "limit": batch_size}),
+            executor_node,
+        );
         let remaining = deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
         let response: PollResponse = post(
             client,
@@ -758,11 +833,15 @@ fn poll_response(
             &body,
             remaining.map_or(timeout, |remaining| timeout.min(remaining)),
         )?;
+        check_executor(executor_node, response.executor_node.as_ref())?;
         check_poll(&response, auth, stream_id, batch_size)?;
-        if let Some(binding) = &binding {
-            binding.check(&response.stream)?;
+        if let Some(binding) = binding.as_ref() {
+            binding.check(&response.stream, response.executor_node.as_ref())?;
         } else {
-            binding = Some(RetainedBinding::from_stream(&response.stream));
+            *binding = Some(RetainedBinding::from_stream(
+                &response.stream,
+                response.executor_node.clone(),
+            ));
         }
         let wait_expired = deadline.is_some_and(|deadline| Instant::now() >= deadline);
         if !response.events.is_empty()
@@ -828,15 +907,20 @@ fn acknowledge(
     auth: &Authority,
     stream_id: &str,
     ack: &EventAck,
+    executor_node: Option<&TailscaleNodeId>,
     timeout: Duration,
 ) -> std::result::Result<AckResponse, Failure> {
     validate_ack_pairs(&ack.seqs, &ack.cursors)?;
     let response: AckResponse = post(
         client,
         "/rpc/streams/ack",
-        &json!({ "auth": auth, "stream_id": stream_id, "ack": ack }),
+        &routed_request(
+            json!({"auth": auth, "stream_id": stream_id, "ack": ack}),
+            executor_node,
+        ),
         timeout,
     )?;
+    check_executor(executor_node, response.executor_node.as_ref())?;
     check_stream(&response.stream, auth, Some(stream_id))?;
     if !response.acknowledged {
         return Err(Failure::InvalidResponse);
@@ -914,8 +998,9 @@ fn failure(command: &StreamCommand, endpoint: Option<&str>, failure: Failure) ->
         "error": { "type": kind, "message": message },
         "outcome_unknown": command.mutates_subscription() && failure.may_have_reached_host(),
         "request_id": command.auth().request_id, "stream_id": command.stream_id(),
+        "executor_node": command.auth().executor_node,
         "scope": { "connector_id": command.auth().connector, "zone_id": command.auth().zone, "topic": command.auth().topic },
-        "next_actions": ["Keep the original host, request ID, stream ID, and delivered sequence/cursor pairs when retrying. Polling never acknowledges events; acknowledge only after processing succeeds."],
+        "next_actions": ["Keep the original host, executor node, request ID, stream ID, and delivered sequence/cursor pairs when retrying. Polling never acknowledges events; acknowledge only after processing succeeds."],
     });
     if let Failure::Http(status) = failure {
         payload["error"]["http_status"] = json!(status);
@@ -950,6 +1035,7 @@ mod tests {
     const TOKEN_CBOR: &[u8] = &[0x84, 0x40, 0xa0, 0x40, 0x40];
     const STREAM: &str = "stream-fixture";
     const TOPIC: &str = "telegram.message.new";
+    const EXECUTOR: &str = "node-journal-owner";
 
     #[derive(Parser)]
     struct TestCli {
@@ -1062,9 +1148,186 @@ mod tests {
             topic: TOPIC.to_owned(),
             request_id: "consumer-stable-1".to_owned(),
             stream_id: STREAM.to_owned(),
+            executor_node: None,
             capability_token_file: file.to_owned(),
             timeout_seconds: 3,
         }
+    }
+
+    #[test]
+    fn explicit_executor_survives_open_resume_poll_ack_and_close() {
+        let file = credential();
+        let opened = json!({
+            "executor_node":EXECUTOR,"stream":metadata(false,0,0),
+            "attached":true,"replay_supported":false,
+        });
+        let (endpoint, task) = host(vec![
+            opened.clone(),
+            opened,
+            json!({"executor_node":EXECUTOR,"stream":metadata(false,1,0),"events":[event()]}),
+            json!({"executor_node":EXECUTOR,"stream":metadata(false,0,1),"acknowledged":true,"upstream_notified":false}),
+            json!({"executor_node":EXECUTOR,"stream":metadata(true,0,1),"upstream_notified":true}),
+        ]);
+        for (command, extra) in [
+            ("open", vec![]),
+            ("open", vec!["--stream-id", STREAM]),
+            ("poll", vec!["--stream-id", STREAM]),
+            (
+                "ack",
+                vec![
+                    "--stream-id",
+                    STREAM,
+                    "--seq",
+                    "7",
+                    "--cursor",
+                    "provider-7",
+                ],
+            ),
+            ("close", vec!["--stream-id", STREAM]),
+        ] {
+            let mut extra = extra;
+            extra.extend(["--executor-node", EXECUTOR]);
+            let result = dispatch(&args(file.path(), command, &extra), Some(&endpoint)).unwrap();
+            assert_eq!(result.exit_code, CliExitCode::Success);
+            assert_eq!(result.payload["executor_node"], EXECUTOR);
+            assert_eq!(result.payload["host"], endpoint);
+        }
+        let requests = task.join().unwrap();
+        assert_eq!(requests.len(), 5);
+        for request in requests {
+            assert_eq!(request.body["executor_node"], EXECUTOR);
+            assert!(request.body["auth"].get("executor_node").is_none());
+            assert_eq!(request.body["auth"]["request_id"], "consumer-stable-1");
+        }
+    }
+
+    #[test]
+    fn every_pinned_operation_rejects_missing_wrong_or_malformed_executor() {
+        for executor in [
+            None,
+            Some(json!(null)),
+            Some(json!("node-other")),
+            Some(json!("bad node")),
+        ] {
+            for command in ["open", "poll", "ack", "close"] {
+                let file = credential();
+                let mut response = json!({
+                    "stream":metadata(command == "close",usize::from(command == "poll"),0),
+                    "attached":true,"replay_supported":false,"events":[event()],
+                    "acknowledged":true,"upstream_notified":true,
+                });
+                if let Some(executor) = &executor {
+                    response["executor_node"] = executor.clone();
+                }
+                let (endpoint, task) = host(vec![response]);
+                let mut extra = vec!["--executor-node", EXECUTOR, "--stream-id", STREAM];
+                if command == "ack" {
+                    extra.extend(["--seq", "7", "--cursor", "provider-7"]);
+                }
+                let result =
+                    dispatch(&args(file.path(), command, &extra), Some(&endpoint)).unwrap();
+                assert_eq!(result.exit_code, CliExitCode::Transport);
+                assert_eq!(result.payload["error"]["type"], "invalid-stream-response");
+                assert_eq!(result.payload["executor_node"], EXECUTOR);
+                assert_eq!(result.payload["outcome_unknown"], command != "poll");
+                assert!(result.payload.get("events").is_none());
+                assert_eq!(task.join().unwrap()[0].body["executor_node"], EXECUTOR);
+            }
+        }
+    }
+
+    #[test]
+    fn consumer_adopts_local_executor_before_repolling_or_acknowledging() {
+        let file = credential();
+        let (endpoint, task) = host(vec![
+            json!({"executor_node":EXECUTOR,"stream":metadata(false,0,0),"events":[]}),
+            json!({"executor_node":EXECUTOR,"stream":metadata(false,1,0),"events":[event()]}),
+            json!({"executor_node":EXECUTOR,"stream":metadata(false,0,1),"acknowledged":true,"upstream_notified":false}),
+        ]);
+        let mut client =
+            NativeStreamClient::new(consumer_config(file.path()), Some(&endpoint)).unwrap();
+        assert!(client.executor_node().is_none());
+        assert_eq!(client.poll(1, 2).unwrap().events.len(), 1);
+        assert_eq!(client.executor_node().unwrap().as_str(), EXECUTOR);
+        client.ack(&[7], &["provider-7".to_owned()]).unwrap();
+        let requests = task.join().unwrap();
+        assert!(requests[0].body["executor_node"].is_null());
+        assert_eq!(requests[1].body["executor_node"], EXECUTOR);
+        assert_eq!(requests[2].body["executor_node"], EXECUTOR);
+        assert_eq!(requests[2].path, "/rpc/streams/ack");
+    }
+
+    #[test]
+    fn consumer_refuses_owner_changes_without_releasing_delivered_pairs() {
+        for reply_owner in [json!(null), json!("node-other")] {
+            let file = credential();
+            let (endpoint, task) = host(vec![
+                json!({"executor_node":EXECUTOR,"stream":metadata(false,1,0),"events":[event()]}),
+                json!({"executor_node":reply_owner,"stream":metadata(false,0,1),"acknowledged":true,"upstream_notified":true}),
+                json!({"executor_node":EXECUTOR,"stream":metadata(false,0,1),"acknowledged":true,"upstream_notified":false}),
+                json!({"executor_node":reply_owner,"stream":metadata(false,1,0),"events":[event()]}),
+            ]);
+            let mut config = consumer_config(file.path());
+            config.executor_node = Some(EXECUTOR.parse().unwrap());
+            let mut client = NativeStreamClient::new(config, Some(&endpoint)).unwrap();
+            client.poll(1, 0).unwrap();
+            let cursors = ["provider-7".to_owned()];
+            assert!(matches!(
+                client.ack(&[7], &cursors),
+                Err(Failure::InvalidResponse)
+            ));
+            assert_eq!(client.delivered.get("provider-7"), Some(&7));
+            assert!(!client.ack(&[7], &cursors).unwrap().upstream_notified);
+            assert!(matches!(client.poll(1, 0), Err(Failure::InvalidResponse)));
+            assert!(client.delivered.is_empty());
+            assert_eq!(client.executor_node().unwrap().as_str(), EXECUTOR);
+            let requests = task.join().unwrap();
+            assert_eq!(requests[1].body, requests[2].body);
+            assert!(
+                requests
+                    .iter()
+                    .all(|request| request.body["executor_node"] == EXECUTOR)
+            );
+        }
+    }
+
+    #[test]
+    fn failed_wait_keeps_the_owner_observed_before_the_failure() {
+        let file = credential();
+        let (endpoint, task) = host(vec![
+            json!({"executor_node":EXECUTOR,"stream":metadata(false,0,0),"events":[]}),
+            json!({"executor_node":"node-other","stream":metadata(false,1,0),"events":[event()]}),
+            json!({"executor_node":EXECUTOR,"stream":metadata(false,1,0),"events":[event()]}),
+        ]);
+        let mut client =
+            NativeStreamClient::new(consumer_config(file.path()), Some(&endpoint)).unwrap();
+        assert!(matches!(client.poll(1, 2), Err(Failure::InvalidResponse)));
+        assert_eq!(client.executor_node().unwrap().as_str(), EXECUTOR);
+        assert!(client.delivered.is_empty());
+        assert_eq!(client.poll(1, 0).unwrap().events.len(), 1);
+        let requests = task.join().unwrap();
+        assert!(requests[0].body["executor_node"].is_null());
+        assert_eq!(requests[1].body["executor_node"], EXECUTOR);
+        assert_eq!(requests[2].body["executor_node"], EXECUTOR);
+    }
+
+    #[test]
+    fn invalid_executor_is_rejected_before_loading_authority_or_transport() {
+        let file = credential();
+        let mut config = consumer_config(file.path());
+        config.executor_node = Some(TailscaleNodeId::new("bad node"));
+        assert!(matches!(
+            NativeStreamClient::new(config, Some("http://127.0.0.1:1")),
+            Err(Failure::InvalidRequest)
+        ));
+        let mut command = args(file.path(), "open", &[]);
+        let StreamCommand::Open(open) = &mut command.command else {
+            unreachable!();
+        };
+        open.auth.executor_node = Some(TailscaleNodeId::new("bad node"));
+        let result = dispatch(&command, Some("http://127.0.0.1:1")).unwrap();
+        assert_eq!(result.exit_code, CliExitCode::Validation);
+        assert_eq!(result.payload["outcome_unknown"], false);
     }
 
     #[test]
@@ -1418,6 +1681,7 @@ mod tests {
             assert_eq!(request.body["auth"]["request_id"], "consumer-stable-1");
             assert_eq!(request.body["auth"]["connector_id"], "fcp.telegram");
             assert!(request.body["auth"]["capability_token"].is_array());
+            assert!(request.body.get("executor_node").is_none());
         }
         assert_eq!(requests[2].body["ack"]["seqs"], json!([7]));
         assert_eq!(requests[2].body["ack"]["cursors"], json!(["provider-7"]));

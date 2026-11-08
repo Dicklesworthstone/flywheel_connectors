@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, ensure};
 use chrono::{DateTime, Duration, Utc};
 use clap::{Args, Subcommand};
-use fcp_core::{EventEnvelope, Provenance, ProvenanceStep, SafetyTier};
+use fcp_core::{EventEnvelope, Provenance, ProvenanceStep, SafetyTier, TailscaleNodeId};
 use fcp_host::{InvocationIdempotency, InvocationOutcome, InvocationQueryResponse};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -17,9 +17,7 @@ use crate::reactive_rules::{
     CircuitBreaker, ExecutionOutcome, IncomingEvent, Rule, RuleDedupCache, RuleSet, RuleSetStore,
     ThrottleState, evaluate_rule_with_dedup, matches_trigger, render_action_inputs, validate_rule,
 };
-use crate::webhook_events::{
-    PollStart, WEBHOOK_EVENT_TOPIC, WebhookPollPage, WebhookSourceScope,
-};
+use crate::webhook_events::{PollStart, WEBHOOK_EVENT_TOPIC, WebhookPollPage, WebhookSourceScope};
 
 const MAX_RULES_BYTES: u64 = 1024 * 1024;
 const MAX_EVENTS_BYTES: u64 = 16 * 1024 * 1024;
@@ -132,6 +130,9 @@ pub(crate) struct RulesConsumeOptions {
     /// Stable subscription request identity; reuse on retries.
     #[arg(long)]
     pub(crate) request_id: String,
+    /// Exact mesh journal owner returned by streams open; reuse it on every retry.
+    #[arg(long, value_name = "NODE_ID")]
+    pub(crate) executor_node: Option<TailscaleNodeId>,
     /// Subscription authority is separate from every action capability.
     #[arg(long, value_name = "PATH")]
     pub(crate) stream_capability_token_file: PathBuf,
@@ -278,6 +279,9 @@ pub(crate) struct RuleEventBatch {
 /// exact delivered sequence/cursor pairs may release retained action records.
 pub(crate) trait RuleEventSource {
     fn host(&self) -> &str;
+    fn executor_node(&self) -> Option<&TailscaleNodeId> {
+        None
+    }
     fn poll(&mut self, limit: u32, wait_seconds: u64) -> Result<RuleEventBatch>;
     fn acknowledge(&mut self, events: &[EventEnvelope]) -> Result<bool>;
 }
@@ -681,9 +685,9 @@ pub(crate) fn reconcile<R: RuleReconciler>(
         .attempts
         .iter()
         .filter(|(_, attempt)| attempt.request_id == options.request_id);
-    let (key, attempt) = matching
-        .next()
-        .context("the request ID has no retained rule action; missing history never authorizes replay")?;
+    let (key, attempt) = matching.next().context(
+        "the request ID has no retained rule action; missing history never authorizes replay",
+    )?;
     ensure!(
         matching.next().is_none(),
         "the request ID identifies multiple rule actions; reconciliation is ambiguous"
@@ -702,14 +706,7 @@ pub(crate) fn reconcile<R: RuleReconciler>(
         .get(rule_name)
         .context("the original rule definition is required for reconciliation")?;
     let response = reconciler.query(&options.request_id, options.attempt_id)?;
-    let evidence = verify_completion(
-        reconciler.host(),
-        options,
-        rule,
-        key,
-        attempt,
-        &response,
-    )?;
+    let evidence = verify_completion(reconciler.host(), options, rule, key, attempt, &response)?;
     let previous = attempt.status;
     let pinned = attempt.retain_until == DateTime::<Utc>::MAX_UTC;
     let key = key.clone();
@@ -825,7 +822,11 @@ fn verify_completion(
         finished_at,
         reconciled_at: attempt.reconciliation.as_ref().map_or_else(
             || Utc::now().max(attempt.started_at),
-            |previous| Utc::now().max(previous.reconciled_at).max(attempt.started_at),
+            |previous| {
+                Utc::now()
+                    .max(previous.reconciled_at)
+                    .max(attempt.started_at)
+            },
         ),
     };
     evidence.validate()?;
@@ -955,6 +956,7 @@ pub(crate) fn run<E: RuleExecutor>(args: &RulesArgs, executor: &mut E) -> Result
         executor,
         &mut journal,
         None,
+        None,
     ))
 }
 
@@ -1019,8 +1021,50 @@ pub(crate) fn consume<E: RuleExecutor, S: RuleEventSource>(
     let state_path = companion_path(&path, ".state.jsonl");
     let (mut state, sequence) = load_run_state(&state_path)?;
     state.prepare(&rules.rules, &identities, Utc::now())?;
+    let mut native_source = NativeSourceState {
+        host: source.host().to_owned(),
+        connector: options.connector.clone(),
+        zone: options.source_zone.clone(),
+        topic: options.topic.clone(),
+        stream_id: options.stream_id.clone(),
+        executor_node: options.executor_node.clone(),
+        observed_executor: None,
+    };
+    let source_key = native_source.identity()?;
+    if let Some(retained) = state.native_sources.get(&source_key) {
+        ensure!(
+            retained.executor_node == native_source.executor_node,
+            "native stream executor selection changed; retry with the retained executor setting"
+        );
+    } else {
+        ensure!(
+            state.native_sources.len() < MAX_POLL_SOURCES,
+            "native stream source checkpoint capacity reached"
+        );
+        let rule_keys = identities.values().collect::<BTreeSet<_>>();
+        ensure!(
+            state.attempts.values().all(|attempt| {
+                !rule_keys.contains(&attempt.rule_key)
+                    || attempt
+                        .native_source
+                        .as_ref()
+                        .and_then(|key| state.native_sources.get(key))
+                        .is_some_and(|source| source.executor_node.is_some())
+                        == options.executor_node.is_some()
+            }),
+            "retained rule effects use a different or legacy executor scope; keep the original executor setting until those effects are reconciled and their source deliveries settled"
+        );
+    }
     let mut journal = RunJournal::open(&state_path, state, sequence)?;
     let received = source.poll(options.max_events, options.wait_seconds)?;
+    native_source.observed_executor = source.executor_node().cloned();
+    native_source.validate(&source_key)?;
+    if let Some(retained) = journal.state.native_sources.get(&source_key) {
+        ensure!(
+            retained == &native_source,
+            "native stream journal owner changed; no actions or acknowledgements were sent"
+        );
+    }
     ensure!(
         received.events.len() <= options.max_events as usize,
         "source exceeded its batch bound"
@@ -1040,7 +1084,8 @@ pub(crate) fn consume<E: RuleExecutor, S: RuleEventSource>(
                 && seen.insert(&envelope.cursor),
             "invalid or repeated source event scope or cursor"
         );
-        let event = normalize_stream_event(source.host(), envelope)?;
+        let event =
+            normalize_stream_event(source.host(), envelope, options.executor_node.as_ref())?;
         provenance.push(
             Provenance::tainted(source_zone.clone()).with_step(ProvenanceStep {
                 timestamp_ms: u64::try_from(envelope.timestamp.timestamp_millis()).unwrap_or(0),
@@ -1056,6 +1101,14 @@ pub(crate) fn consume<E: RuleExecutor, S: RuleEventSource>(
         events.push(event);
     }
     let batch = prepare_batch(&rules, &events)?;
+    if !journal.state.native_sources.contains_key(&source_key) {
+        // Retain the route interpretation before any effect or source ACK.
+        // A failed sync cannot let a later restart silently pick a new owner.
+        journal.append(JournalEntry::NativeSource {
+            key: source_key.clone(),
+            checkpoint: native_source,
+        })?;
+    }
     // A new subscription can redeliver a cursor whose previous source ACK
     // released its replay retention. Pin every retained attempt before
     // effects or ACK, including records after a possible early batch stop.
@@ -1088,6 +1141,7 @@ pub(crate) fn consume<E: RuleExecutor, S: RuleEventSource>(
         executor,
         &mut journal,
         Some(&provenance),
+        Some(&source_key),
     );
     let ack_count = settled_event_prefix(&result.payload, rules.len(), events.len());
     let mut acknowledged = false;
@@ -1133,6 +1187,7 @@ pub(crate) fn consume<E: RuleExecutor, S: RuleEventSource>(
     result.payload["subcommand"] = json!("consume");
     result.payload["data"]["source"] = json!({
         "stream_id": options.stream_id, "request_id": options.request_id,
+        "executor_node": source.executor_node(), "requested_executor_node": options.executor_node,
         "connector": options.connector, "zone": options.source_zone, "topic": options.topic,
         "closed": received.closed, "wait_expired": received.wait_expired,
         "acknowledged": acknowledged, "acknowledged_events": if acknowledged {ack_count} else {0},
@@ -1389,6 +1444,7 @@ fn execute_polled_page<E: RuleExecutor, W: JournalWriter>(
         executor,
         journal,
         Some(&provenance),
+        None,
     );
     let settled = settled_event_prefix(&result.payload, rules.len(), page.events.len());
     let complete = settled == page.events.len() && !result.rejected;
@@ -1455,7 +1511,11 @@ fn execute_polled_page<E: RuleExecutor, W: JournalWriter>(
     Ok(result)
 }
 
-fn normalize_stream_event(host: &str, envelope: &EventEnvelope) -> Result<IncomingEvent> {
+fn normalize_stream_event(
+    host: &str,
+    envelope: &EventEnvelope,
+    executor_node: Option<&TailscaleNodeId>,
+) -> Result<IncomingEvent> {
     ensure!(
         serde_json::to_vec(envelope)?.len() <= MAX_EVENT_BYTES,
         "source event exceeds its byte limit"
@@ -1480,6 +1540,11 @@ fn normalize_stream_event(host: &str, envelope: &EventEnvelope) -> Result<Incomi
         &envelope.topic,
         &envelope.cursor,
     ))?);
+    // Explicit routing introduces a distinct source. Omission preserves every
+    // byte of the old hash, including when a local host starts reporting its ID.
+    if let Some(executor_node) = executor_node {
+        hasher.update(&serde_json::to_vec(&("executor_node", executor_node))?);
+    }
     let event = IncomingEvent {
         connector: envelope.data.connector_id.to_string(),
         event_type: envelope.topic.clone(),
@@ -1697,6 +1762,8 @@ struct RecordedAttempt {
     /// absent field preserves the checksums of pre-reconciliation journals.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reconciliation: Option<CompletionEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    native_source: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1767,6 +1834,62 @@ impl SourceCursorState {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct NativeSourceState {
+    host: String,
+    connector: String,
+    zone: String,
+    topic: String,
+    stream_id: String,
+    executor_node: Option<TailscaleNodeId>,
+    observed_executor: Option<TailscaleNodeId>,
+}
+
+impl NativeSourceState {
+    fn identity(&self) -> Result<String> {
+        let mut hasher =
+            blake3::Hasher::new_derive_key("flywheel_connectors.reactive_rules.native_source.v1");
+        // Correlation request IDs never create a new durable stream. Excluding
+        // the executor also makes an owner change a conflict, not fresh work.
+        hasher.update(&serde_json::to_vec(&(
+            &self.host,
+            &self.connector,
+            &self.zone,
+            &self.topic,
+            &self.stream_id,
+        ))?);
+        Ok(hasher.finalize().to_hex().to_string())
+    }
+
+    fn validate(&self, key: &str) -> Result<()> {
+        self.connector.parse::<fcp_core::ConnectorId>()?;
+        self.zone.parse::<fcp_core::ZoneId>()?;
+        ensure!(
+            !self.host.trim().is_empty()
+                && self.host.len() <= 4096
+                && !self.host.chars().any(char::is_control)
+                && !self.topic.is_empty()
+                && self.topic.len() <= 256
+                && !self
+                    .topic
+                    .chars()
+                    .any(|c| c.is_control() || c.is_whitespace() || c == '*')
+                && valid_poll_cursor(&self.stream_id)
+                && self
+                    .executor_node
+                    .as_ref()
+                    .is_none_or(|node| Some(node) == self.observed_executor.as_ref())
+                && self.identity()? == key,
+            "invalid native stream source or executor claim"
+        );
+        for node in self.executor_node.iter().chain(&self.observed_executor) {
+            TailscaleNodeId::try_new(node.as_str())?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RunState {
@@ -1776,6 +1899,8 @@ struct RunState {
     // checksums on existing run/consume journal checkpoints.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     sources: BTreeMap<String, SourceCursorState>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    native_sources: BTreeMap<String, NativeSourceState>,
 }
 
 impl RunState {
@@ -1783,7 +1908,8 @@ impl RunState {
         ensure!(
             self.attempts.len() <= MAX_RUN_ATTEMPTS
                 && self.rules.len() <= MAX_RUNTIME_RULES
-                && self.sources.len() <= MAX_POLL_SOURCES,
+                && self.sources.len() <= MAX_POLL_SOURCES
+                && self.native_sources.len() <= MAX_POLL_SOURCES,
             "rules execution state exceeds its entry limit"
         );
         let mut total_triggers = 0usize;
@@ -1815,6 +1941,10 @@ impl RunState {
                 valid_digest(key)
                     && valid_digest(&attempt.rule_key)
                     && self.rules.contains_key(&attempt.rule_key)
+                    && attempt
+                        .native_source
+                        .as_ref()
+                        .is_none_or(|key| self.native_sources.contains_key(key))
                     && valid_request_id(&attempt.request_id)
                     && attempt.retain_until >= attempt.started_at,
                 "invalid persisted rule attempt"
@@ -1829,6 +1959,9 @@ impl RunState {
             }
         }
         for (key, source) in &self.sources {
+            source.validate(key)?;
+        }
+        for (key, source) in &self.native_sources {
             source.validate(key)?;
         }
         Ok(())
@@ -1953,6 +2086,10 @@ impl RunState {
                     valid_digest(key)
                         && !self.attempts.contains_key(key)
                         && self.rules.contains_key(&attempt.rule_key)
+                        && attempt
+                            .native_source
+                            .as_ref()
+                            .is_none_or(|key| self.native_sources.contains_key(key))
                         && valid_request_id(&attempt.request_id)
                         && attempt.retain_until >= attempt.started_at
                         && attempt.status == AttemptStatus::Pending
@@ -2052,6 +2189,14 @@ impl RunState {
                     "webhook cursor may release only its completed action records"
                 );
             }
+            JournalEntry::NativeSource { key, checkpoint } => {
+                checkpoint.validate(key)?;
+                ensure!(
+                    self.native_sources.len() < MAX_POLL_SOURCES
+                        && !self.native_sources.contains_key(key),
+                    "native stream source is already bound or its checkpoint capacity is full"
+                );
+            }
         }
         Ok(())
     }
@@ -2132,6 +2277,10 @@ impl RunState {
             } => {
                 self.release_completed(&completed_keys, committed_at)?;
                 self.sources.insert(key, checkpoint);
+                Ok(())
+            }
+            JournalEntry::NativeSource { key, checkpoint } => {
+                self.native_sources.insert(key, checkpoint);
                 Ok(())
             }
             JournalEntry::Checkpoint { .. } => unreachable!("checkpoint rejected before mutation"),
@@ -2221,6 +2370,10 @@ enum JournalEntry {
         previous_cursor: Option<String>,
         completed_keys: Vec<String>,
         committed_at: DateTime<Utc>,
+    },
+    NativeSource {
+        key: String,
+        checkpoint: NativeSourceState,
     },
 }
 
@@ -2442,7 +2595,7 @@ fn classify_invocation(result: &InvocationResult, request_id: &str) -> AttemptSt
     }
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn execute_batch<E: RuleExecutor, W: JournalWriter>(
     rules: &RuleSet,
     events: &[IncomingEvent],
@@ -2451,6 +2604,7 @@ fn execute_batch<E: RuleExecutor, W: JournalWriter>(
     executor: &mut E,
     journal: &mut RunJournal<W>,
     provenance: Option<&[Provenance]>,
+    native_source: Option<&str>,
 ) -> RulesOutput {
     let mut results = Vec::with_capacity(batch.len());
     let mut executed = 0usize;
@@ -2549,6 +2703,7 @@ fn execute_batch<E: RuleExecutor, W: JournalWriter>(
                             },
                             status: AttemptStatus::Pending,
                             reconciliation: None,
+                            native_source: native_source.map(str::to_owned),
                         },
                     })?;
                     admitted = Some(request_id.to_owned());
@@ -3528,6 +3683,7 @@ mod tests {
             executor,
             &mut journal,
             None,
+            None,
         );
         assert!(journal.poisoned);
         result
@@ -3983,6 +4139,7 @@ mod tests {
             Some(PathBuf::from("action.cbor"))
         );
         assert_eq!(options.max_events, 1);
+        assert!(options.executor_node.is_none());
         assert_eq!(options.stream_timeout_seconds, 70);
         assert_eq!(options.execution.deadline_ms, Some(30_000));
         assert!(parsed.rules.execution_options().is_some());
@@ -3990,6 +4147,19 @@ mod tests {
         assert!(parse(&["--wait-seconds", "61"]).is_err());
         assert!(parse(&["--stream-timeout-seconds", "0"]).is_err());
         assert!(parse(&["--dry-run"]).is_err());
+        let pinned = parse(&["--executor-node", "node-journal-owner"]).unwrap();
+        assert_eq!(
+            pinned
+                .rules
+                .consume_options()
+                .unwrap()
+                .executor_node
+                .as_ref()
+                .unwrap()
+                .as_str(),
+            "node-journal-owner"
+        );
+        assert!(parse(&["--executor-node", "bad node"]).is_err());
     }
 
     #[test]
@@ -4031,11 +4201,20 @@ mod tests {
         .unwrap();
         let options = parsed.rules.poll_options().unwrap();
         assert_eq!(options.consumer, "issues");
-        assert_eq!(options.source_capability_token_file, PathBuf::from("source.cbor"));
-        assert_eq!(options.source_holder_key_file, Some(PathBuf::from("source.key")));
+        assert_eq!(
+            options.source_capability_token_file,
+            PathBuf::from("source.cbor")
+        );
+        assert_eq!(
+            options.source_holder_key_file,
+            Some(PathBuf::from("source.key"))
+        );
         assert_eq!(options.source_lease_seq, Some(7));
         assert_eq!(options.execution.lease_seq, Some(11));
-        assert_eq!(options.execution.capability_token_file, Some(PathBuf::from("action.cbor")));
+        assert_eq!(
+            options.execution.capability_token_file,
+            Some(PathBuf::from("action.cbor"))
+        );
         assert_eq!(options.max_events, 50);
         assert_eq!(options.max_bytes, 1_048_576);
         assert_eq!(options.source_timeout_seconds, 30);
@@ -4113,11 +4292,19 @@ mod tests {
 
     fn poll_fixture(
         events: Vec<IncomingEvent>,
-    ) -> (tempfile::TempDir, RulesArgs, FakeExecutor, FakePollingSource) {
+    ) -> (
+        tempfile::TempDir,
+        RulesArgs,
+        FakeExecutor,
+        FakePollingSource,
+    ) {
         let mut definition = rule();
         definition.trigger.connector = "fcp.webhook-receiver".into();
         definition.trigger.event_type = WEBHOOK_EVENT_TOPIC.into();
-        definition.action.input.insert("query".into(), "{{event.data.payload.text}}".into());
+        definition
+            .action
+            .input
+            .insert("query".into(), "{{event.data.payload.text}}".into());
         let (temp, mut args, executor) = fixture(vec![definition], &[]);
         args.command = RulesCommand::Poll(RulesPollOptions {
             connector: "fcp.webhook-receiver".into(),
@@ -4160,7 +4347,11 @@ mod tests {
         }));
         assert_eq!(result.payload["data"]["source"]["cursor_committed"], true);
         assert_eq!(result.payload["data"]["source"]["committed_events"], 2);
-        assert!(result.payload["data"]["source"].get("acknowledged").is_none());
+        assert!(
+            result.payload["data"]["source"]
+                .get("acknowledged")
+                .is_none()
+        );
         let (state, _) = load_run_state(&executor.state_path).unwrap();
         assert_eq!(state.sources.values().next().unwrap().cursor, "cursor_next");
         assert!(state.attempts.values().all(|attempt| {
@@ -4168,7 +4359,11 @@ mod tests {
                 && attempt.retain_until < DateTime::<Utc>::MAX_UTC
         }));
         let persisted = fs::read_to_string(&executor.state_path).unwrap();
-        for private in ["private-webhook-payload", "source.cbor", "private-connector-response"] {
+        for private in [
+            "private-webhook-payload",
+            "source.cbor",
+            "private-connector-response",
+        ] {
             assert!(!persisted.contains(private));
         }
         source.page = webhook_page(Vec::new());
@@ -4179,22 +4374,33 @@ mod tests {
         assert_eq!(restarted.calls, 0);
         assert_eq!(source.cursors, vec![None, Some("cursor_next".into())]);
         let (state, _) = load_run_state(&executor.state_path).unwrap();
-        assert_eq!(state.sources.values().next().unwrap().cursor, "cursor_frontier");
+        assert_eq!(
+            state.sources.values().next().unwrap().cursor,
+            "cursor_frontier"
+        );
     }
 
     #[test]
     fn poll_partial_page_replays_from_saved_start_without_repeating_completed_actions() {
         let (_temp, args, mut executor, mut source) =
             poll_fixture(vec![polled_event("first"), polled_event("second")]);
-        executor.replies.extend([FakeReply::Success, FakeReply::Rejected]);
+        executor
+            .replies
+            .extend([FakeReply::Success, FakeReply::Rejected]);
         let result = poll(&args, &mut executor, &mut source).unwrap();
         assert!(result.rejected);
         assert_eq!(result.payload["data"]["source"]["committed_events"], 0);
         assert_eq!(result.payload["data"]["source"]["settled_prefix_events"], 1);
         assert_eq!(executor.calls, 1);
         let (mut state, sequence) = load_run_state(&executor.state_path).unwrap();
-        assert_eq!(state.sources.values().next().unwrap().cursor, "cursor_start");
-        assert_eq!(state.attempts.values().next().unwrap().retain_until, DateTime::<Utc>::MAX_UTC);
+        assert_eq!(
+            state.sources.values().next().unwrap().cursor,
+            "cursor_start"
+        );
+        assert_eq!(
+            state.attempts.values().next().unwrap().retain_until,
+            DateTime::<Utc>::MAX_UTC
+        );
         // Pending-page evidence must survive even after ordinary completed
         // action retention and the rule's throttle window would have expired.
         for attempt in state.attempts.values_mut() {
@@ -4210,12 +4416,21 @@ mod tests {
         assert_eq!(source.cursors, vec![None, Some("cursor_start".into())]);
         let (state, _) = load_run_state(&executor.state_path).unwrap();
         assert_eq!(state.sources.values().next().unwrap().cursor, "cursor_next");
-        assert!(state.attempts.values().all(|attempt| attempt.retain_until < DateTime::<Utc>::MAX_UTC));
+        assert!(
+            state
+                .attempts
+                .values()
+                .all(|attempt| attempt.retain_until < DateTime::<Utc>::MAX_UTC)
+        );
     }
 
     #[test]
     fn poll_failed_or_uncertain_actions_keep_the_page_and_replay_records() {
-        for reply in [FakeReply::Failed, FakeReply::Unknown, FakeReply::ErrorAfterAdmission] {
+        for reply in [
+            FakeReply::Failed,
+            FakeReply::Unknown,
+            FakeReply::ErrorAfterAdmission,
+        ] {
             let (_temp, args, mut executor, mut source) =
                 poll_fixture(vec![polled_event("first"), polled_event("second")]);
             executor.replies.extend([FakeReply::Success, reply]);
@@ -4223,8 +4438,16 @@ mod tests {
             assert!(result.rejected);
             assert_eq!(result.payload["data"]["source"]["cursor_committed"], false);
             let (state, _) = load_run_state(&executor.state_path).unwrap();
-            assert_eq!(state.sources.values().next().unwrap().cursor, "cursor_start");
-            assert!(state.attempts.values().all(|attempt| attempt.retain_until == DateTime::<Utc>::MAX_UTC));
+            assert_eq!(
+                state.sources.values().next().unwrap().cursor,
+                "cursor_start"
+            );
+            assert!(
+                state
+                    .attempts
+                    .values()
+                    .all(|attempt| attempt.retain_until == DateTime::<Utc>::MAX_UTC)
+            );
             let mut restarted = FakeExecutor::new(executor.state_path.clone());
             assert!(poll(&args, &mut restarted, &mut source).unwrap().rejected);
             assert_eq!(restarted.calls, 0);
@@ -4243,7 +4466,10 @@ mod tests {
             assert_eq!(restarted.calls, 0);
             assert_eq!(source.cursors, vec![None, Some("cursor_start".into())]);
             let (state, _) = load_run_state(&executor.state_path).unwrap();
-            assert_eq!(state.sources.values().next().unwrap().cursor, "cursor_start");
+            assert_eq!(
+                state.sources.values().next().unwrap().cursor,
+                "cursor_start"
+            );
         }
     }
 
@@ -4259,7 +4485,11 @@ mod tests {
                 3 => source.page.events[1].event_id = None,
                 4 => source.page.next_cursor.clear(),
                 5 => source.page.serialized_event_bytes = 16_777_217,
-                _ => { source.page.events[1].data.insert("payload.large".into(), "x".repeat(MAX_EVENT_BYTES)); }
+                _ => {
+                    source.page.events[1]
+                        .data
+                        .insert("payload.large".into(), "x".repeat(MAX_EVENT_BYTES));
+                }
             }
             assert!(poll(&args, &mut executor, &mut source).is_err());
             assert_eq!(executor.calls, 0);
@@ -4273,22 +4503,31 @@ mod tests {
     fn poll_binds_consumer_to_selected_rules_and_rejects_repeated_start() {
         let (_temp, mut args, mut executor, mut source) = poll_fixture(vec![polled_event("first")]);
         assert!(!poll(&args, &mut executor, &mut source).unwrap().rejected);
-        let RulesCommand::Poll(options) = &mut args.command else { unreachable!() };
+        let RulesCommand::Poll(options) = &mut args.command else {
+            unreachable!()
+        };
         options.start = Some(PollStart::Latest);
         let mut restarted = FakeExecutor::new(executor.state_path.clone());
         assert!(poll(&args, &mut restarted, &mut source).is_err());
         assert_eq!(source.cursors.len(), 1);
-        let RulesCommand::Poll(options) = &mut args.command else { unreachable!() };
+        let RulesCommand::Poll(options) = &mut args.command else {
+            unreachable!()
+        };
         options.start = None;
         let path = args.rules_file.as_ref().unwrap();
         let mut definitions = load_rules(path, false).unwrap();
-        definitions.rules[0].action.input.insert("query".into(), "changed action".into());
+        definitions.rules[0]
+            .action
+            .input
+            .insert("query".into(), "changed action".into());
         save_rules(path, &definitions).unwrap();
         let mut changed = FakeExecutor::new(executor.state_path.clone());
         assert!(poll(&args, &mut changed, &mut source).is_err());
         assert_eq!(source.cursors.len(), 1);
         assert_eq!(changed.calls, 0);
-        let RulesCommand::Poll(options) = &mut args.command else { unreachable!() };
+        let RulesCommand::Poll(options) = &mut args.command else {
+            unreachable!()
+        };
         options.consumer = "new-action-consumer".into();
         let mut explicit = FakeExecutor::new(executor.state_path.clone());
         assert!(!poll(&args, &mut explicit, &mut source).unwrap().rejected);
@@ -4300,17 +4539,25 @@ mod tests {
     #[test]
     fn poll_latest_bootstrap_and_empty_pages_commit_without_actions() {
         let (_temp, mut args, mut executor, mut source) = poll_fixture(Vec::new());
-        let RulesCommand::Poll(options) = &mut args.command else { unreachable!() };
+        let RulesCommand::Poll(options) = &mut args.command else {
+            unreachable!()
+        };
         options.start = Some(PollStart::Latest);
         source.page.next_cursor = source.page.start_cursor.clone();
         let result = poll(&args, &mut executor, &mut source).unwrap();
         assert!(!result.rejected);
         assert_eq!(executor.calls, 0);
-        assert_eq!(result.payload["data"]["source"]["checkpoint_initialized"], true);
+        assert_eq!(
+            result.payload["data"]["source"]["checkpoint_initialized"],
+            true
+        );
         assert_eq!(result.payload["data"]["source"]["cursor_committed"], true);
         assert_eq!(result.payload["data"]["source"]["cursor_advanced"], false);
         let (state, _) = load_run_state(&executor.state_path).unwrap();
-        assert_eq!(state.sources.values().next().unwrap().cursor, "cursor_start");
+        assert_eq!(
+            state.sources.values().next().unwrap().cursor,
+            "cursor_start"
+        );
     }
 
     #[test]
@@ -4332,30 +4579,61 @@ mod tests {
     fn poll_consumers_do_not_release_each_others_unfinished_page_records() {
         let (_temp, mut args, mut executor, mut source) =
             poll_fixture(vec![polled_event("first"), polled_event("second")]);
-        executor.replies.extend([FakeReply::Success, FakeReply::Rejected]);
+        executor
+            .replies
+            .extend([FakeReply::Success, FakeReply::Rejected]);
         let first = poll(&args, &mut executor, &mut source).unwrap();
         assert!(first.rejected);
         let first_key = first.payload["data"]["results"][0]["idempotency_key"]
-            .as_str().unwrap().strip_prefix("fwc-rule:").unwrap().to_owned();
-        let RulesCommand::Poll(options) = &mut args.command else { unreachable!() };
+            .as_str()
+            .unwrap()
+            .strip_prefix("fwc-rule:")
+            .unwrap()
+            .to_owned();
+        let RulesCommand::Poll(options) = &mut args.command else {
+            unreachable!()
+        };
         options.consumer = "independent".into();
         let mut second = FakeExecutor::new(executor.state_path.clone());
         let completed = poll(&args, &mut second, &mut source).unwrap();
         assert!(!completed.rejected);
-        assert_eq!(second.calls, 2, "a new consumer deliberately starts an independent effect stream");
-        assert_ne!(first.payload["data"]["results"][0]["idempotency_key"],
-            completed.payload["data"]["results"][0]["idempotency_key"]);
+        assert_eq!(
+            second.calls, 2,
+            "a new consumer deliberately starts an independent effect stream"
+        );
+        assert_ne!(
+            first.payload["data"]["results"][0]["idempotency_key"],
+            completed.payload["data"]["results"][0]["idempotency_key"]
+        );
         let (state, _) = load_run_state(&executor.state_path).unwrap();
-        assert_eq!(state.rules.len(), 1, "consumers share the rule's throttle and circuit");
+        assert_eq!(
+            state.rules.len(),
+            1,
+            "consumers share the rule's throttle and circuit"
+        );
         assert_eq!(state.attempts.len(), 3);
-        assert_eq!(state.attempts[&first_key].retain_until, DateTime::<Utc>::MAX_UTC);
-        assert_eq!(state.sources[&poll_source_identity("issues", &polling_scope()).unwrap()].cursor, "cursor_start");
-        assert_eq!(state.sources[&poll_source_identity("independent", &polling_scope()).unwrap()].cursor, "cursor_next");
-        let RulesCommand::Poll(options) = &mut args.command else { unreachable!() };
+        assert_eq!(
+            state.attempts[&first_key].retain_until,
+            DateTime::<Utc>::MAX_UTC
+        );
+        assert_eq!(
+            state.sources[&poll_source_identity("issues", &polling_scope()).unwrap()].cursor,
+            "cursor_start"
+        );
+        assert_eq!(
+            state.sources[&poll_source_identity("independent", &polling_scope()).unwrap()].cursor,
+            "cursor_next"
+        );
+        let RulesCommand::Poll(options) = &mut args.command else {
+            unreachable!()
+        };
         options.consumer = "issues".into();
         let mut resumed = FakeExecutor::new(executor.state_path.clone());
         assert!(!poll(&args, &mut resumed, &mut source).unwrap().rejected);
-        assert_eq!(resumed.calls, 1, "the original consumer suppresses its completed first action");
+        assert_eq!(
+            resumed.calls, 1,
+            "the original consumer suppresses its completed first action"
+        );
     }
 
     #[test]
@@ -4366,7 +4644,9 @@ mod tests {
         definitions.rules[0].throttle.max = 1;
         save_rules(path, &definitions).unwrap();
         assert!(!poll(&args, &mut executor, &mut source).unwrap().rejected);
-        let RulesCommand::Poll(options) = &mut args.command else { unreachable!() };
+        let RulesCommand::Poll(options) = &mut args.command else {
+            unreachable!()
+        };
         options.consumer = "new-name".into();
         let mut second = FakeExecutor::new(executor.state_path.clone());
         let result = poll(&args, &mut second, &mut source).unwrap();
@@ -4376,7 +4656,10 @@ mod tests {
         let (state, _) = load_run_state(&executor.state_path).unwrap();
         assert_eq!(state.rules.len(), 1);
         assert_eq!(state.attempts.len(), 1);
-        assert_eq!(state.sources[&poll_source_identity("new-name", &polling_scope()).unwrap()].cursor, "cursor_start");
+        assert_eq!(
+            state.sources[&poll_source_identity("new-name", &polling_scope()).unwrap()].cursor,
+            "cursor_start"
+        );
     }
 
     fn poll_with_sync_failure(
@@ -4387,23 +4670,46 @@ mod tests {
     ) -> (Result<RulesOutput>, RunJournal<FailSyncWriter>) {
         let rules = selected_rules(args.rules_file.as_ref().unwrap(), None).unwrap();
         let scopes = executor.prepare(&rules.rules).unwrap();
-        let identities = rules.rules.iter().map(|rule| {
-            (rule.name.clone(), rule_identity(rule, &scopes[&rule.name]).unwrap())
-        }).collect();
+        let identities = rules
+            .rules
+            .iter()
+            .map(|rule| {
+                (
+                    rule.name.clone(),
+                    rule_identity(rule, &scopes[&rule.name]).unwrap(),
+                )
+            })
+            .collect();
         let mut state = RunState::default();
-        state.prepare(&rules.rules, &identities, Utc::now()).unwrap();
-        let RunJournal { state, writer, sequence, bytes, poisoned } =
-            RunJournal::open(&executor.state_path, state, 0).unwrap();
+        state
+            .prepare(&rules.rules, &identities, Utc::now())
+            .unwrap();
+        let RunJournal {
+            state,
+            writer,
+            sequence,
+            bytes,
+            poisoned,
+        } = RunJournal::open(&executor.state_path, state, 0).unwrap();
         let mut journal = RunJournal {
             state,
-            writer: FailSyncWriter { file: writer, syncs: 0, fail_at },
+            writer: FailSyncWriter {
+                file: writer,
+                syncs: 0,
+                fail_at,
+            },
             sequence,
             bytes,
             poisoned,
         };
         let result = execute_polled_page(
-            args.poll_options().unwrap(), &rules, &polling_scope(), &identities,
-            page, executor, &mut journal,
+            args.poll_options().unwrap(),
+            &rules,
+            &polling_scope(),
+            &identities,
+            page,
+            executor,
+            &mut journal,
         );
         (result, journal)
     }
@@ -4422,30 +4728,49 @@ mod tests {
     #[test]
     fn poll_cursor_commit_failure_preserves_effect_evidence_and_atomic_recovery() {
         let (_temp, args, mut executor, mut source) = poll_fixture(vec![polled_event("first")]);
-        let (result, journal) = poll_with_sync_failure(&args, &mut executor, source.page.clone(), 4);
+        let (result, journal) =
+            poll_with_sync_failure(&args, &mut executor, source.page.clone(), 4);
         let result = result.unwrap();
         assert!(result.rejected);
         assert_eq!(executor.calls, 1);
         assert_eq!(result.payload["data"]["results"][0]["outcome"], "executed");
         assert_eq!(result.payload["data"]["source"]["cursor_committed"], false);
-        assert_eq!(result.payload["data"]["source"]["cursor_commit_unknown"], true);
+        assert_eq!(
+            result.payload["data"]["source"]["cursor_commit_unknown"],
+            true
+        );
         assert!(result.payload["data"]["source"]["committed_cursor"].is_null());
         assert!(journal.poisoned);
-        assert_eq!(journal.state.sources.values().next().unwrap().cursor, "cursor_start");
-        assert_eq!(journal.state.attempts.values().next().unwrap().retain_until, DateTime::<Utc>::MAX_UTC);
+        assert_eq!(
+            journal.state.sources.values().next().unwrap().cursor,
+            "cursor_start"
+        );
+        assert_eq!(
+            journal.state.attempts.values().next().unwrap().retain_until,
+            DateTime::<Utc>::MAX_UTC
+        );
         drop(journal);
         // A complete final record recovers progress and retention together,
         // even though this process could not know whether its sync succeeded.
         let (complete, _) = load_run_state(&executor.state_path).unwrap();
-        assert_eq!(complete.sources.values().next().unwrap().cursor, "cursor_next");
+        assert_eq!(
+            complete.sources.values().next().unwrap().cursor,
+            "cursor_next"
+        );
         assert!(complete.attempts.values().next().unwrap().retain_until < DateTime::<Utc>::MAX_UTC);
         // An interrupted final record recovers neither change. Earlier
         // completed action evidence stays pinned and suppresses retransmission.
         let bytes = fs::read(&executor.state_path).unwrap();
         fs::write(&executor.state_path, &bytes[..bytes.len() - 2]).unwrap();
         let (interrupted, _) = load_run_state(&executor.state_path).unwrap();
-        assert_eq!(interrupted.sources.values().next().unwrap().cursor, "cursor_start");
-        assert_eq!(interrupted.attempts.values().next().unwrap().retain_until, DateTime::<Utc>::MAX_UTC);
+        assert_eq!(
+            interrupted.sources.values().next().unwrap().cursor,
+            "cursor_start"
+        );
+        assert_eq!(
+            interrupted.attempts.values().next().unwrap().retain_until,
+            DateTime::<Utc>::MAX_UTC
+        );
         let mut restarted = FakeExecutor::new(executor.state_path.clone());
         assert!(!poll(&args, &mut restarted, &mut source).unwrap().rejected);
         assert_eq!(restarted.calls, 0);
@@ -4458,7 +4783,8 @@ mod tests {
         let path = temp.path().join("state.jsonl");
         // Canonical checkpoint bytes from before the optional sources map.
         let payload = br#"[1,0,{"type":"checkpoint","state":{"attempts":{},"rules":{}}}]"#;
-        let mut hasher = blake3::Hasher::new_derive_key("flywheel_connectors.reactive_rules.journal.v1");
+        let mut hasher =
+            blake3::Hasher::new_derive_key("flywheel_connectors.reactive_rules.journal.v1");
         hasher.update(payload);
         let record = json!({
             "version": 1, "sequence": 0,
@@ -4471,7 +4797,11 @@ mod tests {
         let (state, sequence) = load_run_state(&path).unwrap();
         assert_eq!(sequence, 0);
         assert!(state.sources.is_empty());
-        assert_eq!(serde_json::to_value(state).unwrap(), json!({"attempts": {}, "rules": {}}));
+        assert!(state.native_sources.is_empty());
+        assert_eq!(
+            serde_json::to_value(state).unwrap(),
+            json!({"attempts": {}, "rules": {}})
+        );
     }
 
     fn native_event(cursor: &str, seq: u64) -> EventEnvelope {
@@ -4486,6 +4816,7 @@ mod tests {
 
     struct FakeSource {
         events: Vec<EventEnvelope>,
+        executor_node: Option<TailscaleNodeId>,
         acknowledgements: Vec<Vec<String>>,
         fail_ack: bool,
         polls: usize,
@@ -4495,6 +4826,10 @@ mod tests {
     impl RuleEventSource for FakeSource {
         fn host(&self) -> &str {
             "http://127.0.0.1:8787"
+        }
+
+        fn executor_node(&self) -> Option<&TailscaleNodeId> {
+            self.executor_node.as_ref()
         }
 
         fn poll(&mut self, _limit: u32, _wait_seconds: u64) -> Result<RuleEventBatch> {
@@ -4530,6 +4865,7 @@ mod tests {
             topic: "message.new".into(),
             stream_id: "stream-1".into(),
             request_id: "subscription-1".into(),
+            executor_node: None,
             stream_capability_token_file: temp.path().join("source.cbor"),
             rule: None,
             max_events: 64,
@@ -4539,12 +4875,229 @@ mod tests {
         });
         let source = FakeSource {
             events,
+            executor_node: None,
             acknowledgements: Vec::new(),
             fail_ack: false,
             polls: 0,
             state_path: executor.state_path.clone(),
         };
         (temp, args, executor, source)
+    }
+
+    #[test]
+    fn consume_pins_executor_across_reopen_and_separates_remote_journals() {
+        let (_temp, mut args, mut executor, mut source) =
+            consume_fixture(vec![native_event("cursor-1", 1)]);
+        let first_owner = TailscaleNodeId::new("node-first");
+        let second_owner = TailscaleNodeId::new("node-second");
+        let RulesCommand::Consume(options) = &mut args.command else {
+            unreachable!()
+        };
+        options.executor_node = Some(first_owner.clone());
+        source.executor_node = Some(first_owner.clone());
+        let first = consume(&args, &mut executor, &mut source).unwrap();
+        assert!(!first.rejected);
+        assert_eq!(
+            first.payload["data"]["source"]["executor_node"],
+            "node-first"
+        );
+        let first_key = first.payload["data"]["results"][0]["idempotency_key"].clone();
+        let (saved, _) = load_run_state(&source.state_path).unwrap();
+        assert_eq!(saved.native_sources.len(), 1);
+        assert!(
+            saved
+                .attempts
+                .values()
+                .all(|attempt| attempt.native_source.is_some())
+        );
+
+        let RulesCommand::Consume(options) = &mut args.command else {
+            unreachable!()
+        };
+        options.request_id = "renewed-correlation".into();
+        let mut restarted = FakeExecutor::new(source.state_path.clone());
+        let replay = consume(&args, &mut restarted, &mut source).unwrap();
+        assert!(!replay.rejected);
+        assert_eq!(restarted.calls, 0);
+        assert_eq!(
+            replay.payload["data"]["results"][0]["idempotency_key"],
+            first_key
+        );
+        let polls = source.polls;
+        let acknowledgements = source.acknowledgements.len();
+        let RulesCommand::Consume(options) = &mut args.command else {
+            unreachable!()
+        };
+        options.executor_node = Some(second_owner.clone());
+        options.request_id = "changed-correlation-cannot-change-owner".into();
+        source.executor_node = Some(second_owner);
+        assert!(
+            consume(&args, &mut restarted, &mut source)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("executor selection changed")
+        );
+        assert_eq!(source.polls, polls);
+        assert_eq!(source.acknowledgements.len(), acknowledgements);
+
+        let RulesCommand::Consume(options) = &mut args.command else {
+            unreachable!()
+        };
+        options.stream_id = "stream-independent".into();
+        options.request_id = "subscription-independent".into();
+        let independent = consume(&args, &mut restarted, &mut source).unwrap();
+        assert!(!independent.rejected);
+        assert_eq!(restarted.calls, 1);
+        assert_ne!(
+            independent.payload["data"]["results"][0]["idempotency_key"],
+            first_key
+        );
+        assert_eq!(
+            load_run_state(&source.state_path)
+                .unwrap()
+                .0
+                .native_sources
+                .len(),
+            2
+        );
+
+        let RulesCommand::Consume(options) = &mut args.command else {
+            unreachable!()
+        };
+        options.stream_id = "stream-without-pin".into();
+        options.request_id = "subscription-without-pin".into();
+        options.executor_node = None;
+        let polls = source.polls;
+        assert!(
+            consume(&args, &mut restarted, &mut source)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("retained rule effects")
+        );
+        assert_eq!(source.polls, polls);
+        assert_eq!(restarted.calls, 1);
+    }
+
+    #[test]
+    fn consume_retains_observed_owner_without_changing_unpinned_event_identity() {
+        let (_temp, args, mut executor, mut source) =
+            consume_fixture(vec![native_event("cursor-1", 1)]);
+        source.executor_node = Some(TailscaleNodeId::new("node-original"));
+        let first = consume(&args, &mut executor, &mut source).unwrap();
+        assert!(!first.rejected);
+        let source_event = normalize_stream_event(source.host(), &source.events[0], None).unwrap();
+        let definition = selected_rules(args.rules_file.as_ref().unwrap(), None).unwrap();
+        let rule_key = rule_identity(&definition.rules[0], &execution_scope()).unwrap();
+        assert_eq!(
+            first.payload["data"]["results"][0]["idempotency_key"],
+            format!("fwc-rule:{}", attempt_identity(&rule_key, &source_event))
+        );
+        let acknowledgements = source.acknowledgements.len();
+        let mut restarted = FakeExecutor::new(source.state_path.clone());
+        source.executor_node = Some(TailscaleNodeId::new("node-replacement"));
+        assert!(
+            consume(&args, &mut restarted, &mut source)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("journal owner changed")
+        );
+        assert_eq!(restarted.calls, 0);
+        assert_eq!(source.acknowledgements.len(), acknowledgements);
+        source.executor_node = Some(TailscaleNodeId::new("node-original"));
+        let replay = consume(&args, &mut restarted, &mut source).unwrap();
+        assert!(!replay.rejected);
+        assert_eq!(restarted.calls, 0);
+        assert_eq!(
+            replay.payload["data"]["results"][0]["idempotency_key"],
+            first.payload["data"]["results"][0]["idempotency_key"]
+        );
+    }
+
+    #[test]
+    fn consume_refuses_a_new_pin_when_legacy_effects_lack_owner_evidence() {
+        let (_temp, mut args, mut executor, mut source) =
+            consume_fixture(vec![native_event("cursor-1", 1)]);
+        source.fail_ack = true;
+        assert!(consume(&args, &mut executor, &mut source).unwrap().rejected);
+        let (mut legacy, sequence) = load_run_state(&source.state_path).unwrap();
+        legacy.native_sources.clear();
+        for attempt in legacy.attempts.values_mut() {
+            attempt.native_source = None;
+        }
+        // The optional fields are absent on disk, as in pre-affinity journals.
+        assert!(
+            serde_json::to_value(&legacy)
+                .unwrap()
+                .get("native_sources")
+                .is_none()
+        );
+        drop(RunJournal::open(&source.state_path, legacy, sequence).unwrap());
+        let RulesCommand::Consume(options) = &mut args.command else {
+            unreachable!()
+        };
+        options.executor_node = Some(TailscaleNodeId::new("node-new-pin"));
+        source.executor_node = options.executor_node.clone();
+        let polls = source.polls;
+        let acknowledgements = source.acknowledgements.len();
+        let mut restarted = FakeExecutor::new(source.state_path.clone());
+        assert!(
+            consume(&args, &mut restarted, &mut source)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("legacy executor scope")
+        );
+        assert_eq!(source.polls, polls);
+        assert_eq!(source.acknowledgements.len(), acknowledgements);
+        assert_eq!(restarted.calls, 0);
+    }
+
+    #[test]
+    fn new_executor_source_obeys_legacy_completion_expiry_but_not_uncertainty() {
+        for status in [AttemptStatus::Completed, AttemptStatus::Unknown] {
+            let (_temp, mut args, mut executor, mut source) =
+                consume_fixture(vec![native_event("cursor-1", 1)]);
+            assert!(!consume(&args, &mut executor, &mut source).unwrap().rejected);
+            let (mut legacy, sequence) = load_run_state(&source.state_path).unwrap();
+            legacy.native_sources.clear();
+            for attempt in legacy.attempts.values_mut() {
+                attempt.native_source = None;
+                attempt.status = status;
+                attempt.started_at = Utc::now() - Duration::days(3);
+                attempt.retain_until = Utc::now() - Duration::days(2);
+            }
+            drop(RunJournal::open(&source.state_path, legacy, sequence).unwrap());
+            let RulesCommand::Consume(options) = &mut args.command else {
+                unreachable!()
+            };
+            options.executor_node = Some(TailscaleNodeId::new("node-explicit"));
+            options.stream_id = "stream-new-source".into();
+            source.executor_node = options.executor_node.clone();
+            let polls = source.polls;
+            let acknowledgements = source.acknowledgements.len();
+            let mut restarted = FakeExecutor::new(source.state_path.clone());
+            let result = consume(&args, &mut restarted, &mut source);
+            if status == AttemptStatus::Completed {
+                assert!(!result.unwrap().rejected);
+                assert_eq!(restarted.calls, 1);
+                assert_eq!(source.polls, polls + 1);
+                assert_eq!(source.acknowledgements.len(), acknowledgements + 1);
+            } else {
+                assert!(
+                    result
+                        .err()
+                        .unwrap()
+                        .to_string()
+                        .contains("legacy executor scope")
+                );
+                assert_eq!(restarted.calls, 0);
+                assert_eq!(source.polls, polls);
+                assert_eq!(source.acknowledgements.len(), acknowledgements);
+            }
+        }
     }
 
     #[test]
@@ -4861,7 +5414,7 @@ mod tests {
     #[test]
     fn native_event_identity_is_scoped_and_normalization_preserves_nested_values() {
         let envelope = native_event("cursor-1", 1);
-        let normalized = normalize_stream_event("http://host", &envelope).unwrap();
+        let normalized = normalize_stream_event("http://host", &envelope, None).unwrap();
         assert_eq!(normalized.data["issue.number"], "42");
         let mut replay = envelope.clone();
         replay.timestamp += Duration::days(1);
@@ -4870,22 +5423,34 @@ mod tests {
         replay.data.payload = json!({"text": "changed provider payload"});
         assert_eq!(
             normalized.dedup_identity(),
-            normalize_stream_event("http://host", &replay)
+            normalize_stream_event("http://host", &replay, None)
                 .unwrap()
                 .dedup_identity(),
         );
         assert_ne!(
             normalized.dedup_identity(),
-            normalize_stream_event("http://another-host", &envelope)
+            normalize_stream_event("http://another-host", &envelope, None)
                 .unwrap()
                 .dedup_identity(),
         );
         replay.cursor = "another-cursor".into();
         assert_ne!(
             normalized.dedup_identity(),
-            normalize_stream_event("http://host", &replay)
+            normalize_stream_event("http://host", &replay, None)
                 .unwrap()
                 .dedup_identity(),
+        );
+        let first = TailscaleNodeId::new("node-first");
+        let second = TailscaleNodeId::new("node-second");
+        let first_identity = normalize_stream_event("http://host", &envelope, Some(&first))
+            .unwrap()
+            .dedup_identity();
+        assert_ne!(first_identity, normalized.dedup_identity());
+        assert_ne!(
+            first_identity,
+            normalize_stream_event("http://host", &envelope, Some(&second))
+                .unwrap()
+                .dedup_identity()
         );
     }
 
@@ -5050,8 +5615,14 @@ mod tests {
         assert!(!result.rejected);
         assert_eq!(result.payload["data"]["executed"], 0);
         assert_eq!(result.payload["data"]["source_progress_unchanged"], true);
-        assert_eq!(result.payload["data"]["results"][0]["outcome"], "reconciled");
-        assert_eq!(result.payload["data"]["results"][0]["automatic_retry_allowed"], false);
+        assert_eq!(
+            result.payload["data"]["results"][0]["outcome"],
+            "reconciled"
+        );
+        assert_eq!(
+            result.payload["data"]["results"][0]["automatic_retry_allowed"],
+            false
+        );
         assert!(!result.payload.to_string().contains("private-"));
         assert_eq!(executor.calls, 1);
         let (after, _) = load_run_state(&executor.state_path).unwrap();
@@ -5066,7 +5637,10 @@ mod tests {
             serde_json::to_value(&before.sources).unwrap(),
         );
         let second = reconcile(&reconcile_args, &mut evidence).unwrap();
-        assert_eq!(second.payload["data"]["results"][0]["outcome"], "already_completed");
+        assert_eq!(
+            second.payload["data"]["results"][0]["outcome"],
+            "already_completed"
+        );
         let (reconfirmed, _) = load_run_state(&executor.state_path).unwrap();
         assert_eq!(
             serde_json::to_value(&reconfirmed.rules).unwrap(),
@@ -5091,7 +5665,12 @@ mod tests {
         let (mut state, sequence) = load_run_state(&executor.state_path).unwrap();
         let rule_key = state.attempts.values().next().unwrap().rule_key.clone();
         for _ in 0..5 {
-            state.rules.get_mut(&rule_key).unwrap().circuit.record_failure();
+            state
+                .rules
+                .get_mut(&rule_key)
+                .unwrap()
+                .circuit
+                .record_failure();
         }
         let circuit = serde_json::to_value(&state.rules[&rule_key].circuit).unwrap();
         drop(RunJournal::open(&executor.state_path, state, sequence).unwrap());
@@ -5101,7 +5680,10 @@ mod tests {
         assert_eq!(after.attempts[&key].status, AttemptStatus::Completed);
         let mut expected = circuit;
         expected["total_executions"] = json!(6);
-        assert_eq!(serde_json::to_value(&after.rules[&rule_key].circuit).unwrap(), expected);
+        assert_eq!(
+            serde_json::to_value(&after.rules[&rule_key].circuit).unwrap(),
+            expected
+        );
     }
 
     #[test]
@@ -5129,12 +5711,20 @@ mod tests {
             |response| record(response).admission.operation = "github.write".into(),
             |response| record(response).admission.idempotency = None,
             |response| {
-                record(response).admission.idempotency.as_mut().unwrap().scope_digest =
-                    "a".repeat(64);
+                record(response)
+                    .admission
+                    .idempotency
+                    .as_mut()
+                    .unwrap()
+                    .scope_digest = "a".repeat(64);
             },
             |response| {
-                record(response).admission.idempotency.as_mut().unwrap().effect_digest =
-                    "not-a-digest".into();
+                record(response)
+                    .admission
+                    .idempotency
+                    .as_mut()
+                    .unwrap()
+                    .effect_digest = "not-a-digest".into();
             },
             |response| record(response).terminal = None,
             |response| {
@@ -5168,8 +5758,15 @@ mod tests {
             let bytes = fs::read(&executor.state_path).unwrap();
             let (reconcile_args, mut evidence, _) = reconciliation_fixture(&args, &executor);
             mutate(&mut evidence.response);
-            assert!(reconcile(&reconcile_args, &mut evidence).is_err(), "case {index}");
-            assert_eq!(fs::read(&executor.state_path).unwrap(), bytes, "case {index}");
+            assert!(
+                reconcile(&reconcile_args, &mut evidence).is_err(),
+                "case {index}"
+            );
+            assert_eq!(
+                fs::read(&executor.state_path).unwrap(),
+                bytes,
+                "case {index}"
+            );
             assert_eq!(executor.calls, 1);
         }
     }
@@ -5225,7 +5822,9 @@ mod tests {
                 1 => {}
                 2 => {
                     let (mut state, sequence) = load_run_state(&executor.state_path).unwrap();
-                    state.attempts.insert("a".repeat(64), state.attempts[&key].clone());
+                    state
+                        .attempts
+                        .insert("a".repeat(64), state.attempts[&key].clone());
                     drop(RunJournal::open(&executor.state_path, state, sequence).unwrap());
                 }
                 _ => {
@@ -5333,8 +5932,14 @@ mod tests {
             &mut journal,
         );
         assert!(result.rejected);
-        assert_eq!(result.payload["data"]["results"][0]["state_persisted"], false);
-        assert_eq!(result.payload["data"]["results"][0]["persistence_unknown"], true);
+        assert_eq!(
+            result.payload["data"]["results"][0]["state_persisted"],
+            false
+        );
+        assert_eq!(
+            result.payload["data"]["results"][0]["persistence_unknown"],
+            true
+        );
         assert_eq!(journal.state.attempts[&key].status, AttemptStatus::Unknown);
         assert!(journal.poisoned);
         assert!(
@@ -5370,7 +5975,10 @@ mod tests {
         assert!(attempt.retain_until >= proof.reconciled_at + Duration::days(1));
         drop(RunJournal::open(&executor.state_path, state, sequence).unwrap());
         let (compacted, _) = load_run_state(&executor.state_path).unwrap();
-        assert_eq!(compacted.attempts[&key].reconciliation.as_ref(), Some(&proof));
+        assert_eq!(
+            compacted.attempts[&key].reconciliation.as_ref(),
+            Some(&proof)
+        );
         let mut changed = evidence.response.clone();
         changed
             .invocation
@@ -5397,7 +6005,10 @@ mod tests {
         let (reconcile_args, mut evidence, key) = reconciliation_fixture(&args, &executor);
         let result = reconcile(&reconcile_args, &mut evidence).unwrap();
         assert!(!result.rejected);
-        assert_eq!(result.payload["data"]["results"][0]["outcome"], "already_completed");
+        assert_eq!(
+            result.payload["data"]["results"][0]["outcome"],
+            "already_completed"
+        );
         let (state, _) = load_run_state(&executor.state_path).unwrap();
         assert!(state.attempts[&key].retain_until > Utc::now());
         let mut retry = FakeExecutor::new(executor.state_path);

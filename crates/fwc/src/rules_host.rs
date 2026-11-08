@@ -23,9 +23,9 @@ use crate::webhook_events::{self, PollStart, WebhookFailure, WebhookPollPage, We
 use crate::{
     CliExitCode, CommandAvailability, CommandEnvelope, DispatchOutcome, HostAdminClient,
     HostGuardedInvokeRequest, HostPreflightResponse, InvokeArgs, InvokeRequest, KnowledgeState,
-    LiveAuthArgs, ResolvedHostConfig, ResolvedLiveAuth,
-    inject_truth_source_metadata, invoke_dispatch_host_controlled, normalize_host_endpoint,
-    resolve_host_config, resolve_host_tool, resolve_live_auth, resolved_zone,
+    LiveAuthArgs, ResolvedHostConfig, ResolvedLiveAuth, inject_truth_source_metadata,
+    invoke_dispatch_host_controlled, normalize_host_endpoint, resolve_host_config,
+    resolve_host_tool, resolve_live_auth, resolved_zone,
 };
 
 pub(crate) fn dispatch(args: &RulesArgs, explicit_host: Option<&str>) -> Result<DispatchOutcome> {
@@ -53,6 +53,7 @@ pub(crate) fn dispatch(args: &RulesArgs, explicit_host: Option<&str>) -> Result<
                         topic: options.topic.clone(),
                         request_id: options.request_id.clone(),
                         stream_id: options.stream_id.clone(),
+                        executor_node: options.executor_node.clone(),
                         capability_token_file: options.stream_capability_token_file.clone(),
                         timeout_seconds: options.stream_timeout_seconds,
                     },
@@ -62,7 +63,8 @@ pub(crate) fn dispatch(args: &RulesArgs, explicit_host: Option<&str>) -> Result<
                     source.0.stream_id() == options.stream_id
                         && source.0.connector() == options.connector
                         && source.0.zone() == options.source_zone
-                        && source.0.topic() == options.topic,
+                        && source.0.topic() == options.topic
+                        && source.0.executor_node() == options.executor_node.as_ref(),
                     "native source scope changed during preparation"
                 );
                 rules_cmd::consume(args, &mut executor, &mut source)
@@ -213,6 +215,10 @@ struct NativeRuleSource(NativeStreamClient);
 impl RuleEventSource for NativeRuleSource {
     fn host(&self) -> &str {
         self.0.endpoint()
+    }
+
+    fn executor_node(&self) -> Option<&fcp_core::TailscaleNodeId> {
+        self.0.executor_node()
     }
 
     fn poll(&mut self, limit: u32, wait_seconds: u64) -> Result<RuleEventBatch> {
@@ -885,7 +891,9 @@ mod tests {
         let client = HostAdminClient::new(&endpoint).unwrap();
         let server = std::thread::spawn(move || {
             let (mut socket, _) = listener.accept().unwrap();
-            socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
             let request = {
                 let mut reader = BufReader::new(&mut socket);
                 let mut line = String::new();
@@ -926,10 +934,14 @@ mod tests {
                     "outcome": outcome, "previous_outcome": previous,
                     "state_persisted": true,
                 });
-                assert!(!has_uncertain_results(&json!({"data": {"results": [result.clone()]}})));
+                assert!(!has_uncertain_results(
+                    &json!({"data": {"results": [result.clone()]}})
+                ));
                 let mut failed = result;
                 failed["state_persisted"] = json!(false);
-                assert!(has_uncertain_results(&json!({"data": {"results": [failed]}})));
+                assert!(has_uncertain_results(
+                    &json!({"data": {"results": [failed]}})
+                ));
             }
         }
     }
@@ -947,7 +959,9 @@ mod tests {
         };
         let server = std::thread::spawn(move || {
             let (mut socket, _) = listener.accept().unwrap();
-            socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
             let mut line = String::new();
             let mut input = BufReader::new(&mut socket);
             input.read_line(&mut line).unwrap();
@@ -978,7 +992,8 @@ mod tests {
                 socket,
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 response.len(),
-            ).unwrap();
+            )
+            .unwrap();
             socket.write_all(response).unwrap();
         });
         assert_eq!(reader.host(), endpoint);
@@ -1127,9 +1142,8 @@ mod tests {
         use std::io::Write;
 
         let (client, server) = source_http_server(|socket, _| {
-            let _ = socket.write_all(
-                b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nprivate-provider-payload",
-            );
+            let _ = socket
+                .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nprivate-provider-payload");
         });
         let error = webhook_source_post::<_, serde_json::Value>(
             &client,
@@ -1152,9 +1166,8 @@ mod tests {
         use std::io::Write;
 
         let (client, server) = source_http_server(|socket, _| {
-            let _ = socket.write_all(
-                b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n",
-            );
+            let _ = socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n");
             std::thread::sleep(Duration::from_millis(750));
             let _ = socket.write_all(b"{\"ok\":true}");
         });
@@ -1239,7 +1252,9 @@ mod tests {
                 lease_seq: Some(17),
                 timeout: Duration::from_secs(2),
             };
-            let error = source.poll(cursor, PollStart::Earliest, 4, 4096).unwrap_err();
+            let error = source
+                .poll(cursor, PollStart::Earliest, 4, 4096)
+                .unwrap_err();
             assert_eq!(
                 error.downcast_ref::<WebhookFailure>(),
                 Some(&WebhookFailure::Denied)

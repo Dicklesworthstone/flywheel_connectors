@@ -1113,8 +1113,18 @@ empty polls stop at `--wait-seconds` (0–60) and return `wait_expired: true`;
 the first nonempty batch returns immediately. Each HTTP request, including its
 response body, has a separate `--timeout-seconds` deadline (1–90, default 70).
 
+To use a durable journal on another trusted mesh node, add
+`--executor-node '<node-id>'` to the shared `stream_auth` arguments before
+opening. The selected `--host` forwards once to that exact executor over the
+authenticated mesh route; peer endpoints require HTTPS or literal loopback HTTP.
+Every success returns a top-level `executor_node` (null on a host without mesh).
+Keep a returned non-null node ID and pass it to subsequent open, poll, ack, and
+close commands. The CLI rejects a response from a different or unnamed executor
+when a node is pinned. An unavailable owner remains an error; the host does not
+retry the mutation on another node or move the durable journal.
+
 To reattach, use `open --stream-id "$stream_id"` with renewed authority and the
-original window. Keep the same host, request ID, stream ID, and acknowledgement
+original window. Keep the same host, executor node, request ID, stream ID, and acknowledgement
 pairs when retrying an uncertain result. An error with `outcome_unknown: true`
 means a mutation may already have committed. An ACK response with
 `acknowledged: true` and `upstream_notified: false` has retained the consumer
@@ -1338,12 +1348,16 @@ The command polls at most 64 events (default 1), waits up to 60 seconds for the
 first batch, and returns. Each source HTTP request has a separate
 `--stream-timeout-seconds` bound of 1–90 seconds, default 70. A source response
 is capped at 2 MiB; each event and its normalized form are capped at 256 KiB.
+For a remote journal, add the same `--executor-node '<node-id>'` used to open it.
+The consumer pins that executor through every poll and ACK; an initially local
+consumer also retains the first reported owner for the rest of its batch.
 Nested object fields become dotted template names such as `event.data.issue.title`;
 scalar strings are preserved, and other leaf values use JSON text. Ambiguous
 flattened paths, excessive depth, and more than 1,024 fields are rejected before
 any action starts.
 
-Actions must stay on the source host and in the source zone. The runner carries
+Actions use the same selected gateway and source zone. Their own host admission
+decides execution placement independently of the journal's executor. The runner carries
 the event origin as tainted, unelevated provenance into both guarded preflight
 and invocation, so ordinary host policy still decides whether that source may
 trigger an operation. Capability tokens, approvals and safety ceilings remain
@@ -1367,9 +1381,20 @@ After a confirmed ACK, successful records return to the normal minimum
 24-hour/throttle-window retention policy. The existing 10,000-attempt state
 limit still fails closed rather than discarding unresolved work.
 
+The action journal also records each native source's configured executor and
+observed journal owner before effects or acknowledgements. Reopening the same
+source with a different owner or executor setting is refused. Explicit executor
+IDs separate event identities for different remote journals behind one gateway;
+omitting the flag preserves existing local event identities. Introducing or
+dropping a pin while retained action evidence belongs to an older source scope
+is refused so an uncertain effect cannot become a fresh action. Keep the original
+settings while reconciling and settling that source; do not discard its journal.
+Source checkpoints and action identities also retain the original selected
+gateway; keep the same `--host` when retrying through a mesh executor.
+
 Output includes `data.source.ack_request` for the eligible prefix, so an
 uncertain acknowledgement or `upstream_notified: false` can be reconciled
-explicitly using `fwc streams ack` with the same source identities and exact
+explicitly using `fwc streams ack` with the same source identities, executor node, and exact
 sequence/cursor pairs. `acknowledged: true` records durable host custody even
 when the original provider instance could not yet be notified. No event payloads
 or capability tokens are written into the action journal.
