@@ -17,6 +17,7 @@ struct MeshFixture {
     executor: Arc<AppState>,
     origin_key: Ed25519SigningKey,
     faults: Arc<AtomicU64>,
+    injected_faults: Arc<AtomicU64>,
     received: Arc<AtomicU64>,
     shutdown: fcp_async_core::channel::watch::Sender<bool>,
     server: JoinHandle<HostResult<()>>,
@@ -70,16 +71,21 @@ async fn mesh_fixture(fixture: &Fixture) -> MeshFixture {
         ..(*fixture.host).clone()
     });
     let faults = Arc::new(AtomicU64::new(0));
+    let injected_faults = Arc::new(AtomicU64::new(0));
     let received = Arc::new(AtomicU64::new(0));
     let observed_faults = Arc::clone(&faults);
+    let observed_injections = Arc::clone(&injected_faults);
     let observed_requests = Arc::clone(&received);
+    let reply_directory = origin.mesh.as_ref().unwrap().directory();
     let app = Router::new()
         .route(
             MESH_FORWARD_ROUTE,
             post(
                 move |state: State<Arc<AppState>>, envelope: Json<MeshForwardEnvelope>| {
                     let faults = Arc::clone(&observed_faults);
+                    let injected = Arc::clone(&observed_injections);
                     let received = Arc::clone(&observed_requests);
+                    let reply_directory = Arc::clone(&reply_directory);
                     async move {
                         received.fetch_add(1, Ordering::SeqCst);
                         let fault = match &envelope.0.body {
@@ -91,6 +97,19 @@ async fn mesh_fixture(fixture: &Fixture) -> MeshFixture {
                         let host = Arc::clone(&state.0);
                         let result = crate::mesh_forward_handler(state, envelope).await;
                         if fault != 0 && faults.fetch_and(!fault, Ordering::SeqCst) & fault != 0 {
+                            let Json(reply) = result
+                                .as_ref()
+                                .expect("loss injection needs a signed production reply");
+                            reply
+                                .verify_for(&request, &reply_directory)
+                                .expect("production reply must authenticate before loss injection");
+                            assert_eq!(
+                                reply.status,
+                                StatusCode::OK.as_u16(),
+                                "loss injection requires successful execution: {}",
+                                reply.body_json
+                            );
+                            injected.fetch_or(fault, Ordering::SeqCst);
                             // Execution and durable custody completed; an intermediary
                             // loses the authenticated reply. It cannot prove rollback.
                             return StatusCode::SERVICE_UNAVAILABLE.into_response();
@@ -100,8 +119,18 @@ async fn mesh_fixture(fixture: &Fixture) -> MeshFixture {
                             != 0
                         {
                             let Json(reply) = result.unwrap();
+                            reply.verify_for(&request, &reply_directory).expect(
+                                "production reply must authenticate before identity tampering",
+                            );
+                            assert_eq!(
+                                reply.status,
+                                StatusCode::OK.as_u16(),
+                                "identity tampering requires successful execution: {}",
+                                reply.body_json
+                            );
                             let mut body: Value = serde_json::from_str(&reply.body_json).unwrap();
                             body["executor_node"] = json!("another-executor");
+                            injected.fetch_or(WRONG_SIGNED_EXECUTOR, Ordering::SeqCst);
                             return Json(host.mesh.as_ref().unwrap().sign_reply(
                                 &request,
                                 reply.status,
@@ -122,6 +151,7 @@ async fn mesh_fixture(fixture: &Fixture) -> MeshFixture {
         executor,
         origin_key,
         faults,
+        injected_faults,
         received,
         shutdown,
         server,
@@ -173,7 +203,7 @@ done
         (
             "SUBSCRIBE_RESULT".to_owned(),
             json!({
-                "type":"response", "id":STREAM,
+                "type":"response", "id":REQUEST_ID,
                 "result":{"confirmed_topics":[TOPIC],"replay_supported":true},
             })
             .to_string(),
@@ -240,6 +270,11 @@ async fn remote_open_resume_poll_ack_and_close_preserve_custody_after_lost_repli
     let (status, _) = send(app.clone(), "/rpc/streams/open", open.clone()).await;
     assert_eq!(status, StatusCode::BAD_GATEWAY);
     assert_eq!(
+        mesh.injected_faults.load(Ordering::SeqCst),
+        DROP_OPEN_REPLY,
+        "the lost open must have completed successfully at the executor"
+    );
+    assert_eq!(
         mesh.received.load(Ordering::SeqCst),
         1,
         "uncertain open must not be retried automatically"
@@ -270,6 +305,11 @@ async fn remote_open_resume_poll_ack_and_close_preserve_custody_after_lost_repli
     let before_ack = mesh.received.load(Ordering::SeqCst);
     let (status, _) = send(app.clone(), "/rpc/streams/ack", ack.clone()).await;
     assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        mesh.injected_faults.load(Ordering::SeqCst),
+        DROP_OPEN_REPLY | DROP_ACK_REPLY,
+        "both lost replies must follow authenticated successful execution"
+    );
     assert_eq!(mesh.received.load(Ordering::SeqCst), before_ack + 1);
     assert_eq!(fixture.journal.describe(STREAM).unwrap().pending_events, 0);
     assert_eq!(
@@ -398,6 +438,10 @@ async fn relay_rejects_signed_reply_for_another_executor_without_releasing_credi
     mesh.faults.store(WRONG_SIGNED_EXECUTOR, Ordering::SeqCst);
     let (status, body) = send(relay_app(&mesh), "/rpc/streams/poll", pinned(&alice)).await;
     assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert_eq!(
+        mesh.injected_faults.load(Ordering::SeqCst),
+        WRONG_SIGNED_EXECUTOR
+    );
     assert!(!body.contains("private-native-event-sentinel"));
     assert_eq!(mesh.received.load(Ordering::SeqCst), 1);
     assert_eq!(fixture.journal.describe(STREAM).unwrap().pending_events, 1);

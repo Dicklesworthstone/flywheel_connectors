@@ -18,6 +18,7 @@ const OPERATION: &str = "events.subscribe";
 const TOPIC: &str = "test.message";
 const RESOURCE: &str = "event:test.message";
 const STREAM: &str = "retained-test-stream";
+const REQUEST_ID: &str = "consumer-request-1";
 
 struct Fixture {
     host: Arc<AppState>,
@@ -176,7 +177,7 @@ async fn issue(
 
 fn auth(token: &fcp_core::CapabilityToken) -> Value {
     json!({
-        "request_id":"consumer-request-1",
+        "request_id":REQUEST_ID,
         "connector_id":CONNECTOR,
         "zone_id":ZoneId::work(),
         "topic":TOPIC,
