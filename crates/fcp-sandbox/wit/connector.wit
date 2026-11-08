@@ -1,0 +1,26 @@
+package fcp:connector@1.0.0;
+
+/// The host-facing component contract for an FCP connector.
+///
+/// Each request and response is one canonical CBOR value, without a schema
+/// prefix, JSON envelope, or length prefix. The method selects the existing FCP
+/// request/response type. `configure` accepts the connector configuration object
+/// and returns its configuration result; `handshake` maps HandshakeRequest to
+/// HandshakeResponse; `health` accepts an empty map and returns HealthSnapshot;
+/// `invoke` maps InvokeRequest to InvokeResponse. Business failures are ordinary
+/// InvokeResponse values with an error status, not traps or a second envelope.
+/// Unknown methods and structural protocol failures must fail the call.
+///
+/// The host retains one instance through configuration, handshake, health and
+/// invocation. Capability tokens name the actual instance reported by health.
+/// Instances are scoped to an exact zone and operation with immutable sandbox
+/// policy. A failed, timed-out or cancelled dispatch retires the instance; the
+/// host must not silently recreate it and replay a request with old authority.
+///
+/// Request and response bodies are capped at 16 MiB, with a possibly smaller
+/// response limit chosen by the host. The sandbox also bounds guest memory,
+/// execution fuel and wall time. The CBOR recipient rejects trailing bytes,
+/// noncanonical encodings and responses with mismatched request identities.
+world connector {
+    export fcp-dispatch: func(method: string, request: list<u8>) -> list<u8>;
+}

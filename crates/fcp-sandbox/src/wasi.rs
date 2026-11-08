@@ -63,7 +63,7 @@ use thiserror::Error;
 use tracing::{debug, info, trace};
 use wasmtime::{
     Config, Engine, Store,
-    component::{Component, Linker, ResourceTable},
+    component::{Component, Linker, ResourceTable, TypedFunc},
 };
 use wasmtime_wasi::{
     Deterministic, DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView,
@@ -100,6 +100,14 @@ pub enum WasiError {
     /// Component execution failed.
     #[error("component execution failed: {0}")]
     Execution(String),
+
+    /// The component does not implement the FCP dispatch contract.
+    #[error("component protocol error: {0}")]
+    Protocol(String),
+
+    /// A previous call did not complete safely, so this instance cannot resume.
+    #[error("component session is closed; prepare a new session before invoking")]
+    SessionClosed,
 
     /// Resource limit exceeded during execution.
     #[error("resource limit exceeded: {0}")]
@@ -144,6 +152,12 @@ pub enum WasiError {
 
 /// Result type for WASI operations.
 pub type WasiResult<T> = Result<T, WasiError>;
+
+/// Maximum encoded FCP request or response body for a WASI dispatch call.
+pub const MAX_WASI_RPC_BYTES: usize = 16 * 1024 * 1024;
+
+/// Export defined by the `fcp:connector/connector@1.0.0` WIT world.
+pub const WASI_FCP_DISPATCH_EXPORT: &str = "fcp-dispatch";
 
 // ============================================================================
 // Configuration
@@ -1184,6 +1198,46 @@ impl WasiRuntime {
             .map_err(|e| WasiError::Instantiation(e.to_string()))
     }
 
+    /// Instantiate an FCP component and retain its memory and session identity.
+    ///
+    /// The component must export the typed `fcp-dispatch` function from
+    /// `wit/connector.wit`. Instantiation, including guest start functions, is
+    /// bounded by the configured fuel and wall-clock limits. Component loading
+    /// and compilation are separate from this execution deadline.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if instantiation fails or times out, or if the required
+    /// export is missing or has an incompatible type.
+    pub async fn instantiate_session(
+        &self,
+        component: &Component,
+    ) -> WasiResult<WasiConnectorSession> {
+        let mut store = self.create_store()?;
+        let instance = fcp_async_core::time::timeout(
+            self.config.wall_clock_timeout,
+            self.instantiate(&mut store, component),
+        )
+        .await
+        .map_err(|_| WasiError::Timeout)??;
+        let dispatch = instance
+            .get_typed_func::<(String, Vec<u8>), (Vec<u8>,)>(
+                &mut store,
+                WASI_FCP_DISPATCH_EXPORT,
+            )
+            .map_err(|e| {
+                WasiError::Protocol(format!(
+                    "failed to resolve `{WASI_FCP_DISPATCH_EXPORT}` with (string, list<u8>) -> list<u8>: {e}"
+                ))
+            })?;
+
+        Ok(WasiConnectorSession {
+            state: Some(WasiConnectorSessionState { store, dispatch }),
+            wall_clock_timeout: self.config.wall_clock_timeout,
+            max_fuel: self.config.max_fuel,
+        })
+    }
+
     /// Instantiate a component and invoke a zero-argument exported function.
     ///
     /// The provided `args` override the runtime's configured CLI arguments for
@@ -1249,6 +1303,123 @@ impl WasiRuntime {
     #[must_use]
     pub const fn engine(&self) -> &Engine {
         &self.engine
+    }
+}
+
+// ============================================================================
+// Retained FCP Component Sessions
+// ============================================================================
+
+type WasiDispatch = TypedFunc<(String, Vec<u8>), (Vec<u8>,)>;
+
+struct WasiConnectorSessionState {
+    // A Store owns the instantiated component and all of its guest resources.
+    store: Store<WasiHostState>,
+    dispatch: WasiDispatch,
+}
+
+/// A retained FCP component instance with a bounded request/response transport.
+///
+/// Preparation and invocation must use the same session so a capability issued
+/// for the guest's handshake identity remains bound to the actual executing
+/// instance. The host owns FCP message encoding, identity checks and authority;
+/// this transport passes method names and opaque encoded bodies without
+/// synthesizing connector responses.
+///
+/// A trap, timeout, invalid guest response size or cancellation closes the
+/// session permanently. Callers must explicitly prepare a new instance and
+/// obtain authority for its identity; a failed invocation is never replayed.
+pub struct WasiConnectorSession {
+    state: Option<WasiConnectorSessionState>,
+    wall_clock_timeout: Duration,
+    max_fuel: u64,
+}
+
+impl std::fmt::Debug for WasiConnectorSession {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WasiConnectorSession")
+            .field("open", &self.state.is_some())
+            .field("wall_clock_timeout", &self.wall_clock_timeout)
+            .field("max_fuel", &self.max_fuel)
+            .finish_non_exhaustive()
+    }
+}
+
+impl WasiConnectorSession {
+    /// Call an FCP method on the retained guest instance.
+    ///
+    /// Bodies use the canonical CBOR contract documented in
+    /// `wit/connector.wit`. The caller validates the decoded response before
+    /// reusing the session. Fuel and the execution deadline are reset for each
+    /// call. Guest memory remains subject to the store's sandbox memory limit;
+    /// Wasmtime lifts the returned list before this method checks its length.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid method names or byte limits before executing guest code.
+    /// Returns an error and closes the session if guest execution fails, times
+    /// out, returns too many bytes, or canonical result cleanup fails.
+    pub async fn call(
+        &mut self,
+        method: &str,
+        request: &[u8],
+        max_response_bytes: usize,
+    ) -> WasiResult<Vec<u8>> {
+        if method.is_empty()
+            || method.len() > 64
+            || !method
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+        {
+            return Err(WasiError::Protocol(
+                "method must contain 1..=64 lowercase ASCII letters or underscores".into(),
+            ));
+        }
+        if request.len() > MAX_WASI_RPC_BYTES {
+            return Err(WasiError::ResourceLimit(format!(
+                "request exceeds the {MAX_WASI_RPC_BYTES}-byte FCP dispatch limit"
+            )));
+        }
+        if max_response_bytes == 0 || max_response_bytes > MAX_WASI_RPC_BYTES {
+            return Err(WasiError::Protocol(format!(
+                "response limit must be between 1 and {MAX_WASI_RPC_BYTES} bytes"
+            )));
+        }
+
+        // Take ownership before the first await. Dropping this future while
+        // guest code is suspended drops its Store and leaves the session closed.
+        // A later call can never resume a partially executed invocation.
+        let mut state = self.state.take().ok_or(WasiError::SessionClosed)?;
+        state.store.data_mut().start_time = Instant::now();
+        state
+            .store
+            .set_fuel(if self.max_fuel == 0 {
+                u64::MAX
+            } else {
+                self.max_fuel
+            })
+            .map_err(|e| WasiError::Execution(format!("failed to reset fuel: {e}")))?;
+
+        // Wasmtime 46's typed call performs canonical post-return automatically.
+        // A cleanup trap is therefore a failed call and also retires the Store.
+        let (response,) = fcp_async_core::time::timeout(
+            self.wall_clock_timeout,
+            state
+                .dispatch
+                .call_async(&mut state.store, (method.to_owned(), request.to_vec())),
+        )
+        .await
+        .map_err(|_| WasiError::Timeout)?
+        .map_err(|e| WasiError::Execution(format!("FCP dispatch `{method}` failed: {e}")))?;
+        if response.len() > max_response_bytes {
+            return Err(WasiError::ResourceLimit(format!(
+                "response exceeds the {max_response_bytes}-byte FCP dispatch limit"
+            )));
+        }
+
+        self.state = Some(state);
+        Ok(response)
     }
 }
 
@@ -1433,6 +1604,19 @@ impl WasiConnectorRunner {
         args: &[String],
     ) -> WasiResult<ExecutionResult> {
         self.runtime.invoke(component, "run", args).await
+    }
+
+    /// Prepare a retained FCP request/response session for this component.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if instantiation fails, exceeds its resource limits, or
+    /// the component does not expose the typed FCP dispatch export.
+    pub async fn instantiate_session(
+        &self,
+        component: &Component,
+    ) -> WasiResult<WasiConnectorSession> {
+        self.runtime.instantiate_session(component).await
     }
 
     /// Validate that a filesystem path is allowed by the connector's policy.
@@ -2482,6 +2666,248 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("missing"));
         assert!(message.contains("failed to resolve"));
+    }
+
+    const DISPATCH_COMPONENT: &[u8] = include_bytes!("../tests/fixtures/connector_dispatch.wat");
+
+    #[fcp_async_core::runtime::test]
+    async fn connector_session_dispatches_input_and_retains_instance_state() {
+        let runner = WasiConnectorRunner::new(WasiConfig::default()).unwrap();
+        let component = runner.load_and_validate(DISPATCH_COMPONENT).unwrap();
+        let mut session = runner
+            .instantiate_session(&component.component)
+            .await
+            .unwrap();
+
+        // The component returns its call count, the first method/request bytes
+        // and its previous cleanup count. Its post-return overwrites the guest
+        // result buffer, so these bytes also verify copying precedes cleanup.
+        assert_eq!(
+            session.call("invoke", &[42], 4).await.unwrap(),
+            [1, b'i', 42, 0]
+        );
+        assert_eq!(
+            session.call("health", &[7], 4).await.unwrap(),
+            [2, b'h', 7, 1]
+        );
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn connector_session_requires_typed_dispatch_export() {
+        let runner = WasiConnectorRunner::new(WasiConfig::default()).unwrap();
+        let component = runner
+            .load_and_validate(minimal_command_component())
+            .unwrap();
+        let error = runner
+            .instantiate_session(&component.component)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, WasiError::Protocol(_)));
+        assert!(error.to_string().contains(WASI_FCP_DISPATCH_EXPORT));
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn connector_session_rejects_invalid_arguments_without_entering_guest() {
+        let runner = WasiConnectorRunner::new(WasiConfig::default()).unwrap();
+        let component = runner.load_and_validate(DISPATCH_COMPONENT).unwrap();
+        let mut session = runner
+            .instantiate_session(&component.component)
+            .await
+            .unwrap();
+
+        for method in ["", "Invoke", "invoke\n", "invoke.request", "health\0"] {
+            assert!(matches!(
+                session.call(method, &[42], 4).await,
+                Err(WasiError::Protocol(_))
+            ));
+        }
+        assert!(matches!(
+            session.call("invoke", &[42], 0).await,
+            Err(WasiError::Protocol(_))
+        ));
+        assert!(matches!(
+            session.call("invoke", &[42], MAX_WASI_RPC_BYTES + 1).await,
+            Err(WasiError::Protocol(_))
+        ));
+        assert!(matches!(
+            session
+                .call("invoke", &vec![0; MAX_WASI_RPC_BYTES + 1], 4)
+                .await,
+            Err(WasiError::ResourceLimit(_))
+        ));
+        assert_eq!(
+            session.call("invoke", &[42], 4).await.unwrap(),
+            [1, b'i', 42, 0]
+        );
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn connector_session_closes_after_guest_or_cleanup_failure() {
+        let runner = WasiConnectorRunner::new(WasiConfig::default()).unwrap();
+        let component = runner.load_and_validate(DISPATCH_COMPONENT).unwrap();
+
+        for method in ["trap", "bad_return", "post_trap"] {
+            let mut session = runner
+                .instantiate_session(&component.component)
+                .await
+                .unwrap();
+            assert!(matches!(
+                session.call(method, &[42], 4).await,
+                Err(WasiError::Execution(_))
+            ));
+            assert!(matches!(
+                session.call("invoke", &[42], 4).await,
+                Err(WasiError::SessionClosed)
+            ));
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn connector_session_closes_after_oversized_response() {
+        let runner = WasiConnectorRunner::new(WasiConfig::default()).unwrap();
+        let component = runner.load_and_validate(DISPATCH_COMPONENT).unwrap();
+        let mut session = runner
+            .instantiate_session(&component.component)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            session.call("large", &[], 65_536).await,
+            Err(WasiError::ResourceLimit(_))
+        ));
+        assert!(matches!(
+            session.call("invoke", &[42], 4).await,
+            Err(WasiError::SessionClosed)
+        ));
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn connector_session_resets_fuel_and_deadline_for_each_call() {
+        let runner = WasiConnectorRunner::new(WasiConfig {
+            max_fuel: 10_000,
+            ..WasiConfig::default()
+        })
+        .unwrap();
+        let component = runner.load_and_validate(DISPATCH_COMPONENT).unwrap();
+        let mut session = runner
+            .instantiate_session(&component.component)
+            .await
+            .unwrap();
+        assert_eq!(session.call("invoke", &[42], 4).await.unwrap()[0], 1);
+
+        let state = session.state.as_mut().unwrap();
+        state.store.set_fuel(0).unwrap();
+        state.store.data_mut().start_time = Instant::now() - Duration::from_secs(60);
+        assert!(matches!(
+            state.store.data().check_timeout(),
+            Err(WasiError::Timeout)
+        ));
+
+        assert_eq!(session.call("invoke", &[42], 4).await.unwrap()[0], 2);
+        assert!(
+            session
+                .state
+                .as_ref()
+                .unwrap()
+                .store
+                .data()
+                .check_timeout()
+                .is_ok()
+        );
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn connector_session_closes_after_fuel_exhaustion() {
+        let runner = WasiConnectorRunner::new(WasiConfig {
+            max_fuel: 1_000,
+            ..WasiConfig::default()
+        })
+        .unwrap();
+        let component = runner.load_and_validate(DISPATCH_COMPONENT).unwrap();
+        let mut session = runner
+            .instantiate_session(&component.component)
+            .await
+            .unwrap();
+        assert!(matches!(
+            session.call("spin", &[], 4).await,
+            Err(WasiError::Execution(_))
+        ));
+        assert!(matches!(
+            session.call("invoke", &[42], 4).await,
+            Err(WasiError::SessionClosed)
+        ));
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn connector_session_closes_after_timeout() {
+        let runner = WasiConnectorRunner::new(WasiConfig {
+            max_fuel: 0,
+            wall_clock_timeout: Duration::from_millis(10),
+            ..WasiConfig::default()
+        })
+        .unwrap();
+        let component = runner.load_and_validate(DISPATCH_COMPONENT).unwrap();
+        let mut session = runner
+            .instantiate_session(&component.component)
+            .await
+            .unwrap();
+        assert!(matches!(
+            session.call("spin", &[], 4).await,
+            Err(WasiError::Timeout)
+        ));
+        assert!(matches!(
+            session.call("invoke", &[42], 4).await,
+            Err(WasiError::SessionClosed)
+        ));
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn connector_session_closes_when_in_flight_call_is_dropped() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let runner = WasiConnectorRunner::new(WasiConfig {
+            max_fuel: 0,
+            ..WasiConfig::default()
+        })
+        .unwrap();
+        let component = runner.load_and_validate(DISPATCH_COMPONENT).unwrap();
+        let mut session = runner
+            .instantiate_session(&component.component)
+            .await
+            .unwrap();
+        {
+            let mut call = std::pin::pin!(session.call("spin", &[], 4));
+            let mut context = Context::from_waker(Waker::noop());
+            assert!(matches!(call.as_mut().poll(&mut context), Poll::Pending));
+        }
+        assert!(matches!(
+            session.call("invoke", &[42], 4).await,
+            Err(WasiError::SessionClosed)
+        ));
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn connector_session_bounds_guest_start_function_execution() {
+        let runner = WasiConnectorRunner::new(WasiConfig {
+            max_fuel: 0,
+            wall_clock_timeout: Duration::from_millis(10),
+            ..WasiConfig::default()
+        })
+        .unwrap();
+        let component = runner
+            .load_and_validate(
+                br#"(component
+                    (core module $m
+                        (func $start (loop $spin (br $spin)))
+                        (start $start))
+                    (core instance (instantiate $m)))"#,
+            )
+            .unwrap();
+        assert!(matches!(
+            runner.instantiate_session(&component.component).await,
+            Err(WasiError::Timeout)
+        ));
     }
 
     #[test]
