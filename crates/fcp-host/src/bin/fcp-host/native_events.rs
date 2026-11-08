@@ -30,6 +30,8 @@ struct StreamAuthority {
     zone_id: ZoneId,
     topic: String,
     capability_token: fcp_core::CapabilityToken,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    holder_proof: Option<fcp_core::HolderProof>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -90,6 +92,7 @@ struct Admission {
     capability: CapabilityId,
     enforce_operation_network_constraints: bool,
     generation: u64,
+    authority: live_authority::LiveAuthorityDispatchGuard,
 }
 
 struct Attachment {
@@ -200,6 +203,9 @@ impl EventService {
         {
             return Err(invalid("invalid stream request identity or topic"));
         }
+        // Capture before any asynchronous authority lookup. A revocation
+        // published while those reads wait must invalidate this admission.
+        let lifecycle_fence = host.lifecycle.capability_revocation_fence();
         let generation = host.registry.version.load(Ordering::Acquire);
         let (config, connector, declaration) = {
             let state = host.registry.state.read().await;
@@ -293,13 +299,6 @@ impl EventService {
         let principal = claims_principal(claims)
             .ok_or_else(|| denied("event capability needs a verified subject"))?
             .to_owned();
-        // HTTP event calls do not yet carry the mesh request transcript needed
-        // for holder proofs. Never downgrade a holder-bound token to a bearer.
-        if claims.get_holder_node().is_some() {
-            return Err(denied(
-                "holder-bound capabilities require a supported holder-proof transport",
-            ));
-        }
         verify_live_revocation_cascade(host, &auth.zone_id, &auth.capability_token, claims)?;
         let request = InvokeRequest {
             r#type: "invoke".into(),
@@ -309,7 +308,7 @@ impl EventService {
             zone_id: auth.zone_id.clone(),
             input: json!({"topic": auth.topic, "resource_uri": resource_uri}),
             capability_token: auth.capability_token.clone(),
-            holder_proof: None,
+            holder_proof: auth.holder_proof.clone(),
             context: None,
             idempotency_key: None,
             lease_seq: None,
@@ -318,6 +317,10 @@ impl EventService {
             provenance: None,
             approval_tokens: Vec::new(),
         };
+        // The transcript uses the host-pinned subscription operation, never a
+        // caller-supplied operation or the relay peer's transport signature.
+        enforce_live_holder_proof(host, &request, claims)
+            .map_err(|_| denied("event holder proof or current mesh membership was rejected"))?;
         verify_live_hybrid_owner_capability(host, &request)?;
         let persisted = host
             .lifecycle
@@ -367,6 +370,9 @@ impl EventService {
                 "connector inventory changed during event authorization; retry",
             ));
         }
+        let authority =
+            live_authority::LiveAuthorityDispatchGuard::new(host, &request, lifecycle_fence)?;
+        authority.refresh()?.require_current()?;
         Ok(Admission {
             binding: NativeEventBinding {
                 principal,
@@ -380,6 +386,7 @@ impl EventService {
             capability,
             enforce_operation_network_constraints: config.enforce_operation_network_constraints,
             generation,
+            authority,
         })
     }
 
@@ -414,6 +421,7 @@ impl EventService {
         admission: &Admission,
         stream_id: &str,
     ) -> HostResult<InstanceId> {
+        admission.authority.refresh()?.require_current()?;
         let retained = self.journal()?.describe(stream_id)?;
         if retained.binding != admission.binding {
             return Err(denied("event stream belongs to another consumer or scope"));
@@ -424,6 +432,9 @@ impl EventService {
 
     async fn open(&self, host: &AppState, request: OpenRequest) -> HostResult<Value> {
         let admission = self.authorize(host, &request.auth).await?;
+        let termination = NativeInvocationTermination::new(Instant::now() + REQUEST_TIMEOUT);
+        termination.bind_inventory_fence(host.registry.inventory_fence(admission.generation));
+        termination.bind_authority_guard(admission.authority.clone());
         if admission.enforce_operation_network_constraints {
             return Err(denied(
                 "native streaming cannot bypass strict per-operation egress enforcement",
@@ -439,7 +450,7 @@ impl EventService {
             zone_id: request.auth.zone_id.clone(),
             input: json!({"resource_uri": admission.resource_uri}),
             capability_token: request.auth.capability_token.clone(),
-            holder_proof: None,
+            holder_proof: request.auth.holder_proof.clone(),
             context: None,
             idempotency_key: None,
             lease_seq: None,
@@ -489,7 +500,12 @@ impl EventService {
         } else {
             let health = admission
                 .connector
-                .rpc_in_handshaken_zone(&admission.binding.zone_id, "health", json!({}))
+                .rpc_in_handshaken_zone_with_termination(
+                    &admission.binding.zone_id,
+                    "health",
+                    json!({}),
+                    Some(&termination),
+                )
                 .await?;
             session::prepared_from_health(
                 admission.binding.connector_id.clone(),
@@ -512,6 +528,10 @@ impl EventService {
                 "a concurrent subscription already attached this process",
             ));
         }
+        // Health preparation and attachment ownership can both wait. Refresh
+        // before durable custody changes; the physical RPC has its own guard
+        // at actor selection after any subsequent zone-lock or queue wait.
+        admission.authority.refresh()?.require_current()?;
         // Persist ownership before retiring any previous process. A token for
         // a different principal must not disrupt its retained consumer.
         let stream = journal.register(
@@ -603,7 +623,7 @@ impl EventService {
         }
         let result = admission
             .connector
-            .rpc_in_handshaken_zone(
+            .rpc_in_handshaken_zone_with_termination(
                 &admission.binding.zone_id,
                 "subscribe",
                 json!({
@@ -614,6 +634,7 @@ impl EventService {
                     "window_size": request.window_size,
                     "capability_token": request.auth.capability_token,
                 }),
+                Some(&termination),
             )
             .await?;
         let subscribed: SubscribeResponse = serde_json::from_value(result)
@@ -637,7 +658,12 @@ impl EventService {
                         && !attachment.transport.is_failed()
                 })
         };
-        if current.closed
+        let authority_current = admission
+            .authority
+            .refresh()
+            .is_ok_and(|permit| permit.is_current());
+        if !authority_current
+            || current.closed
             || current.instance_id != stream.instance_id
             || admission.generation != host.registry.version.load(Ordering::Acquire)
             || !still_attached

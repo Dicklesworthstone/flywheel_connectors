@@ -3,7 +3,7 @@
 use super::*;
 use axum::response::IntoResponse;
 use fcp_crypto::ed25519::Ed25519SigningKey;
-use fcp_host::mesh_routing::{MESH_FORWARD_ROUTE, MeshRouter, MeshRoutingSettings, unix_now_ms};
+use fcp_host::mesh_routing::{MESH_FORWARD_ROUTE, unix_now_ms};
 use fcp_mesh::invoke_route::{MeshForwardBody, MeshForwardEnvelope};
 
 const EXECUTOR: &str = "event-executor";
@@ -16,6 +16,8 @@ struct MeshFixture {
     origin: Arc<AppState>,
     executor: Arc<AppState>,
     origin_key: Ed25519SigningKey,
+    holder_key: Ed25519SigningKey,
+    membership: SignedEventMembership,
     faults: Arc<AtomicU64>,
     injected_faults: Arc<AtomicU64>,
     received: Arc<AtomicU64>,
@@ -35,32 +37,17 @@ async fn mesh_fixture(fixture: &Fixture) -> MeshFixture {
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     let origin_key = Ed25519SigningKey::from_bytes(&[41; 32]).unwrap();
     let executor_key = Ed25519SigningKey::from_bytes(&[42; 32]).unwrap();
-    let origin_router = Arc::new(
-        MeshRouter::new(MeshRoutingSettings {
-            node_id: TailscaleNodeId::new(ORIGIN),
-            signing_key: Ed25519SigningKey::from_bytes(&origin_key.to_bytes()).unwrap(),
-            peers_json: json!([{
-                "node_id":EXECUTOR, "endpoint":endpoint,
-                "public_key_hex":hex::encode(executor_key.verifying_key().to_bytes()),
-            }])
-            .to_string(),
-            forward_timeout: Duration::from_secs(5),
-        })
-        .unwrap(),
+    let holder_key = Ed25519SigningKey::from_bytes(&[43; 32]).unwrap();
+    let membership = SignedEventMembership::new(
+        fixture._directory.path().join("relay-membership"),
+        vec![
+            member(ORIGIN, "http://127.0.0.1:1", &origin_key),
+            member(EXECUTOR, &endpoint, &executor_key),
+            member(HOLDER, "http://127.0.0.1:19003", &holder_key),
+        ],
     );
-    let executor_router = Arc::new(
-        MeshRouter::new(MeshRoutingSettings {
-            node_id: TailscaleNodeId::new(EXECUTOR),
-            signing_key: executor_key,
-            peers_json: json!([{
-                "node_id":ORIGIN, "endpoint":"http://127.0.0.1:1",
-                "public_key_hex":hex::encode(origin_key.verifying_key().to_bytes()),
-            }])
-            .to_string(),
-            forward_timeout: Duration::from_secs(5),
-        })
-        .unwrap(),
-    );
+    let origin_router = Arc::new(membership.router(ORIGIN, &origin_key));
+    let executor_router = Arc::new(membership.router(EXECUTOR, &executor_key));
     let empty = crate::tests::cancel_route_test_state();
     let origin = Arc::new(AppState {
         mesh: Some(origin_router),
@@ -150,6 +137,8 @@ async fn mesh_fixture(fixture: &Fixture) -> MeshFixture {
         origin,
         executor,
         origin_key,
+        holder_key,
+        membership,
         faults,
         injected_faults,
         received,
@@ -164,6 +153,10 @@ fn relay_app(mesh: &MeshFixture) -> Router {
 
 fn pinned(token: &fcp_core::CapabilityToken) -> Value {
     json!({"auth":auth(token),"executor_node":EXECUTOR,"stream_id":STREAM})
+}
+
+fn pinned_holder(token: &fcp_core::CapabilityToken, holder: &Ed25519SigningKey) -> Value {
+    json!({"auth":holder_auth(token, holder),"executor_node":EXECUTOR,"stream_id":STREAM})
 }
 
 async fn install_native_source(fixture: &mut Fixture) {
@@ -247,10 +240,12 @@ done
 }
 
 #[fcp_async_core::runtime::test(flavor = "multi_thread")]
-async fn remote_open_resume_poll_ack_and_close_preserve_custody_after_lost_replies() {
+async fn remote_holder_open_resume_poll_ack_and_close_preserve_custody_after_lost_replies() {
     let mut fixture = fixture().await;
     install_native_source(&mut fixture).await;
-    let (alice, _) = issue(&fixture, issuance("agent:alice")).await;
+    let mut issuance = issuance("agent:alice");
+    issuance.holder_node = Some(HOLDER.to_owned());
+    let (alice, _) = issue(&fixture, issuance).await;
     let mesh = mesh_fixture(&fixture).await;
     assert!(
         mesh.origin
@@ -266,7 +261,7 @@ async fn remote_open_resume_poll_ack_and_close_preserve_custody_after_lost_repli
     let app = relay_app(&mesh);
     mesh.faults
         .store(DROP_OPEN_REPLY | DROP_ACK_REPLY, Ordering::SeqCst);
-    let open = pinned(&alice);
+    let open = pinned_holder(&alice, &mesh.holder_key);
     let (status, _) = send(app.clone(), "/rpc/streams/open", open.clone()).await;
     assert_eq!(status, StatusCode::BAD_GATEWAY);
     assert_eq!(
@@ -286,7 +281,12 @@ async fn remote_open_resume_poll_ack_and_close_preserve_custody_after_lost_repli
     assert_eq!(opened["stream"]["stream_id"], STREAM);
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
-        let (status, body) = send(app.clone(), "/rpc/streams/poll", pinned(&alice)).await;
+        let (status, body) = send(
+            app.clone(),
+            "/rpc/streams/poll",
+            pinned_holder(&alice, &mesh.holder_key),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let batch: Value = serde_json::from_str(&body).unwrap();
         if !batch["events"].as_array().unwrap().is_empty() {
@@ -300,7 +300,7 @@ async fn remote_open_resume_poll_ack_and_close_preserve_custody_after_lost_repli
         );
         fcp_async_core::time::sleep(Duration::from_millis(10)).await;
     }
-    let mut ack = pinned(&alice);
+    let mut ack = pinned_holder(&alice, &mesh.holder_key);
     ack["ack"] = json!(acknowledgement());
     let before_ack = mesh.received.load(Ordering::SeqCst);
     let (status, _) = send(app.clone(), "/rpc/streams/ack", ack.clone()).await;
@@ -325,11 +325,58 @@ async fn remote_open_resume_poll_ack_and_close_preserve_custody_after_lost_repli
     let receipt: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(receipt["upstream_notified"], true);
     assert_eq!(receipt["stream"]["acknowledged_events"], 1);
-    let (status, body) = send(app, "/rpc/streams/close", pinned(&alice)).await;
+    let (status, body) = send(
+        app,
+        "/rpc/streams/close",
+        pinned_holder(&alice, &mesh.holder_key),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let closed: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(closed["stream"]["closed"], true);
     assert_eq!(closed["executor_node"], EXECUTOR);
+    mesh.stop().await;
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn signed_relay_cannot_replace_holder_proof_or_withdrawn_holder_membership() {
+    let fixture = fixture().await;
+    let mut issuance = issuance("agent:alice");
+    issuance.holder_node = Some(HOLDER.to_owned());
+    let (token, _) = issue(&fixture, issuance).await;
+    let mut mesh = mesh_fixture(&fixture).await;
+    let app = relay_app(&mesh);
+    // The envelope is signed by an authenticated relay in both cases. The
+    // retained consumer must still prove the separate token holder's key.
+    for request in [pinned(&token), pinned_holder(&token, &mesh.origin_key)] {
+        let (status, body) = send(app.clone(), "/rpc/streams/poll", request).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(!body.contains("private-native-event-sentinel"));
+    }
+    let (status, body) = send(
+        app.clone(),
+        "/rpc/streams/poll",
+        pinned_holder(&token, &mesh.holder_key),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    mesh.membership
+        .withdraw(HOLDER, mesh.executor.mesh.as_ref().unwrap())
+        .await;
+    for route in ["poll", "ack", "close"] {
+        let mut request = pinned_holder(&token, &mesh.holder_key);
+        if route == "ack" {
+            request["ack"] = json!(acknowledgement());
+        }
+        let (status, body) = send(app.clone(), &format!("/rpc/streams/{route}"), request).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{route}: {body}");
+        assert!(!body.contains("private-native-event-sentinel"));
+    }
+    let retained = fixture.journal.describe(STREAM).unwrap();
+    assert_eq!(retained.pending_events, 1);
+    assert_eq!(retained.acknowledged_events, 0);
+    assert!(!retained.closed);
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
     mesh.stop().await;
 }
 

@@ -13,7 +13,8 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use clap::{Args, Subcommand};
 use fcp_core::{
-    CapabilityToken, ConnectorId, EventAck, EventEnvelope, InstanceId, TailscaleNodeId, ZoneId,
+    CapabilityToken, ConnectorId, EventAck, EventEnvelope, HolderProof, InstanceId, RequestId,
+    TailscaleNodeId, ZoneId,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -75,6 +76,14 @@ struct AuthorityArgs {
     /// Read the signed capability from a regular file containing base64, JSON, or COSE CBOR.
     #[arg(long, value_name = "PATH")]
     capability_token_file: PathBuf,
+
+    /// Node signing key for a holder-bound capability (32 raw bytes or 64 hexadecimal digits).
+    #[arg(long, value_name = "PATH", requires = "subscription_operation")]
+    holder_key_file: Option<PathBuf>,
+
+    /// Exact manifest subscription operation signed by the holder, for example telegram.subscribe.
+    #[arg(long, value_name = "OPERATION_ID", requires = "holder_key_file")]
+    subscription_operation: Option<String>,
 
     /// Whole HTTP request deadline, including the response body (1-90 seconds).
     #[arg(long, default_value_t = 70, value_parser = clap::value_parser!(u64).range(1..=90))]
@@ -145,6 +154,8 @@ pub(crate) struct NativeStreamConfig {
     pub(crate) stream_id: String,
     pub(crate) executor_node: Option<TailscaleNodeId>,
     pub(crate) capability_token_file: PathBuf,
+    pub(crate) holder_key_file: Option<PathBuf>,
+    pub(crate) subscription_operation: Option<String>,
     pub(crate) timeout_seconds: u64,
 }
 
@@ -221,6 +232,8 @@ impl NativeStreamClient {
             request_id: config.request_id,
             executor_node: config.executor_node,
             capability_token_file: config.capability_token_file,
+            holder_key_file: config.holder_key_file,
+            subscription_operation: config.subscription_operation,
             timeout_seconds: config.timeout_seconds,
         })?;
         let host = resolve_host_config(explicit_host)
@@ -364,6 +377,8 @@ struct Authority {
     zone_id: ZoneId,
     topic: String,
     capability_token: CapabilityToken,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    holder_proof: Option<HolderProof>,
     // Routing is a top-level host request field, never capability authority.
     #[serde(skip)]
     executor_node: Option<TailscaleNodeId>,
@@ -425,6 +440,7 @@ pub(crate) enum StreamFailure {
     MissingHost,
     InvalidHost,
     Credential,
+    HolderProof,
     Transport,
     Timeout,
     Http(u16),
@@ -455,6 +471,11 @@ impl Failure {
             Self::Credential => (
                 "invalid-stream-capability",
                 "The capability file must be a readable regular file of at most 64 KiB containing a signed COSE capability in base64, JSON, or CBOR form.",
+                CliExitCode::Validation,
+            ),
+            Self::HolderProof => (
+                "invalid-stream-holder-proof",
+                "A holder-bound stream capability needs its node signing key and exact manifest subscription operation. Use --holder-key-file and --subscription-operation for streams, or --stream-holder-key-file and --stream-subscription-operation for rules consume. The regular key file must contain 32 raw bytes or 64 hexadecimal digits; the capability must identify its holder and nonempty token JTI.",
                 CliExitCode::Validation,
             ),
             Self::Transport => (
@@ -621,14 +642,60 @@ fn load_authority(args: &AuthorityArgs) -> std::result::Result<Authority, Failur
     }
     let capability_token =
         parse_capability_token_bytes(&bytes, "capability file").map_err(|_| Failure::Credential)?;
+    let holder_proof = stream_holder_proof(args, &capability_token)?;
     Ok(Authority {
         request_id: args.request_id.clone(),
         connector_id,
         zone_id,
         topic: args.topic.clone(),
         capability_token,
+        holder_proof,
         executor_node,
     })
+}
+
+fn stream_holder_proof(
+    args: &AuthorityArgs,
+    capability_token: &CapabilityToken,
+) -> std::result::Result<Option<HolderProof>, Failure> {
+    // Unverified claims only select the caller's signing context. The host
+    // independently verifies the capability and its current membership key.
+    let claims = capability_token.raw().claims_unverified().ok();
+    let holder = claims.as_ref().and_then(|claims| claims.get_holder_node());
+    match (
+        holder,
+        args.holder_key_file.as_deref(),
+        args.subscription_operation.as_deref(),
+    ) {
+        (None, None, None) => Ok(None),
+        (Some(holder), Some(path), Some(operation)) => {
+            if !bounded_identity(operation, 256)
+                || !std::fs::metadata(path)
+                    .is_ok_and(|metadata| metadata.is_file() && metadata.len() <= 128)
+            {
+                return Err(Failure::HolderProof);
+            }
+            let token_jti = claims
+                .as_ref()
+                .and_then(|claims| claims.get_jti())
+                .filter(|jti| !jti.is_empty())
+                .ok_or(Failure::HolderProof)?;
+            let auth = crate::ResolvedLiveAuth {
+                capability_token: capability_token.clone(),
+                approval_tokens: Vec::new(),
+                principal_hint: None,
+                holder_signer: Some(crate::LiveHolderSigner {
+                    key: crate::read_live_holder_signing_key(path)
+                        .map_err(|_| Failure::HolderProof)?,
+                    holder_node: TailscaleNodeId::new(holder),
+                    token_jti: token_jti.to_vec(),
+                }),
+            };
+            auth.holder_proof_for(&RequestId::new(args.request_id.clone()), operation)
+                .map_err(|_| Failure::HolderProof)
+        }
+        _ => Err(Failure::HolderProof),
+    }
 }
 
 fn validate_ack_pairs(seqs: &[u64], cursors: &[String]) -> std::result::Result<(), Failure> {
@@ -1036,6 +1103,9 @@ mod tests {
     const STREAM: &str = "stream-fixture";
     const TOPIC: &str = "telegram.message.new";
     const EXECUTOR: &str = "node-journal-owner";
+    const HOLDER: &str = "node-stream-holder";
+    const HOLDER_JTI: &[u8] = b"stream-holder-token-id";
+    const SUBSCRIPTION_OPERATION: &str = "telegram.subscribe";
 
     #[derive(Parser)]
     struct TestCli {
@@ -1122,6 +1192,24 @@ mod tests {
         file
     }
 
+    fn holder_credential(holder: Option<&str>, jti: Option<&[u8]>) -> tempfile::NamedTempFile {
+        let issuer = fcp_crypto::Ed25519SigningKey::from_bytes(&[0x42; 32]).unwrap();
+        let mut claims = CapabilityToken::test_token()
+            .raw()
+            .claims_unverified()
+            .unwrap();
+        if let Some(holder) = holder {
+            claims = claims.holder_node(holder);
+        }
+        if let Some(jti) = jti {
+            claims = claims.token_id(jti);
+        }
+        let token = fcp_crypto::cose::CoseToken::sign(&issuer, &claims).unwrap();
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&token.to_cbor().unwrap()).unwrap();
+        file
+    }
+
     fn args(file: &std::path::Path, command: &str, extra: &[&str]) -> StreamsArgs {
         let mut argv = vec![
             "streams".to_owned(),
@@ -1150,13 +1238,18 @@ mod tests {
             stream_id: STREAM.to_owned(),
             executor_node: None,
             capability_token_file: file.to_owned(),
+            holder_key_file: None,
+            subscription_operation: None,
             timeout_seconds: 3,
         }
     }
 
     #[test]
-    fn explicit_executor_survives_open_resume_poll_ack_and_close() {
-        let file = credential();
+    fn explicit_executor_and_holder_proof_survive_open_resume_poll_ack_and_close() {
+        let file = holder_credential(Some(HOLDER), Some(HOLDER_JTI));
+        let mut key_file = tempfile::NamedTempFile::new().unwrap();
+        key_file.write_all(&[0x77; 32]).unwrap();
+        let holder = fcp_crypto::Ed25519SigningKey::from_bytes(&[0x77; 32]).unwrap();
         let opened = json!({
             "executor_node":EXECUTOR,"stream":metadata(false,0,0),
             "attached":true,"replay_supported":false,
@@ -1187,10 +1280,20 @@ mod tests {
         ] {
             let mut extra = extra;
             extra.extend(["--executor-node", EXECUTOR]);
+            extra.extend([
+                "--holder-key-file",
+                key_file.path().to_str().unwrap(),
+                "--subscription-operation",
+                SUBSCRIPTION_OPERATION,
+            ]);
             let result = dispatch(&args(file.path(), command, &extra), Some(&endpoint)).unwrap();
             assert_eq!(result.exit_code, CliExitCode::Success);
             assert_eq!(result.payload["executor_node"], EXECUTOR);
             assert_eq!(result.payload["host"], endpoint);
+            let rendered = result.payload.to_string();
+            assert!(!rendered.contains("capability_token"));
+            assert!(!rendered.contains("holder_proof"));
+            assert!(!rendered.contains(&hex::encode(holder.to_bytes())));
         }
         let requests = task.join().unwrap();
         assert_eq!(requests.len(), 5);
@@ -1198,7 +1301,127 @@ mod tests {
             assert_eq!(request.body["executor_node"], EXECUTOR);
             assert!(request.body["auth"].get("executor_node").is_none());
             assert_eq!(request.body["auth"]["request_id"], "consumer-stable-1");
+            let proof: HolderProof =
+                serde_json::from_value(request.body["auth"]["holder_proof"].clone()).unwrap();
+            assert_eq!(proof.holder_node.as_str(), HOLDER);
+            assert!(
+                request.body["auth"].get("subscription_operation").is_none(),
+                "the executor derives the manifest operation independently"
+            );
+            let signature = fcp_crypto::Ed25519Signature::from_bytes(&proof.signature);
+            for (request_id, operation, token_id, valid) in [
+                (
+                    "consumer-stable-1",
+                    SUBSCRIPTION_OPERATION,
+                    HOLDER_JTI,
+                    true,
+                ),
+                ("another-request", SUBSCRIPTION_OPERATION, HOLDER_JTI, false),
+                ("consumer-stable-1", "telegram.send", HOLDER_JTI, false),
+                (
+                    "consumer-stable-1",
+                    SUBSCRIPTION_OPERATION,
+                    b"renewed-token".as_slice(),
+                    false,
+                ),
+            ] {
+                let transcript = HolderProof::signable_bytes(
+                    &RequestId::new(request_id),
+                    &operation.parse().unwrap(),
+                    token_id,
+                );
+                assert_eq!(
+                    holder
+                        .verifying_key()
+                        .verify(&transcript, &signature)
+                        .is_ok(),
+                    valid
+                );
+            }
         }
+    }
+
+    #[test]
+    fn incomplete_or_unbound_holder_authority_fails_before_any_network_request() {
+        let mut key = tempfile::NamedTempFile::new().unwrap();
+        key.write_all(&[0x77; 32]).unwrap();
+        for (holder, jti, use_key, operation) in [
+            (Some(HOLDER), Some(HOLDER_JTI), false, None),
+            (Some(HOLDER), Some(HOLDER_JTI), true, None),
+            (
+                Some(HOLDER),
+                Some(HOLDER_JTI),
+                false,
+                Some(SUBSCRIPTION_OPERATION),
+            ),
+            (Some(HOLDER), None, true, Some(SUBSCRIPTION_OPERATION)),
+            (
+                Some(HOLDER),
+                Some(b"".as_slice()),
+                true,
+                Some(SUBSCRIPTION_OPERATION),
+            ),
+            (None, Some(HOLDER_JTI), true, Some(SUBSCRIPTION_OPERATION)),
+            (
+                Some(HOLDER),
+                Some(HOLDER_JTI),
+                true,
+                Some("invalid\noperation"),
+            ),
+        ] {
+            let token = holder_credential(holder, jti);
+            let mut config = consumer_config(token.path());
+            config.holder_key_file = use_key.then(|| key.path().to_owned());
+            config.subscription_operation = operation.map(str::to_owned);
+            assert!(
+                matches!(
+                    NativeStreamClient::new(config, Some("not-a-host")),
+                    Err(StreamFailure::HolderProof)
+                ),
+                "holder inputs must fail before host setup"
+            );
+        }
+        let token = holder_credential(Some(HOLDER), Some(HOLDER_JTI));
+        for bytes in [vec![0x77; 129], b"private-invalid-key-sentinel".to_vec()] {
+            let mut key = tempfile::NamedTempFile::new().unwrap();
+            key.write_all(&bytes).unwrap();
+            let mut config = consumer_config(token.path());
+            config.holder_key_file = Some(key.path().to_owned());
+            config.subscription_operation = Some(SUBSCRIPTION_OPERATION.to_owned());
+            let error = NativeStreamClient::new(config, Some("not-a-host"))
+                .err()
+                .unwrap();
+            assert!(matches!(error, StreamFailure::HolderProof));
+            assert!(!error.to_string().contains("private-invalid-key-sentinel"));
+            assert!(!error.to_string().contains(key.path().to_str().unwrap()));
+        }
+    }
+
+    #[test]
+    fn holder_stream_consumer_posts_proof_without_introspection_on_ack() {
+        let token = holder_credential(Some(HOLDER), Some(HOLDER_JTI));
+        let mut key = tempfile::NamedTempFile::new().unwrap();
+        key.write_all(&[0x77; 32]).unwrap();
+        let (endpoint, task) = host(vec![
+            json!({"stream":metadata(false,1,0),"events":[event()]}),
+            json!({"stream":metadata(false,0,1),"acknowledged":true,"upstream_notified":true}),
+        ]);
+        let mut config = consumer_config(token.path());
+        config.holder_key_file = Some(key.path().to_owned());
+        config.subscription_operation = Some(SUBSCRIPTION_OPERATION.to_owned());
+        let mut client = NativeStreamClient::new(config, Some(&endpoint)).unwrap();
+        let batch = client.poll(1, 0).unwrap();
+        assert_eq!(batch.events.len(), 1);
+        client
+            .ack(&[batch.events[0].seq], &[batch.events[0].cursor.clone()])
+            .unwrap();
+        let requests = task.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].path, "/rpc/streams/poll");
+        assert_eq!(requests[1].path, "/rpc/streams/ack");
+        let expected = requests[0].body["auth"]["holder_proof"].clone();
+        assert!(!expected.is_null());
+        assert_eq!(requests[1].body["auth"]["holder_proof"], expected);
     }
 
     #[test]

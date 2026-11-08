@@ -136,6 +136,12 @@ pub(crate) struct RulesConsumeOptions {
     /// Subscription authority is separate from every action capability.
     #[arg(long, value_name = "PATH")]
     pub(crate) stream_capability_token_file: PathBuf,
+    /// Holder signing key for source delivery only, independent of action authority.
+    #[arg(long, value_name = "PATH", requires = "stream_subscription_operation")]
+    pub(crate) stream_holder_key_file: Option<PathBuf>,
+    /// Exact manifest subscription operation signed by the source holder.
+    #[arg(long, value_name = "OPERATION_ID", requires = "stream_holder_key_file")]
+    pub(crate) stream_subscription_operation: Option<String>,
     #[arg(long)]
     pub(crate) rule: Option<String>,
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=64))]
@@ -4140,6 +4146,8 @@ mod tests {
         );
         assert_eq!(options.max_events, 1);
         assert!(options.executor_node.is_none());
+        assert!(options.stream_holder_key_file.is_none());
+        assert!(options.stream_subscription_operation.is_none());
         assert_eq!(options.stream_timeout_seconds, 70);
         assert_eq!(options.execution.deadline_ms, Some(30_000));
         assert!(parsed.rules.execution_options().is_some());
@@ -4160,6 +4168,30 @@ mod tests {
             "node-journal-owner"
         );
         assert!(parse(&["--executor-node", "bad node"]).is_err());
+        assert!(parse(&["--stream-holder-key-file", "source.key"]).is_err());
+        assert!(parse(&["--stream-subscription-operation", "slack.subscribe"]).is_err());
+        let holders = parse(&[
+            "--stream-holder-key-file",
+            "source.key",
+            "--stream-subscription-operation",
+            "slack.subscribe",
+            "--holder-key-file",
+            "action.key",
+        ])
+        .unwrap();
+        let options = holders.rules.consume_options().unwrap();
+        assert_eq!(
+            options.stream_holder_key_file,
+            Some(PathBuf::from("source.key"))
+        );
+        assert_eq!(
+            options.stream_subscription_operation.as_deref(),
+            Some("slack.subscribe")
+        );
+        assert_eq!(
+            options.execution.holder_key_file,
+            Some(PathBuf::from("action.key"))
+        );
     }
 
     #[test]
@@ -4867,6 +4899,8 @@ mod tests {
             request_id: "subscription-1".into(),
             executor_node: None,
             stream_capability_token_file: temp.path().join("source.cbor"),
+            stream_holder_key_file: None,
+            stream_subscription_operation: None,
             rule: None,
             max_events: 64,
             wait_seconds: 0,

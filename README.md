@@ -1095,6 +1095,18 @@ fwc --host http://127.0.0.1:8787 --format json streams poll \
   --batch-size 1 --wait-seconds 20
 ```
 
+For a capability bound to a mesh holder, add `--holder-key-file node.key` and
+`--subscription-operation telegram.subscribe` to `stream_auth`. The key file
+contains the holder's 32 raw signing-key bytes or 64 hexadecimal digits. Use the
+exact subscription operation declared for the topic in the installed manifest.
+The CLI signs the stable request ID, that operation, and the capability's nonempty
+token JTI. The executor verifies the proof against current owner-signed membership,
+including after queue waits, and derives the operation from its own manifest.
+A trusted relay's transport signature does not authorize the holder. Renewed
+tokens need a proof for their own JTI; repeat these arguments on every command.
+Keys, capabilities, and proofs are excluded from command output and retained
+stream state. Poll and ACK require no connector introspection.
+
 Process the returned event before acknowledging it. Polling returns its exact
 pairs in `ack_request`; it never sends an acknowledgement automatically. Replace
 the illustrative sequence and cursor below with the values actually delivered:
@@ -1343,6 +1355,11 @@ fwc --host http://127.0.0.1:8787 rules consume \
   --zone z:work --capability-token-file github-capability.cbor \
   --max-events 8 --wait-seconds 20
 ```
+
+For a holder-bound source, supply `--stream-holder-key-file source-node.key` and
+`--stream-subscription-operation telegram.subscribe`. These sign only the source
+subscription authority; action `--holder-key-file` and per-rule holder keys remain
+independent. No source key, capability, or proof is written into the rule journal.
 
 The command polls at most 64 events (default 1), waits up to 60 seconds for the
 first batch, and returns. Each source HTTP request has a separate

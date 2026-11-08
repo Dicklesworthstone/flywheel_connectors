@@ -55,6 +55,8 @@ pub(crate) fn dispatch(args: &RulesArgs, explicit_host: Option<&str>) -> Result<
                         stream_id: options.stream_id.clone(),
                         executor_node: options.executor_node.clone(),
                         capability_token_file: options.stream_capability_token_file.clone(),
+                        holder_key_file: options.stream_holder_key_file.clone(),
+                        subscription_operation: options.stream_subscription_operation.clone(),
                         timeout_seconds: options.stream_timeout_seconds,
                     },
                     Some(&executor.host.endpoint),

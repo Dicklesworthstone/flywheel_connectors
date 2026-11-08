@@ -7,6 +7,12 @@ use axum::body::Body;
 use axum::http::Request;
 use base64::Engine as _;
 use fcp_core::{EventData, EventEnvelope, InstanceId, Principal, TrustLevel};
+use fcp_crypto::ed25519::Ed25519SigningKey;
+use fcp_host::mesh_routing::MeshRouter;
+use fcp_mesh::invoke_route::MeshPeerConfig;
+use fcp_mesh::peer_manifest::{
+    MESH_PEER_DIRECTORY_SCHEMA, MeshPeerDirectoryPayload, SignedMeshPeerDirectory,
+};
 use tower::util::ServiceExt;
 
 #[path = "native_event_mesh_tests.rs"]
@@ -19,6 +25,113 @@ const TOPIC: &str = "test.message";
 const RESOURCE: &str = "event:test.message";
 const STREAM: &str = "retained-test-stream";
 const REQUEST_ID: &str = "consumer-request-1";
+const HOLDER: &str = "event-holder";
+
+// Both local and relayed consumers use the production owner-signed directory
+// and reload worker. A transport peer's signature is never a holder proof.
+struct SignedEventMembership {
+    root: std::path::PathBuf,
+    owner: Ed25519SigningKey,
+    payload: MeshPeerDirectoryPayload,
+}
+
+impl SignedEventMembership {
+    fn new(root: std::path::PathBuf, peers: Vec<MeshPeerConfig>) -> Self {
+        std::fs::create_dir(&root).unwrap();
+        let now = fcp_host::mesh_routing::unix_now_ms();
+        let membership = Self {
+            root,
+            owner: Ed25519SigningKey::generate(),
+            payload: MeshPeerDirectoryPayload {
+                schema_version: MESH_PEER_DIRECTORY_SCHEMA.to_owned(),
+                mesh_id: "native-event-holder-tests".to_owned(),
+                generation: 1,
+                issued_at_ms: now.saturating_sub(1000),
+                expires_at_ms: now + 300_000,
+                peers,
+            },
+        };
+        membership.publish();
+        membership
+    }
+
+    fn publish(&self) {
+        let document = SignedMeshPeerDirectory::sign(&self.owner, &self.payload).unwrap();
+        let next = self.root.join("peers.next");
+        private_write(&next, &serde_json::to_vec(&document).unwrap());
+        std::fs::rename(next, self.root.join("peers.json")).unwrap();
+    }
+
+    fn router(&self, node_id: &str, key: &Ed25519SigningKey) -> MeshRouter {
+        use fcp_host::mesh_routing::{
+            MESH_DIRECTORY_ID_ENV, MESH_DIRECTORY_OWNER_KEYS_ENV, MESH_DIRECTORY_STATE_ENV,
+            MESH_NODE_ID_ENV, MESH_PEERS_FILE_ENV, MESH_SIGNING_KEY_FILE_ENV,
+        };
+        let directory = self.root.join(node_id);
+        std::fs::create_dir(&directory).unwrap();
+        let key_path = directory.join("node.key");
+        private_write(&key_path, hex::encode(key.to_bytes()).as_bytes());
+        let config = HashMap::from([
+            (MESH_NODE_ID_ENV, node_id.to_owned()),
+            (MESH_SIGNING_KEY_FILE_ENV, key_path.display().to_string()),
+            (MESH_DIRECTORY_ID_ENV, self.payload.mesh_id.clone()),
+            (
+                MESH_DIRECTORY_OWNER_KEYS_ENV,
+                json!([hex::encode(self.owner.verifying_key().to_bytes())]).to_string(),
+            ),
+            (
+                MESH_DIRECTORY_STATE_ENV,
+                directory.join("membership").display().to_string(),
+            ),
+            (
+                MESH_PEERS_FILE_ENV,
+                self.root.join("peers.json").display().to_string(),
+            ),
+        ]);
+        MeshRouter::from_lookup(|name| config.get(name).cloned())
+            .unwrap()
+            .unwrap()
+    }
+
+    async fn withdraw(&mut self, node: &str, router: &MeshRouter) {
+        self.payload.generation += 1;
+        self.payload.peers.retain(|peer| peer.node_id != node);
+        self.publish();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while router
+            .directory()
+            .peer(&TailscaleNodeId::new(node))
+            .is_some()
+        {
+            assert!(
+                Instant::now() < deadline,
+                "signed membership did not reload"
+            );
+            fcp_async_core::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+}
+
+fn private_write(path: &std::path::Path, bytes: &[u8]) {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .unwrap();
+    file.write_all(bytes).unwrap();
+}
+
+fn member(node_id: &str, endpoint: &str, key: &Ed25519SigningKey) -> MeshPeerConfig {
+    MeshPeerConfig {
+        node_id: node_id.to_owned(),
+        endpoint: endpoint.to_owned(),
+        public_key_hex: hex::encode(key.verifying_key().to_bytes()),
+    }
+}
 
 struct Fixture {
     host: Arc<AppState>,
@@ -185,6 +298,39 @@ fn auth(token: &fcp_core::CapabilityToken) -> Value {
     })
 }
 
+fn holder_auth(token: &fcp_core::CapabilityToken, key: &Ed25519SigningKey) -> Value {
+    let claims = token.raw().claims_unverified().unwrap();
+    let proof = fcp_core::HolderProof::new(
+        key.sign(&fcp_core::HolderProof::signable_bytes(
+            &RequestId::new(REQUEST_ID),
+            &OperationId::from_static(OPERATION),
+            claims.get_jti().unwrap(),
+        ))
+        .to_bytes(),
+        TailscaleNodeId::new(claims.get_holder_node().unwrap()),
+    );
+    let mut auth = auth(token);
+    auth["holder_proof"] = json!(proof);
+    auth
+}
+
+fn install_holder_membership(fixture: &mut Fixture) -> (SignedEventMembership, Ed25519SigningKey) {
+    let local = Ed25519SigningKey::generate();
+    let holder = Ed25519SigningKey::generate();
+    let membership = SignedEventMembership::new(
+        fixture._directory.path().join("holder-membership"),
+        vec![
+            member("event-local", "http://127.0.0.1:19001", &local),
+            member(HOLDER, "http://127.0.0.1:19002", &holder),
+        ],
+    );
+    fixture.host = Arc::new(AppState {
+        mesh: Some(Arc::new(membership.router("event-local", &local))),
+        ..(*fixture.host).clone()
+    });
+    (membership, holder)
+}
+
 fn acknowledgement() -> EventAck {
     EventAck::new(TOPIC, vec![7]).with_cursors(vec!["provider-cursor-7".to_owned()])
 }
@@ -259,6 +405,207 @@ async fn signed_consumer_polls_and_commits_ack_without_connector_rpc() {
             .unwrap(),
         NativeEventAdmission::AlreadyAcknowledged(_)
     ));
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn signed_holder_reads_acknowledges_and_closes_without_connector_rpc() {
+    let mut fixture = fixture().await;
+    let (_membership, holder) = install_holder_membership(&mut fixture);
+    let mut request = issuance("agent:alice");
+    request.holder_node = Some(HOLDER.to_owned());
+    let (token, _) = issue(&fixture, request).await;
+    let authority = holder_auth(&token, &holder);
+    let app = app(&fixture);
+    let (status, body) = send(
+        app.clone(),
+        "/rpc/streams/poll",
+        json!({"auth":authority,"stream_id":STREAM}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("private-native-event-sentinel"));
+    for route in ["ack", "close"] {
+        let mut request = json!({"auth":authority,"stream_id":STREAM});
+        if route == "ack" {
+            request["ack"] = json!(acknowledgement());
+        }
+        let (status, body) = send(app.clone(), &format!("/rpc/streams/{route}"), request).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(!body.contains("capability_token"));
+        assert!(!body.contains("holder_proof"));
+    }
+    let retained = fixture.journal.describe(STREAM).unwrap();
+    assert_eq!(retained.pending_events, 0);
+    assert_eq!(retained.acknowledged_events, 1);
+    assert!(retained.closed);
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn holder_proof_binds_request_subscription_operation_token_and_member_key() {
+    let mut fixture = fixture().await;
+    let (_membership, holder) = install_holder_membership(&mut fixture);
+    let mut request = issuance("agent:alice");
+    request.holder_node = Some(HOLDER.to_owned());
+    let (token, _) = issue(&fixture, request.clone()).await;
+    let (renewed, _) = issue(&fixture, request).await;
+    let valid = holder_auth(&token, &holder);
+    let mut wrong_request = valid.clone();
+    wrong_request["request_id"] = json!("different-consumer-request");
+    let mut wrong_operation = valid.clone();
+    wrong_operation["holder_proof"] = json!(fcp_core::HolderProof::new(
+        holder
+            .sign(&fcp_core::HolderProof::signable_bytes(
+                &RequestId::new(REQUEST_ID),
+                &OperationId::from_static("events.other"),
+                token.raw().claims_unverified().unwrap().get_jti().unwrap(),
+            ))
+            .to_bytes(),
+        TailscaleNodeId::new(HOLDER),
+    ));
+    let mut wrong_jti = valid.clone();
+    wrong_jti["capability_token"] = json!(renewed);
+    let mut wrong_node = valid.clone();
+    wrong_node["holder_proof"]["holder_node"] = json!("event-local");
+    let wrong_key = holder_auth(&token, &Ed25519SigningKey::generate());
+    fixture
+        .journal
+        .poll(STREAM, &owner_binding(), &instance(), 1)
+        .unwrap();
+    let app = app(&fixture);
+    for authority in [
+        auth(&token),
+        wrong_request,
+        wrong_operation,
+        wrong_jti,
+        wrong_node,
+        wrong_key,
+    ] {
+        for route in ["poll", "ack", "close"] {
+            let mut request = json!({"auth":authority,"stream_id":STREAM});
+            if route == "ack" {
+                request["ack"] = json!(acknowledgement());
+            }
+            let (status, body) = send(app.clone(), &format!("/rpc/streams/{route}"), request).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{route}: {body}");
+            assert!(!body.contains("private-native-event-sentinel"));
+            assert!(
+                !body.contains("signature"),
+                "holder proof errors are redacted"
+            );
+        }
+    }
+    let retained = fixture.journal.describe(STREAM).unwrap();
+    assert_eq!(retained.pending_events, 1);
+    assert_eq!(retained.acknowledged_events, 0);
+    assert!(!retained.closed);
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn owner_membership_withdrawal_blocks_holder_reads_and_custody_changes() {
+    let mut fixture = fixture().await;
+    let (mut membership, holder) = install_holder_membership(&mut fixture);
+    let mut request = issuance("agent:alice");
+    request.holder_node = Some(HOLDER.to_owned());
+    let (token, _) = issue(&fixture, request).await;
+    let authority: StreamAuthority = serde_json::from_value(holder_auth(&token, &holder)).unwrap();
+    let admission = fixture
+        .host
+        .native_events
+        .authorize(&fixture.host, &authority)
+        .await
+        .unwrap();
+    fixture
+        .journal
+        .poll(STREAM, &owner_binding(), &instance(), 1)
+        .unwrap();
+    membership
+        .withdraw(HOLDER, fixture.host.mesh.as_ref().unwrap())
+        .await;
+    assert!(
+        fixture
+            .host
+            .native_events
+            .authorize_retained(&fixture.host, &authority, &admission, STREAM,)
+            .is_err(),
+        "already admitted authority must refresh after a wait"
+    );
+    let app = app(&fixture);
+    for route in ["poll", "ack", "close"] {
+        let mut request = json!({"auth":authority,"stream_id":STREAM});
+        if route == "ack" {
+            request["ack"] = json!(acknowledgement());
+        }
+        let (status, body) = send(app.clone(), &format!("/rpc/streams/{route}"), request).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{route}: {body}");
+        assert!(!body.contains("private-native-event-sentinel"));
+    }
+    let retained = fixture.journal.describe(STREAM).unwrap();
+    assert_eq!(retained.pending_events, 1);
+    assert_eq!(retained.acknowledged_events, 0);
+    assert!(!retained.closed);
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn holder_withdrawal_during_native_rpc_queue_wait_blocks_stream_open() {
+    let mut fixture = fixture().await;
+    let (mut membership, holder) = install_holder_membership(&mut fixture);
+    let mut request = issuance("agent:alice");
+    request.holder_node = Some(HOLDER.to_owned());
+    let (token, _) = issue(&fixture, request).await;
+    let (runner_tx, mut runner_rx) = mpsc::channel::<ConnectorRpcRequest>(4);
+    let (queued_tx, queued_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let selected = Arc::new(AtomicU64::new(0));
+    let observed = Arc::clone(&selected);
+    let runner_task = task::spawn(async move {
+        let call = runner_rx.recv().await.unwrap();
+        assert_eq!(call.method, "health");
+        queued_tx.send(()).unwrap();
+        release_rx.await.unwrap();
+        if call.rpc.try_begin() {
+            observed.fetch_add(1, Ordering::SeqCst);
+            let _ = call.response_tx.send(Err(std::io::Error::other(
+                "withdrawn holder must not reach the native process",
+            )));
+        } else {
+            let _ = call.response_tx.send(Err(call.rpc.stop_error()));
+        }
+    });
+    fixture
+        .host
+        .registry
+        .state
+        .write()
+        .await
+        .connectors
+        .get_mut(&ConnectorId::from_static(CONNECTOR))
+        .unwrap()
+        .connector = ConnectorRuntime::Native(crate::tests::dispatcher_test_connector(
+        CONNECTOR,
+        runner_tx,
+        runner_task,
+    ));
+    let app = app(&fixture);
+    let request = json!({"auth":holder_auth(&token, &holder),"stream_id":STREAM});
+    let pending = task::spawn(async move { send(app, "/rpc/streams/open", request).await });
+    fcp_async_core::time::timeout(Duration::from_secs(5), queued_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    membership
+        .withdraw(HOLDER, fixture.host.mesh.as_ref().unwrap())
+        .await;
+    release_tx.send(()).unwrap();
+    let (status, body) = pending.await.unwrap();
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(selected.load(Ordering::SeqCst), 0);
+    let retained = fixture.journal.describe(STREAM).unwrap();
+    assert_eq!(retained.pending_events, 1);
+    assert_eq!(retained.acknowledged_events, 0);
+    assert!(!retained.closed);
 }
 
 #[fcp_async_core::runtime::test(flavor = "multi_thread")]
