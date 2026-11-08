@@ -202,9 +202,61 @@ async fn setup_connector_with_config(mut config: serde_json::Value) -> SignedCon
         instance_id: String::new(),
     };
     config["approval_public_key"] = json!(c.approval_key.verifying_key().to_bytes());
+    if config.get("storage").is_none() && config.get("allow_ephemeral_ingest").is_none() {
+        // Provider/authentication fixtures deliberately use volatile state.
+        // Production configuration defaults to requiring durable event storage.
+        config["allow_ephemeral_ingest"] = json!(true);
+    }
     c.inner.handle_configure(config).await.unwrap();
     c.handshake().await;
     c
+}
+
+#[cfg(unix)]
+struct DurableReceiverFixture {
+    _root: tempfile::TempDir,
+    directory: std::path::PathBuf,
+    key_file: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl DurableReceiverFixture {
+    fn new() -> Self {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let directory = root.path().join("receiver-state");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let key_file = root.path().join("receiver.key");
+        let mut key = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&key_file)
+            .unwrap();
+        key.write_all(&[29; 32]).unwrap();
+        key.sync_all().unwrap();
+        Self {
+            _root: root,
+            directory,
+            key_file,
+        }
+    }
+
+    fn config(&self, initialize: bool) -> serde_json::Value {
+        json!({
+            "public_base_url": "https://hooks.flywheel.test",
+            "storage": {
+                "directory": self.directory,
+                "key_file": self.key_file,
+                "zone": "z:work",
+                "initialize": initialize,
+            },
+        })
+    }
 }
 
 async fn create_endpoint(
@@ -235,6 +287,13 @@ fn hmac_sha1_base64(secret: &str, data: &str) -> String {
     let mut mac = HmacSha1::new_from_slice(secret.as_bytes()).unwrap();
     mac.update(data.as_bytes());
     STANDARD.encode(mac.finalize().into_bytes())
+}
+
+fn github_signature_headers(secret: &str, body: &str) -> serde_json::Value {
+    json!({
+        "Content-Type": "application/json",
+        "X-Hub-Signature-256": format!("sha256={}", hmac_sha256_hex(secret, body)),
+    })
 }
 
 fn slack_signature_headers(secret: &str, body: &str, timestamp: i64) -> serde_json::Value {
@@ -431,6 +490,399 @@ async fn lifecycle_handshake_returns_capabilities() {
         caps.iter()
             .any(|cap| cap["capability"] == "webhook.events.write")
     );
+}
+
+#[fcp_async_core::runtime::test]
+async fn production_ingest_requires_durable_storage_and_keeps_control_verification_available() {
+    let mut c = setup_connector().await;
+    // Exercise production defaults rather than the provider-test helper's
+    // explicit opt-in to volatile event storage.
+    c.inner
+        .handle_configure(json!({
+            "public_base_url": "https://hooks.flywheel.test",
+            "approval_public_key": c.approval_key.verifying_key().to_bytes(),
+        }))
+        .await
+        .unwrap();
+    c.handshake().await;
+    let endpoint = create_endpoint(&mut c, "/durable-required", "github", "event-secret").await;
+    let body = r#"{"event":"must-not-be-accepted"}"#;
+    let error = ingest(
+        &mut c,
+        "/durable-required",
+        github_signature_headers("event-secret", body),
+        body,
+        "uncommitted-event",
+    )
+    .await
+    .expect_err("production delivery must not acknowledge volatile state");
+    assert!(matches!(error, FcpError::Internal { .. }));
+    let events = c
+        .handle_invoke(json!({
+            "operation_id": "webhook.events.poll",
+            "input": {"endpoint_id": endpoint["endpoint_id"]},
+        }))
+        .await
+        .unwrap();
+    assert_eq!(events["events"], json!([]));
+    let health = c.handle_health().await.unwrap();
+    assert_eq!(health["storage"]["durable"], false);
+    assert_eq!(health["storage"]["allow_ephemeral_ingest"], false);
+    assert_eq!(health["storage"]["event_ingest_enabled"], false);
+    assert_eq!(health["status"]["state"], "degraded");
+
+    create_endpoint(&mut c, "/control", "slack", "control-secret").await;
+    let challenge = r#"{"type":"url_verification","challenge":"verified-control"}"#;
+    let verified = ingest(
+        &mut c,
+        "/control",
+        slack_signature_headers("control-secret", challenge, unix_seconds()),
+        challenge,
+        "control-only",
+    )
+    .await
+    .unwrap();
+    assert_eq!(verified["status_code"], 200);
+    assert_eq!(verified["verification"]["challenge"], "verified-control");
+    assert_eq!(c.handle_health().await.unwrap()["events"], 0);
+}
+
+#[cfg(unix)]
+#[fcp_async_core::runtime::test]
+async fn durable_receiver_restores_secrets_events_cursors_and_authenticated_replay() {
+    let fixture = DurableReceiverFixture::new();
+    let mut c = setup_connector_with_config(fixture.config(true)).await;
+    let endpoint = c
+        .handle_invoke(json!({
+            "operation_id": "webhook.endpoints.create",
+            "input": {"path": "/recover", "provider": "github"},
+        }))
+        .await
+        .unwrap();
+    let secret = endpoint["signing_secret"].as_str().unwrap().to_owned();
+    assert_eq!(endpoint["signing_secret_generated"], true);
+    let start = c
+        .handle_invoke(json!({
+            "operation_id": "webhook.events.poll",
+            "input": {"endpoint_id": endpoint["endpoint_id"], "start": "latest"},
+        }))
+        .await
+        .unwrap();
+    let first_body = r#"{"event":"committed-before-restart"}"#;
+    let first_headers = github_signature_headers(&secret, first_body);
+    let accepted = ingest(
+        &mut c,
+        "/recover",
+        first_headers.clone(),
+        first_body,
+        "first-durable-event",
+    )
+    .await
+    .unwrap();
+    assert_eq!(accepted["accepted"], true);
+    assert_eq!(accepted["status_code"], 202);
+    let first_page = c
+        .handle_invoke(json!({
+            "operation_id": "webhook.events.poll",
+            "input": {"endpoint_id": endpoint["endpoint_id"], "cursor": start["next_cursor"]},
+        }))
+        .await
+        .unwrap();
+    let old_authority = c
+        .request(json!({"operation_id": "webhook.endpoints.list", "input": {}}))
+        .unwrap();
+    drop(c);
+
+    let mut reopened = setup_connector_with_config(fixture.config(false)).await;
+    let health = reopened.handle_health().await.unwrap();
+    assert_eq!(health["storage"]["durable"], true);
+    assert_eq!(health["storage"]["fenced"], false);
+    assert_eq!(health["storage"]["zone"], "z:work");
+    assert_eq!(health["storage"]["event_ingest_enabled"], true);
+    assert!(
+        reopened
+            .inner
+            .handle_invoke(json!(old_authority))
+            .await
+            .is_err()
+    );
+    let listed = reopened
+        .handle_invoke(json!({"operation_id": "webhook.endpoints.list", "input": {}}))
+        .await
+        .unwrap();
+    assert_eq!(
+        listed["endpoints"][0]["endpoint_id"],
+        endpoint["endpoint_id"]
+    );
+    assert_eq!(
+        listed["endpoints"][0]["secret_last_rotated_at"],
+        endpoint["secret_last_rotated_at"]
+    );
+    assert_eq!(listed["endpoints"][0]["signing_secret_configured"], true);
+    assert!(!listed.to_string().contains(&secret));
+    let recovered_page = reopened
+        .handle_invoke(json!({
+            "operation_id": "webhook.events.poll",
+            "input": {"endpoint_id": endpoint["endpoint_id"], "cursor": start["next_cursor"]},
+        }))
+        .await
+        .unwrap();
+    assert_eq!(recovered_page, first_page);
+    assert_external_status(
+        ingest(
+            &mut reopened,
+            "/recover",
+            first_headers,
+            first_body,
+            "different-unsigned-delivery-id",
+        )
+        .await,
+        409,
+    );
+    let second_body = r#"{"event":"accepted-after-restart"}"#;
+    ingest(
+        &mut reopened,
+        "/recover",
+        github_signature_headers(&secret, second_body),
+        second_body,
+        "second-durable-event",
+    )
+    .await
+    .unwrap();
+    let next = reopened
+        .handle_invoke(json!({
+            "operation_id": "webhook.events.poll",
+            "input": {"endpoint_id": endpoint["endpoint_id"], "cursor": first_page["next_cursor"]},
+        }))
+        .await
+        .unwrap();
+    assert_eq!(next["events"].as_array().unwrap().len(), 1);
+    assert_eq!(next["events"][0]["event_id"], "second-durable-event");
+    assert_eq!(next["events"][0]["sequence"], 1);
+}
+
+#[cfg(unix)]
+#[fcp_async_core::runtime::test]
+async fn durable_receiver_preserves_rotation_and_deletion_across_shutdown_and_restart() {
+    let fixture = DurableReceiverFixture::new();
+    let mut c = setup_connector_with_config(fixture.config(true)).await;
+    let changed = create_endpoint(&mut c, "/rotate-durable", "github", "old-secret").await;
+    let untouched = create_endpoint(&mut c, "/untouched", "github", "other-secret").await;
+    let rotated = c
+        .handle_invoke(json!({
+            "operation_id": "webhook.endpoints.rotate_secret",
+            "input": {"endpoint_id": changed["endpoint_id"]},
+        }))
+        .await
+        .unwrap();
+    let secret = rotated["signing_secret"].as_str().unwrap().to_owned();
+    assert_ne!(secret, "old-secret");
+    c.handle_shutdown(json!({})).await.unwrap();
+    drop(c);
+
+    let mut reopened = setup_connector_with_config(fixture.config(false)).await;
+    let body = r#"{"event":"verify-rotated-secret"}"#;
+    assert_external_status(
+        ingest(
+            &mut reopened,
+            "/rotate-durable",
+            github_signature_headers("old-secret", body),
+            body,
+            "old-signature",
+        )
+        .await,
+        401,
+    );
+    ingest(
+        &mut reopened,
+        "/rotate-durable",
+        github_signature_headers(&secret, body),
+        body,
+        "rotated-event",
+    )
+    .await
+    .unwrap();
+    reopened
+        .handle_invoke(json!({
+            "operation_id": "webhook.endpoints.delete",
+            "input": {"endpoint_id": changed["endpoint_id"]},
+        }))
+        .await
+        .unwrap();
+    drop(reopened);
+
+    let mut recovered = setup_connector_with_config(fixture.config(false)).await;
+    let listed = recovered
+        .handle_invoke(json!({"operation_id": "webhook.endpoints.list", "input": {}}))
+        .await
+        .unwrap();
+    assert_eq!(listed["endpoints"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        listed["endpoints"][0]["endpoint_id"],
+        untouched["endpoint_id"]
+    );
+    assert_external_status(
+        ingest(
+            &mut recovered,
+            "/rotate-durable",
+            github_signature_headers(&secret, body),
+            body,
+            "deleted-endpoint",
+        )
+        .await,
+        404,
+    );
+    let remaining_body = r#"{"event":"other-endpoint-retained"}"#;
+    ingest(
+        &mut recovered,
+        "/untouched",
+        github_signature_headers("other-secret", remaining_body),
+        remaining_body,
+        "remaining-event",
+    )
+    .await
+    .unwrap();
+    let page = recovered
+        .handle_invoke(json!({
+            "operation_id": "webhook.events.poll",
+            "input": {"endpoint_id": untouched["endpoint_id"]},
+        }))
+        .await
+        .unwrap();
+    assert_eq!(page["events"][0]["sequence"], 1);
+}
+
+#[cfg(unix)]
+#[fcp_async_core::runtime::test]
+async fn durable_receiver_refuses_zone_and_namespace_rebinding_without_losing_state() {
+    let fixture = DurableReceiverFixture::new();
+    let mut c = setup_connector_with_config(fixture.config(true)).await;
+    let endpoint = create_endpoint(&mut c, "/bound", "github", "bound-secret").await;
+    let stale = c
+        .request(json!({"operation_id": "webhook.endpoints.list", "input": {}}))
+        .unwrap();
+    let mut other_zone = handshake_request(&c.key);
+    other_zone.zone = ZoneId::private();
+    assert!(c.inner.handle_handshake(json!(other_zone)).await.is_err());
+    assert!(c.inner.handle_invoke(json!(stale)).await.is_err());
+    c.handshake().await;
+
+    for (field, value) in [
+        ("public_base_url", "https://different.flywheel.test"),
+        ("zone", "z:private"),
+    ] {
+        let mut config = fixture.config(false);
+        if field == "zone" {
+            config["storage"]["zone"] = json!(value);
+        } else {
+            config[field] = json!(value);
+        }
+        assert!(c.inner.handle_configure(config).await.is_err());
+        let health = c.handle_health().await.unwrap();
+        assert_eq!(health["configured"], false);
+        assert_eq!(health["handshaken"], false);
+        assert_eq!(health["endpoints"], 0);
+        assert!(
+            c.inner
+                .handle_handshake(json!(handshake_request(&c.key)))
+                .await
+                .is_err()
+        );
+    }
+    drop(c);
+    let mut reopened = setup_connector_with_config(fixture.config(false)).await;
+    let listed = reopened
+        .handle_invoke(json!({"operation_id": "webhook.endpoints.list", "input": {}}))
+        .await
+        .unwrap();
+    assert_eq!(
+        listed["endpoints"][0]["endpoint_id"],
+        endpoint["endpoint_id"]
+    );
+    assert_eq!(listed["endpoints"][0]["url"], endpoint["url"]);
+}
+
+#[cfg(unix)]
+#[fcp_async_core::runtime::test]
+async fn durable_receiver_fences_reads_and_writes_when_journal_identity_changes() {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let fixture = DurableReceiverFixture::new();
+    let mut c = setup_connector_with_config(fixture.config(true)).await;
+    let endpoint = create_endpoint(&mut c, "/fence", "github", "fence-secret").await;
+    let body = r#"{"event":"committed"}"#;
+    ingest(
+        &mut c,
+        "/fence",
+        github_signature_headers("fence-secret", body),
+        body,
+        "committed-event",
+    )
+    .await
+    .unwrap();
+    let journal = fixture.directory.join("state.journal");
+    let quarantined = fixture.directory.join("quarantined.journal");
+    std::fs::rename(&journal, &quarantined).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&journal)
+        .unwrap();
+    let refused_body = r#"{"event":"must-not-publish"}"#;
+    assert!(
+        ingest(
+            &mut c,
+            "/fence",
+            github_signature_headers("fence-secret", refused_body),
+            refused_body,
+            "uncommitted-event",
+        )
+        .await
+        .is_err()
+    );
+    let health = c.handle_health().await.unwrap();
+    assert_eq!(health["storage"]["fenced"], true);
+    assert_eq!(health["storage"]["event_ingest_enabled"], false);
+    assert_eq!(health["status"]["state"], "degraded");
+    for operation in ["webhook.endpoints.list", "webhook.events.recent"] {
+        assert!(
+            c.handle_invoke(json!({"operation_id": operation, "input": {}}))
+                .await
+                .is_err()
+        );
+    }
+    assert!(
+        c.handle_simulate(json!({"operation_id": "webhook.endpoints.list", "input": {}}))
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        c.handle_self_check().await.unwrap()["reason_code"],
+        "durable_storage_fenced"
+    );
+    assert!(
+        c.inner
+            .handle_handshake(json!(handshake_request(&c.key)))
+            .await
+            .is_err()
+    );
+    drop(c);
+
+    // Preserve both files while restoring the last fully committed journal.
+    std::fs::rename(&journal, fixture.directory.join("replacement.journal")).unwrap();
+    std::fs::rename(&quarantined, &journal).unwrap();
+    let mut reopened = setup_connector_with_config(fixture.config(false)).await;
+    let page = reopened
+        .handle_invoke(json!({
+            "operation_id": "webhook.events.poll",
+            "input": {"endpoint_id": endpoint["endpoint_id"]},
+        }))
+        .await
+        .unwrap();
+    assert_eq!(page["events"].as_array().unwrap().len(), 1);
+    assert_eq!(page["events"][0]["event_id"], "committed-event");
+    assert_eq!(page["retention"]["next_sequence"], 1);
 }
 
 // -- Endpoints Create --
@@ -2819,9 +3271,12 @@ async fn double_delete_fails() {
 async fn reconfigure_after_shutdown() {
     let mut c = setup_connector().await;
     c.handle_shutdown(json!({})).await.unwrap();
-    c.handle_configure(json!({"public_base_url": "https://hooks.flywheel.test"}))
-        .await
-        .unwrap();
+    c.handle_configure(json!({
+        "public_base_url": "https://hooks.flywheel.test",
+        "allow_ephemeral_ingest": true,
+    }))
+    .await
+    .unwrap();
     c.handshake().await;
     let h = c.handle_health().await.unwrap();
     assert_eq!(h["status"]["state"], "ready");
@@ -2855,9 +3310,12 @@ async fn endpoints_rotate_secret_returns_new_secret() {
 #[fcp_async_core::runtime::test]
 async fn self_check_degrades_for_local_test_base_url() {
     let mut c = WebhookReceiverConnector::new();
-    c.handle_configure(json!({"public_base_url": "http://localhost:8080"}))
-        .await
-        .unwrap();
+    c.handle_configure(json!({
+        "public_base_url": "http://localhost:8080",
+        "allow_ephemeral_ingest": true,
+    }))
+    .await
+    .unwrap();
     let check = c.handle_self_check().await.unwrap();
     assert_eq!(check["status"], "degraded");
     assert_eq!(check["reason_code"], "public_base_url_not_public");

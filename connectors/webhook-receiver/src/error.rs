@@ -78,6 +78,11 @@ pub enum WebhookReceiverError {
     )]
     ReplayCapacityExceeded { endpoint_id: String, limit: usize },
 
+    /// Durable state is unavailable, corrupt, or fenced after an uncertain write.
+    /// Messages identify only the failed invariant, never stored values or paths.
+    #[error("Webhook durable state unavailable: {message}")]
+    Persistence { message: String },
+
     /// Internal error
     #[error("Internal error: {message}")]
     Internal { message: String },
@@ -101,6 +106,7 @@ impl WebhookReceiverError {
             | Self::UnsupportedMediaType { .. }
             | Self::PayloadTooLarge { .. }
             | Self::ReplayCapacityExceeded { .. }
+            | Self::Persistence { .. }
             | Self::Json(_)
             | Self::Internal { .. } => false,
         }
@@ -225,6 +231,9 @@ impl WebhookReceiverError {
             },
             Self::Internal { message } => FcpError::Internal {
                 message: message.clone(),
+            },
+            Self::Persistence { .. } => FcpError::Internal {
+                message: "Webhook durable state is unavailable; restore or reopen the receiver before continuing".into(),
             },
         }
     }

@@ -1,6 +1,6 @@
 # Webhook Receiver Connector V3 Contract
 
-> **Status**: authenticated host-forwarded intake with signed endpoint approvals and an opt-in host HTTP adapter
+> **Status**: authenticated host-forwarded intake with encrypted local persistence, signed endpoint approvals, and an opt-in host HTTP adapter
 > **Bead**: `flywheel_connectors-yin4m`
 > **Host HTTP adapter bead**: `flywheel_connectors-whing1`
 > **Parent**: `flywheel_connectors-4kw5f`
@@ -15,7 +15,7 @@
 
 This document fixes the operator-facing contract for `fcp.webhook-receiver`. The connector currently exposes a host-forwarded webhook ingestion surface implemented in this crate: endpoint create/list/delete/rotate, verified event ingestion, cursor-based replay with retention-loss detection, recent event inspection, health reporting, and provider-specific signature checks for generic, GitHub, Stripe, Slack, and Twilio-style deliveries.
 
-The connector is intentionally a bounded in-process webhook intake buffer. It is not a public HTTP server, durable event bus, queue service, retry worker, webhook delivery sender, subscription manager, provider API client, secret vault, or general ingress gateway.
+The connector provides a bounded webhook intake buffer backed by an explicitly configured encrypted local journal. It commits endpoint changes, verified events, and replay state before returning success. Canonical mesh replication and state handoff remain separate work; it is not a queue service, retry worker, webhook delivery sender, subscription manager, provider API client, or secret vault.
 
 `fcp-host` provides an opt-in HTTP adapter at `POST /webhooks/{*path}`. It forwards the original provider body through the normal host invocation path to `webhook.events.ingest`, using an explicitly configured receiver, zone, public URL, and capability. Authenticated Slack URL-verification requests receive HTTP `200` containing only their challenge. See [Generic webhook HTTP ingress](../../docs/configuration/webhook_receiver_ingress.md) for configuration, proxy requirements, resource limits, and provider response limitations.
 
@@ -39,6 +39,7 @@ Important runtime truths the contract preserves:
 - Manifest and reported connector ID are `fcp.webhook-receiver`.
 - The embedded manifest interface hash is validated before session negotiation.
 - Default `public_base_url` is `http://localhost:8080`.
+- Ordinary event delivery requires configured durable `storage`. The explicit `allow_ephemeral_ingest: true` override is for development and tests; its default is `false`.
 - Blank or missing `public_base_url` falls back to the default.
 - `public_base_url` policy requires `http` or `https`, a host, and no query or fragment.
 - Non-local hosts must use `https`.
@@ -55,14 +56,14 @@ Important runtime truths the contract preserves:
 - Every invoke verifies the signed capability against negotiated capabilities, zone, operation, and the actual instance returned by handshake. Signed call and byte ceilings are charged before dispatch through the SDK's bounded admission path.
 - Endpoint creation, deletion, and secret rotation additionally require a signed execution approval in `approval_tokens`, verified against the separately configured `approval_public_key`.
 - `simulate` consumes a canonical signed `SimulateRequest` and checks authority without charging an invocation. Endpoint mutations report a missing approval because that request type carries no approval evidence.
-- Every configure attempt invalidates prior authority and clears endpoints, signing secrets, events, dedup IDs, and ingress state. Configuration replaces the previous intake namespace; preserve required endpoint configuration outside this process before reconfiguring.
+- Every configure attempt invalidates prior authority and detaches live state before opening the selected store. Durable recovery must complete before configuration succeeds; an invalid path, key, zone, namespace, or journal leaves the connector unauthorized. Committed files are preserved.
 - Handshake requires a canonical `HandshakeRequest`, accepts protocol `2.0` or `2.0.0`, negotiates only manifest-declared capabilities, rejects forbidden zones, echoes the nonce, and returns a fresh actual `instance_id`. Empty requested capabilities grant no access. Failed handshakes revoke the previous session.
-- Rehandshake within the same zone rotates instance authority. Switching zones requires reconfiguration so prior-zone secrets and payloads cannot cross the boundary.
+- Rehandshake within the same zone rotates instance authority while preserving receiver state. A durable store is bound to its configured zone and public namespace; reconfiguration cannot rebind those retained secrets and payloads to a different scope.
 - `health()` returns a canonical `HealthSnapshot` with `details.configured`, `details.handshaken`, and `details.instance_id`, enabling the host to prepare an instance-bound session. Ready means local authenticated intake is available. Public ingress remains separately reported as unbound because the connector cannot attest the host route, proxy, DNS, or TLS mapping.
 - The JSON-RPC transport returns a canonical `InvokeResponse` with the invocation ID inside the outer JSON-RPC response, including typed operation errors.
 - `doctor()` is degraded in the current no-native-listener build because native ingress listener and gateway binding checks fail non-critically.
 - `self_check()` is degraded for local/non-public base URLs and for the current unbound gateway-ingress mode.
-- `handle_shutdown()` clears endpoints, events, dedup IDs, ingress state, config, session, and base lifecycle flags, but request/error counters remain in memory.
+- `handle_shutdown()` revokes authority, clears live memory, and releases the writer lock without deleting or resetting committed storage. Request/error counters remain in memory.
 
 ## Drift Visible In This Checkout
 
@@ -71,14 +72,14 @@ This README documents runtime truth and keeps current drift visible:
 - The connector has no native HTTP listener. The optional host HTTP adapter forwards deliveries through `webhook.events.ingest`; endpoint creation alone does not activate that route.
 - Manifest optional capabilities include `network.dns`, `network.egress`, and `tls.sni`, but runtime opens no outbound sockets and no inbound listener.
 - Manifest and introspection both mark endpoint creation and rotation as policy-approved and deletion as interactive approval. All three require valid signed execution evidence at dispatch.
-- Manifest says endpoint metadata, signing secrets, and deduplication state are stored under singleton-writer state. Runtime stores them in process memory only.
+- Manifest singleton-writer admission remains host-owned. The receiver's encrypted local journal preserves endpoint metadata, secrets, retained events, replay identities, and cursor state across reopening, but does not publish a canonical mesh checkpoint.
 - `doctor()` currently cannot reach `ok` in the no-native-listener build because it reports no connector-owned listener or verified gateway binding.
 - `self_check()` currently cannot reach `ok` without evidence of gateway binding. Enabling the host adapter does not change this connector-local claim automatically.
 - Endpoint creation and rotation return signing secrets in the response; endpoint listing only returns `signing_secret_configured`.
-- The connector hashes source IPs in recent-event and polling output but stores verified event data in memory until retention eviction or shutdown.
+- The connector hashes source IPs in recent-event and polling output. Durable mode encrypts retained verified event data, including its source address; the existing body-retention limits still apply.
 - There is no dedicated tracked verification shell script for this connector.
 
-Remaining work includes durable endpoint/secrets/event state, verified external ingress-binding evidence, alignment of manifest network capabilities with the no-native-listener runtime, and a live provider verification bundle.
+Remaining work includes canonical mesh persistence and state transfer, verified external ingress-binding evidence, alignment of manifest network capabilities with the no-native-listener runtime, and a live provider verification bundle.
 
 ## First-Slice Scope
 
@@ -88,12 +89,13 @@ The current Webhook Receiver README slice documents the existing runtime surface
 - in-process endpoint secret generation and rotation
 - host-forwarded event ingestion through `webhook.events.ingest`
 - bounded cursor-based replay through `webhook.events.poll`, including explicit unread-history gap detection
+- encrypted local recovery of endpoint secrets, retained events, replay protection, and polling cursors
 - optional bounded HTTP delivery through the host's `/webhooks/{*path}` adapter
 - provider-specific signature verification for generic HMAC, GitHub, Stripe, Slack, and Twilio styles
 - content-type policy, body-size policy, rate limiting, in-flight limiting, deduplication, and redaction behavior
 - lifecycle, health, doctor, self-check, simulation, introspection, and shutdown behavior
 - instance-bound capability verification, signed endpoint approvals, and session invalidation
-- runtime/manifest drift around native listener and persistence
+- explicit limits around native listeners and canonical mesh state handoff
 - deterministic connector tests and direct proof commands
 
 ## Auth And Scope Boundary
@@ -109,10 +111,40 @@ The current Webhook Receiver README slice documents the existing runtime surface
 - Set `approval_public_key` in connector configuration to the 32 unsigned bytes of the trusted Ed25519 approval public key. Use the public half of the key trusted by the host's `FCP_HOST_APPROVAL_PUBLIC_KEY[_FILE]` setting. This is a public key, not a signing secret. The host does not populate this connector setting automatically.
 - Omitting `approval_public_key` permits authenticated read/ingest operations but denies endpoint mutations. Malformed keys reject configuration and leave prior authority revoked.
 - Approval signatures use the same encoding as the host: Ed25519 over `fcp_cbor::to_canonical_cbor` of the complete approval token with `signature = None`. Approval validity, zone, connector, method pattern, request-object binding, canonical input hash, and JSON Pointer constraints are checked before mutation.
-- Host policy, revocation, holder-proof, lease fencing, and durable idempotency remain host responsibilities. Local admission does not claim a durable receipt or deduplication guarantee.
+- Host policy, revocation, holder-proof, lease fencing, and FCP invocation idempotency remain host responsibilities. The receiver persists its own authenticated-delivery replay protection; that does not provide a canonical mesh receipt or exactly-once downstream processing.
 - Resource allow/deny constraints bind to the configured endpoint URLs, derived from the requested path or the stored endpoint ID. Collection reads check every endpoint they could disclose; an excluded endpoint denies the whole collection read. Health and empty collections use the configured public base URL as the namespace resource. Caller-supplied alternative resource identifiers never override these targets.
-- The connector does not persist signing secrets, endpoint records, verified events, source IPs, deduplication IDs, headers, payload bodies, request counters, or error counters outside process memory.
+- Durable mode encrypts endpoint secrets, endpoint records, verified events, source IPs, replay digests, redacted headers, payload bodies, and cursor authentication material. Its encryption key is supplied separately through a protected file. Rate windows, request counters, and error counters remain process-local.
 - Webhook payloads can contain public, private, work, credential, or regulated data. Treat live event output according to the provider and endpoint zone.
+
+## Durable Storage Configuration
+
+Configure storage before registering production endpoints. The storage directory and encryption key file are explicit native filesystem paths; the host-provided handshake directory is a cache and is not used as durable authority.
+
+```json
+{
+  "public_base_url": "https://hooks.example.test/webhooks",
+  "storage": {
+    "directory": "/var/lib/fcp/webhook-receiver-work",
+    "key_file": "/run/secrets/fcp-webhook-state.key",
+    "zone": "z:work",
+    "initialize": false
+  }
+}
+```
+
+The example shows ordinary recovery. Provision a separate random 32-byte encryption key, stored as exactly 32 raw bytes or 64 hexadecimal characters in a private key file. Keep the directory private to the receiver's operating-system account and keep the key separate from stored ciphertext. Endpoint administration still needs the independent `approval_public_key` described above.
+
+Set `initialize: true` only for the first creation of a new empty store, then change it to `false` for later starts. Initialization is create-only and refuses an existing store. Ordinary recovery never initializes missing state and never substitutes an empty receiver for corrupt, truncated, or unauthenticated data. There is no automatic journal-tail repair. Preserve the original files for operator recovery if opening fails.
+
+The journal authenticates the exact configured zone and public base URL. Reopening under another zone, another public namespace, or a different key fails. A successful handshake must also select the stored zone. Namespace changes need a deliberate migration into a separate store; they cannot silently rebase retained endpoint URLs and Twilio signature destinations.
+
+One process holds the store's exclusive writer lock for its entire writable lifetime. Endpoint creation, secret rotation, deletion, and event acceptance synchronize an encrypted record before publishing the corresponding in-memory change or successful response. A failed or uncertain write fences further data access and ingestion until the configured store is reopened and validated. Health, doctor, and self-check expose the fenced state without returning key material or event payloads.
+
+Restart and same-store reconfiguration preserve endpoint IDs, signing secrets, both replay indexes, arrival sequences, eviction history, and polling-cursor authentication. A fresh session still requires fresh instance-bound capabilities; persisted receiver state does not preserve old process authority. Graceful shutdown releases the lock and live state while retaining committed files.
+
+This persistence protects local restart and recovery. It does not replicate data to another host, establish a canonical writer lease, or detect replacement of the entire directory by an older otherwise-valid copy. Existing host singleton ownership, lease fencing, and stateful replacement restrictions continue to apply.
+
+Without `storage`, endpoint setup and read operations remain available, but ordinary event ingest is refused. Authenticated Slack URL verification can still return its challenge because it creates no event. Development fixtures can explicitly set `allow_ephemeral_ingest: true`; health reports the ephemeral mode, and restart or reconfiguration discards its accepted events, replay protection, and cursors.
 
 ## Runtime And Ingress Invariants
 
@@ -125,11 +157,12 @@ The current Webhook Receiver README slice documents the existing runtime surface
 - The invocation is the operator's fixed intake command in the configured zone. Its provenance retains the public-input taint and a public-origin payload receipt in the chain; the adapter neither elevates provider data nor creates approval evidence. Normal host policy remains in force.
 - Each HTTP attempt receives fresh host-generated invocation and delivery identities. Provider metadata cannot choose a host idempotency key; the receiver's authenticated-content replay check rejects ordinary event retries with `409`. Authenticated Slack URL-verification retries return the challenge again without creating events or reserving event replay identities.
 - Ordinary provider-facing HTTP responses contain only `accepted`, `status_code`, and `reason_code`. Successful Slack URL verification returns only the authenticated `challenge`. Endpoint IDs, other payload fields, signature diagnostics, capability material, and source hashes remain outside these public responses.
+- Durable event acceptance commits before the host receives a successful invoke result and returns HTTP `202`. A storage failure cannot produce a successful provider acknowledgment.
 - Endpoint limit: `100`.
 - Event retention limit: `1000` events per endpoint.
 - Retained event data is also capped at `16 MiB` per endpoint and `64 MiB` across the connector, measured as serialized complete events. These are data budgets; allocator and parsed-JSON overhead are additional. The oldest arrivals are evicted when either budget is reached.
 - Event-body eviction never removes replay protection. Public delivery IDs are limited to `1024` UTF-8 bytes. Each accepted delivery retains at most two `32`-byte BLAKE3 digests: its public ID and its authenticated replay identity. The limit is `100000` accepted deliveries per endpoint and across the connector, for at most `6.4 MB` of digest data plus hash-table overhead. New deliveries at capacity return a nonretryable `507`; previously accepted public IDs or authenticated identities still return duplicate `409`.
-- Health, doctor, and self-check expose replay exhaustion. Do not automatically clear or reconfigure the receiver to recover capacity: that would discard its replay history. Endpoint replacement requires an explicit operator continuity plan.
+- Health, doctor, and self-check expose replay exhaustion. Durable reopening preserves that exhaustion and every accepted replay identity; do not replace the store to recover capacity without an explicit operator continuity plan.
 - Recent-event queries select and limit borrowed records before copying payloads. A query no longer copies the entire store to return a small result.
 - Shared byte eviction may remove every retained body for an endpoint, so `min_buffer_events` is `0`; the `1000` count is a ceiling, not a minimum guarantee.
 - Recent-events limit defaults to `50` and is capped at `100`.
@@ -145,7 +178,7 @@ The current Webhook Receiver README slice documents the existing runtime surface
   - Twilio: `twsec_`
 - List endpoints does not expose signing secrets.
 - Rotate secret returns the new signing secret in the operation response.
-- Delete endpoint removes the endpoint and its in-memory events and dedup IDs.
+- Delete endpoint durably removes the endpoint, its retained events, and its replay identities when storage is configured.
 - Ingest accepts only `POST`.
 - Ingest requires a configured endpoint, content type, body or payload, and a valid provider signature.
 - JSON content types are accepted when they are `application/json` or end in `+json`.
@@ -197,13 +230,13 @@ Persist `start_cursor` before executing consumer effects on the first page. It c
 | --- | --- |
 | Normal page | Up to `limit` events; persist `next_cursor` after processing. |
 | Unread events were evicted | Nonretryable `410` with `webhook_replay_gap`; reconcile missing deliveries, then deliberately select a new starting position. |
-| Receiver lifetime changed | Nonretryable `410` with `webhook_cursor_expired`; restore application progress from an external source or deliberately restart consumption. |
+| Receiver state identity changed | Nonretryable `410` with `webhook_cursor_expired`; restore application progress from an external source or deliberately restart consumption. Reopening the same durable store preserves this identity. |
 | Malformed, modified, wrong-endpoint, or future cursor | `400`, except a different encoded lifetime is reported as expired. No events are returned. |
 | First unread event exceeds `max_bytes` | `413`; increase the byte budget before retrying the same cursor. |
 
 `limit` defaults to `50` and must be `1..=100`. `max_bytes` defaults to `1 MiB` and must be `1..=16 MiB`. It bounds the sum of complete stored-event JSON sizes; the response envelope, sequence fields, redaction representation, and transport framing are additional. A later event that would exceed the byte budget ends the page with `has_more: true`. The connector clones only the selected page. Cursor inputs are bounded to `128` encoded bytes and authenticated with a per-store secret.
 
-Retention remains in memory: at most `1000` event bodies per endpoint, `16 MiB` per endpoint, and `64 MiB` shared across the receiver. Eviction from any of these limits is tracked for gap detection. Configure, shutdown, and process restart invalidate all prior cursors; a successful same-zone rehandshake preserves cursors and event bodies while rotating invocation authority. This operation does not add durable queueing or exactly-once downstream processing.
+Retention is bounded to `1000` event bodies per endpoint, `16 MiB` per endpoint, and `64 MiB` shared across the receiver. Durable recovery preserves those retained bodies, both replay indexes, and eviction history used for gap detection. Configure, shutdown, and process restart preserve cursors when reopening the same durable store; ephemeral resets and replacement stores invalidate them. A same-zone rehandshake preserves state while rotating invocation authority. Consumers still own their progress checkpoints and downstream effect idempotency.
 
 ## Signature And Event ID Behavior
 
@@ -255,18 +288,18 @@ For Twilio, the identity hashes the exact verified signing string: signed URL/qu
 The current implementation does not include:
 
 - connector-owned HTTP listener startup, TLS termination, DNS management, public tunnel provisioning, automatic gateway registration, or direct provider subscription setup
-- durable event queueing, durable replay, dead-letter queues, retry workers, cursor persistence, or cross-process deduplication
+- canonical mesh state replication, cross-host state handoff, dead-letter queues, retry workers, or exactly-once downstream effect delivery
 - outbound provider API calls, provider webhook registration, provider secret rotation through remote APIs, or provider-specific subscription discovery
 - arbitrary content-type support, multipart handling, file upload persistence, or large body storage; the host adapter collects accepted UTF-8 bodies with bounded streaming reads
 - arbitrary response customization for providers, Twilio TwiML responses, webhook delivery sending, retry callback endpoints, or bidirectional webhook workflows
 - per-endpoint zone routing, per-endpoint data retention policy, or secret vault integration
-- long-term audit storage, PII classification, payload redaction beyond selected headers, or encrypted local persistence
+- long-term audit storage, PII classification, or payload redaction beyond selected headers
 
 These are excluded on purpose:
 
-- Public ingress and durable event retention are security-sensitive host responsibilities.
+- Public ingress, invocation authority, and canonical mesh state ownership remain host responsibilities.
 - Webhook payloads frequently contain sensitive account, message, billing, or credential-adjacent data.
-- Endpoint secret creation and rotation need explicit policy before this connector can safely become a durable ingress manager.
+- Endpoint secret creation and rotation require signed approvals independently of the local storage encryption key.
 
 ## Readiness And Verification Surface
 
@@ -298,7 +331,7 @@ The host adapter adds request-translation unit tests, bounded runtime tests, and
 ## Source Notes
 
 - `connectors/webhook-receiver/src/connector.rs` defines configuration parsing, lifecycle handlers, endpoint operations, ingest dispatch, introspection, simulation, health, doctor, and self-check.
-- `connectors/webhook-receiver/src/client.rs` defines bounded in-memory endpoint/event storage and replay-identity retention. Signature verification, body parsing, rate limiting, source filtering, event ID extraction, and redaction live in `connector.rs`.
+- `connectors/webhook-receiver/src/client.rs` defines bounded endpoint/event storage, replay-identity retention, and validated recovery from the encrypted local journal in `persistence.rs`. Signature verification, body parsing, rate limiting, source filtering, event ID extraction, and redaction live in `connector.rs`.
 - `connectors/webhook-receiver/src/types.rs` defines endpoint, event, provider, signature, config, and introspection shapes.
 - `connectors/webhook-receiver/src/error.rs` defines connector error classes and FCP error conversion.
 - `connectors/webhook-receiver/manifest.toml` defines the manifest operation catalog, ingress/network intent, sandbox boundary, zone policy, approval intent, and state intent.
@@ -340,12 +373,12 @@ These are verification commands, not stored passing results or live-provider evi
 
 ## Operator Guidance
 
-- Configure the optional host HTTP adapter using the [ingress guide](../../docs/configuration/webhook_receiver_ingress.md). The connector itself remains a host-forwarded in-memory receiver.
+- Configure the optional host HTTP adapter using the [ingress guide](../../docs/configuration/webhook_receiver_ingress.md), and configure the receiver's encrypted local store before accepting production deliveries. The connector itself remains host-forwarded and does not bind an HTTP socket.
 - Use production `https` public base URLs for non-local endpoints.
 - Keep endpoint secrets in a credential manager; endpoint create and rotate responses expose the active secret once.
 - Configure an independent approval public key and provide a signed execution approval for endpoint creation, deletion, and secret rotation.
 - Do not rely on `doctor()` or `self_check()` reaching `ok` in the current no-native-listener build.
-- Keep event retention expectations low; events and deduplication IDs are process-memory state.
+- Plan around the bounded retention and replay-identity budgets. A configured durable store preserves those limits and identities across restart; it does not reset exhausted capacity or replace a downstream work queue.
 - Expose only the configured `/webhooks/` route through a TLS-terminating reverse proxy, preserving the raw path, query, and body. Do not expose host administration or unrelated RPC routes as part of that mapping.
 - Slack Events API URL verification is supported for endpoints configured with provider `slack` and `slack-signature-v0`. The receiver verifies the fresh signature over the exact raw body and applies normal FCP, resource, source, body, and rate admission before returning the challenge. The deprecated payload token grants no authority. Challenges must be nonempty strings of at most `4096` UTF-8 bytes with no control characters; their exact content is preserved. Fresh signed verification retries succeed without creating events or consuming event replay identities.
 - Confirm that ordinary callbacks accept the adapter's minimal HTTP acknowledgment. Twilio flows requiring TwiML and arbitrary provider response formats still need additional response handling.

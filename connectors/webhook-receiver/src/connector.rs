@@ -40,6 +40,7 @@ use crate::{
         MAX_RETAINED_EVENT_BYTES_PER_ENDPOINT, WebhookStore,
     },
     error::WebhookReceiverError,
+    persistence::DurableStoreConfig,
     types::{SourceIpRange, WebhookEndpoint, WebhookEvent, WebhookProvider},
 };
 
@@ -82,6 +83,8 @@ type HmacSha1 = Hmac<Sha1>;
 struct WebhookReceiverConfig {
     approval_public_key: Option<Ed25519VerifyingKey>,
     public_base_url: String,
+    storage: Option<DurableStoreConfig>,
+    allow_ephemeral_ingest: bool,
     max_body_bytes: usize,
     body_timeout_ms: u64,
     rate_limit_window_ms: u64,
@@ -109,10 +112,27 @@ impl WebhookReceiverConfig {
             .filter(|value| !value.is_empty())
             .unwrap_or(DEFAULT_PUBLIC_BASE_URL)
             .to_string();
+        let storage = params
+            .get("storage")
+            .map(|value| {
+                serde_json::from_value(value.clone()).map_err(|_| {
+                    invalid_request("storage must contain directory, key_file, zone, and an optional boolean initialize flag")
+                })
+            })
+            .transpose()?;
+        let allow_ephemeral_ingest = match params.get("allow_ephemeral_ingest") {
+            None => false,
+            Some(Value::Bool(allow)) => *allow,
+            Some(_) => {
+                return Err(invalid_request("allow_ephemeral_ingest must be a boolean"));
+            }
+        };
 
         Ok(Self {
             approval_public_key,
             public_base_url,
+            storage,
+            allow_ephemeral_ingest,
             max_body_bytes: optional_usize_param(
                 params,
                 "max_body_bytes",
@@ -456,8 +476,8 @@ impl Default for WebhookReceiverConnector {
 impl WebhookReceiverConnector {
     /// Handle the `configure` method.
     ///
-    /// The webhook receiver is a local meta-connector so configuration is
-    /// minimal. No external API credentials are needed.
+    /// Open the explicitly configured local durable store before publishing
+    /// readiness. Replacement configuration always revokes previous authority.
     pub async fn handle_configure(
         &mut self,
         params: serde_json::Value,
@@ -465,14 +485,28 @@ impl WebhookReceiverConnector {
         self.invalidate_authority();
         self.config = None;
         self.base.set_configured(false);
-        // Endpoint secrets, payloads and deduplication belong to the old zone.
-        // Reconfiguration cannot carry them into a replacement authority.
+        // Detach the old store and its writer lock before opening a replacement.
+        // This clears only process memory; it never resets committed state.
         self.store.clear();
         self.ingress_state = IngressState::default();
         self.bound_zone = None;
         let config = WebhookReceiverConfig::from_params(&params)?;
-        info!(public_base_url = %config.public_base_url, "Configuring Webhook Receiver connector");
-        self.store.set_public_base_url(&config.public_base_url);
+        let store = if let Some(storage) = &config.storage {
+            WebhookStore::open_durable(storage, &config.public_base_url)
+                .map_err(|error| error.to_fcp_error())?
+        } else {
+            let mut store = WebhookStore::new();
+            store
+                .set_public_base_url(&config.public_base_url)
+                .map_err(|error| error.to_fcp_error())?;
+            store
+        };
+        self.bound_zone = store.durable_zone().cloned();
+        self.store = store;
+        info!(
+            durable = self.store.is_durable(),
+            "Configured Webhook Receiver connector"
+        );
         self.config = Some(config);
         self.base.set_configured(true);
         Ok(json!({
@@ -483,6 +517,7 @@ impl WebhookReceiverConnector {
             "host_forwarded_ingress_message": HOST_FORWARDED_INGRESS_MESSAGE,
             "gateway_binding_status": GATEWAY_BINDING_STATUS,
             "gateway_binding_message": GATEWAY_BINDING_MESSAGE,
+            "storage": self.storage_health(),
         }))
     }
 
@@ -495,6 +530,7 @@ impl WebhookReceiverConnector {
         if self.config.is_none() {
             return Err(FcpError::NotConfigured);
         }
+        self.require_storage_ready()?;
         let request: HandshakeRequest = serde_json::from_value(params)
             .map_err(|_| invalid_request("Invalid FCP handshake request"))?;
         if self
@@ -504,7 +540,7 @@ impl WebhookReceiverConnector {
         {
             return Err(FcpError::CapabilityDenied {
                 capability: "webhook.handshake".into(),
-                reason: "Reconfigure before rebinding webhook state to another zone".into(),
+                reason: "Handshake zone does not match the receiver's bound state zone".into(),
             });
         }
         let zone = request.zone.clone();
@@ -539,6 +575,23 @@ impl WebhookReceiverConnector {
         self.base.set_handshaken(false);
     }
 
+    fn require_storage_ready(&self) -> FcpResult<()> {
+        if self.store.is_fenced() {
+            return Err(FcpError::Internal {
+                message: "Webhook durable storage is fenced after an uncertain write; reopen the configured store before accessing receiver data".into(),
+            });
+        }
+        Ok(())
+    }
+
+    fn event_ingest_enabled(&self) -> bool {
+        !self.store.is_fenced()
+            && self
+                .config
+                .as_ref()
+                .is_some_and(|config| self.store.is_durable() || config.allow_ephemeral_ingest)
+    }
+
     /// Handle the `health` method.
     pub async fn handle_health(&self) -> FcpResult<serde_json::Value> {
         let configured = self.config.is_some();
@@ -547,7 +600,17 @@ impl WebhookReceiverConnector {
             .as_ref()
             .is_some_and(StandaloneSession::is_established);
         let instance_id = self.authority.as_ref().map(StandaloneSession::instance_id);
-        let status = if configured && handshaken && self.store.replay_capacity_remaining() == 0 {
+        let status = if self.store.is_fenced() {
+            HealthState::Degraded {
+                reason: "Webhook durable storage is fenced; reopen before accessing receiver data"
+                    .into(),
+            }
+        } else if configured && handshaken && !self.event_ingest_enabled() {
+            HealthState::Degraded {
+                reason: "Durable storage is required before accepting webhook event deliveries"
+                    .into(),
+            }
+        } else if configured && handshaken && self.store.replay_capacity_remaining() == 0 {
             HealthState::Degraded {
                 reason: "Webhook replay protection is full; new deliveries are refused".into(),
             }
@@ -621,9 +684,25 @@ impl WebhookReceiverConnector {
 
         checks.push(DoctorCheck {
             name: "store_initialized".into(),
-            passed: true,
-            message: None,
+            passed: !self.store.is_fenced(),
+            message: self.store.is_fenced().then(|| {
+                "Durable storage is fenced after an uncertain write; reopen before accessing receiver data".into()
+            }),
             critical: true,
+        });
+        checks.push(DoctorCheck {
+            name: "durable_event_storage".into(),
+            passed: self.store.is_durable() && !self.store.is_fenced(),
+            message: Some(if self.store.is_fenced() {
+                "Encrypted local storage is fenced; recover the configured store before accepting events".into()
+            } else if self.store.is_durable() {
+                "Encrypted local storage commits before event acceptance; canonical mesh state handoff is not provided".into()
+            } else if self.event_ingest_enabled() {
+                "Ephemeral ingest is explicitly enabled for development; accepted events and replay protection are lost on restart".into()
+            } else {
+                "Configure durable storage before accepting event deliveries".into()
+            }),
+            critical: !self.event_ingest_enabled(),
         });
         checks.push(DoctorCheck {
             name: "replay_capacity".into(),
@@ -709,6 +788,23 @@ impl WebhookReceiverConnector {
             return Self::serialize_self_check_report(report);
         };
 
+        if self.store.is_fenced() {
+            let mut report = SelfCheckReport::failed(
+                "durable_storage_fenced",
+                "Reopen the configured durable store before accessing receiver data",
+            );
+            report.details = Some(json!({ "storage": self.storage_health() }));
+            return Self::serialize_self_check_report(report);
+        }
+        if !self.event_ingest_enabled() {
+            let mut report = SelfCheckReport::degraded(
+                "durable_storage_required",
+                "Configure durable storage before accepting event deliveries",
+            );
+            report.details = Some(json!({ "storage": self.storage_health() }));
+            return Self::serialize_self_check_report(report);
+        }
+
         let readiness = config.provisioning_readiness(&self.store);
         if self.store.replay_capacity_remaining() == 0 {
             let mut report = SelfCheckReport::failed(
@@ -758,7 +854,13 @@ impl WebhookReceiverConnector {
 
     fn storage_health(&self) -> Value {
         json!({
-            "durable": false,
+            "durable": self.store.is_durable(),
+            "mode": if self.store.is_durable() { "encrypted_local_journal" } else { "ephemeral" },
+            "fenced": self.store.is_fenced(),
+            "zone": self.store.durable_zone().map(ZoneId::as_str),
+            "event_ingest_enabled": self.event_ingest_enabled(),
+            "allow_ephemeral_ingest": self.config.as_ref().is_some_and(|config| config.allow_ephemeral_ingest),
+            "canonical_mesh_state": false,
             "retained_event_bytes": self.store.retained_event_bytes(),
             "max_retained_event_bytes": crate::client::MAX_RETAINED_EVENT_BYTES_TOTAL,
             "max_retained_event_bytes_per_endpoint": crate::client::MAX_RETAINED_EVENT_BYTES_PER_ENDPOINT,
@@ -803,6 +905,9 @@ impl WebhookReceiverConnector {
         self.base.check_ready()?;
         let request: InvokeRequest = serde_json::from_value(params)
             .map_err(|_| invalid_request("Invalid FCP invoke request"))?;
+        if request.operation.as_str() != "webhook.health" {
+            self.require_storage_ready()?;
+        }
         if !request.input.is_object() || request.deadline_ms == Some(0) {
             return Err(invalid_request(
                 "Invocation requires object input and an unexpired deadline",
@@ -864,6 +969,7 @@ impl WebhookReceiverConnector {
     /// Handle the `simulate` method.
     pub async fn handle_simulate(&self, params: serde_json::Value) -> FcpResult<serde_json::Value> {
         self.base.check_ready()?;
+        self.require_storage_ready()?;
         let request: SimulateRequest = serde_json::from_value(params)
             .map_err(|_| invalid_request("Invalid FCP simulate request"))?;
         if request.r#type != "simulate" || request.id.0.is_empty() || !request.input.is_object() {
@@ -1389,6 +1495,11 @@ impl WebhookReceiverConnector {
 
         let event_id =
             event_id_for_ingest(input, headers, &body.payload, endpoint, &body.raw_body)?;
+        if !self.store.is_durable() && !config.allow_ephemeral_ingest {
+            return Err(WebhookReceiverError::Internal {
+                message: "Durable storage is required before accepting webhook event deliveries; allow_ephemeral_ingest is for explicit development use only".into(),
+            });
+        }
         let received_at = Utc::now();
         let source_ip = optional_ingest_source_ip(input)?;
         let event = WebhookEvent {
@@ -1601,7 +1712,8 @@ fn parse_headers(
             .any(|character| character != '\t' && character.is_control())
         {
             return Err(WebhookReceiverError::InvalidInput {
-                message: "HTTP header values must not contain control characters except tabs".into(),
+                message: "HTTP header values must not contain control characters except tabs"
+                    .into(),
             });
         }
         if parsed
@@ -3328,7 +3440,7 @@ mod tests {
     #[test]
     fn verified_twilio_replay_uses_signed_bytes_and_query_at_store_admission() {
         let mut store = WebhookStore::new();
-        store.set_public_base_url("https://example.com");
+        store.set_public_base_url("https://example.com").unwrap();
         let endpoint = store
             .create_endpoint_profile(
                 "/twilio".into(),

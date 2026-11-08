@@ -50,6 +50,7 @@ impl LiveReceiver {
             .handle_configure(json!({
                 "public_base_url": BASE_URL,
                 "approval_public_key": approval_key.verifying_key().to_bytes(),
+                "allow_ephemeral_ingest": true,
             }))
             .await
             .expect("configure production receiver");

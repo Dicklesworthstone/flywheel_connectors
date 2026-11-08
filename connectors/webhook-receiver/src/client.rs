@@ -1,21 +1,24 @@
-//! In-memory webhook endpoint and event store.
+//! Webhook endpoint and event store with optional durable recovery.
 //!
 //! Unlike other connectors that wrap an HTTP client, the webhook receiver
 //! stores all state locally. It manages webhook endpoint registrations and
 //! buffers received events.
 
 use std::cmp::Reverse;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::io::{self, Write};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
+use fcp_core::ZoneId;
 use rand::RngCore as _;
+use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq as _;
 use tracing::debug;
 
 use crate::{
     error::{WebhookReceiverError, WebhookReceiverResult},
+    persistence::{DurableJournal, DurableStoreConfig},
     types::{EndpointSummary, WebhookEndpoint, WebhookEvent, WebhookProvider},
 };
 
@@ -41,6 +44,15 @@ pub const MAX_REPLAY_IDS_TOTAL: usize = 100_000;
 /// Maximum UTF-8 byte length of a delivery ID.
 pub const MAX_EVENT_ID_BYTES: usize = 1024;
 
+/// Maximum serialized endpoint metadata and private signing-secret bytes.
+pub const MAX_ENDPOINT_STATE_BYTES: usize = 64 * 1024;
+
+/// Leave room for private record framing within JSON's recovery depth limit.
+pub const MAX_EVENT_PAYLOAD_DEPTH: usize = 64;
+
+/// Maximum combined replay identities in one encrypted checkpoint frame.
+pub(crate) const MAX_CHECKPOINT_REPLAY_DIGESTS: usize = 1024;
+
 /// Maximum serialized event bytes retained for one endpoint.
 pub const MAX_RETAINED_EVENT_BYTES_PER_ENDPOINT: usize = 16 * 1024 * 1024;
 
@@ -62,6 +74,54 @@ pub const DEFAULT_PUBLIC_BASE_URL: &str = "http://localhost:8080";
 const EVENT_CURSOR_VERSION: u8 = 1;
 const EVENT_CURSOR_PAYLOAD_BYTES: usize = 1 + 16 + 32 + 8;
 const EVENT_CURSOR_BYTES: usize = EVENT_CURSOR_PAYLOAD_BYTES + 32;
+
+/// Private records passed only to the encrypted journal. Endpoint serialization
+/// deliberately omits secrets, so these records carry them separately. Never
+/// expose a record through diagnostics, public JSON, or an unencrypted file.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum PersistedRecord {
+    CheckpointStart {
+        public_base_url: String,
+        cursor_epoch: [u8; 16],
+        cursor_key: [u8; 32],
+        next_event_sequence: u64,
+    },
+    CheckpointEndpoint {
+        endpoint: WebhookEndpoint,
+        signing_secret: String,
+        #[serde(deserialize_with = "required_option")]
+        highest_evicted_sequence: Option<u64>,
+    },
+    CheckpointReplay {
+        endpoint_id: String,
+        event_ids: Vec<[u8; 32]>,
+        authenticated_digests: Vec<[u8; 32]>,
+    },
+    CheckpointEvent {
+        sequence: u64,
+        event: WebhookEvent,
+    },
+    CheckpointEnd,
+    EndpointCreated {
+        endpoint: WebhookEndpoint,
+        signing_secret: String,
+    },
+    EndpointSecretRotated {
+        endpoint_id: String,
+        signing_secret: String,
+        rotated_at: DateTime<Utc>,
+    },
+    EndpointDeleted {
+        endpoint_id: String,
+    },
+    EventAccepted {
+        sequence: u64,
+        event: WebhookEvent,
+        #[serde(deserialize_with = "required_option")]
+        authenticated_digest: Option<[u8; 32]>,
+    },
+}
 
 /// A bounded page in monotonic arrival order for one endpoint.
 #[derive(Debug)]
@@ -151,7 +211,7 @@ impl Write for SerializedSize {
     }
 }
 
-/// In-memory store for webhook endpoints and received events.
+/// Bounded store for webhook endpoints and received events.
 #[derive(Debug)]
 pub struct WebhookStore {
     /// Public base URL used to build endpoint URLs.
@@ -177,6 +237,8 @@ pub struct WebhookStore {
     next_event_sequence: u64,
     /// Authentication material for bounded, endpoint-scoped replay cursors.
     cursor_identity: CursorIdentity,
+    /// Exclusive encrypted writer, absent for explicitly ephemeral stores.
+    journal: Option<DurableJournal>,
 }
 
 impl WebhookStore {
@@ -190,7 +252,38 @@ impl WebhookStore {
             authenticated_deliveries: HashMap::new(),
             next_event_sequence: 0,
             cursor_identity: CursorIdentity::new(),
+            journal: None,
         }
+    }
+
+    /// Open an explicitly provisioned durable store without changing its scope.
+    pub(crate) fn open_durable(
+        config: &DurableStoreConfig,
+        public_base_url: &str,
+    ) -> WebhookReceiverResult<Self> {
+        let mut store = Self::new();
+        store.public_base_url = public_base_url.to_string();
+        let journal = DurableJournal::open(config, public_base_url, &mut store)?;
+        store.journal = Some(journal);
+        Ok(store)
+    }
+
+    /// Whether mutations must commit through an exclusive durable journal.
+    #[must_use]
+    pub const fn is_durable(&self) -> bool {
+        self.journal.is_some()
+    }
+
+    /// Whether uncertain or failed persistence has fenced this writer.
+    #[must_use]
+    pub fn is_fenced(&self) -> bool {
+        self.journal.as_ref().is_some_and(DurableJournal::is_fenced)
+    }
+
+    /// Immutable zone bound to the durable store, including after a fence.
+    #[must_use]
+    pub fn durable_zone(&self) -> Option<&ZoneId> {
+        self.journal.as_ref().map(DurableJournal::zone)
     }
 
     /// Get the current public base URL.
@@ -200,11 +293,16 @@ impl WebhookStore {
     }
 
     /// Update the public base URL and rebase any existing endpoint URLs.
-    pub fn set_public_base_url(&mut self, public_base_url: &str) {
+    /// An attached durable store must keep its exact configured base URL.
+    pub fn set_public_base_url(&mut self, public_base_url: &str) -> WebhookReceiverResult<()> {
+        if self.is_durable() && self.public_base_url != public_base_url {
+            return Err(invalid_persisted_state("public base URL cannot change"));
+        }
         self.public_base_url = public_base_url.to_string();
         for endpoint in self.endpoints.values_mut() {
             endpoint.update_public_base_url(public_base_url);
         }
+        Ok(())
     }
 
     /// Register a new webhook endpoint.
@@ -259,22 +357,19 @@ impl WebhookStore {
             signature_header,
             signature_algorithm,
         );
+        validate_endpoint_state_size(&endpoint)?;
         let validation_issues = endpoint.validation_issues();
         if !validation_issues.is_empty() {
             return Err(WebhookReceiverError::InvalidInput {
                 message: validation_issues.join("; "),
             });
         }
+        self.persist(&PersistedRecord::EndpointCreated {
+            signing_secret: endpoint.signing_secret.clone(),
+            endpoint: endpoint.clone(),
+        })?;
         debug!(endpoint_id = %endpoint.endpoint_id, path = %endpoint.path, "Created webhook endpoint");
-
-        self.endpoints
-            .insert(endpoint.endpoint_id.clone(), endpoint.clone());
-        self.events
-            .insert(endpoint.endpoint_id.clone(), EventBuffer::default());
-        self.event_ids
-            .insert(endpoint.endpoint_id.clone(), HashSet::new());
-        self.authenticated_deliveries
-            .insert(endpoint.endpoint_id.clone(), HashSet::new());
+        self.insert_endpoint(endpoint.clone());
 
         Ok(endpoint)
     }
@@ -285,22 +380,30 @@ impl WebhookStore {
         endpoint_id: &str,
         signing_secret: String,
     ) -> WebhookReceiverResult<WebhookEndpoint> {
-        let endpoint = self.endpoints.get_mut(endpoint_id).ok_or_else(|| {
-            WebhookReceiverError::EndpointNotFound {
-                endpoint_id: endpoint_id.into(),
-            }
-        })?;
+        let mut endpoint = self.get_endpoint(endpoint_id)?.clone();
+        if signing_secret.trim().is_empty() {
+            return Err(WebhookReceiverError::InvalidInput {
+                message: "signing secret is empty".into(),
+            });
+        }
         endpoint.rotate_signing_secret(signing_secret);
-        Ok(endpoint.clone())
+        validate_endpoint_state_size(&endpoint)?;
+        self.persist(&PersistedRecord::EndpointSecretRotated {
+            endpoint_id: endpoint_id.into(),
+            signing_secret: endpoint.signing_secret.clone(),
+            rotated_at: endpoint.secret_last_rotated_at,
+        })?;
+        self.endpoints.insert(endpoint_id.into(), endpoint.clone());
+        Ok(endpoint)
     }
 
     /// Delete a webhook endpoint and its events.
     pub fn delete_endpoint(&mut self, endpoint_id: &str) -> WebhookReceiverResult<()> {
-        if self.endpoints.remove(endpoint_id).is_none() {
-            return Err(WebhookReceiverError::EndpointNotFound {
-                endpoint_id: endpoint_id.into(),
-            });
-        }
+        self.get_endpoint(endpoint_id)?;
+        self.persist(&PersistedRecord::EndpointDeleted {
+            endpoint_id: endpoint_id.into(),
+        })?;
+        self.endpoints.remove(endpoint_id);
         self.events.remove(endpoint_id);
         self.event_ids.remove(endpoint_id);
         self.authenticated_deliveries.remove(endpoint_id);
@@ -380,6 +483,7 @@ impl WebhookStore {
                 message: format!("Webhook delivery ID exceeds {MAX_EVENT_ID_BYTES} bytes"),
             });
         }
+        validate_event_payload_depth(&event.payload)?;
 
         let event_digest = *blake3::hash(event.event_id.as_bytes()).as_bytes();
         let event_ids = self.event_ids.get(&event.endpoint_id);
@@ -423,6 +527,14 @@ impl WebhookStore {
                 .ok_or_else(|| WebhookReceiverError::Internal {
                     message: "Webhook event arrival sequence exhausted".into(),
                 })?;
+
+        if self.is_durable() {
+            self.persist(&PersistedRecord::EventAccepted {
+                sequence,
+                event: event.clone(),
+                authenticated_digest: replay_digest,
+            })?;
+        }
 
         // Every fallible admission check precedes retention changes. Evict only
         // event bodies, retaining independent replay digests for the namespace.
@@ -748,14 +860,606 @@ impl WebhookStore {
             .map_or(0, |buffer| buffer.serialized_bytes))
     }
 
-    /// Clear all endpoints and events.
+    /// Release the writer and clear process memory without erasing durable state.
     pub fn clear(&mut self) {
+        self.journal = None;
         self.endpoints.clear();
         self.events.clear();
         self.event_ids.clear();
         self.authenticated_deliveries.clear();
         self.next_event_sequence = 0;
         self.cursor_identity = CursorIdentity::new();
+    }
+
+    /// Stream a complete checkpoint without cloning the store or accumulating
+    /// its event bodies. Replay digests use bounded chunks; each event is one
+    /// frame. The caller encrypts and commits the entire stream atomically.
+    pub(crate) fn visit_checkpoint(
+        &self,
+        mut visitor: impl FnMut(&PersistedRecord) -> WebhookReceiverResult<()>,
+    ) -> WebhookReceiverResult<()> {
+        visitor(&PersistedRecord::CheckpointStart {
+            public_base_url: self.public_base_url.clone(),
+            cursor_epoch: self.cursor_identity.epoch,
+            cursor_key: self.cursor_identity.key,
+            next_event_sequence: self.next_event_sequence,
+        })?;
+
+        let mut endpoints: Vec<_> = self.endpoints.values().collect();
+        endpoints.sort_unstable_by(|left, right| left.endpoint_id.cmp(&right.endpoint_id));
+        let mut buffers = Vec::with_capacity(endpoints.len());
+        for endpoint in &endpoints {
+            let buffer = self
+                .events
+                .get(&endpoint.endpoint_id)
+                .ok_or_else(|| invalid_persisted_state("endpoint event namespace is missing"))?;
+            visitor(&PersistedRecord::CheckpointEndpoint {
+                endpoint: (*endpoint).clone(),
+                signing_secret: endpoint.signing_secret.clone(),
+                highest_evicted_sequence: buffer.highest_evicted_sequence,
+            })?;
+            buffers.push(buffer);
+        }
+
+        for endpoint in &endpoints {
+            self.visit_replay_checkpoint(&endpoint.endpoint_id, &mut visitor)?;
+        }
+
+        // At most MAX_ENDPOINTS references are queued. Emitting a global order
+        // makes duplicate or reordered arrival sequences rejectable on restore.
+        let mut arrivals = BinaryHeap::new();
+        for (index, buffer) in buffers.iter().enumerate() {
+            if let Some(event) = buffer.events.front() {
+                arrivals.push(Reverse((event.sequence, index, 0)));
+            }
+        }
+        while let Some(Reverse((sequence, buffer_index, event_index))) = arrivals.pop() {
+            let buffer = buffers[buffer_index];
+            visitor(&PersistedRecord::CheckpointEvent {
+                sequence,
+                event: buffer.events[event_index].event.clone(),
+            })?;
+            if let Some(next) = buffer.events.get(event_index + 1) {
+                arrivals.push(Reverse((next.sequence, buffer_index, event_index + 1)));
+            }
+        }
+        visitor(&PersistedRecord::CheckpointEnd)
+    }
+
+    fn visit_replay_checkpoint(
+        &self,
+        endpoint_id: &str,
+        visitor: &mut impl FnMut(&PersistedRecord) -> WebhookReceiverResult<()>,
+    ) -> WebhookReceiverResult<()> {
+        let event_ids = self
+            .event_ids
+            .get(endpoint_id)
+            .ok_or_else(|| invalid_persisted_state("endpoint replay namespace is missing"))?;
+        let authenticated_digests = self
+            .authenticated_deliveries
+            .get(endpoint_id)
+            .ok_or_else(|| invalid_persisted_state("authenticated replay namespace is missing"))?;
+        if event_ids.is_empty() && authenticated_digests.is_empty() {
+            visitor(&PersistedRecord::CheckpointReplay {
+                endpoint_id: endpoint_id.into(),
+                event_ids: Vec::new(),
+                authenticated_digests: Vec::new(),
+            })?;
+        }
+        for (digests, authenticated) in [(event_ids, false), (authenticated_digests, true)] {
+            let mut digests = digests.iter();
+            loop {
+                let chunk: Vec<_> = digests
+                    .by_ref()
+                    .take(MAX_CHECKPOINT_REPLAY_DIGESTS)
+                    .copied()
+                    .collect();
+                if chunk.is_empty() {
+                    break;
+                }
+                let (event_ids, authenticated_digests) = if authenticated {
+                    (Vec::new(), chunk)
+                } else {
+                    (chunk, Vec::new())
+                };
+                visitor(&PersistedRecord::CheckpointReplay {
+                    endpoint_id: endpoint_id.into(),
+                    event_ids,
+                    authenticated_digests,
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    fn insert_endpoint(&mut self, endpoint: WebhookEndpoint) {
+        self.events
+            .insert(endpoint.endpoint_id.clone(), EventBuffer::default());
+        self.event_ids
+            .insert(endpoint.endpoint_id.clone(), HashSet::new());
+        self.authenticated_deliveries
+            .insert(endpoint.endpoint_id.clone(), HashSet::new());
+        self.endpoints
+            .insert(endpoint.endpoint_id.clone(), endpoint);
+    }
+
+    /// Keep the writer attached on every error so an uncertain append cannot be
+    /// followed by an accidental in-memory-only mutation.
+    fn persist(&mut self, record: &PersistedRecord) -> WebhookReceiverResult<()> {
+        let Some(mut journal) = self.journal.take() else {
+            return Ok(());
+        };
+        let result = if journal.needs_checkpoint() {
+            journal
+                .checkpoint(self)
+                .and_then(|()| journal.append(record))
+        } else {
+            journal.append(record)
+        };
+        self.journal = Some(journal);
+        result
+    }
+}
+
+fn invalid_persisted_state(message: &str) -> WebhookReceiverError {
+    WebhookReceiverError::Persistence {
+        message: format!("Invalid webhook state: {message}"),
+    }
+}
+
+fn validate_endpoint_state_size(endpoint: &WebhookEndpoint) -> WebhookReceiverResult<()> {
+    let mut size = SerializedSize::default();
+    serde_json::to_writer(&mut size, &(endpoint, &endpoint.signing_secret))?;
+    if size.bytes > MAX_ENDPOINT_STATE_BYTES {
+        return Err(WebhookReceiverError::PayloadTooLarge {
+            message: format!(
+                "Webhook endpoint metadata exceeds the {MAX_ENDPOINT_STATE_BYTES}-byte state limit"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_event_payload_depth(payload: &serde_json::Value) -> WebhookReceiverResult<()> {
+    fn within_depth(value: &serde_json::Value, remaining: usize) -> bool {
+        match value {
+            serde_json::Value::Array(items) => {
+                remaining > 0 && items.iter().all(|item| within_depth(item, remaining - 1))
+            }
+            serde_json::Value::Object(fields) => {
+                remaining > 0
+                    && fields
+                        .values()
+                        .all(|item| within_depth(item, remaining - 1))
+            }
+            _ => true,
+        }
+    }
+    if !within_depth(payload, MAX_EVENT_PAYLOAD_DEPTH) {
+        return Err(WebhookReceiverError::InvalidInput {
+            message: format!(
+                "Webhook event payload exceeds the {MAX_EVENT_PAYLOAD_DEPTH}-level nesting limit"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// An explicit null remains valid; an omitted private state field does not.
+fn required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RecoveryPhase {
+    AwaitingStart,
+    Endpoints,
+    Replay,
+    Events,
+    Mutations,
+}
+
+/// Validate an authenticated checkpoint and its mutation tail before exposing
+/// any recovered state. One invalid record permanently invalidates the replay.
+pub(crate) struct StoreRecovery {
+    store: WebhookStore,
+    phase: RecoveryPhase,
+    replay_namespaces: HashSet<String>,
+    last_replay_namespace: Option<String>,
+    last_event_sequence: Option<u64>,
+    evicted_frontiers: HashSet<u64>,
+    retained_event_ids: HashMap<String, HashSet<[u8; 32]>>,
+    failed: bool,
+}
+
+impl StoreRecovery {
+    pub(crate) fn new(expected_base_url: &str) -> Self {
+        let mut store = WebhookStore::new();
+        store.public_base_url = expected_base_url.to_string();
+        Self {
+            store,
+            phase: RecoveryPhase::AwaitingStart,
+            replay_namespaces: HashSet::new(),
+            last_replay_namespace: None,
+            last_event_sequence: None,
+            evicted_frontiers: HashSet::new(),
+            retained_event_ids: HashMap::new(),
+            failed: false,
+        }
+    }
+
+    pub(crate) fn consume(&mut self, record: PersistedRecord) -> WebhookReceiverResult<()> {
+        if self.failed {
+            return Err(invalid_persisted_state("recovery is already invalid"));
+        }
+        let result = self.consume_record(record).map_err(|error| match error {
+            error @ WebhookReceiverError::Persistence { .. } => error,
+            _ => invalid_persisted_state("record violates store admission constraints"),
+        });
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+
+    pub(crate) fn checkpoint_complete(&self) -> bool {
+        !self.failed && self.phase == RecoveryPhase::Mutations
+    }
+
+    pub(crate) fn finish(self) -> WebhookReceiverResult<WebhookStore> {
+        if !self.checkpoint_complete() {
+            return Err(invalid_persisted_state(
+                "checkpoint is incomplete or invalid",
+            ));
+        }
+        Ok(self.store)
+    }
+
+    fn consume_record(&mut self, record: PersistedRecord) -> WebhookReceiverResult<()> {
+        match record {
+            PersistedRecord::CheckpointStart {
+                public_base_url,
+                cursor_epoch,
+                cursor_key,
+                next_event_sequence,
+            } => {
+                if self.phase != RecoveryPhase::AwaitingStart {
+                    return Err(invalid_persisted_state("checkpoint start is out of order"));
+                }
+                if public_base_url != self.store.public_base_url {
+                    return Err(invalid_persisted_state("public base URL does not match"));
+                }
+                self.store.cursor_identity = CursorIdentity {
+                    epoch: cursor_epoch,
+                    key: cursor_key,
+                };
+                self.store.next_event_sequence = next_event_sequence;
+                self.phase = RecoveryPhase::Endpoints;
+                Ok(())
+            }
+            PersistedRecord::CheckpointEndpoint {
+                endpoint,
+                signing_secret,
+                highest_evicted_sequence,
+            } => self.checkpoint_endpoint(endpoint, signing_secret, highest_evicted_sequence),
+            PersistedRecord::CheckpointReplay {
+                endpoint_id,
+                event_ids,
+                authenticated_digests,
+            } => self.checkpoint_replay(endpoint_id, event_ids, authenticated_digests),
+            PersistedRecord::CheckpointEvent { sequence, event } => {
+                self.checkpoint_event(sequence, event)
+            }
+            PersistedRecord::CheckpointEnd => self.end_checkpoint(),
+            mutation => {
+                if self.phase != RecoveryPhase::Mutations {
+                    return Err(invalid_persisted_state(
+                        "mutation precedes complete checkpoint",
+                    ));
+                }
+                self.apply_mutation(mutation)
+            }
+        }
+    }
+
+    fn restore_endpoint(
+        &mut self,
+        mut endpoint: WebhookEndpoint,
+        signing_secret: String,
+    ) -> WebhookReceiverResult<()> {
+        endpoint.signing_secret = signing_secret;
+        validate_endpoint_state_size(&endpoint)?;
+        if self.store.endpoints.len() >= MAX_ENDPOINTS {
+            return Err(invalid_persisted_state("endpoint count exceeds capacity"));
+        }
+        if self.store.endpoints.contains_key(&endpoint.endpoint_id)
+            || self
+                .store
+                .endpoints
+                .values()
+                .any(|registered| registered.path == endpoint.path)
+        {
+            return Err(invalid_persisted_state(
+                "duplicate endpoint identity or path",
+            ));
+        }
+        if endpoint
+            .endpoint_id
+            .strip_prefix("ep_")
+            .and_then(|id| uuid::Uuid::parse_str(id).ok())
+            .is_none()
+            || !endpoint.validation_issues().is_empty()
+            || endpoint.url
+                != format!(
+                    "{}{}",
+                    self.store.public_base_url.trim_end_matches('/'),
+                    endpoint.path
+                )
+        {
+            return Err(invalid_persisted_state("endpoint metadata is invalid"));
+        }
+        self.store.insert_endpoint(endpoint);
+        Ok(())
+    }
+
+    fn checkpoint_endpoint(
+        &mut self,
+        endpoint: WebhookEndpoint,
+        signing_secret: String,
+        highest_evicted_sequence: Option<u64>,
+    ) -> WebhookReceiverResult<()> {
+        if self.phase != RecoveryPhase::Endpoints {
+            return Err(invalid_persisted_state(
+                "endpoint checkpoint is out of order",
+            ));
+        }
+        if let Some(sequence) = highest_evicted_sequence
+            && (sequence >= self.store.next_event_sequence
+                || !self.evicted_frontiers.insert(sequence))
+        {
+            return Err(invalid_persisted_state(
+                "eviction frontier is invalid or repeated",
+            ));
+        }
+        let endpoint_id = endpoint.endpoint_id.clone();
+        self.restore_endpoint(endpoint, signing_secret)?;
+        let buffer = self
+            .store
+            .events
+            .get_mut(&endpoint_id)
+            .ok_or_else(|| invalid_persisted_state("endpoint event namespace is missing"))?;
+        buffer.highest_evicted_sequence = highest_evicted_sequence;
+        Ok(())
+    }
+
+    fn checkpoint_replay(
+        &mut self,
+        endpoint_id: String,
+        event_ids: Vec<[u8; 32]>,
+        authenticated_digests: Vec<[u8; 32]>,
+    ) -> WebhookReceiverResult<()> {
+        if !matches!(self.phase, RecoveryPhase::Endpoints | RecoveryPhase::Replay) {
+            return Err(invalid_persisted_state("replay checkpoint is out of order"));
+        }
+        if event_ids.len().saturating_add(authenticated_digests.len())
+            > MAX_CHECKPOINT_REPLAY_DIGESTS
+        {
+            return Err(invalid_persisted_state(
+                "replay checkpoint chunk exceeds capacity",
+            ));
+        }
+        let same_namespace = self.last_replay_namespace.as_deref() == Some(endpoint_id.as_str());
+        if (!same_namespace && self.replay_namespaces.contains(&endpoint_id))
+            || (same_namespace && event_ids.is_empty() && authenticated_digests.is_empty())
+        {
+            return Err(invalid_persisted_state(
+                "replay checkpoint namespace is repeated",
+            ));
+        }
+        if self
+            .store
+            .replay_event_count()
+            .saturating_add(event_ids.len())
+            > MAX_REPLAY_IDS_TOTAL
+        {
+            return Err(invalid_persisted_state(
+                "global replay identity capacity exceeded",
+            ));
+        }
+        let ids = self
+            .store
+            .event_ids
+            .get_mut(&endpoint_id)
+            .ok_or_else(|| invalid_persisted_state("replay checkpoint endpoint is unknown"))?;
+        if ids.len().saturating_add(event_ids.len()) > MAX_REPLAY_IDS_PER_ENDPOINT {
+            return Err(invalid_persisted_state(
+                "endpoint replay identity capacity exceeded",
+            ));
+        }
+        for id in event_ids {
+            if !ids.insert(id) {
+                return Err(invalid_persisted_state(
+                    "public replay identity is repeated",
+                ));
+            }
+        }
+        let digests = self
+            .store
+            .authenticated_deliveries
+            .get_mut(&endpoint_id)
+            .ok_or_else(|| invalid_persisted_state("authenticated replay namespace is missing"))?;
+        if digests.len().saturating_add(authenticated_digests.len()) > ids.len() {
+            return Err(invalid_persisted_state(
+                "authenticated identities exceed accepted IDs",
+            ));
+        }
+        for digest in authenticated_digests {
+            if !digests.insert(digest) {
+                return Err(invalid_persisted_state(
+                    "authenticated replay identity is repeated",
+                ));
+            }
+        }
+        self.replay_namespaces.insert(endpoint_id.clone());
+        self.last_replay_namespace = Some(endpoint_id);
+        self.phase = RecoveryPhase::Replay;
+        Ok(())
+    }
+
+    fn checkpoint_event(
+        &mut self,
+        sequence: u64,
+        event: WebhookEvent,
+    ) -> WebhookReceiverResult<()> {
+        if !matches!(self.phase, RecoveryPhase::Replay | RecoveryPhase::Events)
+            || self.replay_namespaces.len() != self.store.endpoints.len()
+        {
+            return Err(invalid_persisted_state(
+                "event precedes complete replay namespaces",
+            ));
+        }
+        if sequence >= self.store.next_event_sequence
+            || self
+                .last_event_sequence
+                .is_some_and(|previous| sequence <= previous)
+            || self.evicted_frontiers.contains(&sequence)
+        {
+            return Err(invalid_persisted_state(
+                "retained arrival sequence is invalid",
+            ));
+        }
+        let digest = *blake3::hash(event.event_id.as_bytes()).as_bytes();
+        if event.event_id.len() > MAX_EVENT_ID_BYTES
+            || !self
+                .store
+                .event_ids
+                .get(&event.endpoint_id)
+                .is_some_and(|ids| ids.contains(&digest))
+            || !self
+                .retained_event_ids
+                .entry(event.endpoint_id.clone())
+                .or_default()
+                .insert(digest)
+        {
+            return Err(invalid_persisted_state(
+                "retained event identity is invalid or repeated",
+            ));
+        }
+        validate_event_payload_depth(&event.payload)?;
+        let mut size = SerializedSize::default();
+        serde_json::to_writer(&mut size, &event)?;
+        if size.bytes > MAX_RETAINED_EVENT_BYTES_PER_ENDPOINT
+            || self.store.retained_event_bytes().saturating_add(size.bytes)
+                > MAX_RETAINED_EVENT_BYTES_TOTAL
+        {
+            return Err(invalid_persisted_state(
+                "retained event bytes exceed capacity",
+            ));
+        }
+        let buffer = self
+            .store
+            .events
+            .get_mut(&event.endpoint_id)
+            .ok_or_else(|| invalid_persisted_state("retained event endpoint is unknown"))?;
+        if buffer.events.len() >= MAX_EVENTS_PER_ENDPOINT
+            || buffer.serialized_bytes.saturating_add(size.bytes)
+                > MAX_RETAINED_EVENT_BYTES_PER_ENDPOINT
+            || buffer
+                .highest_evicted_sequence
+                .is_some_and(|evicted| sequence <= evicted)
+        {
+            return Err(invalid_persisted_state(
+                "endpoint retained event bounds are invalid",
+            ));
+        }
+        buffer.events.push_back(RetainedEvent {
+            event,
+            serialized_bytes: size.bytes,
+            sequence,
+        });
+        buffer.serialized_bytes += size.bytes;
+        self.last_event_sequence = Some(sequence);
+        self.phase = RecoveryPhase::Events;
+        Ok(())
+    }
+
+    fn end_checkpoint(&mut self) -> WebhookReceiverResult<()> {
+        if !matches!(
+            self.phase,
+            RecoveryPhase::Endpoints | RecoveryPhase::Replay | RecoveryPhase::Events
+        ) || self.replay_namespaces.len() != self.store.endpoints.len()
+        {
+            return Err(invalid_persisted_state(
+                "checkpoint namespaces are incomplete",
+            ));
+        }
+        if self.store.replay_event_count() as u64 > self.store.next_event_sequence {
+            return Err(invalid_persisted_state(
+                "arrival frontier omits accepted identities",
+            ));
+        }
+        for (endpoint_id, buffer) in &self.store.events {
+            let identities = self.store.event_ids[endpoint_id].len();
+            if identities < buffer.events.len()
+                || (identities > buffer.events.len()) != buffer.highest_evicted_sequence.is_some()
+            {
+                return Err(invalid_persisted_state(
+                    "eviction history does not match retained IDs",
+                ));
+            }
+        }
+        self.replay_namespaces.clear();
+        self.last_replay_namespace = None;
+        self.retained_event_ids.clear();
+        self.evicted_frontiers.clear();
+        self.phase = RecoveryPhase::Mutations;
+        Ok(())
+    }
+
+    fn apply_mutation(&mut self, mutation: PersistedRecord) -> WebhookReceiverResult<()> {
+        match mutation {
+            PersistedRecord::EndpointCreated {
+                endpoint,
+                signing_secret,
+            } => self.restore_endpoint(endpoint, signing_secret),
+            PersistedRecord::EndpointSecretRotated {
+                endpoint_id,
+                signing_secret,
+                rotated_at,
+            } => {
+                if signing_secret.trim().is_empty() {
+                    return Err(invalid_persisted_state("rotated signing secret is empty"));
+                }
+                let mut endpoint = self.store.get_endpoint(&endpoint_id)?.clone();
+                endpoint.signing_secret = signing_secret;
+                endpoint.secret_last_rotated_at = rotated_at;
+                validate_endpoint_state_size(&endpoint)?;
+                self.store.endpoints.insert(endpoint_id, endpoint);
+                Ok(())
+            }
+            PersistedRecord::EndpointDeleted { endpoint_id } => {
+                self.store.delete_endpoint(&endpoint_id)
+            }
+            PersistedRecord::EventAccepted {
+                sequence,
+                event,
+                authenticated_digest,
+            } => {
+                if sequence != self.store.next_event_sequence {
+                    return Err(invalid_persisted_state(
+                        "mutation arrival sequence is not next",
+                    ));
+                }
+                self.store.record_event_inner(event, authenticated_digest)
+            }
+            _ => Err(invalid_persisted_state(
+                "checkpoint appears in mutation tail",
+            )),
+        }
     }
 }
 
@@ -769,6 +1473,621 @@ impl Default for WebhookStore {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn checkpoint_records(store: &WebhookStore) -> Vec<PersistedRecord> {
+        let mut records = Vec::new();
+        store
+            .visit_checkpoint(|record| {
+                // Exercise the private wire representation, including the
+                // intentionally omitted public endpoint signing-secret field.
+                records.push(serde_json::from_slice(&serde_json::to_vec(record)?)?);
+                Ok(())
+            })
+            .unwrap();
+        records
+    }
+
+    fn recover_records(
+        records: Vec<PersistedRecord>,
+        public_base_url: &str,
+    ) -> WebhookReceiverResult<WebhookStore> {
+        let mut recovery = StoreRecovery::new(public_base_url);
+        for record in records {
+            recovery.consume(record)?;
+        }
+        recovery.finish()
+    }
+
+    fn populated_checkpoint() -> Vec<PersistedRecord> {
+        let mut store = WebhookStore::new();
+        let endpoint = store
+            .create_endpoint("/recovery".into(), "retained-secret".into(), vec![])
+            .unwrap();
+        for index in 0..2_u8 {
+            let mut event = WebhookEvent::new(
+                endpoint.endpoint_id.clone(),
+                json!({"index": index}),
+                true,
+                None,
+            );
+            event.event_id = format!("delivery-{index}");
+            store
+                .record_authenticated_event(event, [index; 32])
+                .unwrap();
+        }
+        checkpoint_records(&store)
+    }
+
+    fn reject_checkpoint_change(name: &str, mut change: impl FnMut(&mut PersistedRecord)) {
+        let mut records = populated_checkpoint();
+        for record in &mut records {
+            change(record);
+        }
+        assert!(
+            matches!(
+                recover_records(records, DEFAULT_PUBLIC_BASE_URL),
+                Err(WebhookReceiverError::Persistence { .. })
+            ),
+            "accepted corrupted checkpoint: {name}"
+        );
+    }
+
+    #[test]
+    fn durable_recovery_preserves_private_endpoints_and_exact_cursors() {
+        let mut store = WebhookStore::new();
+        store
+            .set_public_base_url("https://hooks.example.test")
+            .unwrap();
+        let endpoint = store
+            .create_endpoint(
+                "/restart".into(),
+                "initial-secret".into(),
+                vec!["10.0.0.0/8".into()],
+            )
+            .unwrap();
+        let endpoint = store
+            .rotate_endpoint_secret(&endpoint.endpoint_id, "rotated-secret".into())
+            .unwrap();
+        assert!(
+            serde_json::to_value(&endpoint)
+                .unwrap()
+                .get("signing_secret")
+                .is_none()
+        );
+        let mut event = WebhookEvent::new(
+            endpoint.endpoint_id.clone(),
+            json!({"value": "retained payload"}),
+            true,
+            Some("10.1.2.3".into()),
+        );
+        event
+            .headers
+            .insert("x-provider-event".into(), "test".into());
+        store
+            .record_authenticated_event(event.clone(), [11; 32])
+            .unwrap();
+        let before = store
+            .poll_events(&endpoint.endpoint_id, None, 1, 4096, false)
+            .unwrap();
+        let mut recovered =
+            recover_records(checkpoint_records(&store), store.public_base_url()).unwrap();
+        let restored_endpoint = recovered.get_endpoint(&endpoint.endpoint_id).unwrap();
+        assert_eq!(restored_endpoint.signing_secret, endpoint.signing_secret);
+        assert_eq!(
+            serde_json::to_value(restored_endpoint).unwrap(),
+            serde_json::to_value(&endpoint).unwrap()
+        );
+        let after = recovered
+            .poll_events(
+                &endpoint.endpoint_id,
+                Some(&before.start_cursor),
+                1,
+                4096,
+                false,
+            )
+            .unwrap();
+        assert_eq!(after.start_cursor, before.start_cursor);
+        assert_eq!(after.next_cursor, before.next_cursor);
+        assert_eq!(after.next_sequence, before.next_sequence);
+        assert_eq!(after.serialized_event_bytes, before.serialized_event_bytes);
+        assert_eq!(
+            serde_json::to_value(&after.events).unwrap(),
+            serde_json::to_value(&before.events).unwrap()
+        );
+        assert!(!recovered.is_durable());
+        assert!(!recovered.is_fenced());
+        assert!(recovered.durable_zone().is_none());
+        assert!(matches!(
+            recovered.record_authenticated_event(event.clone(), [12; 32]),
+            Err(WebhookReceiverError::DuplicateEvent { .. })
+        ));
+        event.event_id = "transport-retry-with-new-id".into();
+        assert!(matches!(
+            recovered.record_authenticated_event(event, [11; 32]),
+            Err(WebhookReceiverError::DuplicateEvent { .. })
+        ));
+    }
+
+    #[test]
+    fn durable_recovery_keeps_evicted_replay_claims_and_streams_bounded_frames() {
+        let mut store = WebhookStore::new();
+        let first = store
+            .create_endpoint("/first".into(), "first-secret".into(), vec![])
+            .unwrap();
+        let second = store
+            .create_endpoint("/second".into(), "second-secret".into(), vec![])
+            .unwrap();
+        let old_cursor = store
+            .poll_events(&first.endpoint_id, None, 1, 4096, false)
+            .unwrap()
+            .next_cursor;
+        let accepted = MAX_CHECKPOINT_REPLAY_DIGESTS + 1;
+        for index in 0..accepted {
+            for endpoint in [&first, &second] {
+                let mut event = WebhookEvent::new(
+                    endpoint.endpoint_id.clone(),
+                    json!({"index": index}),
+                    true,
+                    None,
+                );
+                event.event_id = format!("delivery-{index}");
+                store
+                    .record_authenticated_event(
+                        event,
+                        *blake3::hash(&index.to_le_bytes()).as_bytes(),
+                    )
+                    .unwrap();
+            }
+        }
+        let mut last_sequence = None;
+        let mut replay_chunks = 0;
+        store
+            .visit_checkpoint(|record| {
+                match record {
+                    PersistedRecord::CheckpointReplay {
+                        event_ids,
+                        authenticated_digests,
+                        ..
+                    } => {
+                        replay_chunks += 1;
+                        assert!(
+                            event_ids.len() + authenticated_digests.len()
+                                <= MAX_CHECKPOINT_REPLAY_DIGESTS
+                        );
+                    }
+                    PersistedRecord::CheckpointEvent { sequence, .. } => {
+                        assert!(last_sequence.is_none_or(|previous| *sequence > previous));
+                        last_sequence = Some(*sequence);
+                    }
+                    _ => {}
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(replay_chunks, 8);
+        let current_page = store
+            .poll_events(&first.endpoint_id, None, 1, 4096, false)
+            .unwrap();
+        let mut recovered =
+            recover_records(checkpoint_records(&store), store.public_base_url()).unwrap();
+        assert_eq!(recovered.replay_event_count(), accepted * 2);
+        assert_eq!(recovered.total_event_count(), MAX_EVENTS_PER_ENDPOINT * 2);
+        assert_eq!(
+            recovered.retained_event_bytes(),
+            store.retained_event_bytes()
+        );
+        assert!(matches!(
+            recovered.poll_events(&first.endpoint_id, Some(&old_cursor), 1, 4096, false),
+            Err(WebhookReceiverError::ReplayGap { .. })
+        ));
+        let restored_page = recovered
+            .poll_events(
+                &first.endpoint_id,
+                Some(&current_page.start_cursor),
+                1,
+                4096,
+                false,
+            )
+            .unwrap();
+        assert_eq!(restored_page.next_cursor, current_page.next_cursor);
+        assert!(restored_page.history_truncated);
+        let mut retry = WebhookEvent::new(first.endpoint_id, json!({}), true, None);
+        retry.event_id = "delivery-0".into();
+        assert!(matches!(
+            recovered.record_authenticated_event(retry.clone(), [42; 32]),
+            Err(WebhookReceiverError::DuplicateEvent { .. })
+        ));
+        retry.event_id = "changed-unsigned-delivery-id".into();
+        assert!(matches!(
+            recovered.record_authenticated_event(
+                retry,
+                *blake3::hash(&0_usize.to_le_bytes()).as_bytes()
+            ),
+            Err(WebhookReceiverError::DuplicateEvent { .. })
+        ));
+    }
+
+    #[test]
+    fn durable_recovery_applies_exact_mutation_tail_and_retains_global_frontier() {
+        let store = WebhookStore::new();
+        let mut recovery = StoreRecovery::new(store.public_base_url());
+        for record in checkpoint_records(&store) {
+            recovery.consume(record).unwrap();
+        }
+        assert!(recovery.checkpoint_complete());
+        let endpoint = WebhookEndpoint::new(
+            "/tail".into(),
+            "original".into(),
+            vec![],
+            store.public_base_url(),
+            WebhookProvider::Generic,
+            "X-Signature".into(),
+            "hmac-sha256".into(),
+        );
+        recovery
+            .consume(PersistedRecord::EndpointCreated {
+                endpoint: endpoint.clone(),
+                signing_secret: endpoint.signing_secret.clone(),
+            })
+            .unwrap();
+        let rotated_at = DateTime::from_timestamp(1_700_000_123, 987_000_000).unwrap();
+        recovery
+            .consume(PersistedRecord::EndpointSecretRotated {
+                endpoint_id: endpoint.endpoint_id.clone(),
+                signing_secret: "restored-rotation".into(),
+                rotated_at,
+            })
+            .unwrap();
+        let event = WebhookEvent::new(endpoint.endpoint_id.clone(), json!({}), true, None);
+        recovery
+            .consume(PersistedRecord::EventAccepted {
+                sequence: 0,
+                event,
+                authenticated_digest: Some([23; 32]),
+            })
+            .unwrap();
+        let mut restored = recovery.finish().unwrap();
+        let restored_endpoint = restored.get_endpoint(&endpoint.endpoint_id).unwrap();
+        assert_eq!(restored_endpoint.signing_secret, "restored-rotation");
+        assert_eq!(restored_endpoint.created_at, endpoint.created_at);
+        assert_eq!(restored_endpoint.secret_last_rotated_at, rotated_at);
+        let before_delete = checkpoint_records(&restored);
+        let mut recovery = StoreRecovery::new(store.public_base_url());
+        for record in before_delete {
+            recovery.consume(record).unwrap();
+        }
+        recovery
+            .consume(PersistedRecord::EndpointDeleted {
+                endpoint_id: endpoint.endpoint_id.clone(),
+            })
+            .unwrap();
+        restored = recovery.finish().unwrap();
+        assert_eq!(restored.next_event_sequence, 1);
+        assert_eq!(restored.endpoint_count(), 0);
+        assert_eq!(restored.replay_event_count(), 0);
+        let replacement = restored
+            .create_endpoint("/tail".into(), "replacement".into(), vec![])
+            .unwrap();
+        restored
+            .record_event(WebhookEvent::new(
+                replacement.endpoint_id.clone(),
+                json!({}),
+                false,
+                None,
+            ))
+            .unwrap();
+        assert_eq!(
+            restored.events[&replacement.endpoint_id].events[0].sequence,
+            1
+        );
+    }
+
+    #[test]
+    fn durable_recovery_rejects_incomplete_and_reordered_checkpoints() {
+        let records = populated_checkpoint();
+        for end in 0..records.len() {
+            assert!(
+                recover_records(records[..end].to_vec(), DEFAULT_PUBLIC_BASE_URL).is_err(),
+                "accepted incomplete checkpoint prefix of length {end}"
+            );
+        }
+        let mut missing_start = records.clone();
+        missing_start.remove(0);
+        assert!(recover_records(missing_start, DEFAULT_PUBLIC_BASE_URL).is_err());
+        let mut duplicate_start = records.clone();
+        duplicate_start.insert(1, records[0].clone());
+        assert!(recover_records(duplicate_start, DEFAULT_PUBLIC_BASE_URL).is_err());
+        let mut duplicate_end = records.clone();
+        duplicate_end.push(PersistedRecord::CheckpointEnd);
+        assert!(recover_records(duplicate_end, DEFAULT_PUBLIC_BASE_URL).is_err());
+        let mut early_mutation = records.clone();
+        early_mutation.insert(
+            1,
+            PersistedRecord::EndpointDeleted {
+                endpoint_id: "unknown".into(),
+            },
+        );
+        assert!(recover_records(early_mutation, DEFAULT_PUBLIC_BASE_URL).is_err());
+        let mut event_before_replay = records.clone();
+        let event_index = event_before_replay
+            .iter()
+            .position(|record| matches!(record, PersistedRecord::CheckpointEvent { .. }))
+            .unwrap();
+        let event = event_before_replay.remove(event_index);
+        event_before_replay.insert(2, event);
+        assert!(recover_records(event_before_replay, DEFAULT_PUBLIC_BASE_URL).is_err());
+        let mut missing_namespace = records;
+        missing_namespace
+            .retain(|record| !matches!(record, PersistedRecord::CheckpointReplay { .. }));
+        assert!(recover_records(missing_namespace, DEFAULT_PUBLIC_BASE_URL).is_err());
+    }
+
+    #[test]
+    fn durable_recovery_rejects_corrupted_endpoint_replay_and_arrival_state() {
+        reject_checkpoint_change("changed public URL", |record| {
+            if let PersistedRecord::CheckpointStart {
+                public_base_url, ..
+            } = record
+            {
+                *public_base_url = "https://another.example.test".into();
+            }
+        });
+        reject_checkpoint_change("empty signing secret", |record| {
+            if let PersistedRecord::CheckpointEndpoint { signing_secret, .. } = record {
+                signing_secret.clear();
+            }
+        });
+        reject_checkpoint_change("endpoint URL outside bound base", |record| {
+            if let PersistedRecord::CheckpointEndpoint { endpoint, .. } = record {
+                endpoint.url = "https://another.example.test/recovery".into();
+            }
+        });
+        reject_checkpoint_change("invalid endpoint ID", |record| {
+            if let PersistedRecord::CheckpointEndpoint { endpoint, .. } = record {
+                endpoint.endpoint_id = "ep_invalid".into();
+            }
+        });
+        reject_checkpoint_change("invalid source policy", |record| {
+            if let PersistedRecord::CheckpointEndpoint { endpoint, .. } = record {
+                endpoint.allowed_sources = vec!["not-an-ip-or-cidr".into()];
+            }
+        });
+        reject_checkpoint_change("oversized endpoint state", |record| {
+            if let PersistedRecord::CheckpointEndpoint { signing_secret, .. } = record {
+                *signing_secret = "s".repeat(MAX_ENDPOINT_STATE_BYTES);
+            }
+        });
+        reject_checkpoint_change("future eviction frontier", |record| {
+            if let PersistedRecord::CheckpointEndpoint {
+                highest_evicted_sequence,
+                ..
+            } = record
+            {
+                *highest_evicted_sequence = Some(u64::MAX);
+            }
+        });
+        reject_checkpoint_change("duplicate public identity", |record| {
+            if let PersistedRecord::CheckpointReplay { event_ids, .. } = record
+                && let Some(id) = event_ids.first().copied()
+            {
+                event_ids.push(id);
+            }
+        });
+        reject_checkpoint_change("duplicate authenticated identity", |record| {
+            if let PersistedRecord::CheckpointReplay {
+                authenticated_digests,
+                ..
+            } = record
+                && let Some(digest) = authenticated_digests.first().copied()
+            {
+                authenticated_digests.push(digest);
+            }
+        });
+        reject_checkpoint_change("unknown replay namespace", |record| {
+            if let PersistedRecord::CheckpointReplay { endpoint_id, .. } = record {
+                *endpoint_id = "unknown".into();
+            }
+        });
+        reject_checkpoint_change("oversized replay chunk", |record| {
+            if let PersistedRecord::CheckpointReplay { event_ids, .. } = record {
+                *event_ids = vec![[9; 32]; MAX_CHECKPOINT_REPLAY_DIGESTS + 1];
+            }
+        });
+        reject_checkpoint_change(
+            "retained event omitted from public replay index",
+            |record| {
+                if let PersistedRecord::CheckpointEvent { event, .. } = record {
+                    event.event_id = "unretained-id".into();
+                }
+            },
+        );
+        reject_checkpoint_change("repeated retained event ID", |record| {
+            if let PersistedRecord::CheckpointEvent { event, .. } = record {
+                event.event_id = "delivery-0".into();
+            }
+        });
+        reject_checkpoint_change("repeated arrival sequence", |record| {
+            if let PersistedRecord::CheckpointEvent { sequence, .. } = record {
+                *sequence = 0;
+            }
+        });
+        reject_checkpoint_change("arrival frontier omits accepted events", |record| {
+            if let PersistedRecord::CheckpointStart {
+                next_event_sequence,
+                ..
+            } = record
+            {
+                *next_event_sequence = 0;
+            }
+        });
+        let mut missing_bodies = populated_checkpoint();
+        missing_bodies.retain(|record| !matches!(record, PersistedRecord::CheckpointEvent { .. }));
+        assert!(recover_records(missing_bodies, DEFAULT_PUBLIC_BASE_URL).is_err());
+    }
+
+    #[test]
+    fn durable_recovery_rejects_duplicate_endpoint_id_or_path() {
+        for change_id in [false, true] {
+            let mut records = populated_checkpoint();
+            let index = records
+                .iter()
+                .position(|record| matches!(record, PersistedRecord::CheckpointEndpoint { .. }))
+                .unwrap();
+            let mut duplicate = records[index].clone();
+            if change_id
+                && let PersistedRecord::CheckpointEndpoint { endpoint, .. } = &mut duplicate
+            {
+                endpoint.endpoint_id = format!("ep_{}", uuid::Uuid::new_v4());
+            }
+            records.insert(index + 1, duplicate);
+            assert!(recover_records(records, DEFAULT_PUBLIC_BASE_URL).is_err());
+        }
+    }
+
+    #[test]
+    fn durable_recovery_rejects_mutation_replays_and_remains_invalid_after_errors() {
+        let records = populated_checkpoint();
+        let original = records
+            .iter()
+            .find_map(|record| match record {
+                PersistedRecord::CheckpointEvent { event, .. } => Some(event.clone()),
+                _ => None,
+            })
+            .unwrap();
+        for failure in ["sequence", "public_id", "authenticated_digest"] {
+            let mut recovery = StoreRecovery::new(DEFAULT_PUBLIC_BASE_URL);
+            for record in records.clone() {
+                recovery.consume(record).unwrap();
+            }
+            let mut event = original.clone();
+            if failure != "public_id" {
+                event.event_id = "fresh-transport-id".into();
+            }
+            let result = recovery.consume(PersistedRecord::EventAccepted {
+                sequence: if failure == "sequence" { 3 } else { 2 },
+                event,
+                authenticated_digest: Some(if failure == "authenticated_digest" {
+                    [0; 32]
+                } else {
+                    [77; 32]
+                }),
+            });
+            assert!(matches!(
+                result,
+                Err(WebhookReceiverError::Persistence { .. })
+            ));
+            assert!(!recovery.checkpoint_complete());
+            assert!(
+                recovery
+                    .consume(PersistedRecord::EndpointDeleted {
+                        endpoint_id: original.endpoint_id.clone(),
+                    })
+                    .is_err()
+            );
+            assert!(recovery.finish().is_err());
+        }
+    }
+
+    #[test]
+    fn durable_recovery_requires_explicit_private_fields_and_rejects_unknown_fields() {
+        let records = populated_checkpoint();
+        let endpoint = records
+            .iter()
+            .find(|record| matches!(record, PersistedRecord::CheckpointEndpoint { .. }))
+            .unwrap();
+        let mut missing_eviction = serde_json::to_value(endpoint).unwrap();
+        missing_eviction
+            .as_object_mut()
+            .unwrap()
+            .remove("highest_evicted_sequence");
+        assert!(serde_json::from_value::<PersistedRecord>(missing_eviction).is_err());
+        let mut extra_field = serde_json::to_value(endpoint).unwrap();
+        extra_field["unexpected"] = json!(true);
+        assert!(serde_json::from_value::<PersistedRecord>(extra_field).is_err());
+        let event = WebhookEvent::new("example".into(), json!({}), true, None);
+        let mut missing_digest = serde_json::to_value(PersistedRecord::EventAccepted {
+            sequence: 0,
+            event,
+            authenticated_digest: None,
+        })
+        .unwrap();
+        missing_digest
+            .as_object_mut()
+            .unwrap()
+            .remove("authenticated_digest");
+        assert!(serde_json::from_value::<PersistedRecord>(missing_digest).is_err());
+    }
+
+    #[test]
+    fn durable_recovery_bounds_payload_depth_before_acceptance() {
+        let mut store = WebhookStore::new();
+        let endpoint = store
+            .create_endpoint("/depth".into(), "secret".into(), vec![])
+            .unwrap();
+        let mut payload = json!(null);
+        for _ in 0..MAX_EVENT_PAYLOAD_DEPTH {
+            payload = serde_json::Value::Array(vec![payload]);
+        }
+        store
+            .record_authenticated_event(
+                WebhookEvent::new(endpoint.endpoint_id.clone(), payload.clone(), true, None),
+                [1; 32],
+            )
+            .unwrap();
+        let mut too_deep = WebhookEvent::new(
+            endpoint.endpoint_id,
+            serde_json::Value::Array(vec![payload]),
+            true,
+            None,
+        );
+        assert!(matches!(
+            store.record_authenticated_event(too_deep.clone(), [2; 32]),
+            Err(WebhookReceiverError::InvalidInput { .. })
+        ));
+        assert_eq!(store.replay_event_count(), 1);
+        too_deep.payload = json!({"retry": true});
+        store.record_authenticated_event(too_deep, [2; 32]).unwrap();
+        let restored =
+            recover_records(checkpoint_records(&store), store.public_base_url()).unwrap();
+        assert_eq!(restored.total_event_count(), 2);
+        reject_checkpoint_change("unrecoverable payload depth", |record| {
+            if let PersistedRecord::CheckpointEvent { event, .. } = record {
+                for _ in 0..=MAX_EVENT_PAYLOAD_DEPTH {
+                    event.payload = serde_json::Value::Array(vec![event.payload.take()]);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn endpoint_state_bound_rejects_creation_and_rotation_without_mutation() {
+        let mut store = WebhookStore::new();
+        assert!(matches!(
+            store.create_endpoint(
+                "/large".into(),
+                "s".repeat(MAX_ENDPOINT_STATE_BYTES),
+                vec![]
+            ),
+            Err(WebhookReceiverError::PayloadTooLarge { .. })
+        ));
+        assert_eq!(store.endpoint_count(), 0);
+        let endpoint = store
+            .create_endpoint("/bounded".into(), "original".into(), vec![])
+            .unwrap();
+        for secret in [String::new(), "s".repeat(MAX_ENDPOINT_STATE_BYTES)] {
+            assert!(
+                store
+                    .rotate_endpoint_secret(&endpoint.endpoint_id, secret)
+                    .is_err()
+            );
+            let retained = store.get_endpoint(&endpoint.endpoint_id).unwrap();
+            assert_eq!(retained.signing_secret, endpoint.signing_secret);
+            assert_eq!(
+                retained.secret_last_rotated_at,
+                endpoint.secret_last_rotated_at
+            );
+        }
+    }
 
     #[test]
     fn store_new_is_empty() {
@@ -818,7 +2137,9 @@ mod tests {
             .unwrap();
         assert_eq!(ep.url, "http://localhost:8080/hooks/github");
 
-        store.set_public_base_url("https://hooks.flywheel.test/");
+        store
+            .set_public_base_url("https://hooks.flywheel.test/")
+            .unwrap();
 
         let updated = store.get_endpoint(&ep.endpoint_id).unwrap();
         assert_eq!(updated.url, "https://hooks.flywheel.test/hooks/github");
@@ -827,7 +2148,9 @@ mod tests {
     #[test]
     fn create_endpoint_profile_uses_provider_defaults() {
         let mut store = WebhookStore::new();
-        store.set_public_base_url("https://hooks.flywheel.test");
+        store
+            .set_public_base_url("https://hooks.flywheel.test")
+            .unwrap();
         let ep = store
             .create_endpoint_profile(
                 "/hooks/github".into(),

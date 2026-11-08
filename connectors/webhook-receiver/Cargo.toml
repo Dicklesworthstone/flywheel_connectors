@@ -46,5 +46,10 @@ subtle.workspace = true
 hex.workspace = true
 blake3.workspace = true
 percent-encoding.workspace = true
+zeroize.workspace = true
+tempfile = "3"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]

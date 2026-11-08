@@ -1,7 +1,8 @@
 //! FCP Webhook Receiver Connector - Main entrypoint
 //!
 //! A meta-connector that manages inbound webhook endpoints and stores
-//! received events in memory. Implements the Flywheel Connector Protocol.
+//! received events in an encrypted local journal when storage is configured.
+//! Implements the Flywheel Connector Protocol.
 
 #![forbid(unsafe_code)]
 #![allow(dead_code)]
@@ -175,7 +176,8 @@ mod tests {
         let configured = handle_message(
             &mut connector,
             &json!({
-                "jsonrpc": "2.0", "id": 1, "method": "configure", "params": {},
+                "jsonrpc": "2.0", "id": 1, "method": "configure",
+                "params": { "allow_ephemeral_ingest": true },
             })
             .to_string(),
         )

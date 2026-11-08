@@ -8027,6 +8027,7 @@ dependencies = [
  "fcp-sdk",
  "hex",
  "hmac 0.12.1",
+ "libc",
  "percent-encoding",
  "rand 0.8.6",
  "reqwest 0.13.2",
@@ -8035,10 +8036,12 @@ dependencies = [
  "sha1 0.10.6",
  "sha2 0.10.9",
  "subtle",
+ "tempfile",
  "thiserror 2.0.18",
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

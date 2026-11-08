@@ -3,14 +3,17 @@
 `fcp-host` can receive provider callbacks at `POST /webhooks/{*path}` and
 forward them to the `webhook.events.ingest` operation of the webhook receiver.
 The host supplies the FCP authority and applies its normal invocation checks.
-The receiver independently verifies the provider signature before retaining
-an ordinary event in its bounded in-memory store or answering a Slack
-URL-verification challenge.
+The receiver independently verifies the provider signature before committing
+an ordinary event to its bounded encrypted local store or answering a Slack
+URL-verification challenge. Production event acceptance requires configured
+durable storage; the host returns HTTP `202` only after the receiver's committed
+invoke result.
 
 This is an opt-in host adapter, tracked by `flywheel_connectors-whing1`.
-The connector still opens no socket. It does not persist endpoints, secrets,
-events, or replay identities across restart or reconfiguration. There is no
-live-provider verification claim for this adapter.
+The connector still opens no socket. Its explicit local storage preserves
+endpoints, secrets, events, replay identities, and polling cursors across
+reopening. Canonical mesh replication and state handoff remain incomplete.
+There is no live-provider verification claim for this adapter.
 
 ## Deployment admission and singleton ownership
 
@@ -74,11 +77,49 @@ and canonical state handoff are supported. An inert
 accept otherwise valid same-model metadata or manifest updates. Explicit
 connector removal and shutdown have separate lifecycle semantics.
 
-These checks do not issue a signed canonical writer lease or create a durable
-receiver checkpoint. The configured HRW sequence remains request-fencing
-input checked by normal admission. Endpoint secrets, retained events, replay
-identities, and cursors still disappear on receiver restart or reconfiguration;
-canonical persistence and state transfer remain incomplete.
+These checks do not issue a signed canonical writer lease. The configured HRW
+sequence remains request-fencing input checked by normal admission. The
+receiver's encrypted local journal now preserves endpoint secrets, retained
+events, replay identities, and cursors across reopening, but canonical mesh
+persistence and state transfer remain incomplete.
+
+## Configure receiver persistence
+
+Configure the receiver's own storage before enabling production event intake.
+This is separate from the host HTTP binding below:
+
+```json
+{
+  "public_base_url": "https://hooks.example.test/webhooks",
+  "storage": {
+    "directory": "/var/lib/fcp/webhook-receiver-work",
+    "key_file": "/run/secrets/fcp-webhook-state.key",
+    "zone": "z:work",
+    "initialize": false
+  }
+}
+```
+
+Use a private state directory and a separate protected key file containing
+32 random raw bytes or 64 hexadecimal characters. Set `initialize` to `true`
+only when creating a new empty store, and use the default `false` for every
+recovery. Initialization refuses existing state; recovery refuses missing,
+corrupt, truncated, or incorrectly scoped state without resetting it.
+
+The stored zone and exact public base URL must match later configuration and
+handshake. The host-provided `zone_dir` is a cache and is not used for this
+durable store. Endpoint creation/rotation/deletion and ordinary event ingest
+synchronize their records before success. A failed or uncertain storage write
+fences data access until validated recovery, so it cannot generate a successful
+provider acknowledgment.
+
+The default connector configuration refuses ordinary event ingest without
+durable storage. Development fixtures may explicitly opt into
+`allow_ephemeral_ingest: true`; their accepted events, replay protection, and
+cursors disappear on reset. Signed Slack URL-verification challenges remain
+available without event persistence because they do not create delivery state.
+See [Durable Storage Configuration](../../connectors/webhook-receiver/README.md#durable-storage-configuration)
+for lifecycle, recovery, and local-storage limits.
 
 ## Configure the host binding
 
@@ -390,7 +431,7 @@ An accepted event delivery returns:
 | HTTP status | Meaning |
 | --- | --- |
 | `200` | Authenticated Slack URL verification completed; the response contains only `challenge`. |
-| `202` | The receiver verified and retained this delivery in its current in-memory store. |
+| `202` | The receiver verified and committed this delivery to its configured encrypted local store. Explicit development mode may use volatile storage instead. |
 | `400`, `414`, `431` | Malformed or ambiguous request, excessive request target, or excessive headers. |
 | `401` | Provider signature validation failed. |
 | `403` | The receiver's source policy denied the delivery. |

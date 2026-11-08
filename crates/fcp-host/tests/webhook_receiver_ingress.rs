@@ -74,6 +74,7 @@ impl SignedReceiver {
             .handle_configure(json!({
                 "public_base_url": PUBLIC_BASE_URL,
                 "approval_public_key": fixture.approval_key.verifying_key().to_bytes(),
+                "allow_ephemeral_ingest": true,
             }))
             .await
             .expect("configure production receiver");

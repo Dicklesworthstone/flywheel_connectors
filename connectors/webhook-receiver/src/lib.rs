@@ -1,6 +1,6 @@
 //! FCP Webhook Receiver Connector library.
 //!
-//! Provides an in-memory webhook endpoint registration and event store
+//! Provides webhook endpoint registration and encrypted durable event storage
 //! implementing the Flywheel Connector Protocol. Re-exported for integration
 //! tests.
 
@@ -31,4 +31,5 @@
 pub mod client;
 pub mod connector;
 pub mod error;
+pub mod persistence;
 pub mod types;
