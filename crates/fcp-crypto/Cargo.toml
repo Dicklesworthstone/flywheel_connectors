@@ -23,7 +23,7 @@ fcp-cbor = { path = "../fcp-cbor" }
 # Signatures
 ed25519-dalek.workspace = true
 curve25519-dalek = { version = "4.1", features = ["group"] }
-frost-ed25519 = "2.2"
+frost-ed25519 = "3.0"
 
 # BLS12-381 threshold-aggregate quorum signatures (br-angoc.17.4).
 # Pure-Rust zkcrypto implementation. `experimental` gates the

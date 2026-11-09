@@ -31,7 +31,7 @@ ed25519-dalek.workspace = true
 x25519-dalek.workspace = true
 blake3.workspace = true
 cryptoki.workspace = true
-frost-ed25519 = "2.2"
+frost-ed25519 = "3.0"
 hkdf.workspace = true
 sha2.workspace = true
 zeroize = { workspace = true, features = ["derive"] }
