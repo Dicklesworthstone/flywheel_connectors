@@ -282,7 +282,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 ed25519-dalek = { version = "2.1", features = ["rand_core", "zeroize"] }
 x25519-dalek = { version = "2.0", features = ["static_secrets", "zeroize"] }
 blake3 = "1.8.3"
-hmac = "0.12.1"
+hmac = "0.13.0"
 hkdf = "0.12"
 sha2 = "0.10"
 chacha20poly1305 = "0.10"

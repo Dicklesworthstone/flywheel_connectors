@@ -29,7 +29,7 @@ fcp-telemetry = { path = "../fcp-telemetry" }
 fcp-tailscale = { path = "../fcp-tailscale" }
 hex.workspace = true
 hkdf = "0.12"
-hmac = "0.12"
+hmac = "0.13"
 ciborium.workspace = true
 rand.workspace = true
 serde.workspace = true
