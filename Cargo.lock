@@ -2599,7 +2599,7 @@ version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "ciborium",
  "fcp-async-core",
@@ -2646,7 +2646,7 @@ version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "fcp-async-core",
  "fcp-core",
@@ -2808,7 +2808,7 @@ version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "fcp-async-core",
  "fcp-core",
@@ -2959,7 +2959,7 @@ version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "ciborium",
  "fcp-async-core",
@@ -2987,7 +2987,7 @@ name = "fcp-azure-speech"
 version = "0.2.1"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "ciborium",
  "fcp-async-core",
@@ -3119,7 +3119,7 @@ name = "fcp-bootstrap"
 version = "0.2.1"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bip39",
  "blake3",
  "bytes",
@@ -3202,7 +3202,7 @@ version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "blake3",
  "bytes",
  "chrono",
@@ -3441,7 +3441,7 @@ version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "ciborium",
  "fcp-async-core",
@@ -3469,7 +3469,7 @@ version = "0.2.1"
 dependencies = [
  "async-trait",
  "axum 0.8.9",
- "base64 0.22.1",
+ "base64 0.23.1",
  "blake3",
  "chrono",
  "ciborium",
@@ -3531,7 +3531,7 @@ name = "fcp-core"
 version = "0.2.1"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "blake3",
  "bytes",
  "chrono",
@@ -3693,7 +3693,7 @@ version = "0.2.1"
 dependencies = [
  "anyhow",
  "asupersync",
- "base64 0.22.1",
+ "base64 0.23.1",
  "fcp-async-core",
  "fcp-core",
  "fcp-e2e",
@@ -3749,7 +3749,7 @@ version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "ciborium",
  "fcp-async-core",
@@ -3924,7 +3924,7 @@ version = "0.2.1"
 dependencies = [
  "asupersync",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "blake3",
  "br-tools",
  "bytes",
@@ -4098,7 +4098,7 @@ version = "0.2.1"
 dependencies = [
  "anyhow",
  "asupersync",
- "base64 0.22.1",
+ "base64 0.23.1",
  "fcp-async-core",
  "fcp-core",
  "fcp-e2e",
@@ -4364,7 +4364,7 @@ version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "ciborium",
  "fcp-async-core",
@@ -4450,7 +4450,7 @@ name = "fcp-glm"
 version = "0.2.1"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "ciborium",
  "fcp-async-core",
@@ -4480,7 +4480,7 @@ version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bytes",
  "chrono",
  "ciborium",
@@ -4542,7 +4542,7 @@ dependencies = [
  "anyhow",
  "asupersync",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bytes",
  "chrono",
  "ciborium",
@@ -4607,7 +4607,7 @@ version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "blake3",
  "chrono",
  "ciborium",
@@ -4683,7 +4683,7 @@ version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "ciborium",
  "fcp-async-core",
@@ -4821,7 +4821,7 @@ version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "fcp-async-core",
  "fcp-core",
  "fcp-crypto",
@@ -4981,7 +4981,7 @@ dependencies = [
  "asupersync",
  "async-trait",
  "axum 0.8.9",
- "base64 0.22.1",
+ "base64 0.23.1",
  "blake3",
  "chrono",
  "ciborium",
@@ -5125,7 +5125,7 @@ version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "ciborium",
  "fcp-async-core",
@@ -5178,7 +5178,7 @@ version = "0.2.1"
 dependencies = [
  "anyhow",
  "asupersync",
- "base64 0.22.1",
+ "base64 0.23.1",
  "blake3",
  "chrono",
  "ciborium",
@@ -5234,7 +5234,7 @@ version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "ciborium",
  "fcp-async-core",
@@ -5445,7 +5445,7 @@ version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "fcp-async-core",
  "fcp-core",
  "fcp-manifest",
@@ -5483,7 +5483,7 @@ dependencies = [
 name = "fcp-manifest"
 version = "0.2.1"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "blake3",
  "chrono",
  "ciborium",
@@ -5538,7 +5538,7 @@ version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "ciborium",
  "fcp-async-core",
@@ -5567,7 +5567,7 @@ version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "ciborium",
  "fcp-async-core",
@@ -5709,7 +5709,7 @@ version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bytes",
  "chrono",
  "ciborium",
@@ -5754,7 +5754,7 @@ version = "0.2.1"
 dependencies = [
  "anyhow",
  "asupersync",
- "base64 0.22.1",
+ "base64 0.23.1",
  "fcp-async-core",
  "fcp-core",
  "fcp-e2e",
@@ -5781,7 +5781,7 @@ version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "fcp-async-core",
  "fcp-core",
  "fcp-prelude",
@@ -5974,7 +5974,7 @@ dependencies = [
  "aes 0.8.4",
  "anyhow",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bech32",
  "cbc",
  "chrono",
@@ -6067,7 +6067,7 @@ name = "fcp-oauth"
 version = "0.2.1"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "criterion",
  "fcp-async-core",
@@ -6169,7 +6169,7 @@ dependencies = [
  "asupersync",
  "async-stream",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bytes",
  "chrono",
  "ciborium",
@@ -6218,7 +6218,7 @@ name = "fcp-openrouter"
 version = "0.2.1"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
+ "base64 0.23.1",
  "fcp-async-core",
  "fcp-core",
  "fcp-e2e",
@@ -6319,7 +6319,7 @@ version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "fcp-async-core",
  "fcp-core",
@@ -6429,7 +6429,7 @@ dependencies = [
 name = "fcp-plivo"
 version = "0.2.1"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "ciborium",
  "fcp-async-core",
@@ -6566,7 +6566,7 @@ name = "fcp-provider-auth"
 version = "0.2.1"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "fcp-async-core",
  "hex",
@@ -6786,7 +6786,7 @@ version = "0.2.1"
 dependencies = [
  "async-trait",
  "axum 0.8.9",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bytes",
  "chrono",
  "clap",
@@ -6886,7 +6886,7 @@ version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bytes",
  "chrono",
  "ciborium",
@@ -7143,7 +7143,7 @@ version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "ciborium",
  "fcp-async-core",
@@ -7176,7 +7176,7 @@ dependencies = [
  "anyhow",
  "asupersync",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bytes",
  "chrono",
  "ciborium",
@@ -7277,7 +7277,7 @@ name = "fcp-sqlite"
 version = "0.2.1"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
+ "base64 0.23.1",
  "fcp-async-core",
  "fcp-core",
  "fcp-manifest",
@@ -7360,7 +7360,7 @@ name = "fcp-streaming"
 version = "0.2.1"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bytes",
  "chrono",
  "criterion",
@@ -7415,7 +7415,7 @@ version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "ciborium",
  "fcp-async-core",
@@ -7470,7 +7470,7 @@ name = "fcp-tailscale"
 version = "0.2.1"
 dependencies = [
  "asupersync",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "criterion",
  "fcp-async-core",
@@ -7606,7 +7606,7 @@ name = "fcp-telnyx"
 version = "0.2.1"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "ciborium",
  "ed25519-dalek",
@@ -7792,7 +7792,7 @@ version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "ciborium",
  "fcp-async-core",
@@ -7853,7 +7853,7 @@ version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bytes",
  "chrono",
  "ciborium",
@@ -7938,7 +7938,7 @@ dependencies = [
 name = "fcp-voice-call"
 version = "0.2.1"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "blake3",
  "chrono",
  "ed25519-dalek",
@@ -8017,7 +8017,7 @@ version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "blake3",
  "chrono",
  "fcp-async-core",
@@ -8052,7 +8052,7 @@ dependencies = [
  "aes 0.8.4",
  "anyhow",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "cbc",
  "chrono",
  "ciborium",
@@ -8196,7 +8196,7 @@ version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bytes",
  "chrono",
  "ciborium",
@@ -8287,7 +8287,7 @@ version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bytes",
  "chrono",
  "ciborium",
@@ -8685,7 +8685,7 @@ name = "fwc"
 version = "0.2.1"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
+ "base64 0.23.1",
  "blake3",
  "chacha20poly1305 0.10.1",
  "chrono",
@@ -11607,7 +11607,7 @@ version = "5.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "51e219e79014df21a225b1860a479e2dcd7cbd9130f4defd4bd0e191ea31d67d"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.21.7",
  "chrono",
  "getrandom 0.2.17",
  "http",

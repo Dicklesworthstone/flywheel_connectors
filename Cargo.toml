@@ -307,7 +307,7 @@ chrono = { version = "0.4", features = ["serde"] }
 # Bytes
 bytes = "1.11"
 hex = { version = "0.4", features = ["serde"] }
-base64 = "0.22"
+base64 = "0.23"
 bitflags = "2.11"
 percent-encoding = "2.3"
 
