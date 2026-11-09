@@ -43,7 +43,7 @@ tracing-subscriber.workspace = true
 testcontainers = { version = "0.23", optional = true }
 tokio = { workspace = true, optional = true }
 tokio-postgres = { version = "0.7", optional = true }
-axum = { version = "0.7", optional = true }
+axum = { version = "0.8", optional = true }
 
 [dev-dependencies]
 fcp-testkit.workspace = true
