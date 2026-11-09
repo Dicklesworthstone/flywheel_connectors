@@ -78,7 +78,7 @@ hyper-util = { version = "0.1.20", features = ["server", "service", "http1", "ht
 reqwest = { workspace = true, features = ["blocking", "form"] }
 rustls = { version = "0.23.38", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2.2.0"
-rustls-platform-verifier = "0.6.2"
+rustls-platform-verifier = "0.7.1"
 tower = { version = "0.5.3", features = ["util"] }
 fcp-sandbox = { version = "0.2.1", path = "../fcp-sandbox" }
 url.workspace = true
