@@ -43,7 +43,7 @@ sha2_09 = { package = "sha2", version = "0.9" }
 # Post-quantum signatures (FIPS 204 ML-DSA-65, br-kyopb.1.1.3)
 # `signature` is re-exported by `ml-dsa` so we do NOT pull our own; pulling
 # both produces two incompatible versions of `signature::Verifier`.
-ml-dsa = { version = "=0.1.0-rc.11", default-features = false, features = ["alloc", "rand_core", "zeroize"] }
+ml-dsa = { version = "=0.1.1", default-features = false, features = ["alloc", "rand_core", "zeroize"] }
 # Post-quantum KEM hybrid (X-Wing draft-06, X25519 + ML-KEM-768) for V4
 # zone-key sealing (br-kyopb.1.2.1).
 x-wing = { version = "0.1.0-rc.0", default-features = false, features = ["zeroize"] }
