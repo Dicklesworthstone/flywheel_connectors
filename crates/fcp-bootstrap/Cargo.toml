@@ -45,7 +45,7 @@ subtle.workspace = true
 # from which the owner signing key is derived. Without this feature the secret
 # survives drop even though `RecoveryPhrase` wipes its redundant entropy copy,
 # breaking the crate's "all cryptographic material is zeroized on drop" contract.
-bip39 = { version = "2.1", features = ["zeroize"] }
+bip39 = { version = "3.0", features = ["zeroize"] }
 
 # Time handling
 chrono.workspace = true
