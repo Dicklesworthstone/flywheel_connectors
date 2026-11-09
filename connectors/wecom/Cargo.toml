@@ -29,7 +29,7 @@ aes = "0.8"
 anyhow.workspace = true
 async-trait.workspace = true
 base64.workspace = true
-cbc = "0.1"
+cbc = "0.2"
 chrono.workspace = true
 reqwest = { workspace = true, features = ["json", "multipart"] }
 quick-xml = "0.41"
