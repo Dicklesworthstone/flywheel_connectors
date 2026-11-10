@@ -3223,6 +3223,23 @@ struct RecipeRefArgs {
     recipe: String,
 }
 
+#[derive(Args, Debug, Default, Serialize)]
+struct WorkflowCheckpointArgs {
+    /// Create a new durable run checkpoint before invoking any workflow step.
+    #[arg(long, value_name = "PATH", conflicts_with = "resume")]
+    checkpoint: Option<PathBuf>,
+
+    /// Resume a matching unfinished checkpoint without repeating completed steps.
+    #[arg(long, value_name = "PATH", conflicts_with = "checkpoint")]
+    resume: Option<PathBuf>,
+}
+
+impl WorkflowCheckpointArgs {
+    const fn requested(&self) -> bool {
+        self.checkpoint.is_some() || self.resume.is_some()
+    }
+}
+
 #[derive(Args, Debug, Serialize)]
 struct RecipeRunArgs {
     /// Built-in recipe slug.
@@ -3240,6 +3257,9 @@ struct RecipeRunArgs {
     /// Reusing a key preserves step identity but does not authorize replay of uncertain effects.
     #[arg(long, value_name = "KEY", value_parser = parse_workflow_idempotency_key)]
     idempotency_key: Option<String>,
+
+    #[command(flatten)]
+    checkpoint: WorkflowCheckpointArgs,
 
     #[command(flatten)]
     auth: WorkflowAuthArgs,
@@ -3299,6 +3319,9 @@ struct PipelineRunArgs {
     /// Reusing a key preserves step identity but does not authorize replay of uncertain effects.
     #[arg(long, value_name = "KEY", value_parser = parse_workflow_idempotency_key)]
     idempotency_key: Option<String>,
+
+    #[command(flatten)]
+    checkpoint: WorkflowCheckpointArgs,
 
     #[command(flatten)]
     auth: WorkflowAuthArgs,
@@ -30169,6 +30192,7 @@ struct LivePipelineExecutionResult {
     status: &'static str,
     exit_code: CliExitCode,
     executed_steps: usize,
+    resumed_steps: usize,
     preflight_only_steps: usize,
     skipped_steps: usize,
     blocked_steps: usize,
@@ -30177,6 +30201,104 @@ struct LivePipelineExecutionResult {
     step_results: Vec<Value>,
     outputs: BTreeMap<String, Value>,
     failure: Option<DispatchOutcome>,
+}
+
+fn workflow_checkpoint_binding(
+    command: &str,
+    plan: &pipe::PipelinePlan,
+    operations: &BTreeMap<String, ResolvedHostOperation>,
+    host: &ResolvedHostConfig,
+    zone: &str,
+) -> Result<pipe::checkpoint::RunBinding> {
+    let resolved_contracts = operations
+        .iter()
+        .map(|(reference, resolved)| {
+            (
+                reference.clone(),
+                json!({
+                    "connector_id": resolved.connector.summary.id.as_str(),
+                    "operation": &resolved.operation,
+                }),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    pipe::checkpoint::RunBinding::new(
+        command,
+        &json!({"plan": plan, "resolved_contracts": resolved_contracts}),
+        &host.endpoint,
+        zone,
+        &plan.execution_order,
+    )
+}
+
+fn workflow_checkpoint_mode_dispatch(command: &str, mode: PipelinePlanMode) -> DispatchOutcome {
+    let mut payload = json!({
+        "status": "error",
+        "command": command,
+        "subcommand": mode.subcommand(),
+        "invoke_attempted": false,
+        "automatic_retry_allowed": false,
+        "error": {
+            "type": "workflow-checkpoint-run-only",
+            "message": "--checkpoint and --resume are only available for live workflow runs.",
+            "recoverable": true,
+        },
+    });
+    CommandEnvelope::new(CommandAvailability::OfflineArtifact, command).inject_into(&mut payload);
+    DispatchOutcome {
+        payload,
+        exit_code: CliExitCode::Validation,
+    }
+}
+
+/// An expired finite budget must remain finite in persistent evidence.
+fn workflow_checkpoint_remaining_ms(budget: pipe::budget::ExecutionBudget) -> Option<u64> {
+    budget
+        .remaining_ms(std::time::Instant::now())
+        .unwrap_or(Some(0))
+}
+
+fn decorate_pipeline_step_records(
+    records: &mut [Value],
+    steps_by_id: &BTreeMap<&str, &pipe::PlannedPipelineStep>,
+) {
+    for record in records {
+        if let Some(step) = record["id"].as_str().and_then(|id| steps_by_id.get(id))
+            && let Some(trigger) = &step.trigger
+        {
+            record["trigger"] = json!(trigger);
+        }
+    }
+}
+
+fn workflow_checkpoint_failure(
+    command: &str,
+    step_id: &str,
+    phase: &str,
+    error: &anyhow::Error,
+) -> DispatchOutcome {
+    pipeline_execution_failure(
+        command,
+        step_id,
+        phase,
+        "workflow-checkpoint-failed",
+        &format!(
+            "The workflow checkpoint could not be safely used: {error:#}. Retained step outcomes describe any completed effects; no further invocation was sent and automatic retry is disabled."
+        ),
+        CliExitCode::Transport,
+    )
+}
+
+fn retain_checkpoint_failure(
+    failure: &mut Option<DispatchOutcome>,
+    checkpoint_failure: DispatchOutcome,
+) {
+    if let Some(original) = failure {
+        original.payload["checkpoint_error"] = checkpoint_failure.payload["error"].clone();
+        original.payload["automatic_retry_allowed"] = json!(false);
+    } else {
+        *failure = Some(checkpoint_failure);
+    }
 }
 
 fn parse_workflow_idempotency_key(value: &str) -> std::result::Result<String, String> {
@@ -30813,7 +30935,8 @@ fn execute_live_pipeline_plan(
     zone: &str,
     auth_by_step: &BTreeMap<String, ResolvedLiveAuth>,
     requested_run_key: Option<&str>,
-    run_budget: pipe::budget::ExecutionBudget,
+    mut run_budget: pipe::budget::ExecutionBudget,
+    checkpoint_args: &WorkflowCheckpointArgs,
 ) -> Result<LivePipelineExecutionResult> {
     for step in &plan.steps {
         anyhow::ensure!(
@@ -30833,16 +30956,92 @@ fn execute_live_pipeline_plan(
     let mut step_statuses = BTreeMap::<String, &'static str>::new();
     let mut step_results = Vec::with_capacity(plan.steps.len());
     let mut executed_steps = 0usize;
+    let mut resumed_steps = 0usize;
     let mut preflight_only_steps = 0usize;
     let mut skipped_steps = 0usize;
     let mut blocked_steps = 0usize;
     let mut denied_steps = 0usize;
     let mut error_steps = 0usize;
-    let run_key = requested_run_key.map_or_else(|| RequestId::random().to_string(), str::to_owned);
+    let mut run_key =
+        requested_run_key.map_or_else(|| RequestId::random().to_string(), str::to_owned);
     let mut failure = None;
     let mut stopped_after = None::<String>;
+    // Keep the handle (and its exclusive lock) alive until every result has
+    // been finalized. A failed write disables all further persistence attempts
+    // and stops execution without discarding already observed effects.
+    let mut checkpoint = None;
+    let mut checkpoint_poisoned = false;
+    let mut checkpoint_setup_error = None;
+    if checkpoint_args.requested() {
+        let initialized = (|| -> Result<_> {
+            anyhow::ensure!(
+                mode == PipelinePlanMode::Run,
+                "workflow checkpoints are only available for live runs"
+            );
+            anyhow::ensure!(
+                checkpoint_args.checkpoint.is_none() || checkpoint_args.resume.is_none(),
+                "--checkpoint and --resume are mutually exclusive"
+            );
+            let binding = workflow_checkpoint_binding(command, plan, operations, host, zone)?;
+            let checkpoint = if let Some(path) = &checkpoint_args.resume {
+                let checkpoint = pipe::checkpoint::RunCheckpoint::resume(path, &binding)?;
+                anyhow::ensure!(
+                    requested_run_key.is_none_or(|requested| requested == checkpoint.run_key()),
+                    "the provided idempotency key conflicts with the checkpoint's original run namespace"
+                );
+                checkpoint
+            } else {
+                let path = checkpoint_args
+                    .checkpoint
+                    .as_ref()
+                    .context("a workflow checkpoint path is required")?;
+                pipe::checkpoint::RunCheckpoint::create(
+                    path,
+                    binding,
+                    run_key.clone(),
+                    workflow_checkpoint_remaining_ms(run_budget),
+                )?
+            };
+            // Discovery/authentication have already consumed the original run
+            // deadline. The saved wall-clock deadline also charges downtime;
+            // intersecting the two can only shorten the remaining execution.
+            let narrowed_at = std::time::Instant::now();
+            let remaining = checkpoint.remaining_ms()?;
+            let narrowed = run_budget.for_step(remaining, narrowed_at);
+            narrowed
+                .remaining_ms(std::time::Instant::now())
+                .context("the workflow execution budget expired during checkpoint setup")?;
+            Ok((checkpoint, narrowed))
+        })();
+        match initialized {
+            Ok((restored, narrowed)) => {
+                run_key = restored.run_key().to_owned();
+                run_budget = narrowed;
+                step_results = restored.snapshot().step_results.clone();
+                step_outputs = restored.snapshot().outputs.clone();
+                resumed_steps = step_results.len();
+                for (id, record) in plan.execution_order.iter().zip(&step_results) {
+                    // RunCheckpoint::resume accepts only terminal successes or
+                    // definite skips and verifies their ordered output prefix.
+                    let status = if record["status"] == "ok" {
+                        "ok"
+                    } else {
+                        "skipped"
+                    };
+                    step_statuses.insert(id.clone(), status);
+                }
+                checkpoint = Some(restored);
+            }
+            Err(error) => checkpoint_setup_error = Some(error),
+        }
+    }
+    // Restored records are already durable evidence and must remain identical.
+    let mut decorated_steps = resumed_steps;
 
-    'steps: for step_id in &plan.execution_order {
+    'steps: for (step_index, step_id) in plan.execution_order.iter().enumerate() {
+        if step_index < resumed_steps {
+            continue;
+        }
         let step = steps_by_id.get(step_id.as_str()).ok_or_else(|| {
             anyhow::anyhow!("pipeline step `{step_id}` disappeared during execution")
         })?;
@@ -30852,6 +31051,61 @@ fn execute_live_pipeline_plan(
         let auth = auth_by_step.get(step_id).ok_or_else(|| {
             anyhow::anyhow!("pipeline step `{step_id}` is missing resolved credentials")
         })?;
+
+        if let Some(error) = checkpoint_setup_error.take() {
+            error_steps += 1;
+            step_statuses.insert(step.id.clone(), "error");
+            stopped_after = Some(step.id.clone());
+            step_results.push(json!({
+                "id": &step.id,
+                "operation": &step.operation,
+                "status": "error",
+                "reason": "checkpoint-failed",
+                "phase": "checkpoint-setup",
+                "invoke_attempted": false,
+                "automatic_retry_allowed": false,
+            }));
+            failure = Some(workflow_checkpoint_failure(
+                command,
+                &step.id,
+                "checkpoint-setup",
+                &error,
+            ));
+            continue;
+        }
+
+        if !checkpoint_poisoned && let Some(checkpoint) = &mut checkpoint {
+            // Persist the previous completed prefix before this step can
+            // preflight or invoke. Enrichment must precede the first save;
+            // otherwise adding a trigger later would rewrite durable evidence.
+            decorate_pipeline_step_records(&mut step_results[decorated_steps..], &steps_by_id);
+            decorated_steps = step_results.len();
+            if let Err(error) = checkpoint.save_snapshot(
+                &step_results,
+                &step_outputs,
+                workflow_checkpoint_remaining_ms(run_budget),
+                false,
+            ) {
+                checkpoint_poisoned = true;
+                error_steps += 1;
+                step_statuses.insert(step.id.clone(), "error");
+                stopped_after = Some(step.id.clone());
+                step_results.push(json!({
+                    "id": &step.id,
+                    "operation": &step.operation,
+                    "status": "error",
+                    "reason": "checkpoint-failed",
+                    "phase": "checkpoint-boundary",
+                    "invoke_attempted": false,
+                    "automatic_retry_allowed": false,
+                }));
+                retain_checkpoint_failure(
+                    &mut failure,
+                    workflow_checkpoint_failure(command, &step.id, "checkpoint-boundary", &error),
+                );
+                continue;
+            }
+        }
 
         if let Some(failed_step) = &stopped_after {
             blocked_steps += 1;
@@ -31376,6 +31630,76 @@ fn execute_live_pipeline_plan(
                         continue 'steps;
                     }
                 };
+            if let Some(checkpoint) = &mut checkpoint {
+                let fenced = (|| -> Result<()> {
+                    let attempt = u32::try_from(attempt_number)
+                        .context("workflow checkpoint attempt counter overflow")?;
+                    checkpoint.mark_pending(
+                        pipe::checkpoint::PendingInvocation {
+                            step_id: step.id.clone(),
+                            request_id: request_id.to_string(),
+                            idempotency_key: idempotency_key.clone(),
+                            attempt,
+                        },
+                        workflow_checkpoint_remaining_ms(run_budget),
+                    )
+                })();
+                if let Err(error) = fenced {
+                    checkpoint_poisoned = true;
+                    error_steps += 1;
+                    step_statuses.insert(step.id.clone(), "error");
+                    stopped_after = Some(step.id.clone());
+                    step_results.push(json!({
+                        "id": &step.id,
+                        "operation": &step.operation,
+                        "status": "error",
+                        "reason": "checkpoint-failed",
+                        "phase": "checkpoint-dispatch",
+                        "request_id": request_id.to_string(),
+                        "idempotency_key": idempotency_key,
+                        "invoke_attempted": !attempts.is_empty(),
+                        "current_attempt_invoked": false,
+                        "automatic_retry_allowed": false,
+                        "attempt": attempt_number,
+                        "attempts": attempts,
+                        "preflight": preflight_value,
+                    }));
+                    retain_checkpoint_failure(
+                        &mut failure,
+                        workflow_checkpoint_failure(
+                            command,
+                            &step.id,
+                            "checkpoint-dispatch",
+                            &error,
+                        ),
+                    );
+                    continue 'steps;
+                }
+                // A durable dispatch fence consumes the same step and run
+                // deadlines as preflight. Never reuse its pre-sync allowance.
+                invoke_request.deadline_ms =
+                    match step_budget.invocation_timeout_ms(std::time::Instant::now()) {
+                        Ok(remaining) => remaining,
+                        Err(_) => {
+                            error_steps += 1;
+                            step_statuses.insert(step.id.clone(), "error");
+                            stopped_after = Some(step.id.clone());
+                            let (mut record, outcome) = pipeline_deadline_failure(
+                                command,
+                                step,
+                                "checkpoint-dispatch",
+                                Some(&invoke_request),
+                                Some(preflight_value),
+                            );
+                            record["invoke_attempted"] = json!(!attempts.is_empty());
+                            record["current_attempt_invoked"] = json!(false);
+                            record["attempts"] = json!(attempts);
+                            step_results.push(record);
+                            failure = Some(outcome);
+                            continue 'steps;
+                        }
+                    };
+            }
             let started_at = std::time::Instant::now();
             let response = match client.invoke(&invoke_request) {
                 Ok(response) => response,
@@ -31612,17 +31936,26 @@ fn execute_live_pipeline_plan(
         }
     }
 
-    for record in &mut step_results {
-        if let Some(step) = record["id"].as_str().and_then(|id| steps_by_id.get(id))
-            && let Some(trigger) = &step.trigger
-        {
-            record["trigger"] = serde_json::to_value(trigger)?;
-        }
+    decorate_pipeline_step_records(&mut step_results[decorated_steps..], &steps_by_id);
+    if !checkpoint_poisoned
+        && let Some(checkpoint) = &mut checkpoint
+        && let Err(error) = checkpoint.save_snapshot(
+            &step_results,
+            &step_outputs,
+            workflow_checkpoint_remaining_ms(run_budget),
+            true,
+        )
+    {
+        let step_id = plan.execution_order.last().map_or("", String::as_str);
+        retain_checkpoint_failure(
+            &mut failure,
+            workflow_checkpoint_failure(command, step_id, "checkpoint-finalize", &error),
+        );
     }
 
-    let status = if error_steps > 0 {
+    let status = if error_steps > 0 || failure.is_some() {
         "error"
-    } else if denied_steps > 0 && executed_steps == 0 && preflight_only_steps == 0 {
+    } else if denied_steps > 0 && step_outputs.is_empty() && preflight_only_steps == 0 {
         "denied"
     } else if denied_steps > 0 || blocked_steps > 0 {
         "partial"
@@ -31644,6 +31977,7 @@ fn execute_live_pipeline_plan(
         status,
         exit_code,
         executed_steps,
+        resumed_steps,
         preflight_only_steps,
         skipped_steps,
         blocked_steps,
@@ -31805,6 +32139,9 @@ fn recipe_run_dispatch(
     mode: PipelinePlanMode,
     explicit_host: Option<&str>,
 ) -> Result<DispatchOutcome> {
+    if args.checkpoint.requested() && mode != PipelinePlanMode::Run {
+        return Ok(workflow_checkpoint_mode_dispatch("recipe", mode));
+    }
     let recipe = match load_recipe_definition(&args.recipe, mode.subcommand()) {
         Ok(recipe) => recipe,
         Err(outcome) => return Ok(outcome),
@@ -31946,6 +32283,7 @@ fn recipe_run_dispatch(
         &auth,
         args.idempotency_key.as_deref(),
         run_budget,
+        &args.checkpoint,
     )?;
 
     let message = match mode {
@@ -31986,6 +32324,7 @@ fn recipe_run_dispatch(
             "mode": mode.subcommand(),
             "idempotency_key": execution.run_key,
             "executed_steps": execution.executed_steps,
+            "resumed_steps": execution.resumed_steps,
             "preflight_only_steps": execution.preflight_only_steps,
             "skipped_steps": execution.skipped_steps,
             "blocked_steps": execution.blocked_steps,
@@ -32346,6 +32685,9 @@ fn pipeline_run_dispatch(
     mode: PipelinePlanMode,
     explicit_host: Option<&str>,
 ) -> Result<DispatchOutcome> {
+    if args.checkpoint.requested() && mode != PipelinePlanMode::Run {
+        return Ok(workflow_checkpoint_mode_dispatch("pipeline", mode));
+    }
     let (path, definition, validation) = match load_pipeline_definition(roots, &args.pipeline) {
         Ok(v) => v,
         Err(outcome) => return Ok(outcome),
@@ -32493,6 +32835,7 @@ fn pipeline_run_dispatch(
         &auth,
         args.idempotency_key.as_deref(),
         run_budget,
+        &args.checkpoint,
     )?;
     let message = match mode {
         PipelinePlanMode::Run => format!(
@@ -32531,6 +32874,7 @@ fn pipeline_run_dispatch(
             "mode": subcommand,
             "idempotency_key": execution.run_key,
             "executed_steps": execution.executed_steps,
+            "resumed_steps": execution.resumed_steps,
             "preflight_only_steps": execution.preflight_only_steps,
             "skipped_steps": execution.skipped_steps,
             "blocked_steps": execution.blocked_steps,
@@ -51243,6 +51587,357 @@ input = {{ query = "independent" }}
                         policy == Some("skip")
                     );
                     assert!(!payload.to_string().contains(&token));
+                }
+            }
+        }
+    }
+
+    fn workflow_checkpoint_fixture(directory: &Path) -> (PathBuf, super::pipe::PipelinePlan) {
+        let path = directory.join("durable-workflow.toml");
+        let source = r#"
+[pipeline]
+name = "durable-workflow"
+timeout_ms = 120000
+
+[[steps]]
+id = "first-read"
+operation = "github.search_issues"
+input = { query = "first" }
+
+[[steps]]
+id = "second-read"
+operation = "github.search_issues"
+depends_on = ["first-read"]
+input = { query = "{{steps.first-read.output.title}}" }
+"#;
+        fs::write(&path, source).unwrap();
+        let definition = super::pipe::parse_pipeline_definition(source).unwrap();
+        let params = super::pipe::bind_pipeline_params(&definition, &[]).unwrap();
+        let plan = super::pipe::build_pipeline_plan(&definition, &params).unwrap();
+        (path, plan)
+    }
+
+    fn seed_workflow_checkpoint(
+        checkpoint_path: &Path,
+        endpoint: &str,
+        plan: &super::pipe::PipelinePlan,
+        leave_pending: bool,
+    ) -> (super::pipe::checkpoint::RunBinding, Value) {
+        let host = ResolvedHostConfig {
+            endpoint: endpoint.to_owned(),
+            default_zone: None,
+        };
+        let client = super::HostAdminClient::new(endpoint).unwrap();
+        let (catalog, _) = client.catalog(None).unwrap();
+        let operations =
+            super::resolve_live_pipeline_operations("pipeline", plan, &client, &catalog)
+                .unwrap_or_else(|outcome| panic!("{}", outcome.payload));
+        let binding =
+            super::workflow_checkpoint_binding("pipeline", plan, &operations, &host, "z:work")
+                .unwrap();
+        let first = &plan.steps[0];
+        let resolved = &operations[&first.operation];
+        let (request_id, idempotency_key) = super::workflow_step_identity(
+            "pipeline",
+            &plan.name,
+            super::PipelinePlanMode::Run,
+            "original-checkpoint-run",
+            &first.id,
+            resolved.connector.summary.id.as_str(),
+            &resolved.operation.name,
+            "z:work",
+            &first.input,
+        )
+        .unwrap();
+        let output =
+            json!({"title": "Saved {{steps.untrusted.output}} and \"quotes\" stay literal"});
+        let record = json!({
+            "id": &first.id,
+            "operation": &first.operation,
+            "status": "ok",
+            "mode": "invoke",
+            "request_id": request_id.to_string(),
+            "idempotency_key": &idempotency_key,
+            "input": &first.input,
+            "response": InvokeResponse::ok(request_id.clone(), output.clone()),
+        });
+        let mut checkpoint = super::pipe::checkpoint::RunCheckpoint::create(
+            checkpoint_path,
+            binding.clone(),
+            "original-checkpoint-run".to_owned(),
+            Some(120_000),
+        )
+        .unwrap();
+        checkpoint
+            .mark_pending(
+                super::pipe::checkpoint::PendingInvocation {
+                    step_id: first.id.clone(),
+                    request_id: request_id.to_string(),
+                    idempotency_key,
+                    attempt: 1,
+                },
+                Some(120_000),
+            )
+            .unwrap();
+        if !leave_pending {
+            checkpoint
+                .save_snapshot(
+                    std::slice::from_ref(&record),
+                    &StdBTreeMap::from([(first.id.clone(), output)]),
+                    Some(120_000),
+                    false,
+                )
+                .unwrap();
+        }
+        (binding, record)
+    }
+
+    #[test]
+    fn execute_pipeline_resume_reuses_confirmed_output_and_checks_current_authority() {
+        for allowed in [true, false] {
+            let tempdir = TempDir::new().unwrap();
+            let _history = super::install_test_history_path(tempdir.path().join("history.jsonl"));
+            let (path, plan) = workflow_checkpoint_fixture(tempdir.path());
+            let checkpoint_path = tempdir.path().join("run.checkpoint.json");
+            let token = test_capability_token_arg();
+            let mut catalog = pipe_mock_catalog(false);
+            catalog.truncate(2);
+            let mut routes = catalog.clone();
+            routes.extend(catalog);
+            routes.push((
+                "POST /rpc/preflight".to_owned(),
+                mock_preflight_response_json(allowed),
+            ));
+            if allowed {
+                routes.push((
+                    "POST /rpc/invoke".to_owned(),
+                    mock_invoke_response_json(json!({"resumed": true})),
+                ));
+            }
+            let expected_requests = routes.len();
+            let (host, server, log) = spawn_mock_host_sequence_with_body_log(routes);
+            let (binding, first_record) =
+                seed_workflow_checkpoint(&checkpoint_path, &host, &plan, false);
+            let (exit, payload) = execute_json(&[
+                "fwc",
+                "--json",
+                "--host",
+                &host,
+                "pipeline",
+                "run",
+                &path.display().to_string(),
+                "--resume",
+                &checkpoint_path.display().to_string(),
+                "--zone",
+                "z:work",
+                "--capability-token",
+                &token,
+            ]);
+            server.join().unwrap();
+            assert_eq!(
+                exit,
+                if allowed {
+                    CliExitCode::Success
+                } else {
+                    CliExitCode::PolicyDenied
+                }
+                .into(),
+                "{payload}"
+            );
+            let execution = &payload["execution"];
+            assert_eq!(execution["idempotency_key"], "original-checkpoint-run");
+            assert_eq!(execution["resumed_steps"], 1);
+            assert_eq!(execution["executed_steps"], usize::from(allowed));
+            assert_eq!(execution["steps"][0], first_record);
+            assert_eq!(
+                execution["outputs"]["first-read"],
+                first_record["response"]["result"]
+            );
+            let requests = log.lock().unwrap();
+            assert_eq!(requests.len(), expected_requests);
+            let preflight: Value = serde_json::from_str(&requests[4].1).unwrap();
+            assert_eq!(
+                preflight["params"]["query"],
+                first_record["response"]["result"]["title"]
+            );
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|(route, _)| route == "POST /rpc/invoke")
+                    .count(),
+                usize::from(allowed)
+            );
+            if allowed {
+                let invocation: Value = serde_json::from_str(&requests[5].1).unwrap();
+                assert_eq!(invocation["input"], preflight["params"]);
+                assert_eq!(invocation["id"], preflight["request_id"]);
+                assert_ne!(invocation["id"], first_record["request_id"]);
+                assert_eq!(execution["outputs"]["second-read"]["resumed"], true);
+            } else {
+                assert_eq!(execution["steps"][1]["status"], "denied");
+                assert!(execution["outputs"].get("second-read").is_none());
+            }
+            let saved = fs::read_to_string(&checkpoint_path).unwrap();
+            assert!(!saved.contains(&token));
+            let saved: Value = serde_json::from_str(&saved).unwrap();
+            assert_eq!(saved["state"]["completed"], true);
+            assert!(saved["state"]["pending"].is_null());
+            assert!(
+                super::pipe::checkpoint::RunCheckpoint::resume(&checkpoint_path, &binding).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn execute_pipeline_resume_refuses_uncertain_or_changed_scope_before_dispatch() {
+        for case in ["pending", "namespace", "zone", "contract"] {
+            let tempdir = TempDir::new().unwrap();
+            let (path, plan) = workflow_checkpoint_fixture(tempdir.path());
+            let checkpoint_path = tempdir.path().join("run.checkpoint.json");
+            let token = test_capability_token_arg();
+            let mut catalog = pipe_mock_catalog(false);
+            catalog.truncate(2);
+            let mut routes = catalog.clone();
+            routes.extend(catalog);
+            if case == "contract" {
+                routes[3].1["tools"][0]["description"] = json!("Changed operation contract");
+            }
+            let (host, server, log) = spawn_mock_host_sequence_with_body_log(routes);
+            seed_workflow_checkpoint(&checkpoint_path, &host, &plan, case == "pending");
+            let before = fs::read(&checkpoint_path).unwrap();
+            let (exit, payload) = execute_json(&[
+                "fwc",
+                "--json",
+                "--host",
+                &host,
+                "pipeline",
+                "run",
+                &path.display().to_string(),
+                "--resume",
+                &checkpoint_path.display().to_string(),
+                "--idempotency-key",
+                if case == "namespace" {
+                    "different-run"
+                } else {
+                    "original-checkpoint-run"
+                },
+                "--zone",
+                if case == "zone" {
+                    "z:personal"
+                } else {
+                    "z:work"
+                },
+                "--capability-token",
+                &token,
+            ]);
+            server.join().unwrap();
+            assert_ne!(exit, CliExitCode::Success.into(), "{case}: {payload}");
+            assert_eq!(
+                payload["error"]["type"], "workflow-checkpoint-failed",
+                "{case}: {payload}"
+            );
+            assert_eq!(payload["phase"], "checkpoint-setup");
+            assert_eq!(payload["automatic_retry_allowed"], false);
+            assert_eq!(payload["execution"]["executed_steps"], 0);
+            assert_eq!(log.lock().unwrap().len(), 4);
+            assert_eq!(fs::read(&checkpoint_path).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn execute_pipeline_checkpoint_records_completed_run_without_credentials() {
+        let tempdir = TempDir::new().unwrap();
+        let _history = super::install_test_history_path(tempdir.path().join("history.jsonl"));
+        let (path, _) = workflow_checkpoint_fixture(tempdir.path());
+        let checkpoint_path = tempdir.path().join("run.checkpoint.json");
+        let token = test_capability_token_arg();
+        let mut routes = pipe_mock_catalog(false);
+        routes.truncate(2);
+        for result in [json!({"title": "first result"}), json!({"done": true})] {
+            routes.extend([
+                (
+                    "POST /rpc/preflight".to_owned(),
+                    mock_preflight_response_json(true),
+                ),
+                (
+                    "POST /rpc/invoke".to_owned(),
+                    mock_invoke_response_json(result),
+                ),
+            ]);
+        }
+        let (host, server, log) = spawn_mock_host_sequence_with_body_log(routes);
+        let (exit, payload) = execute_json(&[
+            "fwc",
+            "--json",
+            "--host",
+            &host,
+            "pipeline",
+            "run",
+            &path.display().to_string(),
+            "--checkpoint",
+            &checkpoint_path.display().to_string(),
+            "--zone",
+            "z:work",
+            "--capability-token",
+            &token,
+        ]);
+        server.join().unwrap();
+        assert_eq!(exit, CliExitCode::Success.into(), "{payload}");
+        assert_eq!(payload["execution"]["resumed_steps"], 0);
+        assert_eq!(payload["execution"]["executed_steps"], 2);
+        assert_eq!(log.lock().unwrap().len(), 6);
+        let saved = fs::read_to_string(&checkpoint_path).unwrap();
+        assert!(!saved.contains(&token));
+        assert!(!saved.contains("capability_token"));
+        let saved: Value = serde_json::from_str(&saved).unwrap();
+        assert_eq!(saved["state"]["completed"], true);
+        assert!(saved["state"]["pending"].is_null());
+        assert_eq!(
+            saved["state"]["run_key"],
+            payload["execution"]["idempotency_key"]
+        );
+        assert_eq!(
+            saved["state"]["snapshot"]["outputs"],
+            payload["execution"]["outputs"]
+        );
+        assert_eq!(
+            saved["state"]["snapshot"]["step_results"],
+            payload["execution"]["steps"]
+        );
+    }
+
+    #[test]
+    fn workflow_checkpoint_flags_require_run_and_are_mutually_exclusive() {
+        for command in ["pipeline", "recipe"] {
+            assert!(
+                Cli::try_parse_from([
+                    "fwc",
+                    command,
+                    "run",
+                    "unused",
+                    "--checkpoint",
+                    "new.json",
+                    "--resume",
+                    "old.json",
+                ])
+                .is_err()
+            );
+            for mode in ["dry-run", "estimate"] {
+                for flag in ["--checkpoint", "--resume"] {
+                    let (exit, payload) = execute_json(&[
+                        "fwc",
+                        "--json",
+                        "--host",
+                        "http://127.0.0.1:9",
+                        command,
+                        mode,
+                        "does-not-exist",
+                        flag,
+                        "unused-checkpoint.json",
+                    ]);
+                    assert_eq!(exit, CliExitCode::Validation.into(), "{payload}");
+                    assert_eq!(payload["error"]["type"], "workflow-checkpoint-run-only");
+                    assert_eq!(payload["invoke_attempted"], false);
                 }
             }
         }

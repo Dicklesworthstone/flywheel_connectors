@@ -16,6 +16,7 @@ use crate::readiness::RateLimitSummary;
 
 #[path = "workflow_budget.rs"]
 pub mod budget;
+pub mod checkpoint;
 
 // ── Map expression types ────────────────────────────────────────────────
 

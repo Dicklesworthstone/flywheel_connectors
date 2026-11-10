@@ -3501,6 +3501,40 @@ partial results, and upstream timeout ambiguity do not activate a fallback.
 Inspect retained evidence before repeating an uncertain operation; a handler's
 success does not prove that the original external effects were undone.
 
+### Durable checkpoints and resume
+
+Use `--checkpoint PATH` with `fwc pipeline run` or `fwc recipe run` to retain
+execution progress. The path must be new; starting another run never replaces
+an existing checkpoint. To continue an interrupted run, use `--resume PATH`
+with the same workflow and parameter values:
+
+```bash
+fwc pipeline run workflow.toml --checkpoint .fwc/runs/workflow.json
+fwc pipeline run workflow.toml --resume .fwc/runs/workflow.json
+
+fwc recipe run github-pr-review-notify --param owner=octocat --param repo=hello-world \
+    --checkpoint .fwc/runs/pr-review.json
+```
+
+Supply the usual host, zone, parameters, and authorization options on both the
+original and resumed command. These two flags are mutually exclusive and are
+available only for `run`. Resume restores an ordered prefix of confirmed
+successful results and definite condition or inactive-handler skips, then
+continues with the first unfinished step. Completed invocations are not
+repeated; remaining steps require current authorization and host preflight.
+
+The workflow, effective parameters, resolved operation contracts, host, and zone
+must still match. Resume retains the original run's idempotency namespace; an
+explicit `--idempotency-key` must match it. Downtime and resumed setup consume
+the original workflow deadline rather than starting a new timeout.
+
+A pending invocation, failed or denied step, blocked or unknown outcome, expired
+deadline, or completed run refuses resume. In particular, interruption after
+dispatch but before a terminal result is durably recorded cannot establish
+whether an external effect happened. Inspect that retained evidence before
+attempting further work. Checkpoints retain operation results, use private Unix
+file permissions, and allow only one writer at a time.
+
 ### Recipes
 
 A recipe is just a pipeline packaged with metadata and named parameters:
