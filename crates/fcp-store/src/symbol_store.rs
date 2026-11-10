@@ -31,24 +31,28 @@ use crate::error::SymbolStoreError;
 /// lock before any symbols arrive. See br-ywpup.
 const MAX_SOURCE_SYMBOLS: u32 = 56_403;
 
-/// Maximum bucket request used when an object advertises many source symbols
-/// but has not received any symbols yet.
+/// Stable accounting for each resident object, including its empty symbol map.
 ///
-/// The symbol map still grows normally as symbols arrive; this only bounds
-/// eager allocation during metadata admission and durable WAL recovery.
-const MAX_EAGER_SYMBOL_MAP_CAPACITY: usize = 1_024;
+/// This is a logical storage charge, independent of allocator layout. Empty
+/// symbol maps allocate no buckets; their growth is paid for by symbol charges.
+/// Charge the variable-length zone identifier as well so metadata-only traffic
+/// cannot bypass the same byte budget that limits symbol payloads.
+pub(crate) fn object_metadata_size(meta: &ObjectSymbolMeta) -> u64 {
+    const OBJECT_BOOKKEEPING_BYTES: u64 = 256;
+    // ZoneId validates a bounded identifier before construction/deserialization.
+    OBJECT_BOOKKEEPING_BYTES
+        + u64::try_from(meta.zone_id.as_str().len()).expect("bounded ZoneId length fits in u64")
+}
 
-/// Bound an empty symbol map's reservation independently of the advertised K.
-///
-/// Both live stores and durable replay use this policy so sparse, valid high-K
-/// metadata cannot allocate a full reconstruction buffer before symbols arrive.
-/// Metadata validation remains a separate admission requirement.
-pub(crate) fn initial_symbol_map_capacity(source_symbols: u32) -> usize {
-    let bounded_source_symbols = source_symbols.min(MAX_SOURCE_SYMBOLS);
-    let bounded_source_symbols =
-        usize::try_from(bounded_source_symbols).expect("MAX_SOURCE_SYMBOLS fits in usize");
-
-    bounded_source_symbols.min(MAX_EAGER_SYMBOL_MAP_CAPACITY)
+/// Reserve an exact charge without wrapping or accepting saturated overflow.
+pub(crate) fn checked_symbol_storage_used(
+    used: u64,
+    additional: u64,
+    max: u64,
+) -> Result<u64, SymbolStoreError> {
+    used.checked_add(additional)
+        .filter(|next| *next <= max)
+        .ok_or(SymbolStoreError::QuotaExceeded { used, max })
 }
 
 /// Validate that object metadata declares a source-symbol count supported by
@@ -169,7 +173,7 @@ pub trait SymbolStore: Send + Sync {
     /// List all object IDs with symbols in a zone.
     async fn list_zone(&self, zone_id: &ZoneId) -> Vec<ObjectId>;
 
-    /// Get total storage used in bytes.
+    /// Get total charged storage in bytes, including resident object metadata.
     async fn storage_used(&self) -> u64;
 
     /// Get storage quota in bytes.
@@ -193,7 +197,7 @@ pub trait SymbolStore: Send + Sync {
 /// Configuration for in-memory symbol store.
 #[derive(Debug, Clone)]
 pub struct MemorySymbolStoreConfig {
-    /// Maximum storage in bytes.
+    /// Maximum charged storage in bytes, including resident object metadata.
     pub max_bytes: u64,
     /// Local node ID for distribution tracking.
     pub local_node_id: u64,
@@ -377,15 +381,10 @@ impl SymbolStore for MemorySymbolStore {
 
         let size = Self::symbol_size(&symbol);
         let mut used = self.used_bytes.write();
-        if *used + size > self.config.max_bytes {
-            return Err(SymbolStoreError::QuotaExceeded {
-                used: *used,
-                max: self.config.max_bytes,
-            });
-        }
+        let next_used = checked_symbol_storage_used(*used, size, self.config.max_bytes)?;
 
         obj.symbols.insert(symbol.meta.esi, symbol);
-        *used += size;
+        *used = next_used;
 
         Ok(())
     }
@@ -412,18 +411,20 @@ impl SymbolStore for MemorySymbolStore {
             return Ok(());
         }
 
-        // Reserve enough buckets for common small objects, but do not let a
-        // valid sparse high-K object burn a large allocation while the global
-        // object map is write-locked. HashMap growth preserves overwrite,
-        // duplicate, and reconstruction semantics once symbols arrive.
-        let capacity = initial_symbol_map_capacity(meta.source_symbols);
+        // Hold the object and accounting locks together: concurrent metadata
+        // admissions must not each observe the same remaining quota. An empty
+        // map reserves no symbol buckets before payloads actually arrive.
+        let mut used = self.used_bytes.write();
+        let next_used =
+            checked_symbol_storage_used(*used, object_metadata_size(&meta), self.config.max_bytes)?;
         objects.insert(
             meta.object_id,
             RwLock::new(ObjectSymbols {
                 meta,
-                symbols: HashMap::with_capacity(capacity),
+                symbols: HashMap::new(),
             }),
         );
+        *used = next_used;
 
         Ok(())
     }
@@ -575,7 +576,8 @@ impl SymbolStore for MemorySymbolStore {
             .ok_or(SymbolStoreError::ObjectNotFound(*object_id))?
             .into_inner();
 
-        let total_size: u64 = obj.symbols.values().map(Self::symbol_size).sum();
+        let total_size = obj.symbols.values().map(Self::symbol_size).sum::<u64>()
+            + object_metadata_size(&obj.meta);
         let mut used = self.used_bytes.write();
         *used = used.saturating_sub(total_size);
 
@@ -979,6 +981,7 @@ mod tests {
                 "object map key must match stored object metadata"
             );
             validate_source_symbols(&obj.meta).expect("stored object metadata must stay valid");
+            expected_used += object_metadata_size(&obj.meta);
             for (esi, symbol) in &obj.symbols {
                 assert_eq!(
                     *esi, symbol.meta.esi,
@@ -997,7 +1000,7 @@ mod tests {
         let actual_used = *store.used_bytes.read();
         assert_eq!(
             actual_used, expected_used,
-            "used_bytes must equal the sum of live symbol sizes"
+            "used_bytes must equal the sum of resident metadata and live symbol sizes"
         );
     }
 
@@ -1808,13 +1811,14 @@ mod tests {
                             data: Bytes::from(vec![0xAA; 63]),
                         },
                     );
-                    *store.used_bytes.write() = MemorySymbolStore::symbol_size(&obj.symbols[&0]);
+                    *store.used_bytes.write() = object_metadata_size(&obj.meta)
+                        + MemorySymbolStore::symbol_size(&obj.symbols[&0]);
                 }
 
                 assert_eq!(store.symbol_count(&meta.object_id).await, 0);
                 assert!(!store.can_reconstruct(&meta.object_id).await);
                 assert!(store.get_all_symbols(&meta.object_id).await.is_empty());
-                assert_eq!(store.storage_used().await, 0);
+                assert_eq!(store.storage_used().await, object_metadata_size(&meta));
 
                 let dist = store.get_distribution(&meta.object_id).await.unwrap();
                 assert_eq!(dist.total_symbols, 0);
@@ -1841,7 +1845,7 @@ mod tests {
     fn quota_enforcement() {
         run_store_test("symbol_quota_enforcement", "verify", "write", 1, || async {
             let config = MemorySymbolStoreConfig {
-                max_bytes: 200,
+                max_bytes: object_metadata_size(&test_object_meta()) + 200,
                 local_node_id: 0,
             };
             let store = MemorySymbolStore::new(config);
@@ -1865,6 +1869,106 @@ mod tests {
         });
     }
 
+    #[fcp_async_core::runtime::test]
+    async fn metadata_quota_covers_empty_objects_duplicates_and_deletion() {
+        let mut meta = test_object_meta();
+        meta.source_symbols = MAX_SOURCE_SYMBOLS;
+        let charge = object_metadata_size(&meta);
+        for max_bytes in [0, charge - 1] {
+            let store = MemorySymbolStore::new(MemorySymbolStoreConfig {
+                max_bytes,
+                local_node_id: 0,
+            });
+            assert!(matches!(
+                store.put_object_meta(meta.clone()).await,
+                Err(SymbolStoreError::QuotaExceeded { .. })
+            ));
+            assert_eq!(store.storage_used().await, 0);
+            assert!(store.list_zone(&meta.zone_id).await.is_empty());
+        }
+
+        let store = MemorySymbolStore::new(MemorySymbolStoreConfig {
+            max_bytes: charge + MemorySymbolStore::symbol_size(&test_symbol(0)),
+            local_node_id: 0,
+        });
+        store.put_object_meta(meta.clone()).await.unwrap();
+        assert_eq!(store.storage_used().await, charge);
+        assert_eq!(
+            store.objects.read()[&meta.object_id]
+                .read()
+                .symbols
+                .capacity(),
+            0
+        );
+        store.put_object_meta(meta.clone()).await.unwrap();
+        assert_eq!(store.storage_used().await, charge);
+
+        let mut conflicting = meta.clone();
+        conflicting.first_symbol_at += 1;
+        assert!(matches!(
+            store.put_object_meta(conflicting).await,
+            Err(SymbolStoreError::InvalidSymbol { .. })
+        ));
+        let mut other = meta.clone();
+        other.object_id = ObjectId::from_bytes([73; 32]);
+        assert!(matches!(
+            store.put_object_meta(other.clone()).await,
+            Err(SymbolStoreError::QuotaExceeded { .. })
+        ));
+        store.put_symbol(test_symbol(0)).await.unwrap();
+        assert_eq!(store.storage_used().await, store.storage_quota().await);
+        store.delete_symbol(&meta.object_id, 0).await.unwrap();
+        assert_eq!(store.storage_used().await, charge);
+        store.delete_object(&meta.object_id).await.unwrap();
+        assert_eq!(store.storage_used().await, 0);
+        store.put_object_meta(other).await.unwrap();
+        assert_eq!(store.storage_used().await, charge);
+    }
+
+    #[test]
+    fn concurrent_metadata_admissions_share_one_quota() {
+        const WORKERS: u8 = 16;
+        const SLOTS: u64 = 8;
+        let sample = test_object_meta();
+        let charge = object_metadata_size(&sample);
+        let store = Arc::new(MemorySymbolStore::new(MemorySymbolStoreConfig {
+            max_bytes: charge * SLOTS,
+            local_node_id: 0,
+        }));
+        let start = Arc::new(Barrier::new(usize::from(WORKERS)));
+        let workers: Vec<_> = (0..WORKERS)
+            .map(|index| {
+                let store = Arc::clone(&store);
+                let start = Arc::clone(&start);
+                let mut meta = sample.clone();
+                meta.object_id = ObjectId::from_bytes([index; 32]);
+                meta.source_symbols = MAX_SOURCE_SYMBOLS;
+                std::thread::spawn(move || {
+                    start.wait();
+                    fcp_async_core::runtime::block_on_sync(store.put_object_meta(meta))
+                        .expect("runtime")
+                })
+            })
+            .collect();
+        let mut accepted = 0;
+        for worker in workers {
+            match worker.join().expect("metadata worker") {
+                Ok(()) => accepted += 1,
+                Err(SymbolStoreError::QuotaExceeded { .. }) => {}
+                Err(error) => panic!("unexpected metadata error: {error}"),
+            }
+        }
+        assert_eq!(accepted, SLOTS);
+        assert_eq!(*store.used_bytes.read(), charge * SLOTS);
+        let objects = store.objects.read();
+        assert_eq!(u64::try_from(objects.len()).unwrap(), SLOTS);
+        assert!(
+            objects
+                .values()
+                .all(|object| object.read().symbols.capacity() == 0)
+        );
+    }
+
     #[test]
     fn duplicate_symbol_does_not_hit_quota() {
         run_store_test(
@@ -1876,7 +1980,7 @@ mod tests {
                 let sample = test_symbol(0);
                 let size = MemorySymbolStore::symbol_size(&sample);
                 let config = MemorySymbolStoreConfig {
-                    max_bytes: size,
+                    max_bytes: object_metadata_size(&test_object_meta()) + size,
                     local_node_id: 0,
                 };
                 let store = MemorySymbolStore::new(config);
@@ -2214,17 +2318,15 @@ mod tests {
     }
 
     #[test]
-    fn initial_symbol_map_capacity_caps_sparse_metadata() {
-        assert_eq!(initial_symbol_map_capacity(100), 100);
-        assert_eq!(initial_symbol_map_capacity(1_000), 1_000);
+    fn symbol_quota_arithmetic_rejects_overflow_even_at_maximum_quota() {
         assert_eq!(
-            initial_symbol_map_capacity(10_000),
-            MAX_EAGER_SYMBOL_MAP_CAPACITY
+            checked_symbol_storage_used(u64::MAX - 1, 1, u64::MAX).unwrap(),
+            u64::MAX
         );
-        assert_eq!(
-            initial_symbol_map_capacity(MAX_SOURCE_SYMBOLS),
-            MAX_EAGER_SYMBOL_MAP_CAPACITY
-        );
+        assert!(matches!(
+            checked_symbol_storage_used(u64::MAX, 1, u64::MAX),
+            Err(SymbolStoreError::QuotaExceeded { .. })
+        ));
     }
 
     #[test]
@@ -2241,14 +2343,11 @@ mod tests {
 
                 store.put_object_meta(meta.clone()).await.unwrap();
 
-                let expected_capacity =
-                    HashMap::<u32, StoredSymbol>::with_capacity(MAX_EAGER_SYMBOL_MAP_CAPACITY)
-                        .capacity();
                 {
                     let objects = store.objects.read();
                     let obj = objects.get(&meta.object_id).unwrap().read();
                     assert_eq!(obj.meta.source_symbols, MAX_SOURCE_SYMBOLS);
-                    assert_eq!(obj.symbols.capacity(), expected_capacity);
+                    assert_eq!(obj.symbols.capacity(), 0);
                     assert!(obj.symbols.is_empty());
                 }
 
@@ -2262,8 +2361,7 @@ mod tests {
                     symbol_count: Some(1),
                     details: Some(json!({
                         "source_symbols": MAX_SOURCE_SYMBOLS,
-                        "initial_capacity": expected_capacity,
-                        "cap": MAX_EAGER_SYMBOL_MAP_CAPACITY
+                        "initial_capacity": 0
                     })),
                     ..StoreLogData::default()
                 }
@@ -3026,9 +3124,9 @@ mod tests {
             || async {
                 let sample = test_symbol(0);
                 let size = MemorySymbolStore::symbol_size(&sample);
-                // Set quota to exactly 2 symbols worth
+                // Set quota to exactly the metadata plus two symbols.
                 let config = MemorySymbolStoreConfig {
-                    max_bytes: size * 2,
+                    max_bytes: object_metadata_size(&test_object_meta()) + size * 2,
                     local_node_id: 0,
                 };
                 let store = MemorySymbolStore::new(config);
@@ -3061,7 +3159,7 @@ mod tests {
             let sample = test_symbol(0);
             let size = MemorySymbolStore::symbol_size(&sample);
             let config = MemorySymbolStoreConfig {
-                max_bytes: size,
+                max_bytes: object_metadata_size(&test_object_meta()) + size,
                 local_node_id: 0,
             };
             let store = MemorySymbolStore::new(config);
