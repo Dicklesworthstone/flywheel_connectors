@@ -2296,6 +2296,42 @@ struct RegistryEntry {
     state_policy: ConnectorStatePolicy,
 }
 
+impl RegistryEntry {
+    /// These three fields are enforced from the current registry generation,
+    /// never from the native process's startup configuration. Updating them
+    /// must not restart a stateful writer just to revoke an operation.
+    ///
+    /// Keep this an explicit allow-list: zone binding, executable identity,
+    /// manifest authority, credentials, state paths and runtime policy still
+    /// require the ordinary replacement/handoff path.
+    fn permits_native_policy_update(
+        &self,
+        candidate: &ConnectorConfig,
+        state_policy: ConnectorStatePolicy,
+    ) -> bool {
+        if !matches!(&self.connector, ConnectorRuntime::Native(_))
+            || self.state_policy != state_policy
+        {
+            return false;
+        }
+        let mut runtime_config = candidate.clone();
+        runtime_config.allowed_operations = self.config.allowed_operations.clone();
+        runtime_config.enforce_empty_allow_lists = self.config.enforce_empty_allow_lists;
+        runtime_config.enforce_operation_network_constraints =
+            self.config.enforce_operation_network_constraints;
+        runtime_config == self.config
+    }
+
+    fn retains_native_runtime(&self, candidate: &Self) -> bool {
+        self.permits_native_policy_update(&candidate.config, candidate.state_policy)
+            && matches!(
+                (&self.connector, &candidate.connector),
+                (ConnectorRuntime::Native(current), ConnectorRuntime::Native(next))
+                    if Arc::ptr_eq(current, next)
+            )
+    }
+}
+
 fn validate_state_policy_replacement(
     connector_id: &ConnectorId,
     current: &RegistryEntry,
@@ -3242,6 +3278,13 @@ impl SubprocessRegistry {
         let mut replacement_entries = HashMap::new();
         for connector_id in &plan.replacement_ids {
             let admitted = validate_registry_config(&plan.next_configs[connector_id])?;
+            if let Some(entry) = self
+                .native_policy_update(connector_id, &plan.next_configs[connector_id], &admitted)
+                .await?
+            {
+                replacement_entries.insert(connector_id.clone(), entry);
+                continue;
+            }
             self.require_state_policy_replacement(connector_id, admitted.state_policy)
                 .await?;
             let entry = build_registry_entry_with_admission(
@@ -3257,6 +3300,28 @@ impl SubprocessRegistry {
             plan,
             replacement_entries,
         })
+    }
+
+    async fn native_policy_update(
+        &self,
+        connector_id: &ConnectorId,
+        config: &ConnectorConfig,
+        admitted: &ValidatedConnectorConfig,
+    ) -> HostResult<Option<RegistryEntry>> {
+        let state = self.state.read().await;
+        let Some(current) = state.connectors.get(connector_id) else {
+            return Ok(None);
+        };
+        if !current.permits_native_policy_update(config, admitted.state_policy) {
+            return Ok(None);
+        }
+        admitted.state_policy.require_admitted_manifest(config)?;
+        Ok(Some(RegistryEntry {
+            config: config.clone(),
+            connector: current.connector.clone(),
+            manifest_constraints: admitted.manifest_constraints.clone(),
+            state_policy: admitted.state_policy,
+        }))
     }
 
     async fn require_state_policy_replacement(
@@ -3278,6 +3343,13 @@ impl SubprocessRegistry {
         let plan = self.plan_configs(configs).await?;
         for connector_id in &plan.replacement_ids {
             let admitted = validate_registry_config(&plan.next_configs[connector_id])?;
+            if self
+                .native_policy_update(connector_id, &plan.next_configs[connector_id], &admitted)
+                .await?
+                .is_some()
+            {
+                continue;
+            }
             self.require_state_policy_replacement(connector_id, admitted.state_policy)
                 .await?;
         }
@@ -3334,7 +3406,19 @@ impl SubprocessRegistry {
             if let Some(replacement) = prepared.replacement_entries.get(connector_id)
                 && let Some(current) = state.connectors.get(connector_id)
             {
-                validate_state_policy_replacement(connector_id, current, replacement.state_policy)?;
+                if current.retains_native_runtime(replacement) {
+                    // Preparation can wait behind other work. A policy-only
+                    // publication cannot silently admit a modified manifest.
+                    replacement
+                        .state_policy
+                        .require_admitted_manifest(&replacement.config)?;
+                } else {
+                    validate_state_policy_replacement(
+                        connector_id,
+                        current,
+                        replacement.state_policy,
+                    )?;
+                }
             }
             let entry = prepared
                 .replacement_entries
@@ -34925,6 +35009,216 @@ done"#;
             };
             assert!(Arc::ptr_eq(retained, &connector));
         }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn registry_native_policy_update_preserves_state_and_fences_old_admission() {
+        let _guard = set_test_hrw_lease_routing_override(Some(state_policy_test_routing()));
+        for model in ["singleton_writer", "crdt"] {
+            let directory = tempfile::tempdir().expect("state policy directory");
+            let connector_id = "fcp.webhook-receiver";
+            let key = ConnectorId::from_static(connector_id);
+            let mut config = dispatcher_test_config(connector_id);
+            config.manifest_path = Some(write_state_policy_test_manifest(
+                directory.path(),
+                Some(model),
+                false,
+            ));
+            config.allowed_operations = vec!["webhook.events.poll".into()];
+            let requests = Arc::new(AtomicU64::new(0));
+            let observed = Arc::clone(&requests);
+            let (runner_tx, mut runner_rx) = mpsc::channel::<ConnectorRpcRequest>(4);
+            let runner_task = task::spawn(async move {
+                while let Some(request) = runner_rx.recv().await {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    let _ = request.response_tx.send(Ok(json!({"result": {}})));
+                }
+            });
+            let connector = dispatcher_test_connector(connector_id, runner_tx, runner_task);
+            *connector.handshaken_zone.lock().await = Some(ZoneId::work());
+            let registry = dispatcher_registry_with_connector(
+                connector_id,
+                Arc::clone(&connector),
+                config.clone(),
+            );
+            let version = registry.version();
+            let queued = registry.inventory_fence(version);
+            let request = runtime_network_test_request(connector_id, "webhook.events.poll");
+            enforce_connector_allow_lists(
+                &registry.allow_list_snapshot(&key).await.unwrap(),
+                &request,
+            )
+            .expect("operation initially allowed");
+
+            let mut restricted = config.clone();
+            restricted.allowed_operations.clear();
+            restricted.enforce_empty_allow_lists = true;
+            restricted.enforce_operation_network_constraints = true;
+            let preview = registry
+                .preview_configs(vec![restricted.clone()])
+                .await
+                .unwrap();
+            assert_eq!(preview.updated, vec![connector_id]);
+            assert_eq!(preview.registry_version, version);
+            assert_eq!(registry.inventory().await, vec![config.clone()]);
+            assert!(queued.is_current());
+
+            let report = registry
+                .apply_configs(vec![restricted.clone()])
+                .await
+                .unwrap();
+            assert_eq!(report.updated, vec![connector_id]);
+            assert_eq!(report.registry_version, version + 1);
+            assert!(!queued.is_current(), "queued authority must be invalidated");
+            assert_eq!(registry.inventory().await, vec![restricted]);
+            let policy = registry.allow_list_snapshot(&key).await.unwrap();
+            assert!(policy.enforce_operation_network_constraints);
+            enforce_connector_allow_lists(&policy, &request)
+                .expect_err("revoked operation must be refused before native dispatch");
+            {
+                let state = registry.state.read().await;
+                let ConnectorRuntime::Native(retained) = &state.connectors[&key].connector else {
+                    panic!("policy publication changed the runtime kind");
+                };
+                assert!(Arc::ptr_eq(retained, &connector));
+                assert_eq!(
+                    retained.handshaken_zone.lock().await.as_ref(),
+                    Some(&ZoneId::work())
+                );
+            }
+            assert_eq!(
+                requests.load(Ordering::SeqCst),
+                0,
+                "no configure or handshake RPC"
+            );
+
+            registry.apply_configs(vec![config]).await.unwrap();
+            enforce_connector_allow_lists(
+                &registry.allow_list_snapshot(&key).await.unwrap(),
+                &request,
+            )
+            .expect("explicit restoration of operation policy is effective");
+            assert_eq!(requests.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn registry_native_policy_update_rejects_runtime_changes_and_manifest_drift() {
+        let _guard = set_test_hrw_lease_routing_override(Some(state_policy_test_routing()));
+        let directory = tempfile::tempdir().expect("state policy directory");
+        let connector_id = "fcp.webhook-receiver";
+        let mut config = dispatcher_test_config(connector_id);
+        let path = write_state_policy_test_manifest(directory.path(), Some("crdt"), false);
+        config.manifest_path = Some(path.clone());
+        let (runner_tx, mut runner_rx) = mpsc::channel::<ConnectorRpcRequest>(4);
+        let runner_task = task::spawn(async move { while runner_rx.recv().await.is_some() {} });
+        let connector = dispatcher_test_connector(connector_id, runner_tx, runner_task);
+        let registry = dispatcher_registry_with_connector(connector_id, connector, config.clone());
+        let mut restricted = config.clone();
+        restricted.enforce_empty_allow_lists = true;
+        let mut candidates = Vec::new();
+        let mut candidate = restricted.clone();
+        candidate
+            .env
+            .insert("FCP_STATE_ROOT".into(), "/different-state".into());
+        candidates.push(candidate);
+        let mut candidate = restricted.clone();
+        candidate.config = Some(json!({"changed": true}));
+        candidates.push(candidate);
+        let mut candidate = restricted.clone();
+        candidate.allowed_zones = vec![ZoneId::private().to_string()];
+        candidates.push(candidate);
+        let mut candidate = restricted.clone();
+        candidate.version = Some("2.0.0".into());
+        candidates.push(candidate);
+        for candidate in candidates {
+            let error = registry
+                .preview_configs(vec![candidate.clone()])
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("canonical state handoff"),
+                "{error}"
+            );
+            assert!(registry.prepare_configs(vec![candidate]).await.is_err());
+        }
+        assert_eq!(registry.version(), 1);
+        assert_eq!(registry.inventory().await, vec![config.clone()]);
+
+        let prepared = registry
+            .prepare_configs(vec![restricted.clone()])
+            .await
+            .unwrap();
+        let original = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, format!("{original}\n# changed after preparation\n")).unwrap();
+        let error = registry.publish_configs(prepared).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("manifest changed after state admission"),
+            "{error}"
+        );
+        assert_eq!(registry.version(), 1);
+        assert_eq!(registry.inventory().await, vec![config]);
+        let error = registry
+            .preview_configs(vec![restricted])
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("canonical state handoff"),
+            "{error}"
+        );
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn registry_native_policy_update_refuses_stale_or_substituted_runtime() {
+        let directory = tempfile::tempdir().expect("state policy directory");
+        let connector_id = "fcp.webhook-receiver";
+        let key = ConnectorId::from_static(connector_id);
+        let mut config = dispatcher_test_config(connector_id);
+        config.manifest_path = Some(write_state_policy_test_manifest(
+            directory.path(),
+            Some("crdt"),
+            false,
+        ));
+        let (runner_tx, mut runner_rx) = mpsc::channel::<ConnectorRpcRequest>(4);
+        let runner_task = task::spawn(async move { while runner_rx.recv().await.is_some() {} });
+        let connector = dispatcher_test_connector(connector_id, runner_tx, runner_task);
+        let registry = dispatcher_registry_with_connector(connector_id, connector, config.clone());
+        let mut restricted = config.clone();
+        restricted.enforce_empty_allow_lists = true;
+        let mut forged = registry
+            .prepare_configs(vec![restricted.clone()])
+            .await
+            .unwrap();
+        let (runner_tx, mut runner_rx) = mpsc::channel::<ConnectorRpcRequest>(4);
+        let runner_task = task::spawn(async move { while runner_rx.recv().await.is_some() {} });
+        forged.replacement_entries.get_mut(&key).unwrap().connector = ConnectorRuntime::Native(
+            dispatcher_test_connector(connector_id, runner_tx, runner_task),
+        );
+        let error = registry.publish_configs(forged).await.unwrap_err();
+        assert!(
+            error.to_string().contains("canonical state handoff"),
+            "{error}"
+        );
+        assert_eq!(registry.version(), 1);
+
+        let stale = registry
+            .prepare_configs(vec![restricted.clone()])
+            .await
+            .unwrap();
+        let mut newer = config;
+        newer.allowed_operations = vec!["webhook.events.poll".into()];
+        registry.apply_configs(vec![newer.clone()]).await.unwrap();
+        let error = registry.publish_configs(stale).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("inventory changed during preparation"),
+            "{error}"
+        );
+        assert_eq!(registry.version(), 2);
+        assert_eq!(registry.inventory().await, vec![newer]);
     }
 
     #[derive(Clone, Copy)]

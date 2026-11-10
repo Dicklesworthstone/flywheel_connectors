@@ -68,10 +68,22 @@ of a validated generation. Unreadable or invalid manifest evidence, and
 attempts to downgrade or remove established stateful policy, fail closed
 while retaining the published generation.
 
+Host-only operation policy can be changed on a persistent native runtime
+without restarting it. Updates limited to `allowed_operations`,
+`enforce_empty_allow_lists`, and `enforce_operation_network_constraints`
+retain the exact native process and its existing handshake and state. The
+host validates the unchanged manifest and publishes a new inventory
+generation, so queued invocations admitted under the previous policy must
+be admitted again. For example, setting `allowed_operations: []` and
+`enforce_empty_allow_lists: true` stops new operation dispatch without
+discarding the receiver's retained endpoints or events. Already-dispatched
+work keeps its ordinary cancellation and settlement semantics.
+
 Hot replacement of an executable native process, warm pool, or WASI runtime
 is refused before spawning a replacement when either the current or proposed
-state model is singleton-writer or CRDT. This includes same-model configuration
-and manifest edits: the active runtime remains intact until verified quiescence
+state model is singleton-writer or CRDT. This includes same-model connector
+configuration, credentials, zone binding, executable and manifest edits:
+the active runtime remains intact until verified quiescence
 and canonical state handoff are supported. An inert
 `UnavailableNativeProxyOnly` registration has no live connector state and may
 accept otherwise valid same-model metadata or manifest updates. Explicit
