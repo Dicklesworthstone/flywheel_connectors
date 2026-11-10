@@ -1611,6 +1611,14 @@ fwc batch-file operations.jsonl --dry-run
 fwc batch-file operations.jsonl
 ```
 
+Independent `fwc map` and `fwc batch-file` runs receive fresh run identities.
+Use `--idempotency-key <key>` only to deliberately reuse a run after reconciling
+its effects. Keep map item positions and batch JSONL member IDs stable: each
+member retains its effect key, while changed input remains subject to the host's
+idempotency conflict checks. JSON `execution` metadata preserves the run key and
+each member's request ID and key, including when the host reply is unusable.
+An uncertain outcome never triggers an automatic retry.
+
 ### MCP Tool Export
 
 ```bash

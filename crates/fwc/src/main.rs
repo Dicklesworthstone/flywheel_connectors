@@ -3336,6 +3336,11 @@ struct MapArgs {
     #[arg(long)]
     lease_seq: Option<u64>,
 
+    /// Run namespace for intentional retries; independent runs get a fresh key.
+    /// Reuse preserves member identity but does not authorize uncertain effects.
+    #[arg(long, value_name = "KEY", value_parser = parse_workflow_idempotency_key)]
+    idempotency_key: Option<String>,
+
     #[command(flatten)]
     auth: LiveAuthArgs,
 }
@@ -3360,6 +3365,11 @@ struct BatchFileArgs {
     /// Default execution zone for operations that do not specify one in the JSONL file.
     #[arg(long)]
     zone: Option<String>,
+
+    /// Run namespace for intentional retries; member IDs must stay stable.
+    /// Reconcile completed and uncertain effects before reusing this key.
+    #[arg(long, value_name = "KEY", value_parser = parse_workflow_idempotency_key)]
+    idempotency_key: Option<String>,
 
     #[command(flatten)]
     auth: LiveAuthArgs,
@@ -27203,6 +27213,51 @@ fn build_host_batch_options(concurrency: usize, on_error: batch::OnError) -> Hos
     }
 }
 
+/// Retain identities without copying operation inputs or invocation credentials.
+fn batch_execution_evidence(run_key: &str, request: &HostBatchInvokeRequest) -> Value {
+    json!({
+        "idempotency_key": run_key,
+        "members": request.operations.iter().map(|member| json!({
+            "id": member.id,
+            "request_id": member.request.id,
+            "idempotency_key": member.request.idempotency_key,
+            "connector_id": member.request.connector_id,
+            "operation": member.request.operation,
+            "zone": member.request.zone_id,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+fn submit_namespaced_batch(
+    client: &HostAdminClient,
+    request: &HostBatchInvokeRequest,
+    command: &str,
+    run_key: &str,
+) -> std::result::Result<HostBatchInvokeResponse, DispatchOutcome> {
+    client.batch(request).map_err(|error| {
+        let mut outcome = error
+            .downcast_ref::<invocation_cmd::BatchOutcomeUnknown>()
+            .map_or_else(
+                || {
+                    invocation_cmd::BatchOutcomeUnknown::from_requests(
+                        request
+                            .operations
+                            .iter()
+                            .map(|member| (member.id.as_str(), &member.request)),
+                        &client.endpoint,
+                        &error,
+                    )
+                    .dispatch(command)
+                },
+                |unknown| unknown.dispatch(command),
+            );
+        // Batch result IDs name members, not the host invocation identities.
+        // Preserve both and the run namespace even when the reply is unusable.
+        outcome.payload["execution"] = batch_execution_evidence(run_key, request);
+        outcome
+    })
+}
+
 fn validate_payload_against_schema(payload: &Value, schema: &Value) -> (bool, Vec<Value>) {
     let validation = validate::validate(payload, schema);
     let errors = validation
@@ -32290,6 +32345,10 @@ fn map_dispatch(args: &MapArgs, explicit_host: Option<&str>) -> Result<DispatchO
         preview_inputs: inputs.items[..preview_count].to_vec(),
     };
 
+    let run_key = args
+        .idempotency_key
+        .clone()
+        .unwrap_or_else(|| RequestId::random().to_string());
     let mut invalid_items = Vec::new();
     let mut operations = Vec::new();
     for (index, payload) in inputs.items.iter().cloned().enumerate() {
@@ -32303,26 +32362,31 @@ fn map_dispatch(args: &MapArgs, explicit_host: Option<&str>) -> Result<DispatchO
             }));
             continue;
         }
+        let member_id = format!("item-{}", index + 1);
+        let (request_id, idempotency_key) = workflow_step_identity(
+            "map",
+            "map",
+            PipelinePlanMode::Run,
+            &run_key,
+            &member_id,
+            resolved.connector.summary.id.as_str(),
+            &resolved.operation.name,
+            &zone,
+            &payload,
+        )?;
         let request = build_live_invoke_request(
             resolved.connector.summary.id.as_str(),
             &resolved.operation.name,
             &zone,
             payload,
-            derive_live_request_id(
-                resolved.connector.summary.id.as_str(),
-                &resolved.operation.name,
-                &zone,
-                &inputs.items[index],
-                None,
-                Some(&format!("map-item-{}", index + 1)),
-            )?,
+            request_id,
             &auth,
-            None,
+            idempotency_key,
             args.lease_seq,
             None,
         )?;
         operations.push(HostBatchOperation {
-            id: format!("item-{}", index + 1),
+            id: member_id,
             request,
             depends_on: Vec::new(),
         });
@@ -32363,7 +32427,10 @@ fn map_dispatch(args: &MapArgs, explicit_host: Option<&str>) -> Result<DispatchO
         operations,
         options: build_host_batch_options(args.concurrency, on_error),
     };
-    let response = client.batch(&request)?;
+    let response = match submit_namespaced_batch(&client, &request, "map", &run_key) {
+        Ok(response) => response,
+        Err(outcome) => return Ok(outcome),
+    };
     let (status, exit_code) = batch_status_label(&response);
 
     let envelope = CommandEnvelope::new(CommandAvailability::LiveRuntime, "map");
@@ -32391,6 +32458,7 @@ fn map_dispatch(args: &MapArgs, explicit_host: Option<&str>) -> Result<DispatchO
         },
         "zone": zone,
         "plan": plan,
+        "execution": batch_execution_evidence(&run_key, &request),
         "response": response,
         "next_actions": [
             format!("fwc status {} --host {}", resolved.connector.slug, host.endpoint),
@@ -32454,6 +32522,10 @@ fn batch_file_dispatch(
     let mut request_operations = Vec::new();
     let mut preflights = Vec::new();
     let mut introspection_cache: BTreeMap<String, HostIntrospectionResponse> = BTreeMap::new();
+    let run_key = args
+        .idempotency_key
+        .clone()
+        .unwrap_or_else(|| RequestId::random().to_string());
 
     for op in &batch.operations {
         let connector = match catalog.resolve_connector(&op.connector) {
@@ -32504,15 +32576,24 @@ fn batch_file_dispatch(
             continue;
         }
 
+        // Stable member IDs and an explicit run key identify the intended
+        // effects; changed input must still reach the host's conflict checks.
+        let (request_id, idempotency_key) = workflow_step_identity(
+            "batch-file",
+            "batch-file",
+            if args.dry_run {
+                PipelinePlanMode::DryRun
+            } else {
+                PipelinePlanMode::Run
+            },
+            &run_key,
+            &op.id,
+            connector.summary.id.as_str(),
+            &operation.name,
+            &zone,
+            &op.input,
+        )?;
         if args.dry_run {
-            let request_id = derive_live_request_id(
-                connector.summary.id.as_str(),
-                &operation.name,
-                &zone,
-                &op.input,
-                None,
-                Some(op.id.as_str()),
-            )?;
             let preflight_request = HostPreflightRequest {
                 holder_proof: auth.holder_proof_for(&request_id, &operation.name)?,
                 request_id,
@@ -32535,6 +32616,7 @@ fn batch_file_dispatch(
             let response = client.preflight(&preflight_request)?;
             preflights.push(json!({
                 "id": &op.id,
+                "request_id": preflight_request.request_id,
                 "connector": &connector.slug,
                 "operation": &operation.name,
                 "zone": &zone,
@@ -32553,16 +32635,9 @@ fn batch_file_dispatch(
             &operation.name,
             &zone,
             op.input.clone(),
-            derive_live_request_id(
-                connector.summary.id.as_str(),
-                &operation.name,
-                &zone,
-                &op.input,
-                None,
-                Some(op.id.as_str()),
-            )?,
+            request_id,
             &auth,
-            None,
+            idempotency_key,
             op.lease_seq,
             None,
         )?;
@@ -32616,6 +32691,7 @@ fn batch_file_dispatch(
             "file": args.file.display().to_string(),
             "dry_run": true,
             "plan": plan,
+            "execution": { "idempotency_key": run_key },
             "preflights": preflights,
             "next_actions": [
                 format!("fwc batch-file {} --host {}", args.file.display(), host.endpoint),
@@ -32629,7 +32705,10 @@ fn batch_file_dispatch(
         operations: request_operations,
         options: build_host_batch_options(args.concurrency, on_error),
     };
-    let response = client.batch(&request)?;
+    let response = match submit_namespaced_batch(&client, &request, "batch-file", &run_key) {
+        Ok(response) => response,
+        Err(outcome) => return Ok(outcome),
+    };
     let (status, exit_code) = batch_status_label(&response);
 
     let envelope = CommandEnvelope::new(CommandAvailability::LiveRuntime, "batch");
@@ -32646,6 +32725,7 @@ fn batch_file_dispatch(
         "file": args.file.display().to_string(),
         "dry_run": false,
         "plan": plan,
+        "execution": batch_execution_evidence(&run_key, &request),
         "response": response,
         "next_actions": plan.connectors.iter().map(|connector| {
             format!("fwc status {connector} --host {}", host.endpoint)
@@ -55606,6 +55686,242 @@ depends_on = ["missing"]
         assert_eq!(payload["response"]["completed"], 2);
         assert_eq!(payload["response"]["failed"], 0);
         assert_eq!(payload["plan"]["input_count"], 2);
+    }
+
+    fn run_batch_identity_case(
+        command: &str,
+        run_key: Option<&str>,
+        title: &str,
+        usable_reply: bool,
+    ) -> (Value, Value) {
+        let temp_dir = tempfile::tempdir().expect("batch identity tempdir");
+        let capability_token = test_capability_token_arg();
+        let input = json!({
+            "owner": "octocat",
+            "repo": "hello-world",
+            "title": title,
+        });
+        let inputs = json!([input, input]).to_string();
+        let path = temp_dir.path().join("identity-batch.jsonl");
+        fs::write(
+            &path,
+            ["item-1", "item-2"]
+                .iter()
+                .map(|id| {
+                    json!({
+                        "id": id,
+                        "connector": "github",
+                        "operation": "issues.create",
+                        "input": input,
+                    })
+                    .to_string()
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .expect("write identity batch");
+        let path_text = path.display().to_string();
+        let batch_response = if usable_reply {
+            mock_batch_response_json(&["item-1", "item-2"])
+        } else {
+            json!({ "invalid": "private-host-error-body" })
+        };
+        let (host, server, request_log) = spawn_mock_host_sequence_with_body_log(vec![
+            (
+                "POST /rpc/discover".to_owned(),
+                mock_discovery_response_json(),
+            ),
+            (
+                "GET /rpc/introspect/fcp.github:enterprise:v1".to_owned(),
+                mock_introspection_response_json(),
+            ),
+            ("POST /rpc/batch".to_owned(), batch_response),
+        ]);
+        let mut arguments = vec!["fwc", "--json", "--host", &host, command];
+        if command == "map" {
+            arguments.extend(["github.issues.create", "--inputs", &inputs]);
+        } else {
+            arguments.push(&path_text);
+        }
+        arguments.extend(["--capability-token", &capability_token]);
+        if let Some(key) = run_key {
+            arguments.extend(["--idempotency-key", key]);
+        }
+        let (exit_code, payload) = execute_json(&arguments);
+        server.join().expect("mock host thread should complete");
+        assert_eq!(
+            exit_code,
+            if usable_reply {
+                CliExitCode::Success
+            } else {
+                CliExitCode::Transport
+            }
+            .into(),
+            "{payload}"
+        );
+        let requests = request_log.lock().expect("request log should lock");
+        assert_eq!(requests.len(), 3, "batch must be submitted exactly once");
+        let request: Value = serde_json::from_str(&requests[2].1).expect("sent batch request");
+        assert_eq!(payload["command"], command);
+        let members = payload["execution"]["members"]
+            .as_array()
+            .expect("retained member identities");
+        assert_eq!(members.len(), 2);
+        for (index, member) in members.iter().enumerate() {
+            let sent = &request["operations"][index];
+            assert_eq!(member["id"], sent["id"]);
+            assert_eq!(member["request_id"], sent["request"]["id"]);
+            assert_eq!(
+                member["idempotency_key"],
+                sent["request"]["idempotency_key"]
+            );
+            assert!(
+                member["idempotency_key"]
+                    .as_str()
+                    .is_some_and(|key| !key.is_empty())
+            );
+        }
+        let evidence = payload["execution"].to_string();
+        assert!(!evidence.contains(title));
+        assert!(!evidence.contains(&capability_token));
+        if !usable_reply {
+            assert_eq!(payload["outcome"], "outcome_unknown");
+            assert_eq!(payload["automatic_retry_allowed"], false);
+            assert_eq!(payload["error"]["recoverable"], false);
+            let rendered = payload.to_string();
+            assert!(!rendered.contains(title));
+            assert!(!rendered.contains(&capability_token));
+            assert!(!rendered.contains("private-host-error-body"));
+        }
+        (payload, request)
+    }
+
+    #[test]
+    fn execute_batch_identities_isolate_independent_runs_and_identical_members() {
+        for command in ["map", "batch-file"] {
+            let (first, first_request) =
+                run_batch_identity_case(command, None, "private-input-one", true);
+            let (second, second_request) =
+                run_batch_identity_case(command, None, "private-input-one", true);
+            assert_ne!(
+                first["execution"]["idempotency_key"],
+                second["execution"]["idempotency_key"]
+            );
+            for field in ["id", "idempotency_key"] {
+                assert_ne!(
+                    first_request["operations"][0]["request"][field],
+                    first_request["operations"][1]["request"][field],
+                    "identical members need separate identities: {command} {field}"
+                );
+                for index in 0..2 {
+                    assert_ne!(
+                        first_request["operations"][index]["request"][field],
+                        second_request["operations"][index]["request"][field],
+                        "independent runs need separate identities: {command} {field}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn execute_batch_identities_explicit_reuse_preserves_effect_keys_and_binds_input() {
+        for command in ["map", "batch-file"] {
+            let (first, first_request) = run_batch_identity_case(
+                command,
+                Some("intentional-retry"),
+                "private-input-one",
+                true,
+            );
+            let (_, repeated_request) = run_batch_identity_case(
+                command,
+                Some("intentional-retry"),
+                "private-input-one",
+                true,
+            );
+            let (_, changed_request) = run_batch_identity_case(
+                command,
+                Some("intentional-retry"),
+                "private-input-two",
+                true,
+            );
+            assert_eq!(first["execution"]["idempotency_key"], "intentional-retry");
+            for index in 0..2 {
+                for field in ["id", "idempotency_key"] {
+                    assert_eq!(
+                        first_request["operations"][index]["request"][field],
+                        repeated_request["operations"][index]["request"][field]
+                    );
+                }
+                assert_eq!(
+                    first_request["operations"][index]["request"]["idempotency_key"],
+                    changed_request["operations"][index]["request"]["idempotency_key"]
+                );
+                assert_ne!(
+                    first_request["operations"][index]["request"]["id"],
+                    changed_request["operations"][index]["request"]["id"]
+                );
+            }
+        }
+        let (_, map_request) =
+            run_batch_identity_case("map", Some("shared-key"), "private-input", true);
+        let (_, file_request) =
+            run_batch_identity_case("batch-file", Some("shared-key"), "private-input", true);
+        assert_ne!(
+            map_request["operations"][0]["request"]["idempotency_key"],
+            file_request["operations"][0]["request"]["idempotency_key"]
+        );
+    }
+
+    #[test]
+    fn execute_batch_identities_retain_random_and_explicit_namespaces_on_unknown_outcomes() {
+        for command in ["map", "batch-file"] {
+            for run_key in [None, Some("inspect-before-retry")] {
+                let (payload, request) =
+                    run_batch_identity_case(command, run_key, "private-input-unknown", false);
+                let retained = payload["execution"]["idempotency_key"]
+                    .as_str()
+                    .expect("run namespace must survive uncertain outcomes");
+                if let Some(expected) = run_key {
+                    assert_eq!(retained, expected);
+                } else {
+                    assert!(!retained.is_empty());
+                }
+                let members = payload["members"].as_array().expect("unknown members");
+                assert_eq!(members.len(), 2);
+                for (index, member) in members.iter().enumerate() {
+                    let request_id = &request["operations"][index]["request"]["id"];
+                    assert_eq!(&member["request_id"], request_id);
+                    assert_eq!(&member["inspection"]["operation_id"], request_id);
+                    assert!(
+                        member["inspection"]["command"]
+                            .as_str()
+                            .expect("inspection command")
+                            .contains(request_id.as_str().expect("request ID"))
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn execute_batch_identities_reject_invalid_explicit_namespaces_before_io() {
+        let oversized = "x".repeat(fcp_core::MAX_IDEMPOTENCY_KEY_LEN + 1);
+        for command in ["map", "batch-file"] {
+            for key in ["", "   ", "line\nbreak", oversized.as_str()] {
+                let mut arguments = vec!["fwc", command];
+                if command == "map" {
+                    arguments.extend(["github.issues.create", "--inputs", "[]"]);
+                } else {
+                    arguments.push("does-not-exist.jsonl");
+                }
+                arguments.extend(["--idempotency-key", key]);
+                assert!(
+                    Cli::try_parse_from(arguments).is_err(),
+                    "{command} must reject invalid run namespaces before I/O"
+                );
+            }
+        }
     }
 
     #[test]
