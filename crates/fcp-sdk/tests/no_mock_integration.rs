@@ -270,17 +270,14 @@ fn retry_after_hint_overrides_computed_backoff() {
     assert_eq!(delay, hint);
 }
 
-/// `Retry-After` is attacker-controlled, so it raises the delay but must not
-/// escape `max_backoff_ms` — the same ceiling
-/// `retry_policy_caps_at_max_backoff` (below) already asserts for the computed
-/// backoff. The hint path used to bypass it entirely.
+/// A provider minimum above the local ceiling stops retries instead of being
+/// shortened into a request sent before the provider permits it.
 #[test]
-fn retry_after_hint_cannot_exceed_max_backoff() {
+fn retry_after_hint_above_max_backoff_stops_retrying() {
     let policy = RetryPolicy::new().with_jitter_enabled(false);
     let decision = decision_from_http_status(429, Some(Duration::from_secs(31_536_000)));
 
-    let delay = policy.next_delay(0, decision, None).unwrap();
-    assert_eq!(delay, Duration::from_millis(policy.max_backoff_ms));
+    assert_eq!(policy.next_delay(0, decision, None), None);
 }
 
 #[test]

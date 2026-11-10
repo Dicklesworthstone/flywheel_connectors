@@ -2723,26 +2723,27 @@ impl<C: PollingCursor> PollingSupervisor<C> {
             .map_err(|error| self.cursor_state_failure("persistence", error))
     }
 
-    /// Compute the next backoff delay, respecting rate-limit hints.
-    ///
-    /// A `retry_after_ms` hint raises the delay but never above
-    /// `max_backoff_ms`. The hint originates from an upstream `Retry-After`
-    /// header (`PollResult::rate_limited`), so it is attacker-controlled;
-    /// letting it win outright broke the documented guarantee that "backoff
-    /// will not exceed this value regardless of attempt count" and let a
-    /// single hostile 429 park the polling loop for as long as it asked
-    /// (`sleep_or_shutdown` only wakes on shutdown).
-    fn compute_delay(&self, attempt: u32, retry_after_ms: Option<u64>) -> Duration {
+    fn compute_backoff_delay(&self, attempt: u32) -> Duration {
         let jitter = pseudo_random_jitter(attempt);
-        let backoff = self.config.compute_backoff_with_jitter(attempt, jitter);
+        let backoff = self
+            .config
+            .compute_backoff_with_jitter(attempt, jitter)
+            .clamp(1, self.config.max_backoff_ms.max(1));
+        Duration::from_millis(backoff)
+    }
 
-        let delay_ms = retry_after_ms.map_or(backoff, |retry_after| {
-            retry_after
-                .max(backoff)
-                .min(self.config.max_backoff_ms.max(backoff))
-        });
+    /// Respect the provider's minimum wait without exceeding the local policy.
+    ///
+    /// A hint above the ceiling forbids a retry; shortening it would poll
+    /// while the provider is still asking us to wait. Jitter and zero hints
+    /// retain a 1ms floor to prevent a busy loop.
+    fn compute_delay(&self, attempt: u32, retry_after_ms: Option<u64>) -> Option<Duration> {
+        if retry_after_ms.is_some_and(|hint| hint > self.config.max_backoff_ms.max(1)) {
+            return None;
+        }
 
-        Duration::from_millis(delay_ms)
+        let backoff = self.compute_backoff_delay(attempt);
+        Some(retry_after_ms.map_or(backoff, |hint| backoff.max(Duration::from_millis(hint))))
     }
 
     /// Run the polling supervisor loop.
@@ -2777,6 +2778,10 @@ impl<C: PollingCursor> PollingSupervisor<C> {
     /// complete batch. If processing fails, the offset is rolled back and the
     /// batch may be delivered again; cursor persistence alone does not make
     /// downstream side effects exactly once.
+    ///
+    /// A provider retry hint above `max_backoff_ms` stops the supervisor with
+    /// `FatalError` and unhealthy status after persisting the cursor. It is
+    /// never shortened into an earlier retry or reported as successful polling.
     #[allow(clippy::too_many_lines)]
     pub async fn run<T, F, Fut, P>(
         &mut self,
@@ -2870,7 +2875,7 @@ impl<C: PollingCursor> PollingSupervisor<C> {
                             };
                         }
 
-                        let delay = self.compute_delay(consecutive_failures - 1, None);
+                        let delay = self.compute_backoff_delay(consecutive_failures - 1);
                         self.stats.backoff_time_ms +=
                             u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
 
@@ -2960,8 +2965,21 @@ impl<C: PollingCursor> PollingSupervisor<C> {
                         };
                     }
 
-                    // Compute backoff delay
-                    let delay = self.compute_delay(consecutive_failures - 1, retry_after_ms);
+                    let Some(delay) = self.compute_delay(consecutive_failures - 1, retry_after_ms)
+                    else {
+                        let message = format!(
+                            "Upstream Retry-After exceeds maximum retry delay of {} ms; polling stopped",
+                            self.config.max_backoff_ms.max(1)
+                        );
+                        tracing::error!(retry_after_ms, error = %message, "Polling retry refused");
+                        self.health.transition(HealthTransition::ToUnhealthy {
+                            reason: message.clone(),
+                        });
+                        if let Err(outcome) = self.persist_cursor() {
+                            return outcome;
+                        }
+                        return SupervisorOutcome::FatalError { message };
+                    };
                     self.stats.backoff_time_ms +=
                         u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
 
@@ -4277,16 +4295,27 @@ deny_ptrace = true
         let supervisor = PollingSupervisor::new(config, cursor);
 
         // Without retry-after, uses exponential backoff
-        let delay = supervisor.compute_delay(0, None);
+        let delay = supervisor.compute_delay(0, None).expect("bounded backoff");
         assert_eq!(delay.as_millis(), 1000);
 
         // With smaller retry-after, uses backoff
-        let delay = supervisor.compute_delay(0, Some(500));
+        let delay = supervisor
+            .compute_delay(0, Some(500))
+            .expect("bounded hint");
         assert_eq!(delay.as_millis(), 1000);
 
         // With larger retry-after, uses retry-after
-        let delay = supervisor.compute_delay(0, Some(10_000));
+        let delay = supervisor
+            .compute_delay(0, Some(10_000))
+            .expect("bounded hint");
         assert_eq!(delay.as_millis(), 10_000);
+
+        assert_eq!(
+            supervisor.compute_delay(0, Some(60_000)),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(supervisor.compute_delay(0, Some(60_001)), None);
+        assert_eq!(supervisor.compute_delay(0, Some(u64::MAX)), None);
     }
 
     #[test]
@@ -6442,7 +6471,7 @@ deny_ptrace = true
         let cursor = InMemoryPollingCursor::new();
         let supervisor = PollingSupervisor::new(config, cursor);
 
-        let delay = supervisor.compute_delay(0, None);
+        let delay = supervisor.compute_delay(0, None).expect("bounded backoff");
         let ms = delay.as_millis();
         assert!(
             (500..=1000).contains(&ms),
@@ -6456,8 +6485,24 @@ deny_ptrace = true
         let cursor = InMemoryPollingCursor::new();
         let supervisor = PollingSupervisor::new(config, cursor);
 
-        let delay = supervisor.compute_delay(0, Some(0));
+        let delay = supervisor.compute_delay(0, Some(0)).expect("bounded hint");
         assert_eq!(delay.as_millis(), 1000);
+    }
+
+    #[test]
+    fn polling_supervisor_jitter_and_zero_hints_never_remove_retry_delay() {
+        let config = SupervisorConfig::default()
+            .with_base_backoff_ms(1)
+            .with_max_backoff_ms(1);
+        let supervisor = PollingSupervisor::new(config, InMemoryPollingCursor::new());
+        for attempt in 0..8 {
+            for hint in [None, Some(0), Some(1)] {
+                assert_eq!(
+                    supervisor.compute_delay(attempt, hint),
+                    Some(Duration::from_millis(1))
+                );
+            }
+        }
     }
 
     // ── NEW: StreamingSupervisor streaming_health_snapshot edge cases ──
@@ -6723,6 +6768,126 @@ deny_ptrace = true
             }
             Ok(())
         }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn polling_supervisor_stops_and_checkpoints_when_retry_after_exceeds_policy() {
+        for fail_persist in [false, true] {
+            let checkpoint = Arc::new(Mutex::new(FaultyPollingCheckpoint {
+                committed_offset: Some(40),
+                fail_persist,
+                ..Default::default()
+            }));
+            let cursor = FaultInjectingPollingCursor::new(Arc::clone(&checkpoint));
+            let config = SupervisorConfig::default()
+                .with_base_backoff_ms(1)
+                .with_max_backoff_ms(25);
+            let mut supervisor = PollingSupervisor::new(config, cursor);
+            let polls = AtomicUsize::new(0);
+            let (_shutdown_tx, shutdown_rx) = fcp_async_core::channel::watch::channel(false);
+
+            let outcome = supervisor
+                .run(
+                    shutdown_rx,
+                    1,
+                    |offset| {
+                        assert_eq!(offset, Some(40));
+                        assert_eq!(polls.fetch_add(1, Ordering::SeqCst), 0);
+                        std::future::ready(PollResult::<i64>::rate_limited(
+                            "provider requires a longer wait",
+                            u64::MAX,
+                        ))
+                    },
+                    |_, _| panic!("a rate-limited poll has no successful batch"),
+                )
+                .await;
+
+            let SupervisorOutcome::FatalError { message } = outcome else {
+                panic!("refusing a retry must be an explicit failure: {outcome:?}");
+            };
+            if fail_persist {
+                assert!(message.contains("persistence"));
+                assert!(message.contains("checkpoint write failed"));
+            } else {
+                assert!(message.contains("Retry-After"));
+                assert!(message.contains("25 ms"));
+            }
+            assert_eq!(polls.load(Ordering::SeqCst), 1);
+            assert_eq!(supervisor.stats().total_polls, 1);
+            assert_eq!(supervisor.stats().failed_polls, 1);
+            assert_eq!(supervisor.stats().successful_polls, 0);
+            assert_eq!(supervisor.stats().backoff_time_ms, 0);
+            assert!(supervisor.health().is_unhealthy());
+            let checkpoint = checkpoint.lock().expect("checkpoint lock");
+            assert_eq!(checkpoint.persist_calls, 1);
+            assert_eq!(checkpoint.committed_offset, Some(40));
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn polling_supervisor_waits_for_rate_limit_hint_before_exhausting_failure_budget() {
+        for hint in [0, 10] {
+            let config = SupervisorConfig::default()
+                .with_base_backoff_ms(1)
+                .with_max_backoff_ms(10)
+                .with_max_consecutive_failures(2);
+            let mut supervisor = PollingSupervisor::new(config, InMemoryPollingCursor::new());
+            let poll_times = Mutex::new(Vec::new());
+            let (_shutdown_tx, shutdown_rx) = fcp_async_core::channel::watch::channel(false);
+
+            let outcome = supervisor
+                .run(
+                    shutdown_rx,
+                    1,
+                    |_| {
+                        poll_times
+                            .lock()
+                            .expect("poll times lock")
+                            .push(Instant::now());
+                        std::future::ready(PollResult::<i64>::rate_limited("429", hint))
+                    },
+                    |_, _| panic!("rate limiting must not process a successful batch"),
+                )
+                .await;
+
+            assert!(matches!(
+                outcome,
+                SupervisorOutcome::MaxFailuresReached { failures: 2 }
+            ));
+            let poll_times = poll_times.lock().expect("poll times lock");
+            assert_eq!(poll_times.len(), 2);
+            assert!(
+                poll_times[1].duration_since(poll_times[0]) >= Duration::from_millis(hint.max(1))
+            );
+            assert_eq!(supervisor.stats().backoff_time_ms, hint.max(1));
+            assert_eq!(supervisor.stats().failed_polls, 2);
+            assert_eq!(supervisor.stats().successful_polls, 0);
+            assert!(supervisor.health().is_unhealthy());
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn polling_supervisor_exhausted_budget_never_schedules_retry_after() {
+        let config = SupervisorConfig::default().with_max_consecutive_failures(1);
+        let mut supervisor = PollingSupervisor::new(config, InMemoryPollingCursor::new());
+        let (_shutdown_tx, shutdown_rx) = fcp_async_core::channel::watch::channel(false);
+        let outcome = supervisor
+            .run(
+                shutdown_rx,
+                1,
+                |_| std::future::ready(PollResult::<i64>::rate_limited("429", u64::MAX)),
+                |_, _| panic!("rate limiting must not process a successful batch"),
+            )
+            .await;
+
+        assert!(matches!(
+            outcome,
+            SupervisorOutcome::MaxFailuresReached { failures: 1 }
+        ));
+        assert_eq!(supervisor.stats().total_polls, 1);
+        assert_eq!(supervisor.stats().successful_polls, 0);
+        assert_eq!(supervisor.stats().backoff_time_ms, 0);
+        assert!(supervisor.health().is_unhealthy());
     }
 
     #[fcp_async_core::runtime::test]

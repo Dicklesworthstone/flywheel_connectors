@@ -54,7 +54,7 @@ fn pseudo_random_jitter(attempt: u32) -> f64 {
 /// High-level retry decision for an operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetryDecision {
-    /// Retry immediately (no delay).
+    /// Retry immediately unless a server hint requires a delay.
     Immediate,
     /// Retry with exponential backoff (policy-controlled).
     Backoff,
@@ -87,6 +87,9 @@ pub struct RetryPolicy {
     /// Base delay for exponential backoff (milliseconds).
     pub base_backoff_ms: u64,
     /// Maximum backoff delay (milliseconds).
+    ///
+    /// A larger explicit delay or server hint stops retries instead of being
+    /// shortened. A non-zero base backoff retains a minimum ceiling of 1ms.
     pub max_backoff_ms: u64,
     /// Whether to add deterministic jitter to backoff delays.
     pub jitter_enabled: bool,
@@ -187,37 +190,14 @@ impl RetryPolicy {
         }
     }
 
-    /// Clamp a server-supplied `Retry-After` hint into this policy's bounds.
-    ///
-    /// `Retry-After` is attacker-controlled. `max_backoff_ms` is the policy's
-    /// documented ceiling, so a hint must not be able to override it — an
-    /// unclamped hint let one response header park a connector for as long as
-    /// the upstream asked (bounded in practice only by the request deadline,
-    /// and not at all on a deadline-less background context). The floor
-    /// matters too: `Retry-After: 0` from a service that just asked to be
-    /// backed off would otherwise produce a zero-delay retry burst for the
-    /// whole attempt budget.
-    const fn clamp_retry_after_ms(&self, hint_ms: u64) -> u64 {
-        let floor = if self.base_backoff_ms > 0 { 1 } else { 0 };
-        let ceiling = if self.max_backoff_ms > floor {
-            self.max_backoff_ms
-        } else {
-            floor
-        };
-        if hint_ms < floor {
-            floor
-        } else if hint_ms > ceiling {
-            ceiling
-        } else {
-            hint_ms
-        }
-    }
-
     /// Translate a retry decision into a delay, applying Retry-After hints.
     ///
     /// `attempt` is the 0-indexed attempt that just failed. Returns `None`
     /// when retry is not permitted (terminal or the failed attempt has already
-    /// exhausted the total-attempt budget).
+    /// exhausted the total-attempt budget), or the required delay exceeds the
+    /// policy's maximum. Server hints are minimum waits, including for
+    /// `Immediate` and `After`: never shorten them to fit the policy. Delays
+    /// retain submillisecond precision so rounding cannot retry too early.
     #[must_use]
     pub fn next_delay(
         &self,
@@ -237,23 +217,24 @@ impl RetryPolicy {
             }
         }
 
-        match decision {
-            RetryDecision::Terminal => None,
-            RetryDecision::Immediate => Some(Duration::from_millis(0)),
-            RetryDecision::After(delay) => Some(Duration::from_millis(
-                self.clamp_retry_after_ms(duration_to_ms(delay)),
-            )),
+        let floor = Duration::from_millis(u64::from(self.base_backoff_ms > 0));
+        let ceiling = Duration::from_millis(self.max_backoff_ms).max(floor);
+        let mut delay = match decision {
+            RetryDecision::Terminal => return None,
+            RetryDecision::Immediate => Duration::ZERO,
+            RetryDecision::After(delay) => delay.max(floor),
             RetryDecision::Backoff => {
                 let jitter = pseudo_random_jitter(attempt);
-                let mut delay_ms = self.compute_backoff_with_jitter_ms(attempt, jitter);
-
-                if let Some(hint) = retry_after_hint {
-                    delay_ms = delay_ms.max(self.clamp_retry_after_ms(duration_to_ms(hint)));
-                }
-
-                Some(Duration::from_millis(delay_ms))
+                Duration::from_millis(self.compute_backoff_with_jitter_ms(attempt, jitter))
             }
+        };
+
+        if let Some(hint) = retry_after_hint {
+            // Even a zero server hint must not turn rate limiting into a busy loop.
+            delay = delay.max(hint).max(floor);
         }
+
+        (delay <= ceiling).then_some(delay)
     }
 }
 
@@ -597,36 +578,46 @@ mod tests {
         assert_eq!(delay, hint);
     }
 
-    /// `Retry-After` is attacker-controlled, so it may raise the delay but must
-    /// never escape `max_backoff_ms` — the policy's documented ceiling. An
-    /// unclamped hint let one response header park a connector for as long as
-    /// the upstream asked.
     #[test]
-    fn next_delay_clamps_hostile_retry_after_to_max_backoff() {
+    fn next_delay_refuses_retry_after_above_policy_ceiling() {
         let p = RetryPolicy::new()
             .with_base_backoff_ms(1_000)
             .with_jitter_enabled(false);
         let ceiling = Duration::from_millis(p.max_backoff_ms);
 
-        // Via the Backoff path (hint passed alongside).
-        let delay = p
-            .next_delay(
-                0,
+        for hint in [
+            ceiling + Duration::from_nanos(1),
+            Duration::from_secs(31_536_000),
+            Duration::MAX,
+        ] {
+            for decision in [
+                RetryDecision::Immediate,
                 RetryDecision::Backoff,
-                Some(Duration::from_secs(31_536_000)),
-            )
-            .unwrap();
-        assert_eq!(delay, ceiling);
+                RetryDecision::After(Duration::from_secs(1)),
+            ] {
+                assert_eq!(p.next_delay(0, decision, Some(hint)), None);
+            }
+            assert_eq!(p.next_delay(0, RetryDecision::After(hint), None), None);
+        }
 
-        // Via the explicit After path, which previously returned the hint verbatim.
-        let delay = p
-            .next_delay(
-                0,
-                RetryDecision::After(Duration::from_secs(31_536_000)),
-                None,
-            )
-            .unwrap();
-        assert_eq!(delay, ceiling);
+        assert_eq!(
+            p.next_delay(0, RetryDecision::After(ceiling), None),
+            Some(ceiling)
+        );
+    }
+
+    #[test]
+    fn next_delay_preserves_submillisecond_provider_minimum() {
+        let p = RetryPolicy::new().with_jitter_enabled(false);
+        let hint = Duration::from_millis(1_001) + Duration::from_nanos(1);
+        for decision in [
+            RetryDecision::Immediate,
+            RetryDecision::Backoff,
+            RetryDecision::After(Duration::from_millis(1)),
+            RetryDecision::After(hint),
+        ] {
+            assert_eq!(p.next_delay(0, decision, Some(hint)), Some(hint));
+        }
     }
 
     /// `Retry-After: 0` from a service that just asked to be backed off must not
@@ -940,21 +931,21 @@ mod tests {
     }
 
     #[test]
-    fn next_delay_after_ignores_retry_after_hint() {
+    fn next_delay_after_uses_larger_of_explicit_delay_and_server_hint() {
         let p = RetryPolicy::new();
         let d = Duration::from_secs(42);
-        let hint = Duration::from_secs(100);
-        // After variant uses its own duration, not the hint
-        let delay = p.next_delay(0, RetryDecision::After(d), Some(hint));
-        assert_eq!(delay, Some(d));
+        for hint in [Duration::from_secs(10), Duration::from_secs(50)] {
+            let delay = p.next_delay(0, RetryDecision::After(d), Some(hint));
+            assert_eq!(delay, Some(d.max(hint)));
+        }
     }
 
     #[test]
-    fn next_delay_immediate_ignores_hint() {
+    fn next_delay_immediate_honors_server_hint() {
         let p = RetryPolicy::new();
-        let hint = Duration::from_secs(100);
+        let hint = Duration::from_secs(10);
         let delay = p.next_delay(0, RetryDecision::Immediate, Some(hint));
-        assert_eq!(delay, Some(Duration::ZERO));
+        assert_eq!(delay, Some(hint));
     }
 
     #[test]
@@ -1323,25 +1314,43 @@ mod tests {
     fn next_delay_terminal_always_none_regardless_of_attempts() {
         let p = RetryPolicy::new().with_max_attempts(None);
         for attempt in [0, 1, 10, 100, 1000] {
-            assert!(
-                p.next_delay(attempt, RetryDecision::Terminal, None)
-                    .is_none(),
-                "attempt {attempt} should be None for Terminal"
-            );
+            for hint in [None, Some(Duration::ZERO), Some(Duration::from_secs(30))] {
+                assert!(
+                    p.next_delay(attempt, RetryDecision::Terminal, hint)
+                        .is_none(),
+                    "attempt {attempt} should be None for Terminal"
+                );
+            }
         }
     }
 
     #[test]
-    fn next_delay_immediate_always_zero_regardless_of_hint() {
+    fn next_delay_immediate_applies_hint_floor_and_ceiling() {
         let p = RetryPolicy::new();
-        let hints = [
-            None,
-            Some(Duration::from_secs(1)),
-            Some(Duration::from_secs(3600)),
+        let cases = [
+            (None, Some(Duration::ZERO)),
+            (Some(Duration::ZERO), Some(Duration::from_millis(1))),
+            (Some(Duration::from_secs(1)), Some(Duration::from_secs(1))),
+            (Some(Duration::from_secs(3600)), None),
         ];
-        for hint in hints {
+        for (hint, expected) in cases {
             let delay = p.next_delay(0, RetryDecision::Immediate, hint);
-            assert_eq!(delay, Some(Duration::ZERO));
+            assert_eq!(delay, expected);
+        }
+    }
+
+    #[test]
+    fn rate_limited_retry_preserves_hints_and_attempt_budget() {
+        let p = RetryPolicy::new().with_max_attempts(Some(2));
+        for (hint, expected) in [
+            (Duration::ZERO, Some(Duration::from_millis(1))),
+            (Duration::from_secs(30), Some(Duration::from_secs(30))),
+            (Duration::from_secs(60), Some(Duration::from_secs(60))),
+            (Duration::from_secs(61), None),
+        ] {
+            let decision = decision_from_http_status(429, Some(hint));
+            assert_eq!(p.next_delay(0, decision, Some(hint)), expected);
+            assert_eq!(p.next_delay(1, decision, Some(hint)), None);
         }
     }
 
