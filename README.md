@@ -3356,7 +3356,7 @@ The credential pool's strategy determines what happens when this AuthProfile is 
 
 ### Pipeline TOML
 
-The on-disk schema lives in `crates/fwc/src/pipeline*.rs`. The example below uses real operation IDs from the GitHub and Slack connector manifests (`github.search_issues`, `github.create_issue`, `slack.post_message`) so the snippet runs against the actual connectors; test fixtures under `crates/fwc/testdata/pipelines/` exercise the same schema with synthetic operation IDs that exist only for the in-tree harness.
+The on-disk schema lives in `crates/fwc/src/pipe.rs`. The example below uses real operation IDs from the GitHub and Slack connector manifests (`github.search_issues`, `github.create_issue`, `slack.post_message`) so the snippet runs against the actual connectors; test fixtures under `crates/fwc/testdata/pipelines/` exercise the same schema with synthetic operation IDs that exist only for the in-tree harness.
 
 ```toml
 [pipeline]
@@ -3369,7 +3369,8 @@ timeout_ms = 90000
 id = "list_existing"
 operation = "github.search_issues"
 timeout_ms = 15000
-input = { owner = "{{params.owner}}", repo = "{{params.repo}}", state = "open" }
+on_error = "retry(2)"
+input = { query = "repo:{{params.owner}}/{{params.repo}} is:issue is:open" }
 
 [[steps]]
 id = "create_issue"
@@ -3399,7 +3400,7 @@ required = true
 Notes on the actual schema:
 
 - `[pipeline]` carries `name`, `description`, `version`, and an optional `timeout_ms` execution budget from 1 to 86,400,000 milliseconds. After local definition and parameter validation, the budget starts before host resolution and discovery and is shared across introspection, credential resolution, and every step. Each setup HTTP read is bounded by the remaining workflow budget and the configured host read timeout. Local credential file reads consume elapsed budget but are not forcibly interrupted; an expired setup cannot invoke an operation.
-- Each `[[steps]]` table carries an `id`, a dotted `operation` (`<connector>.<operation>`), an `input` table, and an optional `depends_on` array naming sibling step IDs. Per-step `on_error = "abort"` is the default; `on_error = "skip"` permits later independent steps after a definite input, policy, or connector failure while preserving the unsuccessful overall result. Dependents remain blocked, and uncertain execution always stops. Unsupported retry/fallback/trigger controls and unknown step fields are rejected before host discovery.
+- Each `[[steps]]` table carries an `id`, a dotted `operation` (`<connector>.<operation>`), an `input` table, and an optional `depends_on` array naming sibling step IDs. Per-step `on_error = "abort"` is the default; `on_error = "skip"` permits later independent steps after a definite input, policy, or connector failure while preserving the unsuccessful overall result. `on_error = "retry"` allows up to three additional attempts; `on_error = "retry(N)"` accepts 1–10 additional attempts under the eligibility rules below. Exhausted or ineligible retries stop later steps. Dependents remain blocked after failure, and uncertain execution always stops. Fallback/trigger controls, invalid retry counts, and unknown step fields are rejected before host discovery.
 - A step can set `timeout_ms` from 1 to 60,000 milliseconds. Its input preparation, host preflight, and invocation share the earlier of this step deadline and the remaining workflow deadline. Successful preflight never renews the budget. Every preflight also has the configured `FWC_HOST_READ_TIMEOUT_MS` read bound, including workflows with no explicit execution budget. Unspecified budgets retain the host's normal invocation ceiling.
 - Parameters are declared as `[params.<name>]` tables with `type` and `required` fields.
 - Template substitution uses double-brace `{{...}}` syntax. Step outputs are referenced as `{{steps.<id>.output.<json_path>}}`; parameters are referenced as `{{params.<name>}}`.
@@ -3420,6 +3421,29 @@ still has an unknown outcome and requires inspection before retrying. These
 budgets apply to live pipeline and recipe execution, including reads performed
 by dry-run. They do not turn a timeout into proof that an external effect was
 undone.
+
+### Retrying transient failures
+
+Retries require live operation metadata declaring `safety_tier = "safe"`,
+`risk_level = "low"`, strict idempotency, and no approval requirement. Best-effort
+deduplication alone is insufficient. Only definite, typed connector failures
+such as rate limiting, upstream timeout/unavailability, or an external error
+marked retryable qualify. Capability, policy, and resource-budget denials do not.
+An HTTP error, lost response, malformed reply, or mismatched request ID stops
+execution with an unknown outcome, even for an otherwise eligible operation.
+
+Every retry retains the original request ID, idempotency key, and input. The CLI
+refreshes the exact connector's operation contract and repeats preflight before
+dispatch; changed safety, capabilities, or schemas stop the retry. Each invoked
+attempt is retained in `execution.steps[].attempts`, including failures followed
+by success and earlier results preceding an unknown outcome. An idempotency key
+does not itself prove that an external effect can safely be repeated.
+
+Backoff, metadata refresh, preflight, and invocation share the original step and
+workflow deadlines. A retry-enabled step without `timeout_ms` has a total
+60-second step budget. Exponential backoff includes jitter; a provider's
+`Retry-After` is honored without shortening it. If the required delay does not
+fit the remaining budget, execution stops immediately and retains the failure.
 
 ### Recipes
 

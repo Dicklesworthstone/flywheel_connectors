@@ -364,7 +364,7 @@ pub struct PipelineStep {
     pub depends_on: Vec<String>,
     #[serde(default)]
     pub condition: Option<String>,
-    /// Continue independent steps only after a definite input, policy, or connector failure.
+    /// Stop, continue independent steps, or retry eligible definitive failures.
     #[serde(default)]
     pub on_error: PipelineErrorPolicy,
 }
@@ -372,17 +372,83 @@ pub struct PipelineStep {
 /// Failure handling supported by the live pipeline executor.
 ///
 /// A skipped failure remains visible and makes the run unsuccessful. Dependent
-/// steps cannot run without a successful prerequisite. Authoring errors,
-/// unavailable preflight, and uncertain invoke outcomes always stop execution;
-/// this policy never authorizes retries or fallback effects.
-#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+/// steps cannot run without a successful prerequisite. Retry is bounded and
+/// requires both a definitive retryable connector response and safe operation
+/// semantics. Authoring errors, unavailable preflight, and uncertain invoke
+/// outcomes always stop execution; no policy authorizes fallback effects.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub enum PipelineErrorPolicy {
     /// Stop before dispatching any later step.
     #[default]
     Abort,
     /// Retain the failed outcome and continue independent steps.
     Skip,
+    /// Retry at most this many times, then stop before later steps.
+    Retry(u32),
+}
+
+/// Maximum retries per pipeline step, excluding its initial invocation.
+pub const MAX_PIPELINE_RETRIES: u32 = 10;
+/// Retry count selected by the `on_error = "retry"` shorthand.
+pub const DEFAULT_PIPELINE_RETRIES: u32 = 3;
+
+impl PipelineErrorPolicy {
+    /// The retry allowance, excluding the initial invocation.
+    #[must_use]
+    pub const fn max_retries(self) -> u32 {
+        match self {
+            Self::Retry(count) => count,
+            Self::Abort | Self::Skip => 0,
+        }
+    }
+
+    /// Whether a final definitive failure blocks all later steps.
+    #[must_use]
+    pub const fn stops_on_failure(self) -> bool {
+        !matches!(self, Self::Skip)
+    }
+}
+
+impl Serialize for PipelineErrorPolicy {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Abort => serializer.serialize_str("abort"),
+            Self::Skip => serializer.serialize_str("skip"),
+            Self::Retry(count) => serializer.serialize_str(&format!("retry({count})")),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for PipelineErrorPolicy {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        match value.as_str() {
+            "abort" => Ok(Self::Abort),
+            "skip" => Ok(Self::Skip),
+            "retry" => Ok(Self::Retry(DEFAULT_PIPELINE_RETRIES)),
+            value => {
+                let count = value
+                    .strip_prefix("retry(")
+                    .and_then(|suffix| suffix.strip_suffix(')'))
+                    .and_then(|digits| {
+                        let count = digits.parse::<u32>().ok()?;
+                        ((1..=MAX_PIPELINE_RETRIES).contains(&count) && count.to_string() == digits)
+                            .then_some(count)
+                    });
+                count.map(Self::Retry).ok_or_else(|| {
+                    serde::de::Error::custom(format!(
+                        "on_error must be abort, skip, retry, or retry(N) with N between 1 and {MAX_PIPELINE_RETRIES}"
+                    ))
+                })
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -481,6 +547,7 @@ pub struct EstimatedApiCalls {
 pub struct PipelineStepEstimate {
     pub id: String,
     pub operation: String,
+    pub on_error: PipelineErrorPolicy,
     pub connector: String,
     pub selector: String,
     pub canonical_id: String,
@@ -1326,6 +1393,14 @@ pub fn validate_pipeline_definition(definition: &PipelineDefinition) -> Pipeline
 
     let mut seen_step_ids = BTreeSet::new();
     for step in &definition.steps {
+        if let PipelineErrorPolicy::Retry(count) = step.on_error
+            && !(1..=MAX_PIPELINE_RETRIES).contains(&count)
+        {
+            errors.push(format!(
+                "step `{}` on_error retry count must be between 1 and {MAX_PIPELINE_RETRIES}",
+                step.id
+            ));
+        }
         if step
             .timeout_ms
             .is_some_and(|value| !(1..=budget::MAX_STEP_TIMEOUT_MS).contains(&value))
@@ -1563,6 +1638,7 @@ pub fn estimate_pipeline(
     let mut required_approvals = Vec::new();
     let mut rate_limit_impact = BTreeMap::<String, RateLimitImpactAccumulator>::new();
     let mut conditional_steps = Vec::new();
+    let mut retry_steps = Vec::new();
     let mut steps_without_declared_limits = Vec::new();
     let mut steps_with_unknown_rate_limits = Vec::new();
     let mut total_min_calls = 0u32;
@@ -1578,7 +1654,7 @@ pub fn estimate_pipeline(
                 step.id, step.operation
             )
         })?;
-        let estimated_api_calls = estimated_api_calls(step.condition.is_some());
+        let estimated_api_calls = estimated_api_calls(step.condition.is_some(), step.on_error);
 
         total_min_calls += estimated_api_calls.min;
         total_max_calls += estimated_api_calls.max;
@@ -1586,6 +1662,9 @@ pub fn estimate_pipeline(
 
         if estimated_api_calls.conditional {
             conditional_steps.push(step.id.clone());
+        }
+        if step.on_error.max_retries() > 0 {
+            retry_steps.push(step.id.clone());
         }
         match metadata.rate_limits.as_ref() {
             Some(rate_limits) if rate_limits.is_empty() => {
@@ -1634,6 +1713,7 @@ pub fn estimate_pipeline(
         step_estimates.push(PipelineStepEstimate {
             id: step.id.clone(),
             operation: step.operation.clone(),
+            on_error: step.on_error,
             connector: metadata.connector.clone(),
             selector: metadata.selector.clone(),
             canonical_id: metadata.canonical_id.clone(),
@@ -1654,8 +1734,14 @@ pub fn estimate_pipeline(
     ];
     if !conditional_steps.is_empty() {
         notes.push(format!(
-            "Conditional steps are estimated as 0-1 API calls because dry-run cannot evaluate runtime predicates without real upstream outputs: {}.",
+            "Conditional steps have a minimum of zero API calls because dry-run cannot evaluate runtime predicates without real upstream outputs: {}.",
             conditional_steps.join(", ")
+        ));
+    }
+    if !retry_steps.is_empty() {
+        notes.push(format!(
+            "Maximum API-call counts include every configured retry. Live retries still require an eligible definitive error, safe operation semantics and remaining execution budget: {}.",
+            retry_steps.join(", ")
         ));
     }
     if !steps_without_declared_limits.is_empty() {
@@ -1942,8 +2028,9 @@ fn visit_step<'a>(
     Ok(())
 }
 
-fn estimated_api_calls(conditional: bool) -> EstimatedApiCalls {
-    let (min, max) = if conditional { (0, 1) } else { (1, 1) };
+fn estimated_api_calls(conditional: bool, policy: PipelineErrorPolicy) -> EstimatedApiCalls {
+    let min = u32::from(!conditional);
+    let max = 1u32.saturating_add(policy.max_retries());
     EstimatedApiCalls {
         min,
         max,
@@ -2836,6 +2923,16 @@ on_error = "abort"
 id = "skip"
 operation = "github.search_issues"
 on_error = "skip"
+
+[[steps]]
+id = "retry-default"
+operation = "github.search_issues"
+on_error = "retry"
+
+[[steps]]
+id = "retry-explicit"
+operation = "github.search_issues"
+on_error = "retry(10)"
 "#,
         )
         .unwrap();
@@ -2846,6 +2943,8 @@ on_error = "skip"
             PipelineErrorPolicy::Abort,
             PipelineErrorPolicy::Abort,
             PipelineErrorPolicy::Skip,
+            PipelineErrorPolicy::Retry(DEFAULT_PIPELINE_RETRIES),
+            PipelineErrorPolicy::Retry(MAX_PIPELINE_RETRIES),
         ]
         .into_iter()
         .enumerate()
@@ -2856,6 +2955,49 @@ on_error = "skip"
                 serialized["steps"][index]["on_error"],
                 serde_json::to_value(expected).unwrap()
             );
+        }
+    }
+
+    #[test]
+    fn pipeline_retry_policy_has_bounded_canonical_string_representation() {
+        for retries in 1..=MAX_PIPELINE_RETRIES {
+            let policy = PipelineErrorPolicy::Retry(retries);
+            let value = serde_json::to_value(policy).unwrap();
+            assert_eq!(value, format!("retry({retries})"));
+            assert_eq!(
+                serde_json::from_value::<PipelineErrorPolicy>(value).unwrap(),
+                policy
+            );
+            assert_eq!(policy.max_retries(), retries);
+            assert!(policy.stops_on_failure());
+        }
+        assert_eq!(PipelineErrorPolicy::Abort.max_retries(), 0);
+        assert!(PipelineErrorPolicy::Abort.stops_on_failure());
+        assert_eq!(PipelineErrorPolicy::Skip.max_retries(), 0);
+        assert!(!PipelineErrorPolicy::Skip.stops_on_failure());
+        assert_eq!(
+            serde_json::from_value::<PipelineErrorPolicy>(json!("retry")).unwrap(),
+            PipelineErrorPolicy::Retry(DEFAULT_PIPELINE_RETRIES)
+        );
+    }
+
+    #[test]
+    fn pipeline_validation_rejects_programmatically_invalid_retry_counts() {
+        let mut definition = parse_pipeline_definition(
+            "[pipeline]\nname = \"retry-validation\"\n[[steps]]\nid = \"first\"\noperation = \"github.search_issues\"\n",
+        )
+        .unwrap();
+        for count in [0, MAX_PIPELINE_RETRIES + 1, u32::MAX] {
+            definition.steps[0].on_error = PipelineErrorPolicy::Retry(count);
+            let validation = validate_pipeline_definition(&definition);
+            assert!(!validation.valid);
+            assert!(
+                validation
+                    .errors
+                    .iter()
+                    .any(|error| error.contains("on_error"))
+            );
+            assert!(build_pipeline_plan(&definition, &BTreeMap::new()).is_err());
         }
     }
 
@@ -2932,8 +3074,16 @@ depends_on = ["first"]
     #[test]
     fn pipeline_definition_rejects_unsupported_error_policies_and_unknown_step_fields() {
         for field in [
-            "on_error = \"retry\"",
-            "on_error = \"retry(3)\"",
+            "on_error = \"retry(0)\"",
+            "on_error = \"retry(11)\"",
+            "on_error = \"retry(4294967296)\"",
+            "on_error = \"retry(-1)\"",
+            "on_error = \"retry(+1)\"",
+            "on_error = \"retry(01)\"",
+            "on_error = \"retry(1.0)\"",
+            "on_error = \"retry( 1)\"",
+            "on_error = \" retry(1)\"",
+            "on_error = \"retry()\"",
             "on_error = \"fallback(notify)\"",
             "on_error = \"continue\"",
             "on_error = { retry = 3 }",
@@ -3232,6 +3382,72 @@ condition = "{{steps.fetch.output.issues | length}} > 0"
                 .iter()
                 .any(|note| note.contains("Conditional steps"))
         );
+    }
+
+    #[test]
+    fn estimate_pipeline_includes_retry_allowances_in_calls_and_rate_limits() {
+        let definition = parse_pipeline_definition(
+            r#"
+[pipeline]
+name = "retry-aware-estimate"
+
+[[steps]]
+id = "fetch"
+operation = "github.list_issues"
+on_error = "retry"
+
+[[steps]]
+id = "fetch-again"
+operation = "github.list_issues"
+condition = "true"
+on_error = "retry(10)"
+"#,
+        )
+        .unwrap();
+        let plan = build_pipeline_plan(&definition, &BTreeMap::new()).unwrap();
+        let operations = BTreeMap::from([(
+            "github.list_issues".to_owned(),
+            PipelineOperationMetadata {
+                connector: "github".to_owned(),
+                selector: "issues.list".to_owned(),
+                canonical_id: "github.list_issues".to_owned(),
+                capability: "github.read".to_owned(),
+                risk_level: "low".to_owned(),
+                safety_tier: "safe".to_owned(),
+                requires_approval: false,
+                approval_mode: "none".to_owned(),
+                rate_limits: Some(vec![RateLimitSummary {
+                    scope: "core".to_owned(),
+                    requests: 5_000,
+                    window: "1h".to_owned(),
+                }]),
+            },
+        )]);
+
+        let estimate = estimate_pipeline(&plan, &operations).unwrap();
+        assert_eq!(estimate.estimated_api_calls.min, 1);
+        assert_eq!(estimate.estimated_api_calls.max, 15);
+        assert_eq!(estimate.estimated_api_calls.summary, "~1-15 API calls");
+        let fetch = estimate
+            .steps
+            .iter()
+            .find(|step| step.id == "fetch")
+            .unwrap();
+        assert_eq!(fetch.on_error, PipelineErrorPolicy::Retry(3));
+        assert_eq!(fetch.estimated_api_calls.min, 1);
+        assert_eq!(fetch.estimated_api_calls.max, 4);
+        let conditional = estimate
+            .steps
+            .iter()
+            .find(|step| step.id == "fetch-again")
+            .unwrap();
+        assert_eq!(conditional.on_error, PipelineErrorPolicy::Retry(10));
+        assert_eq!(conditional.estimated_api_calls.min, 0);
+        assert_eq!(conditional.estimated_api_calls.max, 11);
+        assert_eq!(estimate.rate_limit_impact.len(), 1);
+        assert_eq!(estimate.rate_limit_impact[0].estimated_api_calls.min, 1);
+        assert_eq!(estimate.rate_limit_impact[0].estimated_api_calls.max, 15);
+        assert_eq!(serde_json::to_value(fetch).unwrap()["on_error"], "retry(3)");
     }
 
     #[test]
@@ -4085,7 +4301,7 @@ required = true
 
     #[test]
     fn estimated_api_calls_unconditional() {
-        let calls = estimated_api_calls(false);
+        let calls = estimated_api_calls(false, PipelineErrorPolicy::Abort);
         assert_eq!(calls.min, 1);
         assert_eq!(calls.max, 1);
         assert!(!calls.conditional);
@@ -4094,7 +4310,7 @@ required = true
 
     #[test]
     fn estimated_api_calls_conditional() {
-        let calls = estimated_api_calls(true);
+        let calls = estimated_api_calls(true, PipelineErrorPolicy::Abort);
         assert_eq!(calls.min, 0);
         assert_eq!(calls.max, 1);
         assert!(calls.conditional);
