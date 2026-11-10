@@ -81,15 +81,6 @@ struct RolloutStatusResponse {
 }
 
 #[derive(Debug, Deserialize)]
-struct ManualRollbackResponse {
-    connector_id: String,
-    state: LifecycleState,
-    from_version: semver::Version,
-    to_version: semver::Version,
-    message: String,
-}
-
-#[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum CapabilityPreflightVectorTokenMode {
     Missing,
@@ -5927,42 +5918,64 @@ async fn fcp_host_binary_rollout_pin_route_pins_baseline_version()
     Ok(())
 }
 
+async fn invoke_rollout_runtime_pid(
+    host: &HttpHostProcess,
+    connector_id: &ConnectorId,
+    capability_signing_key: &Ed25519SigningKey,
+    marker_path: &Path,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    let (mut request, _) = build_invoke_request(connector_id.clone(), capability_signing_key);
+    request.input = json!({ "message": "rollout runtime probe", "delay_ms": 0 });
+    let request_id = request.id.to_string();
+    let response: InvokeResponse = http_post_json(
+        host.client.clone(),
+        format!("{}/rpc/invoke", host.base_url),
+        request,
+    )
+    .await?;
+    assert_eq!(response.status, InvokeStatus::Ok);
+    assert_eq!(response.id.to_string(), request_id);
+    let marker: Value = serde_json::from_slice(&std::fs::read(marker_path)?)?;
+    assert_eq!(marker["request_id"].as_str(), Some(request_id.as_str()));
+    marker["pid"]
+        .as_u64()
+        .ok_or_else(|| "rollout runtime probe did not record its process ID".into())
+}
+
 #[fcp_async_core::runtime::test(flavor = "multi_thread")]
-async fn fcp_host_binary_rollout_routes_rollback_and_emit_transition_logs()
+async fn fcp_host_binary_automatic_rollback_refuses_without_runtime_restoration()
 -> Result<(), Box<dyn std::error::Error>> {
     let connector_id = ConnectorId::from_static("fcp.test.rollout-rollback:utility:1.0.0");
-    let host = HttpHostProcess::spawn(vec![test_connector_config(
-        &connector_id,
-        "Rollout Rollback",
-        &["test", "rollout"],
-    )])
+    let previous_version = semver::Version::new(1, 0, 0);
+    let canary_version = semver::Version::new(1, 0, 1);
+    let capability_signing_key = Ed25519SigningKey::generate();
+    let capability_public_key = capability_public_key_hex(&capability_signing_key);
+    let runtime_evidence = tempfile::tempdir()?;
+    let marker_path = runtime_evidence.path().join("invoke.json");
+    let mut connector_config =
+        test_connector_config(&connector_id, "Rollout Rollback", &["test", "rollout"]);
+    connector_config["version"] = json!(canary_version.to_string());
+    connector_config["env"]["FCP_TEST_INVOKE_STARTED_FILE"] = json!(marker_path);
+    let host = HttpHostProcess::spawn_with_connectors_file(
+        vec![connector_config],
+        &[(
+            "FCP_HOST_CAPABILITY_PUBLIC_KEY",
+            capability_public_key.as_str(),
+        )],
+    )
     .await?;
     let url = |path: &str| format!("{}{path}", host.base_url);
 
     let policy = test_rollout_rollback_policy();
-    let previous_version = semver::Version::new(1, 0, 0);
-    let canary_version = semver::Version::new(1, 0, 1);
 
-    let pinned_baseline: PinStateResponse = http_put_json(
+    let pinned_current: PinStateResponse = http_put_json(
         host.client.clone(),
         url(&format!("/rpc/rollout/pin/{}", connector_id.as_str())),
-        json!({ "version": previous_version.clone() }),
+        json!({ "version": canary_version.clone() }),
     )
     .await?;
-    assert_eq!(pinned_baseline.connector_id, connector_id.as_str());
-    assert!(pinned_baseline.pinned);
-    assert_eq!(pinned_baseline.version, Some(previous_version.clone()));
-
-    let pin_status_before_rollout: PinStateResponse = http_get_json(
-        host.client.clone(),
-        url(&format!("/rpc/rollout/pin/{}", connector_id.as_str())),
-    )
-    .await?;
-    assert!(pin_status_before_rollout.pinned);
-    assert_eq!(
-        pin_status_before_rollout.version,
-        Some(previous_version.clone())
-    );
+    assert!(pinned_current.pinned);
+    assert_eq!(pinned_current.version, Some(canary_version.clone()));
 
     let scheduled: RolloutOutcome = http_post_json(
         host.client.clone(),
@@ -5980,10 +5993,23 @@ async fn fcp_host_binary_rollout_routes_rollback_and_emit_transition_logs()
     assert_eq!(scheduled.record.state, LifecycleState::Canary);
     assert_eq!(scheduled.audit_event.reason_code, "canary_scheduled");
 
-    let rolled_back: RolloutOutcome = http_post_json(
+    let original_pid =
+        invoke_rollout_runtime_pid(&host, &connector_id, &capability_signing_key, &marker_path)
+            .await?;
+    let inventory_url = url(&format!("/rpc/connectors/{}", connector_id.as_str()));
+    let inventory_before: ConnectorInventoryResponse =
+        http_get_json(host.client.clone(), inventory_url.clone()).await?;
+    assert_eq!(inventory_before.connector.version, canary_version);
+    let connectors_file = host.lifecycle_state_dir.path().join("connectors.json");
+    let lifecycle_file = host.lifecycle_state_dir.path().join("lifecycle-state.json");
+    let inventory_bytes = std::fs::read(&connectors_file)?;
+    let lifecycle_bytes = std::fs::read(&lifecycle_file)?;
+
+    let (status, error) = request_status_text(
         host.client.clone(),
+        reqwest::Method::POST,
         url("/rpc/rollout/evaluate"),
-        json!({
+        Some(json!({
             "connector_id": connector_id.as_str(),
             "invocation_succeeded": false,
             "latency_ms": 15,
@@ -5992,120 +6018,131 @@ async fn fcp_host_binary_rollout_routes_rollback_and_emit_transition_logs()
             "crashed": false,
             "policy": policy,
             "observed_at": chrono::Utc::now(),
-        }),
+        })),
+        Some(admin_auth_headers()),
     )
     .await?;
-    assert_eq!(rolled_back.decision, RolloutDecision::Rollback);
-    assert_eq!(rolled_back.record.state, LifecycleState::RolledBack);
-    assert_eq!(
-        rolled_back.audit_event.reason_code,
-        "consecutive_failures_exceeded"
-    );
-    assert!(
-        rolled_back
-            .audit_event
-            .evidence_digest
-            .starts_with("blake3-256:")
-    );
+    assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert!(error.contains("verified executable and inventory restoration is unavailable"));
+    assert!(error.contains("consecutive_failures_exceeded"));
+    assert!(error.contains("v1.0.0"));
+    assert!(error.contains("managed inventory"));
+    assert_eq!(std::fs::read(&connectors_file)?, inventory_bytes);
+    assert_eq!(std::fs::read(&lifecycle_file)?, lifecycle_bytes);
 
     let final_status: LifecycleStatus = http_get_json(
         host.client.clone(),
         url(&format!("/rpc/rollout/{}", connector_id.as_str())),
     )
     .await?;
-    assert_eq!(final_status.state, LifecycleState::RolledBack);
-    assert_eq!(final_status.version, canary_version);
+    assert_eq!(final_status.state, LifecycleState::Canary);
+    assert_eq!(final_status.version, canary_version.clone());
     assert_eq!(
         final_status.rollback_target_version,
         Some(previous_version.clone())
     );
-    assert!(!final_status.auto_rollback_pending);
-
-    let restored_pin_status: PinStateResponse = http_get_json(
+    let preserved_pin: PinStateResponse = http_get_json(
         host.client.clone(),
         url(&format!("/rpc/rollout/pin/{}", connector_id.as_str())),
     )
     .await?;
-    assert!(restored_pin_status.pinned);
-    assert_eq!(restored_pin_status.version, Some(previous_version));
+    assert!(preserved_pin.pinned);
+    assert_eq!(preserved_pin.version, Some(canary_version));
+    let inventory_after: ConnectorInventoryResponse =
+        http_get_json(host.client.clone(), inventory_url).await?;
+    assert_eq!(
+        inventory_after.registry_version,
+        inventory_before.registry_version
+    );
+    assert_eq!(
+        inventory_after.connector.version,
+        inventory_before.connector.version
+    );
+    let preserved_pid =
+        invoke_rollout_runtime_pid(&host, &connector_id, &capability_signing_key, &marker_path)
+            .await?;
+    assert_eq!(preserved_pid, original_pid);
 
     let logs = wait_for_log_events(
         &host.stderr_logs,
         &[
-            "rollout_pin_request",
-            "rollout_pin_response",
-            "rollout_pin_status_request",
-            "rollout_pin_status_response",
-            "rollout_schedule_request",
             "rollout_schedule_response",
             "rollout_evaluate_request",
-            "rollout_evaluate_response",
-            "rollout_status_request",
+            "rollout_evaluate_error",
             "rollout_status_response",
         ],
     )
     .await?;
 
     assert!(logs.iter().any(|entry| {
-        entry.get("event").and_then(Value::as_str) == Some("rollout_pin_response")
+        entry.get("event").and_then(Value::as_str) == Some("rollout_evaluate_error")
             && entry.get("connector_id").and_then(Value::as_str) == Some(connector_id.as_str())
-            && entry.get("pinned").and_then(Value::as_bool) == Some(true)
-    }));
-    assert!(logs.iter().any(|entry| {
-        entry.get("event").and_then(Value::as_str) == Some("rollout_pin_status_response")
-            && entry.get("connector_id").and_then(Value::as_str) == Some(connector_id.as_str())
-            && entry.get("pinned").and_then(Value::as_bool) == Some(true)
-    }));
-    assert!(logs.iter().any(|entry| {
-        entry.get("event").and_then(Value::as_str) == Some("rollout_schedule_response")
-            && entry.get("connector_id").and_then(Value::as_str) == Some(connector_id.as_str())
-            && entry.get("reason_code").and_then(Value::as_str) == Some("canary_scheduled")
+            && entry
+                .get("error")
+                .and_then(Value::as_str)
+                .is_some_and(|error| error.contains("consecutive_failures_exceeded"))
             && entry.get("duration_ms").and_then(Value::as_u64).is_some()
     }));
-    assert!(logs.iter().any(|entry| {
+    assert!(!logs.iter().any(|entry| {
         entry.get("event").and_then(Value::as_str) == Some("rollout_evaluate_response")
-            && entry.get("connector_id").and_then(Value::as_str) == Some(connector_id.as_str())
-            && entry.get("reason_code").and_then(Value::as_str)
-                == Some("consecutive_failures_exceeded")
-            && entry.get("duration_ms").and_then(Value::as_u64).is_some()
     }));
-    assert!(logs.iter().any(|entry| {
-        entry.get("message").and_then(Value::as_str) == Some("rollout decision")
-            && entry.get("connector_id").and_then(Value::as_str) == Some(connector_id.as_str())
-            && entry.get("decision").and_then(Value::as_str) == Some("scheduled")
-            && entry.get("state_before").and_then(Value::as_str) == Some("pending")
-            && entry.get("state_after").and_then(Value::as_str) == Some("canary")
-    }));
-    assert!(logs.iter().any(|entry| {
+    assert!(!logs.iter().any(|entry| {
         entry.get("message").and_then(Value::as_str) == Some("rollout decision")
             && entry.get("connector_id").and_then(Value::as_str) == Some(connector_id.as_str())
             && entry.get("decision").and_then(Value::as_str) == Some("rollback")
-            && entry.get("state_before").and_then(Value::as_str) == Some("canary")
-            && entry.get("state_after").and_then(Value::as_str) == Some("rolled_back")
-            && entry
-                .get("evidence_digest")
-                .and_then(Value::as_str)
-                .is_some_and(|digest| digest.starts_with("blake3-256:"))
     }));
 
     Ok(())
 }
 
 #[fcp_async_core::runtime::test(flavor = "multi_thread")]
-async fn fcp_host_binary_pin_status_and_manual_rollback_routes_emit_logs()
+async fn fcp_host_binary_manual_rollback_refuses_without_runtime_restoration()
 -> Result<(), Box<dyn std::error::Error>> {
     let connector_id = ConnectorId::from_static("fcp.test.rollout-pin:utility:1.0.0");
-    let host = HttpHostProcess::spawn(vec![test_connector_config(
-        &connector_id,
-        "Rollout Pin",
-        &["test", "rollout"],
-    )])
-    .await?;
-    let url = |path: &str| format!("{}{path}", host.base_url);
-
     let previous_version = semver::Version::new(1, 0, 0);
     let canary_version = semver::Version::new(1, 0, 1);
+    let capability_signing_key = Ed25519SigningKey::generate();
+    let capability_public_key = capability_public_key_hex(&capability_signing_key);
+    let runtime_evidence = tempfile::tempdir()?;
+    let marker_path = runtime_evidence.path().join("invoke.json");
+    let mut connector_config =
+        test_connector_config(&connector_id, "Rollout Pin", &["test", "rollout"]);
+    connector_config["version"] = json!(canary_version.to_string());
+    connector_config["env"]["FCP_TEST_INVOKE_STARTED_FILE"] = json!(marker_path);
+    let host = HttpHostProcess::spawn_with_connectors_file(
+        vec![connector_config],
+        &[(
+            "FCP_HOST_CAPABILITY_PUBLIC_KEY",
+            capability_public_key.as_str(),
+        )],
+    )
+    .await?;
+    let url = |path: &str| format!("{}{path}", host.base_url);
     let policy = test_rollout_policy();
+
+    // Replayable settings revisions must not be mistaken for retained binaries.
+    for profile in ["previous", "current"] {
+        let applied: ConnectorConfigApplyResponse = http_post_json(
+            host.client.clone(),
+            url(&format!(
+                "/rpc/connectors/{}/config/apply",
+                connector_id.as_str()
+            )),
+            ConnectorConfigApplyRequest {
+                payload: json!({ "profile": profile }),
+                expected_active_revision_id: None,
+                created_by: Some("rollback-regression".to_string()),
+                change_reason: None,
+            },
+        )
+        .await?;
+        assert!(applied.changed);
+        assert!(
+            applied
+                .revision
+                .is_some_and(|revision| revision.is_replayable())
+        );
+    }
 
     let pinned: PinStateResponse = http_put_json(
         host.client.clone(),
@@ -6148,28 +6185,71 @@ async fn fcp_host_binary_pin_status_and_manual_rollback_routes_emit_logs()
     assert_eq!(status.pinned_version, Some(canary_version.clone()));
     assert_eq!(status.canary_percent, policy.canary_percent);
 
-    let rollback: ManualRollbackResponse = http_post_json(
+    let original_pid =
+        invoke_rollout_runtime_pid(&host, &connector_id, &capability_signing_key, &marker_path)
+            .await?;
+    let inventory_url = url(&format!("/rpc/connectors/{}", connector_id.as_str()));
+    let inventory_before: ConnectorInventoryResponse =
+        http_get_json(host.client.clone(), inventory_url.clone()).await?;
+    let connectors_file = host.lifecycle_state_dir.path().join("connectors.json");
+    let lifecycle_file = host.lifecycle_state_dir.path().join("lifecycle-state.json");
+    let inventory_bytes = std::fs::read(&connectors_file)?;
+    let lifecycle_bytes = std::fs::read(&lifecycle_file)?;
+
+    let (rollback_status, rollback_error) = request_status_text(
         host.client.clone(),
+        reqwest::Method::POST,
         url("/rpc/rollout/rollback"),
-        json!({
+        Some(json!({
             "connector_id": connector_id.as_str(),
             "to_version": previous_version.clone(),
-        }),
+            "reason": "operator requested the prior deployment",
+        })),
+        Some(admin_auth_headers()),
     )
     .await?;
-    assert_eq!(rollback.connector_id, connector_id.as_str());
-    assert_eq!(rollback.state, LifecycleState::RolledBack);
-    assert_eq!(rollback.from_version, canary_version.clone());
-    assert_eq!(rollback.to_version, previous_version.clone());
-    assert!(rollback.message.contains("rolled back"));
+    assert_eq!(rollback_status, reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        rollback_error.contains("verified executable and inventory restoration is unavailable")
+    );
+    assert!(rollback_error.contains("retained config revisions contain settings only"));
+    assert!(rollback_error.contains("v1.0.0"));
+    assert!(rollback_error.contains("managed inventory"));
+    assert_eq!(std::fs::read(&connectors_file)?, inventory_bytes);
+    assert_eq!(std::fs::read(&lifecycle_file)?, lifecycle_bytes);
 
-    let repinned: PinStateResponse = http_get_json(
+    let preserved_pin: PinStateResponse = http_get_json(
         host.client.clone(),
         url(&format!("/rpc/rollout/pin/{}", connector_id.as_str())),
     )
     .await?;
-    assert!(repinned.pinned);
-    assert_eq!(repinned.version, Some(previous_version.clone()));
+    assert!(preserved_pin.pinned);
+    assert_eq!(preserved_pin.version, Some(canary_version.clone()));
+    let preserved_status: RolloutStatusResponse = http_get_json(
+        host.client.clone(),
+        url(&format!("/rpc/rollout/{}", connector_id.as_str())),
+    )
+    .await?;
+    assert_eq!(preserved_status.status.state, LifecycleState::Canary);
+    assert_eq!(preserved_status.status.version, canary_version);
+    assert_eq!(
+        preserved_status.status.rollback_target_version,
+        Some(previous_version)
+    );
+    let inventory_after: ConnectorInventoryResponse =
+        http_get_json(host.client.clone(), inventory_url).await?;
+    assert_eq!(
+        inventory_after.registry_version,
+        inventory_before.registry_version
+    );
+    assert_eq!(
+        inventory_after.connector.version,
+        inventory_before.connector.version
+    );
+    let preserved_pid =
+        invoke_rollout_runtime_pid(&host, &connector_id, &capability_signing_key, &marker_path)
+            .await?;
+    assert_eq!(preserved_pid, original_pid);
 
     let unpinned: PinStateResponse = http_delete_json(
         host.client.clone(),
@@ -6187,7 +6267,7 @@ async fn fcp_host_binary_pin_status_and_manual_rollback_routes_emit_logs()
             "rollout_pin_status_request",
             "rollout_pin_status_response",
             "rollout_manual_rollback_request",
-            "rollout_manual_rollback_response",
+            "rollout_manual_rollback_error",
             "rollout_unpin_request",
             "rollout_unpin_response",
         ],
@@ -6200,11 +6280,19 @@ async fn fcp_host_binary_pin_status_and_manual_rollback_routes_emit_logs()
             && entry.get("pinned").and_then(Value::as_bool) == Some(true)
     }));
     assert!(logs.iter().any(|entry| {
-        entry.get("event").and_then(Value::as_str) == Some("rollout_manual_rollback_response")
+        entry.get("event").and_then(Value::as_str) == Some("rollout_manual_rollback_error")
             && entry.get("connector_id").and_then(Value::as_str) == Some(connector_id.as_str())
             && entry.get("from_version").and_then(Value::as_str) == Some("1.0.1")
             && entry.get("to_version").and_then(Value::as_str) == Some("1.0.0")
-            && entry.get("state").and_then(Value::as_str) == Some("rolled_back")
+            && entry
+                .get("error")
+                .and_then(Value::as_str)
+                .is_some_and(|error| {
+                    error.contains("verified executable and inventory restoration")
+                })
+    }));
+    assert!(!logs.iter().any(|entry| {
+        entry.get("event").and_then(Value::as_str) == Some("rollout_manual_rollback_response")
     }));
     assert!(logs.iter().any(|entry| {
         entry.get("event").and_then(Value::as_str) == Some("rollout_unpin_response")

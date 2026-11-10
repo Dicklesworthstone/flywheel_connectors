@@ -508,6 +508,7 @@ fwc rollout set github --canary 10 --host http://127.0.0.1:8787
 fwc rollout status github --host http://127.0.0.1:8787
 fwc status github --host http://127.0.0.1:8787
 fwc doctor --zone z:work --all --host http://127.0.0.1:8787
+# Currently refused: verified runtime restoration is unavailable.
 fwc rollout rollback github --to 1.2.2 --host http://127.0.0.1:8787
 ```
 
@@ -515,8 +516,17 @@ Read the truth contract literally:
 
 - `rollout set` proves that the active node accepted the canary mutation
 - `rollout status` proves the current node-local rollout state snapshot
-- `rollout rollback` proves that the rollback mutation happened on the active node
+- `rollout rollback` currently returns HTTP 503 without changing lifecycle state,
+  version pins, or the active runtime
 - none of those answers by themselves prove later runtime stabilization
+
+Automatic health evaluations that request rollback return the same unavailability
+before recording a completed rollback. Healthy promotion and hold decisions still
+work. Retained configuration revisions contain connector settings; they do not
+retain a verified executable and its complete deployment configuration. Restore
+a verified prior deployment through managed inventory before rescheduling the
+rollout. Existing stateful replacement and canonical state handoff restrictions
+still apply.
 
 The stabilization check is always the same follow-up loop:
 

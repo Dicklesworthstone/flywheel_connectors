@@ -194,6 +194,8 @@ where
     ///
     /// Returns an error if the connector is unknown, the rollout policy is
     /// invalid, or the lifecycle manager rejects the transition/persistence.
+    /// Rollback decisions are refused until verified runtime restoration is
+    /// available; a lifecycle transition alone cannot restore an executable.
     #[allow(clippy::too_many_lines)]
     pub async fn evaluate(
         &self,
@@ -248,19 +250,17 @@ where
                 RolloutDecision::Promote
             }
             RolloutDecision::Rollback => {
-                if record.previous_version.is_none() {
-                    return Err(map_lifecycle_error(LifecycleError::NoRollbackTarget));
-                }
-                record
-                    .transition(
-                        LifecycleState::RolledBack,
-                        TransitionReason::AutoRollback {
-                            health_score: health_score_percent(record.health.success_rate),
-                            failure_reason: decision_plan.message.clone(),
-                        },
-                    )
-                    .map_err(map_lifecycle_error)?;
-                RolloutDecision::Rollback
+                let target = record
+                    .previous_version
+                    .as_ref()
+                    .ok_or_else(|| map_lifecycle_error(LifecycleError::NoRollbackTarget))?;
+                // Registry discovery and lifecycle persistence cannot restore a
+                // previous executable or its admitted inventory. Preserve the
+                // deployed record instead of reporting a completed rollback.
+                return Err(HostError::Unavailable(format!(
+                    "connector '{connector_id}' requires rollback to v{target} ({}: {}), but verified executable and inventory restoration is unavailable; restore a verified prior deployment through managed inventory before rescheduling. Lifecycle state and version pins were not changed",
+                    decision_plan.reason_code, decision_plan.message
+                )));
             }
             RolloutDecision::Hold => RolloutDecision::Hold,
             RolloutDecision::Scheduled => RolloutDecision::Scheduled,
@@ -1152,16 +1152,21 @@ mod tests {
     }
 
     #[fcp_async_core::runtime::test]
-    async fn failed_self_check_triggers_rollback() {
+    async fn failed_self_check_refuses_unavailable_runtime_rollback_without_mutation() {
         let observed_at = Utc::now() - chrono::Duration::seconds(180);
         let registry = Arc::new(TestRegistry {
             summary: connector_summary(ConnectorHealth::healthy()),
             self_check: SelfCheckReport::failed("self_check_failed", "database unavailable"),
         });
         let lifecycle = Arc::new(InMemoryLifecycleManager::new());
-        let controller = scheduled_record(registry, lifecycle, observed_at).await;
+        let controller = scheduled_record(registry, lifecycle.clone(), observed_at).await;
+        let before = lifecycle
+            .get(&connector_id())
+            .await
+            .expect("read lifecycle")
+            .expect("scheduled record");
 
-        let outcome = controller
+        let error = controller
             .evaluate(
                 &connector_id(),
                 RolloutObservation::new(false, rollout_policy())
@@ -1170,45 +1175,80 @@ mod tests {
                     .observed_at(Utc::now()),
             )
             .await
-            .expect("rollback evaluation should succeed");
+            .expect_err("metadata cannot restore a runtime");
 
-        assert_eq!(outcome.decision, RolloutDecision::Rollback);
-        assert_eq!(outcome.record.state, LifecycleState::RolledBack);
-        assert_eq!(outcome.audit_event.reason_code, "self_check_failed");
+        assert!(matches!(
+            error,
+            HostError::Unavailable(message)
+                if message.contains("self_check_failed")
+                    && message.contains("v1.0.0")
+                    && message.contains("verified executable and inventory restoration")
+        ));
+        let after = lifecycle
+            .get(&connector_id())
+            .await
+            .expect("read preserved lifecycle")
+            .expect("scheduled record remains");
+        assert_eq!(after.state, LifecycleState::Canary);
+        assert_eq!(
+            serde_json::to_value(after).expect("serialize preserved record"),
+            serde_json::to_value(before).expect("serialize original record")
+        );
     }
 
     #[fcp_async_core::runtime::test]
-    async fn failure_streak_triggers_rollback() {
+    async fn failure_streak_refuses_unavailable_runtime_rollback_without_mutation() {
         let observed_at = Utc::now() - chrono::Duration::seconds(180);
         let registry = Arc::new(TestRegistry {
             summary: connector_summary(ConnectorHealth::healthy()),
             self_check: SelfCheckReport::ok(),
         });
         let lifecycle = Arc::new(InMemoryLifecycleManager::new());
-        let controller = scheduled_record(registry, lifecycle, observed_at).await;
+        let controller = scheduled_record(registry, lifecycle.clone(), observed_at).await;
 
-        let mut last = None;
-        for _ in 0..3 {
-            last = Some(
-                controller
-                    .evaluate(
-                        &connector_id(),
-                        RolloutObservation::new(false, rollout_policy())
-                            .with_latency_ms(500)
-                            .with_uptime_secs(180)
-                            .observed_at(Utc::now()),
-                    )
-                    .await
-                    .expect("evaluation should succeed"),
-            );
+        for _ in 0..2 {
+            let outcome = controller
+                .evaluate(
+                    &connector_id(),
+                    RolloutObservation::new(false, rollout_policy())
+                        .with_latency_ms(500)
+                        .with_uptime_secs(180)
+                        .observed_at(Utc::now()),
+                )
+                .await
+                .expect("observations below the rollback threshold should succeed");
+            assert_eq!(outcome.decision, RolloutDecision::Hold);
         }
-
-        let outcome = last.expect("last outcome");
-        assert_eq!(outcome.decision, RolloutDecision::Rollback);
-        assert_eq!(outcome.record.state, LifecycleState::RolledBack);
+        let before = lifecycle
+            .get(&connector_id())
+            .await
+            .expect("read lifecycle")
+            .expect("scheduled record");
+        let error = controller
+            .evaluate(
+                &connector_id(),
+                RolloutObservation::new(false, rollout_policy())
+                    .with_latency_ms(500)
+                    .with_uptime_secs(180)
+                    .observed_at(Utc::now()),
+            )
+            .await
+            .expect_err("the rollback threshold cannot complete a runtime restore");
+        assert!(matches!(
+            error,
+            HostError::Unavailable(message)
+                if message.contains("consecutive_failures_exceeded")
+                    && message.contains("managed inventory")
+        ));
+        let after = lifecycle
+            .get(&connector_id())
+            .await
+            .expect("read preserved lifecycle")
+            .expect("scheduled record remains");
+        assert_eq!(after.state, LifecycleState::Canary);
         assert_eq!(
-            outcome.audit_event.reason_code,
-            "consecutive_failures_exceeded"
+            serde_json::to_value(after).expect("serialize preserved record"),
+            serde_json::to_value(before).expect("serialize original record")
         );
     }
 
@@ -1835,7 +1875,7 @@ mod tests {
     }
 
     #[fcp_async_core::runtime::test]
-    async fn ctrl_unavailable_rolls_back() {
+    async fn ctrl_unavailable_runtime_refuses_rollback_without_mutation() {
         let t = Utc::now() - chrono::Duration::seconds(180);
         let reg = Arc::new(TestRegistry {
             summary: connector_summary(ConnectorHealth::Unavailable {
@@ -1845,8 +1885,13 @@ mod tests {
             self_check: SelfCheckReport::ok(),
         });
         let lm = Arc::new(InMemoryLifecycleManager::new());
-        let ctrl = scheduled_record(reg, lm, t).await;
-        let o = ctrl
+        let ctrl = scheduled_record(reg, lm.clone(), t).await;
+        let before = lm
+            .get(&connector_id())
+            .await
+            .expect("read lifecycle")
+            .expect("scheduled record");
+        let error = ctrl
             .evaluate(
                 &connector_id(),
                 RolloutObservation::new(false, rollout_policy())
@@ -1854,8 +1899,23 @@ mod tests {
                     .observed_at(Utc::now()),
             )
             .await
-            .unwrap();
-        assert_eq!(o.decision, RolloutDecision::Rollback);
+            .expect_err("an unavailable runtime cannot prove restoration");
+        assert!(matches!(
+            error,
+            HostError::Unavailable(message)
+                if message.contains("connector_unavailable")
+                    && message.contains("verified executable and inventory restoration")
+        ));
+        let after = lm
+            .get(&connector_id())
+            .await
+            .expect("read preserved lifecycle")
+            .expect("scheduled record remains");
+        assert_eq!(after.state, LifecycleState::Canary);
+        assert_eq!(
+            serde_json::to_value(after).expect("serialize preserved record"),
+            serde_json::to_value(before).expect("serialize original record")
+        );
     }
 
     #[fcp_async_core::runtime::test]
@@ -3970,6 +4030,10 @@ mod tests {
     #[fcp_async_core::runtime::test]
     async fn ctrl_evaluate_resets_failure_streak_on_success() {
         let t = Utc::now() - chrono::Duration::seconds(180);
+        // Isolate the streak gate: aggregate error rate must not request a
+        // rollback before this test can observe the reset after a success.
+        let mut policy = rollout_policy();
+        policy.rollback_rules.max_error_rate_bps = 10_000;
         let reg = Arc::new(TestRegistry {
             summary: connector_summary(ConnectorHealth::healthy()),
             self_check: SelfCheckReport::ok(),
@@ -3981,7 +4045,7 @@ mod tests {
             let _ = ctrl
                 .evaluate(
                     &connector_id(),
-                    RolloutObservation::new(false, rollout_policy())
+                    RolloutObservation::new(false, policy.clone())
                         .with_uptime_secs(180)
                         .observed_at(Utc::now()),
                 )
@@ -3992,23 +4056,25 @@ mod tests {
         let _ = ctrl
             .evaluate(
                 &connector_id(),
-                RolloutObservation::new(true, rollout_policy())
+                RolloutObservation::new(true, policy.clone())
                     .with_uptime_secs(180)
                     .observed_at(Utc::now()),
             )
             .await
             .unwrap();
-        // Send 2 more failures — should NOT trigger rollback (streak restarted)
+        // Send one more failure; the successful sample restarted the streak.
         let o = ctrl
             .evaluate(
                 &connector_id(),
-                RolloutObservation::new(false, rollout_policy())
+                RolloutObservation::new(false, policy)
                     .with_uptime_secs(180)
                     .observed_at(Utc::now()),
             )
             .await
             .unwrap();
         assert_eq!(o.evidence.failure_streak, 1);
+        assert_eq!(o.decision, RolloutDecision::Hold);
+        assert_eq!(o.record.state, LifecycleState::Canary);
         assert_ne!(o.audit_event.reason_code, "consecutive_failures_exceeded");
     }
 

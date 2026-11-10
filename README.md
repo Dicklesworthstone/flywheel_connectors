@@ -2336,10 +2336,13 @@ fwc rollout set github --canary 10 --host http://127.0.0.1:8787
 fwc rollout status github --host http://127.0.0.1:8787
 fwc status github --host http://127.0.0.1:8787
 fwc doctor --zone z:work --all --host http://127.0.0.1:8787
+# Currently refused: verified runtime restoration is unavailable.
 fwc rollout rollback github --to 1.2.2 --host http://127.0.0.1:8787
 ```
 
-After every rollout or rollback, re-check `rollout status`, `status`, `doctor`, and `mesh explain-availability`. If the active node degrades, promote the staged standby peer deliberately rather than assuming automatic lease handoff or automatic state convergence.
+Manual rollback and automatic health evaluations that require rollback currently return HTTP 503 before changing lifecycle state or version pins. Saved configuration revisions contain settings, but cannot restore a verified prior executable and its complete deployment configuration. Restore the verified prior deployment through managed inventory before rescheduling; stateful replacement and canonical state handoff restrictions still apply. Healthy rollout promotion and hold decisions remain available.
+
+After every rollout or managed deployment restoration, re-check `rollout status`, `status`, `doctor`, and `mesh explain-availability`. If the active node degrades, promote the staged standby peer deliberately rather than assuming automatic lease handoff or automatic state convergence.
 
 ### Provisioning and Secret Flow
 

@@ -56,8 +56,6 @@ use fcp_evidence::{
     OwnerMigrationVerificationContext, SoftwareBillOfMaterials, SupplyChainAttestation,
     TrustedV3OwnerMap, verify_hybrid_owner_object,
 };
-#[cfg(test)]
-use fcp_host::BatchStatus;
 use fcp_host::RoutedReadResponse;
 use fcp_host::{
     AdaptiveWarmPoolConfig, AdaptiveWarmPoolController, BatchExecutor, BatchInvokeRequest,
@@ -91,20 +89,22 @@ use fcp_host::{
     PrewarmHealthState, PrewarmManifestState, PrewarmPoolState, PrewarmSandboxState,
     PrewarmStrategy, PrewarmZoneBinding, ProviderKey, ReceiptQueryRequest, ReceiptQueryResponse,
     ReceiptSummary, RequestPriority, ResilienceError, ResilienceLayer, RevocationCascadeVerifier,
-    RolloutController, RolloutDecision, RolloutObservation, RolloutOutcome,
-    RuntimeNetworkEnforcement, SafetyTierExt, SanitizedConnectorConfig, SimulateCostConfidence,
-    SimulateCostEstimate, SimulatePhase, SimulateReceipt, SimulateReceiptQueryRequest,
-    SimulateReceiptQueryResponse, SimulateResourceAvailability, StartupReconciliationReport,
-    StickyCredentialPolicy, SupplyChainGate, SupplyChainGateConfig,
-    TRUTH_PRECEDENCE_BOOT_CONFIG_EXIT_CODE, ToolDescriptor, TruthPrecedenceBootError,
-    TruthPrecedenceBootResolution, TruthPrecedenceBootSelection, V2_DEFAULT_GRADUATED_ENV,
-    V2_INSUFFICIENT_PEERS_BEHAVIOR_ENV, V2_MIN_HEALTHY_MESH_PEERS_ENV, WARM_POOL_EVIDENCE_EVENT,
-    WarmPoolEntrySnapshot, WarmPoolKey, WarmPoolPressureSnapshot, admit_safety_tier,
-    capability_constraint_audit_descriptor, classify_deployment_mode, diff_sanitized_config_values,
-    emit_boot_log, emit_capability_constraint_denial_audit_event, merge_connector_health,
-    native_proxy_only_sandbox_decision, resolve_truth_precedence_boot_resolution,
-    validate_runtime_network_claim, wasi_config_for_operation_network_policy,
+    RolloutController, RolloutObservation, RolloutOutcome, RuntimeNetworkEnforcement,
+    SafetyTierExt, SanitizedConnectorConfig, SimulateCostConfidence, SimulateCostEstimate,
+    SimulatePhase, SimulateReceipt, SimulateReceiptQueryRequest, SimulateReceiptQueryResponse,
+    SimulateResourceAvailability, StartupReconciliationReport, StickyCredentialPolicy,
+    SupplyChainGate, SupplyChainGateConfig, TRUTH_PRECEDENCE_BOOT_CONFIG_EXIT_CODE, ToolDescriptor,
+    TruthPrecedenceBootError, TruthPrecedenceBootResolution, TruthPrecedenceBootSelection,
+    V2_DEFAULT_GRADUATED_ENV, V2_INSUFFICIENT_PEERS_BEHAVIOR_ENV, V2_MIN_HEALTHY_MESH_PEERS_ENV,
+    WARM_POOL_EVIDENCE_EVENT, WarmPoolEntrySnapshot, WarmPoolKey, WarmPoolPressureSnapshot,
+    admit_safety_tier, capability_constraint_audit_descriptor, classify_deployment_mode,
+    diff_sanitized_config_values, emit_boot_log, emit_capability_constraint_denial_audit_event,
+    merge_connector_health, native_proxy_only_sandbox_decision,
+    resolve_truth_precedence_boot_resolution, validate_runtime_network_claim,
+    wasi_config_for_operation_network_policy,
 };
+#[cfg(test)]
+use fcp_host::{BatchStatus, RolloutDecision};
 use fcp_host::{DeploymentClassification, DeploymentTierRefusal, HostError, HostResult};
 use fcp_kernel::{
     ApprovalMode, ConnectorHealth, ConnectorId, HandshakeRequest, HandshakeResponse,
@@ -17206,15 +17206,6 @@ async fn rollout_evaluate_handler(
     }
     match state.rollout.evaluate(&connector_id, observation).await {
         Ok(outcome) => {
-            if matches!(outcome.decision, RolloutDecision::Rollback)
-                && let Some(target_version) = outcome.record.previous_version.clone()
-            {
-                state
-                    .lifecycle
-                    .pin(&connector_id, target_version)
-                    .await
-                    .map_err(|e| map_host_error(map_lifecycle_host_error(e)))?;
-            }
             tracing::info!(
                 event = "rollout_evaluate_response",
                 connector_id = %connector_id,
@@ -17246,7 +17237,7 @@ async fn rollout_manual_rollback_handler(
     let RollbackRequest {
         connector_id,
         to_version,
-        reason,
+        reason: _reason,
     } = request;
     let connector_id = parse_connector_id(&connector_id)?;
     ensure_registered_connector(&state, &connector_id).await?;
@@ -17280,34 +17271,22 @@ async fn rollout_manual_rollback_handler(
         ))));
     }
 
-    let rolled_back = state
-        .lifecycle
-        .rollback(&connector_id, reason)
-        .await
-        .map_err(|e| map_host_error(map_lifecycle_host_error(e)))?;
-    state
-        .lifecycle
-        .pin(&connector_id, to_version.clone())
-        .await
-        .map_err(|e| map_host_error(map_lifecycle_host_error(e)))?;
-
-    let response = RollbackResponse {
-        connector_id: connector_id.to_string(),
-        state: rolled_back.state,
-        from_version,
-        to_version: to_version.clone(),
-        message: format!("connector rolled back to v{to_version} and pinned"),
-    };
-    tracing::info!(
-        event = "rollout_manual_rollback_response",
+    // Config revisions retain connector settings, not an executable and its
+    // complete admitted inventory. Never turn that metadata into a claim that
+    // the running deployment was restored, or repin a runtime we did not load.
+    let error = HostError::Unavailable(format!(
+        "connector '{connector_id}' cannot roll back from v{from_version} to v{to_version}: verified executable and inventory restoration is unavailable; retained config revisions contain settings only. Restore a verified prior deployment through managed inventory before rescheduling. Lifecycle state and version pins were not changed"
+    ));
+    tracing::warn!(
+        event = "rollout_manual_rollback_error",
         connector_id = %connector_id,
-        from_version = %response.from_version,
-        to_version = %response.to_version,
-        state = %response.state,
+        from_version = %from_version,
+        to_version = %to_version,
+        error = %error,
         duration_ms = started_at.elapsed().as_millis() as u64,
-        "rollout manual rollback request complete"
+        "rollout manual rollback request refused"
     );
-    Ok(Json(response))
+    Err(map_host_error(error))
 }
 
 async fn rollout_status_handler(
