@@ -5429,6 +5429,9 @@ struct HostAdminClient {
     // Bound each read through body consumption, not a whole multi-read command
     // or LiveTruthResolver source attempt. Keep invoke/mutation budgets separate.
     read_timeout: Duration,
+    // Workflow discovery and introspection share the original run deadline.
+    // Ordinary commands retain their independent per-read timeout.
+    read_budget: Option<pipe::budget::ExecutionBudget>,
 }
 
 #[derive(Clone, Debug)]
@@ -5580,6 +5583,7 @@ impl HostAdminClient {
                     base_url: "http://localhost".to_owned(),
                     endpoint,
                     read_timeout,
+                    read_budget: None,
                 });
             }
         }
@@ -5592,7 +5596,13 @@ impl HostAdminClient {
             base_url: endpoint.clone(),
             endpoint,
             read_timeout,
+            read_budget: None,
         })
+    }
+
+    fn with_read_budget(mut self, budget: pipe::budget::ExecutionBudget) -> Self {
+        self.read_budget = Some(budget);
+        self
     }
 
     fn catalog(
@@ -6180,8 +6190,11 @@ impl HostAdminClient {
         method: &'static str,
         path: &str,
     ) -> Result<(T, HostReadProvenance)> {
-        request
-            .timeout(self.read_timeout)
+        let timeout = self.read_budget.map_or(Ok(self.read_timeout), |budget| {
+            budget.preflight_timeout(self.read_timeout, std::time::Instant::now())
+        })?;
+        let result = request
+            .timeout(timeout)
             .send()
             .with_context(|| format!("{method} {path} from host admin API failed"))
             .and_then(|response| {
@@ -6198,12 +6211,18 @@ impl HostAdminClient {
                     error.context(HostReadTimeout {
                         method,
                         path: path.to_owned(),
-                        timeout: self.read_timeout,
+                        timeout,
                     })
                 } else {
                     error
                 }
-            })
+            });
+        // Include body consumption, validation and JSON parsing. A late ready
+        // response cannot authorize another setup request or a first effect.
+        if let Some(budget) = self.read_budget {
+            budget.remaining_ms(std::time::Instant::now())?;
+        }
+        result
     }
 
     fn post_json<B: Serialize, T: DeserializeOwned>(&self, path: &str, body: &B) -> Result<T> {
@@ -27086,30 +27105,35 @@ fn resolve_host_operation_from_catalog(
     };
     let introspection = client
         .introspect(connector.summary.id.as_str())
-        .map_err(|error| DispatchOutcome {
-            payload: json!({
-                "status": "error",
-                "command": command,
-                "source": "host-admin-api",
-                "connector": {
-                    "slug": &connector.slug,
-                    "canonical_id": connector.summary.id.as_str(),
-                    "name": &connector.summary.name,
-                },
-                "error": {
-                    "type": "host-introspection-failed",
-                    "message": format!(
-                        "Failed to load live operation descriptors for `{}` from `fcp-host`: {error}",
-                        connector.slug
-                    ),
-                    "recoverable": true,
-                },
-                "next_actions": [
-                    format!("fwc show {} --host {}", connector.slug, client.base_url),
-                    format!("fwc status {} --host {}", connector.slug, client.base_url),
-                ],
-            }),
-            exit_code: CliExitCode::Transport,
+        .map_err(|error| {
+            if error.is::<pipe::budget::DeadlineExpired>() {
+                return workflow_setup_deadline_dispatch(command, "introspection");
+            }
+            DispatchOutcome {
+                payload: json!({
+                    "status": "error",
+                    "command": command,
+                    "source": "host-admin-api",
+                    "connector": {
+                        "slug": &connector.slug,
+                        "canonical_id": connector.summary.id.as_str(),
+                        "name": &connector.summary.name,
+                    },
+                    "error": {
+                        "type": "host-introspection-failed",
+                        "message": format!(
+                            "Failed to load live operation descriptors for `{}` from `fcp-host`: {error}",
+                            connector.slug
+                        ),
+                        "recoverable": true,
+                    },
+                    "next_actions": [
+                        format!("fwc show {} --host {}", connector.slug, client.base_url),
+                        format!("fwc status {} --host {}", connector.slug, client.base_url),
+                    ],
+                }),
+                exit_code: CliExitCode::Transport,
+            }
         })?;
     let operation = match resolve_host_tool(&introspection.tools, operation_selector) {
         Ok(operation) => operation.clone(),
@@ -29914,6 +29938,34 @@ fn pipeline_execution_failure(
     DispatchOutcome { payload, exit_code }
 }
 
+fn workflow_setup_deadline_dispatch(command: &str, phase: &str) -> DispatchOutcome {
+    let mut payload = json!({
+        "status": "error",
+        "command": command,
+        "phase": phase,
+        "invoke_attempted": false,
+        "automatic_retry_allowed": false,
+        "execution": {
+            "executed_steps": 0,
+            "steps": [],
+            "outputs": {},
+        },
+        "error": {
+            "type": "pipeline-deadline-exceeded",
+            "message": "The workflow deadline expired during setup. No workflow operation was invoked.",
+            "recoverable": true,
+        },
+        "next_actions": [
+            "Check host responsiveness or increase the pipeline timeout_ms before starting a new run.",
+        ],
+    });
+    CommandEnvelope::new(CommandAvailability::Unknown, command).inject_into(&mut payload);
+    DispatchOutcome {
+        payload,
+        exit_code: CliExitCode::Transport,
+    }
+}
+
 fn pipeline_deadline_failure(
     command: &str,
     step: &pipe::PlannedPipelineStep,
@@ -30343,6 +30395,7 @@ fn execute_live_pipeline_plan(
     zone: &str,
     auth_by_step: &BTreeMap<String, ResolvedLiveAuth>,
     requested_run_key: Option<&str>,
+    run_budget: pipe::budget::ExecutionBudget,
 ) -> Result<LivePipelineExecutionResult> {
     for step in &plan.steps {
         anyhow::ensure!(
@@ -30369,8 +30422,6 @@ fn execute_live_pipeline_plan(
     let run_key = requested_run_key.map_or_else(|| RequestId::random().to_string(), str::to_owned);
     let mut failure = None;
     let mut stopped_after = None::<String>;
-    let run_budget =
-        pipe::budget::ExecutionBudget::start(plan.timeout_ms, std::time::Instant::now());
 
     for step_id in &plan.execution_order {
         let step = steps_by_id.get(step_id.as_str()).ok_or_else(|| {
@@ -31212,6 +31263,8 @@ fn recipe_run_dispatch(
         });
     }
 
+    let run_budget =
+        pipe::budget::ExecutionBudget::start(plan.timeout_ms, std::time::Instant::now());
     let Some(host) = resolve_host_config(explicit_host)? else {
         return Ok(missing_host_dispatch(
             "recipe",
@@ -31231,14 +31284,27 @@ fn recipe_run_dispatch(
             ],
         ));
     };
-    let client = HostAdminClient::new(&host.endpoint)?;
-    let (catalog, _) = client.catalog(None)?;
+    let client = HostAdminClient::new(&host.endpoint)?.with_read_budget(run_budget);
+    let (catalog, _) = match client.catalog(None) {
+        Ok(catalog) => catalog,
+        Err(error) if error.is::<pipe::budget::DeadlineExpired>() => {
+            return Ok(workflow_setup_deadline_dispatch("recipe", "discovery"));
+        }
+        Err(error) => return Err(error),
+    };
     let resolved_operations =
         match resolve_live_pipeline_operations("recipe", &plan, &client, &catalog) {
             Ok(operations) => operations,
             Err(outcome) => return Ok(outcome),
         };
-    let auth = match resolve_workflow_auth(&args.auth, &plan, &resolved_operations) {
+    if run_budget.remaining_ms(std::time::Instant::now()).is_err() {
+        return Ok(workflow_setup_deadline_dispatch("recipe", "credentials"));
+    }
+    let auth = resolve_workflow_auth(&args.auth, &plan, &resolved_operations);
+    if run_budget.remaining_ms(std::time::Instant::now()).is_err() {
+        return Ok(workflow_setup_deadline_dispatch("recipe", "credentials"));
+    }
+    let auth = match auth {
         Ok(auth) => auth,
         Err(error) => {
             return Ok(live_auth_dispatch(
@@ -31272,6 +31338,7 @@ fn recipe_run_dispatch(
         &zone,
         &auth,
         args.idempotency_key.as_deref(),
+        run_budget,
     )?;
 
     let message = match mode {
@@ -31743,6 +31810,8 @@ fn pipeline_run_dispatch(
         });
     }
 
+    let run_budget =
+        pipe::budget::ExecutionBudget::start(plan.timeout_ms, std::time::Instant::now());
     let Some(host) = resolve_host_config(explicit_host)? else {
         return Ok(missing_host_dispatch(
             "pipeline",
@@ -31762,14 +31831,27 @@ fn pipeline_run_dispatch(
             ],
         ));
     };
-    let client = HostAdminClient::new(&host.endpoint)?;
-    let (catalog, _) = client.catalog(None)?;
+    let client = HostAdminClient::new(&host.endpoint)?.with_read_budget(run_budget);
+    let (catalog, _) = match client.catalog(None) {
+        Ok(catalog) => catalog,
+        Err(error) if error.is::<pipe::budget::DeadlineExpired>() => {
+            return Ok(workflow_setup_deadline_dispatch("pipeline", "discovery"));
+        }
+        Err(error) => return Err(error),
+    };
     let resolved_operations =
         match resolve_live_pipeline_operations("pipeline", &plan, &client, &catalog) {
             Ok(operations) => operations,
             Err(outcome) => return Ok(outcome),
         };
-    let auth = match resolve_workflow_auth(&args.auth, &plan, &resolved_operations) {
+    if run_budget.remaining_ms(std::time::Instant::now()).is_err() {
+        return Ok(workflow_setup_deadline_dispatch("pipeline", "credentials"));
+    }
+    let auth = resolve_workflow_auth(&args.auth, &plan, &resolved_operations);
+    if run_budget.remaining_ms(std::time::Instant::now()).is_err() {
+        return Ok(workflow_setup_deadline_dispatch("pipeline", "credentials"));
+    }
+    let auth = match auth {
         Ok(auth) => auth,
         Err(error) => {
             return Ok(live_auth_dispatch(
@@ -31803,6 +31885,7 @@ fn pipeline_run_dispatch(
         &zone,
         &auth,
         args.idempotency_key.as_deref(),
+        run_budget,
     )?;
     let message = match mode {
         PipelinePlanMode::Run => format!(
@@ -35286,6 +35369,7 @@ mod tests {
             endpoint: base_url.clone(),
             base_url,
             read_timeout: Duration::from_millis(250),
+            read_budget: None,
         };
         let (release, released) = std::sync::mpsc::channel();
         let (observed_request, observed) = std::sync::mpsc::channel();
@@ -50232,6 +50316,121 @@ input = {{ query = "independent" }}
         )
         .unwrap();
         path
+    }
+
+    #[test]
+    fn execute_pipeline_deadline_bounds_discovery_and_cumulative_introspection() {
+        for mode in ["run", "dry-run"] {
+            for phase in ["discovery", "introspection"] {
+                let tempdir = TempDir::new().unwrap();
+                let _history =
+                    super::install_test_history_path(tempdir.path().join("history.jsonl"));
+                let path = workflow_budget_fixture(tempdir.path(), 500, 5_000);
+                let token = test_capability_token_arg();
+                let request_count = if phase == "discovery" { 1 } else { 2 };
+                let routes = pipe_mock_catalog(false)
+                    .into_iter()
+                    .take(request_count)
+                    .enumerate()
+                    .map(|(index, (path, body))| {
+                        let delay = match (phase, index) {
+                            ("introspection", 0) => Duration::from_millis(200),
+                            ("introspection", _) => Duration::from_millis(400),
+                            _ => Duration::from_millis(650),
+                        };
+                        (path, body, delay)
+                    })
+                    .collect();
+                let (host, server, log) = spawn_mock_host_sequence_with_timing(routes);
+                let (exit, payload) = execute_json(&[
+                    "fwc",
+                    "--json",
+                    "--host",
+                    &host,
+                    "pipeline",
+                    mode,
+                    &path.display().to_string(),
+                    "--capability-token",
+                    &token,
+                ]);
+                server.join().unwrap();
+                assert_eq!(
+                    exit,
+                    CliExitCode::Transport.into(),
+                    "{mode}/{phase}: {payload}"
+                );
+                assert_eq!(payload["error"]["type"], "pipeline-deadline-exceeded");
+                assert_eq!(payload["phase"], phase);
+                assert_eq!(payload["invoke_attempted"], false);
+                assert_eq!(payload["execution"]["executed_steps"], 0);
+                assert_eq!(payload["execution"]["outputs"], json!({}));
+                let log = log.lock().unwrap();
+                assert_eq!(log.len(), request_count);
+                assert!(log.iter().all(
+                    |(route, _)| route != "POST /rpc/preflight" && route != "POST /rpc/invoke"
+                ));
+                assert!(!payload.to_string().contains(&token));
+            }
+        }
+    }
+
+    #[test]
+    fn execute_pipeline_deadline_setup_time_reduces_every_invocation_budget() {
+        let tempdir = TempDir::new().unwrap();
+        let _history = super::install_test_history_path(tempdir.path().join("history.jsonl"));
+        let path = workflow_budget_fixture(tempdir.path(), 3_000, 5_000);
+        let token = test_capability_token_arg();
+        let mut routes = pipe_mock_catalog(false)
+            .into_iter()
+            .take(2)
+            .map(|(path, body)| (path, body, Duration::from_millis(300)))
+            .collect::<Vec<_>>();
+        for _ in 0..3 {
+            routes.extend([
+                (
+                    "POST /rpc/preflight".to_owned(),
+                    mock_preflight_response_json(true),
+                    Duration::ZERO,
+                ),
+                (
+                    "POST /rpc/invoke".to_owned(),
+                    mock_invoke_response_json(json!({"completed": true})),
+                    Duration::ZERO,
+                ),
+            ]);
+        }
+        let (host, server, log) = spawn_mock_host_sequence_with_timing(routes);
+        let (exit, payload) = execute_json(&[
+            "fwc",
+            "--json",
+            "--host",
+            &host,
+            "pipeline",
+            "run",
+            &path.display().to_string(),
+            "--capability-token",
+            &token,
+        ]);
+        server.join().unwrap();
+        assert_eq!(exit, CliExitCode::Success.into(), "{payload}");
+        assert_eq!(payload["execution"]["executed_steps"], 3);
+        let log = log.lock().unwrap();
+        let budgets = log
+            .iter()
+            .filter(|(route, _)| route == "POST /rpc/invoke")
+            .map(|(_, body)| {
+                serde_json::from_str::<Value>(body).unwrap()["deadline_ms"]
+                    .as_u64()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(budgets.len(), 3);
+        assert!(
+            budgets
+                .iter()
+                .all(|remaining| (1..=2_400).contains(remaining))
+        );
+        assert!(budgets.windows(2).all(|pair| pair[1] <= pair[0]));
     }
 
     #[test]

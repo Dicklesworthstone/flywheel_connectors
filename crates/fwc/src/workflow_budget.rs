@@ -1,8 +1,9 @@
 //! Monotone execution deadlines for pipelines and recipes.
 //!
-//! A child step inherits the remaining run budget. Preflight and invocation
-//! share that deadline; neither a successful preflight nor a new step renews
-//! the parent budget. Response finalization has a separate transport allowance.
+//! Discovery, introspection and credential resolution consume the run budget.
+//! A child step inherits what remains. Preflight and invocation share that
+//! deadline; neither successful setup, preflight nor a new step renews the
+//! parent budget. Response finalization has a separate transport allowance.
 
 use std::time::{Duration, Instant};
 
