@@ -364,7 +364,10 @@ pub struct PipelineStep {
     pub depends_on: Vec<String>,
     #[serde(default)]
     pub condition: Option<String>,
-    /// Stop, continue independent steps, or retry eligible definitive failures.
+    /// Run only after the named step returns a definitive invocation failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<PipelineTrigger>,
+    /// Stop, continue independent steps, retry, or activate a failure branch.
     #[serde(default)]
     pub on_error: PipelineErrorPolicy,
 }
@@ -375,8 +378,9 @@ pub struct PipelineStep {
 /// steps cannot run without a successful prerequisite. Retry is bounded and
 /// requires both a definitive retryable connector response and safe operation
 /// semantics. Authoring errors, unavailable preflight, and uncertain invoke
-/// outcomes always stop execution; no policy authorizes fallback effects.
-#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+/// outcomes cannot activate failure branches. A fallback is a separately
+/// authorized step; its success never replaces or hides the original failure.
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
 pub enum PipelineErrorPolicy {
     /// Stop before dispatching any later step.
     #[default]
@@ -385,6 +389,8 @@ pub enum PipelineErrorPolicy {
     Skip,
     /// Retry at most this many times, then stop before later steps.
     Retry(u32),
+    /// Continue after a definitive failure and activate the named step.
+    Fallback(String),
 }
 
 /// Maximum retries per pipeline step, excluding its initial invocation.
@@ -395,17 +401,17 @@ pub const DEFAULT_PIPELINE_RETRIES: u32 = 3;
 impl PipelineErrorPolicy {
     /// The retry allowance, excluding the initial invocation.
     #[must_use]
-    pub const fn max_retries(self) -> u32 {
+    pub const fn max_retries(&self) -> u32 {
         match self {
-            Self::Retry(count) => count,
-            Self::Abort | Self::Skip => 0,
+            Self::Retry(count) => *count,
+            Self::Abort | Self::Skip | Self::Fallback(_) => 0,
         }
     }
 
     /// Whether a final definitive failure blocks all later steps.
     #[must_use]
-    pub const fn stops_on_failure(self) -> bool {
-        !matches!(self, Self::Skip)
+    pub const fn stops_on_failure(&self) -> bool {
+        !matches!(self, Self::Skip | Self::Fallback(_))
     }
 }
 
@@ -418,6 +424,7 @@ impl Serialize for PipelineErrorPolicy {
             Self::Abort => serializer.serialize_str("abort"),
             Self::Skip => serializer.serialize_str("skip"),
             Self::Retry(count) => serializer.serialize_str(&format!("retry({count})")),
+            Self::Fallback(step_id) => serializer.serialize_str(&format!("fallback({step_id})")),
         }
     }
 }
@@ -433,6 +440,9 @@ impl<'de> Deserialize<'de> for PipelineErrorPolicy {
             "skip" => Ok(Self::Skip),
             "retry" => Ok(Self::Retry(DEFAULT_PIPELINE_RETRIES)),
             value => {
+                if let Some(step_id) = parse_failure_step_reference(value, "fallback(") {
+                    return Ok(Self::Fallback(step_id.to_owned()));
+                }
                 let count = value
                     .strip_prefix("retry(")
                     .and_then(|suffix| suffix.strip_suffix(')'))
@@ -443,12 +453,69 @@ impl<'de> Deserialize<'de> for PipelineErrorPolicy {
                     });
                 count.map(Self::Retry).ok_or_else(|| {
                     serde::de::Error::custom(format!(
-                        "on_error must be abort, skip, retry, or retry(N) with N between 1 and {MAX_PIPELINE_RETRIES}"
+                        "on_error must be abort, skip, retry, retry(N) with N between 1 and {MAX_PIPELINE_RETRIES}, or fallback(step_id) using letters, digits, underscores or hyphens"
                     ))
                 })
             }
         }
     }
+}
+
+/// An explicit failure-only branch. This orders a step after its source without
+/// requiring the source to succeed or granting any execution authority.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum PipelineTrigger {
+    /// Activate only for a definitive invocation error from this step.
+    OnError(String),
+}
+
+impl PipelineTrigger {
+    /// The step whose definitive failure activates this branch.
+    #[must_use]
+    pub fn source_step(&self) -> &str {
+        match self {
+            Self::OnError(step_id) => step_id,
+        }
+    }
+}
+
+impl Serialize for PipelineTrigger {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&format!("on_error({})", self.source_step()))
+    }
+}
+
+impl<'de> Deserialize<'de> for PipelineTrigger {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        parse_failure_step_reference(&value, "on_error(")
+            .map(|step_id| Self::OnError(step_id.to_owned()))
+            .ok_or_else(|| {
+                serde::de::Error::custom(
+                    "trigger must be on_error(step_id) using letters, digits, underscores or hyphens",
+                )
+            })
+    }
+}
+
+fn valid_failure_step_reference(step_id: &str) -> bool {
+    !step_id.is_empty()
+        && step_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn parse_failure_step_reference<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    value
+        .strip_prefix(prefix)?
+        .strip_suffix(')')
+        .filter(|step_id| valid_failure_step_reference(step_id))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -498,6 +565,8 @@ pub struct PlannedPipelineStep {
     pub lease_seq: Option<u64>,
     pub depends_on: Vec<String>,
     pub on_error: PipelineErrorPolicy,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<PipelineTrigger>,
     pub input: Value,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub unresolved_templates: Vec<String>,
@@ -548,6 +617,8 @@ pub struct PipelineStepEstimate {
     pub id: String,
     pub operation: String,
     pub on_error: PipelineErrorPolicy,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<PipelineTrigger>,
     pub connector: String,
     pub selector: String,
     pub canonical_id: String,
@@ -1393,8 +1464,8 @@ pub fn validate_pipeline_definition(definition: &PipelineDefinition) -> Pipeline
 
     let mut seen_step_ids = BTreeSet::new();
     for step in &definition.steps {
-        if let PipelineErrorPolicy::Retry(count) = step.on_error
-            && !(1..=MAX_PIPELINE_RETRIES).contains(&count)
+        if let PipelineErrorPolicy::Retry(count) = &step.on_error
+            && !(1..=MAX_PIPELINE_RETRIES).contains(count)
         {
             errors.push(format!(
                 "step `{}` on_error retry count must be between 1 and {MAX_PIPELINE_RETRIES}",
@@ -1442,6 +1513,13 @@ pub fn validate_pipeline_definition(definition: &PipelineDefinition) -> Pipeline
             }
         }
     }
+    let triggers = match resolve_pipeline_triggers(definition) {
+        Ok(triggers) => triggers,
+        Err(trigger_errors) => {
+            errors.extend(trigger_errors);
+            BTreeMap::new()
+        }
+    };
 
     for (name, spec) in &definition.params {
         if name.trim().is_empty() {
@@ -1468,7 +1546,7 @@ pub fn validate_pipeline_definition(definition: &PipelineDefinition) -> Pipeline
     }
 
     let execution_order = if errors.is_empty() {
-        match compute_execution_order(definition) {
+        match compute_execution_order(definition, &triggers) {
             Ok(order) => order,
             Err(error) => {
                 errors.push(error);
@@ -1573,6 +1651,7 @@ pub fn build_pipeline_plan(
         return Err(validation.errors.join("; "));
     }
     let execution_order = validation.execution_order;
+    let triggers = resolve_pipeline_triggers(definition).map_err(|errors| errors.join("; "))?;
     let steps_by_id = definition
         .steps
         .iter()
@@ -1604,7 +1683,10 @@ pub fn build_pipeline_plan(
             timeout_ms: step.timeout_ms,
             lease_seq: step.lease_seq,
             depends_on: step.depends_on.clone(),
-            on_error: step.on_error,
+            on_error: step.on_error.clone(),
+            trigger: triggers
+                .get(step.id.as_str())
+                .map(|source| PipelineTrigger::OnError((*source).to_owned())),
             input: rendered_input.value,
             unresolved_templates: rendered_input.unresolved,
             condition,
@@ -1654,7 +1736,10 @@ pub fn estimate_pipeline(
                 step.id, step.operation
             )
         })?;
-        let estimated_api_calls = estimated_api_calls(step.condition.is_some(), step.on_error);
+        let estimated_api_calls = estimated_api_calls(
+            step.condition.is_some() || step.trigger.is_some(),
+            &step.on_error,
+        );
 
         total_min_calls += estimated_api_calls.min;
         total_max_calls += estimated_api_calls.max;
@@ -1713,7 +1798,8 @@ pub fn estimate_pipeline(
         step_estimates.push(PipelineStepEstimate {
             id: step.id.clone(),
             operation: step.operation.clone(),
-            on_error: step.on_error,
+            on_error: step.on_error.clone(),
+            trigger: step.trigger.clone(),
             connector: metadata.connector.clone(),
             selector: metadata.selector.clone(),
             canonical_id: metadata.canonical_id.clone(),
@@ -1734,7 +1820,7 @@ pub fn estimate_pipeline(
     ];
     if !conditional_steps.is_empty() {
         notes.push(format!(
-            "Conditional steps have a minimum of zero API calls because dry-run cannot evaluate runtime predicates without real upstream outputs: {}.",
+            "Conditional steps have a minimum of zero API calls because dry-run cannot evaluate runtime predicates or failure triggers without real upstream outcomes: {}.",
             conditional_steps.join(", ")
         ));
     }
@@ -1962,7 +2048,121 @@ fn discover_pipelines_in_directories(
     Ok(discovered)
 }
 
-fn compute_execution_order(definition: &PipelineDefinition) -> Result<Vec<String>, String> {
+/// Resolve explicit triggers and fallback shorthand into one unambiguous source
+/// per branch. These edges order execution but are not success dependencies.
+fn resolve_pipeline_triggers(
+    definition: &PipelineDefinition,
+) -> Result<BTreeMap<&str, &str>, Vec<String>> {
+    let steps = definition
+        .steps
+        .iter()
+        .map(|step| (step.id.as_str(), step))
+        .collect::<BTreeMap<_, _>>();
+    let mut triggers = BTreeMap::new();
+    let mut fallback_sources = BTreeMap::new();
+    let mut errors = Vec::new();
+
+    for step in &definition.steps {
+        if let Some(trigger) = &step.trigger {
+            let source = trigger.source_step();
+            if !valid_failure_step_reference(source) {
+                errors.push(format!(
+                    "step `{}` trigger needs a source id using letters, digits, underscores or hyphens",
+                    step.id
+                ));
+            } else if source == step.id {
+                errors.push(format!("step `{}` cannot trigger on itself", step.id));
+            } else if !steps.contains_key(source) {
+                errors.push(format!(
+                    "step `{}` trigger references unknown step `{source}`",
+                    step.id
+                ));
+            } else {
+                triggers.insert(step.id.as_str(), source);
+            }
+        }
+    }
+
+    for step in &definition.steps {
+        if let PipelineErrorPolicy::Fallback(target) = &step.on_error {
+            if !valid_failure_step_reference(target) || !valid_failure_step_reference(&step.id) {
+                errors.push(format!(
+                    "step `{}` fallback needs source and target ids using letters, digits, underscores or hyphens",
+                    step.id
+                ));
+                continue;
+            }
+            if target == &step.id {
+                errors.push(format!("step `{}` cannot fall back to itself", step.id));
+                continue;
+            }
+            if !steps.contains_key(target.as_str()) {
+                errors.push(format!(
+                    "step `{}` fallback references unknown step `{target}`",
+                    step.id
+                ));
+                continue;
+            }
+            if let Some(prior_source) = fallback_sources.insert(target.as_str(), step.id.as_str()) {
+                errors.push(format!(
+                    "fallback step `{target}` has multiple sources: `{prior_source}` and `{}`",
+                    step.id
+                ));
+                continue;
+            }
+            if let Some(source) = triggers.get(target.as_str()) {
+                if *source != step.id {
+                    errors.push(format!(
+                        "fallback step `{target}` trigger on `{source}` conflicts with source `{}`",
+                        step.id
+                    ));
+                }
+            } else {
+                triggers.insert(target.as_str(), step.id.as_str());
+            }
+        }
+    }
+
+    for (target, source) in &triggers {
+        let mut pending = vec![*target];
+        let mut visited = BTreeSet::new();
+        let mut depends_on_source = false;
+        while let Some(step_id) = pending.pop() {
+            if !visited.insert(step_id) {
+                continue;
+            }
+            let Some(step) = steps.get(step_id) else {
+                continue;
+            };
+            for dependency in &step.depends_on {
+                if dependency.as_str() == *source {
+                    depends_on_source = true;
+                    break;
+                }
+                pending.push(dependency.as_str());
+            }
+            if depends_on_source {
+                break;
+            }
+        }
+        if depends_on_source {
+            errors.push(format!(
+                "failure-triggered step `{target}` cannot also depend on successful source `{source}`; its trigger already supplies ordering"
+            ));
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(triggers)
+    } else {
+        Err(errors)
+    }
+}
+
+fn compute_execution_order(
+    definition: &PipelineDefinition,
+    triggers: &BTreeMap<&str, &str>,
+) -> Result<Vec<String>, String> {
     let steps = definition
         .steps
         .iter()
@@ -1976,6 +2176,7 @@ fn compute_execution_order(definition: &PipelineDefinition) -> Result<Vec<String
         visit_step(
             step.id.as_str(),
             &steps,
+            triggers,
             &mut states,
             &mut stack,
             &mut order,
@@ -1988,6 +2189,7 @@ fn compute_execution_order(definition: &PipelineDefinition) -> Result<Vec<String
 fn visit_step<'a>(
     step_id: &'a str,
     steps: &BTreeMap<&'a str, &'a PipelineStep>,
+    triggers: &BTreeMap<&'a str, &'a str>,
     states: &mut BTreeMap<&'a str, u8>,
     stack: &mut Vec<&'a str>,
     order: &mut Vec<String>,
@@ -2019,7 +2221,10 @@ fn visit_step<'a>(
     stack.push(step_id);
 
     for dependency in &step.depends_on {
-        visit_step(dependency.as_str(), steps, states, stack, order)?;
+        visit_step(dependency.as_str(), steps, triggers, states, stack, order)?;
+    }
+    if let Some(source) = triggers.get(step_id) {
+        visit_step(source, steps, triggers, states, stack, order)?;
     }
 
     stack.pop();
@@ -2028,7 +2233,7 @@ fn visit_step<'a>(
     Ok(())
 }
 
-fn estimated_api_calls(conditional: bool, policy: PipelineErrorPolicy) -> EstimatedApiCalls {
+fn estimated_api_calls(conditional: bool, policy: &PipelineErrorPolicy) -> EstimatedApiCalls {
     let min = u32::from(!conditional);
     let max = 1u32.saturating_add(policy.max_retries());
     EstimatedApiCalls {
@@ -2962,7 +3167,7 @@ on_error = "retry(10)"
     fn pipeline_retry_policy_has_bounded_canonical_string_representation() {
         for retries in 1..=MAX_PIPELINE_RETRIES {
             let policy = PipelineErrorPolicy::Retry(retries);
-            let value = serde_json::to_value(policy).unwrap();
+            let value = serde_json::to_value(&policy).unwrap();
             assert_eq!(value, format!("retry({retries})"));
             assert_eq!(
                 serde_json::from_value::<PipelineErrorPolicy>(value).unwrap(),
@@ -2998,6 +3203,210 @@ on_error = "retry(10)"
                     .any(|error| error.contains("on_error"))
             );
             assert!(build_pipeline_plan(&definition, &BTreeMap::new()).is_err());
+        }
+    }
+
+    #[test]
+    fn pipeline_failure_branch_syntax_is_canonical_and_roundtrips() {
+        for step_id in ["notify", "fallback-notify", "recover_2", "A1"] {
+            let fallback = PipelineErrorPolicy::Fallback(step_id.to_owned());
+            let serialized = serde_json::to_value(&fallback).unwrap();
+            assert_eq!(serialized, format!("fallback({step_id})"));
+            assert_eq!(
+                serde_json::from_value::<PipelineErrorPolicy>(serialized).unwrap(),
+                fallback
+            );
+            assert_eq!(fallback.max_retries(), 0);
+            assert!(!fallback.stops_on_failure());
+
+            let trigger = PipelineTrigger::OnError(step_id.to_owned());
+            let serialized = serde_json::to_value(&trigger).unwrap();
+            assert_eq!(serialized, format!("on_error({step_id})"));
+            assert_eq!(
+                serde_json::from_value::<PipelineTrigger>(serialized).unwrap(),
+                trigger
+            );
+            assert_eq!(trigger.source_step(), step_id);
+        }
+
+        for invalid_id in [
+            "",
+            " notify",
+            "notify ",
+            "notify me",
+            "a\nb",
+            "a\tb",
+            "a(b)",
+            "a.b",
+            "a|b",
+        ] {
+            assert!(
+                serde_json::from_value::<PipelineErrorPolicy>(json!(format!(
+                    "fallback({invalid_id})"
+                )))
+                .is_err()
+            );
+            assert!(
+                serde_json::from_value::<PipelineTrigger>(json!(format!("on_error({invalid_id})")))
+                    .is_err()
+            );
+        }
+        for value in [
+            json!("on_error"),
+            json!("on_error(source"),
+            json!(" on_error(source)"),
+            json!("on_error(source) "),
+            json!("on_success(source)"),
+            json!({"on_error": "source"}),
+            json!(false),
+        ] {
+            assert!(serde_json::from_value::<PipelineTrigger>(value).is_err());
+        }
+    }
+
+    #[test]
+    fn pipeline_plan_infers_fallback_trigger_without_success_dependency() {
+        for explicit_trigger in ["", "trigger = 'on_error(risky-op)'\n"] {
+            let definition = parse_pipeline_definition(&format!(
+                "[pipeline]\nname = 'recover'\n\
+                 [[steps]]\nid = 'fallback-notify'\noperation = 'slack.send_message'\n\
+                 depends_on = ['prepare']\n{explicit_trigger}\
+                 input = {{ text = '{{{{steps.risky-op.error}}}}' }}\n\
+                 [[steps]]\nid = 'risky-op'\noperation = 'github.create_issue'\n\
+                 on_error = 'fallback(fallback-notify)'\n\
+                 [[steps]]\nid = 'prepare'\noperation = 'slack.get_channel'\n"
+            ))
+            .unwrap();
+            let plan = build_pipeline_plan(&definition, &BTreeMap::new()).unwrap();
+            assert_eq!(
+                plan.execution_order,
+                ["prepare", "risky-op", "fallback-notify"]
+            );
+            let handler = &plan.steps[2];
+            assert_eq!(handler.depends_on, ["prepare"]);
+            assert_eq!(
+                handler.trigger,
+                Some(PipelineTrigger::OnError("risky-op".to_owned()))
+            );
+            assert_eq!(handler.input["text"], "{{steps.risky-op.error}}");
+            assert_eq!(handler.unresolved_templates, ["steps.risky-op.error"]);
+            let serialized = serde_json::to_value(&plan).unwrap();
+            assert_eq!(serialized["steps"][2]["trigger"], "on_error(risky-op)");
+            assert_eq!(
+                serialized["steps"][1]["on_error"],
+                "fallback(fallback-notify)"
+            );
+            assert!(serialized["steps"][1].get("trigger").is_none());
+        }
+    }
+
+    #[test]
+    fn pipeline_plan_orders_standalone_error_trigger_after_source() {
+        let definition = parse_pipeline_definition(
+            "[pipeline]\nname = 'notify-errors'\n\
+             [[steps]]\nid = 'handler'\noperation = 'slack.send_message'\n\
+             trigger = 'on_error(source)'\n\
+             [[steps]]\nid = 'source'\noperation = 'github.create_issue'\non_error = 'skip'\n",
+        )
+        .unwrap();
+        let plan = build_pipeline_plan(&definition, &BTreeMap::new()).unwrap();
+        assert_eq!(plan.execution_order, ["source", "handler"]);
+        assert!(plan.steps[1].depends_on.is_empty());
+        assert_eq!(
+            plan.steps[1].trigger.as_ref().unwrap().source_step(),
+            "source"
+        );
+    }
+
+    #[test]
+    fn pipeline_failure_branches_reject_ambiguous_or_unreachable_graphs() {
+        let cases = [
+            ("on_error = 'fallback(missing)'", "", "", "unknown"),
+            ("on_error = 'fallback(source)'", "", "", "itself"),
+            ("", "trigger = 'on_error(missing)'", "", "unknown"),
+            ("", "trigger = 'on_error(handler)'", "", "itself"),
+            (
+                "on_error = 'fallback(handler)'",
+                "trigger = 'on_error(other)'",
+                "",
+                "conflicts",
+            ),
+            (
+                "on_error = 'fallback(handler)'",
+                "",
+                "on_error = 'fallback(handler)'",
+                "multiple sources",
+            ),
+            (
+                "on_error = 'fallback(handler)'",
+                "depends_on = ['source']",
+                "",
+                "successful source",
+            ),
+            (
+                "on_error = 'fallback(handler)'",
+                "depends_on = ['other']",
+                "depends_on = ['source']",
+                "successful source",
+            ),
+            (
+                "on_error = 'fallback(handler)'",
+                "on_error = 'fallback(source)'",
+                "",
+                "cycle",
+            ),
+            (
+                "depends_on = ['handler']",
+                "trigger = 'on_error(source)'",
+                "",
+                "cycle",
+            ),
+            (
+                "trigger = 'on_error(other)'",
+                "trigger = 'on_error(source)'",
+                "trigger = 'on_error(handler)'",
+                "cycle",
+            ),
+        ];
+        for (source, handler, other, expected) in cases {
+            let definition = parse_pipeline_definition(&format!(
+                "[pipeline]\nname = 'bad-branch'\n\
+                 [[steps]]\nid = 'source'\noperation = 'github.create_issue'\n{source}\n\
+                 [[steps]]\nid = 'handler'\noperation = 'slack.send_message'\n{handler}\n\
+                 [[steps]]\nid = 'other'\noperation = 'github.get_issue'\n{other}\n"
+            ))
+            .unwrap();
+            let validation = validate_pipeline_definition(&definition);
+            assert!(!validation.valid, "{source}/{handler}/{other}");
+            assert!(validation.execution_order.is_empty());
+            assert!(
+                validation
+                    .errors
+                    .iter()
+                    .any(|error| error.contains(expected)),
+                "{expected}: {:?}",
+                validation.errors
+            );
+            assert!(build_pipeline_plan(&definition, &BTreeMap::new()).is_err());
+        }
+    }
+
+    #[test]
+    fn pipeline_failure_branch_validation_checks_programmatic_references() {
+        let mut definition = parse_pipeline_definition(
+            "[pipeline]\nname = 'invalid-branch'\n\
+             [[steps]]\nid = 'source'\noperation = 'github.create_issue'\n\
+             [[steps]]\nid = 'handler'\noperation = 'slack.send_message'\n",
+        )
+        .unwrap();
+        for invalid_id in ["", "handler ", "handler()"] {
+            definition.steps[0].on_error = PipelineErrorPolicy::Fallback(invalid_id.to_owned());
+            assert!(!validate_pipeline_definition(&definition).valid);
+        }
+        definition.steps[0].on_error = PipelineErrorPolicy::Skip;
+        for invalid_id in ["", "source ", "source()"] {
+            definition.steps[1].trigger = Some(PipelineTrigger::OnError(invalid_id.to_owned()));
+            assert!(!validate_pipeline_definition(&definition).valid);
         }
     }
 
@@ -3084,11 +3493,11 @@ depends_on = ["first"]
             "on_error = \"retry( 1)\"",
             "on_error = \" retry(1)\"",
             "on_error = \"retry()\"",
-            "on_error = \"fallback(notify)\"",
+            "on_error = \"fallback()\"",
+            "on_error = \"fallback( notify)\"",
             "on_error = \"continue\"",
             "on_error = { retry = 3 }",
             "on_error = false",
-            "trigger = \"on_error(first)\"",
             "on_erorr = \"abort\"",
             "timeout = 1",
         ] {
@@ -3448,6 +3857,77 @@ on_error = "retry(10)"
         assert_eq!(estimate.rate_limit_impact[0].estimated_api_calls.min, 1);
         assert_eq!(estimate.rate_limit_impact[0].estimated_api_calls.max, 15);
         assert_eq!(serde_json::to_value(fetch).unwrap()["on_error"], "retry(3)");
+    }
+
+    #[test]
+    fn estimate_pipeline_retains_failure_branch_risk_authority_and_call_bounds() {
+        let definition = parse_pipeline_definition(
+            "[pipeline]\nname = 'fallback-estimate'\n\
+             [[steps]]\nid = 'source'\noperation = 'github.list_issues'\n\
+             on_error = 'fallback(handler)'\n\
+             [[steps]]\nid = 'handler'\noperation = 'slack.send_message'\n",
+        )
+        .unwrap();
+        let plan = build_pipeline_plan(&definition, &BTreeMap::new()).unwrap();
+        let operations = BTreeMap::from([
+            (
+                "github.list_issues".to_owned(),
+                PipelineOperationMetadata {
+                    connector: "github".to_owned(),
+                    selector: "issues.list".to_owned(),
+                    canonical_id: "github.list_issues".to_owned(),
+                    capability: "github.read".to_owned(),
+                    risk_level: "low".to_owned(),
+                    safety_tier: "safe".to_owned(),
+                    requires_approval: false,
+                    approval_mode: "none".to_owned(),
+                    rate_limits: Some(Vec::new()),
+                },
+            ),
+            (
+                "slack.send_message".to_owned(),
+                PipelineOperationMetadata {
+                    connector: "slack".to_owned(),
+                    selector: "messages.send".to_owned(),
+                    canonical_id: "slack.send_message".to_owned(),
+                    capability: "slack.write".to_owned(),
+                    risk_level: "medium".to_owned(),
+                    safety_tier: "risky".to_owned(),
+                    requires_approval: true,
+                    approval_mode: "policy".to_owned(),
+                    rate_limits: Some(vec![RateLimitSummary {
+                        scope: "messages-write".to_owned(),
+                        requests: 100,
+                        window: "1m".to_owned(),
+                    }]),
+                },
+            ),
+        ]);
+        let estimate = estimate_pipeline(&plan, &operations).unwrap();
+        assert_eq!(estimate.estimated_api_calls.min, 1);
+        assert_eq!(estimate.estimated_api_calls.max, 2);
+        assert!(estimate.estimated_api_calls.conditional);
+        assert_eq!(
+            estimate.required_capabilities,
+            ["github.read", "slack.write"]
+        );
+        assert_eq!(estimate.required_approvals[0].step_id, "handler");
+        assert_eq!(estimate.risk_assessment.level, "medium");
+        assert_eq!(estimate.risk_assessment.steps, ["handler"]);
+        assert_eq!(estimate.steps[1].estimated_api_calls.min, 0);
+        assert_eq!(estimate.steps[1].estimated_api_calls.max, 1);
+        assert_eq!(
+            serde_json::to_value(&estimate).unwrap()["steps"][1]["trigger"],
+            "on_error(source)"
+        );
+        assert_eq!(estimate.rate_limit_impact[1].estimated_api_calls.min, 0);
+        assert_eq!(estimate.rate_limit_impact[1].rate_limits[0].requests, 100);
+        assert!(
+            estimate
+                .notes
+                .iter()
+                .any(|note| note.contains("failure triggers"))
+        );
     }
 
     #[test]
@@ -4301,7 +4781,7 @@ required = true
 
     #[test]
     fn estimated_api_calls_unconditional() {
-        let calls = estimated_api_calls(false, PipelineErrorPolicy::Abort);
+        let calls = estimated_api_calls(false, &PipelineErrorPolicy::Abort);
         assert_eq!(calls.min, 1);
         assert_eq!(calls.max, 1);
         assert!(!calls.conditional);
@@ -4310,7 +4790,7 @@ required = true
 
     #[test]
     fn estimated_api_calls_conditional() {
-        let calls = estimated_api_calls(true, PipelineErrorPolicy::Abort);
+        let calls = estimated_api_calls(true, &PipelineErrorPolicy::Abort);
         assert_eq!(calls.min, 0);
         assert_eq!(calls.max, 1);
         assert!(calls.conditional);

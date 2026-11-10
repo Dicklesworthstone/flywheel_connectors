@@ -30151,12 +30151,13 @@ fn finish_pipeline_dispatch(
 fn pipeline_execution_context(
     params: &BTreeMap<String, pipe::PipelineParamBinding>,
     step_outputs: &BTreeMap<String, Value>,
+    step_errors: &BTreeMap<String, Value>,
 ) -> Value {
     let params_value = params
         .iter()
         .map(|(name, binding)| (name.clone(), binding.value.clone()))
         .collect::<serde_json::Map<_, _>>();
-    let steps_value = step_outputs
+    let mut steps_value = step_outputs
         .iter()
         .map(|(step_id, output)| {
             (
@@ -30167,6 +30168,11 @@ fn pipeline_execution_context(
             )
         })
         .collect::<serde_json::Map<_, _>>();
+    for (step_id, error) in step_errors {
+        steps_value
+            .entry(step_id.clone())
+            .or_insert_with(|| json!({}))["error"] = error.clone();
+    }
 
     json!({
         "params": Value::Object(params_value),
@@ -30176,6 +30182,24 @@ fn pipeline_execution_context(
 
 fn pipeline_filter_expression(expr: &str) -> String {
     let expr = expr.trim();
+    // Step identifiers may contain hyphens (for example `risky-op`). Quote
+    // the identifier before handing the rest of the expression to the filter
+    // engine, where an unquoted hyphen would be parsed as subtraction.
+    if let Some(rest) = expr
+        .strip_prefix('.')
+        .unwrap_or(expr)
+        .strip_prefix("steps.")
+    {
+        let end = rest
+            .find(|character: char| {
+                !character.is_ascii_alphanumeric() && !matches!(character, '_' | '-')
+            })
+            .unwrap_or(rest.len());
+        let (step_id, suffix) = rest.split_at(end);
+        if !step_id.is_empty() {
+            return format!(".steps[\"{step_id}\"]{suffix}");
+        }
+    }
     if expr.starts_with('.') {
         expr.to_owned()
     } else {
@@ -30347,6 +30371,36 @@ const fn pipeline_retryable_error(error: &fcp_core::FcpError) -> bool {
                 retryable: true,
                 ..
             }
+    )
+}
+
+/// Error branches are for definite connector failures, never for missing
+/// authority, an uncertain transport outcome, or exhausted execution budgets.
+/// A handler is a separately authorized operation; it neither supplies a
+/// successful output for its source nor proves that source effects rolled back.
+const fn pipeline_error_can_trigger(error: &fcp_core::FcpError) -> bool {
+    // A timed-out upstream write may have completed despite a definite FCP
+    // error reply. Do not interpret it as evidence for an alternative effect.
+    if matches!(
+        error,
+        fcp_core::FcpError::External {
+            status_code: Some(408 | 504),
+            ..
+        }
+    ) {
+        return false;
+    }
+    matches!(
+        error,
+        fcp_core::FcpError::RateLimited {
+            violation: None,
+            ..
+        } | fcp_core::FcpError::ConnectorUnavailable { .. }
+            | fcp_core::FcpError::HealthCheckFailed { .. }
+            | fcp_core::FcpError::ResourceNotFound { .. }
+            | fcp_core::FcpError::Conflict { .. }
+            | fcp_core::FcpError::External { .. }
+            | fcp_core::FcpError::DependencyUnavailable { .. }
     )
 }
 
@@ -30578,6 +30632,7 @@ fn execute_live_pipeline_plan(
         .map(|step| (step.id.as_str(), step))
         .collect::<BTreeMap<_, _>>();
     let mut step_outputs = BTreeMap::<String, Value>::new();
+    let mut step_errors = BTreeMap::<String, Value>::new();
     let mut step_statuses = BTreeMap::<String, &'static str>::new();
     let mut step_results = Vec::with_capacity(plan.steps.len());
     let mut executed_steps = 0usize;
@@ -30610,6 +30665,22 @@ fn execute_live_pipeline_plan(
                 "status": "blocked",
                 "reason": "execution-stopped",
                 "blocked_by": [failed_step],
+                "attempted": false,
+            }));
+            continue;
+        }
+
+        if let Some(trigger) = &step.trigger
+            && !step_errors.contains_key(trigger.source_step())
+        {
+            skipped_steps += 1;
+            step_statuses.insert(step.id.clone(), "skipped");
+            step_results.push(json!({
+                "id": &step.id,
+                "operation": &step.operation,
+                "status": "skipped",
+                "reason": "failure-trigger-inactive",
+                "trigger": trigger,
                 "attempted": false,
             }));
             continue;
@@ -30690,7 +30761,7 @@ fn execute_live_pipeline_plan(
             continue;
         }
 
-        let context = pipeline_execution_context(&plan.params, &step_outputs);
+        let context = pipeline_execution_context(&plan.params, &step_outputs, &step_errors);
         let condition_evaluation = match step
             .condition
             .as_ref()
@@ -30790,7 +30861,9 @@ fn execute_live_pipeline_plan(
         if !valid {
             error_steps += 1;
             step_statuses.insert(step.id.clone(), "error");
-            if step.on_error.stops_on_failure() {
+            if step.on_error.stops_on_failure()
+                || matches!(&step.on_error, pipe::PipelineErrorPolicy::Fallback(_))
+            {
                 stopped_after = Some(step.id.clone());
             }
             step_results.push(json!({
@@ -30987,7 +31060,9 @@ fn execute_live_pipeline_plan(
             if !preflight.allowed {
                 denied_steps += 1;
                 step_statuses.insert(step.id.clone(), "denied");
-                if step.on_error.stops_on_failure() {
+                if step.on_error.stops_on_failure()
+                    || matches!(&step.on_error, pipe::PipelineErrorPolicy::Fallback(_))
+                {
                     stopped_after = Some(step.id.clone());
                 }
                 let reason = preflight
@@ -31274,7 +31349,19 @@ fn execute_live_pipeline_plan(
                 InvokeStatus::Error => {
                     error_steps += 1;
                     step_statuses.insert(step.id.clone(), "error");
-                    if step.on_error.stops_on_failure() || execution_deadline_elapsed {
+                    let trigger_error = response.error.as_ref().filter(|error| {
+                        !execution_deadline_elapsed
+                            && response.result.is_none()
+                            && pipeline_error_can_trigger(error)
+                    });
+                    if let Some(error) = trigger_error {
+                        step_errors.insert(step.id.clone(), serde_json::to_value(error)?);
+                    }
+                    if step.on_error.stops_on_failure()
+                        || execution_deadline_elapsed
+                        || (matches!(&step.on_error, pipe::PipelineErrorPolicy::Fallback(_))
+                            && trigger_error.is_none())
+                    {
                         stopped_after = Some(step.id.clone());
                     }
                     if execution_deadline_elapsed {
@@ -31299,6 +31386,7 @@ fn execute_live_pipeline_plan(
                         },
                         "status": "error",
                         "on_error": step.on_error,
+                        "error_trigger_eligible": trigger_error.is_some(),
                         "invoke_attempted": true,
                         "execution_deadline_elapsed": execution_deadline_elapsed,
                         "mode": if mode == PipelinePlanMode::DryRun {
@@ -31324,6 +31412,14 @@ fn execute_live_pipeline_plan(
                 }
             }
             continue 'steps;
+        }
+    }
+
+    for record in &mut step_results {
+        if let Some(step) = record["id"].as_str().and_then(|id| steps_by_id.get(id))
+            && let Some(trigger) = &step.trigger
+        {
+            record["trigger"] = serde_json::to_value(trigger)?;
         }
     }
 
@@ -50720,6 +50816,328 @@ input = {{ query = "independent" }}
         }
     }
 
+    fn workflow_fallback_fixture(directory: &Path, explicit_trigger: bool) -> PathBuf {
+        let path = directory.join("fallback-workflow.toml");
+        let trigger = if explicit_trigger {
+            "trigger = \"on_error(risky-op)\""
+        } else {
+            ""
+        };
+        let policy = if explicit_trigger {
+            "skip"
+        } else {
+            "fallback(fallback-notify)"
+        };
+        fs::write(
+            &path,
+            format!(
+                r#"
+[pipeline]
+name = "failure-branches"
+timeout_ms = 20000
+
+# A handler declared before its source must still be ordered after it.
+[[steps]]
+id = "fallback-notify"
+operation = "slack.post_message"
+lease_seq = 7
+{trigger}
+condition = '{{{{steps.risky-op.error.category}}}} == "External"'
+input = {{ text = "Failure: {{{{steps.risky-op.error.message}}}}" }}
+
+[[steps]]
+id = "risky-op"
+operation = "github.search_issues"
+on_error = "{policy}"
+input = {{ query = "source" }}
+
+[[steps]]
+id = "dependent"
+operation = "github.search_issues"
+depends_on = ["risky-op"]
+input = {{ query = "must not run after source failure" }}
+
+[[steps]]
+id = "after-handler"
+operation = "github.search_issues"
+depends_on = ["fallback-notify"]
+input = {{ query = "{{{{steps.fallback-notify.output.title}}}}" }}
+"#,
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    fn workflow_fallback_error(message: &str) -> Value {
+        workflow_retry_error(fcp_core::FcpError::External {
+            service: "fixture".to_owned(),
+            message: message.to_owned(),
+            status_code: Some(503),
+            retryable: false,
+            retry_after: None,
+        })
+    }
+
+    #[test]
+    fn execute_pipeline_fallback_dispatches_with_separate_authority_and_retains_failure() {
+        for explicit_trigger in [false, true] {
+            let tempdir = TempDir::new().unwrap();
+            let _history = super::install_test_history_path(tempdir.path().join("history.jsonl"));
+            let path = workflow_fallback_fixture(tempdir.path(), explicit_trigger);
+            let token = test_capability_token_arg();
+            let (handler_token, holder_path, signing_key) = test_live_holder_auth(tempdir.path());
+            let message = "provider failed with literal {{steps.other.output}} and \"quotes\"";
+            let mut routes = pipe_mock_catalog(false);
+            routes.extend([
+                (
+                    "POST /rpc/preflight".to_owned(),
+                    mock_preflight_response_json(true),
+                ),
+                (
+                    "POST /rpc/invoke".to_owned(),
+                    workflow_fallback_error(message),
+                ),
+                (
+                    "POST /rpc/preflight".to_owned(),
+                    mock_preflight_response_json(true),
+                ),
+                (
+                    "POST /rpc/invoke".to_owned(),
+                    mock_invoke_response_json(json!({"title": "handler completed"})),
+                ),
+                (
+                    "POST /rpc/preflight".to_owned(),
+                    mock_preflight_response_json(true),
+                ),
+                (
+                    "POST /rpc/invoke".to_owned(),
+                    mock_invoke_response_json(json!({"continued": true})),
+                ),
+            ]);
+            let (host, server, log) = spawn_mock_host_sequence_with_body_log(routes);
+            let (exit, payload) = execute_json(&[
+                "fwc",
+                "--json",
+                "--host",
+                &host,
+                "pipeline",
+                "run",
+                &path.display().to_string(),
+                "--capability-token",
+                &token,
+                "--step-capability-token",
+                &format!("fallback-notify={handler_token}"),
+                "--step-holder-key-file",
+                &format!("fallback-notify={}", holder_path.display()),
+            ]);
+            server.join().unwrap();
+            assert_eq!(exit, CliExitCode::Connector.into(), "{payload}");
+            let execution = &payload["execution"];
+            assert_eq!(execution["error_steps"], 1);
+            assert_eq!(execution["executed_steps"], 2);
+            assert_eq!(execution["blocked_steps"], 1);
+            assert_eq!(execution["steps"][0]["id"], "risky-op");
+            assert_eq!(execution["steps"][0]["status"], "error");
+            assert_eq!(execution["steps"][0]["error_trigger_eligible"], true);
+            assert_eq!(execution["steps"][1]["trigger"], "on_error(risky-op)");
+            assert_eq!(execution["steps"][1]["status"], "ok");
+            assert_eq!(execution["steps"][2]["reason"], "dependency-failed");
+            assert!(execution["outputs"].get("risky-op").is_none());
+            assert_eq!(execution["outputs"]["after-handler"]["continued"], true);
+            let requests = log.lock().unwrap();
+            assert_eq!(requests.len(), 9);
+            let source: Value = serde_json::from_str(&requests[4].1).unwrap();
+            let handler_preflight: Value = serde_json::from_str(&requests[5].1).unwrap();
+            let handler: Value = serde_json::from_str(&requests[6].1).unwrap();
+            let after: Value = serde_json::from_str(&requests[8].1).unwrap();
+            assert_eq!(handler["input"]["text"], format!("Failure: {message}"));
+            assert_eq!(handler_preflight["params"], handler["input"]);
+            assert_eq!(handler_preflight["request_id"], handler["id"]);
+            assert_eq!(handler["lease_seq"], 7);
+            assert_ne!(source["capability_token"], handler["capability_token"]);
+            assert_ne!(source["id"], handler["id"]);
+            assert_ne!(source["idempotency_key"], handler["idempotency_key"]);
+            assert_live_holder_request(&handler, &signing_key);
+            assert_eq!(after["input"]["query"], "handler completed");
+            assert!(!payload.to_string().contains(&token));
+            assert!(!payload.to_string().contains(&handler_token));
+        }
+    }
+
+    #[test]
+    fn execute_pipeline_fallback_skips_handler_after_success_and_respects_dry_run() {
+        for source_succeeds in [false, true] {
+            let tempdir = TempDir::new().unwrap();
+            let _history = super::install_test_history_path(tempdir.path().join("history.jsonl"));
+            let path = workflow_fallback_fixture(tempdir.path(), false);
+            let token = test_capability_token_arg();
+            let mut routes = pipe_mock_catalog(false);
+            routes[2].1["tools"][0]["idempotency"] = json!("none");
+            routes[2].1["tools"][0]["idempotent"] = json!(false);
+            routes.extend([
+                (
+                    "POST /rpc/preflight".to_owned(),
+                    mock_preflight_response_json(true),
+                ),
+                (
+                    "POST /rpc/invoke".to_owned(),
+                    if source_succeeds {
+                        mock_invoke_response_json(json!({"source": true}))
+                    } else {
+                        workflow_fallback_error("definite provider error")
+                    },
+                ),
+                (
+                    "POST /rpc/preflight".to_owned(),
+                    mock_preflight_response_json(true),
+                ),
+            ]);
+            if source_succeeds {
+                routes.push((
+                    "POST /rpc/invoke".to_owned(),
+                    mock_invoke_response_json(json!({"dependent": true})),
+                ));
+            }
+            let expected_count = routes.len();
+            let (host, server, log) = spawn_mock_host_sequence_with_body_log(routes);
+            let (exit, payload) = execute_json(&[
+                "fwc",
+                "--json",
+                "--host",
+                &host,
+                "pipeline",
+                "dry-run",
+                &path.display().to_string(),
+                "--capability-token",
+                &token,
+                "--step-capability-token",
+                &format!("fallback-notify={token}"),
+            ]);
+            server.join().unwrap();
+            assert_eq!(
+                exit,
+                if source_succeeds {
+                    CliExitCode::Success
+                } else {
+                    CliExitCode::Connector
+                }
+                .into(),
+                "{payload}"
+            );
+            let handler = &payload["execution"]["steps"][1];
+            if source_succeeds {
+                assert_eq!(handler["status"], "skipped");
+                assert_eq!(handler["reason"], "failure-trigger-inactive");
+            } else {
+                assert_eq!(handler["mode"], "preflight");
+                assert_eq!(payload["execution"]["preflight_only_steps"], 1);
+            }
+            let requests = log.lock().unwrap();
+            assert_eq!(requests.len(), expected_count);
+            for (_, body) in requests
+                .iter()
+                .filter(|(route, _)| route == "POST /rpc/invoke")
+            {
+                assert_ne!(
+                    serde_json::from_str::<Value>(body).unwrap()["operation"],
+                    "slack.post_message"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn execute_pipeline_fallback_refuses_denial_unknown_and_partial_outcomes() {
+        for case in [
+            "source-denied",
+            "handler-denied",
+            "authority-error",
+            "unknown",
+            "partial",
+            "upstream-timeout",
+            "gateway-timeout",
+        ] {
+            let tempdir = TempDir::new().unwrap();
+            let _history = super::install_test_history_path(tempdir.path().join("history.jsonl"));
+            let path = workflow_fallback_fixture(tempdir.path(), false);
+            let token = test_capability_token_arg();
+            let mut routes = pipe_mock_catalog(false);
+            routes.push((
+                "POST /rpc/preflight".to_owned(),
+                mock_preflight_response_json(case != "source-denied"),
+            ));
+            if case != "source-denied" {
+                let response = match case {
+                    "authority-error" => {
+                        workflow_retry_error(fcp_core::FcpError::CapabilityDenied {
+                            capability: "github.read".to_owned(),
+                            reason: "revoked".to_owned(),
+                        })
+                    }
+                    "unknown" => json!({"unrecognized": "uncertain response"}),
+                    "upstream-timeout" => {
+                        workflow_retry_error(fcp_core::FcpError::UpstreamTimeout {
+                            service: "fixture".to_owned(),
+                        })
+                    }
+                    "gateway-timeout" => workflow_retry_error(fcp_core::FcpError::External {
+                        service: "fixture".to_owned(),
+                        message: "timed out".to_owned(),
+                        status_code: Some(504),
+                        retryable: true,
+                        retry_after: None,
+                    }),
+                    "partial" => {
+                        let mut response = workflow_fallback_error("partial operation");
+                        response["result"] = json!({"possibly_created": true});
+                        response
+                    }
+                    _ => workflow_fallback_error("definite provider error"),
+                };
+                routes.push(("POST /rpc/invoke".to_owned(), response));
+            }
+            if case == "handler-denied" {
+                routes.push((
+                    "POST /rpc/preflight".to_owned(),
+                    mock_preflight_response_json(false),
+                ));
+            }
+            let expected_count = routes.len();
+            let (host, server, log) = spawn_mock_host_sequence_with_body_log(routes);
+            let (exit, payload) = execute_json(&[
+                "fwc",
+                "--json",
+                "--host",
+                &host,
+                "pipeline",
+                "run",
+                &path.display().to_string(),
+                "--capability-token",
+                &token,
+                "--step-capability-token",
+                &format!("fallback-notify={token}"),
+            ]);
+            server.join().unwrap();
+            assert_ne!(exit, CliExitCode::Success.into(), "{case}: {payload}");
+            assert_eq!(
+                payload["execution"]["steps"][1]["status"],
+                if case == "handler-denied" {
+                    "denied"
+                } else {
+                    "blocked"
+                },
+                "{case}: {payload}"
+            );
+            assert!(
+                payload["execution"]["outputs"]
+                    .get("fallback-notify")
+                    .is_none()
+            );
+            assert_eq!(log.lock().unwrap().len(), expected_count, "{case}");
+        }
+    }
+
     fn workflow_retry_fixture(directory: &Path, policy: &str, timeout_ms: u64) -> PathBuf {
         let path = directory.join("retry-workflow.toml");
         fs::write(
@@ -51681,8 +52099,8 @@ input = {{ query = "independent" }}
     fn execute_pipeline_rejects_unsupported_step_policies_before_host_discovery() {
         for field in [
             "on_error = \"retry(11)\"",
-            "on_error = \"fallback(notify)\"",
-            "trigger = \"on_error(first)\"",
+            "on_error = \"fallback()\"",
+            "trigger = \"on_error(first) trailing\"",
             "on_erorr = \"abort\"",
         ] {
             let tempdir = TempDir::new().unwrap();

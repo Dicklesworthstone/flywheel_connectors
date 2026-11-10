@@ -3403,7 +3403,7 @@ required = true
 Notes on the actual schema:
 
 - `[pipeline]` carries `name`, `description`, `version`, and an optional `timeout_ms` execution budget from 1 to 86,400,000 milliseconds. After local definition and parameter validation, the budget starts before host resolution and discovery and is shared across introspection, credential resolution, and every step. Each setup HTTP read is bounded by the remaining workflow budget and the configured host read timeout. Local credential file reads consume elapsed budget but are not forcibly interrupted; an expired setup cannot invoke an operation.
-- Each `[[steps]]` table carries an `id`, a dotted `operation` (`<connector>.<operation>`), an `input` table, and an optional `depends_on` array naming sibling step IDs. Per-step `on_error = "abort"` is the default; `on_error = "skip"` permits later independent steps after a definite input, policy, or connector failure while preserving the unsuccessful overall result. `on_error = "retry"` allows up to three additional attempts; `on_error = "retry(N)"` accepts 1–10 additional attempts under the eligibility rules below. Exhausted or ineligible retries stop later steps. Dependents remain blocked after failure, and uncertain execution always stops. Fallback/trigger controls, invalid retry counts, and unknown step fields are rejected before host discovery.
+- Each `[[steps]]` table carries an `id`, a dotted `operation` (`<connector>.<operation>`), an `input` table, and an optional `depends_on` array naming sibling step IDs. Per-step `on_error = "abort"` is the default; `on_error = "skip"` permits later independent steps after a definite input, policy, or connector failure while preserving the unsuccessful overall result. `on_error = "retry"` allows up to three additional attempts; `on_error = "retry(N)"` accepts 1–10 additional attempts under the eligibility rules below. `on_error = "fallback(step_id)"` activates a separately authorized failure branch after an eligible connector error. Exhausted or ineligible retries stop later steps. Dependents remain blocked after failure, and uncertain execution always stops. Invalid retry counts, malformed failure branches, and unknown step fields are rejected before host discovery.
 - A step can set `timeout_ms` from 1 to 60,000 milliseconds. Its input preparation, host preflight, and invocation share the earlier of this step deadline and the remaining workflow deadline. Successful preflight never renews the budget. Every preflight also has the configured `FWC_HOST_READ_TIMEOUT_MS` read bound, including workflows with no explicit execution budget. Unspecified budgets retain the host's normal invocation ceiling.
 - Parameters are declared as `[params.<name>]` tables with `type` and `required` fields.
 - Template substitution uses double-brace `{{...}}` syntax. Step outputs are referenced as `{{steps.<id>.output.<json_path>}}`; parameters are referenced as `{{params.<name>}}`.
@@ -3447,6 +3447,59 @@ workflow deadlines. A retry-enabled step without `timeout_ms` has a total
 60-second step budget. Exponential backoff includes jitter; a provider's
 `Retry-After` is honored without shortening it. If the required delay does not
 fit the remaining budget, execution stops immediately and retains the failure.
+
+### Failure branches
+
+Use `on_error = "fallback(step_id)"` to run a specific handler after an eligible
+typed connector error. The planner adds `trigger = "on_error(source_id)"` to that
+handler and orders it after the source, even if the handler is declared first.
+For example, a pipeline with `owner`, `repo`, `title`, and `channel` parameters
+can include:
+
+```toml
+[[steps]]
+id = "risky-op"
+operation = "github.create_issue"
+on_error = "fallback(fallback-notify)"
+input = { owner = "{{params.owner}}", repo = "{{params.repo}}", title = "{{params.title}}" }
+
+[[steps]]
+id = "fallback-notify"
+operation = "slack.post_message"
+input = { channel = "{{params.channel}}", text = "Issue creation failed: {{steps.risky-op.error}}" }
+```
+
+You can instead set `on_error = "skip"` on the source and explicitly declare
+`trigger = "on_error(risky-op)"` on the handler. A source with `on_error = "abort"`
+still stops the workflow. Step references in these controls use letters, digits,
+underscores, or hyphens. Error templates expose the original typed error object;
+fields such as `{{steps.risky-op.error.category}}` can drive conditions, and
+hyphenated step IDs work in both conditions and input templates. Returned error
+text remains literal data, including any braces or quotes it contains.
+
+The handler's trigger supplies ordering, while `depends_on` requires successful
+prerequisites. Do not make a handler depend on its failed source, directly or
+through another success-dependent step. Validation rejects that contradiction,
+unknown or self references, conflicting triggers, multiple fallback sources for
+one handler, and cycles across success and failure edges. Other independent
+successful prerequisites are allowed.
+
+Every activated handler uses its own operation, request identity, capability,
+holder proof, approvals, and optional lease evidence through normal host
+preflight. Assign cross-connector authority with
+`--step-capability-token-file STEP=PATH` and, when needed,
+`--step-holder-key-file STEP=PATH`. Failure handling does not bypass authorization
+or renew the workflow deadline. Dry-run follows the normal per-operation rules:
+eligible safe reads may run; other activated handlers receive preflight only.
+Inactive handlers are recorded as skipped without invocation.
+
+Successful handlers retain their own outputs. They do not replace the failed
+source's output, unblock its success-dependent steps, or erase its failure: the
+overall run remains unsuccessful with a nonzero exit code. Policy or credential
+denials, invalid input, exhausted budgets, malformed or lost invocation replies,
+partial results, and upstream timeout ambiguity do not activate a fallback.
+Inspect retained evidence before repeating an uncertain operation; a handler's
+success does not prove that the original external effects were undone.
 
 ### Recipes
 
