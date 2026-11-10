@@ -648,6 +648,9 @@ pub fn classify_fcp_error(err: &FcpError) -> FcpErrorCode {
 pub fn structured_from_fcp_error(err: &FcpError) -> StructuredError {
     let code = classify_fcp_error(err);
     let mut se = StructuredError::new(code, err.to_string());
+    // A broad error category must never promote a provider's explicit denial
+    // of retryability. Preserve the kernel's concrete error semantics.
+    se.retryable = err.is_retryable();
 
     // Attach error-specific details.
     match err {
@@ -678,12 +681,18 @@ pub fn structured_from_fcp_error(err: &FcpError) -> StructuredError {
             service,
             status_code,
             retryable,
+            retry_after,
             ..
         } => {
             se.details = Some(serde_json::json!({
                 "service": service,
                 "status_code": status_code,
                 "retryable": retryable,
+                "retry_after_ms": retry_after.map(|delay| {
+                    // Round upward: even a fractional millisecond is a server
+                    // lower bound, never permission to retry immediately.
+                    u64::try_from(delay.as_nanos().div_ceil(1_000_000)).unwrap_or(u64::MAX)
+                }),
             }));
         }
         FcpError::ZoneViolation {
@@ -1535,10 +1544,7 @@ mod tests {
     }
 
     #[test]
-    fn classify_external_carries_code_level_retryable() {
-        // FcpErrExternalService is retryable at the error-code level,
-        // even when the original External error has retryable=false.
-        // The taxonomy classifies by code, not by the original field.
+    fn classify_external_preserves_explicit_non_retryable_failure() {
         let err = FcpError::External {
             service: "stripe".to_owned(),
             message: "400".to_owned(),
@@ -1547,8 +1553,63 @@ mod tests {
             retry_after: None,
         };
         let se = structured_from_fcp_error(&err);
-        // External code is in the retryable set at the taxonomy level
-        assert!(se.retryable);
+        assert!(!se.retryable);
+        assert_eq!(se.details.as_ref().unwrap()["retryable"], false);
+        assert_eq!(se.to_value()["retryable"], false);
+    }
+
+    #[test]
+    fn structured_error_preserves_kernel_retryability() {
+        for error in [
+            FcpError::HealthCheckFailed {
+                reason: "needs operator repair".to_owned(),
+            },
+            FcpError::ConnectorUnavailable {
+                code: 5001,
+                message: "temporarily unavailable".to_owned(),
+            },
+            FcpError::TokenExpired,
+            FcpError::ResourceExhausted {
+                resource: "connection pool".to_owned(),
+            },
+        ] {
+            assert_eq!(
+                structured_from_fcp_error(&error).retryable,
+                error.is_retryable()
+            );
+        }
+    }
+
+    #[test]
+    fn structured_external_retry_delay_is_preserved_and_saturates() {
+        for (delay, expected) in [
+            (None, serde_json::Value::Null),
+            (Some(std::time::Duration::ZERO), serde_json::json!(0)),
+            (
+                Some(std::time::Duration::from_nanos(1)),
+                serde_json::json!(1),
+            ),
+            (
+                Some(std::time::Duration::from_nanos(1_000_001)),
+                serde_json::json!(2),
+            ),
+            (
+                Some(std::time::Duration::from_millis(45_001)),
+                serde_json::json!(45_001),
+            ),
+            (Some(std::time::Duration::MAX), serde_json::json!(u64::MAX)),
+        ] {
+            let error = FcpError::External {
+                service: "provider".to_owned(),
+                message: "unavailable".to_owned(),
+                status_code: Some(503),
+                retryable: true,
+                retry_after: delay,
+            };
+            let structured = structured_from_fcp_error(&error);
+            assert!(structured.retryable);
+            assert_eq!(structured.details.unwrap()["retry_after_ms"], expected);
+        }
     }
 
     #[test]

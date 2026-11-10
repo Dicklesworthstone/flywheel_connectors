@@ -16,9 +16,10 @@
 //! 5. **Idempotency-conscious** — callers must opt-in to retry for
 //!    non-idempotent operations (the controller does not assume safety).
 
+use fcp_kernel::FcpError;
 use serde::Serialize;
 
-use crate::error_taxonomy::{FcpErrorCode, StructuredError};
+use crate::error_taxonomy::{FcpErrorCode, StructuredError, structured_from_fcp_error};
 
 // ── Policy ──────────────────────────────────────────────────────────────
 
@@ -29,7 +30,7 @@ pub struct RetryPolicy {
     pub max_retries: u32,
     /// Base delay for the first retry (milliseconds).
     pub base_delay_ms: u64,
-    /// Maximum delay cap (milliseconds).
+    /// Maximum computed delay (milliseconds). Server retry delays are not shortened.
     pub max_delay_ms: u64,
     /// Jitter factor (0.0 = no jitter, 0.25 = ±25%).
     pub jitter_factor: f64,
@@ -125,7 +126,7 @@ impl Default for RetryPolicy {
 /// `attempt` is 1-based (first retry = 1).
 /// Returns delay in milliseconds.
 pub fn compute_backoff(policy: &RetryPolicy, attempt: u32, jitter_seed: u64) -> u64 {
-    if attempt == 0 || policy.base_delay_ms == 0 {
+    if attempt == 0 || policy.base_delay_ms == 0 || policy.max_delay_ms == 0 {
         return 0;
     }
 
@@ -145,7 +146,8 @@ pub fn compute_backoff(policy: &RetryPolicy, attempt: u32, jitter_seed: u64) -> 
     let jitter_offset = (capped as f64) * policy.jitter_factor * jitter_raw;
     let jittered = (capped as f64 + jitter_offset).round() as u64;
 
-    jittered.max(1) // never return 0 delay
+    // Positive jitter must not widen the configured backoff ceiling.
+    jittered.max(1).min(policy.max_delay_ms)
 }
 
 // ── Attempt record ──────────────────────────────────────────────────────
@@ -309,6 +311,24 @@ impl RetryController {
         }
     }
 
+    /// Record a definitive connector failure without widening its retryability.
+    ///
+    /// The concrete FCP error is authoritative even if the broad taxonomy or
+    /// `extra_retryable` policy allows its category. Callers must separately
+    /// enforce operation idempotency, preserve effect identity, and refuse to
+    /// call this for a transport failure with an unknown execution outcome.
+    pub fn record_fcp_failure(&mut self, error: &FcpError) -> RetryDecision {
+        let structured = structured_from_fcp_error(error);
+        if !error.is_retryable() {
+            self.attempts_made += 1;
+            return RetryDecision::NonRetryable {
+                code: structured.code.to_owned(),
+                reason: "The connector failure does not permit retry".to_owned(),
+            };
+        }
+        self.record_failure(&structured)
+    }
+
     /// Record a failed attempt and get the retry decision.
     ///
     /// If the decision is `Retry`, the caller should wait the specified
@@ -405,7 +425,10 @@ impl RetryController {
             if let Some(details) = &error.details {
                 if let Some(retry_after) = details.get("retry_after_ms") {
                     if let Some(ms) = retry_after.as_u64() {
-                        return (ms.min(self.policy.max_delay_ms), true);
+                        // Retry-After is a server-imposed lower bound. A caller
+                        // whose remaining budget cannot cover it must stop;
+                        // retrying sooner would violate provider admission.
+                        return (ms, true);
                     }
                 }
             }
@@ -691,6 +714,95 @@ mod tests {
     }
 
     #[test]
+    fn controller_fcp_failure_cannot_promote_explicit_non_retryable_errors() {
+        let failures = [
+            FcpError::External {
+                service: "provider".to_owned(),
+                message: "Definitive rejection".to_owned(),
+                status_code: Some(503),
+                retryable: false,
+                retry_after: Some(std::time::Duration::from_secs(1)),
+            },
+            FcpError::HealthCheckFailed {
+                reason: "Manual repair required".to_owned(),
+            },
+            FcpError::Unauthorized {
+                code: 401,
+                message: "Credential rejected".to_owned(),
+            },
+        ];
+
+        for error in failures {
+            assert!(!error.is_retryable());
+            let category = structured_from_fcp_error(&error).category.to_owned();
+            let mut ctrl = RetryController::new(RetryPolicy {
+                extra_retryable: vec![category],
+                ..RetryPolicy::default()
+            });
+            assert!(matches!(
+                ctrl.record_fcp_failure(&error),
+                RetryDecision::NonRetryable { .. }
+            ));
+            assert_eq!(ctrl.attempts_made(), 1);
+            assert!(ctrl.history().is_empty());
+        }
+    }
+
+    #[test]
+    fn controller_fcp_failure_preserves_provider_delay_and_retry_bound() {
+        let error = FcpError::External {
+            service: "provider".to_owned(),
+            message: "Retry after maintenance".to_owned(),
+            status_code: Some(503),
+            retryable: true,
+            retry_after: Some(std::time::Duration::from_millis(45_001)),
+        };
+        let mut ctrl = RetryController::new(
+            RetryPolicy::default()
+                .with_max_retries(1)
+                .with_max_delay_ms(100),
+        );
+        assert_eq!(
+            ctrl.record_fcp_failure(&error),
+            RetryDecision::Retry {
+                delay_ms: 45_001,
+                attempt: 2,
+                server_directed: true,
+            }
+        );
+        assert_eq!(ctrl.history().len(), 1);
+        assert_eq!(ctrl.history()[0].delay_ms, 45_001);
+        assert!(ctrl.history()[0].server_directed);
+        assert_eq!(
+            ctrl.record_fcp_failure(&error),
+            RetryDecision::Exhausted {
+                attempts_made: 2,
+                max_retries: 1,
+            }
+        );
+        assert_eq!(ctrl.history().len(), 1);
+    }
+
+    #[test]
+    fn controller_fcp_failure_respects_never_retry_policy() {
+        let error = FcpError::RateLimited {
+            retry_after_ms: 10,
+            violation: None,
+        };
+        let category = structured_from_fcp_error(&error).category.to_owned();
+        let mut ctrl = RetryController::new(RetryPolicy {
+            never_retry: vec![category],
+            ..RetryPolicy::default()
+        });
+        assert!(matches!(
+            ctrl.record_fcp_failure(&error),
+            RetryDecision::NonRetryable { .. }
+        ));
+        assert_eq!(ctrl.attempts_made(), 1);
+        assert!(ctrl.history().is_empty());
+    }
+
+    #[test]
     fn controller_exhaustion_after_max_retries() {
         let mut ctrl = RetryController::new(RetryPolicy::default().with_max_retries(2));
         let err = make_retryable_error();
@@ -758,14 +870,14 @@ mod tests {
     }
 
     #[test]
-    fn controller_retry_after_capped_by_max_delay() {
+    fn controller_retry_after_is_not_shortened_by_max_delay() {
         let mut ctrl = RetryController::new(RetryPolicy::default().with_max_delay_ms(3_000));
         let err = make_rate_limited_with_retry_after(10_000);
 
         let decision = ctrl.record_failure(&err);
         match decision {
             RetryDecision::Retry { delay_ms, .. } => {
-                assert_eq!(delay_ms, 3_000);
+                assert_eq!(delay_ms, 10_000);
             }
             other => panic!("Expected Retry, got {:?}", other),
         }
@@ -1399,6 +1511,25 @@ mod tests {
             .with_max_delay_ms(1);
         assert_eq!(compute_backoff(&p, 1, 0), 1);
         assert_eq!(compute_backoff(&p, 5, 0), 1);
+    }
+
+    #[test]
+    fn backoff_positive_jitter_never_exceeds_max_delay() {
+        for max_delay in [0, 1, 16_000, u64::MAX] {
+            let policy = RetryPolicy::default()
+                .with_base_delay_ms(u64::MAX)
+                .with_max_delay_ms(max_delay)
+                .with_jitter_factor(1.0);
+            for attempt in [1, 20, u32::MAX] {
+                for seed in [0, 5_000, 10_000, u64::MAX] {
+                    let delay = compute_backoff(&policy, attempt, seed);
+                    assert!(delay <= max_delay);
+                    if max_delay > 0 {
+                        assert!(delay > 0);
+                    }
+                }
+            }
+        }
     }
 
     #[test]
