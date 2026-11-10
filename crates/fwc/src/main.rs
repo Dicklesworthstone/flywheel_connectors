@@ -3324,6 +3324,11 @@ struct MapArgs {
     #[arg(long, default_value_t = 5)]
     concurrency: usize,
 
+    /// Total execution budget, including discovery and preparation, in milliseconds.
+    /// Response finalization has a separate transport allowance.
+    #[arg(long, default_value_t = 30_000, value_parser = clap::value_parser!(u64).range(1..=pipe::budget::MAX_WORKFLOW_TIMEOUT_MS))]
+    timeout_ms: u64,
+
     /// What to do when an item fails: `abort` or `continue`.
     #[arg(long, default_value = "abort")]
     on_error: String,
@@ -3357,6 +3362,11 @@ struct BatchFileArgs {
     /// Maximum number of concurrent operations per wave.
     #[arg(long, default_value_t = 5)]
     concurrency: usize,
+
+    /// Total execution budget, including discovery and preflight, in milliseconds.
+    /// Response finalization has a separate transport allowance.
+    #[arg(long, default_value_t = 30_000, value_parser = clap::value_parser!(u64).range(1..=pipe::budget::MAX_WORKFLOW_TIMEOUT_MS))]
+    timeout_ms: u64,
 
     /// What to do when an operation fails: `abort` or `continue`.
     #[arg(long, default_value = "abort")]
@@ -27205,10 +27215,15 @@ fn build_live_invoke_request(
     })
 }
 
-fn build_host_batch_options(concurrency: usize, on_error: batch::OnError) -> HostBatchOptions {
+fn build_host_batch_options(
+    concurrency: usize,
+    on_error: batch::OnError,
+    timeout_ms: u64,
+) -> HostBatchOptions {
     HostBatchOptions {
         max_parallelism: u32::try_from(concurrency).unwrap_or(u32::MAX).max(1),
         stop_on_first_error: matches!(on_error, batch::OnError::Abort),
+        timeout_ms,
         ..HostBatchOptions::default()
     }
 }
@@ -27230,10 +27245,16 @@ fn batch_execution_evidence(run_key: &str, request: &HostBatchInvokeRequest) -> 
 
 fn submit_namespaced_batch(
     client: &HostAdminClient,
-    request: &HostBatchInvokeRequest,
+    request: &mut HostBatchInvokeRequest,
     command: &str,
     run_key: &str,
+    budget: pipe::budget::ExecutionBudget,
 ) -> std::result::Result<HostBatchInvokeResponse, DispatchOutcome> {
+    // Preparation, introspection and dry-run preflights never renew this
+    // deadline. Narrow BOTH the batch scheduler and each queued member before
+    // submitting; the host narrows them again when dependency waves activate.
+    narrow_batch_execution_budget(request, budget, std::time::Instant::now())
+        .map_err(|_| batch_setup_deadline_dispatch(command, "dispatch", run_key, &[]))?;
     client.batch(request).map_err(|error| {
         let mut outcome = error
             .downcast_ref::<invocation_cmd::BatchOutcomeUnknown>()
@@ -27256,6 +27277,56 @@ fn submit_namespaced_batch(
         outcome.payload["execution"] = batch_execution_evidence(run_key, request);
         outcome
     })
+}
+
+fn narrow_batch_execution_budget(
+    request: &mut HostBatchInvokeRequest,
+    budget: pipe::budget::ExecutionBudget,
+    now: std::time::Instant,
+) -> Result<(), pipe::budget::DeadlineExpired> {
+    if let Some(remaining) = budget.remaining_ms(now)? {
+        request.options.timeout_ms = request.options.timeout_ms.min(remaining);
+        let member_limit = request.options.timeout_ms.min(HOST_INVOKE_MAX_EXECUTION_MS);
+        for member in &mut request.operations {
+            member.request.deadline_ms = Some(
+                member
+                    .request
+                    .deadline_ms
+                    .map_or(member_limit, |declared| declared.min(member_limit)),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn batch_setup_deadline_dispatch(
+    command: &str,
+    phase: &str,
+    run_key: &str,
+    preflights: &[Value],
+) -> DispatchOutcome {
+    let mut payload = json!({
+        "status": "error",
+        "command": command,
+        "phase": phase,
+        "invoke_attempted": false,
+        "automatic_retry_allowed": false,
+        "execution": { "idempotency_key": run_key, "submitted": false },
+        "preflights": preflights,
+        "error": {
+            "type": "batch-deadline-exceeded",
+            "message": "The batch deadline expired during preparation. No batch operation was invoked.",
+            "recoverable": true,
+        },
+        "next_actions": [
+            "Check host responsiveness or increase --timeout-ms before starting a new run.",
+        ],
+    });
+    CommandEnvelope::new(CommandAvailability::Unknown, command).inject_into(&mut payload);
+    DispatchOutcome {
+        payload,
+        exit_code: CliExitCode::Transport,
+    }
 }
 
 fn validate_payload_against_schema(payload: &Value, schema: &Value) -> (bool, Vec<Value>) {
@@ -32243,6 +32314,12 @@ fn resolve_pipeline_operation_metadata(
 
 #[allow(clippy::too_many_lines)]
 fn map_dispatch(args: &MapArgs, explicit_host: Option<&str>) -> Result<DispatchOutcome> {
+    let run_budget =
+        pipe::budget::ExecutionBudget::start(Some(args.timeout_ms), std::time::Instant::now());
+    let run_key = args
+        .idempotency_key
+        .clone()
+        .unwrap_or_else(|| RequestId::random().to_string());
     // Parse the on-error mode.
     let on_error = batch::OnError::parse(&args.on_error).ok_or_else(|| {
         anyhow::anyhow!(
@@ -32306,8 +32383,19 @@ fn map_dispatch(args: &MapArgs, explicit_host: Option<&str>) -> Result<DispatchO
     else {
         return Ok(invalid_operation_reference_dispatch("map", &args.operation));
     };
-    let client = HostAdminClient::new(&host.endpoint)?;
-    let (catalog, _) = client.catalog(None)?;
+    let client = HostAdminClient::new(&host.endpoint)?.with_read_budget(run_budget);
+    let (catalog, _) = match client.catalog(None) {
+        Ok(catalog) => catalog,
+        Err(error) if error.is::<pipe::budget::DeadlineExpired>() => {
+            return Ok(batch_setup_deadline_dispatch(
+                "map",
+                "discovery",
+                &run_key,
+                &[],
+            ));
+        }
+        Err(error) => return Err(error),
+    };
     let resolved = match resolve_host_operation_from_catalog(
         "map",
         &client,
@@ -32316,10 +32404,27 @@ fn map_dispatch(args: &MapArgs, explicit_host: Option<&str>) -> Result<DispatchO
         operation_selector,
     ) {
         Ok(resolved) => resolved,
+        Err(_) if run_budget.remaining_ms(std::time::Instant::now()).is_err() => {
+            return Ok(batch_setup_deadline_dispatch(
+                "map",
+                "introspection",
+                &run_key,
+                &[],
+            ));
+        }
         Err(outcome) => return Ok(outcome),
     };
     let zone = resolved_zone(args.zone.as_deref(), &host);
-    let auth = match resolve_live_auth(&args.auth) {
+    let auth = resolve_live_auth(&args.auth);
+    if run_budget.remaining_ms(std::time::Instant::now()).is_err() {
+        return Ok(batch_setup_deadline_dispatch(
+            "map",
+            "credentials",
+            &run_key,
+            &[],
+        ));
+    }
+    let auth = match auth {
         Ok(auth) => auth,
         Err(error) => {
             return Ok(live_auth_dispatch(
@@ -32345,13 +32450,17 @@ fn map_dispatch(args: &MapArgs, explicit_host: Option<&str>) -> Result<DispatchO
         preview_inputs: inputs.items[..preview_count].to_vec(),
     };
 
-    let run_key = args
-        .idempotency_key
-        .clone()
-        .unwrap_or_else(|| RequestId::random().to_string());
     let mut invalid_items = Vec::new();
     let mut operations = Vec::new();
     for (index, payload) in inputs.items.iter().cloned().enumerate() {
+        if run_budget.remaining_ms(std::time::Instant::now()).is_err() {
+            return Ok(batch_setup_deadline_dispatch(
+                "map",
+                "validation",
+                &run_key,
+                &[],
+            ));
+        }
         let (valid, errors) =
             validate_payload_against_schema(&payload, &resolved.operation.input_schema);
         if !valid {
@@ -32423,11 +32532,12 @@ fn map_dispatch(args: &MapArgs, explicit_host: Option<&str>) -> Result<DispatchO
         });
     }
 
-    let request = HostBatchInvokeRequest {
+    let mut request = HostBatchInvokeRequest {
         operations,
-        options: build_host_batch_options(args.concurrency, on_error),
+        options: build_host_batch_options(args.concurrency, on_error, args.timeout_ms),
     };
-    let response = match submit_namespaced_batch(&client, &request, "map", &run_key) {
+    let response = match submit_namespaced_batch(&client, &mut request, "map", &run_key, run_budget)
+    {
         Ok(response) => response,
         Err(outcome) => return Ok(outcome),
     };
@@ -32474,6 +32584,12 @@ fn batch_file_dispatch(
     args: &BatchFileArgs,
     explicit_host: Option<&str>,
 ) -> Result<DispatchOutcome> {
+    let run_budget =
+        pipe::budget::ExecutionBudget::start(Some(args.timeout_ms), std::time::Instant::now());
+    let run_key = args
+        .idempotency_key
+        .clone()
+        .unwrap_or_else(|| RequestId::random().to_string());
     let content = std::fs::read_to_string(&args.file)?;
     let batch = batch_file::BatchFile::parse(&content).map_err(|e| anyhow::anyhow!("{e}"))?;
     let plan = batch_file::ExecutionPlan::from_batch(&batch, args.concurrency, &args.on_error);
@@ -32499,9 +32615,29 @@ fn batch_file_dispatch(
             args.on_error
         )
     })?;
-    let client = HostAdminClient::new(&host.endpoint)?;
-    let (catalog, _) = client.catalog(None)?;
-    let auth = match resolve_live_auth(&args.auth) {
+    let client = HostAdminClient::new(&host.endpoint)?.with_read_budget(run_budget);
+    let (catalog, _) = match client.catalog(None) {
+        Ok(catalog) => catalog,
+        Err(error) if error.is::<pipe::budget::DeadlineExpired>() => {
+            return Ok(batch_setup_deadline_dispatch(
+                "batch-file",
+                "discovery",
+                &run_key,
+                &[],
+            ));
+        }
+        Err(error) => return Err(error),
+    };
+    let auth = resolve_live_auth(&args.auth);
+    if run_budget.remaining_ms(std::time::Instant::now()).is_err() {
+        return Ok(batch_setup_deadline_dispatch(
+            "batch-file",
+            "credentials",
+            &run_key,
+            &[],
+        ));
+    }
+    let auth = match auth {
         Ok(auth) => auth,
         Err(error) => {
             return Ok(live_auth_dispatch(
@@ -32522,12 +32658,15 @@ fn batch_file_dispatch(
     let mut request_operations = Vec::new();
     let mut preflights = Vec::new();
     let mut introspection_cache: BTreeMap<String, HostIntrospectionResponse> = BTreeMap::new();
-    let run_key = args
-        .idempotency_key
-        .clone()
-        .unwrap_or_else(|| RequestId::random().to_string());
-
     for op in &batch.operations {
+        if run_budget.remaining_ms(std::time::Instant::now()).is_err() {
+            return Ok(batch_setup_deadline_dispatch(
+                "batch-file",
+                "validation",
+                &run_key,
+                &preflights,
+            ));
+        }
         let connector = match catalog.resolve_connector(&op.connector) {
             Ok(connector) => connector.clone(),
             Err(error) => {
@@ -32542,7 +32681,18 @@ fn batch_file_dispatch(
             if let Some(introspection) = introspection_cache.get(connector.summary.id.as_str()) {
                 introspection.clone()
             } else {
-                let introspection = client.introspect(connector.summary.id.as_str())?;
+                let introspection = match client.introspect(connector.summary.id.as_str()) {
+                    Ok(introspection) => introspection,
+                    Err(error) if error.is::<pipe::budget::DeadlineExpired>() => {
+                        return Ok(batch_setup_deadline_dispatch(
+                            "batch-file",
+                            "introspection",
+                            &run_key,
+                            &preflights,
+                        ));
+                    }
+                    Err(error) => return Err(error),
+                };
                 introspection_cache.insert(
                     connector.summary.id.as_str().to_owned(),
                     introspection.clone(),
@@ -32613,7 +32763,18 @@ fn batch_file_dispatch(
                 capability_token: Some(auth.capability_token.clone()),
                 approval_tokens: auth.approval_tokens.clone(),
             };
-            let response = client.preflight(&preflight_request)?;
+            let response = match client.workflow_preflight(&preflight_request, run_budget) {
+                Ok(response) => response,
+                Err(error) if error.is::<pipe::budget::DeadlineExpired>() => {
+                    return Ok(batch_setup_deadline_dispatch(
+                        "batch-file",
+                        "preflight",
+                        &run_key,
+                        &preflights,
+                    ));
+                }
+                Err(error) => return Err(error),
+            };
             preflights.push(json!({
                 "id": &op.id,
                 "request_id": preflight_request.request_id,
@@ -32676,6 +32837,14 @@ fn batch_file_dispatch(
     }
 
     if args.dry_run {
+        if run_budget.remaining_ms(std::time::Instant::now()).is_err() {
+            return Ok(batch_setup_deadline_dispatch(
+                "batch-file",
+                "preflight",
+                &run_key,
+                &preflights,
+            ));
+        }
         let (status, exit_code) = preflight_status_label(&preflights);
         let envelope = CommandEnvelope::new(CommandAvailability::LiveRuntime, "batch");
         let mut payload = json!({
@@ -32701,14 +32870,15 @@ fn batch_file_dispatch(
         return Ok(DispatchOutcome { payload, exit_code });
     }
 
-    let request = HostBatchInvokeRequest {
+    let mut request = HostBatchInvokeRequest {
         operations: request_operations,
-        options: build_host_batch_options(args.concurrency, on_error),
+        options: build_host_batch_options(args.concurrency, on_error, args.timeout_ms),
     };
-    let response = match submit_namespaced_batch(&client, &request, "batch-file", &run_key) {
-        Ok(response) => response,
-        Err(outcome) => return Ok(outcome),
-    };
+    let response =
+        match submit_namespaced_batch(&client, &mut request, "batch-file", &run_key, run_budget) {
+            Ok(response) => response,
+            Err(outcome) => return Ok(outcome),
+        };
     let (status, exit_code) = batch_status_label(&response);
 
     let envelope = CommandEnvelope::new(CommandAvailability::LiveRuntime, "batch");
@@ -55686,6 +55856,292 @@ depends_on = ["missing"]
         assert_eq!(payload["response"]["completed"], 2);
         assert_eq!(payload["response"]["failed"], 0);
         assert_eq!(payload["plan"]["input_count"], 2);
+    }
+
+    fn batch_budget_fixture(directory: &Path) -> PathBuf {
+        let path = directory.join("budget-batch.jsonl");
+        fs::write(
+            &path,
+            ["item-1", "item-2", "item-3"]
+                .iter()
+                .map(|id| {
+                    json!({
+                        "id": id,
+                        "connector": "github",
+                        "operation": "issues.create",
+                        "input": {"owner":"octocat", "repo":"hello-world", "title":"budget-test"},
+                    })
+                    .to_string()
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn batch_deadlines_reject_invalid_budgets_before_discovery_or_file_reads() {
+        for command in ["map", "batch-file"] {
+            for timeout in ["0", "86400001", "18446744073709551615"] {
+                let args = ["fwc", command, "missing-input", "--timeout-ms", timeout];
+                let error = Cli::try_parse_from(args).unwrap_err();
+                assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+                assert!(error.to_string().contains("--timeout-ms"));
+            }
+        }
+    }
+
+    #[test]
+    fn batch_deadlines_narrow_scheduler_and_members_without_renewing_authority() {
+        let start = Instant::now();
+        let budget = super::pipe::budget::ExecutionBudget::start(Some(120_000), start);
+        let mut request = super::HostBatchInvokeRequest {
+            operations: [None, Some(500), Some(120_000)]
+                .into_iter()
+                .enumerate()
+                .map(|(index, deadline)| {
+                    let mut request = execution_transport_request();
+                    request.deadline_ms = deadline;
+                    super::HostBatchOperation {
+                        id: format!("item-{index}"),
+                        request,
+                        depends_on: Vec::new(),
+                    }
+                })
+                .collect(),
+            options: super::HostBatchOptions {
+                timeout_ms: 90_000,
+                ..Default::default()
+            },
+        };
+        super::narrow_batch_execution_budget(&mut request, budget, start + Duration::from_secs(20))
+            .unwrap();
+        assert_eq!(request.options.timeout_ms, 90_000);
+        assert_eq!(request.operations[0].request.deadline_ms, Some(60_000));
+        assert_eq!(request.operations[1].request.deadline_ms, Some(500));
+        assert_eq!(request.operations[2].request.deadline_ms, Some(60_000));
+        super::narrow_batch_execution_budget(
+            &mut request,
+            budget,
+            start + Duration::from_millis(119_900),
+        )
+        .unwrap();
+        assert_eq!(request.options.timeout_ms, 100);
+        assert!(
+            request
+                .operations
+                .iter()
+                .all(|member| member.request.deadline_ms == Some(100))
+        );
+        let before = serde_json::to_value(&request).unwrap();
+        assert!(
+            super::narrow_batch_execution_budget(
+                &mut request,
+                budget,
+                start + Duration::from_secs(120)
+            )
+            .is_err()
+        );
+        assert_eq!(serde_json::to_value(&request).unwrap(), before);
+    }
+
+    #[test]
+    fn batch_deadlines_bound_discovery_and_cumulative_introspection() {
+        for command in ["map", "batch-file"] {
+            for phase in ["discovery", "introspection"] {
+                let tempdir = TempDir::new().unwrap();
+                let _history =
+                    super::install_test_history_path(tempdir.path().join("history.jsonl"));
+                let path = batch_budget_fixture(tempdir.path());
+                let path_text = path.display().to_string();
+                let token = test_capability_token_arg();
+                let mut routes = vec![(
+                    "POST /rpc/discover".to_owned(),
+                    mock_discovery_response_json(),
+                    Duration::from_millis(if phase == "discovery" { 650 } else { 200 }),
+                )];
+                if phase == "introspection" {
+                    routes.push((
+                        "GET /rpc/introspect/fcp.github:enterprise:v1".to_owned(),
+                        mock_introspection_response_json(),
+                        Duration::from_millis(400),
+                    ));
+                }
+                let request_count = routes.len();
+                let (host, server, log) = spawn_mock_host_sequence_with_timing(routes);
+                let mut args = vec!["fwc", "--json", "--host", &host, command];
+                if command == "map" {
+                    args.extend([
+                        "github.issues.create",
+                        "--inputs",
+                        r#"[{"owner":"octocat","repo":"hello-world","title":"budget-test"}]"#,
+                    ]);
+                } else {
+                    args.push(&path_text);
+                }
+                args.extend([
+                    "--timeout-ms",
+                    "500",
+                    "--idempotency-key",
+                    "budget-run",
+                    "--capability-token",
+                    &token,
+                ]);
+                let (exit, payload) = execute_json(&args);
+                server.join().unwrap();
+                assert_eq!(
+                    exit,
+                    CliExitCode::Transport.into(),
+                    "{command}/{phase}: {payload}"
+                );
+                assert_eq!(payload["error"]["type"], "batch-deadline-exceeded");
+                assert_eq!(payload["phase"], phase);
+                assert_eq!(payload["invoke_attempted"], false);
+                assert_eq!(payload["execution"]["submitted"], false);
+                assert_eq!(payload["execution"]["idempotency_key"], "budget-run");
+                assert_eq!(log.lock().unwrap().len(), request_count);
+                assert!(!payload.to_string().contains(&token));
+            }
+        }
+    }
+
+    #[test]
+    fn batch_deadlines_deduct_setup_before_dispatch_and_retain_unknown_identities() {
+        for command in ["map", "batch-file"] {
+            for usable_reply in [true, false] {
+                let tempdir = TempDir::new().unwrap();
+                let _history =
+                    super::install_test_history_path(tempdir.path().join("history.jsonl"));
+                let path = batch_budget_fixture(tempdir.path());
+                let path_text = path.display().to_string();
+                let token = test_capability_token_arg();
+                let response = if usable_reply {
+                    mock_batch_response_json(&["item-1", "item-2", "item-3"])
+                } else {
+                    json!({"invalid":"private-provider-error"})
+                };
+                let (host, server, log) = spawn_mock_host_sequence_with_timing(vec![
+                    (
+                        "POST /rpc/discover".to_owned(),
+                        mock_discovery_response_json(),
+                        Duration::from_millis(200),
+                    ),
+                    (
+                        "GET /rpc/introspect/fcp.github:enterprise:v1".to_owned(),
+                        mock_introspection_response_json(),
+                        Duration::from_millis(200),
+                    ),
+                    ("POST /rpc/batch".to_owned(), response, Duration::ZERO),
+                ]);
+                let mut args = vec!["fwc", "--json", "--host", &host, command];
+                if command == "map" {
+                    args.extend(["github.issues.create", "--inputs", r#"[{"owner":"octocat","repo":"hello-world","title":"A"},{"owner":"octocat","repo":"hello-world","title":"B"},{"owner":"octocat","repo":"hello-world","title":"C"}]"#]);
+                } else {
+                    args.push(&path_text);
+                }
+                args.extend([
+                    "--timeout-ms",
+                    "3000",
+                    "--idempotency-key",
+                    "budget-run",
+                    "--capability-token",
+                    &token,
+                ]);
+                let (exit, payload) = execute_json(&args);
+                server.join().unwrap();
+                assert_eq!(
+                    exit,
+                    if usable_reply {
+                        CliExitCode::Success
+                    } else {
+                        CliExitCode::Transport
+                    }
+                    .into(),
+                    "{payload}"
+                );
+                let log = log.lock().unwrap();
+                assert_eq!(log.len(), 3);
+                let request: Value = serde_json::from_str(&log[2].1).unwrap();
+                let remaining = request["options"]["timeout_ms"].as_u64().unwrap();
+                assert!((1..=2600).contains(&remaining), "{request}");
+                for (member, evidence) in request["operations"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .zip(payload["execution"]["members"].as_array().unwrap())
+                {
+                    assert_eq!(member["request"]["deadline_ms"], remaining);
+                    assert_eq!(evidence["request_id"], member["request"]["id"]);
+                    assert_eq!(
+                        evidence["idempotency_key"],
+                        member["request"]["idempotency_key"]
+                    );
+                }
+                assert_eq!(payload["execution"]["idempotency_key"], "budget-run");
+                if !usable_reply {
+                    assert_eq!(payload["outcome"], "outcome_unknown");
+                    assert_eq!(payload["automatic_retry_allowed"], false);
+                    assert!(!payload.to_string().contains("private-provider-error"));
+                }
+                assert!(!payload.to_string().contains(&token));
+            }
+        }
+    }
+
+    #[test]
+    fn batch_deadlines_keep_completed_dry_run_evidence_and_stop_later_members() {
+        let tempdir = TempDir::new().unwrap();
+        let _history = super::install_test_history_path(tempdir.path().join("history.jsonl"));
+        let path = batch_budget_fixture(tempdir.path());
+        let token = test_capability_token_arg();
+        let (host, server, log) = spawn_mock_host_sequence_with_timing(vec![
+            (
+                "POST /rpc/discover".to_owned(),
+                mock_discovery_response_json(),
+                Duration::ZERO,
+            ),
+            (
+                "GET /rpc/introspect/fcp.github:enterprise:v1".to_owned(),
+                mock_introspection_response_json(),
+                Duration::ZERO,
+            ),
+            (
+                "POST /rpc/preflight".to_owned(),
+                mock_preflight_response_json(true),
+                Duration::from_millis(200),
+            ),
+            (
+                "POST /rpc/preflight".to_owned(),
+                mock_preflight_response_json(true),
+                Duration::from_millis(600),
+            ),
+        ]);
+        let (exit, payload) = execute_json(&[
+            "fwc",
+            "--json",
+            "--host",
+            &host,
+            "batch-file",
+            &path.display().to_string(),
+            "--dry-run",
+            "--timeout-ms",
+            "700",
+            "--idempotency-key",
+            "budget-run",
+            "--capability-token",
+            &token,
+        ]);
+        server.join().unwrap();
+        assert_eq!(exit, CliExitCode::Transport.into(), "{payload}");
+        assert_eq!(payload["error"]["type"], "batch-deadline-exceeded");
+        assert_eq!(payload["phase"], "preflight");
+        assert_eq!(payload["invoke_attempted"], false);
+        assert_eq!(payload["preflights"].as_array().unwrap().len(), 1);
+        assert_eq!(payload["preflights"][0]["id"], "item-1");
+        assert_eq!(payload["preflights"][0]["allowed"], true);
+        assert_eq!(log.lock().unwrap().len(), 4);
+        assert!(!payload.to_string().contains(&token));
     }
 
     fn run_batch_identity_case(

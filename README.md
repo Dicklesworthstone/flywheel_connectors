@@ -1619,6 +1619,16 @@ idempotency conflict checks. JSON `execution` metadata preserves the run key and
 each member's request ID and key, including when the host reply is unusable.
 An uncertain outcome never triggers an automatic retry.
 
+`fwc map` and `fwc batch-file` share one execution budget across input preparation,
+host discovery, introspection, dry-run preflights, and dispatch. Set
+`--timeout-ms <milliseconds>` to override the 30-second default (maximum one day).
+Only the remaining budget reaches the host batch scheduler; each member also
+inherits that limit, capped at the host's 60-second invocation ceiling. Expiry
+before submission reports that no operation was invoked and preserves completed
+dry-run preflights. A separate response-finalization allowance can extend the
+HTTP wait after dispatch; it does not grant more execution time. A lost or invalid
+batch reply still preserves all member identities as an uncertain outcome.
+
 ### MCP Tool Export
 
 ```bash

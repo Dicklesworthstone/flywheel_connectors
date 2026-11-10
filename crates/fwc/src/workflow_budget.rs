@@ -1,4 +1,4 @@
-//! Monotone execution deadlines for pipelines and recipes.
+//! Monotone execution deadlines for pipelines, recipes, maps, and batches.
 //!
 //! Discovery, introspection and credential resolution consume the run budget.
 //! A child step inherits what remains. Preflight and invocation share that
