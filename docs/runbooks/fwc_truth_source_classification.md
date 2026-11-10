@@ -33,14 +33,14 @@ metadata, but unknown top-level success fields are rejected.
 | `history.schema.json` | `fwc history` | `fcp.fwc.truth-source.v1` | Requires `command: "history"`. |
 | `audit_chain_status.schema.json` | `fwc audit chain status` | `fcp.fwc.audit_chain_status.v1` | Requires `command: "audit"` and `subcommand: "chain status"` on the success path; `truth-source-unavailable` errors use the shared schema version. |
 | `audit_verify.schema.json` | `fwc audit verify` | `fcp.fwc.audit_verify.v1` | Success output is the serialized audit report plus `_truth_source`; `truth-source-unavailable` errors use the shared schema version and carry `command: "audit"` plus `subcommand: "verify"`. |
-| `mesh_explain_availability.schema.json` | `fwc mesh explain-availability` | `fcp.fwc.truth-source.v1` | Requires `command: "mesh"` and `subcommand: "explain-availability"`; live placement-policy answers report `_truth_source: "mesh"` and weaker artifact-only answers report the resolver's lower-confidence source. |
+| `mesh_explain_availability.schema.json` | `fwc mesh explain-availability` | `fcp.fwc.truth-source.v1` | Requires `command: "mesh"` and `subcommand: "explain-availability"`; selected-host runtime and zone declarations report host or degraded truth. Recorded placement policy alone does not establish mesh-backed truth. |
 | `connector_lease_status.schema.json` | `fwc connector lease status` | `1.0.0` | Requires `command: "connector"` and `subcommand: "lease status"`; live host lease evidence reports `_truth_source: "host"` while offline HRW ladder projections report `_truth_source: "offline"`. |
 
 The operator-facing `_truth_source` tags are:
 
 | Tag | Meaning | Typical commands |
 |-----|---------|------------------|
-| `mesh` | Mesh-backed distributed truth. This is the intended highest-confidence answer once mesh-native cutover is complete. | Future mesh-backed resolver paths and live placement-policy answers for `fwc mesh explain-availability`. |
+| `mesh` | Mesh-backed distributed truth. This requires verified remote execution evidence or direct distributed evidence for the reported fact. | Routed read surfaces carrying verified executor evidence; a local runtime plus recorded placement policy does not qualify. |
 | `host` | Live host-admin truth from a reachable `fcp-host` endpoint. | `fwc list`, `show`, `schema`, `search`, `status`, live `doctor`, and live connector lease status paths when a host endpoint is configured. |
 | `node-local` | Local CLI configuration rather than host or mesh state. | `fwc context current`, `fwc context list`. |
 | `offline` | Workspace manifests, local history, local doctor probes, local audit-chain artifacts, or persisted mesh context. | `fwc list --offline`, `show --offline`, `schema --offline`, `search --offline`, `history`, local `doctor`, `audit chain status`, `audit verify`, offline mesh availability, and offline connector lease projections. |
@@ -106,12 +106,45 @@ to fail with `truth-source-unavailable` and `actual: "host"`.
 | `fwc history` | Offline; history reads the local CLI history store. |
 | `fwc audit chain status` | Offline audit-chain artifact truth with `schema_version: "fcp.fwc.audit_chain_status.v1"`. |
 | `fwc audit verify` | Offline audit verification truth with `schema_version: "fcp.fwc.audit_verify.v1"`. |
-| `fwc mesh explain-availability` | Mesh-backed when placement-policy state is live; lower-confidence answers explain the fallback source, branch, and evidence handles. |
+| `fwc mesh availability/explain-availability/repair-hints` | Host-backed selected-node runtime status and artifact provenance. Live `--zone` queries also require authenticated local inventory declarations; missing evidence fails closed. Neither declarations nor recorded placement policy prove invocation admission or replica coverage. |
 | `fwc connector lease status` | Host-backed when live lease evidence is available; offline answers are HRW ladder projections from persisted mesh context and do not prove live quorum state. |
 
 Mutation commands and side-effecting audit commands are not covered by this
 read-only truth-source contract. Keep mutation routing on its command-specific
 host or policy path.
+
+### Live zone availability
+
+Use the selected host's configured zone allowlist together with its current
+runtime status:
+
+```bash
+fwc --host <endpoint> mesh explain-availability github --zone z:work \
+  --admin-token-file <path> --json
+```
+
+The admin secret may also come from `FCP_HOST_ADMIN_BEARER_TOKEN`. The command
+reads the bounded `/rpc/mesh/inventory` endpoint with owner-zone admin
+authentication. It accepts exactly one consistent local inventory entry and
+matches the discovered canonical connector ID to that entry. Fresh peer
+advertisements cannot stand in for the selected host's zone declaration, and a
+runtime status forwarded from another node cannot be joined to a local
+declaration. Missing, stale, malformed, or ambiguous evidence returns a nonzero
+exit status without falling back to workspace manifests or saved targets.
+
+`inventory.zone_declared` and `availability_fact.zone_declared` distinguish the
+allowlist result from runtime health. An empty allowlist or an undeclared zone
+reports `availability_fact.state: "unavailable"` with
+`reason_code: "zone-not-declared"`, even when the process is running. This is a
+successful inspection of an unavailable configuration. The added
+`host-zone-inventory` evidence handle records the local node and observation
+time. A declared zone still requires fresh invocation preflight: capability,
+approval, lease, and placement checks remain independent, and
+`invocation_admission_proven` is always false on this read route.
+
+Use `fwc mesh nodes <connector> --zone <zone> --host <endpoint>
+--admin-token-file <path>` to inspect advertised peer locations. Those
+advertisements do not establish peer liveness, replica health, or quorum.
 
 ## Downgrade Triage
 

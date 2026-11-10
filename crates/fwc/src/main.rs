@@ -315,8 +315,8 @@ use fcp_crypto::{
     Ed25519Signature, Ed25519VerifyingKey, canonicalize::to_deterministic_cbor, cose::CoseToken,
 };
 use fcp_host::mesh_routing::{
-    MESH_INVENTORY_ROUTE, MESH_INVENTORY_SCHEMA_VERSION, MeshInventoryMembershipStatus,
-    MeshInventoryResponse, MeshInventoryStatus,
+    MESH_INVENTORY_ROUTE, MESH_INVENTORY_SCHEMA_VERSION, MeshInventoryConnector,
+    MeshInventoryMembershipStatus, MeshInventoryResponse, MeshInventoryStatus,
 };
 use fcp_host::{
     BatchInvokeResponse as HostBatchInvokeResponse, BatchOptions as HostBatchOptions,
@@ -1024,13 +1024,18 @@ struct MeshAvailabilityArgs {
     /// Connector id, alias, or family name.
     connector: String,
 
-    /// Optional zone to compare against offline manifest declarations.
+    /// Exact zone to compare against live host inventory or offline manifest declarations.
     #[arg(long)]
     zone: Option<String>,
 
     /// Fail unless the command resolves from at least this truth source.
     #[arg(long, value_enum)]
     require_source: Option<RequiredTruthSource>,
+
+    /// Read the host admin bearer secret for live --zone queries; defaults to FCP_HOST_ADMIN_BEARER_TOKEN.
+    #[arg(long, value_name = "PATH")]
+    #[serde(skip_serializing)]
+    admin_token_file: Option<PathBuf>,
 }
 
 #[derive(Args, Debug, Serialize)]
@@ -11656,10 +11661,13 @@ fn mesh_offline_evidence_handles(
     handles
 }
 
-fn mesh_live_zone_filter_dispatch(
+fn mesh_zone_inventory_error_dispatch(
     subcommand: &str,
     connector: &str,
     zone: &str,
+    kind: &str,
+    message: &str,
+    exit_code: CliExitCode,
 ) -> DispatchOutcome {
     DispatchOutcome {
         payload: json!({
@@ -11668,23 +11676,78 @@ fn mesh_live_zone_filter_dispatch(
             "subcommand": subcommand,
             "connector": connector,
             "source": "host-admin-api",
+            "schema_version": TRUTH_SOURCE_SCHEMA_VERSION,
+            "_truth_source": "unavailable",
             "error": {
-                "type": "unsupported-live-zone-filter",
-                "message": format!(
-                    "`fwc mesh {subcommand}` cannot prove connector availability for zone `{zone}` because live host discovery does not expose per-zone inventory metadata."
-                ),
+                "type": kind,
+                "message": message,
                 "recoverable": true,
             },
             "filters": {
                 "zone": zone,
             },
             "next_actions": [
-                format!("Retry without `--zone` so `fwc mesh {subcommand}` can expose live host status truthfully."),
-                "Use `fwc zones <zone>` or explicit invoke/simulate commands when you need zone-scoped planning instead of live runtime proof.".to_owned(),
+                format!("fwc mesh {subcommand} {connector} --zone {zone} --host <endpoint> --admin-token-file <path>"),
+                "Use `fwc mesh nodes <connector> --zone <zone> --host <endpoint> --admin-token-file <path>` to inspect advertised locations; peer declarations do not prove local runtime availability.",
             ],
         }),
-        exit_code: CliExitCode::Validation,
+        exit_code,
     }
+}
+
+/// Join runtime status only to the selected host's own fresh zone declaration.
+/// A peer advertisement cannot supply authority for the local status route.
+fn mesh_local_zone_declaration<'a>(
+    inventory: &'a MeshInventoryResponse,
+    connector_id: &str,
+    now_ms: u64,
+) -> std::result::Result<&'a MeshInventoryConnector, &'static str> {
+    use fcp_mesh::invoke_route::{
+        DEFAULT_MESH_ADVERTISEMENT_MAX_AGE_MS, DEFAULT_MESH_FORWARD_MAX_SKEW_MS,
+    };
+
+    if inventory.generated_at_ms > now_ms.saturating_add(DEFAULT_MESH_FORWARD_MAX_SKEW_MS)
+        || now_ms.saturating_sub(inventory.generated_at_ms) > DEFAULT_MESH_ADVERTISEMENT_MAX_AGE_MS
+    {
+        return Err("The host's zone inventory is stale or has an invalid future timestamp.");
+    }
+    let mut local_nodes = inventory.nodes.iter().filter(|node| node.is_local);
+    let Some(local) = local_nodes.next() else {
+        return Err("The host did not provide its own local zone inventory.");
+    };
+    if local_nodes.next().is_some()
+        || local.inventory_status != MeshInventoryStatus::Local
+        || local.node_id != inventory.local_node_id
+        || inventory.mesh_configured != inventory.local_node_id.is_some()
+        || local.advertisement_issued_at_ms.is_some()
+        || local.advertisement_age_ms.is_some()
+        || inventory.nodes.iter().any(|node| {
+            !node.is_local
+                && (node.inventory_status == MeshInventoryStatus::Local
+                    || node.node_id == local.node_id)
+        })
+    {
+        return Err("The host returned inconsistent local and peer inventory identities.");
+    }
+    let mut declarations = local
+        .connectors
+        .iter()
+        .filter(|candidate| candidate.connector_id == connector_id);
+    let Some(declaration) = declarations.next() else {
+        return Err(
+            "The selected connector has no local zone declaration on this host. Discovery or peer advertisements cannot prove local zone availability.",
+        );
+    };
+    if declarations.next().is_some()
+        || declaration
+            .zones
+            .iter()
+            .any(|zone| zone.parse::<ZoneId>().is_err())
+        || declaration.zones.iter().collect::<BTreeSet<_>>().len() != declaration.zones.len()
+    {
+        return Err("The host returned ambiguous or invalid zone declarations for this connector.");
+    }
+    Ok(declaration)
 }
 
 fn mesh_availability_dispatch(
@@ -11693,8 +11756,21 @@ fn mesh_availability_dispatch(
     explain: bool,
     hints_only: bool,
 ) -> Result<DispatchOutcome> {
-    let resolved_host = resolve_host_config(explicit_host)?;
     let subcommand = mesh_availability_subcommand(explain, hints_only);
+    if let Some(zone) = args.zone.as_deref()
+        && zone.parse::<ZoneId>().is_err()
+    {
+        return Ok(DispatchOutcome {
+            payload: json!({
+                "status": "error",
+                "command": "mesh",
+                "subcommand": subcommand,
+                "error": {"type": "invalid-zone", "message": "--zone must be a valid exact zone id such as z:work.", "recoverable": true},
+            }),
+            exit_code: CliExitCode::Validation,
+        });
+    }
+    let resolved_host = resolve_host_config(explicit_host)?;
     let resolver = LiveTruthResolver::new(ResolverConfig::from_environment());
     let strategy = resolver.config().default_strategy;
 
@@ -11748,15 +11824,45 @@ fn mesh_availability_host_dispatch(
     explain: bool,
     hints_only: bool,
 ) -> Result<DispatchOutcome> {
-    if let Some(zone) = args.zone.as_deref() {
-        return Ok(mesh_live_zone_filter_dispatch(
-            subcommand,
-            &args.connector,
-            zone,
-        ));
-    }
-
     let client = HostAdminClient::new(&host.endpoint)?;
+    let zone_inventory = if let Some(zone) = args.zone.as_deref() {
+        if let Some(outcome) = enforce_required_truth_source_with_subcommand(
+            "mesh",
+            subcommand,
+            args.require_source,
+            KnowledgeState::HostBacked,
+        ) {
+            return Ok(outcome);
+        }
+        let token = match mesh_inventory_credential(args.admin_token_file.as_deref()) {
+            Ok(token) => token,
+            Err(kind) => {
+                return Ok(mesh_zone_inventory_error_dispatch(
+                    subcommand,
+                    &args.connector,
+                    zone,
+                    kind,
+                    "Live zone availability requires a valid host admin bearer secret from --admin-token-file or FCP_HOST_ADMIN_BEARER_TOKEN.",
+                    CliExitCode::PolicyDenied,
+                ));
+            }
+        };
+        match client.mesh_inventory(&token) {
+            Ok(inventory) => Some(inventory),
+            Err(_) => {
+                return Ok(mesh_zone_inventory_error_dispatch(
+                    subcommand,
+                    &args.connector,
+                    zone,
+                    "mesh-inventory-unavailable",
+                    "The selected host did not provide a valid authenticated zone inventory. Check its endpoint, admin credential, and inventory support.",
+                    CliExitCode::Transport,
+                ));
+            }
+        }
+    } else {
+        None
+    };
     let (catalog, _) = client.catalog(None)?;
     let connector = match catalog.resolve_connector(&args.connector) {
         Ok(connector) => connector,
@@ -11768,7 +11874,44 @@ fn mesh_availability_host_dispatch(
             ));
         }
     };
-    let status = client.connector_status(connector.summary.id.as_str())?;
+    let zone_declaration =
+        if let (Some(zone), Some(inventory)) = (args.zone.as_deref(), zone_inventory.as_ref()) {
+            let now_ms = u64::try_from(Utc::now().timestamp_millis()).unwrap_or(0);
+            match mesh_local_zone_declaration(inventory, connector.summary.id.as_str(), now_ms) {
+                Ok(declaration) => Some(declaration),
+                Err(message) => {
+                    return Ok(mesh_zone_inventory_error_dispatch(
+                        subcommand,
+                        &args.connector,
+                        zone,
+                        "local-zone-inventory-unavailable",
+                        message,
+                        CliExitCode::Transport,
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+    let status = if let Some(zone) = args.zone.as_deref() {
+        match client.connector_status_with_provenance(connector.summary.id.as_str()) {
+            Ok((status, provenance)) if provenance.truth_source == KnowledgeState::HostBacked => {
+                status
+            }
+            _ => {
+                return Ok(mesh_zone_inventory_error_dispatch(
+                    subcommand,
+                    &args.connector,
+                    zone,
+                    "local-runtime-status-unavailable",
+                    "The selected host did not provide matching local runtime status. A peer response cannot be combined with this host's zone declaration.",
+                    CliExitCode::Transport,
+                ));
+            }
+        }
+    } else {
+        client.connector_status(connector.summary.id.as_str())?
+    };
 
     let message = if hints_only {
         format!(
@@ -11791,9 +11934,9 @@ fn mesh_availability_host_dispatch(
     let explanation = explain.then_some(vec![
         "This answer is authoritative for the current host because it comes from live connector status, not workspace manifests.".to_owned(),
         "Artifact provenance shows where the installed runtime bundle came from and whether hash/signature checks passed.".to_owned(),
-        "Per-zone mesh inventory is still unavailable on the live host API, so node/zone-specific placement cannot be proven on this route yet.".to_owned(),
+        "Zone declarations describe the selected host's configured allowlist. They do not prove invocation admission, peer health, or replica coverage; every invoke still requires fresh host preflight.".to_owned(),
     ]);
-    let contract = build_mesh_live_operator_contract(
+    let mut contract = build_mesh_live_operator_contract(
         &subcommand,
         &host.endpoint,
         connector,
@@ -11802,6 +11945,60 @@ fn mesh_availability_host_dispatch(
         message,
         explanation,
     );
+    if let (Some(zone), Some(inventory), Some(declaration)) = (
+        args.zone.as_deref(),
+        zone_inventory.as_ref(),
+        zone_declaration,
+    ) {
+        // A status read can spend the entire configured timeout waiting on a
+        // runtime. Do not publish a declaration that expired during that wait.
+        let now_ms = u64::try_from(Utc::now().timestamp_millis()).unwrap_or(0);
+        if let Err(message) =
+            mesh_local_zone_declaration(inventory, connector.summary.id.as_str(), now_ms)
+        {
+            return Ok(mesh_zone_inventory_error_dispatch(
+                subcommand,
+                &args.connector,
+                zone,
+                "local-zone-inventory-unavailable",
+                message,
+                CliExitCode::Transport,
+            ));
+        }
+        let zone_declared = declaration.zones.iter().any(|candidate| candidate == zone);
+        if let Some(runtime_inventory) = contract.inventory.as_mut() {
+            runtime_inventory["per_zone_supported"] = json!(true);
+            runtime_inventory["requested_zone"] = json!(zone);
+            runtime_inventory["zone_declared"] = json!(zone_declared);
+            runtime_inventory["declared_zones"] = json!(declaration.zones);
+            runtime_inventory["zone_inventory_source"] = json!("host-mesh-inventory");
+            runtime_inventory["zone_inventory_generated_at_ms"] = json!(inventory.generated_at_ms);
+            runtime_inventory["local_node_id"] = json!(inventory.local_node_id);
+        }
+        contract.availability_fact["requested_zone"] = json!(zone);
+        contract.availability_fact["zone_declared"] = json!(zone_declared);
+        contract.availability_fact["invocation_admission_proven"] = json!(false);
+        if !zone_declared {
+            contract.availability_fact["state"] = json!("unavailable");
+            contract.availability_fact["reason_code"] = json!("zone-not-declared");
+            contract.availability_fact["explanation"] = json!(
+                "The requested zone is not declared in the selected host's connector allowlist. A running process or a peer's zone declaration does not permit local invocation."
+            );
+            contract.repair_hints.insert(0, format!(
+                "Choose a zone declared by this host or update the connector's allowed_zones through managed inventory, then run fresh preflight for {zone}."
+            ));
+        }
+        contract.evidence_handles.push(json!({
+            "kind": "host-zone-inventory",
+            "connector_id": connector.summary.id.as_str(),
+            "requested_zone": zone,
+            "zone_declared": zone_declared,
+            "generated_at_ms": inventory.generated_at_ms,
+            "node_id": inventory.local_node_id,
+            "endpoint": host.endpoint,
+            "invocation_admission_proven": false,
+        }));
+    }
     let truth_source = contract.resolution.operator_knowledge_state();
     if let Some(outcome) = enforce_required_truth_source_with_subcommand(
         "mesh",
@@ -35708,6 +35905,7 @@ fn is_sensitive_flag(flag: &str) -> bool {
         flag,
         "--capability-token"
             | "--capability-token-file"
+            | "--admin-token-file"
             | "--cancel-capability-token"
             | "--cancel-capability-token-file"
             | "--source-capability-token"
@@ -40529,6 +40727,9 @@ deny_ptrace = true
             "another-cancel-path-secret",
             "--cancel-capability-token=another-cancel-secret",
             "--capability-token-file=invoke-path-secret",
+            "--admin-token-file=admin-path-secret",
+            "--admin-token-file",
+            "another-admin-path-secret",
         ]
         .map(str::to_owned);
 
@@ -40542,6 +40743,8 @@ deny_ptrace = true
         assert_eq!(redacted[15], "<redacted>");
         assert_eq!(redacted[16], "--cancel-capability-token=<redacted>");
         assert_eq!(redacted[17], "--capability-token-file=<redacted>");
+        assert_eq!(redacted[18], "--admin-token-file=<redacted>");
+        assert_eq!(redacted[20], "<redacted>");
     }
 
     #[test]
@@ -47517,33 +47720,262 @@ deny_ptrace = true
     }
 
     #[test]
-    fn execute_mesh_availability_with_host_rejects_live_zone_filter() {
-        let (host, server) = spawn_mock_host(
-            StdBTreeMap::from([(
-                "POST /rpc/discover".to_owned(),
-                mock_discovery_response_json(),
-            )]),
-            0,
-        );
+    fn execute_mesh_availability_live_zone_uses_selected_host_declarations() {
+        let (tempdir, path, _guard) = temp_context_config();
+        let token_file = tempdir.path().join("admin-token");
+        fs::write(&token_file, "zone-inventory-owner-secret\n").unwrap();
+        let mut config = super::default_context_config();
+        config.contexts.get_mut("local").unwrap().endpoint = "http://127.0.0.1:9".to_owned();
+        super::save_context_config(&path, &config).unwrap();
+        let schema: Value = serde_json::from_str(include_str!(
+            "../schemas/mesh_explain_availability.schema.json"
+        ))
+        .unwrap();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        for subcommand in ["availability", "explain-availability", "repair-hints"] {
+            for (zone, declared, zones) in [
+                ("z:private", true, json!(["z:private"])),
+                // A peer advertises z:work, but the selected host does not.
+                ("z:work", false, json!(["z:private"])),
+                ("z:private", false, json!([])),
+            ] {
+                let mut inventory = mock_mesh_inventory_response_json();
+                inventory["generated_at_ms"] = json!(Utc::now().timestamp_millis());
+                inventory["nodes"][0]["connectors"][0]["zones"] = zones;
+                let (host, server) = spawn_mock_host(
+                    StdBTreeMap::from([
+                        ("GET /rpc/mesh/inventory".to_owned(), inventory),
+                        (
+                            "POST /rpc/discover".to_owned(),
+                            mock_discovery_response_json(),
+                        ),
+                        (
+                            "GET /rpc/connectors/fcp.github:enterprise:v1/status".to_owned(),
+                            mock_connector_admin_status_json(),
+                        ),
+                    ]),
+                    3,
+                );
+                let (exit, payload) = execute_json(&[
+                    "fwc",
+                    "--json",
+                    "--host",
+                    &host,
+                    "mesh",
+                    subcommand,
+                    "github",
+                    "--zone",
+                    zone,
+                    "--admin-token-file",
+                    token_file.to_str().unwrap(),
+                ]);
+                server.join().unwrap();
+                assert_eq!(exit, CliExitCode::Success.into());
+                assert_eq!(payload["_truth_source"], "host");
+                assert_eq!(payload["inventory"]["per_zone_supported"], true);
+                assert_eq!(payload["inventory"]["requested_zone"], zone);
+                assert_eq!(payload["inventory"]["zone_declared"], declared);
+                assert_eq!(payload["inventory"]["local_node_id"], "entry-host");
+                assert_eq!(payload["availability_fact"]["zone_declared"], declared);
+                assert_eq!(
+                    payload["availability_fact"]["invocation_admission_proven"],
+                    false
+                );
+                assert_eq!(
+                    payload["availability_fact"]["mesh_placement"]["replica_telemetry_available"],
+                    false
+                );
+                assert_eq!(
+                    payload["availability_fact"]["state"],
+                    if declared { "available" } else { "unavailable" }
+                );
+                if !declared {
+                    assert_eq!(
+                        payload["availability_fact"]["reason_code"],
+                        "zone-not-declared"
+                    );
+                }
+                if subcommand == "explain-availability" {
+                    validator.validate(&payload).unwrap();
+                }
+                assert_evidence_handle(&payload, "host-zone-inventory");
+                assert!(!payload.to_string().contains("zone-inventory-owner-secret"));
+            }
+        }
+    }
 
-        let (exit_code, payload) = execute_json(&[
-            "fwc",
-            "--json",
-            "--host",
-            &host,
-            "mesh",
-            "availability",
-            "github",
-            "--zone",
-            "z:work",
-        ]);
+    #[test]
+    fn execute_mesh_availability_live_zone_rejects_missing_and_hostile_local_evidence() {
+        let (tempdir, _path, _guard) = temp_context_config();
+        let token_file = tempdir.path().join("admin-token");
+        fs::write(&token_file, "zone-inventory-owner-secret").unwrap();
+        let schema: Value = serde_json::from_str(include_str!(
+            "../schemas/mesh_explain_availability.schema.json"
+        ))
+        .unwrap();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        for scenario in [
+            "peer-only",
+            "no-local",
+            "duplicate-local",
+            "mismatched-local-id",
+            "peer-marked-local",
+            "duplicate-connector",
+            "duplicate-zone",
+            "invalid-zone",
+            "stale",
+            "future",
+        ] {
+            let mut inventory = mock_mesh_inventory_response_json();
+            inventory["generated_at_ms"] = json!(Utc::now().timestamp_millis());
+            match scenario {
+                "peer-only" => inventory["nodes"][0]["connectors"] = json!([]),
+                "no-local" => inventory["nodes"][0]["is_local"] = json!(false),
+                "duplicate-local" => inventory["nodes"][1]["is_local"] = json!(true),
+                "mismatched-local-id" => inventory["local_node_id"] = json!("wrong-host"),
+                "peer-marked-local" => inventory["nodes"][1]["inventory_status"] = json!("local"),
+                "duplicate-connector" => {
+                    let declaration = inventory["nodes"][0]["connectors"][0].clone();
+                    inventory["nodes"][0]["connectors"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(declaration);
+                }
+                "duplicate-zone" => {
+                    inventory["nodes"][0]["connectors"][0]["zones"] = json!(["z:work", "z:work"])
+                }
+                "invalid-zone" => {
+                    inventory["nodes"][0]["connectors"][0]["zones"] = json!(["invalid-zone-secret"])
+                }
+                "stale" => inventory["generated_at_ms"] = json!(1),
+                "future" => inventory["generated_at_ms"] = json!(u64::MAX),
+                _ => unreachable!(),
+            }
+            let (host, server) = spawn_mock_host(
+                StdBTreeMap::from([
+                    ("GET /rpc/mesh/inventory".to_owned(), inventory),
+                    (
+                        "POST /rpc/discover".to_owned(),
+                        mock_discovery_response_json(),
+                    ),
+                ]),
+                2,
+            );
+            let (exit, payload) = execute_json(&[
+                "fwc",
+                "--json",
+                "--host",
+                &host,
+                "mesh",
+                "explain-availability",
+                "github",
+                "--zone",
+                "z:work",
+                "--admin-token-file",
+                token_file.to_str().unwrap(),
+            ]);
+            server.join().unwrap();
+            assert_eq!(exit, CliExitCode::Transport.into(), "{scenario}: {payload}");
+            assert_eq!(payload["_truth_source"], "unavailable");
+            assert_eq!(payload["error"]["type"], "local-zone-inventory-unavailable");
+            assert!(payload.get("availability_fact").is_none());
+            assert!(!payload.to_string().contains("invalid-zone-secret"));
+            validator.validate(&payload).unwrap();
+        }
+    }
 
-        server.join().expect("mock host thread should complete");
-        assert_eq!(exit_code, CliExitCode::Validation.into());
-        assert_eq!(payload["command"], "mesh");
-        assert_eq!(payload["subcommand"], "availability");
-        assert!(payload.get("schema_version").is_none());
-        assert_eq!(payload["error"]["type"], "unsupported-live-zone-filter");
+    #[test]
+    fn execute_mesh_availability_live_zone_rejects_remote_or_mismatched_runtime_status() {
+        let (tempdir, _path, _guard) = temp_context_config();
+        let token_file = tempdir.path().join("admin-token");
+        fs::write(&token_file, "zone-inventory-owner-secret").unwrap();
+        let mut mismatched = mock_connector_admin_status_json();
+        mismatched["connector_id"] = json!("fcp.slack:enterprise:v1");
+        for status in [
+            mismatched,
+            mock_mesh_read_response(mock_connector_admin_status_json()),
+        ] {
+            let mut inventory = mock_mesh_inventory_response_json();
+            inventory["generated_at_ms"] = json!(Utc::now().timestamp_millis());
+            let (host, server) = spawn_mock_host(
+                StdBTreeMap::from([
+                    ("GET /rpc/mesh/inventory".to_owned(), inventory),
+                    (
+                        "POST /rpc/discover".to_owned(),
+                        mock_discovery_response_json(),
+                    ),
+                    (
+                        "GET /rpc/connectors/fcp.github:enterprise:v1/status".to_owned(),
+                        status,
+                    ),
+                ]),
+                3,
+            );
+            let (exit, payload) = execute_json(&[
+                "fwc",
+                "--json",
+                "--host",
+                &host,
+                "mesh",
+                "availability",
+                "github",
+                "--zone",
+                "z:private",
+                "--admin-token-file",
+                token_file.to_str().unwrap(),
+            ]);
+            server.join().unwrap();
+            assert_eq!(exit, CliExitCode::Transport.into());
+            assert_eq!(payload["_truth_source"], "unavailable");
+            assert_eq!(payload["error"]["type"], "local-runtime-status-unavailable");
+            assert!(payload.get("availability_fact").is_none());
+        }
+    }
+
+    #[test]
+    fn execute_mesh_availability_live_zone_rejects_invalid_inputs_before_host_queries() {
+        let (_tempdir, _path, _guard) = temp_context_config();
+        for (zone, token_file, requirement, expected_exit, kind) in [
+            (
+                "invalid",
+                "/not-opened/secret",
+                "any-live",
+                CliExitCode::Validation,
+                "invalid-zone",
+            ),
+            (
+                "z:work",
+                "/missing/admin-token",
+                "any-live",
+                CliExitCode::PolicyDenied,
+                "invalid-admin-credential",
+            ),
+            (
+                "z:work",
+                "/not-opened/secret",
+                "mesh",
+                CliExitCode::Transport,
+                "truth-source-unavailable",
+            ),
+        ] {
+            let (exit, payload) = execute_json(&[
+                "fwc",
+                "--json",
+                "--host",
+                "http://127.0.0.1:9",
+                "mesh",
+                "availability",
+                "github",
+                "--zone",
+                zone,
+                "--admin-token-file",
+                token_file,
+                "--require-source",
+                requirement,
+            ]);
+            assert_eq!(exit, expected_exit.into());
+            assert_eq!(payload["error"]["type"], kind);
+        }
     }
 
     #[test]

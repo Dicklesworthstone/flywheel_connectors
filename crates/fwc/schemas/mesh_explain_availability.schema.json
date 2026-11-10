@@ -5,6 +5,7 @@
   "description": "Top-level provenance envelope for `fwc mesh explain-availability --json`.",
   "oneOf": [
     { "$ref": "#/$defs/mesh_explain_availability_success" },
+    { "$ref": "#/$defs/zone_inventory_unavailable_error" },
     { "$ref": "#/$defs/truth_source_unavailable_error" },
     { "$ref": "#/$defs/truth_resolver_internal_error" }
   ],
@@ -211,6 +212,37 @@
         "schema_version": { "const": "fcp.fwc.truth-source.v1" },
         "_truth_source": { "$ref": "#/$defs/truth_source" },
         "availability": { "$ref": "#/$defs/availability_envelope" }
+      }
+    },
+    "zone_inventory_unavailable_error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "command", "subcommand", "connector", "source", "schema_version", "_truth_source", "error", "filters", "next_actions"],
+      "properties": {
+        "status": { "const": "error" },
+        "command": { "const": "mesh" },
+        "subcommand": { "const": "explain-availability" },
+        "connector": { "$ref": "#/$defs/non_empty_string" },
+        "source": { "const": "host-admin-api" },
+        "schema_version": { "const": "fcp.fwc.truth-source.v1" },
+        "_truth_source": { "const": "unavailable" },
+        "error": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "message", "recoverable"],
+          "properties": {
+            "type": { "enum": ["missing-admin-credential", "invalid-admin-credential", "mesh-inventory-unavailable", "local-zone-inventory-unavailable", "local-runtime-status-unavailable"] },
+            "message": { "$ref": "#/$defs/non_empty_string" },
+            "recoverable": { "const": true }
+          }
+        },
+        "filters": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["zone"],
+          "properties": { "zone": { "$ref": "#/$defs/non_empty_string" } }
+        },
+        "next_actions": { "$ref": "#/$defs/string_array" }
       }
     },
     "truth_source_unavailable_error": {
