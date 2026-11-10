@@ -186,6 +186,13 @@ pub enum ConnectorStateStoreError {
         current_seq: u64,
     },
 
+    /// A different singleton writer reused the preceding writer's fencing token.
+    #[error("connector state writer change requires a strictly newer lease than {lease_seq}")]
+    WriterLeaseReuse {
+        /// Fencing token that cannot be shared by two distinct writer keys.
+        lease_seq: u64,
+    },
+
     /// Committed singleton roots have incomparable authenticated heads.
     #[error(
         "connector state fork detected: roots {root_a} and {root_b} have incompatible heads {head_a} and {head_b}"
@@ -1742,14 +1749,8 @@ impl FcpStoreConnectorStateStore {
             Some(head_id) => Some(self.load_state_object(&head_id).await?),
             None => None,
         };
-        if self.state_model.is_singleton_writer()
-            && let Some((_head_id, head)) = &current
-            && state_obj.lease_seq < head.lease_seq
-        {
-            return Err(ConnectorStateStoreError::StaleLease {
-                held_seq: state_obj.lease_seq,
-                current_seq: head.lease_seq,
-            });
+        if let Some((_head_id, head)) = &current {
+            Self::validate_writer_fencing(&self.state_model, head, &state_obj)?;
         }
         let expected_prev = current.as_ref().map(|(object_id, _state)| *object_id);
         if state_obj.prev != expected_prev {
@@ -2000,10 +2001,30 @@ impl FcpStoreConnectorStateStore {
                 got: newer.seq,
             });
         }
-        if model.is_singleton_writer() && newer.lease_seq < older.lease_seq {
+        Self::validate_writer_fencing(model, older, newer)
+    }
+
+    /// Historical writer trust permits reading an old signature; it does not
+    /// let either writer reuse the other's singleton lease. Apply this rule at
+    /// both append admission and every recovered/replicated chain transition.
+    fn validate_writer_fencing(
+        model: &ConnectorStateModel,
+        older: &ConnectorStateObject,
+        newer: &ConnectorStateObject,
+    ) -> Result<()> {
+        if !model.is_singleton_writer() {
+            return Ok(());
+        }
+        if newer.lease_seq < older.lease_seq {
             return Err(ConnectorStateStoreError::StaleLease {
                 held_seq: newer.lease_seq,
                 current_seq: older.lease_seq,
+            });
+        }
+        if newer.lease_seq == older.lease_seq && newer.writer_public_key != older.writer_public_key
+        {
+            return Err(ConnectorStateStoreError::WriterLeaseReuse {
+                lease_seq: newer.lease_seq,
             });
         }
         Ok(())
@@ -3035,6 +3056,14 @@ impl FcpStoreConnectorStateStore {
                 held_seq,
                 current_seq,
             },
+            ConnectorStateStoreError::WriterLeaseReuse { lease_seq } => {
+                ConnectorStateError::AuthorizationDenied {
+                    connector_id: self.connector_id.clone(),
+                    reason: format!(
+                        "singleton writer change requires a strictly newer lease than {lease_seq}"
+                    ),
+                }
+            }
             ConnectorStateStoreError::UnexpectedSchema { .. }
             | ConnectorStateStoreError::IdentityMismatch { .. }
             | ConnectorStateStoreError::HeaderBodyMismatch
@@ -4353,6 +4382,137 @@ mod tests {
             run_async(crdt_store.append_object(independent_writer)).unwrap(),
             ConnectorStateAppendOutcome::Committed { seq: 1, .. }
         ));
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn singleton_writer_handoff_requires_a_new_lease_after_durable_reopen() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let (old_authority, old_key) = write_authorization_with_key();
+        let (new_authority, new_key) = write_authorization_with_key();
+        let pins = [
+            old_key.verifying_key().to_bytes(),
+            new_key.verifying_key().to_bytes(),
+        ];
+        for checkpoint_after_ops in [0, 2] {
+            let mut config = DurableObjectStoreConfig::new(
+                directory.path().join(checkpoint_after_ops.to_string()),
+            );
+            config.checkpoint_after_ops = checkpoint_after_ops;
+            config.mac_key = Some([0x73; 32]);
+            let head0 = {
+                let state_store =
+                    test_store(Arc::new(DurableObjectStore::open(config.clone()).unwrap()))
+                        .with_trusted_writer_keys(pins);
+                let committed = ConnectorStateStore::append_object(
+                    &state_store,
+                    &connector_id(),
+                    &old_authority,
+                    signed_state(0, None, lease_id(1), &old_key),
+                )
+                .await
+                .unwrap();
+                let ConnectorStateAppendOutcome::Committed { object_id, .. } = committed else {
+                    panic!("initial writer must commit");
+                };
+                object_id
+            };
+            let objects = Arc::new(DurableObjectStore::open(config).unwrap());
+            let state_store = test_store(objects.clone()).with_trusted_writer_keys(pins);
+            let before = objects.storage_used().await;
+            for lease_seq in [9, 10] {
+                let mut takeover = signed_state(1, Some(head0), lease_id(2), &new_key);
+                takeover.lease_seq = lease_seq;
+                takeover.sign_with(&new_key).unwrap();
+                let error = ConnectorStateStore::append_object(
+                    &state_store,
+                    &connector_id(),
+                    &new_authority,
+                    takeover,
+                )
+                .await
+                .unwrap_err();
+                if lease_seq == 10 {
+                    assert!(matches!(
+                        error,
+                        ConnectorStateError::AuthorizationDenied { .. }
+                    ));
+                    assert!(error.to_string().contains("strictly newer lease than 10"));
+                } else {
+                    assert!(matches!(error, ConnectorStateError::StaleLease { .. }));
+                }
+                assert_eq!(objects.storage_used().await, before);
+                assert_eq!(state_store.current_head().await.unwrap().unwrap().0, head0);
+            }
+
+            let takeover = signed_state(1, Some(head0), lease_id(2), &new_key);
+            let committed = ConnectorStateStore::append_object(
+                &state_store,
+                &connector_id(),
+                &new_authority,
+                takeover,
+            )
+            .await
+            .unwrap();
+            let ConnectorStateAppendOutcome::Committed {
+                object_id: head1, ..
+            } = committed
+            else {
+                panic!("new writer with a strictly newer lease must commit");
+            };
+
+            // The historical signer remains readable, but cannot reclaim the
+            // new writer's token simply by learning its canonical prev pointer.
+            let before = objects.storage_used().await;
+            let mut old_writer = signed_state(2, Some(head1), lease_id(3), &old_key);
+            old_writer.lease_seq = 11;
+            old_writer.sign_with(&old_key).unwrap();
+            assert!(matches!(
+                ConnectorStateStore::append_object(
+                    &state_store,
+                    &connector_id(),
+                    &old_authority,
+                    old_writer,
+                )
+                .await,
+                Err(ConnectorStateError::AuthorizationDenied { .. })
+            ));
+            assert_eq!(objects.storage_used().await, before);
+
+            // Renewal by the same signer may keep the token and replace the
+            // lease object's content ID without manufacturing another handoff.
+            let mut renewal = signed_state(2, Some(head1), lease_id(4), &new_key);
+            renewal.lease_seq = 11;
+            renewal.sign_with(&new_key).unwrap();
+            assert!(matches!(
+                ConnectorStateStore::append_object(
+                    &state_store,
+                    &connector_id(),
+                    &new_authority,
+                    renewal,
+                )
+                .await
+                .unwrap(),
+                ConnectorStateAppendOutcome::Committed { seq: 2, .. }
+            ));
+            assert_eq!(state_store.read_chain(None, 10).await.unwrap().len(), 3);
+        }
+    }
+
+    #[test]
+    fn crdt_writer_change_does_not_require_singleton_lease_progression() {
+        let state_store = test_store(store()).with_state_model(ConnectorStateModel::Crdt {
+            crdt_type: fcp_prelude::CrdtType::LwwMap,
+        });
+        let (head0, _) = append_ok(&state_store, state(0, None, lease_id(1)));
+        let new_key = Ed25519SigningKey::from_bytes(&[0x79; 32]).unwrap();
+        let mut concurrent = signed_state(1, Some(head0), lease_id(2), &new_key);
+        concurrent.lease_seq = 1;
+        concurrent.sign_with(&new_key).unwrap();
+        append_ok(&state_store, concurrent);
+        assert_eq!(
+            run_async(state_store.read_chain(None, 10)).unwrap().len(),
+            2
+        );
     }
 
     #[test]
@@ -5989,6 +6149,37 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_replay_requires_new_fencing_when_a_trusted_writer_changes() {
+        let fixture = SnapshotReplayFixture::new();
+        let new_key = Ed25519SigningKey::from_bytes(&[0x78; 32]).unwrap();
+        let reader = fixture.reader().with_trusted_writer_keys([
+            test_state_signing_key().verifying_key().to_bytes(),
+            new_key.verifying_key().to_bytes(),
+        ]);
+        for lease_seq in [12, 13] {
+            let mut successor = signed_state(3, Some(fixture.heads[2]), lease_id(93), &new_key);
+            successor.lease_seq = lease_seq;
+            successor.sign_with(&new_key).unwrap();
+            let head = run_async(fixture.state_store.store_state_object(successor)).unwrap();
+            let root = fixture.store_root_for(head);
+            let result = run_async(reader.replay_from_snapshot(root, fixture.snapshot_id, 1));
+            if lease_seq == 12 {
+                assert!(matches!(
+                    result,
+                    Err(ConnectorStateStoreError::WriterLeaseReuse { lease_seq: 12 })
+                ));
+            } else {
+                let replay = result.unwrap();
+                assert_eq!(replay.head().0, head);
+                assert_eq!(
+                    replay.head().1.writer_public_key,
+                    new_key.verifying_key().to_bytes()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn snapshot_replay_checks_exact_root_envelope_and_model() {
         let fixture = SnapshotReplayFixture::new();
         let reader = fixture.reader();
@@ -7023,6 +7214,74 @@ mod tests {
     }
 
     #[test]
+    fn replica_writer_handoff_cannot_reuse_a_trusted_predecessors_lease() {
+        let old_key = test_state_signing_key();
+        let new_key = Ed25519SigningKey::from_bytes(&[0x76; 32]).unwrap();
+        let pins = [
+            old_key.verifying_key().to_bytes(),
+            new_key.verifying_key().to_bytes(),
+        ];
+        let genesis = state(0, None, lease_id(1));
+        let genesis_id = replica_with_states(std::slice::from_ref(&genesis)).objects[0].object_id;
+        let mut successor = signed_state(1, Some(genesis_id), lease_id(2), &new_key);
+        successor.lease_seq = genesis.lease_seq;
+        successor.sign_with(&new_key).unwrap();
+        let bundle = replica_with_states(&[genesis, successor]);
+
+        // Both APIs must reject before persisting even one dependency, despite
+        // valid signatures and explicit read trust for both writers.
+        for retain_exact in [false, true] {
+            let objects = Arc::new(FailNthPutObjectStore::new(store(), usize::MAX));
+            let target = test_store(objects.clone()).with_trusted_writer_keys(pins);
+            let result = if retain_exact {
+                run_async(target.retain_replica_checked(
+                    bundle.clone(),
+                    replica_limits(),
+                    || Ok(()),
+                ))
+                .map(|_| ())
+            } else {
+                run_async(target.import_replica(bundle.clone(), replica_limits())).map(|_| ())
+            };
+            assert!(matches!(
+                result,
+                Err(ConnectorStateStoreError::WriterLeaseReuse { lease_seq: 10 })
+            ));
+            assert_eq!(objects.puts.load(Ordering::SeqCst), 0);
+            assert!(run_async(objects.list_zone(&zone_id())).is_empty());
+        }
+
+        // A chain placed directly in backing storage must not bypass the same
+        // rule through canonical recovery, inspection, or peer export.
+        let objects = store();
+        for object in bundle.objects.iter().cloned() {
+            run_async(objects.put(object)).unwrap();
+        }
+        let reader = test_store(objects).with_trusted_writer_keys(pins);
+        assert!(matches!(
+            run_async(reader.read_root()),
+            Err(ConnectorStateStoreError::WriterLeaseReuse { lease_seq: 10 })
+        ));
+        assert!(matches!(
+            run_async(reader.read_chain(None, 10)),
+            Err(ConnectorStateStoreError::WriterLeaseReuse { lease_seq: 10 })
+        ));
+        assert!(matches!(
+            run_async(reader.export_replica(bundle.root_object_id, replica_limits())),
+            Err(ConnectorStateStoreError::WriterLeaseReuse { lease_seq: 10 })
+        ));
+        assert!(matches!(
+            run_async(reader.inspect_replica_checked(
+                bundle.root_object_id,
+                replica_limits(),
+                || Ok(())
+            )),
+            Err(ConnectorStateStoreError::WriterLeaseReuse { lease_seq: 10 })
+        ));
+        assert!(reader.cached_root().is_none());
+    }
+
+    #[test]
     fn replica_rejects_competing_branch_without_poisoning_canonical_root() {
         let target_objects = Arc::new(FailNthPutObjectStore::new(store(), usize::MAX));
         let target = test_store(target_objects.clone());
@@ -7289,12 +7548,23 @@ mod tests {
         let generation = source.change_bus.generation();
         let missing = ObjectId::from_bytes([99; 32]);
         for error in [
-            run_async(source.export_replica_checked(missing, replica_limits(), denied_replica_read))
-                .unwrap_err(),
-            run_async(source.inspect_replica_checked(missing, replica_limits(), denied_replica_read))
-                .unwrap_err(),
+            run_async(source.export_replica_checked(
+                missing,
+                replica_limits(),
+                denied_replica_read,
+            ))
+            .unwrap_err(),
+            run_async(source.inspect_replica_checked(
+                missing,
+                replica_limits(),
+                denied_replica_read,
+            ))
+            .unwrap_err(),
         ] {
-            assert!(matches!(error, ConnectorStateStoreError::InvalidReplica { .. }));
+            assert!(matches!(
+                error,
+                ConnectorStateStoreError::InvalidReplica { .. }
+            ));
         }
         assert_eq!(objects.gets.load(Ordering::SeqCst), 0);
         assert_eq!(objects.mutations.load(Ordering::SeqCst), 0);
@@ -7312,8 +7582,11 @@ mod tests {
         let generation = source.change_bus.generation();
         objects.gets.store(0, Ordering::SeqCst);
         let inspection = run_async(source.inspect_replica_checked(
-            bundle.root_object_id, replica_limits(), || Ok(()),
-        )).unwrap();
+            bundle.root_object_id,
+            replica_limits(),
+            || Ok(()),
+        ))
+        .unwrap();
         assert_eq!(inspection.root_object_id, bundle.root_object_id);
         assert_eq!(inspection.object_count, bundle.objects.len());
         assert_eq!(inspection.canonical_bytes, replica_bytes(&bundle));
@@ -7321,8 +7594,11 @@ mod tests {
         assert_eq!(objects.mutations.load(Ordering::SeqCst), mutations);
         assert_eq!(source.change_bus.generation(), generation);
         let exported = run_async(source.export_replica_checked(
-            bundle.root_object_id, replica_limits(), || Ok(()),
-        )).unwrap();
+            bundle.root_object_id,
+            replica_limits(),
+            || Ok(()),
+        ))
+        .unwrap();
         assert_eq!(exported, bundle);
         assert_eq!(exported.objects[0].object_id, head0);
         assert_eq!(exported.objects[1].object_id, head1);
@@ -7338,27 +7614,44 @@ mod tests {
             max_objects: bundle.objects.len(),
             max_bytes: replica_bytes(&bundle),
         };
-        let inspection = run_async(source.inspect_replica_checked(
-            bundle.root_object_id, exact, || Ok(()),
-        )).unwrap();
+        let inspection =
+            run_async(source.inspect_replica_checked(bundle.root_object_id, exact, || Ok(())))
+                .unwrap();
         assert_eq!(inspection.canonical_bytes, exact.max_bytes);
         assert_eq!(inspection.object_count, exact.max_objects);
         for limits in [
-            ConnectorStateReplicaLimits { max_objects: exact.max_objects - 1, ..exact },
-            ConnectorStateReplicaLimits { max_bytes: exact.max_bytes - 1, ..exact },
-            ConnectorStateReplicaLimits { max_objects: 0, ..exact },
-            ConnectorStateReplicaLimits { max_bytes: 0, ..exact },
+            ConnectorStateReplicaLimits {
+                max_objects: exact.max_objects - 1,
+                ..exact
+            },
+            ConnectorStateReplicaLimits {
+                max_bytes: exact.max_bytes - 1,
+                ..exact
+            },
+            ConnectorStateReplicaLimits {
+                max_objects: 0,
+                ..exact
+            },
+            ConnectorStateReplicaLimits {
+                max_bytes: 0,
+                ..exact
+            },
         ] {
-            let inspected = run_async(source.inspect_replica_checked(
-                bundle.root_object_id, limits, || Ok(()),
-            )).unwrap_err();
-            let exported = run_async(source.export_replica_checked(
-                bundle.root_object_id, limits, || Ok(()),
-            )).unwrap_err();
-            assert!(matches!(inspected,
+            let inspected =
+                run_async(source.inspect_replica_checked(bundle.root_object_id, limits, || Ok(())))
+                    .unwrap_err();
+            let exported =
+                run_async(source.export_replica_checked(bundle.root_object_id, limits, || Ok(())))
+                    .unwrap_err();
+            assert!(matches!(
+                inspected,
                 ConnectorStateStoreError::ReplicaObjectLimitExceeded { .. }
-                | ConnectorStateStoreError::ReplicaByteLimitExceeded { .. }));
-            assert_eq!(std::mem::discriminant(&inspected), std::mem::discriminant(&exported));
+                    | ConnectorStateStoreError::ReplicaByteLimitExceeded { .. }
+            ));
+            assert_eq!(
+                std::mem::discriminant(&inspected),
+                std::mem::discriminant(&exported)
+            );
         }
     }
 
@@ -7384,14 +7677,23 @@ mod tests {
                 };
                 let result = if inspect {
                     run_async(source.inspect_replica_checked(
-                        bundle.root_object_id, replica_limits(), authorize,
-                    )).map(|_| ())
+                        bundle.root_object_id,
+                        replica_limits(),
+                        authorize,
+                    ))
+                    .map(|_| ())
                 } else {
                     run_async(source.export_replica_checked(
-                        bundle.root_object_id, replica_limits(), authorize,
-                    )).map(|_| ())
+                        bundle.root_object_id,
+                        replica_limits(),
+                        authorize,
+                    ))
+                    .map(|_| ())
                 };
-                assert!(matches!(result, Err(ConnectorStateStoreError::InvalidReplica { .. })));
+                assert!(matches!(
+                    result,
+                    Err(ConnectorStateStoreError::InvalidReplica { .. })
+                ));
                 assert_eq!(objects.gets.load(Ordering::SeqCst), allowed_reads);
                 assert_eq!(objects.mutations.load(Ordering::SeqCst), mutations);
                 assert_eq!(source.change_bus.generation(), generation);
@@ -7418,15 +7720,24 @@ mod tests {
                 };
                 let result = if inspect {
                     run_async(source.inspect_replica_checked(
-                        bundle.root_object_id, replica_limits(), authorize,
-                    )).map(|_| ())
+                        bundle.root_object_id,
+                        replica_limits(),
+                        authorize,
+                    ))
+                    .map(|_| ())
                 } else {
                     run_async(source.export_replica_checked(
-                        bundle.root_object_id, replica_limits(), authorize,
-                    )).map(|_| ())
+                        bundle.root_object_id,
+                        replica_limits(),
+                        authorize,
+                    ))
+                    .map(|_| ())
                 };
                 let error = result.unwrap_err();
-                assert!(matches!(error, ConnectorStateStoreError::InvalidReplica { .. }));
+                assert!(matches!(
+                    error,
+                    ConnectorStateStoreError::InvalidReplica { .. }
+                ));
                 assert!(!error.to_string().contains("private-source-path"));
                 assert_eq!(objects.gets.load(Ordering::SeqCst), failed_read);
             }
@@ -7440,15 +7751,24 @@ mod tests {
         let bundle = export_test_replica(&source);
         for inspect in [false, true] {
             let calls = AtomicUsize::new(0);
-            let count = || { calls.fetch_add(1, Ordering::SeqCst); Ok(()) };
+            let count = || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            };
             if inspect {
                 run_async(source.inspect_replica_checked(
-                    bundle.root_object_id, replica_limits(), count,
-                )).unwrap();
+                    bundle.root_object_id,
+                    replica_limits(),
+                    count,
+                ))
+                .unwrap();
             } else {
                 run_async(source.export_replica_checked(
-                    bundle.root_object_id, replica_limits(), count,
-                )).unwrap();
+                    bundle.root_object_id,
+                    replica_limits(),
+                    count,
+                ))
+                .unwrap();
             }
             let final_call = calls.swap(0, Ordering::SeqCst);
             assert!(final_call > bundle.objects.len());
@@ -7461,14 +7781,23 @@ mod tests {
             };
             let result = if inspect {
                 run_async(source.inspect_replica_checked(
-                    bundle.root_object_id, replica_limits(), authorize,
-                )).map(|_| ())
+                    bundle.root_object_id,
+                    replica_limits(),
+                    authorize,
+                ))
+                .map(|_| ())
             } else {
                 run_async(source.export_replica_checked(
-                    bundle.root_object_id, replica_limits(), authorize,
-                )).map(|_| ())
+                    bundle.root_object_id,
+                    replica_limits(),
+                    authorize,
+                ))
+                .map(|_| ())
             };
-            assert!(matches!(result, Err(ConnectorStateStoreError::InvalidReplica { .. })));
+            assert!(matches!(
+                result,
+                Err(ConnectorStateStoreError::InvalidReplica { .. })
+            ));
             assert_eq!(calls.load(Ordering::SeqCst), final_call);
         }
     }
@@ -7487,13 +7816,21 @@ mod tests {
             run_async(async {
                 let mut operation = Box::pin(async {
                     if inspect {
-                        source.inspect_replica_checked(
-                            bundle.root_object_id, replica_limits(), || Ok(()),
-                        ).await.map(|_| ())
+                        source
+                            .inspect_replica_checked(
+                                bundle.root_object_id,
+                                replica_limits(),
+                                || Ok(()),
+                            )
+                            .await
+                            .map(|_| ())
                     } else {
-                        source.export_replica_checked(
-                            bundle.root_object_id, replica_limits(), || Ok(()),
-                        ).await.map(|_| ())
+                        source
+                            .export_replica_checked(bundle.root_object_id, replica_limits(), || {
+                                Ok(())
+                            })
+                            .await
+                            .map(|_| ())
                     }
                 });
                 assert!(futures_util::poll!(operation.as_mut()).is_pending());
@@ -7506,9 +7843,16 @@ mod tests {
             assert_eq!(source.change_bus.generation(), generation);
         }
         objects.pause_on_get.store(0, Ordering::SeqCst);
-        assert_eq!(run_async(source.inspect_replica_checked(
-            bundle.root_object_id, replica_limits(), || Ok(()),
-        )).unwrap().object_count, bundle.objects.len());
+        assert_eq!(
+            run_async(source.inspect_replica_checked(
+                bundle.root_object_id,
+                replica_limits(),
+                || Ok(()),
+            ))
+            .unwrap()
+            .object_count,
+            bundle.objects.len()
+        );
     }
 
     #[test]
@@ -7537,21 +7881,24 @@ mod tests {
     fn replica_inspection_remains_pinned_to_empty_and_historical_roots() {
         let source = test_store(store());
         let empty = run_async(source.store_root(root_with_head(None, 12))).unwrap();
-        let empty_report = run_async(source.inspect_replica_checked(
-            empty, replica_limits(), || Ok(()),
-        )).unwrap();
+        let empty_report =
+            run_async(source.inspect_replica_checked(empty, replica_limits(), || Ok(()))).unwrap();
         assert_eq!(empty_report.object_count, 1);
         let (head0, _) = append_ok(&source, state(0, None, lease_id(1)));
         let initial = export_test_replica(&source);
         append_ok(&source, state(1, Some(head0), lease_id(2)));
         let historical = run_async(source.inspect_replica_checked(
-            initial.root_object_id, replica_limits(), || Ok(()),
-        )).unwrap();
+            initial.root_object_id,
+            replica_limits(),
+            || Ok(()),
+        ))
+        .unwrap();
         assert_eq!(historical.object_count, 2);
         assert_eq!(historical.canonical_bytes, replica_bytes(&initial));
-        assert_eq!(run_async(source.inspect_replica_checked(
-            empty, replica_limits(), || Ok(()),
-        )).unwrap(), empty_report);
+        assert_eq!(
+            run_async(source.inspect_replica_checked(empty, replica_limits(), || Ok(()),)).unwrap(),
+            empty_report
+        );
     }
 
     #[test]
@@ -7576,24 +7923,40 @@ mod tests {
             }
             let source = test_store(objects);
             let inspected = run_async(source.inspect_replica_checked(
-                bundle.root_object_id, replica_limits(), || Ok(()),
-            )).unwrap_err();
+                bundle.root_object_id,
+                replica_limits(),
+                || Ok(()),
+            ))
+            .unwrap_err();
             let exported = run_async(source.export_replica_checked(
-                bundle.root_object_id, replica_limits(), || Ok(()),
-            )).unwrap_err();
-            assert!(matches!(inspected,
+                bundle.root_object_id,
+                replica_limits(),
+                || Ok(()),
+            ))
+            .unwrap_err();
+            assert!(matches!(
+                inspected,
                 ConnectorStateStoreError::InvalidStateSignature(_)
-                | ConnectorStateStoreError::SequenceMismatch { .. }
-                | ConnectorStateStoreError::StaleLease { .. }));
-            assert_eq!(std::mem::discriminant(&inspected), std::mem::discriminant(&exported));
+                    | ConnectorStateStoreError::SequenceMismatch { .. }
+                    | ConnectorStateStoreError::StaleLease { .. }
+            ));
+            assert_eq!(
+                std::mem::discriminant(&inspected),
+                std::mem::discriminant(&exported)
+            );
         }
         let source = test_store(store());
         append_ok(&source, genesis);
         let bundle = export_test_replica(&source);
         let untrusted = source.with_trusted_writer_keys([[0xee; 32]]);
-        assert!(matches!(run_async(untrusted.inspect_replica_checked(
-            bundle.root_object_id, replica_limits(), || Ok(()),
-        )), Err(ConnectorStateStoreError::UntrustedWriterKey { .. })));
+        assert!(matches!(
+            run_async(untrusted.inspect_replica_checked(
+                bundle.root_object_id,
+                replica_limits(),
+                || Ok(()),
+            )),
+            Err(ConnectorStateStoreError::UntrustedWriterKey { .. })
+        ));
     }
 
     #[test]
@@ -7610,8 +7973,11 @@ mod tests {
         }
         let bundle = export_test_replica(&source);
         let inspection = run_async(source.inspect_replica_checked(
-            bundle.root_object_id, replica_limits(), || Ok(()),
-        )).unwrap();
+            bundle.root_object_id,
+            replica_limits(),
+            || Ok(()),
+        ))
+        .unwrap();
         assert_eq!(inspection.object_count, 17);
         assert_eq!(inspection.canonical_bytes, replica_bytes(&bundle));
         assert!(inspection.canonical_bytes > 64 * 1024);
@@ -7641,25 +8007,37 @@ mod tests {
         let (older, newer) = retention_history_pair();
         let objects = store();
         let target = test_store(objects.clone());
-        run_async(target.import_replica(newer.clone(), replica_limits())).unwrap().unwrap();
+        run_async(target.import_replica(newer.clone(), replica_limits()))
+            .unwrap()
+            .unwrap();
         assert!(!run_async(objects.exists(&older.root_object_id)));
         // Advance-only import deliberately remains a mutation-free no-op.
-        assert!(run_async(target.import_replica(older.clone(), replica_limits())).unwrap().is_none());
+        assert!(
+            run_async(target.import_replica(older.clone(), replica_limits()))
+                .unwrap()
+                .is_none()
+        );
         assert!(!run_async(objects.exists(&older.root_object_id)));
 
-        let change = run_async(target.retain_replica_checked(
-            older.clone(), replica_limits(), || Ok(()),
-        )).unwrap();
+        let change =
+            run_async(target.retain_replica_checked(older.clone(), replica_limits(), || Ok(())))
+                .unwrap();
         assert!(change.is_none());
         assert!(run_async(objects.exists(&older.root_object_id)));
-        assert_eq!(run_async(target.read_root()).unwrap().unwrap().0, newer.root_object_id);
+        assert_eq!(
+            run_async(target.read_root()).unwrap().unwrap().0,
+            newer.root_object_id
+        );
         assert_eq!(
             run_async(target.export_replica(older.root_object_id, replica_limits())).unwrap(),
             older,
         );
         let inspected = run_async(target.inspect_replica_checked(
-            older.root_object_id, replica_limits(), || Ok(()),
-        )).unwrap();
+            older.root_object_id,
+            replica_limits(),
+            || Ok(()),
+        ))
+        .unwrap();
         assert_eq!(inspected.object_count, older.objects.len());
         assert_eq!(inspected.canonical_bytes, replica_bytes(&older));
     }
@@ -7668,15 +8046,19 @@ mod tests {
     fn exact_retention_advances_an_empty_store_and_repeated_retention_does_not_advance() {
         let (_, newer) = retention_history_pair();
         let target = test_store(store());
-        let change = run_async(target.retain_replica_checked(
-            newer.clone(), replica_limits(), || Ok(()),
-        )).unwrap().unwrap();
+        let change =
+            run_async(target.retain_replica_checked(newer.clone(), replica_limits(), || Ok(())))
+                .unwrap()
+                .unwrap();
         assert_eq!(change.seq, Some(1));
-        let repeated = run_async(target.retain_replica_checked(
-            newer.clone(), replica_limits(), || Ok(()),
-        )).unwrap();
+        let repeated =
+            run_async(target.retain_replica_checked(newer.clone(), replica_limits(), || Ok(())))
+                .unwrap();
         assert!(repeated.is_none());
-        assert_eq!(run_async(target.read_root()).unwrap().unwrap().0, newer.root_object_id);
+        assert_eq!(
+            run_async(target.read_root()).unwrap().unwrap().0,
+            newer.root_object_id
+        );
         assert_eq!(
             run_async(target.export_replica(newer.root_object_id, replica_limits())).unwrap(),
             newer,
@@ -7689,18 +8071,29 @@ mod tests {
         let (head, _) = append_ok(&source, state(0, None, lease_id(1)));
         let newer = export_test_replica(&source);
         for historical_head in [None, Some(head)] {
-            let historical_id = run_async(source.store_root(root_with_head(historical_head, 1)))
-                .unwrap();
-            let historical = run_async(source.export_replica(historical_id, replica_limits()))
-                .unwrap();
+            let historical_id =
+                run_async(source.store_root(root_with_head(historical_head, 1))).unwrap();
+            let historical =
+                run_async(source.export_replica(historical_id, replica_limits())).unwrap();
             let objects = store();
             let target = test_store(objects.clone());
-            run_async(target.import_replica(newer.clone(), replica_limits())).unwrap().unwrap();
+            run_async(target.import_replica(newer.clone(), replica_limits()))
+                .unwrap()
+                .unwrap();
             assert!(!run_async(objects.exists(&historical_id)));
-            assert!(run_async(target.retain_replica_checked(
-                historical.clone(), replica_limits(), || Ok(()),
-            )).unwrap().is_none());
-            assert_eq!(run_async(target.read_root()).unwrap().unwrap().0, newer.root_object_id);
+            assert!(
+                run_async(target.retain_replica_checked(
+                    historical.clone(),
+                    replica_limits(),
+                    || Ok(()),
+                ))
+                .unwrap()
+                .is_none()
+            );
+            assert_eq!(
+                run_async(target.read_root()).unwrap().unwrap().0,
+                newer.root_object_id
+            );
             assert_eq!(
                 run_async(target.export_replica(historical_id, replica_limits())).unwrap(),
                 historical,
@@ -7716,15 +8109,23 @@ mod tests {
         let fork = export_test_replica(&fork);
         let objects = Arc::new(FailNthPutObjectStore::new(store(), usize::MAX));
         let target = test_store(objects.clone());
-        run_async(target.import_replica(newer.clone(), replica_limits())).unwrap().unwrap();
+        run_async(target.import_replica(newer.clone(), replica_limits()))
+            .unwrap()
+            .unwrap();
         let writes = objects.puts.load(Ordering::SeqCst);
-        let error = run_async(target.retain_replica_checked(
-            fork.clone(), replica_limits(), || Ok(()),
-        )).unwrap_err();
-        assert!(matches!(error, ConnectorStateStoreError::ForkDetected { .. }));
+        let error =
+            run_async(target.retain_replica_checked(fork.clone(), replica_limits(), || Ok(())))
+                .unwrap_err();
+        assert!(matches!(
+            error,
+            ConnectorStateStoreError::ForkDetected { .. }
+        ));
         assert_eq!(objects.puts.load(Ordering::SeqCst), writes);
         assert!(!run_async(objects.exists(&fork.root_object_id)));
-        assert_eq!(run_async(target.read_root()).unwrap().unwrap().0, newer.root_object_id);
+        assert_eq!(
+            run_async(target.read_root()).unwrap().unwrap().0,
+            newer.root_object_id
+        );
     }
 
     #[test]
@@ -7732,22 +8133,39 @@ mod tests {
         let (older, newer) = retention_history_pair();
         let objects = Arc::new(FailNthPutObjectStore::new(store(), usize::MAX));
         let target = test_store(objects.clone());
-        run_async(target.import_replica(newer.clone(), replica_limits())).unwrap().unwrap();
+        run_async(target.import_replica(newer.clone(), replica_limits()))
+            .unwrap()
+            .unwrap();
         let writes = objects.puts.load(Ordering::SeqCst);
-        assert!(run_async(target.retain_replica_checked(
-            older.clone(), replica_limits(), denied_replica_read,
-        )).is_err());
+        assert!(
+            run_async(target.retain_replica_checked(
+                older.clone(),
+                replica_limits(),
+                denied_replica_read,
+            ))
+            .is_err()
+        );
         for limits in [
-            ConnectorStateReplicaLimits { max_objects: 1, ..replica_limits() },
-            ConnectorStateReplicaLimits { max_bytes: 1, ..replica_limits() },
+            ConnectorStateReplicaLimits {
+                max_objects: 1,
+                ..replica_limits()
+            },
+            ConnectorStateReplicaLimits {
+                max_bytes: 1,
+                ..replica_limits()
+            },
         ] {
-            assert!(run_async(target.retain_replica_checked(
-                older.clone(), limits, || Ok(()),
-            )).is_err());
+            assert!(
+                run_async(target.retain_replica_checked(older.clone(), limits, || Ok(()),))
+                    .is_err()
+            );
         }
         assert_eq!(objects.puts.load(Ordering::SeqCst), writes);
         assert!(!run_async(objects.exists(&older.root_object_id)));
-        assert_eq!(run_async(target.read_root()).unwrap().unwrap().0, newer.root_object_id);
+        assert_eq!(
+            run_async(target.read_root()).unwrap().unwrap().0,
+            newer.root_object_id
+        );
     }
 
     #[test]
@@ -7755,21 +8173,31 @@ mod tests {
         let (older, newer) = retention_history_pair();
         let objects = Arc::new(FailNthPutObjectStore::new(store(), usize::MAX));
         let target = test_store(objects.clone());
-        run_async(target.import_replica(newer.clone(), replica_limits())).unwrap().unwrap();
+        run_async(target.import_replica(newer.clone(), replica_limits()))
+            .unwrap()
+            .unwrap();
         let writes = objects.puts.load(Ordering::SeqCst);
-        let error = run_async(target.retain_replica_checked(
-            older.clone(), replica_limits(), || {
-                if objects.puts.load(Ordering::SeqCst) > writes {
-                    denied_replica_read()
-                } else {
-                    Ok(())
-                }
-            },
-        )).unwrap_err();
-        assert!(matches!(error, ConnectorStateStoreError::InvalidReplica { .. }));
+        let error =
+            run_async(
+                target.retain_replica_checked(older.clone(), replica_limits(), || {
+                    if objects.puts.load(Ordering::SeqCst) > writes {
+                        denied_replica_read()
+                    } else {
+                        Ok(())
+                    }
+                }),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ConnectorStateStoreError::InvalidReplica { .. }
+        ));
         assert_eq!(objects.puts.load(Ordering::SeqCst), writes + 1);
         assert!(!run_async(objects.exists(&older.root_object_id)));
-        assert_eq!(run_async(target.read_root()).unwrap().unwrap().0, newer.root_object_id);
+        assert_eq!(
+            run_async(target.read_root()).unwrap().unwrap().0,
+            newer.root_object_id
+        );
     }
 
     #[test]
@@ -7779,13 +8207,20 @@ mod tests {
         // existing genesis, then the missing historical root (put number five).
         let objects = Arc::new(FailNthPutObjectStore::new(store(), 5));
         let target = test_store(objects.clone());
-        run_async(target.import_replica(newer.clone(), replica_limits())).unwrap().unwrap();
+        run_async(target.import_replica(newer.clone(), replica_limits()))
+            .unwrap()
+            .unwrap();
         assert!(matches!(
             run_async(target.retain_replica_checked(older.clone(), replica_limits(), || Ok(()))),
-            Err(ConnectorStateStoreError::ObjectStore(ObjectStoreError::Io(_))),
+            Err(ConnectorStateStoreError::ObjectStore(ObjectStoreError::Io(
+                _
+            ))),
         ));
         assert!(!run_async(objects.exists(&older.root_object_id)));
-        assert_eq!(run_async(target.read_root()).unwrap().unwrap().0, newer.root_object_id);
+        assert_eq!(
+            run_async(target.read_root()).unwrap().unwrap().0,
+            newer.root_object_id
+        );
     }
 
     #[test]
@@ -7795,19 +8230,31 @@ mod tests {
             let objects = Arc::new(PausedPutObjectStore::new(5, true));
             let target = test_store(objects.clone());
             let reader = test_store(objects.clone());
-            target.import_replica(newer.clone(), replica_limits()).await.unwrap().unwrap();
-            assert_eq!(reader.read_root().await.unwrap().unwrap().0, newer.root_object_id);
+            target
+                .import_replica(newer.clone(), replica_limits())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                reader.read_root().await.unwrap().unwrap().0,
+                newer.root_object_id
+            );
             let generation = reader.change_bus.generation();
-            let mut retention = Box::pin(target.retain_replica_checked(
-                older.clone(), replica_limits(), || Ok(()),
-            ));
+            let mut retention =
+                Box::pin(target.retain_replica_checked(older.clone(), replica_limits(), || Ok(())));
             assert!(futures_util::poll!(retention.as_mut()).is_pending());
             assert!(objects.exists(&older.root_object_id).await);
             drop(retention);
             assert!(reader.change_bus.generation() > generation);
-            assert_eq!(reader.read_root().await.unwrap().unwrap().0, newer.root_object_id);
             assert_eq!(
-                reader.export_replica(older.root_object_id, replica_limits()).await.unwrap(),
+                reader.read_root().await.unwrap().unwrap().0,
+                newer.root_object_id
+            );
+            assert_eq!(
+                reader
+                    .export_replica(older.root_object_id, replica_limits())
+                    .await
+                    .unwrap(),
                 older,
             );
         });
@@ -7819,22 +8266,39 @@ mod tests {
         let directory = tempfile::TempDir::new().unwrap();
         for checkpoint_after_ops in [0, 2] {
             let mut config = DurableObjectStoreConfig::new(
-                directory.path().join(format!("historical-{checkpoint_after_ops}")),
+                directory
+                    .path()
+                    .join(format!("historical-{checkpoint_after_ops}")),
             );
             config.checkpoint_after_ops = checkpoint_after_ops;
             config.mac_key = Some([0x41; 32]);
             {
-                let target = test_store(Arc::new(DurableObjectStore::open(config.clone()).unwrap()));
-                run_async(target.import_replica(newer.clone(), replica_limits())).unwrap().unwrap();
-                assert!(run_async(target.retain_replica_checked(
-                    older.clone(), replica_limits(), || Ok(()),
-                )).unwrap().is_none());
+                let target =
+                    test_store(Arc::new(DurableObjectStore::open(config.clone()).unwrap()));
+                run_async(target.import_replica(newer.clone(), replica_limits()))
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    run_async(target.retain_replica_checked(
+                        older.clone(),
+                        replica_limits(),
+                        || Ok(()),
+                    ))
+                    .unwrap()
+                    .is_none()
+                );
             }
             let target = test_store(Arc::new(DurableObjectStore::open(config).unwrap()));
-            assert_eq!(run_async(target.read_root()).unwrap().unwrap().0, newer.root_object_id);
+            assert_eq!(
+                run_async(target.read_root()).unwrap().unwrap().0,
+                newer.root_object_id
+            );
             let inspected = run_async(target.inspect_replica_checked(
-                older.root_object_id, replica_limits(), || Ok(()),
-            )).unwrap();
+                older.root_object_id,
+                replica_limits(),
+                || Ok(()),
+            ))
+            .unwrap();
             assert_eq!(inspected.object_count, older.objects.len());
             assert_eq!(inspected.canonical_bytes, replica_bytes(&older));
         }
@@ -7845,21 +8309,32 @@ mod tests {
         let (older, newer) = retention_history_pair();
         let objects = store();
         let target = test_store(objects.clone());
-        run_async(target.import_replica(older.clone(), replica_limits())).unwrap().unwrap();
-        run_async(target.import_replica(newer.clone(), replica_limits())).unwrap().unwrap();
+        run_async(target.import_replica(older.clone(), replica_limits()))
+            .unwrap()
+            .unwrap();
+        run_async(target.import_replica(newer.clone(), replica_limits()))
+            .unwrap()
+            .unwrap();
         for object in &older.objects {
             run_async(objects.set_retention(&object.object_id, RetentionClass::Ephemeral)).unwrap();
         }
-        assert!(run_async(target.retain_replica_checked(
-            older.clone(), replica_limits(), || Ok(()),
-        )).unwrap().is_none());
+        assert!(
+            run_async(target.retain_replica_checked(older.clone(), replica_limits(), || Ok(()),))
+                .unwrap()
+                .is_none()
+        );
         for object in &older.objects {
             assert_eq!(
-                run_async(objects.get_storage_meta(&object.object_id)).unwrap().retention,
+                run_async(objects.get_storage_meta(&object.object_id))
+                    .unwrap()
+                    .retention,
                 RetentionClass::Pinned,
             );
         }
-        assert_eq!(run_async(target.read_root()).unwrap().unwrap().0, newer.root_object_id);
+        assert_eq!(
+            run_async(target.read_root()).unwrap().unwrap().0,
+            newer.root_object_id
+        );
     }
 
     #[test]
@@ -7870,13 +8345,17 @@ mod tests {
             let objects = Arc::new(PausedPutObjectStore::new(5, false));
             let target = test_store(objects.clone());
             let writer = test_store(objects.clone());
-            target.import_replica(newer.clone(), replica_limits()).await.unwrap().unwrap();
-            let mut retention = Box::pin(target.retain_replica_checked(
-                older.clone(), replica_limits(), || Ok(()),
-            ));
+            target
+                .import_replica(newer.clone(), replica_limits())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut retention =
+                Box::pin(target.retain_replica_checked(older.clone(), replica_limits(), || Ok(())));
             assert!(futures_util::poll!(retention.as_mut()).is_pending());
             assert!(!objects.exists(&older.root_object_id).await);
-            let mut append = Box::pin(writer.append_object(state(2, Some(current_head), lease_id(3))));
+            let mut append =
+                Box::pin(writer.append_object(state(2, Some(current_head), lease_id(3))));
             assert!(futures_util::poll!(append.as_mut()).is_pending());
             assert_eq!(objects.puts.load(Ordering::SeqCst), 5);
             objects.release();

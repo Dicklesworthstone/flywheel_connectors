@@ -77,6 +77,15 @@ MAC and object-ID key fields. A redacted response is not reusable key material.
 
 ## Retain an Exact Root on Another Host
 
+Singleton state history preserves writer ownership across recovery. A state
+signed by a different writer key must carry a strictly newer `lease_seq` than
+its predecessor, even when both public keys are trusted. The same writer may
+renew a lease without incrementing that token, including replacing the lease
+object's content ID. A lower token always fails. The shared rule applies to
+live appends, restored canonical roots, snapshot tails, and replica
+import/export/inspection; importing a correctly signed history cannot bypass
+writer fencing. CRDT state does not use this singleton rule.
+
 `fwc connector state pull` transfers a granted `ConnectorStateRoot`, its
 validated state ancestry, and the payload objects referenced by that ancestry
 from a configured donor into a recipient's durable, host-owned replica store.

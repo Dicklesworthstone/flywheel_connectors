@@ -850,6 +850,7 @@ fn state_transfer_error(error: ConnectorStateStoreError) -> HostError {
         | ConnectorStateStoreError::SequenceMismatch { .. }
         | ConnectorStateStoreError::SequenceOverflow(_)
         | ConnectorStateStoreError::StaleLease { .. }
+        | ConnectorStateStoreError::WriterLeaseReuse { .. }
         | ConnectorStateStoreError::ChainCycle(_)
         | ConnectorStateStoreError::ReplicaObjectConflict { .. } => {
             "state history is conflicting or discontinuous"
