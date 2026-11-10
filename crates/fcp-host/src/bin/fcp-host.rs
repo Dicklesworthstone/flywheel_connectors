@@ -37746,7 +37746,7 @@ done"#;
             .unwrap();
             if checkpointed {
                 objects.checkpoint().await.unwrap();
-                symbols.checkpoint().unwrap();
+                symbols.checkpoint().await.unwrap();
             }
             let mut config = dispatcher_test_config(CANONICAL_STATE_MAC_TEST_CONNECTOR);
             for (name, value) in [

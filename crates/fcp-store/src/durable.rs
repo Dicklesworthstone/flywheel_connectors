@@ -27,7 +27,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use async_trait::async_trait;
 use bytes::Bytes;
 use fcp_prelude::{ObjectId, ObjectPlacementPolicy, RetentionClass, StoredObject, ZoneId};
-use parking_lot::{Mutex as ParkingMutex, RwLock as ParkingRwLock};
+#[cfg(test)]
+use parking_lot::Mutex as ParkingMutex;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -262,6 +263,9 @@ struct DurableSymbolState {
     // A failed append can leave a complete record or a torn tail on disk.
     // Only reopening and replaying the WAL can establish the committed state.
     write_fence: Option<String>,
+    // Admitted disk work retains this state even when every external store
+    // handle is dropped, so OS ownership must live here too.
+    _writer_lock: Option<File>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -295,18 +299,18 @@ enum SymbolWalOp {
 /// available through [`Self::open_read_only`]. Object and symbol stores have
 /// separate writer locks and may share a directory. A failed WAL append fences
 /// further mutations and checkpoints until the store is reopened and recovered.
+/// Admitted mutations and checkpoints finish on a blocking worker even if their
+/// caller is cancelled. Reads and later writes wait asynchronously for the
+/// complete transaction; they never observe a partially published mutation.
 pub struct DurableSymbolStore {
-    state: ParkingRwLock<DurableSymbolState>,
+    state: Arc<Mutex<DurableSymbolState>>,
     config: DurableSymbolStoreConfig,
-    write_guard: ParkingMutex<()>,
-    last_seq: AtomicU64,
-    ops_since_checkpoint: AtomicU64,
+    write_guard: Arc<Mutex<()>>,
+    last_seq: Arc<AtomicU64>,
+    ops_since_checkpoint: Arc<AtomicU64>,
     snapshot_path: PathBuf,
     wal_path: PathBuf,
     access: DurableAccess,
-    // Mutations are synchronous once admitted, so holding the store keeps
-    // ownership alive until every WAL/checkpoint operation has returned.
-    _writer_lock: Option<File>,
 }
 
 impl DurableObjectState {
@@ -1122,9 +1126,9 @@ impl ObjectStore for DurableObjectStore {
 impl DurableSymbolStore {
     /// Open or create a crash-safe durable symbol store with exclusive ownership.
     ///
-    /// Other writable opens of the same directory fail until this store is
-    /// dropped. Share one `Arc` within a process; use [`Self::open_read_only`]
-    /// for independent observational access.
+    /// Other writable opens of the same directory fail until this store and
+    /// any admitted disk work are dropped. Share one `Arc` within a process;
+    /// use [`Self::open_read_only`] for independent observational access.
     ///
     /// # Errors
     /// Returns an error if exclusive ownership is unavailable or the
@@ -1164,24 +1168,27 @@ impl DurableSymbolStore {
 
         let snapshot_path = config.root_dir.join("symbols.snapshot.json");
         let wal_path = config.root_dir.join("symbols.wal.jsonl");
-        let (state, last_seq) = load_durable_symbol_state(
+        let (mut state, last_seq) = load_durable_symbol_state(
             &snapshot_path,
             &wal_path,
             config.mac_key.as_ref(),
             config.allow_legacy_unauth,
             access,
         )?;
+        #[allow(clippy::used_underscore_binding)]
+        {
+            state._writer_lock = writer_lock;
+        }
 
         Ok(Self {
-            state: ParkingRwLock::new(state),
+            state: Arc::new(Mutex::new(state)),
             config,
-            write_guard: ParkingMutex::new(()),
-            last_seq: AtomicU64::new(last_seq),
-            ops_since_checkpoint: AtomicU64::new(0),
+            write_guard: Arc::new(Mutex::new(())),
+            last_seq: Arc::new(AtomicU64::new(last_seq)),
+            ops_since_checkpoint: Arc::new(AtomicU64::new(0)),
             snapshot_path,
             wal_path,
             access,
-            _writer_lock: writer_lock,
         })
     }
 
@@ -1190,97 +1197,120 @@ impl DurableSymbolStore {
     /// # Errors
     /// Returns an error if the snapshot cannot be durably written or the WAL
     /// requires recovery after a failed append.
-    pub fn checkpoint(&self) -> Result<(), SymbolStoreError> {
+    pub async fn checkpoint(&self) -> Result<(), SymbolStoreError> {
         self.require_writable()?;
-        let _guard = self.write_guard.lock();
-        let last_seq = self.last_seq.load(Ordering::SeqCst);
-        self.checkpoint_locked(last_seq, MAX_SNAPSHOT_BYTES)?;
-        self.ops_since_checkpoint.store(0, Ordering::SeqCst);
-        Ok(())
+        let snapshot_path = self.snapshot_path.clone();
+        let wal_path = self.wal_path.clone();
+        let last_seq = Arc::clone(&self.last_seq);
+        let ops_since_checkpoint = Arc::clone(&self.ops_since_checkpoint);
+        let mac_key = self.config.mac_key;
+        transaction::run(
+            Arc::clone(&self.state),
+            Arc::clone(&self.write_guard),
+            move |state| {
+                state.ensure_writable()?;
+                let last_seq = last_seq.load(Ordering::SeqCst);
+                Self::checkpoint_state(
+                    state,
+                    &snapshot_path,
+                    &wal_path,
+                    last_seq,
+                    mac_key.as_ref(),
+                    MAX_SNAPSHOT_BYTES,
+                )?;
+                ops_since_checkpoint.store(0, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await
+        .map_err(|error| symbol_io(format!("durable symbol checkpoint task failed: {error}")))?
     }
 
-    fn checkpoint_locked(
-        &self,
+    fn checkpoint_state(
+        state: &DurableSymbolState,
+        snapshot_path: &Path,
+        wal_path: &Path,
         last_seq: u64,
+        mac_key: Option<&[u8; 32]>,
         max_snapshot_bytes: u64,
     ) -> Result<(), SymbolStoreError> {
-        let snapshot = {
-            let state = self.state.read();
-            state.ensure_writable()?;
-            state.to_snapshot()
-        };
+        let snapshot = state.to_snapshot();
         write_snapshot(
-            &self.snapshot_path,
+            snapshot_path,
             last_seq,
             &snapshot,
-            self.config.mac_key.as_ref(),
+            mac_key,
             max_snapshot_bytes,
         )
         .map_err(symbol_io_durable)?;
-        clear_wal(&self.wal_path).map_err(symbol_io)?;
+        clear_wal(wal_path).map_err(symbol_io)?;
         Ok(())
     }
 
-    fn record_mutation(
+    async fn record_mutation(
         &self,
         op: SymbolWalOp,
         max_record_bytes: usize,
     ) -> Result<(), SymbolStoreError> {
         self.require_writable()?;
-        let _guard = self.write_guard.lock();
-        {
-            let state = self.state.read();
-            state.ensure_writable()?;
-            state.validate_mutation(&op, self.config.max_bytes)?;
-        }
-
-        {
-            // Keep the committed sequence, including u64::MAX, representable.
-            // Refuse exhaustion before touching disk and publish only after a
-            // synced append so failed writes cannot leave a sequence gap.
-            let seq = self
-                .last_seq
-                .load(Ordering::SeqCst)
-                .checked_add(1)
-                .ok_or_else(|| {
+        let config = self.config.clone();
+        let snapshot_path = self.snapshot_path.clone();
+        let wal_path = self.wal_path.clone();
+        let last_seq = Arc::clone(&self.last_seq);
+        let ops_since_checkpoint = Arc::clone(&self.ops_since_checkpoint);
+        transaction::run(
+            Arc::clone(&self.state),
+            Arc::clone(&self.write_guard),
+            move |state| {
+                state.ensure_writable()?;
+                state.validate_mutation(&op, config.max_bytes)?;
+                // Refuse exhaustion before touching disk and publish only
+                // after a synced append so failed writes cannot leave a gap.
+                let seq = last_seq.load(Ordering::SeqCst).checked_add(1).ok_or_else(|| {
                     SymbolStoreError::Io("durable symbol WAL sequence is exhausted".to_owned())
                 })?;
-            if let Err(error) = append_wal_record(
-                &self.wal_path,
-                seq,
-                &op,
-                self.config.mac_key.as_ref(),
-                max_record_bytes,
-            ) {
-                let needs_recovery = !matches!(error, DurableIoError::RejectedBeforeWrite(_));
-                let error = symbol_io_durable(error);
-                if needs_recovery {
-                    self.state.write().write_fence = Some(error.to_string());
+                if let Err(error) = append_wal_record(
+                    &wal_path,
+                    seq,
+                    &op,
+                    config.mac_key.as_ref(),
+                    max_record_bytes,
+                ) {
+                    let needs_recovery = !matches!(error, DurableIoError::RejectedBeforeWrite(_));
+                    let error = symbol_io_durable(error);
+                    if needs_recovery {
+                        state.write_fence = Some(error.to_string());
+                    }
+                    return Err(error);
                 }
-                return Err(error);
-            }
-            self.last_seq.store(seq, Ordering::SeqCst);
+                last_seq.store(seq, Ordering::SeqCst);
+                state.apply_loaded_mutation(op)?;
 
-            let mut state = self.state.write();
-            state.apply_loaded_mutation(op)?;
-            drop(state);
-
-            if self.config.checkpoint_after_ops > 0 {
-                let ops = self
-                    .ops_since_checkpoint
-                    .load(Ordering::SeqCst)
-                    .saturating_add(1);
-                self.ops_since_checkpoint.store(ops, Ordering::SeqCst);
-                if ops >= self.config.checkpoint_after_ops {
-                    if let Err(error) = self.checkpoint_locked(seq, MAX_SNAPSHOT_BYTES) {
-                        tracing::warn!(error = %error, "durable symbol checkpoint failed after WAL sync");
-                    } else {
-                        self.ops_since_checkpoint.store(0, Ordering::SeqCst);
+                if config.checkpoint_after_ops > 0 {
+                    let ops = ops_since_checkpoint
+                        .load(Ordering::SeqCst)
+                        .saturating_add(1);
+                    ops_since_checkpoint.store(ops, Ordering::SeqCst);
+                    if ops >= config.checkpoint_after_ops {
+                        if let Err(error) = Self::checkpoint_state(
+                            state,
+                            &snapshot_path,
+                            &wal_path,
+                            seq,
+                            config.mac_key.as_ref(),
+                            MAX_SNAPSHOT_BYTES,
+                        ) {
+                            tracing::warn!(error = %error, "durable symbol checkpoint failed after WAL sync");
+                        } else {
+                            ops_since_checkpoint.store(0, Ordering::SeqCst);
+                        }
                     }
                 }
-            }
-        }
-        Ok(())
+                Ok(())
+            },
+        )
+        .await
+        .map_err(|error| symbol_io(format!("durable symbol mutation task failed: {error}")))?
     }
 
     fn require_writable(&self) -> Result<(), SymbolStoreError> {
@@ -1303,10 +1333,12 @@ impl SymbolStore for DurableSymbolStore {
             }),
             MAX_WAL_RECORD_BYTES,
         )
+        .await
     }
 
     async fn put_object_meta(&self, meta: ObjectSymbolMeta) -> Result<(), SymbolStoreError> {
         self.record_mutation(SymbolWalOp::PutObjectMeta(meta), MAX_WAL_RECORD_BYTES)
+            .await
     }
 
     async fn get_symbol(
@@ -1314,7 +1346,7 @@ impl SymbolStore for DurableSymbolStore {
         object_id: &ObjectId,
         esi: u32,
     ) -> Result<StoredSymbol, SymbolStoreError> {
-        let mut state = self.state.write();
+        let mut state = self.state.lock().await;
         if !state.scrub_object_if_present(object_id) {
             return Err(SymbolStoreError::ObjectNotFound(*object_id));
         }
@@ -1336,7 +1368,8 @@ impl SymbolStore for DurableSymbolStore {
         object_id: &ObjectId,
     ) -> Result<ObjectSymbolMeta, SymbolStoreError> {
         self.state
-            .read()
+            .lock()
+            .await
             .objects
             .get(object_id)
             .map(|object| object.meta.clone())
@@ -1344,7 +1377,7 @@ impl SymbolStore for DurableSymbolStore {
     }
 
     async fn get_all_symbols(&self, object_id: &ObjectId) -> Vec<StoredSymbol> {
-        let mut state = self.state.write();
+        let mut state = self.state.lock().await;
         if !state.scrub_object_if_present(object_id) {
             return Vec::new();
         }
@@ -1360,7 +1393,7 @@ impl SymbolStore for DurableSymbolStore {
     }
 
     async fn symbol_count(&self, object_id: &ObjectId) -> u32 {
-        let mut state = self.state.write();
+        let mut state = self.state.lock().await;
         if !state.scrub_object_if_present(object_id) {
             return 0;
         }
@@ -1379,6 +1412,7 @@ impl SymbolStore for DurableSymbolStore {
             },
             MAX_WAL_RECORD_BYTES,
         )
+        .await
     }
 
     async fn delete_symbol(&self, object_id: &ObjectId, esi: u32) -> Result<(), SymbolStoreError> {
@@ -1389,10 +1423,11 @@ impl SymbolStore for DurableSymbolStore {
             },
             MAX_WAL_RECORD_BYTES,
         )
+        .await
     }
 
     async fn get_distribution(&self, object_id: &ObjectId) -> Option<SymbolDistribution> {
-        let mut state = self.state.write();
+        let mut state = self.state.lock().await;
         if !state.scrub_object_if_present(object_id) {
             return None;
         }
@@ -1412,7 +1447,8 @@ impl SymbolStore for DurableSymbolStore {
 
     async fn list_zone(&self, zone_id: &ZoneId) -> Vec<ObjectId> {
         self.state
-            .read()
+            .lock()
+            .await
             .objects
             .values()
             .filter(|object| &object.meta.zone_id == zone_id)
@@ -1421,7 +1457,7 @@ impl SymbolStore for DurableSymbolStore {
     }
 
     async fn storage_used(&self) -> u64 {
-        self.state.read().used_bytes
+        self.state.lock().await.used_bytes
     }
 
     async fn storage_quota(&self) -> u64 {
@@ -1429,7 +1465,7 @@ impl SymbolStore for DurableSymbolStore {
     }
 
     async fn can_reconstruct(&self, object_id: &ObjectId) -> bool {
-        let mut state = self.state.write();
+        let mut state = self.state.lock().await;
         if !state.scrub_object_if_present(object_id) {
             return false;
         }
@@ -2450,6 +2486,26 @@ mod tests {
         }
     }
 
+    /// Occupy the sole blocking worker in a current-thread test runtime. A
+    /// durable transaction must still acquire its async guards and yield while
+    /// queued; no test hook is needed in the production disk path.
+    async fn occupy_blocking_worker() -> (std::sync::mpsc::Sender<()>, tokio::task::JoinHandle<()>)
+    {
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (release, resume) = std::sync::mpsc::channel();
+        let worker = tokio::task::spawn_blocking(move || {
+            entered.send(()).unwrap();
+            resume
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("release blocking worker");
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), started)
+            .await
+            .unwrap()
+            .unwrap();
+        (release, worker)
+    }
+
     fn stored_file_bytes(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
         fs::read_dir(root)
             .expect("list store files")
@@ -2669,7 +2725,7 @@ mod tests {
             objects.checkpoint().await.unwrap();
             symbols.put_object_meta(test_symbol_meta(1)).await.unwrap();
             symbols.put_symbol(test_symbol(1, 0, 7)).await.unwrap();
-            symbols.checkpoint().unwrap();
+            symbols.checkpoint().await.unwrap();
 
             // The log grows while the live state and quota stay small. Each
             // historical payload must be released when its delete is replayed.
@@ -2711,7 +2767,10 @@ mod tests {
                     object_config.max_bytes
                 );
                 assert_eq!(symbols.symbol_count(&test_object_id(1)).await, 2);
-                assert_eq!(symbols.state.read().used_bytes, symbol_config.max_bytes);
+                assert_eq!(
+                    symbols.state.lock().await.used_bytes,
+                    symbol_config.max_bytes
+                );
                 assert_eq!(stored_file_bytes(&root), before);
             }
 
@@ -2722,7 +2781,7 @@ mod tests {
             drop(objects);
             let symbols = DurableSymbolStore::open(symbol_config.clone()).unwrap();
             symbols.delete_symbol(&test_object_id(1), 1).await.unwrap();
-            symbols.checkpoint().unwrap();
+            symbols.checkpoint().await.unwrap();
             drop(symbols);
             let objects = DurableObjectStore::open(object_config).unwrap();
             let symbols = DurableSymbolStore::open(symbol_config).unwrap();
@@ -2938,7 +2997,7 @@ mod tests {
             let store = DurableSymbolStore::open(config.clone()).unwrap();
             store.put_object_meta(test_symbol_meta(1)).await.unwrap();
             store.put_symbol(test_symbol(1, 0, 7)).await.unwrap();
-            store.checkpoint().unwrap();
+            store.checkpoint().await.unwrap();
             store.put_symbol(test_symbol(1, 1, 7)).await.unwrap();
             let before = stored_file_bytes(&config.root_dir);
             let used = store.storage_used().await;
@@ -2949,22 +3008,29 @@ mod tests {
             });
             let wal_cap = wal_fixture_bytes(4, &op, mac_key.as_ref()).len() - 1;
             assert!(matches!(
-                store.record_mutation(op, wal_cap),
+                store.record_mutation(op, wal_cap).await,
                 Err(SymbolStoreError::Io(reason)) if reason.contains("exceeds")
             ));
             assert_eq!(store.last_seq.load(Ordering::SeqCst), 3);
             assert_eq!(store.storage_used().await, used);
             assert_eq!(store.symbol_count(&test_object_id(1)).await, 2);
-            assert!(store.state.read().write_fence.is_none());
+            assert!(store.state.lock().await.write_fence.is_none());
 
             {
-                let _guard = store.write_guard.lock();
-                let cap =
-                    snapshot_fixture_bytes(3, &store.state.read().to_snapshot(), mac_key.as_ref())
-                        .len() as u64
-                        - 1;
+                let _guard = store.write_guard.lock().await;
+                let state = store.state.lock().await;
+                let cap = snapshot_fixture_bytes(3, &state.to_snapshot(), mac_key.as_ref()).len()
+                    as u64
+                    - 1;
                 assert!(matches!(
-                    store.checkpoint_locked(3, cap),
+                    DurableSymbolStore::checkpoint_state(
+                        &state,
+                        &store.snapshot_path,
+                        &store.wal_path,
+                        3,
+                        mac_key.as_ref(),
+                        cap,
+                    ),
                     Err(SymbolStoreError::Io(reason)) if reason.contains("exceeds")
                 ));
             }
@@ -2996,7 +3062,7 @@ mod tests {
                     test_symbol(1, esi, 7).data
                 );
             }
-            recovered.checkpoint().unwrap();
+            recovered.checkpoint().await.unwrap();
             drop(recovered);
             let recovered = DurableSymbolStore::open(config).unwrap();
             assert_eq!(recovered.last_seq.load(Ordering::SeqCst), 4);
@@ -3248,7 +3314,7 @@ mod tests {
                 reader.put_symbol(test_symbol(1, 1, 2)).await,
                 reader.delete_symbol(&test_object_id(1), 0).await,
                 reader.delete_object(&test_object_id(1)).await,
-                reader.checkpoint(),
+                reader.checkpoint().await,
             ] {
                 assert!(
                     matches!(result, Err(SymbolStoreError::Io(reason)) if reason.contains("read-only"))
@@ -3294,7 +3360,7 @@ mod tests {
         drop(writer);
         assert!(DurableSymbolStore::open(config.clone()).is_err());
         retained.put_symbol(test_symbol(1, 1, 8)).await.unwrap();
-        retained.checkpoint().unwrap();
+        retained.checkpoint().await.unwrap();
         drop(retained);
 
         // A reader does not keep writer ownership after the writer is dropped.
@@ -3310,6 +3376,177 @@ mod tests {
         );
         assert_eq!(reader.symbol_count(&test_object_id(1)).await, 1);
         assert!(objects.exists(&test_object_id(9)).await);
+    }
+
+    #[test]
+    fn cancelled_symbol_put_finishes_without_blocking_reads_or_later_writes() {
+        use std::time::Duration;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            for checkpoint_after_ops in [0, 1] {
+                let mut config = DurableSymbolStoreConfig::new(
+                    temp_dir.path().join(checkpoint_after_ops.to_string()),
+                );
+                config.checkpoint_after_ops = checkpoint_after_ops;
+                config.mac_key = Some([0x71; 32]);
+                let store = DurableSymbolStore::open(config.clone()).unwrap();
+                store.put_object_meta(test_symbol_meta(1)).await.unwrap();
+                let object_id = test_object_id(1);
+                let before = stored_file_bytes(&config.root_dir);
+                let (release, blocker) = occupy_blocking_worker().await;
+
+                let mut first = Box::pin(store.put_symbol(test_symbol(1, 0, 7)));
+                assert!(futures_util::poll!(first.as_mut()).is_pending());
+                assert!(store.state.try_lock().is_err());
+                assert!(store.write_guard.try_lock().is_err());
+                assert_eq!(stored_file_bytes(&config.root_dir), before);
+                drop(first);
+
+                // Cancellation after admission leaves the disk transaction
+                // queued. All runtime work below must still yield rather than
+                // blocking this one async thread behind synchronous locks.
+                let mut read = Box::pin(store.get_symbol(&object_id, 0));
+                let mut meta = Box::pin(store.get_object_meta(&object_id));
+                let mut usage = Box::pin(store.storage_used());
+                assert!(futures_util::poll!(read.as_mut()).is_pending());
+                assert!(futures_util::poll!(meta.as_mut()).is_pending());
+                assert!(futures_util::poll!(usage.as_mut()).is_pending());
+                let mut cancelled_before_admission =
+                    Box::pin(store.put_symbol(test_symbol(1, 2, 9)));
+                assert!(futures_util::poll!(cancelled_before_admission.as_mut()).is_pending());
+                drop(cancelled_before_admission);
+                let mut next = Box::pin(store.put_symbol(test_symbol(1, 1, 8)));
+                assert!(futures_util::poll!(next.as_mut()).is_pending());
+                tokio::time::timeout(Duration::from_secs(1), tokio::task::yield_now())
+                    .await
+                    .expect("runtime must remain responsive while disk work waits");
+
+                release.send(()).unwrap();
+                blocker.await.unwrap();
+                assert_eq!(
+                    tokio::time::timeout(Duration::from_secs(5), read)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .data,
+                    test_symbol(1, 0, 7).data
+                );
+                assert_eq!(meta.await.unwrap(), test_symbol_meta(1));
+                assert_eq!(
+                    usage.await,
+                    DurableSymbolState::symbol_size(&test_symbol(1, 0, 7))
+                );
+                tokio::time::timeout(Duration::from_secs(5), next)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(store.last_seq.load(Ordering::SeqCst), 3);
+                let used = store.storage_used().await;
+                drop(store);
+
+                let recovered = DurableSymbolStore::open(config).unwrap();
+                assert_eq!(recovered.symbol_count(&object_id).await, 2);
+                assert_eq!(recovered.storage_used().await, used);
+                for (esi, node) in [(0, 7), (1, 8)] {
+                    assert_eq!(
+                        recovered.get_symbol(&object_id, esi).await.unwrap().data,
+                        test_symbol(1, esi, node).data
+                    );
+                }
+                assert!(matches!(
+                    recovered.get_symbol(&object_id, 2).await,
+                    Err(SymbolStoreError::NotFound { .. })
+                ));
+            }
+        });
+    }
+
+    #[test]
+    fn cancelled_symbol_work_retains_writer_lock_after_last_handle_drops() {
+        use std::time::Duration;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            for checkpoint in [false, true] {
+                let mut config =
+                    DurableSymbolStoreConfig::new(temp_dir.path().join(checkpoint.to_string()));
+                config.checkpoint_after_ops = 0;
+                config.mac_key = Some([0x72; 32]);
+                let store = DurableSymbolStore::open(config.clone()).unwrap();
+                store.put_object_meta(test_symbol_meta(1)).await.unwrap();
+                if checkpoint {
+                    store.put_symbol(test_symbol(1, 0, 7)).await.unwrap();
+                }
+                let state = Arc::downgrade(&store.state);
+                let (release, blocker) = occupy_blocking_worker().await;
+                let mut pending = Box::pin(async {
+                    if checkpoint {
+                        store.checkpoint().await
+                    } else {
+                        store.put_symbol(test_symbol(1, 0, 7)).await
+                    }
+                });
+                assert!(futures_util::poll!(pending.as_mut()).is_pending());
+                drop(pending);
+                drop(store);
+                assert!(matches!(
+                    DurableSymbolStore::open(config.clone()),
+                    Err(SymbolStoreError::Io(reason)) if reason.contains("exclusive")
+                ));
+                let retained = state
+                    .upgrade()
+                    .expect("admitted worker owns state and OS lock");
+                assert!(retained.try_lock().is_err());
+
+                release.send(()).unwrap();
+                blocker.await.unwrap();
+                let completed = tokio::time::timeout(Duration::from_secs(5), retained.lock())
+                    .await
+                    .unwrap();
+                assert_eq!(completed.objects[&test_object_id(1)].symbols.len(), 1);
+                drop(completed);
+                drop(retained);
+                // Acquiring the state lock can precede the disk worker's last
+                // Arc drop. Wait for real ownership release before reopening.
+                let recovered = tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        match DurableSymbolStore::open(config.clone()) {
+                            Ok(store) => break store,
+                            Err(SymbolStoreError::Io(reason)) if reason.contains("exclusive") => {
+                                tokio::task::yield_now().await;
+                            }
+                            Err(error) => panic!("reopen after symbol worker failed: {error}"),
+                        }
+                    }
+                })
+                .await
+                .unwrap();
+                assert_eq!(recovered.last_seq.load(Ordering::SeqCst), 2);
+                assert_eq!(
+                    recovered
+                        .get_symbol(&test_object_id(1), 0)
+                        .await
+                        .unwrap()
+                        .data,
+                    test_symbol(1, 0, 7).data
+                );
+                if checkpoint {
+                    assert!(recovered.snapshot_path.is_file());
+                    assert!(fs::read(&recovered.wal_path).unwrap().is_empty());
+                }
+            }
+        });
     }
 
     #[tokio::test]
@@ -3592,7 +3829,7 @@ mod tests {
                     store.put_symbol(test_symbol(1, 1, 8)).await,
                     store.delete_symbol(&test_object_id(1), 0).await,
                     store.delete_object(&test_object_id(1)).await,
-                    store.checkpoint(),
+                    store.checkpoint().await,
                 ] {
                     assert!(
                         matches!(result, Err(SymbolStoreError::Io(reason)) if reason.contains("requires recovery"))
@@ -3625,7 +3862,7 @@ mod tests {
                 // Retrying the uncertain symbol is safe after either outcome.
                 reopened.put_symbol(test_symbol(1, 1, 8)).await.unwrap();
                 reopened.put_symbol(test_symbol(1, 2, 9)).await.unwrap();
-                reopened.checkpoint().unwrap();
+                reopened.checkpoint().await.unwrap();
                 drop(reopened);
 
                 let recovered = DurableSymbolStore::open(config).unwrap();
@@ -3662,7 +3899,7 @@ mod tests {
         ));
         let wal_before = fs::read(&store.wal_path).unwrap();
         fs::create_dir(&store.snapshot_path).unwrap();
-        assert!(store.checkpoint().is_err());
+        assert!(store.checkpoint().await.is_err());
         assert_eq!(fs::read(&store.wal_path).unwrap(), wal_before);
         fs::rename(
             &store.snapshot_path,
@@ -3672,8 +3909,8 @@ mod tests {
 
         store.put_symbol(test_symbol(1, 1, 8)).await.unwrap();
         assert_eq!(store.last_seq.load(Ordering::SeqCst), 3);
-        assert!(store.state.read().write_fence.is_none());
-        store.checkpoint().unwrap();
+        assert!(store.state.lock().await.write_fence.is_none());
+        store.checkpoint().await.unwrap();
         drop(store);
         let reopened = DurableSymbolStore::open(config).unwrap();
         assert_eq!(reopened.symbol_count(&test_object_id(1)).await, 2);
@@ -3730,7 +3967,7 @@ mod tests {
             for _ in 0..2 {
                 let reopened = DurableSymbolStore::open(config.clone()).unwrap();
                 assert_eq!(reopened.symbol_count(&test_object_id(1)).await, 2);
-                reopened.checkpoint().unwrap();
+                reopened.checkpoint().await.unwrap();
                 let (_, last_seq) = read_snapshot::<SymbolSnapshot>(
                     &snapshot_path,
                     config.mac_key.as_ref(),
@@ -4547,15 +4784,10 @@ mod tests {
         );
     }
 
-    /// `record_mutation` validates under a read lock, releases the lock for
-    /// the WAL append, then reacquires the write lock to call
-    /// `apply_loaded_mutation`. A concurrent reader can take the write lock
-    /// in that gap and run `scrub_object_if_present`, which removes any
-    /// corrupt (size-mismatched) symbol. If the in-flight WAL op is
-    /// `DeleteSymbol{esi}` for that exact corrupt symbol, the WAL entry is
-    /// already on disk; `apply_delete_symbol` MUST converge on the
-    /// requested post-condition (esi absent) instead of returning `NotFound`,
-    /// otherwise the WAL replay path also fails on every restart.
+    /// Recovery may encounter a delete for a symbol already scrubbed while
+    /// loading older state. `apply_delete_symbol` must converge on the requested
+    /// post-condition (ESI absent), preserving recovery of WALs written before
+    /// symbol transactions held the state lock throughout validation and apply.
     #[test]
     fn apply_delete_symbol_tolerates_already_scrubbed_target() {
         let meta = test_symbol_meta(13);
@@ -4651,7 +4883,7 @@ mod tests {
             let store = DurableSymbolStore::open(config.clone()).unwrap();
             for meta in [&empty, &sparse] {
                 store.put_object_meta(meta.clone()).await.unwrap();
-                let state = store.state.read();
+                let state = store.state.lock().await;
                 let object = state.objects.get(&meta.object_id).unwrap();
                 assert_eq!(object.meta, *meta);
                 assert!(object.symbols.is_empty());
@@ -4669,7 +4901,7 @@ mod tests {
             for checkpointed in [false, true] {
                 let recovered = DurableSymbolStore::open(config.clone()).unwrap();
                 for (meta, count) in [(&empty, 0), (&sparse, 2)] {
-                    let state = recovered.state.read();
+                    let state = recovered.state.lock().await;
                     let object = state.objects.get(&meta.object_id).unwrap();
                     assert_eq!(object.meta, *meta);
                     assert_eq!(object.symbols.len(), count);
@@ -4685,7 +4917,7 @@ mod tests {
                     assert_eq!(symbol.data, test_symbol(2, esi, node).data);
                     assert_eq!(symbol.meta.source_node, Some(node));
                 }
-                recovered.checkpoint().unwrap();
+                recovered.checkpoint().await.unwrap();
             }
         }
     }
@@ -4699,7 +4931,7 @@ mod tests {
         let meta = high_k_symbol_meta(3);
         let store = DurableSymbolStore::open(config.clone()).unwrap();
         store.put_object_meta(meta.clone()).await.unwrap();
-        let initial_capacity = store.state.read().objects[&meta.object_id]
+        let initial_capacity = store.state.lock().await.objects[&meta.object_id]
             .symbols
             .capacity();
         let count = u32::try_from(initial_capacity + 1).unwrap();
@@ -4707,7 +4939,7 @@ mod tests {
             store.put_symbol(test_symbol(3, esi, 7)).await.unwrap();
         }
         assert!(
-            store.state.read().objects[&meta.object_id]
+            store.state.lock().await.objects[&meta.object_id]
                 .symbols
                 .capacity()
                 > initial_capacity
@@ -4748,7 +4980,7 @@ mod tests {
                 assert_eq!(recovered.symbol_count(&meta.object_id).await, count - 1);
                 assert_eq!(recovered.storage_used().await, used - (128 + 64));
             } else {
-                recovered.checkpoint().unwrap();
+                recovered.checkpoint().await.unwrap();
             }
         }
     }
@@ -5302,7 +5534,7 @@ mod tests {
             .put_symbol(test_symbol(8, 0, 1))
             .await
             .expect("put sym");
-        store.checkpoint().expect("checkpoint");
+        store.checkpoint().await.expect("checkpoint");
         drop(store);
 
         let wal_path = config.root_dir.join("symbols.wal.jsonl");
@@ -5459,7 +5691,7 @@ mod tests {
             .put_symbol(test_symbol(15, 0, 1))
             .await
             .expect("put sym 0");
-        store.checkpoint().expect("checkpoint");
+        store.checkpoint().await.expect("checkpoint");
         store
             .put_symbol(test_symbol(15, 1, 2))
             .await
