@@ -20,7 +20,7 @@
 //!   here it shows as a `storage_used` line that doesn't change
 //!   between two consecutive put rows)
 //! - that `delete_symbol` releases the right number of bytes
-//! - that `delete_object` releases the sum of its remaining symbols
+//! - that `delete_object` releases its metadata and remaining symbols
 //!
 //! Any future refactor that double-counts a duplicate, leaks bytes
 //! on a failed put, or shifts the WAL apply order would surface as
@@ -107,6 +107,8 @@ async fn run_script(temp: &TempDir) -> String {
     log.push("#   1. each symbol contributes 192 bytes to used (128 data +".to_string());
     log.push("#      64 metadata overhead per Self::symbol_size). A drift in".to_string());
     log.push("#      this constant becomes visible as a per-row delta change.".to_string());
+    log.push("#      Each object also contributes 262 bytes (256 bookkeeping +".to_string());
+    log.push("#      6 zone identifier bytes), even before any symbols arrive.".to_string());
     log.push(
         "#   2. idempotent duplicate put leaves used unchanged (zero double-count)".to_string(),
     );
@@ -114,7 +116,7 @@ async fn run_script(temp: &TempDir) -> String {
     log.push(
         "#   3. delete_symbol releases the symbol's bytes; delete_object releases".to_string(),
     );
-    log.push("#      the sum of its remaining symbols.".to_string());
+    log.push("#      its metadata and the sum of its remaining symbols.".to_string());
     log.push("#   4. failed validate (conflicting bytes) leaves state byte-identical".to_string());
     log.push(
         "#      to pre-attempt — visible as steps 03/04 producing identical lines.".to_string(),

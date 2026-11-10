@@ -41,7 +41,7 @@ use crate::object_id_verifier::ObjectIdVerifier;
 use crate::object_store::{MemoryObjectStoreConfig, ObjectStore};
 use crate::symbol_store::{
     MemorySymbolStoreConfig, ObjectSymbolMeta, StoredSymbol, SymbolMeta, SymbolStore,
-    initial_symbol_map_capacity, validate_source_symbols,
+    checked_symbol_storage_used, object_metadata_size, validate_source_symbols,
 };
 
 /// Legacy unkeyed envelope version. Reads accept it only when
@@ -146,7 +146,7 @@ impl DurableObjectStoreConfig {
 pub struct DurableSymbolStoreConfig {
     /// Directory containing the store snapshot and WAL files.
     pub root_dir: PathBuf,
-    /// Maximum durable symbol bytes allowed in the store.
+    /// Maximum charged symbol and resident metadata bytes allowed in the store.
     pub max_bytes: u64,
     /// Local node ID used for coverage/distribution tracking.
     pub local_node_id: u64,
@@ -339,6 +339,7 @@ impl DurableObjectState {
     fn from_snapshot(
         snapshot: ObjectSnapshot,
         verifier: Option<&dyn ObjectIdVerifier>,
+        max_bytes: u64,
     ) -> Result<Self, ObjectStoreError> {
         let mut state = Self::default();
         for object in snapshot.objects {
@@ -361,6 +362,19 @@ impl DurableObjectState {
             // effectively dropped from the recovered state.
             if let Some(verifier) = verifier {
                 verifier.verify(&object)?;
+            }
+            if state.objects.contains_key(&object.object_id) {
+                return Err(ObjectStoreError::AlreadyExists(object.object_id));
+            }
+            if state
+                .used_bytes
+                .checked_add(Self::object_size(&object))
+                .is_none_or(|next| next > max_bytes)
+            {
+                return Err(ObjectStoreError::QuotaExceeded {
+                    used: state.used_bytes,
+                    max: max_bytes,
+                });
             }
 
             // `insert_loaded` is the sole `used_bytes` accounting site (it is
@@ -408,7 +422,11 @@ impl DurableObjectState {
                     return Err(ObjectStoreError::AlreadyExists(object.object_id));
                 }
                 let size = Self::object_size(object);
-                if self.used_bytes.saturating_add(size) > max_bytes {
+                if self
+                    .used_bytes
+                    .checked_add(size)
+                    .is_none_or(|next| next > max_bytes)
+                {
                     return Err(ObjectStoreError::QuotaExceeded {
                         used: self.used_bytes,
                         max: max_bytes,
@@ -542,11 +560,11 @@ impl DurableSymbolState {
         true
     }
 
-    fn from_snapshot(snapshot: SymbolSnapshot) -> Result<Self, SymbolStoreError> {
+    fn from_snapshot(snapshot: SymbolSnapshot, max_bytes: u64) -> Result<Self, SymbolStoreError> {
         let mut state = Self::default();
         for entry in snapshot.objects {
             validate_source_symbols(&entry.meta)?;
-            state.load_entry(entry);
+            state.load_entry(entry, max_bytes)?;
         }
         state.scrub_corrupt_symbols();
         Ok(state)
@@ -576,19 +594,49 @@ impl DurableSymbolState {
         SymbolSnapshot { objects }
     }
 
-    fn load_entry(&mut self, entry: SymbolSnapshotEntry) {
-        let mut symbols = HashMap::with_capacity(entry.symbols.len());
-        let meta = entry.meta.clone();
+    fn load_entry(
+        &mut self,
+        entry: SymbolSnapshotEntry,
+        max_bytes: u64,
+    ) -> Result<(), SymbolStoreError> {
+        let meta = entry.meta;
+        if self.objects.contains_key(&meta.object_id) {
+            return Err(SymbolStoreError::InvalidSymbol {
+                reason: format!("Duplicate snapshot metadata for object {}", meta.object_id),
+            });
+        }
+        let mut next_used =
+            checked_symbol_storage_used(self.used_bytes, object_metadata_size(&meta), max_bytes)?;
+        let mut symbols: HashMap<u32, StoredSymbol> = HashMap::new();
         for symbol in entry.symbols {
             let stored = StoredSymbol {
                 meta: symbol.meta,
                 data: Bytes::from(symbol.data),
             };
-            self.used_bytes = self.used_bytes.saturating_add(Self::symbol_size(&stored));
+            // Preserve snapshot corruption scrubbing without charging discarded
+            // bytes or allowing them to consume quota before valid data loads.
+            if !Self::symbol_matches_meta(&meta, &stored) {
+                continue;
+            }
+            if let Some(existing) = symbols.get(&stored.meta.esi) {
+                if existing.data != stored.data {
+                    return Err(SymbolStoreError::InvalidSymbol {
+                        reason: format!(
+                            "Conflicting snapshot symbol for object {} esi {}",
+                            meta.object_id, stored.meta.esi
+                        ),
+                    });
+                }
+                continue;
+            }
+            next_used =
+                checked_symbol_storage_used(next_used, Self::symbol_size(&stored), max_bytes)?;
             symbols.insert(stored.meta.esi, stored);
         }
         self.objects
             .insert(meta.object_id, DurableObjectSymbols { meta, symbols });
+        self.used_bytes = next_used;
+        Ok(())
     }
 
     fn validate_mutation(&self, op: &SymbolWalOp, max_bytes: u64) -> Result<(), SymbolStoreError> {
@@ -601,7 +649,13 @@ impl DurableSymbolState {
                             reason: format!("Metadata mismatch for object {}", meta.object_id),
                         });
                     }
+                    return Ok(());
                 }
+                checked_symbol_storage_used(
+                    self.used_bytes,
+                    object_metadata_size(meta),
+                    max_bytes,
+                )?;
                 Ok(())
             }
             SymbolWalOp::PutSymbol(symbol) => {
@@ -649,12 +703,7 @@ impl DurableSymbolState {
                     data: Bytes::copy_from_slice(&symbol.data),
                 };
                 let size = Self::symbol_size(&stored);
-                if self.used_bytes.saturating_add(size) > max_bytes {
-                    return Err(SymbolStoreError::QuotaExceeded {
-                        used: self.used_bytes,
-                        max: max_bytes,
-                    });
-                }
+                checked_symbol_storage_used(self.used_bytes, size, max_bytes)?;
                 Ok(())
             }
             SymbolWalOp::DeleteObject { object_id } => {
@@ -704,17 +753,18 @@ impl DurableSymbolState {
         }
 
         let object_id = meta.object_id;
-        // This path serves both live admission and WAL replay. A valid high-K
-        // object may remain sparse indefinitely; reserve a bounded map now and
-        // grow it only as actual symbols arrive, just like the memory store.
-        let capacity = initial_symbol_map_capacity(meta.source_symbols);
+        let next_used =
+            checked_symbol_storage_used(self.used_bytes, object_metadata_size(&meta), u64::MAX)?;
+        // Metadata-only objects need no symbol buckets. Live admission and
+        // replay charge the same metadata bytes before growing any map.
         self.objects.insert(
             object_id,
             DurableObjectSymbols {
                 meta,
-                symbols: HashMap::with_capacity(capacity),
+                symbols: HashMap::new(),
             },
         );
+        self.used_bytes = next_used;
         Ok(())
     }
 
@@ -744,7 +794,8 @@ impl DurableSymbolState {
             meta: symbol.meta,
             data: Bytes::from(symbol.data),
         };
-        self.used_bytes = self.used_bytes.saturating_add(Self::symbol_size(&stored));
+        self.used_bytes =
+            checked_symbol_storage_used(self.used_bytes, Self::symbol_size(&stored), u64::MAX)?;
         object.symbols.insert(stored.meta.esi, stored);
         Ok(())
     }
@@ -754,7 +805,8 @@ impl DurableSymbolState {
             .objects
             .remove(object_id)
             .ok_or(SymbolStoreError::ObjectNotFound(*object_id))?;
-        let total_size: u64 = object.symbols.values().map(Self::symbol_size).sum();
+        let total_size = object.symbols.values().map(Self::symbol_size).sum::<u64>()
+            + object_metadata_size(&object.meta);
         self.used_bytes = self.used_bytes.saturating_sub(total_size);
         Ok(())
     }
@@ -843,6 +895,33 @@ impl DurableObjectStore {
         Self::open_read_only_with_verifier(config, None)
     }
 
+    /// Read an observational view under one snapshot-plus-WAL input budget.
+    ///
+    /// Successful recovery consumes at most `max_recovery_bytes` encoded bytes,
+    /// including historical WAL records already covered by the snapshot. A
+    /// snapshot growth race may read one extra byte to detect overflow. Both
+    /// metadata and actual reads are bounded before decoding; a moving WAL EOF
+    /// cannot extend the captured view. Recovered live objects must also fit
+    /// `config.max_bytes`. No files are created, repaired, locked or checkpointed.
+    ///
+    /// # Errors
+    /// Returns observational-open errors, or an error for a zero input budget,
+    /// excess encoded input, or recovered objects exceeding the storage quota.
+    pub fn open_read_only_bounded(
+        config: DurableObjectStoreConfig,
+        max_recovery_bytes: u64,
+    ) -> Result<Self, ObjectStoreError> {
+        if max_recovery_bytes == 0 {
+            return Err(object_io("read-only recovery byte budget must be nonzero"));
+        }
+        Self::open_with_recovery_budget(
+            config,
+            None,
+            DurableAccess::ReadOnly,
+            Some(max_recovery_bytes),
+        )
+    }
+
     /// Open an observational view and verify every recovered object's content ID.
     ///
     /// This has the no-write and fixed-view semantics of [`Self::open_read_only`].
@@ -860,6 +939,15 @@ impl DurableObjectStore {
         config: DurableObjectStoreConfig,
         verifier: Option<Arc<dyn ObjectIdVerifier>>,
         access: DurableAccess,
+    ) -> Result<Self, ObjectStoreError> {
+        Self::open_with_recovery_budget(config, verifier, access, None)
+    }
+
+    fn open_with_recovery_budget(
+        config: DurableObjectStoreConfig,
+        verifier: Option<Arc<dyn ObjectIdVerifier>>,
+        access: DurableAccess,
+        max_recovery_bytes: Option<u64>,
     ) -> Result<Self, ObjectStoreError> {
         let writer_lock = if access == DurableAccess::ReadWrite {
             fs::create_dir_all(&config.root_dir).map_err(object_io)?;
@@ -882,6 +970,12 @@ impl DurableObjectStore {
             config.mac_key.as_ref(),
             config.allow_legacy_unauth,
             access,
+            max_recovery_bytes,
+            if max_recovery_bytes.is_some() {
+                config.max_bytes
+            } else {
+                u64::MAX
+            },
         )?;
         #[allow(clippy::used_underscore_binding)]
         {
@@ -1171,6 +1265,7 @@ impl DurableSymbolStore {
         let (mut state, last_seq) = load_durable_symbol_state(
             &snapshot_path,
             &wal_path,
+            config.max_bytes,
             config.mac_key.as_ref(),
             config.allow_legacy_unauth,
             access,
@@ -1560,6 +1655,7 @@ fn acquire_writer_lock(root: &Path, lock_file: &str, kind: &str) -> Result<File,
     Ok(file)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn load_durable_object_state(
     snapshot_path: &Path,
     wal_path: &Path,
@@ -1567,16 +1663,22 @@ fn load_durable_object_state(
     mac_key: Option<&[u8; 32]>,
     allow_legacy_unauth: bool,
     access: DurableAccess,
+    mut remaining_recovery_bytes: Option<u64>,
+    max_live_bytes: u64,
 ) -> Result<(DurableObjectState, u64), ObjectStoreError> {
     let (mut state, last_snapshot_seq) = match read_snapshot::<ObjectSnapshot>(
         snapshot_path,
         mac_key,
         allow_legacy_unauth,
         MAX_SNAPSHOT_BYTES,
+        &mut remaining_recovery_bytes,
     )
     .map_err(object_io_durable)?
     {
-        Some((snapshot, seq)) => (DurableObjectState::from_snapshot(snapshot, verifier)?, seq),
+        Some((snapshot, seq)) => (
+            DurableObjectState::from_snapshot(snapshot, verifier, max_live_bytes)?,
+            seq,
+        ),
         None => (DurableObjectState::default(), 0),
     };
 
@@ -1588,6 +1690,7 @@ fn load_durable_object_state(
         allow_legacy_unauth,
         access,
         MAX_WAL_RECORD_BYTES,
+        &mut remaining_recovery_bytes,
         |record| {
             // Keep the recovered state private until the entire WAL passes
             // validation. The record is consumed before the next is decoded.
@@ -1596,7 +1699,7 @@ fn load_durable_object_state(
             if let (Some(verifier), ObjectWalOp::Put(object)) = (verifier, &record.op) {
                 verifier.verify(object)?;
             }
-            state.validate_mutation(&record.op, u64::MAX)?;
+            state.validate_mutation(&record.op, max_live_bytes)?;
             state.apply_loaded_mutation(record.op)?;
             last_seq = record.seq;
             Ok(())
@@ -1610,6 +1713,7 @@ fn load_durable_object_state(
 fn load_durable_symbol_state(
     snapshot_path: &Path,
     wal_path: &Path,
+    max_bytes: u64,
     mac_key: Option<&[u8; 32]>,
     allow_legacy_unauth: bool,
     access: DurableAccess,
@@ -1619,10 +1723,11 @@ fn load_durable_symbol_state(
         mac_key,
         allow_legacy_unauth,
         MAX_SNAPSHOT_BYTES,
+        &mut None,
     )
     .map_err(symbol_io_durable)?
     {
-        Some((snapshot, seq)) => (DurableSymbolState::from_snapshot(snapshot)?, seq),
+        Some((snapshot, seq)) => (DurableSymbolState::from_snapshot(snapshot, max_bytes)?, seq),
         None => (DurableSymbolState::default(), 0),
     };
 
@@ -1634,10 +1739,11 @@ fn load_durable_symbol_state(
         allow_legacy_unauth,
         access,
         MAX_WAL_RECORD_BYTES,
+        &mut None,
         |record| {
             // Authentication does not establish semantic validity: metadata,
             // symbol sizes, zones and conflicting bytes still need checking.
-            state.validate_mutation(&record.op, u64::MAX)?;
+            state.validate_mutation(&record.op, max_bytes)?;
             state.apply_loaded_mutation(record.op)?;
             last_seq = record.seq;
             Ok(())
@@ -1776,10 +1882,14 @@ fn read_snapshot<T>(
     mac_key: Option<&[u8; 32]>,
     allow_legacy_unauth: bool,
     max_snapshot_bytes: u64,
+    remaining_recovery_bytes: &mut Option<u64>,
 ) -> Result<Option<(T, u64)>, DurableIoError>
 where
     T: Serialize + DeserializeOwned,
 {
+    let max_snapshot_bytes = remaining_recovery_bytes.map_or(max_snapshot_bytes, |remaining| {
+        remaining.min(max_snapshot_bytes)
+    });
     let file = match File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
@@ -1813,6 +1923,9 @@ where
             path.display(),
             max_snapshot_bytes
         )));
+    }
+    if let Some(remaining) = remaining_recovery_bytes {
+        *remaining -= bytes.len() as u64;
     }
     let envelope: SnapshotEnvelope<T> = serde_json::from_slice(&bytes)
         .map_err(|error| format!("parse snapshot {}: {error}", path.display()))?;
@@ -1877,6 +1990,7 @@ where
 /// record makes the entire open fail. Repair happens only after all complete
 /// records have passed both envelope and semantic validation.
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 fn replay_wal_records<T, E>(
     path: &Path,
     min_seq: u64,
@@ -1884,6 +1998,7 @@ fn replay_wal_records<T, E>(
     allow_legacy_unauth: bool,
     access: DurableAccess,
     max_record_bytes: usize,
+    remaining_recovery_bytes: &mut Option<u64>,
     mut apply: impl FnMut(WalEnvelope<T>) -> Result<(), E>,
 ) -> Result<(), WalReplayError<E>>
 where
@@ -1898,6 +2013,15 @@ where
         .metadata()
         .map_err(|error| format!("stat wal {}: {error}", path.display()))?
         .len();
+    if let Some(remaining) = remaining_recovery_bytes {
+        *remaining = remaining.checked_sub(observed_len).ok_or_else(|| {
+            DurableIoError::Other(format!(
+                "wal {} exceeds remaining recovery byte budget of {} bytes (got {observed_len})",
+                path.display(),
+                remaining
+            ))
+        })?;
+    }
     // A live writer may keep appending. Observe at most this opened file's
     // captured length rather than chasing an unbounded moving EOF.
     let mut reader = BufReader::new(file.take(observed_len));
@@ -2586,6 +2710,7 @@ mod tests {
                 mac_key.as_ref(),
                 false,
                 snapshot_cap,
+                &mut None,
             )
             .unwrap()
             .unwrap();
@@ -2597,6 +2722,7 @@ mod tests {
                     mac_key.as_ref(),
                     false,
                     snapshot_cap - 1,
+                    &mut None,
                 )
                 .is_err()
             );
@@ -2613,6 +2739,7 @@ mod tests {
                 false,
                 DurableAccess::ReadWrite,
                 wal_bytes.len(),
+                &mut None,
                 |record| {
                     records.push(record);
                     Ok(())
@@ -2689,6 +2816,7 @@ mod tests {
                     false,
                     access,
                     MAX_WAL_RECORD_BYTES,
+                    &mut None,
                     |record| {
                         assert_eq!(LIVE_RECORDS.with(Cell::get), 1);
                         assert_eq!(record.seq, last_seq + 1);
@@ -2706,6 +2834,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bounded_object_observer_shares_snapshot_and_wal_budget_without_writes() {
+        let directory = TempDir::new().unwrap();
+        for mac_key in [None, Some(TEST_MAC_KEY)] {
+            let mut config =
+                DurableObjectStoreConfig::new(directory.path().join(mac_key.is_some().to_string()));
+            config.mac_key = mac_key;
+            config.checkpoint_after_ops = 0;
+            config.max_bytes = 3 * DurableObjectState::object_size(&test_object(1));
+            let writer = DurableObjectStore::open(config.clone()).unwrap();
+            writer.put(test_object(1)).await.unwrap();
+            writer.checkpoint().await.unwrap();
+            writer.put(test_object(2)).await.unwrap();
+            let snapshot_bytes = fs::metadata(&writer.snapshot_path).unwrap().len();
+            let wal_bytes = fs::metadata(&writer.wal_path).unwrap().len();
+            let total_bytes = snapshot_bytes + wal_bytes;
+            assert!(snapshot_bytes > 0 && wal_bytes > 0);
+            let before = stored_file_bytes(&config.root_dir);
+
+            for budget in [0, snapshot_bytes - 1, total_bytes - 1] {
+                assert!(
+                    DurableObjectStore::open_read_only_bounded(config.clone(), budget).is_err()
+                );
+                assert_eq!(stored_file_bytes(&config.root_dir), before);
+            }
+            let reader =
+                DurableObjectStore::open_read_only_bounded(config.clone(), total_bytes).unwrap();
+            assert!(reader.exists(&test_object_id(1)).await);
+            assert!(reader.exists(&test_object_id(2)).await);
+            assert!(reader.put(test_object(3)).await.is_err());
+            assert!(reader.checkpoint().await.is_err());
+            assert_eq!(stored_file_bytes(&config.root_dir), before);
+
+            let mut insufficient_live_quota = config.clone();
+            insufficient_live_quota.max_bytes = DurableObjectState::object_size(&test_object(1));
+            assert!(matches!(
+                DurableObjectStore::open_read_only_bounded(insufficient_live_quota, total_bytes),
+                Err(ObjectStoreError::QuotaExceeded { .. })
+            ));
+            assert_eq!(stored_file_bytes(&config.root_dir), before);
+
+            // Observing while the writer is alive does not acquire its lock or
+            // stop new commits. The next view must account for the larger WAL.
+            writer.put(test_object(3)).await.unwrap();
+            assert!(!reader.exists(&test_object_id(3)).await);
+            assert!(
+                DurableObjectStore::open_read_only_bounded(config.clone(), total_bytes).is_err()
+            );
+            let grown_bytes = snapshot_bytes + fs::metadata(&writer.wal_path).unwrap().len();
+            let fresh = DurableObjectStore::open_read_only_bounded(config, grown_bytes).unwrap();
+            assert!(fresh.exists(&test_object_id(3)).await);
+        }
+    }
+
+    #[test]
+    fn bounded_object_observer_never_creates_missing_storage() {
+        let directory = TempDir::new().unwrap();
+        let root = directory.path().join("missing");
+        for budget in [0, 1, 1024] {
+            assert!(
+                DurableObjectStore::open_read_only_bounded(
+                    DurableObjectStoreConfig::new(&root),
+                    budget
+                )
+                .is_err()
+            );
+            assert!(!root.exists());
+        }
+    }
+
+    #[test]
+    fn recovery_budget_does_not_follow_a_growing_wal() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("growing.wal");
+        append_wal_record(&path, 1, &1_u64, None, MAX_WAL_RECORD_BYTES).unwrap();
+        let initial_bytes = fs::metadata(&path).unwrap().len();
+        let mut budget = Some(initial_bytes);
+        let mut seen = Vec::new();
+        replay_wal_records::<u64, DurableIoError>(
+            &path,
+            0,
+            None,
+            false,
+            DurableAccess::ReadOnly,
+            MAX_WAL_RECORD_BYTES,
+            &mut budget,
+            |record| {
+                seen.push(record.seq);
+                append_wal_record(&path, 2, &2_u64, None, MAX_WAL_RECORD_BYTES)?;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(seen, vec![1]);
+        assert_eq!(budget, Some(0));
+        assert!(fs::metadata(path).unwrap().len() > initial_bytes);
+    }
+
+    #[tokio::test]
     async fn streaming_recovery_preserves_churned_object_and_symbol_state() {
         let temp_dir = TempDir::new().unwrap();
         for mac_key in [None, Some(TEST_MAC_KEY)] {
@@ -2717,7 +2943,9 @@ mod tests {
             let mut symbol_config = DurableSymbolStoreConfig::new(&root);
             symbol_config.mac_key = mac_key;
             symbol_config.checkpoint_after_ops = 0;
-            symbol_config.max_bytes = 2 * DurableSymbolState::symbol_size(&test_symbol(1, 0, 7));
+            symbol_config.max_bytes = 2
+                * (object_metadata_size(&test_symbol_meta(1))
+                    + DurableSymbolState::symbol_size(&test_symbol(1, 0, 7)));
 
             let objects = DurableObjectStore::open(object_config.clone()).unwrap();
             let symbols = DurableSymbolStore::open(symbol_config.clone()).unwrap();
@@ -2769,7 +2997,8 @@ mod tests {
                 assert_eq!(symbols.symbol_count(&test_object_id(1)).await, 2);
                 assert_eq!(
                     symbols.state.lock().await.used_bytes,
-                    symbol_config.max_bytes
+                    object_metadata_size(&test_symbol_meta(1))
+                        + 2 * DurableSymbolState::symbol_size(&test_symbol(1, 0, 7))
                 );
                 assert_eq!(stored_file_bytes(&root), before);
             }
@@ -3973,6 +4202,7 @@ mod tests {
                     config.mac_key.as_ref(),
                     false,
                     MAX_SNAPSHOT_BYTES,
+                    &mut None,
                 )
                 .unwrap()
                 .unwrap();
@@ -4037,6 +4267,7 @@ mod tests {
                     config.mac_key.as_ref(),
                     false,
                     MAX_SNAPSHOT_BYTES,
+                    &mut None,
                 )
                 .unwrap()
                 .unwrap();
@@ -4680,7 +4911,7 @@ mod tests {
     async fn durable_symbol_store_open_scrubs_invalid_snapshot_symbols_before_quota_checks() {
         let temp_dir = TempDir::new().expect("temp dir");
         let mut config = DurableSymbolStoreConfig::new(temp_dir.path().join("symbols"));
-        config.max_bytes = 256;
+        config.max_bytes = object_metadata_size(&test_symbol_meta(11)) + 256;
         config.checkpoint_after_ops = 0;
 
         fs::create_dir_all(&config.root_dir).expect("create root dir");
@@ -4711,7 +4942,7 @@ mod tests {
         let reopened = DurableSymbolStore::open(config).expect("open symbol store");
         assert_eq!(
             reopened.storage_used().await,
-            0,
+            object_metadata_size(&test_symbol_meta(11)),
             "invalid snapshot symbol should be scrubbed"
         );
 
@@ -4760,7 +4991,7 @@ mod tests {
 
         assert_eq!(
             state.used_bytes,
-            valid_size + corrupt_size,
+            object_metadata_size(&meta) + valid_size + corrupt_size,
             "setup should include the invalid symbol in used_bytes"
         );
 
@@ -4769,7 +5000,8 @@ mod tests {
             "object should still be present"
         );
         assert_eq!(
-            state.used_bytes, valid_size,
+            state.used_bytes,
+            object_metadata_size(&meta) + valid_size,
             "scrub must repair quota accounting before releasing the state lock"
         );
         assert_eq!(
@@ -4850,7 +5082,8 @@ mod tests {
 
         // The valid symbol is unchanged and quota accounting is consistent.
         assert_eq!(
-            state.used_bytes, valid_size,
+            state.used_bytes,
+            object_metadata_size(&meta) + valid_size,
             "used_bytes must reflect only the valid symbol after the tolerated apply"
         );
         assert_eq!(
@@ -4866,6 +5099,179 @@ mod tests {
     }
 
     #[fcp_async_core::runtime::test]
+    async fn durable_symbol_metadata_quota_survives_wal_and_snapshot_recovery() {
+        let directory = TempDir::new().unwrap();
+        for mac_key in [None, Some(TEST_MAC_KEY)] {
+            for checkpointed in [false, true] {
+                let mut config = DurableSymbolStoreConfig::new(
+                    directory
+                        .path()
+                        .join(format!("{}-{checkpointed}", mac_key.is_some())),
+                );
+                let meta = high_k_symbol_meta(1);
+                let other = high_k_symbol_meta(2);
+                let metadata_charge = object_metadata_size(&meta);
+                config.max_bytes =
+                    metadata_charge + DurableSymbolState::symbol_size(&test_symbol(1, 0, 7));
+                config.checkpoint_after_ops = 0;
+                config.mac_key = mac_key;
+                let store = DurableSymbolStore::open(config.clone()).unwrap();
+                store.put_object_meta(meta.clone()).await.unwrap();
+                assert_eq!(store.storage_used().await, metadata_charge);
+                store.put_object_meta(meta.clone()).await.unwrap();
+                assert_eq!(store.storage_used().await, metadata_charge);
+
+                let before_rejection = stored_file_bytes(&config.root_dir);
+                assert!(matches!(
+                    store.put_object_meta(other.clone()).await,
+                    Err(SymbolStoreError::QuotaExceeded { .. })
+                ));
+                assert_eq!(stored_file_bytes(&config.root_dir), before_rejection);
+                assert!(store.state.lock().await.write_fence.is_none());
+                store.put_symbol(test_symbol(1, 0, 7)).await.unwrap();
+                assert_eq!(store.storage_used().await, config.max_bytes);
+                if checkpointed {
+                    store.checkpoint().await.unwrap();
+                }
+                drop(store);
+
+                let before_recovery = stored_file_bytes(&config.root_dir);
+                let mut insufficient = config.clone();
+                insufficient.max_bytes -= 1;
+                for access in [DurableAccess::ReadOnly, DurableAccess::ReadWrite] {
+                    assert!(matches!(
+                        DurableSymbolStore::open_with_access(insufficient.clone(), access),
+                        Err(SymbolStoreError::QuotaExceeded { .. })
+                    ));
+                    assert_eq!(stored_file_bytes(&config.root_dir), before_recovery);
+                    let recovered =
+                        DurableSymbolStore::open_with_access(config.clone(), access).unwrap();
+                    assert_eq!(recovered.storage_used().await, config.max_bytes);
+                    assert_eq!(
+                        recovered.get_object_meta(&meta.object_id).await.unwrap(),
+                        meta
+                    );
+                    assert_eq!(
+                        recovered.get_symbol(&meta.object_id, 0).await.unwrap().data,
+                        test_symbol(1, 0, 7).data
+                    );
+                }
+
+                let recovered = DurableSymbolStore::open(config.clone()).unwrap();
+                recovered.delete_symbol(&meta.object_id, 0).await.unwrap();
+                assert_eq!(recovered.storage_used().await, metadata_charge);
+                recovered.delete_object(&meta.object_id).await.unwrap();
+                assert_eq!(recovered.storage_used().await, 0);
+                recovered.put_object_meta(other.clone()).await.unwrap();
+                drop(recovered);
+                let recovered = DurableSymbolStore::open(config).unwrap();
+                assert_eq!(recovered.storage_used().await, object_metadata_size(&other));
+                assert!(recovered.get_object_meta(&meta.object_id).await.is_err());
+            }
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn durable_symbol_metadata_quota_rejects_before_first_wal_append() {
+        let directory = TempDir::new().unwrap();
+        let meta = test_symbol_meta(1);
+        for max_bytes in [0, object_metadata_size(&meta) - 1] {
+            let mut config =
+                DurableSymbolStoreConfig::new(directory.path().join(max_bytes.to_string()));
+            config.max_bytes = max_bytes;
+            let store = DurableSymbolStore::open(config.clone()).unwrap();
+            let before = stored_file_bytes(&config.root_dir);
+            assert!(matches!(
+                store.put_object_meta(meta.clone()).await,
+                Err(SymbolStoreError::QuotaExceeded { .. })
+            ));
+            assert_eq!(store.storage_used().await, 0);
+            assert!(store.list_zone(&meta.zone_id).await.is_empty());
+            assert_eq!(stored_file_bytes(&config.root_dir), before);
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn durable_symbol_snapshot_cannot_overwrite_metadata_or_double_charge_symbols() {
+        let directory = TempDir::new().unwrap();
+        for mac_key in [None, Some(TEST_MAC_KEY)] {
+            let mut config =
+                DurableSymbolStoreConfig::new(directory.path().join(mac_key.is_some().to_string()));
+            config.mac_key = mac_key;
+            fs::create_dir_all(&config.root_dir).unwrap();
+            let snapshot_path = config.root_dir.join("symbols.snapshot.json");
+            let meta = test_symbol_meta(1);
+            let symbol = test_symbol(1, 0, 7);
+            let entry = || SymbolSnapshotEntry {
+                meta: meta.clone(),
+                symbols: vec![PersistentStoredSymbol {
+                    meta: symbol.meta.clone(),
+                    data: symbol.data.to_vec(),
+                }],
+            };
+            let duplicate_objects = SymbolSnapshot {
+                objects: vec![entry(), entry()],
+            };
+            write_snapshot(
+                &snapshot_path,
+                0,
+                &duplicate_objects,
+                mac_key.as_ref(),
+                MAX_SNAPSHOT_BYTES,
+            )
+            .unwrap();
+            let before = stored_file_bytes(&config.root_dir);
+            assert!(matches!(
+                DurableSymbolStore::open_read_only(config.clone()),
+                Err(SymbolStoreError::InvalidSymbol { .. })
+            ));
+            assert_eq!(stored_file_bytes(&config.root_dir), before);
+
+            let mut duplicate_symbols = entry();
+            duplicate_symbols.symbols.push(PersistentStoredSymbol {
+                meta: symbol.meta.clone(),
+                data: symbol.data.to_vec(),
+            });
+            write_snapshot(
+                &snapshot_path,
+                0,
+                &SymbolSnapshot {
+                    objects: vec![duplicate_symbols],
+                },
+                mac_key.as_ref(),
+                MAX_SNAPSHOT_BYTES,
+            )
+            .unwrap();
+            config.max_bytes =
+                object_metadata_size(&meta) + DurableSymbolState::symbol_size(&symbol);
+            let observed = DurableSymbolStore::open_read_only(config.clone()).unwrap();
+            assert_eq!(observed.symbol_count(&meta.object_id).await, 1);
+            assert_eq!(observed.storage_used().await, config.max_bytes);
+            drop(observed);
+
+            let mut conflict = entry();
+            conflict.symbols.push(PersistentStoredSymbol {
+                meta: symbol.meta,
+                data: vec![0xFF; symbol.data.len()],
+            });
+            write_snapshot(
+                &snapshot_path,
+                0,
+                &SymbolSnapshot {
+                    objects: vec![conflict],
+                },
+                mac_key.as_ref(),
+                MAX_SNAPSHOT_BYTES,
+            )
+            .unwrap();
+            assert!(matches!(
+                DurableSymbolStore::open_read_only(config),
+                Err(SymbolStoreError::InvalidSymbol { .. })
+            ));
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
     async fn durable_symbol_sparse_high_k_metadata_stays_bounded_across_recovery() {
         let temp_dir = TempDir::new().expect("temp dir");
         for (index, mac_key) in [None, Some([0xA7; 32])].into_iter().enumerate() {
@@ -4874,12 +5280,6 @@ mod tests {
             config.mac_key = mac_key;
             let empty = high_k_symbol_meta(1);
             let sparse = high_k_symbol_meta(2);
-            let reserved_capacity = HashMap::<u32, StoredSymbol>::with_capacity(
-                initial_symbol_map_capacity(empty.source_symbols),
-            )
-            .capacity();
-            assert!(reserved_capacity < usize::try_from(empty.source_symbols).unwrap());
-
             let store = DurableSymbolStore::open(config.clone()).unwrap();
             for meta in [&empty, &sparse] {
                 store.put_object_meta(meta.clone()).await.unwrap();
@@ -4887,7 +5287,7 @@ mod tests {
                 let object = state.objects.get(&meta.object_id).unwrap();
                 assert_eq!(object.meta, *meta);
                 assert!(object.symbols.is_empty());
-                assert_eq!(object.symbols.capacity(), reserved_capacity);
+                assert_eq!(object.symbols.capacity(), 0);
             }
             // Repeated metadata must preserve both the bounded map and symbols.
             store.put_symbol(test_symbol(2, 0, 7)).await.unwrap();
@@ -4905,12 +5305,14 @@ mod tests {
                     let object = state.objects.get(&meta.object_id).unwrap();
                     assert_eq!(object.meta, *meta);
                     assert_eq!(object.symbols.len(), count);
-                    assert!(object.symbols.capacity() <= reserved_capacity);
-                    if checkpointed && count == 0 {
+                    if count == 0 {
                         assert_eq!(object.symbols.capacity(), 0);
                     }
                 }
-                assert_eq!(recovered.storage_used().await, 2 * (128 + 64));
+                assert_eq!(
+                    recovered.storage_used().await,
+                    object_metadata_size(&empty) + object_metadata_size(&sparse) + 2 * (128 + 64)
+                );
                 assert!(!recovered.can_reconstruct(&sparse.object_id).await);
                 for (esi, node) in [(0, 7), (56_402, 8)] {
                     let symbol = recovered.get_symbol(&sparse.object_id, esi).await.unwrap();
@@ -4934,7 +5336,7 @@ mod tests {
         let initial_capacity = store.state.lock().await.objects[&meta.object_id]
             .symbols
             .capacity();
-        let count = u32::try_from(initial_capacity + 1).unwrap();
+        let count = 2_049;
         for esi in 0..count {
             store.put_symbol(test_symbol(3, esi, 7)).await.unwrap();
         }
@@ -4945,7 +5347,7 @@ mod tests {
                 > initial_capacity
         );
         assert_eq!(store.symbol_count(&meta.object_id).await, count);
-        let used = u64::from(count) * (128 + 64);
+        let used = object_metadata_size(&meta) + u64::from(count) * (128 + 64);
         assert_eq!(store.storage_used().await, used);
 
         store.put_symbol(test_symbol(3, 0, 7)).await.unwrap();
@@ -5263,6 +5665,7 @@ mod tests {
                     false,
                     access,
                     cap,
+                    &mut None,
                     |_| {
                         replayed += 1;
                         Ok(())
