@@ -105,6 +105,10 @@ pub(super) async fn revalidate(
     request: &InvokeRequest,
     admitted_generation: u64,
 ) -> HostResult<SafetyTier> {
+    let execution_fence = state
+        .lifecycle
+        .connector_execution_fence(&request.connector_id)
+        .await?;
     state.registry.require_generation(admitted_generation)?;
     check_current_token(state, request)?;
     let inventory = state
@@ -220,6 +224,7 @@ pub(super) async fn revalidate(
     verify_live_revocation_cascade(state, &request.zone_id, &request.capability_token, &claims)?;
     require_live_times(&claims, chrono::Utc::now().timestamp())?;
     state.registry.require_generation(admitted_generation)?;
+    execution_fence.require_current()?;
     Ok(tool.safety_tier)
 }
 

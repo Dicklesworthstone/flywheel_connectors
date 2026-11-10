@@ -100,6 +100,7 @@ struct Attachment {
     connector: Arc<SubprocessConnector>,
     transport: native_stream::NativeEventTransport,
     accepting: Arc<AtomicBool>,
+    authority: Arc<std::sync::Mutex<live_authority::LiveAuthorityDispatchGuard>>,
     _ack_relay: JoinHandle<()>,
 }
 
@@ -193,7 +194,13 @@ impl EventService {
 
     /// Authentication does not call the connector: an invocation can be
     /// waiting for exactly the acknowledgement this consumer is submitting.
-    async fn authorize(&self, host: &AppState, auth: &StreamAuthority) -> HostResult<Admission> {
+    async fn authorize(
+        &self,
+        host: &AppState,
+        auth: &StreamAuthority,
+        execution: bool,
+        admitted_execution_fence: Option<fcp_host::ConnectorExecutionFence>,
+    ) -> HostResult<Admission> {
         self.journal()?;
         if auth.request_id.is_empty()
             || auth.request_id.len() > 128
@@ -206,6 +213,23 @@ impl EventService {
         // Capture before any asynchronous authority lookup. A revocation
         // published while those reads wait must invalidate this admission.
         let lifecycle_fence = host.lifecycle.capability_revocation_fence();
+        // Closing retained custody remains available after disable. Opening,
+        // consuming and replenishing upstream credit require live authority.
+        let execution_fence = if execution {
+            Some(match admitted_execution_fence {
+                Some(fence) => {
+                    fence.require_current()?;
+                    fence
+                }
+                None => {
+                    host.lifecycle
+                        .connector_execution_fence(&auth.connector_id)
+                        .await?
+                }
+            })
+        } else {
+            None
+        };
         let generation = host.registry.version.load(Ordering::Acquire);
         let (config, connector, declaration) = {
             let state = host.registry.state.read().await;
@@ -370,8 +394,12 @@ impl EventService {
                 "connector inventory changed during event authorization; retry",
             ));
         }
-        let authority =
-            live_authority::LiveAuthorityDispatchGuard::new(host, &request, lifecycle_fence)?;
+        let authority = live_authority::LiveAuthorityDispatchGuard::new(
+            host,
+            &request,
+            lifecycle_fence,
+            execution_fence,
+        )?;
         authority.refresh()?.require_current()?;
         Ok(Admission {
             binding: NativeEventBinding {
@@ -430,8 +458,15 @@ impl EventService {
         Ok(retained.instance_id)
     }
 
-    async fn open(&self, host: &AppState, request: OpenRequest) -> HostResult<Value> {
-        let admission = self.authorize(host, &request.auth).await?;
+    async fn open(
+        &self,
+        host: &AppState,
+        request: OpenRequest,
+        execution_fence: Option<fcp_host::ConnectorExecutionFence>,
+    ) -> HostResult<Value> {
+        let admission = self
+            .authorize(host, &request.auth, true, execution_fence)
+            .await?;
         let termination = NativeInvocationTermination::new(Instant::now() + REQUEST_TIMEOUT);
         termination.bind_inventory_fence(host.registry.inventory_fence(admission.generation));
         termination.bind_authority_guard(admission.authority.clone());
@@ -556,21 +591,24 @@ impl EventService {
                     unavailable("native process has no continuous event transport")
                 })?;
             let accepting = Arc::new(AtomicBool::new(true));
-            let (ack_tx, mut ack_rx) = mpsc::channel::<EventAck>(64);
+            let authority = Arc::new(std::sync::Mutex::new(admission.authority.clone()));
+            let (ack_tx, mut ack_rx) =
+                mpsc::channel::<(EventAck, live_authority::LiveAuthorityDispatchGuard)>(64);
             let relay_transport = transport.clone();
             let relay_stream = stream_id.clone();
             let relay_accepting = Arc::clone(&accepting);
             let relay = task::try_spawn(async move {
-                while let Some(ack) = ack_rx.recv().await {
+                while let Some((ack, authority)) = ack_rx.recv().await {
                     if !relay_accepting.load(Ordering::Acquire) {
                         break;
                     }
-                    if relay_transport
-                        .acknowledge(&relay_stream, &ack)
+                    if let Err(error) = relay_transport
+                        .acknowledge_with_authority(&relay_stream, &ack, &authority)
                         .await
-                        .is_err()
                     {
-                        break;
+                        if error.kind() != std::io::ErrorKind::PermissionDenied {
+                            break;
+                        }
                     }
                 }
             })
@@ -579,6 +617,7 @@ impl EventService {
             let sink_stream = stream_id.clone();
             let sink_binding = admission.binding.clone();
             let sink_accepting = Arc::clone(&accepting);
+            let sink_authority = Arc::clone(&authority);
             transport
                 .install_sink(Arc::new(move |incoming_stream, event| {
                     if !sink_accepting.load(Ordering::Acquire) || incoming_stream != sink_stream {
@@ -586,6 +625,16 @@ impl EventService {
                             "native event belongs to a retired stream",
                         ));
                     }
+                    // Custody persistence can block while a fresh open renews
+                    // the stream. This arrival keeps its original admission.
+                    let authority = sink_authority
+                        .lock()
+                        .map_err(|_| {
+                            std::io::Error::other(
+                                "native replay acknowledgement authority unavailable",
+                            )
+                        })?
+                        .clone();
                     let admitted = sink_journal
                         .ingest(
                             incoming_stream,
@@ -597,7 +646,7 @@ impl EventService {
                             std::io::Error::other("native event custody rejected the event")
                         })?;
                     if let NativeEventAdmission::AlreadyAcknowledged(ack) = admitted {
-                        ack_tx.try_send(ack).map_err(|_| {
+                        ack_tx.try_send((ack, authority)).map_err(|_| {
                             std::io::Error::other(
                                 "native replay acknowledgement queue is unavailable",
                             )
@@ -613,9 +662,16 @@ impl EventService {
                     connector: Arc::clone(&admission.connector),
                     transport,
                     accepting,
+                    authority,
                     _ack_relay: relay,
                 },
             );
+        } else if let Some(attachment) = attachments.get(&admission.binding.connector_id) {
+            // A fresh open can renew a retained stream's authority. ACKs
+            // already queued retain their original guard and cannot revive.
+            *attachment.authority.lock().map_err(|_| {
+                unavailable("native replay acknowledgement authority unavailable")
+            })? = admission.authority.clone();
         }
         drop(attachments);
         if let Some((transport, previous_stream)) = retired {
@@ -684,8 +740,15 @@ impl EventService {
         )
     }
 
-    async fn poll(&self, host: &AppState, request: PollRequest) -> HostResult<Value> {
-        let admitted = self.authorize(host, &request.auth).await?;
+    async fn poll(
+        &self,
+        host: &AppState,
+        request: PollRequest,
+        execution_fence: Option<fcp_host::ConnectorExecutionFence>,
+    ) -> HostResult<Value> {
+        let admitted = self
+            .authorize(host, &request.auth, true, execution_fence)
+            .await?;
         let instance =
             self.authorize_retained(host, &request.auth, &admitted, &request.stream_id)?;
         let batch = self.journal()?.poll(
@@ -697,8 +760,15 @@ impl EventService {
         serde_json::to_value(batch).map_err(|_| unavailable("event batch could not be encoded"))
     }
 
-    async fn acknowledge(&self, host: &AppState, request: AckRequest) -> HostResult<Value> {
-        let admitted = self.authorize(host, &request.auth).await?;
+    async fn acknowledge(
+        &self,
+        host: &AppState,
+        request: AckRequest,
+        execution_fence: Option<fcp_host::ConnectorExecutionFence>,
+    ) -> HostResult<Value> {
+        let admitted = self
+            .authorize(host, &request.auth, true, execution_fence)
+            .await?;
         let instance =
             self.authorize_retained(host, &request.auth, &admitted, &request.stream_id)?;
         // This synchronization is the custody handoff. No connector ACK may
@@ -729,6 +799,15 @@ impl EventService {
             transport.is_some() && native_ack.seqs.len() == request.ack.seqs.len();
         if let Some((transport, accepting)) = transport {
             for (seq, cursor) in native_ack.seqs.iter().zip(&native_ack.cursors) {
+                if admitted
+                    .authority
+                    .refresh()
+                    .and_then(|permit| permit.require_current())
+                    .is_err()
+                {
+                    upstream_notified = false;
+                    break;
+                }
                 if !accepting.load(Ordering::Acquire) {
                     upstream_notified = false;
                     break;
@@ -736,7 +815,7 @@ impl EventService {
                 let ack =
                     EventAck::new(&native_ack.topic, vec![*seq]).with_cursors(vec![cursor.clone()]);
                 if transport
-                    .acknowledge(&request.stream_id, &ack)
+                    .acknowledge_with_authority(&request.stream_id, &ack, &admitted.authority)
                     .await
                     .is_err()
                 {
@@ -752,7 +831,7 @@ impl EventService {
     }
 
     async fn close(&self, host: &AppState, request: CloseRequest) -> HostResult<Value> {
-        let admitted = self.authorize(host, &request.auth).await?;
+        let admitted = self.authorize(host, &request.auth, false, None).await?;
         let instance =
             self.authorize_retained(host, &request.auth, &admitted, &request.stream_id)?;
         let stream = self

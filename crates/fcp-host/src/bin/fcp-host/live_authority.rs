@@ -11,21 +11,21 @@ use std::time::{Duration, Instant};
 use fcp_core::{CapabilityToken, ZoneId};
 use fcp_crypto::Ed25519VerifyingKey;
 use fcp_host::{
-    CapabilityRevocationFence, HostError, HostResult, RevocationCascadeVerifier,
-    RuntimeRevocationPermit, RuntimeRevocationService,
+    CapabilityRevocationFence, ConnectorExecutionFence, HostError, HostResult,
+    RevocationCascadeVerifier, RuntimeRevocationPermit, RuntimeRevocationService,
 };
 use fcp_kernel::InvokeRequest;
 
 use super::{AppState, HybridOwnerInvokeEvidence, HybridOwnerProductionVerifier};
 
-const REFUSAL: &str =
-    "live capability, approval or revocation authority no longer permits queued execution";
+const REFUSAL: &str = "live connector lifecycle, capability, approval or revocation authority no longer permits queued execution";
 
 struct AuthorityState {
     key: Ed25519VerifyingKey,
     token: CapabilityToken,
     zone: ZoneId,
     lifecycle_fence: CapabilityRevocationFence,
+    execution_fence: Option<ConnectorExecutionFence>,
     cascade: Arc<RevocationCascadeVerifier>,
     runtime_revocation: Option<Arc<RuntimeRevocationService>>,
     holder: Option<(Arc<fcp_host::mesh_routing::MeshRouter>, InvokeRequest)>,
@@ -47,8 +47,12 @@ impl LiveAuthorityDispatchGuard {
         state: &AppState,
         request: &InvokeRequest,
         lifecycle_fence: CapabilityRevocationFence,
+        execution_fence: Option<ConnectorExecutionFence>,
     ) -> HostResult<Self> {
         lifecycle_fence.require_current()?;
+        if let Some(fence) = &execution_fence {
+            fence.require_current()?;
+        }
         let key = state.capability_verifying_key.clone().ok_or_else(refused)?;
         let claims = super::invoke_jobs::verified_dispatch_claims_at(
             &request.capability_token,
@@ -91,6 +95,7 @@ impl LiveAuthorityDispatchGuard {
             token: request.capability_token.clone(),
             zone: request.zone_id.clone(),
             lifecycle_fence,
+            execution_fence,
             cascade: Arc::clone(&state.revocation_cascade),
             runtime_revocation: state.runtime_revocation.clone(),
             holder,
@@ -107,6 +112,9 @@ impl LiveAuthorityDispatchGuard {
             effect_started: AtomicBool::new(false),
         }));
         guard.0.lifecycle_fence.require_current()?;
+        if let Some(fence) = &guard.0.execution_fence {
+            fence.require_current()?;
+        }
         Ok(guard)
     }
 
@@ -124,6 +132,9 @@ impl LiveAuthorityDispatchGuard {
             return Err(refused());
         }
         self.0.lifecycle_fence.require_current()?;
+        if let Some(fence) = &self.0.execution_fence {
+            fence.require_current()?;
+        }
         let claims = super::invoke_jobs::verified_dispatch_claims_at(
             &self.0.token,
             Some(&self.0.key),
@@ -214,6 +225,12 @@ impl LiveAuthorityDispatchPermit {
     pub(super) fn is_current(&self) -> bool {
         let current = !self.guard.0.rejected.load(Ordering::Acquire)
             && self.guard.0.lifecycle_fence.is_current()
+            && self
+                .guard
+                .0
+                .execution_fence
+                .as_ref()
+                .is_none_or(ConnectorExecutionFence::is_current)
             && Instant::now() < self.deadline
             && u64::try_from(chrono::Utc::now().timestamp_millis())
                 .is_ok_and(|now| now >= self.not_before_ms && now < self.expires_at_ms)

@@ -2708,7 +2708,16 @@ impl ConnectorAdminState {
     }
 
     const fn apply_lifecycle_projection(&mut self, record: &LifecycleRecord) {
-        self.desired_state = DesiredRuntimeState::from_lifecycle_state(record.state);
+        // Rollout evaluation can save a Production/Canary record observed
+        // before an operator disabled the connector. Health bookkeeping and
+        // automatic promotion must never silently lift that execution gate.
+        // Explicit lifecycle actions publish Enabled through set_desired_state.
+        if !matches!(
+            self.desired_state,
+            DesiredRuntimeState::Disabled | DesiredRuntimeState::Uninstalled
+        ) {
+            self.desired_state = DesiredRuntimeState::from_lifecycle_state(record.state);
+        }
         self.observed_state = ObservedRuntimeState::from_lifecycle_state(record.state);
     }
 }
@@ -3383,14 +3392,81 @@ impl CapabilityRevocationFence {
     }
 }
 
+/// A connector's persisted lifecycle authority retained through execution waits.
+///
+/// Capture before admission, then require it immediately before selecting an
+/// effect. Disabling or uninstalling a connector retires that admission even if
+/// the connector is enabled again before the queued work resumes. This fence
+/// makes no assertion that an already selected effect or process has stopped.
+#[derive(Clone, Debug)]
+pub struct ConnectorExecutionFence {
+    generation: Arc<AtomicU64>,
+    persistence_failed: Arc<AtomicBool>,
+    admitted_generation: u64,
+}
+
+impl ConnectorExecutionFence {
+    /// Whether the captured lifecycle authority still permits execution.
+    ///
+    /// This performs only atomic reads and is safe at a runtime's final command
+    /// selection boundary. Odd generations permit execution; even generations
+    /// and the reserved maximum generation refuse it.
+    #[must_use]
+    pub fn is_current(&self) -> bool {
+        self.admitted_generation != u64::MAX
+            && self.admitted_generation & 1 == 1
+            && !self.persistence_failed.load(Ordering::Acquire)
+            && self.generation.load(Ordering::Acquire) == self.admitted_generation
+    }
+
+    /// Reject a disabled connector, an old admission or uncertain durable state.
+    ///
+    /// # Errors
+    /// Returns a preflight failure when this admission no longer permits work.
+    pub fn require_current(&self) -> HostResult<()> {
+        if self.is_current() {
+            Ok(())
+        } else {
+            Err(HostError::PreflightFailed(
+                "connector lifecycle execution authority changed after admission".to_string(),
+            ))
+        }
+    }
+}
+
+const fn desired_state_allows_execution(desired: DesiredRuntimeState) -> bool {
+    // Inventory-only and remote-only connectors may not have an admin record
+    // yet. Their existing inventory, capability and policy gates still apply.
+    !matches!(
+        desired,
+        DesiredRuntimeState::Disabled | DesiredRuntimeState::Uninstalled
+    )
+}
+
+fn snapshot_desired_state(
+    snapshot: &HostAdminStateSnapshot,
+    connector_id: &ConnectorId,
+) -> DesiredRuntimeState {
+    snapshot
+        .connectors
+        .get(connector_id)
+        .map_or(DesiredRuntimeState::Unspecified, |state| {
+            state.desired_state
+        })
+}
+
 /// Durable host-side admin-state store.
 pub struct HostAdminStateStore {
     state: RwLock<HostAdminStateSnapshot>,
     state_path: Option<PathBuf>,
     // A failed write may already have replaced the on-disk snapshot. Continuing
     // from the older RAM image could reuse an admitted generation or erase it.
-    persistence_failed: AtomicBool,
+    persistence_failed: Arc<AtomicBool>,
     capability_revocation_generation: Arc<AtomicU64>,
+    // Weak entries retain epochs only while an admission actually uses them.
+    // Invalid remote connector IDs cannot grow this process-local map forever.
+    connector_execution_generations:
+        std::sync::Mutex<HashMap<ConnectorId, std::sync::Weak<AtomicU64>>>,
 }
 
 impl Default for HostAdminStateStore {
@@ -3406,8 +3482,9 @@ impl HostAdminStateStore {
         Self {
             state: RwLock::new(HostAdminStateSnapshot::default()),
             state_path: None,
-            persistence_failed: AtomicBool::new(false),
+            persistence_failed: Arc::new(AtomicBool::new(false)),
             capability_revocation_generation: Arc::new(AtomicU64::new(0)),
+            connector_execution_generations: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -3468,8 +3545,9 @@ impl HostAdminStateStore {
         Ok(Self {
             state: RwLock::new(state),
             state_path,
-            persistence_failed: AtomicBool::new(false),
+            persistence_failed: Arc::new(AtomicBool::new(false)),
             capability_revocation_generation: Arc::new(AtomicU64::new(0)),
+            connector_execution_generations: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -3482,6 +3560,94 @@ impl HostAdminStateStore {
                 .capability_revocation_generation
                 .load(Ordering::Acquire),
         }
+    }
+
+    /// Capture fresh persisted lifecycle authority before admitting connector work.
+    ///
+    /// Explicit disabled and uninstalled states refuse local and forwarded
+    /// execution. Other admission checks remain independently required. Retain
+    /// this fence through all queue, persistence, refresh and transport waits;
+    /// recapturing it after a wait would allow an old request to survive a
+    /// disable/enable cycle.
+    ///
+    /// # Errors
+    /// Returns a preflight failure for disabled/uninstalled connectors, or an
+    /// unavailable error when durable authority cannot be established.
+    pub async fn connector_execution_fence(
+        &self,
+        connector_id: &ConnectorId,
+    ) -> HostResult<ConnectorExecutionFence> {
+        let state = self.state.read().await;
+        if self.persistence_failed.load(Ordering::Acquire) {
+            return Err(HostError::Unavailable(
+                "connector lifecycle authority is unavailable after an admin-state persistence failure"
+                    .to_string(),
+            ));
+        }
+        if !desired_state_allows_execution(snapshot_desired_state(&state, connector_id)) {
+            return Err(HostError::PreflightFailed(format!(
+                "connector `{connector_id}` is disabled or uninstalled"
+            )));
+        }
+        let mut generations = self.connector_execution_generations.lock().map_err(|_| {
+            HostError::Unavailable("connector lifecycle authority lock is unavailable".to_string())
+        })?;
+        generations.retain(|_, generation| generation.strong_count() != 0);
+        let generation = generations
+            .get(connector_id)
+            .and_then(std::sync::Weak::upgrade)
+            .unwrap_or_else(|| {
+                let generation = Arc::new(AtomicU64::new(1));
+                generations.insert(connector_id.clone(), Arc::downgrade(&generation));
+                generation
+            });
+        let fence = ConnectorExecutionFence {
+            admitted_generation: generation.load(Ordering::Acquire),
+            generation,
+            persistence_failed: Arc::clone(&self.persistence_failed),
+        };
+        fence.require_current()?;
+        Ok(fence)
+    }
+
+    fn fence_connector_transitions(
+        &self,
+        previous: &HostAdminStateSnapshot,
+        next: &HostAdminStateSnapshot,
+    ) -> Result<Vec<(Arc<AtomicU64>, u64)>, LifecycleError> {
+        let generations = self.connector_execution_generations.lock().map_err(|_| {
+            invocation_state_error("connector lifecycle authority lock is unavailable")
+        })?;
+        let mut publications = Vec::new();
+        for (connector_id, weak) in generations.iter() {
+            let desired = snapshot_desired_state(next, connector_id);
+            if desired == snapshot_desired_state(previous, connector_id) {
+                continue;
+            }
+            let Some(generation) = weak.upgrade() else {
+                continue;
+            };
+            let current = generation.load(Ordering::Acquire);
+            let Some(retired) = (current & !1)
+                .checked_add(2)
+                .filter(|value| *value < u64::MAX - 1)
+            else {
+                generation.store(u64::MAX, Ordering::Release);
+                return Err(invocation_state_error(
+                    "connector lifecycle execution generation exhausted",
+                ));
+            };
+            // Retire old admissions before any persistence begins. Publication
+            // of newly enabled authority waits for durable commit below.
+            generation.store(retired, Ordering::Release);
+            let published = if desired_state_allows_execution(desired) {
+                retired | 1
+            } else {
+                retired
+            };
+            publications.push((generation, published));
+        }
+        Ok(publications)
     }
 
     async fn apply_mutation<T, F>(&self, mutate: F) -> Result<T, LifecycleError>
@@ -3532,6 +3698,8 @@ impl HostAdminStateStore {
             ));
         }
 
+        let execution_publications = self.fence_connector_transitions(&state, &snapshot)?;
+
         // There is no await after mutation begins: caller cancellation cannot
         // interrupt file sync, replacement, directory sync or RAM publication.
         if let Err(error) = persist_admin_state_snapshot(self.state_path.as_deref(), &snapshot) {
@@ -3544,6 +3712,9 @@ impl HostAdminStateStore {
         }
 
         *state = snapshot;
+        for (generation, published) in execution_publications {
+            generation.store(published, Ordering::Release);
+        }
         Ok(result)
     }
 
@@ -7077,6 +7248,266 @@ mod tests {
                 .admit_invocation(invocation_admission("fresh"))
                 .await
                 .is_ok()
+        );
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn connector_execution_fence_retains_disable_across_reenable() {
+        let store = HostAdminStateStore::new();
+        let connector_id = ConnectorId::from_static("fcp.test:fence:1.0.0");
+        let unrelated = ConnectorId::from_static("fcp.other:fence:1.0.0");
+        store
+            .set_desired_state(&connector_id, DesiredRuntimeState::Enabled, None)
+            .await
+            .unwrap();
+        let admitted = store
+            .connector_execution_fence(&connector_id)
+            .await
+            .unwrap();
+        let other_admitted = store.connector_execution_fence(&unrelated).await.unwrap();
+        store
+            .set_desired_state(&unrelated, DesiredRuntimeState::Enabled, None)
+            .await
+            .unwrap();
+        assert!(
+            admitted.is_current(),
+            "another connector cannot retire this admission"
+        );
+        assert!(!other_admitted.is_current());
+        let other_admitted = store.connector_execution_fence(&unrelated).await.unwrap();
+        store
+            .set_desired_state(&connector_id, DesiredRuntimeState::Disabled, None)
+            .await
+            .unwrap();
+        assert!(!admitted.is_current());
+        assert!(other_admitted.is_current());
+        assert!(
+            store
+                .connector_execution_fence(&connector_id)
+                .await
+                .is_err()
+        );
+        store
+            .set_desired_state(&connector_id, DesiredRuntimeState::Enabled, None)
+            .await
+            .unwrap();
+        assert!(
+            admitted.require_current().is_err(),
+            "reenabling cannot revive old queued work"
+        );
+        assert!(
+            store
+                .connector_execution_fence(&connector_id)
+                .await
+                .unwrap()
+                .is_current()
+        );
+        assert!(other_admitted.is_current());
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn connector_execution_fence_rollout_save_cannot_lift_operator_shutdown_intent() {
+        for lifecycle_state in [LifecycleState::Canary, LifecycleState::Production] {
+            for desired in [
+                DesiredRuntimeState::Disabled,
+                DesiredRuntimeState::Uninstalled,
+            ] {
+                let store = HostAdminStateStore::new();
+                let connector_id = connector_id();
+                let mut record = LifecycleRecord::new(connector_id.clone(), Version::new(1, 0, 0));
+                record
+                    .transition(
+                        LifecycleState::Installing,
+                        TransitionReason::InstallComplete,
+                    )
+                    .unwrap();
+                record
+                    .transition(
+                        LifecycleState::Canary,
+                        TransitionReason::NewVersion {
+                            from_version: "0.9.0".to_string(),
+                            to_version: "1.0.0".to_string(),
+                        },
+                    )
+                    .unwrap();
+                if lifecycle_state == LifecycleState::Production {
+                    record
+                        .transition(
+                            LifecycleState::Production,
+                            TransitionReason::ManualPromotion,
+                        )
+                        .unwrap();
+                }
+                store.save(&record).await.unwrap();
+                let admitted = store
+                    .connector_execution_fence(&connector_id)
+                    .await
+                    .unwrap();
+                // A controller can retain this record across self-check IO.
+                // Its later observation must not undo the operator's decision.
+                store
+                    .set_desired_state(&connector_id, desired, None)
+                    .await
+                    .unwrap();
+                store.save(&record).await.unwrap();
+                assert_eq!(
+                    store
+                        .connector_state(&connector_id)
+                        .await
+                        .unwrap()
+                        .desired_state,
+                    desired
+                );
+                assert!(!admitted.is_current());
+                assert!(
+                    store
+                        .connector_execution_fence(&connector_id)
+                        .await
+                        .is_err()
+                );
+                store
+                    .execute_lifecycle_transition(
+                        &connector_id,
+                        &LifecycleTransitionRequest {
+                            action: LifecycleAction::Enable,
+                            reason: None,
+                            initiated_by: None,
+                            dry_run: false,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert!(
+                    store
+                        .connector_execution_fence(&connector_id)
+                        .await
+                        .unwrap()
+                        .is_current()
+                );
+                assert!(!admitted.is_current());
+            }
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn connector_execution_fence_reloads_persisted_disabled_and_uninstalled_states() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("admin-state.json");
+        let connector_id = ConnectorId::from_static("fcp.test:fence:1.0.0");
+        for desired in [
+            DesiredRuntimeState::Disabled,
+            DesiredRuntimeState::Uninstalled,
+        ] {
+            let store = HostAdminStateStore::with_state_path(path.clone()).unwrap();
+            store
+                .set_desired_state(&connector_id, desired, None)
+                .await
+                .unwrap();
+            drop(store);
+            let restored = HostAdminStateStore::with_state_path(path.clone()).unwrap();
+            assert!(
+                restored
+                    .connector_execution_fence(&connector_id)
+                    .await
+                    .is_err()
+            );
+            // Reconciliation observes a running process without silently
+            // undoing the persisted operator decision.
+            restored
+                .reconcile_registered_connectors(&[connector_summary(
+                    connector_id.clone(),
+                    true,
+                    ConnectorHealth::healthy(),
+                )])
+                .await
+                .unwrap();
+            assert!(
+                restored
+                    .connector_execution_fence(&connector_id)
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn connector_execution_fence_dry_run_preserves_authority_and_observation() {
+        let store = HostAdminStateStore::new();
+        let connector_id = ConnectorId::from_static("fcp.test:fence:1.0.0");
+        store
+            .reconcile_registered_connectors(&[connector_summary(
+                connector_id.clone(),
+                true,
+                ConnectorHealth::healthy(),
+            )])
+            .await
+            .unwrap();
+        let admitted = store
+            .connector_execution_fence(&connector_id)
+            .await
+            .unwrap();
+        let mut request = LifecycleTransitionRequest {
+            action: LifecycleAction::Disable,
+            reason: Some("maintenance".to_string()),
+            initiated_by: None,
+            dry_run: true,
+        };
+        let before = store.connector_status(&connector_id).await.unwrap();
+        let preview = store
+            .execute_lifecycle_transition(&connector_id, &request)
+            .await
+            .unwrap();
+        assert!(preview.dry_run);
+        assert!(admitted.is_current());
+        request.dry_run = false;
+        let response = store
+            .execute_lifecycle_transition(&connector_id, &request)
+            .await
+            .unwrap();
+        assert!(!admitted.is_current());
+        assert_eq!(
+            response.current_desired_state,
+            DesiredRuntimeState::Disabled
+        );
+        let after = store.connector_status(&connector_id).await.unwrap();
+        assert_eq!(
+            after.observed_state, before.observed_state,
+            "admission fencing is not evidence that the process stopped"
+        );
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn connector_execution_fence_refuses_uncertain_persistence_for_existing_and_new_work() {
+        let directory = tempfile::tempdir().unwrap();
+        let obstruction = directory.path().join("not-a-directory");
+        std::fs::write(&obstruction, b"preserve this obstruction").unwrap();
+        let mut store = HostAdminStateStore::new();
+        let connector_id = ConnectorId::from_static("fcp.test:fence:1.0.0");
+        let admitted = store
+            .connector_execution_fence(&connector_id)
+            .await
+            .unwrap();
+        let other = ConnectorId::from_static("fcp.other:fence:1.0.0");
+        let other_admitted = store.connector_execution_fence(&other).await.unwrap();
+        store.state_path = Some(obstruction.join("state.json"));
+        assert!(
+            store
+                .set_desired_state(&connector_id, DesiredRuntimeState::Disabled, None)
+                .await
+                .is_err()
+        );
+        assert!(admitted.require_current().is_err());
+        assert!(other_admitted.require_current().is_err());
+        assert!(
+            store
+                .connector_execution_fence(&connector_id)
+                .await
+                .is_err()
+        );
+        assert!(store.connector_execution_fence(&other).await.is_err());
+        assert_eq!(
+            std::fs::read(&obstruction).unwrap(),
+            b"preserve this obstruction"
         );
     }
 

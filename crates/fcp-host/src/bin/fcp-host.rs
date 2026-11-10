@@ -167,6 +167,8 @@ use tower::ServiceExt;
 mod connector_state_transfer;
 #[path = "fcp-host/deployment_evidence.rs"]
 mod deployment_evidence;
+#[path = "fcp-host/egress_oauth.rs"]
+mod egress_oauth;
 #[path = "fcp-host/guarded_invoke.rs"]
 mod guarded_invoke;
 #[path = "fcp-host/http_batch.rs"]
@@ -2266,7 +2268,7 @@ struct SubprocessRegistry {
 /// Runtime queues can outlive registry selection. Retain the generation that
 /// authorized the invocation and check it again at actual runtime activation.
 /// Already active work retains its existing cancellation/settlement semantics.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct InventoryDispatchFence {
     version: Arc<AtomicU64>,
     admitted_generation: u64,
@@ -7851,6 +7853,10 @@ async fn verify_live_request_for_target(
     execution_target: Option<&TailscaleNodeId>,
     rate_limit_mode: RateLimitMode,
 ) -> HostResult<VerifiedLiveRequest> {
+    let execution_fence = state
+        .lifecycle
+        .connector_execution_fence(&request.connector_id)
+        .await?;
     // Connector home-zone binding (br-flywheel_connectors-by4vu).
     //
     // Without this gate, a structurally-valid capability token signed for
@@ -8056,6 +8062,7 @@ async fn verify_live_request_for_target(
 
     // Membership may have changed while persisted policy or quota was awaited.
     enforce_live_holder_proof(state, request, verified_claims)?;
+    execution_fence.require_current()?;
 
     Ok(VerifiedLiveRequest {
         principal: principal.to_owned(),
@@ -8180,6 +8187,14 @@ async fn evaluate_live_admission(
     execution_target: Option<&TailscaleNodeId>,
     rate_limit_mode: RateLimitMode,
 ) -> PreflightResponse {
+    let execution_fence = match state
+        .lifecycle
+        .connector_execution_fence(&request.connector_id)
+        .await
+    {
+        Ok(fence) => fence,
+        Err(error) => return preflight_response_from_error(error),
+    };
     let mut response = state
         .discovery
         .preflight(PreflightRequest {
@@ -8202,7 +8217,10 @@ async fn evaluate_live_admission(
             verify_live_request_for_target(state, request, principal_override, target, mode).await
         }
     };
-    match verified {
+    match verified.and_then(|verified| {
+        execution_fence.require_current()?;
+        Ok(verified)
+    }) {
         Ok(verified) => {
             tracing::debug!(
                 event = "live_request_verified",
@@ -9885,7 +9903,8 @@ fn map_credential_pool_error(error: CredentialPoolError) -> (StatusCode, String)
         CredentialPoolError::PoolNotFound { .. }
         | CredentialPoolError::CredentialNotFound { .. }
         | CredentialPoolError::UnknownLease { .. } => StatusCode::NOT_FOUND,
-        CredentialPoolError::PoolExhausted { .. }
+        CredentialPoolError::LeaseSuperseded { .. }
+        | CredentialPoolError::PoolExhausted { .. }
         | CredentialPoolError::PoolWaitRequired { .. } => StatusCode::CONFLICT,
         CredentialPoolError::SelectionIndexInvalid { .. } => StatusCode::INTERNAL_SERVER_ERROR,
     };
@@ -12603,6 +12622,14 @@ async fn preflight_handler(
     headers: HeaderMap,
     Json(request): Json<HostPreflightRequest>,
 ) -> Json<PreflightResponse> {
+    let execution_fence = match state
+        .lifecycle
+        .connector_execution_fence(&request.connector_id)
+        .await
+    {
+        Ok(fence) => fence,
+        Err(error) => return Json(preflight_response_from_error(error)),
+    };
     let asserted_principal =
         extract_principal_header(&headers).or_else(|| request.principal.clone());
     if let Some(router) = state.mesh.clone() {
@@ -12657,12 +12684,19 @@ async fn preflight_handler(
                     format!("preflight request could not be encoded for mesh forwarding: {error}"),
                 )),
             };
+            if let Err(error) = execution_fence.require_current() {
+                return Json(preflight_response_from_error(error));
+            }
             return Json(forwarded.unwrap_or_else(|(_, message)| {
                 preflight_response_from_error(HostError::Unavailable(message))
             }));
         }
     }
-    Json(local_preflight(&state, &request, asserted_principal.as_deref()).await)
+    let response = local_preflight(&state, &request, asserted_principal.as_deref()).await;
+    if let Err(error) = execution_fence.require_current() {
+        return Json(preflight_response_from_error(error));
+    }
+    Json(response)
 }
 
 /// Preflight evaluated against this host's own registry and policy.
@@ -13272,6 +13306,7 @@ async fn maybe_orchestrate_mcp_sampling(
         downstream_request.clone(),
         asserted_principal.map(ToOwned::to_owned),
         Some(deadline),
+        None,
         None,
     )
     .await?;
@@ -13917,9 +13952,43 @@ struct AuthorizedHostEgress {
     correlation_id: Option<String>,
     constraints: NetworkConstraints,
     credential_allow: Vec<String>,
+    inventory_fence: InventoryDispatchFence,
+    execution_fence: fcp_host::ConnectorExecutionFence,
+    capability_fence: fcp_host::CapabilityRevocationFence,
+    capability_expires_at: i64,
+    capability_token_id: ObjectId,
+    capability_issuer: KeyId,
+    revocation_cascade: Arc<RevocationCascadeVerifier>,
+    runtime_revocation: Option<Arc<fcp_host::RuntimeRevocationService>>,
 }
 
 impl AuthorizedHostEgress {
+    fn require_current(&self) -> HostResult<()> {
+        self.inventory_fence.require_current()?;
+        self.execution_fence.require_current()?;
+        self.capability_fence.require_current()?;
+        if Utc::now().timestamp() >= self.capability_expires_at {
+            return Err(HostError::PreflightFailed(
+                "host-egress capability expired before dispatch".to_owned(),
+            ));
+        }
+        if let Some(revocations) = &self.runtime_revocation {
+            revocations.verify(
+                &self.zone_id,
+                self.capability_token_id,
+                self.capability_issuer.clone(),
+            )?;
+        }
+        self.revocation_cascade
+            .verify(self.capability_token_id, self.capability_issuer.clone())
+            .map(|_| ())
+            .map_err(|_| {
+                HostError::PreflightFailed(
+                    "host-egress capability was revoked before dispatch".to_owned(),
+                )
+            })
+    }
+
     fn decision_context(&self) -> fcp_host::RuntimeEgressDecisionContext<'_> {
         fcp_host::RuntimeEgressDecisionContext {
             connector_id: self.connector_id.as_str(),
@@ -13987,6 +14056,14 @@ async fn authorize_host_egress_context(
     resource_uri: &str,
 ) -> HostResult<AuthorizedHostEgress> {
     let (connector_id, operation, zone_id) = parse_host_egress_context(context)?;
+    let execution_fence = state
+        .lifecycle
+        .connector_execution_fence(&connector_id)
+        .await?;
+    let capability_fence = state.lifecycle.capability_revocation_fence();
+    let inventory_fence = state
+        .registry
+        .inventory_fence(state.registry.version.load(Ordering::SeqCst));
     let snapshot = state
         .registry
         .runtime_network_policy_snapshot(&connector_id, &operation)
@@ -14083,6 +14160,14 @@ async fn authorize_host_egress_context(
         .map(ToString::to_string)
         .collect::<Vec<_>>();
 
+    inventory_fence.require_current()?;
+    execution_fence.require_current()?;
+    capability_fence.require_current()?;
+    let capability_expires_at = verified_claims.get_expiration().ok_or_else(|| {
+        HostError::PreflightFailed("host-egress capability has no expiration".to_owned())
+    })?;
+    let capability_token_id = revocation_cascade_token_id(&capability_token, verified_claims)?;
+    let capability_issuer = revocation_cascade_issuer_kid(&capability_token)?;
     Ok(AuthorizedHostEgress {
         connector_id,
         operation,
@@ -14091,6 +14176,14 @@ async fn authorize_host_egress_context(
         correlation_id: context.correlation_id.clone(),
         constraints,
         credential_allow,
+        inventory_fence,
+        execution_fence,
+        capability_fence,
+        capability_expires_at,
+        capability_token_id,
+        capability_issuer,
+        revocation_cascade: Arc::clone(&state.revocation_cascade),
+        runtime_revocation: state.runtime_revocation.clone(),
     })
 }
 
@@ -14131,12 +14224,7 @@ async fn acquire_host_egress_credential_lease(
 }
 
 async fn release_host_egress_credential_lease(state: &AppState, lease: CredentialLease) {
-    if let Err(err) = state
-        .credential_pools
-        .lock()
-        .await
-        .release(&lease.pool_key, lease.token)
-    {
+    if let Err(err) = state.credential_pools.lock().await.release_lease(&lease) {
         tracing::warn!(
             event = "host_egress_credential_release_error",
             provider = %lease.pool_key.provider,
@@ -14250,12 +14338,9 @@ impl HostCredentialInjector {
     }
 
     fn auth_profile_is_refreshable(payload: &CredentialPayload) -> bool {
-        payload.as_auth_profile().is_some_and(|profile| {
-            matches!(
-                profile.method,
-                AuthMethodKind::OAuthDeviceCode(_) | AuthMethodKind::OAuthAuthCode(_)
-            )
-        })
+        payload
+            .as_auth_profile()
+            .is_some_and(|profile| profile.method.refresh_token_material().is_some())
     }
 
     fn raw_json_host_allow(payload: &Value) -> Vec<String> {
@@ -14399,13 +14484,21 @@ async fn host_egress_http_handler(
     let authorized = authorize_host_egress_context(&state, &request.context, &request.url)
         .await
         .map_err(map_host_error)?;
-    let lease = acquire_host_egress_credential_lease(
-        &state,
-        &authorized.zone_id,
-        request.credential_id.as_deref(),
-        &authorized.credential_allow,
+    let lease = fcp_async_core::time::timeout(
+        egress_oauth::remaining_budget(&authorized, started_at).map_err(map_host_error)?,
+        acquire_host_egress_credential_lease(
+            &state,
+            &authorized.zone_id,
+            request.credential_id.as_deref(),
+            &authorized.credential_allow,
+        ),
     )
     .await
+    .map_err(|_| {
+        map_host_error(HostError::PreflightFailed(
+            "host-egress credential acquisition deadline exhausted".to_owned(),
+        ))
+    })?
     .map_err(map_host_error)?;
     let result = authorize_and_perform_host_http_egress(
         &state,
@@ -14428,165 +14521,155 @@ async fn authorize_and_perform_host_http_egress(
     lease: Option<&CredentialLease>,
     started_at: Instant,
 ) -> HostResult<HostEgressHttpResponse> {
-    let leased_injector = HostCredentialInjector::new(lease.cloned());
-    let noop = NoOpCredentialInjector;
-    let injector_ref: &dyn CredentialInjector = if request.credential_id.is_some() {
-        &leased_injector
-    } else {
-        &noop
+    let current_lease = match lease {
+        Some(lease) => Some(
+            egress_oauth::prepare(state, authorized, &request, lease, false, started_at).await?,
+        ),
+        None => None,
     };
-    let response =
-        perform_authorized_host_http_egress_once(authorized, &request, injector_ref, started_at)
-            .await?;
-    if response.status != 401 {
+    let response = perform_authorized_host_http_egress_once(
+        state,
+        authorized,
+        &request,
+        current_lease.as_ref(),
+        started_at,
+    )
+    .await?;
+    if response.status != 401 || !egress_oauth::retry_is_safe(&request.method) {
         return Ok(response);
     }
 
-    let Some(lease) = lease else {
+    let Some(current_lease) = current_lease.as_ref() else {
         return Ok(response);
     };
-    let Some(credential_id) = request.credential_id.as_deref() else {
+    let Some(original_lease) = lease else {
         return Ok(response);
     };
-    if !HostCredentialInjector::auth_profile_is_refreshable(&lease.payload) {
+    // One renewal per request is enough. A 401 from the newly refreshed
+    // bearer may be a scope or account denial, not an invitation to rotate
+    // the refresh token again. Mutating methods are never replayed here.
+    if !current_lease.same_payload_revision(original_lease)
+        || !HostCredentialInjector::auth_profile_is_refreshable(&current_lease.payload)
+    {
         return Ok(response);
     }
 
     let refreshed_lease =
-        refresh_host_egress_credential_after_unauthorized(state, authorized, credential_id, lease)
-            .await?;
-    let refreshed_injector = HostCredentialInjector::new(Some(refreshed_lease));
-    perform_authorized_host_http_egress_once(authorized, &request, &refreshed_injector, started_at)
-        .await
+        egress_oauth::prepare(state, authorized, &request, current_lease, true, started_at).await?;
+    perform_authorized_host_http_egress_once(
+        state,
+        authorized,
+        &request,
+        Some(&refreshed_lease),
+        started_at,
+    )
+    .await
 }
 
 async fn perform_authorized_host_http_egress_once(
+    state: &AppState,
     authorized: &AuthorizedHostEgress,
     request: &HostEgressHttpRequest,
-    injector: &dyn CredentialInjector,
+    lease: Option<&CredentialLease>,
     started_at: Instant,
 ) -> HostResult<HostEgressHttpResponse> {
-    let mut guard_request = EgressHttpRequest {
-        url: request.url.clone(),
-        method: request.method.clone(),
-        headers: request
-            .headers
-            .iter()
-            .map(|header| HttpHeader {
-                name: header.name.clone(),
-                value: header.value.clone(),
+    authorized.require_current()?;
+    // One budget covers DNS, authority refresh, pool contention and transport.
+    fcp_async_core::time::timeout(
+        egress_oauth::remaining_budget(authorized, started_at)?,
+        async {
+            let original_request = EgressHttpRequest {
+                url: request.url.clone(),
+                method: request.method.clone(),
+                headers: request
+                    .headers
+                    .iter()
+                    .map(|header| HttpHeader {
+                        name: header.name.clone(),
+                        value: header.value.clone(),
+                    })
+                    .collect(),
+                body: request.body.as_ref().map(|body| body.as_bytes().to_vec()),
+                credential_id: request.credential_id.clone(),
+            };
+            // Validate the destination and credential grant before even resolving
+            // DNS. These prepared headers are never sent across an await.
+            let mut preliminary_request = original_request.clone();
+            let preliminary_injector = HostCredentialInjector::new(lease.cloned());
+            let noop = NoOpCredentialInjector;
+            let injector: &dyn CredentialInjector = if request.credential_id.is_some() {
+                &preliminary_injector
+            } else {
+                &noop
+            };
+            let mut decision = fcp_host::authorize_runtime_http_egress(
+                &authorized.decision_context(),
+                &authorized.constraints,
+                &mut preliminary_request,
+                injector,
+            )?;
+            let socket_addrs =
+                resolve_host_egress_decision(&mut decision, &authorized.constraints, "HTTP")
+                    .await?;
+            // DNS and refresh waits must not retain expired or revoked authority.
+            // Read the credential after all asynchronous preparation, then inject
+            // into the original headers so superseded API-key headers cannot linger.
+            let current_authority =
+                authorize_host_egress_context(state, &request.context, &request.url).await?;
+            let current_lease = match lease {
+                Some(lease) => Some(
+                    state
+                        .credential_pools
+                        .lock()
+                        .await
+                        .current_lease(lease, Utc::now())
+                        .map_err(|_| {
+                            HostError::PreflightFailed(
+                                "host-egress credential changed before dispatch".to_owned(),
+                            )
+                        })?,
+                ),
+                None => None,
+            };
+            authorized.require_current()?;
+            current_authority.require_current()?;
+            let leased_injector = HostCredentialInjector::new(current_lease);
+            let injector: &dyn CredentialInjector = if request.credential_id.is_some() {
+                &leased_injector
+            } else {
+                &noop
+            };
+            let mut guard_request = original_request;
+            let mut current_decision = fcp_host::authorize_runtime_http_egress(
+                &authorized.decision_context(),
+                &authorized.constraints,
+                &mut guard_request,
+                injector,
+            )?;
+            current_decision.resolved_ips = decision.resolved_ips;
+            let response = perform_host_http_egress(
+                authorized,
+                &guard_request,
+                &current_decision,
+                &authorized.constraints,
+                &socket_addrs,
+            )
+            .await?;
+            Ok(HostEgressHttpResponse {
+                status: response.status,
+                headers: response.headers,
+                body: response.body,
+                egress: authorized.metadata(&current_decision, started_at.elapsed().as_millis()),
             })
-            .collect(),
-        body: request.body.as_ref().map(|body| body.as_bytes().to_vec()),
-        credential_id: request.credential_id.clone(),
-    };
-    let mut decision = fcp_host::authorize_runtime_http_egress(
-        &authorized.decision_context(),
-        &authorized.constraints,
-        &mut guard_request,
-        injector,
-    )?;
-    let total_timeout = Duration::from_millis(u64::from(authorized.constraints.total_timeout_ms));
-    let remaining_timeout = total_timeout
-        .checked_sub(started_at.elapsed())
-        .ok_or_else(|| {
-            HostError::PreflightFailed(format!(
-                "host-egress HTTP request to `{}` timed out after {}ms",
-                decision.canonical_host, authorized.constraints.total_timeout_ms
-            ))
-        })?;
-    let response = fcp_async_core::time::timeout(
-        remaining_timeout,
-        perform_host_http_egress(&guard_request, &mut decision, &authorized.constraints),
+        },
     )
     .await
     .map_err(|_| {
         HostError::PreflightFailed(format!(
-            "host-egress HTTP request to `{}` timed out after {}ms",
-            decision.canonical_host, authorized.constraints.total_timeout_ms
+            "host-egress HTTP request timed out after {}ms",
+            authorized.constraints.total_timeout_ms
         ))
-    })??;
-    Ok(HostEgressHttpResponse {
-        status: response.status,
-        headers: response.headers,
-        body: response.body,
-        egress: authorized.metadata(&decision, started_at.elapsed().as_millis()),
-    })
-}
-
-async fn refresh_host_egress_credential_after_unauthorized(
-    state: &Arc<AppState>,
-    authorized: &AuthorizedHostEgress,
-    credential_id: &str,
-    lease: &CredentialLease,
-) -> HostResult<CredentialLease> {
-    let requested = CredentialId::parse(credential_id).map_err(|err| {
-        HostError::PreflightFailed(format!(
-            "host-egress credential id `{credential_id}` is invalid during refresh: {err}"
-        ))
-    })?;
-    if requested != lease.credential_id {
-        return Err(HostError::PreflightFailed(format!(
-            "host-egress credential id `{credential_id}` does not match leased credential during refresh"
-        )));
-    }
-
-    let host_allow = lease
-        .payload
-        .auth_profile_host_allow()
-        .map(<[String]>::to_vec)
-        .unwrap_or_default();
-    let mut profile = lease.payload.as_auth_profile().cloned().ok_or_else(|| {
-        HostError::PreflightFailed(
-            "host-egress credential refresh requires an auth-profile payload".to_string(),
-        )
-    })?;
-    let transport = BlockingOAuthTransport::new().map_err(|err| {
-        HostError::PreflightFailed(format!("host-egress OAuth refresh transport failed: {err}"))
-    })?;
-    let cx = fcp_async_core::compatibility_cx();
-    let refresh_result = match &mut profile.method {
-        AuthMethodKind::OAuthDeviceCode(method) => {
-            method.refresh_with_transport(&cx, &transport).await
-        }
-        AuthMethodKind::OAuthAuthCode(method) => {
-            method.refresh_with_transport(&cx, &transport).await
-        }
-        other => {
-            return Err(HostError::PreflightFailed(format!(
-                "host-egress credential method `{}` is not refreshable after 401",
-                other.id()
-            )));
-        }
-    };
-    refresh_result.map_err(|err| {
-        HostError::PreflightFailed(format!(
-            "host-egress OAuth credential refresh failed: {err}"
-        ))
-    })?;
-
-    let refreshed_payload = CredentialPayload::auth_profile_with_allowed_hosts(profile, host_allow);
-    state
-        .credential_pools
-        .lock()
-        .await
-        .replace_payload_in_zone(
-            &authorized.zone_id,
-            lease.credential_id,
-            refreshed_payload.clone(),
-        )
-        .map_err(|err| {
-            HostError::PreflightFailed(format!(
-                "host-egress refreshed credential could not be persisted: {err}"
-            ))
-        })?;
-
-    Ok(CredentialLease {
-        token: lease.token,
-        credential_id: lease.credential_id,
-        payload: refreshed_payload,
-        pool_key: lease.pool_key.clone(),
-    })
+    })?
 }
 
 struct RawHttpEgressResponse {
@@ -14808,9 +14891,11 @@ fn host_egress_rustls_client_config(
 }
 
 async fn perform_host_http_egress(
+    authorized: &AuthorizedHostEgress,
     request: &EgressHttpRequest,
-    decision: &mut fcp_sandbox::EgressDecision,
+    decision: &fcp_sandbox::EgressDecision,
     constraints: &NetworkConstraints,
+    socket_addrs: &[SocketAddr],
 ) -> HostResult<RawHttpEgressResponse> {
     let url = url::Url::parse(&request.url).map_err(|err| {
         HostError::PreflightFailed(format!("host-egress HTTP URL rejected after policy: {err}"))
@@ -14829,7 +14914,6 @@ async fn perform_host_http_egress(
             decision.canonical_host
         )));
     }
-    let socket_addrs = resolve_host_egress_decision(decision, constraints, "HTTP").await?;
     let mut builder = reqwest::Client::builder()
         .use_rustls_tls()
         .connect_timeout(Duration::from_millis(u64::from(
@@ -14847,7 +14931,7 @@ async fn perform_host_http_egress(
             vec![b"h2".to_vec(), b"http/1.1".to_vec()],
         )?);
     }
-    builder = builder.resolve_to_addrs(&decision.canonical_host, &socket_addrs);
+    builder = builder.resolve_to_addrs(&decision.canonical_host, socket_addrs);
     let client = builder.build().map_err(|err| {
         HostError::PreflightFailed(format!(
             "host-egress HTTP client for `{}` could not be built: {err}",
@@ -14888,6 +14972,7 @@ async fn perform_host_http_egress(
         "host-egress HTTP request (max_redirects={})",
         constraints.max_redirects
     );
+    authorized.require_current()?;
     let response = outbound.send().await.map_err(|err| {
         map_reqwest_host_egress_error(err, &request_error_label, &decision.canonical_host)
     })?;
@@ -15305,6 +15390,7 @@ async fn authorize_and_perform_host_tcp_egress(
     injector: &dyn CredentialInjector,
     started_at: Instant,
 ) -> HostResult<HostEgressTcpResponse> {
+    authorized.require_current()?;
     let guard_request = EgressTcpConnectRequest {
         host: request.host.clone(),
         port: request.port,
@@ -15318,9 +15404,10 @@ async fn authorize_and_perform_host_tcp_egress(
         &guard_request,
         injector,
     )?;
+    authorized.require_current()?;
     let response = fcp_async_core::time::timeout(
         Duration::from_millis(u64::from(authorized.constraints.total_timeout_ms)),
-        perform_host_tcp_egress(&request, &mut decision, &authorized.constraints),
+        perform_host_tcp_egress(&request, &mut decision, authorized),
     )
     .await
     .map_err(|_| {
@@ -15346,9 +15433,14 @@ struct RawTcpEgressResponse {
 async fn perform_host_tcp_egress(
     request: &HostEgressTcpRequest,
     decision: &mut fcp_sandbox::EgressTcpDecision,
-    constraints: &NetworkConstraints,
+    authorized: &AuthorizedHostEgress,
 ) -> HostResult<RawTcpEgressResponse> {
+    authorized.require_current()?;
+    let constraints = &authorized.constraints;
     let mut stream = host_egress_tcp_io(request, &mut decision.decision, constraints).await?;
+    // DNS, socket connection and TLS negotiation may all outlive admission.
+    // Recheck before disclosing credentials or starting the requested effect.
+    authorized.require_current()?;
     let mut bytes_written = 0_u64;
     if let Some(auth) = decision.tcp_auth.as_deref() {
         stream.write_all(auth).await.map_err(|err| {
@@ -15359,6 +15451,7 @@ async fn perform_host_tcp_egress(
         bytes_written = bytes_written.saturating_add(auth.len().try_into().unwrap_or(u64::MAX));
     }
     if let Some(write) = request.write.as_ref() {
+        authorized.require_current()?;
         stream.write_all(write.as_bytes()).await.map_err(|err| {
             HostError::PreflightFailed(format!("host-egress TCP write failed: {err}"))
         })?;
@@ -15435,15 +15528,32 @@ async fn route_invoke_with_deadline(
     let deadline = http_batch::route_deadline(Instant::now(), request.deadline_ms, parent_deadline);
     let Some(router) = state.mesh.clone() else {
         constrain_invoke_deadline(&mut request, deadline);
-        return invoke_jobs::execute(state, request, asserted_principal, Some(deadline), None)
-            .await
-            .map_err(map_host_error);
+        return invoke_jobs::execute(
+            state,
+            request,
+            asserted_principal,
+            Some(deadline),
+            None,
+            None,
+        )
+        .await
+        .map_err(map_host_error);
     };
     request.validate_idempotency_key().map_err(|err| {
         map_host_error(HostError::InvalidFilter(format!(
             "invalid invoke request: {err}"
         )))
     })?;
+    let execution_fence = before_invoke_route_deadline(
+        deadline,
+        state
+            .lifecycle
+            .connector_execution_fence(&request.connector_id),
+        "connector lifecycle authority",
+    )
+    .await
+    .and_then(std::convert::identity)
+    .map_err(map_host_error)?;
     let decision = match before_invoke_route_deadline(
         deadline,
         mesh_route_decision(
@@ -15486,21 +15596,28 @@ async fn route_invoke_with_deadline(
         return Err(map_host_error(error));
     }
     if decision.is_forward() {
-        return mesh_forward_invoke(
+        return mesh_forward_invoke_with_fence(
             state,
             &router,
             &request,
             asserted_principal.as_deref(),
             decision,
             deadline,
+            execution_fence,
         )
         .await;
     }
     constrain_invoke_deadline(&mut request, deadline);
-    let mut response =
-        invoke_jobs::execute(state, request, asserted_principal, Some(deadline), None)
-            .await
-            .map_err(map_host_error)?;
+    let mut response = invoke_jobs::execute(
+        state,
+        request,
+        asserted_principal,
+        Some(deadline),
+        None,
+        Some(execution_fence),
+    )
+    .await
+    .map_err(map_host_error)?;
     stamp_invoke_route(
         &mut response,
         InvokeRouteProvenance::host_backed(
@@ -15551,7 +15668,7 @@ async fn execute_local_invoke(
     asserted_principal: Option<String>,
     relay: Option<fcp_host::RelayCancellationBinding>,
 ) -> Result<InvokeResponse, (StatusCode, String)> {
-    invoke_jobs::execute(state, request, asserted_principal, None, relay)
+    invoke_jobs::execute(state, request, asserted_principal, None, relay, None)
         .await
         .map_err(map_host_error)
 }
@@ -15574,6 +15691,31 @@ fn stamp_invoke_route(response: &mut InvokeResponse, route: InvokeRouteProvenanc
 /// registrations. Ordinary operations and diagnostic reads stay local when
 /// available. A known election never falls through to a different advertiser.
 async fn mesh_route_decision(
+    state: &AppState,
+    router: &fcp_host::mesh_routing::MeshRouter,
+    connector_id: &ConnectorId,
+    zone_id: Option<&ZoneId>,
+    operation: Option<&str>,
+) -> HostResult<fcp_mesh::invoke_route::InvokeRouteDecision> {
+    let execution_fence = if operation.is_some() {
+        Some(
+            state
+                .lifecycle
+                .connector_execution_fence(connector_id)
+                .await?,
+        )
+    } else {
+        None
+    };
+    let decision =
+        mesh_route_decision_inner(state, router, connector_id, zone_id, operation).await?;
+    if let Some(fence) = execution_fence {
+        fence.require_current()?;
+    }
+    Ok(decision)
+}
+
+async fn mesh_route_decision_inner(
     state: &AppState,
     router: &fcp_host::mesh_routing::MeshRouter,
     connector_id: &ConnectorId,
@@ -15748,9 +15890,10 @@ struct MeshForwardJob {
     registered_locally: bool,
     started_at: Instant,
     deadline: Instant,
+    execution_fence: fcp_host::ConnectorExecutionFence,
 }
 
-#[allow(clippy::too_many_lines)]
+#[cfg(test)]
 async fn mesh_forward_invoke(
     state: &Arc<AppState>,
     router: &Arc<fcp_host::mesh_routing::MeshRouter>,
@@ -15758,6 +15901,38 @@ async fn mesh_forward_invoke(
     asserted_principal: Option<&str>,
     decision: fcp_mesh::invoke_route::InvokeRouteDecision,
     deadline: Instant,
+) -> Result<InvokeResponse, (StatusCode, String)> {
+    let execution_fence = before_invoke_route_deadline(
+        deadline,
+        state
+            .lifecycle
+            .connector_execution_fence(&request.connector_id),
+        "connector lifecycle authority",
+    )
+    .await
+    .and_then(std::convert::identity)
+    .map_err(map_host_error)?;
+    mesh_forward_invoke_with_fence(
+        state,
+        router,
+        request,
+        asserted_principal,
+        decision,
+        deadline,
+        execution_fence,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn mesh_forward_invoke_with_fence(
+    state: &Arc<AppState>,
+    router: &Arc<fcp_host::mesh_routing::MeshRouter>,
+    request: &InvokeRequest,
+    asserted_principal: Option<&str>,
+    decision: fcp_mesh::invoke_route::InvokeRouteDecision,
+    deadline: Instant,
+    execution_fence: fcp_host::ConnectorExecutionFence,
 ) -> Result<InvokeResponse, (StatusCode, String)> {
     let started_at = Instant::now();
     let fcp_mesh::invoke_route::InvokeRouteDecision::Forward {
@@ -15774,6 +15949,7 @@ async fn mesh_forward_invoke(
     let admission = before_invoke_route_deadline(
         deadline,
         async {
+            execution_fence.require_current()?;
             let registered_locally = state
                 .registry
                 .allow_list_snapshot(&request.connector_id)
@@ -15815,6 +15991,7 @@ async fn mesh_forward_invoke(
                     .append(&audit_ctx, fcp_host::InvokePhase::PreflightAllow)
                     .map_err(|error| invoke_audit_unavailable("mesh preflight allow", error))?;
             }
+            execution_fence.require_current()?;
             Ok(registered_locally)
         },
         "mesh invoke admission",
@@ -15850,6 +16027,7 @@ async fn mesh_forward_invoke(
                     registered_locally,
                     started_at,
                     deadline,
+                    execution_fence,
                 },
             ),
         )
@@ -15879,6 +16057,7 @@ async fn run_mesh_forward_job(
         registered_locally,
         started_at,
         deadline,
+        execution_fence,
     } = job;
     let state = state.as_ref();
     let router = router.as_ref();
@@ -15972,6 +16151,7 @@ async fn run_mesh_forward_job(
         }
         last_target = candidate.clone();
         let prepared = async {
+            execution_fence.require_current().map_err(map_host_error)?;
             if registered_locally {
                 before_invoke_route_deadline(
                     deadline,
@@ -16018,6 +16198,7 @@ async fn run_mesh_forward_job(
                         .to_string(),
                 )));
             }
+            execution_fence.require_current().map_err(map_host_error)?;
             Ok(fcp_mesh::invoke_route::MeshForwardBody::Invoke {
                 request_json,
                 asserted_principal: asserted_principal.map(str::to_owned),
@@ -26060,6 +26241,660 @@ output_schema = {{ type = "object" }}
                 "host egress response must not echo Gmail OAuth material"
             );
         }
+    }
+
+    fn orefresh1_token_exchange(expires_in: u64) -> HostOAuthLoopbackExpectedRequest {
+        HostOAuthLoopbackExpectedRequest {
+            method: "POST",
+            path: "/token",
+            body_contains: vec![
+                "grant_type=refresh_token",
+                "refresh_token=orefresh1-old-refresh",
+                "client_id=orefresh1-client",
+                "scope=read",
+            ],
+            response: json!({
+                "access_token": "orefresh1-new-access",
+                "token_type": "Bearer",
+                "expires_in": expires_in,
+                "refresh_token": "orefresh1-new-refresh",
+                "scope": "read"
+            }),
+        }
+    }
+
+    fn orefresh1_blocked_token_server(
+        expires_in: u64,
+    ) -> (
+        HostOAuthLoopbackServer,
+        oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut entered_tx = Some(entered_tx);
+        let server = HostOAuthLoopbackServer::start_before_response(
+            vec![orefresh1_token_exchange(expires_in)],
+            move || {
+                entered_tx
+                    .take()
+                    .expect("one refresh request")
+                    .send(())
+                    .expect("refresh observer remains alive");
+                release_rx
+                    .recv_timeout(Duration::from_secs(4))
+                    .expect("test releases the token response");
+            },
+        );
+        (server, entered_rx, release_tx)
+    }
+
+    async fn orefresh1_egress_fixture(
+        token_base_url: &str,
+        api_addr: SocketAddr,
+        device_code: bool,
+        expires_in: Duration,
+        total_timeout_ms: u32,
+    ) -> (Arc<AppState>, HostEgressHttpRequest) {
+        let connector_id = "fcp.test.orefresh1:utility:1.0.0";
+        let operation_id = "test.egress_http";
+        let credential_id =
+            CredentialId::parse("0ef0e501-0001-4000-8000-000000000001").expect("credential id");
+        let tokens = OAuthTokens::bearer(
+            "orefresh1-old-access",
+            Some(expires_in),
+            Some("orefresh1-old-refresh"),
+            Some("read"),
+        )
+        .expect("fixture OAuth tokens");
+        let method = if device_code {
+            let mut method = OAuthDeviceCodeAuth::new(
+                "orefresh1-client",
+                format!("{token_base_url}/device"),
+                format!("{token_base_url}/token"),
+                "read write",
+            )
+            .expect("fixture device-code config");
+            method.apply_tokens(tokens);
+            AuthMethodKind::OAuthDeviceCode(method)
+        } else {
+            let mut method = OAuthAuthCodeAuth::confidential_client(
+                "orefresh1-client",
+                "orefresh1-client-secret",
+                format!("{token_base_url}/authorize"),
+                format!("{token_base_url}/token"),
+                "http://127.0.0.1/oauth/callback",
+                "read write",
+                false,
+            )
+            .expect("fixture auth-code config");
+            method.apply_tokens(tokens);
+            AuthMethodKind::OAuthAuthCode(method)
+        };
+        let profile = AuthProfile::new("primary", "orefresh1", method, "OAuth fixture", 0)
+            .expect("fixture OAuth profile");
+        let mut constraints = d9us6_loopback_constraints(api_addr.port());
+        constraints.total_timeout_ms = total_timeout_ms;
+        let (state, signing_key) = d9us6_host_egress_state_with_constraints(
+            connector_id,
+            operation_id,
+            constraints,
+            credential_id,
+            json!({"host_allow": ["127.0.0.1"]}),
+        )
+        .await;
+        state
+            .credential_pools
+            .lock()
+            .await
+            .replace_payload_in_zone(
+                &ZoneId::work(),
+                credential_id,
+                CredentialPayload::auth_profile_with_allowed_hosts(profile, ["127.0.0.1"]),
+            )
+            .expect("install OAuth profile");
+        let token = d9us6_token_with_credentials(&signing_key, operation_id, vec![credential_id]);
+        let request = HostEgressHttpRequest {
+            context: d9us6_host_egress_context(
+                connector_id,
+                operation_id,
+                "req-orefresh1",
+                "corr-orefresh1",
+                &token,
+            ),
+            url: format!("http://{api_addr}/v1/resource"),
+            method: "GET".to_owned(),
+            headers: Vec::new(),
+            body: None,
+            credential_id: Some(credential_id.to_string()),
+        };
+        (state, request)
+    }
+
+    fn orefresh1_token_material(payload: &CredentialPayload) -> (&str, &str) {
+        let profile = payload.as_auth_profile().expect("OAuth payload");
+        let (access, refresh) = match &profile.method {
+            AuthMethodKind::OAuthAuthCode(method) => (&method.access_token, &method.refresh_token),
+            AuthMethodKind::OAuthDeviceCode(method) => {
+                (&method.access_token, &method.refresh_token)
+            }
+            _ => panic!("expected refreshable OAuth method"),
+        };
+        (
+            access.as_ref().expect("access token").expose_secret(),
+            refresh.as_ref().expect("refresh token").expose_secret(),
+        )
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn br_orefresh1_expired_oauth_refreshes_before_the_first_api_request() {
+        for device_code in [false, true] {
+            let observed_api = Arc::new(StdMutex::new(None));
+            let (api_addr, api_task) = d9us6_one_shot_http_server(Arc::clone(&observed_api)).await;
+            let before_token_response = Arc::clone(&observed_api);
+            let oauth = HostOAuthLoopbackServer::start_before_response(
+                vec![orefresh1_token_exchange(3600)],
+                move || {
+                    assert!(
+                        before_token_response
+                            .lock()
+                            .expect("API observation")
+                            .is_none(),
+                        "an expired bearer must never reach the API before renewal"
+                    );
+                },
+            );
+            let (state, request) = orefresh1_egress_fixture(
+                &oauth.base_url,
+                api_addr,
+                device_code,
+                Duration::ZERO,
+                3_000,
+            )
+            .await;
+            let credential_id = CredentialId::parse(request.credential_id.as_deref().unwrap())
+                .expect("fixture credential id");
+            let response = host_egress_http_handler(State(Arc::clone(&state)), Json(request))
+                .await
+                .expect("expired OAuth refreshes through the production HTTP handler")
+                .0;
+            api_task.await.expect("API server completes");
+            let (observed_oauth, errors) = oauth.join();
+            assert!(errors.is_empty(), "OAuth loopback errors: {errors:?}");
+            assert_eq!(observed_oauth.len(), 1);
+            assert!(observed_oauth[0].1.contains("scope=read"));
+            assert!(
+                !observed_oauth[0].1.contains("write"),
+                "renewal must preserve the narrower granted scope"
+            );
+            assert_eq!(response.status, 200);
+            assert!(response.egress.credential_injected);
+            let observed = observed_api
+                .lock()
+                .expect("API observation")
+                .clone()
+                .unwrap();
+            assert!(
+                observed
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer orefresh1-new-access")
+            );
+            assert!(!observed.contains("orefresh1-old-access"));
+            assert!(!observed.contains("orefresh1-new-refresh"));
+            assert!(!observed.contains("orefresh1-client-secret"));
+            let mut pools = state.credential_pools.lock().await;
+            let lease = pools
+                .acquire_specific_in_zone(&ZoneId::work(), credential_id, Utc::now())
+                .expect("refreshed credential remains selectable");
+            assert_eq!(
+                orefresh1_token_material(&lease.payload),
+                ("orefresh1-new-access", "orefresh1-new-refresh")
+            );
+            assert_eq!(
+                lease.payload.auth_profile_host_allow().unwrap(),
+                ["127.0.0.1"]
+            );
+            pools
+                .release_lease(&lease)
+                .expect("release inspection lease");
+            assert_eq!(
+                pools
+                    .redacted_view(&lease.pool_key, Utc::now())
+                    .unwrap()
+                    .entries[0]
+                    .active_leases,
+                0,
+                "the production handler must release its original reservation after refresh"
+            );
+            let public_response = serde_json::to_string(&response).expect("public response");
+            for secret in [
+                "orefresh1-old-access",
+                "orefresh1-new-access",
+                "orefresh1-old-refresh",
+                "orefresh1-new-refresh",
+                "orefresh1-client-secret",
+            ] {
+                assert!(!public_response.contains(secret));
+            }
+        }
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn br_orefresh1_concurrent_expiry_and_401_coalesce_rotating_refresh_tokens() {
+        for unauthorized in [false, true] {
+            let api_listener = StdTcpListener::bind("127.0.0.1:0").expect("API listener");
+            let (oauth, entered_rx, release_tx) = orefresh1_blocked_token_server(60);
+            let (state, request) = orefresh1_egress_fixture(
+                &oauth.base_url,
+                api_listener.local_addr().unwrap(),
+                false,
+                if unauthorized {
+                    Duration::from_secs(3600)
+                } else {
+                    Duration::ZERO
+                },
+                3_000,
+            )
+            .await;
+            let authorized = authorize_host_egress_context(&state, &request.context, &request.url)
+                .await
+                .expect("authorize refresh fixture");
+            let credential_id =
+                CredentialId::parse(request.credential_id.as_deref().unwrap()).unwrap();
+            let (first_lease, second_lease) = {
+                let mut pools = state.credential_pools.lock().await;
+                (
+                    pools
+                        .acquire_specific_in_zone(&ZoneId::work(), credential_id, Utc::now())
+                        .unwrap(),
+                    pools
+                        .acquire_specific_in_zone(&ZoneId::work(), credential_id, Utc::now())
+                        .unwrap(),
+                )
+            };
+            let started_at = Instant::now();
+            let mut first = Box::pin(egress_oauth::prepare(
+                &state,
+                &authorized,
+                &request,
+                &first_lease,
+                unauthorized,
+                started_at,
+            ));
+            let entered = fcp_async_core::time::timeout(
+                Duration::from_secs(2),
+                futures_util::future::select(first.as_mut(), Box::pin(entered_rx)),
+            )
+            .await
+            .expect("first refresh reaches token provider");
+            assert!(matches!(
+                entered,
+                futures_util::future::Either::Right((Ok(()), _))
+            ));
+            let gate = first_lease.refresh_gate();
+            assert!(
+                gate.try_lock().is_none(),
+                "provider exchange owns the per-credential gate"
+            );
+            let mut second = Box::pin(egress_oauth::prepare(
+                &state,
+                &authorized,
+                &request,
+                &second_lease,
+                unauthorized,
+                started_at,
+            ));
+            assert!(futures_util::poll!(second.as_mut()).is_pending());
+            release_tx
+                .send(())
+                .expect("release the single token response");
+            let (first, second) = futures_util::future::join(first, second).await;
+            let first = first.expect("first refresh commits");
+            let second = second.expect("waiting request observes committed refresh");
+            assert!(first.same_payload_revision(&second));
+            assert!(!first.same_payload_revision(&first_lease));
+            assert_eq!(
+                orefresh1_token_material(&second.payload),
+                ("orefresh1-new-access", "orefresh1-new-refresh")
+            );
+            // Even a token shorter than the proactive window satisfies these
+            // already-admitted requests; stale 401s must not rotate it again.
+            let late = egress_oauth::prepare(
+                &state,
+                &authorized,
+                &request,
+                &second_lease,
+                true,
+                started_at,
+            )
+            .await
+            .expect("late stale 401 shares the completed refresh");
+            assert!(late.same_payload_revision(&first));
+            let (observed, errors) = oauth.join();
+            assert!(errors.is_empty(), "OAuth loopback errors: {errors:?}");
+            assert_eq!(
+                observed.len(),
+                1,
+                "only one rotating-token exchange is allowed"
+            );
+            let mut pools = state.credential_pools.lock().await;
+            pools.release_lease(&first_lease).unwrap();
+            pools.release_lease(&second_lease).unwrap();
+        }
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn br_orefresh1_refresh_gate_wait_uses_the_remaining_request_deadline() {
+        let token_listener = StdTcpListener::bind("127.0.0.1:0").expect("token listener");
+        token_listener.set_nonblocking(true).unwrap();
+        let api_listener = StdTcpListener::bind("127.0.0.1:0").expect("API listener");
+        let (state, request) = orefresh1_egress_fixture(
+            &format!("http://{}", token_listener.local_addr().unwrap()),
+            api_listener.local_addr().unwrap(),
+            false,
+            Duration::ZERO,
+            3_000,
+        )
+        .await;
+        let authorized = authorize_host_egress_context(&state, &request.context, &request.url)
+            .await
+            .unwrap();
+        let lease = acquire_host_egress_credential_lease(
+            &state,
+            &authorized.zone_id,
+            request.credential_id.as_deref(),
+            &authorized.credential_allow,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let gate = lease.refresh_gate();
+        let held_refresh = gate.lock().await;
+        let error = fcp_async_core::time::timeout(
+            Duration::from_secs(1),
+            egress_oauth::prepare(
+                &state,
+                &authorized,
+                &request,
+                &lease,
+                false,
+                Instant::now() - Duration::from_millis(2_900),
+            ),
+        )
+        .await
+        .expect("the gate wait must consume the remaining 100ms, not a new 3s budget")
+        .expect_err("a held refresh gate must hit the request deadline");
+        assert!(error.to_string().contains("deadline exhausted"));
+        drop(held_refresh);
+        assert!(gate.try_lock().is_some());
+        assert_eq!(
+            token_listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        let mut pools = state.credential_pools.lock().await;
+        assert!(
+            pools
+                .current_lease(&lease, Utc::now())
+                .unwrap()
+                .same_payload_revision(&lease)
+        );
+        pools.release_lease(&lease).unwrap();
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn br_orefresh1_token_provider_deadline_cancels_without_publishing_late_tokens() {
+        let api_listener = StdTcpListener::bind("127.0.0.1:0").expect("API listener");
+        let (oauth, entered_rx, release_tx) = orefresh1_blocked_token_server(3600);
+        let (state, request) = orefresh1_egress_fixture(
+            &oauth.base_url,
+            api_listener.local_addr().unwrap(),
+            true,
+            Duration::ZERO,
+            3_000,
+        )
+        .await;
+        let authorized = authorize_host_egress_context(&state, &request.context, &request.url)
+            .await
+            .unwrap();
+        let lease = acquire_host_egress_credential_lease(
+            &state,
+            &authorized.zone_id,
+            request.credential_id.as_deref(),
+            &authorized.credential_allow,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let mut pending = Box::pin(egress_oauth::prepare(
+            &state,
+            &authorized,
+            &request,
+            &lease,
+            false,
+            Instant::now() - Duration::from_millis(2_500),
+        ));
+        let entered = futures_util::future::select(pending.as_mut(), Box::pin(entered_rx)).await;
+        assert!(matches!(
+            entered,
+            futures_util::future::Either::Right((Ok(()), _))
+        ));
+        let error = fcp_async_core::time::timeout(Duration::from_secs(1), pending)
+            .await
+            .expect("provider exchange must consume only the remaining request budget")
+            .expect_err("blocked token provider exceeds the deadline");
+        release_tx.send(()).expect("release late token response");
+        let (observed, errors) = oauth.join();
+        assert!(errors.is_empty(), "OAuth loopback errors: {errors:?}");
+        assert_eq!(observed.len(), 1);
+        assert!(
+            error.to_string().contains("deadline") || error.to_string().contains("refresh failed")
+        );
+        assert!(
+            lease.refresh_gate().try_lock().is_some(),
+            "cancellation releases the gate"
+        );
+        let mut pools = state.credential_pools.lock().await;
+        let current = pools.current_lease(&lease, Utc::now()).unwrap();
+        assert!(current.same_payload_revision(&lease));
+        assert_eq!(
+            orefresh1_token_material(&current.payload),
+            ("orefresh1-old-access", "orefresh1-old-refresh")
+        );
+        pools.release_lease(&lease).unwrap();
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn br_orefresh1_denied_destination_does_not_contact_token_or_api_endpoints() {
+        for denied_by in ["network", "credential"] {
+            let token_listener = StdTcpListener::bind("127.0.0.1:0").expect("token listener");
+            token_listener.set_nonblocking(true).unwrap();
+            let api_listener = StdTcpListener::bind("127.0.0.1:0").expect("API listener");
+            api_listener.set_nonblocking(true).unwrap();
+            let (state, mut request) = orefresh1_egress_fixture(
+                &format!("http://{}", token_listener.local_addr().unwrap()),
+                api_listener.local_addr().unwrap(),
+                false,
+                Duration::ZERO,
+                1_000,
+            )
+            .await;
+            if denied_by == "network" {
+                request.url = format!(
+                    "http://localhost:{}/v1/resource",
+                    api_listener.local_addr().unwrap().port()
+                );
+            } else {
+                let credential_id =
+                    CredentialId::parse(request.credential_id.as_deref().unwrap()).unwrap();
+                let mut pools = state.credential_pools.lock().await;
+                let lease = pools
+                    .acquire_specific_in_zone(&ZoneId::work(), credential_id, Utc::now())
+                    .unwrap();
+                let profile = lease.payload.as_auth_profile().unwrap().clone();
+                pools
+                    .replace_payload_in_zone(
+                        &ZoneId::work(),
+                        credential_id,
+                        CredentialPayload::auth_profile_with_allowed_hosts(
+                            profile,
+                            ["other-api.example.test"],
+                        ),
+                    )
+                    .unwrap();
+                pools.release_lease(&lease).unwrap();
+            }
+            host_egress_http_handler(State(state), Json(request))
+                .await
+                .expect_err("both destination allowlists must be checked before refreshing an expired token");
+            for listener in [token_listener, api_listener] {
+                assert_eq!(
+                    listener.accept().unwrap_err().kind(),
+                    std::io::ErrorKind::WouldBlock
+                );
+            }
+        }
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn br_orefresh1_inflight_refresh_cannot_restore_removed_or_replaced_credentials() {
+        for change in ["replace", "remove", "recreate"] {
+            let api_listener = StdTcpListener::bind("127.0.0.1:0").expect("API listener");
+            api_listener.set_nonblocking(true).unwrap();
+            let (oauth, entered_rx, release_tx) = orefresh1_blocked_token_server(3600);
+            let (state, request) = orefresh1_egress_fixture(
+                &oauth.base_url,
+                api_listener.local_addr().unwrap(),
+                false,
+                Duration::ZERO,
+                3_000,
+            )
+            .await;
+            let credential_id =
+                CredentialId::parse(request.credential_id.as_deref().unwrap()).unwrap();
+            let pool_key =
+                CredentialPoolKey::new(ProviderKey::new("d9us6-fixture").unwrap(), ZoneId::work());
+            let mut pending = Box::pin(host_egress_http_handler(
+                State(Arc::clone(&state)),
+                Json(request),
+            ));
+            let entered = fcp_async_core::time::timeout(
+                Duration::from_secs(2),
+                futures_util::future::select(pending.as_mut(), Box::pin(entered_rx)),
+            )
+            .await
+            .expect("request reaches token endpoint before administrative change");
+            assert!(matches!(
+                entered,
+                futures_util::future::Either::Right((Ok(()), _))
+            ));
+            let operator_payload = json!({
+                "host_allow": ["new-api.example.test"],
+                "http": {"bearer_token": "orefresh1-operator-replacement"}
+            });
+            {
+                let mut pools = state.credential_pools.lock().await;
+                if change == "remove" || change == "recreate" {
+                    pools.remove_credential(&pool_key, credential_id).unwrap();
+                }
+                if change == "replace" {
+                    pools
+                        .replace_payload_in_zone(
+                            &ZoneId::work(),
+                            credential_id,
+                            CredentialPayload::raw_json(operator_payload.clone()),
+                        )
+                        .unwrap();
+                } else if change == "recreate" {
+                    pools
+                        .add_credential(
+                            pool_key.clone(),
+                            CredentialPoolStrategy::Priority,
+                            PooledCredentialInput::new(
+                                credential_id,
+                                fcp_host::CredentialSource::Manual,
+                                37,
+                                "new operator credential",
+                                operator_payload.clone(),
+                            )
+                            .into_credential(),
+                            CredentialUpsertMode::RejectExisting,
+                        )
+                        .unwrap();
+                }
+            }
+            release_tx
+                .send(())
+                .expect("release response after admin change");
+            let error = pending
+                .await
+                .expect_err("stale refresh cannot dispatch after an admin change");
+            let (observed, errors) = oauth.join();
+            assert!(errors.is_empty(), "OAuth loopback errors: {errors:?}");
+            assert_eq!(observed.len(), 1);
+            assert!(error.1.contains("credential"));
+            assert!(!error.1.contains("orefresh1-new-access"));
+            assert!(!error.1.contains("orefresh1-old-refresh"));
+            assert_eq!(
+                api_listener.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+            let mut pools = state.credential_pools.lock().await;
+            let view = pools.redacted_view(&pool_key, Utc::now()).unwrap();
+            if change == "remove" {
+                assert!(
+                    view.entries.is_empty(),
+                    "refresh must not resurrect a removed credential"
+                );
+                assert!(
+                    pools
+                        .acquire_specific_in_zone(&ZoneId::work(), credential_id, Utc::now())
+                        .is_err()
+                );
+            } else {
+                assert_eq!(view.entries[0].active_leases, 0);
+                let current = pools
+                    .acquire_specific_in_zone(&ZoneId::work(), credential_id, Utc::now())
+                    .unwrap();
+                assert_eq!(current.payload.as_raw_json(), Some(&operator_payload));
+                pools.release_lease(&current).unwrap();
+                if change == "recreate" {
+                    assert_eq!(view.entries[0].priority, 37);
+                    assert_eq!(view.entries[0].label, "new operator credential");
+                }
+            }
+        }
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn br_orefresh1_post_401_is_returned_without_refresh_or_replay() {
+        let token_listener = StdTcpListener::bind("127.0.0.1:0").expect("token listener");
+        token_listener.set_nonblocking(true).unwrap();
+        let (api_addr, api_task) = br_4kw5f_9_6_1_one_shot_http_response(
+            b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 2\r\nConnection: close\r\n\r\nNO"
+                .to_vec(),
+        )
+        .await;
+        let (state, mut request) = orefresh1_egress_fixture(
+            &format!("http://{}", token_listener.local_addr().unwrap()),
+            api_addr,
+            false,
+            Duration::from_secs(3600),
+            1_000,
+        )
+        .await;
+        request.method = "POST".to_owned();
+        request.body = Some(fcp_manifest::Base64Bytes::from_vec(b"write-once".to_vec()));
+        let response = host_egress_http_handler(State(state), Json(request))
+            .await
+            .expect("a mutating request must return its first HTTP response")
+            .0;
+        api_task.await.expect("single API request completes");
+        assert_eq!(response.status, 401);
+        assert_eq!(response.body.as_bytes(), b"NO");
+        assert_eq!(
+            token_listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
     }
 
     #[fcp_async_core::runtime::test(flavor = "multi_thread")]

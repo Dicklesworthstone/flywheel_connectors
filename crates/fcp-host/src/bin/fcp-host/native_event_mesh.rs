@@ -166,6 +166,16 @@ pub(super) async fn dispatch(
     forwarded: bool,
 ) -> Result<Value, (StatusCode, String)> {
     let work = async {
+        let execution_fence = if matches!(&request, Request::Close(_)) {
+            None
+        } else {
+            Some(
+                host.lifecycle
+                    .connector_execution_fence(&request.authority().connector_id)
+                    .await
+                    .map_err(map_host_error)?,
+            )
+        };
         if forwarded && request.executor().is_none() {
             return Err(map_host_error(invalid(
                 "forwarded streams require an explicit executor node",
@@ -185,6 +195,9 @@ pub(super) async fn dispatch(
                     ));
                 }
                 let body = request.forward_body()?;
+                if let Some(fence) = &execution_fence {
+                    fence.require_current().map_err(map_host_error)?;
+                }
                 // One attempt, one exact peer. Even transport failures known
                 // to precede delivery do not select another custody journal.
                 let reply = router.forward(target, body).await.map_err(|_| (
@@ -228,10 +241,13 @@ pub(super) async fn dispatch(
                 return Ok(value);
             }
         }
+        if let Some(fence) = &execution_fence {
+            fence.require_current().map_err(map_host_error)?;
+        }
         let mut value = match request {
-            Request::Open(request) => service.open(host, request).await,
-            Request::Poll(request) => service.poll(host, request).await,
-            Request::Ack(request) => service.acknowledge(host, request).await,
+            Request::Open(request) => service.open(host, request, execution_fence).await,
+            Request::Poll(request) => service.poll(host, request, execution_fence).await,
+            Request::Ack(request) => service.acknowledge(host, request, execution_fence).await,
             Request::Close(request) => service.close(host, request).await,
         }
         .map_err(map_host_error)?;

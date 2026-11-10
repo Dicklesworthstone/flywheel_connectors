@@ -408,6 +408,104 @@ async fn signed_consumer_polls_and_commits_ack_without_connector_rpc() {
 }
 
 #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn lifecycle_disable_blocks_stream_work_preserves_custody_and_allows_authorized_close() {
+    for desired in [
+        fcp_host::DesiredRuntimeState::Disabled,
+        fcp_host::DesiredRuntimeState::Uninstalled,
+    ] {
+        let fixture = fixture().await;
+        let (token, _) = issue(&fixture, issuance("agent:alice")).await;
+        let (other, _) = issue(&fixture, issuance("agent:bob")).await;
+        let authority: StreamAuthority = serde_json::from_value(auth(&token)).unwrap();
+        let admitted = fixture
+            .host
+            .native_events
+            .authorize(&fixture.host, &authority, true, None)
+            .await
+            .unwrap();
+        fixture
+            .journal
+            .poll(STREAM, &owner_binding(), &instance(), 1)
+            .unwrap();
+        fixture
+            .host
+            .lifecycle
+            .set_desired_state(&ConnectorId::from_static(CONNECTOR), desired, None)
+            .await
+            .unwrap();
+        let app = app(&fixture);
+        for route in ["open", "poll", "ack"] {
+            let mut body = json!({"auth":auth(&token),"stream_id":STREAM});
+            if route == "ack" {
+                body["ack"] = json!(acknowledgement());
+            }
+            let (status, body) = send(app.clone(), &format!("/rpc/streams/{route}"), body).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{route}: {body}");
+            assert!(!body.contains("private-native-event-sentinel"));
+        }
+        let retained = fixture.journal.describe(STREAM).unwrap();
+        assert_eq!(retained.pending_events, 1);
+        assert_eq!(retained.acknowledged_events, 0);
+        assert!(!retained.closed);
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+
+        fixture
+            .host
+            .lifecycle
+            .set_desired_state(
+                &ConnectorId::from_static(CONNECTOR),
+                fcp_host::DesiredRuntimeState::Enabled,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            fixture
+                .host
+                .native_events
+                .authorize_retained(&fixture.host, &authority, &admitted, STREAM)
+                .is_err(),
+            "reenabling does not restore a consumer admission captured before disable"
+        );
+        let (status, body) = send(
+            app.clone(),
+            "/rpc/streams/poll",
+            json!({"auth":auth(&token),"stream_id":STREAM}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("private-native-event-sentinel"));
+
+        fixture
+            .host
+            .lifecycle
+            .set_desired_state(&ConnectorId::from_static(CONNECTOR), desired, None)
+            .await
+            .unwrap();
+        let (status, _) = send(
+            app.clone(),
+            "/rpc/streams/close",
+            json!({"auth":auth(&other),"stream_id":STREAM}),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "cleanup still requires the retained owner"
+        );
+        let (status, body) = send(
+            app,
+            "/rpc/streams/close",
+            json!({"auth":auth(&token),"stream_id":STREAM}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(fixture.journal.describe(STREAM).unwrap().closed);
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
 async fn signed_holder_reads_acknowledges_and_closes_without_connector_rpc() {
     let mut fixture = fixture().await;
     let (_membership, holder) = install_holder_membership(&mut fixture);
@@ -513,7 +611,7 @@ async fn owner_membership_withdrawal_blocks_holder_reads_and_custody_changes() {
     let admission = fixture
         .host
         .native_events
-        .authorize(&fixture.host, &authority)
+        .authorize(&fixture.host, &authority, true, None)
         .await
         .unwrap();
     fixture

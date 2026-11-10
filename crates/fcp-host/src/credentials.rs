@@ -8,6 +8,7 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Duration, Utc};
@@ -711,6 +712,37 @@ pub struct CredentialLease {
     pub payload: CredentialPayload,
     /// Provider+zone pool that issued the lease.
     pub pool_key: CredentialPoolKey,
+    // These identities never depend on secret bytes. Administrative writes
+    // replace both; successful refreshes retain the gate and rotate revision.
+    pool_incarnation: Arc<()>,
+    payload_revision: Arc<()>,
+    refresh_gate: Arc<futures_util::lock::Mutex<()>>,
+}
+
+impl CredentialLease {
+    /// Gate shared by leases for this exact credential incarnation.
+    ///
+    /// Hold it while rereading the live lease, contacting the OAuth provider,
+    /// and conditionally committing the result. Do not hold the pool registry
+    /// lock while waiting for the gate or the provider. A caller must bound
+    /// the wait and refresh by its remaining request budget.
+    #[must_use]
+    pub fn refresh_gate(&self) -> Arc<futures_util::lock::Mutex<()>> {
+        Arc::clone(&self.refresh_gate)
+    }
+
+    /// Whether two lease snapshots refer to the same admitted payload.
+    ///
+    /// No credential equality check or hash is exposed. A refresh changes
+    /// this witness even if a provider returns identical token strings.
+    #[must_use]
+    pub fn same_payload_revision(&self, other: &Self) -> bool {
+        self.pool_key == other.pool_key
+            && self.credential_id == other.credential_id
+            && Arc::ptr_eq(&self.pool_incarnation, &other.pool_incarnation)
+            && Arc::ptr_eq(&self.refresh_gate, &other.refresh_gate)
+            && Arc::ptr_eq(&self.payload_revision, &other.payload_revision)
+    }
 }
 
 impl fmt::Debug for CredentialLease {
@@ -792,11 +824,13 @@ pub struct CredentialPoolView {
 #[derive(Debug, Clone)]
 pub struct CredentialPool {
     key: CredentialPoolKey,
+    incarnation: Arc<()>,
     strategy: CredentialPoolStrategy,
     sticky_policy: StickyCredentialPolicy,
     exhausted_behavior: PoolExhaustedBehavior,
     max_concurrent_per_credential: u32,
     entries: Vec<PooledCredential>,
+    payload_states: HashMap<CredentialId, CredentialPayloadState>,
     active_leases: HashMap<CredentialId, u32>,
     lease_index: HashMap<CredentialLeaseToken, CredentialId>,
     round_robin_cursor: usize,
@@ -804,6 +838,12 @@ pub struct CredentialPool {
     sticky_restick_target: Option<CredentialId>,
     sticky_current_uses: u32,
     next_lease_serial: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CredentialPayloadState {
+    revision: Arc<()>,
+    refresh_gate: Arc<futures_util::lock::Mutex<()>>,
 }
 
 impl CredentialPool {
@@ -815,14 +855,20 @@ impl CredentialPool {
         mut entries: Vec<PooledCredential>,
     ) -> Self {
         sort_entries(&mut entries);
+        let payload_states = entries
+            .iter()
+            .map(|entry| (entry.credential_id, CredentialPayloadState::default()))
+            .collect();
 
         Self {
             key,
+            incarnation: Arc::new(()),
             strategy,
             sticky_policy: StickyCredentialPolicy::default(),
             exhausted_behavior: PoolExhaustedBehavior::FailFast,
             max_concurrent_per_credential: DEFAULT_MAX_CONCURRENT_PER_CREDENTIAL,
             entries,
+            payload_states,
             active_leases: HashMap::new(),
             lease_index: HashMap::new(),
             round_robin_cursor: 0,
@@ -900,6 +946,7 @@ impl CredentialPool {
         credential: PooledCredential,
         mode: CredentialUpsertMode,
     ) -> Result<CredentialMutationOutcome, CredentialPoolError> {
+        let credential_id = credential.credential_id;
         if let Some(index) = self.index_of(credential.credential_id) {
             if mode == CredentialUpsertMode::RejectExisting {
                 return Err(CredentialPoolError::DuplicateCredential {
@@ -913,12 +960,16 @@ impl CredentialPool {
                 });
             };
             *entry = credential;
+            self.payload_states
+                .insert(credential_id, CredentialPayloadState::default());
             sort_entries(&mut self.entries);
             self.round_robin_cursor = self.round_robin_cursor.min(self.entries.len());
             return Ok(CredentialMutationOutcome::Replaced);
         }
 
         self.entries.push(credential);
+        self.payload_states
+            .insert(credential_id, CredentialPayloadState::default());
         sort_entries(&mut self.entries);
         if !self.entries.is_empty() {
             self.round_robin_cursor %= self.entries.len();
@@ -942,6 +993,8 @@ impl CredentialPool {
             return Err(CredentialPoolError::CredentialNotFound { credential_id });
         };
         entry.payload = payload;
+        self.payload_states
+            .insert(credential_id, CredentialPayloadState::default());
         Ok(())
     }
 
@@ -959,6 +1012,7 @@ impl CredentialPool {
             return Err(CredentialPoolError::CredentialNotFound { credential_id });
         };
         let removed = self.entries.remove(index);
+        self.payload_states.remove(&credential_id);
         self.active_leases.remove(&credential_id);
         self.lease_index
             .retain(|_, leased_credential_id| *leased_credential_id != credential_id);
@@ -1051,6 +1105,12 @@ impl CredentialPool {
         };
         let credential_id = entry.credential_id;
         let payload = entry.payload.clone();
+        let payload_state = self
+            .payload_states
+            .get(&credential_id)
+            .ok_or(CredentialPoolError::LeaseSuperseded { credential_id })?;
+        let payload_revision = Arc::clone(&payload_state.revision);
+        let refresh_gate = Arc::clone(&payload_state.refresh_gate);
         entry.last_used_at = Some(now);
         if self.strategy == CredentialPoolStrategy::Sticky {
             self.record_sticky_selection(credential_id);
@@ -1066,6 +1126,9 @@ impl CredentialPool {
             credential_id,
             payload,
             pool_key: self.key.clone(),
+            pool_incarnation: Arc::clone(&self.incarnation),
+            payload_revision,
+            refresh_gate,
         })
     }
 
@@ -1106,6 +1169,12 @@ impl CredentialPool {
             });
         };
         let payload = entry.payload.clone();
+        let payload_state = self
+            .payload_states
+            .get(&credential_id)
+            .ok_or(CredentialPoolError::LeaseSuperseded { credential_id })?;
+        let payload_revision = Arc::clone(&payload_state.revision);
+        let refresh_gate = Arc::clone(&payload_state.refresh_gate);
         entry.last_used_at = Some(now);
         if self.strategy == CredentialPoolStrategy::Sticky {
             self.record_sticky_selection(credential_id);
@@ -1121,7 +1190,142 @@ impl CredentialPool {
             credential_id,
             payload,
             pool_key: self.key.clone(),
+            pool_incarnation: Arc::clone(&self.incarnation),
+            payload_revision,
+            refresh_gate,
         })
+    }
+
+    /// Read the current payload for an already admitted live lease.
+    ///
+    /// Completed refreshes are visible without acquiring another lease or
+    /// charging another selection. Administrative replacement, deletion,
+    /// release, and cooldown are rechecked before returning any material.
+    /// OAuth access-token expiry is deliberately handled by the refresh caller.
+    ///
+    /// # Errors
+    /// Returns an error for a missing, released, superseded, or cooled-down
+    /// credential. An existing lease is not rejected by the selection ceiling.
+    pub fn current_lease(
+        &self,
+        lease: &CredentialLease,
+        now: DateTime<Utc>,
+    ) -> Result<CredentialLease, CredentialPoolError> {
+        self.require_live_reservation(lease)?;
+        let entry = self
+            .entries
+            .iter()
+            .find(|entry| entry.credential_id == lease.credential_id)
+            .ok_or(CredentialPoolError::CredentialNotFound {
+                credential_id: lease.credential_id,
+            })?;
+        let payload_state = self.payload_states.get(&lease.credential_id).ok_or(
+            CredentialPoolError::LeaseSuperseded {
+                credential_id: lease.credential_id,
+            },
+        )?;
+        if !Arc::ptr_eq(&lease.refresh_gate, &payload_state.refresh_gate) {
+            return Err(CredentialPoolError::LeaseSuperseded {
+                credential_id: lease.credential_id,
+            });
+        }
+        if !entry.is_available(now) {
+            return match (
+                self.exhausted_behavior,
+                entry
+                    .cooldown
+                    .as_ref()
+                    .and_then(|value| value.available_at(now)),
+            ) {
+                (PoolExhaustedBehavior::Wait, Some(available_at)) => {
+                    Err(CredentialPoolError::PoolWaitRequired {
+                        key: self.key.clone(),
+                        available_at,
+                    })
+                }
+                _ => Err(CredentialPoolError::PoolExhausted {
+                    key: self.key.clone(),
+                }),
+            };
+        }
+        Ok(CredentialLease {
+            token: lease.token,
+            credential_id: lease.credential_id,
+            payload: entry.payload.clone(),
+            pool_key: self.key.clone(),
+            pool_incarnation: Arc::clone(&self.incarnation),
+            payload_revision: Arc::clone(&payload_state.revision),
+            refresh_gate: Arc::clone(&payload_state.refresh_gate),
+        })
+    }
+
+    /// Commit refreshed material only if the live lease still names its source.
+    ///
+    /// The caller holds the credential's refresh gate across read, provider
+    /// refresh, and commit. A successful commit keeps the incarnation and
+    /// active-lease accounting but rotates its revision even for identical
+    /// material. `Ok(None)` means another refresh already superseded the
+    /// supplied snapshot; the candidate is discarded without modifying state.
+    ///
+    /// # Errors
+    /// Returns the same live-admission errors as [`Self::current_lease`].
+    pub fn replace_payload_if_current(
+        &mut self,
+        lease: &CredentialLease,
+        payload: CredentialPayload,
+        now: DateTime<Utc>,
+    ) -> Result<Option<CredentialLease>, CredentialPoolError> {
+        let current = self.current_lease(lease, now)?;
+        if !lease.same_payload_revision(&current) {
+            return Ok(None);
+        }
+        let credential_id = lease.credential_id;
+        let index = self
+            .index_of(credential_id)
+            .ok_or(CredentialPoolError::CredentialNotFound { credential_id })?;
+        let payload_state = self
+            .payload_states
+            .get_mut(&credential_id)
+            .ok_or(CredentialPoolError::LeaseSuperseded { credential_id })?;
+        let revision = Arc::new(());
+        payload_state.revision = Arc::clone(&revision);
+        self.entries[index].payload = payload.clone();
+        Ok(Some(CredentialLease {
+            token: lease.token,
+            credential_id,
+            payload,
+            pool_key: self.key.clone(),
+            pool_incarnation: Arc::clone(&self.incarnation),
+            payload_revision: revision,
+            refresh_gate: Arc::clone(&payload_state.refresh_gate),
+        }))
+    }
+
+    fn require_live_reservation(&self, lease: &CredentialLease) -> Result<(), CredentialPoolError> {
+        if lease.pool_key != self.key || !Arc::ptr_eq(&lease.pool_incarnation, &self.incarnation) {
+            return Err(CredentialPoolError::LeaseSuperseded {
+                credential_id: lease.credential_id,
+            });
+        }
+        if self.lease_index.get(&lease.token) != Some(&lease.credential_id) {
+            return Err(CredentialPoolError::UnknownLease { token: lease.token });
+        }
+        Ok(())
+    }
+
+    /// Release exactly this reservation, including after its auth was replaced.
+    ///
+    /// Unlike a numeric token alone, the lease's pool incarnation cannot refer
+    /// to a newly admitted request after a whole-pool replacement.
+    ///
+    /// # Errors
+    /// Rejects an absent reservation or a lease from a different pool incarnation.
+    pub fn release_lease(
+        &mut self,
+        lease: &CredentialLease,
+    ) -> Result<CredentialId, CredentialPoolError> {
+        self.require_live_reservation(lease)?;
+        self.release(lease.token)
     }
 
     /// Release a previously acquired lease.
@@ -1176,6 +1380,8 @@ impl CredentialPool {
         };
         entry.error_count = entry.error_count.saturating_add(1);
         entry.cooldown = cooldown_for_error(kind, retry_after, now);
+        self.payload_states
+            .insert(credential_id, CredentialPayloadState::default());
         self.displace_sticky_current(credential_id);
         Ok(())
     }
@@ -1210,6 +1416,8 @@ impl CredentialPool {
         let displace_sticky = cooldown.is_some();
         entry.cooldown = cooldown;
         if displace_sticky {
+            self.payload_states
+                .insert(credential_id, CredentialPayloadState::default());
             self.displace_sticky_current(credential_id);
         }
         Ok(())
@@ -1457,8 +1665,14 @@ impl CredentialPoolRegistry {
         Self::default()
     }
 
-    /// Insert or replace a pool.
-    pub fn upsert(&mut self, pool: CredentialPool) -> Option<CredentialPool> {
+    /// Insert or replace a pool, invalidating previous payload admissions.
+    pub fn upsert(&mut self, mut pool: CredentialPool) -> Option<CredentialPool> {
+        pool.incarnation = Arc::new(());
+        pool.active_leases.clear();
+        pool.lease_index.clear();
+        for payload_state in pool.payload_states.values_mut() {
+            *payload_state = CredentialPayloadState::default();
+        }
         self.pools.insert(pool.key.clone(), pool)
     }
 
@@ -1719,6 +1933,69 @@ impl CredentialPoolRegistry {
         Ok(())
     }
 
+    /// Read refreshed payload state through an existing exact-pool lease.
+    ///
+    /// This does not repeat the zone-wide provider search or acquire another
+    /// lease. Removal, replacement, release, and cooldown remain authoritative.
+    ///
+    /// # Errors
+    /// Returns [`CredentialPoolError::PoolNotFound`] when the original pool
+    /// no longer exists, or the live-admission error from the original pool.
+    pub fn current_lease(
+        &self,
+        lease: &CredentialLease,
+        now: DateTime<Utc>,
+    ) -> Result<CredentialLease, CredentialPoolError> {
+        self.pools
+            .get(&lease.pool_key)
+            .ok_or_else(|| CredentialPoolError::PoolNotFound {
+                key: lease.pool_key.clone(),
+            })?
+            .current_lease(lease, now)
+    }
+
+    /// Conditionally publish refreshed auth into the exact leased pool.
+    ///
+    /// Only a successful comparison emits a redacted mutation audit event.
+    /// Stale snapshots never overwrite a rotated token or administrative edit.
+    ///
+    /// # Errors
+    /// Returns [`CredentialPoolError::PoolNotFound`] when the original pool
+    /// no longer exists, or its live-admission error at commit time.
+    pub fn replace_payload_if_current(
+        &mut self,
+        lease: &CredentialLease,
+        payload: CredentialPayload,
+        now: DateTime<Utc>,
+    ) -> Result<Option<CredentialLease>, CredentialPoolError> {
+        let updated = self
+            .pool_mut_or_err(&lease.pool_key)?
+            .replace_payload_if_current(lease, payload, now)?;
+        if updated.is_some() {
+            self.record_audit(CredentialPoolAuditEvent::credential_upsert(
+                lease.pool_key.clone(),
+                lease.credential_id,
+                CredentialMutationOutcome::Replaced,
+                now,
+            ));
+        }
+        Ok(updated)
+    }
+
+    /// Release an exact reservation without accepting a reused pool serial.
+    ///
+    /// Auth replacement or cooldown does not prevent cleanup of the original
+    /// lease. A replacement pool's unrelated reservation remains untouched.
+    ///
+    /// # Errors
+    /// Returns a missing-pool, superseded-pool, or unknown-reservation error.
+    pub fn release_lease(
+        &mut self,
+        lease: &CredentialLease,
+    ) -> Result<CredentialId, CredentialPoolError> {
+        self.pool_mut_or_err(&lease.pool_key)?.release_lease(lease)
+    }
+
     /// Release a previously acquired registry lease.
     ///
     /// # Errors
@@ -1887,6 +2164,12 @@ pub enum CredentialPoolError {
     UnknownLease {
         /// Unknown token.
         token: CredentialLeaseToken,
+    },
+    /// An administrative write replaced or disabled the lease's credential.
+    #[error("credential lease was superseded for {credential_id}")]
+    LeaseSuperseded {
+        /// Stable credential identity; never secret material.
+        credential_id: CredentialId,
     },
     /// Credential ID is not part of the pool.
     #[error("credential {credential_id} is not part of the pool")]
@@ -2779,6 +3062,287 @@ mod tests {
         assert!(rendered.contains("[redacted]"));
         assert!(!rendered.contains("api_key"));
         assert!(!rendered.contains("secret-1"));
+    }
+
+    #[test]
+    fn credential_refresh_commits_once_and_waiters_observe_the_rotated_payload() {
+        let mut registry = CredentialPoolRegistry::new();
+        let pool_key = key("openai");
+        registry.upsert(three_entry_pool(CredentialPoolStrategy::Priority));
+        let first = registry.acquire(&pool_key, now()).expect("first lease");
+        let waiter = registry.acquire(&pool_key, now()).expect("waiting lease");
+        assert!(first.same_payload_revision(&waiter));
+        assert!(Arc::ptr_eq(&first.refresh_gate(), &waiter.refresh_gate()));
+        let refreshed = registry
+            .replace_payload_if_current(
+                &first,
+                CredentialPayload::raw_json(serde_json::json!({"api_key": "rotated-secret"})),
+                now(),
+            )
+            .expect("conditional refresh")
+            .expect("first refresh publishes");
+        assert!(!first.same_payload_revision(&refreshed));
+        assert!(Arc::ptr_eq(
+            &first.refresh_gate(),
+            &refreshed.refresh_gate()
+        ));
+        let current = registry
+            .current_lease(&waiter, now())
+            .expect("waiter reads the new payload through its original lease");
+        assert!(current.same_payload_revision(&refreshed));
+        assert_eq!(current.token, waiter.token);
+        assert_eq!(
+            current.payload.as_raw_json().expect("raw payload")["api_key"],
+            "rotated-secret"
+        );
+        assert!(
+            registry
+                .replace_payload_if_current(&waiter, first.payload.clone(), now())
+                .expect("stale comparison is a clean miss")
+                .is_none()
+        );
+        assert_eq!(registry.audit_events().len(), 1);
+        assert!(
+            registry
+                .current_lease(&waiter, now())
+                .expect("stale commit kept current material")
+                .same_payload_revision(&refreshed)
+        );
+        let view = registry.get(&pool_key).expect("pool").redacted_view(now());
+        assert_eq!(view.entries[0].active_leases, 2);
+        assert_eq!(view.entries[0].priority, 10);
+        assert_eq!(view.entries[0].label, "first");
+        let rendered = format!("{refreshed:?} {current:?} {:?}", registry.audit_events());
+        assert!(!rendered.contains("rotated-secret"));
+        registry
+            .release(&pool_key, first.token)
+            .expect("first release");
+        registry
+            .release(&pool_key, waiter.token)
+            .expect("waiter release");
+        assert_eq!(
+            registry
+                .get(&pool_key)
+                .expect("pool")
+                .redacted_view(now())
+                .entries[0]
+                .active_leases,
+            0
+        );
+    }
+
+    #[test]
+    fn credential_refresh_revision_rotates_even_for_identical_provider_material() {
+        let mut pool = three_entry_pool(CredentialPoolStrategy::Priority);
+        let lease = pool.acquire(now()).expect("lease");
+        let refreshed = pool
+            .replace_payload_if_current(&lease, lease.payload.clone(), now())
+            .expect("non-rotating provider refresh")
+            .expect("commit");
+        assert!(!lease.same_payload_revision(&refreshed));
+        assert!(
+            pool.replace_payload_if_current(&lease, lease.payload.clone(), now())
+                .expect("stale comparison")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn credential_refresh_admin_replacement_invalidates_pending_admission() {
+        for replace_entry in [false, true] {
+            let mut pool = three_entry_pool(CredentialPoolStrategy::Priority);
+            let lease = pool.acquire(now()).expect("lease before admin edit");
+            if replace_entry {
+                pool.add_credential(
+                    entry(0x01, 10, "first"),
+                    CredentialUpsertMode::ReplaceExisting,
+                )
+                .expect("replace identical entry");
+            } else {
+                pool.replace_payload(lease.credential_id, lease.payload.clone())
+                    .expect("replace identical payload");
+            }
+            assert_eq!(
+                pool.current_lease(&lease, now())
+                    .expect_err("old admission denied"),
+                CredentialPoolError::LeaseSuperseded {
+                    credential_id: lease.credential_id
+                }
+            );
+            assert!(matches!(
+                pool.replace_payload_if_current(
+                    &lease,
+                    CredentialPayload::raw_json(serde_json::json!({"api_key": "stale-rotation"})),
+                    now(),
+                ),
+                Err(CredentialPoolError::LeaseSuperseded { .. })
+            ));
+            let current = pool.acquire(now()).expect("new admission");
+            assert!(!Arc::ptr_eq(&lease.refresh_gate(), &current.refresh_gate()));
+            assert_eq!(
+                current.payload.as_raw_json().expect("raw payload")["api_key"],
+                "secret-1"
+            );
+            pool.release_lease(&lease)
+                .expect("old lease remains releasable");
+            pool.release(current.token).expect("new lease release");
+        }
+    }
+
+    #[test]
+    fn credential_refresh_cooldown_fences_inflight_work_even_after_reenable() {
+        for cooldown in [
+            CredentialCooldown::Permanent,
+            CredentialCooldown::Until {
+                until: now() + Duration::seconds(10),
+            },
+        ] {
+            let mut pool = three_entry_pool(CredentialPoolStrategy::Priority);
+            let lease = pool.acquire(now()).expect("lease before disable");
+            pool.set_cooldown(lease.credential_id, Some(cooldown))
+                .expect("disable credential");
+            pool.clear_cooldown(lease.credential_id)
+                .expect("reenable credential");
+            assert!(matches!(
+                pool.replace_payload_if_current(&lease, lease.payload.clone(), now()),
+                Err(CredentialPoolError::LeaseSuperseded { .. })
+            ));
+            assert!(matches!(
+                pool.current_lease(&lease, now()),
+                Err(CredentialPoolError::LeaseSuperseded { .. })
+            ));
+            assert!(pool.acquire_specific(lease.credential_id, now()).is_ok());
+        }
+    }
+
+    #[test]
+    fn credential_refresh_delete_recreate_and_released_leases_are_rejected() {
+        let mut pool = three_entry_pool(CredentialPoolStrategy::Priority);
+        let removed = pool.acquire(now()).expect("first admission");
+        pool.remove_credential(removed.credential_id)
+            .expect("remove");
+        pool.add_credential(
+            entry(0x01, 10, "first"),
+            CredentialUpsertMode::RejectExisting,
+        )
+        .expect("recreate same credential");
+        let recreated = pool.acquire(now()).expect("new admission");
+        assert!(!removed.same_payload_revision(&recreated));
+        assert!(matches!(
+            pool.replace_payload_if_current(&removed, removed.payload.clone(), now()),
+            Err(CredentialPoolError::UnknownLease { .. })
+        ));
+        pool.release(recreated.token).expect("release");
+        assert!(matches!(
+            pool.current_lease(&recreated, now()),
+            Err(CredentialPoolError::UnknownLease { .. })
+        ));
+        assert!(matches!(
+            pool.replace_payload_if_current(&recreated, recreated.payload.clone(), now()),
+            Err(CredentialPoolError::UnknownLease { .. })
+        ));
+    }
+
+    #[test]
+    fn credential_refresh_pool_replacement_fences_reused_serials_and_cloned_pools() {
+        for clone_pool in [false, true] {
+            let mut registry = CredentialPoolRegistry::new();
+            let pool_key = key("openai");
+            registry.upsert(three_entry_pool(CredentialPoolStrategy::Priority));
+            let old = registry.acquire(&pool_key, now()).expect("old admission");
+            let replacement = if clone_pool {
+                registry.get(&pool_key).expect("pool").clone()
+            } else {
+                three_entry_pool(CredentialPoolStrategy::Priority)
+            };
+            registry.upsert(replacement);
+            let new = registry.acquire(&pool_key, now()).expect("new admission");
+            if !clone_pool {
+                assert_eq!(new.token, old.token, "new pool starts its own serial");
+            }
+            assert!(!new.same_payload_revision(&old));
+            assert!(matches!(
+                registry.replace_payload_if_current(&old, old.payload.clone(), now()),
+                Err(CredentialPoolError::LeaseSuperseded { .. })
+            ));
+            assert!(matches!(
+                registry.release_lease(&old),
+                Err(CredentialPoolError::LeaseSuperseded { .. })
+            ));
+            assert_eq!(
+                registry
+                    .get(&pool_key)
+                    .expect("pool")
+                    .redacted_view(now())
+                    .entries[0]
+                    .active_leases,
+                1,
+                "stale cleanup cannot consume the new reservation"
+            );
+            registry
+                .release_lease(&new)
+                .expect("release new reservation");
+            assert!(registry.audit_events().is_empty());
+        }
+    }
+
+    #[test]
+    fn credential_refresh_gates_are_per_credential_provider_and_zone() {
+        let mut registry = CredentialPoolRegistry::new();
+        let mut leases = Vec::new();
+        for provider in ["first", "second"] {
+            for zone_id in [ZoneId::work(), ZoneId::private()] {
+                let pool_key =
+                    CredentialPoolKey::new(ProviderKey::new(provider).expect("provider"), zone_id);
+                registry.upsert(CredentialPool::new(
+                    pool_key.clone(),
+                    CredentialPoolStrategy::Priority,
+                    vec![entry(0x01, 1, "same credential id")],
+                ));
+                leases.push(registry.acquire(&pool_key, now()).expect("admitted lease"));
+            }
+        }
+        let gate = leases[0].refresh_gate();
+        let guard = gate.try_lock().expect("first leader");
+        assert!(
+            gate.try_lock().is_none(),
+            "second refresh cannot start concurrently"
+        );
+        for other in &leases[1..] {
+            assert!(!leases[0].same_payload_revision(other));
+            assert!(
+                other.refresh_gate().try_lock().is_some(),
+                "unrelated credentials proceed"
+            );
+        }
+        drop(guard);
+        assert!(
+            gate.try_lock().is_some(),
+            "cancelled leader releases the gate"
+        );
+        let mut misbound = leases[0].clone();
+        misbound.pool_key = leases[1].pool_key.clone();
+        assert!(matches!(
+            registry.current_lease(&misbound, now()),
+            Err(CredentialPoolError::LeaseSuperseded { .. })
+        ));
+    }
+
+    #[test]
+    fn credential_refresh_does_not_reacquire_or_consume_selection_capacity() {
+        let mut pool = three_entry_pool(CredentialPoolStrategy::Priority)
+            .with_max_concurrent_per_credential(1);
+        let lease = pool.acquire(now()).expect("only admitted selection");
+        assert!(pool.acquire_specific(lease.credential_id, now()).is_err());
+        let refreshed = pool
+            .replace_payload_if_current(&lease, lease.payload.clone(), now())
+            .expect("existing lease may refresh at capacity")
+            .expect("committed");
+        assert!(pool.current_lease(&refreshed, now()).is_ok());
+        assert_eq!(pool.redacted_view(now()).entries[0].active_leases, 1);
+        pool.release(refreshed.token)
+            .expect("release original reservation");
+        assert!(pool.acquire_specific(lease.credential_id, now()).is_ok());
     }
 
     #[test]

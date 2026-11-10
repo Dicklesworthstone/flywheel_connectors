@@ -722,6 +722,14 @@ async fn wasi_session_queue_rechecks_live_authority_without_entering_guest() {
         fixture.host.as_ref(),
         &request,
         fixture.host.lifecycle.capability_revocation_fence(),
+        Some(
+            fixture
+                .host
+                .lifecycle
+                .connector_execution_fence(&request.connector_id)
+                .await
+                .unwrap(),
+        ),
     )
     .unwrap();
     let slot = fixture

@@ -174,12 +174,36 @@ impl NativeEventTransport {
     }
 
     pub(super) async fn write_json(&self, value: &Value, timeout: Duration) -> io::Result<()> {
+        self.write_json_with_authority(value, timeout, None).await
+    }
+
+    async fn write_json_with_authority(
+        &self,
+        value: &Value,
+        timeout: Duration,
+        authority: Option<&super::live_authority::LiveAuthorityDispatchGuard>,
+    ) -> io::Result<()> {
         let line = serde_json::to_vec(value)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let mut authority_refused = false;
         let result = fcp_async_core::time::timeout(timeout, async {
             let mut writer = self.writer.lock().await;
             if self.failed.is_cancelled() {
                 return Err(self.failure_error());
+            }
+            if let Some(authority) = authority
+                && authority
+                    .refresh()
+                    .and_then(|permit| permit.require_current())
+                    .is_err()
+            {
+                // No frame has started. A denied credit update must not poison
+                // the transport or prevent the consumer from closing it.
+                authority_refused = true;
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "native acknowledgement execution authority changed",
+                ));
             }
             let mut pending = NativeWriteGuard {
                 transport: self,
@@ -194,14 +218,36 @@ impl NativeEventTransport {
         .await
         .map_err(|_| connector_io_timeout_error("stdin write", timeout))
         .and_then(std::convert::identity);
-        if let Err(error) = &result {
+        if let Err(error) = &result
+            && !authority_refused
+        {
             self.fail(error);
         }
         result
     }
 
     /// Credits only come from the host's consumer acknowledgement boundary.
+    #[cfg(test)]
     pub(super) async fn acknowledge(&self, stream_id: &str, ack: &EventAck) -> io::Result<()> {
+        self.acknowledge_guarded(stream_id, ack, None).await
+    }
+
+    pub(super) async fn acknowledge_with_authority(
+        &self,
+        stream_id: &str,
+        ack: &EventAck,
+        authority: &super::live_authority::LiveAuthorityDispatchGuard,
+    ) -> io::Result<()> {
+        self.acknowledge_guarded(stream_id, ack, Some(authority))
+            .await
+    }
+
+    async fn acknowledge_guarded(
+        &self,
+        stream_id: &str,
+        ack: &EventAck,
+        authority: Option<&super::live_authority::LiveAuthorityDispatchGuard>,
+    ) -> io::Result<()> {
         validate_stream_id(stream_id)?;
         let notification = json!({
             "jsonrpc": "2.0",
@@ -217,7 +263,7 @@ impl NativeEventTransport {
                 "native acknowledgement exceeded its byte limit",
             ));
         }
-        self.write_json(&notification, CONNECTOR_RPC_IO_TIMEOUT)
+        self.write_json_with_authority(&notification, CONNECTOR_RPC_IO_TIMEOUT, authority)
             .await
     }
 
@@ -613,6 +659,123 @@ while IFS= read -r _request; do :; done
         control.close_stream("stream-123").await.unwrap();
         let reply = runner.request("health", json!({})).await.unwrap();
         assert_eq!(reply["result"]["closed"], true);
+    }
+
+    #[cfg(unix)]
+    #[fcp_async_core::runtime::test]
+    async fn lifecycle_disable_reenable_fences_queued_ack_without_poisoning_cleanup() {
+        let script = r#"
+IFS= read -r ack || exit 1
+case "$ack" in
+  *'"method":"ack"'*) ;;
+  *) exit 2 ;;
+esac
+IFS= read -r close || exit 1
+case "$close" in
+  *'"method":"stream_close"'*) ;;
+  *) exit 3 ;;
+esac
+IFS= read -r _request || exit 1
+printf '%s\n' '{"jsonrpc":"2.0","id":"0:0","result":{"fresh_ack_and_close":true}}'
+while IFS= read -r _request; do :; done
+"#;
+        let mut runner = spawn_fixture(script, &[]).await;
+        let transport = runner.event_transport.clone();
+        let key = fcp_crypto::ed25519::Ed25519SigningKey::generate();
+        let lifecycle = Arc::new(fcp_host::HostAdminStateStore::new());
+        let registry = Arc::new(
+            crate::SubprocessRegistry::from_configs(Vec::new(), None)
+                .await
+                .unwrap(),
+        );
+        let host = crate::tests::dispatcher_app_state(
+            registry,
+            Arc::clone(&lifecycle),
+            Some(key.verifying_key()),
+            std::collections::HashMap::new(),
+        );
+        let request = fcp_kernel::InvokeRequest {
+            r#type: "invoke".to_owned(),
+            id: fcp_core::RequestId::random(),
+            connector_id: ConnectorId::from_static("fcp.test:stream:1.0.0"),
+            operation: fcp_core::OperationId::from_static("events.subscribe"),
+            zone_id: ZoneId::work(),
+            input: Value::Null,
+            capability_token: crate::tests::test_capability_token(
+                &key,
+                "cap.events",
+                "events.subscribe",
+                ZoneId::work().as_str(),
+            ),
+            holder_proof: None,
+            context: None,
+            idempotency_key: None,
+            lease_seq: None,
+            deadline_ms: None,
+            correlation_id: None,
+            provenance: None,
+            approval_tokens: Vec::new(),
+        };
+        let guard = super::super::live_authority::LiveAuthorityDispatchGuard::new(
+            &host,
+            &request,
+            lifecycle.capability_revocation_fence(),
+            Some(
+                lifecycle
+                    .connector_execution_fence(&request.connector_id)
+                    .await
+                    .unwrap(),
+            ),
+        )
+        .unwrap();
+        let ack = EventAck::new("events", vec![1]);
+        let owner = transport.writer.lock().await;
+        let mut queued = Box::pin(transport.acknowledge_with_authority("stream-123", &ack, &guard));
+        assert!(futures_util::poll!(queued.as_mut()).is_pending());
+        lifecycle
+            .set_desired_state(
+                &request.connector_id,
+                fcp_host::DesiredRuntimeState::Disabled,
+                None,
+            )
+            .await
+            .unwrap();
+        lifecycle
+            .set_desired_state(
+                &request.connector_id,
+                fcp_host::DesiredRuntimeState::Enabled,
+                None,
+            )
+            .await
+            .unwrap();
+        drop(owner);
+        assert_eq!(
+            queued.await.unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert!(
+            !transport.is_failed(),
+            "an undispatched refusal must preserve cleanup transport"
+        );
+        let fresh = super::super::live_authority::LiveAuthorityDispatchGuard::new(
+            &host,
+            &request,
+            lifecycle.capability_revocation_fence(),
+            Some(
+                lifecycle
+                    .connector_execution_fence(&request.connector_id)
+                    .await
+                    .unwrap(),
+            ),
+        )
+        .unwrap();
+        transport
+            .acknowledge_with_authority("stream-123", &ack, &fresh)
+            .await
+            .unwrap();
+        transport.close_stream("stream-123").await.unwrap();
+        let response = runner.request("health", json!({})).await.unwrap();
+        assert_eq!(response["result"]["fresh_ack_and_close"], true);
     }
 
     #[cfg(unix)]

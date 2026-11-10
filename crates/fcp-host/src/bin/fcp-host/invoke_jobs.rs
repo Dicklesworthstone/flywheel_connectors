@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use fcp_async_core::channel::oneshot;
 use fcp_async_core::task::{self, JoinHandle};
-use fcp_host::{HostError, HostResult};
+use fcp_host::{ConnectorExecutionFence, HostError, HostResult};
 use fcp_kernel::InvokeResponse;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 
@@ -399,6 +399,7 @@ pub(super) fn execute<'a>(
     asserted_principal: Option<String>,
     parent_deadline: Option<Instant>,
     relay: Option<fcp_host::RelayCancellationBinding>,
+    execution_fence: Option<ConnectorExecutionFence>,
 ) -> std::pin::Pin<Box<dyn Future<Output = HostResult<InvokeResponse>> + Send + 'a>> {
     Box::pin(async move {
         request.validate_idempotency_key().map_err(|error| {
@@ -420,6 +421,29 @@ pub(super) fn execute<'a>(
             correlation_id: request.correlation_id.as_ref().map(ToString::to_string),
             occurred_at: u64::try_from(chrono::Utc::now().timestamp()).unwrap_or_default(),
         };
+        let execution_fence = match execution_fence {
+            Some(fence) => fence,
+            None => match before_deadline(
+                deadline,
+                state
+                    .lifecycle
+                    .connector_execution_fence(&request.connector_id),
+                "connector lifecycle authority",
+            )
+            .await
+            .and_then(std::convert::identity)
+            {
+                Ok(fence) => fence,
+                Err(error) => {
+                    append_deny(state, &audit, &error.to_string())?;
+                    return Err(error);
+                }
+            },
+        };
+        if let Err(error) = execution_fence.require_current() {
+            append_deny(state, &audit, &error.to_string())?;
+            return Err(error);
+        }
         // Consuming admission, quota and runtime selection must belong to one
         // inventory generation. A publication requires fresh admission.
         let registry_generation = state.registry.version.load(Ordering::SeqCst);
@@ -450,6 +474,10 @@ pub(super) fn execute<'a>(
             return Err(HostError::PreflightFailed(reason));
         }
         if let Err(error) = state.registry.require_generation(registry_generation) {
+            append_deny(state, &audit, &error.to_string())?;
+            return Err(error);
+        }
+        if let Err(error) = execution_fence.require_current() {
             append_deny(state, &audit, &error.to_string())?;
             return Err(error);
         }
@@ -489,6 +517,7 @@ pub(super) fn execute<'a>(
                         deadline,
                         relay,
                         registry_generation,
+                        execution_fence,
                     },
                 )
                 .await
@@ -595,7 +624,11 @@ async fn dispatch(
     deadline: Instant,
     relay: Option<fcp_host::RelayCancellationBinding>,
     registry_generation: u64,
+    execution_fence: ConnectorExecutionFence,
 ) -> (HostResult<InvokeResponse>, bool) {
+    if let Err(error) = execution_fence.require_current() {
+        return (Err(error), false);
+    }
     let target = before_deadline(
         deadline,
         state
@@ -656,6 +689,7 @@ async fn dispatch(
                 state,
                 &request,
                 lifecycle_fence,
+                Some(execution_fence),
             )?;
             let _ = authority_capture.set(authority_guard.clone());
             state.registry.require_generation(registry_generation)?;
@@ -793,6 +827,7 @@ struct AdmittedInvocationContext {
     deadline: Instant,
     relay: Option<fcp_host::RelayCancellationBinding>,
     registry_generation: u64,
+    execution_fence: ConnectorExecutionFence,
 }
 
 async fn run_owned(
@@ -807,6 +842,7 @@ async fn run_owned(
         deadline,
         relay,
         registry_generation,
+        execution_fence,
     } = admitted;
     let remaining_ms = u64::try_from(
         deadline
@@ -852,8 +888,15 @@ async fn run_owned(
     };
 
     state.invoke_jobs.bind_attempt(&ticket)?;
-    let (source_result, dispatched) =
-        dispatch(state, request.clone(), deadline, relay, registry_generation).await;
+    let (source_result, dispatched) = dispatch(
+        state,
+        request.clone(),
+        deadline,
+        relay,
+        registry_generation,
+        execution_fence,
+    )
+    .await;
     let duration_ms = super::elapsed_millis(started_at);
     let terminal = terminal_observation(&source_result, dispatched, deadline, duration_ms);
     let finalize_by = finalization_deadline(deadline);
@@ -989,6 +1032,24 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    async fn dispatch(
+        state: &Arc<crate::AppState>,
+        request: fcp_kernel::InvokeRequest,
+        deadline: Instant,
+        relay: Option<fcp_host::RelayCancellationBinding>,
+        registry_generation: u64,
+    ) -> (HostResult<InvokeResponse>, bool) {
+        let fence = match state
+            .lifecycle
+            .connector_execution_fence(&request.connector_id)
+            .await
+        {
+            Ok(fence) => fence,
+            Err(error) => return (Err(error), false),
+        };
+        super::dispatch(state, request, deadline, relay, registry_generation, fence).await
+    }
 
     struct DispatchFixture {
         state: Arc<crate::AppState>,
@@ -1288,6 +1349,164 @@ mod tests {
     }
 
     #[fcp_async_core::runtime::test]
+    async fn lifecycle_disable_and_uninstall_deny_preflight_and_owned_invoke_until_enabled() {
+        for action in [
+            fcp_host::LifecycleAction::Disable,
+            fcp_host::LifecycleAction::Uninstall,
+        ] {
+            let fixture = dispatch_fixture();
+            let connector_id = fixture.request.connector_id.clone();
+            fixture
+                .state
+                .lifecycle
+                .set_desired_state(&connector_id, fcp_host::DesiredRuntimeState::Enabled, None)
+                .await
+                .unwrap();
+            crate::lifecycle_transition_handler(
+                axum::extract::State(Arc::clone(&fixture.state)),
+                axum::extract::Path(connector_id.to_string()),
+                axum::Json(fcp_host::LifecycleTransitionRequest {
+                    action,
+                    reason: None,
+                    initiated_by: None,
+                    dry_run: false,
+                }),
+            )
+            .await
+            .unwrap();
+            let preflight =
+                crate::evaluate_live_preflight(&fixture.state, &fixture.request, None).await;
+            assert!(!preflight.allowed, "{action:?}");
+            assert!(
+                preflight
+                    .reason
+                    .unwrap()
+                    .contains("disabled or uninstalled")
+            );
+            let result = execute(
+                &fixture.state,
+                fixture.request.clone(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+            assert!(
+                matches!(result, Err(HostError::PreflightFailed(_))),
+                "{action:?}: {result:?}"
+            );
+            assert_eq!(fixture.invoke_count.load(Ordering::SeqCst), 0);
+            assert!(
+                fixture
+                    .state
+                    .lifecycle
+                    .invocation_record(&fixture.request.id.to_string(), None)
+                    .await
+                    .is_none()
+            );
+
+            crate::lifecycle_transition_handler(
+                axum::extract::State(Arc::clone(&fixture.state)),
+                axum::extract::Path(connector_id.to_string()),
+                axum::Json(fcp_host::LifecycleTransitionRequest {
+                    action: fcp_host::LifecycleAction::Enable,
+                    reason: None,
+                    initiated_by: None,
+                    dry_run: false,
+                }),
+            )
+            .await
+            .unwrap();
+            let response = execute(&fixture.state, fixture.request, None, None, None, None)
+                .await
+                .unwrap();
+            assert!(matches!(response.status, fcp_kernel::InvokeStatus::Ok));
+            assert_eq!(fixture.invoke_count.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn lifecycle_disable_reenable_retires_work_waiting_in_preflight_or_native_queue() {
+        for queued in [false, true] {
+            let fixture = dispatch_fixture();
+            let connector_id = fixture.request.connector_id.clone();
+            let operation_id = fixture.request.id.to_string();
+            let fresh_request = fixture.request.clone();
+            fixture
+                .state
+                .lifecycle
+                .set_desired_state(&connector_id, fcp_host::DesiredRuntimeState::Enabled, None)
+                .await
+                .unwrap();
+            if queued {
+                fixture.block_invoke.store(true, Ordering::SeqCst);
+            } else {
+                fixture.block_catalog.store(true, Ordering::SeqCst);
+            }
+            let state = Arc::clone(&fixture.state);
+            let request = fixture.request;
+            let pending =
+                task::spawn(async move { execute(&state, request, None, None, None, None).await });
+            if queued {
+                fixture.invoke_queued.await.unwrap();
+            } else {
+                fixture.catalog_entered.await.unwrap();
+            }
+            fixture
+                .state
+                .lifecycle
+                .set_desired_state(&connector_id, fcp_host::DesiredRuntimeState::Disabled, None)
+                .await
+                .unwrap();
+            fixture
+                .state
+                .lifecycle
+                .set_desired_state(&connector_id, fcp_host::DesiredRuntimeState::Enabled, None)
+                .await
+                .unwrap();
+            if queued {
+                fixture.release_invoke.send(()).unwrap();
+            } else {
+                fixture.release_catalog.send(()).unwrap();
+            }
+            let result = pending.await.unwrap();
+            assert!(
+                matches!(result, Err(HostError::PreflightFailed(_))),
+                "queued={queued}: {result:?}"
+            );
+            assert_eq!(fixture.invoke_count.load(Ordering::SeqCst), 0);
+            let retained = fixture
+                .state
+                .lifecycle
+                .invocation_record(&operation_id, None)
+                .await;
+            if queued {
+                assert_eq!(
+                    retained.unwrap().terminal.unwrap().outcome,
+                    fcp_host::InvocationOutcome::HostError,
+                    "a runtime selection refusal must not fabricate an uncertain effect"
+                );
+            } else {
+                assert!(
+                    retained.is_none(),
+                    "preflight refusal precedes durable admission"
+                );
+            }
+            let mut fresh_request = fresh_request;
+            fresh_request.id = fcp_core::RequestId::random();
+            execute(&fixture.state, fresh_request, None, None, None, None)
+                .await
+                .unwrap();
+            assert_eq!(
+                fixture.invoke_count.load(Ordering::SeqCst),
+                1,
+                "only fresh work after reenable may select an effect"
+            );
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
     async fn live_authority_rejects_lifecycle_revocation_after_native_queue_wait() {
         let fixture = dispatch_fixture();
         fixture.block_invoke.store(true, Ordering::SeqCst);
@@ -1406,6 +1625,14 @@ mod tests {
             &fixture.state,
             &fixture.request,
             fixture.state.lifecycle.capability_revocation_fence(),
+            Some(
+                fixture
+                    .state
+                    .lifecycle
+                    .connector_execution_fence(&fixture.request.connector_id)
+                    .await
+                    .unwrap(),
+            ),
         )
         .unwrap();
         let invocation =
@@ -1491,7 +1718,8 @@ mod tests {
         let request = fixture.request;
         let operation_id = request.id.to_string();
         fixture.block_catalog.store(true, Ordering::SeqCst);
-        let pending = task::spawn(async move { execute(&state, request, None, None, None).await });
+        let pending =
+            task::spawn(async move { execute(&state, request, None, None, None, None).await });
         fixture.catalog_entered.await.unwrap();
         publish_dispatch_fixture_change(&fixture.state, "unrelated").await;
         fixture.release_catalog.send(()).unwrap();
