@@ -100,9 +100,9 @@ impl SigningScope {
 /// Number of URI-encoding passes applied to the canonical request's path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CanonicalPathEncoding {
-    /// Encode each path segment once — Amazon S3.
+    /// Use the already encoded wire path without another pass — Amazon S3.
     Single,
-    /// Encode each path segment twice — every other AWS service.
+    /// Apply one extra encoding pass to the wire path — other AWS services.
     Double,
 }
 
@@ -132,11 +132,10 @@ pub struct SignableRequest {
     /// request line, percent-encoded (e.g. `url::Url::path()` gives this
     /// directly, as `/bucket/my%20key`).
     ///
-    /// The signer percent-DECODES this back to the raw path before building
-    /// the canonical URI, because that is what the service does with what it
-    /// receives. Passing an already-decoded path here signs a different
-    /// resource than the one the request targets whenever the path contains
-    /// anything needing an escape.
+    /// The signer never percent-decodes this path. S3 signs the wire path
+    /// verbatim; other services apply one additional URI-encoding pass after
+    /// resolving literal dot segments. Encoded separators such as `%2F` remain
+    /// part of their original segment rather than becoming `/` separators.
     pub uri: String,
     /// Query string parameters (key → value).
     pub query_params: BTreeMap<String, String>,
@@ -604,26 +603,14 @@ fn uri_encode_path(path: &str) -> String {
         .join("/")
 }
 
-/// Percent-decode a wire path back to the raw bytes the service will see.
-///
-/// Invalid UTF-8 is replaced rather than rejected: the canonical URI is only
-/// ever compared against the service's own rendering, and a request whose path
-/// is not valid UTF-8 will fail on its own merits rather than here.
-fn percent_decode_path(path: &str) -> String {
-    percent_encoding::percent_decode_str(path)
-        .decode_utf8_lossy()
-        .into_owned()
-}
-
 /// Build the canonical URI for a request.
 ///
-/// The service percent-decodes the path it receives and then re-encodes it to
-/// canonicalize, so the signer has to do the same thing: decode the wire path,
-/// then apply the service's required number of encoding passes. Encoding the
-/// wire path directly (the previous behaviour) is only equivalent when the
-/// path contains nothing that needed escaping in the first place — which is
-/// why plain ASCII keys signed correctly while a key with a space, a literal
-/// `%`, or any non-ASCII character produced `SignatureDoesNotMatch`.
+/// Matches AWS's Rust signer (`aws-sigv4/src/http_request/canonical_request.rs`)
+/// and CRT signer (`aws-c-auth/source/aws_signing.c`, `s_append_canonical_path`):
+/// normalize the wire path when requested, then preserve it for single
+/// encoding or apply one extra encoding pass for double encoding. Never decode
+/// escapes: `%2F` and `%252F` identify different paths and must stay distinct.
+/// Mirrors `fcp_provider_auth::canonical_uri`.
 fn canonical_uri_path(
     wire_path: &str,
     encoding: CanonicalPathEncoding,
@@ -639,21 +626,15 @@ fn canonical_uri_path(
     } else {
         format!("/{wire_path}")
     };
-    // Normalise the WIRE path, before decoding. Order matters: decoding first
-    // would turn an encoded `%2F` inside a segment into a real separator, and
-    // normalisation would then treat it as one — silently signing a different
-    // resource than the request targets. Dot segments are unreserved and so are
-    // never percent-encoded on the wire, which is why normalising first loses
-    // nothing.
+    // Resolve only literal separators and dot segments. Percent-encoded dots
+    // and slashes are data in their original segment, not navigation syntax.
     let normalized = match normalization {
         CanonicalPathNormalization::RemoveDotSegments => remove_dot_segments(&rooted),
         CanonicalPathNormalization::Preserve => rooted,
     };
-    let raw = percent_decode_path(&normalized);
-    let once = uri_encode_path(&raw);
     match encoding {
-        CanonicalPathEncoding::Single => once,
-        CanonicalPathEncoding::Double => uri_encode_path(&once),
+        CanonicalPathEncoding::Single => normalized,
+        CanonicalPathEncoding::Double => uri_encode_path(&normalized),
     }
 }
 
@@ -721,7 +702,11 @@ fn remove_dot_segments(path: &str) -> String {
     if resolved.is_empty() {
         return "/".into();
     }
-    let trailing = if path.ends_with('/') { "/" } else { "" };
+    let trailing = if path.ends_with('/') || path.ends_with("/.") || path.ends_with("/..") {
+        "/"
+    } else {
+        ""
+    };
     format!("/{}{trailing}", resolved.join("/"))
 }
 
@@ -799,8 +784,7 @@ mod tests {
     /// which is correct only for a path that needed no escaping to begin with.
     #[test]
     fn canonical_uri_encodes_once_for_s3_and_twice_for_other_services() {
-        // `%20` on the wire decodes to a space, which S3 canonicalizes back to
-        // `%20` — not `%2520`.
+        // S3 keeps the wire escape; other services escape its '%' once more.
         assert_eq!(
             canonical_uri_path(
                 "/bucket/my%20report.pdf",
@@ -834,6 +818,8 @@ mod tests {
             ("//", "/"),
             ("/./example", "/example"),
             ("//example//", "/example/"),
+            ("/foo/bar/.", "/foo/bar/"),
+            ("/foo/bar/..", "/foo/"),
             ("/", "/"),
             ("/example", "/example"),
             // `..` cannot escape the root.
@@ -898,37 +884,33 @@ mod tests {
         assert_eq!(canonical_header_value(""), "");
     }
 
-    /// PINS CURRENT BEHAVIOUR — deliberately not a correctness claim.
-    ///
-    /// AWS's published vectors contain no case with a percent-encoded slash, so
-    /// nothing authoritative constrains this path. What the pipeline does today:
-    /// dot-segment resolution runs on the WIRE path (RFC 3986 §6.2.2.3 operates
-    /// on the still-encoded path, where `%2F` is not a separator), then the
-    /// decode step turns `%2F` into a real `/`, and `uri_encode_path` treats
-    /// that as a separator and leaves it unencoded. Net effect: a `..` that only
-    /// becomes a segment AFTER decoding is not resolved.
-    ///
-    /// Recorded so the behaviour cannot drift unnoticed. Resolving whether it
-    /// matches live AWS needs a measurement against a real endpoint, not a
-    /// closer reading of the spec — see br-f57c6.
+    /// AWS's Rust signer preserves `%2F` during normalization and only escapes
+    /// its '%' for double encoding; it must never become a path separator.
     #[test]
-    fn encoded_slash_behaviour_is_pinned_pending_measurement() {
+    fn encoded_slashes_stay_inside_their_original_path_segment() {
         assert_eq!(
             canonical_uri_path(
                 "/bucket/a%2F..%2Fb",
                 CanonicalPathEncoding::Single,
                 CanonicalPathNormalization::RemoveDotSegments,
             ),
-            "/bucket/a/../b"
+            "/bucket/a%2F..%2Fb"
         );
-        // S3 preserves, so the encoded slash still decodes but nothing resolves.
         assert_eq!(
             canonical_uri_path(
                 "/bucket/a%2F..%2Fb",
                 CanonicalPathEncoding::Single,
                 CanonicalPathNormalization::Preserve,
             ),
-            "/bucket/a/../b"
+            "/bucket/a%2F..%2Fb"
+        );
+        assert_eq!(
+            canonical_uri_path(
+                "/bucket/a%2F..%2Fb",
+                CanonicalPathEncoding::Double,
+                CanonicalPathNormalization::RemoveDotSegments,
+            ),
+            "/bucket/a%252F..%252Fb"
         );
     }
 
@@ -947,17 +929,17 @@ mod tests {
         }
     }
 
-    /// Characters the URL parser leaves unescaped (`&`, `+`, `:`) still get
-    /// encoded by the canonicalizer, matching what S3 computes after decoding.
+    /// Single encoding preserves the exact wire path, including reserved
+    /// characters that the URL parser leaves unescaped.
     #[test]
-    fn canonical_uri_encodes_aws_reserved_characters_left_raw_by_the_url_parser() {
+    fn canonical_uri_preserves_reserved_wire_characters_for_s3() {
         assert_eq!(
             canonical_uri_path(
                 "/bucket/Q&A.pdf",
                 CanonicalPathEncoding::Single,
                 CanonicalPathNormalization::Preserve,
             ),
-            "/bucket/Q%26A.pdf"
+            "/bucket/Q&A.pdf"
         );
         assert_eq!(
             canonical_uri_path(
@@ -965,12 +947,11 @@ mod tests {
                 CanonicalPathEncoding::Single,
                 CanonicalPathNormalization::Preserve,
             ),
-            "/bucket/a%2Bb.pdf"
+            "/bucket/a+b.pdf"
         );
     }
 
-    /// A literal `%` in the key arrives as `%25` and must survive the
-    /// decode/re-encode round trip rather than becoming `%2525`.
+    /// A literal `%` in the key arrives as `%25` and remains unchanged for S3.
     #[test]
     fn canonical_uri_round_trips_a_literal_percent() {
         assert_eq!(
@@ -1406,36 +1387,29 @@ mod tests {
         assert!(rendered.contains(&signed.x_amz_date));
     }
 
-    /// Pins the input-convention boundary between this signer and AWS's own.
-    ///
-    /// `aws-c-auth` NEVER percent-decodes the path: with `use_double_uri_encode`
-    /// it applies exactly ONE encoding pass to the path string it was handed, and
-    /// with the flag off it emits that string verbatim (`source/aws_signing.c`,
-    /// `s_append_canonical_path`). This signer instead decodes the wire path and
-    /// then applies its profile's number of passes.
-    ///
-    /// Those two algorithms are IDENTICAL for a canonically-encoded wire path,
-    /// which is what [`SignableRequest::uri`] is documented to carry — that
-    /// equivalence is what this test measures, in both profiles. They differ only
-    /// when the input is a RAW (un-encoded) path, which is not a legal
-    /// request-target and not what this API accepts.
-    ///
-    /// That difference is the entire explanation for the three published vectors
-    /// (`get-space-normalized`, `get-space-unnormalized`, `get-utf8`) whose
-    /// fixtures supply raw paths: it is an input-convention boundary, not a
-    /// signing defect. Recorded here as measurement so it cannot decay back into
-    /// a suspected bug.
+    /// AWS's CRT and Rust signers never decode a wire path. These expected
+    /// strings cover cases where decode/re-encode silently changed the target.
     #[test]
     fn wire_path_input_reproduces_aws_own_canonical_path_algorithm() {
-        for wire in ["/example%20space/", "/%E1%88%B4", "/bucket/plain.txt", "/"] {
-            // Non-S3 profile: AWS applies one encode pass to the wire path.
+        for (wire, double_encoded) in [
+            ("/example%20space/", "/example%2520space/"),
+            ("/%E1%88%B4", "/%25E1%2588%25B4"),
+            ("/bucket/a%2Fb", "/bucket/a%252Fb"),
+            ("/bucket/a%252Fb", "/bucket/a%25252Fb"),
+            ("/bucket/50%25", "/bucket/50%2525"),
+            ("/bucket/%FF", "/bucket/%25FF"),
+            ("/bucket/%2E%2E/key", "/bucket/%252E%252E/key"),
+            ("/model/claude-v2:0/invoke", "/model/claude-v2%3A0/invoke"),
+            ("/bucket/plain.txt", "/bucket/plain.txt"),
+            ("/", "/"),
+        ] {
             assert_eq!(
                 canonical_uri_path(
                     wire,
                     CanonicalPathEncoding::Double,
                     CanonicalPathNormalization::RemoveDotSegments,
                 ),
-                uri_encode_path(wire),
+                double_encoded,
                 "double-encoding profile must equal one encode pass over the \
                  wire path for {wire}"
             );
@@ -1451,16 +1425,14 @@ mod tests {
             );
         }
 
-        // And the boundary itself: handed the RAW path the fixtures use, this
-        // signer emits one pass MORE than AWS does, because its decode step is a
-        // no-op on a string with no escapes. Measured, not desired.
+        // The published raw-space vector also matches AWS's single extra pass.
         assert_eq!(
             canonical_uri_path(
                 "/example space/",
                 CanonicalPathEncoding::Double,
                 CanonicalPathNormalization::RemoveDotSegments,
             ),
-            "/example%2520space/",
+            "/example%20space/",
         );
     }
 

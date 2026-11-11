@@ -465,55 +465,12 @@ const PROVIDER_AUTH_REFUSED: &[&str] = &[];
 /// set is EXACTLY this, so a new divergence fails, and a case that starts
 /// matching also fails until the name is removed here.
 ///
-/// Only ONE category remains, and it is a documented input-convention boundary
-/// rather than a signing defect. Resolved history, kept because it explains why
-/// the list is the shape it is (br-f57c6):
-///
-/// * Path normalisation (was 6 cases) — FIXED: `CanonicalPathNormalization` is
-///   now a second profile axis and `remove_dot_segments` resolves `.` / `..`
-///   and collapses duplicate slashes. Independently confirmed as the right
-///   shape by upstream, which also treats `should_normalize_uri_path` and
-///   `use_double_uri_encode` as independent flags.
-/// * Header-value whitespace (was 1) — FIXED: `canonical_header_value` collapses
-///   internal runs, not just the ends.
-/// * Canonical query ordering (was 1) — FIXED: pairs are percent-encoded and
-///   only THEN sorted, matching `s_transform_query_params` → `qsort` with
-///   `s_canonical_query_param_comparator`. The earlier note that this needed an
-///   API change was wrong: the encoded key is a pure function of the decoded
-///   key, so the ordering is always recoverable from a decoded-keyed map.
-/// * Session token always signed (was 1) — NOT A DEFECT: `context.json` carries
-///   `omit_session_token`, which this harness previously ignored. It is now
-///   parsed and threaded through `with_omit_session_token`.
-///
-/// REMAINING — raw-vs-wire input convention (3 cases):
-/// `get-space-normalized`, `get-space-unnormalized`, `get-utf8`.
-///
-/// These fixtures put a LITERAL space or a literal `U+1234` in the request
-/// target (`GET /example space/ HTTP/1.1`), which is not a legal
-/// request-target. AWS's own signer never percent-decodes the path: with
-/// `use_double_uri_encode` it applies exactly ONE encoding pass to whatever
-/// string it was handed, and with the flag off it emits that string verbatim
-/// (`aws-c-auth` `source/aws_signing.c`, `s_append_canonical_path`). So on a raw
-/// path it produces `%20`. `SignableRequest::uri` is documented to carry the
-/// WIRE path, and this signer decodes it before re-encoding, so on the same raw
-/// string its decode is a no-op and it emits one pass more: `%2520`.
-///
-/// For a canonically-encoded wire path the two algorithms are IDENTICAL in both
-/// profiles. That equivalence is measured directly, not asserted in prose, by
-/// `fcp_sdk::sigv4` test `wire_path_input_reproduces_aws_own_canonical_path_algorithm`
-/// and by [`wire_form_of_the_raw_fixture_paths_matches_aws`] below.
-///
-/// The encoding contract itself was settled by measurement against live AWS in
-/// br-1nqg7 / br-0lsi3 and is NOT re-derived from these files. The earlier
-/// hypothesis — that the corpus was generated with double-encoding disabled —
-/// was checked against the generator and REFUTED: `use_double_uri_encode` is
-/// hardcoded `true` for all 38 cases.
-const KNOWN_DIVERGENT: &[&str] = &[
-    // Raw (non-wire) fixture paths; see above.
-    "get-space-normalized",
-    "get-space-unnormalized",
-    "get-utf8",
-];
+/// No divergence exemptions remain. The former raw-space/UTF-8 exceptions
+/// exposed an extra encoding pass: AWS's CRT and Rust signers preserve the
+/// wire path for single encoding and encode it once more for double encoding,
+/// without percent-decoding either form. The same defect also corrupted
+/// encoded separators and ordinary reserved characters in real wire paths.
+const KNOWN_DIVERGENT: &[&str] = &[];
 
 /// Every case is checked stage by stage. Divergences are reported all at once,
 /// per stage, because a signer bug shows up as a FAMILY of related failures and
@@ -651,11 +608,9 @@ fn provider_auth_signer_against_official_vectors() {
 
 /// The two signers must produce byte-identical canonical requests.
 ///
-/// This is the assertion that actually protects callers. Both crates matching AWS
-/// on 35 of 38 cases would still permit them to differ on the other 3, and a
-/// request signed by whichever crate happened to be on the call path would then
-/// verify or not depending on that accident. Comparing them to each other
-/// directly closes that gap — including on the cases where NEITHER matches AWS.
+/// Cross-signer equality protects callers even if either implementation changes
+/// its refusal or divergence policy: a request must not acquire a different
+/// signature depending on which crate happens to be on its call path.
 #[test]
 fn both_signers_agree_byte_for_byte_on_every_vector() {
     let mut compared = 0_usize;
@@ -858,85 +813,53 @@ fn both_signers_agree_on_inputs_the_corpus_cannot_express() {
     );
 }
 
-/// AWS's URI-path encoder: percent-encode every byte outside the unreserved
-/// set, preserving `/` as the segment separator.
+/// Additional wire-path golden cases from the algorithms in AWS's Rust signer:
+/// <https://github.com/smithy-lang/smithy-rs/blob/main/aws/rust-runtime/aws-sigv4/src/http_request/canonical_request.rs>
+/// and its sibling `uri_path_normalization.rs`. The CRT's
+/// `s_append_canonical_path` uses the same preserve-or-encode rule.
 ///
-/// Harness-local on purpose. It exists to CHARACTERISE the remaining divergence,
-/// never to construct an expectation a signer is then checked against, so it
-/// must not be imported from the crate under test.
-fn aws_uri_encode_path_once(path: &str) -> String {
-    path.split('/')
-        .map(|segment| {
-            segment
-                .bytes()
-                .map(|b| match b {
-                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                        (b as char).to_string()
-                    }
-                    other => format!("%{other:02X}"),
-                })
-                .collect::<String>()
-        })
-        .collect::<Vec<_>>()
-        .join("/")
-}
-
-/// Characterises the three remaining divergences EXACTLY, so the ratchet records
-/// a bounded, understood difference rather than an open question.
-///
-/// For each case the claim is: our canonical request differs from AWS's in the
-/// canonical-URI line ONLY, and that line is precisely one additional
-/// URI-encoding pass over AWS's. Both halves matter. The second half says the
-/// difference is the input-convention boundary (see [`KNOWN_DIVERGENT`]); the
-/// first says no OTHER defect is hiding inside these three cases, which is the
-/// part a bare "known divergence" entry cannot tell you.
+/// These extend the pinned published corpus with encoded separators, literal
+/// percent escapes, Bedrock model IDs, and trailing dot segments. Expectations
+/// are literal strings, never computed using either implementation under test.
 #[test]
-fn remaining_divergences_are_exactly_one_extra_encoding_pass() {
-    let raw_path_cases = ["get-space-normalized", "get-space-unnormalized", "get-utf8"];
-    assert_eq!(
-        raw_path_cases.len(),
-        KNOWN_DIVERGENT.len(),
-        "every known divergence must be characterised here, not just listed"
-    );
-
-    for v in load_vectors()
-        .iter()
-        .filter(|v| raw_path_cases.contains(&v.name.as_str()))
-    {
-        let (canonical, _, _) = sign_with_sdk(v);
-        let ours: Vec<&str> = canonical.trim_end().split('\n').collect();
-        let theirs: Vec<&str> = v
-            .expected_canonical_request
-            .trim_end()
-            .split('\n')
-            .collect();
-
-        assert_eq!(
-            ours.len(),
-            theirs.len(),
-            "{}: canonical request line count differs, so this is not a \
-             canonical-URI-only difference",
-            v.name
-        );
-
-        // Line 1 is the method; line 2 is the canonical URI.
-        assert_eq!(
-            ours[1],
-            aws_uri_encode_path_once(theirs[1]),
-            "{}: our canonical URI must be exactly one encoding pass over AWS's",
-            v.name
-        );
-
-        for (i, (a, b)) in ours.iter().zip(theirs.iter()).enumerate() {
-            if i == 1 {
-                continue;
-            }
+fn both_signers_match_aws_wire_path_golden_cases() {
+    let host = [("host", "example.amazonaws.com")];
+    let empty_hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    for (wire, s3_uri, other_uri) in [
+        ("", "/", "/"),
+        ("/a%2Fb", "/a%2Fb", "/a%252Fb"),
+        ("/a%2fb", "/a%2fb", "/a%252fb"),
+        ("/a%252Fb", "/a%252Fb", "/a%25252Fb"),
+        ("/a%2F..%2Fb", "/a%2F..%2Fb", "/a%252F..%252Fb"),
+        ("/50%25", "/50%25", "/50%2525"),
+        ("/%2E%2E/key", "/%2E%2E/key", "/%252E%252E/key"),
+        ("/%FF", "/%FF", "/%25FF"),
+        ("/e%C3%B1e", "/e%C3%B1e", "/e%25C3%25B1e"),
+        ("/a+b&c", "/a+b&c", "/a%2Bb%26c"),
+        (
+            "/model/anthropic.claude-v2:0/invoke",
+            "/model/anthropic.claude-v2:0/invoke",
+            "/model/anthropic.claude-v2%3A0/invoke",
+        ),
+        ("/a/./b/../c", "/a/./b/../c", "/a/c"),
+        ("/a/b/.", "/a/b/.", "/a/b/"),
+        ("/a/b/..", "/a/b/..", "/a/"),
+        ("/a//b///", "/a//b///", "/a/b/"),
+    ] {
+        for (service, normalize, expected_uri) in
+            [("s3", false, s3_uri), ("bedrock", true, other_uri)]
+        {
+            let mut vector = synthetic_vector("wire-path", "GET", wire, &[], &host, empty_hash);
+            vector.context.service = service.to_owned();
+            vector.context.normalize = normalize;
+            let sdk = sign_with_sdk(&vector);
+            let provider =
+                sign_with_provider_auth(&vector).expect("wire-path golden case must be signable");
+            assert_eq!(sdk, provider, "signer parity for {service} path {wire}");
             assert_eq!(
-                a, b,
-                "{}: line {i} of the canonical request differs too — the \
-                 divergence is NOT confined to the canonical URI, so something \
-                 else is wrong in this case",
-                v.name
+                sdk.0.lines().nth(1),
+                Some(expected_uri),
+                "AWS canonical URI for {service} path {wire}"
             );
         }
     }
