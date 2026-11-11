@@ -13,11 +13,12 @@ use serde_json::json;
 
 use crate::invocation_cmd::{LookupFailure, query_invocation, read_admin_token};
 use crate::native_events::{NativeStreamClient, NativeStreamConfig, StreamFailure};
+use crate::pipe::budget::ExecutionBudget;
 use crate::reactive_rules::Rule;
 use crate::rules_cmd::{
     self, ExecutionScope, InvocationResult, RuleEventBatch, RuleEventSource, RuleExecutor,
     RulePollingSource, RuleReconciler, RulesArgs, RulesExecutionOptions, RulesPollOptions,
-    RulesReconcileOptions,
+    RulesReconcileOptions, has_uncertain_results,
 };
 use crate::webhook_events::{self, PollStart, WebhookFailure, WebhookPollPage, WebhookSourceScope};
 use crate::{
@@ -39,12 +40,29 @@ pub(crate) fn dispatch(args: &RulesArgs, explicit_host: Option<&str>) -> Result<
         })()
     } else if let Some(options) = args.execution_options() {
         (|| {
+            let started = Instant::now();
+            let budget = args
+                .watch_options()
+                .map(|options| options.budget(started))
+                .transpose()?;
             let host = resolve_host_config(explicit_host)?
                 .context("live rules require a configured host or --host")?;
             let mut executor = HostRuleExecutor::new(host, options)?;
             if let Some(options) = args.poll_options() {
                 let mut source = WebhookRuleSource::new(&executor.host, options)?;
-                rules_cmd::poll(args, &mut executor, &mut source)
+                if let Some(budget) = budget {
+                    source.budget = budget;
+                    rules_cmd::watch(args, started, |batch, budget| {
+                        let mut next = HostRuleExecutor::new(
+                            executor.host.clone(),
+                            batch.execution_options().context("missing rule action options")?,
+                        )?
+                        .with_budget(budget);
+                        rules_cmd::poll(batch, &mut next, &mut source)
+                    })
+                } else {
+                    rules_cmd::poll(args, &mut executor, &mut source)
+                }
             } else if let Some(options) = args.consume_options() {
                 let mut source = NativeRuleSource(NativeStreamClient::new(
                     NativeStreamConfig {
@@ -69,7 +87,19 @@ pub(crate) fn dispatch(args: &RulesArgs, explicit_host: Option<&str>) -> Result<
                         && source.0.executor_node() == options.executor_node.as_ref(),
                     "native source scope changed during preparation"
                 );
-                rules_cmd::consume(args, &mut executor, &mut source)
+                if let Some(budget) = budget {
+                    source.0.set_budget(budget);
+                    rules_cmd::watch(args, started, |batch, budget| {
+                        let mut next = HostRuleExecutor::new(
+                            executor.host.clone(),
+                            batch.execution_options().context("missing rule action options")?,
+                        )?
+                        .with_budget(budget);
+                        rules_cmd::consume(batch, &mut next, &mut source)
+                    })
+                } else {
+                    rules_cmd::consume(args, &mut executor, &mut source)
+                }
             } else {
                 rules_cmd::run(args, &mut executor)
             }
@@ -145,27 +175,6 @@ pub(crate) fn dispatch(args: &RulesArgs, explicit_host: Option<&str>) -> Result<
         payload["_truth_source"] = json!("unavailable");
     }
     Ok(DispatchOutcome { payload, exit_code })
-}
-
-fn has_uncertain_results(payload: &serde_json::Value) -> bool {
-    payload["data"]["source"]["acknowledgement_unknown"] == true
-        || payload["data"]["source"]["ack_state_persisted"] == false
-        || payload["data"]["source"]["cursor_commit_unknown"] == true
-        || payload["data"]["results"]
-            .as_array()
-            .is_some_and(|results| {
-                results.iter().any(|result| {
-                    let reconciled = matches!(
-                        result["outcome"].as_str(),
-                        Some("reconciled" | "already_completed")
-                    ) && result["state_persisted"] == true;
-                    result["outcome"] == "outcome_unknown"
-                        || (!reconciled
-                            && (result["previous_outcome"] == "pending"
-                                || result["previous_outcome"] == "unknown"))
-                        || result["state_persisted"] == false
-                })
-            })
 }
 
 /// Reuses the protected invocation-inspection transport. No action authority,
@@ -253,6 +262,7 @@ struct WebhookRuleSource {
     auth: ResolvedLiveAuth,
     lease_seq: Option<u64>,
     timeout: Duration,
+    budget: ExecutionBudget,
 }
 
 impl WebhookRuleSource {
@@ -288,6 +298,7 @@ impl WebhookRuleSource {
             auth,
             lease_seq: options.source_lease_seq,
             timeout: Duration::from_secs(options.source_timeout_seconds),
+            budget: ExecutionBudget::start(None, Instant::now()),
         })
     }
 }
@@ -305,6 +316,10 @@ impl RulePollingSource for WebhookRuleSource {
         max_bytes: usize,
     ) -> Result<WebhookPollPage> {
         let started = Instant::now();
+        let timeout = self
+            .budget
+            .preflight_timeout(self.timeout, started)
+            .map_err(|_| WebhookFailure::Timeout)?;
         if !(1..=64).contains(&limit) || !(1..=16 * 1024 * 1024).contains(&max_bytes) {
             return Err(WebhookFailure::InvalidRequest.into());
         }
@@ -352,7 +367,7 @@ impl RulePollingSource for WebhookRuleSource {
                 idempotency_key: Some(format!("webhook-poll:{request_id}")),
                 lease_seq: self.lease_seq,
                 deadline_ms: Some(
-                    u64::try_from(self.timeout.as_millis())
+                    u64::try_from(timeout.as_millis())
                         .map_err(|_| WebhookFailure::InvalidRequest)?,
                 ),
                 correlation_id: None,
@@ -364,22 +379,27 @@ impl RulePollingSource for WebhookRuleSource {
             &self.client,
             "/rpc/preflight/guarded",
             &request,
-            source_remaining(started, self.timeout)?,
+            source_remaining(started, timeout)?,
             WEBHOOK_SOURCE_ENVELOPE_BYTES,
         )?;
         if !preflight.allowed {
             return Err(WebhookFailure::Denied.into());
         }
+        let mut request = request;
+        request.request.deadline_ms = Some(
+            u64::try_from(source_remaining(started, timeout)?.as_millis())
+                .map_err(|_| WebhookFailure::InvalidRequest)?,
+        );
         let response: InvokeResponse = webhook_source_post(
             &self.client,
             "/rpc/invoke/guarded",
             &request,
-            source_remaining(started, self.timeout)?,
+            source_remaining(started, timeout)?,
             max_bytes
                 .checked_add(WEBHOOK_SOURCE_ENVELOPE_BYTES)
                 .ok_or(WebhookFailure::InvalidRequest)?,
         )?;
-        source_remaining(started, self.timeout)?;
+        source_remaining(started, timeout)?;
         if response.r#type != "response" || response.id != request_id {
             return Err(WebhookFailure::InvalidResponse.into());
         }
@@ -392,7 +412,7 @@ impl RulePollingSource for WebhookRuleSource {
         };
         let page =
             webhook_events::decode_page(&self.scope, cursor, start, limit, max_bytes, value)?;
-        source_remaining(started, self.timeout)?;
+        source_remaining(started, timeout)?;
         Ok(page)
     }
 }
@@ -400,7 +420,7 @@ impl RulePollingSource for WebhookRuleSource {
 fn source_remaining(started: Instant, timeout: Duration) -> Result<Duration> {
     timeout
         .checked_sub(started.elapsed())
-        .filter(|remaining| !remaining.is_zero())
+        .filter(|remaining| remaining.as_millis() > 0)
         .ok_or_else(|| WebhookFailure::Timeout.into())
 }
 
@@ -494,23 +514,34 @@ struct PreparedRule {
     auth: ResolvedLiveAuth,
 }
 
+const MAX_RULE_HOST_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
+
 struct HostRuleExecutor {
     host: ResolvedHostConfig,
     client: HostAdminClient,
     options: RulesExecutionOptions,
     prepared: BTreeMap<String, PreparedRule>,
+    budget: ExecutionBudget,
 }
 
 impl HostRuleExecutor {
     fn new(mut host: ResolvedHostConfig, options: &RulesExecutionOptions) -> Result<Self> {
         host.endpoint = canonical_host(&host.endpoint)?;
-        let client = HostAdminClient::new(&host.endpoint)?;
+        let client = HostAdminClient::new(&host.endpoint)?
+            .with_response_limit(MAX_RULE_HOST_RESPONSE_BYTES);
         Ok(Self {
             host,
             client,
             options: options.clone(),
             prepared: BTreeMap::new(),
+            budget: ExecutionBudget::start(None, Instant::now()),
         })
+    }
+
+    fn with_budget(mut self, budget: ExecutionBudget) -> Self {
+        self.budget = budget;
+        self.client = self.client.with_read_budget(budget);
+        self
     }
 }
 
@@ -574,6 +605,7 @@ fn require_tier(actual: SafetyTier, ceiling: SafetyTier) -> Result<()> {
 
 impl RuleExecutor for HostRuleExecutor {
     fn prepare(&mut self, rules: &[Rule]) -> Result<BTreeMap<String, ExecutionScope>> {
+        self.budget.remaining_ms(Instant::now())?;
         ensure!(
             self.prepared.is_empty(),
             "rule authority has already been prepared"
@@ -712,6 +744,10 @@ impl RuleExecutor for HostRuleExecutor {
         provenance: Option<&Provenance>,
         admit: &mut dyn FnMut(&str, &str) -> Result<()>,
     ) -> Result<InvocationResult> {
+        let budget = self
+            .budget
+            .for_step(self.options.deadline_ms, Instant::now());
+        budget.remaining_ms(Instant::now())?;
         let prepared = self
             .prepared
             .get(&rule.name)
@@ -727,16 +763,18 @@ impl RuleExecutor for HostRuleExecutor {
             principal: prepared.scope.principal.clone(),
             idempotency_key: Some(idempotency_key.to_owned()),
             lease_seq: self.options.lease_seq,
-            deadline_ms: self.options.deadline_ms,
+            deadline_ms: budget.invocation_timeout_ms(Instant::now())?,
             auth: LiveAuthArgs::default(),
         };
+        let client = self.client.clone().with_read_budget(budget);
         let mut guard = InvocationGuard {
             auth: &prepared.auth,
-            client: &self.client,
+            client: &client,
             scope: &prepared.scope,
             max_safety_tier: rule.safety_tier,
             provenance,
             admit,
+            budget,
         };
         let outcome = invoke_dispatch_host_controlled(
             "invoke",
@@ -762,6 +800,7 @@ pub(crate) struct InvocationGuard<'a> {
     pub(crate) max_safety_tier: SafetyTier,
     pub(crate) provenance: Option<&'a Provenance>,
     admit: &'a mut dyn FnMut(&str, &str) -> Result<()>,
+    budget: ExecutionBudget,
 }
 
 impl InvocationGuard<'_> {
@@ -774,6 +813,7 @@ impl InvocationGuard<'_> {
         principal: Option<&str>,
         safety: SafetyTier,
     ) -> Result<()> {
+        self.budget.remaining_ms(Instant::now())?;
         ensure!(
             self.scope.host == host
                 && self.scope.connector == connector
@@ -786,6 +826,7 @@ impl InvocationGuard<'_> {
     }
 
     pub(crate) fn reserve(&mut self, request: &InvokeRequest) -> Result<()> {
+        self.budget.remaining_ms(Instant::now())?;
         ensure!(
             request.connector_id.as_str() == self.scope.connector
                 && request.operation.as_str() == self.scope.operation
@@ -798,6 +839,31 @@ impl InvocationGuard<'_> {
             .as_deref()
             .context("reactive invoke requires an idempotency key")?;
         (self.admit)(&request.id.to_string(), key)
+    }
+
+    pub(crate) fn preflight(
+        &self,
+        request: &HostGuardedInvokeRequest,
+    ) -> Result<HostPreflightResponse> {
+        let mut request = request.clone();
+        request.request.deadline_ms = self.budget.invocation_timeout_ms(Instant::now())?;
+        let response = self.client.preflight_guarded(
+            &request,
+            self.budget
+                .preflight_timeout(self.client.read_timeout, Instant::now())?,
+        )?;
+        self.budget.remaining_ms(Instant::now())?;
+        Ok(response)
+    }
+
+    pub(crate) fn invoke(&self, request: &HostGuardedInvokeRequest) -> Result<InvokeResponse> {
+        let mut request = request.clone();
+        request.request.deadline_ms = self.budget.invocation_timeout_ms(Instant::now())?;
+        let timeout = self.budget.preflight_timeout(
+            crate::host_invoke_http_timeout(request.request.deadline_ms),
+            Instant::now(),
+        )?;
+        self.client.invoke_guarded(&request, timeout)
     }
 }
 
@@ -880,6 +946,144 @@ mod tests {
             canonical_host("https://example.com/a").unwrap(),
             canonical_host("https://example.com/b").unwrap()
         );
+    }
+
+    fn guarded_fixture() -> (ExecutionScope, HostGuardedInvokeRequest) {
+        let scope = ExecutionScope {
+            host: "http://127.0.0.1:8787".into(),
+            zone: "z:work".into(),
+            principal: None,
+            connector: "fcp.github".into(),
+            operation: "github.search_issues".into(),
+        };
+        let request = HostGuardedInvokeRequest {
+            max_safety_tier: SafetyTier::Safe,
+            request: InvokeRequest {
+                r#type: "invoke".into(),
+                id: RequestId::new("watch-budget-test"),
+                connector_id: scope.connector.parse().unwrap(),
+                operation: scope.operation.parse().unwrap(),
+                zone_id: scope.zone.parse().unwrap(),
+                input: json!({}),
+                capability_token: fcp_core::CapabilityToken::test_token(),
+                holder_proof: None,
+                context: None,
+                idempotency_key: Some("watch-idempotency".into()),
+                lease_seq: None,
+                deadline_ms: Some(30_000),
+                correlation_id: None,
+                provenance: None,
+                approval_tokens: Vec::new(),
+            },
+        };
+        (scope, request)
+    }
+
+    #[test]
+    fn expired_watch_guard_cannot_preflight_reserve_or_dispatch() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let client = HostAdminClient::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let (scope, request) = guarded_fixture();
+        let auth = ResolvedLiveAuth::for_test_token(request.request.capability_token.clone());
+        let mut reservations = 0;
+        let mut admit = |_: &str, _: &str| { reservations += 1; Ok(()) };
+        let mut guard = InvocationGuard {
+            auth: &auth,
+            client: &client,
+            scope: &scope,
+            max_safety_tier: SafetyTier::Safe,
+            provenance: None,
+            admit: &mut admit,
+            budget: ExecutionBudget::start(Some(1), Instant::now() - Duration::from_secs(1)),
+        };
+        assert!(guard.preflight(&request).is_err());
+        assert!(guard.reserve(&request.request).is_err());
+        assert!(guard.invoke(&request).is_err());
+        assert_eq!(reservations, 0);
+        assert!(matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock));
+    }
+
+    #[test]
+    fn watch_guard_charges_preflight_body_wait_to_the_original_deadline() {
+        use std::io::Write;
+
+        let (client, server) = source_http_server(|socket, body| {
+            let request: HostGuardedInvokeRequest = serde_json::from_value(body).unwrap();
+            assert!(request.request.deadline_ms.unwrap() <= 100);
+            let response = serde_json::to_vec(&HostPreflightResponse::allowed()).unwrap();
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", response.len()).unwrap();
+            std::thread::sleep(Duration::from_millis(250));
+            let _ = socket.write_all(&response);
+        });
+        let (scope, request) = guarded_fixture();
+        let auth = ResolvedLiveAuth::for_test_token(request.request.capability_token.clone());
+        let started = Instant::now();
+        let mut admit = |_: &str, _: &str| -> Result<()> { panic!("timed-out preflight cannot reserve") };
+        let mut guard = InvocationGuard {
+            auth: &auth,
+            client: &client,
+            scope: &scope,
+            max_safety_tier: SafetyTier::Safe,
+            provenance: None,
+            admit: &mut admit,
+            budget: ExecutionBudget::start(Some(100), started),
+        };
+        assert!(guard.preflight(&request).is_err());
+        assert!(guard.reserve(&request.request).is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn rule_client_bounds_streamed_discovery_and_guarded_response_bodies() {
+        use std::io::Write;
+
+        for phase in ["discovery", "preflight", "invoke"] {
+            let (release, released) = std::sync::mpsc::channel();
+            let (client, server) = source_http_server(move |socket, _| {
+                // No Content-Length and no EOF until the client has returned:
+                // a header-only check or an unbounded read would time out.
+                write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+                let body = json!({"private": "private-response-sentinel".repeat(16)}).to_string();
+                socket.write_all(body.as_bytes()).unwrap();
+                let _ = released.recv_timeout(Duration::from_secs(3));
+            });
+            let started = Instant::now();
+            let budget = ExecutionBudget::start(Some(2_000), started);
+            let client = client.with_response_limit(128).with_read_budget(budget);
+            let (_, request) = guarded_fixture();
+            let result = match phase {
+                "discovery" => client.catalog(None).map(|_| ()),
+                "preflight" => client
+                    .preflight_guarded(&request, Duration::from_secs(2))
+                    .map(|_| ()),
+                "invoke" => client
+                    .invoke_guarded(&request, Duration::from_secs(2))
+                    .map(|_| ()),
+                _ => unreachable!(),
+            };
+            release.send(()).unwrap();
+            server.join().unwrap();
+            let error = result.expect_err("oversized rule response must be refused");
+            assert!(!error.to_string().contains("private-response-sentinel"));
+            if phase == "invoke" {
+                let unknown = error
+                    .downcast_ref::<crate::invocation_cmd::InvokeOutcomeUnknown>()
+                    .expect("a refused invoke response must retain uncertain-effect semantics");
+                let payload = unknown.dispatch("invoke").payload;
+                assert_eq!(payload["outcome"], "outcome_unknown");
+                assert_eq!(payload["automatic_retry_allowed"], false);
+                assert_eq!(payload["error"]["timed_out"], false);
+            } else {
+                assert!(error.to_string().contains("128-byte limit"), "{error}");
+            }
+            assert!(budget.remaining_ms(Instant::now()).is_ok());
+        }
     }
 
     fn source_http_server<F>(respond: F) -> (HostAdminClient, std::thread::JoinHandle<()>)
@@ -1253,6 +1457,7 @@ mod tests {
                 auth: ResolvedLiveAuth::for_test_token(source_capability),
                 lease_seq: Some(17),
                 timeout: Duration::from_secs(2),
+                budget: ExecutionBudget::start(None, Instant::now()),
             };
             let error = source
                 .poll(cursor, PollStart::Earliest, 4, 4096)

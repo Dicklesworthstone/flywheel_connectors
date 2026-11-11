@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration as StdDuration, Instant};
 
 use anyhow::{Context, Result, ensure};
 use chrono::{DateTime, Duration, Utc};
@@ -17,6 +18,7 @@ use crate::reactive_rules::{
     CircuitBreaker, ExecutionOutcome, IncomingEvent, Rule, RuleDedupCache, RuleSet, RuleSetStore,
     ThrottleState, evaluate_rule_with_dedup, matches_trigger, render_action_inputs, validate_rule,
 };
+use crate::pipe::budget::ExecutionBudget;
 use crate::webhook_events::{PollStart, WEBHOOK_EVENT_TOPIC, WebhookPollPage, WebhookSourceScope};
 
 const MAX_RULES_BYTES: u64 = 1024 * 1024;
@@ -33,6 +35,7 @@ const MAX_RUNTIME_RULES: usize = 1024;
 const MAX_POLL_SOURCES: usize = 1024;
 const MAX_POLL_CURSOR_BYTES: usize = 128;
 const RUN_STATE_VERSION: u32 = 1;
+const MAX_WATCH_EVIDENCE_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Args, Debug)]
 pub(crate) struct RulesArgs {
@@ -83,8 +86,48 @@ enum RulesCommand {
     Consume(RulesConsumeOptions),
     /// Process one webhook page and commit its cursor only after every action succeeds.
     Poll(RulesPollOptions),
+    /// Watch a source for a finite number of batches with durable replay protection.
+    Watch(RulesWatchOptions),
     /// Settle one uncertain action only from matching durable host completion evidence.
     Reconcile(RulesReconcileOptions),
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct RulesWatchOptions {
+    /// Maximum source batches, including empty batches.
+    #[arg(long, global = true, default_value_t = 20, value_parser = clap::value_parser!(u32).range(1..=1000))]
+    pub(crate) max_batches: u32,
+    /// Total wall-clock budget shared by discovery, polling, actions and acknowledgements.
+    #[arg(long, global = true, default_value_t = 300, value_parser = clap::value_parser!(u64).range(1..=3600))]
+    pub(crate) timeout_seconds: u64,
+    /// Minimum delay between batches; the total deadline also bounds this wait.
+    #[arg(long, global = true, default_value_t = 1000, value_parser = clap::value_parser!(u64).range(100..=60_000))]
+    pub(crate) poll_interval_ms: u64,
+    #[command(subcommand)]
+    source: RulesWatchSource,
+}
+
+#[derive(Subcommand, Debug)]
+enum RulesWatchSource {
+    /// Resume a durable webhook consumer across successive pages.
+    Poll(RulesPollOptions),
+    /// Poll an existing native stream and acknowledge each settled prefix.
+    Consume(RulesConsumeOptions),
+}
+
+impl RulesWatchOptions {
+    pub(crate) fn budget(&self, started: Instant) -> Result<ExecutionBudget> {
+        ensure!(
+            (1..=1000).contains(&self.max_batches)
+                && (1..=3600).contains(&self.timeout_seconds)
+                && (100..=60_000).contains(&self.poll_interval_ms),
+            "invalid rules watch bounds"
+        );
+        Ok(ExecutionBudget::start(
+            Some(self.timeout_seconds * 1000),
+            started,
+        ))
+    }
 }
 
 #[derive(Args, Clone, Debug)]
@@ -231,6 +274,10 @@ impl RulesArgs {
     pub(crate) fn consume_options(&self) -> Option<&RulesConsumeOptions> {
         match &self.command {
             RulesCommand::Consume(options) => Some(options),
+            RulesCommand::Watch(RulesWatchOptions {
+                source: RulesWatchSource::Consume(options),
+                ..
+            }) => Some(options),
             _ => None,
         }
     }
@@ -238,6 +285,17 @@ impl RulesArgs {
     pub(crate) fn poll_options(&self) -> Option<&RulesPollOptions> {
         match &self.command {
             RulesCommand::Poll(options) => Some(options),
+            RulesCommand::Watch(RulesWatchOptions {
+                source: RulesWatchSource::Poll(options),
+                ..
+            }) => Some(options),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn watch_options(&self) -> Option<&RulesWatchOptions> {
+        match &self.command {
+            RulesCommand::Watch(options) => Some(options),
             _ => None,
         }
     }
@@ -254,6 +312,10 @@ impl RulesArgs {
             RulesCommand::Run(options) if !options.dry_run => Some(&options.execution),
             RulesCommand::Consume(options) => Some(&options.execution),
             RulesCommand::Poll(options) => Some(&options.execution),
+            RulesCommand::Watch(options) => Some(match &options.source {
+                RulesWatchSource::Poll(options) => &options.execution,
+                RulesWatchSource::Consume(options) => &options.execution,
+            }),
             _ => None,
         }
     }
@@ -423,6 +485,7 @@ pub(crate) fn dispatch(args: &RulesArgs) -> Result<RulesOutput> {
         RulesCommand::Run(_) => anyhow::bail!("live rules require the host execution bridge"),
         RulesCommand::Consume(_) => anyhow::bail!("stream rules require the native stream bridge"),
         RulesCommand::Poll(_) => anyhow::bail!("webhook rules require the polling source bridge"),
+        RulesCommand::Watch(_) => anyhow::bail!("rules watch requires the live source bridge"),
         RulesCommand::Reconcile(_) => {
             anyhow::bail!("rule reconciliation requires the host evidence bridge")
         }
@@ -435,6 +498,176 @@ fn output(subcommand: &str, data: Value) -> RulesOutput {
         payload: json!({"status": "ok", "command": "rules", "subcommand": subcommand, "data": data}),
         rejected: false,
     }
+}
+
+/// Run bounded, separately admitted batches. The live bridge keeps one selected
+/// source and supplies the original budget to every batch. Definitions and
+/// action credentials are prepared again after each unlocked interval.
+#[allow(clippy::too_many_lines)]
+pub(crate) fn watch(
+    args: &RulesArgs,
+    started: Instant,
+    mut run_batch: impl FnMut(&RulesArgs, ExecutionBudget) -> Result<RulesOutput>,
+) -> Result<RulesOutput> {
+    let options = args.watch_options().context("expected rules watch")?;
+    let budget = options.budget(started)?;
+    let store = args
+        .rules_file
+        .as_ref()
+        .map_or_else(RuleSetStore::default_path, RuleSetStore::new);
+    // Resolving the file once keeps all batches on the same journal, even if
+    // an alias or the active CLI context changes while this process is alive.
+    let path = canonical_rules_path(store.path(), false)?;
+    let mut batches = Vec::new();
+    let mut results = BTreeMap::<String, Value>::new();
+    let mut totals = BTreeMap::<&str, u64>::new();
+    let mut evidence_bytes = 0usize;
+    let mut last_batch = Value::Null;
+    let mut error = Value::Null;
+    let mut rejected = false;
+    let mut stop_reason = "max_batches";
+    for index in 0..options.max_batches {
+        if budget.remaining_ms(Instant::now()).is_err() {
+            stop_reason = "deadline";
+            break;
+        }
+        let command = match &options.source {
+            RulesWatchSource::Poll(options) => {
+                let mut options = options.clone();
+                // --start bootstraps only the first page. Every subsequent
+                // page must load the cursor just committed to the journal.
+                if index > 0 {
+                    options.start = None;
+                }
+                RulesCommand::Poll(options)
+            }
+            RulesWatchSource::Consume(options) => RulesCommand::Consume(options.clone()),
+        };
+        let batch_args = RulesArgs {
+            rules_file: Some(path.clone()),
+            command,
+        };
+        let batch = match run_batch(&batch_args, budget) {
+            Ok(batch) => batch,
+            Err(_) => {
+                // Raw transport and admission errors can contain provider
+                // bodies or authority. Earlier durable evidence is retained.
+                rejected = true;
+                stop_reason = "batch_failed";
+                error = json!({
+                    "type": "rules-watch-batch-failed",
+                    "batch": index + 1,
+                    "message": "The next batch could not be confirmed. Inspect the retained journal and source before resuming with the same identities.",
+                });
+                break;
+            }
+        };
+        let data = &batch.payload["data"];
+        let mut summary = json!({
+            "batch": index + 1,
+            "status": batch.payload["status"],
+            "source": data["source"],
+        });
+        for field in ["events", "evaluations", "processed", "attempted", "executed"] {
+            let count = data[field].as_u64().unwrap_or(0);
+            *totals.entry(field).or_default() += count;
+            summary[field] = json!(count);
+        }
+        for field in ["committed_events", "acknowledged_events"] {
+            *totals.entry(field).or_default() += data["source"][field].as_u64().unwrap_or(0);
+        }
+        let mut outcomes = BTreeMap::<String, u64>::new();
+        if let Some(entries) = data["results"].as_array() {
+            for result in entries {
+                if let Some(outcome) = result["outcome"].as_str() {
+                    *outcomes.entry(outcome.to_owned()).or_default() += 1;
+                }
+                if let Some(request_id) = result["request_id"].as_str()
+                    && !results.contains_key(request_id)
+                {
+                    evidence_bytes = evidence_bytes
+                        .saturating_add(serde_json::to_vec(result)?.len());
+                    results.insert(request_id.to_owned(), result.clone());
+                }
+            }
+        }
+        summary["outcomes"] = json!(outcomes);
+        evidence_bytes = evidence_bytes.saturating_add(serde_json::to_vec(&summary)?.len());
+        // A closed journal can still contain more than one retained batch.
+        // Drain it until an authenticated empty poll confirms exhaustion.
+        let closed = data["source"]["closed"] == true && data["events"] == 0;
+        rejected = batch.rejected
+            || batch.payload["status"] != "ok"
+            || has_uncertain_results(&batch.payload);
+        last_batch = batch.payload;
+        batches.push(summary);
+        if rejected {
+            stop_reason = "batch_rejected";
+            break;
+        }
+        if closed {
+            stop_reason = "source_closed";
+            break;
+        }
+        // Every unique effect retains its exact request ID. Completed replay
+        // entries are stored once; no-match evaluations need only counts. The
+        // full latest batch also retains any failure without a request ID.
+        if evidence_bytes >= MAX_WATCH_EVIDENCE_BYTES || results.len() >= MAX_RUN_ATTEMPTS {
+            stop_reason = "evidence_limit";
+            break;
+        }
+        if index + 1 < options.max_batches {
+            let Ok(Some(remaining)) = budget.remaining_ms(Instant::now()) else {
+                stop_reason = "deadline";
+                break;
+            };
+            std::thread::sleep(StdDuration::from_millis(
+                options.poll_interval_ms.min(remaining),
+            ));
+        }
+    }
+    let outcome_unknown = !error.is_null() || batches.is_empty() || has_uncertain_results(&last_batch);
+    let mut result = output(
+        "watch",
+        json!({
+            "source_kind": if args.poll_options().is_some() { "webhook_poll" } else { "native_stream" },
+            "limits": {"max_batches": options.max_batches, "timeout_seconds": options.timeout_seconds,
+                "poll_interval_ms": options.poll_interval_ms},
+            "batch_count": batches.len(), "batches": batches, "totals": totals,
+            "results": results.into_values().collect::<Vec<_>>(),
+            "last_batch": last_batch, "elapsed_ms": started.elapsed().as_millis(),
+            "stopped": true, "stop_reason": stop_reason, "outcome_unknown": outcome_unknown,
+            "error": error,
+        }),
+    );
+    result.rejected = rejected;
+    if rejected {
+        result.payload["status"] = json!("error");
+    }
+    Ok(result)
+}
+
+pub(crate) fn has_uncertain_results(payload: &Value) -> bool {
+    payload["data"]["outcome_unknown"] == true
+        || payload["data"]["source"]["acknowledgement_unknown"] == true
+        || payload["data"]["source"]["ack_state_persisted"] == false
+        || payload["data"]["source"]["cursor_commit_unknown"] == true
+        || payload["data"]["last_batch"]
+            .as_object()
+            .is_some_and(|_| has_uncertain_results(&payload["data"]["last_batch"]))
+        || payload["data"]["results"].as_array().is_some_and(|results| {
+            results.iter().any(|result| {
+                let reconciled = matches!(
+                    result["outcome"].as_str(),
+                    Some("reconciled" | "already_completed")
+                ) && result["state_persisted"] == true;
+                result["outcome"] == "outcome_unknown"
+                    || (!reconciled
+                        && (result["previous_outcome"] == "pending"
+                            || result["previous_outcome"] == "unknown"))
+                    || result["state_persisted"] == false
+            })
+        })
 }
 
 fn registration_acknowledged(rule: &Rule, allow_risky: bool) -> Result<()> {
@@ -4362,6 +4595,184 @@ mod tests {
         (temp, args, executor, source)
     }
 
+    fn watching(args: RulesArgs, max_batches: u32) -> RulesArgs {
+        let source = match args.command {
+            RulesCommand::Poll(options) => RulesWatchSource::Poll(options),
+            RulesCommand::Consume(options) => RulesWatchSource::Consume(options),
+            _ => panic!("watch needs a live source"),
+        };
+        RulesArgs {
+            rules_file: args.rules_file,
+            command: RulesCommand::Watch(RulesWatchOptions {
+                max_batches,
+                timeout_seconds: 10,
+                poll_interval_ms: 100,
+                source,
+            }),
+        }
+    }
+
+    #[test]
+    fn watch_cli_bounds_both_sources_and_keeps_authority_separate() {
+        #[derive(clap::Parser)]
+        struct Command {
+            #[command(flatten)]
+            rules: RulesArgs,
+        }
+        let parse = |extra: &[&str]| {
+            let mut args = vec![
+                "fwc", "watch", "poll", "--connector", "fcp.webhook-receiver",
+                "--source-zone", "z:work", "--endpoint-id", "endpoint-one",
+                "--consumer", "issues", "--source-capability-token-file", "source.cbor",
+                "--capability-token-file", "action.cbor",
+            ];
+            args.extend_from_slice(extra);
+            <Command as clap::Parser>::try_parse_from(args)
+        };
+        let parsed = parse(&[]).unwrap();
+        let options = parsed.rules.watch_options().unwrap();
+        assert_eq!(options.max_batches, 20);
+        assert_eq!(options.timeout_seconds, 300);
+        assert_eq!(options.poll_interval_ms, 1000);
+        assert_eq!(
+            parsed.rules.poll_options().unwrap().source_capability_token_file,
+            PathBuf::from("source.cbor")
+        );
+        assert_eq!(
+            parsed.rules.execution_options().unwrap().capability_token_file,
+            Some(PathBuf::from("action.cbor"))
+        );
+        for flags in [
+            ["--max-batches", "0"], ["--max-batches", "1001"],
+            ["--timeout-seconds", "0"], ["--timeout-seconds", "3601"],
+            ["--poll-interval-ms", "99"], ["--poll-interval-ms", "60001"],
+        ] {
+            assert!(parse(&flags).is_err());
+        }
+        let native = <Command as clap::Parser>::try_parse_from([
+            "fwc", "watch", "--max-batches", "2", "consume", "--connector", "fcp.slack",
+            "--source-zone", "z:work", "--topic", "message.new", "--stream-id", "stream-one",
+            "--request-id", "subscription-one", "--stream-capability-token-file", "source.cbor",
+            "--executor-node", "journal-owner", "--timeout-seconds", "5",
+        ]).unwrap();
+        assert_eq!(native.rules.watch_options().unwrap().max_batches, 2);
+        assert_eq!(native.rules.watch_options().unwrap().timeout_seconds, 5);
+        assert_eq!(
+            native.rules.consume_options().unwrap().executor_node.as_ref().unwrap().as_str(),
+            "journal-owner"
+        );
+    }
+
+    #[test]
+    fn watch_commits_successive_pages_and_deduplicates_repeated_effects() {
+        let (_temp, mut args, executor, mut source) = poll_fixture(vec![polled_event("first")]);
+        let RulesCommand::Poll(options) = &mut args.command else { unreachable!() };
+        options.start = Some(PollStart::Earliest);
+        let args = watching(args, 2);
+        let mut batch_number = 0;
+        let mut calls = 0;
+        let result = watch(&args, Instant::now(), |batch, budget| {
+            assert!(budget.remaining_ms(Instant::now())?.unwrap() <= 10_000);
+            let options = batch.poll_options().unwrap();
+            if batch_number == 0 {
+                assert!(matches!(options.start, Some(PollStart::Earliest)));
+            } else {
+                assert!(options.start.is_none());
+                source.page = webhook_page(vec![polled_event("first"), polled_event("second")]);
+                source.page.start_cursor = "cursor_next".into();
+                source.page.next_cursor = "cursor_final".into();
+            }
+            let mut next = FakeExecutor::new(executor.state_path.clone());
+            let result = poll(batch, &mut next, &mut source);
+            calls += next.calls;
+            batch_number += 1;
+            result
+        }).unwrap();
+        assert!(!result.rejected);
+        assert_eq!(calls, 2);
+        assert_eq!(source.cursors, vec![None, Some("cursor_next".into())]);
+        assert_eq!(result.payload["data"]["stop_reason"], "max_batches");
+        assert_eq!(result.payload["data"]["batch_count"], 2);
+        assert_eq!(result.payload["data"]["totals"]["events"], 3);
+        assert_eq!(result.payload["data"]["totals"]["executed"], 2);
+        assert_eq!(result.payload["data"]["results"].as_array().unwrap().len(), 2);
+        assert_eq!(result.payload["data"]["batches"][1]["outcomes"]["duplicate"], 1);
+        let (state, _) = load_run_state(&executor.state_path).unwrap();
+        assert_eq!(state.sources.values().next().unwrap().cursor, "cursor_final");
+        assert!(state.attempts.values().all(|attempt| attempt.status == AttemptStatus::Completed));
+        let rendered = serde_json::to_string(&result.payload).unwrap();
+        for private in ["private-webhook-payload", "private-connector-response", "source.cbor"] {
+            assert!(!rendered.contains(private));
+        }
+    }
+
+    #[test]
+    fn watch_stops_unknown_actions_without_advancing_the_unfinished_page() {
+        let (_temp, args, executor, mut source) = poll_fixture(vec![polled_event("first")]);
+        let args = watching(args, 5);
+        let mut batch_number = 0;
+        let result = watch(&args, Instant::now(), |batch, _| {
+            let mut next = FakeExecutor::new(executor.state_path.clone());
+            if batch_number == 1 {
+                source.page = webhook_page(vec![polled_event("second")]);
+                source.page.start_cursor = "cursor_next".into();
+                source.page.next_cursor = "cursor_final".into();
+                next.replies.push_back(FakeReply::Unknown);
+            }
+            batch_number += 1;
+            poll(batch, &mut next, &mut source)
+        }).unwrap();
+        assert!(result.rejected);
+        assert_eq!(batch_number, 2);
+        assert_eq!(result.payload["data"]["stop_reason"], "batch_rejected");
+        assert_eq!(result.payload["data"]["totals"]["executed"], 1);
+        assert_eq!(result.payload["data"]["outcome_unknown"], true);
+        assert!(has_uncertain_results(&result.payload));
+        let (state, _) = load_run_state(&executor.state_path).unwrap();
+        assert_eq!(state.sources.values().next().unwrap().cursor, "cursor_next");
+        assert!(state.attempts.values().any(|attempt| attempt.status == AttemptStatus::Unknown));
+    }
+
+    #[test]
+    fn watch_reloads_definitions_and_preserves_evidence_when_a_later_batch_fails() {
+        let (_temp, args, executor, mut source) = poll_fixture(vec![polled_event("first")]);
+        let args = watching(args, 5);
+        let mut batch_number = 0;
+        let result = watch(&args, Instant::now(), |batch, _| {
+            if batch_number == 1 {
+                let path = args.rules_file.as_ref().unwrap();
+                let mut definitions = load_rules(path, false)?;
+                definitions.rules[0].enabled = false;
+                save_rules(path, &definitions)?;
+            }
+            batch_number += 1;
+            let mut next = FakeExecutor::new(executor.state_path.clone());
+            poll(batch, &mut next, &mut source)
+        }).unwrap();
+        assert!(result.rejected);
+        assert_eq!(batch_number, 2);
+        assert_eq!(source.cursors.len(), 1);
+        assert_eq!(result.payload["data"]["stop_reason"], "batch_failed");
+        assert_eq!(result.payload["data"]["totals"]["executed"], 1);
+        assert_eq!(result.payload["data"]["results"].as_array().unwrap().len(), 1);
+        assert_eq!(result.payload["data"]["error"]["batch"], 2);
+        assert!(has_uncertain_results(&result.payload));
+    }
+
+    #[test]
+    fn watch_validates_limits_and_never_starts_after_its_original_deadline() {
+        let (_temp, args, _executor, _source) = poll_fixture(Vec::new());
+        let mut args = watching(args, 1);
+        let started = Instant::now() - StdDuration::from_secs(20);
+        let result = watch(&args, started, |_, _| panic!("expired watch must not poll")).unwrap();
+        assert_eq!(result.payload["data"]["stop_reason"], "deadline");
+        assert_eq!(result.payload["data"]["batch_count"], 0);
+        assert!(has_uncertain_results(&result.payload));
+        let RulesCommand::Watch(options) = &mut args.command else { unreachable!() };
+        options.max_batches = 0;
+        assert!(watch(&args, Instant::now(), |_, _| panic!("invalid watch must not poll")).is_err());
+    }
+
     #[test]
     fn poll_persists_start_before_effects_and_commits_only_the_completed_page() {
         let (_temp, args, mut executor, mut source) =
@@ -4848,6 +5259,7 @@ mod tests {
 
     struct FakeSource {
         events: Vec<EventEnvelope>,
+        closed: bool,
         executor_node: Option<TailscaleNodeId>,
         acknowledgements: Vec<Vec<String>>,
         fail_ack: bool,
@@ -4868,7 +5280,7 @@ mod tests {
             self.polls += 1;
             Ok(RuleEventBatch {
                 events: self.events.clone(),
-                closed: false,
+                closed: self.closed,
                 wait_expired: false,
             })
         }
@@ -4909,6 +5321,7 @@ mod tests {
         });
         let source = FakeSource {
             events,
+            closed: false,
             executor_node: None,
             acknowledgements: Vec::new(),
             fail_ack: false,
@@ -4916,6 +5329,50 @@ mod tests {
             state_path: executor.state_path.clone(),
         };
         (temp, args, executor, source)
+    }
+
+    #[test]
+    fn watch_native_redelivery_never_repeats_an_effect_and_stops_on_unknown_ack() {
+        let (_temp, args, executor, mut source) = consume_fixture(vec![native_event("cursor-1", 1)]);
+        let args = watching(args, 5);
+        let mut batch_number = 0;
+        let mut calls = 0;
+        let result = watch(&args, Instant::now(), |batch, _| {
+            source.fail_ack = batch_number > 0;
+            let mut next = FakeExecutor::new(executor.state_path.clone());
+            let result = consume(batch, &mut next, &mut source);
+            calls += next.calls;
+            batch_number += 1;
+            result
+        }).unwrap();
+        assert!(result.rejected);
+        assert_eq!(calls, 1);
+        assert_eq!(source.polls, 2);
+        assert_eq!(source.acknowledgements.len(), 2);
+        assert_eq!(result.payload["data"]["totals"]["executed"], 1);
+        assert_eq!(result.payload["data"]["totals"]["acknowledged_events"], 1);
+        assert_eq!(result.payload["data"]["stop_reason"], "batch_rejected");
+        assert_eq!(result.payload["data"]["outcome_unknown"], true);
+        assert!(has_uncertain_results(&result.payload));
+        assert!(!result.payload.to_string().contains("bearer material"));
+    }
+
+    #[test]
+    fn watch_stops_after_draining_a_closed_native_stream() {
+        let (_temp, args, executor, mut source) = consume_fixture(vec![native_event("cursor-1", 1)]);
+        let args = watching(args, 5);
+        source.closed = true;
+        let result = watch(&args, Instant::now(), |batch, _| {
+            let mut next = FakeExecutor::new(executor.state_path.clone());
+            let result = consume(batch, &mut next, &mut source);
+            source.events.clear();
+            result
+        }).unwrap();
+        assert!(!result.rejected);
+        assert_eq!(source.polls, 2);
+        assert_eq!(source.acknowledgements.len(), 1);
+        assert_eq!(result.payload["data"]["stop_reason"], "source_closed");
+        assert_eq!(result.payload["data"]["totals"]["executed"], 1);
     }
 
     #[test]

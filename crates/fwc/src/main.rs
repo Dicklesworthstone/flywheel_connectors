@@ -2117,6 +2117,9 @@ enum AuthCommand {
     /// Create or replace a host-managed provider auth profile.
     Login(AuthLoginArgs),
 
+    /// Bind an admitted provider profile to an explicit zone and destination hosts.
+    BindProfile(AuthBindProfileArgs),
+
     /// Poll an in-progress host-managed OAuth device-code login.
     LoginPoll(AuthLoginPollArgs),
 
@@ -2282,6 +2285,34 @@ struct AuthLoginArgs {
     #[arg(long)]
     oauth_auth_code: bool,
 
+    /// Configure AWS SigV4 signing from --aws-credentials-file, --region, and --service.
+    #[arg(long)]
+    sigv4: bool,
+
+    /// JSON file with access_key_id, secret_access_key, and optional session_token.
+    #[arg(long, value_name = "PATH")]
+    aws_credentials_file: Option<PathBuf>,
+
+    /// AWS signing region, for example us-east-1.
+    #[arg(long)]
+    region: Option<String>,
+
+    /// AWS signing service, for example s3 or bedrock.
+    #[arg(long)]
+    service: Option<String>,
+
+    /// Read a short-lived bearer setup token from a file; requires --expires-at.
+    #[arg(long, value_name = "PATH")]
+    setup_token_file: Option<PathBuf>,
+
+    /// Expiry timestamp for --setup-token-file.
+    #[arg(long, value_name = "RFC3339")]
+    expires_at: Option<String>,
+
+    /// Read the host admin bearer from a file; defaults to FCP_HOST_ADMIN_BEARER_TOKEN.
+    #[arg(long, value_name = "PATH")]
+    admin_token_file: Option<PathBuf>,
+
     /// OAuth client id.
     #[arg(long)]
     client_id: Option<String>,
@@ -2322,6 +2353,44 @@ struct AuthLoginArgs {
     /// Optional credential value prefix such as `Bearer`.
     #[arg(long)]
     value_prefix: Option<String>,
+}
+
+#[derive(Args, Debug, Serialize)]
+struct AuthBindProfileArgs {
+    /// Provider owning the profile and the target credential pool.
+    provider: String,
+
+    /// Existing host-managed provider profile to snapshot into the pool.
+    #[arg(long, default_value = "default")]
+    profile: String,
+
+    /// Credential reference that connector operations will request.
+    #[arg(long)]
+    credential_id: String,
+
+    /// Zone allowed to lease this credential.
+    #[arg(long)]
+    zone: String,
+
+    /// Exact destination host; repeat for multiple hosts. Wildcards are refused.
+    #[arg(long, required = true)]
+    host_allow: Vec<String>,
+
+    /// Redacted label for the pooled credential; defaults to the profile id.
+    #[arg(long)]
+    label: Option<String>,
+
+    /// Lower values are preferred by priority-based pools.
+    #[arg(long, default_value_t = 0)]
+    priority: u32,
+
+    /// Replace an existing credential and revoke its previous lease authority.
+    #[arg(long)]
+    replace: bool,
+
+    /// Read the host admin bearer from a file; defaults to FCP_HOST_ADMIN_BEARER_TOKEN.
+    #[arg(long, value_name = "PATH")]
+    admin_token_file: Option<PathBuf>,
 }
 
 #[derive(Args, Debug, Serialize)]
@@ -5480,6 +5549,9 @@ struct HostAdminClient {
     // Workflow discovery and introspection share the original run deadline.
     // Ordinary commands retain their independent per-read timeout.
     read_budget: Option<pipe::budget::ExecutionBudget>,
+    // Rule execution opts into bounded discovery and action response bodies.
+    // Other clients keep their existing decoding behavior.
+    response_limit_bytes: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -5600,8 +5672,50 @@ impl HostReadProvenance {
     }
 }
 
+#[derive(Deserialize, Serialize)]
+struct AuthProfileAdminMetadata {
+    provider: String,
+    profile_id: String,
+    method: String,
+    label: String,
+    priority: i32,
+    created_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_used_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct AuthProfileAdminResponse {
+    profile: AuthProfileAdminMetadata,
+}
+
+#[derive(Deserialize, Serialize)]
+struct AuthProfileBindingResponse {
+    outcome: fcp_host::CredentialMutationOutcome,
+    pool: fcp_host::CredentialPoolView,
+}
+
 impl HostAdminClient {
     fn new(endpoint: &str) -> Result<Self> {
+        Self::new_with_admin_credential(endpoint, None)
+    }
+
+    // Explicitly opt auth-administration clients into owner credentials. Ordinary
+    // discovery/invoke clients never acquire this bearer as ambient authority.
+    fn for_provider_auth(endpoint: &str, token_file: Option<&Path>) -> Result<Self> {
+        let token = if token_file.is_some()
+            || std::env::var_os("FCP_HOST_ADMIN_BEARER_TOKEN").is_some()
+        {
+            Some(mesh_inventory_credential(token_file).map_err(|_| {
+                anyhow::anyhow!("host admin credential must be a nonempty bounded ASCII token")
+            })?)
+        } else {
+            None
+        };
+        Self::new_with_admin_credential(endpoint, token.as_ref().map(|value| value.as_str()))
+    }
+
+    fn new_with_admin_credential(endpoint: &str, token: Option<&str>) -> Result<Self> {
         let endpoint = normalize_host_endpoint(endpoint)?;
         let configured_timeout = match std::env::var(HOST_READ_TIMEOUT_ENV) {
             Ok(value) => Some(value),
@@ -5615,9 +5729,18 @@ impl HostAdminClient {
         // Authorization header on a cross-origin redirect cannot protect them.
         // Keep every request on the chosen host and leave replay decisions to
         // the invocation journal instead of the HTTP transport.
+        let mut headers = reqwest::header::HeaderMap::new();
+        if let Some(token) = token {
+            let mut authorization = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+                .map_err(|_| anyhow::anyhow!("invalid host admin credential"))?;
+            authorization.set_sensitive(true);
+            headers.insert(reqwest::header::AUTHORIZATION, authorization);
+            headers.insert("x-fcp-zone", reqwest::header::HeaderValue::from_static("z:owner"));
+        }
         let builder = BlockingClientBuilder::new()
             .redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::never());
+            .retry(reqwest::retry::never())
+            .default_headers(headers);
 
         #[cfg(unix)]
         {
@@ -5632,6 +5755,7 @@ impl HostAdminClient {
                     endpoint,
                     read_timeout,
                     read_budget: None,
+                    response_limit_bytes: None,
                 });
             }
         }
@@ -5645,11 +5769,17 @@ impl HostAdminClient {
             endpoint,
             read_timeout,
             read_budget: None,
+            response_limit_bytes: None,
         })
     }
 
     fn with_read_budget(mut self, budget: pipe::budget::ExecutionBudget) -> Self {
         self.read_budget = Some(budget);
+        self
+    }
+
+    fn with_response_limit(mut self, limit_bytes: u64) -> Self {
+        self.response_limit_bytes = Some(limit_bytes);
         self
     }
 
@@ -5983,15 +6113,20 @@ impl HostAdminClient {
     fn preflight_guarded(
         &self,
         request: &HostGuardedInvokeRequest,
+        timeout: Duration,
     ) -> Result<HostPreflightResponse> {
-        self.post_json_with_timeout("/rpc/preflight/guarded", request, self.read_timeout)
+        self.post_json_with_timeout("/rpc/preflight/guarded", request, timeout)
     }
 
-    fn invoke_guarded(&self, request: &HostGuardedInvokeRequest) -> Result<InvokeResponse> {
+    fn invoke_guarded(
+        &self,
+        request: &HostGuardedInvokeRequest,
+        timeout: Duration,
+    ) -> Result<InvokeResponse> {
         self.post_json_with_timeout(
             "/rpc/invoke/guarded",
             request,
-            host_invoke_http_timeout(request.request.deadline_ms),
+            timeout,
         )
         .and_then(|response: InvokeResponse| {
             anyhow::ensure!(
@@ -6115,7 +6250,18 @@ impl HostAdminClient {
     }
 
     fn auth_profile_upsert(&self, provider: &str, request: &Value) -> Result<Value> {
-        self.post_json(&format!("/rpc/admin/auth/profiles/{provider}"), request)
+        let response: AuthProfileAdminResponse = self.post_auth_json(
+            &format!("/rpc/admin/auth/profiles/{provider}"), request,
+        )?;
+        Ok(serde_json::to_value(response)?)
+    }
+
+    fn auth_profile_bind(&self, provider: &str, zone: &str, request: &Value) -> Result<Value> {
+        let response: AuthProfileBindingResponse = self.post_auth_json(
+            &format!("/rpc/admin/credentials/pools/{provider}/{zone}/credentials"),
+            request,
+        )?;
+        Ok(serde_json::to_value(response)?)
     }
 
     fn auth_profiles(&self, provider: &str) -> Result<Value> {
@@ -6248,7 +6394,8 @@ impl HostAdminClient {
             .and_then(|response| {
                 let mut provenance = HostReadProvenance::from_headers(response.headers())?;
                 provenance.path = path.to_owned();
-                Self::decode_response(response, method, path).map(|value| (value, provenance))
+                self.decode_client_response(response, method, path)
+                    .map(|value| (value, provenance))
             })
             .map_err(|error| {
                 if error.chain().any(|cause| {
@@ -6283,6 +6430,27 @@ impl HostAdminClient {
         Self::decode_response(response, "POST", path)
     }
 
+    fn post_auth_json<B: Serialize, T: DeserializeOwned>(&self, path: &str, body: &B) -> Result<T> {
+        // Authentication endpoints can receive secret material. Never reflect
+        // an error body or JSON deserialization error back into CLI diagnostics.
+        const MAX_AUTH_RESPONSE_BYTES: u64 = 65_536;
+        let response = self.client.post(format!("{}{}", self.base_url, path))
+            .json(body).timeout(self.read_timeout).send()
+            .map_err(|_| anyhow::anyhow!("host auth administration request failed"))?;
+        let status = response.status();
+        if !status.is_success() {
+            bail!("host auth administration returned HTTP {}", status.as_u16());
+        }
+        let mut bytes = zeroize::Zeroizing::new(Vec::new());
+        response.take(MAX_AUTH_RESPONSE_BYTES + 1).read_to_end(&mut bytes)
+            .map_err(|_| anyhow::anyhow!("host auth administration response could not be read"))?;
+        if bytes.len() as u64 > MAX_AUTH_RESPONSE_BYTES {
+            bail!("host auth administration response exceeded 65,536 bytes");
+        }
+        serde_json::from_slice(&bytes)
+            .map_err(|_| anyhow::anyhow!("host auth administration returned an invalid response"))
+    }
+
     fn put_json<B: Serialize, T: DeserializeOwned>(&self, path: &str, body: &B) -> Result<T> {
         let response = self
             .client
@@ -6306,7 +6474,7 @@ impl HostAdminClient {
             .timeout(timeout)
             .send()
             .with_context(|| format!("POST {path} to host admin API failed"))?;
-        Self::decode_response(response, "POST", path)
+        self.decode_client_response(response, "POST", path)
     }
 
     fn delete_json<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
@@ -6316,6 +6484,44 @@ impl HostAdminClient {
             .send()
             .with_context(|| format!("DELETE {path} to host admin API failed"))?;
         Self::decode_response(response, "DELETE", path)
+    }
+
+    fn decode_client_response<T: DeserializeOwned>(
+        &self,
+        response: reqwest::blocking::Response,
+        method: &str,
+        path: &str,
+    ) -> Result<T> {
+        let Some(limit_bytes) = self.response_limit_bytes else {
+            return Self::decode_response(response, method, path);
+        };
+        let status = response.status();
+        anyhow::ensure!(
+            status.is_success(),
+            "{method} {path} returned HTTP {}",
+            status.as_u16(),
+        );
+        anyhow::ensure!(
+            response
+                .content_length()
+                .is_none_or(|length| length <= limit_bytes),
+            "{method} {path} response exceeded its {limit_bytes}-byte limit",
+        );
+        // The streaming bound also covers absent or dishonest Content-Length.
+        // The request's existing timeout continues through this body read.
+        let mut bytes = Vec::new();
+        response
+            .take(limit_bytes.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .with_context(|| format!("{method} {path} returned an unreadable response body"))?;
+        anyhow::ensure!(
+            bytes.len() as u64 <= limit_bytes,
+            "{method} {path} response exceeded its {limit_bytes}-byte limit",
+        );
+        // Rule diagnostics must not echo connector data from error bodies or
+        // deserialization failures, even when the response fits the limit.
+        serde_json::from_slice(&bytes)
+            .map_err(|_| anyhow::anyhow!("{method} {path} returned invalid JSON"))
     }
 
     fn decode_response<T: DeserializeOwned>(
@@ -18393,6 +18599,7 @@ fn auth_dispatch_with_store_and_host(
     match &args.command {
         AuthCommand::Add(add_args) => auth_add_dispatch(add_args, store),
         AuthCommand::Login(login_args) => auth_login_dispatch(login_args, explicit_host),
+        AuthCommand::BindProfile(bind_args) => auth_bind_profile_dispatch(bind_args, explicit_host),
         AuthCommand::LoginPoll(poll_args) => auth_login_poll_dispatch(poll_args, explicit_host),
         AuthCommand::LoginComplete(complete_args) => {
             auth_login_complete_dispatch(complete_args, explicit_host)
@@ -18513,6 +18720,8 @@ fn auth_login_validation_error(
                 format!("fwc auth login {} --profile {} --api-key <secret> --host <endpoint>", args.provider, args.profile),
                 format!("fwc auth login {} --profile {} --oauth-device --client-id <id> --device-code-url <url> --token-url <url> --scope <scope> --host <endpoint>", args.provider, args.profile),
                 format!("fwc auth login {} --profile {} --oauth-auth-code --client-id <id> --authorize-url <url> --token-url <url> --redirect-uri <url> --scope <scope> --host <endpoint>", args.provider, args.profile),
+                format!("fwc auth login {} --profile {} --sigv4 --aws-credentials-file <path> --region <region> --service <service> --host <endpoint>", args.provider, args.profile),
+                format!("fwc auth login {} --profile {} --setup-token-file <path> --expires-at <RFC3339> --host <endpoint>", args.provider, args.profile),
             ],
         }),
         exit_code: CliExitCode::Validation,
@@ -18538,18 +18747,147 @@ fn require_auth_login_field(
         })
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AwsCredentialsFile {
+    access_key_id: String,
+    secret_access_key: String,
+    #[serde(default)]
+    session_token: Option<String>,
+}
+
+fn read_auth_login_file(
+    args: &AuthLoginArgs,
+    field: &'static str,
+    path: &Path,
+) -> Result<zeroize::Zeroizing<String>, DispatchOutcome> {
+    const MAX_BYTES: u64 = 65_536;
+    let invalid = || auth_login_validation_error(
+        args,
+        format!("`--{field}` must name a readable regular UTF-8 file of at most 65,536 bytes."),
+    );
+    if !std::fs::metadata(path).map_err(|_| invalid())?.is_file() {
+        return Err(invalid());
+    }
+    let file = std::fs::File::open(path).map_err(|_| invalid())?;
+    if !file.metadata().map_err(|_| invalid())?.is_file() {
+        return Err(invalid());
+    }
+    let mut raw = zeroize::Zeroizing::new(String::new());
+    file.take(MAX_BYTES + 1).read_to_string(&mut raw).map_err(|_| invalid())?;
+    if raw.len() as u64 > MAX_BYTES {
+        return Err(invalid());
+    }
+    Ok(raw)
+}
+
+fn auth_login_credential_is_valid(value: &str, max_bytes: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= max_bytes
+        && value.bytes().all(|byte| byte.is_ascii_graphic())
+}
+
+fn auth_login_scope_is_valid(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
 fn auth_login_request(args: &AuthLoginArgs) -> Result<(Value, &'static str), DispatchOutcome> {
+    if validate_connector_id(&args.provider).is_err()
+        || matches!(args.provider.as_str(), "." | "..")
+        || args.profile.trim().is_empty()
+        || args.label.as_ref().is_some_and(|label| label.trim().is_empty())
+    {
+        return Err(auth_login_validation_error(args, "Provider must be a path-safe identifier, and profile and label must be nonempty."));
+    }
     let method_count = usize::from(args.api_key.is_some())
         + usize::from(args.oauth_device)
-        + usize::from(args.oauth_auth_code);
+        + usize::from(args.oauth_auth_code)
+        + usize::from(args.sigv4)
+        + usize::from(args.setup_token_file.is_some());
     if method_count != 1 {
         return Err(auth_login_validation_error(
             args,
-            "Choose exactly one login method: `--api-key`, `--oauth-device`, or `--oauth-auth-code`.",
+            "Choose exactly one login method: `--api-key`, `--oauth-device`, `--oauth-auth-code`, `--sigv4`, or `--setup-token-file`.",
         ));
+    }
+    if !args.sigv4 && (args.aws_credentials_file.is_some() || args.region.is_some() || args.service.is_some()) {
+        return Err(auth_login_validation_error(args, "AWS credentials, region, and service require `--sigv4`."));
+    }
+    if args.setup_token_file.is_none() && args.expires_at.is_some() {
+        return Err(auth_login_validation_error(args, "`--expires-at` requires `--setup-token-file`."));
+    }
+    if args.api_key.is_none() && args.value_prefix.is_some() {
+        return Err(auth_login_validation_error(args, "`--value-prefix` only applies to `--api-key`."));
+    }
+    if args.api_key.is_none() && args.setup_token_file.is_none() && args.header_name.is_some() {
+        return Err(auth_login_validation_error(args, "`--header-name` only applies to `--api-key` or `--setup-token-file`."));
+    }
+    if (args.sigv4 || args.setup_token_file.is_some())
+        && (args.client_id.is_some() || args.client_secret.is_some()
+            || args.device_code_url.is_some() || args.authorize_url.is_some()
+            || args.token_url.is_some() || args.redirect_uri.is_some()
+            || !args.scope.is_empty() || args.no_pkce)
+    {
+        return Err(auth_login_validation_error(args, "OAuth options cannot be combined with SigV4 or setup-token login."));
     }
 
     let label = args.label.clone().unwrap_or_else(|| args.profile.clone());
+    if args.sigv4 {
+        let region = require_auth_login_field(args, "region", args.region.as_ref())?;
+        let service = require_auth_login_field(args, "service", args.service.as_ref())?;
+        if !auth_login_scope_is_valid(&region) || !auth_login_scope_is_valid(&service) {
+            return Err(auth_login_validation_error(args, "AWS region and service must contain 1 to 64 ASCII letters, digits, or hyphens."));
+        }
+        let path = args.aws_credentials_file.as_deref().ok_or_else(|| {
+            auth_login_validation_error(args, "`--aws-credentials-file` is required for SigV4 login.")
+        })?;
+        let raw = read_auth_login_file(args, "aws-credentials-file", path)?;
+        let credentials: AwsCredentialsFile = serde_json::from_str(&raw).map_err(|_| {
+            auth_login_validation_error(args, "AWS credential file must be a JSON object with access_key_id, secret_access_key, and optional session_token; unknown or duplicate fields are refused.")
+        })?;
+        if !auth_login_credential_is_valid(&credentials.access_key_id, 128)
+            || !credentials.access_key_id.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+            || !auth_login_credential_is_valid(&credentials.secret_access_key, 4096)
+            || credentials.session_token.as_ref().is_some_and(|token| !auth_login_credential_is_valid(token, 16_384))
+        {
+            return Err(auth_login_validation_error(args, "AWS credential file contains empty, oversized, or unsafe credential material."));
+        }
+        return Ok((json!({
+            "profile_id": args.profile, "method": "sigv4", "label": label, "priority": args.priority,
+            "access_key_id": credentials.access_key_id, "secret_access_key": credentials.secret_access_key,
+            "session_token": credentials.session_token, "region": region, "service": service
+        }), "sigv4"));
+    }
+    if let Some(path) = args.setup_token_file.as_deref() {
+        let expiry = require_auth_login_field(args, "expires_at", args.expires_at.as_ref())?;
+        let expiry = DateTime::parse_from_rfc3339(&expiry).map_err(|_| {
+            auth_login_validation_error(args, "`--expires-at` must be an RFC3339 timestamp.")
+        })?;
+        if expiry <= Utc::now() {
+            return Err(auth_login_validation_error(args, "Setup token expiry must be in the future."));
+        }
+        let header_name = args.header_name.as_deref().unwrap_or("Authorization");
+        let normalized = header_name.to_ascii_lowercase();
+        if reqwest::header::HeaderName::from_bytes(header_name.as_bytes()).is_err()
+            || normalized.starts_with("x-fcp-")
+            || matches!(normalized.as_str(), "host" | "content-length" | "transfer-encoding" | "connection"
+                | "trailer" | "te" | "upgrade" | "proxy-authorization" | "proxy-connection"
+                | "keep-alive" | "proxy-authenticate")
+        {
+            return Err(auth_login_validation_error(args, "Setup tokens require a valid credential header, not a routing, framing, or host-authority header."));
+        }
+        let raw = read_auth_login_file(args, "setup-token-file", path)?;
+        let token = raw.trim();
+        if !auth_login_credential_is_valid(token, 16_384) {
+            return Err(auth_login_validation_error(args, "Setup token must contain 1 to 16,384 visible ASCII bytes without whitespace."));
+        }
+        return Ok((json!({
+            "profile_id": args.profile, "method": "setup_token", "label": label, "priority": args.priority,
+            "token": token, "expires_at": expiry, "header_name": header_name
+        }), "setup_token"));
+    }
     if let Some(api_key) = args.api_key.as_ref() {
         let mut request = json!({
             "profile_id": args.profile,
@@ -18627,7 +18965,7 @@ fn auth_login_dispatch(
         Ok(host) => host,
         Err(outcome) => return Ok(outcome),
     };
-    let client = HostAdminClient::new(&host.endpoint)?;
+    let client = HostAdminClient::for_provider_auth(&host.endpoint, args.admin_token_file.as_deref())?;
     let response = client.auth_profile_upsert(&args.provider, &request)?;
     let oauth_start = match method {
         "oauth_device" => Some(client.auth_oauth_device_start(&args.provider, &args.profile)?),
@@ -18654,9 +18992,15 @@ fn auth_login_dispatch(
                 args.provider, args.profile, login_id, host.endpoint
             ));
         }
-    } else {
+    } else if !matches!(method, "sigv4" | "setup_token") {
         next_actions.push(format!(
             "fwc auth refresh {} --profile {} --host {}",
+            args.provider, args.profile, host.endpoint
+        ));
+    }
+    if matches!(method, "sigv4" | "setup_token") {
+        next_actions.push(format!(
+            "fwc auth bind-profile {} --profile {} --credential-id <uuid> --zone <zone> --host-allow <host> --host {}",
             args.provider, args.profile, host.endpoint
         ));
     }
@@ -18688,6 +19032,92 @@ fn auth_login_dispatch(
     })
 }
 
+fn auth_bind_profile_dispatch(
+    args: &AuthBindProfileArgs,
+    explicit_host: Option<&str>,
+) -> Result<DispatchOutcome> {
+    let invalid = |message: &str| DispatchOutcome {
+        payload: json!({
+            "status": "error", "command": "auth", "subcommand": "bind-profile",
+            "error": {"type": "invalid-auth-profile-binding", "message": message, "recoverable": true},
+            "next_actions": ["Supply an existing provider profile, a credential UUID, a valid zone, and at least one exact --host-allow destination."],
+        }),
+        exit_code: CliExitCode::Validation,
+    };
+    if validate_connector_id(&args.provider).is_err()
+        || matches!(args.provider.as_str(), "." | "..")
+        || args.profile.trim().is_empty()
+        || args.label.as_ref().is_some_and(|label| label.trim().is_empty())
+    {
+        return Ok(invalid("Provider must be a path-safe identifier, and profile and label must be nonempty."));
+    }
+    let credential_id = match fcp_core::CredentialId::parse(&args.credential_id) {
+        Ok(id) => id,
+        Err(_) => return Ok(invalid("--credential-id must be a UUID.")),
+    };
+    let zone = match args.zone.parse::<ZoneId>() {
+        Ok(zone) => zone,
+        Err(_) => return Ok(invalid("--zone must be a valid FCP zone id.")),
+    };
+    if args.host_allow.is_empty() || args.host_allow.len() > 128 {
+        return Ok(invalid("Supply 1 to 128 explicit --host-allow destinations."));
+    }
+    let mut host_allow = Vec::with_capacity(args.host_allow.len());
+    for host in &args.host_allow {
+        if host.len() > 253 || host.trim() != host || host.contains(['*', '/', '@', '?', '#', '[', ']']) {
+            return Ok(invalid("--host-allow accepts exact hostnames or IP addresses without wildcards, ports, or URL syntax."));
+        }
+        let canonical = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+            ip.to_string()
+        } else {
+            let Ok(canonical) = fcp_sandbox::canonicalize_hostname(host) else {
+                return Ok(invalid("--host-allow contains an invalid hostname."));
+            };
+            if canonical.len() > 253 || canonical.split('.').any(|label| {
+                label.is_empty() || label.len() > 63 || label.starts_with('-') || label.ends_with('-')
+                    || !label.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            }) {
+                return Ok(invalid("--host-allow contains an invalid hostname."));
+            }
+            canonical
+        };
+        host_allow.push(canonical);
+    }
+    host_allow.sort_unstable();
+    host_allow.dedup();
+    let host = match auth_host_config(
+        "bind-profile",
+        serde_json::to_value(args)?,
+        vec!["Retry with --host <endpoint> and an owner admin credential.".to_owned()],
+        explicit_host,
+    ) {
+        Ok(host) => host,
+        Err(outcome) => return Ok(outcome),
+    };
+    let client = HostAdminClient::for_provider_auth(&host.endpoint, args.admin_token_file.as_deref())?;
+    let response = client.auth_profile_bind(&args.provider, zone.as_str(), &json!({
+        "profile_credential": {
+            "credential_id": credential_id, "profile_id": args.profile,
+            "label": args.label.as_ref().unwrap_or(&args.profile),
+            "priority": args.priority, "host_allow": host_allow,
+        },
+        "mode": if args.replace { "replace_existing" } else { "reject_existing" },
+    }))?;
+    let mut payload = json!({
+        "status": "ok", "command": "auth", "subcommand": "bind-profile",
+        "source": "host-admin-api", "provider": args.provider, "profile_id": args.profile,
+        "credential_id": credential_id, "zone_id": zone, "host_allow": host_allow,
+        "binding": "snapshot", "result": response,
+        "message": "Bound the current profile to a zone-scoped credential. Later profile edits require an explicit rebind with --replace.",
+    });
+    attach_auth_host_contract(
+        &mut payload, &host.endpoint, &args.provider, Some(&args.profile),
+        "provider-auth-profile-bind", true,
+    );
+    CommandEnvelope::new(CommandAvailability::LiveRuntime, "auth").inject_into(&mut payload);
+    Ok(DispatchOutcome { payload, exit_code: CliExitCode::Success })
+}
+
 fn auth_login_poll_dispatch(
     args: &AuthLoginPollArgs,
     explicit_host: Option<&str>,
@@ -18707,7 +19137,7 @@ fn auth_login_poll_dispatch(
         Ok(host) => host,
         Err(outcome) => return Ok(outcome),
     };
-    let client = HostAdminClient::new(&host.endpoint)?;
+    let client = HostAdminClient::for_provider_auth(&host.endpoint, None)?;
     let response = client.auth_oauth_device_poll(&args.provider, &args.profile, &args.login_id)?;
     let envelope = CommandEnvelope::new(CommandAvailability::LiveRuntime, "auth");
     let mut payload = json!({
@@ -18758,7 +19188,7 @@ fn auth_login_complete_dispatch(
         Ok(host) => host,
         Err(outcome) => return Ok(outcome),
     };
-    let client = HostAdminClient::new(&host.endpoint)?;
+    let client = HostAdminClient::for_provider_auth(&host.endpoint, None)?;
     let request = json!({
         "login_id": args.login_id,
         "code": args.code,
@@ -18837,7 +19267,7 @@ fn auth_provider_profile_read_dispatch(
         Ok(host) => host,
         Err(outcome) => return Ok(outcome),
     };
-    let client = HostAdminClient::new(&host.endpoint)?;
+    let client = HostAdminClient::for_provider_auth(&host.endpoint, None)?;
     let response = match profile {
         Some(profile_id) => client.auth_profile(provider, profile_id)?,
         None => client.auth_profiles(provider)?,
@@ -18890,7 +19320,7 @@ fn auth_set_priority_dispatch(
         Ok(host) => host,
         Err(outcome) => return Ok(outcome),
     };
-    let client = HostAdminClient::new(&host.endpoint)?;
+    let client = HostAdminClient::for_provider_auth(&host.endpoint, None)?;
     let response = client.auth_profile_priority(&args.provider, &args.profile, args.priority)?;
     let envelope = CommandEnvelope::new(CommandAvailability::LiveRuntime, "auth");
     let mut payload = json!({
@@ -18939,7 +19369,7 @@ fn auth_refresh_dispatch(
         Ok(host) => host,
         Err(outcome) => return Ok(outcome),
     };
-    let client = HostAdminClient::new(&host.endpoint)?;
+    let client = HostAdminClient::for_provider_auth(&host.endpoint, None)?;
     let response = client.auth_profile_refresh(&args.provider, args.profile.as_deref())?;
     let envelope = CommandEnvelope::new(CommandAvailability::LiveRuntime, "auth");
     let mut payload = json!({
@@ -19013,7 +19443,7 @@ fn auth_remove_profile_dispatch(
         Ok(host) => host,
         Err(outcome) => return Ok(outcome),
     };
-    let client = HostAdminClient::new(&host.endpoint)?;
+    let client = HostAdminClient::for_provider_auth(&host.endpoint, None)?;
     let response = client.auth_profile_delete(&args.provider, &args.profile)?;
     let envelope = CommandEnvelope::new(CommandAvailability::LiveRuntime, "auth");
     let mut payload = json!({
@@ -19108,6 +19538,13 @@ fn auth_migrate_from_claude_code_dispatch(
         api_key: Some(api_key),
         oauth_device: false,
         oauth_auth_code: false,
+        sigv4: false,
+        aws_credentials_file: None,
+        region: None,
+        service: None,
+        setup_token_file: None,
+        expires_at: None,
+        admin_token_file: None,
         client_id: None,
         client_secret: None,
         device_code_url: None,
@@ -25876,7 +26313,10 @@ fn invoke_dispatch_host_controlled(
         approval_tokens: auth.approval_tokens.clone(),
     };
     let preflight: HostPreflightResponse = if let Some(request) = &guarded_request {
-        client.preflight_guarded(request)?
+        guard
+            .as_deref()
+            .context("guarded preflight is missing its rule authority")?
+            .preflight(request)?
     } else if let Some(control) = control {
         control.checkpoint()?;
         client.post_json_with_timeout("/rpc/preflight", &preflight_request, client.read_timeout)?
@@ -25934,7 +26374,10 @@ fn invoke_dispatch_host_controlled(
     }
     let started_at = std::time::Instant::now();
     let invocation = if let Some(request) = &guarded_request {
-        client.invoke_guarded(request)
+        guard
+            .as_deref()
+            .context("guarded invocation is missing its rule authority")?
+            .invoke(request)
     } else if let Some(control) = control {
         control.invoke(&client, &invoke_request)
     } else {
@@ -36250,6 +36693,8 @@ fn is_sensitive_flag(flag: &str) -> bool {
         "--capability-token"
             | "--capability-token-file"
             | "--admin-token-file"
+            | "--aws-credentials-file"
+            | "--setup-token-file"
             | "--cancel-capability-token"
             | "--cancel-capability-token-file"
             | "--source-capability-token"
@@ -36446,6 +36891,7 @@ mod tests {
             base_url,
             read_timeout: Duration::from_millis(250),
             read_budget: None,
+            response_limit_bytes: None,
         };
         let (release, released) = std::sync::mpsc::channel();
         let (observed_request, observed) = std::sync::mpsc::channel();
@@ -65740,6 +66186,229 @@ require_attestation_types = ["in-toto"]"#,
                 .as_array()
                 .is_some_and(|actions| !actions.is_empty())
         );
+    }
+
+    #[test]
+    fn auth_specialty_login_and_binding_use_authenticated_redacted_requests() {
+        let temp = tempfile::tempdir().expect("credential fixture directory");
+        let aws_file = temp.path().join("aws.json");
+        let setup_file = temp.path().join("setup.txt");
+        let admin_file = temp.path().join("admin.txt");
+        fs::write(&aws_file, json!({
+            "access_key_id": "AKIAEXAMPLE", "secret_access_key": "aws-secret-sentinel",
+            "session_token": "aws-session-sentinel",
+        }).to_string()).expect("AWS fixture");
+        fs::write(&setup_file, "setup-secret-sentinel\n").expect("setup fixture");
+        fs::write(&admin_file, "admin-secret-sentinel\n").expect("admin fixture");
+        let expiry = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("auth mock bind");
+        listener.set_nonblocking(true).expect("nonblocking accept");
+        let host = format!("http://{}", listener.local_addr().expect("auth mock address"));
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let mut requests = Vec::new();
+            while requests.len() < 5 && Instant::now() < deadline {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(error) => panic!("auth accept failed: {error}"),
+                };
+                stream.set_read_timeout(Some(Duration::from_secs(3))).expect("request timeout");
+                let mut reader = BufReader::new(stream.try_clone().expect("auth socket clone"));
+                let mut request_line = String::new();
+                reader.read_line(&mut request_line).expect("request line");
+                let mut content_length = 0;
+                let mut authorization = false;
+                let mut owner_zone = false;
+                loop {
+                    let mut header = String::new();
+                    reader.read_line(&mut header).expect("request header");
+                    if header == "\r\n" || header.is_empty() { break; }
+                    if let Some((name, value)) = header.split_once(':') {
+                        match name.to_ascii_lowercase().as_str() {
+                            "content-length" => content_length = value.trim().parse::<usize>().expect("body length"),
+                            "authorization" => authorization = value.trim() == "Bearer admin-secret-sentinel",
+                            "x-fcp-zone" => owner_zone = value.trim() == "z:owner",
+                            _ => {}
+                        }
+                    }
+                }
+                assert!(authorization && owner_zone, "owner authorization is required on every auth request");
+                let mut body = vec![0; content_length];
+                reader.read_exact(&mut body).expect("request body");
+                let body: Value = serde_json::from_slice(&body).expect("JSON request");
+                let provider = if request_line.contains("test-aws") { "test-aws" } else { "test-setup" };
+                let rejected = requests.len() == 4;
+                let response = if rejected {
+                    body.clone()
+                } else if let Some(method) = body.get("method") {
+                    json!({"profile": {"provider": provider, "profile_id": "primary", "method": method,
+                        "label": "primary", "priority": 0, "created_at": chrono::Utc::now(),
+                        "secret_access_key": "response-secret-sentinel"},
+                        "token": "response-secret-sentinel"})
+                } else {
+                    json!({"outcome": "added", "pool": {
+                        "key": {"provider": provider, "zone_id": "z:work"}, "strategy": "round_robin",
+                        "sticky_policy": {"restick_on_recovery": false}, "max_concurrent_per_credential": 1,
+                        "exhausted_behavior": "fail_fast", "entries": [{
+                            "credential_id": "57300000-0000-4000-8000-000000000001", "source": "config",
+                            "priority": 0, "label": "primary", "payload_kind": "auth_profile", "active_leases": 0,
+                            "error_count": 0, "available": true, "payload": {"token": "response-secret-sentinel"}
+                        }], "raw_token": "response-secret-sentinel"
+                    }})
+                }.to_string();
+                let status = if rejected { "403 Forbidden" } else { "200 OK" };
+                write!(stream, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).expect("response");
+                requests.push((request_line, body));
+            }
+            assert_eq!(requests.len(), 5, "login and bind both providers, then reject a credential echo");
+            requests
+        });
+
+        for method in ["sigv4", "setup_token"] {
+            let provider = if method == "sigv4" { "test-aws" } else { "test-setup" };
+            let mut args = vec!["fwc", "--json", "--host", host.as_str(), "auth", "login", provider,
+                "--profile", "primary", "--admin-token-file", admin_file.to_str().expect("admin path")];
+            if method == "sigv4" {
+                args.extend(["--sigv4", "--aws-credentials-file", aws_file.to_str().expect("AWS path"),
+                    "--region", "us-east-1", "--service", "s3"]);
+            } else {
+                args.extend(["--setup-token-file", setup_file.to_str().expect("setup path"),
+                    "--expires-at", expiry.as_str(), "--header-name", "X-Setup-Token"]);
+            }
+            let (exit, payload) = execute_json(&args);
+            assert_eq!(exit, CliExitCode::Success.into(), "{payload}");
+            assert_eq!(payload["method"], method);
+            assert!(payload["oauth_start"].is_null());
+            assert!(payload["next_actions"].to_string().contains("bind-profile"));
+            assert!(!payload.to_string().contains("secret-sentinel"));
+            assert!(!payload.to_string().contains("session-sentinel"));
+
+            let (exit, payload) = execute_json(&["fwc", "--json", "--host", &host,
+                "auth", "bind-profile", provider, "--profile", "primary",
+                "--credential-id", "57300000-0000-4000-8000-000000000001", "--zone", "z:work",
+                "--host-allow", "API.EXAMPLE.COM.", "--host-allow", "api.example.com",
+                "--admin-token-file", admin_file.to_str().expect("admin path"), "--replace"]);
+            assert_eq!(exit, CliExitCode::Success.into(), "{payload}");
+            assert_eq!(payload["binding"], "snapshot");
+            assert_eq!(payload["host_allow"], json!(["api.example.com"]));
+            assert!(!payload.to_string().contains("secret-sentinel"));
+        }
+        let client = super::HostAdminClient::for_provider_auth(&host, Some(&admin_file)).expect("auth client");
+        let error = client.auth_profile_upsert("test-error", &json!({
+            "method": "sigv4", "access_key_id": "AKIAEXAMPLE", "secret_access_key": "echo-secret-sentinel",
+            "session_token": "echo-session-sentinel"
+        })).expect_err("error response must not be accepted");
+        let diagnostic = format!("{error:#}");
+        assert!(diagnostic.contains("403"));
+        assert!(!diagnostic.contains("sentinel"));
+        assert!(!diagnostic.contains("AKIAEXAMPLE"));
+        let requests = server.join().expect("auth mock should finish");
+        assert!(requests[0].0.starts_with("POST /rpc/admin/auth/profiles/test-aws "));
+        assert_eq!(requests[0].1["method"], "sigv4");
+        assert_eq!(requests[0].1["secret_access_key"], "aws-secret-sentinel");
+        assert_eq!(requests[0].1["session_token"], "aws-session-sentinel");
+        assert_eq!(requests[0].1["region"], "us-east-1");
+        assert_eq!(requests[0].1["service"], "s3");
+        assert!(requests[1].0.starts_with("POST /rpc/admin/credentials/pools/test-aws/z:work/credentials "));
+        assert_eq!(requests[1].1["profile_credential"]["profile_id"], "primary");
+        assert_eq!(requests[1].1["profile_credential"]["host_allow"], json!(["api.example.com"]));
+        assert_eq!(requests[1].1["mode"], "replace_existing");
+        assert!(requests[1].1.get("credential").is_none());
+        assert!(!requests[1].1.to_string().contains("secret-sentinel"));
+        assert_eq!(requests[2].1["method"], "setup_token");
+        assert_eq!(requests[2].1["token"], "setup-secret-sentinel");
+        assert_eq!(requests[2].1["header_name"], "X-Setup-Token");
+        assert!(requests[2].1["expires_at"].is_string());
+        assert!(requests[3].0.starts_with("POST /rpc/admin/credentials/pools/test-setup/z:work/credentials "));
+    }
+
+    #[test]
+    fn auth_specialty_login_rejects_invalid_files_scope_and_expiry_before_network() {
+        let temp = tempfile::tempdir().expect("credential fixtures");
+        let path = temp.path().join("credentials");
+        let path_str = path.to_str().expect("credential path");
+        let valid = json!({"access_key_id": "AKIAEXAMPLE", "secret_access_key": "secret-sentinel"}).to_string();
+        for contents in [
+            "{not-json secret-sentinel}".to_owned(),
+            json!({"access_key_id": "AKIAEXAMPLE", "secret_access_key": "secret-sentinel", "unexpected": "secret-sentinel"}).to_string(),
+            "{\"access_key_id\":\"AKIAEXAMPLE\",\"secret_access_key\":\"secret-sentinel\",\"secret_access_key\":\"duplicate\"}".to_owned(),
+            json!({"access_key_id": "AKIA/EXAMPLE", "secret_access_key": "secret-sentinel"}).to_string(),
+            json!({"access_key_id": "AKIAEXAMPLE", "secret_access_key": "secret-sentinel\r\n"}).to_string(),
+            "s".repeat(65_537),
+        ] {
+            fs::write(&path, contents).expect("credential fixture");
+            let (exit, payload) = execute_json(&["fwc", "--json", "--host", "http://127.0.0.1:9",
+                "auth", "login", "test-aws", "--sigv4", "--aws-credentials-file", path_str,
+                "--region", "us-east-1", "--service", "s3"]);
+            assert_eq!(exit, CliExitCode::Validation.into(), "{payload}");
+            assert_eq!(payload["error"]["type"], "invalid-auth-login-request");
+            assert!(!payload.to_string().contains("secret-sentinel"));
+        }
+        fs::write(&path, &valid).expect("valid AWS fixture");
+        for region in ["", "us-east-1/s3", "us east 1"] {
+            let (exit, payload) = execute_json(&["fwc", "--json", "--host", "http://127.0.0.1:9",
+                "auth", "login", "test-aws", "--sigv4", "--aws-credentials-file", path_str,
+                "--region", region, "--service", "s3"]);
+            assert_eq!(exit, CliExitCode::Validation.into(), "{payload}");
+        }
+        fs::write(&path, "setup-secret-sentinel\n").expect("setup fixture");
+        let future = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        for (expiry, header) in [
+            ("2020-01-01T00:00:00Z", "Authorization"), ("not-a-time", "Authorization"),
+            (future.as_str(), "Host"), (future.as_str(), "Content-Length"),
+            (future.as_str(), "x-fcp-zone"), (future.as_str(), "Keep-Alive"),
+            (future.as_str(), "Proxy-Authenticate"), (future.as_str(), "X-Bad\r\nHeader"),
+        ] {
+            let (exit, payload) = execute_json(&["fwc", "--json", "--host", "http://127.0.0.1:9",
+                "auth", "login", "test-setup", "--setup-token-file", path_str,
+                "--expires-at", expiry, "--header-name", header]);
+            assert_eq!(exit, CliExitCode::Validation.into(), "{payload}");
+            assert!(!payload.to_string().contains("secret-sentinel"));
+        }
+    }
+
+    #[test]
+    fn auth_profile_binding_rejects_invalid_authority_before_network() {
+        for (provider, credential, zone, host) in [
+            ("test/other", "57300000-0000-4000-8000-000000000001", "z:work", "api.example.com"),
+            ("..", "57300000-0000-4000-8000-000000000001", "z:work", "api.example.com"),
+            ("test", "invalid-uuid", "z:work", "api.example.com"),
+            ("test", "57300000-0000-4000-8000-000000000001", "bad-zone", "api.example.com"),
+            ("test", "57300000-0000-4000-8000-000000000001", "z:work", "*.example.com"),
+            ("test", "57300000-0000-4000-8000-000000000001", "z:work", "https://api.example.com"),
+            ("test", "57300000-0000-4000-8000-000000000001", "z:work", "api.example.com:443"),
+        ] {
+            let (exit, payload) = execute_json(&["fwc", "--json", "--host", "http://127.0.0.1:9",
+                "auth", "bind-profile", provider, "--credential-id", credential, "--zone", zone,
+                "--host-allow", host]);
+            assert_eq!(exit, CliExitCode::Validation.into(), "{payload}");
+            assert_eq!(payload["error"]["type"], "invalid-auth-profile-binding");
+        }
+    }
+
+    #[test]
+    fn auth_admin_response_decoding_bounds_untrusted_content_and_body_waits() {
+        for response in [json!({"profile": {"created_at": "response-secret-sentinel"}}), json!("s".repeat(65_537))] {
+            let (host, server) = spawn_mock_host_sequence(vec![(
+                "POST /rpc/admin/auth/profiles/test-bounded".to_owned(), response,
+            )]);
+            let client = super::HostAdminClient::new(&host).expect("host client");
+            let error = client.auth_profile_upsert("test-bounded", &json!({})).expect_err("invalid response");
+            assert!(!format!("{error:#}").contains("sentinel"));
+            server.join().expect("bounded response mock");
+        }
+        let held = hold_host_response_body_or_headers(true);
+        let start = Instant::now();
+        let result = held.client.auth_profile_upsert("test-timeout", &json!({}));
+        let elapsed = start.elapsed();
+        held.release.send(()).expect("release held response");
+        held.server.join().expect("held response mock");
+        assert!(result.is_err(), "auth response body must obey the deadline");
+        assert!(elapsed < Duration::from_secs(2), "auth body read exceeded its deadline");
     }
 
     #[test]

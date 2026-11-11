@@ -20,6 +20,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::pipe::budget::ExecutionBudget;
 use crate::{
     CliExitCode, CommandAvailability, CommandEnvelope, DispatchOutcome, HostAdminClient,
     parse_capability_token_bytes, resolve_host_config,
@@ -213,6 +214,7 @@ pub(crate) struct NativeStreamClient {
     auth: Authority,
     stream_id: String,
     timeout: Duration,
+    budget: ExecutionBudget,
     binding: Option<RetainedBinding>,
     delivered: BTreeMap<String, u64>,
 }
@@ -245,6 +247,7 @@ impl NativeStreamClient {
             auth,
             stream_id: config.stream_id,
             timeout: Duration::from_secs(config.timeout_seconds),
+            budget: ExecutionBudget::start(None, Instant::now()),
             binding: None,
             delivered: BTreeMap::new(),
         })
@@ -252,6 +255,10 @@ impl NativeStreamClient {
 
     pub(crate) fn endpoint(&self) -> &str {
         &self.client.endpoint
+    }
+
+    pub(crate) fn set_budget(&mut self, budget: ExecutionBudget) {
+        self.budget = budget;
     }
 
     pub(crate) fn stream_id(&self) -> &str {
@@ -290,6 +297,7 @@ impl NativeStreamClient {
             batch_size,
             wait_seconds,
             self.timeout,
+            self.budget,
             &mut self.binding,
         )?;
         for event in &batch.response.events {
@@ -322,7 +330,9 @@ impl NativeStreamClient {
             &self.stream_id,
             &ack,
             self.executor_node(),
-            self.timeout,
+            self.budget
+                .preflight_timeout(self.timeout, Instant::now())
+                .map_err(|_| Failure::Timeout)?,
         )?;
         self.binding
             .as_ref()
@@ -830,6 +840,7 @@ fn poll(
         args.batch_size,
         args.wait_seconds,
         timeout,
+        ExecutionBudget::start(None, Instant::now()),
         &mut binding,
     )?;
     let ack = if batch.response.events.is_empty() {
@@ -869,6 +880,7 @@ struct PolledResponse {
     wait_expired: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn poll_response(
     client: &HostAdminClient,
     auth: &Authority,
@@ -876,6 +888,7 @@ fn poll_response(
     batch_size: u32,
     wait_seconds: u64,
     timeout: Duration,
+    budget: ExecutionBudget,
     binding: &mut Option<RetainedBinding>,
 ) -> std::result::Result<PolledResponse, Failure> {
     if !valid_stream_id(stream_id) || !(1..=64).contains(&batch_size) || wait_seconds > 60 {
@@ -898,7 +911,12 @@ fn poll_response(
             client,
             "/rpc/streams/poll",
             &body,
-            remaining.map_or(timeout, |remaining| timeout.min(remaining)),
+            budget
+                .preflight_timeout(
+                    remaining.map_or(timeout, |remaining| timeout.min(remaining)),
+                    Instant::now(),
+                )
+                .map_err(|_| Failure::Timeout)?,
         )?;
         check_executor(executor_node, response.executor_node.as_ref())?;
         check_poll(&response, auth, stream_id, batch_size)?;
@@ -910,7 +928,8 @@ fn poll_response(
                 response.executor_node.clone(),
             ));
         }
-        let wait_expired = deadline.is_some_and(|deadline| Instant::now() >= deadline);
+        let wait_expired = deadline.is_some_and(|deadline| Instant::now() >= deadline)
+            || budget.remaining_ms(Instant::now()).is_err();
         if !response.events.is_empty()
             || response.stream.closed
             || deadline.is_none()
@@ -921,11 +940,25 @@ fn poll_response(
                 wait_expired,
             });
         }
-        let remaining = deadline
+        let mut remaining = deadline
             .expect("bounded wait")
             .saturating_duration_since(Instant::now());
+        match budget.remaining_ms(Instant::now()) {
+            Ok(Some(milliseconds)) => {
+                remaining = remaining.min(Duration::from_millis(milliseconds))
+            }
+            Ok(None) => {}
+            Err(_) => {
+                return Ok(PolledResponse {
+                    response,
+                    wait_expired: true,
+                });
+            }
+        }
         std::thread::sleep(POLL_INTERVAL.min(remaining));
-        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline)
+            || budget.remaining_ms(Instant::now()).is_err()
+        {
             // Preserve the last confirmed empty batch instead of starting a
             // zero-budget request when the waiting interval consumes the deadline.
             return Ok(PolledResponse {
@@ -1478,6 +1511,44 @@ mod tests {
         assert_eq!(requests[1].body["executor_node"], EXECUTOR);
         assert_eq!(requests[2].body["executor_node"], EXECUTOR);
         assert_eq!(requests[2].path, "/rpc/streams/ack");
+    }
+
+    #[test]
+    fn consumer_long_poll_inherits_the_watch_deadline_without_an_extra_request() {
+        let file = credential();
+        let (endpoint, task) = host(vec![
+            json!({"executor_node":EXECUTOR,"stream":metadata(false,0,0),"events":[]}),
+        ]);
+        let mut client =
+            NativeStreamClient::new(consumer_config(file.path()), Some(&endpoint)).unwrap();
+        let started = Instant::now();
+        client.set_budget(ExecutionBudget::start(Some(100), started));
+        let batch = client.poll(1, 60).unwrap();
+        assert!(batch.events.is_empty());
+        assert!(batch.wait_expired);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(task.join().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn consumer_expired_watch_does_not_ack_or_release_delivered_pairs() {
+        let file = credential();
+        let (endpoint, task) = host(vec![
+            json!({"stream":metadata(false,1,0),"events":[event()]}),
+        ]);
+        let mut client =
+            NativeStreamClient::new(consumer_config(file.path()), Some(&endpoint)).unwrap();
+        client.poll(1, 0).unwrap();
+        client.set_budget(ExecutionBudget::start(
+            Some(1),
+            Instant::now() - Duration::from_secs(1),
+        ));
+        assert!(matches!(
+            client.ack(&[7], &["provider-7".to_owned()]),
+            Err(Failure::Timeout)
+        ));
+        assert_eq!(client.delivered.get("provider-7"), Some(&7));
+        assert_eq!(task.join().unwrap().len(), 1);
     }
 
     #[test]

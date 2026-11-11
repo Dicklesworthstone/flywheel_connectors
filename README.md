@@ -1209,7 +1209,7 @@ A shared crate consolidating per-provider auth in one place:
 | OAuth device-code | Headless flow for CLI / agents |
 | OAuth authorization-code + PKCE | Browser-mediated flow |
 | Refresh-token | Long-lived session continuation |
-| Setup-token | One-time provisioning (used by Anthropic CLI auth, hardware tokens) |
+| Setup-token | Short-lived bearer credentials with enforced expiry |
 
 `AuthProfile` flows through the credential-pool lease layer. `fcp-host` and `fwc` expose profile-admin and OAuth login surfaces.
 
@@ -1225,6 +1225,66 @@ Multi-credential per-provider pools support:
 - **Connector-boundary E2E** — redaction-safe JSONL evidence harness.
 
 Admin API routes expose pool inspection and mutation; SDK extensions let connectors lease credentials without ever holding raw bearer material.
+
+### Host-managed AWS signing and setup tokens
+
+`fwc auth login` can store an AWS SigV4 or setup-token profile on the selected
+host. `fwc auth bind-profile` then gives a snapshot of that profile a credential
+UUID, an explicit zone, and exact destination hosts for secretless egress.
+Both commands accept `--admin-token-file` containing the host admin bearer;
+omit the flag to use `FCP_HOST_ADMIN_BEARER_TOKEN`. Provider credentials and
+host administration credentials are separate.
+
+For AWS, create `aws-credentials.json` with this shape, replacing the values
+with the provider credentials. Omit `session_token` for credentials without one:
+
+```json
+{
+  "access_key_id": "<access-key-id>",
+  "secret_access_key": "<secret-access-key>",
+  "session_token": "<optional-session-token>"
+}
+```
+
+```bash
+fwc --host http://127.0.0.1:8787 auth login aws --profile s3-work \
+  --sigv4 --aws-credentials-file aws-credentials.json \
+  --region us-east-1 --service s3 --admin-token-file host-admin.token
+
+fwc --host http://127.0.0.1:8787 auth bind-profile aws --profile s3-work \
+  --credential-id 11111111-1111-1111-1111-111111111111 --zone z:work \
+  --host-allow example-bucket.s3.us-east-1.amazonaws.com \
+  --admin-token-file host-admin.token
+```
+
+Repeat `--host-allow` for additional exact hosts. Wildcards, URLs, and ports are
+refused. The operation's capability must allow that credential UUID, and its
+network policy must independently allow the destination. A connector already
+using the host's `credential_id` egress path can request the bound credential;
+the host signs the admitted method, URL, headers, and body immediately before
+dispatch. Signed redirects are returned to the caller, and duplicate query names
+or duplicate request headers are refused rather than signed ambiguously.
+
+For a setup token, put the raw token in `setup.token` and supply its actual
+future expiry timestamp:
+
+```bash
+fwc --host http://127.0.0.1:8787 auth login anthropic --profile bootstrap \
+  --setup-token-file setup.token --expires-at '<token-expiry-in-RFC3339>' \
+  --admin-token-file host-admin.token
+```
+
+Bind it with `auth bind-profile` using the same provider/profile and the intended
+zone and destination hosts. Setup tokens default to `Authorization: Bearer ...`;
+`--header-name` selects a custom credential header while retaining the `Bearer`
+prefix. Expired tokens are refused at registration, binding, and egress.
+
+Bindings are snapshots: later profile edits or deletion leave existing pool
+entries unchanged. Re-run `bind-profile` with the same credential UUID and
+`--replace` to rotate a binding and invalidate its previous leases. Connector
+adoption is explicit: the current AWS connector still requires its existing
+`access_key_id`/`secret_access_key` configuration. These commands do not migrate
+that configuration or route a connector's direct HTTP client through host egress.
 
 ---
 
@@ -1509,6 +1569,56 @@ or replay-gap error. The consumer journal persists progress; it does not make
 the receiver's currently volatile backlog durable. Reconcile missing deliveries
 before choosing a new consumer or deliberately starting after retained history.
 No source payloads or capability tokens are stored in the cursor/action journal.
+
+#### Watching a source across bounded batches
+
+`fwc rules watch poll` and `fwc rules watch consume` repeatedly process the
+corresponding source without an external polling loop. They accept the same
+source and action options as the one-batch commands above. For example:
+
+```bash
+fwc --host http://127.0.0.1:8787 rules watch \
+  --max-batches 100 --timeout-seconds 300 --poll-interval-ms 1000 poll \
+  --connector fcp.webhook-receiver --source-zone z:work \
+  --endpoint-id '<registered-endpoint-id>' --consumer github-issue-hooks \
+  --source-capability-token-file webhook-read-capability.cbor \
+  --zone z:work --capability-token-file github-capability.cbor
+
+fwc --host http://127.0.0.1:8787 rules watch \
+  --max-batches 20 --timeout-seconds 300 consume \
+  --connector fcp.telegram --source-zone z:work --topic telegram.message.new \
+  --stream-id '<returned-stream-id>' --request-id consumer-subscription-001 \
+  --stream-capability-token-file telegram-capability.cbor \
+  --zone z:work --capability-token-file github-capability.cbor \
+  --max-events 8 --wait-seconds 20
+```
+
+The finite defaults are **20 batches**, **300 seconds total**, and **1,000 ms
+between batches**. Empty batches count toward the limit. Bounds are 1–1,000
+batches, 1–3,600 seconds, and a 100–60,000 ms interval. The same total deadline
+covers discovery, source reads, action preflight and execution, acknowledgements,
+and waiting; starting another batch never renews it.
+
+Each batch reloads rule definitions and action credentials and passes current
+host admission. Webhook pages resume the durable consumer cursor, advancing it
+only after the complete page settles. Native streams acknowledge only settled
+prefixes and keep the selected journal executor pinned; include the original
+`--executor-node` for a remote stream. A closed stream drains through a confirmed
+empty batch before watch exits. Source authority remains separate from action
+authority in both modes.
+
+Watch reuses the existing durable deduplication journal and stops on a rejected
+or uncertain action, acknowledgement, or cursor commit. Resolve uncertain actions
+with `rules reconcile`, then resume with the same rules journal, host, consumer
+or subscription identities, and executor setting. Use `--start latest` only to
+bootstrap a new webhook consumer; subsequent batches automatically use its saved
+cursor, and later watch runs must omit `--start`.
+
+Output retains cumulative `data.totals`, per-batch summaries in `data.batches`,
+unique action request evidence in `data.results`, and the full latest batch in
+`data.last_batch`. A later failure preserves earlier results. `data.stop_reason`
+identifies the batch/deadline limit, drained source, bounded evidence capacity,
+or failure that ended the run. Source payloads and credentials are omitted.
 
 ### Quick Start
 
@@ -2369,6 +2479,7 @@ Proof anchors for deployment claims:
 | `FWC_HOST` | Default `fcp-host` endpoint URL (`fwc` consults this first) | None (requires `--host` or context) |
 | `FWC_CREDENTIAL_STORE_KEY_FILE` | Private file with an independent 32-byte raw or 64-digit hex encryption key for local credential-file fallback | None (file writes fail closed without it) |
 | `FCP_HOST_ENDPOINT` | Alternate name for the `fcp-host` endpoint URL (`fwc` consults this second) | None |
+| `FCP_HOST_ADMIN_BEARER_TOKEN` | Bearer for the protected host admin API; also used by `fwc` host auth commands when no admin token file is supplied | None |
 | `FCP_HOST_BIND` | `fcp-host` listen address (also used by `fwc` as a third fallback for endpoint resolution) | `127.0.0.1:8787` |
 | `FCP_HOST_CONNECTORS_FILE` | Live connector inventory file mutated by `fcp-host` | None |
 | `FCP_HOST_LIFECYCLE_STATE_FILE` | Local admin-state snapshot for `fcp-host` | None |
