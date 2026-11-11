@@ -434,7 +434,9 @@ impl EgressGuard {
             });
         }
 
-        injector.inject_http(credential_id, &mut request.headers)?;
+        // Signers may replace headers, never the method, URL, body or credential
+        // identity which this guard already authorized. The body stays borrowed.
+        request.headers = injector.inject_http_request(credential_id, request)?;
         decision.credential_injected = true;
 
         Ok(decision)
@@ -957,6 +959,31 @@ pub trait CredentialInjector: Send + Sync {
         headers: &mut Vec<HttpHeader>,
     ) -> Result<(), EgressError>;
 
+    /// Inject authentication using the complete, policy-authorized request.
+    ///
+    /// Request-signing schemes can inspect the method, URL, headers, and body
+    /// before returning the authenticated headers. The request is immutable:
+    /// its authorized destination and request identity cannot be rewritten by
+    /// an injector. The guard publishes headers only after signing succeeds.
+    ///
+    /// The default uses header-only injection for authentication schemes that
+    /// do not sign request content. Wrappers must forward this method to their
+    /// inner injector so request-aware signing is preserved.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the credential cannot be retrieved or the request
+    /// cannot be authenticated.
+    fn inject_http_request(
+        &self,
+        credential_id: &str,
+        request: &EgressHttpRequest,
+    ) -> Result<Vec<HttpHeader>, EgressError> {
+        let mut headers = request.headers.clone();
+        self.inject_http(credential_id, &mut headers)?;
+        Ok(headers)
+    }
+
     /// Get connection credentials for a TCP connection.
     ///
     /// Returns opaque bytes that should be sent after connection establishment
@@ -1024,6 +1051,14 @@ impl<I: CredentialInjector> CredentialInjector for AllowAllHosts<I> {
         headers: &mut Vec<HttpHeader>,
     ) -> Result<(), EgressError> {
         self.inner.inject_http(credential_id, headers)
+    }
+
+    fn inject_http_request(
+        &self,
+        credential_id: &str,
+        request: &EgressHttpRequest,
+    ) -> Result<Vec<HttpHeader>, EgressError> {
+        self.inner.inject_http_request(credential_id, request)
     }
 
     fn get_tcp_auth(&self, credential_id: &str) -> Result<Option<Vec<u8>>, EgressError> {
@@ -1239,6 +1274,8 @@ impl TlsVerifier for DefaultTlsVerifier {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
 
     struct StaticSecretHook {
@@ -2433,6 +2470,210 @@ mod tests {
         fn get_tcp_auth(&self, _cred: &str) -> Result<Option<Vec<u8>>, EgressError> {
             Ok(Some(b"hostless-auth".to_vec()))
         }
+    }
+
+    struct RequestAwareInjector {
+        host_allowed: bool,
+        fail_signing: bool,
+        calls: AtomicUsize,
+    }
+
+    impl RequestAwareInjector {
+        const fn new(host_allowed: bool, fail_signing: bool) -> Self {
+            Self {
+                host_allowed,
+                fail_signing,
+                calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl CredentialInjector for RequestAwareInjector {
+        fn is_authorized(
+            &self,
+            credential_id: &str,
+            operation_id: &str,
+            credential_allow: &[String],
+        ) -> Result<bool, EgressError> {
+            Ok(operation_id == "op" && credential_allow.iter().any(|id| id == credential_id))
+        }
+
+        fn is_host_allowed(&self, _credential_id: &str, _host: &str) -> Result<bool, EgressError> {
+            Ok(self.host_allowed)
+        }
+
+        fn inject_http(
+            &self,
+            _credential_id: &str,
+            _headers: &mut Vec<HttpHeader>,
+        ) -> Result<(), EgressError> {
+            Err(EgressError::CredentialError(
+                "signing requires the complete request".into(),
+            ))
+        }
+
+        fn inject_http_request(
+            &self,
+            credential_id: &str,
+            request: &EgressHttpRequest,
+        ) -> Result<Vec<HttpHeader>, EgressError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(credential_id, "cred-1");
+            assert_eq!(request.credential_id.as_deref(), Some(credential_id));
+            assert_eq!(request.method, "POST");
+            assert_eq!(
+                request.url,
+                "https://api.example.com/messages?mode=send%20message&part=2"
+            );
+            assert_eq!(request.body.as_deref(), Some([0, 255, 1, 2].as_slice()));
+            assert_eq!(request.headers.len(), 1);
+            assert_eq!(request.headers[0].name, "Content-Type");
+            assert_eq!(request.headers[0].value, "application/octet-stream");
+            if self.fail_signing {
+                return Err(EgressError::CredentialError(
+                    "request signing failed".into(),
+                ));
+            }
+            let mut headers = request.headers.clone();
+            headers.push(HttpHeader {
+                name: "Authorization".into(),
+                value: "request-signature".into(),
+            });
+            Ok(headers)
+        }
+
+        fn get_tcp_auth(&self, _credential_id: &str) -> Result<Option<Vec<u8>>, EgressError> {
+            Ok(None)
+        }
+    }
+
+    fn request_for_signing() -> EgressHttpRequest {
+        EgressHttpRequest {
+            url: "https://api.example.com/messages?mode=send%20message&part=2".into(),
+            method: "POST".into(),
+            headers: vec![HttpHeader {
+                name: "Content-Type".into(),
+                value: "application/octet-stream".into(),
+            }],
+            body: Some(vec![0, 255, 1, 2]),
+            credential_id: Some("cred-1".into()),
+        }
+    }
+
+    #[test]
+    fn test_authorize_http_signer_receives_original_request_context() {
+        let guard = EgressGuard::new();
+        let injector = RequestAwareInjector::new(true, false);
+        let mut request = request_for_signing();
+        let body_ptr = request.body.as_ref().unwrap().as_ptr();
+        let url_ptr = request.url.as_ptr();
+
+        let decision = guard
+            .authorize_http(
+                &mut request,
+                &test_constraints(),
+                &injector,
+                "op",
+                &["cred-1".into()],
+            )
+            .expect("request-aware signing should succeed");
+
+        assert!(decision.credential_injected);
+        assert_eq!(injector.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(request.body.as_ref().unwrap().as_ptr(), body_ptr);
+        assert_eq!(request.url.as_ptr(), url_ptr);
+        assert_eq!(request.headers[1].value, "request-signature");
+        assert_eq!(request.credential_id.as_deref(), Some("cred-1"));
+    }
+
+    #[test]
+    fn test_authorize_http_signer_is_not_called_after_policy_or_credential_denial() {
+        let guard = EgressGuard::new();
+        for (network_allowed, credential_allowed, host_allowed, expected_reason) in [
+            (false, true, true, DenyReason::HostNotAllowed),
+            (true, false, true, DenyReason::CredentialNotAuthorized),
+            (true, true, false, DenyReason::CredentialHostNotAllowed),
+        ] {
+            let injector = RequestAwareInjector::new(host_allowed, false);
+            let mut request = request_for_signing();
+            let mut constraints = test_constraints();
+            if !network_allowed {
+                constraints.host_allow = vec!["other.example.com".into()];
+            }
+            let credential_allow = if credential_allowed {
+                vec!["cred-1".into()]
+            } else {
+                vec![]
+            };
+
+            let error = guard
+                .authorize_http(
+                    &mut request,
+                    &constraints,
+                    &injector,
+                    "op",
+                    &credential_allow,
+                )
+                .expect_err("denied request must never reach the signer");
+
+            assert!(matches!(error, EgressError::Denied { code, .. } if code == expected_reason));
+            assert_eq!(injector.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(request.headers.len(), 1);
+            assert_eq!(request.credential_id.as_deref(), Some("cred-1"));
+        }
+    }
+
+    #[test]
+    fn test_authorize_http_allow_all_hosts_preserves_request_aware_signing() {
+        let guard = EgressGuard::new();
+        let injector = AllowAllHosts::new(RequestAwareInjector::new(false, false));
+        let mut request = request_for_signing();
+        let body_ptr = request.body.as_ref().unwrap().as_ptr();
+        let url_ptr = request.url.as_ptr();
+
+        let decision = guard
+            .authorize_http(
+                &mut request,
+                &test_constraints(),
+                &injector,
+                "op",
+                &["cred-1".into()],
+            )
+            .expect("host wrapper must forward the complete request to the signer");
+
+        assert!(decision.credential_injected);
+        assert_eq!(injector.inner().calls.load(Ordering::SeqCst), 1);
+        assert_eq!(request.body.as_ref().unwrap().as_ptr(), body_ptr);
+        assert_eq!(request.body.as_deref(), Some([0, 255, 1, 2].as_slice()));
+        assert_eq!(request.url.as_ptr(), url_ptr);
+        assert_eq!(
+            request.url,
+            "https://api.example.com/messages?mode=send%20message&part=2"
+        );
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.headers[1].value, "request-signature");
+    }
+
+    #[test]
+    fn test_authorize_http_propagates_request_signing_failure() {
+        let guard = EgressGuard::new();
+        let injector = RequestAwareInjector::new(true, true);
+        let mut request = request_for_signing();
+
+        let error = guard
+            .authorize_http(
+                &mut request,
+                &test_constraints(),
+                &injector,
+                "op",
+                &["cred-1".into()],
+            )
+            .expect_err("a signing failure must prevent authorization");
+
+        assert!(matches!(error, EgressError::CredentialError(_)));
+        assert_eq!(injector.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(request.headers.len(), 1);
+        assert_eq!(request.credential_id.as_deref(), Some("cred-1"));
     }
 
     #[test]
