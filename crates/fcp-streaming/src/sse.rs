@@ -41,10 +41,8 @@ fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a s
 
 fn parse_retry_after(value: &str) -> Option<Duration> {
     let value = value.trim();
-    if let Ok(seconds) = value.parse::<u128>() {
-        return Some(Duration::from_secs(
-            u64::try_from(seconds).unwrap_or(u64::MAX),
-        ));
+    if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Some(Duration::from_secs(value.parse().unwrap_or(u64::MAX)));
     }
 
     let retry_at = DateTime::parse_from_rfc2822(value).ok()?;
@@ -66,13 +64,20 @@ fn max_retry_after(left: Option<Duration>, right: Option<Duration>) -> Option<Du
     }
 }
 
+fn retry_after_from_headers(headers: &[(String, String)], name: &str) -> Option<Duration> {
+    headers
+        .iter()
+        .filter(|(key, _)| key.eq_ignore_ascii_case(name))
+        .filter_map(|(_, value)| parse_retry_after(value))
+        .max()
+}
+
 fn http_error_from_head(status: u16, reason: String, headers: &[(String, String)]) -> StreamError {
     if status == HOST_BACKPRESSURE_STATUS {
         if let Some(backpressure_reason) = header_value(headers, FCP_BACKPRESSURE_REASON_HEADER) {
             let retry_after = max_retry_after(
-                header_value(headers, "retry-after").and_then(parse_retry_after),
-                header_value(headers, FCP_BACKPRESSURE_RETRY_AFTER_HEADER)
-                    .and_then(parse_retry_after),
+                retry_after_from_headers(headers, "retry-after"),
+                retry_after_from_headers(headers, FCP_BACKPRESSURE_RETRY_AFTER_HEADER),
             );
 
             return StreamError::HostBackpressure {
@@ -83,42 +88,15 @@ fn http_error_from_head(status: u16, reason: String, headers: &[(String, String)
         }
     }
 
-    // RFC 7231 §7.1.3 defines Retry-After for 429 and 503 (and other
-    // statuses, but these are the practical reconnect-budget cases for an
-    // SSE consumer). The FCP backpressure 503 path above already extracted
-    // retry_after via HostBackpressureSignal; this branch handles generic
-    // upstream 429/503 where the connector got an HTTP retry hint without
-    // the FCP-specific reason header.
-    let retry_after = if status == 429 || status == HOST_BACKPRESSURE_STATUS {
-        header_value(headers, "retry-after").and_then(parse_retry_after)
-    } else {
-        None
-    };
+    // Retry eligibility is decided separately. Retain the provider's floor
+    // for any response so a retryable 5xx cannot silently discard its hint.
+    let retry_after = retry_after_from_headers(headers, "retry-after");
 
     StreamError::HttpError {
         status,
         message: reason,
         retry_after,
     }
-}
-
-/// Pick the reconnect delay, honouring a server `Retry-After` but never
-/// letting it exceed the configured ceiling.
-///
-/// `Retry-After` is attacker-controlled: `parse_retry_after` maps an oversized
-/// integer to `Duration::from_secs(u64::MAX)`, so an unclamped
-/// `base.max(retry_after)` let one response header park the stream for ~584
-/// billion years — the sleep never resolves, the connector never reconnects,
-/// and its timer thread stays alive. `delay_for_attempt` already enforces
-/// `max_delay`; the server-supplied value has to be intersected with the same
-/// ceiling rather than allowed to override it. (`fcp-graphql`'s
-/// `RetryPolicy::decide` already clamps with `.min(max_delay)`.)
-fn reconnect_delay_for_error(handler: &ReconnectHandler, err: &StreamError) -> Duration {
-    let config = handler.config();
-    let base = config.delay_for_attempt(handler.attempts());
-    err.retry_after().map_or(base, |retry_after| {
-        base.max(retry_after).min(config.max_delay)
-    })
 }
 
 /// A 204 is the server's explicit stop signal, not a reconnectable EOF.
@@ -164,7 +142,8 @@ fn sse_error_can_reconnect(error: &StreamError) -> bool {
         | StreamError::ParseError(_)
         | StreamError::SseError(_)
         | StreamError::InvalidState(_)
-        | StreamError::ReconnectLimitExceeded { .. } => false,
+        | StreamError::ReconnectLimitExceeded { .. }
+        | StreamError::ReconnectDelayExceeded { .. } => false,
         _ => true,
     }
 }
@@ -499,7 +478,7 @@ impl SseParser {
             }
             "retry" if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) => {
                 // Arbitrarily large digit strings remain a valid hint;
-                // the reconnect policy bounds them to its local ceiling.
+                // the reconnect policy refuses hints beyond its wait budget.
                 let ms = value.parse().unwrap_or(u64::MAX);
                 self.retry = Some(ms);
                 self.reconnect_retry = Some(ms);
@@ -1146,23 +1125,22 @@ impl ReconnectingSseStream {
 
     fn observe_stream_controls(&mut self, stream: &SseStream) {
         if let Some(retry) = stream.parser.reconnect_retry {
-            self.retry_hint =
-                Some(Duration::from_millis(retry).min(self.handler.config().max_delay));
+            self.retry_hint = Some(Duration::from_millis(retry));
         }
     }
 
-    fn reconnect_delay(&self, error: Option<&StreamError>) -> Duration {
-        let base = error.map_or_else(
-            || {
-                self.handler
-                    .config()
-                    .delay_for_attempt(self.handler.attempts())
-            },
-            |error| reconnect_delay_for_error(&self.handler, error),
-        );
-        self.retry_hint.map_or(base, |hint| {
-            base.max(hint).min(self.handler.config().max_delay)
-        })
+    /// Last delivered event ID, retained after a terminal reconnect refusal.
+    /// This is a delivery position, not an application-level acknowledgement.
+    #[must_use]
+    pub fn last_event_id(&self) -> Option<&str> {
+        self.last_event_id.as_deref()
+    }
+
+    fn reconnect_delay(&self, error: Option<&StreamError>) -> StreamResult<Duration> {
+        let minimum = max_retry_after(error.and_then(StreamError::retry_after), self.retry_hint);
+        self.handler
+            .config()
+            .delay_for_attempt_with_minimum(self.handler.attempts(), minimum)
     }
 }
 
@@ -1197,7 +1175,10 @@ impl Stream for ReconnectingSseStream {
                             self.state = ReconnectState::Terminated;
                             return Poll::Ready(Some(Err(err)));
                         }
-                        let delay = self.reconnect_delay(Some(&err));
+                        let Ok(delay) = self.reconnect_delay(Some(&err)) else {
+                            self.state = ReconnectState::Terminated;
+                            return Poll::Ready(Some(Err(err)));
+                        };
                         self.handler.record_failure();
                         self.state = ReconnectState::Waiting(Box::pin(sleep(delay)));
                     }
@@ -1229,7 +1210,10 @@ impl Stream for ReconnectingSseStream {
                             self.state = ReconnectState::Terminated;
                             return Poll::Ready(Some(Err(err)));
                         }
-                        let delay = self.reconnect_delay(Some(&err));
+                        let Ok(delay) = self.reconnect_delay(Some(&err)) else {
+                            self.state = ReconnectState::Terminated;
+                            return Poll::Ready(Some(Err(err)));
+                        };
                         self.handler.record_failure();
                         self.state = ReconnectState::Waiting(Box::pin(sleep(delay)));
                     }
@@ -1242,7 +1226,13 @@ impl Stream for ReconnectingSseStream {
                             self.state = ReconnectState::Terminated;
                             return Poll::Ready(None);
                         }
-                        let delay = self.reconnect_delay(None);
+                        let delay = match self.reconnect_delay(None) {
+                            Ok(delay) => delay,
+                            Err(error) => {
+                                self.state = ReconnectState::Terminated;
+                                return Poll::Ready(Some(Err(error)));
+                            }
+                        };
                         self.handler.record_failure();
                         self.state = ReconnectState::Waiting(Box::pin(sleep(delay)));
                     }
@@ -1269,6 +1259,104 @@ mod tests {
             terminated: false,
             stop_reconnecting: false,
         }
+    }
+
+    fn retry_refusal_peer(response: String) -> (String, thread::JoinHandle<usize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/events", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let server = thread::spawn(move || {
+            let mut deadline = std::time::Instant::now() + Duration::from_secs(2);
+            let mut requests = 0;
+            loop {
+                match listener.accept() {
+                    Ok((mut socket, _)) => {
+                        socket
+                            .set_read_timeout(Some(Duration::from_secs(1)))
+                            .unwrap();
+                        socket
+                            .set_write_timeout(Some(Duration::from_secs(1)))
+                            .unwrap();
+                        let _ = read_request_head(&mut socket);
+                        requests += 1;
+                        socket.write_all(response.as_bytes()).unwrap();
+                        deadline = std::time::Instant::now() + Duration::from_millis(200);
+                        if requests == 2 {
+                            return requests;
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() >= deadline {
+                            return requests;
+                        }
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("accept SSE request: {error}"),
+                }
+            }
+        });
+        (url, server)
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn http_retry_minimum_exceeding_policy_terminates_without_reconnect() {
+        for hint in ["1", "999999999999999999999999999999999999999999999999"] {
+            let (url, peer) = retry_refusal_peer(format!(
+                "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\nRetry-After: {hint}\r\n\r\n"
+            ));
+            let mut stream =
+                SseClient::with_config(url, SseConfig::new().with_timeout(Duration::from_secs(1)))
+                    .stream();
+            stream.handler = ReconnectHandler::new(
+                ReconnectConfig::new().with_max_delay(Duration::from_millis(1)),
+            );
+            let error = time::timeout(Duration::from_secs(1), stream.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err();
+            assert!(
+                matches!(error, StreamError::HttpError { status: 429, retry_after, .. }
+                if retry_after == parse_retry_after(hint))
+            );
+            assert_eq!(stream.handler.attempts(), 0);
+            for _ in 0..3 {
+                assert!(stream.next().await.is_none());
+            }
+            assert_eq!(peer.join().unwrap(), 1);
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn sse_retry_minimum_refusal_preserves_delivered_cursor() {
+        let body = "id: committed\ndata: accepted\n\nretry: 60000\n\n";
+        let (url, peer) = retry_refusal_peer(format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ));
+        let mut stream = SseClient::new(url).stream();
+        let event = time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.data, "accepted");
+        assert_eq!(stream.last_event_id(), Some("committed"));
+        let error = time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            matches!(error, StreamError::ReconnectDelayExceeded { required, max }
+            if required == Duration::from_secs(60) && max == crate::MAX_RECONNECT_DELAY)
+        );
+        assert_eq!(stream.handler.attempts(), 0);
+        for _ in 0..3 {
+            assert!(stream.next().await.is_none());
+            assert_eq!(stream.last_event_id(), Some("committed"));
+        }
+        assert_eq!(peer.join().unwrap(), 1);
     }
 
     #[test]
@@ -1456,16 +1544,21 @@ mod tests {
                 .with_jitter(false),
         );
         reconnecting.observe_stream_controls(&parsed_stream(parser, Vec::new()));
-        assert_eq!(reconnecting.reconnect_delay(None), Duration::from_secs(7));
+        assert_eq!(
+            reconnecting.reconnect_delay(None).unwrap(),
+            Duration::from_secs(7)
+        );
         let mut huge = SseParser::new();
         huge.parse(&Bytes::from(
             "retry: 999999999999999999999999999999999999\n\n",
         ));
         reconnecting.observe_stream_controls(&parsed_stream(huge, Vec::new()));
-        assert_eq!(
+        assert!(matches!(
             reconnecting.reconnect_delay(None),
-            reconnecting.handler.config().max_delay
-        );
+            Err(StreamError::ReconnectDelayExceeded { required, max })
+                if required == Duration::from_millis(u64::MAX)
+                    && max == reconnecting.handler.config().max_delay
+        ));
     }
 
     #[fcp_async_core::runtime::test]
@@ -1837,14 +1930,23 @@ mod tests {
     }
 
     #[test]
-    fn sse_other_status_does_not_set_retry_after() {
+    fn sse_other_status_preserves_retry_after() {
         let headers = vec![("Retry-After".to_string(), "5".to_string())];
 
         let err = http_error_from_head(500, "Internal Server Error".to_string(), &headers);
 
-        // Retry-After on a non-rate-limited 5xx isn't part of the SSE
-        // reconnect-budget contract; ignore it.
-        assert_eq!(err.retry_after(), None);
+        assert_eq!(err.retry_after(), Some(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn repeated_retry_after_fields_preserve_the_longest_minimum() {
+        let headers = vec![
+            ("Retry-After".into(), "1".into()),
+            ("retry-after".into(), "invalid".into()),
+            ("RETRY-AFTER".into(), "60".into()),
+        ];
+        let error = http_error_from_head(503, "unavailable".into(), &headers);
+        assert_eq!(error.retry_after(), Some(Duration::from_secs(60)));
     }
 
     #[test]
@@ -1861,7 +1963,10 @@ mod tests {
         };
 
         assert_eq!(
-            reconnect_delay_for_error(&handler, &err),
+            handler
+                .config()
+                .delay_for_attempt_with_minimum(handler.attempts(), err.retry_after())
+                .unwrap(),
             Duration::from_secs(2)
         );
     }
@@ -1880,7 +1985,10 @@ mod tests {
         };
 
         assert_eq!(
-            reconnect_delay_for_error(&handler, &err),
+            handler
+                .config()
+                .delay_for_attempt_with_minimum(handler.attempts(), err.retry_after())
+                .unwrap(),
             Duration::from_secs(3)
         );
     }

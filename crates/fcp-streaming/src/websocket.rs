@@ -61,10 +61,8 @@ fn connection_failed(message: impl Into<String>) -> StreamError {
 
 fn parse_retry_after(value: &str) -> Option<Duration> {
     let value = value.trim();
-    if let Ok(seconds) = value.parse::<u128>() {
-        return Some(Duration::from_secs(
-            u64::try_from(seconds).unwrap_or(u64::MAX),
-        ));
+    if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Some(Duration::from_secs(value.parse().unwrap_or(u64::MAX)));
     }
 
     let retry_at = DateTime::parse_from_rfc2822(value).ok()?;
@@ -83,6 +81,79 @@ fn max_retry_after(left: Option<Duration>, right: Option<Duration>) -> Option<Du
         (Some(left), Some(right)) => Some(left.max(right)),
         (Some(value), None) | (None, Some(value)) => Some(value),
         (None, None) => None,
+    }
+}
+
+/// The handshake parser rejects duplicate headers. On HTTP error responses,
+/// collapse only repeated retry hints to their greatest valid value so that a
+/// duplicate cannot turn a server minimum into an immediate transport retry.
+/// Successful upgrades and all other duplicate-header checks remain strict.
+fn normalize_duplicate_retry_hints(response_bytes: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(response_bytes).ok()?;
+    // Match the dependency parser's line boundaries so a bare LF inside an
+    // invalid retry field cannot make normalization discard another header.
+    let mut lines = text.lines();
+    let status_line = lines.next()?;
+    let status = status_line.split(' ').nth(1)?.parse::<u16>().ok()?;
+    if status == 101 {
+        return None;
+    }
+
+    let mut normalized = String::with_capacity(text.len());
+    normalized.push_str(status_line);
+    normalized.push_str("\r\n");
+    let mut retry_hint: Option<(&str, Option<Duration>)> = None;
+    let mut host_retry_hint: Option<(&str, Option<Duration>)> = None;
+    let mut found_duplicate = false;
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            let slot = if name.eq_ignore_ascii_case("retry-after") {
+                Some(&mut retry_hint)
+            } else if name.eq_ignore_ascii_case(FCP_BACKPRESSURE_RETRY_AFTER_HEADER) {
+                Some(&mut host_retry_hint)
+            } else {
+                None
+            };
+            if let Some(slot) = slot {
+                let delay = parse_retry_after(value);
+                if let Some((_, current_delay)) = slot.as_ref() {
+                    found_duplicate = true;
+                    if delay > *current_delay {
+                        *slot = Some((line, delay));
+                    }
+                } else {
+                    *slot = Some((line, delay));
+                }
+                continue;
+            }
+        }
+        normalized.push_str(line);
+        normalized.push_str("\r\n");
+    }
+    if !found_duplicate {
+        return None;
+    }
+    for (line, _) in [retry_hint, host_retry_hint].into_iter().flatten() {
+        normalized.push_str(line);
+        normalized.push_str("\r\n");
+    }
+    normalized.push_str("\r\n");
+    Some(normalized)
+}
+
+fn parse_handshake_response(response_bytes: &[u8]) -> StreamResult<HttpResponse> {
+    match HttpResponse::parse(response_bytes) {
+        Ok(response) => Ok(response),
+        Err(error) => {
+            let Some(normalized) = normalize_duplicate_retry_hints(response_bytes) else {
+                return Err(connection_failed(error.to_string()));
+            };
+            HttpResponse::parse(normalized.as_bytes())
+                .map_err(|error| connection_failed(error.to_string()))
+        }
     }
 }
 
@@ -113,11 +184,7 @@ fn http_error_from_response(response: &HttpResponse) -> StreamError {
         };
     }
 
-    let retry_after = if response.status == 429 {
-        response.header("retry-after").and_then(parse_retry_after)
-    } else {
-        None
-    };
+    let retry_after = response.header("retry-after").and_then(parse_retry_after);
 
     StreamError::HttpError {
         status: response.status,
@@ -126,22 +193,14 @@ fn http_error_from_response(response: &HttpResponse) -> StreamError {
     }
 }
 
-/// Pick the reconnect delay, honouring a server `Retry-After` but never
-/// letting it exceed the configured ceiling.
-///
-/// `Retry-After` is attacker-controlled: `parse_retry_after` maps an oversized
-/// integer to `Duration::from_secs(u64::MAX)`, so an unclamped
-/// `base.max(retry_after)` let one response header park the stream for ~584
-/// billion years — the sleep never resolves, the connector never reconnects,
-/// and its timer thread stays alive. `delay_for_attempt` already enforces
-/// `max_delay`; the server-supplied value has to be intersected with the same
-/// ceiling rather than allowed to override it.
-fn reconnect_delay_for_error(handler: &ReconnectHandler, err: &StreamError) -> Duration {
-    let config = handler.config();
-    let base = config.delay_for_attempt(handler.attempts());
-    err.retry_after().map_or(base, |retry_after| {
-        base.max(retry_after).min(config.max_delay)
-    })
+/// Refuse reconnect when the server's minimum exceeds local wait policy.
+fn reconnect_delay_for_error(
+    handler: &ReconnectHandler,
+    err: &StreamError,
+) -> StreamResult<Duration> {
+    handler
+        .config()
+        .delay_for_attempt_with_minimum(handler.attempts(), err.retry_after())
 }
 
 fn websocket_error(err: WsError) -> StreamError {
@@ -236,8 +295,7 @@ where
     let response_bytes = read_http_response(&mut io)
         .await
         .map_err(|err| connection_failed(err.to_string()))?;
-    let response =
-        HttpResponse::parse(&response_bytes).map_err(|err| connection_failed(err.to_string()))?;
+    let response = parse_handshake_response(&response_bytes)?;
     if response.status != 101 {
         return Err(http_error_from_response(&response));
     }
@@ -1011,11 +1069,17 @@ impl Stream for ReconnectingWsStream {
                         self.state = ReconnectState::Connected(Box::new(connection));
                     }
                     Poll::Ready(Err(err)) => {
-                        if !self.handler.can_reconnect() {
+                        if err.is_terminal_backpressure()
+                            || matches!(&err, StreamError::ReconnectDelayExceeded { .. })
+                            || !self.handler.can_reconnect()
+                        {
                             self.state = ReconnectState::Terminated;
                             return Poll::Ready(Some(Err(err)));
                         }
-                        let delay = reconnect_delay_for_error(&self.handler, &err);
+                        let Ok(delay) = reconnect_delay_for_error(&self.handler, &err) else {
+                            self.state = ReconnectState::Terminated;
+                            return Poll::Ready(Some(Err(err)));
+                        };
                         self.handler.record_failure();
                         self.state = ReconnectState::Waiting(Box::pin(sleep(delay)));
                     }
@@ -1054,11 +1118,17 @@ impl Stream for ReconnectingWsStream {
                     Poll::Ready((connection, Err(err))) => {
                         drop(connection);
                         self.note_connection_lost();
-                        if !self.handler.can_reconnect() {
+                        if err.is_terminal_backpressure()
+                            || matches!(&err, StreamError::ReconnectDelayExceeded { .. })
+                            || !self.handler.can_reconnect()
+                        {
                             self.state = ReconnectState::Terminated;
                             return Poll::Ready(Some(Err(err)));
                         }
-                        let delay = reconnect_delay_for_error(&self.handler, &err);
+                        let Ok(delay) = reconnect_delay_for_error(&self.handler, &err) else {
+                            self.state = ReconnectState::Terminated;
+                            return Poll::Ready(Some(Err(err)));
+                        };
                         self.handler.record_failure();
                         self.state = ReconnectState::Waiting(Box::pin(sleep(delay)));
                     }
@@ -1163,6 +1233,147 @@ mod tests {
             second.flush().expect("flush websocket frame");
         });
         (format!("ws://{address}"), handle)
+    }
+
+    fn spawn_http_error_websocket_server(
+        status: u16,
+        headers: &str,
+    ) -> (String, thread::JoinHandle<usize>) {
+        let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let response = format!(
+            "HTTP/1.1 {status} Upstream refused\r\nContent-Length: 0\r\nConnection: close\r\n{headers}\r\n"
+        );
+        let peer = thread::spawn(move || {
+            let mut deadline = std::time::Instant::now() + Duration::from_secs(2);
+            let mut requests = 0;
+            loop {
+                match listener.accept() {
+                    Ok((mut socket, _)) => {
+                        socket
+                            .set_read_timeout(Some(Duration::from_secs(1)))
+                            .unwrap();
+                        socket
+                            .set_write_timeout(Some(Duration::from_secs(1)))
+                            .unwrap();
+                        let request = read_http_request(&mut socket);
+                        assert!(request.starts_with("GET "));
+                        requests += 1;
+                        socket.write_all(response.as_bytes()).unwrap();
+                        deadline = std::time::Instant::now() + Duration::from_millis(200);
+                        if requests == 2 {
+                            return requests;
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() >= deadline {
+                            return requests;
+                        }
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("accept websocket handshake: {error}"),
+                }
+            }
+        });
+        (format!("ws://{address}/events"), peer)
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn websocket_http_minimum_refusal_preserves_error_without_reconnecting() {
+        for (status, headers, minimum) in [
+            (429, "Retry-After: 1\r\n", Duration::from_secs(1)),
+            (500, "Retry-After: 1\r\n", Duration::from_secs(1)),
+            (503, "Retry-After: 1\r\n", Duration::from_secs(1)),
+            (
+                503,
+                "Retry-After: 0\r\nrEtRy-AfTeR: 2\r\nRetry-After: 1\r\n",
+                Duration::from_secs(2),
+            ),
+            (
+                429,
+                "Retry-After: invalid\r\nRetry-After: 3\r\n",
+                Duration::from_secs(3),
+            ),
+            (
+                429,
+                "Retry-After: 999999999999999999999999999999999999999999999999\r\n",
+                Duration::from_secs(u64::MAX),
+            ),
+        ] {
+            let (url, peer) = spawn_http_error_websocket_server(status, headers);
+            let mut stream = WsClient::with_config(
+                url,
+                WsConfig::new().with_connect_timeout(Duration::from_secs(1)),
+            )
+            .stream();
+            stream.handler = ReconnectHandler::new(
+                crate::reconnect::ReconnectConfig::new().with_max_delay(Duration::from_millis(1)),
+            );
+            let error = timeout(Duration::from_secs(1), stream.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err();
+            assert!(
+                matches!(error, StreamError::HttpError { status: actual, retry_after, .. }
+                if actual == status && retry_after == Some(minimum))
+            );
+            assert_eq!(stream.handler.attempts(), 0);
+            for _ in 0..3 {
+                assert!(stream.next().await.is_none());
+            }
+            assert_eq!(peer.join().unwrap(), 1);
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn websocket_host_backpressure_refusal_is_terminal_and_fused() {
+        for (reason, headers, minimum) in [
+            (
+                "budget-exhausted",
+                "X-FCP-Backpressure-Reason: budget-exhausted\r\nRetry-After: 0\r\n",
+                Duration::ZERO,
+            ),
+            (
+                "temporarily-busy",
+                "X-FCP-Backpressure-Reason: temporarily-busy\r\nRetry-After: 2\r\n\
+                 X-FCP-Backpressure-Retry-After: 1\r\n\
+                 x-fcp-backpressure-retry-after: 3\r\n",
+                Duration::from_secs(3),
+            ),
+        ] {
+            let (url, peer) = spawn_http_error_websocket_server(503, headers);
+            let mut stream = WsClient::new(url).stream();
+            stream.handler = ReconnectHandler::new(
+                crate::reconnect::ReconnectConfig::new().with_max_delay(Duration::from_millis(1)),
+            );
+            let error = timeout(Duration::from_secs(1), stream.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err();
+            assert!(
+                matches!(error, StreamError::HostBackpressure { status: 503, signal, .. }
+                if signal.reason == reason && signal.retry_after() == Some(minimum))
+            );
+            assert_eq!(stream.handler.attempts(), 0);
+            for _ in 0..3 {
+                assert!(stream.next().await.is_none());
+            }
+            assert_eq!(peer.join().unwrap(), 1);
+        }
+    }
+
+    #[test]
+    fn duplicate_retry_hint_normalization_preserves_upgrade_and_other_header_validation() {
+        for response in [
+            b"HTTP/1.1 101 Switching Protocols\r\nRetry-After: 1\r\nRetry-After: 2\r\n\r\n".as_slice(),
+            b"HTTP/1.1 503 Unavailable\r\nRetry-After: 1\r\nRetry-After: 2\r\nUpgrade: websocket\r\nUpgrade: websocket\r\n\r\n".as_slice(),
+            b"HTTP/1.1 503 Unavailable\r\nRetry-After: 1\nUpgrade: websocket\r\nRetry-After: 2\r\nUpgrade: websocket\r\n\r\n".as_slice(),
+        ] {
+            assert!(parse_handshake_response(response).is_err());
+        }
     }
 
     #[test]
@@ -1918,7 +2129,7 @@ mod tests {
             retry_after: Some(Duration::from_secs(5)),
         };
         assert_eq!(
-            reconnect_delay_for_error(&handler, &err),
+            reconnect_delay_for_error(&handler, &err).unwrap(),
             Duration::from_secs(5)
         );
     }
@@ -1937,7 +2148,7 @@ mod tests {
             retry_after: Some(Duration::from_millis(500)),
         };
         assert_eq!(
-            reconnect_delay_for_error(&handler, &err),
+            reconnect_delay_for_error(&handler, &err).unwrap(),
             Duration::from_secs(4)
         );
     }

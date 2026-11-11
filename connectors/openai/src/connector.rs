@@ -1580,6 +1580,13 @@ fn map_realtime_stream_error(error: StreamError) -> FcpError {
             retryable: false,
             retry_after: None,
         },
+        StreamError::ReconnectDelayExceeded { required, max } => FcpError::External {
+            service: "openai.realtime".into(),
+            message: format!("Required reconnect delay {required:?} exceeds local maximum {max:?}"),
+            status_code: None,
+            retryable: false,
+            retry_after: Some(required),
+        },
         StreamError::ParseError(message) | StreamError::InvalidState(message) => {
             FcpError::External {
                 service: "openai.realtime".into(),

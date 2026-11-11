@@ -106,6 +106,15 @@ pub enum StreamError {
         attempts: u32,
     },
 
+    /// A server minimum cannot fit the local reconnect wait policy.
+    #[error("Required reconnect delay {required:?} exceeds local maximum {max:?}")]
+    ReconnectDelayExceeded {
+        /// Minimum delay required by the server.
+        required: Duration,
+        /// Maximum wait permitted by the local policy.
+        max: Duration,
+    },
+
     /// Buffer overflow.
     #[error("Buffer overflow: {size} bytes exceeds limit of {limit}")]
     BufferOverflow {
@@ -150,6 +159,7 @@ impl StreamError {
         match self {
             Self::HttpError { retry_after, .. } => *retry_after,
             Self::HostBackpressure { signal, .. } => signal.retry_after(),
+            Self::ReconnectDelayExceeded { required, .. } => Some(*required),
             _ => None,
         }
     }

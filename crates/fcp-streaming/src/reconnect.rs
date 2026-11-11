@@ -21,7 +21,8 @@ pub struct ReconnectConfig {
     pub max_attempts: Option<u32>,
     /// Initial delay before first reconnection.
     pub initial_delay: Duration,
-    /// Maximum delay between reconnections.
+    /// Maximum permitted wait between reconnections. Server minimums beyond
+    /// this limit refuse reconnect instead of being shortened.
     pub max_delay: Duration,
     /// Backoff multiplier.
     pub backoff_multiplier: f64,
@@ -88,6 +89,26 @@ impl ReconnectConfig {
     pub const fn with_jitter(mut self, enabled: bool) -> Self {
         self.jitter = enabled;
         self
+    }
+
+    /// Combine local backoff with a server minimum without shortening either.
+    ///
+    /// # Errors
+    /// Returns [`StreamError::ReconnectDelayExceeded`] if the server minimum
+    /// cannot fit the local wait policy. No timer should be started in that case.
+    pub fn delay_for_attempt_with_minimum(
+        &self,
+        attempt: u32,
+        minimum: Option<Duration>,
+    ) -> StreamResult<Duration> {
+        let required = minimum.unwrap_or_default();
+        if required > self.max_delay {
+            return Err(StreamError::ReconnectDelayExceeded {
+                required,
+                max: self.max_delay,
+            });
+        }
+        Ok(self.delay_for_attempt(attempt).max(required))
     }
 
     /// Calculate delay for a given attempt.
@@ -206,13 +227,27 @@ impl ReconnectHandler {
     /// # Errors
     /// Returns [`StreamError::ReconnectLimitExceeded`] when the retry budget is exhausted.
     pub async fn wait_for_reconnect(&mut self) -> StreamResult<()> {
+        self.wait_for_reconnect_after(None).await
+    }
+
+    /// Wait for the next attempt while preserving an upstream minimum delay.
+    ///
+    /// # Errors
+    /// Returns a reconnect limit or delay-policy error before waiting when the
+    /// next attempt cannot be admitted.
+    pub async fn wait_for_reconnect_after(
+        &mut self,
+        minimum: Option<Duration>,
+    ) -> StreamResult<()> {
         if !self.can_reconnect() {
             return Err(StreamError::ReconnectLimitExceeded {
                 attempts: self.attempts,
             });
         }
 
-        let delay = self.config.delay_for_attempt(self.attempts);
+        let delay = self
+            .config
+            .delay_for_attempt_with_minimum(self.attempts, minimum)?;
         debug!(
             attempt = self.attempts,
             delay_ms = delay.as_millis(),
@@ -241,11 +276,13 @@ impl ReconnectHandler {
                     return Ok(result);
                 }
                 Err(e) => {
-                    if e.is_terminal_backpressure() {
+                    if e.is_terminal_backpressure()
+                        || matches!(&e, StreamError::ReconnectDelayExceeded { .. })
+                    {
                         warn!(
                             error = %e,
                             attempt = self.attempts,
-                            "Operation failed with host budget backpressure; refusing retry"
+                            "Operation failed with terminal reconnect policy; refusing retry"
                         );
                         return Err(e);
                     }
@@ -262,7 +299,14 @@ impl ReconnectHandler {
                         });
                     }
 
-                    self.wait_for_reconnect().await?;
+                    if let Err(error) = self.wait_for_reconnect_after(e.retry_after()).await {
+                        // Preserve status and retry guidance from the upstream
+                        // when local policy refuses its minimum wait.
+                        if matches!(error, StreamError::ReconnectDelayExceeded { .. }) {
+                            return Err(e);
+                        }
+                        return Err(error);
+                    }
                 }
             }
         }
@@ -296,6 +340,55 @@ fn random_float() -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_minimum_is_never_shortened_by_jitter_or_backoff() {
+        let config = ReconnectConfig::new()
+            .with_initial_delay(Duration::from_millis(100))
+            .with_max_delay(Duration::from_secs(2));
+        for minimum in [Duration::from_nanos(1_000_000_001), config.max_delay] {
+            for _ in 0..20 {
+                let delay = config
+                    .delay_for_attempt_with_minimum(0, Some(minimum))
+                    .unwrap();
+                assert!(delay >= minimum);
+                assert!(delay <= config.max_delay);
+            }
+        }
+        for minimum in [config.max_delay + Duration::from_nanos(1), Duration::MAX] {
+            assert!(matches!(
+                config.delay_for_attempt_with_minimum(0, Some(minimum)),
+                Err(StreamError::ReconnectDelayExceeded { required, max })
+                    if required == minimum && max == config.max_delay
+            ));
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn reconnect_refuses_provider_minimum_before_another_attempt() {
+        let mut handler =
+            ReconnectHandler::new(ReconnectConfig::new().with_max_delay(Duration::from_millis(1)));
+        let mut calls = 0;
+        let error = handler
+            .reconnect(|| {
+                calls += 1;
+                async {
+                    Err::<(), _>(StreamError::HttpError {
+                        status: 429,
+                        message: "provider rate limit".into(),
+                        retry_after: Some(Duration::from_secs(60)),
+                    })
+                }
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(calls, 1);
+        assert_eq!(handler.attempts(), 0);
+        assert!(
+            matches!(error, StreamError::HttpError { status: 429, retry_after, .. }
+            if retry_after == Some(Duration::from_secs(60)))
+        );
+    }
 
     #[test]
     fn test_reconnect_config_default() {
