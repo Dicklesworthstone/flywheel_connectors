@@ -118,8 +118,19 @@ pub fn parse_rate_limit_headers(
             .and_then(parse_u64),
         token_reset_after: override_value(config.token_reset_header.as_ref(), TOKEN_RESET)
             .and_then(parse_retry_after),
-        retry_after: override_value(config.retry_after_header.as_ref(), RETRY_AFTER)
-            .and_then(parse_retry_after),
+        // Every valid provider minimum applies, including repeated fields and
+        // a standard hint alongside a provider-specific override.
+        retry_after: headers
+            .iter()
+            .filter(|(name, _)| {
+                name.eq_ignore_ascii_case(RETRY_AFTER)
+                    || config
+                        .retry_after_header
+                        .as_ref()
+                        .is_some_and(|header| name.eq_ignore_ascii_case(header))
+            })
+            .filter_map(|(_, value)| parse_retry_after(value))
+            .max(),
     }
 }
 
@@ -131,10 +142,8 @@ fn parse_u64(value: &str) -> Option<u64> {
 #[must_use]
 pub fn parse_retry_after(value: &str) -> Option<Duration> {
     let value = value.trim();
-    if let Ok(seconds) = value.parse::<u128>() {
-        return Some(Duration::from_secs(
-            u64::try_from(seconds).unwrap_or(u64::MAX),
-        ));
+    if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Some(Duration::from_secs(value.parse().unwrap_or(u64::MAX)));
     }
     if let Ok(seconds) = value.parse::<f64>() {
         return Duration::try_from_secs_f64(seconds).ok();
@@ -200,6 +209,40 @@ mod tests {
     fn retry_after_fractional_seconds_parse() {
         let parsed = parse_retry_after("0.25");
         assert_eq!(parsed, Some(Duration::from_millis(250)));
+    }
+
+    #[test]
+    fn retry_after_preserves_longest_standard_and_provider_minimum() {
+        let headers = vec![
+            ("Retry-After".to_string(), "0".to_string()),
+            ("retry-after".to_string(), "60".to_string()),
+            ("RETRY-AFTER".to_string(), "invalid".to_string()),
+            ("x-provider-wait".to_string(), "120".to_string()),
+            ("X-Provider-Wait".to_string(), "0.25".to_string()),
+        ];
+        assert_eq!(
+            parse_rate_limit_headers(&headers, None).retry_after,
+            Some(Duration::from_secs(60))
+        );
+        let overrides = RateLimitConfig {
+            retry_after_header: Some("x-provider-wait".to_string()),
+            ..RateLimitConfig::default()
+        };
+        assert_eq!(
+            parse_rate_limit_headers(&headers, Some(&overrides)).retry_after,
+            Some(Duration::from_secs(120))
+        );
+    }
+
+    #[test]
+    fn oversized_retry_after_remains_a_minimum_instead_of_disappearing() {
+        assert_eq!(
+            parse_retry_after("999999999999999999999999999999999999999999999999"),
+            Some(Duration::from_secs(u64::MAX))
+        );
+        for invalid in ["", "-1", "NaN", "inf", "invalid"] {
+            assert_eq!(parse_retry_after(invalid), None);
+        }
     }
 
     proptest! {

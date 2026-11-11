@@ -26,7 +26,7 @@ mod types;
 
 pub use client::{
     ChatCompletionStream, ErrorMapper, HttpRequest, OpenAiCompatClient, OpenAiCompatClientConfig,
-    OpenAiCompatProvider,
+    OpenAiCompatProvider, RequestBudget,
 };
 pub use error::{
     NetworkError, OpenAiError, StreamingError, redact_sensitive_text, truncate_response_body,

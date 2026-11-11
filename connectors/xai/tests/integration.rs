@@ -556,7 +556,7 @@ async fn responses_timeout_and_cancellation_are_bounded() {
         .expect_err("slow server should time out");
     assert!(matches!(
         timeout_error,
-        OpenAiError::Network(NetworkError::Http { .. })
+        OpenAiError::Network(NetworkError::DeadlineExceeded { .. })
     ));
 
     let cx = fcp_async_core::compatibility_cx();

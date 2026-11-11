@@ -64,6 +64,15 @@ pub fn openai_error_to_fcp(error: &OpenAiError) -> FcpError {
                 message: format!("Cerebras request cancelled: {message}"),
             }
         }
+        OpenAiError::Network(NetworkError::DeadlineExceeded { timeout_ms }) => FcpError::External {
+            service: "cerebras".into(),
+            message: format!(
+                "request budget exhausted after {timeout_ms}ms; provider outcome may be unknown"
+            ),
+            status_code: Some(504),
+            retryable: false,
+            retry_after: None,
+        },
         OpenAiError::Network(NetworkError::ConnectionDropped) => FcpError::External {
             service: "cerebras".into(),
             message: "stream connection dropped before completion".into(),

@@ -22,6 +22,12 @@ pub enum NetworkError {
         /// Cancellation detail.
         message: String,
     },
+    /// The complete operation, including retries or streaming, exhausted its budget.
+    #[error("request deadline exceeded after {timeout_ms}ms")]
+    DeadlineExceeded {
+        /// Effective timeout after narrowing against the caller's context.
+        timeout_ms: u64,
+    },
     /// Stream ended before `[DONE]`.
     #[error("stream connection dropped before completion")]
     ConnectionDropped,

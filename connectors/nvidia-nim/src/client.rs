@@ -1,12 +1,12 @@
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
 
+use fcp_async_core::Cx;
 use fcp_async_core::http::{HttpClient, HttpClientBuilder, Method};
-use fcp_async_core::{Cx, time};
 use fcp_openai_compat::{
     ChatCompletionStream, ChatCompletionsRequest, ChatCompletionsResponse, EmbeddingsRequest,
-    EmbeddingsResponse, HeaderList, HttpRequest, ModelInfo, NetworkError, OpenAiCompatClient,
-    OpenAiCompatClientConfig, OpenAiCompatProvider, OpenAiError, RateLimitPolicy,
+    EmbeddingsResponse, HeaderList, HttpRequest, ModelInfo, OpenAiCompatClient,
+    OpenAiCompatClientConfig, OpenAiCompatProvider, OpenAiError, RateLimitPolicy, RequestBudget,
     parse_rate_limit_headers, redact_sensitive_text, truncate_response_body,
 };
 use serde_json::Value;
@@ -236,34 +236,25 @@ impl NvidiaNimClient {
         cx: &Cx,
         request: RerankRequest,
     ) -> Result<RerankResponse, OpenAiError> {
+        let mut budget = RequestBudget::new(cx, self.request_timeout);
         let mut attempted_rate_limit_retry = false;
         loop {
-            checkpoint(cx)?;
+            budget.checkpoint()?;
             let body = serde_json::to_vec(&request).map_err(|err| OpenAiError::InvalidRequest {
                 message: format!("failed to serialize rerank request: {err}"),
                 param: None,
                 code: Some("serialize_request".into()),
             })?;
-            let response = match time::timeout(
-                self.request_timeout,
-                self.http_client.request(
+            let response = budget
+                .run(self.http_client.request(
                     cx,
                     Method::Post,
                     &self.rerank_url(),
                     self.headers_for(&request.model),
                     body,
-                ),
-            )
-            .await
-            {
-                Ok(Ok(response)) => response,
-                Ok(Err(err)) => return Err(OpenAiError::Network(err.into())),
-                Err(err) => {
-                    return Err(OpenAiError::Network(NetworkError::Http {
-                        message: redact_sensitive_text(&err.to_string()),
-                    }));
-                }
-            };
+                ))
+                .await?
+                .map_err(|err| OpenAiError::Network(err.into()))?;
 
             let status = response.status_code();
             let rate_limits = parse_rate_limit_headers(&response.headers, None);
@@ -272,14 +263,15 @@ impl NvidiaNimClient {
                 if !attempted_rate_limit_retry {
                     if let Some(delay) = retry_delay_for_policy(&mapped, self.rate_limit_policy) {
                         attempted_rate_limit_retry = true;
-                        time::sleep(delay).await;
-                        continue;
+                        if budget.wait_for_retry(delay).await? {
+                            continue;
+                        }
                     }
                 }
                 return Err(mapped);
             }
 
-            checkpoint(cx)?;
+            budget.checkpoint()?;
             return serde_json::from_slice(&response.body).map_err(|err| {
                 OpenAiError::InvalidRequest {
                     message: format!("failed to decode rerank response: {err}"),
@@ -547,14 +539,6 @@ fn retry_delay_for_policy(error: &OpenAiError, policy: RateLimitPolicy) -> Optio
         RateLimitPolicy::FailFast | RateLimitPolicy::WaitUpTo(_) => None,
         RateLimitPolicy::WaitForever => Some(retry_after),
     }
-}
-
-fn checkpoint(cx: &Cx) -> Result<(), OpenAiError> {
-    cx.checkpoint().map_err(|err| {
-        OpenAiError::Network(NetworkError::Cancelled {
-            message: err.to_string(),
-        })
-    })
 }
 
 fn canonical_host(host: &str) -> String {

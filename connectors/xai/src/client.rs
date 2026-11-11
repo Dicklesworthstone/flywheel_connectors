@@ -3,11 +3,10 @@ use std::time::Duration;
 
 use fcp_async_core::Cx;
 use fcp_async_core::http::{HttpClient, HttpClientBuilder, Method};
-use fcp_async_core::time;
 use fcp_openai_compat::{
     ChatCompletionStream, ChatCompletionsRequest, ChatCompletionsResponse, HeaderList, HttpRequest,
-    ModelInfo, NetworkError, OpenAiCompatClient, OpenAiCompatClientConfig, OpenAiCompatProvider,
-    OpenAiError, RateLimitConfig, RateLimitPolicy, parse_rate_limit_headers,
+    ModelInfo, OpenAiCompatClient, OpenAiCompatClientConfig, OpenAiCompatProvider, OpenAiError,
+    RateLimitConfig, RateLimitPolicy, RequestBudget, parse_rate_limit_headers,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -176,9 +175,10 @@ impl XaiClient {
     where
         T: Serialize + Sync + ?Sized,
     {
+        let mut budget = RequestBudget::new(cx, self.request_timeout);
         let mut attempted_rate_limit_retry = false;
         loop {
-            checkpoint(cx)?;
+            budget.checkpoint()?;
             let body_bytes =
                 serde_json::to_vec(body).map_err(|err| OpenAiError::InvalidRequest {
                     message: format!("failed to serialize request: {err}"),
@@ -193,15 +193,10 @@ impl XaiClient {
                 self.headers_for(model),
                 body_bytes,
             );
-            let response = match time::timeout(self.request_timeout, request).await {
-                Ok(Ok(response)) => response,
-                Ok(Err(err)) => return Err(OpenAiError::Network(err.into())),
-                Err(err) => {
-                    return Err(OpenAiError::Network(NetworkError::Http {
-                        message: err.to_string(),
-                    }));
-                }
-            };
+            let response = budget
+                .run(request)
+                .await?
+                .map_err(|err| OpenAiError::Network(err.into()))?;
 
             let status = response.status_code();
             let rate_limits = parse_rate_limit_headers(
@@ -219,14 +214,15 @@ impl XaiClient {
                 if !attempted_rate_limit_retry {
                     if let Some(delay) = retry_delay_for_policy(&mapped, self.rate_limit_policy) {
                         attempted_rate_limit_retry = true;
-                        time::sleep(delay).await;
-                        continue;
+                        if budget.wait_for_retry(delay).await? {
+                            continue;
+                        }
                     }
                 }
                 return Err(mapped);
             }
 
-            checkpoint(cx)?;
+            budget.checkpoint()?;
             return serde_json::from_slice(&response.body).map_err(|err| {
                 OpenAiError::InvalidRequest {
                     message: format!("failed to decode provider response: {err}"),
@@ -317,12 +313,4 @@ fn retry_delay_for_policy(error: &OpenAiError, policy: RateLimitPolicy) -> Optio
         RateLimitPolicy::FailFast | RateLimitPolicy::WaitUpTo(_) => None,
         RateLimitPolicy::WaitForever => Some(retry_after),
     }
-}
-
-fn checkpoint(cx: &Cx) -> Result<(), OpenAiError> {
-    cx.checkpoint().map_err(|err| {
-        OpenAiError::Network(NetworkError::Cancelled {
-            message: err.to_string(),
-        })
-    })
 }

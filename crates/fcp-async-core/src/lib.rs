@@ -133,6 +133,19 @@ pub fn compatibility_cx() -> asupersync::Cx {
     )
 }
 
+/// Wait for cancellation of an explicit native context without polling a timer.
+///
+/// The native oneshot receive future owns and unregisters its cancellation
+/// waker, including when this wait loses a race or is dropped. Its sender stays
+/// private and alive, so cancellation is the only way the receive can complete.
+/// This uses the runtime's public cancel-aware wait surface instead of relying
+/// on the ambient task context or leaving a detached cancellation watcher.
+pub async fn wait_for_cx_cancellation(cx: &Cx) {
+    let (sender, mut receiver) = asupersync::channel::oneshot::channel::<()>();
+    let _ = receiver.recv(cx).await;
+    drop(sender);
+}
+
 /// Runtime bridging helpers.
 pub mod runtime {
     use std::cell::RefCell;
@@ -784,10 +797,17 @@ impl ExecutionContext {
         }
     }
 
-    /// Set or replace the context deadline.
+    /// Tighten the context deadline, retaining any earlier inherited deadline.
     #[must_use]
     pub fn with_deadline(mut self, timeout: Duration) -> Self {
-        self.deadline = Some(Deadline::after(timeout));
+        let requested = Deadline::after(timeout);
+        self.deadline = Some(self.deadline.map_or(requested, |inherited| {
+            if inherited.deadline_at <= requested.deadline_at {
+                inherited
+            } else {
+                requested
+            }
+        }));
         self
     }
 
@@ -3356,10 +3376,66 @@ mod tests {
     }
 
     #[runtime::test]
-    async fn context_with_deadline_replaces_existing() {
+    async fn context_with_deadline_sets_background_budget() {
         let ctx = ExecutionContext::background().with_deadline(Duration::from_secs(30));
         assert!(ctx.deadline().is_some());
         assert!(ctx.remaining_budget().is_some());
+    }
+
+    #[test]
+    fn context_child_cannot_extend_inherited_deadline() {
+        let parent = ExecutionContext::request_scoped(Duration::from_secs(10));
+        let original = parent.deadline();
+        let child = parent.child().with_deadline(Duration::MAX);
+
+        assert_eq!(child.deadline(), original);
+        assert_eq!(parent.deadline(), original);
+        let tighter = child.with_deadline(Duration::ZERO);
+        assert!(tighter.deadline().unwrap().is_expired());
+        assert_eq!(parent.deadline(), original);
+    }
+
+    #[runtime::test]
+    async fn context_expired_deadline_cannot_be_revived() {
+        let expired = ExecutionContext::request_scoped(Duration::ZERO);
+        let child = expired.child().with_deadline(Duration::from_secs(60));
+        assert_eq!(child.deadline(), expired.deadline());
+        assert!(matches!(
+            child.run(future::pending::<()>()).await,
+            Err(AsyncError::Timeout { .. })
+        ));
+    }
+
+    #[test]
+    fn native_cancellation_wait_wakes_and_unregisters_on_drop() {
+        use std::future::Future as _;
+        use std::task::{Context, Wake, Waker};
+
+        struct WakeCounter(AtomicUsize);
+        impl Wake for WakeCounter {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let cx = super::Cx::for_testing();
+        let wakes = Arc::new(WakeCounter(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&wakes));
+        let mut task = Context::from_waker(&waker);
+        let mut waiting = Box::pin(super::wait_for_cx_cancellation(&cx));
+        assert!(waiting.as_mut().poll(&mut task).is_pending());
+        cx.set_cancel_requested(true);
+        assert!(wakes.0.load(Ordering::SeqCst) > 0);
+        assert!(waiting.as_mut().poll(&mut task).is_ready());
+        drop(waiting);
+
+        let cx = super::Cx::for_testing();
+        let mut waiting = Box::pin(super::wait_for_cx_cancellation(&cx));
+        assert!(waiting.as_mut().poll(&mut task).is_pending());
+        drop(waiting);
+        let before = wakes.0.load(Ordering::SeqCst);
+        cx.set_cancel_requested(true);
+        assert_eq!(wakes.0.load(Ordering::SeqCst), before);
     }
 
     #[runtime::test]

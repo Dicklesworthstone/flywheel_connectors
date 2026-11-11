@@ -1,13 +1,13 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use fcp_async_core::Cx;
 use fcp_async_core::http::{HttpClient, HttpClientBuilder, Method};
-use fcp_async_core::{Cx, time};
 use fcp_openai_compat::{
     ChatCompletionStream, ChatCompletionsRequest, ChatCompletionsResponse, CompletionsRequest,
     CompletionsResponse, EmbeddingsRequest, EmbeddingsResponse, HeaderList, HttpRequest, ModelInfo,
     OpenAiCompatClient, OpenAiCompatClientConfig, OpenAiCompatProvider, OpenAiError,
-    RateLimitPolicy, parse_rate_limit_headers,
+    RateLimitPolicy, RequestBudget, parse_rate_limit_headers,
 };
 use serde::Deserialize;
 use url::Url;
@@ -158,8 +158,9 @@ impl FireworksClient {
     }
 
     pub async fn list_models(&self, cx: &Cx) -> Result<Vec<ModelInfo>, OpenAiError> {
+        let mut budget = RequestBudget::new(cx, self.request_timeout);
         {
-            let guard = self.model_cache.lock().await;
+            let guard = budget.run(self.model_cache.lock()).await?;
             if let Some(cache) = guard.as_ref() {
                 if cache.fetched_at.elapsed() <= self.model_cache_ttl {
                     return Ok(cache.models.clone());
@@ -167,8 +168,8 @@ impl FireworksClient {
             }
         }
 
-        let models = self.fetch_models(cx).await?;
-        *self.model_cache.lock().await = Some(ModelCache {
+        let models = self.fetch_models(cx, &mut budget).await?;
+        *budget.run(self.model_cache.lock()).await? = Some(ModelCache {
             fetched_at: Instant::now(),
             models: models.clone(),
         });
@@ -188,10 +189,14 @@ impl FireworksClient {
         self.inner.legacy_completions(cx, request).await
     }
 
-    async fn fetch_models(&self, cx: &Cx) -> Result<Vec<ModelInfo>, OpenAiError> {
+    async fn fetch_models(
+        &self,
+        cx: &Cx,
+        budget: &mut RequestBudget,
+    ) -> Result<Vec<ModelInfo>, OpenAiError> {
         let mut attempted_rate_limit_retry = false;
         loop {
-            checkpoint(cx)?;
+            budget.checkpoint()?;
             let mut request = HttpRequest {
                 headers: vec![
                     (ACCEPT_HEADER.to_string(), JSON_CONTENT_TYPE.to_string()),
@@ -204,23 +209,13 @@ impl FireworksClient {
             };
             self.provider.auth_header(&mut request);
             let url = format!("{}/models", self.provider.base_url().trim_end_matches('/'));
-            let response = match time::timeout(
-                self.request_timeout,
-                self.http_client
-                    .request(cx, Method::Get, &url, request.headers, Vec::new()),
-            )
-            .await
-            {
-                Ok(Ok(response)) => response,
-                Ok(Err(err)) => return Err(OpenAiError::Network(err.into())),
-                Err(err) => {
-                    return Err(OpenAiError::Network(
-                        fcp_openai_compat::NetworkError::Http {
-                            message: err.to_string(),
-                        },
-                    ));
-                }
-            };
+            let response = budget
+                .run(
+                    self.http_client
+                        .request(cx, Method::Get, &url, request.headers, Vec::new()),
+                )
+                .await?
+                .map_err(|err| OpenAiError::Network(err.into()))?;
             let status = response.status_code();
             let rate_limits = parse_rate_limit_headers(&response.headers, None);
             if !status.is_success() {
@@ -234,13 +229,14 @@ impl FireworksClient {
                 if !attempted_rate_limit_retry {
                     if let Some(delay) = retry_delay_for_policy(&mapped, self.rate_limit_policy) {
                         attempted_rate_limit_retry = true;
-                        time::sleep(delay).await;
-                        continue;
+                        if budget.wait_for_retry(delay).await? {
+                            continue;
+                        }
                     }
                 }
                 return Err(mapped);
             }
-            checkpoint(cx)?;
+            budget.checkpoint()?;
             return parse_models_body(&response.body);
         }
     }
@@ -356,12 +352,4 @@ fn retry_delay_for_policy(error: &OpenAiError, policy: RateLimitPolicy) -> Optio
         RateLimitPolicy::FailFast | RateLimitPolicy::WaitUpTo(_) => None,
         RateLimitPolicy::WaitForever => Some(retry_after),
     }
-}
-
-fn checkpoint(cx: &Cx) -> Result<(), OpenAiError> {
-    cx.checkpoint().map_err(|err| {
-        OpenAiError::Network(fcp_openai_compat::NetworkError::Cancelled {
-            message: err.to_string(),
-        })
-    })
 }
