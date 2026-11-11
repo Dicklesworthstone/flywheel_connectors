@@ -195,12 +195,7 @@ fn retryable_errors_allow_retry_with_always_strategy() {
         strategy: RetryStrategy::Always,
     };
 
-    let retryable = [
-        server_error_500(),
-        server_error_503(),
-        server_error_500(),
-        rate_limit_error(),
-    ];
+    let retryable = [server_error_500(), server_error_503(), server_error_500()];
 
     for (i, err) in retryable.iter().enumerate() {
         assert!(err.is_retryable(), "error {i} should be retryable: {err}");
@@ -1069,10 +1064,7 @@ fn full_error_pipeline_rate_limit() {
         strategy: RetryStrategy::Always,
         ..RetryPolicy::default()
     };
-    assert!(matches!(
-        policy.decide(&err, 1, false),
-        RetryDecision::RetryAfter(_)
-    ));
+    assert_eq!(policy.decide(&err, 1, false), RetryDecision::DoNotRetry);
 
     match err.to_fcp_error("api") {
         FcpError::RateLimited { retry_after_ms, .. } => assert_eq!(retry_after_ms, 30_000),

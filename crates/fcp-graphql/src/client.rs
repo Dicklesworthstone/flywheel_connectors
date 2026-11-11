@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use fcp_async_core::http::{HttpClient, HttpClientBuilder, Method};
@@ -323,7 +323,7 @@ pub struct GraphqlClientConfig {
     pub service_name: String,
     /// Default headers applied to every request.
     pub headers: HeaderList,
-    /// Request timeout.
+    /// Total HTTP execution timeout, including every retry attempt and backoff.
     pub timeout: Duration,
     /// Retry policy.
     pub retry: RetryPolicy,
@@ -466,7 +466,7 @@ impl GraphqlClientBuilder {
         self
     }
 
-    /// Set timeout.
+    /// Set the total HTTP execution timeout, including retries and backoff.
     #[must_use]
     pub const fn with_timeout(mut self, timeout: Duration) -> Self {
         self.config.timeout = timeout;
@@ -925,49 +925,66 @@ impl GraphqlClient {
         body_bytes: Vec<u8>,
         idempotent: bool,
     ) -> Result<Vec<u8>, GraphqlClientError> {
-        let mut attempt = 1;
-        loop {
-            let result = self.send_once(&body_bytes).await;
-            match result {
-                Ok(bytes) => return Ok(bytes),
-                Err(err) => {
-                    let decision = self.config.retry.decide(&err, attempt, idempotent);
-                    match decision {
-                        RetryDecision::RetryAfter(delay) => {
-                            self.metrics
-                                .requests_retried
-                                .fetch_add(1, Ordering::Relaxed);
-                            debug!("retrying GraphQL request after {:?}", delay);
-                            time::sleep(delay).await;
-                            attempt += 1;
+        let timeout = self.config.timeout;
+        if timeout.is_zero() {
+            return Err(GraphqlClientError::Http(
+                crate::error::HttpErrorInfo::timeout(timeout),
+            ));
+        }
+        let started = Instant::now();
+        // A single timer owns the complete request. In particular, a retry
+        // cannot renew the time spent connecting, reading a body, or backing off.
+        time::timeout(timeout, async {
+            let mut attempt = 1;
+            loop {
+                if started.elapsed() >= timeout {
+                    return Err(GraphqlClientError::Http(
+                        crate::error::HttpErrorInfo::timeout(timeout),
+                    ));
+                }
+                if attempt > 1 {
+                    self.metrics
+                        .requests_retried
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                let result = self.send_once(&body_bytes).await;
+                match result {
+                    Ok(bytes) => return Ok(bytes),
+                    Err(err) => {
+                        let decision = self.config.retry.decide(&err, attempt, idempotent);
+                        match decision {
+                            RetryDecision::RetryAfter(delay) => {
+                                if delay >= timeout.saturating_sub(started.elapsed()) {
+                                    // Preserve the actionable provider failure and
+                                    // its minimum delay when no retry can fit.
+                                    return Err(err);
+                                }
+                                debug!("retrying GraphQL request after {:?}", delay);
+                                time::sleep(delay).await;
+                                attempt += 1;
+                            }
+                            RetryDecision::DoNotRetry => return Err(err),
                         }
-                        RetryDecision::DoNotRetry => return Err(err),
                     }
                 }
             }
-        }
+        })
+        .await
+        .map_err(|error| map_request_async_error(error, timeout))?
     }
 
     async fn send_once(&self, body_bytes: &[u8]) -> Result<Vec<u8>, GraphqlClientError> {
         let cx = fcp_async_core::compatibility_cx();
-        let response = match time::timeout(
-            self.config.timeout,
-            self.http.request(
+        let response = self
+            .http
+            .request(
                 &cx,
                 Method::Post,
                 &self.endpoint,
                 self.config.headers.clone(),
                 body_bytes.to_vec(),
-            ),
-        )
-        .await
-        {
-            Ok(Ok(response)) => response,
-            Ok(Err(error)) => return Err(error.into()),
-            Err(async_error) => {
-                return Err(map_request_async_error(async_error, self.config.timeout));
-            }
-        };
+            )
+            .await?;
 
         let status = response.status_code();
         let retry_after = parse_retry_after(&response.headers);
@@ -1006,12 +1023,17 @@ fn map_request_async_error(error: AsyncError, timeout: Duration) -> GraphqlClien
 }
 
 fn parse_retry_after(headers: &HeaderList) -> Option<Duration> {
-    let value = header_value(headers, RETRY_AFTER_HEADER)?;
+    headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case(RETRY_AFTER_HEADER))
+        .filter_map(|(_, value)| parse_retry_after_value(value))
+        .max()
+}
+
+fn parse_retry_after_value(value: &str) -> Option<Duration> {
     let value = value.trim();
-    if let Ok(seconds) = value.parse::<u128>() {
-        return Some(Duration::from_secs(
-            u64::try_from(seconds).unwrap_or(u64::MAX),
-        ));
+    if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Some(Duration::from_secs(value.parse().unwrap_or(u64::MAX)));
     }
 
     let retry_at = chrono::DateTime::parse_from_rfc2822(value).ok()?;
@@ -1060,6 +1082,181 @@ impl GraphqlClient {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// Real HTTP peer: every connection is closed so a retry necessarily
+    /// reaches a new accepted socket. The idle bound also catches unwanted
+    /// follow-up requests after a terminal provider failure.
+    fn retry_peer(
+        replies: Vec<(u16, Option<&'static str>, Duration)>,
+    ) -> (String, std::thread::JoinHandle<usize>) {
+        use std::io::{BufRead, Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/graphql", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let peer = std::thread::spawn(move || {
+            let mut count = 0;
+            for (status, retry_after, delay) in replies {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                let socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            if Instant::now() >= deadline {
+                                return count;
+                            }
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(error) => panic!("accept GraphQL request: {error}"),
+                    }
+                };
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                socket
+                    .set_write_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut reader = std::io::BufReader::new(socket);
+                let mut content_length = 0;
+                loop {
+                    let mut line = String::new();
+                    assert!(reader.read_line(&mut line).unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':') {
+                        if name.eq_ignore_ascii_case("content-length") {
+                            content_length = value.trim().parse::<usize>().unwrap();
+                        }
+                    }
+                }
+                assert!(content_length < 4096);
+                reader.read_exact(&mut vec![0; content_length]).unwrap();
+                count += 1;
+                std::thread::sleep(delay);
+                let body = r#"{"data":{"ok":true}}"#;
+                let header = retry_after
+                    .map_or_else(String::new, |value| format!("Retry-After: {value}\r\n"));
+                let response = format!(
+                    "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{header}\r\n{body}",
+                    body.len()
+                );
+                // Timing out an attempt intentionally closes the connection.
+                let _ = reader.get_mut().write_all(response.as_bytes());
+            }
+            count
+        });
+        (endpoint, peer)
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn retry_budget_covers_all_attempts() {
+        let (endpoint, peer) = retry_peer(vec![
+            (503, None, Duration::from_millis(150)),
+            (200, None, Duration::from_millis(150)),
+        ]);
+        let client = GraphqlClientBuilder::new(endpoint)
+            .with_timeout(Duration::from_millis(250))
+            .with_retry_policy(RetryPolicy {
+                max_attempts: 2,
+                base_delay: Duration::from_millis(5),
+                max_delay: Duration::from_millis(10),
+                max_jitter: Duration::ZERO,
+                ..RetryPolicy::default()
+            })
+            .build()
+            .unwrap();
+        let error = client
+            .send_with_retry(b"{}".to_vec(), true)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, GraphqlClientError::Http(info) if info.is_timeout));
+        assert_eq!(peer.join().unwrap(), 2);
+        assert_eq!(client.metrics.snapshot().requests_retried, 1);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn retry_budget_preserves_provider_failure_when_wait_cannot_fit() {
+        let (endpoint, peer) = retry_peer(vec![
+            (429, Some("1"), Duration::ZERO),
+            (200, None, Duration::ZERO),
+        ]);
+        let client = GraphqlClientBuilder::new(endpoint)
+            .with_timeout(Duration::from_millis(250))
+            .with_retry_policy(RetryPolicy {
+                max_delay: Duration::from_secs(2),
+                max_jitter: Duration::ZERO,
+                ..RetryPolicy::default()
+            })
+            .build()
+            .unwrap();
+        let error = client
+            .send_with_retry(b"{}".to_vec(), true)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, GraphqlClientError::HttpStatus { status, retry_after, .. }
+            if status.as_u16() == 429 && retry_after == Some(Duration::from_secs(1)))
+        );
+        assert_eq!(client.metrics.snapshot().requests_retried, 0);
+        assert_eq!(peer.join().unwrap(), 1);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn retry_budget_refuses_oversized_provider_minimum_without_dispatching_again() {
+        let (endpoint, peer) = retry_peer(vec![
+            (
+                503,
+                Some("999999999999999999999999999999999999999999999999"),
+                Duration::ZERO,
+            ),
+            (200, None, Duration::ZERO),
+        ]);
+        let client = GraphqlClientBuilder::new(endpoint)
+            .with_timeout(Duration::from_secs(1))
+            .with_retry_policy(RetryPolicy {
+                base_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(5),
+                max_jitter: Duration::ZERO,
+                ..RetryPolicy::default()
+            })
+            .build()
+            .unwrap();
+        let error = client
+            .send_with_retry(b"{}".to_vec(), true)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, GraphqlClientError::HttpStatus { status, retry_after, .. }
+            if status.as_u16() == 503 && retry_after == Some(Duration::from_secs(u64::MAX)))
+        );
+        assert_eq!(peer.join().unwrap(), 1);
+        assert_eq!(client.metrics.snapshot().requests_retried, 0);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn retry_budget_zero_never_dispatches() {
+        let client = GraphqlClientBuilder::new("http://127.0.0.1:1/graphql")
+            .with_timeout(Duration::ZERO)
+            .build()
+            .unwrap();
+        let error = client
+            .send_with_retry(b"{}".to_vec(), true)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, GraphqlClientError::Http(info) if info.is_timeout));
+        assert_eq!(client.metrics.snapshot().requests_retried, 0);
+    }
+
+    #[test]
+    fn repeated_retry_after_fields_preserve_the_longest_minimum() {
+        let headers = vec![
+            ("Retry-After".into(), "1".into()),
+            ("retry-after".into(), "invalid".into()),
+            ("RETRY-AFTER".into(), "60".into()),
+        ];
+        assert_eq!(parse_retry_after(&headers), Some(Duration::from_secs(60)));
+    }
 
     // ---- SchemaValidationMode ----
 

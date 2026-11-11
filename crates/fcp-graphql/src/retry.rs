@@ -33,7 +33,8 @@ pub struct RetryPolicy {
     pub max_attempts: usize,
     /// Base delay for exponential backoff.
     pub base_delay: Duration,
-    /// Maximum delay between retries.
+    /// Maximum permitted delay between retries. A longer provider minimum
+    /// refuses retry rather than sending before the provider allows it.
     pub max_delay: Duration,
     /// Maximum jitter to add to delays.
     pub max_jitter: Duration,
@@ -73,13 +74,18 @@ impl RetryPolicy {
             RetryStrategy::Never => RetryDecision::DoNotRetry,
             RetryStrategy::IdempotentOnly if !idempotent => RetryDecision::DoNotRetry,
             _ => {
-                if let GraphqlClientError::HttpStatus {
+                let provider_minimum = if let GraphqlClientError::HttpStatus {
                     retry_after: Some(delay),
                     ..
                 } = error
                 {
-                    return RetryDecision::RetryAfter((*delay).min(self.max_delay));
-                }
+                    if *delay > self.max_delay {
+                        return RetryDecision::DoNotRetry;
+                    }
+                    *delay
+                } else {
+                    Duration::ZERO
+                };
 
                 let base_ms = u64::try_from(self.base_delay.as_millis()).unwrap_or(u64::MAX);
                 let exp = 2_u64
@@ -97,7 +103,7 @@ impl RetryPolicy {
                     0
                 };
                 let delay_ms = delay_ms.saturating_add(jitter_ms).min(max_ms);
-                RetryDecision::RetryAfter(Duration::from_millis(delay_ms))
+                RetryDecision::RetryAfter(Duration::from_millis(delay_ms).max(provider_minimum))
             }
         }
     }
@@ -312,7 +318,7 @@ mod tests {
     }
 
     #[test]
-    fn decide_retry_after_is_capped_by_max_delay() {
+    fn decide_retry_after_above_policy_refuses_retry() {
         let p = RetryPolicy {
             max_delay: Duration::from_secs(5),
             ..RetryPolicy::default()
@@ -323,10 +329,55 @@ mod tests {
             retry_after: Some(Duration::from_secs(60)),
         };
 
-        assert_eq!(
-            p.decide(&err, 1, true),
-            RetryDecision::RetryAfter(Duration::from_secs(5))
-        );
+        assert_eq!(p.decide(&err, 1, true), RetryDecision::DoNotRetry);
+    }
+
+    #[test]
+    fn provider_minimum_never_shortens_local_backoff() {
+        let policy = RetryPolicy {
+            base_delay: Duration::from_secs(2),
+            max_jitter: Duration::ZERO,
+            ..RetryPolicy::default()
+        };
+        for minimum in [Duration::ZERO, Duration::from_secs(1)] {
+            let error = GraphqlClientError::HttpStatus {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                body: String::new(),
+                retry_after: Some(minimum),
+            };
+            assert_eq!(
+                policy.decide(&error, 1, true),
+                RetryDecision::RetryAfter(Duration::from_secs(2))
+            );
+        }
+    }
+
+    #[test]
+    fn provider_minimum_preserves_precision_and_policy_boundary() {
+        let policy = RetryPolicy {
+            max_jitter: Duration::ZERO,
+            ..RetryPolicy::default()
+        };
+        for minimum in [Duration::from_nanos(200_000_001), policy.max_delay] {
+            let error = GraphqlClientError::HttpStatus {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                body: String::new(),
+                retry_after: Some(minimum),
+            };
+            assert_eq!(
+                policy.decide(&error, 1, true),
+                RetryDecision::RetryAfter(minimum)
+            );
+            assert_eq!(policy.decide(&error, 1, false), RetryDecision::DoNotRetry);
+        }
+        for minimum in [policy.max_delay + Duration::from_nanos(1), Duration::MAX] {
+            let error = GraphqlClientError::HttpStatus {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                body: String::new(),
+                retry_after: Some(minimum),
+            };
+            assert_eq!(policy.decide(&error, 1, true), RetryDecision::DoNotRetry);
+        }
     }
 
     #[test]
