@@ -72,16 +72,17 @@ use fcp_host::{
     ConnectorInventoryApplyReport, ConnectorInventoryMutationKind,
     ConnectorInventoryMutationRequest, ConnectorInventoryMutationResponse,
     ConnectorInventoryResponse, ConnectorRegistry, ConnectorSummary, CredentialCooldown,
-    CredentialLease, CredentialMutationOutcome, CredentialPayload, CredentialPoolError,
-    CredentialPoolKey, CredentialPoolRegistry, CredentialPoolStrategy, CredentialPoolView,
-    CredentialUpsertMode, DiscoveryEndpoint, DiscoveryFilter, DiscoveryResponse, DoctorReport,
-    DoctorRequest, DoctorService, EventAcknowledgeRequest, EventAcknowledgeResponse,
-    EventQueryRequest, EventQueryResponse, GateOutcome, HostAdminStateStore, HostHealthResponse,
-    HostHealthStatus, HostPreflightRequest, HostSimulateRequest, HostSimulateResponse,
-    IntrospectionResponse, JournalQueryRequest, JournalQueryResponse, LifecycleTransitionRequest,
-    LifecycleTransitionResponse, LocalPlacementController, LocalPlacementPlan,
-    LocalPlacementPressureSnapshot, LocalPlacementRequest, LogQueryRequest, LogQueryResponse,
-    ManagedConnectorConfig, ManagedNetworkConstraints, ManagedPortConstraint, MeshQuorumSignals,
+    CredentialLease, CredentialLeaseGuard, CredentialMutationOutcome, CredentialPayload,
+    CredentialPoolError, CredentialPoolKey, CredentialPoolRegistry, CredentialPoolStrategy,
+    CredentialPoolView, CredentialUpsertMode, DiscoveryEndpoint, DiscoveryFilter,
+    DiscoveryResponse, DoctorReport, DoctorRequest, DoctorService, EventAcknowledgeRequest,
+    EventAcknowledgeResponse, EventQueryRequest, EventQueryResponse, GateOutcome,
+    HostAdminStateStore, HostHealthResponse, HostHealthStatus, HostPreflightRequest,
+    HostSimulateRequest, HostSimulateResponse, IntrospectionResponse, JournalQueryRequest,
+    JournalQueryResponse, LifecycleTransitionRequest, LifecycleTransitionResponse,
+    LocalPlacementController, LocalPlacementPlan, LocalPlacementPressureSnapshot,
+    LocalPlacementRequest, LogQueryRequest, LogQueryResponse, ManagedConnectorConfig,
+    ManagedNetworkConstraints, ManagedPortConstraint, MeshQuorumSignals,
     NativeProxyOnlySandboxDecision, NativeProxyOnlySandboxSupport, OperationResult,
     OperationResultStatus, PLACEMENT_EVIDENCE_EVENT, PlacementHintDerivationInput,
     PlacementOperationClass, PoolExhaustedBehavior, PooledCredentialInput, PreflightRequest,
@@ -14198,7 +14199,7 @@ async fn acquire_host_egress_credential_lease(
     zone_id: &ZoneId,
     credential_id: Option<&str>,
     credential_allow: &[String],
-) -> HostResult<Option<CredentialLease>> {
+) -> HostResult<Option<CredentialLeaseGuard>> {
     let Some(raw_credential_id) = credential_id else {
         return Ok(None);
     };
@@ -14220,20 +14221,9 @@ async fn acquire_host_egress_credential_lease(
                 "host-egress credential lease denied for `{raw_credential_id}`: {err}"
             ))
         })?;
-    Ok(Some(lease))
-}
-
-async fn release_host_egress_credential_lease(state: &AppState, lease: CredentialLease) {
-    if let Err(err) = state.credential_pools.lock().await.release_lease(&lease) {
-        tracing::warn!(
-            event = "host_egress_credential_release_error",
-            provider = %lease.pool_key.provider,
-            zone_id = %lease.pool_key.zone_id.as_str(),
-            credential_id = %lease.credential_id,
-            error = %err,
-            "failed to release host-egress credential lease"
-        );
-    }
+    // Convert before another await or returning to the handler: cancellation
+    // can never leave an admitted reservation without a synchronous owner.
+    Ok(Some(lease.into_guard()))
 }
 
 #[derive(Debug, Clone)]
@@ -14504,13 +14494,10 @@ async fn host_egress_http_handler(
         &state,
         &authorized,
         request,
-        lease.as_ref(),
+        lease.as_ref().map(CredentialLeaseGuard::lease),
         started_at,
     )
     .await;
-    if let Some(lease) = lease {
-        release_host_egress_credential_lease(&state, lease).await;
-    }
     result.map(Json).map_err(map_host_error)
 }
 
@@ -15369,7 +15356,7 @@ async fn host_egress_tcp_handler(
     )
     .await
     .map_err(map_host_error)?;
-    let injector = HostCredentialInjector::new(lease.clone());
+    let injector = HostCredentialInjector::new(lease.as_ref().map(|guard| guard.lease().clone()));
     let noop = NoOpCredentialInjector;
     let injector_ref: &dyn CredentialInjector = if request.credential_id.is_some() {
         &injector
@@ -15378,9 +15365,6 @@ async fn host_egress_tcp_handler(
     };
     let result =
         authorize_and_perform_host_tcp_egress(&authorized, request, injector_ref, started_at).await;
-    if let Some(lease) = lease {
-        release_host_egress_credential_lease(&state, lease).await;
-    }
     result.map(Json).map_err(map_host_error)
 }
 
@@ -26026,7 +26010,7 @@ output_schema = {{ type = "object" }}
             credential_id: Some(credential_id.to_string()),
         };
 
-        let response = host_egress_http_handler(State(state), Json(request))
+        let response = host_egress_http_handler(State(Arc::clone(&state)), Json(request))
             .await
             .expect("host HTTP egress should succeed")
             .0;
@@ -26048,6 +26032,201 @@ output_schema = {{ type = "object" }}
         assert!(
             !serialized.contains("redaction-sentinel-http-secret"),
             "host egress response must not echo injected HTTP credentials"
+        );
+        assert!(
+            state
+                .credential_pools
+                .lock()
+                .await
+                .redacted_views(Utc::now())
+                .iter()
+                .flat_map(|pool| &pool.entries)
+                .all(|entry| entry.active_leases == 0)
+        );
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn credential_lease_guard_cancelled_http_and_tcp_handlers_release_under_pool_contention()
+    {
+        for tcp in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let connector_id = "fcp.test.credential-cancellation:utility:1.0.0";
+            let operation_id = "test.egress";
+            let credential_id =
+                CredentialId::parse("ceaceace-1111-4111-8111-111111111111").unwrap();
+            let (state, signing_key) = d9us6_host_egress_state(
+                connector_id,
+                operation_id,
+                addr.port(),
+                credential_id,
+                json!({
+                    "host_allow": ["127.0.0.1"],
+                    "http": {"bearer_token": "cancellation-fixture-secret"},
+                    "tcp": {"auth": "cancellation-fixture-secret"}
+                }),
+            )
+            .await;
+            let pool_key =
+                CredentialPoolKey::new(ProviderKey::new("d9us6-fixture").unwrap(), ZoneId::work());
+            state
+                .credential_pools
+                .lock()
+                .await
+                .set_max_concurrent_per_credential(&pool_key, 1)
+                .unwrap();
+            let token =
+                d9us6_token_with_credentials(&signing_key, operation_id, vec![credential_id]);
+            let context = d9us6_host_egress_context(
+                connector_id,
+                operation_id,
+                "req-cancel-lease",
+                "corr-cancel-lease",
+                &token,
+            );
+            let call_state = Arc::clone(&state);
+            let mut pending = Box::pin(async move {
+                if tcp {
+                    host_egress_tcp_handler(
+                        State(call_state),
+                        Json(HostEgressTcpRequest {
+                            context,
+                            host: "127.0.0.1".to_owned(),
+                            port: addr.port(),
+                            tls: false,
+                            sni_override: None,
+                            write: Some(fcp_manifest::Base64Bytes::from_vec(b"PING".to_vec())),
+                            read_limit_bytes: Some(128),
+                            credential_id: Some(credential_id.to_string()),
+                        }),
+                    )
+                    .await
+                    .map(|_| ())
+                } else {
+                    host_egress_http_handler(
+                        State(call_state),
+                        Json(HostEgressHttpRequest {
+                            context,
+                            url: format!("http://{addr}/cancellation"),
+                            method: "GET".to_owned(),
+                            headers: Vec::new(),
+                            body: None,
+                            credential_id: Some(credential_id.to_string()),
+                        }),
+                    )
+                    .await
+                    .map(|_| ())
+                }
+            });
+            let observe_request = async {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let mut chunk = [0_u8; 1024];
+                loop {
+                    let count = socket.read(&mut chunk).await.unwrap();
+                    assert!(count > 0 && bytes.len() < 8192, "bounded complete request");
+                    bytes.extend_from_slice(&chunk[..count]);
+                    if (tcp && bytes.ends_with(b"PING"))
+                        || (!tcp && bytes.windows(4).any(|window| window == b"\r\n\r\n"))
+                    {
+                        break;
+                    }
+                }
+                assert!(String::from_utf8_lossy(&bytes).contains("cancellation-fixture-secret"));
+                socket
+            };
+            let outcome = fcp_async_core::time::timeout(
+                Duration::from_secs(2),
+                futures_util::future::select(pending.as_mut(), Box::pin(observe_request)),
+            )
+            .await
+            .expect("real egress request reaches the waiting provider");
+            let mut socket = match outcome {
+                futures_util::future::Either::Right((socket, _)) => socket,
+                futures_util::future::Either::Left((result, _)) => {
+                    panic!("egress ended before cancellation: {result:?}")
+                }
+            };
+            let mut pools = state.credential_pools.lock().await;
+            assert_eq!(
+                pools.redacted_view(&pool_key, Utc::now()).unwrap().entries[0].active_leases,
+                1
+            );
+            assert!(
+                pools
+                    .acquire_specific_in_zone(&ZoneId::work(), credential_id, Utc::now())
+                    .is_err()
+            );
+
+            // Cancellation happens while another task owns the async registry
+            // lock. Cleanup must be immediate, not an enqueued async release.
+            drop(pending);
+            assert_eq!(
+                pools.redacted_view(&pool_key, Utc::now()).unwrap().entries[0].active_leases,
+                0
+            );
+            let recovered = pools
+                .acquire_specific_in_zone(&ZoneId::work(), credential_id, Utc::now())
+                .expect("cancelled request returned its capacity")
+                .into_guard();
+            drop(recovered);
+            drop(pools);
+            let mut byte = [0_u8; 1];
+            assert_eq!(
+                fcp_async_core::time::timeout(Duration::from_secs(1), socket.read(&mut byte))
+                    .await
+                    .expect("cancelled transport closes promptly")
+                    .unwrap(),
+                0
+            );
+        }
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn credential_lease_guard_http_provider_failure_releases_capacity() {
+        let (addr, provider) =
+            br_4kw5f_9_6_1_one_shot_http_response(b"invalid HTTP response\r\n\r\n".to_vec()).await;
+        let connector_id = "fcp.test.credential-error:utility:1.0.0";
+        let operation_id = "test.egress";
+        let credential_id = CredentialId::parse("ceaceace-2222-4222-8222-222222222222").unwrap();
+        let (state, signing_key) = d9us6_host_egress_state(
+            connector_id,
+            operation_id,
+            addr.port(),
+            credential_id,
+            json!({"host_allow": ["127.0.0.1"], "http": {"bearer_token": "error-fixture-secret"}}),
+        )
+        .await;
+        let token = d9us6_token_with_credentials(&signing_key, operation_id, vec![credential_id]);
+        let result = host_egress_http_handler(
+            State(Arc::clone(&state)),
+            Json(HostEgressHttpRequest {
+                context: d9us6_host_egress_context(
+                    connector_id,
+                    operation_id,
+                    "req-error-lease",
+                    "corr-error-lease",
+                    &token,
+                ),
+                url: format!("http://{addr}/error"),
+                method: "GET".to_owned(),
+                headers: Vec::new(),
+                body: None,
+                credential_id: Some(credential_id.to_string()),
+            }),
+        )
+        .await;
+        provider.await.unwrap();
+        assert!(result.is_err(), "malformed upstream response must fail");
+        assert!(
+            state
+                .credential_pools
+                .lock()
+                .await
+                .redacted_views(Utc::now())
+                .iter()
+                .flat_map(|pool| &pool.entries)
+                .all(|entry| entry.active_leases == 0)
         );
     }
 
@@ -26584,6 +26763,92 @@ output_schema = {{ type = "object" }}
     }
 
     #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn credential_lease_guard_cancelled_oauth_handler_releases_gate_and_reservation() {
+        let api_listener = StdTcpListener::bind("127.0.0.1:0").expect("API listener");
+        api_listener.set_nonblocking(true).unwrap();
+        let (oauth, entered_rx, release_tx) = orefresh1_blocked_token_server(3600);
+        let (state, request) = orefresh1_egress_fixture(
+            &oauth.base_url,
+            api_listener.local_addr().unwrap(),
+            true,
+            Duration::ZERO,
+            3_000,
+        )
+        .await;
+        let credential_id = CredentialId::parse(request.credential_id.as_deref().unwrap()).unwrap();
+        let before = {
+            let mut pools = state.credential_pools.lock().await;
+            let lease = pools
+                .acquire_specific_in_zone(&ZoneId::work(), credential_id, Utc::now())
+                .unwrap();
+            pools.release_lease(&lease).unwrap();
+            pools
+                .set_max_concurrent_per_credential(&lease.pool_key, 1)
+                .unwrap();
+            lease
+        };
+        let gate = before.refresh_gate();
+        let mut pending = Box::pin(host_egress_http_handler(
+            State(Arc::clone(&state)),
+            Json(request),
+        ));
+        let entered = fcp_async_core::time::timeout(
+            Duration::from_secs(2),
+            futures_util::future::select(pending.as_mut(), Box::pin(entered_rx)),
+        )
+        .await
+        .expect("the real handler reaches the token provider");
+        assert!(matches!(
+            entered,
+            futures_util::future::Either::Right((Ok(()), _))
+        ));
+        assert!(gate.try_lock().is_none());
+
+        let mut pools = state.credential_pools.lock().await;
+        assert_eq!(
+            pools
+                .redacted_view(&before.pool_key, Utc::now())
+                .unwrap()
+                .entries[0]
+                .active_leases,
+            1
+        );
+        drop(pending);
+        assert!(
+            gate.try_lock().is_some(),
+            "cancellation drops the refresh exchange and gate"
+        );
+        assert_eq!(
+            pools
+                .redacted_view(&before.pool_key, Utc::now())
+                .unwrap()
+                .entries[0]
+                .active_leases,
+            0
+        );
+        let after = pools
+            .acquire_specific_in_zone(&ZoneId::work(), credential_id, Utc::now())
+            .expect("cancelled refresh must return its slot")
+            .into_guard();
+        assert_eq!(
+            orefresh1_token_material(&after.lease().payload),
+            ("orefresh1-old-access", "orefresh1-old-refresh")
+        );
+        drop(after);
+        drop(pools);
+        release_tx
+            .send(())
+            .expect("finish the late provider response");
+        let (observed, errors) = oauth.join();
+        assert_eq!(observed.len(), 1);
+        assert!(errors.is_empty(), "OAuth loopback errors: {errors:?}");
+        assert_eq!(
+            api_listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
     async fn br_orefresh1_refresh_gate_wait_uses_the_remaining_request_deadline() {
         let token_listener = StdTcpListener::bind("127.0.0.1:0").expect("token listener");
         token_listener.set_nonblocking(true).unwrap();
@@ -26599,7 +26864,7 @@ output_schema = {{ type = "object" }}
         let authorized = authorize_host_egress_context(&state, &request.context, &request.url)
             .await
             .unwrap();
-        let lease = acquire_host_egress_credential_lease(
+        let lease_guard = acquire_host_egress_credential_lease(
             &state,
             &authorized.zone_id,
             request.credential_id.as_deref(),
@@ -26608,6 +26873,7 @@ output_schema = {{ type = "object" }}
         .await
         .unwrap()
         .unwrap();
+        let lease = lease_guard.lease();
         let gate = lease.refresh_gate();
         let held_refresh = gate.lock().await;
         let error = fcp_async_core::time::timeout(
@@ -26616,7 +26882,7 @@ output_schema = {{ type = "object" }}
                 &state,
                 &authorized,
                 &request,
-                &lease,
+                lease,
                 false,
                 Instant::now() - Duration::from_millis(2_900),
             ),
@@ -26634,11 +26900,11 @@ output_schema = {{ type = "object" }}
         let mut pools = state.credential_pools.lock().await;
         assert!(
             pools
-                .current_lease(&lease, Utc::now())
+                .current_lease(lease, Utc::now())
                 .unwrap()
-                .same_payload_revision(&lease)
+                .same_payload_revision(lease)
         );
-        pools.release_lease(&lease).unwrap();
+        pools.release_lease(lease).unwrap();
     }
 
     #[fcp_async_core::runtime::test(flavor = "multi_thread")]
@@ -26656,7 +26922,7 @@ output_schema = {{ type = "object" }}
         let authorized = authorize_host_egress_context(&state, &request.context, &request.url)
             .await
             .unwrap();
-        let lease = acquire_host_egress_credential_lease(
+        let lease_guard = acquire_host_egress_credential_lease(
             &state,
             &authorized.zone_id,
             request.credential_id.as_deref(),
@@ -26665,11 +26931,12 @@ output_schema = {{ type = "object" }}
         .await
         .unwrap()
         .unwrap();
+        let lease = lease_guard.lease();
         let mut pending = Box::pin(egress_oauth::prepare(
             &state,
             &authorized,
             &request,
-            &lease,
+            lease,
             false,
             Instant::now() - Duration::from_millis(2_500),
         ));
@@ -26694,13 +26961,13 @@ output_schema = {{ type = "object" }}
             "cancellation releases the gate"
         );
         let mut pools = state.credential_pools.lock().await;
-        let current = pools.current_lease(&lease, Utc::now()).unwrap();
-        assert!(current.same_payload_revision(&lease));
+        let current = pools.current_lease(lease, Utc::now()).unwrap();
+        assert!(current.same_payload_revision(lease));
         assert_eq!(
             orefresh1_token_material(&current.payload),
             ("orefresh1-old-access", "orefresh1-old-refresh")
         );
-        pools.release_lease(&lease).unwrap();
+        pools.release_lease(lease).unwrap();
     }
 
     #[fcp_async_core::runtime::test(flavor = "multi_thread")]
@@ -26997,7 +27264,7 @@ output_schema = {{ type = "object" }}
             credential_id: Some(credential_id.to_string()),
         };
 
-        let response = host_egress_tcp_handler(State(state), Json(request))
+        let response = host_egress_tcp_handler(State(Arc::clone(&state)), Json(request))
             .await
             .expect("host TCP egress should succeed")
             .0;
@@ -27015,6 +27282,16 @@ output_schema = {{ type = "object" }}
         assert!(
             !serialized.contains("redaction-sentinel-tcp-secret"),
             "host egress response must not echo injected TCP credentials"
+        );
+        assert!(
+            state
+                .credential_pools
+                .lock()
+                .await
+                .redacted_views(Utc::now())
+                .iter()
+                .flat_map(|pool| &pool.entries)
+                .all(|entry| entry.active_leases == 0)
         );
     }
 

@@ -8,7 +8,7 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Duration, Utc};
@@ -717,9 +717,23 @@ pub struct CredentialLease {
     pool_incarnation: Arc<()>,
     payload_revision: Arc<()>,
     refresh_gate: Arc<futures_util::lock::Mutex<()>>,
+    reservations: Arc<Mutex<CredentialReservationState>>,
+    reservation_identity: Arc<()>,
 }
 
 impl CredentialLease {
+    /// Own this reservation for a local request's lifetime.
+    ///
+    /// The returned guard releases synchronously on normal return, error, panic,
+    /// or cancellation, without acquiring the async pool registry lock. Cloned
+    /// payload snapshots do not extend the guard's lifetime or retain authority
+    /// after it is dropped. Remote lease clients may continue to use explicit
+    /// token release instead.
+    #[must_use = "the guard must be retained until the local request completes"]
+    pub fn into_guard(self) -> CredentialLeaseGuard {
+        CredentialLeaseGuard { lease: self }
+    }
+
     /// Gate shared by leases for this exact credential incarnation.
     ///
     /// Hold it while rereading the live lease, contacting the OAuth provider,
@@ -756,6 +770,98 @@ impl fmt::Debug for CredentialLease {
             .finish()
     }
 }
+
+/// A locally owned credential reservation with cancellation-safe cleanup.
+///
+/// This owner is intentionally not cloneable. Borrow or clone its lease
+/// snapshot when injecting credentials or refreshing tokens; those snapshots
+/// remain subordinate to the original owner's lifetime.
+#[derive(Debug)]
+#[must_use = "dropping the guard immediately releases the credential reservation"]
+pub struct CredentialLeaseGuard {
+    lease: CredentialLease,
+}
+
+impl CredentialLeaseGuard {
+    /// Borrow the admitted payload and exact reservation identity.
+    #[must_use]
+    pub const fn lease(&self) -> &CredentialLease {
+        &self.lease
+    }
+}
+
+impl Drop for CredentialLeaseGuard {
+    fn drop(&mut self) {
+        let mut reservations = lock_reservations(&self.lease.reservations);
+        if reservations.contains(&self.lease) {
+            let _ = reservations.release(self.lease.token);
+        }
+    }
+}
+
+/// Short synchronous bookkeeping only. The ledger contains no secret material.
+/// Critical sections never await, perform I/O, or call user code. Refresh
+/// publication only swaps already prepared payloads while holding this lock.
+#[derive(Debug, Default)]
+struct CredentialReservationState {
+    active_leases: HashMap<CredentialId, u32>,
+    lease_index: HashMap<CredentialLeaseToken, CredentialReservation>,
+}
+
+#[derive(Debug)]
+struct CredentialReservation {
+    credential_id: CredentialId,
+    identity: Arc<()>,
+}
+
+impl CredentialReservationState {
+    fn insert(&mut self, token: CredentialLeaseToken, credential_id: CredentialId) -> Arc<()> {
+        let identity = Arc::new(());
+        self.lease_index.insert(
+            token,
+            CredentialReservation {
+                credential_id,
+                identity: Arc::clone(&identity),
+            },
+        );
+        *self.active_leases.entry(credential_id).or_default() += 1;
+        identity
+    }
+
+    fn contains(&self, lease: &CredentialLease) -> bool {
+        self.lease_index
+            .get(&lease.token)
+            .is_some_and(|reservation| {
+                reservation.credential_id == lease.credential_id
+                    && Arc::ptr_eq(&reservation.identity, &lease.reservation_identity)
+            })
+    }
+
+    fn release(&mut self, token: CredentialLeaseToken) -> Option<CredentialId> {
+        let reservation = self.lease_index.remove(&token)?;
+        let credential_id = reservation.credential_id;
+        if let Some(count) = self.active_leases.get_mut(&credential_id) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.active_leases.remove(&credential_id);
+            }
+        }
+        Some(credential_id)
+    }
+}
+
+fn lock_reservations(
+    reservations: &Mutex<CredentialReservationState>,
+) -> MutexGuard<'_, CredentialReservationState> {
+    // Cleanup must not panic during unwinding. This private ledger has no
+    // user callbacks or fallible work inside its mutation critical sections.
+    reservations
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[derive(Debug, Default)]
+struct CredentialReservations(Arc<Mutex<CredentialReservationState>>);
 
 /// Opaque credential lease token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -821,7 +927,11 @@ pub struct CredentialPoolView {
 }
 
 /// Host-side credential pool with deterministic selection and lease tracking.
-#[derive(Debug, Clone)]
+///
+/// Cloning preserves configuration, credentials, cooldowns and selection history,
+/// but creates an independent unleased pool. Runtime reservations and refresh
+/// authority cannot be copied or resurrected by restoring a pool snapshot.
+#[derive(Debug)]
 pub struct CredentialPool {
     key: CredentialPoolKey,
     incarnation: Arc<()>,
@@ -831,13 +941,37 @@ pub struct CredentialPool {
     max_concurrent_per_credential: u32,
     entries: Vec<PooledCredential>,
     payload_states: HashMap<CredentialId, CredentialPayloadState>,
-    active_leases: HashMap<CredentialId, u32>,
-    lease_index: HashMap<CredentialLeaseToken, CredentialId>,
+    reservations: CredentialReservations,
     round_robin_cursor: usize,
     sticky_current: Option<CredentialId>,
     sticky_restick_target: Option<CredentialId>,
     sticky_current_uses: u32,
     next_lease_serial: u64,
+}
+
+impl Clone for CredentialPool {
+    fn clone(&self) -> Self {
+        Self {
+            key: self.key.clone(),
+            incarnation: Arc::new(()),
+            strategy: self.strategy,
+            sticky_policy: self.sticky_policy,
+            exhausted_behavior: self.exhausted_behavior,
+            max_concurrent_per_credential: self.max_concurrent_per_credential,
+            entries: self.entries.clone(),
+            payload_states: self
+                .entries
+                .iter()
+                .map(|entry| (entry.credential_id, CredentialPayloadState::default()))
+                .collect(),
+            reservations: CredentialReservations::default(),
+            round_robin_cursor: self.round_robin_cursor,
+            sticky_current: self.sticky_current,
+            sticky_restick_target: self.sticky_restick_target,
+            sticky_current_uses: self.sticky_current_uses,
+            next_lease_serial: self.next_lease_serial,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -869,8 +1003,7 @@ impl CredentialPool {
             max_concurrent_per_credential: DEFAULT_MAX_CONCURRENT_PER_CREDENTIAL,
             entries,
             payload_states,
-            active_leases: HashMap::new(),
-            lease_index: HashMap::new(),
+            reservations: CredentialReservations::default(),
             round_robin_cursor: 0,
             sticky_current: None,
             sticky_restick_target: None,
@@ -1013,9 +1146,13 @@ impl CredentialPool {
         };
         let removed = self.entries.remove(index);
         self.payload_states.remove(&credential_id);
-        self.active_leases.remove(&credential_id);
-        self.lease_index
-            .retain(|_, leased_credential_id| *leased_credential_id != credential_id);
+        {
+            let mut reservations = lock_reservations(&self.reservations.0);
+            reservations.active_leases.remove(&credential_id);
+            reservations
+                .lease_index
+                .retain(|_, reservation| reservation.credential_id != credential_id);
+        }
         if self.sticky_current == Some(credential_id) {
             self.sticky_current = None;
             self.sticky_current_uses = 0;
@@ -1117,9 +1254,13 @@ impl CredentialPool {
         }
 
         let lease_id = CredentialLeaseToken(self.next_lease_serial);
-        self.next_lease_serial = self.next_lease_serial.saturating_add(1);
-        *self.active_leases.entry(credential_id).or_default() += 1;
-        self.lease_index.insert(lease_id, credential_id);
+        self.next_lease_serial = self.next_lease_serial.checked_add(1).ok_or_else(|| {
+            CredentialPoolError::PoolExhausted {
+                key: self.key.clone(),
+            }
+        })?;
+        let reservation_identity =
+            lock_reservations(&self.reservations.0).insert(lease_id, credential_id);
 
         Ok(CredentialLease {
             token: lease_id,
@@ -1129,6 +1270,8 @@ impl CredentialPool {
             pool_incarnation: Arc::clone(&self.incarnation),
             payload_revision,
             refresh_gate,
+            reservations: Arc::clone(&self.reservations.0),
+            reservation_identity,
         })
     }
 
@@ -1181,9 +1324,13 @@ impl CredentialPool {
         }
 
         let lease_id = CredentialLeaseToken(self.next_lease_serial);
-        self.next_lease_serial = self.next_lease_serial.saturating_add(1);
-        *self.active_leases.entry(credential_id).or_default() += 1;
-        self.lease_index.insert(lease_id, credential_id);
+        self.next_lease_serial = self.next_lease_serial.checked_add(1).ok_or_else(|| {
+            CredentialPoolError::PoolExhausted {
+                key: self.key.clone(),
+            }
+        })?;
+        let reservation_identity =
+            lock_reservations(&self.reservations.0).insert(lease_id, credential_id);
 
         Ok(CredentialLease {
             token: lease_id,
@@ -1193,6 +1340,8 @@ impl CredentialPool {
             pool_incarnation: Arc::clone(&self.incarnation),
             payload_revision,
             refresh_gate,
+            reservations: Arc::clone(&self.reservations.0),
+            reservation_identity,
         })
     }
 
@@ -1256,6 +1405,8 @@ impl CredentialPool {
             pool_incarnation: Arc::clone(&self.incarnation),
             payload_revision: Arc::clone(&payload_state.revision),
             refresh_gate: Arc::clone(&payload_state.refresh_gate),
+            reservations: Arc::clone(&self.reservations.0),
+            reservation_identity: Arc::clone(&lease.reservation_identity),
         })
     }
 
@@ -1288,8 +1439,19 @@ impl CredentialPool {
             .get_mut(&credential_id)
             .ok_or(CredentialPoolError::LeaseSuperseded { credential_id })?;
         let revision = Arc::new(());
+        let candidate = payload.clone();
+        // A cloned snapshot may refresh on another thread while its original
+        // request guard is dropped. Serialize the final admission check and
+        // publication with that cleanup, without holding the ledger across
+        // payload allocation or destruction.
+        let reservations = lock_reservations(&self.reservations.0);
+        if !reservations.contains(lease) {
+            return Err(CredentialPoolError::UnknownLease { token: lease.token });
+        }
         payload_state.revision = Arc::clone(&revision);
-        self.entries[index].payload = payload.clone();
+        let previous = std::mem::replace(&mut self.entries[index].payload, candidate);
+        drop(reservations);
+        drop(previous);
         Ok(Some(CredentialLease {
             token: lease.token,
             credential_id,
@@ -1298,6 +1460,8 @@ impl CredentialPool {
             pool_incarnation: Arc::clone(&self.incarnation),
             payload_revision: revision,
             refresh_gate: Arc::clone(&payload_state.refresh_gate),
+            reservations: Arc::clone(&self.reservations.0),
+            reservation_identity: Arc::clone(&lease.reservation_identity),
         }))
     }
 
@@ -1307,7 +1471,7 @@ impl CredentialPool {
                 credential_id: lease.credential_id,
             });
         }
-        if self.lease_index.get(&lease.token) != Some(&lease.credential_id) {
+        if !lock_reservations(&self.reservations.0).contains(lease) {
             return Err(CredentialPoolError::UnknownLease { token: lease.token });
         }
         Ok(())
@@ -1338,11 +1502,9 @@ impl CredentialPool {
         &mut self,
         token: CredentialLeaseToken,
     ) -> Result<CredentialId, CredentialPoolError> {
-        let Some(credential_id) = self.lease_index.remove(&token) else {
-            return Err(CredentialPoolError::UnknownLease { token });
-        };
-        self.decrement_active_lease(credential_id);
-        Ok(credential_id)
+        lock_reservations(&self.reservations.0)
+            .release(token)
+            .ok_or(CredentialPoolError::UnknownLease { token })
     }
 
     /// Report a credential-scoped error for an active lease, then release it.
@@ -1549,7 +1711,8 @@ impl CredentialPool {
     }
 
     fn active_count(&self, credential_id: CredentialId) -> u32 {
-        self.active_leases
+        lock_reservations(&self.reservations.0)
+            .active_leases
             .get(&credential_id)
             .copied()
             .unwrap_or_default()
@@ -1625,15 +1788,6 @@ impl CredentialPool {
             .min()
     }
 
-    fn decrement_active_lease(&mut self, credential_id: CredentialId) {
-        if let Some(count) = self.active_leases.get_mut(&credential_id) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                self.active_leases.remove(&credential_id);
-            }
-        }
-    }
-
     fn index_of(&self, credential_id: CredentialId) -> Option<usize> {
         self.entries
             .iter()
@@ -1668,8 +1822,7 @@ impl CredentialPoolRegistry {
     /// Insert or replace a pool, invalidating previous payload admissions.
     pub fn upsert(&mut self, mut pool: CredentialPool) -> Option<CredentialPool> {
         pool.incarnation = Arc::new(());
-        pool.active_leases.clear();
-        pool.lease_index.clear();
+        pool.reservations = CredentialReservations::default();
         for payload_state in pool.payload_states.values_mut() {
             *payload_state = CredentialPayloadState::default();
         }
@@ -2687,6 +2840,289 @@ mod tests {
         pool.release(first.token).expect("release first");
         let third = pool.acquire(now()).expect("first available again");
         assert_eq!(third.credential_id, cred(0x01));
+    }
+
+    #[test]
+    fn credential_lease_guard_releases_while_registry_lock_is_held() {
+        let mut registry = CredentialPoolRegistry::new();
+        let pool_key = key("openai");
+        registry.upsert(
+            three_entry_pool(CredentialPoolStrategy::Priority)
+                .with_max_concurrent_per_credential(1),
+        );
+        let registry = Mutex::new(registry);
+        let mut locked = registry.lock().expect("registry lock");
+        let guard = locked
+            .acquire_specific_in_zone(&ZoneId::work(), cred(0x01), now())
+            .expect("first reservation")
+            .into_guard();
+        let snapshot = guard.lease().clone();
+        assert!(
+            locked
+                .acquire_specific_in_zone(&ZoneId::work(), cred(0x01), now())
+                .is_err()
+        );
+
+        // Neither dropping a request nor its final cleanup may wait for this
+        // registry lock. Secret-bearing snapshots cannot keep the slot alive.
+        drop(guard);
+        assert_eq!(
+            locked.redacted_view(&pool_key, now()).unwrap().entries[0].active_leases,
+            0
+        );
+        assert!(matches!(
+            locked.current_lease(&snapshot, now()),
+            Err(CredentialPoolError::UnknownLease { .. })
+        ));
+        assert!(matches!(
+            locked.replace_payload_if_current(
+                &snapshot,
+                CredentialPayload::raw_json(serde_json::json!({"api_key": "late-refresh"})),
+                now(),
+            ),
+            Err(CredentialPoolError::UnknownLease { .. })
+        ));
+        let next = locked
+            .acquire_specific_in_zone(&ZoneId::work(), cred(0x01), now())
+            .expect("cancelled reservation made capacity available")
+            .into_guard();
+        assert!(snapshot.same_payload_revision(next.lease()));
+        assert_eq!(
+            next.lease().payload.as_raw_json().unwrap()["api_key"],
+            "secret-1"
+        );
+        drop(next);
+        let pool = locked.get(&pool_key).unwrap();
+        let reservations = lock_reservations(&pool.reservations.0);
+        assert!(reservations.lease_index.is_empty());
+        assert!(reservations.active_leases.is_empty());
+    }
+
+    #[test]
+    fn credential_lease_guard_releases_dropped_futures_and_unwinds() {
+        let mut pool = three_entry_pool(CredentialPoolStrategy::Priority)
+            .with_max_concurrent_per_credential(1);
+        for poll_once in [false, true] {
+            let guard = pool
+                .acquire_specific(cred(0x01), now())
+                .unwrap()
+                .into_guard();
+            let mut pending = Box::pin(async move {
+                let _guard = guard;
+                std::future::pending::<()>().await;
+            });
+            if poll_once {
+                let mut context =
+                    std::task::Context::from_waker(futures_util::task::noop_waker_ref());
+                assert!(std::future::Future::poll(pending.as_mut(), &mut context).is_pending());
+            }
+            assert_eq!(pool.active_count(cred(0x01)), 1);
+            drop(pending);
+            assert_eq!(pool.active_count(cred(0x01)), 0);
+        }
+
+        let guard = pool
+            .acquire_specific(cred(0x01), now())
+            .unwrap()
+            .into_guard();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _guard = guard;
+            panic!("cancelled credential owner panic fixture");
+        }));
+        assert!(outcome.is_err());
+        assert_eq!(pool.active_count(cred(0x01)), 0);
+    }
+
+    #[test]
+    fn credential_lease_guard_stale_cleanup_cannot_release_reused_serial() {
+        let mut pool = three_entry_pool(CredentialPoolStrategy::Priority)
+            .with_max_concurrent_per_credential(1);
+        let guard = pool
+            .acquire_specific(cred(0x01), now())
+            .unwrap()
+            .into_guard();
+        let stale = guard.lease().clone();
+        pool.release_lease(guard.lease()).expect("explicit release");
+        // Exercise exact identity independently of the monotonic serial policy.
+        pool.next_lease_serial = stale.token.as_u64();
+        let current = pool
+            .acquire_specific(cred(0x01), now())
+            .unwrap()
+            .into_guard();
+        assert_eq!(current.lease().token, stale.token);
+        assert!(matches!(
+            pool.release_lease(&stale),
+            Err(CredentialPoolError::UnknownLease { .. })
+        ));
+        drop(guard);
+        drop(stale.into_guard());
+        assert_eq!(pool.active_count(cred(0x01)), 1);
+        assert!(pool.current_lease(current.lease(), now()).is_ok());
+        drop(current);
+        assert_eq!(pool.active_count(cred(0x01)), 0);
+    }
+
+    #[test]
+    fn credential_lease_guard_preserves_recreated_credentials_and_replacement_pools() {
+        for replace_pool in [false, true] {
+            let mut registry = CredentialPoolRegistry::new();
+            let pool_key = key("openai");
+            registry.upsert(three_entry_pool(CredentialPoolStrategy::Priority));
+            let guard = registry.acquire(&pool_key, now()).unwrap().into_guard();
+            if replace_pool {
+                registry.upsert(three_entry_pool(CredentialPoolStrategy::Priority));
+            } else {
+                registry.remove_credential(&pool_key, cred(0x01)).unwrap();
+                registry
+                    .add_credential(
+                        pool_key.clone(),
+                        CredentialPoolStrategy::Priority,
+                        entry(0x01, 10, "recreated"),
+                        CredentialUpsertMode::RejectExisting,
+                    )
+                    .unwrap();
+            }
+            let current = registry.acquire(&pool_key, now()).unwrap().into_guard();
+            drop(guard);
+            assert_eq!(
+                registry.redacted_view(&pool_key, now()).unwrap().entries[0].active_leases,
+                1
+            );
+            assert!(registry.current_lease(current.lease(), now()).is_ok());
+            drop(current);
+            assert_eq!(
+                registry.redacted_view(&pool_key, now()).unwrap().entries[0].active_leases,
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn credential_lease_guard_owns_refreshed_and_replaced_payload_reservations() {
+        for replace_payload in [false, true] {
+            let mut pool = three_entry_pool(CredentialPoolStrategy::Priority)
+                .with_max_concurrent_per_credential(1);
+            let guard = pool
+                .acquire_specific(cred(0x01), now())
+                .unwrap()
+                .into_guard();
+            let refreshed = pool
+                .replace_payload_if_current(guard.lease(), guard.lease().payload.clone(), now())
+                .unwrap()
+                .unwrap();
+            if replace_payload {
+                pool.replace_payload(cred(0x01), refreshed.payload.clone())
+                    .unwrap();
+            }
+            assert_eq!(pool.active_count(cred(0x01)), 1);
+            drop(guard);
+            assert_eq!(pool.active_count(cred(0x01)), 0);
+            assert!(matches!(
+                pool.current_lease(&refreshed, now()),
+                Err(CredentialPoolError::UnknownLease { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn credential_lease_guard_pool_clone_is_independent_and_unleased() {
+        for clone_registry in [false, true] {
+            let mut registry = CredentialPoolRegistry::new();
+            let pool_key = key("openai");
+            let mut original = three_entry_pool(CredentialPoolStrategy::Sticky)
+                .with_max_concurrent_per_credential(1)
+                .with_exhausted_behavior(PoolExhaustedBehavior::Wait);
+            original
+                .set_sticky_policy(StickyCredentialPolicy {
+                    restick_on_recovery: true,
+                    max_uses_per_stick: Some(3),
+                })
+                .unwrap();
+            original
+                .mark_error(cred(0x03), CredentialErrorKind::RateLimited, None, now())
+                .unwrap();
+            registry.upsert(original);
+            let old = registry.acquire(&pool_key, now()).unwrap().into_guard();
+            let source_view = registry.redacted_view(&pool_key, now()).unwrap();
+            let source_gate = old.lease().refresh_gate();
+            if clone_registry {
+                registry = registry.clone();
+            } else {
+                let snapshot = registry.get(&pool_key).unwrap().clone();
+                *registry.get_mut(&pool_key).unwrap() = snapshot;
+            }
+            let cloned = registry.redacted_view(&pool_key, now()).unwrap();
+            assert_eq!(cloned.strategy, source_view.strategy);
+            assert_eq!(cloned.sticky_policy, source_view.sticky_policy);
+            assert_eq!(cloned.exhausted_behavior, source_view.exhausted_behavior);
+            assert_eq!(cloned.max_concurrent_per_credential, 1);
+            assert_eq!(
+                cloned.entries[0].last_used_at,
+                source_view.entries[0].last_used_at
+            );
+            assert_eq!(cloned.entries[2].cooldown, source_view.entries[2].cooldown);
+            assert_eq!(
+                cloned.entries[2].error_count,
+                source_view.entries[2].error_count
+            );
+            assert!(cloned.entries.iter().all(|entry| entry.active_leases == 0));
+            assert!(matches!(
+                registry.current_lease(old.lease(), now()),
+                Err(CredentialPoolError::LeaseSuperseded { .. })
+            ));
+            let current = registry.acquire(&pool_key, now()).unwrap().into_guard();
+            assert!(!old.lease().same_payload_revision(current.lease()));
+            assert!(!Arc::ptr_eq(&source_gate, &current.lease().refresh_gate()));
+            drop(old);
+            assert_eq!(
+                registry.redacted_view(&pool_key, now()).unwrap().entries[0].active_leases,
+                1
+            );
+            assert!(registry.current_lease(current.lease(), now()).is_ok());
+            drop(current);
+            assert_eq!(
+                registry.redacted_view(&pool_key, now()).unwrap().entries[0].active_leases,
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn credential_lease_guard_churn_retains_only_active_reservations() {
+        let mut pool = three_entry_pool(CredentialPoolStrategy::Priority)
+            .with_max_concurrent_per_credential(1);
+        for _ in 0..1_000 {
+            let guard = pool
+                .acquire_specific(cred(0x01), now())
+                .unwrap()
+                .into_guard();
+            assert_eq!(pool.active_count(cred(0x01)), 1);
+            drop(guard);
+            let reservations = lock_reservations(&pool.reservations.0);
+            assert!(reservations.active_leases.is_empty());
+            assert!(reservations.lease_index.is_empty());
+        }
+    }
+
+    #[test]
+    fn credential_lease_guard_sequence_exhaustion_never_reuses_live_reservations() {
+        let mut pool = three_entry_pool(CredentialPoolStrategy::Priority);
+        pool.next_lease_serial = u64::MAX - 1;
+        let guard = pool.acquire(now()).unwrap().into_guard();
+        assert_eq!(guard.lease().token.as_u64(), u64::MAX - 1);
+        assert!(matches!(
+            pool.acquire(now()),
+            Err(CredentialPoolError::PoolExhausted { .. })
+        ));
+        assert!(matches!(
+            pool.acquire_specific(cred(0x01), now()),
+            Err(CredentialPoolError::PoolExhausted { .. })
+        ));
+        assert_eq!(pool.active_count(cred(0x01)), 1);
+        assert_eq!(lock_reservations(&pool.reservations.0).lease_index.len(), 1);
+        assert!(pool.current_lease(guard.lease(), now()).is_ok());
+        drop(guard);
+        assert_eq!(pool.active_count(cred(0x01)), 0);
     }
 
     #[test]
