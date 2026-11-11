@@ -168,6 +168,8 @@ use tower::ServiceExt;
 mod connector_state_transfer;
 #[path = "fcp-host/deployment_evidence.rs"]
 mod deployment_evidence;
+#[path = "fcp-host/egress_auth.rs"]
+mod egress_auth;
 #[path = "fcp-host/egress_oauth.rs"]
 mod egress_oauth;
 #[path = "fcp-host/guarded_invoke.rs"]
@@ -9803,11 +9805,74 @@ async fn local_connector_self_check(
 
 #[derive(Debug, Deserialize)]
 struct CredentialPoolAddRequest {
-    credential: PooledCredentialInput,
+    #[serde(default)]
+    credential: Option<PooledCredentialInput>,
+    #[serde(default)]
+    profile_credential: Option<ProfileCredentialInput>,
     #[serde(default = "default_credential_upsert_mode")]
     mode: CredentialUpsertMode,
     #[serde(default = "default_credential_pool_strategy")]
     strategy_for_new_pool: CredentialPoolStrategy,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProfileCredentialInput {
+    credential_id: CredentialId,
+    profile_id: String,
+    #[serde(default)]
+    priority: u32,
+    label: String,
+    host_allow: Vec<String>,
+}
+
+fn auth_profile_exact_hosts(hosts: Vec<String>) -> Result<Vec<String>, AuthError> {
+    if hosts.is_empty() || hosts.len() > 128 {
+        return Err(invalid_auth_config(
+            "host_allow",
+            "must contain 1 to 128 explicit destination hosts",
+        ));
+    }
+    let mut normalized = Vec::with_capacity(hosts.len());
+    for host in hosts {
+        if host.len() > 253
+            || host.trim() != host
+            || host.contains(['*', '/', '@', '?', '#', '[', ']'])
+        {
+            return Err(invalid_auth_config(
+                "host_allow",
+                "must contain exact hostnames or IP addresses, without wildcard, port, or URL syntax",
+            ));
+        }
+        let canonical = if let Ok(ip) = host.parse::<IpAddr>() {
+            ip.to_string()
+        } else {
+            let canonical = fcp_sandbox::canonicalize_hostname(&host).map_err(|_| {
+                invalid_auth_config("host_allow", "contains an invalid destination hostname")
+            })?;
+            if canonical.len() > 253
+                || canonical.split('.').any(|label| {
+                    label.is_empty()
+                        || label.len() > 63
+                        || label.starts_with('-')
+                        || label.ends_with('-')
+                        || !label
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                })
+            {
+                return Err(invalid_auth_config(
+                    "host_allow",
+                    "contains an invalid destination hostname",
+                ));
+            }
+            canonical
+        };
+        normalized.push(canonical);
+    }
+    normalized.sort_unstable();
+    normalized.dedup();
+    Ok(normalized)
 }
 
 #[derive(Debug, Deserialize)]
@@ -9939,12 +10004,49 @@ async fn credential_pool_add_handler(
     Json(request): Json<CredentialPoolAddRequest>,
 ) -> Result<Json<CredentialPoolMutationResponse>, (StatusCode, String)> {
     let key = credential_pool_key_from_path(provider, zone_id)?;
+    let credential = match (request.credential, request.profile_credential) {
+        (Some(credential), None) => credential.into_credential(),
+        (None, Some(binding)) => {
+            let host_allow =
+                auth_profile_exact_hosts(binding.host_allow).map_err(map_auth_profile_error)?;
+            if binding.profile_id.trim().is_empty() || binding.label.trim().is_empty() {
+                return Err(map_auth_profile_error(invalid_auth_config(
+                    "profile_credential",
+                    "profile_id and label must be nonempty",
+                )));
+            }
+            let profile = auth_profile_store()
+                .get_profile(key.provider.as_str(), &binding.profile_id)
+                .await
+                .map_err(map_auth_profile_error)?;
+            profile
+                .method
+                .validate(&fcp_async_core::compatibility_cx())
+                .await
+                .map_err(map_auth_profile_error)?;
+            // Binding captures the admitted profile now. Later profile edits or
+            // removal cannot silently replace an already leased pool entry.
+            fcp_host::PooledCredential::new(
+                binding.credential_id,
+                fcp_host::CredentialSource::Config,
+                binding.priority,
+                binding.label,
+                CredentialPayload::auth_profile_with_allowed_hosts(profile, host_allow),
+            )
+        }
+        _ => {
+            return Err(map_auth_profile_error(invalid_auth_config(
+                "credential",
+                "supply exactly one of credential or profile_credential",
+            )));
+        }
+    };
     let mut registry = state.credential_pools.lock().await;
     let outcome = registry
         .add_credential(
             key.clone(),
             request.strategy_for_new_pool,
-            request.credential.into_credential(),
+            credential,
             request.mode,
         )
         .map_err(map_credential_pool_error)?;
@@ -10061,7 +10163,7 @@ struct AuthProfileUpsertRequest {
     method: AuthProfileMethodRequest,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
 enum AuthProfileMethodRequest {
     ApiKey {
@@ -10090,6 +10192,37 @@ enum AuthProfileMethodRequest {
         #[serde(default = "default_auth_code_pkce")]
         use_pkce: bool,
     },
+    #[serde(rename = "sigv4")]
+    SigV4 {
+        access_key_id: String,
+        secret_access_key: String,
+        #[serde(default)]
+        session_token: Option<String>,
+        region: String,
+        service: String,
+    },
+    SetupToken {
+        token: String,
+        expires_at: DateTime<Utc>,
+        #[serde(default)]
+        header_name: Option<String>,
+    },
+}
+
+impl std::fmt::Debug for AuthProfileMethodRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let method = match self {
+            Self::ApiKey { .. } => "api_key",
+            Self::OAuthDevice { .. } => "oauth_device",
+            Self::OAuthAuthCode { .. } => "oauth_auth_code",
+            Self::SigV4 { .. } => "sigv4",
+            Self::SetupToken { .. } => "setup_token",
+        };
+        formatter
+            .debug_struct("AuthProfileMethodRequest")
+            .field("method", &method)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -10673,7 +10806,99 @@ fn auth_profile_method_from_request(
             };
             Ok(AuthMethodKind::OAuthAuthCode(method))
         }
+        AuthProfileMethodRequest::SigV4 {
+            access_key_id,
+            secret_access_key,
+            session_token,
+            region,
+            service,
+        } => {
+            validate_auth_sigv4_scope("region", &region)?;
+            validate_auth_sigv4_scope("service", &service)?;
+            validate_auth_credential_material("access_key_id", &access_key_id, 128)?;
+            if access_key_id
+                .bytes()
+                .any(|byte| !byte.is_ascii_alphanumeric() && !matches!(byte, b'-' | b'_' | b'.'))
+            {
+                return Err(invalid_auth_config(
+                    "access_key_id",
+                    "must contain only ASCII letters, digits, hyphens, underscores, or periods",
+                ));
+            }
+            validate_auth_credential_material("secret_access_key", &secret_access_key, 4096)?;
+            if let Some(token) = &session_token {
+                validate_auth_credential_material("session_token", token, 16_384)?;
+            }
+            fcp_provider_auth::SigV4Auth::new(
+                access_key_id,
+                secret_access_key,
+                session_token,
+                region,
+                service,
+            )
+            .map(AuthMethodKind::SigV4)
+        }
+        AuthProfileMethodRequest::SetupToken {
+            token,
+            expires_at,
+            header_name,
+        } => {
+            validate_auth_credential_material("token", &token, 16_384)?;
+            if expires_at <= Utc::now() {
+                return Err(AuthError::Expired {
+                    method: "setup_token",
+                    expires_at,
+                });
+            }
+            let header_name = header_name.unwrap_or_else(|| "Authorization".to_owned());
+            validate_auth_setup_header(&header_name)?;
+            fcp_provider_auth::SetupTokenAuth::new(token, expires_at, header_name)
+                .map(AuthMethodKind::SetupToken)
+        }
     }
+}
+
+fn validate_auth_sigv4_scope(field: &'static str, value: &str) -> Result<(), AuthError> {
+    if value.is_empty()
+        || value.len() > 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return Err(invalid_auth_config(
+            field,
+            "must contain 1 to 64 ASCII letters, digits, or hyphens",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_auth_credential_material(
+    field: &'static str,
+    value: &str,
+    max_bytes: usize,
+) -> Result<(), AuthError> {
+    if value.is_empty()
+        || value.len() > max_bytes
+        || !value.bytes().all(|byte| byte.is_ascii_graphic())
+    {
+        return Err(invalid_auth_config(
+            field,
+            format!("must contain 1 to {max_bytes} visible ASCII bytes without whitespace"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_auth_setup_header(name: &str) -> Result<(), AuthError> {
+    let normalized = name.to_ascii_lowercase();
+    if normalized.starts_with("x-fcp-") || forbidden_egress_request_header(name) {
+        return Err(invalid_auth_config(
+            "header_name",
+            "must name a credential header, not a routing, framing, or host-authority header",
+        ));
+    }
+    Ok(())
 }
 
 fn oauth_device_config_from_profile(
@@ -14320,6 +14545,17 @@ impl HostCredentialInjector {
                     value: format!("Bearer {}", token.expose_secret()),
                 }])
             }
+            AuthMethodKind::SetupToken(method) => {
+                if Utc::now() >= method.expires_at {
+                    return Err(EgressError::CredentialError(
+                        "setup_token is expired".to_owned(),
+                    ));
+                }
+                Ok(vec![HttpHeader {
+                    name: method.header_name.clone(),
+                    value: format!("Bearer {}", method.token.expose_secret()),
+                }])
+            }
             other => Err(EgressError::CredentialError(format!(
                 "auth profile method `{}` is not supported for host-egress HTTP injection",
                 other.id()
@@ -14447,17 +14683,40 @@ impl CredentialInjector for HostCredentialInjector {
         headers: &mut Vec<HttpHeader>,
     ) -> Result<(), EgressError> {
         let payload = self.lease_payload(credential_id)?;
-        Self::remove_connector_credential_headers(headers);
-        if let Some(raw) = payload.as_raw_json() {
-            headers.extend(Self::raw_json_http_headers(raw)?);
+        let injected = if let Some(raw) = payload.as_raw_json() {
+            Self::raw_json_http_headers(raw)?
         } else if let Some(profile) = payload.as_auth_profile() {
-            headers.extend(Self::auth_profile_http_headers(profile)?);
+            Self::auth_profile_http_headers(profile)?
         } else {
             return Err(EgressError::CredentialError(format!(
                 "credential `{credential_id}` did not contain injectable host-egress material"
             )));
-        }
+        };
+        Self::remove_connector_credential_headers(headers);
+        // A caller's case variant of a custom API-key or setup-token header
+        // must not coexist with the host's authoritative credential value.
+        headers.retain(|header| {
+            !injected
+                .iter()
+                .any(|injected| header.name.eq_ignore_ascii_case(&injected.name))
+        });
+        headers.extend(injected);
         Ok(())
+    }
+
+    fn inject_http_request(
+        &self,
+        credential_id: &str,
+        request: &EgressHttpRequest,
+    ) -> Result<Vec<HttpHeader>, EgressError> {
+        if let Some(profile) = self.lease_payload(credential_id)?.as_auth_profile()
+            && let AuthMethodKind::SigV4(method) = &profile.method
+        {
+            return egress_auth::inject_sigv4(method, request);
+        }
+        let mut headers = request.headers.clone();
+        self.inject_http(credential_id, &mut headers)?;
+        Ok(headers)
     }
 
     fn get_tcp_auth(&self, credential_id: &str) -> Result<Option<Vec<u8>>, EgressError> {
@@ -14909,7 +15168,13 @@ async fn perform_host_http_egress(
         .timeout(Duration::from_millis(u64::from(
             constraints.total_timeout_ms,
         )))
-        .redirect(host_http_redirect_policy(&url, constraints)?);
+        .redirect(if egress_auth::requires_original_target(request) {
+            // A SigV4 signature authorizes this exact method, path, query and
+            // body. Even a same-origin redirect changes its signed meaning.
+            reqwest::redirect::Policy::none()
+        } else {
+            host_http_redirect_policy(&url, constraints)?
+        });
     if is_https {
         builder = builder.tls_backend_preconfigured(host_egress_rustls_client_config(
             "HTTP",
@@ -15205,7 +15470,17 @@ async fn connect_host_egress_tcp_socket(
 fn forbidden_egress_request_header(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
-        "host" | "connection" | "content-length" | "transfer-encoding"
+        "host"
+            | "connection"
+            | "content-length"
+            | "transfer-encoding"
+            | "keep-alive"
+            | "proxy-connection"
+            | "proxy-authorization"
+            | "proxy-authenticate"
+            | "te"
+            | "trailer"
+            | "upgrade"
     )
 }
 
@@ -25957,6 +26232,239 @@ output_schema = {{ type = "object" }}
                 }),
             ),
         );
+    }
+
+    async fn request_auth_egress_fixture(
+        addr: SocketAddr,
+        method: AuthMethodKind,
+        max_redirects: u8,
+    ) -> (Arc<AppState>, HostEgressHttpRequest) {
+        let connector_id = "fcp.test.request-auth:utility:1.0.0";
+        let operation_id = "test.egress_http";
+        let credential_id = CredentialId::parse("570dc000-1111-4111-8111-111111111111").unwrap();
+        let mut constraints = d9us6_loopback_constraints(addr.port());
+        constraints.max_redirects = max_redirects;
+        let (state, signing_key) = d9us6_host_egress_state_with_constraints(
+            connector_id,
+            operation_id,
+            constraints,
+            credential_id,
+            json!({"host_allow": ["127.0.0.1"]}),
+        )
+        .await;
+        let profile = AuthProfile::new(
+            "primary",
+            "d9us6-fixture",
+            method,
+            "Request auth fixture",
+            0,
+        )
+        .unwrap();
+        state
+            .credential_pools
+            .lock()
+            .await
+            .replace_payload_in_zone(
+                &ZoneId::work(),
+                credential_id,
+                CredentialPayload::auth_profile_with_allowed_hosts(profile, ["127.0.0.1"]),
+            )
+            .unwrap();
+        let token = d9us6_token_with_credentials(&signing_key, operation_id, vec![credential_id]);
+        let fixture = egress_auth::tests::request(format!(
+            "http://{addr}/bucket/a%20b%2B?tag=a%2Bb&other=a+b"
+        ));
+        let request = HostEgressHttpRequest {
+            context: d9us6_host_egress_context(
+                connector_id,
+                operation_id,
+                "req-request-auth",
+                "corr-request-auth",
+                &token,
+            ),
+            url: fixture.url,
+            method: fixture.method,
+            headers: fixture
+                .headers
+                .into_iter()
+                .map(|header| HostEgressHttpHeader {
+                    name: header.name,
+                    value: header.value,
+                })
+                .collect(),
+            body: fixture.body.map(fcp_manifest::Base64Bytes::from_vec),
+            credential_id: Some(credential_id.to_string()),
+        };
+        (state, request)
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn host_sigv4_egress_signs_the_actual_http_bytes_without_exposing_keys() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let provider = task::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let mut chunk = [0u8; 1024];
+            let header_end = loop {
+                let count = socket.read(&mut chunk).await.unwrap();
+                assert!(count > 0 && bytes.len() < 8192);
+                bytes.extend_from_slice(&chunk[..count]);
+                if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                    if bytes.len() >= end + 4 + 5 {
+                        break end + 4;
+                    }
+                }
+            };
+            let wire_headers = std::str::from_utf8(&bytes[..header_end]).unwrap();
+            let mut lines = wire_headers.split("\r\n");
+            assert_eq!(
+                lines.next(),
+                Some("PUT /bucket/a%20b%2B?tag=a%2Bb&other=a+b HTTP/1.1")
+            );
+            let headers = lines
+                .filter(|line| !line.is_empty())
+                .map(|line| {
+                    let (name, value) = line.split_once(':').unwrap();
+                    HttpHeader {
+                        name: name.to_owned(),
+                        value: value.trim().to_owned(),
+                    }
+                })
+                .collect();
+            let observed = EgressHttpRequest {
+                url: format!("http://{addr}/bucket/a%20b%2B?tag=a%2Bb&other=a+b"),
+                method: "PUT".to_owned(),
+                headers,
+                body: Some(bytes[header_end..].to_vec()),
+                credential_id: None,
+            };
+            egress_auth::tests::assert_example_signature(&observed, &addr.to_string());
+            assert_eq!(
+                observed.body.as_deref(),
+                Some([0, 1, 0xff, b'\n', b'+'].as_slice())
+            );
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK")
+                .await
+                .unwrap();
+        });
+        let (state, request) = request_auth_egress_fixture(
+            addr,
+            AuthMethodKind::SigV4(egress_auth::tests::method()),
+            0,
+        )
+        .await;
+        let response = host_egress_http_handler(State(state), Json(request))
+            .await
+            .expect("scoped host credential must sign and dispatch")
+            .0;
+        provider.await.unwrap();
+        assert_eq!(response.status, 200);
+        assert!(response.egress.credential_injected);
+        let rendered = serde_json::to_string(&response).unwrap();
+        for secret in [
+            "AKIAEXAMPLEHOSTTEST",
+            "host-signing-fixture-secret",
+            "host-signing-fixture-session",
+            "caller-supplied-secret",
+            "AWS4-HMAC-SHA256",
+        ] {
+            assert!(!rendered.contains(secret));
+        }
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn host_sigv4_egress_returns_redirect_without_reusing_request_signature() {
+        let (addr, provider) = br_4kw5f_9_6_1_one_shot_http_response(
+            b"HTTP/1.1 307 Temporary Redirect\r\nLocation: /different-object\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+        )
+        .await;
+        let (state, mut request) = request_auth_egress_fixture(
+            addr,
+            AuthMethodKind::SigV4(egress_auth::tests::method()),
+            5,
+        )
+        .await;
+        request.method = "GET".to_owned();
+        request.body = None;
+        let response = host_egress_http_handler(State(state), Json(request))
+            .await
+            .expect("signed redirect is returned to the caller")
+            .0;
+        provider.await.unwrap();
+        assert_eq!(response.status, 307);
+        assert!(response.egress.credential_injected);
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn host_setup_token_egress_replaces_custom_header_and_rejects_expiry() {
+        let observed = Arc::new(StdMutex::new(None::<String>));
+        let (addr, provider) = d9us6_one_shot_http_server(Arc::clone(&observed)).await;
+        let method = fcp_provider_auth::SetupTokenAuth::new(
+            "host-setup-token-fixture",
+            Utc::now() + chrono::Duration::minutes(5),
+            "X-Setup-Token",
+        )
+        .unwrap();
+        let (state, mut request) =
+            request_auth_egress_fixture(addr, AuthMethodKind::SetupToken(method.clone()), 0).await;
+        request.method = "GET".to_owned();
+        request.body = None;
+        request.headers.push(HostEgressHttpHeader {
+            name: "x-setup-TOKEN".to_owned(),
+            value: "untrusted-setup-value".to_owned(),
+        });
+        let response = host_egress_http_handler(State(Arc::clone(&state)), Json(request.clone()))
+            .await
+            .unwrap()
+            .0;
+        provider.await.unwrap();
+        let wire = observed
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap()
+            .to_ascii_lowercase();
+        assert_eq!(wire.matches("x-setup-token:").count(), 1);
+        assert!(wire.contains("x-setup-token: bearer host-setup-token-fixture"));
+        assert!(!wire.contains("untrusted-setup-value"));
+        assert!(
+            !serde_json::to_string(&response)
+                .unwrap()
+                .contains("host-setup-token-fixture")
+        );
+
+        let expired = fcp_provider_auth::SetupTokenAuth {
+            expires_at: Utc::now() - chrono::Duration::seconds(1),
+            ..method
+        };
+        let credential_id = CredentialId::parse(request.credential_id.as_ref().unwrap()).unwrap();
+        state
+            .credential_pools
+            .lock()
+            .await
+            .replace_payload_in_zone(
+                &ZoneId::work(),
+                credential_id,
+                CredentialPayload::auth_profile_with_allowed_hosts(
+                    AuthProfile::new(
+                        "expired",
+                        "d9us6-fixture",
+                        AuthMethodKind::SetupToken(expired),
+                        "expired fixture",
+                        0,
+                    )
+                    .unwrap(),
+                    ["127.0.0.1"],
+                ),
+            )
+            .unwrap();
+        let error = host_egress_http_handler(State(state), Json(request))
+            .await
+            .expect_err("expired setup credentials must fail before a network attempt");
+        assert!(error.1.contains("expired"));
+        assert!(!error.1.contains("host-setup-token-fixture"));
     }
 
     #[fcp_async_core::runtime::test(flavor = "multi_thread")]
@@ -40371,6 +40879,278 @@ done"#;
         .await?;
 
         assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
+        Ok(())
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn auth_profile_specialty_admin_creation_and_pool_binding_are_redacted()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let state = cancel_route_test_state();
+        let app = credential_pool_admin_test_app(Arc::clone(&state));
+        let auth = [
+            ("Authorization", "Bearer topsecret"),
+            (ADMIN_ZONE_HEADER, "z:owner"),
+        ];
+        let expiry = Utc::now() + chrono::Duration::hours(1);
+        for (provider, method, credential_id, mut request, secret_field) in [
+            (
+                "test-specialty-sigv4",
+                "sigv4",
+                "57300000-0000-0000-0000-000000000001",
+                json!({
+                    "method": "sigv4", "profile_id": "primary", "label": "primary",
+                    "access_key_id": "AKIDSPECIALTY",
+                    "secret_access_key": "specialty-secret-original",
+                    "session_token": "specialty-session-secret",
+                    "region": "US-EAST-1", "service": "S3"
+                }),
+                "secret_access_key",
+            ),
+            (
+                "test-specialty-setup-token",
+                "setup_token",
+                "57300000-0000-0000-0000-000000000002",
+                json!({
+                    "method": "setup_token", "profile_id": "primary", "label": "primary",
+                    "token": "specialty-secret-original", "expires_at": expiry
+                }),
+                "token",
+            ),
+        ] {
+            let profile_path = format!("/rpc/admin/auth/profiles/{provider}");
+            let pool_path = format!("/rpc/admin/credentials/pools/{provider}/z:work/credentials");
+            let parsed: AuthProfileUpsertRequest = serde_json::from_value(request.clone())?;
+            let debug = format!("{parsed:?}");
+            for sentinel in [
+                "specialty-secret-original",
+                "specialty-session-secret",
+                "AKIDSPECIALTY",
+            ] {
+                assert!(!debug.contains(sentinel));
+            }
+            let response = send_json_request(
+                app.clone(),
+                axum::http::Method::POST,
+                &profile_path,
+                request.clone(),
+                &auth,
+            )
+            .await?;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response_body_json(response).await?;
+            assert_eq!(body["profile"]["method"], method);
+            assert!(!body.to_string().contains("specialty-secret-original"));
+            assert!(!body.to_string().contains("specialty-session-secret"));
+            assert!(!body.to_string().contains("AKIDSPECIALTY"));
+
+            let mut binding = json!({"profile_credential": {
+                "credential_id": credential_id, "profile_id": "primary",
+                "label": "bound profile", "priority": 3,
+                "host_allow": ["API.EXAMPLE.COM.", "api.example.com"]
+            }});
+            let response = send_json_request(
+                app.clone(),
+                axum::http::Method::POST,
+                &pool_path,
+                binding.clone(),
+                &auth,
+            )
+            .await?;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response_body_json(response).await?;
+            assert_eq!(body["pool"]["entries"][0]["payload_kind"], "auth_profile");
+            assert!(!body.to_string().contains("specialty-secret-original"));
+            let credential_id = CredentialId::parse(credential_id)?;
+            let lease = state
+                .credential_pools
+                .lock()
+                .await
+                .acquire_specific_in_zone(&ZoneId::work(), credential_id, Utc::now())?;
+            assert_eq!(
+                lease.payload.auth_profile_host_allow(),
+                Some(["api.example.com".to_owned()].as_slice())
+            );
+            assert_eq!(
+                lease
+                    .payload
+                    .as_auth_profile()
+                    .expect("typed profile")
+                    .method
+                    .id(),
+                method
+            );
+            assert!(
+                state
+                    .credential_pools
+                    .lock()
+                    .await
+                    .acquire_specific_in_zone(&ZoneId::private(), credential_id, Utc::now(),)
+                    .is_err(),
+                "profile binding cannot escape its selected zone"
+            );
+
+            request[secret_field] = json!("specialty-secret-replacement");
+            let response = send_json_request(
+                app.clone(),
+                axum::http::Method::POST,
+                &profile_path,
+                request,
+                &auth,
+            )
+            .await?;
+            assert_eq!(response.status(), StatusCode::OK);
+            let retained = state
+                .credential_pools
+                .lock()
+                .await
+                .current_lease(&lease, Utc::now())?;
+            let profile = retained.payload.as_auth_profile().expect("typed profile");
+            match &profile.method {
+                AuthMethodKind::SigV4(auth) => {
+                    assert_eq!(auth.secret_key.expose_secret(), "specialty-secret-original");
+                    assert_eq!(auth.region, "us-east-1");
+                    assert_eq!(auth.service, "s3");
+                }
+                AuthMethodKind::SetupToken(auth) => {
+                    assert_eq!(auth.token.expose_secret(), "specialty-secret-original");
+                    assert_eq!(auth.header_name, "Authorization");
+                }
+                _ => panic!("unexpected profile method"),
+            }
+
+            binding["mode"] = json!("replace_existing");
+            let response = send_json_request(
+                app.clone(),
+                axum::http::Method::POST,
+                &pool_path,
+                binding,
+                &auth,
+            )
+            .await?;
+            assert_eq!(response.status(), StatusCode::OK);
+            let mut registry = state.credential_pools.lock().await;
+            assert!(
+                registry.current_lease(&lease, Utc::now()).is_err(),
+                "explicit rebinding must fence old credential authority"
+            );
+            registry.release_lease(&lease)?;
+            let next =
+                registry.acquire_specific_in_zone(&ZoneId::work(), credential_id, Utc::now())?;
+            let profile = next.payload.as_auth_profile().expect("new typed profile");
+            let secret = match &profile.method {
+                AuthMethodKind::SigV4(auth) => auth.secret_key.expose_secret(),
+                AuthMethodKind::SetupToken(auth) => auth.token.expose_secret(),
+                _ => panic!("unexpected profile method"),
+            };
+            assert_eq!(secret, "specialty-secret-replacement");
+            registry.release_lease(&next)?;
+            let audit = serde_json::to_string(registry.audit_events())?;
+            assert!(!audit.contains("specialty-secret"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn auth_profile_specialty_creation_rejects_invalid_material_and_scope() {
+        let valid = json!({
+            "method": "sigv4", "access_key_id": "AKIDSPECIALTY",
+            "secret_access_key": "secret-sentinel", "region": "us-east-1", "service": "s3"
+        });
+        for (field, value) in [
+            ("access_key_id", "AKID/scope"),
+            ("secret_access_key", "secret-sentinel\r\nInjected: true"),
+            ("session_token", "secret-sentinel\nInjected: true"),
+            ("region", "us-east-1/s3"),
+            ("service", "s3\r\nInjected: true"),
+            ("region", ""),
+        ] {
+            let mut invalid = valid.clone();
+            invalid[field] = json!(value);
+            let request = serde_json::from_value(invalid).expect("well-typed request");
+            let error = auth_profile_method_from_request(request).expect_err("invalid credential");
+            assert!(!error.to_string().contains("secret-sentinel"));
+        }
+        for header in [
+            "Host",
+            "content-length",
+            "X-Fcp-Zone",
+            "Proxy-Authorization",
+            "Keep-Alive",
+            "Proxy-Authenticate",
+            "X-Bad\r\nHeader",
+        ] {
+            let request = serde_json::from_value(json!({
+                "method": "setup_token", "token": "setup-secret-sentinel",
+                "expires_at": Utc::now() + chrono::Duration::hours(1), "header_name": header
+            }))
+            .expect("well-typed request");
+            let error =
+                auth_profile_method_from_request(request).expect_err("invalid token header");
+            assert!(!error.to_string().contains("setup-secret-sentinel"));
+        }
+        let expired = serde_json::from_value(json!({
+            "method": "setup_token", "token": "setup-secret-sentinel",
+            "expires_at": Utc::now() - chrono::Duration::seconds(1)
+        }))
+        .expect("well-typed request");
+        assert!(matches!(
+            auth_profile_method_from_request(expired),
+            Err(AuthError::Expired { .. })
+        ));
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn auth_profile_pool_binding_refuses_ambiguous_or_unbound_credentials()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let state = cancel_route_test_state();
+        let app = credential_pool_admin_test_app(Arc::clone(&state));
+        let auth = [
+            ("Authorization", "Bearer topsecret"),
+            (ADMIN_ZONE_HEADER, "z:owner"),
+        ];
+        let path = "/rpc/admin/credentials/pools/test-specialty-invalid/z:work/credentials";
+        let binding = json!({"profile_credential": {
+            "credential_id": "57300000-0000-0000-0000-000000000003",
+            "profile_id": "missing", "label": "bound profile", "host_allow": ["api.example.com"]
+        }});
+        let response = send_json_request(
+            app.clone(),
+            axum::http::Method::POST,
+            path,
+            binding.clone(),
+            &auth,
+        )
+        .await?;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        for hosts in [
+            json!([]),
+            json!(["*"]),
+            json!(["*.example.com"]),
+            json!(["https://api.example.com"]),
+            json!(["api.example.com:443"]),
+        ] {
+            let mut invalid = binding.clone();
+            invalid["profile_credential"]["host_allow"] = hosts;
+            let response =
+                send_json_request(app.clone(), axum::http::Method::POST, path, invalid, &auth)
+                    .await?;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        let mut mixed = binding;
+        mixed["credential"] = json!({
+            "credential_id": "57300000-0000-0000-0000-000000000003", "source": "config",
+            "priority": 0, "label": "raw", "payload": {"api_key": "raw-secret-sentinel"}
+        });
+        let response = send_json_request(app, axum::http::Method::POST, path, mixed, &auth).await?;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            state
+                .credential_pools
+                .lock()
+                .await
+                .redacted_views(Utc::now())
+                .is_empty()
+        );
         Ok(())
     }
 

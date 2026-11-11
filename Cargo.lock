@@ -5017,6 +5017,7 @@ dependencies = [
  "insta",
  "libc",
  "mach2 0.4.3",
+ "percent-encoding",
  "proptest",
  "rcgen",
  "reqwest 0.13.2",
