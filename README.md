@@ -1334,7 +1334,8 @@ fwc rules disable search-related-issues
 ```
 
 Use `--rules-file PATH` after `rules` for a separate rules file. Each event uses
-`connector`, `event_type`, an optional `event_id`, and string-valued `data`.
+`connector`, `event_type`, an optional `event_id`, string-valued `data`, and
+an optional original JSON `payload`.
 
 Action inputs preserve TOML numbers, booleans, arrays, and nested objects through
 preview, host preflight, and invocation. Templates expand only inside string
@@ -1354,6 +1355,30 @@ embedded in text are rejected before any action in the batch starts. JSON data
 is inserted literally: template-looking strings inside provider data are never
 evaluated again. Existing string-only definitions keep their persisted execution
 identities; changing an input's type changes the action identity.
+
+Native stream and webhook events also retain the original provider JSON as
+`event.payload`. Use `"{{event.payload | value}}"` to pass that complete value,
+or append a raw JSON Pointer to select a nested object, array element, or scalar:
+
+```toml
+input = { body = "{{event.payload/issue | value}}", labels = "{{event.payload/issue/labels | value}}" }
+```
+
+The target operation must declare matching input fields. The `value` filter copies
+the selected JSON type directly; it does not parse string contents as JSON or
+interpret provider strings as templates. A pointer uses `/0` for an array index,
+`~1` for a slash in a key, and `~0` for a tilde. It is not a dotted path or a
+percent-decoded URI fragment. Template delimiter whitespace is trimmed; use
+whole-payload forwarding when a field name ends in whitespace. A missing path
+is refused; an explicit JSON null is a valid value. A `value` selector must occupy the complete input string and cannot
+be chained with another filter.
+
+The original payload remains separate from source verification metadata. For
+example, a webhook's `event.payload/signature_valid` is provider data;
+`event.data.signature_valid` is the receiver's verified admission result.
+Original and flattened data count together toward each normalized event's
+256 KiB limit. Retaining a payload does not change an upstream event's replay
+identity; payload changes participate in deduplication when no upstream ID exists.
 
 Definitions are capped at 1 MiB, events at 256 KiB each and 16 MiB per file,
 and previews at 10,000 rule/event evaluations and 8 MiB of output. Each rendered
@@ -1471,8 +1496,10 @@ The consumer pins that executor through every poll and ACK; an initially local
 consumer also retains the first reported owner for the rest of its batch.
 Nested object fields become dotted template names such as `event.data.issue.title`;
 scalar strings are preserved, and other leaf values use JSON text. A complete
-`{{event.data.field | json}}` input can retain a leaf's numeric, boolean, or array
-type; construct object inputs with nested input tables and dotted leaf templates.
+`{{event.data.field | json}}` input can decode a stringified leaf. Use
+`{{event.payload/path | value}}` for exact typed selection from the original
+payload, including whole nested objects, arrays, nulls, and empty containers.
+Literal dotted keys remain distinct from JSON Pointer path segments.
 Ambiguous flattened paths, excessive depth, and more than 1,024 fields are
 rejected before any action starts.
 

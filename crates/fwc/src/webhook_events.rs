@@ -305,6 +305,7 @@ pub(crate) fn decode_page(
             event_type: WEBHOOK_EVENT_TOPIC.into(),
             event_id: Some(format!("webhook:{}", hasher.finalize().to_hex())),
             data,
+            payload: Some(event.payload.clone()),
             received_at,
         };
         let event_bytes =
@@ -640,8 +641,34 @@ mod tests {
         assert_eq!(first.data["signature_valid"], "true");
         assert_eq!(first.data["payload.signature_valid"], "false");
         assert_eq!(first.data["payload.order.id"], "42");
+        assert_eq!(
+            first.payload,
+            Some(json!({"order": {"id": "42"}, "signature_valid": false})),
+        );
         assert_eq!(first.data["headers.x-github-event"], "push");
         assert_eq!(first.received_at.timestamp_millis(), 1_794_054_896_123);
+    }
+
+    #[test]
+    fn source_payload_retains_empty_containers_and_explicit_null() {
+        for payload in [Value::Null, json!({}), json!([]), json!([{"active": true}, null])] {
+            let mut value = page();
+            value["events"][0]["payload"] = payload.clone();
+            let event = decode(value).unwrap().events.remove(0);
+            assert_eq!(event.payload, Some(payload));
+            let reopened: IncomingEvent =
+                serde_json::from_slice(&serde_json::to_vec(&event).unwrap()).unwrap();
+            assert_eq!(reopened.payload, event.payload);
+            assert_eq!(reopened.dedup_identity(), event.dedup_identity());
+        }
+    }
+
+    #[test]
+    fn retained_payload_copy_counts_toward_the_normalized_event_bound() {
+        let mut value = page();
+        value["events"][1]["payload"] = json!({"text": "x".repeat(MAX_EVENT_BYTES / 2)});
+        value["serialized_event_bytes"] = json!(MAX_EVENT_BYTES);
+        assert_failure(decode(value), WebhookFailure::PageTooLarge);
     }
 
     #[test]

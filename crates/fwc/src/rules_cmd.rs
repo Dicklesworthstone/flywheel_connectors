@@ -1789,6 +1789,7 @@ fn normalize_stream_event(
         event_type: envelope.topic.clone(),
         event_id: Some(format!("native:{}", hasher.finalize().to_hex())),
         data,
+        payload: Some(envelope.data.payload.clone()),
         received_at: envelope.timestamp,
     };
     validate_event(&event)?;
@@ -1875,8 +1876,9 @@ fn prepare_batch(rules: &RuleSet, events: &[IncomingEvent]) -> Result<Vec<Planne
     for (event_index, event) in events.iter().enumerate() {
         for (rule_index, rule) in rules.rules.iter().enumerate() {
             let inputs = if rule.enabled && matches_trigger(event, &rule.trigger) {
-                let inputs = render_action_inputs(&rule.action, event)
-                    .context("a rendered action is invalid or exceeds its bounds; no actions were started")?;
+                let inputs = render_action_inputs(&rule.action, event).context(
+                    "a rendered action is invalid or exceeds its bounds; no actions were started",
+                )?;
                 // Count the actual JSON, including nested values, punctuation
                 // and string escaping, before any action can be admitted.
                 input_bytes = input_bytes.saturating_add(serde_json::to_vec(&inputs)?.len());
@@ -3295,7 +3297,13 @@ mod tests {
         assert!(!fs::read_to_string(&executor.state_path).unwrap().contains("private-source-text"));
 
         definition.action.input.insert("limit".into(), json!("25"));
-        save_rules(args.rules_file.as_ref().unwrap(), &RuleSet { rules: vec![definition] }).unwrap();
+        save_rules(
+            args.rules_file.as_ref().unwrap(),
+            &RuleSet {
+                rules: vec![definition],
+            },
+        )
+        .unwrap();
         let mut changed = FakeExecutor::new(executor.state_path.clone());
         let next = run(&args, &mut changed).unwrap();
         assert!(!next.rejected);
@@ -3334,7 +3342,13 @@ mod tests {
         );
         assert_eq!(
             previous_bytes,
-            serde_json::to_vec(&(&definition.name, &definition.trigger, &definition.action, &scope)).unwrap(),
+            serde_json::to_vec(&(
+                &definition.name,
+                &definition.trigger,
+                &definition.action,
+                &scope,
+            ))
+            .unwrap(),
         );
     }
 
@@ -3347,7 +3361,14 @@ mod tests {
             event("last").with_data("limit", "private-invalid-json"),
         ];
         let (_temp, args, mut executor) = fixture(vec![definition.clone()], &incoming);
-        let preview = preview_output("test", &RuleSet { rules: vec![definition] }, &incoming).unwrap();
+        let preview = preview_output(
+            "test",
+            &RuleSet {
+                rules: vec![definition],
+            },
+            &incoming,
+        )
+        .unwrap();
         assert!(preview.rejected);
         assert_eq!(
             preview.payload["data"]["results"][1]["match"]["validation_error"]["type"],
@@ -6029,6 +6050,7 @@ mod tests {
         let envelope = native_event("cursor-1", 1);
         let normalized = normalize_stream_event("http://host", &envelope, None).unwrap();
         assert_eq!(normalized.data["issue.number"], "42");
+        assert_eq!(normalized.payload.as_ref(), Some(&envelope.data.payload));
         let mut replay = envelope.clone();
         replay.timestamp += Duration::days(1);
         replay.seq = 77;
@@ -6065,6 +6087,77 @@ mod tests {
                 .unwrap()
                 .dedup_identity()
         );
+    }
+
+    #[test]
+    fn consume_copies_typed_source_values_and_replay_only_acknowledges() {
+        let (_temp, args, mut executor, mut source) =
+            consume_fixture(vec![native_event("cursor-1", 1)]);
+        let path = args.rules_file.as_ref().unwrap();
+        let mut definitions = load_rules(path, false).unwrap();
+        definitions.rules[0]
+            .action
+            .input
+            .insert("source".into(), json!("{{event.payload | value}}"));
+        definitions.rules[0]
+            .action
+            .input
+            .insert("issue".into(), json!("{{event.payload/issue | value}}"));
+        save_rules(path, &definitions).unwrap();
+
+        source.fail_ack = true;
+        let first = consume(&args, &mut executor, &mut source).unwrap();
+        assert!(first.rejected);
+        assert_eq!(executor.calls, 1);
+        assert_eq!(executor.inputs[0]["source"], source.events[0].data.payload);
+        assert_eq!(executor.inputs[0]["issue"], json!({"number": 42}));
+        assert!(
+            !fs::read_to_string(&executor.state_path)
+                .unwrap()
+                .contains("private-source-text")
+        );
+
+        source.fail_ack = false;
+        source.events[0].data.payload["issue"]["number"] = json!(99);
+        let mut restarted = FakeExecutor::new(executor.state_path.clone());
+        let replay = consume(&args, &mut restarted, &mut source).unwrap();
+        assert!(!replay.rejected);
+        assert_eq!(restarted.calls, 0);
+        assert_eq!(replay.payload["data"]["source"]["acknowledged_events"], 1);
+        assert_eq!(
+            first.payload["data"]["results"][0]["request_id"],
+            replay.payload["data"]["results"][0]["request_id"],
+        );
+    }
+
+    #[test]
+    fn missing_payload_selection_in_later_event_prevents_all_actions_and_acks() {
+        let (_temp, args, mut executor, mut source) = consume_fixture(vec![
+            native_event("cursor-1", 1),
+            native_event("cursor-2", 2),
+        ]);
+        let path = args.rules_file.as_ref().unwrap();
+        let mut definitions = load_rules(path, false).unwrap();
+        definitions.rules[0]
+            .action
+            .input
+            .insert("issue".into(), json!("{{event.payload/issue | value}}"));
+        save_rules(path, &definitions).unwrap();
+        source.events[1].data.payload = json!({"text": "private-source-text"});
+        assert!(consume(&args, &mut executor, &mut source).is_err());
+        assert_eq!(executor.calls, 0);
+        assert!(source.acknowledgements.is_empty());
+    }
+
+    #[test]
+    fn native_payload_copy_is_bounded_before_any_action_or_acknowledgement() {
+        let (_temp, args, mut executor, mut source) =
+            consume_fixture(vec![native_event("cursor-1", 1)]);
+        source.events[0].data.payload = json!({"text": "x".repeat(MAX_EVENT_BYTES / 2)});
+        assert!(serde_json::to_vec(&source.events[0]).unwrap().len() < MAX_EVENT_BYTES);
+        assert!(consume(&args, &mut executor, &mut source).is_err());
+        assert_eq!(executor.calls, 0);
+        assert!(source.acknowledgements.is_empty());
     }
 
     #[test]

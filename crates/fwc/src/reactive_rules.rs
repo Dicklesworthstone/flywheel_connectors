@@ -206,9 +206,17 @@ pub struct IncomingEvent {
     /// Stable upstream event identifier, if the source provides one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event_id: Option<String>,
-    /// Event data as key-value pairs.
+    /// Flattened fields used by text matching and string templates.
     #[serde(default)]
     pub data: BTreeMap<String, String>,
+    /// Original source payload, selectable without losing JSON types.
+    /// Missing payload and a present JSON null are deliberately distinct.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_event_payload",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub payload: Option<Value>,
     /// When the event was received.
     #[serde(default = "Utc::now")]
     pub received_at: DateTime<Utc>,
@@ -222,6 +230,7 @@ impl IncomingEvent {
             event_type: event_type.into(),
             event_id: None,
             data: BTreeMap::new(),
+            payload: None,
             received_at: Utc::now(),
         }
     }
@@ -235,6 +244,12 @@ impl IncomingEvent {
     /// Builder: add a data field.
     pub fn with_data(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.data.insert(key.into(), value.into());
+        self
+    }
+
+    /// Attach the original payload for exact JSON value selection.
+    pub fn with_payload(mut self, payload: Value) -> Self {
+        self.payload = Some(payload);
         self
     }
 
@@ -271,8 +286,76 @@ impl IncomingEvent {
             hash_field(&mut hasher, key);
             hash_field(&mut hasher, value);
         }
+        // Omitted payload keeps the existing identity byte-for-byte. When no
+        // upstream ID exists, typed payload changes must produce a new identity.
+        if let Some(payload) = &self.payload {
+            hash_field(&mut hasher, "structured_payload.v1");
+            hash_payload_value(&mut hasher, payload);
+        }
 
         format!("hash:{}", hasher.finalize().to_hex())
+    }
+}
+
+// A defaulted field distinguishes absence from explicit JSON null. Ordinary
+// Option<Value> deserialization would turn both into None.
+fn deserialize_event_payload<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let mut budget = InputBudget::new();
+    InputValueSeed {
+        budget: &mut budget,
+        depth: 0,
+    }
+    .deserialize(deserializer)
+    .map(Some)
+}
+
+/// Hash JSON structure with explicit type and length framing. Object order is
+/// canonical even if another workspace member enables serde_json/preserve_order.
+/// The explicit stack also avoids recursive hashing of provider-controlled data.
+fn hash_payload_value(hasher: &mut blake3::Hasher, payload: &Value) {
+    enum Part<'a> {
+        Key(&'a str),
+        Value(&'a Value),
+    }
+
+    let mut pending = vec![Part::Value(payload)];
+    while let Some(part) = pending.pop() {
+        match part {
+            Part::Key(key) => hash_field(hasher, key),
+            Part::Value(value) => match value {
+                Value::Null => hash_field(hasher, "null"),
+                Value::Bool(value) => {
+                    hash_field(hasher, "bool");
+                    hash_field(hasher, if *value { "true" } else { "false" });
+                }
+                Value::Number(value) => {
+                    hash_field(hasher, "number");
+                    hash_field(hasher, &value.to_string());
+                }
+                Value::String(value) => {
+                    hash_field(hasher, "string");
+                    hash_field(hasher, value);
+                }
+                Value::Array(values) => {
+                    hash_field(hasher, "array");
+                    hasher.update(&(values.len() as u64).to_le_bytes());
+                    pending.extend(values.iter().rev().map(Part::Value));
+                }
+                Value::Object(fields) => {
+                    hash_field(hasher, "object");
+                    hasher.update(&(fields.len() as u64).to_le_bytes());
+                    let mut fields = fields.iter().collect::<Vec<_>>();
+                    fields.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+                    for (key, value) in fields.into_iter().rev() {
+                        pending.push(Part::Value(value));
+                        pending.push(Part::Key(key));
+                    }
+                }
+            },
+        }
     }
 }
 
@@ -678,6 +761,12 @@ pub enum RenderError {
     InvalidJsonTemplate,
     /// A JSON source is absent, malformed, ambiguous, or exceeds the remaining bounds.
     InvalidJsonValue,
+    /// A value selector is not one complete original-payload expression.
+    InvalidValueTemplate,
+    /// The original payload or selected JSON Pointer does not exist.
+    MissingPayloadValue,
+    /// A selected source value exceeds the action's remaining resource bounds.
+    InvalidPayloadValue,
 }
 
 impl fmt::Display for RenderError {
@@ -697,6 +786,17 @@ impl fmt::Display for RenderError {
             }
             Self::InvalidJsonValue => {
                 f.write_str("the json input source is missing, invalid, or exceeds its bounds")
+            }
+            Self::InvalidValueTemplate => {
+                f.write_str(
+                    "the value filter requires one complete event.payload JSON Pointer expression",
+                )
+            }
+            Self::MissingPayloadValue => {
+                f.write_str("the original event payload or selected value is missing")
+            }
+            Self::InvalidPayloadValue => {
+                f.write_str("the selected event payload value exceeds its bounds")
             }
         }
     }
@@ -920,6 +1020,12 @@ fn render_template_with_budget(
             // event.data source. Never silently stringify or discard it.
             return Err(RenderError::InvalidJsonTemplate);
         }
+        if expression
+            .split_once('|')
+            .is_some_and(|(_, filter)| filter.split('|').any(|part| part.trim() == "value"))
+        {
+            return Err(RenderError::InvalidValueTemplate);
+        }
         match expression {
             "event.connector" => {
                 append_rendered(&mut result, &event.connector, remaining_bytes)?;
@@ -966,7 +1072,9 @@ fn render_template_with_budget(
 
 /// Render typed action values under shared byte, value-count and depth bounds.
 /// Only string leaves are templates. An entire `{{event.data.field | json}}`
-/// value explicitly decodes a JSON source; inserted data is never rendered again.
+/// value explicitly decodes JSON text. An entire `{{event.payload/path | value}}`
+/// selects an original source value by JSON Pointer. Neither inserted subtree
+/// is rendered again.
 ///
 /// # Errors
 ///
@@ -985,6 +1093,52 @@ pub fn render_action_inputs(
         inputs.insert(key.clone(), value);
     }
     Ok(inputs)
+}
+
+/// Select a complete, typed source value. The suffix is a raw JSON Pointer,
+/// not a dotted path or a percent-decoded URI fragment.
+fn value_template_pointer(template: &str) -> Result<Option<&str>, RenderError> {
+    let mut remaining = template;
+    while let Some(start) = remaining.find("{{") {
+        let after_open = &remaining[start + 2..];
+        let Some(end) = after_open.find("}}") else {
+            if after_open.split('|').skip(1).any(|filter| filter.trim() == "value") {
+                return Err(RenderError::InvalidValueTemplate);
+            }
+            break;
+        };
+        let expression = after_open[..end].trim();
+        let literal = &remaining[start..start + end + 4];
+        remaining = &after_open[end + 2..];
+        if !expression
+            .split('|')
+            .skip(1)
+            .any(|filter| filter.trim() == "value")
+        {
+            continue;
+        }
+        let Some((source, filter)) = expression.split_once('|') else {
+            return Err(RenderError::InvalidValueTemplate);
+        };
+        if template.trim() != literal || filter.trim() != "value" {
+            return Err(RenderError::InvalidValueTemplate);
+        }
+        let pointer = source
+            .trim()
+            .strip_prefix("event.payload")
+            .ok_or(RenderError::InvalidValueTemplate)?;
+        if !pointer.is_empty() && !pointer.starts_with('/') {
+            return Err(RenderError::InvalidValueTemplate);
+        }
+        let mut bytes = pointer.bytes();
+        while let Some(byte) = bytes.next() {
+            if byte == b'~' && !matches!(bytes.next(), Some(b'0' | b'1')) {
+                return Err(RenderError::InvalidValueTemplate);
+            }
+        }
+        return Ok(Some(pointer));
+    }
+    Ok(None)
 }
 
 fn json_template_field(template: &str) -> Result<Option<&str>, RenderError> {
@@ -1037,6 +1191,21 @@ fn render_input_value(
         // The visitor validates and charges every inserted value. Returning it
         // directly keeps provider strings literal, including template syntax.
         return Ok(value);
+    }
+
+    if let Value::String(template) = template
+        && let Some(pointer) = value_template_pointer(template)?
+    {
+        let value = event
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.pointer(pointer))
+            .ok_or(RenderError::MissingPayloadValue)?;
+        // Deserialize a borrowed Value to make one bounded owned copy. Provider
+        // strings are data, so they never enter the author-template renderer.
+        return InputValueSeed { budget, depth }
+            .deserialize(value)
+            .map_err(|_| RenderError::InvalidPayloadValue);
     }
 
     budget.enter(depth)?;
@@ -1532,6 +1701,171 @@ mod tests {
             .with_data("text", "Found a bug in login")
             .with_data("user", "alice")
             .with_data("channel", "general")
+    }
+
+    #[test]
+    fn event_payload_null_is_distinct_from_absence_and_round_trips() {
+        let absent: IncomingEvent = serde_json::from_value(serde_json::json!({
+            "connector": "slack", "event_type": "message.new"
+        }))
+        .unwrap();
+        let present: IncomingEvent = serde_json::from_value(serde_json::json!({
+            "connector": "slack", "event_type": "message.new", "payload": null
+        }))
+        .unwrap();
+        assert!(absent.payload.is_none());
+        assert_eq!(present.payload, Some(Value::Null));
+        assert!(serde_json::to_value(&absent).unwrap().get("payload").is_none());
+        assert_eq!(serde_json::to_value(&present).unwrap()["payload"], Value::Null);
+        let reopened: IncomingEvent =
+            serde_json::from_slice(&serde_json::to_vec(&present).unwrap()).unwrap();
+        assert_eq!(reopened.payload, Some(Value::Null));
+        assert_eq!(present.dedup_identity(), reopened.dedup_identity());
+        assert_ne!(absent.dedup_identity(), present.dedup_identity());
+    }
+
+    #[test]
+    fn payload_identity_preserves_upstream_ids_and_distinguishes_json_types() {
+        let original = sample_event();
+        let upstream = original.clone().with_event_id("provider-event");
+        assert_eq!(
+            upstream.dedup_identity(),
+            upstream
+                .clone()
+                .with_payload(serde_json::json!({"changed": true}))
+                .dedup_identity(),
+        );
+        assert_eq!(
+            upstream.dedup_identity(),
+            upstream.with_payload(Value::Null).dedup_identity(),
+        );
+
+        let identities = [
+            original.dedup_identity(),
+            original.clone().with_payload(Value::Null).dedup_identity(),
+            original.clone().with_payload(serde_json::json!(true)).dedup_identity(),
+            original.clone().with_payload(serde_json::json!("true")).dedup_identity(),
+            original.clone().with_payload(serde_json::json!([1, 2])).dedup_identity(),
+            original.clone().with_payload(serde_json::json!([2, 1])).dedup_identity(),
+            original.clone().with_payload(serde_json::json!({})).dedup_identity(),
+            original.with_payload(serde_json::json!([])).dedup_identity(),
+        ];
+        assert_eq!(
+            identities.iter().collect::<std::collections::BTreeSet<_>>().len(),
+            identities.len(),
+        );
+    }
+
+    #[test]
+    fn payload_identity_cannot_be_confused_with_flat_marker_fields() {
+        let structured = IncomingEvent::new("slack", "message.new").with_payload(Value::Null);
+        let flat = IncomingEvent::new("slack", "message.new")
+            .with_data("structured_payload.v1", "null");
+        assert_ne!(structured.dedup_identity(), flat.dedup_identity());
+    }
+
+    #[test]
+    fn payload_identity_canonicalizes_objects_at_every_depth() {
+        let mut forward = serde_json::Map::new();
+        forward.insert("a".into(), serde_json::json!(1));
+        forward.insert("b".into(), serde_json::json!("2"));
+        let mut reverse = serde_json::Map::new();
+        reverse.insert("b".into(), serde_json::json!("2"));
+        reverse.insert("a".into(), serde_json::json!(1));
+        assert_eq!(
+            sample_event()
+                .with_payload(serde_json::json!([{"nested": forward}]))
+                .dedup_identity(),
+            sample_event()
+                .with_payload(serde_json::json!([{"nested": reverse}]))
+                .dedup_identity(),
+        );
+    }
+
+    #[test]
+    fn payload_value_selectors_preserve_types_and_do_not_render_provider_strings() {
+        let payload = serde_json::json!({
+            "items": [{"active": true, "count": 4, "optional": null, "empty": {},
+                "text": "{{event.data.secret}}"}],
+            "a/b": {"~key": ["selected"]},
+            "~1": "literal escaped token",
+            "": "empty key",
+            "a.b": "literal dotted key"
+        });
+        let event = sample_event()
+            .with_data("secret", "private-value")
+            .with_payload(payload.clone());
+        for (selector, expected) in [
+            ("event.payload", payload.clone()),
+            ("event.payload/items/0", payload["items"][0].clone()),
+            ("event.payload/items/0/count", serde_json::json!(4)),
+            ("event.payload/items/0/active", serde_json::json!(true)),
+            ("event.payload/items/0/optional", Value::Null),
+            ("event.payload/items/0/empty", serde_json::json!({})),
+            ("event.payload/items/0/text", serde_json::json!("{{event.data.secret}}")),
+            ("event.payload/a~1b/~0key/0", serde_json::json!("selected")),
+            ("event.payload/~01", serde_json::json!("literal escaped token")),
+            ("event.payload/", serde_json::json!("empty key")),
+            ("event.payload/a.b", serde_json::json!("literal dotted key")),
+        ] {
+            let template = format!("{{{{{selector} | value}}}}");
+            let action = RuleAction::new("github", "create_issue").with_input("body", template);
+            assert_eq!(render_action_inputs(&action, &event).unwrap()["body"], expected);
+        }
+    }
+
+    #[test]
+    fn payload_value_selectors_fail_before_dispatch_on_missing_or_invalid_paths() {
+        let event = sample_event().with_payload(serde_json::json!({
+            "items": [null], "private": "private-value", "~2": "not an escape"
+        }));
+        for template in [
+            "{{event.payload/missing | value}}",
+            "{{event.payload/items/1 | value}}",
+            "{{event.payload/items/01 | value}}",
+            "{{event.payload/items/-1 | value}}",
+            "{{event.payload/items/- | value}}",
+            "{{event.payload/~ | value}}",
+            "{{event.payload/~2 | value}}",
+            "{{event.payload.items | value}}",
+            "{{event.data.text | value}}",
+            "prefix {{event.payload | value}}",
+            "{{event.payload | value}} suffix",
+            "{{event.payload | value | json}}",
+        ] {
+            let action = RuleAction::new("github", "create_issue").with_input("body", template);
+            let error = render_action_inputs(&action, &event).unwrap_err();
+            assert!(!error.to_string().contains("private-value"));
+        }
+        let action = RuleAction::new("github", "create_issue")
+            .with_input("body", "{{event.payload | value}}");
+        assert!(render_action_inputs(&action, &sample_event()).is_err());
+        let rendered =
+            render_action_inputs(&action, &sample_event().with_payload(Value::Null)).unwrap();
+        assert_eq!(rendered["body"], Value::Null);
+    }
+
+    #[test]
+    fn payload_value_copy_obeys_shared_bytes_depth_and_value_limits() {
+        let action = RuleAction::new("github", "create_issue")
+            .with_input("body", "{{event.payload | value}}");
+        let oversized = sample_event()
+            .with_payload(Value::String("x".repeat(MAX_RENDERED_INPUT_BYTES)));
+        assert!(render_action_inputs(&action, &oversized).is_err());
+
+        let half = sample_event()
+            .with_payload(Value::String("x".repeat(MAX_RENDERED_INPUT_BYTES / 2)));
+        assert!(render_action_inputs(&action, &half).is_ok());
+        let twice = action.clone().with_input("again", "{{event.payload | value}}");
+        assert!(render_action_inputs(&twice, &half).is_err());
+
+        let mut nested = Value::Null;
+        for _ in 0..32 {
+            nested = Value::Array(vec![nested]);
+        }
+        assert!(render_action_inputs(&action, &sample_event().with_payload(nested)).is_err());
+        let broad = Value::Array(vec![Value::Null; 10_001]);
+        assert!(render_action_inputs(&action, &sample_event().with_payload(broad)).is_err());
     }
 
     // ── EventTrigger ──────────────────────────────────────────────
@@ -2089,7 +2423,8 @@ archived = false
         ));
 
         let values = Value::Array(vec![Value::Array(Vec::new()); MAX_RENDERED_INPUT_VALUES / 2]);
-        let first = RuleAction::new("github", "issues.update").with_input_value("a", values.clone());
+        let first = RuleAction::new("github", "issues.update")
+            .with_input_value("a", values.clone());
         assert!(render_action_inputs(&first, &event).is_ok());
         let combined = first.with_input_value("b", values);
         assert!(matches!(
@@ -2126,7 +2461,9 @@ archived = false
             render_action_inputs(&too_deep, &sample_event()),
             Err(RenderError::NestingLimitExceeded { .. }),
         ));
-        assert!(serde_json::from_str::<RuleAction>(&serde_json::to_string(&too_deep).unwrap()).is_err());
+        assert!(
+            serde_json::from_str::<RuleAction>(&serde_json::to_string(&too_deep).unwrap()).is_err()
+        );
 
         let mut template = Value::String("{{event.data.value | json}}".into());
         for _ in 1..MAX_RENDERED_INPUT_DEPTH {
@@ -3164,7 +3501,10 @@ archived = false
             rule_name: "r1".to_string(),
             matched: true,
             reason: "ok".to_string(),
-            rendered_inputs: Some(BTreeMap::from([("k".to_string(), Value::String("v".to_string()))])),
+            rendered_inputs: Some(BTreeMap::from([(
+                "k".to_string(),
+                Value::String("v".to_string()),
+            )])),
             validation_error: None,
         };
         let json = serde_json::to_value(&mr).unwrap();
