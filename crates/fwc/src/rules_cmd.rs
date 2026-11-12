@@ -388,7 +388,7 @@ pub(crate) trait RuleExecutor {
     fn invoke(
         &mut self,
         rule: &Rule,
-        inputs: &BTreeMap<String, String>,
+        inputs: &BTreeMap<String, Value>,
         idempotency_key: &str,
         provenance: Option<&Provenance>,
         admit: &mut dyn FnMut(&str, &str) -> Result<()>,
@@ -1858,7 +1858,7 @@ fn settled_event_prefix(payload: &Value, rules: usize, events: usize) -> usize {
 struct PlannedEvaluation {
     event: usize,
     rule: usize,
-    inputs: Option<BTreeMap<String, String>>,
+    inputs: Option<BTreeMap<String, Value>>,
 }
 
 fn prepare_batch(rules: &RuleSet, events: &[IncomingEvent]) -> Result<Vec<PlannedEvaluation>> {
@@ -1876,12 +1876,10 @@ fn prepare_batch(rules: &RuleSet, events: &[IncomingEvent]) -> Result<Vec<Planne
         for (rule_index, rule) in rules.rules.iter().enumerate() {
             let inputs = if rule.enabled && matches_trigger(event, &rule.trigger) {
                 let inputs = render_action_inputs(&rule.action, event)
-                    .context("a rendered action exceeds its byte limit; no actions were started")?;
-                for (key, value) in &inputs {
-                    input_bytes = input_bytes
-                        .saturating_add(key.len())
-                        .saturating_add(value.len());
-                }
+                    .context("a rendered action is invalid or exceeds its bounds; no actions were started")?;
+                // Count the actual JSON, including nested values, punctuation
+                // and string escaping, before any action can be admitted.
+                input_bytes = input_bytes.saturating_add(serde_json::to_vec(&inputs)?.len());
                 ensure!(
                     input_bytes <= MAX_RUN_INPUT_BYTES,
                     "rendered event batch exceeds its byte limit; no actions were started"
@@ -3127,7 +3125,7 @@ mod tests {
         calls: usize,
         replies: VecDeque<FakeReply>,
         omit_scope: bool,
-        inputs: Vec<BTreeMap<String, String>>,
+        inputs: Vec<BTreeMap<String, Value>>,
         provenance: Vec<Option<Provenance>>,
         expected_source_cursor: Option<String>,
     }
@@ -3163,7 +3161,7 @@ mod tests {
         fn invoke(
             &mut self,
             _rule: &Rule,
-            inputs: &BTreeMap<String, String>,
+            inputs: &BTreeMap<String, Value>,
             key: &str,
             provenance: Option<&Provenance>,
             admit: &mut dyn FnMut(&str, &str) -> Result<()>,
@@ -3252,6 +3250,130 @@ mod tests {
             assert!(!journal.contains(private));
             assert!(!summary.contains(private));
         }
+    }
+
+    #[test]
+    fn typed_inputs_agree_between_preview_dispatch_and_durable_replay() {
+        let mut definition = rule();
+        definition.action = definition
+            .action
+            .with_input_value("limit", json!(25))
+            .with_input_value(
+                "options",
+                json!({"labels": ["{{event.data.text}}"], "draft": false}),
+            )
+            .with_input("enabled", "{{event.data.enabled | json}}");
+        let incoming = event("typed").with_data("enabled", "false");
+        let expected = json!({
+            "query": "private-source-text", "limit": 25, "enabled": false,
+            "options": {"labels": ["private-source-text"], "draft": false},
+        });
+        let preview = preview_output(
+            "test",
+            &RuleSet { rules: vec![definition.clone()] },
+            std::slice::from_ref(&incoming),
+        )
+        .unwrap();
+        assert_eq!(
+            preview.payload["data"]["results"][0]["match"]["rendered_inputs"],
+            expected,
+        );
+        let (_temp, args, mut executor) = fixture(vec![definition.clone()], &[incoming]);
+        let first = run(&args, &mut executor).unwrap();
+        assert!(!first.rejected);
+        assert_eq!(executor.calls, 1);
+        assert_eq!(serde_json::to_value(&executor.inputs[0]).unwrap(), expected);
+
+        let mut restarted = FakeExecutor::new(executor.state_path.clone());
+        let replay = run(&args, &mut restarted).unwrap();
+        assert!(!replay.rejected);
+        assert_eq!(restarted.calls, 0);
+        assert_eq!(
+            first.payload["data"]["results"][0]["request_id"],
+            replay.payload["data"]["results"][0]["request_id"],
+        );
+        assert!(!fs::read_to_string(&executor.state_path).unwrap().contains("private-source-text"));
+
+        definition.action.input.insert("limit".into(), json!("25"));
+        save_rules(args.rules_file.as_ref().unwrap(), &RuleSet { rules: vec![definition] }).unwrap();
+        let mut changed = FakeExecutor::new(executor.state_path.clone());
+        let next = run(&args, &mut changed).unwrap();
+        assert!(!next.rejected);
+        assert_eq!(changed.calls, 1);
+        assert_eq!(changed.inputs[0]["limit"], "25");
+        assert_ne!(
+            first.payload["data"]["results"][0]["request_id"],
+            next.payload["data"]["results"][0]["request_id"],
+        );
+    }
+
+    #[test]
+    fn typed_input_upgrade_preserves_string_only_persisted_identities() {
+        #[derive(Serialize)]
+        struct StringAction<'a> {
+            connector: &'a str,
+            operation: &'a str,
+            input: BTreeMap<&'a str, &'a str>,
+        }
+
+        let definition = rule();
+        let scope = execution_scope();
+        let legacy = StringAction {
+            connector: &definition.action.connector,
+            operation: &definition.action.operation,
+            input: BTreeMap::from([("query", "{{event.data.text}}")]),
+        };
+        let previous_bytes =
+            serde_json::to_vec(&(&definition.name, &definition.trigger, &legacy, &scope)).unwrap();
+        let mut previous =
+            blake3::Hasher::new_derive_key("flywheel_connectors.reactive_rules.run_rule.v1");
+        previous.update(&previous_bytes);
+        assert_eq!(
+            rule_identity(&definition, &scope).unwrap(),
+            previous.finalize().to_hex().to_string(),
+        );
+        assert_eq!(
+            previous_bytes,
+            serde_json::to_vec(&(&definition.name, &definition.trigger, &definition.action, &scope)).unwrap(),
+        );
+    }
+
+    #[test]
+    fn invalid_typed_input_late_in_batch_never_reserves_or_dispatches() {
+        let mut definition = rule();
+        definition.action = definition.action.with_input("limit", "{{event.data.limit | json}}");
+        let incoming = [
+            event("first").with_data("limit", "25"),
+            event("last").with_data("limit", "private-invalid-json"),
+        ];
+        let (_temp, args, mut executor) = fixture(vec![definition.clone()], &incoming);
+        let preview = preview_output("test", &RuleSet { rules: vec![definition] }, &incoming).unwrap();
+        assert!(preview.rejected);
+        assert_eq!(
+            preview.payload["data"]["results"][1]["match"]["validation_error"]["type"],
+            "invalid_json_value",
+        );
+        let error = run(&args, &mut executor).err().expect("invalid typed input");
+        assert!(!error.to_string().contains("private-invalid-json"));
+        assert_eq!(executor.prepare_calls, 0);
+        assert_eq!(executor.calls, 0);
+        assert!(!executor.state_path.exists());
+    }
+
+    #[test]
+    fn typed_batch_budget_counts_complete_json_escaping_before_admission() {
+        let mut definition = rule();
+        definition.action = definition
+            .action
+            .with_input("query", "{{event.data.text}}".repeat(33));
+        let incoming = ["first", "second", "third"]
+            .map(|id| event(id).with_data("text", "\0".repeat(30_000)));
+        let (_temp, args, mut executor) = fixture(vec![definition], &incoming);
+        let error = run(&args, &mut executor).err().expect("oversized JSON batch");
+        assert!(error.to_string().contains("rendered event batch exceeds its byte limit"));
+        assert_eq!(executor.prepare_calls, 0);
+        assert_eq!(executor.calls, 0);
+        assert!(!executor.state_path.exists());
     }
 
     #[test]
@@ -3484,7 +3606,7 @@ mod tests {
         expanded
             .action
             .input
-            .insert("query".into(), "{{event.data.text}}".repeat(8));
+            .insert("query".into(), Value::String("{{event.data.text}}".repeat(8)));
         let (_temp, args, mut executor) = fixture(
             vec![expanded],
             &[
@@ -4133,7 +4255,7 @@ mod tests {
         first
             .action
             .input
-            .insert("query".into(), "x".repeat(600_000));
+            .insert("query".into(), Value::String("x".repeat(600_000)));
         save_rules(
             &path,
             &RuleSet {

@@ -739,7 +739,7 @@ impl RuleExecutor for HostRuleExecutor {
     fn invoke(
         &mut self,
         rule: &Rule,
-        inputs: &BTreeMap<String, String>,
+        inputs: &BTreeMap<String, serde_json::Value>,
         idempotency_key: &str,
         provenance: Option<&Provenance>,
         admit: &mut dyn FnMut(&str, &str) -> Result<()>,

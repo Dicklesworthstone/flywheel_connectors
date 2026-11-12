@@ -12,7 +12,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Utc};
 use fcp_core::SafetyTier;
-use serde::{Deserialize, Serialize};
+use serde::de::DeserializeSeed;
+use serde::{Deserialize, Serialize, de};
+use serde_json::Value;
 
 // ── Event Trigger ─────────────────────────────────────────────────
 
@@ -55,9 +57,10 @@ pub struct RuleAction {
     pub connector: String,
     /// Operation to invoke.
     pub operation: String,
-    /// Input template (keys may contain `{{event.data.field}}` placeholders).
-    #[serde(default)]
-    pub input: BTreeMap<String, String>,
+    /// Typed inputs. String values may contain `{{event.data.field}}` templates;
+    /// keys are literal and nested arrays, objects, numbers and booleans retain their types.
+    #[serde(default, deserialize_with = "deserialize_rule_inputs")]
+    pub input: BTreeMap<String, Value>,
 }
 
 impl RuleAction {
@@ -70,9 +73,15 @@ impl RuleAction {
         }
     }
 
-    /// Builder: add an input field.
+    /// Builder: add a string input or template.
     pub fn with_input(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
-        self.input.insert(key.into(), value.into());
+        self.input.insert(key.into(), Value::String(value.into()));
+        self
+    }
+
+    /// Builder: add a typed input, rendering templates only in its string leaves.
+    pub fn with_input_value(mut self, key: impl Into<String>, value: Value) -> Self {
+        self.input.insert(key.into(), value);
         self
     }
 }
@@ -279,8 +288,8 @@ pub struct MatchResult {
     /// Reason for match/mismatch.
     pub reason: String,
     /// Rendered action inputs (only if matched).
-    pub rendered_inputs: Option<BTreeMap<String, String>>,
-    /// Structured rendering failure, when a matching action exceeds its bounds.
+    pub rendered_inputs: Option<BTreeMap<String, Value>>,
+    /// Structured rendering failure, when a matching action is invalid or exceeds its bounds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub validation_error: Option<RenderError>,
 }
@@ -301,7 +310,7 @@ pub enum ExecutionOutcome {
     DryRun,
     /// Rule matched but the event has already been processed.
     Duplicate,
-    /// Rule matched, but its rendered action inputs exceed their resource bound.
+    /// Rule matched, but its rendered action inputs are invalid or exceed their bounds.
     InputRejected,
     /// Rule did not match.
     NoMatch,
@@ -639,8 +648,12 @@ fn evaluate_match_expr(event: &IncomingEvent, expr: &str) -> bool {
         .any(|pattern| value.contains(pattern.trim()))
 }
 
-/// Maximum total UTF-8 bytes in the keys and values of one rendered action.
+/// Maximum total UTF-8 bytes in keys, strings and scalar encodings of one rendered action.
 pub const MAX_RENDERED_INPUT_BYTES: usize = 1024 * 1024;
+/// Maximum value depth below the top-level input object.
+pub const MAX_RENDERED_INPUT_DEPTH: usize = 16;
+/// Maximum values, including empty containers and the top-level input object.
+pub const MAX_RENDERED_INPUT_VALUES: usize = 10_000;
 
 /// A rendering failure that prevents an action from being dispatched.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -651,6 +664,20 @@ pub enum RenderError {
         /// Maximum permitted UTF-8 bytes across all input keys and values.
         limit: usize,
     },
+    /// The complete rendered action contains too many nested values.
+    ValueLimitExceeded {
+        /// Maximum permitted values, including empty containers.
+        limit: usize,
+    },
+    /// An input value is nested too deeply.
+    NestingLimitExceeded {
+        /// Maximum permitted value depth.
+        limit: usize,
+    },
+    /// A JSON filter is not the entire string value or has no source field.
+    InvalidJsonTemplate,
+    /// A JSON source is absent, malformed, ambiguous, or exceeds the remaining bounds.
+    InvalidJsonValue,
 }
 
 impl fmt::Display for RenderError {
@@ -658,6 +685,18 @@ impl fmt::Display for RenderError {
         match self {
             Self::ByteLimitExceeded { limit } => {
                 write!(f, "rendered action inputs exceed the {limit} byte limit")
+            }
+            Self::ValueLimitExceeded { limit } => {
+                write!(f, "rendered action inputs exceed the {limit} value limit")
+            }
+            Self::NestingLimitExceeded { limit } => {
+                write!(f, "rendered action inputs exceed the {limit} nesting limit")
+            }
+            Self::InvalidJsonTemplate => {
+                f.write_str("the json filter requires one complete event.data field expression")
+            }
+            Self::InvalidJsonValue => {
+                f.write_str("the json input source is missing, invalid, or exceeds its bounds")
             }
         }
     }
@@ -672,6 +711,157 @@ fn charge_render_bytes(remaining: &mut usize, bytes: usize) -> Result<(), Render
             limit: MAX_RENDERED_INPUT_BYTES,
         })?;
     Ok(())
+}
+
+struct InputBudget {
+    bytes: usize,
+    values: usize,
+}
+
+impl InputBudget {
+    const fn new() -> Self {
+        Self {
+            bytes: MAX_RENDERED_INPUT_BYTES,
+            values: MAX_RENDERED_INPUT_VALUES,
+        }
+    }
+
+    fn enter(&mut self, depth: usize) -> Result<(), RenderError> {
+        if depth > MAX_RENDERED_INPUT_DEPTH {
+            return Err(RenderError::NestingLimitExceeded {
+                limit: MAX_RENDERED_INPUT_DEPTH,
+            });
+        }
+        self.values = self
+            .values
+            .checked_sub(1)
+            .ok_or(RenderError::ValueLimitExceeded {
+                limit: MAX_RENDERED_INPUT_VALUES,
+            })?;
+        Ok(())
+    }
+}
+
+fn charge_scalar(budget: &mut InputBudget, value: Value) -> Result<Value, RenderError> {
+    charge_render_bytes(&mut budget.bytes, value.to_string().len())?;
+    Ok(value)
+}
+
+/// Decode typed inputs without losing non-finite TOML numbers as JSON nulls.
+/// The same bounded visitor decodes explicit JSON substitutions, so excessive
+/// nesting and wide collections are refused before their full allocation.
+struct InputValueSeed<'a> {
+    budget: &'a mut InputBudget,
+    depth: usize,
+}
+
+impl<'de> DeserializeSeed<'de> for InputValueSeed<'_> {
+    type Value = Value;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Value, D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        self.budget.enter(self.depth).map_err(de::Error::custom)?;
+        deserializer.deserialize_any(InputValueVisitor {
+            budget: self.budget,
+            depth: self.depth,
+        })
+    }
+}
+
+struct InputValueVisitor<'a> {
+    budget: &'a mut InputBudget,
+    depth: usize,
+}
+
+impl<'de> de::Visitor<'de> for InputValueVisitor<'_> {
+    type Value = Value;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a bounded JSON-compatible input value")
+    }
+
+    fn visit_bool<E: de::Error>(self, value: bool) -> Result<Value, E> {
+        charge_scalar(self.budget, Value::Bool(value)).map_err(de::Error::custom)
+    }
+
+    fn visit_i64<E: de::Error>(self, value: i64) -> Result<Value, E> {
+        charge_scalar(self.budget, Value::Number(value.into())).map_err(de::Error::custom)
+    }
+
+    fn visit_u64<E: de::Error>(self, value: u64) -> Result<Value, E> {
+        charge_scalar(self.budget, Value::Number(value.into())).map_err(de::Error::custom)
+    }
+
+    fn visit_f64<E: de::Error>(self, value: f64) -> Result<Value, E> {
+        let number = serde_json::Number::from_f64(value)
+            .ok_or_else(|| E::custom("rule input numbers must be finite"))?;
+        charge_scalar(self.budget, Value::Number(number)).map_err(de::Error::custom)
+    }
+
+    fn visit_str<E: de::Error>(self, value: &str) -> Result<Value, E> {
+        charge_render_bytes(&mut self.budget.bytes, value.len()).map_err(de::Error::custom)?;
+        Ok(Value::String(value.to_owned()))
+    }
+
+    fn visit_string<E: de::Error>(self, value: String) -> Result<Value, E> {
+        charge_render_bytes(&mut self.budget.bytes, value.len()).map_err(de::Error::custom)?;
+        Ok(Value::String(value))
+    }
+
+    fn visit_unit<E: de::Error>(self) -> Result<Value, E> {
+        charge_scalar(self.budget, Value::Null).map_err(de::Error::custom)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Value, A::Error>
+    where
+        A: de::SeqAccess<'de>,
+    {
+        let mut values = Vec::new();
+        while let Some(value) = sequence.next_element_seed(InputValueSeed {
+            budget: &mut *self.budget,
+            depth: self.depth + 1,
+        })? {
+            values.push(value);
+        }
+        Ok(Value::Array(values))
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Value, A::Error>
+    where
+        A: de::MapAccess<'de>,
+    {
+        let mut values = serde_json::Map::new();
+        while let Some(key) = map.next_key::<String>()? {
+            charge_render_bytes(&mut self.budget.bytes, key.len()).map_err(de::Error::custom)?;
+            if values.contains_key(&key) {
+                return Err(de::Error::custom("rule input object has a duplicate key"));
+            }
+            let value = map.next_value_seed(InputValueSeed {
+                budget: &mut *self.budget,
+                depth: self.depth + 1,
+            })?;
+            values.insert(key, value);
+        }
+        Ok(Value::Object(values))
+    }
+}
+
+fn deserialize_rule_inputs<'de, D>(deserializer: D) -> Result<BTreeMap<String, Value>, D::Error>
+where
+    D: de::Deserializer<'de>,
+{
+    let mut budget = InputBudget::new();
+    let Value::Object(values) = (InputValueSeed {
+        budget: &mut budget,
+        depth: 0,
+    })
+    .deserialize(deserializer)?
+    else {
+        return Err(de::Error::custom("rule inputs must be an object"));
+    };
+    Ok(values.into_iter().collect())
 }
 
 fn append_rendered(
@@ -722,6 +912,14 @@ fn render_template_with_budget(
         let literal = &remaining[start..start + end + 4];
         remaining = &after_open[end + 2..];
 
+        if expression
+            .split_once('|')
+            .is_some_and(|(_, filter)| filter.split('|').any(|part| part.trim() == "json"))
+        {
+            // A typed cast must be one complete input value with a valid
+            // event.data source. Never silently stringify or discard it.
+            return Err(RenderError::InvalidJsonTemplate);
+        }
         match expression {
             "event.connector" => {
                 append_rendered(&mut result, &event.connector, remaining_bytes)?;
@@ -766,24 +964,105 @@ fn render_template_with_budget(
     Ok(result)
 }
 
-/// Render all action inputs with event data under one shared byte budget.
+/// Render typed action values under shared byte, value-count and depth bounds.
+/// Only string leaves are templates. An entire `{{event.data.field | json}}`
+/// value explicitly decodes a JSON source; inserted data is never rendered again.
 ///
 /// # Errors
 ///
-/// Returns [`RenderError`] if the combined UTF-8 bytes in all input keys and
-/// rendered values would exceed [`MAX_RENDERED_INPUT_BYTES`].
+/// Returns `RenderError` for invalid typed substitutions or when the complete
+/// action exceeds its resource bounds. Keys remain literal.
 pub fn render_action_inputs(
     action: &RuleAction,
     event: &IncomingEvent,
-) -> Result<BTreeMap<String, String>, RenderError> {
-    let mut remaining_bytes = MAX_RENDERED_INPUT_BYTES;
+) -> Result<BTreeMap<String, Value>, RenderError> {
+    let mut budget = InputBudget::new();
+    budget.enter(0)?;
     let mut inputs = BTreeMap::new();
     for (key, template) in &action.input {
-        charge_render_bytes(&mut remaining_bytes, key.len())?;
-        let value = render_template_with_budget(template, event, &mut remaining_bytes)?;
+        charge_render_bytes(&mut budget.bytes, key.len())?;
+        let value = render_input_value(template, event, &mut budget, 1)?;
         inputs.insert(key.clone(), value);
     }
     Ok(inputs)
+}
+
+fn json_template_field(template: &str) -> Result<Option<&str>, RenderError> {
+    let Some(expression) = template
+        .strip_prefix("{{")
+        .and_then(|value| value.strip_suffix("}}"))
+    else {
+        return Ok(None);
+    };
+    let Some((source, filter)) = expression.trim().split_once('|') else {
+        return Ok(None);
+    };
+    if !filter.split('|').any(|part| part.trim() == "json") {
+        return Ok(None);
+    }
+    if filter.trim() != "json" {
+        return Err(RenderError::InvalidJsonTemplate);
+    }
+    let field = source
+        .trim()
+        .strip_prefix("event.data.")
+        .map(str::trim)
+        .filter(|field| !field.is_empty() && !field.contains(['{', '}']))
+        .ok_or(RenderError::InvalidJsonTemplate)?;
+    Ok(Some(field))
+}
+
+fn render_input_value(
+    template: &Value,
+    event: &IncomingEvent,
+    budget: &mut InputBudget,
+    depth: usize,
+) -> Result<Value, RenderError> {
+    if let Value::String(template) = template
+        && let Some(field) = json_template_field(template)?
+    {
+        let source = event.data.get(field).ok_or(RenderError::InvalidJsonValue)?;
+        if source.len() > MAX_RENDERED_INPUT_BYTES {
+            return Err(RenderError::ByteLimitExceeded {
+                limit: MAX_RENDERED_INPUT_BYTES,
+            });
+        }
+        let mut deserializer = serde_json::Deserializer::from_str(source);
+        let value = InputValueSeed { budget, depth }
+            .deserialize(&mut deserializer)
+            .map_err(|_| RenderError::InvalidJsonValue)?;
+        deserializer
+            .end()
+            .map_err(|_| RenderError::InvalidJsonValue)?;
+        // The visitor validates and charges every inserted value. Returning it
+        // directly keeps provider strings literal, including template syntax.
+        return Ok(value);
+    }
+
+    budget.enter(depth)?;
+    match template {
+        Value::String(template) => render_template_with_budget(template, event, &mut budget.bytes)
+            .map(Value::String),
+        Value::Array(values) => {
+            let mut rendered = Vec::new();
+            for value in values {
+                rendered.push(render_input_value(value, event, budget, depth + 1)?);
+            }
+            Ok(Value::Array(rendered))
+        }
+        Value::Object(values) => {
+            let mut rendered = serde_json::Map::new();
+            for (key, value) in values {
+                charge_render_bytes(&mut budget.bytes, key.len())?;
+                rendered.insert(
+                    key.clone(),
+                    render_input_value(value, event, budget, depth + 1)?,
+                );
+            }
+            Ok(Value::Object(rendered))
+        }
+        scalar => charge_scalar(budget, scalar.clone()),
+    }
 }
 
 // ── Rule Evaluation ───────────────────────────────────────────────
@@ -1140,7 +1419,11 @@ pub fn format_match_result(result: &MatchResult) -> String {
             output.push_str("\n  Inputs:");
             for (k, v) in inputs {
                 use std::fmt::Write;
-                let _ = write!(output, "\n    {k}: {v}");
+                if let Value::String(value) = v {
+                    let _ = write!(output, "\n    {k}: {value}");
+                } else {
+                    let _ = write!(output, "\n    {k}: {v}");
+                }
             }
         }
     }
@@ -1686,6 +1969,209 @@ mod tests {
     }
 
     #[test]
+    fn typed_action_inputs_round_trip_toml_and_preserve_json_types() {
+        let source = r#"
+connector = "github"
+operation = "issues.update"
+[input]
+enabled = true
+limit = 20
+ratio = 0.5
+text_number = "20"
+copied = "{{event.data.flags | json}}"
+[input.options]
+labels = ["bug", "{{event.data.label}}"]
+archived = false
+"#;
+        let action: RuleAction = toml::from_str(source).unwrap();
+        let saved = toml::to_string(&action).unwrap();
+        let restored: RuleAction = toml::from_str(&saved).unwrap();
+        assert_eq!(restored.input, action.input);
+        let event = sample_event()
+            .with_data("label", "urgent")
+            .with_data("secret", "must-not-be-interpolated")
+            .with_data("flags", r#"[1,true,null,{"title":"{{event.data.secret}}"}]"#);
+        let actual = render_action_inputs(&restored, &event).unwrap();
+        assert_eq!(
+            serde_json::to_value(actual).unwrap(),
+            serde_json::json!({
+                "enabled": true, "limit": 20, "ratio": 0.5, "text_number": "20",
+                "options": {"labels": ["bug", "urgent"], "archived": false},
+                "copied": [1, true, null, {"title": "{{event.data.secret}}"}],
+            }),
+        );
+    }
+
+    #[test]
+    fn typed_json_scalars_are_explicit_and_inserted_strings_stay_literal() {
+        let action = RuleAction::new("github", "issues.update")
+            .with_input("plain", "{{event.data.number}}")
+            .with_input("number", "{{event.data.number | json}}")
+            .with_input("boolean", "{{event.data.boolean | json}}")
+            .with_input("nothing", "{{event.data.nothing | json}}")
+            .with_input("text", "{{event.data.text | json}}");
+        let event = sample_event()
+            .with_data("number", "18446744073709551615")
+            .with_data("boolean", "false")
+            .with_data("nothing", "null")
+            .with_data("text", r#""{{event.data.boolean}}""#);
+        let rendered = render_action_inputs(&action, &event).unwrap();
+        assert_eq!(rendered["plain"], "18446744073709551615");
+        assert_eq!(rendered["number"].as_u64(), Some(u64::MAX));
+        assert_eq!(rendered["boolean"], false);
+        assert!(rendered["nothing"].is_null());
+        assert_eq!(rendered["text"], "{{event.data.boolean}}");
+    }
+
+    #[test]
+    fn typed_json_sources_fail_closed_without_disclosing_the_source() {
+        let action = RuleAction::new("github", "issues.update")
+            .with_input("value", "{{event.data.private | json}}");
+        for source in ["", "private-malformed-json", "1 2", r#"{"a":1,"a":2}"#, "1e9999"] {
+            let event = sample_event().with_data("private", source);
+            let error = render_action_inputs(&action, &event).unwrap_err();
+            assert_eq!(error, RenderError::InvalidJsonValue);
+            assert!(!error.to_string().contains("private"));
+        }
+        assert_eq!(
+            render_action_inputs(&action, &sample_event()),
+            Err(RenderError::InvalidJsonValue),
+        );
+        for template in [
+            "prefix {{event.data.private | json}}",
+            "{{event.data.private | json}} suffix",
+            "{{event.data.private}}{{event.data.private | json}}",
+            "{{event.data. | json}}",
+            "{{event.connector | json}}",
+            "{{unknown.field | json}}",
+            "{{event.data.private | json | truncate(2)}}",
+            "{{event.data.private | truncate(2) | json}}",
+        ] {
+            let action = RuleAction::new("github", "issues.update").with_input("value", template);
+            assert_eq!(
+                render_action_inputs(&action, &sample_event().with_data("private", "1")),
+                Err(RenderError::InvalidJsonTemplate),
+                "{template}",
+            );
+        }
+    }
+
+    #[test]
+    fn typed_input_decoding_rejects_nonfinite_numbers_and_duplicate_keys() {
+        for number in ["nan", "inf", "-inf"] {
+            let source = format!(
+                "connector = 'github'\noperation = 'issues.update'\n[input.nested]\nnumber = {number}\n"
+            );
+            assert!(toml::from_str::<RuleAction>(&source).is_err());
+        }
+        for input in [r#"{"a":1,"a":2}"#, r#"{"nested":{"a":1,"a":2}}"#, "[]"] {
+            let source = format!(
+                r#"{{"connector":"github","operation":"issues.update","input":{input}}}"#
+            );
+            assert!(serde_json::from_str::<RuleAction>(&source).is_err());
+        }
+    }
+
+    #[test]
+    fn typed_inputs_share_byte_and_value_limits_across_nested_fields() {
+        let event = sample_event();
+        let text = Value::String("x".repeat(MAX_RENDERED_INPUT_BYTES / 2));
+        let first = RuleAction::new("github", "issues.update")
+            .with_input_value("a", serde_json::json!({"nested": text}));
+        assert!(render_action_inputs(&first, &event).is_ok());
+        let combined = first.with_input_value(
+            "b",
+            serde_json::json!({"nested": "x".repeat(MAX_RENDERED_INPUT_BYTES / 2)}),
+        );
+        assert!(matches!(
+            render_action_inputs(&combined, &event),
+            Err(RenderError::ByteLimitExceeded { .. }),
+        ));
+
+        let values = Value::Array(vec![Value::Array(Vec::new()); MAX_RENDERED_INPUT_VALUES / 2]);
+        let first = RuleAction::new("github", "issues.update").with_input_value("a", values.clone());
+        assert!(render_action_inputs(&first, &event).is_ok());
+        let combined = first.with_input_value("b", values);
+        assert!(matches!(
+            render_action_inputs(&combined, &event),
+            Err(RenderError::ValueLimitExceeded { .. }),
+        ));
+        let encoded = serde_json::to_string(&combined).unwrap();
+        assert!(serde_json::from_str::<RuleAction>(&encoded).is_err());
+
+        let source = serde_json::to_string(&vec![""; MAX_RENDERED_INPUT_VALUES / 2]).unwrap();
+        let event = sample_event().with_data("items", source);
+        let first = RuleAction::new("github", "issues.update")
+            .with_input("a", "{{event.data.items | json}}");
+        assert!(render_action_inputs(&first, &event).is_ok());
+        let combined = first.with_input("b", "{{event.data.items | json}}");
+        assert_eq!(
+            render_action_inputs(&combined, &event),
+            Err(RenderError::InvalidJsonValue),
+        );
+    }
+
+    #[test]
+    fn typed_json_sources_cannot_reset_depth_or_escape_the_source_byte_bound() {
+        let mut boundary = Value::Bool(true);
+        for _ in 1..MAX_RENDERED_INPUT_DEPTH {
+            boundary = Value::Array(vec![boundary]);
+        }
+        let action = RuleAction::new("github", "issues.update")
+            .with_input_value("value", boundary.clone());
+        assert!(render_action_inputs(&action, &sample_event()).is_ok());
+        let too_deep = RuleAction::new("github", "issues.update")
+            .with_input_value("value", Value::Array(vec![boundary]));
+        assert!(matches!(
+            render_action_inputs(&too_deep, &sample_event()),
+            Err(RenderError::NestingLimitExceeded { .. }),
+        ));
+        assert!(serde_json::from_str::<RuleAction>(&serde_json::to_string(&too_deep).unwrap()).is_err());
+
+        let mut template = Value::String("{{event.data.value | json}}".into());
+        for _ in 1..MAX_RENDERED_INPUT_DEPTH {
+            template = Value::Array(vec![template]);
+        }
+        let action = RuleAction::new("github", "issues.update").with_input_value("value", template);
+        assert!(render_action_inputs(&action, &sample_event().with_data("value", "1")).is_ok());
+        assert_eq!(
+            render_action_inputs(&action, &sample_event().with_data("value", "[1]")),
+            Err(RenderError::InvalidJsonValue),
+        );
+
+        let action = RuleAction::new("github", "issues.update")
+            .with_input("value", "{{event.data.value | json}}");
+        let source = format!("{}0", " ".repeat(MAX_RENDERED_INPUT_BYTES));
+        assert!(matches!(
+            render_action_inputs(&action, &sample_event().with_data("value", source)),
+            Err(RenderError::ByteLimitExceeded { .. }),
+        ));
+    }
+
+    #[test]
+    fn typed_object_keys_and_decoded_provider_templates_are_literal() {
+        let action = RuleAction::new("github", "issues.update").with_input_value(
+            "{{event.data.key}}",
+            serde_json::json!({
+                "{{event.data.key}}": "{{event.data.value | json}}",
+                "label": "{{event.data.label}}",
+            }),
+        );
+        let event = sample_event()
+            .with_data("key", "changed")
+            .with_data("label", "resolved")
+            .with_data("value", r#"{"nested":["{{event.data.label}}"]}"#);
+        let rendered = render_action_inputs(&action, &event).unwrap();
+        assert_eq!(
+            rendered["{{event.data.key}}"],
+            serde_json::json!({
+                "{{event.data.key}}": {"nested": ["{{event.data.label}}"]},
+                "label": "resolved",
+            }),
+        );
+    }
+
+    #[test]
     fn template_expansion_rejects_amplification() {
         let event =
             IncomingEvent::new("slack", "message.new").with_data("text", "x".repeat(128 * 1024));
@@ -1772,7 +2258,7 @@ mod tests {
             RuleAction::new("github", "create_issue").with_input("key", "{{event.data.text}}");
         let rendered = render_action_inputs(&action, &event).unwrap();
         assert_eq!(
-            rendered["key"].len() + "key".len(),
+            rendered["key"].as_str().unwrap().len() + "key".len(),
             MAX_RENDERED_INPUT_BYTES
         );
         let action = action.with_input("z", "");
@@ -2373,7 +2859,7 @@ mod tests {
             reason: "matched".to_string(),
             rendered_inputs: Some(BTreeMap::from([(
                 "title".to_string(),
-                "Bug report".to_string(),
+                Value::String("Bug report".to_string()),
             )])),
             validation_error: None,
         };
@@ -2678,7 +3164,7 @@ mod tests {
             rule_name: "r1".to_string(),
             matched: true,
             reason: "ok".to_string(),
-            rendered_inputs: Some(BTreeMap::from([("k".to_string(), "v".to_string())])),
+            rendered_inputs: Some(BTreeMap::from([("k".to_string(), Value::String("v".to_string()))])),
             validation_error: None,
         };
         let json = serde_json::to_value(&mr).unwrap();
@@ -3321,8 +3807,8 @@ mod tests {
     #[test]
     fn format_match_result_multiple_inputs() {
         let mut inputs = BTreeMap::new();
-        inputs.insert("alpha".to_string(), "one".to_string());
-        inputs.insert("beta".to_string(), "two".to_string());
+        inputs.insert("alpha".to_string(), Value::String("one".to_string()));
+        inputs.insert("beta".to_string(), Value::String("two".to_string()));
         let result = MatchResult {
             rule_name: "test".to_string(),
             matched: true,

@@ -1335,10 +1335,34 @@ fwc rules disable search-related-issues
 
 Use `--rules-file PATH` after `rules` for a separate rules file. Each event uses
 `connector`, `event_type`, an optional `event_id`, and string-valued `data`.
+
+Action inputs preserve TOML numbers, booleans, arrays, and nested objects through
+preview, host preflight, and invocation. Templates expand only inside string
+values; object keys are literal. A quoted `"false"` stays a string, while
+`false` stays a boolean. Use a complete `"{{event.data.field | json}}"` value
+to explicitly decode JSON text from an event field into a number, boolean,
+array, object, string, or null. For example, the input for `github.search_issues`
+can be:
+
+```toml
+input = { query = "{{event.data.text}}", per_page = 25, page = "{{event.data.page | json}}" }
+```
+
+With `data.page = "2"`, the host receives the integer `2`. Missing or invalid
+JSON fields, duplicate JSON object keys, non-finite TOML numbers, and JSON filters
+embedded in text are rejected before any action in the batch starts. JSON data
+is inserted literally: template-looking strings inside provider data are never
+evaluated again. Existing string-only definitions keep their persisted execution
+identities; changing an input's type changes the action identity.
+
 Definitions are capped at 1 MiB, events at 256 KiB each and 16 MiB per file,
-and previews at 10,000 rule/event evaluations and 8 MiB of output. Every
-rendered action has a shared 1 MiB limit; an exceeded limit is reported as
-`input_rejected` and yields a nonzero exit status.
+and previews at 10,000 rule/event evaluations and 8 MiB of output. Each rendered
+action shares a 1 MiB budget across nested keys, strings and scalar encodings,
+a 10,000-value budget including empty containers, and a maximum depth of 16 below
+the input object. Each explicit JSON source is also limited to 1 MiB before
+decoding, and the complete serialized input batch is capped at 16 MiB, including
+JSON escaping. Invalid or excessive inputs are reported as `input_rejected`
+in previews and fail live admission without dispatch.
 
 Live runs validate the complete event batch and resolve every enabled rule's
 target and credentials before starting any action. Default credentials may cover
@@ -1446,9 +1470,11 @@ For a remote journal, add the same `--executor-node '<node-id>'` used to open it
 The consumer pins that executor through every poll and ACK; an initially local
 consumer also retains the first reported owner for the rest of its batch.
 Nested object fields become dotted template names such as `event.data.issue.title`;
-scalar strings are preserved, and other leaf values use JSON text. Ambiguous
-flattened paths, excessive depth, and more than 1,024 fields are rejected before
-any action starts.
+scalar strings are preserved, and other leaf values use JSON text. A complete
+`{{event.data.field | json}}` input can retain a leaf's numeric, boolean, or array
+type; construct object inputs with nested input tables and dotted leaf templates.
+Ambiguous flattened paths, excessive depth, and more than 1,024 fields are
+rejected before any action starts.
 
 Actions use the same selected gateway and source zone. Their own host admission
 decides execution placement independently of the journal's executor. The runner carries
