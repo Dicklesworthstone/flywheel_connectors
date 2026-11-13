@@ -15923,13 +15923,22 @@ async fn before_invoke_route_deadline<T>(
 /// this same admission boundary; the transport retains only a response waiter.
 async fn execute_local_invoke(
     state: &Arc<AppState>,
-    request: InvokeRequest,
+    mut request: InvokeRequest,
     asserted_principal: Option<String>,
     relay: Option<fcp_host::RelayCancellationBinding>,
+    deadline: Instant,
 ) -> Result<InvokeResponse, (StatusCode, String)> {
-    invoke_jobs::execute(state, request, asserted_principal, None, relay, None)
-        .await
-        .map_err(map_host_error)
+    constrain_invoke_deadline(&mut request, deadline);
+    invoke_jobs::execute(
+        state,
+        request,
+        asserted_principal,
+        Some(deadline),
+        relay,
+        None,
+    )
+    .await
+    .map_err(map_host_error)
 }
 
 /// Body limit for `/rpc/mesh/forward` (forward envelope cap plus JSON
@@ -17050,6 +17059,41 @@ fn mesh_reply_body<T: Serialize>(result: Result<T, (StatusCode, String)>) -> (u1
     }
 }
 
+/// Account for time in transit once, then use only a monotonic deadline. A
+/// future origin clock cannot add time to the request's relative budget; the
+/// envelope verifier separately enforces the permitted clock-skew window.
+fn mesh_inbound_invoke_deadline(
+    deadline_ms: Option<u64>,
+    received_at: Instant,
+    received_unix_ms: u64,
+    issued_at_ms: u64,
+) -> Instant {
+    let budget =
+        invocation_deadline(received_at, deadline_ms).saturating_duration_since(received_at);
+    let age = Duration::from_millis(received_unix_ms.saturating_sub(issued_at_ms));
+    received_at
+        .checked_add(budget.saturating_sub(age))
+        .unwrap_or(received_at)
+}
+
+/// Replay admission consumes the same execution budget as local dispatch.
+/// Timing out never rolls back a queued or committed nonce, and an unsigned
+/// refusal is not proof of non-execution for an origin considering failover.
+async fn admit_mesh_forward(
+    deadline: Option<Instant>,
+    admission: impl std::future::Future<Output = Result<(), fcp_mesh::invoke_route::MeshForwardError>>,
+) -> Result<(), (StatusCode, String)> {
+    let admitted = match deadline {
+        Some(deadline) => {
+            before_invoke_route_deadline(deadline, admission, "mesh replay admission")
+                .await
+                .map_err(map_host_error)?
+        }
+        None => admission.await,
+    };
+    admitted.map_err(|error| (mesh_forward_error_status(&error), error.to_string()))
+}
+
 /// Peer-facing endpoint: execute a signed forward from a mesh peer.
 ///
 /// The envelope must be addressed to this node, signed by a directory peer,
@@ -17062,23 +17106,46 @@ async fn mesh_forward_handler(
 ) -> Result<Json<fcp_mesh::invoke_route::MeshForwardReply>, (StatusCode, String)> {
     use fcp_mesh::invoke_route::MeshForwardBody;
 
+    let started_at = Instant::now();
+    let received_unix_ms = fcp_host::mesh_routing::unix_now_ms();
     let Some(router) = state.mesh.clone() else {
         return Err((
             StatusCode::NOT_FOUND,
             "mesh routing is not configured on this host".to_string(),
         ));
     };
-    if let Err(error) = router.accept_inbound_async(&envelope).await {
+    // Decode once before admission so journal queueing/sync and JSON decoding
+    // cannot grant a fresh budget at the executor. No decoded field authorizes
+    // execution: signature verification and durable replay admission still
+    // precede every local handler, including malformed-request responses.
+    let prepared_invoke = match &envelope.body {
+        MeshForwardBody::Invoke { request_json, .. } => Some(
+            serde_json::from_str::<InvokeRequest>(request_json).map(|request| {
+                let deadline = mesh_inbound_invoke_deadline(
+                    request.deadline_ms,
+                    started_at,
+                    received_unix_ms,
+                    envelope.issued_at_ms,
+                );
+                (request, deadline)
+            }),
+        ),
+        _ => None,
+    };
+    let deadline = prepared_invoke
+        .as_ref()
+        .and_then(|request| request.as_ref().ok())
+        .map(|(_, deadline)| *deadline);
+    if let Err(error) = admit_mesh_forward(deadline, router.accept_inbound_async(&envelope)).await {
         tracing::warn!(
             event = "mesh_forward_rejected",
             origin_node = envelope.origin_node.as_str(),
             method = envelope.body.method(),
-            error = %error,
+            error = %error.1,
             "rejected mesh forward envelope"
         );
-        return Err((mesh_forward_error_status(&error), error.to_string()));
+        return Err(error);
     }
-    let started_at = Instant::now();
     let (status, body_json) = match &envelope.body {
         MeshForwardBody::ConnectorStateExport { request_json } => {
             connector_state_transfer::export_reply(&state, &router, &envelope, request_json).await
@@ -17093,11 +17160,15 @@ async fn mesh_forward_handler(
                 .await,
         ),
         MeshForwardBody::Invoke {
-            request_json,
             asserted_principal,
             origin_attempt_id,
-        } => match serde_json::from_str::<InvokeRequest>(request_json) {
-            Ok(request) => mesh_reply_body(
+            ..
+        } => match prepared_invoke.ok_or_else(|| {
+            map_host_error(HostError::Internal(
+                "mesh invocation was not decoded before admission".to_string(),
+            ))
+        })? {
+            Ok((request, deadline)) => mesh_reply_body(
                 Box::pin(execute_local_invoke(
                     &state,
                     request,
@@ -17106,6 +17177,7 @@ async fn mesh_forward_handler(
                         origin_node: envelope.origin_node.as_str().to_owned(),
                         origin_attempt_id,
                     }),
+                    deadline,
                 ))
                 .await,
             ),
@@ -21007,6 +21079,254 @@ output_schema = {{ type = "object" }}
             mesh_forward_error_status(&MeshForwardError::ReplayCacheSaturated { capacity: 1 }),
             StatusCode::SERVICE_UNAVAILABLE
         );
+    }
+
+    #[test]
+    fn mesh_inbound_invoke_budget_accounts_for_transit_without_skew_credit() {
+        let received_at = Instant::now();
+        let received_unix_ms = 1_000_000;
+        for (requested, issued_at_ms, remaining_ms) in [
+            (Some(500), 999_800, 300),
+            (Some(500), 999_500, 0),
+            (Some(500), 999_000, 0),
+            (Some(500), 1_000_100, 500),
+            (Some(500), u64::MAX, 500),
+            (Some(0), 1_000_000, 0),
+            (None, 990_000, 50_000),
+            (Some(u64::MAX), 990_000, 50_000),
+            (Some(u64::MAX), 0, 0),
+        ] {
+            let deadline = mesh_inbound_invoke_deadline(
+                requested,
+                received_at,
+                received_unix_ms,
+                issued_at_ms,
+            );
+            assert_eq!(
+                deadline.saturating_duration_since(received_at),
+                Duration::from_millis(remaining_ms),
+                "requested={requested:?}, issued_at_ms={issued_at_ms}"
+            );
+        }
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn mesh_inbound_replay_admission_is_bounded_by_the_execution_deadline() {
+        let polled = AtomicBool::new(false);
+        let expired = Instant::now() - Duration::from_millis(1);
+        let error = admit_mesh_forward(Some(expired), async {
+            polled.store(true, Ordering::SeqCst);
+            Ok(())
+        })
+        .await
+        .expect_err("an expired request cannot begin replay admission");
+        assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            error
+                .1
+                .contains("deadline expired before mesh replay admission")
+        );
+        assert!(!polled.load(Ordering::SeqCst));
+
+        let remaining = Instant::now() + Duration::from_millis(30);
+        let error = fcp_async_core::time::timeout(
+            Duration::from_secs(2),
+            admit_mesh_forward(Some(remaining), async {
+                polled.store(true, Ordering::SeqCst);
+                std::future::pending().await
+            }),
+        )
+        .await
+        .expect("a stalled replay journal must not renew the execution budget")
+        .expect_err("replay admission must stop at the invocation deadline");
+        assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            error
+                .1
+                .contains("deadline expired during mesh replay admission")
+        );
+        assert!(polled.load(Ordering::SeqCst));
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn mesh_inbound_invoke_retains_parent_deadline_after_replay_admission() {
+        let state = dispatcher_app_state(
+            dispatcher_registry_with_connectors(Vec::new()),
+            Arc::new(HostAdminStateStore::new()),
+            None,
+            HashMap::new(),
+        );
+        let signing_key = fcp_crypto::ed25519::Ed25519SigningKey::generate();
+        let mut request = invoke_token_bucket_request(
+            "fcp.test.mesh-deadline:utility:1.0.0",
+            "test.echo",
+            "cap.test.echo",
+            ZoneId::work(),
+            &signing_key,
+        );
+        request.deadline_ms = Some(5_000);
+        let deadline = Instant::now() + Duration::from_millis(30);
+        admit_mesh_forward(Some(deadline), async { Ok(()) })
+            .await
+            .expect("replay admission completes before the deadline");
+        // Scheduling after admission consumes the same budget. There is no
+        // connector in this fixture: reaching discovery would produce a
+        // different failure and prove that execution renewed its allowance.
+        fcp_async_core::time::sleep(Duration::from_millis(50)).await;
+        let error = execute_local_invoke(&state, request.clone(), None, None, deadline)
+            .await
+            .expect_err("post-admission scheduling cannot mint five more seconds");
+        assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            error
+                .1
+                .contains("deadline expired before connector lifecycle authority")
+        );
+        assert!(
+            state
+                .lifecycle
+                .invocation_record(&request.id.to_string(), None)
+                .await
+                .is_none()
+        );
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn mesh_inbound_invoke_age_reaches_native_handoff_and_expired_calls_do_not_execute() {
+        use fcp_host::mesh_routing::{MeshRouter, MeshRoutingSettings, unix_now_ms};
+        use fcp_mesh::invoke_route::{MeshForwardBody, MeshForwardEnvelope};
+
+        const CONNECTOR: &str = "fcp.test.mesh-inbound-deadline:utility:1.0.0";
+        const OPERATION: &str = "test.echo";
+        const CAPABILITY: &str = "cap.test.echo";
+        let signing_key = fcp_crypto::ed25519::Ed25519SigningKey::generate();
+        let origin_key = fcp_crypto::ed25519::Ed25519SigningKey::generate();
+        let invokes = Arc::new(AtomicU64::new(0));
+        let observed_invokes = Arc::clone(&invokes);
+        let introspection = dispatcher_introspection(OPERATION, CAPABILITY, SafetyTier::Safe);
+        let (runner_tx, mut runner_rx) = mpsc::channel::<ConnectorRpcRequest>(8);
+        let runner_task = task::spawn(async move {
+            while let Some(rpc) = runner_rx.recv().await {
+                assert!(rpc.rpc.try_begin());
+                let result = match rpc.method.as_str() {
+                    "introspect" => json!(introspection),
+                    "health" => dispatcher_health_result(),
+                    "invoke" => {
+                        observed_invokes.fetch_add(1, Ordering::SeqCst);
+                        let request: InvokeRequest =
+                            serde_json::from_value(rpc.params).expect("native invoke request");
+                        json!(InvokeResponse::ok(
+                            request.id,
+                            json!({ "deadline_ms": request.deadline_ms }),
+                        ))
+                    }
+                    method => panic!("unexpected connector method {method}"),
+                };
+                assert!(rpc.rpc.try_settle_reply());
+                let _ = rpc.response_tx.send(Ok(json!({ "result": result })));
+            }
+        });
+        let mut state = dispatcher_app_state(
+            dispatcher_registry_with_connector(
+                CONNECTOR,
+                dispatcher_test_connector(CONNECTOR, runner_tx, runner_task),
+                dispatcher_test_config(CONNECTOR),
+            ),
+            Arc::new(HostAdminStateStore::new()),
+            Some(signing_key.verifying_key()),
+            HashMap::new(),
+        );
+        Arc::get_mut(&mut state).expect("exclusive test state").mesh = Some(Arc::new(
+            MeshRouter::new(MeshRoutingSettings {
+                node_id: TailscaleNodeId::new("executor"),
+                signing_key: fcp_crypto::ed25519::Ed25519SigningKey::generate(),
+                peers_json: json!([{
+                    "node_id": "origin",
+                    "endpoint": "http://127.0.0.1:1",
+                    "public_key_hex": hex::encode(origin_key.verifying_key().to_bytes()),
+                }])
+                .to_string(),
+                forward_timeout: Duration::from_secs(60),
+            })
+            .expect("executor router"),
+        ));
+        let envelope_for = |request: &InvokeRequest, issued_at_ms| {
+            MeshForwardEnvelope::sign(
+                &origin_key,
+                TailscaleNodeId::new("origin"),
+                TailscaleNodeId::new("executor"),
+                issued_at_ms,
+                MeshForwardBody::Invoke {
+                    request_json: serde_json::to_string(request).expect("invoke JSON"),
+                    asserted_principal: None,
+                    origin_attempt_id: None,
+                },
+            )
+            .expect("signed invocation")
+        };
+        let mut request = invoke_token_bucket_request(
+            CONNECTOR,
+            OPERATION,
+            CAPABILITY,
+            ZoneId::work(),
+            &signing_key,
+        );
+        request.deadline_ms = Some(20_000);
+        let envelope = envelope_for(&request, unix_now_ms().saturating_sub(5_000));
+        let Json(reply) = mesh_forward_handler(State(Arc::clone(&state)), Json(envelope))
+            .await
+            .expect("unexpired signed request reaches the local pipeline");
+        assert_eq!(reply.status, StatusCode::OK.as_u16(), "{}", reply.body_json);
+        let response: InvokeResponse =
+            serde_json::from_str(&reply.body_json).expect("invoke response");
+        let native_budget = response.result.as_ref().expect("result")["deadline_ms"]
+            .as_u64()
+            .expect("narrowed native request");
+        assert!((1..=15_000).contains(&native_budget), "{native_budget}");
+
+        request.id = RequestId::random();
+        request.deadline_ms = Some(5_000);
+        let envelope = envelope_for(&request, unix_now_ms() + 10_000);
+        let Json(reply) = mesh_forward_handler(State(Arc::clone(&state)), Json(envelope))
+            .await
+            .expect("permitted future skew cannot add budget");
+        assert_eq!(reply.status, StatusCode::OK.as_u16(), "{}", reply.body_json);
+        let response: InvokeResponse =
+            serde_json::from_str(&reply.body_json).expect("invoke response");
+        let native_budget = response.result.as_ref().expect("result")["deadline_ms"]
+            .as_u64()
+            .expect("bounded native request");
+        assert!((1..=5_000).contains(&native_budget), "{native_budget}");
+
+        request.id = RequestId::random();
+        let envelope = envelope_for(&request, unix_now_ms() + 60_000);
+        let error = mesh_forward_handler(State(Arc::clone(&state)), Json(envelope))
+            .await
+            .expect_err("excessive future skew must still fail authentication");
+        assert_eq!(error.0, StatusCode::UNAUTHORIZED);
+
+        for budget in [0, 50] {
+            request.id = RequestId::random();
+            request.deadline_ms = Some(budget);
+            let envelope = envelope_for(&request, unix_now_ms().saturating_sub(500));
+            let error = mesh_forward_handler(State(Arc::clone(&state)), Json(envelope))
+                .await
+                .expect_err("an expired signed request must not begin local execution");
+            assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
+            assert!(
+                error
+                    .1
+                    .contains("deadline expired before mesh replay admission")
+            );
+            assert!(
+                state
+                    .lifecycle
+                    .invocation_record(&request.id.to_string(), None)
+                    .await
+                    .is_none()
+            );
+        }
+        assert_eq!(invokes.load(Ordering::SeqCst), 2);
     }
 
     #[cfg(unix)]
