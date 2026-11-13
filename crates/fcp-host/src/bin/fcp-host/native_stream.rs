@@ -726,6 +726,7 @@ while IFS= read -r _request; do :; done
                     .await
                     .unwrap(),
             ),
+            None,
         )
         .unwrap();
         let ack = EventAck::new("events", vec![1]);
@@ -767,6 +768,7 @@ while IFS= read -r _request; do :; done
                     .await
                     .unwrap(),
             ),
+            None,
         )
         .unwrap();
         transport

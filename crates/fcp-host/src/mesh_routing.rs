@@ -137,6 +137,50 @@ const STREAM_FORWARD_LIMITS: MeshForwardLimits = MeshForwardLimits {
     max_response_bytes: 4 * MAX_REPLY_BYTES,
 };
 
+/// Continuous transport authority for an already admitted forwarded invocation.
+///
+/// This retains the origin's exact pre-journal peer incarnation independently of
+/// cancellation metadata or capability-holder identity. It grants no capability
+/// to invoke a connector and carries no request body or credential material.
+#[derive(Clone, Debug)]
+pub struct MeshInvokeOrigin {
+    router: Arc<MeshRouter>,
+    snapshot: Arc<PeerSnapshot>,
+}
+
+impl MeshInvokeOrigin {
+    /// Recheck membership after local admission, persistence or preparation waits.
+    ///
+    /// # Errors
+    /// Refuses unavailable or expired membership and any removal or key/endpoint
+    /// change of the originally authenticated origin, including remove/re-add.
+    /// An unrelated peer update or continuous renewal preserves this authority.
+    pub fn require_current(&self) -> Result<(), MeshForwardError> {
+        self.router.ensure_current_peer(&self.snapshot)
+    }
+
+    /// Check immediately before runtime command selection without blocking.
+    ///
+    /// No disk access, signature verification or blocking lock acquisition occurs.
+    /// Contention or poisoning of the publication lock conservatively returns
+    /// false; this is an inability to establish authority, not proof of revocation.
+    /// A completed unrelated publication still preserves the captured peer epoch.
+    #[must_use]
+    pub fn is_current_for_dispatch(&self) -> bool {
+        self.router
+            .membership
+            .as_ref()
+            .map_or_else(
+                || {
+                    self.router
+                        .ensure_current_directory(self.snapshot.directory())
+                },
+                |membership| membership.check_peer_snapshot_for_dispatch(&self.snapshot),
+            )
+            .is_ok()
+    }
+}
+
 /// Continuous origin authority for one already admitted cancellation envelope.
 /// The guard carries no cancellation capability; the executor must verify that
 /// separately and recheck this guard immediately before changing an operation.
@@ -442,6 +486,7 @@ pub struct MeshRouter {
 const _: fn() = || {
     const fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<MeshRouter>();
+    assert_send_sync::<MeshInvokeOrigin>();
 };
 
 impl std::fmt::Debug for MeshRouter {
@@ -992,6 +1037,43 @@ impl MeshRouter {
         self.accept_inbound(envelope)
     }
 
+    /// Admit an invoke while retaining its original peer authority for dispatch.
+    ///
+    /// Capture precedes replay admission: reacquiring a peer after the journal
+    /// wait could authorize a different incarnation with the same node and key.
+    /// The existing replay path still owns nonce consumption, including uncertain
+    /// or cancelled admission. This method never reverses or retries that work.
+    /// Envelope freshness is an admission check; the invocation's inherited
+    /// execution deadline continues to govern its later runtime waits.
+    ///
+    /// # Errors
+    /// Refuses non-invoke envelopes, unauthenticated or replayed requests, and
+    /// changes to the captured origin before durable admission completes.
+    pub async fn accept_inbound_invoke_async(
+        self: &Arc<Self>,
+        envelope: &MeshForwardEnvelope,
+    ) -> Result<MeshInvokeOrigin, MeshForwardError> {
+        if !matches!(&envelope.body, MeshForwardBody::Invoke { .. }) {
+            return Err(MeshForwardError::Malformed {
+                field: "invoke_origin",
+                detail: "invoke origin authority requires an invocation envelope".to_owned(),
+            });
+        }
+        let snapshot = self.trusted_peer(&envelope.origin_node)?;
+        envelope.verify(
+            snapshot.directory(),
+            unix_now_ms(),
+            DEFAULT_MESH_FORWARD_MAX_SKEW_MS,
+        )?;
+        self.ensure_current_peer(&snapshot)?;
+        self.accept_inbound_async(envelope).await?;
+        self.ensure_current_peer(&snapshot)?;
+        Ok(MeshInvokeOrigin {
+            router: Arc::clone(self),
+            snapshot: Arc::new(snapshot),
+        })
+    }
+
     /// Sign the reply to an accepted inbound envelope.
     #[must_use]
     pub fn sign_reply(
@@ -1308,6 +1390,77 @@ mod tests {
                 "{endpoint}"
             );
         }
+    }
+
+    #[test]
+    fn invoke_origin_requires_authenticated_invoke_and_consumes_nonce_once() {
+        let local_key = Ed25519SigningKey::generate();
+        let peer_key = Ed25519SigningKey::generate();
+        let router = Arc::new(
+            MeshRouter::new(MeshRoutingSettings {
+                node_id: TailscaleNodeId::new("node-a"),
+                signing_key: local_key,
+                peers_json: peers_json(&[("node-b", &peer_key)]),
+                forward_timeout: Duration::from_secs(5),
+            })
+            .unwrap(),
+        );
+        for origin_attempt_id in [None, Some(7)] {
+            let envelope = MeshForwardEnvelope::sign(
+                &peer_key,
+                TailscaleNodeId::new("node-b"),
+                TailscaleNodeId::new("node-a"),
+                unix_now_ms(),
+                MeshForwardBody::Invoke {
+                    request_json: "{}".to_owned(),
+                    asserted_principal: None,
+                    origin_attempt_id,
+                },
+            )
+            .unwrap();
+            let mut forged = envelope.clone();
+            forged.signature = "00".repeat(64);
+            assert!(
+                fcp_async_core::runtime::block_on_sync(
+                    router.accept_inbound_invoke_async(&forged),
+                )
+                .unwrap()
+                .is_err()
+            );
+            let origin = fcp_async_core::runtime::block_on_sync(
+                router.accept_inbound_invoke_async(&envelope),
+            )
+            .unwrap()
+            .expect("failed authentication cannot consume the valid envelope's nonce");
+            origin.require_current().unwrap();
+            assert!(origin.clone().is_current_for_dispatch());
+            assert!(matches!(
+                fcp_async_core::runtime::block_on_sync(
+                    router.accept_inbound_invoke_async(&envelope),
+                )
+                .unwrap(),
+                Err(MeshForwardError::Replayed { .. })
+            ));
+        }
+        let read = MeshForwardEnvelope::sign(
+            &peer_key,
+            TailscaleNodeId::new("node-b"),
+            TailscaleNodeId::new("node-a"),
+            unix_now_ms(),
+            MeshForwardBody::Introspect {
+                connector_id: "fcp.test:utility:1.0.0".to_owned(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            fcp_async_core::runtime::block_on_sync(router.accept_inbound_invoke_async(&read))
+                .unwrap(),
+            Err(MeshForwardError::Malformed {
+                field: "invoke_origin",
+                ..
+            })
+        ));
+        router.accept_inbound(&read).unwrap();
     }
 
     #[test]

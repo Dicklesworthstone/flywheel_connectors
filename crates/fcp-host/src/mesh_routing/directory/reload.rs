@@ -98,6 +98,21 @@ impl LiveMembership {
         current.continuity.check(snapshot)
     }
 
+    /// Runtime selection cannot wait on this publication while holding command
+    /// ownership. A busy or poisoned view fails closed without claiming that the
+    /// peer was revoked; a completed renewal keeps the existing continuity epoch.
+    pub(super) fn check_peer_snapshot_for_dispatch(
+        &self,
+        snapshot: &PeerSnapshot,
+    ) -> Result<(), MeshForwardError> {
+        let current = self
+            .publication
+            .try_read()
+            .map_err(|_| unavailable("publication_unavailable_for_dispatch"))?;
+        current.check()?;
+        current.continuity.check(snapshot)
+    }
+
     fn refuse(&self, reason: &'static str) {
         if let Ok(mut current) = self.publication.write() {
             current.failure = Some(reason);
@@ -1230,6 +1245,222 @@ mod tests {
                 endpoint: "http://127.0.0.1:19003".to_owned(),
                 public_key_hex: hex::encode(key.verifying_key().to_bytes()),
             });
+        }
+
+        fn invoke_envelope(origin_attempt_id: Option<u64>) -> MeshForwardEnvelope {
+            let key = Ed25519SigningKey::from_bytes(&[33; 32]).unwrap();
+            MeshForwardEnvelope::sign(
+                &key,
+                TailscaleNodeId::new("peer"),
+                TailscaleNodeId::new("local"),
+                unix_now_ms(),
+                MeshForwardBody::Invoke {
+                    request_json: "{\"operation\":\"non_idempotent_write\"}".to_owned(),
+                    asserted_principal: None,
+                    origin_attempt_id,
+                },
+            )
+            .unwrap()
+        }
+
+        fn admit_invoke_origin(
+            router: &Arc<crate::mesh_routing::MeshRouter>,
+            origin_attempt_id: Option<u64>,
+        ) -> (MeshForwardEnvelope, crate::mesh_routing::MeshInvokeOrigin) {
+            let envelope = invoke_envelope(origin_attempt_id);
+            let origin = fcp_async_core::runtime::block_on_sync(
+                router.accept_inbound_invoke_async(&envelope),
+            )
+            .unwrap()
+            .unwrap();
+            (envelope, origin)
+        }
+
+        #[test]
+        fn invoke_origin_survives_completed_renewal_and_unrelated_peer_changes() {
+            for origin_attempt_id in [None, Some(7)] {
+                let mut fixture = Fixture::new();
+                let router = Arc::new(fixture.router());
+                let (envelope, origin) = admit_invoke_origin(&router, origin_attempt_id);
+                fixture.payload.expires_at_ms += 60_000;
+                publish(&mut fixture);
+                origin.require_current().unwrap();
+                assert!(origin.is_current_for_dispatch());
+                add_other_peer(&mut fixture);
+                publish(&mut fixture);
+                origin.require_current().unwrap();
+                assert!(origin.is_current_for_dispatch());
+                let other = fixture
+                    .payload
+                    .peers
+                    .iter_mut()
+                    .find(|peer| peer.node_id == "other")
+                    .unwrap();
+                let key = Ed25519SigningKey::from_bytes(&[36; 32]).unwrap();
+                other.public_key_hex = hex::encode(key.verifying_key().to_bytes());
+                other.endpoint = "http://127.0.0.1:19004".to_owned();
+                publish(&mut fixture);
+                origin.require_current().unwrap();
+                assert!(origin.is_current_for_dispatch());
+                fixture.payload.peers.retain(|peer| peer.node_id != "other");
+                publish(&mut fixture);
+                origin.require_current().unwrap();
+                assert!(origin.is_current_for_dispatch());
+                assert!(matches!(
+                    router.accept_inbound(&envelope),
+                    Err(MeshForwardError::Replayed { .. })
+                ));
+            }
+        }
+
+        #[test]
+        fn invoke_origin_rejects_revoked_peer_incarnations_even_after_restoration() {
+            for change in ["remove", "key", "endpoint"] {
+                for restore in [false, true] {
+                    let mut fixture = Fixture::new();
+                    let router = Arc::new(fixture.router());
+                    let (_, origin) = admit_invoke_origin(&router, None);
+                    let original = fixture.payload.peers.clone();
+                    match change {
+                        "remove" => fixture.payload.peers.retain(|peer| peer.node_id != "peer"),
+                        "key" => {
+                            let key = Ed25519SigningKey::from_bytes(&[34; 32]).unwrap();
+                            fixture.payload.peers[1].public_key_hex =
+                                hex::encode(key.verifying_key().to_bytes());
+                        }
+                        _ => {
+                            fixture.payload.peers[1].endpoint = "http://127.0.0.1:19004".to_owned()
+                        }
+                    }
+                    publish(&mut fixture);
+                    if restore {
+                        fixture.payload.peers = original;
+                        publish(&mut fixture);
+                    }
+                    // No intermediate probe observed the removal or rotation.
+                    // The captured epoch itself must remember the authority gap.
+                    assert!(
+                        origin.require_current().is_err(),
+                        "{change}, restore={restore}"
+                    );
+                    assert!(
+                        !origin.is_current_for_dispatch(),
+                        "{change}, restore={restore}"
+                    );
+                    if restore {
+                        let (_, fresh) = admit_invoke_origin(&router, None);
+                        fresh.require_current().unwrap();
+                        assert!(fresh.is_current_for_dispatch());
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn invoke_origin_retains_pre_journal_incarnation_and_consumed_nonce() {
+            let mut fixture = Fixture::new();
+            let router = Arc::new(fixture.router());
+            let envelope = invoke_envelope(None);
+            let journal = router.durable_replay.as_ref().unwrap().lock().unwrap();
+            let mut pending = Box::pin(router.accept_inbound_invoke_async(&envelope));
+            assert!(
+                pending
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+            let original = fixture.payload.peers.clone();
+            fixture.payload.peers.retain(|peer| peer.node_id != "peer");
+            publish(&mut fixture);
+            fixture.payload.peers = original;
+            publish(&mut fixture);
+            drop(journal);
+            let result = fcp_async_core::runtime::block_on_sync(fcp_async_core::time::timeout(
+                Duration::from_secs(5),
+                pending,
+            ))
+            .unwrap()
+            .unwrap();
+            assert!(
+                result.is_err(),
+                "re-added peer cannot authorize the queued envelope"
+            );
+            assert!(
+                matches!(
+                    router.accept_inbound(&envelope),
+                    Err(MeshForwardError::Replayed { .. })
+                ),
+                "failed continuity cannot undo a durably consumed nonce"
+            );
+        }
+
+        #[test]
+        fn invoke_origin_dispatch_probe_never_blocks_on_publication_or_revokes_for_contention() {
+            let fixture = Fixture::new();
+            let router = Arc::new(fixture.router());
+            let (_, origin) = admit_invoke_origin(&router, None);
+            let publication = fixture.membership.publication.write().unwrap();
+            let probe = origin.clone();
+            let (completed, observed) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                completed.send(probe.is_current_for_dispatch()).unwrap();
+            });
+            let result = observed.recv_timeout(Duration::from_secs(5));
+            drop(publication);
+            worker.join().unwrap();
+            assert!(!result.expect("dispatch probe must return while publication remains locked"));
+            origin.require_current().unwrap();
+            assert!(origin.is_current_for_dispatch());
+
+            let membership = Arc::clone(&fixture.membership);
+            assert!(
+                std::thread::spawn(move || {
+                    let _publication = membership.publication.write().unwrap();
+                    panic!("poison the publication lock");
+                })
+                .join()
+                .is_err()
+            );
+            assert!(origin.require_current().is_err());
+            assert!(!origin.is_current_for_dispatch());
+        }
+
+        #[test]
+        fn invoke_origin_dispatch_probe_refuses_expiry_and_membership_failure() {
+            for expiration in ["observed", "wall_clock", "monotonic"] {
+                let mut fixture = Fixture::new();
+                let router = Arc::new(fixture.router());
+                let (_, origin) = admit_invoke_origin(&router, None);
+                {
+                    let mut current = fixture.membership.publication.write().unwrap();
+                    match expiration {
+                        "observed" => current.validity.expired.store(true, Ordering::Release),
+                        "wall_clock" => current.validity.expires_at_ms = 0,
+                        _ => current.validity.deadline = Instant::now(),
+                    }
+                }
+                assert!(!origin.is_current_for_dispatch(), "{expiration}");
+                assert!(origin.require_current().is_err(), "{expiration}");
+                fixture.payload.expires_at_ms += 60_000;
+                publish(&mut fixture);
+                assert!(
+                    !origin.is_current_for_dispatch(),
+                    "{expiration}: old epoch revived"
+                );
+                let (_, fresh) = admit_invoke_origin(&router, None);
+                assert!(fresh.is_current_for_dispatch());
+            }
+            let fixture = Fixture::new();
+            let router = Arc::new(fixture.router());
+            let (_, origin) = admit_invoke_origin(&router, None);
+            for reason in [
+                "signed_source_rejected",
+                "checkpoint_failure_requires_restart",
+            ] {
+                fixture.membership.refuse(reason);
+                assert!(origin.require_current().is_err());
+                assert!(!origin.is_current_for_dispatch());
+            }
         }
 
         #[test]

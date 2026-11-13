@@ -128,6 +128,13 @@ impl DirectoryGuard {
     ) -> Result<(), MeshForwardError> {
         self.state.check_peer_snapshot(snapshot)
     }
+
+    pub(super) fn check_peer_snapshot_for_dispatch(
+        &self,
+        snapshot: &PeerSnapshot,
+    ) -> Result<(), MeshForwardError> {
+        self.state.check_peer_snapshot_for_dispatch(snapshot)
+    }
 }
 
 /// Preserve the existing explicit static configuration mode. Setting any signed

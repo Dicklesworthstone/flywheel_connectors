@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use fcp_core::{CapabilityToken, ZoneId};
 use fcp_crypto::Ed25519VerifyingKey;
+use fcp_host::mesh_routing::MeshInvokeOrigin;
 use fcp_host::{
     CapabilityRevocationFence, ConnectorExecutionFence, HostError, HostResult,
     RevocationCascadeVerifier, RuntimeRevocationPermit, RuntimeRevocationService,
@@ -18,7 +19,7 @@ use fcp_kernel::InvokeRequest;
 
 use super::{AppState, HybridOwnerInvokeEvidence, HybridOwnerProductionVerifier};
 
-const REFUSAL: &str = "live connector lifecycle, capability, approval or revocation authority no longer permits queued execution";
+const REFUSAL: &str = "live connector lifecycle, capability, approval, mesh origin or revocation authority no longer permits queued execution";
 
 struct AuthorityState {
     key: Ed25519VerifyingKey,
@@ -26,6 +27,7 @@ struct AuthorityState {
     zone: ZoneId,
     lifecycle_fence: CapabilityRevocationFence,
     execution_fence: Option<ConnectorExecutionFence>,
+    origin: Option<MeshInvokeOrigin>,
     cascade: Arc<RevocationCascadeVerifier>,
     runtime_revocation: Option<Arc<RuntimeRevocationService>>,
     holder: Option<(Arc<fcp_host::mesh_routing::MeshRouter>, InvokeRequest)>,
@@ -48,10 +50,14 @@ impl LiveAuthorityDispatchGuard {
         request: &InvokeRequest,
         lifecycle_fence: CapabilityRevocationFence,
         execution_fence: Option<ConnectorExecutionFence>,
+        origin: Option<MeshInvokeOrigin>,
     ) -> HostResult<Self> {
         lifecycle_fence.require_current()?;
         if let Some(fence) = &execution_fence {
             fence.require_current()?;
+        }
+        if let Some(origin) = &origin {
+            origin.require_current().map_err(|_| refused())?;
         }
         let key = state.capability_verifying_key.clone().ok_or_else(refused)?;
         let claims = super::invoke_jobs::verified_dispatch_claims_at(
@@ -96,6 +102,7 @@ impl LiveAuthorityDispatchGuard {
             zone: request.zone_id.clone(),
             lifecycle_fence,
             execution_fence,
+            origin,
             cascade: Arc::clone(&state.revocation_cascade),
             runtime_revocation: state.runtime_revocation.clone(),
             holder,
@@ -114,6 +121,9 @@ impl LiveAuthorityDispatchGuard {
         guard.0.lifecycle_fence.require_current()?;
         if let Some(fence) = &guard.0.execution_fence {
             fence.require_current()?;
+        }
+        if let Some(origin) = &guard.0.origin {
+            origin.require_current().map_err(|_| refused())?;
         }
         Ok(guard)
     }
@@ -134,6 +144,9 @@ impl LiveAuthorityDispatchGuard {
         self.0.lifecycle_fence.require_current()?;
         if let Some(fence) = &self.0.execution_fence {
             fence.require_current()?;
+        }
+        if let Some(origin) = &self.0.origin {
+            origin.require_current().map_err(|_| refused())?;
         }
         let claims = super::invoke_jobs::verified_dispatch_claims_at(
             &self.0.token,
@@ -221,7 +234,8 @@ pub(super) struct LiveAuthorityDispatchPermit {
 }
 
 impl LiveAuthorityDispatchPermit {
-    /// Only bounded clock/atomic reads: safe while holding selection ownership.
+    /// Bounded clock/atomic reads and a nonblocking membership check: safe while
+    /// holding selection ownership, without source I/O or signature verification.
     pub(super) fn is_current(&self) -> bool {
         let current = !self.guard.0.rejected.load(Ordering::Acquire)
             && self.guard.0.lifecycle_fence.is_current()
@@ -231,6 +245,12 @@ impl LiveAuthorityDispatchPermit {
                 .execution_fence
                 .as_ref()
                 .is_none_or(ConnectorExecutionFence::is_current)
+            && self
+                .guard
+                .0
+                .origin
+                .as_ref()
+                .is_none_or(MeshInvokeOrigin::is_current_for_dispatch)
             && Instant::now() < self.deadline
             && u64::try_from(chrono::Utc::now().timestamp_millis())
                 .is_ok_and(|now| now >= self.not_before_ms && now < self.expires_at_ms)

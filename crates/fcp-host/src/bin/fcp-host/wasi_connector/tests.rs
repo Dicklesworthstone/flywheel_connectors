@@ -730,6 +730,7 @@ async fn wasi_session_queue_rechecks_live_authority_without_entering_guest() {
                 .await
                 .unwrap(),
         ),
+        None,
     )
     .unwrap();
     let slot = fixture

@@ -13648,6 +13648,7 @@ async fn maybe_orchestrate_mcp_sampling(
     response: InvokeResponse,
     parent_ticket: &fcp_host::InvocationTicket,
     deadline: Instant,
+    origin: Option<fcp_host::mesh_routing::MeshInvokeOrigin>,
 ) -> HostResult<(InvokeResponse, Option<bool>)> {
     if source.operation.as_str() != MCP_SAMPLING_HANDLE_OPERATION {
         return Ok((response, None));
@@ -13710,6 +13711,7 @@ async fn maybe_orchestrate_mcp_sampling(
         Some(deadline),
         None,
         None,
+        origin,
     )
     .await?;
     Ok((
@@ -15970,6 +15972,7 @@ async fn route_invoke_with_deadline(
             Some(deadline),
             None,
             None,
+            None,
         )
         .await
         .map_err(map_host_error);
@@ -16050,6 +16053,7 @@ async fn route_invoke_with_deadline(
         Some(deadline),
         None,
         Some(execution_fence),
+        None,
     )
     .await
     .map_err(map_host_error)?;
@@ -16103,6 +16107,7 @@ async fn execute_local_invoke(
     asserted_principal: Option<String>,
     relay: Option<fcp_host::RelayCancellationBinding>,
     deadline: Instant,
+    origin: Option<fcp_host::mesh_routing::MeshInvokeOrigin>,
 ) -> Result<InvokeResponse, (StatusCode, String)> {
     constrain_invoke_deadline(&mut request, deadline);
     invoke_jobs::execute(
@@ -16112,6 +16117,7 @@ async fn execute_local_invoke(
         Some(deadline),
         relay,
         None,
+        origin,
     )
     .await
     .map_err(map_host_error)
@@ -17255,10 +17261,10 @@ fn mesh_inbound_invoke_deadline(
 /// Replay admission consumes the same execution budget as local dispatch.
 /// Timing out never rolls back a queued or committed nonce, and an unsigned
 /// refusal is not proof of non-execution for an origin considering failover.
-async fn admit_mesh_forward(
+async fn admit_mesh_forward<T>(
     deadline: Option<Instant>,
-    admission: impl std::future::Future<Output = Result<(), fcp_mesh::invoke_route::MeshForwardError>>,
-) -> Result<(), (StatusCode, String)> {
+    admission: impl std::future::Future<Output = Result<T, fcp_mesh::invoke_route::MeshForwardError>>,
+) -> Result<T, (StatusCode, String)> {
     let admitted = match deadline {
         Some(deadline) => {
             before_invoke_route_deadline(deadline, admission, "mesh replay admission")
@@ -17312,16 +17318,31 @@ async fn mesh_forward_handler(
         .as_ref()
         .and_then(|request| request.as_ref().ok())
         .map(|(_, deadline)| *deadline);
-    if let Err(error) = admit_mesh_forward(deadline, router.accept_inbound_async(&envelope)).await {
-        tracing::warn!(
-            event = "mesh_forward_rejected",
-            origin_node = envelope.origin_node.as_str(),
-            method = envelope.body.method(),
-            error = %error.1,
-            "rejected mesh forward envelope"
-        );
-        return Err(error);
-    }
+    // Invocation origin continuity is captured before replay journal waits and
+    // retained through final runtime selection. Cancellation attempt metadata
+    // is optional and never determines whether this authority is required.
+    let admission = if matches!(&envelope.body, MeshForwardBody::Invoke { .. }) {
+        admit_mesh_forward(deadline, router.accept_inbound_invoke_async(&envelope))
+            .await
+            .map(Some)
+    } else {
+        admit_mesh_forward(deadline, router.accept_inbound_async(&envelope))
+            .await
+            .map(|()| None)
+    };
+    let origin = match admission {
+        Ok(origin) => origin,
+        Err(error) => {
+            tracing::warn!(
+                event = "mesh_forward_rejected",
+                origin_node = envelope.origin_node.as_str(),
+                method = envelope.body.method(),
+                error = %error.1,
+                "rejected mesh forward envelope"
+            );
+            return Err(error);
+        }
+    };
     let (status, body_json) = match &envelope.body {
         MeshForwardBody::ConnectorStateExport { request_json } => {
             connector_state_transfer::export_reply(&state, &router, &envelope, request_json).await
@@ -17354,6 +17375,11 @@ async fn mesh_forward_handler(
                         origin_attempt_id,
                     }),
                     deadline,
+                    Some(origin.ok_or_else(|| {
+                        map_host_error(HostError::Internal(
+                            "mesh invocation lost its admitted origin authority".to_owned(),
+                        ))
+                    })?),
                 ))
                 .await,
             ),
@@ -20589,6 +20615,7 @@ output_schema = {{ type = "object" }}
                 attempt_id: u64::MAX,
             },
             Instant::now() + Duration::from_secs(5),
+            None,
         )
         .await
         .expect_err("a rejected parent link must block all child work");
@@ -21306,7 +21333,7 @@ output_schema = {{ type = "object" }}
         let remaining = Instant::now() + Duration::from_millis(30);
         let error = fcp_async_core::time::timeout(
             Duration::from_secs(2),
-            admit_mesh_forward(Some(remaining), async {
+            admit_mesh_forward::<()>(Some(remaining), async {
                 polled.store(true, Ordering::SeqCst);
                 std::future::pending().await
             }),
@@ -21348,7 +21375,7 @@ output_schema = {{ type = "object" }}
         // connector in this fixture: reaching discovery would produce a
         // different failure and prove that execution renewed its allowance.
         fcp_async_core::time::sleep(Duration::from_millis(50)).await;
-        let error = execute_local_invoke(&state, request.clone(), None, None, deadline)
+        let error = execute_local_invoke(&state, request.clone(), None, None, deadline, None)
             .await
             .expect_err("post-admission scheduling cannot mint five more seconds");
         assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);

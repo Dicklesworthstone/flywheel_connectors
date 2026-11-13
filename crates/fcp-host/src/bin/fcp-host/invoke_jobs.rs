@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use fcp_async_core::channel::oneshot;
 use fcp_async_core::task::{self, JoinHandle};
+use fcp_host::mesh_routing::MeshInvokeOrigin;
 use fcp_host::{ConnectorExecutionFence, HostError, HostResult};
 use fcp_kernel::InvokeResponse;
 use futures_util::stream::{FuturesUnordered, StreamExt};
@@ -400,6 +401,7 @@ pub(super) fn execute<'a>(
     parent_deadline: Option<Instant>,
     relay: Option<fcp_host::RelayCancellationBinding>,
     execution_fence: Option<ConnectorExecutionFence>,
+    origin: Option<MeshInvokeOrigin>,
 ) -> std::pin::Pin<Box<dyn Future<Output = HostResult<InvokeResponse>> + Send + 'a>> {
     Box::pin(async move {
         request.validate_idempotency_key().map_err(|error| {
@@ -440,7 +442,10 @@ pub(super) fn execute<'a>(
                 }
             },
         };
-        if let Err(error) = execution_fence.require_current() {
+        if let Err(error) = execution_fence
+            .require_current()
+            .and_then(|()| require_origin(origin.as_ref()))
+        {
             append_deny(state, &audit, &error.to_string())?;
             return Err(error);
         }
@@ -477,7 +482,10 @@ pub(super) fn execute<'a>(
             append_deny(state, &audit, &error.to_string())?;
             return Err(error);
         }
-        if let Err(error) = execution_fence.require_current() {
+        if let Err(error) = execution_fence
+            .require_current()
+            .and_then(|()| require_origin(origin.as_ref()))
+        {
             append_deny(state, &audit, &error.to_string())?;
             return Err(error);
         }
@@ -518,6 +526,7 @@ pub(super) fn execute<'a>(
                         relay,
                         registry_generation,
                         execution_fence,
+                        origin,
                     },
                 )
                 .await
@@ -540,6 +549,17 @@ pub(super) fn execute<'a>(
             )
         })?
     })
+}
+
+fn require_origin(origin: Option<&MeshInvokeOrigin>) -> HostResult<()> {
+    if let Some(origin) = origin {
+        origin.require_current().map_err(|_| {
+            HostError::PreflightFailed(
+                "mesh origin authority no longer permits forwarded execution".to_owned(),
+            )
+        })?;
+    }
+    Ok(())
 }
 
 async fn before_deadline<T>(
@@ -625,8 +645,12 @@ async fn dispatch(
     relay: Option<fcp_host::RelayCancellationBinding>,
     registry_generation: u64,
     execution_fence: ConnectorExecutionFence,
+    origin: Option<MeshInvokeOrigin>,
 ) -> (HostResult<InvokeResponse>, bool) {
-    if let Err(error) = execution_fence.require_current() {
+    if let Err(error) = execution_fence
+        .require_current()
+        .and_then(|()| require_origin(origin.as_ref()))
+    {
         return (Err(error), false);
     }
     let target = before_deadline(
@@ -690,6 +714,7 @@ async fn dispatch(
                 &request,
                 lifecycle_fence,
                 Some(execution_fence),
+                origin,
             )?;
             let _ = authority_capture.set(authority_guard.clone());
             state.registry.require_generation(registry_generation)?;
@@ -828,6 +853,7 @@ struct AdmittedInvocationContext {
     relay: Option<fcp_host::RelayCancellationBinding>,
     registry_generation: u64,
     execution_fence: ConnectorExecutionFence,
+    origin: Option<MeshInvokeOrigin>,
 }
 
 async fn run_owned(
@@ -843,6 +869,7 @@ async fn run_owned(
         relay,
         registry_generation,
         execution_fence,
+        origin,
     } = admitted;
     let remaining_ms = u64::try_from(
         deadline
@@ -888,6 +915,9 @@ async fn run_owned(
     };
 
     state.invoke_jobs.bind_attempt(&ticket)?;
+    // Origin continuity is rechecked inside dispatch after durable admission.
+    // Revocation during journal or scheduler waits takes the same terminal and
+    // audit finalization path as every other undispatched admission failure.
     let (source_result, dispatched) = dispatch(
         state,
         request.clone(),
@@ -895,6 +925,7 @@ async fn run_owned(
         relay,
         registry_generation,
         execution_fence,
+        origin.clone(),
     )
     .await;
     let duration_ms = super::elapsed_millis(started_at);
@@ -979,6 +1010,7 @@ async fn run_owned(
                     response,
                     &ticket,
                     deadline,
+                    origin,
                 )
                 .await
                 {
@@ -1048,7 +1080,16 @@ mod tests {
             Ok(fence) => fence,
             Err(error) => return (Err(error), false),
         };
-        super::dispatch(state, request, deadline, relay, registry_generation, fence).await
+        super::dispatch(
+            state,
+            request,
+            deadline,
+            relay,
+            registry_generation,
+            fence,
+            None,
+        )
+        .await
     }
 
     struct DispatchFixture {
@@ -1181,6 +1222,390 @@ mod tests {
             block_invoke,
             invoke_queued,
             release_invoke,
+        }
+    }
+
+    #[cfg(unix)]
+    mod mesh_origin_tests {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        use axum::Json;
+        use axum::extract::State;
+        use axum::http::StatusCode;
+        use fcp_core::TailscaleNodeId;
+        use fcp_crypto::ed25519::Ed25519SigningKey;
+        use fcp_host::mesh_routing::{MeshRouter, unix_now_ms};
+        use fcp_mesh::invoke_route::{MeshForwardBody, MeshForwardEnvelope, MeshPeerConfig};
+        use fcp_mesh::peer_manifest::{
+            MESH_PEER_DIRECTORY_SCHEMA, MeshPeerDirectoryPayload, SignedMeshPeerDirectory,
+        };
+
+        use super::*;
+
+        struct OriginFixture {
+            router: Arc<MeshRouter>,
+            _directory: tempfile::TempDir,
+            source: std::path::PathBuf,
+            owner: Ed25519SigningKey,
+            origin_key: Ed25519SigningKey,
+            payload: MeshPeerDirectoryPayload,
+        }
+
+        fn private_write(path: &std::path::Path, bytes: &[u8]) {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(path)
+                .unwrap();
+            file.write_all(bytes).unwrap();
+        }
+
+        impl OriginFixture {
+            fn peer(node: &str, key: &Ed25519SigningKey, port: u16) -> MeshPeerConfig {
+                MeshPeerConfig {
+                    node_id: node.to_owned(),
+                    endpoint: format!("http://127.0.0.1:{port}"),
+                    public_key_hex: hex::encode(key.verifying_key().to_bytes()),
+                }
+            }
+
+            fn new() -> Self {
+                let directory = tempfile::tempdir().unwrap();
+                let owner = Ed25519SigningKey::generate();
+                let local_key = Ed25519SigningKey::generate();
+                let origin_key = Ed25519SigningKey::generate();
+                let key_path = directory.path().join("executor.key");
+                private_write(&key_path, hex::encode(local_key.to_bytes()).as_bytes());
+                let now = unix_now_ms();
+                let payload = MeshPeerDirectoryPayload {
+                    schema_version: MESH_PEER_DIRECTORY_SCHEMA.to_owned(),
+                    mesh_id: "invoke-origin-continuity".to_owned(),
+                    generation: 1,
+                    issued_at_ms: now.saturating_sub(1_000),
+                    expires_at_ms: now + 300_000,
+                    peers: vec![
+                        Self::peer("executor", &local_key, 19021),
+                        Self::peer("origin", &origin_key, 19022),
+                    ],
+                };
+                let source = directory.path().join("peers.json");
+                private_write(
+                    &source,
+                    &serde_json::to_vec(&SignedMeshPeerDirectory::sign(&owner, &payload).unwrap())
+                        .unwrap(),
+                );
+                let settings = HashMap::from([
+                    ("FCP_HOST_MESH_NODE_ID", "executor".to_owned()),
+                    (
+                        "FCP_HOST_MESH_SIGNING_KEY_FILE",
+                        key_path.display().to_string(),
+                    ),
+                    ("FCP_HOST_MESH_PEERS_FILE", source.display().to_string()),
+                    ("FCP_HOST_MESH_ID", payload.mesh_id.clone()),
+                    (
+                        "FCP_HOST_MESH_DIRECTORY_OWNER_KEYS",
+                        serde_json::json!([hex::encode(owner.verifying_key().to_bytes())])
+                            .to_string(),
+                    ),
+                    (
+                        "FCP_HOST_MESH_DIRECTORY_STATE",
+                        directory.path().join("membership").display().to_string(),
+                    ),
+                ]);
+                let router = Arc::new(
+                    MeshRouter::from_lookup(|name| settings.get(name).cloned())
+                        .unwrap()
+                        .unwrap(),
+                );
+                Self {
+                    _directory: directory,
+                    source,
+                    owner,
+                    origin_key,
+                    payload,
+                    router,
+                }
+            }
+
+            fn envelope(
+                &self,
+                request: &fcp_kernel::InvokeRequest,
+                origin_attempt_id: Option<u64>,
+            ) -> MeshForwardEnvelope {
+                MeshForwardEnvelope::sign(
+                    &self.origin_key,
+                    TailscaleNodeId::new("origin"),
+                    TailscaleNodeId::new("executor"),
+                    unix_now_ms(),
+                    MeshForwardBody::Invoke {
+                        request_json: serde_json::to_string(request).unwrap(),
+                        asserted_principal: None,
+                        origin_attempt_id,
+                    },
+                )
+                .unwrap()
+            }
+
+            async fn set_origin_present(&mut self, present: bool) {
+                self.payload.generation += 1;
+                self.payload.peers.retain(|peer| peer.node_id != "origin");
+                if present {
+                    self.payload
+                        .peers
+                        .push(Self::peer("origin", &self.origin_key, 19022));
+                }
+                let next = self.source.with_extension("next");
+                private_write(
+                    &next,
+                    &serde_json::to_vec(
+                        &SignedMeshPeerDirectory::sign(&self.owner, &self.payload).unwrap(),
+                    )
+                    .unwrap(),
+                );
+                std::fs::rename(next, &self.source).unwrap();
+                fcp_async_core::time::timeout(Duration::from_secs(5), async {
+                    while self
+                        .router
+                        .directory()
+                        .peer(&TailscaleNodeId::new("origin"))
+                        .is_some()
+                        != present
+                    {
+                        fcp_async_core::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("production signed-membership worker publishes the new origin state");
+            }
+        }
+
+        #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+        async fn forwarded_origin_revocation_survives_preflight_and_native_queue_waits_without_attempt_metadata()
+         {
+            for origin_attempt_id in [None, Some(7)] {
+                for queued in [false, true] {
+                    let mut membership = OriginFixture::new();
+                    let mut fixture = dispatch_fixture();
+                    fixture.request.deadline_ms = Some(30_000);
+                    assert!(fixture.request.holder_proof.is_none());
+                    Arc::get_mut(&mut fixture.state).unwrap().mesh =
+                        Some(Arc::clone(&membership.router));
+                    if queued {
+                        fixture.block_invoke.store(true, Ordering::SeqCst);
+                    } else {
+                        fixture.block_catalog.store(true, Ordering::SeqCst);
+                    }
+                    let operation_id = fixture.request.id.to_string();
+                    let envelope = membership.envelope(&fixture.request, origin_attempt_id);
+                    let state = Arc::clone(&fixture.state);
+                    let pending = task::spawn(async move {
+                        crate::mesh_forward_handler(State(state), Json(envelope)).await
+                    });
+                    let entered = if queued {
+                        fixture.invoke_queued
+                    } else {
+                        fixture.catalog_entered
+                    };
+                    fcp_async_core::time::timeout(Duration::from_secs(5), entered)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    membership.set_origin_present(false).await;
+                    membership.set_origin_present(true).await;
+                    if queued {
+                        fixture.release_invoke.send(()).unwrap();
+                    } else {
+                        fixture.release_catalog.send(()).unwrap();
+                    }
+                    let Json(reply) =
+                        fcp_async_core::time::timeout(Duration::from_secs(5), pending)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .unwrap();
+                    assert_eq!(
+                        reply.status,
+                        StatusCode::FORBIDDEN.as_u16(),
+                        "{}",
+                        reply.body_json
+                    );
+                    assert_eq!(fixture.invoke_count.load(Ordering::SeqCst), 0);
+                    assert!(!reply.body_json.contains("private-dispatch-fixture"));
+                    let retained = fixture
+                        .state
+                        .lifecycle
+                        .invocation_record(&operation_id, None)
+                        .await;
+                    if queued {
+                        assert_eq!(
+                            retained.unwrap().terminal.unwrap().outcome,
+                            fcp_host::InvocationOutcome::HostError
+                        );
+                    } else {
+                        assert!(
+                            retained.is_none(),
+                            "origin refusal after preflight precedes durable invocation admission"
+                        );
+                    }
+
+                    let mut fresh = fixture.request;
+                    fresh.id = fcp_core::RequestId::random();
+                    let Json(reply) = crate::mesh_forward_handler(
+                        State(Arc::clone(&fixture.state)),
+                        Json(membership.envelope(&fresh, origin_attempt_id)),
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(reply.status, StatusCode::OK.as_u16(), "{}", reply.body_json);
+                    assert_eq!(
+                        fixture.invoke_count.load(Ordering::SeqCst),
+                        1,
+                        "only a newly admitted origin epoch may select the effect"
+                    );
+                }
+            }
+        }
+
+        #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+        async fn origin_revocation_does_not_relabel_an_already_selected_native_effect() {
+            let mut membership = OriginFixture::new();
+            let fixture = dispatch_fixture();
+            let origin = membership
+                .router
+                .accept_inbound_invoke_async(&membership.envelope(&fixture.request, None))
+                .await
+                .unwrap();
+            let guard = crate::live_authority::LiveAuthorityDispatchGuard::new(
+                &fixture.state,
+                &fixture.request,
+                fixture.state.lifecycle.capability_revocation_fence(),
+                Some(
+                    fixture
+                        .state
+                        .lifecycle
+                        .connector_execution_fence(&fixture.request.connector_id)
+                        .await
+                        .unwrap(),
+                ),
+                Some(origin),
+            )
+            .unwrap();
+            let invocation =
+                crate::NativeInvocationTermination::new(Instant::now() + Duration::from_secs(30));
+            invocation.bind_authority_guard(guard.clone());
+            let active = invocation.register_rpc_for_method("invoke");
+            assert!(active.try_begin());
+            membership.set_origin_present(false).await;
+            membership.set_origin_present(true).await;
+            let queued = invocation.register_rpc_for_method("invoke");
+            assert!(!queued.try_begin());
+            assert!(!guard.refused_before_effect());
+            assert!(
+                active.try_settle_reply(),
+                "selected effects retain their response settlement boundary"
+            );
+            let unknown = Err(HostError::Unavailable("lost response".to_owned()));
+            assert_eq!(
+                terminal_observation(&unknown, !guard.refused_before_effect(), Instant::now(), 0)
+                    .outcome,
+                fcp_host::InvocationOutcome::OutcomeUnknown,
+            );
+        }
+
+        #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+        async fn sampling_child_retains_origin_authority_without_erasing_completed_parent() {
+            let mut membership = OriginFixture::new();
+            let fixture = dispatch_fixture();
+            let mut source = fixture.request.clone();
+            source.operation =
+                fcp_core::OperationId::from_static(crate::MCP_SAMPLING_HANDLE_OPERATION);
+            source.input = serde_json::json!({
+                "host_dispatch": {
+                    "connector_id": fixture.request.connector_id,
+                    "operation": fixture.request.operation,
+                    "capability_token": fixture.request.capability_token,
+                    "input": {"sampling_child": true}
+                }
+            });
+            let origin = membership
+                .router
+                .accept_inbound_invoke_async(&membership.envelope(&source, None))
+                .await
+                .unwrap();
+            let ticket = fixture
+                .state
+                .lifecycle
+                .admit_invocation(fcp_host::InvocationAdmission {
+                    operation_id: source.id.to_string(),
+                    connector_id: source.connector_id.to_string(),
+                    operation: source.operation.to_string(),
+                    zone_id: source.zone_id.to_string(),
+                    principal: "test".to_owned(),
+                    correlation_id: None,
+                    deadline_at: chrono::Utc::now() + chrono::Duration::seconds(30),
+                    idempotency: None,
+                    transport_idempotency: None,
+                })
+                .await
+                .unwrap();
+            fixture
+                .state
+                .lifecycle
+                .finish_invocation(
+                    &ticket,
+                    fcp_host::InvocationTerminal {
+                        outcome: fcp_host::InvocationOutcome::Succeeded,
+                        receipt_id: None,
+                        duration_ms: 1,
+                        http_status: StatusCode::OK.as_u16(),
+                    },
+                )
+                .await
+                .unwrap();
+            membership.set_origin_present(false).await;
+            membership.set_origin_present(true).await;
+            let result = crate::maybe_orchestrate_mcp_sampling(
+                &fixture.state,
+                None,
+                &source,
+                InvokeResponse::ok(
+                    source.id.clone(),
+                    serde_json::json!({"event": crate::MCP_SAMPLING_EVENT}),
+                ),
+                &ticket,
+                Instant::now() + Duration::from_secs(5),
+                Some(origin),
+            )
+            .await;
+            assert!(
+                matches!(result, Err(HostError::PreflightFailed(_))),
+                "{result:?}"
+            );
+            assert_eq!(fixture.invoke_count.load(Ordering::SeqCst), 0);
+            let parent = fixture
+                .state
+                .lifecycle
+                .invocation_record(&ticket.operation_id, None)
+                .await
+                .unwrap();
+            assert_eq!(
+                parent.terminal.unwrap().outcome,
+                fcp_host::InvocationOutcome::Succeeded
+            );
+            let finalization = parent.finalization.unwrap();
+            assert_eq!(finalization.sampling_completed, Some(false));
+            assert!(
+                fixture
+                    .state
+                    .lifecycle
+                    .invocation_record(&finalization.sampling_operation_id.unwrap(), None,)
+                    .await
+                    .is_none(),
+                "revoked origin cannot admit the linked child"
+            );
         }
     }
 
@@ -1350,9 +1775,9 @@ mod tests {
 
     #[fcp_async_core::runtime::test]
     async fn lifecycle_disable_and_uninstall_deny_preflight_and_owned_invoke_until_enabled() {
-        for action in [
-            fcp_host::LifecycleAction::Disable,
-            fcp_host::LifecycleAction::Uninstall,
+        for desired in [
+            fcp_host::DesiredRuntimeState::Disabled,
+            fcp_host::DesiredRuntimeState::Uninstalled,
         ] {
             let fixture = dispatch_fixture();
             let connector_id = fixture.request.connector_id.clone();
@@ -1362,21 +1787,18 @@ mod tests {
                 .set_desired_state(&connector_id, fcp_host::DesiredRuntimeState::Enabled, None)
                 .await
                 .unwrap();
-            crate::lifecycle_transition_handler(
-                axum::extract::State(Arc::clone(&fixture.state)),
-                axum::extract::Path(connector_id.to_string()),
-                axum::Json(fcp_host::LifecycleTransitionRequest {
-                    action,
-                    reason: None,
-                    initiated_by: None,
-                    dry_run: false,
-                }),
-            )
-            .await
-            .unwrap();
+            // This fixture verifies dispatch authority, not process custody.
+            // Actual lifecycle retirement is covered with real native children
+            // in lifecycle_runtime; this synthetic actor has no manifest.
+            fixture
+                .state
+                .lifecycle
+                .set_desired_state(&connector_id, desired, None)
+                .await
+                .unwrap();
             let preflight =
                 crate::evaluate_live_preflight(&fixture.state, &fixture.request, None).await;
-            assert!(!preflight.allowed, "{action:?}");
+            assert!(!preflight.allowed, "{desired:?}");
             assert!(
                 preflight
                     .reason
@@ -1390,11 +1812,12 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await;
             assert!(
                 matches!(result, Err(HostError::PreflightFailed(_))),
-                "{action:?}: {result:?}"
+                "{desired:?}: {result:?}"
             );
             assert_eq!(fixture.invoke_count.load(Ordering::SeqCst), 0);
             assert!(
@@ -1406,21 +1829,23 @@ mod tests {
                     .is_none()
             );
 
-            crate::lifecycle_transition_handler(
-                axum::extract::State(Arc::clone(&fixture.state)),
-                axum::extract::Path(connector_id.to_string()),
-                axum::Json(fcp_host::LifecycleTransitionRequest {
-                    action: fcp_host::LifecycleAction::Enable,
-                    reason: None,
-                    initiated_by: None,
-                    dry_run: false,
-                }),
+            fixture
+                .state
+                .lifecycle
+                .set_desired_state(&connector_id, fcp_host::DesiredRuntimeState::Enabled, None)
+                .await
+                .unwrap();
+            let response = execute(
+                &fixture.state,
+                fixture.request,
+                None,
+                None,
+                None,
+                None,
+                None,
             )
             .await
             .unwrap();
-            let response = execute(&fixture.state, fixture.request, None, None, None, None)
-                .await
-                .unwrap();
             assert!(matches!(response.status, fcp_kernel::InvokeStatus::Ok));
             assert_eq!(fixture.invoke_count.load(Ordering::SeqCst), 1);
         }
@@ -1447,7 +1872,9 @@ mod tests {
             let state = Arc::clone(&fixture.state);
             let request = fixture.request;
             let pending =
-                task::spawn(async move { execute(&state, request, None, None, None, None).await });
+                task::spawn(
+                    async move { execute(&state, request, None, None, None, None, None).await },
+                );
             if queued {
                 fixture.invoke_queued.await.unwrap();
             } else {
@@ -1495,7 +1922,7 @@ mod tests {
             }
             let mut fresh_request = fresh_request;
             fresh_request.id = fcp_core::RequestId::random();
-            execute(&fixture.state, fresh_request, None, None, None, None)
+            execute(&fixture.state, fresh_request, None, None, None, None, None)
                 .await
                 .unwrap();
             assert_eq!(
@@ -1633,6 +2060,7 @@ mod tests {
                     .await
                     .unwrap(),
             ),
+            None,
         )
         .unwrap();
         let invocation =
@@ -1719,7 +2147,9 @@ mod tests {
         let operation_id = request.id.to_string();
         fixture.block_catalog.store(true, Ordering::SeqCst);
         let pending =
-            task::spawn(async move { execute(&state, request, None, None, None, None).await });
+            task::spawn(
+                async move { execute(&state, request, None, None, None, None, None).await },
+            );
         fixture.catalog_entered.await.unwrap();
         publish_dispatch_fixture_change(&fixture.state, "unrelated").await;
         fixture.release_catalog.send(()).unwrap();

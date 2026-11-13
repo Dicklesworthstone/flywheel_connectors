@@ -399,6 +399,7 @@ impl EventService {
             &request,
             lifecycle_fence,
             execution_fence,
+            None,
         )?;
         authority.refresh()?.require_current()?;
         Ok(Admission {
