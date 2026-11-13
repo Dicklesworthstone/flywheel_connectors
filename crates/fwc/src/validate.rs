@@ -3,6 +3,8 @@
 //! Validates operation inputs against JSON Schema BEFORE sending to the
 //! connector, catching errors locally and producing actionable fix suggestions.
 
+use std::collections::BTreeSet;
+
 use serde::Serialize;
 use serde_json::Value;
 
@@ -31,8 +33,23 @@ impl ValidationResult {
 
 /// Validate an input value against a JSON Schema.
 pub fn validate(input: &Value, schema: &Value) -> ValidationResult {
+    validate_partial(input, schema, &BTreeSet::new())
+}
+
+/// Validate known template values while deferring exact unresolved paths.
+///
+/// Paths use unescaped object keys and decimal array indices. Only a value at
+/// an exact deferred path is unknown; its ancestors retain their type, required
+/// fields and container-size checks, and siblings retain ordinary validation.
+/// Ancestor value comparisons such as enum cannot be decided until every
+/// descendant is known. This is a local preview, not a host preflight decision.
+pub fn validate_partial(
+    input: &Value,
+    schema: &Value,
+    deferred_paths: &BTreeSet<Vec<String>>,
+) -> ValidationResult {
     let mut errors = Vec::new();
-    validate_value(input, schema, &[], &mut errors);
+    validate_value(input, schema, &[], &[], deferred_paths, &mut errors);
     ValidationResult { errors }
 }
 
@@ -40,8 +57,13 @@ fn validate_value(
     input: &Value,
     schema: &Value,
     path: &[String],
+    pointer_path: &[String],
+    deferred_paths: &BTreeSet<Vec<String>>,
     errors: &mut Vec<ValidationError>,
 ) {
+    if deferred_paths.contains(pointer_path) {
+        return;
+    }
     let path_str = if path.is_empty() {
         "<root>".to_string()
     } else {
@@ -61,8 +83,12 @@ fn validate_value(
         }
     }
 
-    // Check enum constraint.
-    if let Some(enum_values) = schema.get("enum").and_then(Value::as_array) {
+    // A partial object/array cannot be compared to a complete enum value yet.
+    // Its known type, shape and literal descendants still require validation.
+    let contains_deferred = deferred_paths
+        .iter()
+        .any(|deferred| deferred.starts_with(pointer_path));
+    if !contains_deferred && let Some(enum_values) = schema.get("enum").and_then(Value::as_array) {
         if !enum_values.contains(input) {
             let allowed = enum_values
                 .iter()
@@ -79,12 +105,12 @@ fn validate_value(
 
     // For objects: check required fields and recurse into properties.
     if input.is_object() {
-        validate_object(input, schema, path, errors);
+        validate_object(input, schema, path, pointer_path, deferred_paths, errors);
     }
 
     // For arrays: validate items against items schema.
     if input.is_array() {
-        validate_array(input, schema, path, errors);
+        validate_array(input, schema, path, pointer_path, deferred_paths, errors);
     }
 
     // Check string constraints.
@@ -102,6 +128,8 @@ fn validate_object(
     input: &Value,
     schema: &Value,
     path: &[String],
+    pointer_path: &[String],
+    deferred_paths: &BTreeSet<Vec<String>>,
     errors: &mut Vec<ValidationError>,
 ) {
     let Some(input_obj) = input.as_object() else {
@@ -135,7 +163,16 @@ fn validate_object(
             if let Some(value) = input_obj.get(key) {
                 let mut child_path = path.to_vec();
                 child_path.push(key.clone());
-                validate_value(value, prop_schema, &child_path, errors);
+                let mut child_pointer = pointer_path.to_vec();
+                child_pointer.push(key.clone());
+                validate_value(
+                    value,
+                    prop_schema,
+                    &child_path,
+                    &child_pointer,
+                    deferred_paths,
+                    errors,
+                );
             }
         }
     }
@@ -145,6 +182,8 @@ fn validate_array(
     input: &Value,
     schema: &Value,
     path: &[String],
+    pointer_path: &[String],
+    deferred_paths: &BTreeSet<Vec<String>>,
     errors: &mut Vec<ValidationError>,
 ) {
     let Some(arr) = input.as_array() else {
@@ -192,7 +231,16 @@ fn validate_array(
         for (i, item) in arr.iter().enumerate() {
             let mut item_path = path.to_vec();
             item_path.push(format!("[{i}]"));
-            validate_value(item, item_schema, &item_path, errors);
+            let mut item_pointer = pointer_path.to_vec();
+            item_pointer.push(i.to_string());
+            validate_value(
+                item,
+                item_schema,
+                &item_path,
+                &item_pointer,
+                deferred_paths,
+                errors,
+            );
         }
     }
 }
@@ -281,6 +329,106 @@ fn type_fix_suggestion(expected: &str, actual: &Value) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn partial_validation_defers_only_the_unknown_value() {
+        let input = json!({"id": null, "literal_null": null, "title": 7});
+        let schema = json!({
+            "type": "object",
+            "required": ["id", "title", "missing"],
+            "properties": {
+                "id": {"type": "integer", "minimum": 1},
+                "literal_null": {"type": "string"},
+                "title": {"type": "string"},
+                "missing": {"type": "boolean"},
+            },
+        });
+        let deferred = BTreeSet::from([vec!["id".to_owned()]]);
+        let result = validate_partial(&input, &schema, &deferred);
+        let paths = result
+            .errors
+            .iter()
+            .map(|error| error.path.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(paths, BTreeSet::from(["literal_null", "missing", "title"]));
+        assert!(
+            validate(&input, &schema)
+                .errors
+                .iter()
+                .any(|error| error.path == "id")
+        );
+    }
+
+    #[test]
+    fn partial_validation_keeps_ancestor_shape_and_literal_enum_checks() {
+        let input = json!({"id": null, "mode": "invalid", "items": [null]});
+        let schema = json!({
+            "type": "object",
+            "enum": [{"id": "eventual", "mode": "valid", "items": [1, 2]}],
+            "properties": {
+                "id": {"type": "string", "minLength": 5},
+                "mode": {"type": "string", "enum": ["valid"]},
+                "items": {"type": "array", "minItems": 2, "items": {"type": "integer"}},
+            },
+        });
+        let deferred = BTreeSet::from([
+            vec!["id".to_owned()],
+            vec!["items".to_owned(), "0".to_owned()],
+        ]);
+        let result = validate_partial(&input, &schema, &deferred);
+        assert_eq!(result.errors.len(), 2);
+        assert!(result.errors.iter().any(|error| error.path == "mode"));
+        assert!(result.errors.iter().any(|error| error.path == "items"));
+        assert!(!result.errors.iter().any(|error| error.path == "<root>"));
+
+        let wrong_container = json!({"type": "array"});
+        let result = validate_partial(&input, &wrong_container, &deferred);
+        assert_eq!(result.errors.len(), 1);
+        assert_eq!(result.errors[0].path, "<root>");
+        assert!(result.errors[0].message.contains("expected array"));
+    }
+
+    #[test]
+    fn partial_validation_uses_exact_segments_for_arrays_and_unusual_keys() {
+        let input = json!({"a.b": null, "a": {"b": null}, "items": [null, null]});
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "a.b": {"type": "integer"},
+                "a": {"type": "object", "properties": {"b": {"type": "integer"}}},
+                "items": {"type": "array", "maxItems": 1, "items": {"type": "integer"}},
+            },
+        });
+        let deferred = BTreeSet::from([
+            vec!["a.b".to_owned()],
+            vec!["items".to_owned(), "0".to_owned()],
+        ]);
+        let result = validate_partial(&input, &schema, &deferred);
+        assert_eq!(result.errors.len(), 3);
+        assert!(result.errors.iter().any(|error| error.path == "a.b"));
+        assert!(result.errors.iter().any(|error| error.path == "items"));
+        assert!(result.errors.iter().any(|error| error.path == "items.[1]"));
+        assert!(!result.errors.iter().any(|error| error.path == "items.[0]"));
+    }
+
+    #[test]
+    fn partial_validation_accepts_unknown_root_without_treating_literal_null_as_unknown() {
+        let schema = json!({"type": "object", "required": ["id"]});
+        assert!(validate_partial(&Value::Null, &schema, &BTreeSet::from([Vec::new()])).is_valid());
+        assert!(!validate_partial(&Value::Null, &schema, &BTreeSet::new()).is_valid());
+
+        let input = json!({"id": 7, "name": "valid"});
+        let schema = json!({
+            "type": "object",
+            "required": ["missing"],
+            "properties": {"id": {"type": "string"}, "name": {"enum": ["other"]}},
+        });
+        assert_eq!(
+            serde_json::to_value(validate(&input, &schema).errors).unwrap(),
+            serde_json::to_value(validate_partial(&input, &schema, &BTreeSet::new()).errors)
+                .unwrap()
+        );
+    }
 
     fn issue_schema() -> Value {
         json!({

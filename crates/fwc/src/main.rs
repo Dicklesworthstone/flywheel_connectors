@@ -33883,6 +33883,32 @@ fn batch_file_dispatch(
             args.on_error
         )
     })?;
+    let default_zone = resolved_zone(args.zone.as_deref(), &host);
+    let input_templates = match batch.input_templates(&default_zone) {
+        Ok(templates) => templates,
+        Err(error) => {
+            let mut payload = json!({
+                "status": "error",
+                "command": "batch-file",
+                "invoke_attempted": false,
+                "error": {
+                    "type": "invalid-batch-input-reference",
+                    "message": error.to_string(),
+                    "recoverable": true,
+                },
+                "execution": { "idempotency_key": run_key, "submitted": false },
+                "next_actions": [
+                    "Use bounded references to an explicit dependency in the same execution zone, with a canonical JSON pointer.",
+                ],
+            });
+            CommandEnvelope::new(CommandAvailability::OfflineArtifact, "batch-file")
+                .inject_into(&mut payload);
+            return Ok(DispatchOutcome {
+                payload,
+                exit_code: CliExitCode::Validation,
+            });
+        }
+    };
     let client = HostAdminClient::new(&host.endpoint)?.with_read_budget(run_budget);
     let (catalog, _) = match client.catalog(None) {
         Ok(catalog) => catalog,
@@ -33978,18 +34004,23 @@ fn batch_file_dispatch(
                 ));
             }
         };
-        let zone = op.zone.as_deref().map_or_else(
-            || resolved_zone(args.zone.as_deref(), &host),
-            ToOwned::to_owned,
+        let zone = op
+            .zone
+            .as_deref()
+            .map_or_else(|| default_zone.clone(), ToOwned::to_owned);
+        let template = &input_templates[&op.id];
+        let validation = validate::validate_partial(
+            &template.projection,
+            &operation.input_schema,
+            &template.deferred_paths,
         );
-        let (valid, errors) = validate_payload_against_schema(&op.input, &operation.input_schema);
-        if !valid {
+        if !validation.is_valid() {
             invalid_operations.push(json!({
                 "id": &op.id,
                 "connector": &connector.slug,
                 "operation": &operation.name,
                 "zone": &zone,
-                "errors": errors,
+                "errors": validation.errors,
             }));
             continue;
         }
@@ -34012,6 +34043,23 @@ fn batch_file_dispatch(
             &op.input,
         )?;
         if args.dry_run {
+            if template.has_references() {
+                // Neither a placeholder nor an invented value establishes
+                // resource authorization for the eventual resolved input.
+                preflights.push(json!({
+                    "id": &op.id,
+                    "request_id": request_id,
+                    "connector": &connector.slug,
+                    "operation": &operation.name,
+                    "zone": &zone,
+                    "allowed": null,
+                    "status": "deferred",
+                    "reason": "Input validation and input-dependent authorization require upstream results. The host will check the resolved request before invocation.",
+                    "input_bindings": template.references,
+                    "invoke_attempted": false,
+                }));
+                continue;
+            }
             let preflight_request = HostPreflightRequest {
                 holder_proof: auth.holder_proof_for(&request_id, &operation.name)?,
                 request_id,
@@ -34022,7 +34070,7 @@ fn batch_file_dispatch(
                     )
                 })?,
                 operation: operation.name.clone(),
-                params: Some(op.input.clone()),
+                params: Some(template.projection.clone()),
                 principal: None,
                 zone_id: Some(zone.parse().map_err(|error| {
                     anyhow::anyhow!("`{zone}` is not a valid FCP zone for `batch-file`: {error}")
@@ -34113,22 +34161,33 @@ fn batch_file_dispatch(
                 &preflights,
             ));
         }
-        let (status, exit_code) = preflight_status_label(&preflights);
+        let deferred = preflights
+            .iter()
+            .filter(|entry| entry["status"] == "deferred")
+            .count();
+        let denied = preflights.iter().any(|entry| entry["allowed"] == false);
+        let (status, exit_code) = if deferred > 0 && !denied {
+            ("deferred", CliExitCode::Validation)
+        } else {
+            preflight_status_label(&preflights)
+        };
         let envelope = CommandEnvelope::new(CommandAvailability::LiveRuntime, "batch");
         let mut payload = json!({
             "status": status,
             "command": "batch-file",
             "source": "host-admin-api",
             "message": format!(
-                "Evaluated real preflight checks for `{}` across {} operation(s) and {} wave(s).",
+                "Evaluated {} real preflight check(s) for `{}`; {} operation(s) require upstream results before validation and authorization can finish.",
+                preflights.len() - deferred,
                 args.file.display(),
-                plan.total_operations,
-                plan.waves.len()
+                deferred,
             ),
             "file": args.file.display().to_string(),
             "dry_run": true,
             "plan": plan,
-            "execution": { "idempotency_key": run_key },
+            "preflight_complete": deferred == 0,
+            "deferred_operations": deferred,
+            "execution": { "idempotency_key": run_key, "submitted": false },
             "preflights": preflights,
             "next_actions": [
                 format!("fwc batch-file {} --host {}", args.file.display(), host.endpoint),
@@ -59139,6 +59198,240 @@ depends_on = ["missing"]
                     assert_ne!(proofs[left].signature, proofs[right].signature);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn execute_batch_file_preserves_typed_references_and_member_authority() {
+        let temp_dir = tempfile::tempdir().expect("batch tempdir");
+        let (capability_token, key_path, signing_key) = test_live_holder_auth(temp_dir.path());
+        let path = temp_dir.path().join("dataflow.jsonl");
+        let reference = json!({"$fcp_batch_ref": {
+            "operation": "source", "pointer": "/result/title"
+        }});
+        fs::write(&path, [
+            json!({"id":"source","connector":"github","operation":"get_issue","lease_seq":9,
+                "input":{"owner":"octocat","repo":"hello-world","number":1}}).to_string(),
+            json!({"id":"dependent","connector":"github","operation":"create_issue","lease_seq":12,
+                "depends_on":["source"],
+                "input":{"owner":"octocat","repo":"hello-world","title":reference}}).to_string(),
+        ].join("\n")).expect("write dataflow batch");
+        let (host, server, request_log) = spawn_mock_host_sequence_with_body_log(vec![
+            (
+                "POST /rpc/discover".to_owned(),
+                mock_discovery_response_json(),
+            ),
+            (
+                "GET /rpc/introspect/fcp.github:enterprise:v1".to_owned(),
+                mock_introspection_response_json(),
+            ),
+            (
+                "POST /rpc/batch".to_owned(),
+                mock_batch_response_json(&["source", "dependent"]),
+            ),
+        ]);
+        let path_text = path.display().to_string();
+        let key_text = key_path.display().to_string();
+        let (exit, payload) = execute_json(&[
+            "fwc",
+            "--json",
+            "--host",
+            &host,
+            "batch-file",
+            &path_text,
+            "--capability-token",
+            &capability_token,
+            "--holder-key-file",
+            &key_text,
+            "--idempotency-key",
+            "typed-dataflow-run",
+        ]);
+        server.join().expect("mock host");
+        assert_eq!(exit, CliExitCode::Success.into(), "{payload}");
+        let requests = request_log.lock().expect("request log");
+        let submitted: Value = serde_json::from_str(&requests[2].1).unwrap();
+        let members = submitted["operations"].as_array().unwrap();
+        assert_eq!(members[1]["request"]["input"]["title"], reference);
+        assert_eq!(members[1]["depends_on"], json!(["source"]));
+        assert_eq!(members[0]["request"]["lease_seq"], 9);
+        assert_eq!(members[1]["request"]["lease_seq"], 12);
+        for member in members {
+            assert_live_holder_request(&member["request"], &signing_key);
+            assert_eq!(member["request"]["zone_id"], "z:work");
+            assert!(member["request"]["idempotency_key"].is_string());
+        }
+        assert_ne!(members[0]["request"]["id"], members[1]["request"]["id"]);
+    }
+
+    #[test]
+    fn execute_batch_file_dry_run_defers_unknown_inputs_and_unwraps_literals() {
+        let temp_dir = tempfile::tempdir().expect("batch tempdir");
+        let path = temp_dir.path().join("dry-dataflow.jsonl");
+        fs::write(
+            &path,
+            [
+                json!({"id":"source","connector":"github","operation":"get_issue",
+                "input":{"$fcp_batch_literal":{"owner":"octocat","repo":"hello-world","number":1}}})
+                .to_string(),
+                json!({"id":"dependent","connector":"github","operation":"create_issue",
+                "depends_on":["source"],"input":{"owner":"octocat","repo":"hello-world",
+                    "title":{"$fcp_batch_ref":{"operation":"source","pointer":"/result/title"}}}})
+                .to_string(),
+            ]
+            .join("\n"),
+        )
+        .expect("write dataflow batch");
+        let (host, server, request_log) = spawn_mock_host_sequence_with_body_log(vec![
+            (
+                "POST /rpc/discover".to_owned(),
+                mock_discovery_response_json(),
+            ),
+            (
+                "GET /rpc/introspect/fcp.github:enterprise:v1".to_owned(),
+                mock_introspection_response_json(),
+            ),
+            (
+                "POST /rpc/preflight".to_owned(),
+                mock_preflight_response_json(true),
+            ),
+        ]);
+        let path_text = path.display().to_string();
+        let token = test_capability_token_arg();
+        let (exit, payload) = execute_json(&[
+            "fwc",
+            "--json",
+            "--host",
+            &host,
+            "batch-file",
+            &path_text,
+            "--dry-run",
+            "--capability-token",
+            &token,
+        ]);
+        server.join().expect("mock host");
+        assert_eq!(exit, CliExitCode::Validation.into(), "{payload}");
+        assert_eq!(payload["status"], "deferred");
+        assert_eq!(payload["preflight_complete"], false);
+        assert_eq!(payload["deferred_operations"], 1);
+        assert_eq!(payload["execution"]["submitted"], false);
+        assert_eq!(payload["preflights"][0]["allowed"], true);
+        assert!(payload["preflights"][1]["allowed"].is_null());
+        assert_eq!(payload["preflights"][1]["status"], "deferred");
+        assert_eq!(
+            payload["preflights"][1]["input_bindings"][0]["target_path"],
+            json!(["title"])
+        );
+        let requests = request_log.lock().expect("request log");
+        assert_eq!(requests.len(), 3, "unresolved input is never preflighted");
+        let preflight: Value = serde_json::from_str(&requests[2].1).unwrap();
+        assert_eq!(
+            preflight["params"],
+            json!({"owner":"octocat","repo":"hello-world","number":1})
+        );
+    }
+
+    #[test]
+    fn execute_batch_file_reference_does_not_hide_invalid_literal_siblings() {
+        let temp_dir = tempfile::tempdir().expect("batch tempdir");
+        let path = temp_dir.path().join("invalid-literal.jsonl");
+        fs::write(
+            &path,
+            [
+                json!({"id":"source","connector":"github","operation":"get_issue",
+                "input":{"owner":"octocat","repo":"hello-world","number":1}})
+                .to_string(),
+                json!({"id":"dependent","connector":"github","operation":"create_issue",
+                "depends_on":["source"],"input":{"owner":7,"repo":"hello-world",
+                    "title":{"$fcp_batch_ref":{"operation":"source","pointer":"/result/title"}}}})
+                .to_string(),
+            ]
+            .join("\n"),
+        )
+        .expect("write dataflow batch");
+        let (host, server, request_log) = spawn_mock_host_sequence_with_body_log(vec![
+            (
+                "POST /rpc/discover".to_owned(),
+                mock_discovery_response_json(),
+            ),
+            (
+                "GET /rpc/introspect/fcp.github:enterprise:v1".to_owned(),
+                mock_introspection_response_json(),
+            ),
+        ]);
+        let path_text = path.display().to_string();
+        let token = test_capability_token_arg();
+        let (exit, payload) = execute_json(&[
+            "fwc",
+            "--json",
+            "--host",
+            &host,
+            "batch-file",
+            &path_text,
+            "--capability-token",
+            &token,
+        ]);
+        server.join().expect("mock host");
+        assert_eq!(exit, CliExitCode::Validation.into(), "{payload}");
+        assert_eq!(payload["invalid_operations"][0]["id"], "dependent");
+        assert_eq!(
+            payload["invalid_operations"][0]["errors"][0]["path"],
+            "owner"
+        );
+        assert_eq!(
+            request_log.lock().unwrap().len(),
+            2,
+            "no batch was submitted"
+        );
+    }
+
+    #[test]
+    fn execute_batch_file_rejects_invalid_references_before_host_io() {
+        let temp_dir = tempfile::tempdir().expect("batch tempdir");
+        let path = temp_dir.path().join("invalid-reference.jsonl");
+        let token = test_capability_token_arg();
+        for (depends_on, zone, reference) in [
+            (
+                json!([]),
+                "z:work",
+                json!({"$fcp_batch_ref":{"operation":"source","pointer":"/result/title"}}),
+            ),
+            (
+                json!(["source"]),
+                "z:private",
+                json!({"$fcp_batch_ref":{"operation":"source","pointer":"/result/title"}}),
+            ),
+            (
+                json!(["source"]),
+                "z:work",
+                json!({"$fcp_batch_ref":{"operation":"source","pointer":"/~2"}}),
+            ),
+            (
+                json!(["source"]),
+                "z:work",
+                json!({"$fcp_batch_ref":{"operation":"source","pointer":""},"extra":true}),
+            ),
+        ] {
+            fs::write(&path, [
+                json!({"id":"source","connector":"github","operation":"get_issue","zone":"z:work",
+                    "input":{"owner":"octocat","repo":"hello-world","number":1}}).to_string(),
+                json!({"id":"dependent","connector":"github","operation":"create_issue","zone":zone,
+                    "depends_on":depends_on,"input":{"owner":"octocat","repo":"hello-world","title":reference}}).to_string(),
+            ].join("\n")).expect("write invalid reference batch");
+            let path_text = path.display().to_string();
+            let (exit, payload) = execute_json(&[
+                "fwc",
+                "--json",
+                "--host",
+                "http://127.0.0.1:1",
+                "batch-file",
+                &path_text,
+                "--capability-token",
+                &token,
+            ]);
+            assert_eq!(exit, CliExitCode::Validation.into(), "{payload}");
+            assert_eq!(payload["error"]["type"], "invalid-batch-input-reference");
+            assert_eq!(payload["invoke_attempted"], false);
+            assert_eq!(payload["execution"]["submitted"], false);
         }
     }
 

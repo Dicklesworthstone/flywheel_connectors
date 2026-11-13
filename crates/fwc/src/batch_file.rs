@@ -5,9 +5,19 @@
 //! topological order.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::io::{self, Write};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+// Match the host's input-template admission bounds. The host additionally
+// bounds resolved values and cumulative dataflow storage when results exist.
+const REFERENCE_KEY: &str = "$fcp_batch_ref";
+const LITERAL_KEY: &str = "$fcp_batch_literal";
+const MAX_TEMPLATE_DEPTH: usize = 64;
+const MAX_TEMPLATE_NODES: usize = 65_536;
+const MAX_TEMPLATE_REFERENCES: usize = 128;
+const MAX_TEMPLATE_BYTES: usize = 1024 * 1024;
 
 // ── Batch operation entry ──────────────────────────────────────────────
 
@@ -33,6 +43,35 @@ pub struct BatchOp {
     pub depends_on: Vec<String>,
 }
 
+/// One unresolved value required from an explicitly declared dependency.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct InputReference {
+    /// Batch member that must produce a successful retained result first.
+    pub source_operation: String,
+    /// Canonical JSON pointer within that member's output.
+    pub pointer: String,
+    /// Exact target path, using unescaped keys and decimal array indices.
+    pub target_path: Vec<String>,
+}
+
+/// A local validation projection, never an input to live execution.
+#[derive(Debug, Clone)]
+pub struct InputTemplate {
+    /// Literal wrappers are unwrapped and unresolved references become null.
+    pub projection: Value,
+    /// Only these exact paths have an unknown value or type until execution.
+    pub deferred_paths: BTreeSet<Vec<String>>,
+    /// Dependency evidence suitable for explaining a deferred dry-run check.
+    pub references: Vec<InputReference>,
+}
+
+impl InputTemplate {
+    /// Whether provider results are needed before all inputs can be checked.
+    pub fn has_references(&self) -> bool {
+        !self.references.is_empty()
+    }
+}
+
 // ── Parse errors ───────────────────────────────────────────────────────
 
 /// Errors that can occur during batch file parsing and validation.
@@ -48,6 +87,8 @@ pub enum BatchFileError {
     UnknownDependency { id: String, dependency: String },
     /// The dependency graph contains a cycle.
     CycleDetected { ids: Vec<String> },
+    /// A reference or literal wrapper does not satisfy host template rules.
+    InvalidInputTemplate { id: String, reason: &'static str },
     /// The batch file is empty.
     Empty,
 }
@@ -67,6 +108,12 @@ impl std::fmt::Display for BatchFileError {
             }
             Self::CycleDetected { ids } => {
                 write!(f, "dependency cycle detected involving: {}", ids.join(", "))
+            }
+            Self::InvalidInputTemplate { id, reason } => {
+                write!(
+                    f,
+                    "operation '{id}' has an invalid input template: {reason}"
+                )
             }
             Self::Empty => f.write_str("batch file is empty"),
         }
@@ -155,6 +202,61 @@ impl BatchFile {
         Ok(batch)
     }
 
+    /// Analyze input bindings without resolving provider data or changing inputs.
+    ///
+    /// References require an explicit, existing dependency in the same effective
+    /// zone. Literal wrappers suppress marker interpretation throughout their
+    /// contents while still consuming the host's shape and byte limits. Nulls
+    /// in the returned projection represent unknown values only at the recorded
+    /// paths; callers must send the original operation inputs to the host.
+    pub fn input_templates(
+        &self,
+        default_zone: &str,
+    ) -> Result<BTreeMap<String, InputTemplate>, BatchFileError> {
+        let members: HashMap<_, _> = self
+            .operations
+            .iter()
+            .map(|operation| (operation.id.as_str(), operation))
+            .collect();
+        let mut templates = BTreeMap::new();
+        for operation in &self.operations {
+            let invalid = |reason| BatchFileError::InvalidInputTemplate {
+                id: operation.id.clone(),
+                reason,
+            };
+            let mut analysis = TemplateAnalysis::default();
+            analysis
+                .scan(&operation.input, 0, &mut Vec::new())
+                .map_err(invalid)?;
+            if analysis.substitutes {
+                measure_template(&operation.input).map_err(invalid)?;
+            }
+            let zone = operation.zone.as_deref().unwrap_or(default_zone);
+            for reference in &analysis.references {
+                let source = members
+                    .get(reference.source_operation.as_str())
+                    .ok_or_else(|| invalid("reference names an unknown batch member"))?;
+                if source.id == operation.id || !operation.depends_on.contains(&source.id) {
+                    return Err(invalid(
+                        "reference requires an explicit dependency on another member",
+                    ));
+                }
+                if source.zone.as_deref().unwrap_or(default_zone) != zone {
+                    return Err(invalid("reference crosses the effective zone boundary"));
+                }
+            }
+            templates.insert(
+                operation.id.clone(),
+                InputTemplate {
+                    projection: project_template(&operation.input),
+                    deferred_paths: analysis.deferred_paths,
+                    references: analysis.references,
+                },
+            );
+        }
+        Ok(templates)
+    }
+
     /// Verify there are no cycles in the dependency graph.
     fn check_cycles(&self) -> Result<(), BatchFileError> {
         let mut in_degree: HashMap<&str, usize> = HashMap::new();
@@ -222,6 +324,151 @@ impl BatchFile {
             .map(|op| op.connector.clone())
             .collect()
     }
+}
+
+#[derive(Default)]
+struct TemplateAnalysis {
+    visited: usize,
+    substitutes: bool,
+    deferred_paths: BTreeSet<Vec<String>>,
+    references: Vec<InputReference>,
+}
+
+impl TemplateAnalysis {
+    fn visit(&mut self, depth: usize) -> Result<(), &'static str> {
+        self.visited += 1;
+        if depth > MAX_TEMPLATE_DEPTH || self.visited > MAX_TEMPLATE_NODES {
+            return Err("template exceeds the host depth or node limit");
+        }
+        Ok(())
+    }
+
+    fn scan(
+        &mut self,
+        value: &Value,
+        depth: usize,
+        path: &mut Vec<String>,
+    ) -> Result<(), &'static str> {
+        self.visit(depth)?;
+        match value {
+            Value::Object(object) if object.contains_key(REFERENCE_KEY) => {
+                let reference = object[REFERENCE_KEY]
+                    .as_object()
+                    .filter(|reference| object.len() == 1 && reference.len() == 2)
+                    .ok_or("reference must contain only operation and pointer")?;
+                let source = reference
+                    .get("operation")
+                    .and_then(Value::as_str)
+                    .filter(|source| !source.is_empty() && source.len() <= 128)
+                    .ok_or("reference operation must be a nonempty ID of at most 128 bytes")?;
+                let pointer = reference
+                    .get("pointer")
+                    .and_then(Value::as_str)
+                    .filter(|pointer| valid_pointer(pointer))
+                    .ok_or("reference pointer must be canonical and at most 1024 bytes")?;
+                if self.references.len() >= MAX_TEMPLATE_REFERENCES {
+                    return Err("template exceeds the host reference limit");
+                }
+                self.substitutes = true;
+                self.deferred_paths.insert(path.clone());
+                self.references.push(InputReference {
+                    source_operation: source.to_owned(),
+                    pointer: pointer.to_owned(),
+                    target_path: path.clone(),
+                });
+            }
+            Value::Object(object) if object.contains_key(LITERAL_KEY) => {
+                if object.len() != 1 {
+                    return Err("literal wrapper must contain only its literal value");
+                }
+                self.substitutes = true;
+                self.scan_literal(&object[LITERAL_KEY], depth + 1)?;
+            }
+            Value::Object(object) => {
+                for (key, child) in object {
+                    path.push(key.clone());
+                    self.scan(child, depth + 1, path)?;
+                    path.pop();
+                }
+            }
+            Value::Array(array) => {
+                for (index, child) in array.iter().enumerate() {
+                    path.push(index.to_string());
+                    self.scan(child, depth + 1, path)?;
+                    path.pop();
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn scan_literal(&mut self, value: &Value, depth: usize) -> Result<(), &'static str> {
+        self.visit(depth)?;
+        match value {
+            Value::Object(object) => {
+                for child in object.values() {
+                    self.scan_literal(child, depth + 1)?;
+                }
+            }
+            Value::Array(array) => {
+                for child in array {
+                    self.scan_literal(child, depth + 1)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+fn valid_pointer(pointer: &str) -> bool {
+    if pointer.len() > 1024 || (!pointer.is_empty() && !pointer.starts_with('/')) {
+        return false;
+    }
+    let mut bytes = pointer.bytes();
+    while let Some(byte) = bytes.next() {
+        if byte == b'~' && !matches!(bytes.next(), Some(b'0' | b'1')) {
+            return false;
+        }
+    }
+    true
+}
+
+// Analysis checks the complete shape before this second pass clones any data.
+// Escaped contents stay opaque; nested marker-shaped literals are not expanded.
+fn project_template(value: &Value) -> Value {
+    match value {
+        Value::Object(object) if object.contains_key(REFERENCE_KEY) => Value::Null,
+        Value::Object(object) if object.contains_key(LITERAL_KEY) => object[LITERAL_KEY].clone(),
+        Value::Object(object) => Value::Object(
+            object
+                .iter()
+                .map(|(key, child)| (key.clone(), project_template(child)))
+                .collect(),
+        ),
+        Value::Array(array) => Value::Array(array.iter().map(project_template).collect()),
+        value => value.clone(),
+    }
+}
+
+fn measure_template(value: &Value) -> Result<(), &'static str> {
+    struct Counter(usize);
+    impl Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if bytes.len() > MAX_TEMPLATE_BYTES.saturating_sub(self.0) {
+                return Err(io::Error::other("batch input template byte limit"));
+            }
+            self.0 += bytes.len();
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    serde_json::to_writer(&mut Counter(0), value)
+        .map_err(|_| "template exceeds the host encoded input byte limit")
 }
 
 // ── Execution plan ─────────────────────────────────────────────────────
@@ -447,6 +694,221 @@ pub fn format_results_toon(results: &[OpResult]) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn reference_input(source: &str, pointer: &str) -> Value {
+        json!({"$fcp_batch_ref": {"operation": source, "pointer": pointer}})
+    }
+
+    fn template_batch(input: Value) -> BatchFile {
+        BatchFile {
+            operations: vec![
+                BatchOp {
+                    id: "source".to_owned(),
+                    connector: "github".to_owned(),
+                    operation: "create_issue".to_owned(),
+                    input: json!({}),
+                    zone: None,
+                    lease_seq: None,
+                    depends_on: Vec::new(),
+                },
+                BatchOp {
+                    id: "dependent".to_owned(),
+                    connector: "slack".to_owned(),
+                    operation: "send_message".to_owned(),
+                    input,
+                    zone: None,
+                    lease_seq: None,
+                    depends_on: vec!["source".to_owned()],
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn input_templates_keep_original_input_and_record_exact_target_paths() {
+        let input = json!({
+            "items": [
+                {"a.b/~": reference_input("source", "/items/0/id")},
+                reference_input("source", ""),
+            ],
+            "known_null": null,
+            "text": "literal text",
+        });
+        let batch = template_batch(input.clone());
+        let templates = batch.input_templates("z:work").unwrap();
+        let template = &templates["dependent"];
+        assert!(template.has_references());
+        assert!(!templates["source"].has_references());
+        assert_eq!(batch.operations[1].input, input);
+        assert_eq!(
+            template.projection,
+            json!({"items": [{"a.b/~": null}, null], "known_null": null, "text": "literal text"})
+        );
+        assert_eq!(
+            template.deferred_paths,
+            BTreeSet::from([
+                vec!["items".to_owned(), "0".to_owned(), "a.b/~".to_owned()],
+                vec!["items".to_owned(), "1".to_owned()],
+            ])
+        );
+        assert_eq!(template.references[0].source_operation, "source");
+        assert_eq!(template.references[0].pointer, "/items/0/id");
+        assert_eq!(
+            serde_json::to_value(&template.references[0]).unwrap()["target_path"],
+            json!(["items", "0", "a.b/~"])
+        );
+    }
+
+    #[test]
+    fn input_templates_require_strict_marker_shapes_and_canonical_pointers() {
+        for input in [
+            json!({"$fcp_batch_ref": null}),
+            json!({"$fcp_batch_ref": "source"}),
+            json!({"$fcp_batch_ref": {"operation": "source"}}),
+            json!({"$fcp_batch_ref": {"operation": "source", "pointer": "", "extra": true}}),
+            json!({"$fcp_batch_ref": {"operation": "source", "pointer": 0}}),
+            json!({"$fcp_batch_ref": {"operation": "source", "pointer": ""}, "private": "private-input-sentinel"}),
+            json!({"$fcp_batch_literal": {}, "extra": true}),
+            json!({"$fcp_batch_literal": {}, "$fcp_batch_ref": {"operation": "source", "pointer": ""}}),
+            reference_input("", ""),
+            reference_input(&"x".repeat(129), ""),
+            reference_input("source", "field"),
+            reference_input("source", "/trailing~"),
+            reference_input("source", "/invalid~2escape"),
+            reference_input("source", &format!("/{}", "x".repeat(1024))),
+        ] {
+            let error = template_batch(input).input_templates("z:work").unwrap_err();
+            assert!(matches!(error, BatchFileError::InvalidInputTemplate { .. }));
+            assert!(!error.to_string().contains("private-input-sentinel"));
+        }
+        for pointer in ["", "/", "/items/0", "/a~1b/~0c"] {
+            assert!(
+                template_batch(reference_input("source", pointer))
+                    .input_templates("z:work")
+                    .is_ok()
+            );
+        }
+        assert!(
+            template_batch(reference_input("source", &format!("/{}", "x".repeat(1023))))
+                .input_templates("z:work")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn input_templates_require_explicit_same_zone_dependencies() {
+        let mut batch = template_batch(reference_input("source", "/id"));
+        batch.operations[1].depends_on.clear();
+        assert!(batch.input_templates("z:work").is_err());
+        batch.operations[1].depends_on.push("source".to_owned());
+        batch.operations[1].input = reference_input("missing", "/id");
+        assert!(batch.input_templates("z:work").is_err());
+        batch.operations[1].input = reference_input("dependent", "/id");
+        batch.operations[1].depends_on.push("dependent".to_owned());
+        assert!(batch.input_templates("z:work").is_err());
+
+        let mut batch = template_batch(reference_input("source", "/id"));
+        batch.operations[0].zone = Some("z:work".to_owned());
+        assert!(batch.input_templates("z:work").is_ok());
+        assert!(batch.input_templates("z:private").is_err());
+        batch.operations[1].zone = Some("z:work".to_owned());
+        assert!(batch.input_templates("z:private").is_ok());
+        batch.operations[1].zone = Some("z:public".to_owned());
+        assert!(batch.input_templates("z:work").is_err());
+    }
+
+    #[test]
+    fn input_literal_wrappers_unwrap_once_and_keep_nested_markers_opaque() {
+        let literal = json!({
+            "$fcp_batch_ref": {"not": "a valid reference"},
+            "nested": {"$fcp_batch_literal": reference_input("unknown", "/bad~2")},
+        });
+        let input = json!({"value": {"$fcp_batch_literal": literal.clone()}});
+        let batch = template_batch(input.clone());
+        let templates = batch.input_templates("z:work").unwrap();
+        let template = &templates["dependent"];
+        assert_eq!(template.projection, json!({"value": literal}));
+        assert!(!template.has_references());
+        assert!(template.deferred_paths.is_empty());
+        assert_eq!(batch.operations[1].input, input);
+        assert!(template_batch(literal).input_templates("z:work").is_err());
+    }
+
+    #[test]
+    fn input_template_depth_limits_include_escaped_contents() {
+        let nested = |depth| (0..depth).fold(Value::Null, |value, _| json!([value]));
+        assert!(template_batch(nested(64)).input_templates("z:work").is_ok());
+        assert!(
+            template_batch(nested(65))
+                .input_templates("z:work")
+                .is_err()
+        );
+        assert!(
+            template_batch(json!({"$fcp_batch_literal": nested(63)}))
+                .input_templates("z:work")
+                .is_ok()
+        );
+        assert!(
+            template_batch(json!({"$fcp_batch_literal": nested(64)}))
+                .input_templates("z:work")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn input_template_node_and_reference_limits_match_host_boundaries() {
+        assert!(
+            template_batch(Value::Array(vec![Value::Null; MAX_TEMPLATE_NODES - 1]))
+                .input_templates("z:work")
+                .is_ok()
+        );
+        assert!(
+            template_batch(Value::Array(vec![Value::Null; MAX_TEMPLATE_NODES]))
+                .input_templates("z:work")
+                .is_err()
+        );
+        assert!(
+            template_batch(
+                json!({"$fcp_batch_literal": vec![Value::Null; MAX_TEMPLATE_NODES - 1]})
+            )
+            .input_templates("z:work")
+            .is_err()
+        );
+        for (count, accepted) in [(128, true), (129, false)] {
+            let input = Value::Array(vec![reference_input("source", "/id"); count]);
+            assert_eq!(
+                template_batch(input).input_templates("z:work").is_ok(),
+                accepted
+            );
+        }
+    }
+
+    #[test]
+    fn input_template_byte_limit_counts_encoded_original_before_projection() {
+        let mut input = json!({"$fcp_batch_literal": "界\n"});
+        let overhead = serde_json::to_vec(&input).unwrap().len();
+        let mut text = format!("界\n{}", "x".repeat(MAX_TEMPLATE_BYTES - overhead));
+        input[LITERAL_KEY] = json!(text);
+        assert_eq!(
+            serde_json::to_vec(&input).unwrap().len(),
+            MAX_TEMPLATE_BYTES
+        );
+        assert!(
+            template_batch(input.clone())
+                .input_templates("z:work")
+                .is_ok()
+        );
+        text.push('x');
+        input[LITERAL_KEY] = json!(text);
+        assert!(template_batch(input).input_templates("z:work").is_err());
+
+        // The host applies this byte cap only to templates that substitute.
+        assert!(
+            template_batch(json!("x".repeat(MAX_TEMPLATE_BYTES + 1)))
+                .input_templates("z:work")
+                .is_ok()
+        );
+    }
 
     // ── Parsing ────────────────────────────────────────────────────
 

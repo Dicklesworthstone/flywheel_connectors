@@ -510,7 +510,6 @@ fn inconsistent_member_results_are_unknown_and_never_retryable() {
     }
 }
 
-
 #[fcp_async_core::runtime::test]
 async fn streaming_batch_returns_fast_results_before_unrelated_slow_work() {
     use futures_util::StreamExt;
@@ -552,7 +551,10 @@ async fn streaming_batch_returns_fast_results_before_unrelated_slow_work() {
     };
     assert_eq!(batch.bounded.response.status, BatchStatus::Success);
     assert_eq!(batch.acknowledged_results, 3);
-    assert_eq!(batch.delivery_status, fcp_host::BatchDeliveryStatus::Complete);
+    assert_eq!(
+        batch.delivery_status,
+        fcp_host::BatchDeliveryStatus::Complete
+    );
     assert_eq!(
         batch
             .bounded
@@ -651,7 +653,11 @@ async fn streaming_batch_paused_consumer_cannot_renew_the_execution_budget() {
     );
     assert!(batch.bounded.response.results[1].output.is_some());
     assert_eq!(
-        batch.bounded.response.results[2].error.as_ref().unwrap().code,
+        batch.bounded.response.results[2]
+            .error
+            .as_ref()
+            .unwrap()
+            .code,
         "BATCH_TIMEOUT",
     );
     assert!(stream.next().await.is_none());
@@ -694,7 +700,10 @@ async fn streaming_batch_withholds_oversized_output_before_any_delivery() {
     assert_eq!(batch.bounded.withheld_results, 1);
     assert_eq!(batch.bounded.response.status, BatchStatus::Aborted);
     assert_eq!(batch.acknowledged_results, 2);
-    assert_eq!(batch.delivery_status, fcp_host::BatchDeliveryStatus::Complete);
+    assert_eq!(
+        batch.delivery_status,
+        fcp_host::BatchDeliveryStatus::Complete
+    );
     assert!(stream.next().await.is_none());
 }
 
@@ -822,7 +831,10 @@ async fn streaming_batch_first_poll_after_deadline_never_dispatches() {
     assert_eq!(calls.get(), 0);
     assert_eq!(batch.bounded.response.skipped, 2);
     assert_eq!(batch.acknowledged_results, 0);
-    assert_eq!(batch.delivery_status, fcp_host::BatchDeliveryStatus::Interrupted);
+    assert_eq!(
+        batch.delivery_status,
+        fcp_host::BatchDeliveryStatus::Interrupted
+    );
     assert!(
         batch
             .bounded

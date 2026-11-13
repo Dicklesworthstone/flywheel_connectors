@@ -32191,7 +32191,12 @@ output_schema = { type = "object" }
                                 response
                             }
                             Some("blocked") => {
-                                assert_eq!(request.deadline_ms, Some(10_000));
+                                assert!(
+                                    request
+                                        .deadline_ms
+                                        .is_some_and(|deadline| deadline > 0 && deadline <= 2_000),
+                                    "the original batch deadline narrows the member request"
+                                );
                                 assert!(
                                     rpc.rpc.remaining() <= Duration::from_secs(2),
                                     "the original batch deadline caps physical IO"

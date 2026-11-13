@@ -533,9 +533,9 @@ impl BatchExecutor {
                 // After any panic we stop admission rather than calling a factory
                 // whose captured state may have been left partially mutated.
                 if let Ok(future) = catch_unwind(AssertUnwindSafe(|| handler(operation))) {
-                    active.push(async move {
-                        (index, AssertUnwindSafe(future).catch_unwind().await)
-                    });
+                    active.push(
+                        async move { (index, AssertUnwindSafe(future).catch_unwind().await) },
+                    );
                 } else {
                     run.record_panicked(index);
                     dependencies.complete(index);

@@ -953,7 +953,10 @@ mod tests {
             ),
             (2, 0, 1)
         );
-        assert_eq!(streamed.bounded.response.results[1].output, Some(Value::Null));
+        assert_eq!(
+            streamed.bounded.response.results[1].output,
+            Some(Value::Null)
+        );
         assert_eq!(
             streamed.bounded.response.results[2]
                 .error
@@ -1104,7 +1107,10 @@ mod tests {
         assert_eq!(streamed.bounded.retained_result_bytes, 4);
         assert_eq!(streamed.bounded.response.completed, 1);
         assert_eq!(streamed.bounded.response.skipped, 1);
-        assert_eq!(streamed.bounded.response.results[0].output, Some(Value::Null));
+        assert_eq!(
+            streamed.bounded.response.results[0].output,
+            Some(Value::Null)
+        );
         assert_eq!(
             streamed.bounded.response.results[1]
                 .error
@@ -1222,7 +1228,11 @@ mod tests {
             assert_eq!(streamed.bounded.response.completed, 1);
             assert_eq!(streamed.bounded.response.failed, 1);
             assert_eq!(streamed.bounded.response.skipped, 1);
-            assert!(!serde_json::to_string(&streamed).unwrap().contains("private"));
+            assert!(
+                !serde_json::to_string(&streamed)
+                    .unwrap()
+                    .contains("private")
+            );
         }
     }
 

@@ -3725,17 +3725,39 @@ Pipes are the imperative shorthand; pipelines and recipes are the declarative fo
 
 ### Batch Files (Heterogeneous Operations)
 
-`fwc batch-file` executes a JSONL file of arbitrary operations with optional dependency ordering:
+`fwc batch-file` executes a JSONL file of arbitrary operations with explicit
+dependency ordering and typed references to earlier results:
 
 ```jsonl
-{"id":"a","connector":"github","operation":"issues.create","inputs":{...}}
-{"id":"b","connector":"slack", "operation":"messages.send","needs":["a"],"inputs":{...}}
+{"id":"issue","connector":"github","operation":"github.create_issue","input":{"owner":"octocat","repo":"hello-world","title":"Follow up"}}
+{"id":"notify","connector":"slack","operation":"slack.post_message","depends_on":["issue"],"input":{"channel":"C0123456789","text":{"$fcp_batch_ref":{"operation":"issue","pointer":"/result/issue/html_url"}}}}
 ```
 
 ```bash
 fwc batch-file operations.jsonl --dry-run
 fwc batch-file operations.jsonl
 ```
+
+A reference replaces its whole JSON value with the selected value; numbers,
+objects, arrays and booleans keep their types. Its source must appear explicitly
+in `depends_on` and use the same effective execution zone. JSON pointers select
+from the member's complete invoke response, so provider data normally starts
+under `/result`. Use `~0` for a literal `~` and `~1` for a literal `/` in pointer
+segments. Wrap a value in `{"$fcp_batch_literal": ...}` when reserved marker keys
+must be treated as literal provider input.
+
+The CLI checks reference structure, dependency scope and resource bounds before
+host I/O, then checks known input values against the operation schema. Reference
+values remain unresolved until the host has a successful upstream result; the
+host binds them, preserves their provenance, and applies ordinary schema,
+capability, approval and resource checks before invoking the dependent.
+
+During `--dry-run`, fully known inputs receive real host preflight checks.
+Members requiring upstream results report `allowed: null`, `status: deferred`
+and their input bindings, without sending placeholder values to preflight. If
+there are no explicit denials but some checks remain deferred, the command
+reports `status: deferred` and exits with validation code **5**. This does not
+authorize the eventual resolved request. No batch operation runs during dry-run.
 
 ### Streaming live HTTP batch results
 

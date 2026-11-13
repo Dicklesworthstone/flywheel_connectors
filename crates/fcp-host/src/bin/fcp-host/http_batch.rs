@@ -95,7 +95,8 @@ where
                 if started_at.elapsed() >= Duration::from_millis(request.options.timeout_ms) {
                     return Err(BatchOperationError {
                         code: "BATCH_INPUT_TIMEOUT".into(),
-                        message: "batch input resolution exhausted the deadline before invocation".into(),
+                        message: "batch input resolution exhausted the deadline before invocation"
+                            .into(),
                         retry_after_ms: None,
                     });
                 }
@@ -161,8 +162,9 @@ where
                     if started_at.elapsed() >= timeout {
                         return Err(BatchOperationError {
                             code: "BATCH_INPUT_TIMEOUT".into(),
-                            message: "batch input resolution exhausted the deadline before invocation"
-                                .into(),
+                            message:
+                                "batch input resolution exhausted the deadline before invocation"
+                                    .into(),
                             retry_after_ms: None,
                         });
                     }
@@ -377,24 +379,19 @@ where
     let (sender, receiver) = mpsc::channel(1);
     let result_sender = sender.clone();
     let execution = async move {
-        let outcome = execute_dataflow_wait_with(
-            &request,
-            started_at,
-            handler,
-            move |result| {
-                let sender = result_sender.clone();
-                async move {
-                    sender
-                        .send(HttpBatchStreamRecord::Result { result })
-                        .await
-                        .map_err(|_| BatchOperationError {
-                            code: "BATCH_STREAM_CLOSED".into(),
-                            message: "batch result consumer closed".into(),
-                            retry_after_ms: None,
-                        })
-                }
-            },
-        )
+        let outcome = execute_dataflow_wait_with(&request, started_at, handler, move |result| {
+            let sender = result_sender.clone();
+            async move {
+                sender
+                    .send(HttpBatchStreamRecord::Result { result })
+                    .await
+                    .map_err(|_| BatchOperationError {
+                        code: "BATCH_STREAM_CLOSED".into(),
+                        message: "batch result consumer closed".into(),
+                        retry_after_ms: None,
+                    })
+            }
+        })
         .await;
         let terminal = match outcome {
             Ok(batch) => HttpBatchStreamRecord::Complete {
