@@ -143,6 +143,7 @@ impl LiveReceiver {
             runner_tx,
             event_transport: None,
             _runner_task: runner_task,
+            runtime_retirement: native_rpc::NativeRuntimeRetirement::default(),
             resilience: Arc::new(ResilienceLayer::default()),
             capability_verifying_key: Some(signing_key.verifying_key().to_bytes()),
             state_root: None,

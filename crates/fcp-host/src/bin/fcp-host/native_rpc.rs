@@ -33,6 +33,8 @@ const RETIREMENT_GRACE: Duration = Duration::from_secs(2);
 // Physical exit still needs a nonblocking child probe. Ordinary cancellation
 // must not use this interval: async-core sleep creates a thread for every wait.
 const RETIREMENT_POLL: Duration = Duration::from_millis(20);
+/// Host-owned queue control; this method is never sent to a connector.
+pub(super) const RETIRE_RUNTIME_METHOD: &str = "__fcp_host_retire_runtime";
 
 fn deadline_after(started_at: Instant, timeout: Duration) -> Instant {
     started_at.checked_add(timeout).unwrap_or(started_at)
@@ -89,6 +91,53 @@ pub(super) struct NativeRpc {
     cancellation: CancellationToken,
 }
 
+/// Retain the exact process retirement across dispatcher failure and retained
+/// connector references. An ended task or a closed channel alone is not proof
+/// that its child has exited.
+#[derive(Clone, Debug, Default)]
+pub(super) struct NativeRuntimeRetirement {
+    terminal: Arc<Mutex<Option<NativeRpc>>>,
+}
+
+impl NativeRuntimeRetirement {
+    pub(super) fn record(&self, rpc: NativeRpc) {
+        let mut terminal = self
+            .terminal
+            .lock()
+            .expect("native runtime retirement lock");
+        // One dispatcher owns exactly one child. Preserve the first custody
+        // record even if a later teardown path observes the same transport.
+        if terminal.is_none() {
+            *terminal = Some(rpc);
+        }
+    }
+
+    pub(super) fn is_exited(&self) -> bool {
+        let terminal = self
+            .terminal
+            .lock()
+            .expect("native runtime retirement lock")
+            .clone();
+        terminal.is_some_and(|rpc| rpc.transport_retired() && rpc.is_settled())
+    }
+
+    pub(super) async fn wait_for_exit(&self, deadline: Instant) -> HostResult<()> {
+        loop {
+            if self.is_exited() {
+                return Ok(());
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(HostError::Unavailable(
+                    "native connector runtime retirement has not confirmed process exit"
+                        .to_string(),
+                ));
+            }
+            fcp_async_core::time::sleep(RETIREMENT_POLL.min(remaining)).await;
+        }
+    }
+}
+
 impl std::fmt::Debug for NativeRpc {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -122,6 +171,15 @@ impl NativeRpc {
     #[must_use]
     pub(super) fn for_io() -> Self {
         Self::new(deadline_after(Instant::now(), CONNECTOR_RPC_IO_TIMEOUT))
+    }
+
+    /// Teardown of an idle actor still needs durable in-memory child custody.
+    /// This ticket can only retire a child; it is never admitted to a queue or
+    /// used to authorize connector execution.
+    pub(super) fn for_retirement() -> Self {
+        let rpc = Self::for_io();
+        rpc.state.lock().expect("native RPC state lock").phase = RpcPhase::Active;
+        rpc
     }
 
     #[must_use]
@@ -433,6 +491,24 @@ pub(super) fn run_dispatcher(
             }
             // No await separates selection from publishing the exact active ticket.
             runner.active_rpc = Some(rpc.clone());
+            if request.method == RETIRE_RUNTIME_METHOD {
+                // A lifecycle stop waits behind already selected work. Once
+                // selected, it closes admission before killing the exact child;
+                // retained Arc callers cannot revive this dispatcher.
+                receiver.close();
+                runner.retire_child();
+                rpc.wait_for_settlement().await;
+                let response = if runner.runtime_retirement.is_exited() {
+                    Ok(serde_json::json!({ "result": {} }))
+                } else {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "native runtime retirement has not confirmed process exit",
+                    ))
+                };
+                let _ = request.response_tx.send(response);
+                break;
+            }
             let response = {
                 let mut cancelled = pin!(rpc.cancelled());
                 // cancelled() already enforces the ticket's absolute deadline;
@@ -465,10 +541,7 @@ pub(super) fn run_dispatcher(
             // Ambiguous IO, expiration and selected cancellation retire the
             // transport. Keep the Child in the ticket even if the actor is dropped
             // while waiting for exit or the request receiver has disappeared.
-            if let Some(child) = runner.child.take() {
-                rpc.retire(child);
-            }
-            runner.active_rpc = None;
+            runner.retire_child();
             rpc.wait_for_settlement().await;
             let error = response.err().unwrap_or_else(|| rpc.stop_error());
             let _ = request.response_tx.send(Err(error));
@@ -1934,5 +2007,239 @@ mod queue_shutdown_tests {
                 CancellationScope::new("replacement", ConnectorArchetype::RequestResponse),
             )
             .expect("undispatched backlog must not strand its operation registration");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod runtime_retirement_tests {
+    use std::collections::BTreeMap;
+    use std::path::Path;
+
+    use fcp_async_core::channel::oneshot;
+    use fcp_async_core::task;
+    use serde_json::json;
+
+    use super::*;
+
+    async fn wait_for_file(path: &Path) {
+        fcp_async_core::time::timeout(Duration::from_secs(5), async {
+            while !path.exists() {
+                fcp_async_core::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("native fixture reached its observable boundary");
+    }
+
+    async fn connector(
+        script: &str,
+        environment: &BTreeMap<String, String>,
+    ) -> Arc<crate::SubprocessConnector> {
+        let runner = ConnectorProcessRunner::spawn(
+            "/bin/sh",
+            &["-c".to_owned(), script.to_owned()],
+            environment,
+        )
+        .await
+        .expect("spawn native retirement fixture");
+        let retirement = runner.runtime_retirement.clone();
+        let events = runner.event_transport.clone();
+        let (sender, receiver) = mpsc::channel(4);
+        let actor = task::try_spawn(run_dispatcher(runner, receiver)).expect("native actor");
+        let mut connector = crate::tests::dispatcher_test_connector(
+            "fcp.test.runtime-retirement:utility:1.0.0",
+            sender,
+            actor,
+        );
+        let fixture = Arc::get_mut(&mut connector).expect("exclusive connector fixture");
+        fixture.runtime_retirement = retirement;
+        fixture.event_transport = Some(events);
+        connector
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn idle_native_retirement_confirms_exit_without_sending_provider_rpc() {
+        let directory = tempfile::tempdir().unwrap();
+        let ready = directory.path().join("ready");
+        let calls = directory.path().join("calls");
+        let environment = BTreeMap::from([
+            ("READY".to_owned(), ready.to_string_lossy().into_owned()),
+            ("CALLS".to_owned(), calls.to_string_lossy().into_owned()),
+        ]);
+        let connector = connector(
+            ": > \"$READY\"; while IFS= read -r request; do printf '%s\\n' \"$request\" >> \"$CALLS\"; done",
+            &environment,
+        )
+        .await;
+        let retained = Arc::clone(&connector);
+        wait_for_file(&ready).await;
+        assert!(!connector.runtime_retirement.is_exited());
+        connector
+            .retire_runtime(Instant::now() + Duration::from_secs(5))
+            .await
+            .expect("retirement requires observed process exit");
+        assert!(connector.runtime_retirement.is_exited());
+        assert!(connector.runner_tx.is_closed());
+        assert!(
+            !calls.exists(),
+            "host retirement must never reach provider stdin"
+        );
+        retained
+            .retire_runtime(Instant::now() + Duration::from_secs(1))
+            .await
+            .expect("confirmed retirement remains idempotent through retained references");
+        fcp_async_core::time::timeout(Duration::from_secs(2), retained.rpc("invoke", json!({})))
+            .await
+            .expect("a retained reference must fail promptly")
+            .expect_err("retained references cannot revive a stopped dispatcher");
+        assert!(!calls.exists());
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn failed_and_naturally_exited_actors_keep_confirmed_retirement_evidence() {
+        let failed = connector(
+            "IFS= read -r request || exit 1; printf '%s\\n' 'malformed response'; exec sleep 30",
+            &BTreeMap::new(),
+        )
+        .await;
+        failed
+            .rpc("probe", json!({}))
+            .await
+            .expect_err("a malformed response must poison and retire its actual child");
+        failed
+            .retire_runtime(Instant::now() + Duration::from_secs(5))
+            .await
+            .expect("closed dispatch channel is usable only with retained exit evidence");
+        assert!(failed.runtime_retirement.is_exited());
+        assert!(failed.runner_tx.is_closed());
+
+        let exited = connector("exit 0", &BTreeMap::new()).await;
+        exited
+            .runtime_retirement
+            .wait_for_exit(Instant::now() + Duration::from_secs(5))
+            .await
+            .expect("idle dispatcher EOF must transfer and confirm child custody");
+        exited
+            .retire_runtime(Instant::now() + Duration::from_secs(1))
+            .await
+            .expect("an already exited actor is a confirmed stop");
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn native_retirement_queue_timeout_never_claims_to_have_stopped_active_work() {
+        let directory = tempfile::tempdir().unwrap();
+        let ready = directory.path().join("active");
+        let release = directory.path().join("release");
+        let calls = directory.path().join("calls");
+        let environment = BTreeMap::from([
+            ("READY".to_owned(), ready.to_string_lossy().into_owned()),
+            ("RELEASE".to_owned(), release.to_string_lossy().into_owned()),
+            ("CALLS".to_owned(), calls.to_string_lossy().into_owned()),
+        ]);
+        let script = r#"
+IFS= read -r request || exit 1
+printf '%s\n' "$request" > "$CALLS"
+: > "$READY"
+while [ ! -f "$RELEASE" ]; do sleep 0.01; done
+printf '%s\n' '{"jsonrpc":"2.0","id":"0:0","result":{"completed":true}}'
+IFS= read -r request || exit 1
+printf '%s\n' "$request" >> "$CALLS"
+printf '%s\n' '{"jsonrpc":"2.0","id":"0:1","result":{"alive":true}}'
+IFS= read -r request || exit 0
+printf '%s\n' "$request" >> "$CALLS"
+exec sleep 30
+"#;
+        let connector = connector(script, &environment).await;
+        let active = Arc::clone(&connector);
+        let active = task::try_spawn(async move { active.rpc("hold", json!({})).await }).unwrap();
+        wait_for_file(&ready).await;
+        connector
+            .retire_runtime(Instant::now() + Duration::from_millis(30))
+            .await
+            .expect_err("a queued stop cannot claim an active process already exited");
+        assert!(!connector.runtime_retirement.is_exited());
+        assert!(!connector.runner_tx.is_closed());
+        std::fs::write(&release, b"").unwrap();
+        assert_eq!(active.await.unwrap().unwrap(), json!({"completed": true}));
+        assert_eq!(
+            connector.rpc("ping", json!({})).await.unwrap(),
+            json!({"alive": true})
+        );
+        let methods: Vec<String> = std::fs::read_to_string(&calls)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).unwrap()["method"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(methods, ["hold", "ping"]);
+        connector
+            .retire_runtime(Instant::now() + Duration::from_secs(5))
+            .await
+            .expect("a later explicit stop can retire the now-idle process");
+        assert!(connector.runtime_retirement.is_exited());
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn dropping_selected_retirement_waiter_and_actor_preserves_exact_child_custody() {
+        let runner = ConnectorProcessRunner::spawn(
+            "/bin/sh",
+            &["-c".to_owned(), "exec sleep 30".to_owned()],
+            &BTreeMap::new(),
+        )
+        .await
+        .unwrap();
+        let retirement = runner.runtime_retirement.clone();
+        let (sender, receiver) = mpsc::channel(1);
+        let rpc = NativeRpc::new(Instant::now() + Duration::from_secs(5));
+        let waiter = rpc.waiter();
+        let (response_tx, response_rx) = oneshot::channel();
+        sender
+            .try_send(ConnectorRpcRequest {
+                method: RETIRE_RUNTIME_METHOD.to_owned(),
+                params: json!({}),
+                response_tx,
+                rpc: rpc.clone(),
+            })
+            .unwrap();
+        let mut actor = Box::pin(run_dispatcher(runner, receiver));
+        let _ = futures_util::poll!(actor.as_mut());
+        assert!(
+            rpc.transport_retired(),
+            "the selected control must first transfer its child"
+        );
+        drop(response_rx);
+        drop(waiter);
+        drop(actor);
+        retirement
+            .wait_for_exit(Instant::now() + Duration::from_secs(5))
+            .await
+            .expect("caller and dispatcher loss cannot erase exact process custody");
+        assert!(retirement.is_exited());
+        assert!(rpc.is_settled());
+        assert!(sender.is_closed());
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn dropping_unpolled_idle_actor_still_records_and_confirms_process_exit() {
+        let runner = ConnectorProcessRunner::spawn(
+            "/bin/sh",
+            &["-c".to_owned(), "exec sleep 30".to_owned()],
+            &BTreeMap::new(),
+        )
+        .await
+        .unwrap();
+        let retirement = runner.runtime_retirement.clone();
+        let (sender, receiver) = mpsc::channel(1);
+        drop(run_dispatcher(runner, receiver));
+        retirement
+            .wait_for_exit(Instant::now() + Duration::from_secs(5))
+            .await
+            .expect("unpolled actor destruction must retain and reap the idle child");
+        assert!(retirement.is_exited());
+        assert!(sender.is_closed());
     }
 }

@@ -2,6 +2,7 @@
 //! drives the production SubprocessConnector path, not a second implementation.
 
 use fcp_core::{AgentHint, CapabilityGrant, IdempotencyClass, OperationInfo, RiskLevel, SessionId};
+use fcp_host::DesiredRuntimeState;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::*;
@@ -339,6 +340,7 @@ fn dispatcher() -> Dispatcher {
         runner_tx,
         event_transport: None,
         _runner_task: runner_task,
+        runtime_retirement: native_rpc::NativeRuntimeRetirement::default(),
         resilience,
         capability_verifying_key: Some([1; PUBLIC_KEY_SIZE]),
         state_root: Some(state_dir.path().to_owned()),
@@ -351,6 +353,117 @@ fn dispatcher() -> Dispatcher {
         reject_configure,
         _state_dir: state_dir,
     }
+}
+
+fn preparation_host(
+    connector: Arc<SubprocessConnector>,
+    lifecycle: Arc<HostAdminStateStore>,
+) -> Arc<AppState> {
+    let registry = crate::tests::dispatcher_registry_with_connector(
+        "fcp.fixture",
+        connector,
+        crate::tests::dispatcher_test_config("fcp.fixture"),
+    );
+    crate::tests::dispatcher_app_state(registry, lifecycle, None, HashMap::new())
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn preparation_refuses_disabled_and_uninstalled_retained_runtimes_without_io() {
+    let connector_id = ConnectorId::from_static("fcp.fixture");
+    for desired in [
+        DesiredRuntimeState::Disabled,
+        DesiredRuntimeState::Uninstalled,
+    ] {
+        let fixture = dispatcher();
+        let calls = Arc::clone(&fixture.calls);
+        let lifecycle = Arc::new(HostAdminStateStore::new());
+        lifecycle
+            .set_desired_state(&connector_id, desired, None)
+            .await
+            .unwrap();
+        // The registered native actor remains alive, as after an unsupported
+        // or timed-out stop. Durable authority must reject before any RPC.
+        let host = preparation_host(Arc::new(fixture.connector), lifecycle);
+        let error = prepare_session_for_operation(
+            host.as_ref(),
+            connector_id.clone(),
+            ZoneId::work(),
+            None,
+        )
+        .await
+        .expect_err("lifecycle denial must prevent session preparation");
+        assert_eq!(error.0, StatusCode::FORBIDDEN);
+        assert!(error.1.contains("disabled or uninstalled"));
+        assert!(calls.lock().unwrap().is_empty());
+    }
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn preparation_rechecks_lifecycle_after_registry_admission_before_handshake() {
+    let fixture = dispatcher();
+    let calls = Arc::clone(&fixture.calls);
+    let lifecycle = Arc::new(HostAdminStateStore::new());
+    let host = preparation_host(Arc::new(fixture.connector), Arc::clone(&lifecycle));
+    let connector_id = ConnectorId::from_static("fcp.fixture");
+    let inventory = host.registry.state.write().await;
+    let mut preparation = Box::pin(prepare_session_for_operation(
+        host.as_ref(),
+        connector_id.clone(),
+        ZoneId::work(),
+        None,
+    ));
+    assert!(futures_util::poll!(preparation.as_mut()).is_pending());
+    lifecycle
+        .set_desired_state(&connector_id, DesiredRuntimeState::Disabled, None)
+        .await
+        .unwrap();
+    drop(inventory);
+    let error = preparation
+        .await
+        .expect_err("registry admission cannot refresh withdrawn lifecycle authority");
+    assert_eq!(error.0, StatusCode::FORBIDDEN);
+    assert!(calls.lock().unwrap().is_empty());
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn preparation_never_returns_old_authority_after_disable_and_reenable() {
+    let fixture = dispatcher();
+    let calls = Arc::clone(&fixture.calls);
+    let connector = Arc::new(fixture.connector);
+    let lifecycle = Arc::new(HostAdminStateStore::new());
+    let host = preparation_host(Arc::clone(&connector), Arc::clone(&lifecycle));
+    let connector_id = ConnectorId::from_static("fcp.fixture");
+    let session = connector.handshaken_zone.lock().await;
+    let mut preparation = Box::pin(prepare_session_for_operation(
+        host.as_ref(),
+        connector_id.clone(),
+        ZoneId::work(),
+        None,
+    ));
+    assert!(futures_util::poll!(preparation.as_mut()).is_pending());
+    assert!(calls.lock().unwrap().is_empty());
+    lifecycle
+        .set_desired_state(&connector_id, DesiredRuntimeState::Disabled, None)
+        .await
+        .unwrap();
+    lifecycle
+        .set_desired_state(&connector_id, DesiredRuntimeState::Enabled, None)
+        .await
+        .unwrap();
+    drop(session);
+    let error = preparation
+        .await
+        .expect_err("reenabling cannot revive the admission that waited through denial");
+    assert_eq!(error.0, StatusCode::FORBIDDEN);
+
+    // Already selected negotiation may complete. A fresh, independently
+    // admitted preparation can return the retained actor's actual readiness.
+    let (_, Json(prepared)) =
+        prepare_session_for_operation(host.as_ref(), connector_id.clone(), ZoneId::work(), None)
+            .await
+            .expect("fresh lifecycle admission must remain usable");
+    assert_eq!(prepared.connector_id, connector_id);
+    assert_eq!(prepared.zone_id, ZoneId::work());
 }
 
 #[fcp_async_core::runtime::test(flavor = "multi_thread")]

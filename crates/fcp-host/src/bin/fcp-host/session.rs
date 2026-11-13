@@ -225,6 +225,9 @@ pub(super) fn prepared_from_health(
 /// process-custody rules; it never aborts a shared runner by connector ID.
 /// Negotiation may already have changed connector state before a timeout. No
 /// authority is returned, and the host neither retries nor rolls those changes back.
+/// Persisted lifecycle denial refuses new preparation, including retained runtimes
+/// whose retirement is incomplete. A denial during already selected negotiation
+/// prevents returning readiness; it does not claim that negotiation never ran.
 pub(super) async fn prepare_handler(
     State(state): State<Arc<AppState>>,
     Path(connector_id): Path<String>,
@@ -253,6 +256,13 @@ pub(super) async fn prepare_session_for_operation(
     zone_id: ZoneId,
     operation_id: Option<OperationId>,
 ) -> Result<(HeaderMap, Json<PreparedSession>), HttpFailure> {
+    // Capture once before registry or session admission. Reacquiring after a
+    // wait would let an old preparation survive a disable/enable cycle.
+    let execution_fence = state
+        .lifecycle
+        .connector_execution_fence(&connector_id)
+        .await
+        .map_err(map_host_error)?;
     let connector = {
         let registry = state.registry.state.read().await;
         let entry = registry
@@ -270,6 +280,7 @@ pub(super) async fn prepare_session_for_operation(
             }
         }
     };
+    execution_fence.require_current().map_err(map_host_error)?;
     let prepared =
         match &connector {
             ConnectorRuntime::Native(native) => {
@@ -326,6 +337,9 @@ pub(super) async fn prepare_session_for_operation(
             ));
         }
     }
+    // The same runtime can remain registered after an unsupported or timed-out
+    // stop. Identity alone cannot authorize readiness after durable denial.
+    execution_fence.require_current().map_err(map_host_error)?;
     let mut response_headers = HeaderMap::new();
     response_headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
     Ok((response_headers, Json(prepared)))

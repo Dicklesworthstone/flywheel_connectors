@@ -25,6 +25,42 @@ state file as authoritative. The command reports `schema_version: "1.0.0"`,
 `canonical_storage`, cache marker evidence, and any live-host downgrade or
 offline-inspection warnings.
 
+## Runtime Lifecycle and State Handoff
+
+Persisted `disabled` and `uninstalled` intent suppresses runtime launch during
+host startup and managed inventory reload. The connector remains visible as a
+dormant inventory entry with its admitted manifest and configuration; it is not
+advertised as an executable mesh route. An explicit lifecycle `enable` prepares
+and configures a runtime before allowing execution. Failed preparation preserves
+the disabled authority, and dry-run enable validates configuration without
+starting a process.
+
+For a native connector with an admitted `stateless` manifest and `on_demand`
+prewarm strategy, `disable` and `uninstall` persist the execution denial, drain
+the selected native dispatcher, and confirm that its exact child exited before
+reporting `stopped`. `restart` retires that dispatcher before starting its
+replacement, including when the old dispatcher was poisoned or already exited.
+Previously retained references cannot revive the retired actor. Re-enabling a
+runtime retained after an incomplete disable also requires retirement and fresh
+preparation. Each transition has a 30-second deadline including transaction
+queueing; inspect desired and observed status after a timeout before retrying.
+
+Live stateful handoff, whole warm-pool retirement, and whole WASI-runtime
+retirement remain unavailable. A requested disable still persists execution
+denial when retirement is unsupported or times out, but returns an error and
+does not report the retained runtime as stopped. Stateful restart refuses before
+changing intent. Do not treat a disabled dispatch gate as proof of a canonical
+state flush or completed ownership transfer. A retained stateful runtime cannot
+be re-enabled through this lifecycle path without a supported handoff.
+
+In-place lifecycle `reload` returns an explicit unavailable error. Use managed
+configuration preview/apply for supported inventory changes; their existing
+state-authority and replacement checks still apply. A failed health probe during
+a lifecycle transition is reported as degraded rather than treated as proof of
+process exit. Runtime preparation still observes the host's resilience policy;
+an open circuit can refuse replacement configuration and leave the connector
+disabled until a later retry succeeds.
+
 ## Inspect Authenticated Canonical Stores
 
 The host's canonical state explanation, durable lease status, and

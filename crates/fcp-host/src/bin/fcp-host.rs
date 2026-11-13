@@ -178,6 +178,8 @@ mod guarded_invoke;
 mod http_batch;
 #[path = "fcp-host/invoke_jobs.rs"]
 mod invoke_jobs;
+#[path = "fcp-host/lifecycle_runtime.rs"]
+mod lifecycle_runtime;
 #[path = "fcp-host/live_authority.rs"]
 mod live_authority;
 #[path = "fcp-host/mesh_cancel.rs"]
@@ -413,6 +415,7 @@ struct SubprocessConnector {
     runner_tx: mpsc::Sender<ConnectorRpcRequest>,
     event_transport: Option<native_stream::NativeEventTransport>,
     _runner_task: JoinHandle<()>,
+    runtime_retirement: native_rpc::NativeRuntimeRetirement,
     resilience: Arc<ResilienceLayer>,
     capability_verifying_key: Option<[u8; PUBLIC_KEY_SIZE]>,
     state_root: Option<PathBuf>,
@@ -649,6 +652,7 @@ impl SubprocessConnector {
             .map_err(|err| HostError::Internal(format!("spawn failed: {err}")))?;
         runner.response_limits = response_limits;
         let event_transport = runner.event_transport.clone();
+        let runtime_retirement = runner.runtime_retirement.clone();
         let state_root = configured_connector_state_root(&config);
         let (runner_tx, runner_rx) =
             mpsc::channel::<ConnectorRpcRequest>(CONNECTOR_RPC_QUEUE_CAPACITY);
@@ -662,6 +666,7 @@ impl SubprocessConnector {
             runner_tx,
             event_transport: Some(event_transport),
             _runner_task: runner_task,
+            runtime_retirement,
             resilience,
             capability_verifying_key,
             state_root,
@@ -684,6 +689,48 @@ impl SubprocessConnector {
 
     async fn configure(&self, config: serde_json::Value) -> HostResult<()> {
         self.configure_with_termination(config, None).await
+    }
+
+    /// Close the exact native actor and prove its child exited before a
+    /// replacement can start. This control request bypasses provider RPCs and
+    /// circuit breakers, but waits behind already selected work. An expired
+    /// queue request cannot stop a later invocation or claim successful exit.
+    async fn retire_runtime(&self, deadline: Instant) -> HostResult<()> {
+        if self.runtime_retirement.is_exited() {
+            return Ok(());
+        }
+        let rpc = NativeRpc::new(deadline);
+        let _waiter = rpc.waiter();
+        let (response_tx, response_rx) = oneshot::channel();
+        let retirement = async {
+            if self
+                .runner_tx
+                .send(ConnectorRpcRequest {
+                    method: native_rpc::RETIRE_RUNTIME_METHOD.to_string(),
+                    params: json!({}),
+                    response_tx,
+                    rpc: rpc.clone(),
+                })
+                .await
+                .is_ok()
+            {
+                // The reply is advisory. Only the retained Child's wait result
+                // proves retirement, including after actor failure or abort.
+                let _ = response_rx.await;
+            }
+            self.runtime_retirement.wait_for_exit(deadline).await
+        };
+        fcp_async_core::time::timeout(
+            deadline.saturating_duration_since(Instant::now()),
+            retirement,
+        )
+        .await
+        .map_err(|_| {
+            HostError::Unavailable(
+                "native connector runtime retirement deadline expired before confirmed process exit"
+                    .to_string(),
+            )
+        })?
     }
 
     async fn configure_with_termination(
@@ -2134,6 +2181,7 @@ enum ConnectorRuntime {
     NativeWarmPool(Arc<NativeWarmPoolConnector>),
     Wasi(Arc<WasiConnector>),
     UnavailableNativeProxyOnly(Arc<UnavailableNativeProxyOnlyConnector>),
+    Dormant(Arc<lifecycle_runtime::DormantConnector>),
 }
 
 impl ConnectorRuntime {
@@ -2207,6 +2255,7 @@ impl ConnectorRuntime {
             Self::NativeWarmPool(connector) => connector.invoke(request).await,
             Self::Wasi(connector) => connector.invoke(request).await,
             Self::UnavailableNativeProxyOnly(connector) => connector.invoke(request).await,
+            Self::Dormant(connector) => Err(connector.refusal()),
         }
     }
 
@@ -2216,6 +2265,7 @@ impl ConnectorRuntime {
             Self::NativeWarmPool(connector) => connector.simulate(request).await,
             Self::Wasi(connector) => connector.simulate(request).await,
             Self::UnavailableNativeProxyOnly(connector) => connector.simulate(request).await,
+            Self::Dormant(connector) => Err(connector.refusal()),
         }
     }
 
@@ -2225,6 +2275,7 @@ impl ConnectorRuntime {
             Self::NativeWarmPool(connector) => connector.introspect().await,
             Self::Wasi(connector) => connector.introspect(),
             Self::UnavailableNativeProxyOnly(connector) => connector.introspect(),
+            Self::Dormant(connector) => Err(connector.refusal()),
         }
     }
 
@@ -2234,6 +2285,7 @@ impl ConnectorRuntime {
             Self::NativeWarmPool(connector) => connector.summary_snapshot().await,
             Self::Wasi(connector) => connector.summary_snapshot(),
             Self::UnavailableNativeProxyOnly(connector) => connector.summary_snapshot(),
+            Self::Dormant(connector) => connector.summary(),
         }
     }
 
@@ -2243,6 +2295,7 @@ impl ConnectorRuntime {
             Self::NativeWarmPool(connector) => connector.static_summary(),
             Self::Wasi(connector) => connector.summary.clone(),
             Self::UnavailableNativeProxyOnly(connector) => connector.summary.clone(),
+            Self::Dormant(connector) => connector.summary(),
         }
     }
 
@@ -2252,6 +2305,7 @@ impl ConnectorRuntime {
             Self::NativeWarmPool(connector) => connector.self_check().await,
             Self::Wasi(connector) => connector.self_check(),
             Self::UnavailableNativeProxyOnly(connector) => Ok(connector.self_check()),
+            Self::Dormant(connector) => Ok(connector.self_check()),
         }
     }
 }
@@ -2355,7 +2409,7 @@ fn validate_state_policy_replacement(
     if (current_policy.is_stateful() || candidate.is_stateful())
         && !matches!(
             &current.connector,
-            ConnectorRuntime::UnavailableNativeProxyOnly(_)
+            ConnectorRuntime::UnavailableNativeProxyOnly(_) | ConnectorRuntime::Dormant(_)
         )
     {
         return Err(HostError::InvalidFilter(format!(
@@ -2816,6 +2870,13 @@ fn validate_production_prewarm_policy(
 /// Preview callers intentionally do not test executable availability, connector RPCs,
 /// or runtime health: those checks belong to an actual apply.
 fn validate_registry_config(config: &ConnectorConfig) -> HostResult<ValidatedConnectorConfig> {
+    validate_registry_config_for_launch(config, true)
+}
+
+fn validate_registry_config_for_launch(
+    config: &ConnectorConfig,
+    launch: bool,
+) -> HostResult<ValidatedConnectorConfig> {
     connector_summary_from_config(config)?;
     for env_keys in [
         [
@@ -2839,8 +2900,10 @@ fn validate_registry_config(config: &ConnectorConfig) -> HostResult<ValidatedCon
         &config.operation_network_constraints,
         config.config.as_ref(),
     )?;
-    let hrw_routing = current_hrw_lease_routing_config()?;
-    enforce_hrw_singleton_writer_launch_route(config, state_policy, hrw_routing.as_ref())?;
+    if launch {
+        let hrw_routing = current_hrw_lease_routing_config()?;
+        enforce_hrw_singleton_writer_launch_route(config, state_policy, hrw_routing.as_ref())?;
+    }
     if config.runtime_network_enforcement == RuntimeNetworkEnforcement::WasiSandbox {
         state_policy.reject_stateful_wasi(&config.id)?;
     }
@@ -2848,16 +2911,6 @@ fn validate_registry_config(config: &ConnectorConfig) -> HostResult<ValidatedCon
         manifest_constraints,
         state_policy,
     })
-}
-
-async fn build_registry_entry(
-    config: ConnectorConfig,
-    resilience: Arc<ResilienceLayer>,
-    capability_verifying_key: Option<[u8; PUBLIC_KEY_SIZE]>,
-) -> HostResult<RegistryEntry> {
-    let admitted = validate_registry_config(&config)?;
-    build_registry_entry_with_admission(config, admitted, resilience, capability_verifying_key)
-        .await
 }
 
 async fn build_registry_entry_with_admission(
@@ -2988,6 +3041,7 @@ impl RegistryConfigPlan {
 struct PreparedRegistryApply {
     plan: RegistryConfigPlan,
     replacement_entries: HashMap<ConnectorId, RegistryEntry>,
+    launch_fences: Vec<fcp_host::ConnectorExecutionFence>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -3067,9 +3121,23 @@ fn rate_limit_scope_label(scope: RateLimitScope) -> &'static str {
 }
 
 impl SubprocessRegistry {
+    #[cfg(test)]
     async fn from_configs(
         configs: Vec<ConnectorConfig>,
         capability_verifying_key: Option<[u8; PUBLIC_KEY_SIZE]>,
+    ) -> HostResult<Self> {
+        Self::from_configs_with_lifecycle(
+            configs,
+            capability_verifying_key,
+            &HostAdminStateStore::new(),
+        )
+        .await
+    }
+
+    async fn from_configs_with_lifecycle(
+        configs: Vec<ConnectorConfig>,
+        capability_verifying_key: Option<[u8; PUBLIC_KEY_SIZE]>,
+        lifecycle: &HostAdminStateStore,
     ) -> HostResult<Self> {
         let resilience = Arc::new(ResilienceLayer::default());
         let mut map = HashMap::new();
@@ -3082,9 +3150,20 @@ impl SubprocessRegistry {
                     "duplicate connector id in managed inventory: {connector_id}"
                 )));
             }
-            let entry =
-                build_registry_entry(config, Arc::clone(&resilience), capability_verifying_key)
-                    .await?;
+            let authority =
+                lifecycle_runtime::LaunchAuthority::capture(lifecycle, &connector_id).await?;
+            let admitted = validate_registry_config_for_launch(
+                &config,
+                !matches!(&authority, lifecycle_runtime::LaunchAuthority::Dormant(_)),
+            )?;
+            let (entry, _) = lifecycle_runtime::prepare_entry(
+                config,
+                admitted,
+                Arc::clone(&resilience),
+                capability_verifying_key,
+                authority,
+            )
+            .await?;
             map.insert(connector_id, entry);
         }
         Ok(Self {
@@ -3122,6 +3201,12 @@ impl SubprocessRegistry {
         state
             .connectors
             .values()
+            .filter(|entry| {
+                !matches!(
+                    &entry.connector,
+                    ConnectorRuntime::Dormant(_) | ConnectorRuntime::UnavailableNativeProxyOnly(_)
+                )
+            })
             .map(|entry| fcp_mesh::invoke_route::AdvertisedConnector {
                 singleton_writer: entry.state_policy.is_singleton_writer(),
                 summary_json: None,
@@ -3202,7 +3287,7 @@ impl SubprocessRegistry {
                 scope = scope.with_terminator(capture.terminator());
                 wasi_capture = Some(capture);
             }
-            ConnectorRuntime::UnavailableNativeProxyOnly(_) => {}
+            ConnectorRuntime::UnavailableNativeProxyOnly(_) | ConnectorRuntime::Dormant(_) => {}
         }
         Ok((scope, runtime, warm_pool, wasi_capture, native_capture))
     }
@@ -3275,35 +3360,64 @@ impl SubprocessRegistry {
         Ok(plan)
     }
 
+    #[cfg(test)]
     async fn prepare_configs(
         &self,
         configs: Vec<ConnectorConfig>,
     ) -> HostResult<PreparedRegistryApply> {
+        self.prepare_configs_with_lifecycle(configs, &HostAdminStateStore::new())
+            .await
+    }
+
+    async fn prepare_configs_with_lifecycle(
+        &self,
+        configs: Vec<ConnectorConfig>,
+        lifecycle: &HostAdminStateStore,
+    ) -> HostResult<PreparedRegistryApply> {
         let plan = self.plan_configs(configs).await?;
         let mut replacement_entries = HashMap::new();
+        let mut launch_fences = Vec::new();
         for connector_id in &plan.replacement_ids {
-            let admitted = validate_registry_config(&plan.next_configs[connector_id])?;
+            let authority =
+                lifecycle_runtime::LaunchAuthority::capture(lifecycle, connector_id).await?;
+            let dormant = matches!(&authority, lifecycle_runtime::LaunchAuthority::Dormant(_));
+            let admitted =
+                validate_registry_config_for_launch(&plan.next_configs[connector_id], !dormant)?;
             if let Some(entry) = self
                 .native_policy_update(connector_id, &plan.next_configs[connector_id], &admitted)
                 .await?
             {
+                if let Some(fence) = authority.into_fence() {
+                    launch_fences.push(fence);
+                }
                 replacement_entries.insert(connector_id.clone(), entry);
                 continue;
             }
             self.require_state_policy_replacement(connector_id, admitted.state_policy)
                 .await?;
-            let entry = build_registry_entry_with_admission(
+            if dormant {
+                let current = self.state.read().await;
+                lifecycle_runtime::require_dormant_replacement(
+                    current.connectors.get(connector_id),
+                )?;
+            }
+            let (entry, fence) = lifecycle_runtime::prepare_entry(
                 plan.next_configs[connector_id].clone(),
                 admitted,
                 Arc::clone(&self.resilience),
                 self.capability_verifying_key,
+                authority,
             )
             .await?;
+            if let Some(fence) = fence {
+                launch_fences.push(fence);
+            }
             replacement_entries.insert(connector_id.clone(), entry);
         }
         Ok(PreparedRegistryApply {
             plan,
             replacement_entries,
+            launch_fences,
         })
     }
 
@@ -3341,13 +3455,27 @@ impl SubprocessRegistry {
         validate_state_policy_replacement(connector_id, current, candidate)
     }
 
+    #[cfg(test)]
     async fn preview_configs(
         &self,
         configs: Vec<ConnectorConfig>,
     ) -> HostResult<ConnectorInventoryApplyReport> {
+        self.preview_configs_with_lifecycle(configs, &HostAdminStateStore::new())
+            .await
+    }
+
+    async fn preview_configs_with_lifecycle(
+        &self,
+        configs: Vec<ConnectorConfig>,
+        lifecycle: &HostAdminStateStore,
+    ) -> HostResult<ConnectorInventoryApplyReport> {
         let plan = self.plan_configs(configs).await?;
         for connector_id in &plan.replacement_ids {
-            let admitted = validate_registry_config(&plan.next_configs[connector_id])?;
+            let authority =
+                lifecycle_runtime::LaunchAuthority::capture(lifecycle, connector_id).await?;
+            let dormant = matches!(&authority, lifecycle_runtime::LaunchAuthority::Dormant(_));
+            let admitted =
+                validate_registry_config_for_launch(&plan.next_configs[connector_id], !dormant)?;
             if self
                 .native_policy_update(connector_id, &plan.next_configs[connector_id], &admitted)
                 .await?
@@ -3357,15 +3485,33 @@ impl SubprocessRegistry {
             }
             self.require_state_policy_replacement(connector_id, admitted.state_policy)
                 .await?;
+            if dormant {
+                let current = self.state.read().await;
+                lifecycle_runtime::require_dormant_replacement(
+                    current.connectors.get(connector_id),
+                )?;
+            }
         }
         Ok(plan.report(plan.source_version))
     }
 
+    #[cfg(test)]
     async fn apply_configs(
         &self,
         configs: Vec<ConnectorConfig>,
     ) -> HostResult<ConnectorInventoryApplyReport> {
-        let prepared = self.prepare_configs(configs).await?;
+        self.apply_configs_with_lifecycle(configs, &HostAdminStateStore::new())
+            .await
+    }
+
+    async fn apply_configs_with_lifecycle(
+        &self,
+        configs: Vec<ConnectorConfig>,
+        lifecycle: &HostAdminStateStore,
+    ) -> HostResult<ConnectorInventoryApplyReport> {
+        let prepared = self
+            .prepare_configs_with_lifecycle(configs, lifecycle)
+            .await?;
         self.publish_configs(prepared).await
     }
 
@@ -3378,6 +3524,9 @@ impl SubprocessRegistry {
         prepared: PreparedRegistryApply,
     ) -> HostResult<ConnectorInventoryApplyReport> {
         let mut state = self.state.write().await;
+        for fence in &prepared.launch_fences {
+            fence.require_current()?;
+        }
         let source_version = self.version.load(Ordering::SeqCst);
         if source_version != prepared.plan.source_version {
             return Err(HostError::Unavailable(
@@ -5273,6 +5422,7 @@ fn sanitize_state_path_segment(value: &str) -> String {
 struct ConnectorProcessRunner {
     child: Option<Child>,
     active_rpc: Option<NativeRpc>,
+    runtime_retirement: native_rpc::NativeRuntimeRetirement,
     event_transport: native_stream::NativeEventTransport,
     responses: mpsc::Receiver<std::io::Result<native_stream::NativeReply>>,
     _stdout_task: JoinHandle<()>,
@@ -5289,13 +5439,10 @@ impl Drop for ConnectorProcessRunner {
             std::io::ErrorKind::BrokenPipe,
             "native subprocess transport owner stopped",
         ));
-        if let Some(rpc) = self.active_rpc.take()
-            && let Some(child) = self.child.take()
-        {
-            // Task abortion must preserve the active command's child custody.
-            // Its invocation/controller will probe for confirmed process exit.
-            rpc.retire(child);
-        }
+        // Preserve both active and idle process custody on actor abortion.
+        // Lifecycle callers and the original invocation can independently
+        // observe confirmed exit without treating task completion as proof.
+        self.retire_child();
     }
 }
 
@@ -5392,6 +5539,17 @@ fn log_connector_stderr_line(line: &[u8], truncated: bool) {
 }
 
 impl ConnectorProcessRunner {
+    fn retire_child(&mut self) {
+        if let Some(child) = self.child.take() {
+            let rpc = self
+                .active_rpc
+                .take()
+                .unwrap_or_else(NativeRpc::for_retirement);
+            self.runtime_retirement.record(rpc.clone());
+            rpc.retire(child);
+        }
+    }
+
     async fn spawn(
         command: &str,
         args: &[String],
@@ -5456,6 +5614,7 @@ impl ConnectorProcessRunner {
         Ok(Self {
             child: Some(child),
             active_rpc: None,
+            runtime_retirement: native_rpc::NativeRuntimeRetirement::default(),
             event_transport,
             responses,
             _stdout_task: stdout_task,
@@ -9103,11 +9262,12 @@ async fn async_main(telemetry_config: TelemetryConfig) -> HostResult<()> {
     let lifecycle = Arc::new(lifecycle);
     let invoke_audit = Arc::new(invoke_audit);
     let registry = Arc::new(
-        SubprocessRegistry::from_configs(
+        SubprocessRegistry::from_configs_with_lifecycle(
             loaded_configs.configs,
             capability_verifying_key
                 .as_ref()
                 .map(Ed25519VerifyingKey::to_bytes),
+            &lifecycle,
         )
         .await?,
     );
@@ -9645,7 +9805,10 @@ async fn reload_connectors(state: &AppState) -> Result<usize, HostError> {
     let count = loaded.configs.len();
 
     // Apply the new config set (handles add/update/remove diff).
-    let report = state.registry.apply_configs(loaded.configs).await?;
+    let report = state
+        .registry
+        .apply_configs_with_lifecycle(loaded.configs, &state.lifecycle)
+        .await?;
     tracing::info!(
         event = "config_reload_applied",
         added = report.added.len(),
@@ -11966,7 +12129,8 @@ async fn mesh_inventory_handler(
     let started_at = Instant::now();
     // Reading the configured registry does not run connector health checks or
     // spawn a child. A read of topology must not consume invocation capacity.
-    let local_connectors = state.registry.advertised_connectors().await;
+    let local_connectors =
+        lifecycle_runtime::advertised_connectors(&state.registry, &state.lifecycle).await;
     let inventory = match state.mesh.as_ref() {
         Some(router) => router.inventory(local_connectors).await,
         None => fcp_host::mesh_routing::MeshInventoryResponse::local_only(local_connectors),
@@ -12123,7 +12287,7 @@ async fn connector_inventory_apply_handler(
     let (apply, current_inventory, current, admin_state) = if request.dry_run {
         let preview = state
             .registry
-            .preview_configs(next_configs.clone())
+            .preview_configs_with_lifecycle(next_configs.clone(), &state.lifecycle)
             .await
             .map_err(map_host_error)?;
         let current = next_configs
@@ -12139,7 +12303,11 @@ async fn connector_inventory_apply_handler(
         (preview, next_configs.clone(), current, None)
     } else {
         write_connector_configs_file(&connectors_file, &next_configs).map_err(map_host_error)?;
-        let apply = match state.registry.apply_configs(next_configs.clone()).await {
+        let apply = match state
+            .registry
+            .apply_configs_with_lifecycle(next_configs.clone(), &state.lifecycle)
+            .await
+        {
             Ok(report) => report,
             Err(err) => {
                 let rollback_result =
@@ -12420,7 +12588,7 @@ async fn rollback_connector_inventory(
     };
     let registry_note = match state
         .registry
-        .apply_configs(previous_configs.to_vec())
+        .apply_configs_with_lifecycle(previous_configs.to_vec(), &state.lifecycle)
         .await
     {
         Ok(_) => "live registry rolled back".to_string(),
@@ -12485,7 +12653,11 @@ async fn apply_connector_config_payload(
     let next_configs = next_inventory_with_config(previous_configs.clone(), connector_id, payload)?;
 
     write_connector_configs_file(&connectors_file, &next_configs)?;
-    let apply = match state.registry.apply_configs(next_configs).await {
+    let apply = match state
+        .registry
+        .apply_configs_with_lifecycle(next_configs, &state.lifecycle)
+        .await
+    {
         Ok(report) => report,
         Err(err) => {
             let rollback_note =
@@ -12736,7 +12908,11 @@ async fn connector_config_validate_handler(
         request.payload,
     )
     .map_err(map_host_error)?;
-    let (valid, preview, error) = match state.registry.preview_configs(preview_inventory).await {
+    let (valid, preview, error) = match state
+        .registry
+        .preview_configs_with_lifecycle(preview_inventory, &state.lifecycle)
+        .await
+    {
         Ok(preview) => (true, Some(preview), None),
         Err(err) => (false, None, Some(err.to_string())),
     };
@@ -17282,9 +17458,7 @@ async fn local_mesh_advertised_connectors(
                 .map(|json| (summary.id.to_string(), json))
         })
         .collect();
-    state
-        .registry
-        .advertised_connectors()
+    lifecycle_runtime::advertised_connectors(&state.registry, &state.lifecycle)
         .await
         .into_iter()
         .map(|mut connector| {
@@ -17549,6 +17723,10 @@ async fn health_handler(
     for summary in summaries {
         let connector_id = summary.id;
         let connector_health = summary.health;
+        if !summary.enabled {
+            connectors.insert(connector_id, connector_health);
+            continue;
+        }
         match &connector_health {
             ConnectorHealth::Healthy => {}
             ConnectorHealth::Degraded { .. } => {
@@ -17939,11 +18117,7 @@ async fn lifecycle_transition_handler(
         "processing lifecycle transition request"
     );
 
-    match state
-        .lifecycle
-        .execute_lifecycle_transition(&connector_id, &request)
-        .await
-    {
+    match lifecycle_runtime::transition(&state, &connector_id, &request).await {
         Ok(response) => {
             tracing::info!(
                 event = "lifecycle_transition_response",
@@ -17958,7 +18132,7 @@ async fn lifecycle_transition_handler(
             Ok(Json(response))
         }
         Err(err) => {
-            let host_error = map_lifecycle_host_error(err);
+            let host_error = err;
             tracing::warn!(
                 event = "lifecycle_transition_error",
                 connector_id = %connector_id,
@@ -18385,7 +18559,7 @@ mod tests {
         })
     }
 
-    fn subprocess_test_connector_config(connector_id: &str) -> ConnectorConfig {
+    pub(super) fn subprocess_test_connector_config(connector_id: &str) -> ConnectorConfig {
         ConnectorConfig {
             cancellation_deadline_ms: None,
             id: connector_id.to_string(),
@@ -19099,6 +19273,7 @@ output_schema = {{ type = "object" }}
             },
             runner_tx,
             _runner_task: runner_task,
+            runtime_retirement: native_rpc::NativeRuntimeRetirement::default(),
             resilience: Arc::new(ResilienceLayer::default()),
             event_transport: None,
             capability_verifying_key: None,
@@ -33016,6 +33191,7 @@ done"#
             runner_tx,
             event_transport: None,
             _runner_task: runner_task,
+            runtime_retirement: native_rpc::NativeRuntimeRetirement::default(),
             resilience: Arc::new(ResilienceLayer::default()),
             capability_verifying_key: None,
             state_root: None,
@@ -34262,6 +34438,7 @@ done"#;
         PreparedRegistryApply {
             plan,
             replacement_entries,
+            launch_fences: Vec::new(),
         }
     }
 
@@ -35797,6 +35974,7 @@ done"#;
             runner_tx,
             event_transport: None,
             _runner_task: runner_task,
+            runtime_retirement: native_rpc::NativeRuntimeRetirement::default(),
             resilience: Arc::new(ResilienceLayer::default()),
             capability_verifying_key: Some(signing_key.verifying_key().to_bytes()),
             state_root: Some(state_root.path().to_path_buf()),
@@ -36669,7 +36847,7 @@ done"#;
                 .unwrap()
                 .singleton_writer
         );
-        assert!(registry.advertised_connectors().await[0].singleton_writer);
+        assert!(registry.advertised_connectors().await.is_empty());
 
         std::fs::write(&path, state_policy_test_manifest(Some("stateless"), false)).unwrap();
         assert!(
@@ -36743,7 +36921,7 @@ done"#;
                 .unwrap()
                 .singleton_writer
         );
-        assert!(registry.advertised_connectors().await[0].singleton_writer);
+        assert!(registry.advertised_connectors().await.is_empty());
         let unchanged = registry.apply_configs(vec![config.clone()]).await.unwrap();
         assert_eq!(unchanged.unchanged, vec![config.id.clone()]);
         let version = registry.version();
@@ -36759,7 +36937,7 @@ done"#;
             "{error}"
         );
         assert_eq!(registry.version(), version);
-        assert!(registry.advertised_connectors().await[0].singleton_writer);
+        assert!(registry.advertised_connectors().await.is_empty());
         std::fs::rename(directory.path().join("retired-manifest.toml"), &path).unwrap();
         let restored = registry
             .apply_configs(vec![config])
