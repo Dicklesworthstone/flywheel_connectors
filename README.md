@@ -3759,6 +3759,47 @@ there are no explicit denials but some checks remain deferred, the command
 reports `status: deferred` and exits with validation code **5**. This does not
 authorize the eventual resolved request. No batch operation runs during dry-run.
 
+### Streaming batch results from the CLI
+
+Use `--stream` on `fwc map` or `fwc batch-file` to flush NDJSON records as the
+host completes work:
+
+```bash
+fwc map github.get_issue \
+    --inputs '[{"owner":"octocat","repo":"hello-world","issue_number":1}]' \
+    --capability-token-file token.cbor --stream
+fwc batch-file operations.jsonl --capability-token-file token.cbor --stream
+```
+
+The host comes from `--host` or the active configuration. Streaming uses the
+same input validation, capability and approval tokens, holder proofs, lease
+evidence, run identity and original execution budget as ordinary execution.
+It requires `/rpc/batch/stream`; it never falls back by resubmitting to another
+endpoint. `--stream` emits NDJSON directly and cannot be combined with dry-run,
+JSON pretty-printing, extraction, templates or token statistics.
+
+| CLI record | Meaning |
+|---|---|
+| `start` | Stable run and member invocation identities, flushed before the batch POST. `execution.submitted` is false at this boundary; the record does not prove admission. |
+| `result` | One validated result in completion order, with its host `request_id`. Each record is flushed immediately. |
+| `complete` | `summary.response` contains final submission-ordered accounting; `summary.stream` contains delivery and retention information. Inspect execution status and the process exit code. |
+| `interrupted` | The stream could not be completed or validated. `summary.known_results` retains validated outcomes when available, and `summary.execution.members` preserves every submitted invocation identity. |
+| `error` | Preparation, validation or output failed before streaming submission. |
+
+The final response repeats outputs already delivered incrementally. The client
+checks member identity, duplicates, result consistency, terminal counters and
+ordering before accepting completion. It requires a terminal record followed
+by the end of the HTTP body. Truncation, malformed records, extra trailing data
+or a closed output consumer never authorize automatic retries. If output closes
+after submission, admitted jobs retain the host's ordinary durable ownership;
+reconcile their request IDs before repeating effects.
+
+The decoder bounds frames to **32 MiB** and the whole HTTP stream to **64 MiB**,
+including the terminal response's repeated data. Provider payloads retain the
+host's **1 MiB per result / 16 MiB aggregate** limits. These limits describe
+encoded data, not total process memory. Flushing the initial identities and
+waiting for results cannot renew the original execution deadline.
+
 ### Streaming live HTTP batch results
 
 `POST /rpc/batch/stream` accepts the same request object as `POST /rpc/batch`:

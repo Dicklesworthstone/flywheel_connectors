@@ -61,7 +61,7 @@ hex.workspace = true
 ipnet = "2.9"
 keyring = { version = "3.6.3", features = ["apple-native", "windows-native", "sync-secret-service"] }
 serde = { workspace = true, features = ["derive"] }
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["float_roundtrip"] }
 serde_yaml = "0.9"
 sha2.workspace = true
 reqwest = { workspace = true, features = ["blocking"] }

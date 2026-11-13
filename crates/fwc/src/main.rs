@@ -114,6 +114,7 @@ mod batch;
 mod batch_file;
 #[allow(dead_code)] // Progress tracking wired when host integration lands.
 mod batch_progress;
+mod batch_stream;
 #[allow(
     dead_code,
     clippy::redundant_pub_crate,
@@ -3398,6 +3399,9 @@ struct PipelineRunArgs {
 
 #[derive(Args, Debug, Serialize)]
 struct MapArgs {
+    /// Flush NDJSON identities, results and final accounting as they arrive.
+    #[arg(long, conflicts_with_all = ["json", "template", "template_file", "extract", "token_stats"])]
+    stream: bool,
     /// Operation to apply to every input (e.g. `github.get_issue`).
     operation: String,
 
@@ -3451,6 +3455,10 @@ struct MapArgs {
 struct BatchFileArgs {
     /// Path to a JSONL batch file.
     file: PathBuf,
+
+    /// Flush NDJSON identities, results and final accounting as they arrive.
+    #[arg(long, conflicts_with_all = ["dry_run", "json", "template", "template_file", "extract", "token_stats"])]
+    stream: bool,
 
     /// Preview the execution plan without running anything.
     #[arg(long)]
@@ -3590,6 +3598,8 @@ fn execute(raw_args: &[String]) -> Result<ExecutionOutcome> {
 
 fn execute_passthrough_command(prepared: &PreparedCli) -> Result<Option<ExecutionOutcome>> {
     match &prepared.cli.command {
+        Commands::Map(args) if args.stream => execute_streaming_batch(prepared).map(Some),
+        Commands::BatchFile(args) if args.stream => execute_streaming_batch(prepared).map(Some),
         Commands::ServeMcp(args) => execute_serve_mcp(prepared, args).map(Some),
         Commands::SupplyChain(args) => {
             supply_chain_cmd::run(args)?;
@@ -3659,6 +3669,121 @@ fn execute_passthrough_command(prepared: &PreparedCli) -> Result<Option<Executio
         }
         _ => Ok(None),
     }
+}
+
+fn execute_streaming_batch(prepared: &PreparedCli) -> Result<ExecutionOutcome> {
+    let stdout = std::io::stdout();
+    let mut writer = stdout.lock();
+    let exit_code = execute_streaming_batch_with_writer(prepared, &mut writer)?;
+    Ok(ExecutionOutcome {
+        text: String::new(),
+        exit_code,
+    })
+}
+
+fn execute_streaming_batch_with_writer(
+    prepared: &PreparedCli,
+    writer: &mut dyn std::io::Write,
+) -> Result<ExitCode> {
+    let command = match &prepared.cli.command {
+        Commands::Map(_) => "map",
+        Commands::BatchFile(_) => "batch-file",
+        _ => bail!("streaming execution requires map or batch-file"),
+    };
+    let invalid_format = !matches!(
+        prepared.format,
+        OutputFormat::Toon | OutputFormat::Ndjson | OutputFormat::Jsonl
+    ) || prepared.render_options.has_transform()
+        || prepared.cli.token_stats
+        || !prepared.cli.columns.is_empty()
+        || prepared.cli.sort_by.is_some()
+        || prepared.cli.limit != 0
+        || prepared.cli.no_headers;
+    let result = if invalid_format {
+        Ok(DispatchOutcome {
+            payload: json!({
+                "status": "error",
+                "command": command,
+                "invoke_attempted": false,
+                "error": {
+                    "type": "incompatible-stream-format",
+                    "message": "--stream emits complete NDJSON records; omit rendering transforms and use the default format or --format ndjson.",
+                },
+            }),
+            exit_code: CliExitCode::Validation,
+        })
+    } else {
+        match &prepared.cli.command {
+            Commands::Map(args) => {
+                map_dispatch_with_stream(args, prepared.cli.host.as_deref(), Some(writer))
+            }
+            Commands::BatchFile(args) => {
+                batch_file_dispatch_with_stream(args, prepared.cli.host.as_deref(), Some(writer))
+            }
+            _ => unreachable!("streaming command checked above"),
+        }
+    };
+    let mut dispatch = result.unwrap_or_else(|_| DispatchOutcome {
+        // Setup failures can contain raw local inputs or host bodies. Streaming
+        // errors retain only a stable classification, never those diagnostics.
+        payload: json!({
+            "status": "error",
+            "command": command,
+            "invoke_attempted": false,
+            "error": {
+                "type": "batch-stream-preparation-failed",
+                "message": "The batch could not be prepared. No streaming batch was submitted.",
+            },
+        }),
+        exit_code: CliExitCode::Validation,
+    });
+    // A writer can accept a prefix and then fail. Appending a summary after
+    // either identity or member delivery fails would corrupt that NDJSON frame
+    // and could repeat bytes the consumer already received.
+    if dispatch.payload["error"]["type"] == "batch-stream-output-closed"
+        || dispatch.payload["stream"]["failure"] == "output_error"
+    {
+        return Ok(CliExitCode::Transport.into());
+    }
+    annotate_with_corrections(
+        &mut dispatch.payload,
+        &prepared.received_args,
+        &prepared.normalized_args,
+        &prepared.corrections,
+    );
+    annotate_output_contract(
+        &mut dispatch.payload,
+        OutputFormat::Ndjson,
+        dispatch.exit_code,
+        false,
+        &RenderOptions::default(),
+    );
+    let record_type = if dispatch.payload["stream"]["complete"] == true {
+        "complete"
+    } else if dispatch.payload["execution"]["submitted"] == true {
+        "interrupted"
+    } else {
+        "error"
+    };
+    let exit_code = dispatch.exit_code;
+    // A broken output pipe stops consumption. Do not attempt to print another
+    // renderer's error into a partially written NDJSON stream.
+    if write_batch_record(
+        writer,
+        &json!({"type": record_type, "command": command, "summary": dispatch.payload}),
+    )
+    .is_err()
+    {
+        return Ok(CliExitCode::Transport.into());
+    }
+    Ok(exit_code.into())
+}
+
+fn write_batch_record(writer: &mut dyn std::io::Write, record: &Value) -> std::io::Result<()> {
+    serde_json::to_writer(&mut *writer, record)
+        .map_err(|_| std::io::Error::other("batch stream output encoding failed"))?;
+    writer.write_all(b"\n")?;
+    writer.flush()
 }
 
 fn execute_serve_mcp(prepared: &PreparedCli, args: &ServeMcpArgs) -> Result<ExecutionOutcome> {
@@ -5231,6 +5356,11 @@ struct HostBatchOperation {
     depends_on: Vec<String>,
 }
 
+struct BatchSubmission {
+    response: HostBatchInvokeResponse,
+    stream: Option<Value>,
+}
+
 fn resolve_host_config(explicit_host: Option<&str>) -> Result<Option<ResolvedHostConfig>> {
     if let Some(host) = explicit_host.map(str::trim).filter(|host| !host.is_empty()) {
         return Ok(Some(ResolvedHostConfig {
@@ -6192,6 +6322,44 @@ impl HostAdminClient {
                 )
                 .into()
             })
+    }
+
+    fn batch_stream<F>(
+        &self,
+        request: &HostBatchInvokeRequest,
+        on_result: F,
+    ) -> Result<fcp_host::BatchBoundedStreamingResponse>
+    where
+        F: FnMut(&fcp_host::OperationResult) -> std::io::Result<()>,
+    {
+        let timeout = host_execution_http_timeout(request.options.timeout_ms)?;
+        let response = self
+            .client
+            .post(format!("{}/rpc/batch/stream", self.base_url))
+            .header(reqwest::header::ACCEPT, "application/x-ndjson")
+            .json(request)
+            .timeout(timeout)
+            .send()
+            .map_err(|_| anyhow::anyhow!("batch stream transport failed"))?;
+        anyhow::ensure!(
+            response.status().is_success(),
+            "host did not accept the batch stream"
+        );
+        anyhow::ensure!(
+            response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.split(';').next())
+                .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/x-ndjson")),
+            "host returned an unsupported batch stream content type"
+        );
+        let ids = request
+            .operations
+            .iter()
+            .map(|member| member.id.clone())
+            .collect::<Vec<_>>();
+        batch_stream::consume(response, &ids, on_result).map_err(Into::into)
     }
 
     fn pin(&self, connector_id: &str, version: &semver::Version) -> Result<HostPinState> {
@@ -27912,13 +28080,94 @@ fn submit_namespaced_batch(
     command: &str,
     run_key: &str,
     budget: pipe::budget::ExecutionBudget,
-) -> std::result::Result<HostBatchInvokeResponse, DispatchOutcome> {
+    writer: Option<&mut dyn std::io::Write>,
+) -> std::result::Result<BatchSubmission, DispatchOutcome> {
     // Preparation, introspection and dry-run preflights never renew this
     // deadline. Narrow BOTH the batch scheduler and each queued member before
     // submitting; the host narrows them again when dependency waves activate.
     narrow_batch_execution_budget(request, budget, std::time::Instant::now())
         .map_err(|_| batch_setup_deadline_dispatch(command, "dispatch", run_key, &[]))?;
-    client.batch(request).map_err(|error| {
+    let Some(writer) = writer else {
+        return client
+            .batch(request)
+            .map(|response| BatchSubmission {
+                response,
+                stream: None,
+            })
+            .map_err(|error| batch_submission_failure(client, request, command, run_key, &error));
+    };
+    let mut evidence = batch_execution_evidence(run_key, request);
+    evidence["submitted"] = Value::Bool(false);
+    if write_batch_record(
+        writer,
+        &json!({
+            "type": "start",
+            "command": command,
+            "execution": evidence,
+            "automatic_retry_allowed": false,
+        }),
+    )
+    .is_err()
+    {
+        return Err(DispatchOutcome {
+            payload: json!({
+                "status": "error",
+                "command": command,
+                "invoke_attempted": false,
+                "execution": evidence,
+                "error": {
+                    "type": "batch-stream-output-closed",
+                    "message": "The result consumer closed before the batch was submitted.",
+                },
+            }),
+            exit_code: CliExitCode::Transport,
+        });
+    }
+    // Flushing identities may itself block. Recheck and narrow the same
+    // original budget immediately before sending the first effectful request.
+    narrow_batch_execution_budget(request, budget, std::time::Instant::now())
+        .map_err(|_| batch_setup_deadline_dispatch(command, "dispatch", run_key, &[]))?;
+    let members: HashMap<&str, &InvokeRequest> = request
+        .operations
+        .iter()
+        .map(|member| (member.id.as_str(), &member.request))
+        .collect();
+    client
+        .batch_stream(request, |result| {
+            write_batch_record(
+                writer,
+                &json!({
+                    "type": "result",
+                    "command": command,
+                    "request_id": members[result.id.as_str()].id,
+                    "result": result,
+                }),
+            )
+        })
+        .map(|response| {
+            let stream = json!({
+                "complete": true,
+                "acknowledged_results": response.acknowledged_results,
+                "delivery_status": response.delivery_status,
+                "limits": response.bounded.limits,
+                "retained_result_bytes": response.bounded.retained_result_bytes,
+                "withheld_results": response.bounded.withheld_results,
+            });
+            BatchSubmission {
+                response: response.bounded.response,
+                stream: Some(stream),
+            }
+        })
+        .map_err(|error| batch_submission_failure(client, request, command, run_key, &error))
+}
+
+fn batch_submission_failure(
+    client: &HostAdminClient,
+    request: &HostBatchInvokeRequest,
+    command: &str,
+    run_key: &str,
+    error: &anyhow::Error,
+) -> DispatchOutcome {
         let mut outcome = error
             .downcast_ref::<invocation_cmd::BatchOutcomeUnknown>()
             .map_or_else(
@@ -27929,7 +28178,7 @@ fn submit_namespaced_batch(
                             .iter()
                             .map(|member| (member.id.as_str(), &member.request)),
                         &client.endpoint,
-                        &error,
+                        error,
                     )
                     .dispatch(command)
                 },
@@ -27938,8 +28187,32 @@ fn submit_namespaced_batch(
         // Batch result IDs name members, not the host invocation identities.
         // Preserve both and the run namespace even when the reply is unusable.
         outcome.payload["execution"] = batch_execution_evidence(run_key, request);
+    outcome.payload["execution"]["submitted"] = Value::Bool(true);
+    if let Some(failure) = error.downcast_ref::<batch_stream::BatchStreamFailure>() {
+        let observed = failure
+            .results
+            .iter()
+            .map(|result| result.id.as_str())
+            .collect::<BTreeSet<_>>();
+        let unobserved = outcome.payload["execution"]["members"]
+            .as_array()
+            .expect("execution evidence contains members")
+            .iter()
+            .filter(|member| !observed.contains(member["id"].as_str().expect("member has an id")))
+            .cloned()
+            .collect::<Vec<_>>();
+        outcome.payload["known_results"] = json!(failure.results);
+        outcome.payload["unobserved_members"] = json!(unobserved);
+        outcome.payload["stream"] = json!({
+            "complete": false,
+            "failure": failure.kind.as_str(),
+            "retained_results": failure.results.len(),
+        });
+        outcome.payload["error"]["message"] = Value::String(
+                "The stream did not complete. Validated results are retained; reconcile member request IDs before repeating any work.".to_owned(),
+            );
+    }
         outcome
-    })
 }
 
 fn narrow_batch_execution_budget(
@@ -28024,7 +28297,8 @@ fn preflight_status_label(preflights: &[Value]) -> (&'static str, CliExitCode) {
 
 #[allow(clippy::missing_const_for_fn)]
 fn batch_status_label(response: &HostBatchInvokeResponse) -> (&'static str, CliExitCode) {
-    if response.failed == 0 && response.skipped == 0 {
+    if response.status == fcp_host::BatchStatus::Success
+        && response.failed == 0 && response.skipped == 0 {
         ("ok", CliExitCode::Success)
     } else if response.completed > 0 {
         ("partial", CliExitCode::Connector)
@@ -33582,6 +33856,15 @@ fn resolve_pipeline_operation_metadata(
 
 #[allow(clippy::too_many_lines)]
 fn map_dispatch(args: &MapArgs, explicit_host: Option<&str>) -> Result<DispatchOutcome> {
+    map_dispatch_with_stream(args, explicit_host, None)
+}
+
+#[allow(clippy::too_many_lines)]
+fn map_dispatch_with_stream(
+    args: &MapArgs,
+    explicit_host: Option<&str>,
+    writer: Option<&mut dyn std::io::Write>,
+) -> Result<DispatchOutcome> {
     let run_budget =
         pipe::budget::ExecutionBudget::start(Some(args.timeout_ms), std::time::Instant::now());
     let run_key = args
@@ -33804,12 +34087,12 @@ fn map_dispatch(args: &MapArgs, explicit_host: Option<&str>) -> Result<DispatchO
         operations,
         options: build_host_batch_options(args.concurrency, on_error, args.timeout_ms),
     };
-    let response = match submit_namespaced_batch(&client, &mut request, "map", &run_key, run_budget)
+    let submission = match submit_namespaced_batch(&client, &mut request, "map", &run_key, run_budget, writer)
     {
         Ok(response) => response,
         Err(outcome) => return Ok(outcome),
     };
-    let (status, exit_code) = batch_status_label(&response);
+    let (status, exit_code) = batch_status_label(&submission.response);
 
     let envelope = CommandEnvelope::new(CommandAvailability::LiveRuntime, "map");
     let mut payload = json!({
@@ -33837,12 +34120,16 @@ fn map_dispatch(args: &MapArgs, explicit_host: Option<&str>) -> Result<DispatchO
         "zone": zone,
         "plan": plan,
         "execution": batch_execution_evidence(&run_key, &request),
-        "response": response,
+        "response": submission.response,
         "next_actions": [
             format!("fwc status {} --host {}", resolved.connector.slug, host.endpoint),
             format!("fwc history --connector {} --limit 20", resolved.connector.slug),
         ],
     });
+    if let Some(stream) = submission.stream {
+        payload["stream"] = stream;
+        payload["execution"]["submitted"] = Value::Bool(true);
+    }
     envelope.inject_into(&mut payload);
     Ok(DispatchOutcome { payload, exit_code })
 }
@@ -33851,6 +34138,15 @@ fn map_dispatch(args: &MapArgs, explicit_host: Option<&str>) -> Result<DispatchO
 fn batch_file_dispatch(
     args: &BatchFileArgs,
     explicit_host: Option<&str>,
+) -> Result<DispatchOutcome> {
+    batch_file_dispatch_with_stream(args, explicit_host, None)
+}
+
+#[allow(clippy::too_many_lines)]
+fn batch_file_dispatch_with_stream(
+    args: &BatchFileArgs,
+    explicit_host: Option<&str>,
+    writer: Option<&mut dyn std::io::Write>,
 ) -> Result<DispatchOutcome> {
     let run_budget =
         pipe::budget::ExecutionBudget::start(Some(args.timeout_ms), std::time::Instant::now());
@@ -34201,12 +34497,12 @@ fn batch_file_dispatch(
         operations: request_operations,
         options: build_host_batch_options(args.concurrency, on_error, args.timeout_ms),
     };
-    let response =
-        match submit_namespaced_batch(&client, &mut request, "batch-file", &run_key, run_budget) {
+    let submission =
+        match submit_namespaced_batch(&client, &mut request, "batch-file", &run_key, run_budget, writer) {
             Ok(response) => response,
             Err(outcome) => return Ok(outcome),
         };
-    let (status, exit_code) = batch_status_label(&response);
+    let (status, exit_code) = batch_status_label(&submission.response);
 
     let envelope = CommandEnvelope::new(CommandAvailability::LiveRuntime, "batch");
     let mut payload = json!({
@@ -34223,11 +34519,15 @@ fn batch_file_dispatch(
         "dry_run": false,
         "plan": plan,
         "execution": batch_execution_evidence(&run_key, &request),
-        "response": response,
+        "response": submission.response,
         "next_actions": plan.connectors.iter().map(|connector| {
             format!("fwc status {connector} --host {}", host.endpoint)
         }).collect::<Vec<_>>(),
     });
+    if let Some(stream) = submission.stream {
+        payload["stream"] = stream;
+        payload["execution"]["submitted"] = Value::Bool(true);
+    }
     envelope.inject_into(&mut payload);
     Ok(DispatchOutcome { payload, exit_code })
 }
@@ -59199,6 +59499,786 @@ depends_on = ["missing"]
                 }
             }
         }
+    }
+
+    #[derive(Clone)]
+    struct CliStreamRequest {
+        route: String,
+        headers: StdBTreeMap<String, String>,
+        body: Value,
+    }
+
+    struct CliStreamReply {
+        first: Vec<u8>,
+        remaining: Vec<u8>,
+        result_flushed: Option<std::sync::mpsc::Receiver<()>>,
+        allow_disconnect: bool,
+    }
+
+    struct CliStreamMock {
+        endpoint: String,
+        listener: TcpListener,
+        server: thread::JoinHandle<()>,
+        requests: Arc<StdMutex<Vec<CliStreamRequest>>>,
+    }
+
+    impl CliStreamMock {
+        fn finish(self, expected_posts: usize) -> Vec<CliStreamRequest> {
+            self.server.join().expect("stream mock should finish");
+            assert!(
+                matches!(self.listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+                "no additional connection or retry may follow the observed requests",
+            );
+            let requests = self.requests.lock().expect("stream request log").clone();
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|request| request.route == "POST /rpc/batch/stream")
+                    .count(),
+                expected_posts,
+            );
+            requests
+        }
+    }
+
+    fn spawn_cli_stream_mock(
+        reply: Option<CliStreamReply>,
+        start_flushed: Arc<std::sync::atomic::AtomicBool>,
+    ) -> CliStreamMock {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("stream mock bind");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking mock listener");
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server_listener = listener
+            .try_clone()
+            .expect("retain no-retry listener probe");
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let log = Arc::clone(&requests);
+        let server = thread::spawn(move || {
+            let metadata = [
+                mock_discovery_response_json(),
+                mock_introspection_response_json(),
+            ];
+            let expected = if reply.is_some() { 3 } else { 2 };
+            let mut reply = reply;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            for index in 0..expected {
+                let (mut stream, _) = loop {
+                    match server_listener.accept() {
+                        Ok(connection) => break connection,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "stream mock accept deadline");
+                            thread::yield_now();
+                        }
+                        Err(error) => panic!("stream mock accept failed: {error}"),
+                    }
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                reader
+                    .read_line(&mut request_line)
+                    .expect("stream request line");
+                let mut parts = request_line.split_whitespace();
+                let route = format!("{} {}", parts.next().unwrap(), parts.next().unwrap());
+                let mut headers = StdBTreeMap::new();
+                loop {
+                    let mut header = String::new();
+                    reader
+                        .read_line(&mut header)
+                        .expect("stream request header");
+                    if header == "\r\n" || header.is_empty() {
+                        break;
+                    }
+                    let (name, value) = header.split_once(':').expect("HTTP header");
+                    headers.insert(name.to_ascii_lowercase(), value.trim().to_owned());
+                }
+                let length = headers
+                    .get("content-length")
+                    .map_or(0, |value| value.parse::<usize>().unwrap());
+                assert!(length <= 2 * 1024 * 1024, "bounded test request");
+                let mut bytes = vec![0; length];
+                reader.read_exact(&mut bytes).expect("stream request body");
+                let body = if bytes.is_empty() {
+                    Value::Null
+                } else {
+                    serde_json::from_slice(&bytes).unwrap()
+                };
+                let expected_route = [
+                    "POST /rpc/discover",
+                    "GET /rpc/introspect/fcp.github:enterprise:v1",
+                    "POST /rpc/batch/stream",
+                ][index];
+                assert_eq!(route, expected_route);
+                log.lock().unwrap().push(CliStreamRequest {
+                    route,
+                    headers: headers.clone(),
+                    body,
+                });
+                if index < 2 {
+                    let body = serde_json::to_vec(&metadata[index]).unwrap();
+                    write!(stream, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len()).unwrap();
+                    stream.write_all(&body).unwrap();
+                    stream.flush().expect("flush mock metadata");
+                } else {
+                    assert!(
+                        start_flushed.load(std::sync::atomic::Ordering::SeqCst),
+                        "identities must be flushed before POST"
+                    );
+                    assert_eq!(
+                        headers.get("accept").map(String::as_str),
+                        Some("application/x-ndjson")
+                    );
+                    assert_eq!(
+                        headers.get("content-type").map(String::as_str),
+                        Some("application/json")
+                    );
+                    let reply = reply.take().expect("one streaming response");
+                    write!(stream, "HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\ncache-control: no-store\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", reply.first.len() + reply.remaining.len()).unwrap();
+                    stream.write_all(&reply.first).unwrap();
+                    stream.flush().unwrap();
+                    if let Some(gate) = reply.result_flushed {
+                        gate.recv_timeout(Duration::from_secs(5)).expect(
+                            "CLI must flush the first result before terminal bytes are sent",
+                        );
+                    }
+                    let sent = stream
+                        .write_all(&reply.remaining)
+                        .and_then(|()| stream.flush());
+                    if !reply.allow_disconnect {
+                        sent.expect("flush mock terminal");
+                    }
+                }
+            }
+        });
+        CliStreamMock {
+            endpoint,
+            listener,
+            server,
+            requests,
+        }
+    }
+
+    struct CliStreamWriter {
+        bytes: Vec<u8>,
+        flushed: usize,
+        start_flushed: Arc<std::sync::atomic::AtomicBool>,
+        result_flushed: Option<std::sync::mpsc::Sender<()>>,
+    }
+
+    impl Write for CliStreamWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            for bytes in self.bytes[self.flushed..]
+                .split(|byte| *byte == b'\n')
+                .filter(|bytes| !bytes.is_empty())
+            {
+                let record: Value =
+                    serde_json::from_slice(bytes).expect("flush only complete NDJSON frames");
+                if record["type"] == "start" {
+                    self.start_flushed
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                } else if record["type"] == "result" {
+                    if let Some(sender) = self.result_flushed.take() {
+                        sender.send(()).expect("server is waiting for result flush");
+                    }
+                }
+            }
+            self.flushed = self.bytes.len();
+            Ok(())
+        }
+    }
+
+    fn cli_stream_line(record: &Value) -> Vec<u8> {
+        let mut bytes = serde_json::to_vec(record).unwrap();
+        bytes.push(b'\n');
+        bytes
+    }
+
+    fn cli_stream_success_reply(ids: &[&str], aborted: bool) -> CliStreamReply {
+        let results = ids
+            .iter()
+            .map(|id| fcp_host::OperationResult {
+                id: (*id).to_owned(),
+                status: fcp_host::OperationResultStatus::Success,
+                output: Some(json!({"member": id, "ok": true})),
+                error: None,
+                duration_ms: 1,
+            })
+            .collect::<Vec<_>>();
+        let retained = results
+            .iter()
+            .map(|result| {
+                serde_json::to_vec(result.output.as_ref().unwrap())
+                    .unwrap()
+                    .len()
+            })
+            .sum();
+        let terminal = fcp_host::BatchBoundedStreamingResponse {
+            bounded: fcp_host::BatchBoundedResponse {
+                response: fcp_host::BatchInvokeResponse {
+                    status: if aborted {
+                        fcp_host::BatchStatus::Aborted
+                    } else {
+                        fcp_host::BatchStatus::Success
+                    },
+                    completed: ids.len(),
+                    failed: 0,
+                    skipped: 0,
+                    results: results.clone(),
+                    total_duration_ms: 5,
+                    schedule_report: None,
+                },
+                limits: fcp_host::BatchResultLimits::default(),
+                retained_result_bytes: retained,
+                withheld_results: 0,
+            },
+            acknowledged_results: ids.len(),
+            delivery_status: fcp_host::BatchDeliveryStatus::Complete,
+        };
+        let first = cli_stream_line(&json!({"type":"result","result":results.last().unwrap()}));
+        let mut remaining = Vec::new();
+        for result in &results[..results.len() - 1] {
+            remaining.extend(cli_stream_line(&json!({"type":"result","result":result})));
+        }
+        remaining.extend(cli_stream_line(
+            &json!({"type":"complete","batch":terminal}),
+        ));
+        CliStreamReply {
+            first,
+            remaining,
+            result_flushed: None,
+            allow_disconnect: false,
+        }
+    }
+
+    fn cli_stream_fixture(directory: &Path) -> PathBuf {
+        let path = directory.join("streaming.jsonl");
+        fs::write(
+            &path,
+            [
+                json!({"id":"a","connector":"github","operation":"get_issue","lease_seq":9,
+                "input":{"owner":"octocat","repo":"hello-world","number":1}})
+                .to_string(),
+                json!({"id":"b","connector":"github","operation":"get_issue","lease_seq":12,
+                "input":{"owner":"octocat","repo":"hello-world","number":2}})
+                .to_string(),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        path
+    }
+
+    fn cli_stream_args(
+        command: &str,
+        endpoint: &str,
+        path: &Path,
+        token: &str,
+        holder: &Path,
+    ) -> Vec<String> {
+        let mut args = vec![
+            "fwc".to_owned(),
+            "--host".to_owned(),
+            endpoint.to_owned(),
+            command.to_owned(),
+        ];
+        if command == "map" {
+            args.extend([
+                "github.get_issue".to_owned(), "--inputs".to_owned(),
+                r#"[{"owner":"octocat","repo":"hello-world","number":1},{"owner":"octocat","repo":"hello-world","number":2}]"#.to_owned(),
+                "--lease-seq".to_owned(), "9".to_owned(),
+            ]);
+        } else {
+            args.push(path.display().to_string());
+        }
+        args.extend([
+            "--stream".to_owned(),
+            "--timeout-ms".to_owned(),
+            "5000".to_owned(),
+            "--on-error".to_owned(),
+            "continue".to_owned(),
+            "--zone".to_owned(),
+            "z:work".to_owned(),
+            "--idempotency-key".to_owned(),
+            "stream-regression-run".to_owned(),
+            "--capability-token".to_owned(),
+            token.to_owned(),
+            "--holder-key-file".to_owned(),
+            holder.display().to_string(),
+        ]);
+        args
+    }
+
+    fn cli_stream_records(bytes: &[u8]) -> Vec<Value> {
+        std::str::from_utf8(bytes)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn streaming_cli_map_and_batch_file_flush_identities_and_results_before_terminal() {
+        let directory = tempfile::tempdir().unwrap();
+        let (token, holder, signing_key) = test_live_holder_auth(directory.path());
+        let path = cli_stream_fixture(directory.path());
+        for command in ["map", "batch-file"] {
+            let ids = if command == "map" {
+                ["item-1", "item-2"]
+            } else {
+                ["a", "b"]
+            };
+            let start = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (sent, received) = std::sync::mpsc::channel();
+            let mut reply = cli_stream_success_reply(&ids, false);
+            reply.result_flushed = Some(received);
+            let mock = spawn_cli_stream_mock(Some(reply), Arc::clone(&start));
+            let prepared = prepare_cli(&cli_stream_args(
+                command,
+                &mock.endpoint,
+                &path,
+                &token,
+                &holder,
+            ))
+            .expect("valid streaming CLI");
+            let mut writer = CliStreamWriter {
+                bytes: Vec::new(),
+                flushed: 0,
+                start_flushed: start,
+                result_flushed: Some(sent),
+            };
+            let exit = super::execute_streaming_batch_with_writer(&prepared, &mut writer).unwrap();
+            let requests = mock.finish(1);
+            assert_eq!(exit, CliExitCode::Success.into());
+            let records = cli_stream_records(&writer.bytes);
+            assert_eq!(
+                records
+                    .iter()
+                    .map(|record| record["type"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                ["start", "result", "result", "complete"]
+            );
+            assert_eq!(records[0]["execution"]["submitted"], false);
+            assert_eq!(records[0]["automatic_retry_allowed"], false);
+            assert_eq!(records[1]["result"]["id"], ids[1]);
+            assert_eq!(records[2]["result"]["id"], ids[0]);
+            let final_summary = &records[3]["summary"];
+            assert_eq!(final_summary["execution"]["submitted"], true);
+            assert_eq!(final_summary["stream"]["complete"], true);
+            assert_eq!(final_summary["stream"]["acknowledged_results"], 2);
+            assert_eq!(final_summary["response"]["results"][0]["id"], ids[0]);
+            assert_eq!(final_summary["response"]["results"][1]["id"], ids[1]);
+            let posted = &requests[2];
+            assert_eq!(posted.route, "POST /rpc/batch/stream");
+            assert_eq!(posted.headers["accept"], "application/x-ndjson");
+            let timeout = posted.body["options"]["timeout_ms"].as_u64().unwrap();
+            assert!(timeout > 0 && timeout <= 5_000);
+            assert_eq!(posted.body["options"]["stop_on_first_error"], false);
+            let members = posted.body["operations"].as_array().unwrap();
+            let identities = records[0]["execution"]["members"].as_array().unwrap();
+            assert_eq!(members.len(), 2);
+            assert_ne!(members[0]["request"]["id"], members[1]["request"]["id"]);
+            assert_ne!(
+                members[0]["request"]["idempotency_key"],
+                members[1]["request"]["idempotency_key"]
+            );
+            for (index, member) in members.iter().enumerate() {
+                let request = &member["request"];
+                assert_live_holder_request(request, &signing_key);
+                assert_eq!(request["zone_id"], "z:work");
+                assert_eq!(
+                    request["lease_seq"],
+                    if command == "batch-file" && index == 1 {
+                        12
+                    } else {
+                        9
+                    }
+                );
+                assert!(
+                    request["deadline_ms"]
+                        .as_u64()
+                        .is_some_and(|deadline| deadline > 0 && deadline <= timeout)
+                );
+                assert_eq!(identities[index]["request_id"], request["id"]);
+                assert_eq!(
+                    identities[index]["idempotency_key"],
+                    request["idempotency_key"]
+                );
+                assert!(identities[index].get("input").is_none());
+                assert!(identities[index].get("capability_token").is_none());
+            }
+            assert_eq!(records[1]["request_id"], members[1]["request"]["id"]);
+            assert_eq!(records[2]["request_id"], members[0]["request"]["id"]);
+        }
+    }
+
+    #[test]
+    fn streaming_cli_truncation_preserves_known_results_and_every_member_identity_without_retry() {
+        let directory = tempfile::tempdir().unwrap();
+        let (token, holder, _) = test_live_holder_auth(directory.path());
+        let path = cli_stream_fixture(directory.path());
+        for command in ["map", "batch-file"] {
+            let ids = if command == "map" {
+                ["item-1", "item-2"]
+            } else {
+                ["a", "b"]
+            };
+            let start = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let mut reply = cli_stream_success_reply(&ids, false);
+            reply.remaining.clear();
+            let mock = spawn_cli_stream_mock(Some(reply), Arc::clone(&start));
+            let prepared = prepare_cli(&cli_stream_args(
+                command,
+                &mock.endpoint,
+                &path,
+                &token,
+                &holder,
+            ))
+            .unwrap();
+            let mut writer = CliStreamWriter {
+                bytes: Vec::new(),
+                flushed: 0,
+                start_flushed: start,
+                result_flushed: None,
+            };
+            let exit = super::execute_streaming_batch_with_writer(&prepared, &mut writer).unwrap();
+            let requests = mock.finish(1);
+            assert_eq!(exit, CliExitCode::Transport.into());
+            let records = cli_stream_records(&writer.bytes);
+            assert_eq!(
+                records
+                    .iter()
+                    .map(|record| record["type"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                ["start", "result", "interrupted"]
+            );
+            let summary = &records[2]["summary"];
+            assert_eq!(summary["execution"]["submitted"], true);
+            assert_eq!(summary["stream"]["complete"], false);
+            assert_eq!(summary["stream"]["failure"], "incomplete_stream");
+            assert_eq!(summary["automatic_retry_allowed"], false);
+            assert_eq!(summary["known_results"].as_array().unwrap().len(), 1);
+            assert_eq!(summary["known_results"][0]["id"], ids[1]);
+            assert_eq!(summary["known_results"][0]["status"], "success");
+            assert_eq!(summary["execution"]["members"].as_array().unwrap().len(), 2);
+            assert_eq!(summary["unobserved_members"].as_array().unwrap().len(), 1);
+            assert_eq!(summary["unobserved_members"][0]["id"], ids[0]);
+            assert_eq!(
+                summary["unobserved_members"][0]["request_id"],
+                requests[2].body["operations"][0]["request"]["id"]
+            );
+            for (identity, member) in summary["execution"]["members"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .zip(requests[2].body["operations"].as_array().unwrap())
+            {
+                assert_eq!(identity["request_id"], member["request"]["id"]);
+                assert_eq!(
+                    identity["idempotency_key"],
+                    member["request"]["idempotency_key"]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_cli_transient_sink_error_never_appends_or_repeats_after_a_partial_frame() {
+        struct PrefixFailureWriter {
+            bytes: Vec<u8>,
+            start: Arc<std::sync::atomic::AtomicBool>,
+            fail_start: bool,
+            prefix: usize,
+            failed: bool,
+            calls_after_failure: usize,
+        }
+        impl Write for PrefixFailureWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.failed {
+                    self.calls_after_failure += 1;
+                    self.bytes.extend_from_slice(bytes);
+                    return Ok(bytes.len());
+                }
+                if self.fail_start || self.start.load(std::sync::atomic::Ordering::SeqCst) {
+                    if self.prefix == 16 {
+                        self.failed = true;
+                        return Err(std::io::Error::other("transient secret output failure"));
+                    }
+                    let written = bytes.len().min(16 - self.prefix);
+                    self.bytes.extend_from_slice(&bytes[..written]);
+                    self.prefix += written;
+                    return Ok(written);
+                }
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                if self.failed {
+                    self.calls_after_failure += 1;
+                }
+                self.start.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let (token, holder, _) = test_live_holder_auth(directory.path());
+        let path = cli_stream_fixture(directory.path());
+        for fail_start in [true, false] {
+            let start = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let reply = (!fail_start).then(|| {
+                let mut reply = cli_stream_success_reply(&["item-1", "item-2"], false);
+                reply.allow_disconnect = true;
+                reply
+            });
+            let mock = spawn_cli_stream_mock(reply, Arc::clone(&start));
+            let prepared = prepare_cli(&cli_stream_args(
+                "map",
+                &mock.endpoint,
+                &path,
+                &token,
+                &holder,
+            ))
+            .unwrap();
+            let mut writer = PrefixFailureWriter {
+                bytes: Vec::new(),
+                start,
+                fail_start,
+                prefix: 0,
+                failed: false,
+                calls_after_failure: 0,
+            };
+            let exit = super::execute_streaming_batch_with_writer(&prepared, &mut writer).unwrap();
+            mock.finish(usize::from(!fail_start));
+            assert_eq!(exit, CliExitCode::Transport.into());
+            assert!(writer.failed);
+            assert_eq!(
+                writer.calls_after_failure, 0,
+                "even a recoverable writer must never receive a summary after a partial record"
+            );
+            assert_eq!(
+                writer.bytes.iter().filter(|byte| **byte == b'\n').count(),
+                usize::from(!fail_start)
+            );
+            assert!(
+                !std::str::from_utf8(&writer.bytes)
+                    .unwrap()
+                    .contains("transient secret")
+            );
+        }
+    }
+
+    #[test]
+    fn streaming_cli_rejects_invalid_options_and_rendering_before_host_io() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        for extra in [
+            vec!["--json"],
+            vec!["--extract", ".results[]"],
+            vec!["--template", "{{status}}"],
+            vec!["--token-stats"],
+            vec!["--timeout-ms", "0"],
+        ] {
+            let mut args = vec![
+                "fwc",
+                "--host",
+                &endpoint,
+                "map",
+                "github.get_issue",
+                "--inputs",
+                "[{}]",
+                "--stream",
+            ];
+            args.extend(extra);
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+        for command in ["map", "batch-file"] {
+            for extra in [
+                vec!["--format", "json"],
+                vec!["--columns", "status"],
+                vec!["--sort-by", "status"],
+                vec!["--limit", "1"],
+                vec!["--no-headers"],
+            ] {
+                let mut args = vec![
+                    "fwc".to_owned(),
+                    "--host".to_owned(),
+                    endpoint.clone(),
+                    command.to_owned(),
+                ];
+                if command == "map" {
+                    args.extend([
+                        "github.get_issue".to_owned(),
+                        "--inputs".to_owned(),
+                        "[{}]".to_owned(),
+                    ]);
+                } else {
+                    args.push("must-not-be-read.jsonl".to_owned());
+                }
+                args.push("--stream".to_owned());
+                args.extend(extra.iter().map(|arg| (*arg).to_owned()));
+                let prepared = prepare_cli(&args)
+                    .expect("render option parses before stream compatibility validation");
+                let mut bytes = Vec::new();
+                let exit =
+                    super::execute_streaming_batch_with_writer(&prepared, &mut bytes).unwrap();
+                assert_eq!(exit, CliExitCode::Validation.into());
+                let records = cli_stream_records(&bytes);
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0]["type"], "error");
+                assert_eq!(
+                    records[0]["summary"]["error"]["type"],
+                    "incompatible-stream-format"
+                );
+                assert_eq!(records[0]["summary"]["invoke_attempted"], false);
+            }
+        }
+        assert!(
+            Cli::try_parse_from([
+                "fwc",
+                "batch-file",
+                "must-not-be-read.jsonl",
+                "--stream",
+                "--dry-run"
+            ])
+            .is_err()
+        );
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+    }
+
+    #[test]
+    fn streaming_cli_aborted_batch_with_all_known_successes_has_non_success_exit() {
+        let directory = tempfile::tempdir().unwrap();
+        let (token, holder, _) = test_live_holder_auth(directory.path());
+        let path = cli_stream_fixture(directory.path());
+        for command in ["map", "batch-file"] {
+            let ids = if command == "map" {
+                ["item-1", "item-2"]
+            } else {
+                ["a", "b"]
+            };
+            let start = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let mock = spawn_cli_stream_mock(
+                Some(cli_stream_success_reply(&ids, true)),
+                Arc::clone(&start),
+            );
+            let prepared = prepare_cli(&cli_stream_args(
+                command,
+                &mock.endpoint,
+                &path,
+                &token,
+                &holder,
+            ))
+            .unwrap();
+            let mut writer = CliStreamWriter {
+                bytes: Vec::new(),
+                flushed: 0,
+                start_flushed: start,
+                result_flushed: None,
+            };
+            let exit = super::execute_streaming_batch_with_writer(&prepared, &mut writer).unwrap();
+            mock.finish(1);
+            assert_eq!(exit, CliExitCode::Connector.into());
+            let records = cli_stream_records(&writer.bytes);
+            let final_record = records.last().unwrap();
+            assert_eq!(final_record["type"], "complete");
+            assert_eq!(final_record["summary"]["stream"]["complete"], true);
+            assert_eq!(final_record["summary"]["execution"]["submitted"], true);
+            assert_eq!(final_record["summary"]["response"]["status"], "aborted");
+            assert_eq!(final_record["summary"]["response"]["completed"], 2);
+            assert_eq!(final_record["summary"]["response"]["failed"], 0);
+            assert_eq!(final_record["summary"]["status"], "partial");
+        }
+    }
+
+    #[test]
+    fn streaming_cli_identity_flush_cannot_renew_the_original_execution_budget() {
+        struct ExpiringWriter {
+            budget: super::pipe::budget::ExecutionBudget,
+            bytes: Vec<u8>,
+            flushed: bool,
+        }
+        impl Write for ExpiringWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.flushed = true;
+                while self.budget.remaining_ms(Instant::now()).is_ok() {
+                    thread::yield_now();
+                }
+                Ok(())
+            }
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let client = super::HostAdminClient::new(&endpoint).unwrap();
+        let auth = super::resolve_live_auth(&LiveAuthArgs {
+            capability_token: Some(test_capability_token_arg()),
+            ..LiveAuthArgs::default()
+        })
+        .unwrap();
+        let request = super::build_live_invoke_request(
+            "fcp.github:enterprise:v1",
+            "github.get_issue",
+            "z:work",
+            json!({"owner":"octocat","repo":"hello-world","number":1}),
+            RequestId::new("blocked-start-flush"),
+            &auth,
+            Some("flush-idempotency".into()),
+            None,
+            None,
+        )
+        .unwrap();
+        let mut batch = super::HostBatchInvokeRequest {
+            operations: vec![super::HostBatchOperation {
+                id: "a".into(),
+                request,
+                depends_on: Vec::new(),
+            }],
+            options: super::build_host_batch_options(1, super::batch::OnError::Continue, 5_000),
+        };
+        let budget = super::pipe::budget::ExecutionBudget::start(Some(250), Instant::now());
+        let mut writer = ExpiringWriter {
+            budget,
+            bytes: Vec::new(),
+            flushed: false,
+        };
+        let Err(outcome) = super::submit_namespaced_batch(
+            &client,
+            &mut batch,
+            "map",
+            "flush-run",
+            budget,
+            Some(&mut writer),
+        ) else {
+            panic!("expired identity flush must prevent submission");
+        };
+        assert!(writer.flushed);
+        assert_eq!(outcome.exit_code, CliExitCode::Transport);
+        assert_eq!(outcome.payload["invoke_attempted"], false);
+        assert_eq!(outcome.payload["execution"]["submitted"], false);
+        assert_eq!(outcome.payload["error"]["type"], "batch-deadline-exceeded");
+        assert_eq!(cli_stream_records(&writer.bytes)[0]["type"], "start");
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
     }
 
     #[test]
