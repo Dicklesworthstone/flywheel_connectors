@@ -439,6 +439,32 @@ impl BatchExecutor {
     }
 
     #[allow(clippy::future_not_send)]
+    pub(crate) async fn execute_async_streaming_wait_guarded<'a, F, Fut, S, DeliveryFut, G>(
+        &self,
+        request: &'a BatchInvokeRequest,
+        context: Option<&ExecutionContext>,
+        handler: F,
+        on_result: S,
+        admission_guard: G,
+    ) -> HostResult<BatchStreamingResponse>
+    where
+        F: FnMut(&'a BatchOperation) -> Fut,
+        Fut: Future<Output = Result<serde_json::Value, BatchOperationError>>,
+        S: FnMut(OperationResult) -> DeliveryFut,
+        DeliveryFut: Future<Output = Result<(), BatchOperationError>>,
+        G: FnMut() -> Result<(), BatchOperationError>,
+    {
+        self.execute_async_inner(
+            request,
+            context,
+            handler,
+            Some(WaitingSink(on_result)),
+            admission_guard,
+        )
+        .await
+    }
+
+    #[allow(clippy::future_not_send)]
     async fn execute_async_inner<'a, F, Fut, S, G>(
         &self,
         request: &'a BatchInvokeRequest,

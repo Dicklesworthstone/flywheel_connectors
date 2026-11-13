@@ -77,7 +77,7 @@ pub use admin_state::*;
 pub use agent_api::*;
 pub use batch::*;
 pub use batch_async::{BatchDeliveryStatus, BatchStreamingResponse};
-pub use batch_bounded::{BatchBoundedResponse, BatchResultLimits};
+pub use batch_bounded::{BatchBoundedResponse, BatchBoundedStreamingResponse, BatchResultLimits};
 pub use budget::*;
 pub use cancellation::*;
 pub use connector_state_recovery::*;

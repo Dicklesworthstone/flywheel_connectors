@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    BatchExecutor, BatchInvokeRequest, BatchInvokeResponse, BatchOperation, BatchOperationError,
-    HostError, HostResult, OperationResult,
+    BatchDeliveryStatus, BatchExecutor, BatchInvokeRequest, BatchInvokeResponse, BatchOperation,
+    BatchOperationError, HostError, HostResult, OperationResult,
 };
 
 /// Serialized provider-result limits, excluding fixed scheduler accounting.
@@ -67,6 +67,18 @@ pub struct BatchBoundedResponse {
     /// Provider results withheld because retention or encoding failed.
     /// This is not the number of failed or cancelled external effects.
     pub withheld_results: usize,
+}
+
+/// Byte-bounded provider results and independent streaming-delivery accounting.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BatchBoundedStreamingResponse {
+    /// Final retained results and encoded-byte budget accounting.
+    pub bounded: BatchBoundedResponse,
+    /// User callbacks that returned success, including fixed accounting records.
+    /// This is not proof of remote receipt or durable storage.
+    pub acknowledged_results: usize,
+    /// Whether every result was acknowledged without refusal or interruption.
+    pub delivery_status: BatchDeliveryStatus,
 }
 
 #[derive(Clone, Copy)]
@@ -202,6 +214,93 @@ impl BatchExecutor {
     {
         self.execute_async_bounded_observed(request, context, limits, handler, |_| Ok(()))
             .await
+    }
+
+    /// Bound retained provider results while awaiting incremental sink capacity.
+    ///
+    /// Provider values and errors pass the encoded-byte checks before the sink
+    /// receives an owned clone. Oversized payloads are replaced with fixed
+    /// errors, never truncated or passed through. Retention failure stops new
+    /// admission independently of delivery: admitted work drains and the sink
+    /// can still acknowledge its retained results and all skipped records.
+    ///
+    /// Only one delivery is active. While it waits, no new handler is admitted
+    /// and other owned handler futures are not polled. Use an independently
+    /// driven receiver; waiting on another operation in this batch cannot make
+    /// progress until delivery finishes. Waiting, draining and final delivery
+    /// share the original batch and optional parent deadlines.
+    ///
+    /// A real sink refusal, unwinding panic, cancellation or timeout keeps the
+    /// ordinary streaming delivery status. Known results remain in the response
+    /// even when undelivered. Neither execution nor delivery is retried, and
+    /// withholding a payload does not undo an external effect. Cancellation
+    /// preserves outcome-unknown accounting for unresolved admitted operations.
+    ///
+    /// The byte limit covers retained encoded provider results, not peak heap
+    /// usage, allocation inside handlers, fixed accounting, or extra storage
+    /// retained by the callback. At most one additional result clone belongs to
+    /// the pending delivery. No mutex is held during a user callback or await.
+    /// Borrowing and local-only callbacks are supported; the future is `Send`
+    /// when both callbacks and their futures are `Send`.
+    ///
+    /// # Errors
+    /// Returns limit and batch validation errors before either callback runs.
+    /// Runtime, retention and delivery failures remain in response accounting.
+    #[allow(clippy::future_not_send, clippy::missing_panics_doc)]
+    pub async fn execute_async_bounded_wait<'a, F, Fut, S, DeliveryFut>(
+        &self,
+        request: &'a BatchInvokeRequest,
+        context: Option<&ExecutionContext>,
+        limits: BatchResultLimits,
+        mut handler: F,
+        on_result: S,
+    ) -> HostResult<BatchBoundedStreamingResponse>
+    where
+        F: FnMut(&'a BatchOperation) -> Fut,
+        Fut: Future<Output = Result<Value, BatchOperationError>>,
+        S: FnMut(OperationResult) -> DeliveryFut,
+        DeliveryFut: Future<Output = Result<(), BatchOperationError>>,
+    {
+        limits.validate()?;
+        let budget = Mutex::new(ResultBudget {
+            limits,
+            retained: 0,
+            withheld: 0,
+            stop: None,
+        });
+        let shared = &budget;
+        let streamed = self
+            .execute_async_streaming_wait_guarded(
+                request,
+                context,
+                |operation| {
+                    let future = handler(operation);
+                    async move {
+                        let result = future.await;
+                        shared
+                            .lock()
+                            .expect("batch result budget lock")
+                            .retain(result)
+                    }
+                },
+                on_result,
+                || {
+                    let stop = shared.lock().expect("batch result budget lock").stop;
+                    stop.map_or(Ok(()), |failure| Err(failure.error(false)))
+                },
+            )
+            .await?;
+        let budget = budget.into_inner().expect("batch result budget lock");
+        Ok(BatchBoundedStreamingResponse {
+            bounded: BatchBoundedResponse {
+                response: streamed.response,
+                limits,
+                retained_result_bytes: budget.retained,
+                withheld_results: budget.withheld,
+            },
+            acknowledged_results: streamed.acknowledged_results,
+            delivery_status: streamed.delivery_status,
+        })
     }
 
     /// Observe retention-checked results before dependent work can be admitted.
@@ -716,6 +815,433 @@ mod tests {
             bounded.response.results[2].error.as_ref().unwrap().code,
             "BATCH_ABORTED"
         );
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn bounded_wait_backpressure_delivers_limit_and_final_records_exactly_once() {
+        let executor = BatchExecutor::new();
+        let request = request(4, 1);
+        let admitted = Cell::new(0);
+        let (sender, mut receiver) = fcp_async_core::channel::bounded("bounded-batch-results", 1);
+        let mut batch = Box::pin(executor.execute_async_bounded_wait(
+            &request,
+            None,
+            limits(6, 6),
+            |_| {
+                admitted.set(admitted.get() + 1);
+                ready(Ok(Value::Null))
+            },
+            |result| {
+                let sender = sender.clone();
+                async move {
+                    sender.send(result).await.map_err(|_| BatchOperationError {
+                        code: "SINK_CLOSED".into(),
+                        message: "private receiver failure".into(),
+                        retry_after_ms: None,
+                    })
+                }
+            },
+        ));
+
+        assert!(poll!(batch.as_mut()).is_pending());
+        assert_eq!(admitted.get(), 2);
+        let mut delivered = vec![receiver.recv().await.unwrap()];
+        assert_eq!(delivered[0].output, Some(Value::Null));
+        assert!(poll!(batch.as_mut()).is_pending());
+        delivered.push(receiver.recv().await.unwrap());
+        assert!(poll!(batch.as_mut()).is_pending());
+        delivered.push(receiver.recv().await.unwrap());
+        let streamed = batch.await.unwrap();
+        assert_eq!(streamed.acknowledged_results, 4);
+        delivered.push(receiver.recv().await.unwrap());
+
+        assert_eq!(admitted.get(), 2);
+        assert_eq!(streamed.delivery_status, BatchDeliveryStatus::Complete);
+        let bounded = streamed.bounded;
+        assert_eq!(bounded.retained_result_bytes, 4);
+        assert_eq!(bounded.withheld_results, 1);
+        assert_eq!(bounded.response.status, BatchStatus::Aborted);
+        assert_eq!(
+            (
+                bounded.response.completed,
+                bounded.response.failed,
+                bounded.response.skipped
+            ),
+            (1, 1, 2)
+        );
+        assert_eq!(
+            serde_json::to_value(&delivered).unwrap(),
+            serde_json::to_value(&bounded.response.results).unwrap()
+        );
+        for result in &delivered[1..] {
+            assert_eq!(result.error.as_ref().unwrap().code, "BATCH_RESULT_LIMIT");
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn bounded_wait_preserves_exact_boundary_and_submission_order() {
+        let executor = BatchExecutor::new();
+        let mut request = request(3, 1);
+        request.operations.reverse();
+        let observed = RefCell::new(Vec::new());
+        let streamed = executor
+            .execute_async_bounded_wait(
+                &request,
+                None,
+                limits(4, 12),
+                |_| ready(Ok(Value::Null)),
+                |result| {
+                    observed.borrow_mut().push(result.id);
+                    ready(Ok(()))
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(*observed.borrow(), ["op-0", "op-1", "op-2"]);
+        assert_eq!(streamed.acknowledged_results, 3);
+        assert_eq!(streamed.delivery_status, BatchDeliveryStatus::Complete);
+        assert_eq!(streamed.bounded.retained_result_bytes, 12);
+        assert_eq!(streamed.bounded.withheld_results, 0);
+        assert_eq!(streamed.bounded.response.status, BatchStatus::Success);
+        assert_eq!(
+            streamed
+                .bounded
+                .response
+                .results
+                .iter()
+                .map(|result| result.id.as_str())
+                .collect::<Vec<_>>(),
+            ["op-2", "op-1", "op-0"]
+        );
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn bounded_wait_channel_rejection_keeps_successes_and_real_delivery_status() {
+        let executor = BatchExecutor::new();
+        let request = request(3, 1);
+        let (sender, receiver) = fcp_async_core::channel::bounded("bounded-batch-disconnect", 1);
+        let mut batch = Box::pin(executor.execute_async_bounded_wait(
+            &request,
+            None,
+            limits(4, 12),
+            |_| ready(Ok(Value::Null)),
+            |result| {
+                let sender = sender.clone();
+                async move {
+                    sender.send(result).await.map_err(|_| BatchOperationError {
+                        code: "SINK_CLOSED".into(),
+                        message: "private receiver failure".into(),
+                        retry_after_ms: None,
+                    })
+                }
+            },
+        ));
+
+        assert!(poll!(batch.as_mut()).is_pending());
+        drop(receiver);
+        let streamed = batch.await.unwrap();
+        assert_eq!(streamed.acknowledged_results, 1);
+        assert_eq!(streamed.delivery_status, BatchDeliveryStatus::Rejected);
+        assert_eq!(streamed.bounded.retained_result_bytes, 8);
+        assert_eq!(streamed.bounded.withheld_results, 0);
+        assert_eq!(
+            (
+                streamed.bounded.response.completed,
+                streamed.bounded.response.failed,
+                streamed.bounded.response.skipped
+            ),
+            (2, 0, 1)
+        );
+        assert_eq!(streamed.bounded.response.results[1].output, Some(Value::Null));
+        assert_eq!(
+            streamed.bounded.response.results[2]
+                .error
+                .as_ref()
+                .unwrap()
+                .code,
+            "BATCH_RESULT_DELIVERY_FAILED"
+        );
+        assert!(
+            !serde_json::to_string(&streamed)
+                .unwrap()
+                .contains("private receiver")
+        );
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn cancellation_of_blocked_limit_delivery_keeps_known_and_unknown_outcomes() {
+        struct DeliveryDrop<'a>(&'a Cell<usize>);
+        impl Drop for DeliveryDrop<'_> {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+
+        let executor = BatchExecutor::new();
+        let request = request(3, 2);
+        let context = ExecutionContext::background();
+        let calls = Cell::new(0);
+        let drops = Cell::new(0);
+        let mut batch = Box::pin(executor.execute_async_bounded_wait(
+            &request,
+            Some(&context),
+            limits(8, 8),
+            |op| async move {
+                if op.id == "op-1" {
+                    pending::<()>().await;
+                }
+                Ok(json!("private oversized payload"))
+            },
+            |_| {
+                calls.set(calls.get() + 1);
+                let guard = DeliveryDrop(&drops);
+                async move {
+                    let _guard = guard;
+                    pending::<()>().await;
+                    Ok(())
+                }
+            },
+        ));
+
+        assert!(poll!(batch.as_mut()).is_pending());
+        context.cancel();
+        let streamed = batch.await.unwrap();
+        assert_eq!(calls.get(), 1);
+        assert_eq!(drops.get(), 1);
+        assert_eq!(streamed.acknowledged_results, 0);
+        assert_eq!(streamed.delivery_status, BatchDeliveryStatus::Interrupted);
+        assert_eq!(streamed.bounded.retained_result_bytes, 0);
+        assert_eq!(streamed.bounded.withheld_results, 1);
+        let response = streamed.bounded.response;
+        assert_eq!(
+            (response.completed, response.failed, response.skipped),
+            (0, 2, 1)
+        );
+        assert_eq!(
+            response.results[0].error.as_ref().unwrap().code,
+            "BATCH_RESULT_LIMIT"
+        );
+        assert_eq!(
+            response.results[1].error.as_ref().unwrap().code,
+            "BATCH_OUTCOME_UNKNOWN"
+        );
+        assert_eq!(
+            response.results[2].error.as_ref().unwrap().code,
+            "BATCH_CANCELLED"
+        );
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn bounded_delivery_wait_uses_the_earlier_original_deadline() {
+        use std::time::Duration;
+
+        for inherited_shorter in [true, false] {
+            let executor = BatchExecutor::new();
+            let mut request = request(3, 1);
+            request.options.timeout_ms = if inherited_shorter { 60_000 } else { 250 };
+            let context = ExecutionContext::request_scoped(if inherited_shorter {
+                Duration::from_millis(250)
+            } else {
+                Duration::from_secs(60)
+            });
+            let streamed = fcp_async_core::time::timeout(
+                Duration::from_secs(5),
+                executor.execute_async_bounded_wait(
+                    &request,
+                    Some(&context),
+                    limits(4, 12),
+                    |_| ready(Ok(Value::Null)),
+                    |_| pending::<Result<(), BatchOperationError>>(),
+                ),
+            )
+            .await
+            .expect("backpressure must not renew the execution budget")
+            .unwrap();
+
+            assert_eq!(streamed.acknowledged_results, 0);
+            assert_eq!(streamed.delivery_status, BatchDeliveryStatus::Interrupted);
+            assert_eq!(streamed.bounded.retained_result_bytes, 4);
+            assert_eq!(streamed.bounded.withheld_results, 0);
+            let response = streamed.bounded.response;
+            assert_eq!(
+                (response.completed, response.failed, response.skipped),
+                (1, 0, 2)
+            );
+            assert_eq!(response.results[0].output, Some(Value::Null));
+            for result in &response.results[1..] {
+                assert_eq!(result.error.as_ref().unwrap().code, "BATCH_TIMEOUT");
+            }
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn cancellation_at_completion_preserves_result_without_late_delivery() {
+        let executor = BatchExecutor::new();
+        let request = request(2, 1);
+        let context = ExecutionContext::background();
+        let delivered = Cell::new(0);
+        let streamed = executor
+            .execute_async_bounded_wait(
+                &request,
+                Some(&context),
+                limits(4, 8),
+                |_| async {
+                    context.cancel();
+                    Ok(Value::Null)
+                },
+                |_| {
+                    delivered.set(delivered.get() + 1);
+                    ready(Ok(()))
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(delivered.get(), 0);
+        assert_eq!(streamed.acknowledged_results, 0);
+        assert_eq!(streamed.delivery_status, BatchDeliveryStatus::Interrupted);
+        assert_eq!(streamed.bounded.retained_result_bytes, 4);
+        assert_eq!(streamed.bounded.response.completed, 1);
+        assert_eq!(streamed.bounded.response.skipped, 1);
+        assert_eq!(streamed.bounded.response.results[0].output, Some(Value::Null));
+        assert_eq!(
+            streamed.bounded.response.results[1]
+                .error
+                .as_ref()
+                .unwrap()
+                .code,
+            "BATCH_CANCELLED"
+        );
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn bounded_wait_validation_and_pre_cancelled_context_never_call_user_code() {
+        let executor = BatchExecutor::new();
+        let mut request = request(2, 1);
+        let calls = Cell::new(0);
+        for invalid in [limits(0, 8), limits(8, 0), limits(9, 8)] {
+            assert!(
+                executor
+                    .execute_async_bounded_wait(
+                        &request,
+                        None,
+                        invalid,
+                        |_| {
+                            calls.set(calls.get() + 1);
+                            ready(Ok(Value::Null))
+                        },
+                        |_| {
+                            calls.set(calls.get() + 1);
+                            ready(Ok(()))
+                        },
+                    )
+                    .await
+                    .is_err()
+            );
+        }
+        request.operations[1].depends_on.push("missing".into());
+        assert!(
+            executor
+                .execute_async_bounded_wait(
+                    &request,
+                    None,
+                    limits(4, 8),
+                    |_| {
+                        calls.set(calls.get() + 1);
+                        ready(Ok(Value::Null))
+                    },
+                    |_| {
+                        calls.set(calls.get() + 1);
+                        ready(Ok(()))
+                    },
+                )
+                .await
+                .is_err()
+        );
+        request.operations[1].depends_on.clear();
+        let context = ExecutionContext::background();
+        context.cancel();
+        let streamed = executor
+            .execute_async_bounded_wait(
+                &request,
+                Some(&context),
+                limits(4, 8),
+                |_| {
+                    calls.set(calls.get() + 1);
+                    ready(Ok(Value::Null))
+                },
+                |_| {
+                    calls.set(calls.get() + 1);
+                    ready(Ok(()))
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(calls.get(), 0);
+        assert_eq!(streamed.acknowledged_results, 0);
+        assert_eq!(streamed.delivery_status, BatchDeliveryStatus::Interrupted);
+        assert_eq!(streamed.bounded.retained_result_bytes, 0);
+        assert_eq!(streamed.bounded.withheld_results, 0);
+        assert_eq!(streamed.bounded.response.skipped, 2);
+    }
+
+    #[cfg(panic = "unwind")]
+    #[fcp_async_core::runtime::test]
+    async fn bounded_wait_contains_sink_panics_without_exposing_withheld_payloads() {
+        for factory_panics in [true, false] {
+            let executor = BatchExecutor::new();
+            let request = request(3, 2);
+            let streamed = executor
+                .execute_async_bounded_wait(
+                    &request,
+                    None,
+                    limits(8, 8),
+                    |op| {
+                        ready(Ok(if op.id == "op-0" {
+                            json!("private oversized payload")
+                        } else {
+                            Value::Null
+                        }))
+                    },
+                    |_| {
+                        assert!(!factory_panics, "private sink factory panic");
+                        async {
+                            panic!("private sink poll panic");
+                            #[allow(unreachable_code)]
+                            Ok::<(), BatchOperationError>(())
+                        }
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(streamed.delivery_status, BatchDeliveryStatus::Panicked);
+            assert_eq!(streamed.acknowledged_results, 0);
+            assert_eq!(streamed.bounded.retained_result_bytes, 4);
+            assert_eq!(streamed.bounded.withheld_results, 1);
+            assert_eq!(streamed.bounded.response.completed, 1);
+            assert_eq!(streamed.bounded.response.failed, 1);
+            assert_eq!(streamed.bounded.response.skipped, 1);
+            assert!(!serde_json::to_string(&streamed).unwrap().contains("private"));
+        }
+    }
+
+    #[test]
+    fn bounded_wait_is_send_without_requiring_sync_callbacks() {
+        fn assert_send<T: Send>(_: T) {}
+        let executor = BatchExecutor::new();
+        let request = request(1, 1);
+        let callbacks = Cell::new(0);
+        assert_send(executor.execute_async_bounded_wait(
+            &request,
+            None,
+            limits(4, 4),
+            |_| ready(Ok(Value::Null)),
+            move |_| {
+                callbacks.set(callbacks.get() + 1);
+                ready(Ok(()))
+            },
+        ));
     }
 
     #[test]
