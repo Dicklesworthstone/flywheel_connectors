@@ -9591,6 +9591,7 @@ async fn async_main(telemetry_config: TelemetryConfig) -> HostResult<()> {
         .route("/rpc/cancel-self", post(cancel_self_handler))
         .route("/rpc/batch", post(batch_invoke_handler))
         .route("/rpc/batch-invoke", post(batch_invoke_handler))
+        .route("/rpc/batch/stream", post(http_batch::stream_handler))
         .route("/rpc/mesh/cutover-gates", get(mesh_cutover_gates_handler))
         // Peer-facing mesh routes. They are authenticated by the peer
         // directory's Ed25519 keys (signed envelopes / signed
@@ -32128,6 +32129,15 @@ output_schema = { type = "object" }
 
     #[fcp_async_core::runtime::test(flavor = "multi_thread")]
     async fn batch_owned_members_preserve_errors_dependencies_and_disconnected_results() {
+        batch_owned_members_fixture(false).await;
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn streaming_batch_disconnect_preserves_durable_member_finalization() {
+        batch_owned_members_fixture(true).await;
+    }
+
+    async fn batch_owned_members_fixture(streaming: bool) {
         let lifecycle = Arc::new(HostAdminStateStore::new());
         let signing_key = fcp_crypto::ed25519::Ed25519SigningKey::generate();
         register_test_capability_issuer(
@@ -32374,7 +32384,41 @@ output_schema = { type = "object" }
             fcp_host::InvocationOutcome::ConnectorError
         );
 
-        let disconnected_batch = HttpBatchInvokeRequest {
+        if streaming {
+            let mut headers = HeaderMap::new();
+            headers.insert(PRINCIPAL_HEADER, HeaderValue::from_static("user:other"));
+            let denied = http_batch::stream_handler(
+                State(Arc::clone(&state)),
+                headers,
+                Json(HttpBatchInvokeRequest {
+                    operations: vec![member("25-principal-denied", "success", Vec::new())],
+                    options: BatchOptions::default(),
+                }),
+            )
+            .await
+            .expect("structured streaming denial");
+            let bytes = axum::body::to_bytes(denied.into_body(), 1024 * 1024)
+                .await
+                .expect("bounded denial stream");
+            let records: Vec<Value> = std::str::from_utf8(&bytes)
+                .expect("UTF-8 NDJSON")
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("denial record"))
+                .collect();
+            assert_eq!(records.len(), 2);
+            assert_eq!(records[0]["type"], "result");
+            assert_eq!(records[0]["result"]["status"], "error");
+            assert!(
+                records[0]["result"]["error"]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("request principal `user:other`")),
+            );
+            assert_eq!(records[1]["type"], "complete");
+            assert_eq!(records[1]["batch"]["bounded"]["response"]["failed"], 1);
+            assert_eq!(records[1]["batch"]["bounded"]["response"]["completed"], 0);
+        }
+
+        let mut disconnected_batch = HttpBatchInvokeRequest {
             operations: vec![
                 member("30-blocked", "blocked", Vec::new()),
                 member("31-never-admitted", "success", Vec::new()),
@@ -32386,15 +32430,51 @@ output_schema = { type = "object" }
                 ..BatchOptions::default()
             },
         };
+        if streaming {
+            disconnected_batch
+                .operations
+                .insert(0, member("29-streamed-first", "success", Vec::new()));
+        }
         let http_state = Arc::clone(&state);
+        let (first_frame_tx, first_frame_rx) = oneshot::channel();
         let waiter = task::spawn(async move {
-            batch_invoke_handler(
-                State(http_state),
-                HeaderMap::new(),
-                Json(disconnected_batch),
-            )
-            .await
+            if streaming {
+                use futures_util::StreamExt;
+
+                let response = http_batch::stream_handler(
+                    State(http_state),
+                    HeaderMap::new(),
+                    Json(disconnected_batch),
+                )
+                .await
+                .expect("streaming HTTP response");
+                assert_eq!(
+                    response.headers()[axum::http::header::CONTENT_TYPE],
+                    "application/x-ndjson",
+                );
+                assert_eq!(response.headers()[CACHE_CONTROL], "no-store");
+                let mut body = response.into_body().into_data_stream();
+                let first = body.next().await.expect("first result").expect("result bytes");
+                let first: Value = serde_json::from_slice(&first).expect("result JSON");
+                assert_eq!(first["type"], "result");
+                assert_eq!(first["result"]["id"], "29-streamed-first");
+                first_frame_tx.send(()).expect("first frame observer");
+                while let Some(chunk) = body.next().await {
+                    chunk.expect("streaming body");
+                }
+            } else {
+                batch_invoke_handler(
+                    State(http_state),
+                    HeaderMap::new(),
+                    Json(disconnected_batch),
+                )
+                .await
+                .expect("ordinary batch response");
+            }
         });
+        if streaming {
+            first_frame_rx.await.expect("consumer received the first frame");
+        }
         let ticket = started_rx.await.expect("member admitted");
         assert!(state.invoke_jobs.is_active(&ticket.operation_id));
         waiter.abort();
@@ -32434,16 +32514,17 @@ output_schema = { type = "object" }
                 "{never_admitted} must never acquire ownership or dispatch"
             );
         }
-        assert_eq!(
-            *observed_ids.lock().expect("observed ids"),
-            [
-                "00-limit",
-                "10-limit",
-                "11-independent",
-                "20-missing",
-                "30-blocked"
-            ]
-        );
+        let mut expected_ids = vec![
+            "00-limit",
+            "10-limit",
+            "11-independent",
+            "20-missing",
+            "30-blocked",
+        ];
+        if streaming {
+            expected_ids.insert(4, "29-streamed-first");
+        }
+        assert_eq!(*observed_ids.lock().expect("observed ids"), expected_ids);
         assert_eq!(
             state
                 .budget
@@ -32452,7 +32533,7 @@ output_schema = { type = "object" }
                 .expect("budget")
                 .budgets[0]
                 .used,
-            9,
+            if streaming { 11 } else { 9 },
             "each source request is accounted once, including disconnected members"
         );
         let receipts = lifecycle

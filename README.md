@@ -3737,6 +3737,68 @@ fwc batch-file operations.jsonl --dry-run
 fwc batch-file operations.jsonl
 ```
 
+### Streaming live HTTP batch results
+
+`POST /rpc/batch/stream` accepts the same request object as `POST /rpc/batch`:
+`operations` contains DAG member IDs, complete `InvokeRequest` values under
+`request`, optional `depends_on` lists, and scheduler hints; `options` controls
+parallelism, stop-on-error behavior, and the original batch execution deadline.
+This endpoint takes the HTTP batch object, not a `fwc batch-file` JSONL input.
+
+For an existing authenticated HTTP batch request:
+
+```bash
+curl --no-buffer \
+  --user-agent 'flywheel_connectors-agent (+https://github.com/Dicklesworthstone/flywheel_connectors)' \
+  --header 'Content-Type: application/json' \
+  --data-binary @batch-request.json \
+  http://127.0.0.1:8787/rpc/batch/stream
+```
+
+The response uses `application/x-ndjson`: one JSON object per line. Graph,
+member-identity, and input-reference validation finish before HTTP 200. Every
+member still passes through the ordinary capability, principal, approval,
+revocation, lease, lifecycle, and invocation-ownership checks.
+
+| Record type | Meaning |
+|---|---|
+| `result` | `result` contains one retention-checked `OperationResult`, in the order the scheduler observes completions. Incremental delivery is at most once. |
+| `complete` | `batch.bounded.response` contains the authoritative final response in submission order, including undelivered outcomes. `batch.bounded` also reports limits, retained bytes, and withheld results. |
+| `error` | Execution could not produce final accounting. Retain earlier results and reconcile submitted member request IDs before retrying. |
+
+A `complete` record means accounting is complete; inspect
+`batch.bounded.response.status` to determine whether execution succeeded,
+partially failed, or aborted. The terminal response repeats provider outputs
+already sent incrementally. Clients can use it to reconcile known successes,
+failed operations, skipped members, and admitted operations with unknown
+outcomes. A missing terminal record is an incomplete stream, never a success
+signal or permission to repeat effects.
+
+A capacity-one delivery channel lets slow consumers pause further admission
+without an unbounded output queue. Planning, input binding, invocation, and
+waiting for delivery capacity share the original deadline; delayed consumption
+does not start a new execution budget. Final accounting can be read after that
+budget expires. Dropping the response body releases its scheduler and waiters;
+already admitted invocation jobs retain their existing durable ownership and
+must be reconciled through their request IDs.
+
+The endpoint enforces the host's default retained-provider-result limits:
+**1 MiB per result and 16 MiB total**. Oversized successes and provider errors
+are replaced with a nonretryable `BATCH_RESULT_LIMIT` record before they reach
+the stream or dataflow cache. These are encoded provider-result limits, not a
+claim about total heap use or total HTTP bytes: scheduler metadata, the bounded
+delivery copy, input-binding cache, and serialization buffers are separate.
+
+`batch.acknowledged_results` counts callbacks that successfully enqueued a
+result locally. It is not proof that a remote client received or durably stored
+that result. `batch.delivery_status` is separate from execution status: a
+batch can abort because its result budget was exhausted and still deliver all
+of its bounded accounting records.
+
+Library callers can use `BatchExecutor::execute_async_bounded_wait` for the
+same combination of per-result limits, aggregate retention limits, awaited
+delivery capacity, cancellation, and final execution/delivery accounting.
+
 ---
 
 ## CRDT-Backed Multi-Writer Connector State

@@ -509,3 +509,354 @@ fn inconsistent_member_results_are_unknown_and_never_retryable() {
         assert_eq!(error.retry_after_ms, None);
     }
 }
+
+
+#[fcp_async_core::runtime::test]
+async fn streaming_batch_returns_fast_results_before_unrelated_slow_work() {
+    use futures_util::StreamExt;
+
+    let request = batch(
+        vec![member("a", &[]), member("b", &[]), member("c", &["b"])],
+        2,
+    );
+    let slow = Rc::new(Gate::default());
+    let calls = RefCell::new(Vec::new());
+    let mut stream = Box::pin(
+        stream_with(request, Instant::now(), |operation, _| {
+            calls.borrow_mut().push(operation.id.clone());
+            let slow = Rc::clone(&slow);
+            async move {
+                if operation.id == "a" {
+                    slow.wait().await;
+                }
+                success(&operation)
+            }
+        })
+        .unwrap(),
+    );
+    for expected in ["b", "c"] {
+        let HttpBatchStreamRecord::Result { result } = stream.next().await.unwrap() else {
+            panic!("expected an independent result before the slow operation");
+        };
+        assert_eq!(result.id, expected);
+        assert_eq!(result.status, OperationResultStatus::Success);
+    }
+    assert!(poll!(stream.next()).is_pending());
+    slow.release();
+    let HttpBatchStreamRecord::Result { result } = stream.next().await.unwrap() else {
+        panic!("expected the final member before terminal accounting");
+    };
+    assert_eq!(result.id, "a");
+    let HttpBatchStreamRecord::Complete { batch } = stream.next().await.unwrap() else {
+        panic!("expected complete batch accounting");
+    };
+    assert_eq!(batch.bounded.response.status, BatchStatus::Success);
+    assert_eq!(batch.acknowledged_results, 3);
+    assert_eq!(batch.delivery_status, fcp_host::BatchDeliveryStatus::Complete);
+    assert_eq!(
+        batch
+            .bounded
+            .response
+            .results
+            .iter()
+            .map(|result| result.id.as_str())
+            .collect::<Vec<_>>(),
+        ["a", "b", "c"],
+    );
+    assert_eq!(*calls.borrow(), ["a", "b", "c"]);
+    assert!(stream.next().await.is_none());
+}
+
+#[fcp_async_core::runtime::test]
+async fn streaming_batch_demand_bounds_admission_and_keeps_terminal_order() {
+    use futures_util::StreamExt;
+
+    let request = batch(
+        ["a", "b", "c", "d", "e"]
+            .into_iter()
+            .map(|id| member(id, &[]))
+            .collect(),
+        1,
+    );
+    let calls = Cell::new(0);
+    let mut stream = Box::pin(
+        stream_with(request, Instant::now(), |operation, _| {
+            calls.set(calls.get() + 1);
+            ready(success(&operation))
+        })
+        .unwrap(),
+    );
+    let HttpBatchStreamRecord::Result { result } = stream.next().await.unwrap() else {
+        panic!("expected the first result");
+    };
+    assert_eq!(result.id, "a");
+    // One queued result plus one pending delivery. The body owns the scheduler;
+    // it cannot run the remaining factories while the consumer is not polling.
+    assert_eq!(calls.get(), 2);
+    for expected in ["b", "c", "d", "e"] {
+        let HttpBatchStreamRecord::Result { result } = stream.next().await.unwrap() else {
+            panic!("terminal record overtook a queued result");
+        };
+        assert_eq!(result.id, expected);
+    }
+    let HttpBatchStreamRecord::Complete { batch } = stream.next().await.unwrap() else {
+        panic!("expected terminal accounting after every result");
+    };
+    assert_eq!(batch.acknowledged_results, 5);
+    assert_eq!(batch.bounded.response.completed, 5);
+    assert_eq!(calls.get(), 5);
+    assert!(stream.next().await.is_none());
+}
+
+#[fcp_async_core::runtime::test]
+async fn streaming_batch_paused_consumer_cannot_renew_the_execution_budget() {
+    use futures_util::StreamExt;
+
+    let mut request = batch(
+        vec![member("a", &[]), member("b", &[]), member("c", &[])],
+        1,
+    );
+    request.options.timeout_ms = 100;
+    let calls = Cell::new(0);
+    let mut stream = Box::pin(
+        stream_with(request, Instant::now(), |operation, _| {
+            calls.set(calls.get() + 1);
+            ready(success(&operation))
+        })
+        .unwrap(),
+    );
+    assert!(matches!(
+        stream.next().await,
+        Some(HttpBatchStreamRecord::Result { .. })
+    ));
+    assert_eq!(calls.get(), 2);
+    fcp_async_core::time::sleep(Duration::from_millis(200)).await;
+    let HttpBatchStreamRecord::Complete { batch } = stream.next().await.unwrap() else {
+        panic!("expired delivery must return final accounting without new callbacks");
+    };
+    assert_eq!(calls.get(), 2);
+    assert_eq!(batch.bounded.response.status, BatchStatus::Aborted);
+    assert_eq!(
+        (
+            batch.bounded.response.completed,
+            batch.bounded.response.failed,
+            batch.bounded.response.skipped,
+        ),
+        (2, 0, 1),
+    );
+    assert_eq!(batch.acknowledged_results, 1);
+    assert_eq!(
+        batch.delivery_status,
+        fcp_host::BatchDeliveryStatus::Interrupted,
+    );
+    assert!(batch.bounded.response.results[1].output.is_some());
+    assert_eq!(
+        batch.bounded.response.results[2].error.as_ref().unwrap().code,
+        "BATCH_TIMEOUT",
+    );
+    assert!(stream.next().await.is_none());
+}
+
+#[fcp_async_core::runtime::test]
+async fn streaming_batch_withholds_oversized_output_before_any_delivery() {
+    use futures_util::StreamExt;
+
+    let request = batch(vec![member("a", &[]), member("b", &[])], 1);
+    let calls = Cell::new(0);
+    let mut stream = Box::pin(
+        stream_with(request, Instant::now(), |operation, _| {
+            calls.set(calls.get() + 1);
+            let mut result = success(&operation);
+            result.output = Some(Value::String("x".repeat(1024 * 1024 + 1)));
+            ready(result)
+        })
+        .unwrap(),
+    );
+    for (expected_id, expected_status) in [
+        ("a", OperationResultStatus::Error),
+        ("b", OperationResultStatus::Skipped),
+    ] {
+        let HttpBatchStreamRecord::Result { result } = stream.next().await.unwrap() else {
+            panic!("expected bounded member accounting");
+        };
+        assert_eq!(result.id, expected_id);
+        assert_eq!(result.status, expected_status);
+        assert!(result.output.is_none());
+        let error = result.error.as_ref().unwrap();
+        assert_eq!(error.code, "BATCH_RESULT_LIMIT");
+        assert_eq!(error.retry_after_ms, None);
+    }
+    let HttpBatchStreamRecord::Complete { batch } = stream.next().await.unwrap() else {
+        panic!("expected bounded terminal accounting");
+    };
+    assert_eq!(calls.get(), 1);
+    assert_eq!(batch.bounded.retained_result_bytes, 0);
+    assert_eq!(batch.bounded.withheld_results, 1);
+    assert_eq!(batch.bounded.response.status, BatchStatus::Aborted);
+    assert_eq!(batch.acknowledged_results, 2);
+    assert_eq!(batch.delivery_status, fcp_host::BatchDeliveryStatus::Complete);
+    assert!(stream.next().await.is_none());
+}
+
+#[fcp_async_core::runtime::test]
+async fn streaming_batch_binds_inputs_without_changing_authority_or_identity() {
+    use futures_util::StreamExt;
+
+    let mut source = member("a", &[]);
+    source.request.input = json!({"value": 42});
+    let mut dependent = member("b", &["a"]);
+    dependent.request.input = json!({
+        "$fcp_batch_ref": {"operation": "a", "pointer": "/result/value"}
+    });
+    let mut expected = serde_json::to_value(&dependent.request).unwrap();
+    expected.as_object_mut().unwrap().remove("input");
+    expected.as_object_mut().unwrap().remove("provenance");
+    let request = batch(vec![source, dependent], 1);
+    let mut stream = Box::pin(
+        stream_with(request, Instant::now(), |operation, _| {
+            if operation.id == "b" {
+                assert_eq!(operation.request.input, json!(42));
+                let provenance = operation.request.provenance.as_ref().unwrap();
+                assert_eq!(provenance.taint, fcp_core::TaintLevel::HighlyTainted);
+                assert!(!provenance.elevated);
+                let mut actual = serde_json::to_value(&operation.request).unwrap();
+                actual.as_object_mut().unwrap().remove("input");
+                actual.as_object_mut().unwrap().remove("provenance");
+                assert_eq!(actual, expected);
+            }
+            ready(success(&operation))
+        })
+        .unwrap(),
+    );
+    for expected_id in ["a", "b"] {
+        let HttpBatchStreamRecord::Result { result } = stream.next().await.unwrap() else {
+            panic!("expected dataflow member output");
+        };
+        assert_eq!(result.id, expected_id);
+    }
+    let HttpBatchStreamRecord::Complete { batch } = stream.next().await.unwrap() else {
+        panic!("expected complete dataflow accounting");
+    };
+    assert_eq!(batch.bounded.response.completed, 2);
+    assert_eq!(
+        batch.bounded.response.results[1].output.as_ref().unwrap()["result"],
+        json!(42),
+    );
+}
+
+#[test]
+fn streaming_batch_rejects_invalid_requests_before_opening_a_body() {
+    let missing_dependency = batch(vec![member("a", &["missing"])], 1);
+    let mut duplicate = batch(vec![member("a", &[]), member("b", &[])], 1);
+    duplicate.operations[1].request.id = duplicate.operations[0].request.id.clone();
+    let mut invalid_reference = batch(vec![member("a", &[]), member("b", &[])], 1);
+    invalid_reference.operations[1].request.input = json!({
+        "$fcp_batch_ref": {"operation": "a", "pointer": "/result"}
+    });
+    for request in [missing_dependency, duplicate, invalid_reference] {
+        let calls = Cell::new(0);
+        let result = stream_with(request, Instant::now(), |operation, _| {
+            calls.set(calls.get() + 1);
+            ready(success(&operation))
+        });
+        assert!(result.is_err());
+        assert_eq!(calls.get(), 0);
+    }
+}
+
+#[fcp_async_core::runtime::test]
+async fn streaming_batch_drop_releases_owned_waiters_without_new_admissions() {
+    use futures_util::StreamExt;
+
+    struct Guard(Rc<Cell<usize>>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() - 1);
+        }
+    }
+    let request = batch(
+        vec![member("a", &[]), member("b", &[]), member("c", &[])],
+        2,
+    );
+    let active = Rc::new(Cell::new(0));
+    let calls = Cell::new(0);
+    let mut stream = Box::pin(
+        stream_with(request, Instant::now(), |operation, _| {
+            calls.set(calls.get() + 1);
+            active.set(active.get() + 1);
+            let guard = Guard(Rc::clone(&active));
+            async move {
+                let _guard = guard;
+                pending::<()>().await;
+                success(&operation)
+            }
+        })
+        .unwrap(),
+    );
+    assert!(poll!(stream.next()).is_pending());
+    assert_eq!(calls.get(), 2);
+    assert_eq!(active.get(), 2);
+    drop(stream);
+    assert_eq!(active.get(), 0);
+    assert_eq!(calls.get(), 2);
+}
+
+#[fcp_async_core::runtime::test]
+async fn streaming_batch_first_poll_after_deadline_never_dispatches() {
+    use futures_util::StreamExt;
+
+    let mut request = batch(vec![member("a", &[]), member("b", &[])], 1);
+    request.options.timeout_ms = 1;
+    let started_at = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
+    let calls = Cell::new(0);
+    let mut stream = Box::pin(
+        stream_with(request, started_at, |operation, _| {
+            calls.set(calls.get() + 1);
+            ready(success(&operation))
+        })
+        .unwrap(),
+    );
+    let HttpBatchStreamRecord::Complete { batch } = stream.next().await.unwrap() else {
+        panic!("expired execution should only emit terminal accounting");
+    };
+    assert_eq!(calls.get(), 0);
+    assert_eq!(batch.bounded.response.skipped, 2);
+    assert_eq!(batch.acknowledged_results, 0);
+    assert_eq!(batch.delivery_status, fcp_host::BatchDeliveryStatus::Interrupted);
+    assert!(
+        batch
+            .bounded
+            .response
+            .results
+            .iter()
+            .all(|result| result.error.as_ref().unwrap().code == "BATCH_TIMEOUT"),
+    );
+    assert!(stream.next().await.is_none());
+}
+
+#[test]
+fn streaming_batch_encoding_is_one_json_object_per_line() {
+    let operation = member("a", &[]);
+    let mut result = success(&operation);
+    result.output = Some(json!({"message": "first\nsecond"}));
+    let bytes = encode_stream_record(HttpBatchStreamRecord::Result { result }).unwrap();
+    assert_eq!(bytes.last(), Some(&b'\n'));
+    assert_eq!(bytes.iter().filter(|byte| **byte == b'\n').count(), 1);
+    let record: Value = serde_json::from_slice(&bytes[..bytes.len() - 1]).unwrap();
+    assert_eq!(record["type"], "result");
+    assert_eq!(record["result"]["output"]["message"], "first\nsecond");
+}
+
+#[test]
+fn streaming_batch_body_is_send_for_owned_send_callbacks() {
+    fn assert_send<T: Send>(_: T) {}
+    let request = batch(vec![member("a", &[])], 1);
+    let calls = Cell::new(0);
+    assert_send(
+        stream_with(request, Instant::now(), move |operation, _| {
+            calls.set(calls.get() + 1);
+            ready(success(&operation))
+        })
+        .unwrap(),
+    );
+}

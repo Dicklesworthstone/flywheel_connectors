@@ -119,6 +119,74 @@ where
     .await
 }
 
+/// Result retention, dataflow observation and delivery all precede dependency
+/// release. A slow consumer uses the same deadline as planning and invocation.
+#[allow(clippy::future_not_send)]
+async fn execute_dataflow_wait_with<F, Fut, S, DeliveryFut>(
+    request: &HttpBatchInvokeRequest,
+    started_at: Instant,
+    mut handler: F,
+    mut on_result: S,
+) -> HostResult<fcp_host::BatchBoundedStreamingResponse>
+where
+    F: FnMut(HttpBatchOperation, Option<Instant>) -> Fut,
+    Fut: Future<Output = OperationResult>,
+    S: FnMut(OperationResult) -> DeliveryFut,
+    DeliveryFut: Future<Output = Result<(), BatchOperationError>>,
+{
+    let timeout = Duration::from_millis(request.options.timeout_ms);
+    let context = ExecutionContext::request_scoped(timeout.saturating_sub(started_at.elapsed()));
+    let deadline = started_at.checked_add(timeout);
+    let planning = request.planning_request();
+    let executor = BatchExecutor::new();
+    executor.plan_with_schedule_report(&planning)?;
+    validate_members(request)?;
+    let flow = dataflow::Dataflow::compile(request)?;
+    let members: HashMap<&str, &HttpBatchOperation> = request
+        .operations
+        .iter()
+        .map(|operation| (operation.id.as_str(), operation))
+        .collect();
+
+    let mut response = executor
+        .execute_async_bounded_wait(
+            &planning,
+            Some(&context),
+            fcp_host::BatchResultLimits::default(),
+            |planned| {
+                let operation = members[planned.id.as_str()];
+                let future = flow.resolve(operation).and_then(|resolved| {
+                    // Synchronous resolution can consume the last budget
+                    // without yielding. Do not construct another invoke then.
+                    if started_at.elapsed() >= timeout {
+                        return Err(BatchOperationError {
+                            code: "BATCH_INPUT_TIMEOUT".into(),
+                            message: "batch input resolution exhausted the deadline before invocation"
+                                .into(),
+                            retry_after_ms: None,
+                        });
+                    }
+                    Ok(handler(resolved, deadline))
+                });
+                async move {
+                    match future {
+                        Ok(future) => member_outcome(&operation.id, future.await),
+                        Err(error) => Err(error),
+                    }
+                }
+            },
+            |result| {
+                // Observe only retention-checked results. Neither this lock nor
+                // a borrow of the callback survives in the delivery future.
+                let delivery = flow.observe(&result).map(|()| on_result(result));
+                async move { delivery?.await }
+            },
+        )
+        .await?;
+    response.bounded.response.total_duration_ms = elapsed_millis(started_at);
+    Ok(response)
+}
+
 #[allow(clippy::future_not_send)]
 async fn execute_with_observer<'a, F, Fut, S>(
     request: &'a HttpBatchInvokeRequest,
@@ -239,6 +307,153 @@ pub(super) fn route_failure((status, message): (StatusCode, String)) -> BatchOpe
         message,
         retry_after_ms: None,
     }
+}
+
+/// One JSON object per line. The terminal record retains the complete,
+/// submission-ordered response, including outcomes not incrementally delivered.
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum HttpBatchStreamRecord {
+    Result {
+        result: OperationResult,
+    },
+    Complete {
+        batch: Box<fcp_host::BatchBoundedStreamingResponse>,
+    },
+    Error {
+        error: BatchOperationError,
+    },
+}
+
+/// Stream independent completions over the ordinary capability-checked invoke
+/// path. Graph, member and input-reference validation finish before HTTP 200.
+pub(super) async fn stream_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<HttpBatchInvokeRequest>,
+) -> Result<Response, (StatusCode, String)> {
+    use futures_util::StreamExt;
+
+    let started_at = Instant::now();
+    let asserted_principal = extract_principal_header(&headers).map(Arc::<str>::from);
+    let records = stream_with(request, started_at, move |operation, deadline| {
+        execute_batch_operation(
+            Arc::clone(&state),
+            operation,
+            asserted_principal.clone(),
+            deadline,
+        )
+    })
+    .map_err(map_host_error)?;
+    let mut response = Response::new(Body::from_stream(records.map(encode_stream_record)));
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/x-ndjson"),
+    );
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(response)
+}
+
+/// The body owns both the scheduler and its capacity-one delivery channel.
+/// No detached producer survives a dropped body. Ordinary invocation jobs keep
+/// their existing durable ownership: dropping a waiter does not undo an effect.
+fn stream_with<F, Fut>(
+    request: HttpBatchInvokeRequest,
+    started_at: Instant,
+    handler: F,
+) -> HostResult<impl futures_util::Stream<Item = HttpBatchStreamRecord>>
+where
+    F: FnMut(HttpBatchOperation, Option<Instant>) -> Fut,
+    Fut: Future<Output = OperationResult>,
+{
+    BatchExecutor::new().plan_with_schedule_report(&request.planning_request())?;
+    validate_members(&request)?;
+    // Reject malformed references before opening a successful response. Compile
+    // again inside the owned future so no self-referential request is required.
+    dataflow::Dataflow::compile(&request)?;
+
+    let (sender, receiver) = mpsc::channel(1);
+    let result_sender = sender.clone();
+    let execution = async move {
+        let outcome = execute_dataflow_wait_with(
+            &request,
+            started_at,
+            handler,
+            move |result| {
+                let sender = result_sender.clone();
+                async move {
+                    sender
+                        .send(HttpBatchStreamRecord::Result { result })
+                        .await
+                        .map_err(|_| BatchOperationError {
+                            code: "BATCH_STREAM_CLOSED".into(),
+                            message: "batch result consumer closed".into(),
+                            retry_after_ms: None,
+                        })
+                }
+            },
+        )
+        .await;
+        let terminal = match outcome {
+            Ok(batch) => HttpBatchStreamRecord::Complete {
+                batch: Box::new(batch),
+            },
+            Err(_) => HttpBatchStreamRecord::Error {
+                error: BatchOperationError {
+                    code: "BATCH_STREAM_FAILED".into(),
+                    message: "batch execution could not complete; reconcile member request IDs before retrying"
+                        .into(),
+                    retry_after_ms: None,
+                },
+            },
+        };
+        // Terminal accounting may be read after the execution budget elapsed.
+        // Sending it admits no new work and cannot renew a member's deadline.
+        // A full channel preserves all earlier result records before this one.
+        let _ = sender.send(terminal).await;
+        drop(sender);
+    };
+    Ok(drive_stream(execution, receiver))
+}
+
+/// Drive execution and delivery together on body demand. Retain the same pinned
+/// scheduler future across every received record; never restart a pending send.
+fn drive_stream<F>(
+    execution: F,
+    receiver: mpsc::Receiver<HttpBatchStreamRecord>,
+) -> impl futures_util::Stream<Item = HttpBatchStreamRecord>
+where
+    F: Future<Output = ()>,
+{
+    use futures_util::future::{Either, select};
+
+    futures_util::stream::unfold(
+        (Box::pin(execution), receiver, false),
+        |(mut execution, mut receiver, mut finished)| async move {
+            let record = if finished {
+                receiver.recv().await
+            } else {
+                let incoming = Box::pin(receiver.recv());
+                match select(execution.as_mut(), incoming).await {
+                    Either::Left(((), incoming)) => {
+                        finished = true;
+                        incoming.await
+                    }
+                    Either::Right((record, _)) => record,
+                }
+            };
+            record.map(|record| (record, (execution, receiver, finished)))
+        },
+    )
+}
+
+fn encode_stream_record(record: HttpBatchStreamRecord) -> Result<Bytes, std::io::Error> {
+    let mut bytes = serde_json::to_vec(&record)
+        .map_err(|_| std::io::Error::other("batch stream record encoding failed"))?;
+    bytes.push(b'\n');
+    Ok(Bytes::from(bytes))
 }
 
 #[cfg(test)]
