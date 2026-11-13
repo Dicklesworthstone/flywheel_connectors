@@ -257,6 +257,7 @@ impl BatchExecutor {
             None,
             handler,
             None::<ImmediateSink<SilentResultSink>>,
+            || Ok(()),
         )
         .await
         .map(|result| result.response)
@@ -301,6 +302,7 @@ impl BatchExecutor {
             Some(context),
             handler,
             None::<ImmediateSink<SilentResultSink>>,
+            || Ok(()),
         )
         .await
         .map(|result| result.response)
@@ -342,8 +344,14 @@ impl BatchExecutor {
         Fut: Future<Output = Result<serde_json::Value, BatchOperationError>>,
         S: FnMut(&OperationResult) -> Result<(), BatchOperationError>,
     {
-        self.execute_async_inner(request, context, handler, Some(ImmediateSink(on_result)))
-            .await
+        self.execute_async_inner(
+            request,
+            context,
+            handler,
+            Some(ImmediateSink(on_result)),
+            || Ok(()),
+        )
+        .await
     }
 
     /// Deliver batch results through a sink that can wait for bounded capacity.
@@ -393,22 +401,57 @@ impl BatchExecutor {
         S: FnMut(OperationResult) -> DeliveryFut,
         DeliveryFut: Future<Output = Result<(), BatchOperationError>>,
     {
-        self.execute_async_inner(request, context, handler, Some(WaitingSink(on_result)))
-            .await
+        self.execute_async_inner(
+            request,
+            context,
+            handler,
+            Some(WaitingSink(on_result)),
+            || Ok(()),
+        )
+        .await
+    }
+
+    // Admission refusal is independent of delivery. A retention budget can
+    // stop new work while the sink continues receiving drained/final records.
+    #[allow(clippy::future_not_send)]
+    pub(crate) async fn execute_async_streaming_guarded<'a, F, Fut, S, G>(
+        &self,
+        request: &'a BatchInvokeRequest,
+        context: Option<&ExecutionContext>,
+        handler: F,
+        on_result: S,
+        admission_guard: G,
+    ) -> HostResult<BatchStreamingResponse>
+    where
+        F: FnMut(&'a BatchOperation) -> Fut,
+        Fut: Future<Output = Result<serde_json::Value, BatchOperationError>>,
+        S: FnMut(&OperationResult) -> Result<(), BatchOperationError>,
+        G: FnMut() -> Result<(), BatchOperationError>,
+    {
+        self.execute_async_inner(
+            request,
+            context,
+            handler,
+            Some(ImmediateSink(on_result)),
+            admission_guard,
+        )
+        .await
     }
 
     #[allow(clippy::future_not_send)]
-    async fn execute_async_inner<'a, F, Fut, S>(
+    async fn execute_async_inner<'a, F, Fut, S, G>(
         &self,
         request: &'a BatchInvokeRequest,
         context: Option<&ExecutionContext>,
         mut handler: F,
         sink: Option<S>,
+        mut admission_guard: G,
     ) -> HostResult<BatchStreamingResponse>
     where
         F: FnMut(&'a BatchOperation) -> Fut,
         Fut: Future<Output = Result<serde_json::Value, BatchOperationError>>,
         S: ResultSink,
+        G: FnMut() -> Result<(), BatchOperationError>,
     {
         let started_at = Instant::now();
         let (plan, report) = self.plan_with_schedule_report(request)?;
@@ -433,6 +476,8 @@ impl BatchExecutor {
                 break;
             }
             while run.halt.is_none() && active.len() < limit {
+                run.check_limits(context);
+                run.check_admission(&mut admission_guard);
                 run.check_limits(context);
                 if run.halt.is_some() {
                     break;
@@ -486,6 +531,10 @@ impl BatchExecutor {
             };
             match result {
                 Ok(Some((index, result))) => {
+                    // A completed handler may have exhausted a retention
+                    // budget. Capture that cause before ordinary error policy.
+                    run.check_limits(context);
+                    run.check_admission(&mut admission_guard);
                     match result {
                         Ok(result) => run.record(index, result),
                         Err(_) => run.record_panicked(index),
@@ -579,6 +628,7 @@ enum Halt {
     FirstError,
     HandlerPanic,
     DeliveryFailure,
+    AdmissionRefused,
     Timeout,
     Cancelled,
     RuntimeFailure,
@@ -613,6 +663,7 @@ struct BatchRun<'a> {
     results: Vec<Option<OperationResult>>,
     admitted_at: Vec<Option<Instant>>,
     halt: Option<Halt>,
+    admission_refusal: Option<BatchOperationError>,
 }
 
 impl<'a> BatchRun<'a> {
@@ -630,6 +681,7 @@ impl<'a> BatchRun<'a> {
             results: vec![None; request.operations.len()],
             admitted_at: vec![None; request.operations.len()],
             halt: None,
+            admission_refusal: None,
         }
     }
 
@@ -648,6 +700,25 @@ impl<'a> BatchRun<'a> {
             self.halt = Some(Halt::Cancelled);
         } else if self.remaining(context).is_zero() {
             self.halt = Some(Halt::Timeout);
+        }
+    }
+
+    fn check_admission<G>(&mut self, guard: &mut G)
+    where
+        G: FnMut() -> Result<(), BatchOperationError>,
+    {
+        // Keep an earlier refusal or execution failure. Cancellation and
+        // deadlines still supersede admission failures through check_limits.
+        if self.halt.is_some() {
+            return;
+        }
+        match catch_unwind(AssertUnwindSafe(|| guard())) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                self.admission_refusal = Some(error);
+                self.halt = Some(Halt::AdmissionRefused);
+            }
+            Err(_) => self.halt = Some(Halt::RuntimeFailure),
         }
     }
 
@@ -714,7 +785,7 @@ impl<'a> BatchRun<'a> {
         if S::WAIT_FOR_CAPACITY {
             self.check_limits(context);
         }
-        if !delivered && !self.interrupted() {
+        if !delivered && self.halt.is_none() {
             self.halt = Some(Halt::DeliveryFailure);
         }
     }
@@ -747,8 +818,17 @@ impl<'a> BatchRun<'a> {
                 "BATCH_RESULT_DELIVERY_FAILED",
                 "batch result sink failed before this operation was admitted",
             ),
+            Some(Halt::AdmissionRefused) => (
+                "BATCH_ADMISSION_REFUSED",
+                "batch admission policy refused further operations",
+            ),
             _ => ("BATCH_ABORTED", "batch stopped before admission"),
         };
+        let skip_error = self
+            .admission_refusal
+            .take()
+            .filter(|_| matches!(self.halt, Some(Halt::AdmissionRefused)))
+            .unwrap_or_else(|| operation_error(skip_code, skip_message));
         let mut results = Vec::with_capacity(self.request.operations.len());
         for index in 0..self.request.operations.len() {
             if let Some(result) = self.results[index].take() {
@@ -759,7 +839,7 @@ impl<'a> BatchRun<'a> {
             }
             let operation = &self.request.operations[index];
             let result = self.admitted_at[index].map_or_else(
-                || skipped(operation, skip_code, skip_message),
+                || skipped_with_error(operation, skip_error.clone()),
                 |started_at| OperationResult {
                     id: operation.id.clone(),
                     status: OperationResultStatus::Error,
@@ -777,7 +857,7 @@ impl<'a> BatchRun<'a> {
             if S::WAIT_FOR_CAPACITY {
                 self.check_limits(context);
             }
-            if !delivered && !self.interrupted() {
+            if !delivered && self.halt.is_none() {
                 self.halt = Some(Halt::DeliveryFailure);
             }
             results.push(result);
@@ -825,11 +905,15 @@ fn operation_error(code: &str, message: &str) -> BatchOperationError {
 }
 
 fn skipped(operation: &BatchOperation, code: &str, message: &str) -> OperationResult {
+    skipped_with_error(operation, operation_error(code, message))
+}
+
+fn skipped_with_error(operation: &BatchOperation, error: BatchOperationError) -> OperationResult {
     OperationResult {
         id: operation.id.clone(),
         status: OperationResultStatus::Skipped,
         output: None,
-        error: Some(operation_error(code, message)),
+        error: Some(error),
         duration_ms: 0,
     }
 }
