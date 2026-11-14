@@ -4,6 +4,7 @@
 //! never start a process or prepare a guest. Native retirement uses the exact
 //! process owner, not a PID lookup or a replacement with the same connector ID.
 //! WASI retirement seals the exact runtime and drains all retained guest stores.
+//! Warm-pool retirement seals creation and drains every admitted physical child.
 
 use fcp_host::{
     ConnectorExecutionFence, DesiredRuntimeState, LifecycleAction, ObservedRuntimeState,
@@ -183,12 +184,14 @@ fn stateless_retirement_supported(entry: &RegistryEntry) -> HostResult<()> {
     }
     if !matches!(
         &entry.connector,
-        ConnectorRuntime::Native(_) | ConnectorRuntime::Wasi(_)
+        ConnectorRuntime::Native(_)
+            | ConnectorRuntime::NativeWarmPool(_)
+            | ConnectorRuntime::Wasi(_)
     ) || entry.state_policy.model != ConnectorStateKind::Stateless
         || entry.state_policy.manifest_digest.is_none()
     {
         return Err(HostError::Unavailable(
-            "runtime retirement requires an admitted stateless on-demand native or WASI connector; stateful handoff and warm-pool draining are not available"
+            "runtime retirement requires an admitted stateless native or WASI connector; canonical state handoff is not available"
                 .to_owned(),
         ));
     }
@@ -198,14 +201,20 @@ fn stateless_retirement_supported(entry: &RegistryEntry) -> HostResult<()> {
 fn restart_supported(entry: &RegistryEntry) -> HostResult<()> {
     if entry.state_policy.model != ConnectorStateKind::Stateless
         || entry.state_policy.manifest_digest.is_none()
-        || entry.config.prewarm.strategy != PrewarmStrategy::OnDemand
+        || !matches!(
+            entry.config.prewarm.strategy,
+            PrewarmStrategy::OnDemand | PrewarmStrategy::WarmPool
+        )
         || !matches!(
             &entry.connector,
-            ConnectorRuntime::Native(_) | ConnectorRuntime::Wasi(_) | ConnectorRuntime::Dormant(_)
+            ConnectorRuntime::Native(_)
+                | ConnectorRuntime::NativeWarmPool(_)
+                | ConnectorRuntime::Wasi(_)
+                | ConnectorRuntime::Dormant(_)
         )
     {
         return Err(HostError::Unavailable(
-            "live restart requires an admitted stateless on-demand native or WASI connector; canonical state handoff is not available"
+            "live restart requires an admitted stateless native or WASI connector with a supported prewarm strategy; canonical state handoff is not available"
                 .to_owned(),
         ));
     }
@@ -307,11 +316,9 @@ async fn retire_selected(
     stateless_retirement_supported(entry)?;
     match &entry.connector {
         ConnectorRuntime::Native(native) => native.retire_runtime(deadline).await?,
+        ConnectorRuntime::NativeWarmPool(pool) => pool.retire_runtime(deadline).await?,
         ConnectorRuntime::Wasi(wasi) => wasi.retire_runtime(deadline).await?,
         ConnectorRuntime::Dormant(_) | ConnectorRuntime::UnavailableNativeProxyOnly(_) => {}
-        ConnectorRuntime::NativeWarmPool(_) => {
-            unreachable!("warm-pool retirement is refused before selecting a runtime")
-        }
     }
     let dormant = dormant_entry(
         entry.config.clone(),
@@ -578,6 +585,42 @@ mod tests {
         config
     }
 
+    #[cfg(unix)]
+    fn shell_warm_pool_config(directory: &StdPath) -> ConnectorConfig {
+        let manifest = directory.join("manifest.toml");
+        std::fs::write(
+            &manifest,
+            crate::tests::state_policy_test_manifest_for(CONNECTOR, Some("stateless"), false),
+        )
+        .expect("write admitted warm-pool manifest");
+        let mut config = crate::tests::dispatcher_test_config(CONNECTOR);
+        config.binary = "/bin/sh".to_owned();
+        config.args = vec![
+            "-c".to_owned(),
+            r#"while IFS= read -r request; do
+  id=$(printf '%s' "$request" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  case "$request" in
+    *'"method":"health"'*)
+      result='{"status":{"state":"ready"},"uptime_ms":0,"details":{"configured":true}}' ;;
+    *'"method":"introspect"'*)
+      result='{"operations":[],"events":[],"resource_types":[]}' ;;
+    *) result='{}' ;;
+  esac
+  printf '{"jsonrpc":"2.0","id":"%s","result":%s}\n' "$id" "$result"
+done"#
+                .to_owned(),
+        ];
+        config.config = Some(json!({}));
+        config.manifest_path = Some(manifest.to_string_lossy().into_owned());
+        config.prewarm = fcp_host::ConnectorPrewarmConfig::warm_pool(
+            2,
+            2,
+            Duration::from_secs(30),
+            Duration::from_secs(5),
+        );
+        config
+    }
+
     async fn app(config: ConnectorConfig, desired: DesiredRuntimeState) -> Arc<AppState> {
         let connector_id = config.id.parse().expect("connector id");
         let lifecycle = Arc::new(HostAdminStateStore::new());
@@ -605,6 +648,31 @@ mod tests {
             panic!("expected an active on-demand native runtime");
         };
         native
+    }
+
+    #[cfg(unix)]
+    async fn warm_pool(
+        state: &AppState,
+        connector_id: &ConnectorId,
+    ) -> Arc<NativeWarmPoolConnector> {
+        let (entry, _) = selected_entry(&state.registry, connector_id)
+            .await
+            .expect("retained warm-pool inventory");
+        let ConnectorRuntime::NativeWarmPool(pool) = entry.connector else {
+            panic!("expected an active native warm pool");
+        };
+        pool
+    }
+
+    #[cfg(unix)]
+    async fn retained_pool_processes(
+        pool: &NativeWarmPoolConnector,
+    ) -> Vec<Arc<SubprocessConnector>> {
+        let entries = pool.entries.lock().await;
+        assert_eq!(entries.len(), 2, "fixture starts two real idle workers");
+        std::iter::once(Arc::clone(&pool.control))
+            .chain(entries.iter().map(|entry| Arc::clone(&entry.connector)))
+            .collect()
     }
 
     async fn assert_dormant(state: &AppState, connector_id: &ConnectorId) {
@@ -816,6 +884,116 @@ mod tests {
         );
         assert_eq!(uninstalled.observed_state, ObservedRuntimeState::Stopped);
         assert!(third.runtime_retirement.is_exited());
+        assert_dormant(&state, &connector_id).await;
+    }
+
+    #[cfg(unix)]
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn warm_pool_lifecycle_retires_control_idle_and_checked_out_processes_before_replacement()
+    {
+        let directory = tempfile::tempdir().unwrap();
+        let state = app(
+            shell_warm_pool_config(directory.path()),
+            DesiredRuntimeState::Disabled,
+        )
+        .await;
+        let connector_id = ConnectorId::from_static(CONNECTOR);
+        assert_dormant(&state, &connector_id).await;
+
+        let enabled = transition(&state, &connector_id, &request(LifecycleAction::Enable))
+            .await
+            .expect("enable launches a real stateless warm pool");
+        assert_eq!(enabled.observed_state, ObservedRuntimeState::Running);
+        let first = warm_pool(&state, &connector_id).await;
+        let first_processes = retained_pool_processes(&first).await;
+        for process in &first_processes {
+            assert!(!process.runtime_retirement.is_exited());
+        }
+        let checked_out = first.checkout(&ZoneId::work()).await.unwrap();
+        assert!(checked_out.warm_checkout);
+        assert!(
+            first_processes
+                .iter()
+                .any(|process| Arc::ptr_eq(process, &checked_out.entry.connector))
+        );
+        let first_generation = state.registry.inventory_fence(state.registry.version());
+
+        let mut preview = request(LifecycleAction::Disable);
+        preview.dry_run = true;
+        transition(&state, &connector_id, &preview).await.unwrap();
+        first_generation.require_current().unwrap();
+        first.runtime_retirement.require_open().unwrap();
+        for process in &first_processes {
+            assert!(!process.runtime_retirement.is_exited());
+        }
+
+        let disabled = transition(&state, &connector_id, &request(LifecycleAction::Disable))
+            .await
+            .expect("disable waits for every exact child, including checked-out workers");
+        assert_eq!(
+            disabled.current_desired_state,
+            DesiredRuntimeState::Disabled
+        );
+        assert_eq!(disabled.observed_state, ObservedRuntimeState::Stopped);
+        for process in &first_processes {
+            assert!(process.runtime_retirement.is_exited());
+        }
+        assert!(checked_out.entry.connector.runtime_retirement.is_exited());
+        assert!(first_generation.require_current().is_err());
+        assert!(first.runtime_retirement.require_open().is_err());
+        assert!(first.checkout(&ZoneId::work()).await.is_err());
+        assert!(first.maintain_min_idle().await.is_err());
+        assert_dormant(&state, &connector_id).await;
+        drop(checked_out);
+
+        transition(&state, &connector_id, &request(LifecycleAction::Enable))
+            .await
+            .expect("enable starts a replacement instead of reopening retired workers");
+        let second = warm_pool(&state, &connector_id).await;
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert!(!Arc::ptr_eq(&first.control, &second.control));
+        let second_processes = retained_pool_processes(&second).await;
+        for process in &second_processes {
+            assert!(!process.runtime_retirement.is_exited());
+        }
+        assert_eq!(
+            second.control.health().await.unwrap().details.unwrap()["configured"],
+            true
+        );
+
+        let restarted = transition(&state, &connector_id, &request(LifecycleAction::Restart))
+            .await
+            .expect("restart drains every old process before enabling its replacement");
+        assert_eq!(
+            restarted.previous_desired_state,
+            DesiredRuntimeState::Enabled
+        );
+        assert_eq!(restarted.observed_state, ObservedRuntimeState::Running);
+        let third = warm_pool(&state, &connector_id).await;
+        assert!(!Arc::ptr_eq(&second, &third));
+        assert!(!Arc::ptr_eq(&second.control, &third.control));
+        for process in &second_processes {
+            assert!(process.runtime_retirement.is_exited());
+        }
+        assert!(second.runtime_retirement.require_open().is_err());
+        assert!(second.checkout(&ZoneId::work()).await.is_err());
+        let third_processes = retained_pool_processes(&third).await;
+        for process in &third_processes {
+            assert!(!process.runtime_retirement.is_exited());
+        }
+
+        let uninstalled = transition(&state, &connector_id, &request(LifecycleAction::Uninstall))
+            .await
+            .expect("uninstall retires the complete replacement pool");
+        assert_eq!(
+            uninstalled.current_desired_state,
+            DesiredRuntimeState::Uninstalled
+        );
+        assert_eq!(uninstalled.observed_state, ObservedRuntimeState::Stopped);
+        for process in &third_processes {
+            assert!(process.runtime_retirement.is_exited());
+        }
+        assert!(third.runtime_retirement.require_open().is_err());
         assert_dormant(&state, &connector_id).await;
     }
 

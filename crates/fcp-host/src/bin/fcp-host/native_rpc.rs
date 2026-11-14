@@ -138,6 +138,188 @@ impl NativeRuntimeRetirement {
     }
 }
 
+/// A control handle for one physical process, retained even after a warm-pool
+/// entry is checked out, evicted, or abandoned during startup.
+#[derive(Clone)]
+pub(super) struct NativeRuntimeControl {
+    sender: mpsc::Sender<ConnectorRpcRequest>,
+    retirement: NativeRuntimeRetirement,
+}
+
+impl NativeRuntimeControl {
+    pub(super) fn new(
+        sender: mpsc::Sender<ConnectorRpcRequest>,
+        retirement: NativeRuntimeRetirement,
+    ) -> Self {
+        Self { sender, retirement }
+    }
+
+    pub(super) async fn retire(&self, deadline: Instant) -> HostResult<()> {
+        if self.retirement.is_exited() {
+            return Ok(());
+        }
+        let rpc = NativeRpc::new(deadline);
+        let _waiter = rpc.waiter();
+        let (response_tx, response_rx) = fcp_async_core::channel::oneshot::channel();
+        let retirement = async {
+            if self
+                .sender
+                .send(ConnectorRpcRequest {
+                    method: RETIRE_RUNTIME_METHOD.to_owned(),
+                    params: serde_json::json!({}),
+                    response_tx,
+                    rpc: rpc.clone(),
+                })
+                .await
+                .is_ok()
+            {
+                // A reply or a closed queue is not proof of physical exit.
+                let _ = response_rx.await;
+            }
+            self.retirement.wait_for_exit(deadline).await
+        };
+        fcp_async_core::time::timeout(
+            deadline.saturating_duration_since(Instant::now()),
+            retirement,
+        )
+        .await
+        .map_err(|_| {
+            HostError::Unavailable(
+                "native connector runtime retirement deadline expired before confirmed process exit"
+                    .to_owned(),
+            )
+        })?
+    }
+}
+
+#[derive(Default)]
+struct NativePoolState {
+    closed: bool,
+    spawning: usize,
+    runtimes: Vec<NativeRuntimeControl>,
+}
+
+/// Pool-wide custody is separate from the idle-entry vector: checked-out and
+/// evicted workers must still be proven stopped before lifecycle publication.
+#[derive(Default)]
+pub(super) struct NativePoolRetirement {
+    state: Mutex<NativePoolState>,
+    launches_drained: CancellationToken,
+}
+
+pub(super) struct NativePoolSpawn<'a> {
+    pool: &'a NativePoolRetirement,
+}
+
+impl NativePoolRetirement {
+    pub(super) fn require_open(&self) -> HostResult<()> {
+        if self
+            .state
+            .lock()
+            .expect("native pool lifecycle lock")
+            .closed
+        {
+            return Err(HostError::Unavailable(
+                "native warm pool is retiring or retired; enable a replacement before dispatch"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn begin_spawn(&self) -> HostResult<NativePoolSpawn<'_>> {
+        let mut state = self.state.lock().expect("native pool lifecycle lock");
+        if state.closed {
+            return Err(HostError::Unavailable(
+                "native warm pool is retiring or retired; worker creation is closed".to_owned(),
+            ));
+        }
+        state.spawning = state.spawning.checked_add(1).ok_or_else(|| {
+            HostError::Unavailable("native warm-pool launch capacity exhausted".to_owned())
+        })?;
+        Ok(NativePoolSpawn { pool: self })
+    }
+
+    pub(super) async fn retire(&self, deadline: Instant) -> HostResult<()> {
+        if Instant::now() >= deadline {
+            return Err(HostError::Unavailable(
+                "native warm-pool retirement deadline expired".to_owned(),
+            ));
+        }
+        let launches_drained = {
+            let mut state = self.state.lock().expect("native pool lifecycle lock");
+            state.closed = true;
+            state.spawning == 0
+        };
+        if launches_drained {
+            self.launches_drained.cancel();
+        }
+        let mut drained = self.launches_drained.subscribe();
+        fcp_async_core::time::timeout(
+            deadline.saturating_duration_since(Instant::now()),
+            drained.cancelled(),
+        )
+        .await
+        .map_err(|_| {
+            HostError::Unavailable(
+                "native warm-pool retirement is waiting for admitted worker creation".to_owned(),
+            )
+        })?;
+        let runtimes = self
+            .state
+            .lock()
+            .expect("native pool lifecycle lock")
+            .runtimes
+            .clone();
+        // Send every stop concurrently. A busy worker must not keep unrelated
+        // idle processes alive while its own selected operation drains.
+        let results =
+            futures_util::future::join_all(runtimes.iter().map(|runtime| runtime.retire(deadline)))
+                .await;
+        for result in results {
+            result?;
+        }
+        if Instant::now() >= deadline {
+            return Err(HostError::Unavailable(
+                "native warm-pool retirement deadline expired before confirmed pool exit"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl NativePoolSpawn<'_> {
+    /// Record custody immediately after the OS creates the child, before any
+    /// fallible transport setup or awaited configure/handshake work.
+    pub(super) fn record(
+        &self,
+        sender: mpsc::Sender<ConnectorRpcRequest>,
+        retirement: NativeRuntimeRetirement,
+    ) {
+        let mut state = self.pool.state.lock().expect("native pool lifecycle lock");
+        state
+            .runtimes
+            .retain(|runtime| !runtime.retirement.is_exited());
+        state
+            .runtimes
+            .push(NativeRuntimeControl::new(sender, retirement));
+    }
+}
+
+impl Drop for NativePoolSpawn<'_> {
+    fn drop(&mut self) {
+        let launches_drained = {
+            let mut state = self.pool.state.lock().expect("native pool lifecycle lock");
+            state.spawning -= 1;
+            state.closed && state.spawning == 0
+        };
+        if launches_drained {
+            self.pool.launches_drained.cancel();
+        }
+    }
+}
+
 impl std::fmt::Debug for NativeRpc {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -969,6 +1151,7 @@ mod tests {
             crate::PlacementOperationClass::BulkPrewarm,
             Some(&invocation),
             None,
+            None,
         )
         .await
         .err()
@@ -1047,6 +1230,7 @@ mod tests {
             None,
             crate::PlacementOperationClass::BulkPrewarm,
             Some(&invocation),
+            None,
             None,
         )
         .await
@@ -2241,5 +2425,153 @@ exec sleep 30
             .expect("unpolled actor destruction must retain and reap the idle child");
         assert!(retirement.is_exited());
         assert!(sender.is_closed());
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn native_pool_retirement_stops_retained_and_evicted_processes() {
+        let pool = NativePoolRetirement::default();
+        let launch = pool.begin_spawn().unwrap();
+        let control = connector("exec sleep 30", &BTreeMap::new()).await;
+        let checked_out = connector("exec sleep 30", &BTreeMap::new()).await;
+        let evicted = connector("exec sleep 30", &BTreeMap::new()).await;
+        let evicted_retirement = evicted.runtime_retirement.clone();
+        for runtime in [&control, &checked_out, &evicted] {
+            launch.record(
+                runtime.runner_tx.clone(),
+                runtime.runtime_retirement.clone(),
+            );
+        }
+        drop(launch);
+        drop(evicted);
+        pool.retire(Instant::now() + Duration::from_secs(5))
+            .await
+            .expect("idle membership is not needed to account for every child");
+        assert!(control.runtime_retirement.is_exited());
+        assert!(checked_out.runtime_retirement.is_exited());
+        assert!(evicted_retirement.is_exited());
+        assert!(pool.require_open().is_err());
+        assert!(pool.begin_spawn().is_err());
+        assert!(control.rpc("health", json!({})).await.is_err());
+        assert!(checked_out.rpc("health", json!({})).await.is_err());
+        pool.retire(Instant::now() + Duration::from_secs(1))
+            .await
+            .expect("retained references can repeat a confirmed pool stop");
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn native_pool_retirement_tracks_launches_that_finish_after_an_interrupted_stop() {
+        for cancel_waiter in [false, true] {
+            let pool = NativePoolRetirement::default();
+            let launch = pool.begin_spawn().unwrap();
+            let mut stop = Box::pin(pool.retire(Instant::now() + Duration::from_millis(30)));
+            assert!(futures_util::poll!(stop.as_mut()).is_pending());
+            assert!(pool.require_open().is_err());
+            assert!(pool.begin_spawn().is_err());
+            if cancel_waiter {
+                drop(stop);
+            } else {
+                stop.await
+                    .expect_err("admitted startup still owns launch permission");
+            }
+
+            // This launch was admitted before closure. Record its actual child
+            // even though the stop waiter has already timed out or disappeared.
+            let (sender, receiver) = mpsc::channel(1);
+            let runner = ConnectorProcessRunner::spawn_with_pool_tracking(
+                "/bin/sh",
+                &["-c".to_owned(), "exec sleep 30".to_owned()],
+                &BTreeMap::new(),
+                Some((&launch, sender)),
+            )
+            .await
+            .unwrap();
+            let retirement = runner.runtime_retirement.clone();
+            drop(run_dispatcher(runner, receiver));
+            drop(launch);
+            pool.retire(Instant::now() + Duration::from_secs(5))
+                .await
+                .expect("retry accounts for the late child and waits for physical exit");
+            assert!(retirement.is_exited());
+            assert!(pool.require_open().is_err());
+        }
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn native_pool_retirement_drains_idle_workers_while_preserving_active_results() {
+        let directory = tempfile::tempdir().unwrap();
+        let ready = directory.path().join("active");
+        let release = directory.path().join("release");
+        let environment = BTreeMap::from([
+            ("READY".to_owned(), ready.to_string_lossy().into_owned()),
+            ("RELEASE".to_owned(), release.to_string_lossy().into_owned()),
+        ]);
+        let active = connector(
+            r#"
+IFS= read -r request || exit 1
+: > "$READY"
+while [ ! -f "$RELEASE" ]; do sleep 0.01; done
+printf '%s\n' '{"jsonrpc":"2.0","id":"0:0","result":{"completed":true}}'
+while IFS= read -r request; do :; done
+"#,
+            &environment,
+        )
+        .await;
+        let idle = connector("exec sleep 30", &BTreeMap::new()).await;
+        let pool = NativePoolRetirement::default();
+        let launch = pool.begin_spawn().unwrap();
+        for runtime in [&active, &idle] {
+            launch.record(
+                runtime.runner_tx.clone(),
+                runtime.runtime_retirement.clone(),
+            );
+        }
+        drop(launch);
+        let caller = Arc::clone(&active);
+        let call = task::try_spawn(async move { caller.rpc("hold", json!({})).await }).unwrap();
+        wait_for_file(&ready).await;
+        let mut stop = Box::pin(pool.retire(Instant::now() + Duration::from_secs(5)));
+        assert!(futures_util::poll!(stop.as_mut()).is_pending());
+        idle.runtime_retirement
+            .wait_for_exit(Instant::now() + Duration::from_secs(2))
+            .await
+            .expect("one active worker must not hold idle worker retirement behind it");
+        assert!(!active.runtime_retirement.is_exited());
+        drop(stop);
+        assert!(pool.require_open().is_err());
+        std::fs::write(&release, b"").unwrap();
+        assert_eq!(call.await.unwrap().unwrap(), json!({"completed": true}));
+        pool.retire(Instant::now() + Duration::from_secs(5))
+            .await
+            .expect("a retry closes the same pool after its original work completes");
+        assert!(active.runtime_retirement.is_exited());
+        assert!(idle.runtime_retirement.is_exited());
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn native_pool_retirement_accounts_for_failed_transport_setup_and_expired_calls() {
+        let pool = NativePoolRetirement::default();
+        pool.retire(Instant::now())
+            .await
+            .expect_err("an already expired stop cannot change admission");
+        pool.require_open().unwrap();
+        let launch = pool.begin_spawn().unwrap();
+        let mut command = fcp_async_core::process::Command::new("/bin/sh");
+        command.args(["-c", "exec sleep 30"]).kill_on_drop(true);
+        let retirement = NativeRuntimeRetirement::default();
+        let custody = crate::NativeLaunchCustody {
+            child: Some(command.spawn().unwrap()),
+            retirement: retirement.clone(),
+        };
+        let (sender, receiver) = mpsc::channel(1);
+        launch.record(sender, retirement.clone());
+        // Exercise the same guard that handles stdin/reader/task-admission
+        // failures before a ConnectorProcessRunner can be constructed.
+        drop(custody);
+        drop(receiver);
+        drop(launch);
+        pool.retire(Instant::now() + Duration::from_secs(5))
+            .await
+            .expect("partial transport setup still has exact process-exit custody");
+        assert!(retirement.is_exited());
     }
 }

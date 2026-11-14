@@ -593,6 +593,7 @@ impl SubprocessConnector {
             placement_operation_class,
             None,
             None,
+            None,
         )
         .await
     }
@@ -604,6 +605,7 @@ impl SubprocessConnector {
         placement_operation_class: PlacementOperationClass,
         termination: Option<&NativeInvocationTermination>,
         admitted_manifest: Option<&ManifestOperationConstraintCatalog>,
+        pool_spawn: Option<&native_rpc::NativePoolSpawn<'_>>,
     ) -> HostResult<Self> {
         if termination.is_some_and(NativeInvocationTermination::is_cancel_requested) {
             return Err(HostError::RegistryError(
@@ -647,15 +649,20 @@ impl SubprocessConnector {
             termination.require_current_authority()?;
             termination.require_current_inventory()?;
         }
-        let mut runner = ConnectorProcessRunner::spawn(&config.binary, &config.args, &config.env)
-            .await
-            .map_err(|err| HostError::Internal(format!("spawn failed: {err}")))?;
+        let (runner_tx, runner_rx) =
+            mpsc::channel::<ConnectorRpcRequest>(CONNECTOR_RPC_QUEUE_CAPACITY);
+        let mut runner = ConnectorProcessRunner::spawn_with_pool_tracking(
+            &config.binary,
+            &config.args,
+            &config.env,
+            pool_spawn.map(|spawn| (spawn, runner_tx.clone())),
+        )
+        .await
+        .map_err(|err| HostError::Internal(format!("spawn failed: {err}")))?;
         runner.response_limits = response_limits;
         let event_transport = runner.event_transport.clone();
         let runtime_retirement = runner.runtime_retirement.clone();
         let state_root = configured_connector_state_root(&config);
-        let (runner_tx, runner_rx) =
-            mpsc::channel::<ConnectorRpcRequest>(CONNECTOR_RPC_QUEUE_CAPACITY);
         let runner_task =
             task::try_spawn(native_rpc::run_dispatcher(runner, runner_rx)).map_err(|error| {
                 HostError::Internal(format!("connector dispatcher admission failed: {error}"))
@@ -696,41 +703,12 @@ impl SubprocessConnector {
     /// circuit breakers, but waits behind already selected work. An expired
     /// queue request cannot stop a later invocation or claim successful exit.
     async fn retire_runtime(&self, deadline: Instant) -> HostResult<()> {
-        if self.runtime_retirement.is_exited() {
-            return Ok(());
-        }
-        let rpc = NativeRpc::new(deadline);
-        let _waiter = rpc.waiter();
-        let (response_tx, response_rx) = oneshot::channel();
-        let retirement = async {
-            if self
-                .runner_tx
-                .send(ConnectorRpcRequest {
-                    method: native_rpc::RETIRE_RUNTIME_METHOD.to_string(),
-                    params: json!({}),
-                    response_tx,
-                    rpc: rpc.clone(),
-                })
-                .await
-                .is_ok()
-            {
-                // The reply is advisory. Only the retained Child's wait result
-                // proves retirement, including after actor failure or abort.
-                let _ = response_rx.await;
-            }
-            self.runtime_retirement.wait_for_exit(deadline).await
-        };
-        fcp_async_core::time::timeout(
-            deadline.saturating_duration_since(Instant::now()),
-            retirement,
+        native_rpc::NativeRuntimeControl::new(
+            self.runner_tx.clone(),
+            self.runtime_retirement.clone(),
         )
+        .retire(deadline)
         .await
-        .map_err(|_| {
-            HostError::Unavailable(
-                "native connector runtime retirement deadline expired before confirmed process exit"
-                    .to_string(),
-            )
-        })?
     }
 
     async fn configure_with_termination(
@@ -1233,6 +1211,7 @@ struct NativeWarmPoolConnector {
     capability_verifying_key: Option<[u8; PUBLIC_KEY_SIZE]>,
     controller: AdaptiveWarmPoolController,
     entries: Mutex<Vec<NativeWarmPoolEntry>>,
+    runtime_retirement: native_rpc::NativePoolRetirement,
     /// Background maintenance task handle. Dropping the pool drops the handle,
     /// which aborts the task (the task itself only holds a `Weak` back-pointer
     /// so it never keeps the pool alive).
@@ -1251,17 +1230,22 @@ impl NativeWarmPoolConnector {
         // pool exists, all replenishment uses this same immutable admission.
         state_policy.require_parallel_workers(&config.id)?;
         state_policy.require_current_manifest(&config)?;
-        let control = Arc::new(
-            SubprocessConnector::spawn_with_placement_and_termination(
-                config.clone(),
-                Arc::clone(&resilience),
-                capability_verifying_key,
-                PlacementOperationClass::LifecycleCritical,
-                None,
-                Some(&admitted.manifest_constraints),
+        let runtime_retirement = native_rpc::NativePoolRetirement::default();
+        let control = {
+            let launch = runtime_retirement.begin_spawn()?;
+            Arc::new(
+                SubprocessConnector::spawn_with_placement_and_termination(
+                    config.clone(),
+                    Arc::clone(&resilience),
+                    capability_verifying_key,
+                    PlacementOperationClass::LifecycleCritical,
+                    None,
+                    Some(&admitted.manifest_constraints),
+                    Some(&launch),
+                )
+                .await?,
             )
-            .await?,
-        );
+        };
         state_policy.require_current_manifest(&config)?;
         let connector_id = control.summary.id.clone();
         let per_connector_max_idle = usize::try_from(config.prewarm.max_idle)
@@ -1282,6 +1266,7 @@ impl NativeWarmPoolConnector {
                 global_rss_cap_bytes,
             )),
             entries: Mutex::new(Vec::new()),
+            runtime_retirement,
             maintainer: Mutex::new(None),
         });
         connector.maintain_min_idle().await?;
@@ -1306,6 +1291,9 @@ impl NativeWarmPoolConnector {
                 let Some(connector) = weak.upgrade() else {
                     break;
                 };
+                if connector.runtime_retirement.require_open().is_err() {
+                    break;
+                }
                 connector.run_maintenance_once().await;
             }
         })
@@ -1314,6 +1302,9 @@ impl NativeWarmPoolConnector {
     /// One maintenance pass: refresh idle-entry health, apply retention, and
     /// regrow toward `min_idle` when the pressure controller permits.
     async fn run_maintenance_once(&self) {
+        if self.runtime_retirement.require_open().is_err() {
+            return;
+        }
         self.refresh_idle_entry_health().await;
         let pool_enabled = {
             let mut entries = self.entries.lock().await;
@@ -1379,6 +1370,7 @@ impl NativeWarmPoolConnector {
         &self,
         termination: Option<&NativeInvocationTermination>,
     ) -> HostResult<()> {
+        self.runtime_retirement.require_open()?;
         let zones = self
             .config
             .allowed_zones
@@ -1432,6 +1424,7 @@ impl NativeWarmPoolConnector {
         request: InvokeRequest,
         termination: Option<WarmPoolTermination>,
     ) -> HostResult<InvokeResponse> {
+        self.runtime_retirement.require_open()?;
         let termination = termination.unwrap_or_else(|| {
             WarmPoolTermination::new(invocation_deadline(Instant::now(), request.deadline_ms))
         });
@@ -1452,6 +1445,7 @@ impl NativeWarmPoolConnector {
         let checkout = self
             .checkout_with_termination(&request.zone_id, Some(&termination.invocation))
             .await?;
+        self.runtime_retirement.require_open()?;
         termination.invocation.require_current_deployment()?;
         termination.invocation.require_current_inventory()?;
         termination.invocation.require_current_authority()?;
@@ -1543,6 +1537,7 @@ impl NativeWarmPoolConnector {
 
     async fn simulate(&self, request: SimulateRequest) -> HostResult<SimulateResponse> {
         let checkout = self.checkout(&request.zone_id).await?;
+        self.runtime_retirement.require_open()?;
         self.state_policy.require_current_manifest(&self.config)?;
         let mut entry = checkout.entry;
         let response = entry.connector.simulate(request).await;
@@ -1569,6 +1564,7 @@ impl NativeWarmPoolConnector {
     }
 
     async fn introspect(&self) -> HostResult<Introspection> {
+        self.runtime_retirement.require_open()?;
         self.control.introspect().await
     }
 
@@ -1581,7 +1577,18 @@ impl NativeWarmPoolConnector {
     }
 
     async fn self_check(&self) -> HostResult<SelfCheckReport> {
+        self.runtime_retirement.require_open()?;
         self.control.self_check().await
+    }
+
+    async fn retire_runtime(&self, deadline: Instant) -> HostResult<()> {
+        // The tracker seals first and covers both idle and checked-out workers,
+        // including transport startup that raced this stop. No replacement may
+        // be published until every retained physical process has exited.
+        self.runtime_retirement.retire(deadline).await?;
+        self.maintainer.lock().await.take();
+        self.entries.lock().await.clear();
+        Ok(())
     }
 
     async fn checkout(&self, zone: &ZoneId) -> HostResult<NativeWarmPoolCheckout> {
@@ -1593,12 +1600,14 @@ impl NativeWarmPoolConnector {
         zone: &ZoneId,
         termination: Option<&NativeInvocationTermination>,
     ) -> HostResult<NativeWarmPoolCheckout> {
+        self.runtime_retirement.require_open()?;
         self.state_policy.require_current_manifest(&self.config)?;
         let key = self.warm_pool_key(zone);
         self.apply_retention().await;
         if let Some(entry) = self.take_pool_entry(&key).await
             && let Some(checkout) = self.try_admit_entry(entry, zone, termination).await?
         {
+            self.runtime_retirement.require_open()?;
             return Ok(checkout);
         }
 
@@ -1667,6 +1676,7 @@ impl NativeWarmPoolConnector {
         zone: &ZoneId,
         termination: Option<&NativeInvocationTermination>,
     ) -> HostResult<NativeWarmPoolEntry> {
+        let launch = self.runtime_retirement.begin_spawn()?;
         self.state_policy.require_current_manifest(&self.config)?;
         let connector = Arc::new(
             SubprocessConnector::spawn_with_placement_and_termination(
@@ -1676,6 +1686,7 @@ impl NativeWarmPoolConnector {
                 PlacementOperationClass::BulkPrewarm,
                 termination,
                 Some(&self.manifest_constraints),
+                Some(&launch),
             )
             .await?,
         );
@@ -1687,6 +1698,7 @@ impl NativeWarmPoolConnector {
         } else {
             connector.ensure_handshake(zone).await?;
         }
+        self.runtime_retirement.require_open()?;
         let now = Instant::now();
         Ok(NativeWarmPoolEntry {
             key: self.warm_pool_key(zone),
@@ -1700,6 +1712,9 @@ impl NativeWarmPoolConnector {
 
     async fn insert_pool_entry(&self, entry: NativeWarmPoolEntry) {
         let mut entries = self.entries.lock().await;
+        if self.runtime_retirement.require_open().is_err() {
+            return;
+        }
         entries.push(entry);
         self.apply_retention_locked(&mut entries);
     }
@@ -2244,6 +2259,7 @@ impl ConnectorRuntime {
                 PlacementOperationClass::LifecycleCritical,
                 None,
                 Some(&admitted.manifest_constraints),
+                None,
             )
             .await?,
         )))
@@ -5463,6 +5479,23 @@ struct ConnectorProcessRunner {
     response_limits: native_framing::NativeResponseLimits,
 }
 
+/// Transport setup can fail after the OS has already created a process. Keep
+/// that child in the same exit-custody mechanism used by a running dispatcher.
+struct NativeLaunchCustody {
+    child: Option<Child>,
+    retirement: native_rpc::NativeRuntimeRetirement,
+}
+
+impl Drop for NativeLaunchCustody {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.take() {
+            let rpc = NativeRpc::for_retirement();
+            self.retirement.record(rpc.clone());
+            rpc.retire(child);
+        }
+    }
+}
+
 impl Drop for ConnectorProcessRunner {
     fn drop(&mut self) {
         self.event_transport.fail(&std::io::Error::new(
@@ -5580,10 +5613,23 @@ impl ConnectorProcessRunner {
         }
     }
 
+    #[cfg(test)]
     async fn spawn(
         command: &str,
         args: &[String],
         env: &BTreeMap<String, String>,
+    ) -> std::io::Result<Self> {
+        Self::spawn_with_pool_tracking(command, args, env, None).await
+    }
+
+    async fn spawn_with_pool_tracking(
+        command: &str,
+        args: &[String],
+        env: &BTreeMap<String, String>,
+        pool_spawn: Option<(
+            &native_rpc::NativePoolSpawn<'_>,
+            mpsc::Sender<ConnectorRpcRequest>,
+        )>,
     ) -> std::io::Result<Self> {
         let mut cmd = Command::new(command);
         cmd.args(args)
@@ -5596,7 +5642,14 @@ impl ConnectorProcessRunner {
             cmd.env(key, value);
         }
 
-        let mut child = cmd.spawn()?;
+        let mut custody = NativeLaunchCustody {
+            child: Some(cmd.spawn()?),
+            retirement: native_rpc::NativeRuntimeRetirement::default(),
+        };
+        if let Some((launch, sender)) = pool_spawn {
+            launch.record(sender, custody.retirement.clone());
+        }
+        let child = custody.child.as_mut().expect("newly spawned native child");
         let stdin = child
             .stdin()
             .ok_or_else(|| std::io::Error::other("connector stdin unavailable"))?;
@@ -5642,9 +5695,9 @@ impl ConnectorProcessRunner {
         let (responses, stdout_task) = event_transport.spawn_reader(stdout)?;
 
         Ok(Self {
-            child: Some(child),
+            child: custody.child.take(),
             active_rpc: None,
-            runtime_retirement: native_rpc::NativeRuntimeRetirement::default(),
+            runtime_retirement: custody.retirement.clone(),
             event_transport,
             responses,
             _stdout_task: stdout_task,
@@ -32501,7 +32554,11 @@ output_schema = { type = "object" }
                 );
                 assert_eq!(response.headers()[CACHE_CONTROL], "no-store");
                 let mut body = response.into_body().into_data_stream();
-                let first = body.next().await.expect("first result").expect("result bytes");
+                let first = body
+                    .next()
+                    .await
+                    .expect("first result")
+                    .expect("result bytes");
                 let first: Value = serde_json::from_slice(&first).expect("result JSON");
                 assert_eq!(first["type"], "result");
                 assert_eq!(first["result"]["id"], "29-streamed-first");
@@ -32520,7 +32577,9 @@ output_schema = { type = "object" }
             }
         });
         if streaming {
-            first_frame_rx.await.expect("consumer received the first frame");
+            first_frame_rx
+                .await
+                .expect("consumer received the first frame");
         }
         let ticket = started_rx.await.expect("member admitted");
         assert!(state.invoke_jobs.is_active(&ticket.operation_id));
