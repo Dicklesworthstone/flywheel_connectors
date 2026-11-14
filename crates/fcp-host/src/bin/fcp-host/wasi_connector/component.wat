@@ -26,6 +26,7 @@
     (data (i32.const 288) "\a2\64echo")
     (data (i32.const 304) "\65calls")
     (data (i32.const 320) "\65wrong")
+    (data (i32.const 336) "yield")
     (data (i32.const 510) "\78\25inst_")
     (data (i32.const 1024) "{{CONFIG}}")
     (data (i32.const 2048) "{{HANDSHAKE_PREFIX}}")
@@ -166,6 +167,13 @@
         (local.set $mode (call $field (local.get $input) (i32.const 112) (i32.const 4)))
         (if (call $text_eq (local.get $mode) (i32.const 192) (i32.const 4)) (then unreachable))
         (if (call $text_eq (local.get $mode) (i32.const 256) (i32.const 4)) (then (loop $spin (br $spin))))
+        ;; A finite call crosses the host's 10,000-fuel yield interval, allowing
+        ;; retirement tests to seal admission before this invocation completes.
+        (if (call $text_eq (local.get $mode) (i32.const 336) (i32.const 5))
+          (then
+            (loop $yield
+              (local.set $i (i32.add (local.get $i) (i32.const 1)))
+              (br_if $yield (i32.lt_u (local.get $i) (i32.const 100000))))))
         (if (call $text_eq (local.get $mode) (i32.const 208) (i32.const 9))
           (then
             (i32.store8 (global.get $out) (i32.const 255))

@@ -17,6 +17,10 @@ const CONTROL_BYTES: usize = 64 * 1024;
 #[derive(Default)]
 pub(super) struct WasiSessions {
     slots: StdMutex<BTreeMap<(String, String), Arc<SessionSlot>>>,
+    /// A lifecycle stop permanently closes this runtime, including retained
+    /// references and callers already waiting for a guest. Only a replacement
+    /// runtime can admit preparation again.
+    closed: AtomicBool,
 }
 
 #[derive(Default)]
@@ -98,6 +102,41 @@ async fn call<T: serde::Serialize, R: DeserializeOwned>(
 }
 
 impl WasiSessions {
+    fn require_open(&self) -> HostResult<()> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(unavailable(
+                "WASI connector runtime is retiring or retired; enable a replacement before preparing or invoking a session",
+            ));
+        }
+        Ok(())
+    }
+
+    fn close_admission(&self) -> HostResult<Vec<Arc<SessionSlot>>> {
+        let slots = self
+            .slots
+            .lock()
+            .map_err(|_| HostError::Internal("WASI session registry is unavailable".into()))?;
+        // Selection and closure share this lock. Every slot that could own a
+        // guest is retained in this snapshot; no new slot can appear afterward.
+        self.closed.store(true, Ordering::Release);
+        Ok(slots.values().map(Arc::clone).collect())
+    }
+
+    fn retain_guest(
+        &self,
+        held: &mut Option<PreparedGuest>,
+        guest: PreparedGuest,
+    ) -> HostResult<()> {
+        let _slots = self
+            .slots
+            .lock()
+            .map_err(|_| HostError::Internal("WASI session registry is unavailable".into()))?;
+        self.require_open()?;
+        guest.ready.store(true, Ordering::Release);
+        *held = Some(guest);
+        Ok(())
+    }
+
     fn existing_slot(
         &self,
         zone: &ZoneId,
@@ -122,6 +161,7 @@ impl WasiSessions {
             .slots
             .lock()
             .map_err(|_| HostError::Internal("WASI session registry is unavailable".into()))?;
+        self.require_open()?;
         let key = (zone.to_string(), operation.to_string());
         if let Some(slot) = slots.get(&key) {
             return Ok(Arc::clone(slot));
@@ -145,14 +185,47 @@ impl WasiSessions {
 
     pub(super) fn has_ready_session(&self) -> bool {
         self.slots.lock().is_ok_and(|slots| {
-            slots
-                .values()
-                .any(|slot| slot.ready.load(Ordering::Acquire))
+            !self.closed.load(Ordering::Acquire)
+                && slots
+                    .values()
+                    .any(|slot| slot.ready.load(Ordering::Acquire))
         })
     }
 }
 
 impl WasiConnector {
+    /// Seal the exact runtime before waiting for its selected guest calls.
+    /// Dropping a retained Store after its owner releases the slot proves that
+    /// guest cannot continue. A timeout or cancelled waiter keeps admission
+    /// closed and retains every undrained slot for a later explicit retry.
+    pub(super) async fn retire_runtime(&self, deadline: Instant) -> HostResult<()> {
+        let expired = || {
+            HostError::Unavailable(
+                "WASI runtime retirement deadline expired before all guest sessions drained".into(),
+            )
+        };
+        if Instant::now() >= deadline {
+            return Err(expired());
+        }
+        let slots = self.sessions.close_admission()?;
+        for slot in slots {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or_else(expired)?;
+            let mut held = fcp_async_core::time::timeout(remaining, slot.guest.lock())
+                .await
+                .map_err(|_| expired())?;
+            if Instant::now() >= deadline {
+                return Err(expired());
+            }
+            drop(held.take());
+        }
+        if Instant::now() >= deadline {
+            return Err(expired());
+        }
+        Ok(())
+    }
+
     pub(super) async fn retire_session(
         &self,
         zone: &ZoneId,
@@ -272,6 +345,7 @@ impl WasiConnector {
         self.state_policy.require_admitted_manifest(&self.config)?;
         let slot = self.sessions.slot(zone, operation, true)?;
         let mut held = slot.guest.lock().await;
+        self.sessions.require_open()?;
         // Taking before awaited guest work ensures cancellation cannot restore
         // an instance whose state or canonical return area is uncertain.
         let mut guest = if let Some(guest) = held.take() {
@@ -340,9 +414,10 @@ impl WasiConnector {
         if prepared.instance_id != guest.instance_id {
             return Err(protocol_failure());
         }
+        // A stop may have sealed admission while configure/handshake/health
+        // was executing. Do not publish that instance to waiting callers.
         prepared.operation_id = Some(operation.clone());
-        slot.ready.store(true, Ordering::Release);
-        *held = Some(guest);
+        self.sessions.retain_guest(&mut held, guest)?;
         Ok(prepared)
     }
 
@@ -408,6 +483,7 @@ impl WasiConnector {
             .sessions
             .slot(&request.zone_id, &request.operation, false)?;
         let mut held = slot.guest.lock().await;
+        self.sessions.require_open()?;
         let guest = held.as_ref().ok_or_else(|| {
             unavailable("WASI operation session was retired; prepare a new instance")
         })?;
@@ -462,7 +538,9 @@ impl WasiConnector {
         {
             return Err(protocol_failure());
         }
-        *held = Some(guest);
+        // Already selected calls retain their real outcome during drain, but
+        // the completed guest must not become reusable after closure.
+        let _ = self.sessions.retain_guest(&mut held, guest);
         Ok(response)
     }
 }

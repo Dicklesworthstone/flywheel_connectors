@@ -944,6 +944,438 @@ async fn cancelling_wasi_guest_retires_only_that_operation_session() {
     );
 }
 
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn runtime_retirement_drains_every_zone_and_operation_and_seals_retained_references() {
+    let fixture = Fixture::new().await;
+    let mut prepared = Vec::new();
+    for zone in [ZoneId::work(), ZoneId::private()] {
+        for operation in [ECHO, OTHER] {
+            let instance = fixture.prepare(zone.clone(), operation).await;
+            prepared.push((zone.clone(), operation, instance.instance_id));
+        }
+    }
+    assert!(fixture.connector.sessions.has_ready_session());
+    fixture
+        .connector
+        .retire_runtime(Instant::now() + Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert!(!fixture.connector.sessions.has_ready_session());
+    for (zone, operation, instance) in prepared {
+        let slot = fixture
+            .connector
+            .sessions
+            .existing_slot(&zone, &OperationId::from_static(operation))
+            .unwrap()
+            .unwrap();
+        assert!(slot.guest.lock().await.is_none());
+        assert!(!slot.ready.load(Ordering::Acquire));
+        assert!(
+            fixture
+                .connector
+                .prepare_session(&zone, &OperationId::from_static(operation))
+                .await
+                .is_err(),
+            "a retained runtime cannot recreate a retired guest"
+        );
+        assert!(
+            fixture
+                .invoke(fixture.request(&instance, zone, operation, json!({})))
+                .await
+                .is_err()
+        );
+    }
+    fixture
+        .connector
+        .retire_runtime(Instant::now() + Duration::from_secs(1))
+        .await
+        .expect("retirement remains idempotent through retained references");
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn runtime_retirement_fences_preparation_and_invocation_already_waiting_for_a_guest() {
+    let fixture = Fixture::new().await;
+    let prepared = fixture.prepare(ZoneId::work(), ECHO).await;
+    let zone = ZoneId::work();
+    let operation = OperationId::from_static(ECHO);
+    let slot = fixture
+        .connector
+        .sessions
+        .existing_slot(&zone, &operation)
+        .unwrap()
+        .unwrap();
+    let owner = slot.guest.lock().await;
+    let mut prepare = Box::pin(fixture.connector.prepare_session(&zone, &operation));
+    let mut invoke = Box::pin(fixture.invoke(fixture.request(
+        &prepared.instance_id,
+        zone.clone(),
+        ECHO,
+        json!({"must_not_run": true}),
+    )));
+    assert!(futures_util::poll!(prepare.as_mut()).is_pending());
+    assert!(futures_util::poll!(invoke.as_mut()).is_pending());
+    let mut retire = Box::pin(
+        fixture
+            .connector
+            .retire_runtime(Instant::now() + Duration::from_secs(5)),
+    );
+    assert!(futures_util::poll!(retire.as_mut()).is_pending());
+    assert!(fixture.connector.sessions.require_open().is_err());
+    drop(owner);
+    assert!(prepare.await.is_err());
+    assert!(invoke.await.is_err());
+    retire.await.unwrap();
+    assert!(slot.guest.lock().await.is_none());
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn runtime_retirement_preserves_the_result_of_an_already_executing_guest() {
+    let fixture = Fixture::new().await;
+    let prepared = fixture.prepare(ZoneId::work(), ECHO).await;
+    let input = json!({"mode": "yield", "complete_once": true});
+    let request = fixture.request(&prepared.instance_id, ZoneId::work(), ECHO, input.clone());
+    let request_id = request.id.clone();
+    let mut invocation = Box::pin(fixture.invoke(request));
+    assert!(
+        futures_util::poll!(invocation.as_mut()).is_pending(),
+        "finite guest work must yield while retaining its actual Store"
+    );
+    let mut retirement = Box::pin(
+        fixture
+            .connector
+            .retire_runtime(Instant::now() + Duration::from_secs(5)),
+    );
+    assert!(futures_util::poll!(retirement.as_mut()).is_pending());
+    let (response, retired) = futures_util::future::join(invocation, retirement).await;
+    let response = response.expect("selected guest finishes with its real response during drain");
+    retired.expect("retirement waits until the selected invocation released its Store");
+    assert_eq!(response.id, request_id);
+    let result = response.result.unwrap();
+    assert_eq!(result["calls"], 1);
+    assert_eq!(result["echo"], input);
+    let slot = fixture
+        .connector
+        .sessions
+        .existing_slot(&ZoneId::work(), &OperationId::from_static(ECHO))
+        .unwrap()
+        .unwrap();
+    assert!(slot.guest.lock().await.is_none());
+    assert!(
+        fixture
+            .invoke(fixture.request(&prepared.instance_id, ZoneId::work(), ECHO, json!({})))
+            .await
+            .is_err()
+    );
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn timed_out_or_cancelled_runtime_retirement_keeps_admission_closed_until_replacement() {
+    for cancel_waiter in [false, true] {
+        let fixture = Fixture::new().await;
+        let prepared = fixture.prepare(ZoneId::work(), ECHO).await;
+        let mut invocation = Box::pin(fixture.invoke(fixture.request(
+            &prepared.instance_id,
+            ZoneId::work(),
+            ECHO,
+            json!({"mode": "spin"}),
+        )));
+        assert!(futures_util::poll!(invocation.as_mut()).is_pending());
+        let started = Instant::now();
+        let mut retirement = Box::pin(
+            fixture
+                .connector
+                .retire_runtime(started + Duration::from_millis(30)),
+        );
+        assert!(futures_util::poll!(retirement.as_mut()).is_pending());
+        if cancel_waiter {
+            drop(retirement);
+        } else {
+            assert!(retirement.await.is_err());
+            assert!(started.elapsed() < Duration::from_secs(2));
+        }
+        assert!(fixture.connector.sessions.require_open().is_err());
+        assert!(
+            fixture
+                .connector
+                .prepare_session(&ZoneId::private(), &OperationId::from_static(OTHER))
+                .await
+                .is_err(),
+            "partial retirement must never admit another operation or zone"
+        );
+        // The active call was never replayed or replaced by retirement. Its
+        // owner still controls cancellation, which drops the exact guest Store.
+        drop(invocation);
+        fixture
+            .connector
+            .retire_runtime(Instant::now() + Duration::from_secs(5))
+            .await
+            .expect("a retry drains the same sealed runtime after its owner exits");
+        let slots: Vec<_> = fixture
+            .connector
+            .sessions
+            .slots
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect();
+        for slot in slots {
+            assert!(slot.guest.lock().await.is_none());
+        }
+    }
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn expired_runtime_retirement_cannot_seal_a_live_guest() {
+    let fixture = Fixture::new().await;
+    let prepared = fixture.prepare(ZoneId::work(), ECHO).await;
+    assert!(
+        fixture
+            .connector
+            .retire_runtime(Instant::now())
+            .await
+            .is_err()
+    );
+    let response = fixture
+        .invoke(fixture.request(
+            &prepared.instance_id,
+            ZoneId::work(),
+            ECHO,
+            json!({"unchanged": true}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.result.unwrap()["calls"], 1);
+}
+
+async fn registered_runtime(fixture: &Fixture) -> Arc<WasiConnector> {
+    let state = fixture.host.registry.state.read().await;
+    let entry = &state.connectors[&ConnectorId::from_static(CONNECTOR)];
+    let ConnectorRuntime::Wasi(runtime) = &entry.connector else {
+        panic!("expected an enabled WASI runtime")
+    };
+    Arc::clone(runtime)
+}
+
+fn lifecycle_request(action: fcp_host::LifecycleAction) -> LifecycleTransitionRequest {
+    LifecycleTransitionRequest {
+        action,
+        reason: Some("WASI runtime lifecycle regression".into()),
+        initiated_by: Some("test".into()),
+        dry_run: false,
+    }
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn lifecycle_disable_enable_restart_and_uninstall_control_all_wasi_guests() {
+    use fcp_host::{DesiredRuntimeState, LifecycleAction, ObservedRuntimeState};
+
+    let fixture = Fixture::new().await;
+    let first = fixture.prepare(ZoneId::work(), ECHO).await;
+    fixture.prepare(ZoneId::private(), OTHER).await;
+    let connector_id = ConnectorId::from_static(CONNECTOR);
+    fixture
+        .host
+        .lifecycle
+        .reconcile_registered_connectors(&fixture.host.registry.list().await)
+        .await
+        .unwrap();
+    fixture
+        .host
+        .lifecycle
+        .set_desired_state(&connector_id, DesiredRuntimeState::Enabled, None)
+        .await
+        .unwrap();
+    let old_inventory = fixture
+        .host
+        .registry
+        .inventory_fence(fixture.host.registry.version());
+    let mut dry_run = lifecycle_request(LifecycleAction::Disable);
+    dry_run.dry_run = true;
+    lifecycle_runtime::transition(&fixture.host, &connector_id, &dry_run)
+        .await
+        .unwrap();
+    assert!(fixture.connector.sessions.has_ready_session());
+    old_inventory.require_current().unwrap();
+
+    let disabled = lifecycle_runtime::transition(
+        &fixture.host,
+        &connector_id,
+        &lifecycle_request(LifecycleAction::Disable),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        disabled.current_desired_state,
+        DesiredRuntimeState::Disabled
+    );
+    assert_eq!(disabled.observed_state, ObservedRuntimeState::Stopped);
+    assert!(
+        !fixture
+            .host
+            .registry
+            .get(&connector_id)
+            .await
+            .unwrap()
+            .enabled
+    );
+    assert!(old_inventory.require_current().is_err());
+    assert!(fixture.connector.sessions.require_open().is_err());
+    assert!(
+        fixture
+            .invoke(fixture.request(&first.instance_id, ZoneId::work(), ECHO, json!({})))
+            .await
+            .is_err()
+    );
+
+    for action in [LifecycleAction::Enable, LifecycleAction::Restart] {
+        let previous = if action == LifecycleAction::Enable {
+            Arc::clone(&fixture.connector)
+        } else {
+            registered_runtime(&fixture).await
+        };
+        let enabled =
+            lifecycle_runtime::transition(&fixture.host, &connector_id, &lifecycle_request(action))
+                .await
+                .unwrap();
+        assert_eq!(enabled.current_desired_state, DesiredRuntimeState::Enabled);
+        assert_eq!(
+            enabled.observed_state,
+            ObservedRuntimeState::Degraded,
+            "fresh WASI runtime must not claim readiness before explicit session preparation"
+        );
+        let current = registered_runtime(&fixture).await;
+        assert!(!Arc::ptr_eq(&previous, &current));
+        assert!(previous.sessions.require_open().is_err());
+        assert!(!current.sessions.has_ready_session());
+        let prepared = fixture.prepare(ZoneId::work(), ECHO).await;
+        assert_ne!(prepared.instance_id, first.instance_id);
+        assert!(
+            current
+                .invoke_prepared(
+                    fixture.request(&first.instance_id, ZoneId::work(), ECHO, json!({})),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .is_err(),
+            "replacement cannot inherit a capability for a retired guest"
+        );
+        let response = current
+            .invoke_prepared(
+                fixture.request(&prepared.instance_id, ZoneId::work(), ECHO, json!({})),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.result.unwrap()["calls"], 1);
+    }
+    let retained = registered_runtime(&fixture).await;
+    let uninstalled = lifecycle_runtime::transition(
+        &fixture.host,
+        &connector_id,
+        &lifecycle_request(LifecycleAction::Uninstall),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        uninstalled.current_desired_state,
+        DesiredRuntimeState::Uninstalled
+    );
+    assert_eq!(uninstalled.observed_state, ObservedRuntimeState::Stopped);
+    assert!(retained.sessions.require_open().is_err());
+    assert!(
+        !fixture
+            .host
+            .registry
+            .get(&connector_id)
+            .await
+            .unwrap()
+            .enabled
+    );
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn abandoned_wasi_disable_preserves_durable_denial_and_enable_finishes_retirement() {
+    use fcp_host::{DesiredRuntimeState, LifecycleAction, ObservedRuntimeState};
+
+    let fixture = Fixture::new().await;
+    let prepared = fixture.prepare(ZoneId::work(), ECHO).await;
+    let connector_id = ConnectorId::from_static(CONNECTOR);
+    fixture
+        .host
+        .lifecycle
+        .reconcile_registered_connectors(&fixture.host.registry.list().await)
+        .await
+        .unwrap();
+    fixture
+        .host
+        .lifecycle
+        .set_desired_state(&connector_id, DesiredRuntimeState::Enabled, None)
+        .await
+        .unwrap();
+    let generation = fixture.host.registry.version();
+    let mut invocation = Box::pin(fixture.invoke(fixture.request(
+        &prepared.instance_id,
+        ZoneId::work(),
+        ECHO,
+        json!({"mode": "spin"}),
+    )));
+    assert!(futures_util::poll!(invocation.as_mut()).is_pending());
+    let request = lifecycle_request(LifecycleAction::Disable);
+    let mut disable = Box::pin(lifecycle_runtime::transition(
+        &fixture.host,
+        &connector_id,
+        &request,
+    ));
+    assert!(futures_util::poll!(disable.as_mut()).is_pending());
+    assert!(fixture.connector.sessions.require_open().is_err());
+    drop(disable);
+    let status = fixture
+        .host
+        .lifecycle
+        .connector_status(&connector_id)
+        .await
+        .unwrap();
+    assert_eq!(status.desired_state, DesiredRuntimeState::Disabled);
+    assert_ne!(status.observed_state, ObservedRuntimeState::Stopped);
+    assert_eq!(fixture.host.registry.version(), generation);
+    assert!(
+        fixture
+            .host
+            .lifecycle
+            .connector_execution_fence(&connector_id)
+            .await
+            .is_err()
+    );
+    drop(invocation);
+    lifecycle_runtime::transition(
+        &fixture.host,
+        &connector_id,
+        &lifecycle_request(LifecycleAction::Enable),
+    )
+    .await
+    .expect("enable must finish the retained runtime's retirement before replacement");
+    let replacement = registered_runtime(&fixture).await;
+    assert!(!Arc::ptr_eq(&fixture.connector, &replacement));
+    assert!(fixture.connector.sessions.require_open().is_err());
+    let fresh = fixture.prepare(ZoneId::work(), ECHO).await;
+    assert_ne!(fresh.instance_id, prepared.instance_id);
+    let response = replacement
+        .invoke_prepared(
+            fixture.request(&fresh.instance_id, ZoneId::work(), ECHO, json!({})),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.result.unwrap()["calls"], 1);
+}
+
 #[test]
 fn wasi_response_codec_rejects_noncanonical_and_trailing_cbor() {
     assert!(

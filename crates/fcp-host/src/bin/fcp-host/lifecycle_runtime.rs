@@ -3,6 +3,7 @@
 //! Dormant entries retain their managed configuration and admitted manifest but
 //! never start a process or prepare a guest. Native retirement uses the exact
 //! process owner, not a PID lookup or a replacement with the same connector ID.
+//! WASI retirement seals the exact runtime and drains all retained guest stores.
 
 use fcp_host::{
     ConnectorExecutionFence, DesiredRuntimeState, LifecycleAction, ObservedRuntimeState,
@@ -180,12 +181,14 @@ fn stateless_retirement_supported(entry: &RegistryEntry) -> HostResult<()> {
     ) {
         return Ok(());
     }
-    if !matches!(&entry.connector, ConnectorRuntime::Native(_))
-        || entry.state_policy.model != ConnectorStateKind::Stateless
+    if !matches!(
+        &entry.connector,
+        ConnectorRuntime::Native(_) | ConnectorRuntime::Wasi(_)
+    ) || entry.state_policy.model != ConnectorStateKind::Stateless
         || entry.state_policy.manifest_digest.is_none()
     {
         return Err(HostError::Unavailable(
-            "runtime retirement requires an admitted stateless on-demand native connector; stateful handoff, warm-pool draining and WASI-wide retirement are not available"
+            "runtime retirement requires an admitted stateless on-demand native or WASI connector; stateful handoff and warm-pool draining are not available"
                 .to_owned(),
         ));
     }
@@ -196,14 +199,13 @@ fn restart_supported(entry: &RegistryEntry) -> HostResult<()> {
     if entry.state_policy.model != ConnectorStateKind::Stateless
         || entry.state_policy.manifest_digest.is_none()
         || entry.config.prewarm.strategy != PrewarmStrategy::OnDemand
-        || entry.config.runtime_network_enforcement == RuntimeNetworkEnforcement::WasiSandbox
         || !matches!(
             &entry.connector,
-            ConnectorRuntime::Native(_) | ConnectorRuntime::Dormant(_)
+            ConnectorRuntime::Native(_) | ConnectorRuntime::Wasi(_) | ConnectorRuntime::Dormant(_)
         )
     {
         return Err(HostError::Unavailable(
-            "live restart requires an admitted stateless on-demand native connector; canonical state handoff is not available"
+            "live restart requires an admitted stateless on-demand native or WASI connector; canonical state handoff is not available"
                 .to_owned(),
         ));
     }
@@ -303,8 +305,13 @@ async fn retire_selected(
     })?;
     registry.require_generation(generation)?;
     stateless_retirement_supported(entry)?;
-    if let ConnectorRuntime::Native(native) = &entry.connector {
-        native.retire_runtime(deadline).await?;
+    match &entry.connector {
+        ConnectorRuntime::Native(native) => native.retire_runtime(deadline).await?,
+        ConnectorRuntime::Wasi(wasi) => wasi.retire_runtime(deadline).await?,
+        ConnectorRuntime::Dormant(_) | ConnectorRuntime::UnavailableNativeProxyOnly(_) => {}
+        ConnectorRuntime::NativeWarmPool(_) => {
+            unreachable!("warm-pool retirement is refused before selecting a runtime")
+        }
     }
     let dormant = dormant_entry(
         entry.config.clone(),
@@ -416,7 +423,7 @@ async fn transition_before(
 
     if request.action == LifecycleAction::Reload {
         return Err(HostError::Unavailable(
-            "in-place connector reload is unavailable; apply managed configuration or explicitly restart a stateless native connector"
+            "in-place connector reload is unavailable; apply managed configuration or explicitly restart a stateless native or WASI connector"
                 .to_owned(),
         ));
     }
