@@ -13,8 +13,9 @@
 #![cfg_attr(windows, feature(windows_by_handle))]
 
 use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -252,6 +253,18 @@ pub enum RegistryError {
     TufTargetUnbound,
     #[error("TUF target hash mismatch (attested {attested}, bundle binary {bundle})")]
     TufTargetBindingMismatch { attested: String, bundle: String },
+    #[error("TUF evidence does not identify its verified root")]
+    TufRootUnbound,
+    #[error("TUF evidence does not satisfy the currently pinned root: {reason}")]
+    TufRootBindingMismatch { reason: &'static str },
+    #[error("TUF evidence does not retain a metadata freshness deadline")]
+    TufFreshnessUnbound,
+    #[error("TUF verification evidence expired at {expires_at}")]
+    TufEvidenceExpired { expires_at: u64 },
+    #[error("Sigstore evidence does not identify its verified artifact")]
+    SigstoreArtifactUnbound,
+    #[error("Sigstore artifact hash mismatch (attested {attested}, bundle binary {bundle})")]
+    SigstoreArtifactBindingMismatch { attested: String, bundle: String },
     #[error("Sigstore evidence carries no identity but operator config pins trusted identities")]
     SigstoreIdentityUnbound,
     #[error("Sigstore identity `{identity}` not in operator trusted identities")]
@@ -266,6 +279,19 @@ pub enum RegistryError {
     Canonical(#[from] SerializationError),
     #[error("signature bytes malformed")]
     SignatureBytes,
+    #[error("verification evidence belongs to a different verifier or supply-chain policy")]
+    VerificationAuthorityMismatch,
+    #[error("verified bundle {field} mismatch (expected {expected}, got {actual})")]
+    VerifiedBundleMismatch {
+        field: &'static str,
+        expected: String,
+        actual: String,
+    },
+    #[error("mirrored object {object_id} failed authentication: {reason}")]
+    MirrorObjectInvalid {
+        object_id: ObjectId,
+        reason: &'static str,
+    },
     #[error("object store failure: {0}")]
     ObjectStore(#[from] ObjectStoreError),
     #[error("symbol store failure: {0}")]
@@ -343,7 +369,13 @@ pub struct SupplyChainEvidence {
     /// *path* is enumerated in validly-signed TUF metadata, so enforcement
     /// re-binds this hash to the bundle binary (br-g7jhf finding 4).
     tuf_target_hash: Option<String>,
+    /// Root identity and threshold accepted by the TUF verifier.
+    tuf_root: Option<TufRootMetadata>,
+    /// Earliest expiry across the root, timestamp, snapshot, and targets roles.
+    tuf_expires_at: Option<u64>,
     sigstore_verified: bool,
+    /// Exact artifact digest accepted by the Sigstore verifier.
+    sigstore_artifact_hash: Option<String>,
     /// OIDC identity the Sigstore verifier adapter reported.
     sigstore_identity: Option<String>,
     /// OIDC issuer the Sigstore verifier adapter reported.
@@ -404,10 +436,28 @@ impl SupplyChainEvidence {
         self.tuf_target_hash.as_deref()
     }
 
+    /// Root metadata authenticated by the TUF adapter.
+    #[must_use]
+    pub const fn tuf_root(&self) -> Option<&TufRootMetadata> {
+        self.tuf_root.as_ref()
+    }
+
+    /// Earliest expiry of the authenticated TUF metadata chain.
+    #[must_use]
+    pub const fn tuf_expires_at(&self) -> Option<u64> {
+        self.tuf_expires_at
+    }
+
     /// Whether a Sigstore verifier adapter has validated the bundle.
     #[must_use]
     pub const fn sigstore_verified(&self) -> bool {
         self.sigstore_verified
+    }
+
+    /// Digest of the exact artifact accepted by the Sigstore adapter.
+    #[must_use]
+    pub fn sigstore_artifact_hash(&self) -> Option<&str> {
+        self.sigstore_artifact_hash.as_deref()
     }
 
     /// OIDC identity the Sigstore verifier adapter reported, if any.
@@ -424,8 +474,9 @@ impl SupplyChainEvidence {
 
     /// Promote this evidence with a TUF verification result.
     ///
-    /// Sets `tuf_verified = result.verified()` and records the attested
-    /// target hash. Callers obtain `result` from a real
+    /// Sets `tuf_verified = result.verified()` and records the attested target
+    /// hash, authenticated root, and earliest metadata expiry. Callers obtain
+    /// `result` from a real
     /// [`TufVerifier::verify_target`] / `verify_target_bytes` invocation; a
     /// result with `verified == false` leaves the flag untouched so a failed
     /// verification cannot silently upgrade the evidence.
@@ -437,6 +488,8 @@ impl SupplyChainEvidence {
                 .target
                 .as_ref()
                 .map(|target| normalize_sha256(&target.hash));
+            self.tuf_root.clone_from(&result.root);
+            self.tuf_expires_at = result.expires_at;
         }
         self
     }
@@ -455,9 +508,9 @@ impl SupplyChainEvidence {
 
     /// Promote this evidence with a Sigstore verification result.
     ///
-    /// Records the identity and issuer the adapter reported so
-    /// `enforce_supply_chain_verification_config` can re-check them
-    /// against the operator's trusted allowlists (br-g7jhf finding 5).
+    /// Records the exact artifact digest, identity, and issuer the adapter
+    /// verified so policy checks cannot reuse another artifact's proof or
+    /// bypass the operator's trusted allowlists.
     #[must_use]
     pub fn with_sigstore_verification_result(
         mut self,
@@ -465,6 +518,7 @@ impl SupplyChainEvidence {
     ) -> Self {
         if result.verified {
             self.sigstore_verified = true;
+            self.sigstore_artifact_hash = result.artifact_hash.as_deref().map(normalize_sha256);
             self.sigstore_identity.clone_from(&result.identity);
             self.sigstore_issuer.clone_from(&result.issuer);
         }
@@ -482,20 +536,30 @@ impl SupplyChainEvidence {
     pub fn mark_tuf_verified_for_tests(mut self, target_hash: &str) -> Self {
         self.tuf_verified = true;
         self.tuf_target_hash = Some(normalize_sha256(target_hash));
+        self.tuf_root = Some(TufRootMetadata {
+            version: 1,
+            root_hash: format!("sha256:{}", "1".repeat(64)),
+            expires: u64::MAX,
+            key_ids: vec!["test-only-root".to_string()],
+            threshold: 1,
+        });
+        self.tuf_expires_at = Some(u64::MAX);
         self
     }
 
     /// Test-only shortcut that stamps `sigstore_verified = true` with the
-    /// identity/issuer an adapter would have reported.
+    /// artifact digest and identity/issuer an adapter would have reported.
     /// Gated the same way as [`Self::mark_tuf_verified_for_tests`].
     #[cfg(any(test, feature = "test-mocks"))]
     #[must_use]
     pub fn mark_sigstore_verified_for_tests(
         mut self,
+        artifact_hash: &str,
         identity: Option<&str>,
         issuer: Option<&str>,
     ) -> Self {
         self.sigstore_verified = true;
+        self.sigstore_artifact_hash = Some(normalize_sha256(artifact_hash));
         self.sigstore_identity = identity.map(ToString::to_string);
         self.sigstore_issuer = issuer.map(ToString::to_string);
         self
@@ -511,13 +575,19 @@ pub struct AttestationEvidence {
     pub expires_at: Option<u64>,
 }
 
-/// Verified connector bundle metadata.
+/// Immutable evidence produced by [`RegistryVerifier::verify_bundle`].
+///
+/// Evidence is bound to the exact manifest bytes, binary bytes, target, and
+/// verifier policy that admitted the bundle. It cannot be constructed or
+/// rewritten by a caller to bless different content before mirroring.
 #[derive(Debug, Clone)]
 pub struct VerifiedConnectorBundle {
-    pub manifest: ConnectorManifest,
-    pub manifest_hash: String,
-    pub binary_hash: String,
-    pub target: ConnectorTarget,
+    manifest: ConnectorManifest,
+    manifest_hash: String,
+    binary_hash: String,
+    target: ConnectorTarget,
+    authority: Arc<()>,
+    zone_id: Option<ZoneId>,
 }
 
 /// Minimal structured report for audit/logging sinks.
@@ -644,6 +714,10 @@ pub struct TufVerificationResult {
     verified: bool,
     /// Root version used for verification.
     root_version: u32,
+    /// Full authenticated root identity, including its key threshold.
+    root: Option<TufRootMetadata>,
+    /// Earliest metadata expiry in the authenticated role chain.
+    expires_at: Option<u64>,
     /// Target info if found.
     target: Option<TufTargetInfo>,
 }
@@ -661,6 +735,18 @@ impl TufVerificationResult {
         self.root_version
     }
 
+    /// Root metadata authenticated by the adapter.
+    #[must_use]
+    pub const fn root(&self) -> Option<&TufRootMetadata> {
+        self.root.as_ref()
+    }
+
+    /// Earliest metadata expiry in the authenticated role chain.
+    #[must_use]
+    pub const fn expires_at(&self) -> Option<u64> {
+        self.expires_at
+    }
+
     /// Target info if found.
     #[must_use]
     pub fn target(&self) -> Option<&TufTargetInfo> {
@@ -673,6 +759,8 @@ impl TufVerificationResult {
 pub struct SigstoreVerificationResult {
     /// Whether the signature is valid.
     verified: bool,
+    /// Digest of the exact artifact whose signature was checked.
+    artifact_hash: Option<String>,
     /// OIDC identity from certificate.
     identity: Option<String>,
     /// OIDC issuer from certificate.
@@ -686,6 +774,12 @@ impl SigstoreVerificationResult {
     #[must_use]
     pub const fn verified(&self) -> bool {
         self.verified
+    }
+
+    /// Digest of the exact artifact whose signature was checked.
+    #[must_use]
+    pub fn artifact_hash(&self) -> Option<&str> {
+        self.artifact_hash.as_deref()
     }
 
     /// OIDC identity from certificate.
@@ -1151,6 +1245,21 @@ impl LocalTufVerifier {
         Ok(TufVerificationResult {
             verified: true,
             root_version: root.signed.version,
+            root: Some(TufRootMetadata {
+                version: root.signed.version,
+                root_hash: actual_root_hash,
+                expires: unix_expiry(&root.signed.expires)?,
+                key_ids: root_role.keyids.clone(),
+                threshold: root_role.threshold,
+            }),
+            expires_at: [
+                unix_expiry(&root.signed.expires)?,
+                unix_expiry(&timestamp.signed.expires)?,
+                unix_expiry(&snapshot.signed.expires)?,
+                unix_expiry(&targets.signed.expires)?,
+            ]
+            .into_iter()
+            .min(),
             target: Some(TufTargetInfo {
                 target_path: target_path.to_string(),
                 hash: expected_hash,
@@ -1291,12 +1400,35 @@ impl CosignBlobVerifier {
         if !self.require_transparency_log {
             command.arg("--insecure-ignore-tlog=true");
         }
-        command.arg(artifact_path);
-
-        let output = command.output().map_err(|source| {
+        // Verify the exact bytes whose digest was checked above. Reopening the
+        // artifact path in cosign would allow a replacement between hashing
+        // and signature verification to bless the wrong artifact digest.
+        command
+            .arg("-")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().map_err(|source| {
             SupplyChainVerificationError::Network(format!(
                 "failed to execute `{}` verify-blob: {source}",
                 self.cosign_binary.display()
+            ))
+        })?;
+        let stdin = child.stdin.take();
+        let (output, written) = std::thread::scope(|scope| {
+            // Drain output while the input pipe is written so a verifier that
+            // rejects early cannot deadlock against a full stdout/stderr pipe.
+            let writer = scope.spawn(move || {
+                let mut stdin =
+                    stdin.ok_or_else(|| std::io::Error::other("cosign input pipe unavailable"))?;
+                stdin.write_all(&artifact)
+            });
+            let output = child.wait_with_output();
+            (output, writer.join())
+        });
+        let output = output.map_err(|source| {
+            SupplyChainVerificationError::Network(format!(
+                "failed to wait for cosign verify-blob: {source}"
             ))
         })?;
         if !output.status.success() {
@@ -1307,9 +1439,21 @@ impl CosignBlobVerifier {
                 String::from_utf8_lossy(&output.stderr).trim()
             )));
         }
+        written
+            .map_err(|_| {
+                SupplyChainVerificationError::Network(
+                    "cosign artifact input writer failed".to_string(),
+                )
+            })?
+            .map_err(|source| {
+                SupplyChainVerificationError::Network(format!(
+                    "failed to supply verified artifact bytes to cosign: {source}"
+                ))
+            })?;
 
         Ok(SigstoreVerificationResult {
             verified: true,
+            artifact_hash: Some(actual_hash),
             identity: declared_identity,
             issuer: declared_issuer,
             rekor_log_index: None,
@@ -1831,6 +1975,8 @@ impl TufVerifier for MockTufVerifier {
             Ok(TufVerificationResult {
                 verified: true,
                 root_version: self.root.version,
+                root: Some(self.root.clone()),
+                expires_at: Some(self.root.expires),
                 target: Some(target.clone()),
             })
         } else {
@@ -1881,10 +2027,12 @@ impl MockSigstoreVerifier {
         issuer: Option<String>,
         rekor_log_index: Option<u64>,
     ) {
+        let bound_hash = normalize_sha256(&artifact_hash);
         self.add_valid_bundle(
             artifact_hash,
             SigstoreVerificationResult {
                 verified: true,
+                artifact_hash: Some(bound_hash),
                 identity,
                 issuer,
                 rekor_log_index,
@@ -1942,6 +2090,30 @@ impl SigstoreVerifier for MockSigstoreVerifier {
 }
 
 impl VerifiedConnectorBundle {
+    /// The manifest that passed signature and policy verification.
+    #[must_use]
+    pub const fn manifest(&self) -> &ConnectorManifest {
+        &self.manifest
+    }
+
+    /// Digest of the exact admitted manifest bytes, including signatures.
+    #[must_use]
+    pub fn manifest_hash(&self) -> &str {
+        &self.manifest_hash
+    }
+
+    /// Digest of the admitted executable or module bytes.
+    #[must_use]
+    pub fn binary_hash(&self) -> &str {
+        &self.binary_hash
+    }
+
+    /// Execution target admitted for this bundle.
+    #[must_use]
+    pub const fn target(&self) -> &ConnectorTarget {
+        &self.target
+    }
+
     /// Build a verification report stamped with the current wall-clock time.
     ///
     /// # Panics
@@ -2006,6 +2178,7 @@ pub struct ReconstructedConnectorBinary {
 pub struct RegistryVerifier {
     trust_policy: RegistryTrustPolicy,
     supply_chain_config: SupplyChainVerificationConfig,
+    authority: Arc<()>,
 }
 
 #[derive(Debug)]
@@ -2033,9 +2206,10 @@ struct RegistryVerificationSummary {
 
 impl RegistryVerifier {
     #[must_use]
-    pub const fn new(trust_policy: RegistryTrustPolicy) -> Self {
+    pub fn new(trust_policy: RegistryTrustPolicy) -> Self {
         Self {
             trust_policy,
+            authority: Arc::new(()),
             supply_chain_config: SupplyChainVerificationConfig {
                 tuf_pinned_root: None,
                 trusted_sigstore_identities: Vec::new(),
@@ -2057,6 +2231,9 @@ impl RegistryVerifier {
         supply_chain_config: SupplyChainVerificationConfig,
     ) -> Self {
         self.supply_chain_config = supply_chain_config;
+        // A clone with tightened policy must not accept evidence minted before
+        // that change. Unchanged verifier clones intentionally share authority.
+        self.authority = Arc::new(());
         self
     }
 
@@ -2139,7 +2316,53 @@ impl RegistryVerifier {
             manifest_hash,
             binary_hash,
             target: bundle.target.clone(),
+            authority: Arc::clone(&self.authority),
+            zone_id: zone_policy.map(|policy| policy.zone_id.clone()),
         })
+    }
+
+    fn require_verified_bundle(
+        &self,
+        verified: &VerifiedConnectorBundle,
+        bundle: &ConnectorBundle,
+        zone_id: &ZoneId,
+    ) -> Result<(), RegistryError> {
+        if !Arc::ptr_eq(&self.authority, &verified.authority) {
+            return Err(RegistryError::VerificationAuthorityMismatch);
+        }
+        if let Some(admitted_zone) = verified.zone_id.as_ref()
+            && admitted_zone != zone_id
+        {
+            return Err(RegistryError::VerifiedBundleMismatch {
+                field: "zone",
+                expected: admitted_zone.to_string(),
+                actual: zone_id.to_string(),
+            });
+        }
+        if verified.target != bundle.target {
+            return Err(RegistryError::VerifiedBundleMismatch {
+                field: "target",
+                expected: verified.target.as_string(),
+                actual: bundle.target.as_string(),
+            });
+        }
+        let actual_manifest_hash = hash_bytes(bundle.manifest_toml.as_bytes());
+        if actual_manifest_hash != verified.manifest_hash {
+            return Err(RegistryError::VerifiedBundleMismatch {
+                field: "manifest",
+                expected: verified.manifest_hash.clone(),
+                actual: actual_manifest_hash,
+            });
+        }
+        let actual_binary_hash = hash_bytes(&bundle.binary);
+        if actual_binary_hash != verified.binary_hash {
+            return Err(RegistryError::VerifiedBundleMismatch {
+                field: "binary",
+                expected: verified.binary_hash.clone(),
+                actual: actual_binary_hash,
+            });
+        }
+        Ok(())
     }
 
     /// Mirror a verified bundle into the object store as pinned objects.
@@ -2157,6 +2380,7 @@ impl RegistryVerifier {
         object_id_key: &ObjectIdKey,
         store: &dyn ObjectStore,
     ) -> Result<MirrorResult, RegistryError> {
+        self.require_verified_bundle(verified, bundle, &zone_id)?;
         let manifest_obj = ConnectorManifestObject {
             manifest_toml: bundle.manifest_toml.clone(),
             manifest_hash: verified.manifest_hash.clone(),
@@ -2223,27 +2447,10 @@ impl RegistryVerifier {
             },
         };
 
-        // `mirror_bundle` is the install-side idempotency hinge: callers
-        // re-run install/verify/mirror on the same bundle (e.g. retries,
-        // re-bootstraps, the
-        // `metamorphic_install_verify_reinstall_round_trip_is_observationally_idempotent`
-        // invariant) and expect observationally identical state. Object
-        // IDs are blake3-256 over `(header, body)`, so an `AlreadyExists`
-        // for the derived ID is a *guarantee* that the existing record
-        // is byte-identical to ours: the only way to land at the same
-        // ObjectId is if the canonical `(header, body)` matched, which
-        // requires the same manifest_toml/binary/target/zone/provenance
-        // tuple. Treating `AlreadyExists` as success is therefore safe
-        // and is what makes re-mirroring genuinely idempotent at the
-        // ObjectStore boundary; any other store error still propagates.
-        match store.put(manifest_record).await {
-            Ok(()) | Err(ObjectStoreError::AlreadyExists(_)) => {}
-            Err(err) => return Err(err.into()),
-        }
-        match store.put(binary_record).await {
-            Ok(()) | Err(ObjectStoreError::AlreadyExists(_)) => {}
-            Err(err) => return Err(err.into()),
-        }
+        // Object stores may enforce structure without holding the zone's ID
+        // key. An AlreadyExists result alone does not authenticate its bytes.
+        put_pinned_mirror_object(store, manifest_record, object_id_key).await?;
+        put_pinned_mirror_object(store, binary_record, object_id_key).await?;
 
         Ok(MirrorResult {
             manifest_object_id,
@@ -2277,6 +2484,12 @@ impl RegistryVerifier {
         config: &RaptorQConfig,
         source_node: Option<u64>,
     ) -> Result<SymbolMirrorResult, RegistryError> {
+        self.require_verified_bundle(verified, bundle, &zone_id)?;
+        // Authenticate the retained pair before publishing any symbols. A
+        // caller-provided object ID must never retarget verified bytes to an
+        // unrelated object, connector, or zone.
+        let retained = load_mirrored_bundle(mirror, &zone_id, object_id_key, store).await?;
+        self.require_verified_bundle(verified, &retained, &zone_id)?;
         let binary_obj = ConnectorBinaryObject {
             target: verified.target.clone(),
             binary_hash: verified.binary_hash.clone(),
@@ -2351,7 +2564,7 @@ impl RegistryVerifier {
                 retention: RetentionClass::Pinned,
             },
         };
-        store.put(descriptor_record).await?;
+        put_pinned_mirror_object(store, descriptor_record, object_id_key).await?;
 
         Ok(SymbolMirrorResult {
             descriptor_object_id,
@@ -2362,6 +2575,46 @@ impl RegistryVerifier {
             source_symbols,
             total_symbols,
         })
+    }
+
+    /// Load an exact retained manifest/executable pair and re-run current trust
+    /// and supply-chain policy before offline activation or rollback planning.
+    ///
+    /// This authenticates both keyed object IDs, zone, schema, pair references,
+    /// and content hashes. Retention is not a substitute for fresh verification:
+    /// missing current attestations, changed trust roots, an incompatible target,
+    /// or stricter zone policy still deny the load. The returned evidence is
+    /// usable by this verifier and its unchanged clones.
+    /// Required adapter evidence is supplied by the caller; this method checks
+    /// its artifact/root bindings, freshness, and configured policy without
+    /// fetching new remote metadata or attestations.
+    ///
+    /// # Errors
+    /// Returns [`RegistryError`] if retained objects are missing, altered, bound
+    /// to another zone or pair, or fail the current verification policy.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn load_verified_mirror(
+        &self,
+        mirror: &MirrorResult,
+        zone_id: &ZoneId,
+        object_id_key: &ObjectIdKey,
+        store: &dyn ObjectStore,
+        zone_policy: Option<&ZonePolicyObject>,
+        supply_chain: Option<&SupplyChainEvidence>,
+        expected_target: Option<&ConnectorTarget>,
+    ) -> Result<(ConnectorBundle, VerifiedConnectorBundle), RegistryError> {
+        if let Some(policy) = zone_policy
+            && (&policy.zone_id != zone_id || &policy.header.zone_id != zone_id)
+        {
+            return Err(RegistryError::VerifiedBundleMismatch {
+                field: "zone policy",
+                expected: zone_id.to_string(),
+                actual: policy.zone_id.to_string(),
+            });
+        }
+        let bundle = load_mirrored_bundle(mirror, zone_id, object_id_key, store).await?;
+        let verified = self.verify_bundle(&bundle, zone_policy, supply_chain, expected_target)?;
+        Ok((bundle, verified))
     }
 
     /// Load a previously mirrored binary symbol descriptor from the object store.
@@ -2523,6 +2776,140 @@ impl RegistryVerifier {
             target: reconstructed.target,
         })
     }
+}
+
+fn authenticate_mirror_object(
+    object: &StoredObject,
+    expected_id: &ObjectId,
+    zone_id: &ZoneId,
+    object_id_key: &ObjectIdKey,
+) -> Result<(), RegistryError> {
+    let invalid = |reason| RegistryError::MirrorObjectInvalid {
+        object_id: *expected_id,
+        reason,
+    };
+    if object.object_id != *expected_id {
+        return Err(invalid("store returned a different object ID"));
+    }
+    if &object.header.zone_id != zone_id {
+        return Err(invalid("object belongs to a different zone"));
+    }
+    if StoredObject::derive_id(&object.header, &object.body, object_id_key)? != *expected_id {
+        return Err(invalid("header or body does not match its keyed object ID"));
+    }
+    Ok(())
+}
+
+async fn put_pinned_mirror_object(
+    store: &dyn ObjectStore,
+    object: StoredObject,
+    object_id_key: &ObjectIdKey,
+) -> Result<(), RegistryError> {
+    let expected_id = object.object_id;
+    let zone_id = object.header.zone_id.clone();
+    match store.put(object).await {
+        Ok(()) => Ok(()),
+        Err(ObjectStoreError::AlreadyExists(found_id)) => {
+            if found_id != expected_id {
+                return Err(RegistryError::MirrorObjectInvalid {
+                    object_id: expected_id,
+                    reason: "store reported a collision for a different object ID",
+                });
+            }
+            let existing = store.get(&expected_id).await?;
+            authenticate_mirror_object(&existing, &expected_id, &zone_id, object_id_key)?;
+            if existing.storage.retention != RetentionClass::Pinned {
+                store
+                    .set_retention(&expected_id, RetentionClass::Pinned)
+                    .await?;
+            }
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn load_mirrored_bundle(
+    mirror: &MirrorResult,
+    zone_id: &ZoneId,
+    object_id_key: &ObjectIdKey,
+    store: &dyn ObjectStore,
+) -> Result<ConnectorBundle, RegistryError> {
+    let manifest_record = store.get(&mirror.manifest_object_id).await?;
+    let binary_record = store.get(&mirror.binary_object_id).await?;
+    authenticate_mirror_object(
+        &manifest_record,
+        &mirror.manifest_object_id,
+        zone_id,
+        object_id_key,
+    )?;
+    authenticate_mirror_object(
+        &binary_record,
+        &mirror.binary_object_id,
+        zone_id,
+        object_id_key,
+    )?;
+    let invalid_manifest = |reason| RegistryError::MirrorObjectInvalid {
+        object_id: mirror.manifest_object_id,
+        reason,
+    };
+    let invalid_binary = |reason| RegistryError::MirrorObjectInvalid {
+        object_id: mirror.binary_object_id,
+        reason,
+    };
+    let manifest_schema = ConnectorManifestObject::schema();
+    let binary_schema = ConnectorBinaryObject::schema();
+    if manifest_record.header.schema != manifest_schema {
+        return Err(invalid_manifest("unexpected manifest object schema"));
+    }
+    if binary_record.header.schema != binary_schema {
+        return Err(invalid_binary("unexpected binary object schema"));
+    }
+    if !manifest_record.header.refs.is_empty() || !manifest_record.header.foreign_refs.is_empty() {
+        return Err(invalid_manifest("unexpected manifest object references"));
+    }
+    if binary_record.header.refs.as_slice() != [mirror.manifest_object_id]
+        || !binary_record.header.foreign_refs.is_empty()
+    {
+        return Err(invalid_binary(
+            "binary is not bound to the retained manifest",
+        ));
+    }
+    if manifest_record.storage.retention != RetentionClass::Pinned {
+        return Err(invalid_manifest(
+            "manifest is not retained as a pinned artifact",
+        ));
+    }
+    if binary_record.storage.retention != RetentionClass::Pinned {
+        return Err(invalid_binary(
+            "binary is not retained as a pinned artifact",
+        ));
+    }
+    let manifest: ConnectorManifestObject =
+        CanonicalSerializer::deserialize(&manifest_record.body, &manifest_schema)?;
+    let binary: ConnectorBinaryObject =
+        CanonicalSerializer::deserialize(&binary_record.body, &binary_schema)?;
+    let actual_manifest_hash = hash_bytes(manifest.manifest_toml.as_bytes());
+    if manifest.manifest_hash != mirror.manifest_hash
+        || actual_manifest_hash != mirror.manifest_hash
+    {
+        return Err(RegistryError::ReconstructedManifestHashMismatch {
+            expected: mirror.manifest_hash.clone(),
+            actual: actual_manifest_hash,
+        });
+    }
+    let actual_binary_hash = hash_bytes(&binary.binary);
+    if binary.binary_hash != mirror.binary_hash || actual_binary_hash != mirror.binary_hash {
+        return Err(RegistryError::ReconstructedBinaryHashMismatch {
+            expected: mirror.binary_hash.clone(),
+            actual: actual_binary_hash,
+        });
+    }
+    Ok(ConnectorBundle {
+        manifest_toml: manifest.manifest_toml,
+        binary: binary.binary,
+        target: binary.target,
+    })
 }
 
 /// Compute canonical signing bytes for a manifest (excludes signatures section).
@@ -2971,6 +3358,41 @@ fn enforce_supply_chain_verification_config(
                 bundle: binary_hash.to_string(),
             });
         }
+        let root = evidence.tuf_root().ok_or(RegistryError::TufRootUnbound)?;
+        let expires_at = evidence
+            .tuf_expires_at()
+            .ok_or(RegistryError::TufFreshnessUnbound)?
+            .min(root.expires);
+        let now = u64::try_from(Utc::now().timestamp()).expect("system clock before year 2262");
+        if expires_at <= now {
+            return Err(RegistryError::TufEvidenceExpired { expires_at });
+        }
+        if let Some(pinned) = config.tuf_pinned_root.as_ref() {
+            if pinned.expires <= now {
+                return Err(RegistryError::TufEvidenceExpired {
+                    expires_at: pinned.expires,
+                });
+            }
+            if !normalize_sha256(&root.root_hash)
+                .eq_ignore_ascii_case(&normalize_sha256(&pinned.root_hash))
+            {
+                return Err(RegistryError::TufRootBindingMismatch {
+                    reason: "root digest changed",
+                });
+            }
+            if root.version < pinned.version {
+                return Err(RegistryError::TufRootBindingMismatch {
+                    reason: "root version is older than the current pin",
+                });
+            }
+            if root.threshold != pinned.threshold
+                || !pinned.key_ids.iter().all(|key| root.key_ids.contains(key))
+            {
+                return Err(RegistryError::TufRootBindingMismatch {
+                    reason: "root signing threshold or pinned keys changed",
+                });
+            }
+        }
     }
 
     if config.sigstore_verification_required() {
@@ -2981,6 +3403,15 @@ fn enforce_supply_chain_verification_config(
         let evidence = evidence.ok_or(RegistryError::SigstoreVerificationRequired)?;
         if !evidence.sigstore_verified() {
             return Err(RegistryError::SigstoreVerificationRequired);
+        }
+        let attested = evidence
+            .sigstore_artifact_hash()
+            .ok_or(RegistryError::SigstoreArtifactUnbound)?;
+        if !attested.eq_ignore_ascii_case(binary_hash) {
+            return Err(RegistryError::SigstoreArtifactBindingMismatch {
+                attested: attested.to_string(),
+                bundle: binary_hash.to_string(),
+            });
         }
         // Configuring trusted identities/issuers previously only flipped
         // `sigstore_verification_required()` on; the allowlists themselves
@@ -4170,6 +4601,9 @@ sig = "{sig}"
                     transparency_log_present: false,
                     tuf_verified: false,
                     tuf_target_hash: None,
+                    tuf_root: None,
+                    tuf_expires_at: None,
+                    sigstore_artifact_hash: None,
                     sigstore_verified: false,
                     sigstore_identity: None,
                     sigstore_issuer: None,
@@ -4225,6 +4659,9 @@ sig = "{sig}"
                     transparency_log_present: false,
                     tuf_verified: false,
                     tuf_target_hash: None,
+                    tuf_root: None,
+                    tuf_expires_at: None,
+                    sigstore_artifact_hash: None,
                     sigstore_verified: false,
                     sigstore_identity: None,
                     sigstore_issuer: None,
@@ -4277,6 +4714,9 @@ sig = "{sig}"
                     transparency_log_present: false,
                     tuf_verified: false,
                     tuf_target_hash: None,
+                    tuf_root: None,
+                    tuf_expires_at: None,
+                    sigstore_artifact_hash: None,
                     sigstore_verified: false,
                     sigstore_identity: None,
                     sigstore_issuer: None,
@@ -4730,6 +5170,8 @@ sig = "{sig}"
         let unbound = TufVerificationResult {
             verified: true,
             root_version: 1,
+            root: None,
+            expires_at: None,
             target: None,
         };
         let unbound_evidence = SupplyChainEvidence::new().with_tuf_verification_result(&unbound);
@@ -4760,6 +5202,190 @@ sig = "{sig}"
         );
     }
 
+    #[test]
+    fn offline_mirror_requires_current_tuf_root_and_fresh_role_chain() {
+        run_registry_test(
+            "offline_mirror_requires_current_tuf_root_and_fresh_role_chain",
+            "verify",
+            "offline-tuf-binding",
+            10,
+            || async {
+                let dir = tempfile::tempdir().expect("TUF metadata directory");
+                let signer = Ed25519SigningKey::generate();
+                let binary = b"retained-connector-binary".to_vec();
+                let target_path = "connectors/retained";
+                let root = write_test_tuf_metadata(dir.path(), target_path, &binary, &signer);
+                // The short-lived timestamp, not just the root, bounds how
+                // long cached adapter evidence remains usable.
+                let timestamp_path = dir.path().join("timestamp.json");
+                let mut timestamp: serde_json::Value = serde_json::from_slice(
+                    &std::fs::read(&timestamp_path).expect("timestamp metadata"),
+                )
+                .expect("timestamp JSON");
+                let timestamp_expiry = (Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+                timestamp["signed"]["expires"] = json!(timestamp_expiry);
+                resign_test_tuf_role(&mut timestamp, &signer);
+                std::fs::write(&timestamp_path, serde_json::to_vec(&timestamp).unwrap()).unwrap();
+                let tuf_result = LocalTufVerifier::new(dir.path())
+                    .verify_target_bytes(&root, target_path, &binary)
+                    .expect("real TUF role-chain verification");
+                assert_eq!(tuf_result.root().unwrap().root_hash, root.root_hash);
+                assert_eq!(
+                    tuf_result.expires_at(),
+                    Some(unix_expiry(&timestamp_expiry).unwrap())
+                );
+                assert!(tuf_result.expires_at().unwrap() < root.expires);
+                let evidence = SupplyChainEvidence::new().with_tuf_verification_result(&tuf_result);
+
+                let unsigned = unsigned_manifest_toml("");
+                let signature = sign_manifest_toml(&unsigned, &signer, &hash_bytes(&binary));
+                let bundle = ConnectorBundle {
+                    manifest_toml: with_signatures(
+                        &unsigned,
+                        &publisher_signature_section("pub1", &signature),
+                    ),
+                    binary,
+                    target: test_target(),
+                };
+                let mut trust = RegistryTrustPolicy::default();
+                trust
+                    .publisher_keys
+                    .insert("pub1".to_string(), signer.verifying_key());
+                let verifier = RegistryVerifier::new(trust.clone())
+                    .with_supply_chain_verification_config(SupplyChainVerificationConfig {
+                        tuf_pinned_root: Some(root.clone()),
+                        ..SupplyChainVerificationConfig::default()
+                    });
+                let verified = verifier
+                    .verify_bundle(&bundle, None, Some(&evidence), None)
+                    .expect("admit");
+                let zone = ZoneId::work();
+                let key = ObjectIdKey::from_bytes([38; 32]);
+                let store = MemoryObjectStore::new(MemoryObjectStoreConfig::default());
+                let mirror = verifier
+                    .mirror_bundle(&verified, &bundle, zone.clone(), &key, &store)
+                    .await
+                    .expect("retain");
+                verifier
+                    .load_verified_mirror(&mirror, &zone, &key, &store, None, Some(&evidence), None)
+                    .await
+                    .expect("valid offline evidence");
+
+                for field in ["hash", "version", "keys", "threshold"] {
+                    let mut changed = root.clone();
+                    match field {
+                        "hash" => changed.root_hash = hash_bytes(b"another root"),
+                        "version" => changed.version += 1,
+                        "keys" => changed.key_ids = vec!["new-root-key".to_string()],
+                        "threshold" => changed.threshold += 1,
+                        _ => unreachable!(),
+                    }
+                    let current = RegistryVerifier::new(trust.clone())
+                        .with_supply_chain_verification_config(SupplyChainVerificationConfig {
+                            tuf_pinned_root: Some(changed),
+                            ..SupplyChainVerificationConfig::default()
+                        });
+                    assert!(
+                        matches!(
+                            current
+                                .load_verified_mirror(
+                                    &mirror,
+                                    &zone,
+                                    &key,
+                                    &store,
+                                    None,
+                                    Some(&evidence),
+                                    None
+                                )
+                                .await,
+                            Err(RegistryError::TufRootBindingMismatch { .. })
+                        ),
+                        "old proof crossed a changed root {field}"
+                    );
+                }
+                let mut expired = evidence.clone();
+                expired.tuf_expires_at = Some(0);
+                assert!(matches!(
+                    verifier
+                        .load_verified_mirror(
+                            &mirror,
+                            &zone,
+                            &key,
+                            &store,
+                            None,
+                            Some(&expired),
+                            None
+                        )
+                        .await,
+                    Err(RegistryError::TufEvidenceExpired { expires_at: 0 })
+                ));
+                let mut unbound = evidence.clone();
+                unbound.tuf_root = None;
+                assert!(matches!(
+                    verifier.verify_bundle(&bundle, None, Some(&unbound), None),
+                    Err(RegistryError::TufRootUnbound)
+                ));
+                let mut no_deadline = evidence;
+                no_deadline.tuf_expires_at = None;
+                assert!(matches!(
+                    verifier.verify_bundle(&bundle, None, Some(&no_deadline), None),
+                    Err(RegistryError::TufFreshnessUnbound)
+                ));
+                assert_eq!(store.list_zone(&zone).await.len(), 2);
+                RegistryLogData {
+                    reason_code: Some("offline_tuf_binding_enforced".to_string()),
+                    ..RegistryLogData::default()
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn sigstore_evidence_cannot_verify_a_different_artifact() {
+        let manifest = ConnectorManifest::parse_str(&unsigned_manifest_toml("")).unwrap();
+        let first_hash = hash_bytes(b"first signed artifact");
+        let second_hash = hash_bytes(b"different signed artifact");
+        let config = SupplyChainVerificationConfig {
+            require_sigstore: true,
+            trusted_sigstore_identities: vec!["trusted-builder".to_string()],
+            ..SupplyChainVerificationConfig::default()
+        };
+        let result = SigstoreVerificationResult {
+            verified: true,
+            artifact_hash: Some(first_hash.clone()),
+            identity: Some("trusted-builder".to_string()),
+            issuer: None,
+            rekor_log_index: None,
+        };
+        let evidence = SupplyChainEvidence::new().with_sigstore_verification_result(&result);
+        assert_eq!(evidence.sigstore_artifact_hash(), Some(first_hash.as_str()));
+        enforce_supply_chain_verification_config(&config, &manifest, Some(&evidence), &first_hash)
+            .expect("same artifact");
+        assert!(matches!(
+            enforce_supply_chain_verification_config(
+                &config,
+                &manifest,
+                Some(&evidence),
+                &second_hash
+            ),
+            Err(RegistryError::SigstoreArtifactBindingMismatch { .. })
+        ));
+        let unbound_result = SigstoreVerificationResult {
+            artifact_hash: None,
+            ..result
+        };
+        let unbound = SupplyChainEvidence::new().with_sigstore_verification_result(&unbound_result);
+        assert!(matches!(
+            enforce_supply_chain_verification_config(
+                &config,
+                &manifest,
+                Some(&unbound),
+                &first_hash
+            ),
+            Err(RegistryError::SigstoreArtifactUnbound)
+        ));
+    }
+
     /// Regression for br-pcmm8 (sigstore side).
     #[test]
     fn verify_bundle_rejects_unverified_sigstore_evidence() {
@@ -4785,7 +5411,7 @@ sig = "{sig}"
         );
 
         let verified_evidence =
-            SupplyChainEvidence::new().mark_sigstore_verified_for_tests(None, None);
+            SupplyChainEvidence::new().mark_sigstore_verified_for_tests(&binary_hash, None, None);
         enforce_supply_chain_verification_config(
             &config,
             &manifest,
@@ -4811,7 +5437,8 @@ sig = "{sig}"
         let manifest = ConnectorManifest::parse_str(&unsigned_manifest_toml("")).unwrap();
         let binary_hash = hash_bytes(b"registry-binary");
 
-        let unbound = SupplyChainEvidence::new().mark_sigstore_verified_for_tests(None, None);
+        let unbound =
+            SupplyChainEvidence::new().mark_sigstore_verified_for_tests(&binary_hash, None, None);
         let err = enforce_supply_chain_verification_config(
             &config,
             &manifest,
@@ -4825,6 +5452,7 @@ sig = "{sig}"
         );
 
         let wrong_identity = SupplyChainEvidence::new().mark_sigstore_verified_for_tests(
+            &binary_hash,
             Some("attacker-identity"),
             Some("https://token.actions.githubusercontent.com"),
         );
@@ -4840,8 +5468,11 @@ sig = "{sig}"
             "expected SigstoreIdentityUntrusted, got {err:?}"
         );
 
-        let wrong_issuer = SupplyChainEvidence::new()
-            .mark_sigstore_verified_for_tests(Some("github-actions"), Some("https://evil.example"));
+        let wrong_issuer = SupplyChainEvidence::new().mark_sigstore_verified_for_tests(
+            &binary_hash,
+            Some("github-actions"),
+            Some("https://evil.example"),
+        );
         let err = enforce_supply_chain_verification_config(
             &config,
             &manifest,
@@ -4855,6 +5486,7 @@ sig = "{sig}"
         );
 
         let trusted = SupplyChainEvidence::new().mark_sigstore_verified_for_tests(
+            &binary_hash,
             Some("github-actions"),
             Some("https://token.actions.githubusercontent.com"),
         );
@@ -5041,11 +5673,15 @@ sig = "{sig}"
         let failed = TufVerificationResult {
             verified: false,
             root_version: 1,
+            root: None,
+            expires_at: None,
             target: None,
         };
         let ok = TufVerificationResult {
             verified: true,
             root_version: 1,
+            root: None,
+            expires_at: None,
             target: None,
         };
 
@@ -5067,12 +5703,14 @@ sig = "{sig}"
     fn supply_chain_evidence_refuses_failed_sigstore_verification_result() {
         let failed = SigstoreVerificationResult {
             verified: false,
+            artifact_hash: None,
             identity: None,
             issuer: None,
             rekor_log_index: None,
         };
         let ok = SigstoreVerificationResult {
             verified: true,
+            artifact_hash: Some(hash_bytes(b"verified sigstore artifact")),
             identity: Some("gha".into()),
             issuer: Some("https://token.actions.githubusercontent.com".into()),
             rekor_log_index: Some(42),
@@ -5225,6 +5863,9 @@ require_attestation_types = ["in-toto"]
                     transparency_log_present: false,
                     tuf_verified: false,
                     tuf_target_hash: None,
+                    tuf_root: None,
+                    tuf_expires_at: None,
+                    sigstore_artifact_hash: None,
                     sigstore_verified: false,
                     sigstore_identity: None,
                     sigstore_issuer: None,
@@ -5289,6 +5930,9 @@ min_slsa_level = 3
                     transparency_log_present: false,
                     tuf_verified: false,
                     tuf_target_hash: None,
+                    tuf_root: None,
+                    tuf_expires_at: None,
+                    sigstore_artifact_hash: None,
                     sigstore_verified: false,
                     sigstore_identity: None,
                     sigstore_issuer: None,
@@ -5353,6 +5997,9 @@ trusted_builders = ["trusted-builder"]
                     transparency_log_present: false,
                     tuf_verified: false,
                     tuf_target_hash: None,
+                    tuf_root: None,
+                    tuf_expires_at: None,
+                    sigstore_artifact_hash: None,
                     sigstore_verified: false,
                     sigstore_identity: None,
                     sigstore_issuer: None,
@@ -6011,6 +6658,9 @@ trusted_builders = ["trusted-builder"]
                     transparency_log_present: false,
                     tuf_verified: false,
                     tuf_target_hash: None,
+                    tuf_root: None,
+                    tuf_expires_at: None,
+                    sigstore_artifact_hash: None,
                     sigstore_verified: false,
                     sigstore_identity: None,
                     sigstore_issuer: None,
@@ -6085,6 +6735,9 @@ sig = "{}"
                     transparency_log_present: true,
                     tuf_verified: false,
                     tuf_target_hash: None,
+                    tuf_root: None,
+                    tuf_expires_at: None,
+                    sigstore_artifact_hash: None,
                     sigstore_verified: false,
                     sigstore_identity: None,
                     sigstore_issuer: None,
@@ -6255,6 +6908,9 @@ require_attestation_types = ["in-toto", "code-review"]
                     transparency_log_present: false,
                     tuf_verified: false,
                     tuf_target_hash: None,
+                    tuf_root: None,
+                    tuf_expires_at: None,
+                    sigstore_artifact_hash: None,
                     sigstore_verified: false,
                     sigstore_identity: None,
                     sigstore_issuer: None,
@@ -7132,6 +7788,7 @@ sig = "base64:{sig_b64}"
                 let verifier = MockSigstoreVerifier::new();
                 let result = SigstoreVerificationResult {
                     verified: true,
+                    artifact_hash: Some("sha256:artifact".to_string()),
                     identity: Some("github-actions".to_string()),
                     issuer: Some("https://token.actions.githubusercontent.com".to_string()),
                     rekor_log_index: Some(54321),
@@ -7179,6 +7836,7 @@ sig = "base64:{sig_b64}"
                 let verifier = MockSigstoreVerifier::new();
                 let result = SigstoreVerificationResult {
                     verified: true,
+                    artifact_hash: Some("sha256:artifact".to_string()),
                     identity: Some("untrusted-ci".to_string()),
                     issuer: Some("https://example.com".to_string()),
                     rekor_log_index: Some(54321),
@@ -7226,6 +7884,7 @@ sig = "base64:{sig_b64}"
                 let verifier = MockSigstoreVerifier::new();
                 let result = SigstoreVerificationResult {
                     verified: true,
+                    artifact_hash: Some("sha256:artifact".to_string()),
                     identity: Some("github-actions".to_string()),
                     issuer: Some("https://untrusted-issuer.com".to_string()),
                     rekor_log_index: Some(54321),
@@ -7884,6 +8543,9 @@ sig = "base64:{sig_b64}"
                     transparency_log_present: false,
                     tuf_verified: false,
                     tuf_target_hash: None,
+                    tuf_root: None,
+                    tuf_expires_at: None,
+                    sigstore_artifact_hash: None,
                     sigstore_verified: false,
                     sigstore_identity: None,
                     sigstore_issuer: None,
@@ -7923,6 +8585,9 @@ sig = "base64:{sig_b64}"
                     transparency_log_present: false,
                     tuf_verified: false,
                     tuf_target_hash: None,
+                    tuf_root: None,
+                    tuf_expires_at: None,
+                    sigstore_artifact_hash: None,
                     sigstore_verified: false,
                     sigstore_identity: None,
                     sigstore_issuer: None,
@@ -7970,6 +8635,9 @@ sig = "base64:{sig_b64}"
                     transparency_log_present: false,
                     tuf_verified: false,
                     tuf_target_hash: None,
+                    tuf_root: None,
+                    tuf_expires_at: None,
+                    sigstore_artifact_hash: None,
                     sigstore_verified: false,
                     sigstore_identity: None,
                     sigstore_issuer: None,
@@ -8901,6 +9569,8 @@ sig = "{reg_sig}"
                 let result = TufVerificationResult {
                     verified: true,
                     root_version: 5,
+                    root: None,
+                    expires_at: None,
                     target: Some(TufTargetInfo {
                         target_path: "p".into(),
                         hash: "h".into(),
@@ -8932,6 +9602,7 @@ sig = "{reg_sig}"
             || async {
                 let result = SigstoreVerificationResult {
                     verified: true,
+                    artifact_hash: None,
                     identity: Some("gh-actions".into()),
                     issuer: Some("https://token.actions.githubusercontent.com".into()),
                     rekor_log_index: Some(99),
@@ -9283,6 +9954,9 @@ sig = "{reg_sig}"
                     transparency_log_present: false,
                     tuf_verified: false,
                     tuf_target_hash: None,
+                    tuf_root: None,
+                    tuf_expires_at: None,
+                    sigstore_artifact_hash: None,
                     sigstore_verified: false,
                     sigstore_identity: None,
                     sigstore_issuer: None,
@@ -9337,6 +10011,9 @@ sig = "{reg_sig}"
                     transparency_log_present: false,
                     tuf_verified: false,
                     tuf_target_hash: None,
+                    tuf_root: None,
+                    tuf_expires_at: None,
+                    sigstore_artifact_hash: None,
                     sigstore_verified: false,
                     sigstore_identity: None,
                     sigstore_issuer: None,
@@ -9862,6 +10539,8 @@ sig = "{reg_sig}"
                         os: "linux".into(),
                         arch: "amd64".into(),
                     },
+                    authority: Arc::new(()),
+                    zone_id: None,
                 };
 
                 let report = verified.report("verified_ok");
@@ -9896,6 +10575,8 @@ sig = "{reg_sig}"
                         os: "linux".into(),
                         arch: "amd64".into(),
                     },
+                    authority: Arc::new(()),
+                    zone_id: None,
                 };
 
                 let pass_report = verified.report("pass");
@@ -10031,6 +10712,8 @@ sig = "{reg_sig}"
         let result = TufVerificationResult {
             verified: false,
             root_version: 1,
+            root: None,
+            expires_at: None,
             target: None,
         };
         assert!(!result.verified);
@@ -10040,6 +10723,7 @@ sig = "{reg_sig}"
     fn sigstore_verification_result_empty() {
         let result = SigstoreVerificationResult {
             verified: false,
+            artifact_hash: None,
             identity: None,
             issuer: None,
             rekor_log_index: None,
@@ -10053,6 +10737,9 @@ sig = "{reg_sig}"
             transparency_log_present: true,
             tuf_verified: false,
             tuf_target_hash: None,
+            tuf_root: None,
+            tuf_expires_at: None,
+            sigstore_artifact_hash: None,
             sigstore_verified: false,
             sigstore_identity: None,
             sigstore_issuer: None,
@@ -10499,6 +11186,7 @@ sig = "{reg_sig}"
                     "sha256:artifact".into(),
                     SigstoreVerificationResult {
                         verified: true,
+                        artifact_hash: Some("sha256:artifact".to_string()),
                         identity: Some("bad-actor".into()),
                         issuer: None,
                         rekor_log_index: None,
@@ -10540,6 +11228,7 @@ sig = "{reg_sig}"
                     "sha256:a".into(),
                     SigstoreVerificationResult {
                         verified: true,
+                        artifact_hash: Some("sha256:a".to_string()),
                         identity: None,
                         issuer: Some("https://evil.com".into()),
                         rekor_log_index: None,
@@ -10846,6 +11535,73 @@ sig = "{reg_sig}"
         );
     }
 
+    #[test]
+    fn mirror_collision_authenticates_existing_bytes_and_restores_pinning() {
+        run_registry_test(
+            "mirror_collision_authenticates_existing_bytes_and_restores_pinning",
+            "mirror",
+            "object_integrity",
+            6,
+            || async {
+                let zone = ZoneId::work();
+                let key = ObjectIdKey::from_bytes([37; 32]);
+                let manifest = ConnectorManifestObject {
+                    manifest_toml: "retained manifest bytes".to_string(),
+                    manifest_hash: hash_bytes(b"retained manifest bytes"),
+                };
+                let schema = ConnectorManifestObject::schema();
+                let body = CanonicalSerializer::serialize(&manifest, &schema).expect("body");
+                let header = ObjectHeader {
+                    encryption_kind: Default::default(),
+                    schema,
+                    zone_id: zone.clone(),
+                    created_at: 1_700_000_000,
+                    provenance: Provenance::new(zone.clone()),
+                    refs: Vec::new(),
+                    foreign_refs: Vec::new(),
+                    ttl_secs: None,
+                    placement: None,
+                };
+                let object_id = StoredObject::derive_id(&header, &body, &key).expect("id");
+                let expected = StoredObject {
+                    object_id,
+                    header,
+                    body,
+                    storage: StorageMeta {
+                        retention: RetentionClass::Pinned,
+                    },
+                };
+                for corrupt in [false, true] {
+                    let store = MemoryObjectStore::new(MemoryObjectStoreConfig::default());
+                    let mut existing = expected.clone();
+                    existing.storage.retention = RetentionClass::Ephemeral;
+                    if corrupt {
+                        // Stores without a zone-key verifier may contain an
+                        // attacker-selected ID or damaged bytes under a valid ID.
+                        existing.body.push(0);
+                    }
+                    store.put(existing.clone()).await.expect("existing object");
+                    let result = put_pinned_mirror_object(&store, expected.clone(), &key).await;
+                    if corrupt {
+                        assert!(matches!(
+                            result,
+                            Err(RegistryError::MirrorObjectInvalid { .. })
+                        ));
+                        assert_eq!(store.get(&object_id).await.expect("not replaced"), existing);
+                    } else {
+                        result.expect("authentic collision is idempotent");
+                        assert_eq!(store.get(&object_id).await.expect("pinned"), expected);
+                    }
+                    assert_eq!(store.list_zone(&zone).await, vec![object_id]);
+                }
+                RegistryLogData {
+                    reason_code: Some("mirror_collision_authenticated".to_string()),
+                    ..RegistryLogData::default()
+                }
+            },
+        );
+    }
+
     // ── mirror_bundle result consistency ─────────────────────────────
 
     #[test]
@@ -11020,6 +11776,9 @@ sig = "{}"
                     transparency_log_present: true,
                     tuf_verified: false,
                     tuf_target_hash: None,
+                    tuf_root: None,
+                    tuf_expires_at: None,
+                    sigstore_artifact_hash: None,
                     sigstore_verified: false,
                     sigstore_identity: None,
                     sigstore_issuer: None,
@@ -11092,6 +11851,9 @@ trusted_builders = ["trusted-ci"]
                     transparency_log_present: false,
                     tuf_verified: false,
                     tuf_target_hash: None,
+                    tuf_root: None,
+                    tuf_expires_at: None,
+                    sigstore_artifact_hash: None,
                     sigstore_verified: false,
                     sigstore_identity: None,
                     sigstore_issuer: None,
@@ -11530,6 +12292,9 @@ trusted_builders = ["trusted-ci"]
             transparency_log_present: true,
             tuf_verified: false,
             tuf_target_hash: None,
+            tuf_root: None,
+            tuf_expires_at: None,
+            sigstore_artifact_hash: None,
             sigstore_verified: false,
             sigstore_identity: None,
             sigstore_issuer: None,
@@ -11552,6 +12317,9 @@ trusted_builders = ["trusted-ci"]
             transparency_log_present: true,
             tuf_verified: false,
             tuf_target_hash: None,
+            tuf_root: None,
+            tuf_expires_at: None,
+            sigstore_artifact_hash: None,
             sigstore_verified: false,
             sigstore_identity: None,
             sigstore_issuer: None,
@@ -11576,6 +12344,9 @@ trusted_builders = ["trusted-ci"]
             transparency_log_present: false,
             tuf_verified: false,
             tuf_target_hash: None,
+            tuf_root: None,
+            tuf_expires_at: None,
+            sigstore_artifact_hash: None,
             sigstore_verified: false,
             sigstore_identity: None,
             sigstore_issuer: None,
@@ -11942,6 +12713,8 @@ trusted_builders = ["trusted-ci"]
         let result = TufVerificationResult {
             verified: true,
             root_version: 10,
+            root: None,
+            expires_at: None,
             target: Some(TufTargetInfo {
                 target_path: "p".to_string(),
                 hash: "h".to_string(),
@@ -11961,6 +12734,8 @@ trusted_builders = ["trusted-ci"]
         let result = TufVerificationResult {
             verified: false,
             root_version: 0,
+            root: None,
+            expires_at: None,
             target: None,
         };
         let debug = format!("{result:?}");
@@ -11974,6 +12749,7 @@ trusted_builders = ["trusted-ci"]
     fn sigstore_verification_result_clone_all_some() {
         let result = SigstoreVerificationResult {
             verified: true,
+            artifact_hash: Some("sha256:artifact".to_string()),
             identity: Some("github-actions".to_string()),
             issuer: Some("https://github.com".to_string()),
             rekor_log_index: Some(12345),
@@ -11987,6 +12763,7 @@ trusted_builders = ["trusted-ci"]
     fn sigstore_verification_result_clone_all_none() {
         let result = SigstoreVerificationResult {
             verified: false,
+            artifact_hash: None,
             identity: None,
             issuer: None,
             rekor_log_index: None,
@@ -12092,6 +12869,8 @@ trusted_builders = ["trusted-ci"]
             manifest_hash: "sha256:m".to_string(),
             binary_hash: "sha256:b".to_string(),
             target: test_target(),
+            authority: Arc::new(()),
+            zone_id: None,
         };
         let cloned = verified.clone();
         assert_eq!(verified.manifest_hash, "sha256:m");
@@ -12107,6 +12886,8 @@ trusted_builders = ["trusted-ci"]
             manifest_hash: "sha256:m".to_string(),
             binary_hash: "sha256:b".to_string(),
             target: test_target(),
+            authority: Arc::new(()),
+            zone_id: None,
         };
         let report = verified.report("");
         assert!(report.outcome.is_empty());
@@ -12120,6 +12901,8 @@ trusted_builders = ["trusted-ci"]
             manifest_hash: "sha256:m".to_string(),
             binary_hash: "sha256:b".to_string(),
             target: test_target(),
+            authority: Arc::new(()),
+            zone_id: None,
         };
         let report = verified.report("\u{2705} passed");
         assert_eq!(report.outcome, "\u{2705} passed");
@@ -12133,6 +12916,8 @@ trusted_builders = ["trusted-ci"]
             manifest_hash: "sha256:m".to_string(),
             binary_hash: "sha256:b".to_string(),
             target: test_target(),
+            authority: Arc::new(()),
+            zone_id: None,
         };
         assert!(verified.rate_limit_declarations().is_none());
     }
@@ -12754,6 +13539,9 @@ trusted_builders = ["trusted-ci"]
             transparency_log_present: false,
             tuf_verified: false,
             tuf_target_hash: None,
+            tuf_root: None,
+            tuf_expires_at: None,
+            sigstore_artifact_hash: None,
             sigstore_verified: false,
             sigstore_identity: None,
             sigstore_issuer: None,
@@ -12782,6 +13570,9 @@ trusted_builders = ["trusted-ci"]
             transparency_log_present: false,
             tuf_verified: false,
             tuf_target_hash: None,
+            tuf_root: None,
+            tuf_expires_at: None,
+            sigstore_artifact_hash: None,
             sigstore_verified: false,
             sigstore_identity: None,
             sigstore_issuer: None,
@@ -12817,6 +13608,9 @@ trusted_builders = ["trusted-ci"]
             transparency_log_present: false,
             tuf_verified: false,
             tuf_target_hash: None,
+            tuf_root: None,
+            tuf_expires_at: None,
+            sigstore_artifact_hash: None,
             sigstore_verified: false,
             sigstore_identity: None,
             sigstore_issuer: None,
@@ -12849,6 +13643,9 @@ trusted_builders = ["trusted-ci"]
             transparency_log_present: false,
             tuf_verified: false,
             tuf_target_hash: None,
+            tuf_root: None,
+            tuf_expires_at: None,
+            sigstore_artifact_hash: None,
             sigstore_verified: false,
             sigstore_identity: None,
             sigstore_issuer: None,
@@ -12876,6 +13673,9 @@ trusted_builders = ["trusted-ci"]
             transparency_log_present: false,
             tuf_verified: false,
             tuf_target_hash: None,
+            tuf_root: None,
+            tuf_expires_at: None,
+            sigstore_artifact_hash: None,
             sigstore_verified: false,
             sigstore_identity: None,
             sigstore_issuer: None,
@@ -12905,6 +13705,9 @@ trusted_builders = ["trusted-ci"]
             transparency_log_present: false,
             tuf_verified: false,
             tuf_target_hash: None,
+            tuf_root: None,
+            tuf_expires_at: None,
+            sigstore_artifact_hash: None,
             sigstore_verified: false,
             sigstore_identity: None,
             sigstore_issuer: None,
@@ -12933,6 +13736,9 @@ trusted_builders = ["trusted-ci"]
             transparency_log_present: false,
             tuf_verified: false,
             tuf_target_hash: None,
+            tuf_root: None,
+            tuf_expires_at: None,
+            sigstore_artifact_hash: None,
             sigstore_verified: false,
             sigstore_identity: None,
             sigstore_issuer: None,
@@ -12962,6 +13768,9 @@ trusted_builders = ["trusted-ci"]
             transparency_log_present: false,
             tuf_verified: false,
             tuf_target_hash: None,
+            tuf_root: None,
+            tuf_expires_at: None,
+            sigstore_artifact_hash: None,
             sigstore_verified: false,
             sigstore_identity: None,
             sigstore_issuer: None,
@@ -12990,6 +13799,9 @@ trusted_builders = ["trusted-ci"]
             transparency_log_present: false,
             tuf_verified: false,
             tuf_target_hash: None,
+            tuf_root: None,
+            tuf_expires_at: None,
+            sigstore_artifact_hash: None,
             sigstore_verified: false,
             sigstore_identity: None,
             sigstore_issuer: None,
@@ -13175,6 +13987,7 @@ trusted_builders = ["trusted-ci"]
                     "sha256:art".into(),
                     SigstoreVerificationResult {
                         verified: true,
+                        artifact_hash: Some("sha256:art".to_string()),
                         identity: Some("any-id".into()),
                         issuer: Some("any-issuer".into()),
                         rekor_log_index: None,
@@ -14046,6 +14859,9 @@ trusted_builders = ["trusted-ci"]
             transparency_log_present: true,
             tuf_verified: false,
             tuf_target_hash: None,
+            tuf_root: None,
+            tuf_expires_at: None,
+            sigstore_artifact_hash: None,
             sigstore_verified: false,
             sigstore_identity: None,
             sigstore_issuer: None,
@@ -14094,6 +14910,8 @@ trusted_builders = ["trusted-ci"]
             manifest_hash: "sha256:m".into(),
             binary_hash: "sha256:b".into(),
             target: test_target(),
+            authority: Arc::new(()),
+            zone_id: None,
         };
         let report = verified.report("test");
         // Timestamp should be > some reasonable epoch (2020-01-01)

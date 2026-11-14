@@ -158,9 +158,9 @@ fn verify_valid_signed_bundle(seed: &RegistryManifestSeed) {
             let again = verifier
                 .verify_bundle(&bundle, None, None, None)
                 .expect("repeat verify of same bundle must stay stable");
-            assert_eq!(again.manifest_hash, verified.manifest_hash);
-            assert_eq!(again.binary_hash, verified.binary_hash);
-            assert_eq!(again.target, verified.target);
+            assert_eq!(again.manifest_hash(), verified.manifest_hash());
+            assert_eq!(again.binary_hash(), verified.binary_hash());
+            assert_eq!(again.target(), verified.target());
         }
         Err(_) => {
             assert!(

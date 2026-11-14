@@ -1158,8 +1158,8 @@ async fn fcps_registry_reconstruction_roundtrip_remains_manifest_compliant() {
     let reverified = verifier
         .verify_bundle(&recovered, None, None, None)
         .expect("reverify recovered bundle");
-    assert_eq!(reverified.manifest_hash, verified.manifest_hash);
-    assert_eq!(reverified.binary_hash, verified.binary_hash);
+    assert_eq!(reverified.manifest_hash(), verified.manifest_hash());
+    assert_eq!(reverified.binary_hash(), verified.binary_hash());
 }
 
 #[fcp_async_core::runtime::test]
@@ -1200,7 +1200,7 @@ async fn fcps_registry_reconstruction_rejects_tampered_manifest_object() {
         .await
         .expect("get manifest");
     let replacement_hash = format!("sha256:{}", "0".repeat(64));
-    let original_hash = verified.manifest_hash.as_bytes();
+    let original_hash = verified.manifest_hash().as_bytes();
     let replacement_hash_bytes = replacement_hash.as_bytes();
     let position = manifest_record
         .body

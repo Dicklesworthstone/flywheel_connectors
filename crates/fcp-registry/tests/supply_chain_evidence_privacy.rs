@@ -42,10 +42,13 @@ fn main() {
     let _tuf = TufVerificationResult {
         verified: true,
         root_version: 1,
+        root: None,
+        expires_at: None,
         target: None,
     };
     let _sigstore = SigstoreVerificationResult {
         verified: true,
+        artifact_hash: None,
         identity: None,
         issuer: None,
         rekor_log_index: None,

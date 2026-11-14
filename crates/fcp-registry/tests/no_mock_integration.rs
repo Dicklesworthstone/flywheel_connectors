@@ -193,9 +193,9 @@ fn verify_bundle_valid_publisher_signature() {
     );
 
     let verified = result.unwrap();
-    assert_eq!(verified.manifest.connector.id.to_string(), "fcp.minimal");
-    assert!(verified.binary_hash.starts_with("sha256:"));
-    assert!(verified.manifest_hash.starts_with("sha256:"));
+    assert_eq!(verified.manifest().connector.id.to_string(), "fcp.minimal");
+    assert!(verified.binary_hash().starts_with("sha256:"));
+    assert!(verified.manifest_hash().starts_with("sha256:"));
 }
 
 #[test]
@@ -853,6 +853,339 @@ async fn mirror_bundle_stores_two_objects() {
 }
 
 #[fcp_async_core::runtime::test]
+async fn mirroring_rejects_substituted_bytes_and_target_before_writes() {
+    let (bundle, trust) = signed_bundle("pub1");
+    let verifier = RegistryVerifier::new(trust);
+    let verified = verifier
+        .verify_bundle(&bundle, None, None, None)
+        .expect("verify");
+    let zone = ZoneId::work();
+    let key = ObjectIdKey::from_bytes([31; 32]);
+    let retained_store = MemoryObjectStore::new(MemoryObjectStoreConfig::default());
+    let mirror = verifier
+        .mirror_bundle(&verified, &bundle, zone.clone(), &key, &retained_store)
+        .await
+        .expect("retain admitted bundle");
+
+    let mut binary_changed = bundle.clone();
+    binary_changed.binary.push(1);
+    let mut manifest_changed = bundle.clone();
+    manifest_changed
+        .manifest_toml
+        .push_str("\n# changed after verification\n");
+    let mut target_changed = bundle.clone();
+    target_changed.target.arch = "aarch64".to_string();
+    for (field, candidate) in [
+        ("binary", binary_changed),
+        ("manifest", manifest_changed),
+        ("target", target_changed),
+    ] {
+        let store = MemoryObjectStore::new(MemoryObjectStoreConfig::default());
+        let error = verifier
+            .mirror_bundle(&verified, &candidate, zone.clone(), &key, &store)
+            .await
+            .expect_err("changed bytes cannot inherit verification");
+        assert!(
+            matches!(error, RegistryError::VerifiedBundleMismatch { field: actual, .. } if actual == field)
+        );
+        assert!(store.list_zone(&zone).await.is_empty());
+        assert_eq!(store.storage_used().await, 0);
+
+        let symbol_store = MemorySymbolStore::new(MemorySymbolStoreConfig::default());
+        let error = verifier
+            .mirror_bundle_symbols(
+                &verified,
+                &candidate,
+                &mirror,
+                zone.clone(),
+                &key,
+                &retained_store,
+                &symbol_store,
+                &symbol_config(),
+                None,
+            )
+            .await
+            .expect_err("changed bytes cannot enter the symbol layer");
+        assert!(
+            matches!(error, RegistryError::VerifiedBundleMismatch { field: actual, .. } if actual == field)
+        );
+        assert!(symbol_store.list_zone(&zone).await.is_empty());
+        assert_eq!(symbol_store.storage_used().await, 0);
+        assert_eq!(retained_store.list_zone(&zone).await.len(), 2);
+    }
+}
+
+#[fcp_async_core::runtime::test]
+async fn mirroring_binds_verifier_policy_and_admitted_zone() {
+    let (bundle, trust) = signed_bundle("pub1");
+    let verifier = RegistryVerifier::new(trust.clone());
+    let policy = zone_policy_with_ceiling(&[]);
+    let verified = verifier
+        .verify_bundle(&bundle, Some(&policy), None, None)
+        .expect("verify for work zone");
+    let key = ObjectIdKey::from_bytes([32; 32]);
+
+    let unrelated = RegistryVerifier::new(trust);
+    let tightened =
+        verifier
+            .clone()
+            .with_supply_chain_verification_config(SupplyChainVerificationConfig {
+                require_tuf: true,
+                ..SupplyChainVerificationConfig::default()
+            });
+    for other in [&unrelated, &tightened] {
+        let store = MemoryObjectStore::new(MemoryObjectStoreConfig::default());
+        assert!(matches!(
+            other
+                .mirror_bundle(&verified, &bundle, ZoneId::work(), &key, &store)
+                .await,
+            Err(RegistryError::VerificationAuthorityMismatch)
+        ));
+        assert_eq!(store.storage_used().await, 0);
+    }
+    let store = MemoryObjectStore::new(MemoryObjectStoreConfig::default());
+    assert!(matches!(
+        verifier
+            .mirror_bundle(&verified, &bundle, ZoneId::owner(), &key, &store)
+            .await,
+        Err(RegistryError::VerifiedBundleMismatch { field: "zone", .. })
+    ));
+    assert_eq!(store.storage_used().await, 0);
+    verifier
+        .clone()
+        .mirror_bundle(&verified, &bundle, ZoneId::work(), &key, &store)
+        .await
+        .expect("unchanged verifier clone retains its authority");
+}
+
+#[fcp_async_core::runtime::test]
+async fn offline_mirror_load_reverifies_current_trust_policy_and_target() {
+    let (bundle, trust) = signed_bundle("pub1");
+    let verifier = RegistryVerifier::new(trust.clone());
+    let verified = verifier
+        .verify_bundle(&bundle, None, None, None)
+        .expect("verify");
+    let store = MemoryObjectStore::new(MemoryObjectStoreConfig::default());
+    let zone = ZoneId::work();
+    let key = ObjectIdKey::from_bytes([33; 32]);
+    let mirror = verifier
+        .mirror_bundle(&verified, &bundle, zone.clone(), &key, &store)
+        .await
+        .expect("mirror");
+
+    // A fresh verifier models a restart: serialized verification booleans are
+    // neither available nor required. The retained bytes are verified again.
+    let restarted = RegistryVerifier::new(trust.clone());
+    let (restored, evidence) = restarted
+        .load_verified_mirror(
+            &mirror,
+            &zone,
+            &key,
+            &store,
+            None,
+            None,
+            Some(&test_target()),
+        )
+        .await
+        .expect("load retained pair without registry access");
+    assert_eq!(restored.manifest_toml, bundle.manifest_toml);
+    assert_eq!(restored.binary, bundle.binary);
+    assert_eq!(restored.target, bundle.target);
+    assert_eq!(evidence.binary_hash(), verified.binary_hash());
+    assert_eq!(evidence.manifest_hash(), verified.manifest_hash());
+
+    let untrusted = RegistryVerifier::new(RegistryTrustPolicy::default());
+    assert!(
+        untrusted
+            .load_verified_mirror(&mirror, &zone, &key, &store, None, None, None)
+            .await
+            .is_err()
+    );
+    let strict = RegistryVerifier::new(trust).with_supply_chain_verification_config(
+        SupplyChainVerificationConfig {
+            require_tuf: true,
+            ..SupplyChainVerificationConfig::default()
+        },
+    );
+    assert!(matches!(
+        strict
+            .load_verified_mirror(&mirror, &zone, &key, &store, None, None, None)
+            .await,
+        Err(RegistryError::TufVerificationRequired)
+    ));
+    let target = ConnectorTarget {
+        os: "linux".to_string(),
+        arch: "aarch64".to_string(),
+    };
+    assert!(matches!(
+        restarted
+            .load_verified_mirror(&mirror, &zone, &key, &store, None, None, Some(&target))
+            .await,
+        Err(RegistryError::TargetMismatch { .. })
+    ));
+    let restricted = zone_policy_with_ceiling(&["unrelated.capability"]);
+    assert!(matches!(
+        restarted
+            .load_verified_mirror(&mirror, &zone, &key, &store, Some(&restricted), None, None)
+            .await,
+        Err(RegistryError::CapabilityCeilingViolation { .. })
+    ));
+    assert_eq!(store.list_zone(&zone).await.len(), 2);
+}
+
+#[fcp_async_core::runtime::test]
+async fn retained_pair_rejects_wrong_key_zone_and_substituted_manifest() {
+    let (bundle, trust) = signed_bundle("pub1");
+    let verifier = RegistryVerifier::new(trust);
+    let verified = verifier
+        .verify_bundle(&bundle, None, None, None)
+        .expect("verify");
+    let store = MemoryObjectStore::new(MemoryObjectStoreConfig::default());
+    let zone = ZoneId::work();
+    let key = ObjectIdKey::from_bytes([34; 32]);
+    let mirror = verifier
+        .mirror_bundle(&verified, &bundle, zone.clone(), &key, &store)
+        .await
+        .expect("mirror");
+    for (requested_zone, requested_key) in [
+        (ZoneId::owner(), key),
+        (zone.clone(), ObjectIdKey::from_bytes([35; 32])),
+    ] {
+        assert!(matches!(
+            verifier
+                .load_verified_mirror(
+                    &mirror,
+                    &requested_zone,
+                    &requested_key,
+                    &store,
+                    None,
+                    None,
+                    None
+                )
+                .await,
+            Err(RegistryError::MirrorObjectInvalid { .. })
+        ));
+        let symbols = MemorySymbolStore::new(MemorySymbolStoreConfig::default());
+        assert!(matches!(
+            verifier
+                .mirror_bundle_symbols(
+                    &verified,
+                    &bundle,
+                    &mirror,
+                    requested_zone.clone(),
+                    &requested_key,
+                    &store,
+                    &symbols,
+                    &symbol_config(),
+                    None
+                )
+                .await,
+            Err(RegistryError::MirrorObjectInvalid { .. })
+        ));
+        assert_eq!(symbols.storage_used().await, 0);
+        assert!(symbols.list_zone(&requested_zone).await.is_empty());
+    }
+
+    let (other_bundle, other_trust) = signed_bundle_with_binary("pub2", b"other binary".to_vec());
+    let other_verifier = RegistryVerifier::new(other_trust);
+    let other_verified = other_verifier
+        .verify_bundle(&other_bundle, None, None, None)
+        .expect("other verify");
+    let other_mirror = other_verifier
+        .mirror_bundle(&other_verified, &other_bundle, zone.clone(), &key, &store)
+        .await
+        .expect("other mirror");
+    let mut crossed = mirror.clone();
+    crossed.manifest_object_id = other_mirror.manifest_object_id;
+    crossed.manifest_hash = other_mirror.manifest_hash;
+    assert!(matches!(
+        verifier
+            .load_verified_mirror(&crossed, &zone, &key, &store, None, None, None)
+            .await,
+        Err(RegistryError::MirrorObjectInvalid {
+            reason: "binary is not bound to the retained manifest",
+            ..
+        })
+    ));
+    let symbols = MemorySymbolStore::new(MemorySymbolStoreConfig::default());
+    assert!(
+        verifier
+            .mirror_bundle_symbols(
+                &verified,
+                &bundle,
+                &crossed,
+                zone.clone(),
+                &key,
+                &store,
+                &symbols,
+                &symbol_config(),
+                None
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(symbols.storage_used().await, 0);
+    assert!(symbols.list_zone(&zone).await.is_empty());
+}
+
+#[fcp_async_core::runtime::test]
+async fn retained_pair_rejects_tampering_before_offline_use_or_symbol_writes() {
+    for tamper_manifest in [true, false] {
+        let (bundle, trust) = signed_bundle("pub1");
+        let verifier = RegistryVerifier::new(trust);
+        let verified = verifier
+            .verify_bundle(&bundle, None, None, None)
+            .expect("verify");
+        let store = MemoryObjectStore::new(MemoryObjectStoreConfig::default());
+        let zone = ZoneId::work();
+        let key = ObjectIdKey::from_bytes([36; 32]);
+        let mirror = verifier
+            .mirror_bundle(&verified, &bundle, zone.clone(), &key, &store)
+            .await
+            .expect("mirror");
+        let id = if tamper_manifest {
+            mirror.manifest_object_id
+        } else {
+            mirror.binary_object_id
+        };
+        let mut corrupted = store.get(&id).await.expect("retained object");
+        corrupted.body.push(0);
+        store
+            .delete(&id)
+            .await
+            .expect("remove in-memory test object");
+        store
+            .put(corrupted)
+            .await
+            .expect("simulate storage corruption");
+        assert!(matches!(
+            verifier.load_verified_mirror(&mirror, &zone, &key, &store, None, None, None).await,
+            Err(RegistryError::MirrorObjectInvalid { object_id, .. }) if object_id == id
+        ));
+        let symbols = MemorySymbolStore::new(MemorySymbolStoreConfig::default());
+        assert!(matches!(
+            verifier
+                .mirror_bundle_symbols(
+                    &verified,
+                    &bundle,
+                    &mirror,
+                    zone.clone(),
+                    &key,
+                    &store,
+                    &symbols,
+                    &symbol_config(),
+                    None
+                )
+                .await,
+            Err(RegistryError::MirrorObjectInvalid { .. })
+        ));
+        assert_eq!(symbols.storage_used().await, 0);
+        assert!(symbols.list_zone(&zone).await.is_empty());
+        assert_eq!(store.list_zone(&zone).await.len(), 2);
+    }
+}
+
+#[fcp_async_core::runtime::test]
 async fn mirror_bundle_binary_refs_manifest() {
     let (bundle, trust) = signed_bundle("pub1");
     let verifier = RegistryVerifier::new(trust);
@@ -991,7 +1324,7 @@ async fn full_pipeline_verify_and_mirror() {
         .verify_bundle(&bundle, Some(&zone_policy), None, Some(&expected_target))
         .expect("verify");
 
-    assert_eq!(verified.manifest.connector.id.to_string(), "fcp.minimal");
+    assert_eq!(verified.manifest().connector.id.to_string(), "fcp.minimal");
 
     let store = MemoryObjectStore::new(MemoryObjectStoreConfig::default());
     let zone = ZoneId::work();
@@ -1134,7 +1467,7 @@ async fn reconstruct_binary_from_symbols_roundtrips_without_binary_object() {
             manifest_object_id: mirror.manifest_object_id,
             binary_object_id: mirror.binary_object_id,
             target: bundle.target.clone(),
-            binary_hash: verified.binary_hash.clone(),
+            binary_hash: verified.binary_hash().to_string(),
             binary: large_binary,
         }
     );
@@ -1375,8 +1708,8 @@ async fn reconstruct_bundle_from_symbol_descriptor_roundtrips_and_reverifies() {
     let reverified = verifier
         .verify_bundle(&recovered, None, None, None)
         .expect("reverify recovered bundle");
-    assert_eq!(reverified.manifest_hash, verified.manifest_hash);
-    assert_eq!(reverified.binary_hash, verified.binary_hash);
+    assert_eq!(reverified.manifest_hash(), verified.manifest_hash());
+    assert_eq!(reverified.binary_hash(), verified.binary_hash());
 }
 
 #[fcp_async_core::runtime::test]
@@ -1417,7 +1750,7 @@ async fn reconstruct_bundle_from_symbol_descriptor_rejects_manifest_hash_mismatc
         .await
         .expect("get manifest");
     let replacement_hash = format!("sha256:{}", "0".repeat(64));
-    let original_hash = verified.manifest_hash.as_bytes();
+    let original_hash = verified.manifest_hash().as_bytes();
     let replacement_hash_bytes = replacement_hash.as_bytes();
     let position = manifest_record
         .body
