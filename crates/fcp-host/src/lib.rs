@@ -34,6 +34,7 @@ mod emergency_revocation;
 mod enforcement;
 mod error;
 mod event_delivery;
+pub mod executable;
 // Retained-but-unwired: composite host-health framework
 // (`HealthAggregator`, `CompositeHealthStatus`, tri-state `HealthState`,
 // merge/rollup logic across connector / mesh / resource / named-component
