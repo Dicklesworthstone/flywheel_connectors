@@ -2478,7 +2478,7 @@ exec sleep 30
             // even though the stop waiter has already timed out or disappeared.
             let (sender, receiver) = mpsc::channel(1);
             let runner = ConnectorProcessRunner::spawn_with_pool_tracking(
-                OsStr::new("/bin/sh"),
+                std::ffi::OsStr::new("/bin/sh"),
                 &["-c".to_owned(), "exec sleep 30".to_owned()],
                 &BTreeMap::new(),
                 Some((&launch, sender)),
