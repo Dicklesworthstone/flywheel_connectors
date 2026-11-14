@@ -140,6 +140,7 @@ impl LiveReceiver {
                 health: ConnectorHealth::healthy(),
                 last_health_check: None,
             },
+            admitted_executable: None,
             runner_tx,
             event_transport: None,
             _runner_task: runner_task,

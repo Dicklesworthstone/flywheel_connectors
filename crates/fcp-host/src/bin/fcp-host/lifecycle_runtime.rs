@@ -1,7 +1,7 @@
 //! Apply persisted lifecycle intent to actual connector runtime ownership.
 //!
 //! Dormant entries retain their managed configuration, admitted manifest and
-//! admitted WASI bytes without starting a process or preparing a guest.
+//! admitted WASI bytes or Linux native images without starting a runtime.
 //! Native retirement uses the exact process owner, not a PID lookup or a
 //! replacement with the same connector ID.
 //! WASI retirement seals the exact runtime and drains all retained guest stores.
@@ -35,6 +35,7 @@ const fn denies_execution(desired: DesiredRuntimeState) -> bool {
 pub(super) struct DormantConnector {
     summary: ConnectorSummary,
     desired: DesiredRuntimeState,
+    native_executable: Option<native_artifact::AdmittedNativeExecutable>,
     wasi_component: Option<wasi_connector::AdmittedWasiComponent>,
 }
 
@@ -42,6 +43,7 @@ impl DormantConnector {
     fn new(
         config: &ConnectorConfig,
         desired: DesiredRuntimeState,
+        native_executable: Option<native_artifact::AdmittedNativeExecutable>,
         wasi_component: Option<wasi_connector::AdmittedWasiComponent>,
     ) -> HostResult<Self> {
         let mut summary = connector_summary_from_config(config)?;
@@ -52,12 +54,19 @@ impl DormantConnector {
         Ok(Self {
             summary,
             desired,
+            native_executable,
             wasi_component,
         })
     }
 
     pub(super) fn admitted_wasi_component(&self) -> Option<&wasi_connector::AdmittedWasiComponent> {
         self.wasi_component.as_ref()
+    }
+
+    pub(super) fn admitted_native_executable(
+        &self,
+    ) -> Option<&native_artifact::AdmittedNativeExecutable> {
+        self.native_executable.as_ref()
     }
 
     pub(super) fn summary(&self) -> ConnectorSummary {
@@ -142,6 +151,7 @@ pub(super) fn dormant_entry(
     let connector = ConnectorRuntime::Dormant(Arc::new(DormantConnector::new(
         &config,
         desired,
+        admitted.native_executable,
         admitted.wasi_component,
     )?));
     Ok(RegistryEntry {
@@ -343,6 +353,7 @@ async fn retire_selected(
         ValidatedConnectorConfig {
             manifest_constraints: entry.manifest_constraints.clone(),
             state_policy: entry.state_policy,
+            native_executable: entry.admitted_native_executable().cloned(),
             wasi_component: entry.admitted_wasi_component().cloned(),
         },
         desired,
@@ -352,19 +363,21 @@ async fn retire_selected(
 
 fn validate_activation(entry: &RegistryEntry) -> HostResult<ValidatedConnectorConfig> {
     let retained_component = entry.admitted_wasi_component();
-    if retained_component.is_some() {
+    let retained_executable = entry.admitted_native_executable();
+    if retained_component.is_some() || retained_executable.is_some() {
         entry
             .state_policy
             .require_admitted_manifest(&entry.config)?;
     }
     let mut admitted = validate_registry_config(&entry.config)?;
-    if let Some(component) = retained_component {
+    if retained_component.is_some() || retained_executable.is_some() {
         // Enable and Restart retain executable bytes and their exact admitted
         // authority. Re-reading a changed manifest during validation must not
         // silently pair old bytes with a new operation catalog or state policy.
         admitted.manifest_constraints = entry.manifest_constraints.clone();
         admitted.state_policy = entry.state_policy;
-        admitted.wasi_component = Some(component.clone());
+        admitted.wasi_component = retained_component.cloned();
+        admitted.native_executable = retained_executable.cloned();
         admitted
             .state_policy
             .require_admitted_manifest(&entry.config)?;
@@ -1036,6 +1049,193 @@ done"#
         }
         assert!(third.runtime_retirement.require_open().is_err());
         assert_dormant(&state, &connector_id).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn native_restart_retains_image_and_explicit_apply_selects_same_path_changes() {
+        use std::io::Write;
+
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("native-connector");
+        std::fs::copy("/bin/sh", &source).expect("copy native ELF fixture");
+        let mut config = shell_warm_pool_config(directory.path());
+        config.prewarm = fcp_host::ConnectorPrewarmConfig::default();
+        config.binary = source.to_string_lossy().into_owned();
+        let state = app(config.clone(), DesiredRuntimeState::Enabled).await;
+        let connector_id = ConnectorId::from_static(CONNECTOR);
+        let original = native(&state, &connector_id).await;
+        let admitted = original.admitted_executable.as_ref().unwrap();
+        std::fs::write(&source, b"source changed after admission").unwrap();
+
+        transition(&state, &connector_id, &request(LifecycleAction::Restart))
+            .await
+            .expect("restart must use the retained native image");
+        assert!(original.runtime_retirement.is_exited());
+        let restarted = native(&state, &connector_id).await;
+        assert_eq!(
+            restarted.admitted_executable.as_ref().unwrap().program(),
+            admitted.program()
+        );
+        assert!(restarted.health().await.is_ok());
+        let generation = state.registry.version();
+        let error = state
+            .registry
+            .apply_configs_with_lifecycle(vec![config.clone()], &state.lifecycle)
+            .await
+            .expect_err("explicit update must validate changed source bytes");
+        assert!(error.to_string().contains("immutable executable admission"));
+        assert_eq!(state.registry.version(), generation);
+        assert!(restarted.health().await.is_ok());
+
+        std::fs::copy("/bin/sh", &source).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(b"\nnew admitted deployment\n")
+            .unwrap();
+        // An operation-policy edit must not hide a simultaneous image change
+        // behind the shortcut that retains an unchanged native runtime.
+        config.enforce_empty_allow_lists = !config.enforce_empty_allow_lists;
+        let preview = state
+            .registry
+            .preview_configs_with_lifecycle(vec![config.clone()], &state.lifecycle)
+            .await
+            .expect("same-path binary changes are visible in preview");
+        assert_eq!(preview.updated, vec![connector_id.to_string()]);
+        state
+            .registry
+            .apply_configs_with_lifecycle(vec![config.clone()], &state.lifecycle)
+            .await
+            .expect("explicit apply admits replacement bytes");
+        let replacement = native(&state, &connector_id).await;
+        assert!(!Arc::ptr_eq(&restarted, &replacement));
+        assert!(
+            replacement
+                .admitted_executable
+                .as_ref()
+                .unwrap()
+                .source_matches(&config)
+                .unwrap()
+        );
+        assert!(!admitted.source_matches(&config).unwrap());
+        restarted
+            .retire_runtime(Instant::now() + Duration::from_secs(5))
+            .await
+            .unwrap();
+        transition(&state, &connector_id, &request(LifecycleAction::Disable))
+            .await
+            .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn dormant_native_update_captures_image_before_later_enable() {
+        use std::io::Write;
+
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("native-connector");
+        std::fs::copy("/bin/sh", &source).unwrap();
+        let mut config = shell_warm_pool_config(directory.path());
+        config.prewarm = fcp_host::ConnectorPrewarmConfig::default();
+        config.binary = source.to_string_lossy().into_owned();
+        let state = app(config.clone(), DesiredRuntimeState::Enabled).await;
+        let connector_id = ConnectorId::from_static(CONNECTOR);
+        let original = native(&state, &connector_id).await;
+        transition(&state, &connector_id, &request(LifecycleAction::Disable))
+            .await
+            .unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(b"\nupdated while dormant\n")
+            .unwrap();
+        state
+            .registry
+            .apply_configs_with_lifecycle(vec![config.clone()], &state.lifecycle)
+            .await
+            .expect("dormant update captures replacement now");
+        let (dormant, _) = selected_entry(&state.registry, &connector_id)
+            .await
+            .unwrap();
+        let replacement = dormant.admitted_native_executable().unwrap();
+        assert!(replacement.source_matches(&config).unwrap());
+        assert!(
+            !original
+                .admitted_executable
+                .as_ref()
+                .unwrap()
+                .source_matches(&config)
+                .unwrap()
+        );
+        std::fs::write(&source, b"source changed after dormant update").unwrap();
+        let generation = state.registry.version();
+        assert!(
+            state
+                .registry
+                .apply_configs_with_lifecycle(vec![config.clone()], &state.lifecycle)
+                .await
+                .is_err()
+        );
+        assert_eq!(state.registry.version(), generation);
+        transition(&state, &connector_id, &request(LifecycleAction::Enable))
+            .await
+            .expect("enable uses the dormant admission, not changed source bytes");
+        let enabled = native(&state, &connector_id).await;
+        assert_eq!(
+            enabled.admitted_executable.as_ref().unwrap().program(),
+            replacement.program()
+        );
+        assert!(enabled.health().await.is_ok());
+        transition(&state, &connector_id, &request(LifecycleAction::Disable))
+            .await
+            .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn native_warm_replenishment_and_reenable_use_the_admitted_image() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("native-connector");
+        std::fs::copy("/bin/sh", &source).unwrap();
+        let mut config = shell_warm_pool_config(directory.path());
+        config.binary = source.to_string_lossy().into_owned();
+        let state = app(config, DesiredRuntimeState::Enabled).await;
+        let connector_id = ConnectorId::from_static(CONNECTOR);
+        let pool = warm_pool(&state, &connector_id).await;
+        let admitted_program = pool.admitted_executable.as_ref().unwrap().program();
+        let prior_workers = std::mem::take(&mut *pool.entries.lock().await);
+        std::fs::write(&source, b"source replaced before replenishment").unwrap();
+        pool.maintain_min_idle()
+            .await
+            .expect("warm replenishment must never reopen config.binary");
+        for worker in retained_pool_processes(&pool).await {
+            assert_eq!(
+                worker.admitted_executable.as_ref().unwrap().program(),
+                admitted_program
+            );
+            assert!(worker.health().await.is_ok());
+        }
+        transition(&state, &connector_id, &request(LifecycleAction::Disable))
+            .await
+            .unwrap();
+        for worker in &prior_workers {
+            assert!(worker.connector.runtime_retirement.is_exited());
+        }
+        transition(&state, &connector_id, &request(LifecycleAction::Enable))
+            .await
+            .expect("re-enabled pool keeps the prior deployment image");
+        let replacement = warm_pool(&state, &connector_id).await;
+        assert_eq!(
+            replacement.admitted_executable.as_ref().unwrap().program(),
+            admitted_program
+        );
+        assert!(replacement.control.health().await.is_ok());
+        transition(&state, &connector_id, &request(LifecycleAction::Disable))
+            .await
+            .unwrap();
     }
 
     #[fcp_async_core::runtime::test(flavor = "multi_thread")]

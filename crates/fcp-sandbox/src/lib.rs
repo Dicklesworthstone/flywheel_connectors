@@ -85,6 +85,7 @@
 #![allow(clippy::borrow_as_ptr)]
 
 mod egress;
+mod native_executable;
 mod sandbox;
 mod wasi;
 
@@ -101,5 +102,6 @@ mod windows;
 pub use windows::{WindowsAppContainerChild, WindowsFirewallPolicyGuard, WindowsSandbox};
 
 pub use egress::*;
+pub use native_executable::*;
 pub use sandbox::*;
 pub use wasi::*;

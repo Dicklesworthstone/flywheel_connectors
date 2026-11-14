@@ -184,6 +184,8 @@ mod lifecycle_runtime;
 mod live_authority;
 #[path = "fcp-host/mesh_cancel.rs"]
 mod mesh_cancel;
+#[path = "fcp-host/native_artifact.rs"]
+mod native_artifact;
 #[path = "fcp-host/native_events.rs"]
 mod native_events;
 #[path = "fcp-host/native_framing.rs"]
@@ -412,6 +414,7 @@ fn connector_summary_from_config(config: &ConnectorConfig) -> HostResult<Connect
 
 struct SubprocessConnector {
     summary: ConnectorSummary,
+    admitted_executable: Option<native_artifact::AdmittedNativeExecutable>,
     runner_tx: mpsc::Sender<ConnectorRpcRequest>,
     event_transport: Option<native_stream::NativeEventTransport>,
     _runner_task: JoinHandle<()>,
@@ -594,6 +597,7 @@ impl SubprocessConnector {
             None,
             None,
             None,
+            None,
         )
         .await
     }
@@ -605,6 +609,7 @@ impl SubprocessConnector {
         placement_operation_class: PlacementOperationClass,
         termination: Option<&NativeInvocationTermination>,
         admitted_manifest: Option<&ManifestOperationConstraintCatalog>,
+        retained_executable: Option<&native_artifact::AdmittedNativeExecutable>,
         pool_spawn: Option<&native_rpc::NativePoolSpawn<'_>>,
     ) -> HostResult<Self> {
         if termination.is_some_and(NativeInvocationTermination::is_cancel_requested) {
@@ -642,6 +647,25 @@ impl SubprocessConnector {
         let state_policy = ConnectorStatePolicy::resolve(&config, manifest)?;
         state_policy.require_admitted_manifest(&config)?;
         let response_limits = native_rpc_response_limits(&config, manifest);
+        let admitted_executable = match retained_executable {
+            Some(executable) => Some(executable.clone()),
+            None => native_artifact::AdmittedNativeExecutable::capture_for_platform(&config)?,
+        };
+        state_policy.require_admitted_manifest(&config)?;
+        #[cfg(target_os = "linux")]
+        let program = admitted_executable
+            .as_ref()
+            .ok_or_else(|| {
+                HostError::RegistryError(
+                    "Linux native launch requires an immutable admitted executable".to_owned(),
+                )
+            })?
+            .program();
+        // Native image retention is a Linux capability. Preserve the existing
+        // launch implementation on other supported host platforms without
+        // presenting mutable paths as retained executable identity.
+        #[cfg(not(target_os = "linux"))]
+        let program = PathBuf::from(&config.binary);
         // A warm checkout can wait for health checks before falling back to a
         // cold worker. Do not launch a binary/env whose authority was replaced.
         if let Some(termination) = termination {
@@ -652,7 +676,7 @@ impl SubprocessConnector {
         let (runner_tx, runner_rx) =
             mpsc::channel::<ConnectorRpcRequest>(CONNECTOR_RPC_QUEUE_CAPACITY);
         let mut runner = ConnectorProcessRunner::spawn_with_pool_tracking(
-            &config.binary,
+            program.as_os_str(),
             &config.args,
             &config.env,
             pool_spawn.map(|spawn| (spawn, runner_tx.clone())),
@@ -670,6 +694,7 @@ impl SubprocessConnector {
 
         let connector = Self {
             summary,
+            admitted_executable,
             runner_tx,
             event_transport: Some(event_transport),
             _runner_task: runner_task,
@@ -1203,6 +1228,7 @@ struct NativeWarmPoolCheckout {
 
 struct NativeWarmPoolConnector {
     config: ConnectorConfig,
+    admitted_executable: Option<native_artifact::AdmittedNativeExecutable>,
     state_policy: ConnectorStatePolicy,
     manifest_constraints: ManifestOperationConstraintCatalog,
     connector_id: ConnectorId,
@@ -1230,6 +1256,10 @@ impl NativeWarmPoolConnector {
         // pool exists, all replenishment uses this same immutable admission.
         state_policy.require_parallel_workers(&config.id)?;
         state_policy.require_current_manifest(&config)?;
+        let admitted_executable = match &admitted.native_executable {
+            Some(executable) => Some(executable.clone()),
+            None => native_artifact::AdmittedNativeExecutable::capture_for_platform(&config)?,
+        };
         let runtime_retirement = native_rpc::NativePoolRetirement::default();
         let control = {
             let launch = runtime_retirement.begin_spawn()?;
@@ -1241,6 +1271,7 @@ impl NativeWarmPoolConnector {
                     PlacementOperationClass::LifecycleCritical,
                     None,
                     Some(&admitted.manifest_constraints),
+                    admitted_executable.as_ref(),
                     Some(&launch),
                 )
                 .await?,
@@ -1255,6 +1286,7 @@ impl NativeWarmPoolConnector {
             .saturating_mul(u64::from(config.prewarm.max_idle.max(1)));
         let connector = Arc::new(Self {
             config,
+            admitted_executable,
             state_policy,
             manifest_constraints: admitted.manifest_constraints.clone(),
             connector_id,
@@ -1686,6 +1718,7 @@ impl NativeWarmPoolConnector {
                 PlacementOperationClass::BulkPrewarm,
                 termination,
                 Some(&self.manifest_constraints),
+                self.admitted_executable.as_ref(),
                 Some(&launch),
             )
             .await?,
@@ -2245,6 +2278,7 @@ impl ConnectorRuntime {
                 PlacementOperationClass::LifecycleCritical,
                 None,
                 Some(&admitted.manifest_constraints),
+                admitted.native_executable.as_ref(),
                 None,
             )
             .await?,
@@ -2358,6 +2392,15 @@ struct RegistryEntry {
 }
 
 impl RegistryEntry {
+    fn admitted_native_executable(&self) -> Option<&native_artifact::AdmittedNativeExecutable> {
+        match &self.connector {
+            ConnectorRuntime::Native(connector) => connector.admitted_executable.as_ref(),
+            ConnectorRuntime::NativeWarmPool(connector) => connector.admitted_executable.as_ref(),
+            ConnectorRuntime::Dormant(connector) => connector.admitted_native_executable(),
+            ConnectorRuntime::Wasi(_) | ConnectorRuntime::UnavailableNativeProxyOnly(_) => None,
+        }
+    }
+
     fn admitted_wasi_component(&self) -> Option<&wasi_connector::AdmittedWasiComponent> {
         match &self.connector {
             ConnectorRuntime::Wasi(connector) => Some(&connector.component),
@@ -2632,6 +2675,9 @@ impl ConnectorStatePolicy {
 struct ValidatedConnectorConfig {
     manifest_constraints: ManifestOperationConstraintCatalog,
     state_policy: ConnectorStatePolicy,
+    /// Linux runtime/lifecycle launches retain a sealed image. Explicit
+    /// inventory apply is the only operation that selects new source bytes.
+    native_executable: Option<native_artifact::AdmittedNativeExecutable>,
     /// Retained only across lifecycle stops/restarts of the same deployment.
     /// A managed inventory apply intentionally admits a new component snapshot.
     wasi_component: Option<wasi_connector::AdmittedWasiComponent>,
@@ -2925,6 +2971,7 @@ fn validate_registry_config_for_launch(
     Ok(ValidatedConnectorConfig {
         manifest_constraints,
         state_policy,
+        native_executable: None,
         wasi_component: None,
     })
 }
@@ -3360,7 +3407,13 @@ impl SubprocessRegistry {
     }
 
     async fn plan_configs(&self, configs: Vec<ConnectorConfig>) -> HostResult<RegistryConfigPlan> {
-        let (current_configs, current_state_policies, current_wasi_components, source_version) = {
+        let (
+            current_configs,
+            current_state_policies,
+            current_wasi_components,
+            current_native_executables,
+            source_version,
+        ) = {
             let state = self.state.read().await;
             let current_configs = state
                 .connectors
@@ -3381,10 +3434,20 @@ impl SubprocessRegistry {
                         .map(|component| (id.clone(), component.clone()))
                 })
                 .collect::<HashMap<_, _>>();
+            let current_native_executables = state
+                .connectors
+                .iter()
+                .filter_map(|(id, entry)| {
+                    entry
+                        .admitted_native_executable()
+                        .map(|executable| (id.clone(), executable.clone()))
+                })
+                .collect::<HashMap<_, _>>();
             (
                 current_configs,
                 current_state_policies,
                 current_wasi_components,
+                current_native_executables,
                 self.version.load(Ordering::SeqCst),
             )
         };
@@ -3408,7 +3471,13 @@ impl SubprocessRegistry {
                 } else {
                     false
                 };
-            if manifest_changed || component_changed {
+            let executable_changed =
+                if let Some(executable) = current_native_executables.get(connector_id) {
+                    !executable.source_matches(config)?
+                } else {
+                    false
+                };
+            if manifest_changed || component_changed || executable_changed {
                 // Explicit preview/apply observes files even when their managed
                 // paths are unchanged. Preparation captures new authority; only
                 // successful publication replaces the active snapshot.
@@ -3470,6 +3539,28 @@ impl SubprocessRegistry {
                     .state_policy
                     .require_admitted_manifest(&plan.next_configs[connector_id])?;
             }
+            if dormant
+                && plan.next_configs[connector_id].runtime_network_enforcement
+                    != RuntimeNetworkEnforcement::WasiSandbox
+                && self
+                    .state
+                    .read()
+                    .await
+                    .connectors
+                    .get(connector_id)
+                    .is_some_and(|entry| entry.admitted_native_executable().is_some())
+            {
+                // A disabled deployment keeps its chosen executable. An
+                // explicit inventory update chooses replacement bytes now,
+                // rather than reopening a mutable path at a later Enable.
+                admitted.native_executable =
+                    native_artifact::AdmittedNativeExecutable::capture_for_platform(
+                        &plan.next_configs[connector_id],
+                    )?;
+                admitted
+                    .state_policy
+                    .require_admitted_manifest(&plan.next_configs[connector_id])?;
+            }
             if let Some(entry) = self
                 .native_policy_update(connector_id, &plan.next_configs[connector_id], &admitted)
                 .await?
@@ -3514,11 +3605,32 @@ impl SubprocessRegistry {
         config: &ConnectorConfig,
         admitted: &ValidatedConnectorConfig,
     ) -> HostResult<Option<RegistryEntry>> {
-        let state = self.state.read().await;
-        let Some(current) = state.connectors.get(connector_id) else {
+        let Some(current) = self
+            .state
+            .read()
+            .await
+            .connectors
+            .get(connector_id)
+            .cloned()
+        else {
             return Ok(None);
         };
         if !current.permits_native_policy_update(config, admitted.state_policy) {
+            return Ok(None);
+        }
+        if current.config == *config && current.admitted_native_executable().is_some() {
+            // A replacement with identical configuration was selected because
+            // an admitted artifact changed. Do not mistake that for a policy
+            // edit and keep executing the old image while reporting an update.
+            return Ok(None);
+        }
+        if let Some(executable) = current.admitted_native_executable()
+            && !executable.source_matches(config)?
+        {
+            // A combined operation-policy edit and source replacement is an
+            // executable update too. Stateful handoff restrictions must still
+            // apply, and an apply cannot claim the new bytes while retaining
+            // the old process. Hash outside the registry read-lock.
             return Ok(None);
         }
         admitted.state_policy.require_admitted_manifest(config)?;
@@ -5660,11 +5772,11 @@ impl ConnectorProcessRunner {
         args: &[String],
         env: &BTreeMap<String, String>,
     ) -> std::io::Result<Self> {
-        Self::spawn_with_pool_tracking(command, args, env, None).await
+        Self::spawn_with_pool_tracking(OsStr::new(command), args, env, None).await
     }
 
     async fn spawn_with_pool_tracking(
-        command: &str,
+        command: &OsStr,
         args: &[String],
         env: &BTreeMap<String, String>,
         pool_spawn: Option<(
@@ -19428,6 +19540,7 @@ output_schema = {{ type = "object" }}
                 health: ConnectorHealth::healthy(),
                 last_health_check: None,
             },
+            admitted_executable: None,
             runner_tx,
             _runner_task: runner_task,
             runtime_retirement: native_rpc::NativeRuntimeRetirement::default(),
@@ -33448,6 +33561,7 @@ done"#
         });
         let connector = SubprocessConnector {
             summary,
+            admitted_executable: None,
             runner_tx,
             event_transport: None,
             _runner_task: runner_task,
@@ -33857,6 +33971,7 @@ done"#;
             ValidatedConnectorConfig {
                 manifest_constraints: catalog,
                 state_policy: policy,
+                native_executable: None,
                 wasi_component: None,
             },
         )
@@ -36350,6 +36465,7 @@ done"#;
                 health: ConnectorHealth::healthy(),
                 last_health_check: None,
             },
+            admitted_executable: None,
             runner_tx,
             event_transport: None,
             _runner_task: runner_task,
@@ -37066,6 +37182,7 @@ done"#;
             let admitted = ValidatedConnectorConfig {
                 manifest_constraints,
                 state_policy,
+                native_executable: None,
                 wasi_component: None,
             };
             let error = NativeWarmPoolConnector::spawn(
