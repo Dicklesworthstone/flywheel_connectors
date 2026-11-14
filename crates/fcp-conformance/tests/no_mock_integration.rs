@@ -1099,7 +1099,7 @@ async fn fcps_registry_reconstruction_roundtrip_remains_manifest_compliant() {
             &verified,
             &bundle,
             &mirror,
-            zone,
+            zone.clone(),
             &object_id_key,
             &store,
             &symbol_store,
@@ -1134,12 +1134,17 @@ async fn fcps_registry_reconstruction_roundtrip_remains_manifest_compliant() {
         .await
         .expect("delete mirrored binary");
 
-    let recovered = verifier
-        .reconstruct_bundle_from_symbol_descriptor(
+    let (recovered, reverified) = verifier
+        .load_verified_symbol_mirror(
             &symbol_result.descriptor_object_id,
+            &zone,
+            &object_id_key,
             &store,
             &symbol_store,
             &registry_symbol_config(),
+            None,
+            None,
+            Some(&bundle.target),
         )
         .await
         .expect("reconstruct bundle");
@@ -1155,11 +1160,29 @@ async fn fcps_registry_reconstruction_roundtrip_remains_manifest_compliant() {
         static_checks.findings
     );
 
-    let reverified = verifier
-        .verify_bundle(&recovered, None, None, None)
-        .expect("reverify recovered bundle");
     assert_eq!(reverified.manifest_hash(), verified.manifest_hash());
     assert_eq!(reverified.binary_hash(), verified.binary_hash());
+
+    // Recovery remains an admission boundary even after the bytes were once
+    // verified and mirrored: removing the publisher from current trust denies
+    // the same retained descriptor without consulting a registry.
+    let untrusted = RegistryVerifier::new(RegistryTrustPolicy::default());
+    assert!(
+        untrusted
+            .load_verified_symbol_mirror(
+                &symbol_result.descriptor_object_id,
+                &zone,
+                &object_id_key,
+                &store,
+                &symbol_store,
+                &registry_symbol_config(),
+                None,
+                None,
+                Some(&bundle.target),
+            )
+            .await
+            .is_err()
+    );
 }
 
 #[fcp_async_core::runtime::test]
@@ -1185,7 +1208,7 @@ async fn fcps_registry_reconstruction_rejects_tampered_manifest_object() {
             &verified,
             &bundle,
             &mirror,
-            zone,
+            zone.clone(),
             &object_id_key,
             &store,
             &symbol_store,
@@ -1220,16 +1243,21 @@ async fn fcps_registry_reconstruction_rejects_tampered_manifest_object() {
         .expect("put tampered manifest");
 
     let err = verifier
-        .reconstruct_bundle_from_symbol_descriptor(
+        .load_verified_symbol_mirror(
             &symbol_result.descriptor_object_id,
+            &zone,
+            &object_id_key,
             &store,
             &symbol_store,
             &registry_symbol_config(),
+            None,
+            None,
+            None,
         )
         .await
         .expect_err("tampered manifest hash should fail reconstruction");
     assert!(matches!(
         err,
-        RegistryError::ReconstructedManifestHashMismatch { .. }
+        RegistryError::MirrorObjectInvalid { .. }
     ));
 }

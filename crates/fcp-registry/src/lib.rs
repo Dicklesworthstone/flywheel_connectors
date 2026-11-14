@@ -2613,7 +2613,11 @@ impl RegistryVerifier {
             });
         }
         let bundle = load_mirrored_bundle(mirror, zone_id, object_id_key, store).await?;
-        let verified = self.verify_bundle(&bundle, zone_policy, supply_chain, expected_target)?;
+        let mut verified =
+            self.verify_bundle(&bundle, zone_policy, supply_chain, expected_target)?;
+        // Retained recovery authenticates authority within this exact zone,
+        // even when no additional zone policy was supplied by the caller.
+        verified.zone_id = Some(zone_id.clone());
         Ok((bundle, verified))
     }
 
@@ -2740,7 +2744,10 @@ impl RegistryVerifier {
             binary: reconstructed.binary,
             target: reconstructed.target,
         };
-        let verified = self.verify_bundle(&bundle, zone_policy, supply_chain, expected_target)?;
+        let mut verified =
+            self.verify_bundle(&bundle, zone_policy, supply_chain, expected_target)?;
+        // Do not let a successful keyed recovery authorize a different zone.
+        verified.zone_id = Some(zone_id.clone());
         Ok((bundle, verified))
     }
 

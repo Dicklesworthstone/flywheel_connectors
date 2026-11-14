@@ -994,6 +994,19 @@ async fn offline_mirror_load_reverifies_current_trust_policy_and_target() {
     assert_eq!(evidence.binary_hash(), verified.binary_hash());
     assert_eq!(evidence.manifest_hash(), verified.manifest_hash());
 
+    let destination = MemoryObjectStore::new(MemoryObjectStoreConfig::default());
+    assert!(matches!(
+        restarted
+            .mirror_bundle(&evidence, &restored, ZoneId::owner(), &key, &destination,)
+            .await,
+        Err(RegistryError::VerifiedBundleMismatch { field: "zone", .. })
+    ));
+    assert_eq!(destination.storage_used().await, 0);
+    restarted
+        .mirror_bundle(&evidence, &restored, zone.clone(), &key, &destination)
+        .await
+        .expect("retained recovery proof remains valid in its authenticated zone");
+
     let untrusted = RegistryVerifier::new(RegistryTrustPolicy::default());
     assert!(
         untrusted
@@ -1550,6 +1563,20 @@ async fn verified_symbol_mirror_recovers_lost_binary_with_repair_esis() {
     // Fresh evidence must belong to the current verifier and remain usable
     // by the normal installation/mirroring path.
     let destination = MemoryObjectStore::new(MemoryObjectStoreConfig::default());
+    assert!(matches!(
+        fixture
+            .verifier
+            .mirror_bundle(
+                &evidence,
+                &restored,
+                ZoneId::owner(),
+                &fixture.key,
+                &destination,
+            )
+            .await,
+        Err(RegistryError::VerifiedBundleMismatch { field: "zone", .. })
+    ));
+    assert_eq!(destination.storage_used().await, 0);
     fixture
         .verifier
         .mirror_bundle(
@@ -1745,6 +1772,66 @@ async fn verified_symbol_mirror_revalidates_current_trust_policy_and_target() {
         .expect("current policy permits recovery");
     assert_eq!(fixture.store.storage_used().await, object_bytes);
     assert_eq!(fixture.symbols.storage_used().await, symbol_bytes);
+}
+
+#[fcp_async_core::runtime::test]
+async fn verified_symbol_mirror_revalidates_attestation_freshness_after_restart() {
+    let mut fixture = RetainedSymbolFixture::new().await;
+    fixture
+        .store
+        .delete(&fixture.mirror.binary_object_id)
+        .await
+        .expect("lose materialized binary");
+    let object_bytes = fixture.store.storage_used().await;
+    let symbol_bytes = fixture.symbols.storage_used().await;
+
+    // The retained artifact was accepted before this operator requirement was
+    // introduced. Recovery must apply the restarted verifier's current policy.
+    fixture.verifier = RegistryVerifier::new(fixture.trust.clone())
+        .with_supply_chain_verification_config(SupplyChainVerificationConfig {
+            require_attestation_types: vec![AttestationType::InToto],
+            require_attestation_expiry: true,
+            ..SupplyChainVerificationConfig::default()
+        });
+    for expires_at in [Some(0), None, Some(u64::MAX)] {
+        let evidence = SupplyChainEvidence::new().with_attestations(vec![AttestationEvidence {
+            attestation_type: AttestationType::InToto,
+            slsa_level: None,
+            builder_id: None,
+            expires_at,
+        }]);
+        let result = fixture
+            .verifier
+            .load_verified_symbol_mirror(
+                &fixture.descriptor_id,
+                &fixture.zone,
+                &fixture.key,
+                &fixture.store,
+                &fixture.symbols,
+                &fixture.config,
+                None,
+                Some(&evidence),
+                Some(&test_target()),
+            )
+            .await;
+        match expires_at {
+            Some(0) => assert!(matches!(
+                result,
+                Err(RegistryError::AttestationExpired { .. })
+            )),
+            None => assert!(matches!(
+                result,
+                Err(RegistryError::AttestationExpiryMissing { .. })
+            )),
+            Some(_) => {
+                let (restored, _) = result.expect("fresh current evidence permits recovery");
+                assert_eq!(restored.binary, fixture.bundle.binary);
+            }
+        }
+    }
+    assert_eq!(fixture.store.storage_used().await, object_bytes);
+    assert_eq!(fixture.symbols.storage_used().await, symbol_bytes);
+    assert_eq!(fixture.store.list_zone(&fixture.zone).await.len(), 2);
 }
 
 #[fcp_async_core::runtime::test]

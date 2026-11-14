@@ -1116,10 +1116,7 @@ impl DecodeAdmissionController {
                     return Err(DecodeError::Cancelled);
                 }
 
-                if decoder.received_count() >= decoder.k
-                    && decoder.received_count() > decoder.last_attempted_at_count
-                    && let Some(payload) = decoder.attempt_reconstruct()?
-                {
+                if let Some(payload) = decoder.finish()? {
                     return Ok(payload);
                 }
 
@@ -1435,6 +1432,100 @@ mod tests {
 
         assert_eq!(decoder.expected_k(), 16);
         assert_eq!(decoder.needed(), 17); // ceil(16 * 1.002) = 17
+    }
+
+    #[test]
+    fn finish_recovers_a_complete_source_tail_deferred_by_backoff() {
+        let config = RaptorQConfig {
+            repair_ratio_bps: 10_000,
+            ..test_config()
+        };
+        let payload: Vec<u8> = (0..640)
+            .map(|index| u8::try_from(index % 251).unwrap())
+            .collect();
+        let encoder = RaptorQEncoder::new(&payload, &config).unwrap();
+        let mut decoder = RaptorQDecoder::new(encoder.transmission_info(), &config);
+        let symbols = encoder.encode_all();
+        let k = encoder.source_symbols();
+        for (esi, bytes) in symbols.iter().filter(|(esi, _)| *esi < k - 1) {
+            decoder.add_symbol(*esi, bytes.clone()).unwrap();
+        }
+        let (repair_esi, repair_bytes) = symbols.iter().find(|(esi, _)| *esi >= k).unwrap();
+        decoder
+            .add_symbol(*repair_esi, repair_bytes.clone())
+            .unwrap();
+
+        // Model an outstanding post-K backoff after an earlier rank-deficient
+        // attempt. The final source arrival must remain coalesced; finish must
+        // nevertheless decode the actual, complete source equations.
+        decoder.last_attempted_at_count = k;
+        decoder.post_k_retry_step = 4;
+        let (last_esi, last_bytes) = symbols.iter().find(|(esi, _)| *esi == k - 1).unwrap();
+        assert!(
+            decoder
+                .add_symbol(*last_esi, last_bytes.clone())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(decoder.last_attempted_at_count, k);
+        assert_eq!(decoder.finish().unwrap(), Some(payload));
+        assert_eq!(decoder.last_attempted_at_count, k + 1);
+        assert!(decoder.finish().unwrap().is_none());
+    }
+
+    #[test]
+    fn finish_does_not_retry_insufficient_equations_without_new_input() {
+        let config = RaptorQConfig {
+            repair_ratio_bps: 10_000,
+            ..test_config()
+        };
+        let payload = vec![0x5a; 640];
+        let encoder = RaptorQEncoder::new(&payload, &config).unwrap();
+        let mut decoder = RaptorQDecoder::new(encoder.transmission_info(), &config);
+        assert!(decoder.finish().unwrap().is_none());
+        // An authenticated but incompatible payload hash must remain a failed
+        // reconstruction, including after the final buffered repair is tried.
+        decoder.payload_hash = Some(*blake3::hash(b"different payload").as_bytes());
+        let k = encoder.source_symbols();
+        for (esi, bytes) in encoder.encode_all().into_iter().take(k as usize + 2) {
+            assert!(decoder.add_symbol(esi, bytes).unwrap().is_none());
+        }
+        assert!(decoder.last_attempted_at_count < decoder.received_count());
+        assert!(decoder.finish().unwrap().is_none());
+        let last_attempt = decoder.last_attempted_at_count;
+        let retry_step = decoder.post_k_retry_step;
+        assert_eq!(last_attempt, decoder.received_count());
+        assert!(decoder.finish().unwrap().is_none());
+        assert_eq!(decoder.last_attempted_at_count, last_attempt);
+        assert_eq!(decoder.post_k_retry_step, retry_step);
+    }
+
+    #[test]
+    fn finish_preserves_timeout_and_transmission_bounds() {
+        let config = test_config();
+        let expired_config = RaptorQConfig {
+            decode_timeout: Duration::ZERO,
+            ..config.clone()
+        };
+        let mut expired = RaptorQDecoder::with_expected_symbols(1, 64, 64, &expired_config);
+        std::thread::sleep(Duration::from_millis(1));
+        assert!(matches!(expired.finish(), Err(DecodeError::Timeout)));
+
+        let mut invalid =
+            RaptorQDecoder::new(ObjectTransmissionInformation::new(64, 0, 1, 1, 8), &config);
+        assert!(matches!(
+            invalid.finish(),
+            Err(DecodeError::InvalidTransmissionInfo { .. })
+        ));
+
+        let mut oversized = RaptorQDecoder::new(
+            ObjectTransmissionInformation::new(u64::from(config.max_object_size) + 1, 64, 1, 1, 8),
+            &config,
+        );
+        assert!(matches!(
+            oversized.finish(),
+            Err(DecodeError::MemoryLimitExceeded { .. })
+        ));
     }
 
     #[test]
