@@ -202,7 +202,8 @@ use fcp_async_core::http::HttpClientError;
 use fcp_async_core::{AsyncError, ExecutionContext};
 #[cfg(feature = "connector-http")]
 use fcp_manifest::{
-    HostEgressHttpRequest, HostEgressHttpResponse, HostEgressTcpRequest, HostEgressTcpResponse,
+    HostEgressContext, HostEgressDecisionMetadata, HostEgressHttpRequest, HostEgressHttpResponse,
+    HostEgressTcpRequest, HostEgressTcpResponse,
 };
 use tracing::{debug, warn};
 
@@ -215,23 +216,103 @@ use crate::retry::{RetryDecision, RetryPolicy};
 use std::fmt;
 
 /// Connector-side client for the host egress proxy.
+///
+/// Each call has a total deadline and a bounded JSON response. Redirects,
+/// ambient HTTP proxies, and automatic retries are disabled: these requests
+/// carry capability material and may cause effects at the upstream service.
 #[cfg(feature = "connector-http")]
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HostEgressProxyClient {
     base_url: String,
     client: reqwest::Client,
+    timeout: Duration,
+    max_response_bytes: usize,
+}
+
+#[cfg(feature = "connector-http")]
+impl std::fmt::Debug for HostEgressProxyClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostEgressProxyClient")
+            .field("timeout", &self.timeout)
+            .field("max_response_bytes", &self.max_response_bytes)
+            .finish_non_exhaustive()
+    }
 }
 
 #[cfg(feature = "connector-http")]
 impl HostEgressProxyClient {
     /// Construct a host egress proxy client from a base URL such as
-    /// `http://127.0.0.1:7878`.
-    #[must_use]
-    pub fn new(base_url: impl Into<String>) -> Self {
-        Self {
-            base_url: base_url.into().trim_end_matches('/').to_string(),
-            client: reqwest::Client::new(),
+    /// `http://127.0.0.1:7878`. Defaults to a 30-second total deadline and a
+    /// 16 MiB JSON response limit, including base64 encoding and metadata.
+    /// Rejection bodies are additionally capped at 64 KiB.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid URLs, non-HTTP(S) schemes, URL credentials, queries, and
+    /// fragments. Also returns transport initialization failures.
+    pub fn new(base_url: impl Into<String>) -> Result<Self, HostEgressProxyError> {
+        let base_url = base_url.into();
+        let url = reqwest::Url::parse(&base_url)
+            .map_err(|_| HostEgressProxyError::InvalidConfiguration("invalid host proxy URL"))?;
+        if !matches!(url.scheme(), "http" | "https")
+            || url.host_str().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(HostEgressProxyError::InvalidConfiguration(
+                "host proxy URL must use HTTP(S) without credentials, query, or fragment",
+            ));
         }
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .no_proxy()
+            .build()
+            .map_err(host_egress_transport_error)?;
+        Ok(Self {
+            base_url: url.as_str().trim_end_matches('/').to_string(),
+            client,
+            timeout: Duration::from_secs(30),
+            max_response_bytes: 16 * 1024 * 1024,
+        })
+    }
+
+    /// Set the total deadline for connecting, sending, and reading a response.
+    /// A timeout does not establish whether the upstream effect happened.
+    ///
+    /// # Errors
+    ///
+    /// Rejects zero or unrepresentable deadlines.
+    pub fn with_timeout(mut self, timeout: Duration) -> Result<Self, HostEgressProxyError> {
+        if timeout.is_zero() || std::time::Instant::now().checked_add(timeout).is_none() {
+            return Err(HostEgressProxyError::InvalidConfiguration(
+                "host proxy timeout must be positive and representable",
+            ));
+        }
+        self.timeout = timeout;
+        Ok(self)
+    }
+
+    /// Set the maximum encoded JSON response size, including metadata and
+    /// base64 overhead. This is a connector-side resource bound; the host still
+    /// independently enforces the operation's upstream response policy.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a zero byte limit.
+    pub fn with_max_response_bytes(
+        mut self,
+        max_response_bytes: usize,
+    ) -> Result<Self, HostEgressProxyError> {
+        if max_response_bytes == 0 {
+            return Err(HostEgressProxyError::InvalidConfiguration(
+                "host proxy response limit must be positive",
+            ));
+        }
+        self.max_response_bytes = max_response_bytes;
+        Ok(self)
     }
 
     /// Absolute host RPC endpoint for mediated HTTP egress.
@@ -256,25 +337,25 @@ impl HostEgressProxyClient {
         &self,
         request: &HostEgressHttpRequest,
     ) -> Result<HostEgressHttpResponse, HostEgressProxyError> {
-        let response = self
-            .client
-            .post(self.http_endpoint())
-            .json(request)
-            .send()
-            .await
-            .map_err(HostEgressProxyError::Transport)?;
-        let status = response.status();
+        let (status, body) = self.post(self.http_endpoint(), request).await?;
         if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
             return Err(HostEgressProxyError::Rejected {
                 status: status.as_u16(),
-                body: redact_http_host_egress_rejection_body(request, body),
+                body: redact_http_host_egress_rejection_body(
+                    request,
+                    String::from_utf8_lossy(&body).into_owned(),
+                ),
             });
         }
-        response
-            .json()
-            .await
-            .map_err(HostEgressProxyError::Transport)
+        let response: HostEgressHttpResponse = serde_json::from_slice(&body)
+            .map_err(|_| HostEgressProxyError::InvalidResponse("invalid HTTP response contract"))?;
+        validate_host_egress_response(&request.context, &response.egress)?;
+        if !(100..=599).contains(&response.status) {
+            return Err(HostEgressProxyError::InvalidResponse(
+                "invalid upstream HTTP status",
+            ));
+        }
+        Ok(response)
     }
 
     /// Send a bounded TCP exchange through the host egress proxy.
@@ -287,26 +368,109 @@ impl HostEgressProxyClient {
         &self,
         request: &HostEgressTcpRequest,
     ) -> Result<HostEgressTcpResponse, HostEgressProxyError> {
-        let response = self
+        let (status, body) = self.post(self.tcp_endpoint(), request).await?;
+        if !status.is_success() {
+            return Err(HostEgressProxyError::Rejected {
+                status: status.as_u16(),
+                body: redact_tcp_host_egress_rejection_body(
+                    request,
+                    String::from_utf8_lossy(&body).into_owned(),
+                ),
+            });
+        }
+        let response: HostEgressTcpResponse = serde_json::from_slice(&body)
+            .map_err(|_| HostEgressProxyError::InvalidResponse("invalid TCP response contract"))?;
+        validate_host_egress_response(&request.context, &response.egress)?;
+        if u64::try_from(response.read.as_bytes().len()).ok() != Some(response.bytes_read)
+            || request
+                .read_limit_bytes
+                .is_some_and(|limit| response.bytes_read > limit)
+        {
+            return Err(HostEgressProxyError::InvalidResponse(
+                "TCP response violates read byte accounting",
+            ));
+        }
+        Ok(response)
+    }
+
+    async fn post<T: serde::Serialize>(
+        &self,
+        endpoint: String,
+        request: &T,
+    ) -> Result<(reqwest::StatusCode, Vec<u8>), HostEgressProxyError> {
+        let mut response = self
             .client
-            .post(self.tcp_endpoint())
+            .post(endpoint)
+            .timeout(self.timeout)
             .json(request)
             .send()
             .await
-            .map_err(HostEgressProxyError::Transport)?;
+            .map_err(host_egress_transport_error)?;
         let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(HostEgressProxyError::Rejected {
-                status: status.as_u16(),
-                body: redact_tcp_host_egress_rejection_body(request, body),
-            });
+        let limit = if status.is_success() {
+            self.max_response_bytes
+        } else {
+            self.max_response_bytes.min(64 * 1024)
+        };
+        if response
+            .content_length()
+            .is_some_and(|length| length > u64::try_from(limit).unwrap_or(u64::MAX))
+        {
+            return Err(HostEgressProxyError::ResponseTooLarge { limit });
         }
-        response
-            .json()
+        let mut body = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
             .await
-            .map_err(HostEgressProxyError::Transport)
+            .map_err(host_egress_transport_error)?
+        {
+            if chunk.len() > limit.saturating_sub(body.len()) {
+                return Err(HostEgressProxyError::ResponseTooLarge { limit });
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok((status, body))
     }
+}
+
+#[cfg(feature = "connector-http")]
+fn host_egress_transport_error(error: reqwest::Error) -> HostEgressProxyError {
+    HostEgressProxyError::Transport(error.without_url())
+}
+
+#[cfg(feature = "connector-http")]
+fn validate_host_egress_response(
+    request: &HostEgressContext,
+    response: &HostEgressDecisionMetadata,
+) -> Result<(), HostEgressProxyError> {
+    for (field, matches) in [
+        (
+            "connector_id",
+            request.connector_id == response.connector_id,
+        ),
+        (
+            "operation_id",
+            request.operation_id == response.operation_id,
+        ),
+        ("zone_id", request.zone_id == response.zone_id),
+        ("request_id", request.request_id == response.request_id),
+        (
+            "correlation_id",
+            request.correlation_id == response.correlation_id,
+        ),
+        ("decision", response.decision == "allow"),
+        (
+            "execution_mode",
+            response.execution_mode == "host_egress_proxy",
+        ),
+    ] {
+        if !matches {
+            // Never echo mismatched values: even an invalid response may carry
+            // another request's credentials, payload, or identifying metadata.
+            return Err(HostEgressProxyError::InvalidResponse(field));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(feature = "connector-http")]
@@ -374,9 +538,21 @@ fn redact_tcp_host_egress_rejection_body(request: &HostEgressTcpRequest, body: S
 #[cfg(feature = "connector-http")]
 #[derive(Debug, thiserror::Error)]
 pub enum HostEgressProxyError {
+    /// Invalid endpoint or unbounded client configuration.
+    #[error("invalid host egress proxy configuration: {0}")]
+    InvalidConfiguration(&'static str),
     /// The connector could not reach the host proxy or decode its response.
     #[error("host egress proxy transport failed: {0}")]
     Transport(reqwest::Error),
+    /// The host sent more encoded response bytes than the configured bound.
+    #[error("host egress proxy response exceeded {limit} bytes")]
+    ResponseTooLarge {
+        /// Maximum encoded response size accepted by this client.
+        limit: usize,
+    },
+    /// Malformed response or response attribution that did not match the call.
+    #[error("invalid host egress proxy response: {0}")]
+    InvalidResponse(&'static str),
     /// The host proxy rejected the request before returning a contract payload.
     #[error("host egress proxy rejected request with HTTP {status}: {body}")]
     Rejected {
@@ -393,8 +569,11 @@ impl HostEgressProxyError {
     #[must_use]
     pub const fn status(&self) -> Option<u16> {
         match self {
-            Self::Transport(_) => None,
             Self::Rejected { status, .. } => Some(*status),
+            Self::InvalidConfiguration(_)
+            | Self::Transport(_)
+            | Self::ResponseTooLarge { .. }
+            | Self::InvalidResponse(_) => None,
         }
     }
 
@@ -402,8 +581,11 @@ impl HostEgressProxyError {
     #[must_use]
     pub fn rejection_body(&self) -> Option<&str> {
         match self {
-            Self::Transport(_) => None,
             Self::Rejected { body, .. } => Some(body),
+            Self::InvalidConfiguration(_)
+            | Self::Transport(_)
+            | Self::ResponseTooLarge { .. }
+            | Self::InvalidResponse(_) => None,
         }
     }
 }
@@ -1049,6 +1231,419 @@ mod tests {
                 .expect("rejection body")
                 .contains("deny_reason=denied_host")
         );
+    }
+
+    #[cfg(feature = "connector-http")]
+    fn host_egress_test_http_request() -> HostEgressHttpRequest {
+        HostEgressHttpRequest {
+            context: br_b0qqv_host_egress_context("messages.create", "req-bounded-http"),
+            url: "https://api.example.test/messages".to_string(),
+            method: "POST".to_string(),
+            headers: vec![fcp_manifest::HostEgressHttpHeader {
+                name: "authorization".to_string(),
+                value: "Bearer header-secret-sentinel".to_string(),
+            }],
+            body: Some(fcp_manifest::Base64Bytes::from_vec(
+                b"request-body-secret-sentinel".to_vec(),
+            )),
+            credential_id: Some("credential-secret-sentinel".to_string()),
+        }
+    }
+
+    #[cfg(feature = "connector-http")]
+    fn host_egress_test_metadata(context: &HostEgressContext) -> HostEgressDecisionMetadata {
+        HostEgressDecisionMetadata {
+            connector_id: context.connector_id.clone(),
+            operation_id: context.operation_id.clone(),
+            zone_id: context.zone_id.clone(),
+            request_id: context.request_id.clone(),
+            correlation_id: context.correlation_id.clone(),
+            execution_mode: "host_egress_proxy".to_string(),
+            constraint_source: "managed_connector_config.operation_network_constraints".to_string(),
+            decision: "allow".to_string(),
+            resolved_host: "api.example.test".to_string(),
+            resolved_port: 443,
+            credential_injected: true,
+            elapsed_ms: 1,
+        }
+    }
+
+    #[cfg(feature = "connector-http")]
+    fn host_egress_test_http_response(request: &HostEgressHttpRequest) -> HostEgressHttpResponse {
+        HostEgressHttpResponse {
+            status: 201,
+            headers: Vec::new(),
+            body: fcp_manifest::Base64Bytes::from_vec(b"created".to_vec()),
+            egress: host_egress_test_metadata(&request.context),
+        }
+    }
+
+    #[cfg(feature = "connector-http")]
+    #[test]
+    fn host_egress_client_rejects_unsafe_endpoint_and_unbounded_configuration() {
+        for url in [
+            "not-a-url-secret-sentinel",
+            "file:///tmp/secret-sentinel",
+            "https://secret-sentinel:password@host.test/",
+            "https://host.test/?token=secret-sentinel",
+            "https://host.test/#secret-sentinel",
+        ] {
+            let error = HostEgressProxyClient::new(url).expect_err("unsafe endpoint");
+            assert!(matches!(
+                error,
+                HostEgressProxyError::InvalidConfiguration(_)
+            ));
+            assert!(!format!("{error:?} {error}").contains("secret-sentinel"));
+        }
+        let client =
+            HostEgressProxyClient::new("https://host.test/prefix/").expect("valid endpoint");
+        assert_eq!(
+            client.http_endpoint(),
+            "https://host.test/prefix/rpc/egress/http"
+        );
+        assert_eq!(
+            client.tcp_endpoint(),
+            "https://host.test/prefix/rpc/egress/tcp"
+        );
+        assert!(!format!("{client:?}").contains("host.test"));
+        assert!(client.clone().with_timeout(Duration::ZERO).is_err());
+        assert!(client.clone().with_timeout(Duration::MAX).is_err());
+        assert!(client.with_max_response_bytes(0).is_err());
+    }
+
+    #[cfg(feature = "connector-http")]
+    #[test]
+    fn host_egress_client_binds_http_and_tcp_results_to_the_exact_call() {
+        fcp_async_core::runtime::block_on_sync(async {
+            use wiremock::matchers::{method, path};
+            use wiremock::{Mock, MockServer, ResponseTemplate};
+
+            let server = MockServer::start().await;
+            let request = host_egress_test_http_request();
+            let expected = host_egress_test_http_response(&request);
+            let body = serde_json::to_vec(&expected).expect("serialize response");
+            Mock::given(method("POST"))
+                .and(path("/rpc/egress/http"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let client = HostEgressProxyClient::new(server.uri())
+                .expect("proxy client")
+                .with_max_response_bytes(body.len())
+                .expect("exact response boundary");
+            assert_eq!(
+                client.http(&request).await.expect("HTTP response"),
+                expected
+            );
+
+            let tcp_request = HostEgressTcpRequest {
+                context: br_b0qqv_host_egress_context("socket.exchange", "req-bounded-tcp"),
+                host: "api.example.test".to_string(),
+                port: 443,
+                tls: true,
+                sni_override: None,
+                write: Some(fcp_manifest::Base64Bytes::from_vec(b"PING".to_vec())),
+                read_limit_bytes: Some(4),
+                credential_id: None,
+            };
+            let tcp_expected = HostEgressTcpResponse {
+                bytes_written: 4,
+                bytes_read: 4,
+                read: fcp_manifest::Base64Bytes::from_vec(b"PONG".to_vec()),
+                egress: host_egress_test_metadata(&tcp_request.context),
+            };
+            Mock::given(method("POST"))
+                .and(path("/rpc/egress/tcp"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(&tcp_expected))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let tcp_client = HostEgressProxyClient::new(server.uri()).expect("TCP proxy client");
+            assert_eq!(
+                tcp_client.tcp(&tcp_request).await.expect("TCP response"),
+                tcp_expected
+            );
+            let requests = server.received_requests().await.expect("captured requests");
+            assert_eq!(requests.len(), 2);
+            assert_eq!(
+                requests[0]
+                    .body_json::<HostEgressHttpRequest>()
+                    .expect("HTTP request"),
+                request
+            );
+            assert_eq!(
+                requests[1]
+                    .body_json::<HostEgressTcpRequest>()
+                    .expect("TCP request"),
+                tcp_request
+            );
+        })
+        .expect("host egress response runtime");
+    }
+
+    #[cfg(feature = "connector-http")]
+    #[test]
+    fn host_egress_client_rejects_mismatched_or_malformed_authority_without_echoing_it() {
+        fcp_async_core::runtime::block_on_sync(async {
+            use wiremock::matchers::{method, path};
+            use wiremock::{Mock, MockServer, ResponseTemplate};
+
+            let server = MockServer::start().await;
+            let client = HostEgressProxyClient::new(server.uri()).expect("proxy client");
+            let request = host_egress_test_http_request();
+            for field in [
+                "connector_id", "operation_id", "zone_id", "request_id", "correlation_id",
+                "decision", "execution_mode",
+            ] {
+                let mut response = serde_json::to_value(host_egress_test_http_response(&request))
+                    .expect("response JSON");
+                response["egress"][field] = serde_json::json!("another-request-secret-sentinel");
+                let _guard = Mock::given(method("POST"))
+                    .and(path("/rpc/egress/http"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(response))
+                    .expect(1)
+                    .mount_as_scoped(&server)
+                    .await;
+                let error = client.http(&request).await.expect_err("mismatched response");
+                assert!(matches!(error, HostEgressProxyError::InvalidResponse(reason) if reason == field));
+                assert!(!format!("{error:?} {error}").contains("secret-sentinel"));
+            }
+            let _guard = Mock::given(method("POST"))
+                .and(path("/rpc/egress/http"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(
+                    r#"{"status":"unexpected-secret-sentinel"}"#,
+                ))
+                .expect(1)
+                .mount_as_scoped(&server)
+                .await;
+            let error = client.http(&request).await.expect_err("invalid response contract");
+            assert!(matches!(error, HostEgressProxyError::InvalidResponse(_)));
+            assert!(!format!("{error:?} {error}").contains("secret-sentinel"));
+        })
+        .expect("host egress identity runtime");
+    }
+
+    #[cfg(feature = "connector-http")]
+    #[test]
+    fn host_egress_client_does_not_redirect_capabilities_or_payloads() {
+        fcp_async_core::runtime::block_on_sync(async {
+            use wiremock::matchers::{method, path};
+            use wiremock::{Mock, MockServer, ResponseTemplate};
+
+            let server = MockServer::start().await;
+            let redirected = MockServer::start().await;
+            let request = host_egress_test_http_request();
+            let client = HostEgressProxyClient::new(server.uri()).expect("proxy client");
+            for status in [307, 308] {
+                let _guard = Mock::given(method("POST"))
+                    .and(path("/rpc/egress/http"))
+                    .respond_with(
+                        ResponseTemplate::new(status)
+                            .insert_header("Location", redirected.uri())
+                            .set_body_string(format!(
+                                "redirect denied: {}; {}; {}; {}",
+                                request.context.capability_token_cbor_b64,
+                                request.headers[0].value,
+                                request.credential_id.as_deref().expect("credential"),
+                                "request-body-secret-sentinel",
+                            )),
+                    )
+                    .expect(1)
+                    .mount_as_scoped(&server)
+                    .await;
+                let error = client.http(&request).await.expect_err("redirect rejected");
+                assert_eq!(error.status(), Some(status));
+                let diagnostic = format!("{error:?} {error}");
+                assert!(!diagnostic.contains("secret-sentinel"));
+                assert!(!diagnostic.contains("capability-material-redaction-sentinel"));
+            }
+            assert!(
+                redirected
+                    .received_requests()
+                    .await
+                    .expect("redirect capture")
+                    .is_empty()
+            );
+        })
+        .expect("host egress redirect runtime");
+    }
+
+    #[cfg(feature = "connector-http")]
+    fn host_egress_test_raw_server(
+        prefix: Vec<u8>,
+        pause: Duration,
+        suffix: Vec<u8>,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("raw proxy listener");
+        let address = listener.local_addr().expect("proxy address");
+        listener.set_nonblocking(true).expect("bounded accept");
+        let thread = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "proxy was not contacted"
+                        );
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("raw proxy accept: {error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("read bound");
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .expect("write bound");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let read = stream.read(&mut buffer).expect("request bytes");
+                assert!(read > 0, "request ended before body");
+                request.extend_from_slice(&buffer[..read]);
+                assert!(request.len() < 64 * 1024, "bounded test request");
+                if let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..end]);
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().expect("request length"))
+                        })
+                        .expect("content length");
+                    if request.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            stream.write_all(&prefix).expect("response prefix");
+            if !pause.is_zero() {
+                std::thread::sleep(pause);
+            }
+            // The client may already have rejected the size or deadline.
+            let _ = stream.write_all(&suffix);
+        });
+        (format!("http://{address}"), thread)
+    }
+
+    #[cfg(feature = "connector-http")]
+    #[test]
+    fn host_egress_client_bounds_declared_streamed_and_rejection_bodies() {
+        fcp_async_core::runtime::block_on_sync(async {
+            let request = host_egress_test_http_request();
+            for response in [
+                b"HTTP/1.1 200 OK\r\nContent-Length: 999999999\r\n\r\n".to_vec(),
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n10\r\n0123456789abcdef\r\n10\r\n0123456789abcdef\r\n0\r\n\r\n".to_vec(),
+                b"HTTP/1.1 403 Forbidden\r\nTransfer-Encoding: chunked\r\n\r\n10\r\n0123456789abcdef\r\n10\r\n0123456789abcdef\r\n0\r\n\r\n".to_vec(),
+            ] {
+                let (url, server) = host_egress_test_raw_server(response, Duration::ZERO, Vec::new());
+                let client = HostEgressProxyClient::new(url)
+                    .expect("proxy client")
+                    .with_max_response_bytes(20)
+                    .expect("bounded response");
+                let error = client.http(&request).await.expect_err("oversized response");
+                assert!(matches!(error, HostEgressProxyError::ResponseTooLarge { limit: 20 }));
+                server.join().expect("raw proxy completed");
+            }
+
+            let (url, server) = host_egress_test_raw_server(
+                b"HTTP/1.1 403 Forbidden\r\nContent-Length: 65537\r\n\r\n".to_vec(),
+                Duration::ZERO,
+                Vec::new(),
+            );
+            let client = HostEgressProxyClient::new(url).expect("default proxy client");
+            let error = client.http(&request).await.expect_err("rejection cap");
+            assert!(matches!(error, HostEgressProxyError::ResponseTooLarge { limit: 65_536 }));
+            server.join().expect("rejection proxy completed");
+        })
+        .expect("host egress bounds runtime");
+    }
+
+    #[cfg(feature = "connector-http")]
+    #[test]
+    fn host_egress_client_deadline_includes_success_and_error_body_reads() {
+        fcp_async_core::runtime::block_on_sync(async {
+            let request = host_egress_test_http_request();
+            for status in [200, 403] {
+                let (url, server) = host_egress_test_raw_server(
+                    format!("HTTP/1.1 {status} Test\r\nContent-Length: 100\r\n\r\n{{").into_bytes(),
+                    Duration::from_millis(250),
+                    vec![b' '; 99],
+                );
+                let runtime = crate::runtime::ConnectorRuntime::new(
+                    crate::runtime::ConnectorRuntimeConfig::default()
+                        .with_request_timeout(Duration::from_millis(40))
+                        .with_host_egress_proxy_url(url),
+                );
+                let client = runtime.host_egress_proxy_client()
+                    .expect("bounded runtime client")
+                    .expect("configured proxy");
+                let started = std::time::Instant::now();
+                let error = client.http(&request).await.expect_err("stalled body");
+                assert!(matches!(error, HostEgressProxyError::Transport(ref source) if source.is_timeout()));
+                assert!(started.elapsed() < Duration::from_secs(2));
+                assert!(!format!("{error:?} {error}").contains("127.0.0.1"));
+                server.join().expect("stalled proxy completed");
+            }
+        })
+        .expect("host egress deadline runtime");
+    }
+
+    #[cfg(feature = "connector-http")]
+    #[test]
+    fn host_egress_client_rejects_tcp_accounting_and_cross_request_results() {
+        fcp_async_core::runtime::block_on_sync(async {
+            use wiremock::matchers::{method, path};
+            use wiremock::{Mock, MockServer, ResponseTemplate};
+
+            let server = MockServer::start().await;
+            let client = HostEgressProxyClient::new(server.uri()).expect("proxy client");
+            let request = HostEgressTcpRequest {
+                context: br_b0qqv_host_egress_context("socket.exchange", "req-bounded-tcp"),
+                host: "api.example.test".to_string(),
+                port: 443,
+                tls: true,
+                sni_override: None,
+                write: None,
+                read_limit_bytes: Some(4),
+                credential_id: None,
+            };
+            for (bytes_read, read, replace_request) in [
+                (3, b"PONG".as_slice(), false),
+                (5, b"PONG!".as_slice(), false),
+                (4, b"PONG".as_slice(), true),
+            ] {
+                let mut metadata = host_egress_test_metadata(&request.context);
+                if replace_request {
+                    metadata.request_id = "different-request-secret-sentinel".to_string();
+                }
+                let response = HostEgressTcpResponse {
+                    bytes_written: 0,
+                    bytes_read,
+                    read: fcp_manifest::Base64Bytes::from_vec(read.to_vec()),
+                    egress: metadata,
+                };
+                let _guard = Mock::given(method("POST"))
+                    .and(path("/rpc/egress/tcp"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(response))
+                    .expect(1)
+                    .mount_as_scoped(&server)
+                    .await;
+                let error = client
+                    .tcp(&request)
+                    .await
+                    .expect_err("invalid TCP response");
+                assert!(matches!(error, HostEgressProxyError::InvalidResponse(_)));
+                assert!(!format!("{error:?} {error}").contains("secret-sentinel"));
+            }
+        })
+        .expect("host egress TCP validation runtime");
     }
 
     // -- HttpRetryConfig tests ------------------------------------------------

@@ -43,7 +43,7 @@ use fcp_manifest::{ConnectorManifest, ManifestTimeouts};
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "connector-http")]
-use crate::migration::HostEgressProxyClient;
+use crate::migration::{HostEgressProxyClient, HostEgressProxyError};
 #[cfg(feature = "cursor-store-object-store")]
 use fcp_cbor::CanonicalSerializer;
 use fcp_prelude::{
@@ -427,11 +427,19 @@ impl ConnectorRuntime {
     /// Build a connector-facing client for host-mediated HTTP/TCP egress.
     ///
     /// The helper is only available with `connector-http`, matching the rest of
-    /// the SDK HTTP client surface.
+    /// the SDK HTTP client surface. Its total deadline uses the runtime's
+    /// request timeout, including reading the host response body.
+    ///
+    /// # Errors
+    ///
+    /// Returns invalid proxy configuration or transport initialization errors.
     #[cfg(feature = "connector-http")]
-    #[must_use]
-    pub fn host_egress_proxy_client(&self) -> Option<HostEgressProxyClient> {
-        self.host_egress_proxy_url().map(HostEgressProxyClient::new)
+    pub fn host_egress_proxy_client(
+        &self,
+    ) -> Result<Option<HostEgressProxyClient>, HostEgressProxyError> {
+        self.host_egress_proxy_url()
+            .map(|url| HostEgressProxyClient::new(url)?.with_timeout(self.request_timeout()))
+            .transpose()
     }
 }
 
@@ -3205,6 +3213,7 @@ deny_ptrace = true
         );
         let client = runtime
             .host_egress_proxy_client()
+            .expect("valid host egress proxy configuration")
             .expect("configured host egress proxy client");
         assert_eq!(
             client.http_endpoint(),
@@ -3214,6 +3223,34 @@ deny_ptrace = true
             client.tcp_endpoint(),
             "http://127.0.0.1:7878/rpc/egress/tcp"
         );
+    }
+
+    #[cfg(feature = "connector-http")]
+    #[test]
+    fn host_egress_client_preserves_absent_and_invalid_configuration() {
+        let absent = ConnectorRuntime::new(ConnectorRuntimeConfig::default());
+        assert!(
+            absent
+                .host_egress_proxy_client()
+                .expect("no proxy")
+                .is_none()
+        );
+
+        let invalid = ConnectorRuntime::new(
+            ConnectorRuntimeConfig::default()
+                .with_host_egress_proxy_url("https://token-sentinel@host.test/"),
+        );
+        let error = invalid
+            .host_egress_proxy_client()
+            .expect_err("reject URL credentials");
+        assert!(!format!("{error:?} {error}").contains("token-sentinel"));
+
+        let unbounded = ConnectorRuntime::new(
+            ConnectorRuntimeConfig::default()
+                .with_host_egress_proxy_url("http://127.0.0.1:7878")
+                .with_request_timeout(Duration::ZERO),
+        );
+        assert!(unbounded.host_egress_proxy_client().is_err());
     }
 
     #[test]

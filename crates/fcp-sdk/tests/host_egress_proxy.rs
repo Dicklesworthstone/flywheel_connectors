@@ -310,6 +310,7 @@ fn host_egress_proxy_sdk_loopback_e2e_jsonl_matrix() {
         let http_runtime = runtime_for_proxy(&http_proxy);
         let http_client = http_runtime
             .host_egress_proxy_client()
+            .expect("valid HTTP host egress configuration")
             .expect("configured HTTP host egress client");
         let http_response = http_client
             .http(&http_request)
@@ -388,6 +389,7 @@ fn host_egress_proxy_sdk_loopback_e2e_jsonl_matrix() {
         let tcp_runtime = runtime_for_proxy(&tcp_proxy);
         let tcp_client = tcp_runtime
             .host_egress_proxy_client()
+            .expect("valid TCP host egress configuration")
             .expect("configured TCP host egress client");
         let tcp_response = tcp_client
             .tcp(&tcp_request)
@@ -530,6 +532,7 @@ fn host_egress_proxy_denied_decision_matrix_surfaces_structured_redacted_errors(
             let runtime = runtime_for_proxy(&proxy);
             let client = runtime
                 .host_egress_proxy_client()
+                .expect("valid denial proxy configuration")
                 .expect("configured denial proxy client");
 
             let error = if case.use_tcp {
