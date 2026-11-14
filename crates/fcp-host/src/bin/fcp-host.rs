@@ -3225,6 +3225,36 @@ impl SubprocessRegistry {
         require_allowed_zones_configured(connector_id, &entry.config.allowed_zones)
     }
 
+    /// Read the host's exact zone envelope without asking the connector or
+    /// mixing it with a summary from a different inventory generation.
+    async fn inventory_allowed_zones(
+        &self,
+        connector_id: &ConnectorId,
+        registry_version: u64,
+    ) -> HostResult<Vec<ZoneId>> {
+        let state = self.state.read().await;
+        self.require_generation(registry_version)?;
+        let entry = state
+            .connectors
+            .get(connector_id)
+            .ok_or_else(|| HostError::ConnectorNotFound(connector_id.to_string()))?;
+        let mut zones = entry
+            .config
+            .allowed_zones
+            .iter()
+            .map(|zone| {
+                zone.parse::<ZoneId>().map_err(|_| {
+                    HostError::InvalidFilter(format!(
+                        "connector '{connector_id}' has an invalid managed zone envelope"
+                    ))
+                })
+            })
+            .collect::<HostResult<Vec<_>>>()?;
+        zones.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        zones.dedup();
+        Ok(zones)
+    }
+
     /// Select invocation runtime and cancellation target from ONE registry
     /// snapshot. The runtime cloned here MUST be the one invoked below;
     /// a subsequent configuration replacement cannot redirect its reaper
@@ -11828,10 +11858,16 @@ async fn local_connector_inventory(
     );
     match state
         .discovery
-        .connector_with_cache(connector_id, cache_validator)
+        .connector_with_cache(connector_id, None)
         .await
     {
         Ok(response) => {
+            let allowed_zones = state
+                .registry
+                .inventory_allowed_zones(connector_id, response.registry_version)
+                .await
+                .map_err(map_host_error)?;
+            let response = response.with_allowed_zones(allowed_zones, cache_validator.as_ref());
             tracing::debug!(
                 event = "connector_response",
                 connector_id = %connector_id,
@@ -23442,7 +23478,11 @@ output_schema = {{ type = "object" }}
                     let mut body = match &envelope.body {
                         MeshForwardBody::Inventory { connector_id } => {
                             assert_eq!(connector_id, CONNECTOR);
-                            json!({ "connector": summary, "registry_version": 7 })
+                            json!({
+                                "connector": summary,
+                                "registry_version": 7,
+                                "allowed_zones": ["z:work"],
+                            })
                         }
                         MeshForwardBody::Introspect { connector_id } => {
                             assert_eq!(connector_id, CONNECTOR);
@@ -23518,6 +23558,7 @@ output_schema = {{ type = "object" }}
         assert!(!headers.contains_key(ETAG));
         assert!(!headers.contains_key(CACHE_CONTROL));
         assert!(inventory.response.cache.is_none());
+        assert_eq!(inventory.response.allowed_zones, Some(vec![ZoneId::work()]));
         let (headers, Json(introspection)) = introspect_handler(
             State(Arc::clone(&state)),
             HeaderMap::new(),
@@ -23613,6 +23654,7 @@ output_schema = {{ type = "object" }}
         let inventory_json = serde_json::to_string(&ConnectorInventoryResponse {
             connector: wrong_summary,
             registry_version: 1,
+            allowed_zones: Some(vec![ZoneId::work()]),
             cache: None,
             meta: None,
         })
@@ -34556,6 +34598,123 @@ done"#;
     }
 
     #[fcp_async_core::runtime::test]
+    async fn local_connector_inventory_exposes_exact_host_zones_and_cache_identity() {
+        let state = cancel_route_test_state();
+        let mut config = dispatcher_test_config("fcp.test.inventory-zones:utility:1.0.0");
+        let connector_id: ConnectorId = config.id.parse().unwrap();
+        config.allowed_zones = vec![
+            ZoneId::work().to_string(),
+            ZoneId::private().to_string(),
+            ZoneId::work().to_string(),
+        ];
+        state
+            .registry
+            .publish_configs(
+                registry_publication_fixture(&state.registry, vec![config.clone()]).await,
+            )
+            .await
+            .unwrap();
+
+        let (headers, response) = local_connector_inventory(&state, &connector_id, None)
+            .await
+            .unwrap();
+        assert_eq!(response.connector.id, connector_id);
+        assert_eq!(response.registry_version, state.registry.version());
+        assert_eq!(
+            response.allowed_zones,
+            Some(vec![ZoneId::private(), ZoneId::work()])
+        );
+        let etag = response.cache.as_ref().unwrap().etag.clone();
+        assert_eq!(headers.get(ETAG).unwrap().to_str().unwrap(), etag);
+        let validator = CacheValidator {
+            if_none_match: Some(etag),
+            if_modified_since: None,
+        };
+        let (_, unchanged) =
+            local_connector_inventory(&state, &connector_id, Some(validator.clone()))
+                .await
+                .unwrap();
+        assert_eq!(unchanged.meta.as_ref().unwrap().status, 304);
+        assert_eq!(unchanged.allowed_zones, response.allowed_zones);
+
+        let public: ZoneId = "z:public".parse().unwrap();
+        config.allowed_zones = vec![public.to_string()];
+        state
+            .registry
+            .publish_configs(registry_publication_fixture(&state.registry, vec![config]).await)
+            .await
+            .unwrap();
+        let (_, changed) = local_connector_inventory(&state, &connector_id, Some(validator))
+            .await
+            .unwrap();
+        assert!(changed.meta.is_none());
+        assert!(changed.registry_version > response.registry_version);
+        assert_eq!(changed.allowed_zones, Some(vec![public]));
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn local_connector_inventory_empty_zones_are_deny_all_for_either_operation_flag() {
+        for enforce_empty_allow_lists in [false, true] {
+            let state = cancel_route_test_state();
+            let mut config = dispatcher_test_config("fcp.test.inventory-no-zones:utility:1.0.0");
+            let connector_id: ConnectorId = config.id.parse().unwrap();
+            config.allowed_zones.clear();
+            config.enforce_empty_allow_lists = enforce_empty_allow_lists;
+            state
+                .registry
+                .publish_configs(registry_publication_fixture(&state.registry, vec![config]).await)
+                .await
+                .unwrap();
+
+            let (_, response) = local_connector_inventory(&state, &connector_id, None)
+                .await
+                .unwrap();
+            assert_eq!(response.allowed_zones, Some(Vec::new()));
+            assert!(
+                state
+                    .registry
+                    .zone_envelope_status(&connector_id)
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn inventory_zone_metadata_rejects_stale_generation_and_invalid_zone() {
+        let registry = empty_registry(1);
+        let mut config = dispatcher_test_config("fcp.test.inventory-zone-fence:utility:1.0.0");
+        let connector_id: ConnectorId = config.id.parse().unwrap();
+        registry
+            .publish_configs(registry_publication_fixture(&registry, vec![config.clone()]).await)
+            .await
+            .unwrap();
+        let initial_generation = registry.version();
+        config.allowed_zones = vec![ZoneId::private().to_string()];
+        registry
+            .publish_configs(registry_publication_fixture(&registry, vec![config.clone()]).await)
+            .await
+            .unwrap();
+
+        let error = registry
+            .inventory_allowed_zones(&connector_id, initial_generation)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("inventory changed"));
+
+        config.allowed_zones = vec!["*".to_string()];
+        registry
+            .publish_configs(registry_publication_fixture(&registry, vec![config]).await)
+            .await
+            .unwrap();
+        let error = registry
+            .inventory_allowed_zones(&connector_id, registry.version())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("invalid managed zone envelope"));
+    }
+
+    #[fcp_async_core::runtime::test]
     async fn registry_publication_rejects_stale_plan_without_erasing_current_inventory() {
         let registry = empty_registry(1);
         let removed = dispatcher_test_config("fcp.test.publish-removed:utility:1.0.0");
@@ -34623,6 +34782,7 @@ done"#;
                 .await
                 .unwrap(),
             replacement_entries: HashMap::new(),
+            launch_fences: Vec::new(),
         };
         let error = registry.publish_configs(missing).await.unwrap_err();
         assert!(error.to_string().contains("replacement set"));

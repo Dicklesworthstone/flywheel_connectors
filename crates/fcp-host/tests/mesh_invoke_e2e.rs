@@ -1038,6 +1038,7 @@ async fn valid_mesh_read_responses() -> Result<(Value, Value), Box<dyn std::erro
     let inventory = fcp_host::ConnectorInventoryResponse {
         connector,
         registry_version: 1,
+        allowed_zones: Some(vec![ZoneId::work()]),
         cache: None,
         meta: None,
     };

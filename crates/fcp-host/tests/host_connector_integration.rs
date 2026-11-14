@@ -1638,6 +1638,7 @@ async fn assert_discovery_routes(
     let connector_summary_headers = connector_summary.headers.clone();
     let connector_summary = connector_summary.body;
     assert_eq!(connector_summary.connector.id, *connector_a_id);
+    assert_eq!(connector_summary.allowed_zones, Some(vec![ZoneId::work()]));
     assert_eq!(connector_summary.connector.tool_count, 1);
     assert!(matches!(
         connector_summary.connector.max_safety_tier,
@@ -1669,6 +1670,10 @@ async fn assert_discovery_routes(
         Some(304)
     );
     assert_eq!(connector_not_modified.connector.id, *connector_a_id);
+    assert_eq!(
+        connector_not_modified.allowed_zones,
+        Some(vec![ZoneId::work()])
+    );
     assert_cache_headers(
         &connector_not_modified_headers,
         connector_not_modified

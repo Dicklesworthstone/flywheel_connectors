@@ -1808,6 +1808,10 @@ fwc serve-mcp --host http://127.0.0.1:8787 github \
 fwc serve-mcp --host http://127.0.0.1:8787 --risk-max medium github \
     --capability-token-file invoke.token
 
+# Expose only connectors admitted by the host to a specific zone
+fwc serve-mcp --host http://127.0.0.1:8787 --zone z:work github \
+    --capability-token-file invoke.token
+
 # Offline tool schema export
 fwc export-tools --offline --format mcp --json
 fwc export-tools --offline --format claude github
@@ -1815,6 +1819,14 @@ fwc export-tools --offline --format openai --risk-max medium --output tools.json
 ```
 
 `--risk-max` excludes operations above a risk threshold, preventing agents from accidentally invoking dangerous operations. Both `export-tools` and `serve-mcp` honor it with the same inclusive boundary semantics; a live `serve-mcp` server enforces the ceiling on `tools/list` and on `tools/call`, and tools without declared risk metadata are excluded whenever a ceiling is set.
+
+`serve-mcp --zone` filters the live inventory using the host's explicit managed
+zone allow-list. An empty list permits no zone; missing metadata from an older
+host is unknown and is refused. Disabled connectors are excluded. Tool calls
+retain the selected zone and exact canonical connector and operation identities,
+so removing an installed version or operation cannot silently redirect a retained
+MCP tool to a similarly named replacement. Normal host preflight, capabilities,
+approvals, and current admission rules still apply to every call.
 
 The stdio server admits up to eight queued or running tool calls and continues reading requests while those calls execute. `ping` and tool discovery can respond while a provider call is pending. Requests and responses are limited to 32 MiB, and request IDs to 256 bytes. Calls beyond the concurrency limit receive a `server_busy` error before execution. Each accepted tool call has a fresh host request identity, including calls with identical arguments or a reused MCP request ID.
 

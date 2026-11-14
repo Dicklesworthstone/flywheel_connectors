@@ -355,6 +355,14 @@ pub struct ConnectorInventoryResponse {
     /// Registry version backing the response.
     pub registry_version: u64,
 
+    /// Exact invocation zones admitted by the host's managed inventory.
+    ///
+    /// `None` means this response does not establish zone authority. An empty
+    /// list means no zone is admitted, never unrestricted access. These are
+    /// host-owned constraints, not connector-reported introspection metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_zones: Option<Vec<ZoneId>>,
+
     /// Optional cache metadata for agent-side validation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache: Option<CacheMetadata>,
@@ -365,6 +373,34 @@ pub struct ConnectorInventoryResponse {
 }
 
 impl ConnectorInventoryResponse {
+    /// Attach the authoritative zone envelope from this registry generation.
+    ///
+    /// The caller must obtain the envelope from the same registry generation
+    /// as the summary. Cache validators are recomputed over the complete
+    /// representation so a zone-policy change cannot reuse a summary-only tag.
+    #[must_use]
+    pub fn with_allowed_zones(
+        mut self,
+        allowed_zones: Vec<ZoneId>,
+        validator: Option<&CacheValidator>,
+    ) -> Self {
+        self.allowed_zones = Some(allowed_zones);
+        if let Some(cache) = self.cache.as_mut() {
+            *cache = CacheMetadata::strong(
+                &(self.registry_version, &self.connector, &self.allowed_zones),
+                cache.last_modified,
+                cache.max_age_seconds,
+                cache.stale_while_revalidate_seconds,
+            );
+            self.meta = validator
+                .filter(|validator| validator.is_not_modified(cache))
+                .map(|_| ResponseMeta::not_modified());
+        } else {
+            self.meta = None;
+        }
+        self
+    }
+
     #[must_use]
     fn not_modified(
         connector: ConnectorSummary,
@@ -374,6 +410,7 @@ impl ConnectorInventoryResponse {
         Self {
             connector,
             registry_version,
+            allowed_zones: None,
             cache: Some(cache),
             meta: Some(ResponseMeta::not_modified()),
         }
@@ -1153,6 +1190,7 @@ where
         Ok(ConnectorInventoryResponse {
             connector,
             registry_version: cache_result.registry_version,
+            allowed_zones: None,
             cache: Some(cache),
             meta: None,
         })
@@ -1407,6 +1445,20 @@ impl DiscoveryCache {
         // Cache miss or expired - refresh
         let connectors = registry.list().await;
         let refreshed_version = registry.version();
+
+        // A registry lookup can wait on a runtime while an inventory update
+        // publishes. Never label that earlier snapshot with the new version:
+        // callers attaching host policy rely on this generation as a fence.
+        // The next lookup will refresh, and generation-bound callers can
+        // refuse this result instead of combining unrelated authority.
+        if registry_version != refreshed_version {
+            return DiscoveryCacheResult {
+                connectors,
+                registry_version,
+                cache_hit: false,
+                last_modified: Utc::now(),
+            };
+        }
 
         let mut write = self.cache.write().await;
         let last_modified = if write
@@ -2401,6 +2453,39 @@ mod tests {
             2,
             "loader is called once (panics) then once more (succeeds)"
         );
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn discovery_cache_does_not_publish_a_refresh_across_inventory_generations() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let summary = make_summary(
+            "generation-race",
+            "test",
+            "v1",
+            vec![],
+            SafetyTier::Safe,
+            ConnectorHealth::healthy(),
+        );
+        let registry = MutableRegistry::new(vec![summary], 1, Arc::clone(&calls));
+        let cache = DiscoveryCache::new(Duration::from_secs(30));
+
+        let inventory = registry.connectors.write().await;
+        let mut refresh = Box::pin(cache.get_or_refresh(&registry));
+        assert!(futures_util::poll!(refresh.as_mut()).is_pending());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        registry.version.store(2, Ordering::SeqCst);
+        drop(inventory);
+
+        let raced = refresh.await;
+        assert_eq!(raced.registry_version, 1);
+        assert!(!raced.cache_hit);
+        assert!(cache.cache.read().await.is_none());
+
+        let fresh = cache.get_or_refresh(&registry).await;
+        assert_eq!(fresh.registry_version, 2);
+        assert!(!fresh.cache_hit);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(cache.get_or_refresh(&registry).await.cache_hit);
     }
 
     #[fcp_async_core::runtime::test]
@@ -5784,14 +5869,92 @@ mod tests {
         let resp = ConnectorInventoryResponse {
             connector: summary,
             registry_version: 42,
+            allowed_zones: Some(vec![ZoneId::work()]),
             cache: None,
             meta: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         let parsed: ConnectorInventoryResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.registry_version, 42);
+        assert_eq!(parsed.allowed_zones, Some(vec![ZoneId::work()]));
         assert!(parsed.cache.is_none());
         assert!(parsed.meta.is_none());
+    }
+
+    #[test]
+    fn connector_inventory_zone_authority_distinguishes_unknown_and_deny_all() {
+        let response = ConnectorInventoryResponse {
+            connector: make_summary(
+                "zone-authority",
+                "test",
+                "v1",
+                vec![],
+                SafetyTier::Safe,
+                ConnectorHealth::healthy(),
+            ),
+            registry_version: 7,
+            allowed_zones: None,
+            cache: None,
+            meta: None,
+        };
+        let unknown = serde_json::to_value(&response).unwrap();
+        assert!(unknown.get("allowed_zones").is_none());
+        let decoded: ConnectorInventoryResponse = serde_json::from_value(unknown).unwrap();
+        assert!(decoded.allowed_zones.is_none());
+
+        let denied = response.with_allowed_zones(Vec::new(), None);
+        let encoded = serde_json::to_value(&denied).unwrap();
+        assert_eq!(encoded["allowed_zones"], serde_json::json!([]));
+        let decoded: ConnectorInventoryResponse = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.allowed_zones, Some(Vec::new()));
+    }
+
+    #[test]
+    fn connector_inventory_zone_envelope_revalidates_cache_identity() {
+        let summary = make_summary(
+            "zone-cache",
+            "test",
+            "v1",
+            vec![],
+            SafetyTier::Safe,
+            ConnectorHealth::healthy(),
+        );
+        let cache = CacheMetadata {
+            etag: "\"summary-only\"".to_string(),
+            last_modified: Utc::now(),
+            max_age_seconds: 30,
+            stale_while_revalidate_seconds: None,
+        };
+        let summary_validator = CacheValidator {
+            if_none_match: Some(cache.etag.clone()),
+            if_modified_since: None,
+        };
+        let response = ConnectorInventoryResponse::not_modified(summary, 7, cache);
+        let scoped = response
+            .clone()
+            .with_allowed_zones(vec![ZoneId::work()], Some(&summary_validator));
+        assert!(scoped.meta.is_none());
+        assert_eq!(scoped.allowed_zones, Some(vec![ZoneId::work()]));
+        let scoped_validator = CacheValidator {
+            if_none_match: Some(scoped.cache.as_ref().unwrap().etag.clone()),
+            if_modified_since: None,
+        };
+        let unchanged = response
+            .clone()
+            .with_allowed_zones(vec![ZoneId::work()], Some(&scoped_validator));
+        assert_eq!(unchanged.meta.as_ref().unwrap().status, 304);
+        assert_eq!(unchanged.allowed_zones, Some(vec![ZoneId::work()]));
+
+        for zones in [vec![ZoneId::private()], Vec::new()] {
+            let changed = response
+                .clone()
+                .with_allowed_zones(zones, Some(&scoped_validator));
+            assert!(changed.meta.is_none());
+            assert_ne!(
+                changed.cache.as_ref().unwrap().etag,
+                scoped_validator.if_none_match.as_ref().unwrap().as_str()
+            );
+        }
     }
 
     #[test]
@@ -5807,6 +5970,7 @@ mod tests {
         let resp = ConnectorInventoryResponse {
             connector: summary,
             registry_version: 1,
+            allowed_zones: None,
             cache: None,
             meta: None,
         };

@@ -3826,36 +3826,23 @@ fn execute_serve_mcp(prepared: &PreparedCli, args: &ServeMcpArgs) -> Result<Exec
     // Validate explicit cancellation credentials before opening the MCP stream.
     // Each accepted call then retains its own credential snapshot for cleanup.
     args.cancellation.resolve()?;
-    if let Some(zone) = args.zone.as_deref() {
-        return render_dispatch(
-            DispatchOutcome {
-                payload: json!({
-                    "status": "error",
-                    "command": "serve-mcp",
-                    "source": "host-admin-api",
-                    "error": {
-                        "type": "unsupported-live-zone-filter",
-                        "message": format!(
-                            "`fwc serve-mcp` cannot prove connector availability for zone `{zone}` because live host discovery does not expose per-zone inventory metadata."
-                        ),
-                        "recoverable": true,
-                    },
-                    "filters": {
-                        "connector": args.connector,
-                        "zone": zone,
-                    },
-                    "next_actions": [
-                        "Retry without `--zone` so `fwc` can expose the live host inventory truthfully.".to_owned(),
-                        "Use host contexts or explicit `fwc invoke/simulate --zone ...` commands when you need zone-scoped execution.".to_owned(),
-                    ],
-                }),
-                exit_code: CliExitCode::Validation,
-            },
-            prepared.format,
-            prepared.cli.token_stats,
-            &prepared.render_options,
-        );
-    }
+    let zone = match args.zone.as_deref().map(str::parse::<ZoneId>).transpose() {
+        Ok(zone) => zone,
+        Err(_) => {
+            return render_dispatch(
+                serve_mcp_zone_failure(
+                    "invalid-mcp-zone",
+                    "The MCP zone filter must be a valid exact zone identifier.",
+                    args.zone.as_deref().unwrap_or_default(),
+                    None,
+                    CliExitCode::Validation,
+                ),
+                prepared.format,
+                prepared.cli.token_stats,
+                &prepared.render_options,
+            );
+        }
+    };
     let client = HostAdminClient::new(&resolved_host.endpoint)?;
     let (catalog, _) = client.catalog(None)?;
     let connectors = if let Some(selector) = &args.connector {
@@ -3875,18 +3862,51 @@ fn execute_serve_mcp(prepared: &PreparedCli, args: &ServeMcpArgs) -> Result<Exec
         catalog.connectors.clone()
     };
 
-    let config = serve_mcp_config(
+    let connectors = if let Some(zone) = zone.as_ref() {
+        match serve_mcp_zone_connectors(&client, connectors, zone, args.connector.is_some()) {
+            Ok(connectors) => connectors,
+            Err(failure) => {
+                return render_dispatch(
+                    failure,
+                    prepared.format,
+                    prepared.cli.token_stats,
+                    &prepared.render_options,
+                );
+            }
+        }
+    } else {
+        connectors
+    };
+
+    let mut config = serve_mcp_config(
         args.connector.as_ref().and(connectors.first()),
         args.risk_max.as_deref(),
     );
+    if let Some(zone) = zone.as_ref() {
+        config = config.with_zone_filter(zone.as_str());
+    }
 
     let mut tools = Vec::new();
     for connector in &connectors {
-        let introspection = client.introspect(connector.summary.id.as_str())?;
-        tools.extend(try_host_mcp_tool_definitions(connector, &introspection)?);
+        let (introspection, _) =
+            client.introspect_with_provenance(connector.summary.id.as_str())?;
+        let mut connector_tools = try_host_mcp_tool_definitions(connector, &introspection)?;
+        if let Some(zone) = zone.as_ref() {
+            anyhow::ensure!(
+                introspection.connector.enabled,
+                "connector became disabled while preparing zone-scoped MCP tools"
+            );
+            for tool in &mut connector_tools {
+                // The host's current envelope, rather than an offline manifest
+                // wildcard, established this exact exposure scope. Invocation
+                // still performs normal current-policy/capability admission.
+                tool.supported_zones = vec![zone.to_string()];
+            }
+        }
+        tools.extend(connector_tools);
     }
 
-    let zone = args.zone.clone();
+    let zone = zone.map(|zone| zone.to_string());
     let state = serve_mcp::state_from_tools(tools, config);
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
@@ -3917,6 +3937,96 @@ fn execute_serve_mcp(prepared: &PreparedCli, args: &ServeMcpArgs) -> Result<Exec
         text: String::new(),
         exit_code: ExitCode::SUCCESS,
     })
+}
+
+fn serve_mcp_zone_connectors(
+    client: &HostAdminClient,
+    connectors: Vec<HostConnectorRecord>,
+    zone: &ZoneId,
+    explicit_connector: bool,
+) -> std::result::Result<Vec<HostConnectorRecord>, DispatchOutcome> {
+    let mut eligible = Vec::new();
+    for mut connector in connectors {
+        let id = connector.summary.id.as_str();
+        let (inventory, _) = client.connector_with_provenance(id).map_err(|_| {
+            serve_mcp_zone_failure(
+                "mcp-zone-inventory-unavailable",
+                "The selected host did not return valid, identity-bound connector inventory. No tools from this zone have been exposed.",
+                zone.as_str(),
+                Some(id),
+                CliExitCode::Transport,
+            )
+        })?;
+        if !inventory.connector.enabled {
+            if explicit_connector {
+                return Err(serve_mcp_zone_failure(
+                    "mcp-zone-connector-disabled",
+                    "The selected connector is disabled in the host's current inventory.",
+                    zone.as_str(),
+                    Some(id),
+                    CliExitCode::PolicyDenied,
+                ));
+            }
+            continue;
+        }
+        let Some(allowed_zones) = inventory.allowed_zones else {
+            return Err(serve_mcp_zone_failure(
+                "mcp-zone-inventory-unknown",
+                "The host did not attest this connector's live zone envelope. Upgrade the host or select a connector with authoritative zone inventory.",
+                zone.as_str(),
+                Some(id),
+                CliExitCode::Validation,
+            ));
+        };
+        if !allowed_zones.contains(zone) {
+            if explicit_connector {
+                return Err(serve_mcp_zone_failure(
+                    "mcp-zone-connector-denied",
+                    "The selected connector's live zone envelope does not permit the requested zone.",
+                    zone.as_str(),
+                    Some(id),
+                    CliExitCode::PolicyDenied,
+                ));
+            }
+            continue;
+        }
+        connector.summary = inventory.connector;
+        eligible.push(connector);
+    }
+    if eligible.is_empty() {
+        return Err(serve_mcp_zone_failure(
+            "mcp-zone-no-connectors",
+            "The host has no enabled connectors with an authoritative envelope permitting the requested zone.",
+            zone.as_str(),
+            None,
+            CliExitCode::PolicyDenied,
+        ));
+    }
+    Ok(eligible)
+}
+
+fn serve_mcp_zone_failure(
+    error_type: &str,
+    message: &str,
+    zone: &str,
+    connector_id: Option<&str>,
+    exit_code: CliExitCode,
+) -> DispatchOutcome {
+    DispatchOutcome {
+        payload: json!({
+            "status": "error",
+            "command": "serve-mcp",
+            "source": "host-admin-api",
+            "error": {
+                "type": error_type,
+                "message": message,
+                "recoverable": true,
+            },
+            "filters": { "connector": connector_id, "zone": zone },
+            "tools_exposed": false,
+        }),
+        exit_code,
+    }
 }
 
 fn serve_mcp_config(
@@ -4011,7 +4121,7 @@ fn mcp_tool_invoke_args(
     auth: &LiveAuthArgs,
 ) -> InvokeArgs {
     InvokeArgs {
-        connector: tool.connector_id.clone(),
+        connector: tool.execution_connector_id().to_owned(),
         operation: tool.operation_id.clone(),
         input: Some(arguments.to_string()),
         file: None,
@@ -7244,6 +7354,14 @@ fn try_host_mcp_tool_definitions(
     connector: &HostConnectorRecord,
     introspection: &HostIntrospectionResponse,
 ) -> Result<Vec<serve_mcp::McpToolDefinition>> {
+    anyhow::ensure!(
+        introspection.connector.id == connector.summary.id,
+        "host returned tool metadata for a different connector"
+    );
+    anyhow::ensure!(
+        introspection.connector.version == connector.summary.version,
+        "connector version changed while preparing MCP tool inventory"
+    );
     let options = export_tools::ExportOptions::default();
     introspection
         .tools
@@ -7265,6 +7383,7 @@ fn try_host_mcp_tool_definitions(
                 connector.slug.clone(),
                 tool.name.clone(),
             )
+            .with_runtime_connector_id(connector.summary.id.to_string())
             .with_annotations(exported.annotations)
             .with_provenance(catalog::tool_provenance(
                 &exported.name,
@@ -26160,8 +26279,21 @@ fn invoke_dispatch_host_controlled(
     };
     if let Some(control) = control {
         control.checkpoint()?;
+        // MCP tools retain an exact runtime identity from their original
+        // inventory. A removed connector must not resolve to an alias or
+        // prefix match (for example, v1 matching a newly installed v10).
+        anyhow::ensure!(
+            connector.summary.id.as_str() == args.connector.as_str(),
+            "MCP runtime connector identity no longer matches live inventory"
+        );
     }
-    let introspection = client.introspect(connector.summary.id.as_str())?;
+    let introspection = if control.is_some() {
+        client
+            .introspect_with_provenance(connector.summary.id.as_str())?
+            .0
+    } else {
+        client.introspect(connector.summary.id.as_str())?
+    };
     let operation = match resolve_host_tool(&introspection.tools, &args.operation) {
         Ok(operation) => operation,
         Err(error) => {
@@ -26173,6 +26305,14 @@ fn invoke_dispatch_host_controlled(
             ));
         }
     };
+    if control.is_some() {
+        // A previously exposed MCP operation cannot be replaced by a newly
+        // matching alias or prefix, even when its capability is unchanged.
+        anyhow::ensure!(
+            operation.name.as_str() == args.operation.as_str(),
+            "MCP operation identity no longer matches live introspection"
+        );
+    }
 
     let prepared = match prepare_invoke_input(command, args, &operation.input_schema) {
         Ok(prepared) => prepared,
@@ -56125,7 +56265,7 @@ depends_on = ["missing"]
     }
 
     #[test]
-    fn execute_serve_mcp_rejects_unprovable_live_zone_filter() {
+    fn execute_serve_mcp_rejects_invalid_zone_before_host_discovery() {
         let capability_token = test_capability_token_arg();
         let outcome = execute(&[
             "fwc".to_owned(),
@@ -56135,7 +56275,7 @@ depends_on = ["missing"]
             "serve-mcp".to_owned(),
             "github".to_owned(),
             "--zone".to_owned(),
-            "z:work".to_owned(),
+            "not-a-zone".to_owned(),
             "--capability-token".to_owned(),
             capability_token,
         ])
@@ -56145,7 +56285,359 @@ depends_on = ["missing"]
 
         assert_eq!(outcome.exit_code, CliExitCode::Validation.into());
         assert_eq!(payload["command"], "serve-mcp");
-        assert_eq!(payload["error"]["type"], "unsupported-live-zone-filter");
+        assert_eq!(payload["error"]["type"], "invalid-mcp-zone");
+        assert_eq!(payload["tools_exposed"], false);
+    }
+
+    #[test]
+    fn execute_serve_mcp_rejects_unknown_host_zone_envelope() {
+        let (host, server) = spawn_mock_host_sequence(vec![
+            ("POST /rpc/discover".to_owned(), mock_discovery_response_json()),
+            (
+                "GET /rpc/connectors/fcp.github:enterprise:v1".to_owned(),
+                mock_inventory_response_json(),
+            ),
+        ]);
+        let token = test_capability_token_arg();
+        let (exit, payload) = execute_json(&[
+            "fwc",
+            "--json",
+            "--host",
+            &host,
+            "serve-mcp",
+            "github",
+            "--zone",
+            "z:work",
+            "--capability-token",
+            &token,
+        ]);
+        server.join().expect("zone inventory server should finish");
+        assert_eq!(exit, CliExitCode::Validation.into());
+        assert_eq!(payload["error"]["type"], "mcp-zone-inventory-unknown");
+        assert_eq!(payload["filters"]["zone"], "z:work");
+        assert_eq!(payload["tools_exposed"], false);
+    }
+
+    #[test]
+    fn serve_mcp_zone_filter_rejects_empty_mismatched_and_disabled_envelopes() {
+        for (zones, enabled, error_type) in [
+            (json!([]), true, "mcp-zone-connector-denied"),
+            (json!(["z:private"]), true, "mcp-zone-connector-denied"),
+            (json!(["z:work"]), false, "mcp-zone-connector-disabled"),
+        ] {
+            let mut inventory = mock_inventory_response_json();
+            inventory["allowed_zones"] = zones;
+            inventory["connector"]["enabled"] = json!(enabled);
+            let (host, server) = spawn_mock_host_sequence(vec![(
+                "GET /rpc/connectors/fcp.github:enterprise:v1".to_owned(),
+                inventory,
+            )]);
+            let response: HostDiscoveryResponse =
+                serde_json::from_value(mock_discovery_response_json()).unwrap();
+            let connectors = HostConnectorCatalog::from_response(&response).connectors;
+            let client = super::HostAdminClient::new(&host).unwrap();
+            let failure = super::serve_mcp_zone_connectors(
+                &client,
+                connectors,
+                &ZoneId::work(),
+                true,
+            )
+            .expect_err("an unpermitted or disabled connector must not expose tools");
+            server.join().unwrap();
+            assert_eq!(failure.exit_code, CliExitCode::PolicyDenied);
+            assert_eq!(failure.payload["error"]["type"], error_type);
+            assert_eq!(failure.payload["tools_exposed"], false);
+        }
+    }
+
+    #[test]
+    fn serve_mcp_zone_filter_rejects_mismatched_inventory_identity() {
+        let mut inventory = mock_inventory_response_json();
+        inventory["allowed_zones"] = json!(["z:work"]);
+        inventory["connector"]["id"] = json!("fcp.github:enterprise:v2");
+        let (host, server) = spawn_mock_host_sequence(vec![(
+            "GET /rpc/connectors/fcp.github:enterprise:v1".to_owned(),
+            inventory,
+        )]);
+        let response: HostDiscoveryResponse =
+            serde_json::from_value(mock_discovery_response_json()).unwrap();
+        let client = super::HostAdminClient::new(&host).unwrap();
+        let failure = super::serve_mcp_zone_connectors(
+            &client,
+            HostConnectorCatalog::from_response(&response).connectors,
+            &ZoneId::work(),
+            true,
+        )
+        .expect_err("another connector's envelope cannot authorize exposure");
+        server.join().unwrap();
+        assert_eq!(failure.exit_code, CliExitCode::Transport);
+        assert_eq!(failure.payload["error"]["type"], "mcp-zone-inventory-unavailable");
+    }
+
+    #[test]
+    fn serve_mcp_zone_filter_exposes_only_exact_enabled_matches() {
+        let github = mock_connector_summary_json();
+        let slack =
+            mock_connector_summary_custom_json("fcp.slack:enterprise:v1", "Slack", 1, "safe");
+        let disabled =
+            mock_connector_summary_custom_json("fcp.notion:enterprise:v1", "Notion", 1, "safe");
+        let response: HostDiscoveryResponse =
+            serde_json::from_value(mock_discovery_response_with_connectors(vec![
+                github, slack, disabled,
+            ]))
+            .unwrap();
+        let catalog = HostConnectorCatalog::from_response(&response);
+        let routes = catalog
+            .connectors
+            .iter()
+            .map(|connector| {
+                let mut summary = serde_json::to_value(&connector.summary).unwrap();
+                let zones = if connector.slug == "github" {
+                    json!(["z:work", "z:private"])
+                } else if connector.slug == "slack" {
+                    json!(["z:private"])
+                } else {
+                    summary["enabled"] = json!(false);
+                    json!(["z:work"])
+                };
+                (
+                    format!("GET /rpc/connectors/{}", connector.summary.id),
+                    json!({"connector": summary, "registry_version": 8, "allowed_zones": zones}),
+                )
+            })
+            .collect();
+        let (host, server) = spawn_mock_host_sequence(routes);
+        let client = super::HostAdminClient::new(&host).unwrap();
+        let selected = super::serve_mcp_zone_connectors(
+            &client,
+            catalog.connectors,
+            &ZoneId::work(),
+            false,
+        )
+        .expect("the matching live connector should remain");
+        server.join().unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].summary.id.as_str(), "fcp.github:enterprise:v1");
+    }
+
+    #[test]
+    fn serve_mcp_zone_tool_call_keeps_verified_identity_and_rechecks_authority() {
+        let directory = TempDir::new().unwrap();
+        let _history = super::install_test_history_path(directory.path().join("history.jsonl"));
+        let response: HostDiscoveryResponse =
+            serde_json::from_value(mock_discovery_response_json()).unwrap();
+        let catalog = HostConnectorCatalog::from_response(&response);
+        let mut inventory = mock_inventory_response_json();
+        inventory["allowed_zones"] = json!(["z:work"]);
+        let introspection: HostIntrospectionResponse =
+            serde_json::from_value(mock_introspection_response_json()).unwrap();
+        let mut newer = mock_connector_summary_json();
+        newer["id"] = json!("fcp.github:enterprise:v2");
+        newer["version"] = json!("2.0.0");
+        // A second installed version makes a later slug lookup ambiguous. The
+        // tool must retain the exact identity whose envelope was inspected.
+        let invocation_inventory =
+            mock_discovery_response_with_connectors(vec![newer, mock_connector_summary_json()]);
+        for allowed in [true, false] {
+            let mut routes = vec![
+                (
+                    "GET /rpc/connectors/fcp.github:enterprise:v1".to_owned(),
+                    inventory.clone(),
+                ),
+                ("POST /rpc/discover".to_owned(), invocation_inventory.clone()),
+                (
+                    "GET /rpc/introspect/fcp.github:enterprise:v1".to_owned(),
+                    mock_introspection_response_json(),
+                ),
+                (
+                    "POST /rpc/preflight".to_owned(),
+                    mock_preflight_response_json(allowed),
+                ),
+            ];
+            if allowed {
+                routes.push((
+                    "POST /rpc/invoke".to_owned(),
+                    mock_invoke_response_json(json!({"title": "Issue"})),
+                ));
+            }
+            let (host, server, requests) = spawn_mock_host_sequence_with_body_log(routes);
+            let client = super::HostAdminClient::new(&host).unwrap();
+            let selected = super::serve_mcp_zone_connectors(
+                &client,
+                catalog.connectors.clone(),
+                &ZoneId::work(),
+                true,
+            )
+            .unwrap();
+            let tools = try_host_mcp_tool_definitions(&selected[0], &introspection).unwrap();
+            let tool = tools
+                .iter()
+                .find(|tool| tool.operation_id == "github.get_issue")
+                .unwrap();
+            let tool = tool
+                .clone()
+                .with_supported_zones(vec!["z:work".to_owned()]);
+            let config =
+                super::serve_mcp_config(Some(&selected[0]), None).with_zone_filter("z:work");
+            let state = serve_mcp::state_from_tools(vec![tool.clone()], config);
+            let listed = serve_mcp::handle_request(
+                &state,
+                &serve_mcp::JsonRpcRequest {
+                    jsonrpc: "2.0".to_owned(),
+                    id: Some(json!(1)),
+                    method: "tools/list".to_owned(),
+                    params: None,
+                },
+            );
+            assert_eq!(
+                listed.result().unwrap()["tools"].as_array().unwrap().len(),
+                1
+            );
+            let resolved_host = ResolvedHostConfig {
+                endpoint: host,
+                default_zone: Some("z:private".to_owned()),
+            };
+            let auth = LiveAuthArgs {
+                capability_token: Some(test_capability_token_arg()),
+                ..LiveAuthArgs::default()
+            };
+            let result = super::mcp_tool_call_response(
+                &tool,
+                json!(2),
+                &json!({"owner": "octocat", "repo": "hello-world", "number": 42}),
+                Some(&resolved_host),
+                None,
+                Some("z:work"),
+                &auth,
+                &super::serve_mcp_host::CancellationArgs::default(),
+                serve_mcp::McpCallContext::default(),
+            );
+            server.join().unwrap();
+            assert_eq!(result.result().unwrap()["isError"], !allowed);
+            let requests = requests.lock().unwrap();
+            for (route, body) in requests.iter().filter(|(route, _)| {
+                route == "POST /rpc/preflight" || route == "POST /rpc/invoke"
+            }) {
+                let body: Value = serde_json::from_str(body).unwrap();
+                assert_eq!(body["connector_id"], "fcp.github:enterprise:v1", "{route}");
+                assert_eq!(body["zone_id"], "z:work", "{route}");
+                assert!(!body["capability_token"].is_null(), "{route}");
+            }
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|(route, _)| route == "POST /rpc/invoke")
+                    .count(),
+                usize::from(allowed)
+            );
+        }
+    }
+
+    #[test]
+    fn serve_mcp_tool_call_never_retargets_a_removed_runtime_by_prefix() {
+        let response: HostDiscoveryResponse =
+            serde_json::from_value(mock_discovery_response_json()).unwrap();
+        let catalog = HostConnectorCatalog::from_response(&response);
+        let introspection: HostIntrospectionResponse =
+            serde_json::from_value(mock_introspection_response_json()).unwrap();
+        let tools = try_host_mcp_tool_definitions(&catalog.connectors[0], &introspection).unwrap();
+        let tool = tools
+            .iter()
+            .find(|tool| tool.operation_id == "github.get_issue")
+            .unwrap();
+        let mut replacement = mock_connector_summary_json();
+        replacement["id"] = json!("fcp.github:enterprise:v10");
+        let (endpoint, server) = spawn_mock_host_sequence(vec![(
+            "POST /rpc/discover".to_owned(),
+            mock_discovery_response_with_connectors(vec![replacement]),
+        )]);
+        let host = ResolvedHostConfig {
+            endpoint,
+            default_zone: None,
+        };
+        let auth = LiveAuthArgs {
+            capability_token: Some(test_capability_token_arg()),
+            ..LiveAuthArgs::default()
+        };
+        let response = super::mcp_tool_call_response(
+            tool,
+            json!(1),
+            &json!({"owner": "octocat", "repo": "hello-world", "number": 42}),
+            Some(&host),
+            None,
+            Some("z:work"),
+            &auth,
+            &super::serve_mcp_host::CancellationArgs::default(),
+            serve_mcp::McpCallContext::default(),
+        );
+        server.join().unwrap();
+        assert!(response.result().is_none());
+        let response = serde_json::to_value(response).unwrap();
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("runtime connector identity no longer matches")
+        );
+    }
+
+    #[test]
+    fn serve_mcp_tool_call_never_retargets_a_removed_operation_by_prefix() {
+        let response: HostDiscoveryResponse =
+            serde_json::from_value(mock_discovery_response_json()).unwrap();
+        let catalog = HostConnectorCatalog::from_response(&response);
+        let introspection: HostIntrospectionResponse =
+            serde_json::from_value(mock_introspection_response_json()).unwrap();
+        let tools = try_host_mcp_tool_definitions(&catalog.connectors[0], &introspection).unwrap();
+        let tool = tools
+            .iter()
+            .find(|tool| tool.operation_id == "github.get_issue")
+            .unwrap();
+        let mut replacement = mock_introspection_response_json();
+        let mut replacement_tool = replacement["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "github.get_issue")
+            .unwrap()
+            .clone();
+        replacement_tool["name"] = json!("github.get_issue_bulk");
+        replacement["tools"] = json!([replacement_tool]);
+        let (endpoint, server) = spawn_mock_host_sequence(vec![
+            ("POST /rpc/discover".to_owned(), mock_discovery_response_json()),
+            (
+                "GET /rpc/introspect/fcp.github:enterprise:v1".to_owned(),
+                replacement,
+            ),
+        ]);
+        let host = ResolvedHostConfig {
+            endpoint,
+            default_zone: None,
+        };
+        let auth = LiveAuthArgs {
+            capability_token: Some(test_capability_token_arg()),
+            ..LiveAuthArgs::default()
+        };
+        let response = super::mcp_tool_call_response(
+            tool,
+            json!(1),
+            &json!({"owner": "octocat", "repo": "hello-world", "number": 42}),
+            Some(&host),
+            None,
+            Some("z:work"),
+            &auth,
+            &super::serve_mcp_host::CancellationArgs::default(),
+            serve_mcp::McpCallContext::default(),
+        );
+        server.join().unwrap();
+        assert!(response.result().is_none());
+        let response = serde_json::to_value(response).unwrap();
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("operation identity no longer matches")
+        );
     }
 
     #[test]
@@ -56211,6 +56703,7 @@ depends_on = ["missing"]
         assert_eq!(tools.len(), 2);
         assert_eq!(tools[0].name, "github.create_issue");
         assert_eq!(tools[0].connector_id, "github");
+        assert_eq!(tools[0].execution_connector_id(), "fcp.github:enterprise:v1");
         assert_eq!(tools[0].operation_id, "github.create_issue");
         assert_eq!(
             tools[0]
@@ -56233,6 +56726,26 @@ depends_on = ["missing"]
                 .map(|provenance| provenance.availability.tag()),
             Some("live")
         );
+    }
+
+    #[test]
+    fn host_mcp_tool_definitions_reject_mismatched_runtime_metadata() {
+        let discovery: HostDiscoveryResponse =
+            serde_json::from_value(mock_discovery_response_json()).unwrap();
+        let catalog = HostConnectorCatalog::from_response(&discovery);
+        for (field, value) in [
+            ("id", json!("fcp.github:enterprise:v2")),
+            ("version", json!("9.0.0")),
+        ] {
+            let mut response = mock_introspection_response_json();
+            response["connector"][field] = value;
+            let introspection: HostIntrospectionResponse =
+                serde_json::from_value(response).unwrap();
+            assert!(
+                try_host_mcp_tool_definitions(&catalog.connectors[0], &introspection).is_err(),
+                "MCP tool metadata must remain bound to the selected connector {field}"
+            );
+        }
     }
 
     #[test]

@@ -197,6 +197,13 @@ pub struct McpToolDefinition {
     pub input_schema: Value,
     /// Connector that provides this tool.
     pub connector_id: String,
+    /// Exact live connector identity used for invocation, when inventory proved it.
+    ///
+    /// Presentation and resource filters retain the readable connector selector;
+    /// live execution must not resolve that selector to a different installed
+    /// connector after the tool's zone envelope has been checked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_connector_id: Option<String>,
     /// Operation within the connector.
     pub operation_id: String,
     /// Optional MCP annotations preserved from the export surface.
@@ -224,6 +231,7 @@ impl McpToolDefinition {
             description: description.into(),
             input_schema,
             connector_id: connector_id.into(),
+            runtime_connector_id: None,
             operation_id: operation_id.into(),
             annotations: None,
             provenance: None,
@@ -239,6 +247,19 @@ impl McpToolDefinition {
     /// Return the connector that provides this tool.
     pub fn connector_id(&self) -> &str {
         &self.connector_id
+    }
+
+    /// Return the exact live identity, or the selector for non-runtime definitions.
+    pub fn execution_connector_id(&self) -> &str {
+        self.runtime_connector_id
+            .as_deref()
+            .unwrap_or(&self.connector_id)
+    }
+
+    /// Attach an exact identity from authenticated host inventory.
+    pub fn with_runtime_connector_id(mut self, connector_id: impl Into<String>) -> Self {
+        self.runtime_connector_id = Some(connector_id.into());
+        self
     }
 
     /// Return the operation id.
