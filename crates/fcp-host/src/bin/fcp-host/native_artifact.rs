@@ -12,6 +12,9 @@ pub(super) struct AdmittedNativeExecutable {
     #[cfg(target_os = "linux")]
     image: fcp_sandbox::NativeExecutableSnapshot,
     digest: [u8; 32],
+    /// Fingerprint of the exact immutable buffer used to create the image.
+    /// Source-path metadata and a caller's claimed pin never populate it.
+    executable_digest: ExecutableDigest,
     bytes: u64,
 }
 
@@ -23,7 +26,12 @@ impl AdmittedNativeExecutable {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = config;
+            if config.binary_sha256.is_some() {
+                return Err(HostError::RegistryError(format!(
+                    "native connector '{}' binary_sha256 enforcement is unavailable on this platform; no mutable-path fallback is permitted",
+                    config.id
+                )));
+            }
             Ok(None)
         }
     }
@@ -37,6 +45,11 @@ impl AdmittedNativeExecutable {
             &mut bytes,
         )
         .map_err(|_| source_error(config))?;
+        if bytes.is_empty() || bytes.len() > fcp_sandbox::MAX_NATIVE_EXECUTABLE_BYTES {
+            return Err(source_error(config));
+        }
+        let executable_digest = ExecutableDigest::of_bytes(&bytes);
+        require_configured_pin(config, executable_digest)?;
         let image = fcp_sandbox::NativeExecutableSnapshot::from_bytes(&bytes).map_err(|error| {
             HostError::RegistryError(format!(
                 "native connector '{}' immutable executable admission failed: {error}",
@@ -46,8 +59,15 @@ impl AdmittedNativeExecutable {
         Ok(Self {
             image,
             digest: *blake3::hash(&bytes).as_bytes(),
+            executable_digest,
             bytes: bytes.len() as u64,
         })
+    }
+
+    /// Revalidate requested authority against the retained image fingerprint.
+    /// Lifecycle activation and warm workers must never rehash the source path.
+    pub(super) fn require_pin(&self, config: &ConnectorConfig) -> HostResult<()> {
+        require_configured_pin(config, self.executable_digest)
     }
 
     #[cfg(target_os = "linux")]
@@ -83,6 +103,20 @@ impl AdmittedNativeExecutable {
         }
         Ok(total == self.bytes && hasher.finalize().as_bytes() == &self.digest)
     }
+}
+
+fn require_configured_pin(config: &ConnectorConfig, actual: ExecutableDigest) -> HostResult<()> {
+    if let Some(pin) = config.binary_sha256.as_deref() {
+        let expected = ExecutableDigest::parse(pin)
+            .map_err(|error| HostError::InvalidFilter(error.to_string()))?;
+        if actual != expected {
+            return Err(HostError::RegistryError(format!(
+                "native connector '{}' admitted executable does not match its managed binary_sha256 pin",
+                config.id
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn source_error(config: &ConnectorConfig) -> HostError {
@@ -181,6 +215,43 @@ fn open_source_path(path: &StdPath) -> std::io::Result<std::fs::File> {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pinned_image_retains_verified_identity_after_source_replacement() {
+        use sha2::Digest as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("pinned-connector");
+        std::fs::copy("/bin/sh", &source).unwrap();
+        let original = std::fs::read(&source).unwrap();
+        let mut config = super::super::tests::dispatcher_test_config("fcp.webhook-receiver");
+        config.binary = source.to_string_lossy().into_owned();
+        config.binary_sha256 = Some(hex::encode(sha2::Sha256::digest(&original)));
+        let admitted = AdmittedNativeExecutable::capture(&config).unwrap();
+        std::fs::write(&source, b"source changed after pinned admission").unwrap();
+        admitted.require_pin(&config).unwrap();
+        let output = std::process::Command::new(admitted.program())
+            .args(["-c", "printf pinned-native"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"pinned-native");
+        assert!(
+            AdmittedNativeExecutable::capture(&config)
+                .unwrap_err()
+                .to_string()
+                .contains("binary_sha256")
+        );
+        config.binary_sha256 = Some("00".repeat(32));
+        assert!(
+            admitted
+                .require_pin(&config)
+                .unwrap_err()
+                .to_string()
+                .contains("binary_sha256"),
+            "a retained image must not accept a different claimed pin"
+        );
+    }
 
     #[test]
     fn managed_path_is_resolved_once_and_source_writes_do_not_change_launches() {

@@ -6222,7 +6222,15 @@ impl HostAdminClient {
         &self,
         request: &HostConnectorInventoryMutationRequest,
     ) -> Result<HostConnectorInventoryMutationResponse> {
-        self.post_json("/rpc/connectors/apply", request)
+        // Older hosts may silently ignore unknown configuration fields. A
+        // distinct route makes lack of pin support fail before activation;
+        // never retry a pinned request through the legacy apply endpoint.
+        let path = if request.connector.binary_sha256.is_some() {
+            "/rpc/connectors/apply-pinned"
+        } else {
+            "/rpc/connectors/apply"
+        };
+        self.post_json(path, request)
     }
 
     fn invoke(&self, request: &InvokeRequest) -> Result<InvokeResponse> {
@@ -21550,6 +21558,7 @@ fn connector_descriptor_json(
         "canonical_id": entry.id,
         "name": entry.name,
         "binary": entry.binary,
+        "binary_sha256": entry.binary_sha256,
         "version": entry.version,
     })
 }
@@ -23136,7 +23145,9 @@ fn materialize_registry_package_output(
         manifest_path,
         sbom_path: None,
         build_metadata_path,
-        binary_sha256: compute_file_sha256(&binary_path)?,
+        // Registry verification authenticated these in-memory bytes. Reopening
+        // a mutable cache path must never redefine the admitted executable.
+        binary_sha256: format!("{:x}", Sha256::digest(binary_bytes)),
         connector_id: connector_id.to_owned(),
         version: version.to_owned(),
     };
@@ -23793,6 +23804,12 @@ fn inspect_package_output(
             "detail": actual_sha256,
         }),
         json!({
+            "check": "host-executable-digest-pin",
+            "status": "planned",
+            "target": build_metadata.target_triple,
+            "detail": "Install and update requests carry this digest for exact-byte host launch checks. Hosts without immutable native launch support refuse activation. Verification alone does not start a connector.",
+        }),
+        json!({
             "check": "version",
             "status": "ok",
             "detail": manifest_version,
@@ -23821,6 +23838,10 @@ fn managed_connector_from_artifact(
         cancellation_deadline_ms: existing.and_then(|entry| entry.cancellation_deadline_ms),
         id: artifact.manifest.connector.id.to_string(),
         binary: artifact.package_output.binary_path.display().to_string(),
+        // Carry the admitted artifact identity across the CLI/host boundary.
+        // An update replaces the old pin; retaining it would bind a new path
+        // to the previous executable rather than the inspected package.
+        binary_sha256: Some(artifact.package_output.binary_sha256.clone()),
         name: Some(artifact.manifest.connector.name.clone()),
         description: Some(artifact.manifest.connector.description.clone()),
         args: existing.map_or_else(Vec::new, |entry| entry.args.clone()),
@@ -38966,6 +38987,15 @@ max_state_replication_staleness_secs = 120
         expected_requests: usize,
         response_headers: StdBTreeMap<String, Vec<(String, String)>>,
     ) -> (String, thread::JoinHandle<()>) {
+        spawn_mock_host_with_response_status(routes, expected_requests, response_headers, 200)
+    }
+
+    fn spawn_mock_host_with_response_status(
+        routes: StdBTreeMap<String, Value>,
+        expected_requests: usize,
+        response_headers: StdBTreeMap<String, Vec<(String, String)>>,
+        status: u16,
+    ) -> (String, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("mock host should bind");
         listener
             .set_nonblocking(true)
@@ -39061,7 +39091,7 @@ max_state_replication_staleness_secs = 120
 
                 write!(
                     stream,
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n{}\r\n{}",
+                    "HTTP/1.1 {status} Test\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n{}\r\n{}",
                     body.len(),
                     headers,
                     body
@@ -45255,6 +45285,133 @@ deny_ptrace = true
     }
 
     #[test]
+    fn package_inventory_carries_verified_executable_pin_and_replaces_old_pin() {
+        let (_package_dir, package_path) =
+            write_test_package_output("fcp.github:enterprise:v1", "1.2.4");
+        let artifact = super::prepare_package_artifact(
+            package_path.to_str().unwrap(),
+            None,
+            false,
+            None,
+            None,
+        )
+        .expect("inspect package before constructing inventory");
+        let mut previous = super::managed_connector_from_artifact(&artifact, None);
+        previous.binary_sha256 = Some("00".repeat(32));
+        previous.cancellation_deadline_ms = Some(350);
+
+        let candidate = super::managed_connector_from_artifact(&artifact, Some(&previous));
+        let expected = artifact.package_output.binary_sha256.clone();
+        assert_eq!(candidate.binary_sha256.as_ref(), Some(&expected));
+        assert_eq!(candidate.cancellation_deadline_ms, Some(350));
+        let request = super::HostConnectorInventoryMutationRequest {
+            kind: super::HostConnectorInventoryMutationKind::Update,
+            dry_run: false,
+            connector: candidate.clone(),
+        };
+        let wire = serde_json::to_value(request).expect("serialize host request");
+        assert_eq!(wire["connector"]["binary_sha256"], expected);
+        assert_eq!(
+            super::connector_descriptor_json(&candidate, None)["binary_sha256"],
+            expected
+        );
+        assert!(artifact.verification.iter().any(|check| {
+            check["check"] == "host-executable-digest-pin" && check["status"] == "planned"
+        }));
+
+        // Changing the path after package inspection cannot silently change
+        // the digest sent to the host for its independent launch check.
+        fs::write(&artifact.package_output.binary_path, b"changed executable").unwrap();
+        assert_eq!(
+            super::managed_connector_from_artifact(&artifact, None).binary_sha256,
+            Some(expected)
+        );
+        assert!(super::inspect_package_output(&artifact.package_output, None).is_err());
+    }
+
+    #[test]
+    fn package_metadata_cannot_disable_executable_digest_pinning() {
+        let (_package_dir, package_path) =
+            write_test_package_output("fcp.github:enterprise:v1", "1.2.4");
+        let mut artifact = super::prepare_package_artifact(
+            package_path.to_str().unwrap(),
+            None,
+            false,
+            None,
+            None,
+        )
+        .expect("inspect package");
+        let mut previous = super::managed_connector_from_artifact(&artifact, None);
+        previous.binary_sha256 = Some("00".repeat(32));
+        for target in [
+            "aarch64-apple-darwin",
+            "x86_64-pc-windows-msvc",
+            "riscv64-linux",
+            "aarch64-unknown-linux-gnu",
+            "wasm32-wasip1",
+            "wasm32-wasip2",
+        ] {
+            artifact.build_metadata.target_triple = target.to_string();
+            fs::write(
+                &artifact.package_output.build_metadata_path,
+                serde_json::to_vec(&artifact.build_metadata).unwrap(),
+            )
+            .unwrap();
+            let (_, _, checks) = super::inspect_package_output(&artifact.package_output, None)
+                .expect("package checksum verification remains available");
+            assert!(checks.iter().any(|check| {
+                check["check"] == "host-executable-digest-pin" && check["status"] == "planned"
+            }));
+            assert_eq!(
+                super::managed_connector_from_artifact(&artifact, None).binary_sha256,
+                Some(artifact.package_output.binary_sha256.clone())
+            );
+            assert_eq!(
+                super::managed_connector_from_artifact(&artifact, Some(&previous)).binary_sha256,
+                Some(artifact.package_output.binary_sha256.clone())
+            );
+        }
+    }
+
+    #[test]
+    fn pinned_inventory_rejects_hosts_without_the_pin_aware_route() {
+        let (_package_dir, package_path) =
+            write_test_package_output("fcp.github:enterprise:v1", "1.2.4");
+        let artifact = super::prepare_package_artifact(
+            package_path.to_str().unwrap(),
+            None,
+            false,
+            None,
+            None,
+        )
+        .expect("inspect package");
+        let request = super::HostConnectorInventoryMutationRequest {
+            kind: ConnectorInventoryMutationKind::Install,
+            dry_run: false,
+            connector: super::managed_connector_from_artifact(&artifact, None),
+        };
+        let (host, server) = spawn_mock_host_with_response_status(
+            StdBTreeMap::from([(
+                "POST /rpc/connectors/apply-pinned".to_string(),
+                json!({"error": "route not supported"}),
+            )]),
+            1,
+            StdBTreeMap::new(),
+            404,
+        );
+        let result = super::HostAdminClient::new(&host)
+            .unwrap()
+            .mutate_inventory(&request);
+        server
+            .join()
+            .expect("host receives only the pin-aware request");
+        assert!(
+            result.is_err(),
+            "unsupported pins must not report installation success"
+        );
+    }
+
+    #[test]
     fn execute_install_applies_live_host_inventory_mutation() {
         let (_package_dir, package_output_path) =
             write_test_package_output("fcp.github:enterprise:v1", "1.2.4");
@@ -45262,11 +45419,12 @@ deny_ptrace = true
         let (host, server) = spawn_mock_host(
             StdBTreeMap::from([
                 (
-                    "POST /rpc/connectors/apply".to_owned(),
+                    "POST /rpc/connectors/apply-pinned".to_owned(),
                     mock_inventory_mutation_response_json(
                         ConnectorInventoryMutationKind::Install,
                         false,
                         ManagedConnectorConfig {
+                            binary_sha256: None,
                             cancellation_deadline_ms: None,
                             id: "fcp.github:enterprise:v1".to_string(),
                             binary: "/opt/fcp/github-enterprise".to_string(),
@@ -45376,11 +45534,12 @@ deny_ptrace = true
         let (host, server) = spawn_mock_host(
             StdBTreeMap::from([
                 (
-                    "POST /rpc/connectors/apply".to_owned(),
+                    "POST /rpc/connectors/apply-pinned".to_owned(),
                     mock_inventory_mutation_response_json(
                         ConnectorInventoryMutationKind::Install,
                         false,
                         ManagedConnectorConfig {
+                            binary_sha256: None,
                             cancellation_deadline_ms: None,
                             id: "fcp.github:enterprise:v1".to_string(),
                             binary: "/opt/fcp/github-enterprise".to_string(),
@@ -45472,11 +45631,12 @@ deny_ptrace = true
         let package_output_path = package_output_path.display().to_string();
         let (host, server) = spawn_mock_host(
             StdBTreeMap::from([(
-                "POST /rpc/connectors/apply".to_owned(),
+                "POST /rpc/connectors/apply-pinned".to_owned(),
                 mock_inventory_mutation_response_json(
                     ConnectorInventoryMutationKind::Install,
                     false,
                     ManagedConnectorConfig {
+                        binary_sha256: None,
                         cancellation_deadline_ms: None,
                         id: "fcp.github:enterprise:v1".to_string(),
                         binary: "/opt/fcp/github-enterprise".to_string(),
@@ -45577,6 +45737,7 @@ deny_ptrace = true
             write_test_package_output("fcp.github:enterprise:v1", "1.2.4");
         let package_output_path = package_output_path.display().to_string();
         let previous = ManagedConnectorConfig {
+            binary_sha256: None,
             cancellation_deadline_ms: None,
             id: "fcp.github:enterprise:v1".to_string(),
             binary: "/opt/fcp/github-enterprise-old".to_string(),
@@ -45597,6 +45758,7 @@ deny_ptrace = true
             operation_network_constraints: StdBTreeMap::new(),
         };
         let planned = ManagedConnectorConfig {
+            binary_sha256: None,
             cancellation_deadline_ms: None,
             id: "fcp.github:enterprise:v1".to_string(),
             binary: "/opt/fcp/github-enterprise-new".to_string(),
@@ -45623,7 +45785,7 @@ deny_ptrace = true
                     mock_discovery_response_json(),
                 ),
                 (
-                    "POST /rpc/connectors/apply".to_owned(),
+                    "POST /rpc/connectors/apply-pinned".to_owned(),
                     mock_inventory_mutation_response_json(
                         ConnectorInventoryMutationKind::Update,
                         true,
@@ -45676,6 +45838,7 @@ deny_ptrace = true
             write_test_package_output("fcp.github:enterprise:v1", "1.2.4");
         let package_output_path = package_output_path.display().to_string();
         let previous = ManagedConnectorConfig {
+            binary_sha256: None,
             cancellation_deadline_ms: None,
             id: "fcp.github:enterprise:v1".to_string(),
             binary: "/opt/fcp/github-enterprise-old".to_string(),
@@ -45696,6 +45859,7 @@ deny_ptrace = true
             operation_network_constraints: StdBTreeMap::new(),
         };
         let updated = ManagedConnectorConfig {
+            binary_sha256: None,
             cancellation_deadline_ms: None,
             id: "fcp.github:enterprise:v1".to_string(),
             binary: "/opt/fcp/github-enterprise-new".to_string(),
@@ -45722,7 +45886,7 @@ deny_ptrace = true
                     mock_discovery_response_json(),
                 ),
                 (
-                    "POST /rpc/connectors/apply".to_owned(),
+                    "POST /rpc/connectors/apply-pinned".to_owned(),
                     mock_inventory_mutation_response_json(
                         ConnectorInventoryMutationKind::Update,
                         false,
@@ -62452,11 +62616,12 @@ require_attestation_types = ["in-toto"]"#,
         let (host, host_server) = spawn_mock_host(
             StdBTreeMap::from([
                 (
-                    "POST /rpc/connectors/apply".to_owned(),
+                    "POST /rpc/connectors/apply-pinned".to_owned(),
                     mock_inventory_mutation_response_json(
                         ConnectorInventoryMutationKind::Install,
                         false,
                         ManagedConnectorConfig {
+                            binary_sha256: None,
                             cancellation_deadline_ms: None,
                             id: "fcp.github:enterprise:v1".to_string(),
                             binary: "/opt/fcp/github-enterprise".to_string(),
@@ -62565,6 +62730,7 @@ require_attestation_types = ["in-toto"]"#,
             5,
         );
         let previous = ManagedConnectorConfig {
+            binary_sha256: None,
             cancellation_deadline_ms: None,
             id: "fcp.github:enterprise:v1".to_string(),
             binary: "/opt/fcp/github-enterprise-old".to_string(),
@@ -62585,6 +62751,7 @@ require_attestation_types = ["in-toto"]"#,
             operation_network_constraints: StdBTreeMap::new(),
         };
         let updated = ManagedConnectorConfig {
+            binary_sha256: None,
             cancellation_deadline_ms: None,
             id: "fcp.github:enterprise:v1".to_string(),
             binary: "/opt/fcp/github-enterprise-new".to_string(),
@@ -62611,7 +62778,7 @@ require_attestation_types = ["in-toto"]"#,
                     mock_discovery_response_json(),
                 ),
                 (
-                    "POST /rpc/connectors/apply".to_owned(),
+                    "POST /rpc/connectors/apply-pinned".to_owned(),
                     mock_inventory_mutation_response_json(
                         ConnectorInventoryMutationKind::Update,
                         false,

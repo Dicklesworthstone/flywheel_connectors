@@ -137,7 +137,7 @@ impl NativeExecutableSnapshot {
 
     #[cfg(target_os = "linux")]
     fn seal_linux(bytes: &[u8]) -> io::Result<Self> {
-        use std::io::Write;
+        use std::io::{Read, Seek, Write};
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
         use std::os::unix::fs::PermissionsExt;
 
@@ -207,6 +207,26 @@ impl NativeExecutableSnapshot {
             return Err(io::Error::other(
                 "native executable did not retain every required kernel seal",
             ));
+        }
+        // Admission fingerprints the supplied buffer. Confirm that the final
+        // sealed image contains those exact bytes before that fingerprint can
+        // authorize execution; copying alone is not the final trust boundary.
+        if file.metadata()?.len() != bytes.len() as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "sealed native executable length differs from its admitted bytes",
+            ));
+        }
+        file.rewind()?;
+        let mut buffer = [0_u8; 32 * 1024];
+        for expected in bytes.chunks(buffer.len()) {
+            file.read_exact(&mut buffer[..expected.len()])?;
+            if &buffer[..expected.len()] != expected {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "sealed native executable differs from its admitted bytes",
+                ));
+            }
         }
         Ok(Self {
             file: Arc::new(file),

@@ -2455,6 +2455,36 @@ Owner policy can enforce:
 
 **Optional enhanced security:** Registries can configure a `RegistryTrustPolicy` (`crates/fcp-registry/src/lib.rs:285`) that adds TUF root pinning (prevents freeze/rollback and mix-and-match attacks) and Sigstore/cosign verification (supply-chain provenance beyond publisher keys).
 
+### Binding Verified Bytes to Connector Launch
+
+Managed inventory accepts an optional `binary_sha256` containing exactly 64
+hexadecimal digits. `fwc install` and `fwc update` populate it from the inspected
+package digest for every execution target, including registry packages whose
+publisher signatures were verified. Updating an artifact replaces its previous
+pin; package target metadata cannot disable this check. Configuration validation
+checks pin syntax, and previews do not execute connectors.
+
+Pinned inventory requests use a dedicated host endpoint. An older host that does
+not support this endpoint rejects installation before activation; the CLI never
+falls back to an endpoint that could silently discard the digest. Registry cache
+metadata preserves the digest of the signature-verified in-memory bytes, and
+subsequent file inspection must match that digest.
+
+| Execution target | Launch behavior with a digest pin |
+|------------------|-----------------------------------|
+| Linux native ELF | Checks the digest of the exact captured bytes and retains their kernel-sealed image across worker creation, restart, and disable/enable. Explicit inventory apply selects replacement bytes; a new host process admits the configured source again. |
+| WASI | Verifies the admitted component bytes under the existing 64-MiB limit, then retains and compiles that exact byte buffer. |
+| Other native platforms | Pinned activation, including activation of packages installed through `fwc`, is refused until immutable native launch is supported. Existing operator-managed inventory without a pin retains its previous launch behavior. |
+
+Native host admission rejects empty, nonregular, or larger-than-256-MiB executables.
+WASI retains its stricter 64-MiB component limit. Linux pinned native launches
+accept ELF binaries; interpreted scripts are unsupported.
+The pin covers the main executable, while dynamic loaders, shared libraries, and
+other runtime files remain under the existing sandbox and deployment policies.
+Source-path replacement cannot change an already admitted sealed image or cached
+WASI buffer. Pinning provides executable identity; a full rollback still requires
+retained verified deployment history and coordinated runtime restoration.
+
 ---
 
 ## Installation

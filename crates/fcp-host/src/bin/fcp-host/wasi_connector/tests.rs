@@ -359,6 +359,71 @@ fn wasi_component_admission_rejects_fifo_and_device_sources() {
     assert!(AdmittedWasiComponent::capture(&config).is_err());
 }
 
+#[test]
+fn pinned_wasi_admission_verifies_exact_bytes_and_retained_lifecycle_snapshot() {
+    use sha2::Digest as _;
+
+    let directory = tempfile::tempdir().unwrap();
+    let mut config = write_fixture(directory.path(), CONNECTOR);
+    let original = std::fs::read(&config.binary).unwrap();
+    config.binary_sha256 = Some(hex::encode(sha2::Sha256::digest(&original)));
+    let admitted = validate_registry_config(&config).unwrap();
+    let connector = WasiConnector::new(
+        config.clone(),
+        admitted.state_policy,
+        admitted.manifest_constraints.clone(),
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(connector.component.bytes.as_ref(), &original);
+    assert!(!connector.sessions.has_ready_session());
+
+    std::fs::write(&config.binary, b"tampered component").unwrap();
+    let restarted = WasiConnector::new(
+        config.clone(),
+        admitted.state_policy,
+        admitted.manifest_constraints.clone(),
+        None,
+        Some(connector.component.clone()),
+    )
+    .expect("lifecycle restart retains the exact verified deployment bytes");
+    assert!(Arc::ptr_eq(
+        &connector.component.bytes,
+        &restarted.component.bytes
+    ));
+    assert!(
+        WasiConnector::new(
+            config.clone(),
+            admitted.state_policy,
+            admitted.manifest_constraints.clone(),
+            None,
+            None,
+        )
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("binary_sha256"),
+        "a fresh admission must reject the changed component source"
+    );
+
+    config.binary_sha256 = Some("00".repeat(32));
+    assert!(
+        WasiConnector::new(
+            config,
+            admitted.state_policy,
+            admitted.manifest_constraints,
+            None,
+            Some(connector.component.clone()),
+        )
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("binary_sha256"),
+        "retained snapshots must not bypass a different requested pin"
+    );
+}
+
 #[fcp_async_core::runtime::test(flavor = "multi_thread")]
 async fn wasi_component_admission_precedes_every_first_guest() {
     let fixture = Fixture::new().await;

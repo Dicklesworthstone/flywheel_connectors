@@ -49,22 +49,42 @@ impl AdmittedWasiComponent {
         if bytes.is_empty() || bytes.len() as u64 > MAX_COMPONENT_BYTES {
             return Err(component_source_error(config));
         }
+        let component = Self {
+            digest: *blake3::hash(&bytes).as_bytes(),
+            bytes: Arc::new(bytes),
+        };
+        component.require_pin(config)?;
         let runner = WasiConnectorRunner::new(WasiConfig::default()).map_err(|error| {
             HostError::RegistryError(format!(
                 "WASI connector '{}' admission could not initialize executable validation: {error}",
                 config.id
             ))
         })?;
-        runner.load_fcp_component(&bytes).map_err(|error| {
-            HostError::RegistryError(format!(
-                "WASI connector '{}' failed executable admission before inventory publication: {error}",
-                config.id
-            ))
-        })?;
-        Ok(Self {
-            digest: *blake3::hash(&bytes).as_bytes(),
-            bytes: Arc::new(bytes),
-        })
+        runner
+            .load_fcp_component(component.bytes.as_ref())
+            .map_err(|error| {
+                HostError::RegistryError(format!(
+                    "WASI connector '{}' failed executable admission before inventory publication: {error}",
+                    config.id
+                ))
+            })?;
+        Ok(component)
+    }
+
+    /// Check the bytes that guest compilation will consume, including retained
+    /// lifecycle snapshots. Never authorize a second read of the source path.
+    pub(super) fn require_pin(&self, config: &ConnectorConfig) -> HostResult<()> {
+        if let Some(pin) = config.binary_sha256.as_deref() {
+            ExecutableDigest::parse(pin)
+                .and_then(|digest| digest.verify_bytes(self.bytes.as_ref()))
+                .map_err(|error| {
+                    HostError::RegistryError(format!(
+                        "WASI connector '{}' pinned component admission failed: {error}",
+                        config.id
+                    ))
+                })?;
+        }
+        Ok(())
     }
 
     /// Used only by explicit inventory planning, never by guest execution.

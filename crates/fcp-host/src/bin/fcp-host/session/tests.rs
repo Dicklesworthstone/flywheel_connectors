@@ -337,6 +337,7 @@ fn dispatcher() -> Dispatcher {
     let state_dir = tempfile::tempdir().unwrap();
     let connector = SubprocessConnector {
         summary,
+        admitted_executable: None,
         runner_tx,
         event_transport: None,
         _runner_task: runner_task,

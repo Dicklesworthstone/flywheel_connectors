@@ -1152,6 +1152,7 @@ mod tests {
             Some(&invocation),
             None,
             None,
+            None,
         )
         .await
         .err()
@@ -1230,6 +1231,7 @@ mod tests {
             None,
             crate::PlacementOperationClass::BulkPrewarm,
             Some(&invocation),
+            None,
             None,
             None,
         )

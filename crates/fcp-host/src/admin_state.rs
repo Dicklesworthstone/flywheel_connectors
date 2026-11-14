@@ -45,6 +45,14 @@ pub struct ManagedConnectorConfig {
     pub id: String,
     /// Executable path for the connector binary.
     pub binary: String,
+    /// Operator-admitted SHA-256 of the main executable, as 64 hexadecimal
+    /// digits. Package installs populate this from the verified artifact.
+    ///
+    /// Pinned native execution requires an immutable executable image; the
+    /// host refuses platforms that cannot provide it. WASI compiles the exact
+    /// bytes checked against this digest. This does not pin shared libraries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary_sha256: Option<String>,
     /// Optional connector manifest TOML path used by the host to derive
     /// operation-level enforcement metadata, including
     /// `provides.operations.*.network_constraints`.
@@ -13209,6 +13217,7 @@ mod tests {
         let config: ManagedConnectorConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.id, "test");
         assert_eq!(config.binary, "/bin/test");
+        assert!(config.binary_sha256.is_none());
         assert!(config.name.is_none());
         assert!(config.args.is_empty());
         assert!(config.env.is_empty());
@@ -13221,6 +13230,7 @@ mod tests {
             cancellation_deadline_ms: None,
             id: "test-connector".to_string(),
             binary: "/usr/bin/test".to_string(),
+            binary_sha256: Some("ab".repeat(32)),
             manifest_path: None,
             name: Some("Test".to_string()),
             description: Some("A test connector".to_string()),
@@ -13248,6 +13258,7 @@ mod tests {
             cancellation_deadline_ms: None,
             id: "test-connector".to_string(),
             binary: "/usr/bin/test".to_string(),
+            binary_sha256: None,
             manifest_path: None,
             name: None,
             description: None,
@@ -13288,6 +13299,7 @@ mod tests {
                 cancellation_deadline_ms: None,
                 id: "fcp.github".to_string(),
                 binary: "[connector-binary]".to_string(),
+                binary_sha256: None,
                 manifest_path: Some("connectors/github/manifest.toml".to_string()),
                 name: Some("GitHub".to_string()),
                 description: Some("GitHub connector".to_string()),

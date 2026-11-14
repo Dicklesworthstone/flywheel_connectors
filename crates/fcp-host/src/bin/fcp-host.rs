@@ -57,6 +57,7 @@ use fcp_evidence::{
     TrustedV3OwnerMap, verify_hybrid_owner_object,
 };
 use fcp_host::RoutedReadResponse;
+use fcp_host::executable::ExecutableDigest;
 use fcp_host::{
     AdaptiveWarmPoolConfig, AdaptiveWarmPoolController, BatchExecutor, BatchInvokeRequest,
     BatchInvokeResponse, BatchOperation, BatchOperationError, BatchOptions, BatchScheduleHint,
@@ -602,6 +603,7 @@ impl SubprocessConnector {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn spawn_with_placement_and_termination(
         mut config: ConnectorConfig,
         resilience: Arc<ResilienceLayer>,
@@ -648,7 +650,10 @@ impl SubprocessConnector {
         state_policy.require_admitted_manifest(&config)?;
         let response_limits = native_rpc_response_limits(&config, manifest);
         let admitted_executable = match retained_executable {
-            Some(executable) => Some(executable.clone()),
+            Some(executable) => {
+                executable.require_pin(&config)?;
+                Some(executable.clone())
+            }
             None => native_artifact::AdmittedNativeExecutable::capture_for_platform(&config)?,
         };
         state_policy.require_admitted_manifest(&config)?;
@@ -1257,7 +1262,10 @@ impl NativeWarmPoolConnector {
         state_policy.require_parallel_workers(&config.id)?;
         state_policy.require_current_manifest(&config)?;
         let admitted_executable = match &admitted.native_executable {
-            Some(executable) => Some(executable.clone()),
+            Some(executable) => {
+                executable.require_pin(&config)?;
+                Some(executable.clone())
+            }
             None => native_artifact::AdmittedNativeExecutable::capture_for_platform(&config)?,
         };
         let runtime_retirement = native_rpc::NativePoolRetirement::default();
@@ -1932,7 +1940,10 @@ impl WasiConnector {
         state_policy.reject_stateful_wasi(&config.id)?;
         state_policy.require_admitted_manifest(&config)?;
         let component = match retained_component {
-            Some(component) => component,
+            Some(component) => {
+                component.require_pin(&config)?;
+                component
+            }
             None => wasi_connector::AdmittedWasiComponent::capture(&config)?,
         };
         state_policy.require_admitted_manifest(&config)?;
@@ -2939,6 +2950,10 @@ fn validate_registry_config_for_launch(
     launch: bool,
 ) -> HostResult<ValidatedConnectorConfig> {
     connector_summary_from_config(config)?;
+    if let Some(pin) = config.binary_sha256.as_deref() {
+        ExecutableDigest::parse(pin)
+            .map_err(|error| HostError::InvalidFilter(error.to_string()))?;
+    }
     for env_keys in [
         [
             FCP_HOST_CONNECTOR_STATE_OBJECT_MAC_KEY_ENV,
@@ -9643,6 +9658,10 @@ async fn async_main(telemetry_config: TelemetryConfig) -> HostResult<()> {
             post(connector_inventory_apply_handler),
         )
         .route(
+            "/rpc/connectors/apply-pinned",
+            post(connector_inventory_apply_pinned_handler),
+        )
+        .route(
             "/rpc/supply-chain/verify",
             post(supply_chain_verify_handler),
         )
@@ -12475,6 +12494,22 @@ async fn connector_artifact_register_handler(
             Err(map_host_error(host_error))
         }
     }
+}
+
+/// A separate route makes executable pin enforcement explicit to clients.
+/// Older hosts cannot acknowledge a pin they ignore on the legacy apply route.
+async fn connector_inventory_apply_pinned_handler(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<ConnectorInventoryMutationRequest>,
+) -> Result<Json<ConnectorInventoryMutationResponse>, (StatusCode, String)> {
+    let pin = request.connector.binary_sha256.as_deref().ok_or_else(|| {
+        map_host_error(HostError::InvalidFilter(
+            "pinned connector inventory apply requires binary_sha256".to_owned(),
+        ))
+    })?;
+    ExecutableDigest::parse(pin)
+        .map_err(|error| map_host_error(HostError::InvalidFilter(error.to_string())))?;
+    connector_inventory_apply_handler(State(state), Json(request)).await
 }
 
 async fn connector_inventory_apply_handler(
@@ -18833,6 +18868,7 @@ mod tests {
             cancellation_deadline_ms: None,
             id: connector_id.to_string(),
             binary: compiled_test_connector_binary().display().to_string(),
+            binary_sha256: None,
             manifest_path: None,
             name: Some("Test Connector".to_string()),
             description: Some("Subprocess test connector".to_string()),
@@ -18860,6 +18896,7 @@ mod tests {
             cancellation_deadline_ms: None,
             id: "fcp.test.replace:utility:1.0.0".to_string(),
             binary: "/old/bin".to_string(),
+            binary_sha256: None,
             manifest_path: None,
             name: Some("Old Name".to_string()),
             description: Some("old description".to_string()),
@@ -18880,6 +18917,7 @@ mod tests {
             cancellation_deadline_ms: None,
             id: existing.id.clone(),
             binary: "/new/bin".to_string(),
+            binary_sha256: None,
             manifest_path: None,
             name: None,
             description: None,
@@ -19714,6 +19752,7 @@ output_schema = {{ type = "object" }}
             cancellation_deadline_ms: None,
             id: connector_id.to_string(),
             binary: "dispatcher-test".to_string(),
+            binary_sha256: None,
             manifest_path: None,
             name: Some(format!("{connector_id} test connector")),
             description: None,
@@ -24641,6 +24680,7 @@ output_schema = {{ type = "object" }}
             cancellation_deadline_ms: None,
             id: connector_id.to_string(),
             binary: "dispatcher-test".to_string(),
+            binary_sha256: None,
             manifest_path: None,
             name: Some("l9tt6 snapshot race fixture".to_string()),
             description: None,
@@ -29234,6 +29274,7 @@ output_schema = { type = "object" }
                 cancellation_deadline_ms: None,
                 id: connector_id.to_string(),
                 binary: "dispatcher-test".to_string(),
+                binary_sha256: None,
                 manifest_path: Some(manifest_path.clone()),
                 name: Some("HRW Lease Refuse Test Connector".to_string()),
                 description: None,
@@ -30284,6 +30325,7 @@ output_schema = { type = "object" }
                     cancellation_deadline_ms: None,
                     id: connector_id.to_string(),
                     binary: "dispatcher-test".to_string(),
+                    binary_sha256: None,
                     manifest_path: None,
                     name: Some("Admit Safety Test Connector".to_string()),
                     description: None,
@@ -30527,6 +30569,7 @@ output_schema = { type = "object" }
                 cancellation_deadline_ms: None,
                 id: connector_id.to_string(),
                 binary: "dispatcher-test".to_string(),
+                binary_sha256: None,
                 manifest_path: None,
                 name: Some("Invoke Token Bucket Test Connector".to_string()),
                 description: None,
@@ -30873,6 +30916,7 @@ output_schema = { type = "object" }
                     cancellation_deadline_ms: None,
                     id: connector_id.to_string(),
                     binary: "dispatcher-test".to_string(),
+                    binary_sha256: None,
                     manifest_path: None,
                     name: Some("Cascade Caller Test Connector".to_string()),
                     description: None,
@@ -31033,6 +31077,7 @@ output_schema = { type = "object" }
                 cancellation_deadline_ms: None,
                 id: connector_id.to_string(),
                 binary: "dispatcher-test".to_string(),
+                binary_sha256: None,
                 manifest_path: None,
                 name: Some("Hybrid Owner Production Test Connector".to_string()),
                 description: None,
@@ -33942,6 +33987,93 @@ done"#;
         path.to_string_lossy().into_owned()
     }
 
+    #[cfg(target_os = "linux")]
+    fn executable_test_pin(bytes: &[u8]) -> String {
+        use sha2::Digest as _;
+        hex::encode(sha2::Sha256::digest(bytes))
+    }
+
+    #[test]
+    fn pinned_executable_preview_validates_pin_without_opening_binary() {
+        let mut config = dispatcher_test_config("fcp.test.executable-pin");
+        config.binary = "/unavailable/pinned/connector".to_owned();
+        config.binary_sha256 = Some("ab".repeat(32));
+        validate_registry_config(&config)
+            .expect("a configuration preview must not open or execute its binary");
+        config.binary_sha256 = Some("not-a-sha256-pin".to_owned());
+        let error = validate_registry_config(&config).unwrap_err();
+        assert!(error.to_string().contains("binary_sha256"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[fcp_async_core::runtime::test]
+    async fn pinned_native_wrong_digest_never_starts_source_process() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("unexpected-start");
+        let mut config = dispatcher_test_config("fcp.test.executable-pin");
+        config.binary = "/bin/sh".to_owned();
+        config.args = vec![
+            "-c".to_owned(),
+            "printf started > \"$1\"".to_owned(),
+            "fcp-pin-test".to_owned(),
+            marker.display().to_string(),
+        ];
+        config.binary_sha256 = Some("00".repeat(32));
+        let error = SubprocessConnector::spawn(config, Arc::new(ResilienceLayer::default()), None)
+            .await
+            .err()
+            .expect("incorrect pinned bytes must never spawn");
+        assert!(error.to_string().contains("binary_sha256"));
+        assert!(!marker.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[fcp_async_core::runtime::test]
+    async fn pinned_warm_pool_reuses_sealed_image_after_origin_replacement() {
+        if maybe_compiled_test_connector_binary().is_none() {
+            eprintln!("compiled fcp-test-connector missing; skipping pinned warm-pool test");
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let signing_key = fcp_crypto::ed25519::Ed25519SigningKey::generate();
+        let mut config =
+            subprocess_test_connector_config_requiring_handshake("fcp.test.pinned-pool");
+        let original = std::fs::read(&config.binary).unwrap();
+        let source = directory.path().join("connector");
+        std::fs::copy(&config.binary, &source).unwrap();
+        config.binary = source.display().to_string();
+        config.binary_sha256 = Some(executable_test_pin(&original));
+        config.prewarm = fcp_host::ConnectorPrewarmConfig::warm_pool(
+            0,
+            2,
+            Duration::from_secs(30),
+            Duration::from_millis(50),
+        );
+        let (_manifest_directory, admitted) = configure_stateless_pool_test_manifest(&mut config);
+        let pool = NativeWarmPoolConnector::spawn(
+            config.clone(),
+            &admitted,
+            Arc::new(ResilienceLayer::default()),
+            Some(signing_key.verifying_key().to_bytes()),
+        )
+        .await
+        .expect("pinned pool control starts from sealed bytes");
+        std::fs::write(&source, b"replacement must not become an executable").unwrap();
+        let zone: ZoneId = "z:work".parse().unwrap();
+        let worker = pool
+            .spawn_pool_entry(&zone, None)
+            .await
+            .expect("new workers reuse the admitted sealed image");
+        assert_eq!(subprocess_handshake_count(&worker.connector).await, 1);
+        assert!(
+            native_artifact::AdmittedNativeExecutable::capture_for_platform(&config).is_err(),
+            "a new runtime admission must reject the changed origin"
+        );
+        pool.retire_runtime(Instant::now() + Duration::from_secs(5))
+            .await
+            .expect("retire the exact pinned pool children");
+    }
+
     fn stateless_warm_pool_test_policy() -> ConnectorStatePolicy {
         let raw = state_policy_test_manifest(Some("stateless"), false);
         let manifest = ConnectorManifest::parse_str(&raw).expect("validated stateless manifest");
@@ -35163,6 +35295,37 @@ done"#;
         })
         .await
         .expect("actual apply must execute the same startup command");
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn pinned_inventory_handler_rejects_missing_pin_before_inventory_access() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = test_app_state_with_connectors_file(
+            Vec::new(),
+            directory.path().join("connectors.json"),
+            Arc::new(HostAdminStateStore::new()),
+        )
+        .await;
+        Arc::get_mut(&mut state).unwrap().connectors_file = None;
+        for pin in [None, Some("malformed-pin".to_owned())] {
+            let mut config = dispatcher_test_config("fcp.test.pinned-handler:utility:1.0.0");
+            config.binary = "/unavailable/pinned/connector".to_owned();
+            config.binary_sha256 = pin;
+            let error = connector_inventory_apply_pinned_handler(
+                State(Arc::clone(&state)),
+                Json(ConnectorInventoryMutationRequest {
+                    kind: ConnectorInventoryMutationKind::Install,
+                    dry_run: true,
+                    connector: config,
+                }),
+            )
+            .await
+            .expect_err("pin validation must precede inventory access");
+            assert_eq!(error.0, StatusCode::BAD_REQUEST);
+            assert!(error.1.contains("binary_sha256"));
+            assert!(state.registry.inventory().await.is_empty());
+            assert_eq!(state.registry.version.load(Ordering::SeqCst), 1);
+        }
     }
 
     #[fcp_async_core::runtime::test(flavor = "multi_thread")]
@@ -36483,6 +36646,7 @@ done"#;
             cancellation_deadline_ms: None,
             id: connector_id.to_string(),
             binary: "in-process-telegram-test".to_string(),
+            binary_sha256: None,
             manifest_path: Some(
                 StdPath::new(env!("CARGO_MANIFEST_DIR"))
                     .join("../../connectors/telegram/manifest.toml")
@@ -38999,6 +39163,7 @@ done"#;
             cancellation_deadline_ms: None,
             id: "fcp.test:echo:1.0.0".to_string(),
             binary: "/bin/echo".to_string(),
+            binary_sha256: None,
             manifest_path: None,
             name: None,
             description: None,

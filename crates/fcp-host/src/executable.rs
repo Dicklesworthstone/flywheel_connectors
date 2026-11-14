@@ -37,12 +37,18 @@ impl ExecutableDigest {
         Ok(Self(digest))
     }
 
+    /// Fingerprint an immutable byte buffer selected for executable admission.
+    #[must_use]
+    pub fn of_bytes(bytes: &[u8]) -> Self {
+        Self(Sha256::digest(bytes).into())
+    }
+
     /// Verify an already admitted byte buffer without reopening its source.
     ///
     /// # Errors
     /// Returns an invalid-data error when the supplied bytes do not match.
     pub fn verify_bytes(&self, bytes: &[u8]) -> io::Result<()> {
-        self.require_match(Sha256::digest(bytes).into())
+        self.require_match(Self::of_bytes(bytes).0)
     }
 
     fn require_match(self, actual: [u8; 32]) -> io::Result<()> {
@@ -166,10 +172,12 @@ impl PinnedNativeExecutable {
         {
             use std::io::Seek as _;
             use std::os::fd::AsRawFd as _;
+            use std::os::unix::fs::PermissionsExt as _;
 
             use rustix::fs::{MemfdFlags, Mode, SealFlags};
 
             let source = open_bounded_executable(path)?;
+            fcp_sandbox::NativeExecutableSnapshot::require_source_execution(&source)?;
             let flags = MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING;
             let descriptor =
                 match rustix::fs::memfd_create("fcp-connector", flags | MemfdFlags::EXEC) {
@@ -180,7 +188,17 @@ impl PinnedNativeExecutable {
                     }
                     result => result?,
                 };
-            let mut image = File::from(descriptor);
+            // Process creation replaces stdio descriptors before exec. Keep
+            // the executable above that range even if host stdio was closed.
+            let retained = rustix::io::fcntl_dupfd_cloexec(&descriptor, 3)?;
+            drop(descriptor);
+            let mut image = File::from(retained);
+            if image.metadata()?.permissions().mode() & 0o111 == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "kernel policy denied executable memfd admission",
+                ));
+            }
             let length = io::copy(
                 &mut source.take(MAX_PINNED_EXECUTABLE_BYTES + 1),
                 &mut image,
@@ -251,11 +269,13 @@ impl PinnedNativeExecutable {
 #[cfg(test)]
 mod tests {
     use std::io::Write as _;
+    #[cfg(target_os = "linux")]
+    use std::os::unix::fs::PermissionsExt as _;
 
     use super::*;
 
     fn digest(bytes: &[u8]) -> ExecutableDigest {
-        ExecutableDigest(Sha256::digest(bytes).into())
+        ExecutableDigest::of_bytes(bytes)
     }
 
     #[test]
@@ -321,6 +341,10 @@ mod tests {
         let original = std::fs::read("/bin/true").unwrap();
         let mut source = tempfile::NamedTempFile::new().unwrap();
         source.write_all(&original).unwrap();
+        source
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o700))
+            .unwrap();
         let pin = digest(&original);
         let executable = PinnedNativeExecutable::load(source.path(), &pin).unwrap();
         std::fs::write(source.path(), std::fs::read("/bin/false").unwrap()).unwrap();
@@ -344,9 +368,12 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn native_image_is_sealed_against_writes_and_resizing() {
+        use std::os::fd::AsRawFd as _;
+
         let bytes = std::fs::read("/bin/true").unwrap();
         let executable =
             PinnedNativeExecutable::load(Path::new("/bin/true"), &digest(&bytes)).unwrap();
+        assert!(executable._image.as_raw_fd() > 2);
         let mut writable = executable._image.try_clone().unwrap();
         assert!(writable.write_all(b"changed").is_err());
         assert!(writable.set_len(1).is_err());
@@ -376,9 +403,31 @@ mod tests {
         let mut script = tempfile::NamedTempFile::new().unwrap();
         let bytes = b"#!/bin/sh\nexit 0\n";
         script.write_all(bytes).unwrap();
+        script
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o700))
+            .unwrap();
         let error = PinnedNativeExecutable::load(script.path(), &digest(bytes)).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Unsupported);
         assert!(error.to_string().contains("ELF"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_matching_pin_does_not_override_source_execution_permissions() {
+        let original = std::fs::read("/bin/true").unwrap();
+        let mut source = tempfile::NamedTempFile::new().unwrap();
+        source.write_all(&original).unwrap();
+        source
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+        assert_eq!(
+            PinnedNativeExecutable::load(source.path(), &digest(&original))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
     }
 
     #[cfg(target_os = "linux")]

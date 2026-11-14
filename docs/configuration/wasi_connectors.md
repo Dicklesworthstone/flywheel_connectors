@@ -119,6 +119,16 @@ configured files again. Executable compatibility validation and retained bytes
 do not establish publisher signature verification or a persistent deployment
 rollback record.
 
+Managed inventory can set `binary_sha256` to exactly 64 hexadecimal SHA-256
+characters. Admission checks this pin against the same bounded component bytes
+that every guest compiles, before publishing the runtime. Lifecycle restarts
+recheck retained bytes against the configured pin without reopening the source.
+A digest mismatch rejects new admission; an already admitted runtime retains
+its verified snapshot. Verified package installs populate this pin and use the
+protected `/rpc/connectors/apply-pinned` route, which requires a valid pin. An
+older host without that route cannot silently accept an unverified installation.
+Direct operator configurations may omit the pin; the byte snapshot still applies.
+
 ## Prepare the instance before issuing its token
 
 Call the protected admin endpoint for the exact operation and zone:
