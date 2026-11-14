@@ -1709,6 +1709,210 @@ mod tests {
     }
 
     #[test]
+    fn token_store_refresh_returns_the_exact_merged_credentials() {
+        run_with_test_runtime(async {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/token"))
+                .and(body_string_contains("refresh_token=refresh-steady"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "access-new",
+                    "token_type": "Bearer"
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let client = OAuth2Client::new(OAuth2Config::new(
+                "cid",
+                "csec",
+                format!("{}/authorize", server.uri()),
+                format!("{}/token", server.uri()),
+            ))
+            .unwrap();
+            let original = OAuthTokens::from_response(TokenResponse {
+                access_token: "access-old".into(),
+                token_type: "Bearer".into(),
+                expires_in: Some(120),
+                refresh_token: Some("refresh-steady".into()),
+                scope: Some("read write".into()),
+                id_token: Some("retained-id-token".into()),
+            })
+            .unwrap();
+            let original_json = serde_json::to_value(&original).unwrap();
+            let store = TokenStore::new();
+            store.store("user", original);
+
+            let returned = store.get_or_refresh("user", &client).await.unwrap();
+            let stored = store.get("user").unwrap();
+            let returned_json = serde_json::to_value(&returned).unwrap();
+            assert_eq!(returned_json, serde_json::to_value(stored).unwrap());
+            assert_eq!(returned.access_token(), "access-new");
+            assert_eq!(returned.refresh_token(), Some("refresh-steady"));
+            assert_eq!(returned.scopes(), &["read", "write"]);
+            assert_eq!(returned.id_token(), Some("retained-id-token"));
+            assert_eq!(returned_json["expires_at"], original_json["expires_at"]);
+            assert!(returned.needs_refresh());
+            server.verify().await;
+        });
+    }
+
+    #[test]
+    fn token_store_refresh_cannot_turn_an_expired_token_into_an_unbounded_bearer() {
+        run_with_test_runtime(async {
+            for expires_in in [None, Some(0)] {
+                let server = MockServer::start().await;
+                let mut response = serde_json::json!({
+                    "access_token": "new-but-expired",
+                    "token_type": "Bearer"
+                });
+                if let Some(seconds) = expires_in {
+                    response["expires_in"] = serde_json::json!(seconds);
+                }
+                Mock::given(method("POST"))
+                    .and(path("/token"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(response))
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                let client = OAuth2Client::new(OAuth2Config::new(
+                    "cid",
+                    "csec",
+                    format!("{}/authorize", server.uri()),
+                    format!("{}/token", server.uri()),
+                ))
+                .unwrap();
+                let store = TokenStore::new();
+                store.store(
+                    "user",
+                    OAuthTokens::from_response(TokenResponse {
+                        access_token: "expired-access".into(),
+                        token_type: "Bearer".into(),
+                        expires_in: Some(0),
+                        refresh_token: Some("retained-refresh".into()),
+                        scope: Some("read".into()),
+                        id_token: None,
+                    })
+                    .unwrap(),
+                );
+                assert!(matches!(
+                    store.get_or_refresh("user", &client).await,
+                    Err(OAuthError::TokenExpired(_))
+                ));
+                let stored = store.get("user").unwrap();
+                assert!(stored.is_expired());
+                assert_eq!(stored.refresh_token(), Some("retained-refresh"));
+                server.verify().await;
+            }
+        });
+    }
+
+    #[test]
+    fn token_store_inflight_refresh_respects_administrative_replacement_and_removal() {
+        run_with_test_runtime(async {
+            for provider_succeeds in [true, false] {
+                for mutation in [
+                    "store",
+                    "update",
+                    "remove_reinsert",
+                    "clear_reinsert",
+                    "remove",
+                    "clear",
+                ] {
+                    let server = MockServer::start().await;
+                    let store = TokenStore::new();
+                    let fixture = |access_token: &str, expires_in| {
+                        OAuthTokens::from_response(TokenResponse {
+                            access_token: access_token.into(),
+                            token_type: "Bearer".into(),
+                            expires_in: Some(expires_in),
+                            refresh_token: Some("unchanged-refresh-token".into()),
+                            scope: Some("read".into()),
+                            id_token: None,
+                        })
+                        .unwrap()
+                    };
+                    store.store("user", fixture("old-access-token", 0));
+                    let responding_store = store.clone();
+                    Mock::given(method("POST"))
+                        .and(path("/token"))
+                        .and(body_string_contains("refresh_token=unchanged-refresh-token"))
+                        .respond_with(move |_: &wiremock::Request| {
+                            // Mutate after the real HTTP request arrives and
+                            // before its response: admission has already run.
+                            match mutation {
+                                "store" => responding_store.store(
+                                    "user",
+                                    fixture("replacement-access-token", 3600),
+                                ),
+                                "update" => responding_store
+                                    .update("user", fixture("replacement-access-token", 3600))
+                                    .unwrap(),
+                                "remove_reinsert" => {
+                                    assert!(responding_store.remove("user").is_some());
+                                    responding_store.store(
+                                        "user",
+                                        fixture("replacement-access-token", 3600),
+                                    );
+                                }
+                                "clear_reinsert" => {
+                                    responding_store.clear();
+                                    responding_store.store(
+                                        "user",
+                                        fixture("replacement-access-token", 3600),
+                                    );
+                                }
+                                "remove" => {
+                                    assert!(responding_store.remove("user").is_some());
+                                }
+                                "clear" => responding_store.clear(),
+                                _ => unreachable!(),
+                            }
+                            if provider_succeeds {
+                                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                                    "access_token": "stale-provider-access-token",
+                                    "token_type": "Bearer",
+                                    "expires_in": 3600,
+                                    "refresh_token": "stale-provider-refresh-token"
+                                }))
+                            } else {
+                                ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                                    "error": "invalid_grant"
+                                }))
+                            }
+                        })
+                        .expect(1)
+                        .mount(&server)
+                        .await;
+                    let client = OAuth2Client::new(OAuth2Config::new(
+                        "cid",
+                        "csec",
+                        format!("{}/authorize", server.uri()),
+                        format!("{}/token", server.uri()),
+                    ))
+                    .unwrap();
+                    let result = store.get_or_refresh("user", &client).await;
+                    if matches!(mutation, "remove" | "clear") {
+                        assert!(
+                            matches!(result, Err(OAuthError::TokenNotFound(_))),
+                            "removed credentials must fail: {mutation}, success={provider_succeeds}"
+                        );
+                        assert!(store.get("user").is_none());
+                    } else {
+                        let current = result.unwrap();
+                        assert_eq!(current.access_token(), "replacement-access-token");
+                        assert_eq!(current.refresh_token(), Some("unchanged-refresh-token"));
+                        assert_eq!(
+                            serde_json::to_value(current).unwrap(),
+                            serde_json::to_value(store.get("user").unwrap()).unwrap()
+                        );
+                    }
+                    server.verify().await;
+                }
+            }
+        });
+    }
+
+    #[test]
     fn test_exchange_code_with_pkce_sends_verifier() {
         run_with_test_runtime(async {
             let server = MockServer::start().await;
