@@ -36,6 +36,8 @@ impl fmt::Debug for AdmittedWasiComponent {
 impl AdmittedWasiComponent {
     /// Capture once, before publishing a runtime. Guest creation never reopens
     /// the configured path, even if no operation has prepared a session yet.
+    /// Compile and resolve the dispatch contract without executing the guest,
+    /// so an incompatible update cannot replace a working deployment.
     pub(super) fn capture(config: &ConnectorConfig) -> HostResult<Self> {
         let file = open_component_source(config)?;
         let mut bytes = Vec::new();
@@ -47,6 +49,18 @@ impl AdmittedWasiComponent {
         if bytes.is_empty() || bytes.len() as u64 > MAX_COMPONENT_BYTES {
             return Err(component_source_error(config));
         }
+        let runner = WasiConnectorRunner::new(WasiConfig::default()).map_err(|error| {
+            HostError::RegistryError(format!(
+                "WASI connector '{}' admission could not initialize executable validation: {error}",
+                config.id
+            ))
+        })?;
+        runner.load_fcp_component(&bytes).map_err(|error| {
+            HostError::RegistryError(format!(
+                "WASI connector '{}' failed executable admission before inventory publication: {error}",
+                config.id
+            ))
+        })?;
         Ok(Self {
             digest: *blake3::hash(&bytes).as_bytes(),
             bytes: Arc::new(bytes),

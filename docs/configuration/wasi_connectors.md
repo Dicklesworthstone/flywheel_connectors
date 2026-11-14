@@ -90,6 +90,15 @@ regular file no larger than 64 MiB. Every operation and zone loads that snapshot
 including the first prepared guest. Changing or removing the source path cannot
 silently change an already admitted runtime.
 
+Admission compiles the captured bytes, resolves their required imports against
+the host's WASI linker, and checks the synchronous
+`fcp-dispatch(string, list<u8>) -> list<u8>` export. Invalid components,
+unsupported imports, and incompatible dispatch signatures are rejected before
+publication, preserving the current deployment and any prepared guests. This
+validation does not instantiate the guest or run its start functions. Guest
+configuration, resource limits, and readiness are checked during explicit
+session preparation.
+
 Disable, enable, restart, and session retirement retain the same component bytes
 within the running host process. Lifecycle enable and restart also retain the
 component's admitted operation catalog and state policy. A changed manifest
@@ -106,9 +115,9 @@ A missing, unreadable, empty, special, or oversized component source makes the
 inventory operation fail without replacing the current runtime.
 
 The snapshot lasts for the host process lifetime. Starting a new host admits the
-configured files again. Component syntax and the FCP dispatch contract are
-validated when preparing a guest; retaining bytes alone is not publisher
-signature verification or a persistent deployment rollback record.
+configured files again. Executable compatibility validation and retained bytes
+do not establish publisher signature verification or a persistent deployment
+rollback record.
 
 ## Prepare the instance before issuing its token
 

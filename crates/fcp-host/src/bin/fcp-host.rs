@@ -19736,20 +19736,12 @@ output_schema = {{ type = "object" }}
         }
     }
 
-    const fn minimal_wasi_command_component() -> &'static [u8] {
-        br#"
-        (component
-            (core module $m
-                (func (export "run"))
-            )
-            (core instance $i (instantiate $m))
-            (func (export "run") (canon lift (core func $i "run")))
-        )
-        "#
+    const fn minimal_wasi_fcp_component() -> &'static [u8] {
+        include_bytes!("../../../fcp-sandbox/tests/fixtures/connector_dispatch.wat")
     }
 
     fn write_minimal_wasi_component(path: &std::path::Path) {
-        std::fs::write(path, minimal_wasi_command_component()).expect("write test component");
+        std::fs::write(path, minimal_wasi_fcp_component()).expect("write test component");
     }
 
     #[test]

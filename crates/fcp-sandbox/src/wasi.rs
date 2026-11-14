@@ -63,7 +63,10 @@ use thiserror::Error;
 use tracing::{debug, info, trace};
 use wasmtime::{
     Config, Engine, Store,
-    component::{Component, Linker, ResourceTable, TypedFunc},
+    component::{
+        Component, Linker, ResourceTable, TypedFunc,
+        types::{ComponentItem, Type},
+    },
 };
 use wasmtime_wasi::{
     Deterministic, DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView,
@@ -1593,6 +1596,59 @@ impl WasiConnectorRunner {
         })
     }
 
+    /// Compile an FCP component and validate its imports and dispatch ABI.
+    ///
+    /// This checks the exact bytes supplied by deployment admission before an
+    /// existing runtime is replaced. Import resolution does not instantiate a
+    /// guest, run start functions, open preopened directories, or dispatch FCP
+    /// messages. Runtime resource limits, configuration, and guest readiness
+    /// are still checked when an explicit session is prepared.
+    ///
+    /// This is executable compatibility validation, not signature or publisher
+    /// verification. Callers must apply their deployment trust policy separately.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if compilation fails, a required import is unavailable,
+    /// or the synchronous FCP dispatch export has an incompatible signature.
+    pub fn load_fcp_component(&self, wasm_bytes: &[u8]) -> WasiResult<ValidatedComponent> {
+        let validated = self.load_and_validate(wasm_bytes)?;
+        let incompatible_dispatch = || {
+            WasiError::Protocol(format!(
+                "component must export synchronous `{WASI_FCP_DISPATCH_EXPORT}` with (string, list<u8>) -> list<u8>"
+            ))
+        };
+        let Some((ComponentItem::ComponentFunc(dispatch), _)) = validated
+            .component
+            .get_export(None, WASI_FCP_DISPATCH_EXPORT)
+        else {
+            return Err(incompatible_dispatch());
+        };
+        let mut params = dispatch.params();
+        let compatible_params = matches!(
+            (params.next(), params.next(), params.next()),
+            (Some((_, Type::String)), Some((_, Type::List(bytes))), None)
+                if bytes.ty() == Type::U8
+        );
+        let mut results = dispatch.results();
+        let compatible_results = matches!(
+            (results.next(), results.next()),
+            (Some(Type::List(bytes)), None) if bytes.ty() == Type::U8
+        );
+        if dispatch.async_() || !compatible_params || !compatible_results {
+            return Err(incompatible_dispatch());
+        }
+        self.runtime
+            .linker
+            .instantiate_pre(&validated.component)
+            .map_err(|error| {
+                WasiError::Instantiation(format!(
+                    "component imports are incompatible with the FCP WASI host: {error}"
+                ))
+            })?;
+        Ok(validated)
+    }
+
     /// Execute a connector component's export function.
     ///
     /// # Errors
@@ -2669,6 +2725,78 @@ mod tests {
     }
 
     const DISPATCH_COMPONENT: &[u8] = include_bytes!("../tests/fixtures/connector_dispatch.wat");
+
+    #[test]
+    fn fcp_component_admission_requires_executable_dispatch_compatibility() {
+        let runner = WasiConnectorRunner::new(WasiConfig::default()).unwrap();
+        runner
+            .load_fcp_component(DISPATCH_COMPONENT)
+            .expect("the real FCP transport ABI is admitted without a guest");
+        assert!(matches!(
+            runner.load_fcp_component(b"not a WebAssembly component"),
+            Err(WasiError::ComponentLoad(_))
+        ));
+        assert!(matches!(
+            runner.load_fcp_component(minimal_command_component()),
+            Err(WasiError::Protocol(_))
+        ));
+        let dispatch = std::str::from_utf8(DISPATCH_COMPONENT).unwrap();
+        for incompatible in [
+            std::str::from_utf8(minimal_command_component())
+                .unwrap()
+                .replace("\"run\"", "\"fcp-dispatch\""),
+            dispatch.replace("(param \"method\" string)", "(param \"method\" (list u8))"),
+            dispatch.replace(
+                "(param \"request\" (list u8))",
+                "(param \"request\" (list u16))",
+            ),
+            dispatch.replace("(result (list u8))", "(result string)"),
+        ] {
+            let error = runner
+                .load_fcp_component(incompatible.as_bytes())
+                .err()
+                .expect("a same-name export with the wrong signature is not FCP");
+            assert!(matches!(error, WasiError::Protocol(_)));
+            assert!(error.to_string().contains(WASI_FCP_DISPATCH_EXPORT));
+        }
+    }
+
+    #[test]
+    fn fcp_component_admission_resolves_required_host_imports() {
+        let runner = WasiConnectorRunner::new(WasiConfig::default()).unwrap();
+        let unsupported = std::str::from_utf8(DISPATCH_COMPONENT).unwrap().replacen(
+            "(component\n",
+            "(component\n  (import \"unavailable-host-call\" (func))\n",
+            1,
+        );
+        runner
+            .load_and_validate(unsupported.as_bytes())
+            .expect("the component and dispatch ABI are structurally valid");
+        let error = runner
+            .load_fcp_component(unsupported.as_bytes())
+            .err()
+            .expect("unavailable imports must fail before deployment publication");
+        assert!(matches!(error, WasiError::Instantiation(_)));
+        assert!(error.to_string().contains("unavailable-host-call"));
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn fcp_component_admission_does_not_execute_guest_start_functions() {
+        let runner = WasiConnectorRunner::new(WasiConfig::default()).unwrap();
+        let trapping_start = std::str::from_utf8(DISPATCH_COMPONENT).unwrap().replacen(
+            "(core module $guest\n",
+            "(core module $guest\n    (func $start unreachable)\n    (start $start)\n",
+            1,
+        );
+        let admitted = runner
+            .load_fcp_component(trapping_start.as_bytes())
+            .expect("admission must not instantiate or execute guest code");
+        let error = runner
+            .instantiate_session(&admitted.component)
+            .await
+            .expect_err("the trapping start runs only during explicit session preparation");
+        assert!(matches!(error, WasiError::Instantiation(_)));
+    }
 
     #[fcp_async_core::runtime::test]
     async fn connector_session_dispatches_input_and_retains_instance_state() {

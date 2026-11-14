@@ -313,16 +313,19 @@ fn wasi_component_admission_bounds_sources_and_captures_exact_bytes() {
     assert!(AdmittedWasiComponent::capture(&config).is_err());
     std::fs::write(&path, b"").unwrap();
     assert!(AdmittedWasiComponent::capture(&config).is_err());
-    std::fs::write(&path, b"first").unwrap();
+    std::fs::write(&path, b"not a WebAssembly component").unwrap();
+    assert!(AdmittedWasiComponent::capture(&config).is_err());
+    let original = format!("{}\n;; first\n", component_fixture());
+    std::fs::write(&path, &original).unwrap();
     let admitted = AdmittedWasiComponent::capture(&config).unwrap();
     assert!(admitted.source_matches(&config).unwrap());
 
-    std::fs::write(&path, b"other").unwrap();
+    std::fs::write(&path, original.replace(";; first", ";; other")).unwrap();
     assert!(
         !admitted.source_matches(&config).unwrap(),
         "same-length source replacements must be detected"
     );
-    assert_eq!(admitted.bytes.as_slice(), b"first");
+    assert_eq!(admitted.bytes.as_slice(), original.as_bytes());
     std::fs::write(&path, b"a longer replacement").unwrap();
     assert!(!admitted.source_matches(&config).unwrap());
     std::fs::File::create(&path)
@@ -331,7 +334,7 @@ fn wasi_component_admission_bounds_sources_and_captures_exact_bytes() {
         .unwrap();
     assert!(AdmittedWasiComponent::capture(&config).is_err());
     assert!(admitted.source_matches(&config).is_err());
-    assert_eq!(admitted.bytes.as_slice(), b"first");
+    assert_eq!(admitted.bytes.as_slice(), original.as_bytes());
 
     config.binary = directory.path().to_string_lossy().into_owned();
     assert!(AdmittedWasiComponent::capture(&config).is_err());
@@ -374,6 +377,69 @@ async fn wasi_component_admission_precedes_every_first_guest() {
             .await
             .unwrap();
         assert_eq!(response.result, Some(json!({"echo": input, "calls": 1})));
+    }
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn wasi_component_incompatible_updates_preserve_the_live_deployment() {
+    let fixture = Fixture::new().await;
+    let prepared = fixture.prepare(ZoneId::work(), ECHO).await;
+    let config = fixture.connector.config.clone();
+    let generation = fixture.host.registry.version();
+    let fence = fixture.host.registry.inventory_fence(generation);
+    let incompatible_dispatch = r#"
+        (component
+            (core module $m (func (export "dispatch")))
+            (core instance $i (instantiate $m))
+            (func (export "fcp-dispatch") (canon lift (core func $i "dispatch")))
+        )
+    "#;
+    let unsupported_import = component_fixture().replacen(
+        "(component\n",
+        "(component\n  (import \"unavailable-host-call\" (func))\n",
+        1,
+    );
+    for (index, candidate) in [
+        "not a WebAssembly component",
+        "(component)",
+        incompatible_dispatch,
+        unsupported_import.as_str(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        std::fs::write(&config.binary, candidate).unwrap();
+        let error = fixture
+            .host
+            .registry
+            .apply_configs_with_lifecycle(vec![config.clone()], &fixture.host.lifecycle)
+            .await
+            .expect_err("incompatible bytes must not replace the admitted runtime");
+        assert!(
+            error.to_string().contains("failed executable admission"),
+            "{error}"
+        );
+        assert_eq!(fixture.host.registry.version(), generation);
+        fence.require_current().unwrap();
+        assert!(Arc::ptr_eq(
+            &fixture.connector,
+            &registered_runtime(&fixture).await
+        ));
+        assert_eq!(
+            fixture.prepare(ZoneId::work(), ECHO).await.instance_id,
+            prepared.instance_id,
+            "a rejected update must preserve the actual guest identity"
+        );
+        let response = fixture
+            .invoke(fixture.request(
+                &prepared.instance_id,
+                ZoneId::work(),
+                ECHO,
+                json!({"rejected_update": index}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.result.unwrap()["calls"], index + 1);
     }
 }
 
@@ -1349,6 +1415,25 @@ async fn wasi_component_dormant_apply_binds_replacement_bytes_and_manifest() {
     .unwrap();
 
     let config = fixture.connector.config.clone();
+    let disabled_generation = fixture.host.registry.version();
+    std::fs::write(&config.binary, b"incompatible dormant replacement").unwrap();
+    let error = fixture
+        .host
+        .registry
+        .apply_configs_with_lifecycle(vec![config.clone()], &fixture.host.lifecycle)
+        .await
+        .expect_err("dormant updates must validate bytes before replacing retained authority");
+    assert!(error.to_string().contains("failed executable admission"));
+    assert_eq!(fixture.host.registry.version(), disabled_generation);
+    {
+        let state = fixture.host.registry.state.read().await;
+        let entry = &state.connectors[&connector_id];
+        assert!(matches!(&entry.connector, ConnectorRuntime::Dormant(_)));
+        assert!(Arc::ptr_eq(
+            &fixture.connector.component.bytes,
+            &entry.admitted_wasi_component().unwrap().bytes
+        ));
+    }
     let replacement = format!(
         "{}\n;; dormant inventory replacement\n",
         component_fixture()
