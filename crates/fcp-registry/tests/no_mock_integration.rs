@@ -1353,6 +1353,663 @@ async fn full_pipeline_denied_by_ceiling_never_mirrors() {
     // No mirror should happen since verify failed
 }
 
+// ── authenticated recovery from retained repair symbols ──
+
+struct RetainedSymbolFixture {
+    bundle: ConnectorBundle,
+    trust: RegistryTrustPolicy,
+    verifier: RegistryVerifier,
+    store: MemoryObjectStore,
+    symbols: MemorySymbolStore,
+    zone: ZoneId,
+    key: ObjectIdKey,
+    mirror: fcp_registry::MirrorResult,
+    descriptor_id: fcp_core::ObjectId,
+    config: RaptorQConfig,
+}
+
+impl RetainedSymbolFixture {
+    async fn new() -> Self {
+        let (bundle, trust) = signed_bundle_with_binary("symbol-publisher", patterned_binary(4096));
+        let verifier = RegistryVerifier::new(trust.clone());
+        let verified = verifier
+            .verify_bundle(&bundle, None, None, None)
+            .expect("verify signed fixture");
+        let store = MemoryObjectStore::new(MemoryObjectStoreConfig::default());
+        let symbols = MemorySymbolStore::new(MemorySymbolStoreConfig::default());
+        let zone = ZoneId::work();
+        let key = ObjectIdKey::from_bytes([71; 32]);
+        let mirror = verifier
+            .mirror_bundle(&verified, &bundle, zone.clone(), &key, &store)
+            .await
+            .expect("mirror signed fixture");
+        let body_len = store
+            .get(&mirror.binary_object_id)
+            .await
+            .expect("retained binary")
+            .body
+            .len();
+        // Force K=11, whose first repair ESI is K'=12. This catches callers
+        // that confuse the symbol count with the RFC's repair ESI range.
+        let config = RaptorQConfig {
+            symbol_size: u16::try_from(body_len.div_ceil(11).next_multiple_of(8))
+                .expect("fixture symbol size fits"),
+            repair_ratio_bps: 10_000,
+            ..RaptorQConfig::default()
+        };
+        assert_eq!(config.source_symbols(body_len), 11);
+        let mirrored = verifier
+            .mirror_bundle_symbols(
+                &verified,
+                &bundle,
+                &mirror,
+                zone.clone(),
+                &key,
+                &store,
+                &symbols,
+                &config,
+                Some(71),
+            )
+            .await
+            .expect("retain repair symbols");
+        Self {
+            bundle,
+            trust,
+            verifier,
+            store,
+            symbols,
+            zone,
+            key,
+            mirror,
+            descriptor_id: mirrored.descriptor_object_id,
+            config,
+        }
+    }
+
+    async fn load(
+        &self,
+    ) -> Result<(ConnectorBundle, fcp_registry::VerifiedConnectorBundle), RegistryError> {
+        self.load_with_policy(None, None).await
+    }
+
+    async fn load_with_policy(
+        &self,
+        policy: Option<&ZonePolicyObject>,
+        target: Option<&ConnectorTarget>,
+    ) -> Result<(ConnectorBundle, fcp_registry::VerifiedConnectorBundle), RegistryError> {
+        self.verifier
+            .load_verified_symbol_mirror(
+                &self.descriptor_id,
+                &self.zone,
+                &self.key,
+                &self.store,
+                &self.symbols,
+                &self.config,
+                policy,
+                None,
+                target,
+            )
+            .await
+    }
+
+    async fn descriptor(&self) -> ConnectorBinarySymbolSet {
+        self.verifier
+            .load_symbol_descriptor(&self.descriptor_id, &self.store)
+            .await
+            .expect("read fixture descriptor")
+    }
+
+    async fn put_rekeyed(&self, mut record: fcp_core::StoredObject) -> fcp_core::ObjectId {
+        record.object_id =
+            fcp_core::StoredObject::derive_id(&record.header, &record.body, &self.key)
+                .expect("derive changed object ID");
+        let id = record.object_id;
+        self.store.put(record).await.expect("retain changed object");
+        id
+    }
+
+    async fn put_descriptor(&self, descriptor: &ConnectorBinarySymbolSet) -> fcp_core::ObjectId {
+        let mut record = self
+            .store
+            .get(&self.descriptor_id)
+            .await
+            .expect("descriptor record");
+        record.body = fcp_cbor::CanonicalSerializer::serialize(
+            descriptor,
+            &ConnectorBinarySymbolSet::schema(),
+        )
+        .expect("serialize changed descriptor");
+        record.header.refs = vec![descriptor.manifest_object_id, descriptor.binary_object_id];
+        self.put_rekeyed(record).await
+    }
+}
+
+#[fcp_async_core::runtime::test]
+async fn verified_symbol_mirror_recovers_lost_binary_with_repair_esis() {
+    let mut fixture = RetainedSymbolFixture::new().await;
+    let descriptor = fixture.descriptor().await;
+    let metadata = fixture
+        .symbols
+        .get_object_meta(&fixture.mirror.binary_object_id)
+        .await
+        .expect("symbol metadata");
+    let repair_start = fcp_raptorq::RaptorQDecoder::new(metadata.oti.to_oti(), &fixture.config)
+        .first_repair_esi()
+        .expect("valid repair range");
+    assert_eq!(descriptor.source_symbols, 11);
+    assert_eq!(repair_start, 12);
+
+    fixture
+        .store
+        .delete(&fixture.mirror.binary_object_id)
+        .await
+        .expect("lose materialized binary");
+    for esi in [0, 1, descriptor.source_symbols - 1] {
+        fixture
+            .symbols
+            .delete_symbol(&fixture.mirror.binary_object_id, esi)
+            .await
+            .expect("lose source symbol");
+    }
+
+    // Even a stored, correctly sized symbol in the virtual-padding gap must
+    // never be fed to the decoder. It is not part of the authenticated corpus.
+    let mut padding = fixture
+        .symbols
+        .get_symbol(&fixture.mirror.binary_object_id, repair_start)
+        .await
+        .expect("repair symbol");
+    padding.meta.esi = descriptor.source_symbols;
+    padding.data = vec![0x5a; usize::from(descriptor.oti.symbol_size)].into();
+    fixture
+        .symbols
+        .put_symbol(padding)
+        .await
+        .expect("gap noise");
+
+    let before_symbols = fixture.symbols.storage_used().await;
+    let before_objects = fixture.store.storage_used().await;
+    fixture.verifier = RegistryVerifier::new(fixture.trust.clone());
+    let (restored, evidence) = fixture.load().await.expect("recover after restart");
+    assert_eq!(restored.manifest_toml, fixture.bundle.manifest_toml);
+    assert_eq!(restored.binary, fixture.bundle.binary);
+    assert_eq!(restored.target, fixture.bundle.target);
+    assert_eq!(evidence.binary_hash(), fixture.mirror.binary_hash);
+    assert_eq!(evidence.manifest_hash(), fixture.mirror.manifest_hash);
+    assert!(
+        fixture
+            .store
+            .get(&fixture.mirror.binary_object_id)
+            .await
+            .is_err()
+    );
+    assert_eq!(fixture.store.list_zone(&fixture.zone).await.len(), 2);
+    assert_eq!(fixture.store.storage_used().await, before_objects);
+    assert_eq!(fixture.symbols.storage_used().await, before_symbols);
+
+    // Fresh evidence must belong to the current verifier and remain usable
+    // by the normal installation/mirroring path.
+    let destination = MemoryObjectStore::new(MemoryObjectStoreConfig::default());
+    fixture
+        .verifier
+        .mirror_bundle(
+            &evidence,
+            &restored,
+            fixture.zone.clone(),
+            &fixture.key,
+            &destination,
+        )
+        .await
+        .expect("recovered verification authorizes normal mirroring");
+}
+
+#[fcp_async_core::runtime::test]
+async fn verified_symbol_mirror_rejects_wrong_key_zone_and_stored_mutation() {
+    for wrong_key in [false, true] {
+        let mut fixture = RetainedSymbolFixture::new().await;
+        if wrong_key {
+            fixture.key = ObjectIdKey::from_bytes([72; 32]);
+        } else {
+            fixture.zone = ZoneId::owner();
+        }
+        assert!(matches!(
+            fixture.load().await,
+            Err(RegistryError::MirrorObjectInvalid { object_id, .. })
+                if object_id == fixture.descriptor_id
+        ));
+    }
+
+    for mutate_manifest in [false, true] {
+        let fixture = RetainedSymbolFixture::new().await;
+        let id = if mutate_manifest {
+            fixture.mirror.manifest_object_id
+        } else {
+            fixture.descriptor_id
+        };
+        let mut record = fixture.store.get(&id).await.expect("retained object");
+        record.body.push(0);
+        fixture
+            .store
+            .delete(&id)
+            .await
+            .expect("replace test object");
+        fixture
+            .store
+            .put(record)
+            .await
+            .expect("simulate corruption");
+        assert!(matches!(
+            fixture.load().await,
+            Err(RegistryError::MirrorObjectInvalid { object_id, .. }) if object_id == id
+        ));
+    }
+}
+
+#[fcp_async_core::runtime::test]
+async fn verified_symbol_mirror_rejects_rekeyed_schema_and_reference_changes() {
+    for manifest_record in [false, true] {
+        for mutation in ["schema", "references", "foreign_references"] {
+            let mut fixture = RetainedSymbolFixture::new().await;
+            let id = if manifest_record {
+                fixture.mirror.manifest_object_id
+            } else {
+                fixture.descriptor_id
+            };
+            let mut record = fixture.store.get(&id).await.expect("retained object");
+            match mutation {
+                "schema" => {
+                    record.header.schema =
+                        fcp_cbor::SchemaId::new("fcp.test", "WrongSchema", Version::new(1, 0, 0));
+                }
+                "references" => record.header.refs.push(fixture.mirror.binary_object_id),
+                "foreign_references" => {
+                    record
+                        .header
+                        .foreign_refs
+                        .push(fixture.mirror.binary_object_id);
+                }
+                _ => unreachable!(),
+            }
+            // Recompute a valid keyed ID so this exercises semantic checks,
+            // rather than stopping at ordinary storage-tampering detection.
+            let changed_id = fixture.put_rekeyed(record).await;
+            if manifest_record {
+                let mut descriptor = fixture.descriptor().await;
+                descriptor.manifest_object_id = changed_id;
+                fixture.descriptor_id = fixture.put_descriptor(&descriptor).await;
+            } else {
+                fixture.descriptor_id = changed_id;
+            }
+            assert!(
+                matches!(
+                    fixture.load().await,
+                    Err(RegistryError::MirrorObjectInvalid { object_id, .. })
+                        if object_id == changed_id
+                ),
+                "accepted {mutation} mutation of manifest={manifest_record}"
+            );
+        }
+    }
+
+    let mut fixture = RetainedSymbolFixture::new().await;
+    let mut descriptor = fixture.descriptor().await;
+    descriptor.binary_object_id = descriptor.manifest_object_id;
+    fixture.descriptor_id = fixture.put_descriptor(&descriptor).await;
+    assert!(matches!(
+        fixture.load().await,
+        Err(RegistryError::MirrorObjectInvalid { object_id, .. })
+            if object_id == fixture.descriptor_id
+    ));
+}
+
+#[fcp_async_core::runtime::test]
+async fn verified_symbol_mirror_requires_retained_descriptor_and_manifest() {
+    for manifest_record in [false, true] {
+        let fixture = RetainedSymbolFixture::new().await;
+        let id = if manifest_record {
+            fixture.mirror.manifest_object_id
+        } else {
+            fixture.descriptor_id
+        };
+        fixture
+            .store
+            .set_retention(&id, fcp_core::RetentionClass::Ephemeral)
+            .await
+            .expect("drop retention");
+        assert!(matches!(
+            fixture.load().await,
+            Err(RegistryError::MirrorObjectInvalid { object_id, .. }) if object_id == id
+        ));
+    }
+}
+
+#[fcp_async_core::runtime::test]
+async fn verified_symbol_mirror_revalidates_current_trust_policy_and_target() {
+    let mut fixture = RetainedSymbolFixture::new().await;
+    fixture
+        .store
+        .delete(&fixture.mirror.binary_object_id)
+        .await
+        .expect("lose materialized binary");
+    let object_bytes = fixture.store.storage_used().await;
+    let symbol_bytes = fixture.symbols.storage_used().await;
+
+    fixture.verifier = RegistryVerifier::new(RegistryTrustPolicy::default());
+    assert!(
+        fixture.load().await.is_err(),
+        "removed publisher trust must invalidate retained recovery"
+    );
+    fixture.verifier = RegistryVerifier::new(fixture.trust.clone())
+        .with_supply_chain_verification_config(SupplyChainVerificationConfig {
+            require_tuf: true,
+            ..SupplyChainVerificationConfig::default()
+        });
+    assert!(matches!(
+        fixture.load().await,
+        Err(RegistryError::TufVerificationRequired)
+    ));
+    fixture.verifier = RegistryVerifier::new(fixture.trust.clone());
+    let wrong_target = ConnectorTarget {
+        os: "linux".to_string(),
+        arch: "aarch64".to_string(),
+    };
+    assert!(matches!(
+        fixture.load_with_policy(None, Some(&wrong_target)).await,
+        Err(RegistryError::TargetMismatch { .. })
+    ));
+    let restricted = zone_policy_with_ceiling(&["unrelated.capability"]);
+    assert!(matches!(
+        fixture.load_with_policy(Some(&restricted), None).await,
+        Err(RegistryError::CapabilityCeilingViolation { .. })
+    ));
+
+    for change_header in [false, true] {
+        let mut crossed_zone = zone_policy_with_ceiling(&["network.dns", "minimal.op"]);
+        if change_header {
+            crossed_zone.header.zone_id = ZoneId::owner();
+        } else {
+            crossed_zone.zone_id = ZoneId::owner();
+        }
+        assert!(matches!(
+            fixture.load_with_policy(Some(&crossed_zone), None).await,
+            Err(RegistryError::VerifiedBundleMismatch {
+                field: "zone policy",
+                ..
+            })
+        ));
+    }
+    let allowed = zone_policy_with_ceiling(&["network.dns", "minimal.op"]);
+    fixture
+        .load_with_policy(Some(&allowed), Some(&test_target()))
+        .await
+        .expect("current policy permits recovery");
+    assert_eq!(fixture.store.storage_used().await, object_bytes);
+    assert_eq!(fixture.symbols.storage_used().await, symbol_bytes);
+}
+
+#[fcp_async_core::runtime::test]
+async fn verified_symbol_mirror_rejects_rekeyed_manifest_corruption_and_signature_changes() {
+    for update_digest in [false, true] {
+        let mut fixture = RetainedSymbolFixture::new().await;
+        let mut record = fixture
+            .store
+            .get(&fixture.mirror.manifest_object_id)
+            .await
+            .expect("manifest record");
+        let schema = ConnectorManifestObject::schema();
+        let mut manifest: ConnectorManifestObject =
+            fcp_cbor::CanonicalSerializer::deserialize(&record.body, &schema)
+                .expect("manifest body");
+        // Replace the valid manifest with a separately signed manifest whose
+        // signature binds a different binary. Even a valid local keyed ID and
+        // updated digest must not make those bytes activation authority.
+        let (other_bundle, _) =
+            signed_bundle_with_binary("symbol-publisher", b"different binary".to_vec());
+        manifest.manifest_toml = other_bundle.manifest_toml;
+        if update_digest {
+            manifest.manifest_hash = binary_hash(manifest.manifest_toml.as_bytes());
+        }
+        record.body = fcp_cbor::CanonicalSerializer::serialize(&manifest, &schema)
+            .expect("serialize changed manifest");
+        let mut descriptor = fixture.descriptor().await;
+        descriptor.manifest_object_id = fixture.put_rekeyed(record).await;
+        fixture.descriptor_id = fixture.put_descriptor(&descriptor).await;
+        let error = fixture
+            .load()
+            .await
+            .expect_err("reject substituted manifest");
+        if update_digest {
+            assert!(
+                matches!(
+                    error,
+                    RegistryError::SignatureInvalid { .. }
+                        | RegistryError::PublisherThresholdUnmet { .. }
+                        | RegistryError::NoTrustedSignature
+                ),
+                "expected fresh signature verification, got {error:?}"
+            );
+        } else {
+            assert!(matches!(
+                error,
+                RegistryError::ReconstructedManifestHashMismatch { .. }
+            ));
+        }
+    }
+}
+
+#[fcp_async_core::runtime::test]
+async fn verified_symbol_mirror_rejects_authenticated_descriptor_hash_and_target_changes() {
+    for mutation in ["encoded_hash", "binary_hash", "target"] {
+        let mut fixture = RetainedSymbolFixture::new().await;
+        let mut descriptor = fixture.descriptor().await;
+        match mutation {
+            "encoded_hash" => descriptor.encoded_body_hash = binary_hash(b"other encoded body"),
+            "binary_hash" => descriptor.binary_hash = binary_hash(b"other binary"),
+            "target" => descriptor.target.arch = "aarch64".to_string(),
+            _ => unreachable!(),
+        }
+        fixture.descriptor_id = fixture.put_descriptor(&descriptor).await;
+        let error = fixture
+            .load()
+            .await
+            .expect_err("reject descriptor mismatch");
+        let expected_error = match mutation {
+            "encoded_hash" => matches!(error, RegistryError::ReconstructedBodyHashMismatch { .. }),
+            "binary_hash" => matches!(error, RegistryError::ReconstructedBinaryHashMismatch { .. }),
+            "target" => matches!(
+                error,
+                RegistryError::ReconstructedBinaryTargetMismatch { .. }
+            ),
+            _ => unreachable!(),
+        };
+        assert!(expected_error, "{mutation}: {error:?}");
+    }
+}
+
+#[fcp_async_core::runtime::test]
+async fn verified_symbol_mirror_rejects_symbol_metadata_from_another_encoding() {
+    for mutation in [
+        "zone",
+        "source_count",
+        "transfer_length",
+        "symbol_size",
+        "payload_hash",
+    ] {
+        let mut fixture = RetainedSymbolFixture::new().await;
+        let mut metadata = fixture
+            .symbols
+            .get_object_meta(&fixture.mirror.binary_object_id)
+            .await
+            .expect("original metadata");
+        match mutation {
+            "zone" => metadata.zone_id = ZoneId::owner(),
+            "source_count" => metadata.source_symbols += 1,
+            "transfer_length" => metadata.oti.transfer_length += 1,
+            "symbol_size" => metadata.oti.symbol_size += 8,
+            "payload_hash" => metadata.oti.payload_hash = Some([0; 32]),
+            _ => unreachable!(),
+        }
+        fixture.symbols = MemorySymbolStore::new(MemorySymbolStoreConfig::default());
+        fixture
+            .symbols
+            .put_object_meta(metadata)
+            .await
+            .expect("store structurally valid but unrelated metadata");
+        assert!(
+            matches!(
+                fixture.load().await,
+                Err(RegistryError::SymbolStore(
+                    fcp_store::SymbolStoreError::InvalidSymbol { .. }
+                ))
+            ),
+            "accepted {mutation} metadata"
+        );
+    }
+}
+
+#[fcp_async_core::runtime::test]
+async fn verified_symbol_mirror_rejects_incomplete_corpus_and_ignores_unadvertised_esis() {
+    let fixture = RetainedSymbolFixture::new().await;
+    let descriptor = fixture.descriptor().await;
+    let metadata = fixture
+        .symbols
+        .get_object_meta(&fixture.mirror.binary_object_id)
+        .await
+        .expect("metadata");
+    let repair_start = fcp_raptorq::RaptorQDecoder::new(metadata.oti.to_oti(), &fixture.config)
+        .first_repair_esi()
+        .expect("repair range");
+    let repair_end = repair_start + descriptor.total_symbols - descriptor.source_symbols;
+    for mut symbol in fixture
+        .symbols
+        .get_all_symbols(&fixture.mirror.binary_object_id)
+        .await
+    {
+        fixture
+            .symbols
+            .delete_symbol(&fixture.mirror.binary_object_id, symbol.meta.esi)
+            .await
+            .expect("remove advertised symbol");
+        // A large inventory outside the descriptor's advertised ESI ranges
+        // cannot inflate recovery's count or trigger an unbounded bulk read.
+        symbol.meta.esi += repair_end;
+        fixture.symbols.put_symbol(symbol).await.expect("extra ESI");
+    }
+    assert!(
+        fixture
+            .symbols
+            .can_reconstruct(&fixture.mirror.binary_object_id)
+            .await
+    );
+    assert!(matches!(
+        fixture.load().await,
+        Err(RegistryError::IncompleteSymbols {
+            received: 0,
+            needed: 11
+        })
+    ));
+}
+
+#[fcp_async_core::runtime::test]
+async fn verified_symbol_mirror_rejects_corrupt_source_bytes() {
+    let mut fixture = RetainedSymbolFixture::new().await;
+    let metadata = fixture
+        .symbols
+        .get_object_meta(&fixture.mirror.binary_object_id)
+        .await
+        .expect("metadata");
+    let source_symbols = fixture
+        .symbols
+        .get_all_symbols(&fixture.mirror.binary_object_id)
+        .await;
+    fixture.symbols = MemorySymbolStore::new(MemorySymbolStoreConfig::default());
+    fixture
+        .symbols
+        .put_object_meta(metadata.clone())
+        .await
+        .expect("copy metadata");
+    for mut symbol in source_symbols {
+        if symbol.meta.esi >= metadata.source_symbols {
+            continue;
+        }
+        if symbol.meta.esi == 0 {
+            let mut bytes = symbol.data.to_vec();
+            bytes[0] ^= 0x80;
+            symbol.data = bytes.into();
+        }
+        fixture.symbols.put_symbol(symbol).await.expect("source");
+    }
+    assert!(
+        fixture.load().await.is_err(),
+        "correctly sized corrupt sources must never produce verified evidence"
+    );
+}
+
+#[fcp_async_core::runtime::test]
+async fn verified_symbol_mirror_rejects_hostile_counts_and_oti_before_symbol_reads() {
+    for mutation in [
+        "source_count",
+        "total_underflow",
+        "repair_count",
+        "oversized_body",
+        "zero_symbol_size",
+        "multiple_source_blocks",
+        "multiple_sub_blocks",
+        "alignment",
+        "zero_transfer",
+        "unsupported_source_count",
+    ] {
+        let mut fixture = RetainedSymbolFixture::new().await;
+        let mut descriptor = fixture.descriptor().await;
+        match mutation {
+            "source_count" => descriptor.source_symbols += 1,
+            "total_underflow" => descriptor.total_symbols = descriptor.source_symbols - 1,
+            "repair_count" => descriptor.total_symbols = u32::MAX,
+            "oversized_body" => {
+                descriptor.oti.transfer_length =
+                    u64::try_from(MAX_CANONICAL_OBJECT_BYTES).expect("canonical limit fits") + 1;
+            }
+            "zero_symbol_size" => descriptor.oti.symbol_size = 0,
+            "multiple_source_blocks" => descriptor.oti.source_blocks = 2,
+            "multiple_sub_blocks" => descriptor.oti.sub_blocks = 2,
+            "alignment" => descriptor.oti.alignment = 1,
+            "zero_transfer" => descriptor.oti.transfer_length = 0,
+            "unsupported_source_count" => {
+                descriptor.oti.symbol_size = 8;
+                descriptor.oti.transfer_length = 56_404 * 8;
+                descriptor.source_symbols = 56_404;
+                descriptor.total_symbols = 56_404;
+            }
+            _ => unreachable!(),
+        }
+        fixture.descriptor_id = fixture.put_descriptor(&descriptor).await;
+        // No metadata exists in this store. Reaching symbol I/O would produce
+        // ObjectNotFound, so a codec/bounds error proves validation happened first.
+        fixture.symbols = MemorySymbolStore::new(MemorySymbolStoreConfig::default());
+        let error = fixture.load().await.expect_err("reject hostile descriptor");
+        assert!(
+            matches!(
+                error,
+                RegistryError::Decode(_) | RegistryError::ReconstructedBodyTooLarge { .. }
+            ),
+            "{mutation} reached symbol I/O or another unrelated path: {error:?}"
+        );
+        assert_eq!(fixture.symbols.storage_used().await, 0);
+    }
+
+    let mut fixture = RetainedSymbolFixture::new().await;
+    let transfer_length = fixture.descriptor().await.oti.transfer_length;
+    fixture.config.max_object_size =
+        u32::try_from(transfer_length - 1).expect("fixture length fits");
+    fixture.symbols = MemorySymbolStore::new(MemorySymbolStoreConfig::default());
+    assert!(matches!(
+        fixture.load().await,
+        Err(RegistryError::Decode(
+            fcp_raptorq::DecodeError::MemoryLimitExceeded { .. }
+        ))
+    ));
+}
+
 // ── mirror_bundle_symbols / reconstruct_binary_from_symbols ──
 
 #[fcp_async_core::runtime::test]

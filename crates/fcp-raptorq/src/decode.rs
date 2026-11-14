@@ -208,6 +208,27 @@ impl RaptorQDecoder {
         self.attempt_reconstruct()
     }
 
+    /// Try the final buffered symbols when a finite input stream ends.
+    ///
+    /// Streaming arrivals coalesce expensive reconstruction retries. Call this
+    /// once after exhausting a retained symbol set so a decodable final tail
+    /// does not need another symbol to reach the next retry threshold. Repeated
+    /// calls without a new symbol do not repeat reconstruction.
+    ///
+    /// # Errors
+    /// Returns the same timeout, transmission, memory, and reconstruction errors
+    /// as [`Self::add_symbol`].
+    pub fn finish(&mut self) -> Result<Option<Vec<u8>>, DecodeError> {
+        if self.is_timed_out() {
+            return Err(DecodeError::Timeout);
+        }
+        self.validate_decode_bounds()?;
+        if self.received_count() < self.k || self.received_count() == self.last_attempted_at_count {
+            return Ok(None);
+        }
+        self.attempt_reconstruct()
+    }
+
     /// Decide whether to run a full `try_reconstruct` for the newly
     /// inserted ESI. Returns `true` at the first K-symbol crossover,
     /// for one repair-symbol grace attempt immediately after that
@@ -638,6 +659,35 @@ impl RaptorQDecoder {
     #[must_use]
     pub const fn expected_k(&self) -> u32 {
         self.k
+    }
+
+    /// Return the first repair-symbol ESI for this source block.
+    ///
+    /// Source symbols occupy `0..K`; repair symbols start at the RFC 6330
+    /// extended block size `K'`, not at `K`. The intervening virtual padding
+    /// must never be fetched as if it were stored source or repair data.
+    ///
+    /// # Errors
+    /// Rejects unsupported transmission parameters or a source block that
+    /// exceeds the configured decode budget before a caller retrieves symbols.
+    pub fn first_repair_esi(&self) -> Result<u32, DecodeError> {
+        self.validate_decode_bounds()?;
+        let params = crate::codec::systematic::SystematicParams::try_for_source_block(
+            usize::try_from(self.k).unwrap_or(usize::MAX),
+            usize::from(self.symbol_size),
+        )
+        .map_err(|error| match error {
+            crate::codec::systematic::SystematicParamError::UnsupportedSourceBlockSize {
+                requested,
+                max_supported,
+            } => DecodeError::UnsupportedSourceBlockSize {
+                requested,
+                max_supported,
+            },
+        })?;
+        u32::try_from(params.k_prime).map_err(|_| DecodeError::Runtime {
+            reason: "extended source block size exceeds the ESI range".to_string(),
+        })
     }
 
     fn validate_decode_bounds(&self) -> Result<(), DecodeError> {
@@ -1227,6 +1277,145 @@ mod tests {
             max_chunk_threshold: 256 * 1024,
             chunk_size: 64 * 1024,
         }
+    }
+
+    #[test]
+    fn decoder_finish_recovers_valid_symbols_before_the_next_retry_threshold() {
+        let config = RaptorQConfig {
+            repair_ratio_bps: 10_000,
+            ..test_config()
+        };
+        let payload = vec![0x5a; 10 * usize::from(config.symbol_size)];
+        let encoder = RaptorQEncoder::new(&payload, &config).expect("encode fixture");
+        let mut decoder = RaptorQDecoder::new(encoder.transmission_info(), &config);
+        // Recreate a coalesced finite tail with real codec symbols. Scheduling
+        // is paused until K+5, but the K+2 buffered rows already suffice.
+        let retained = usize::try_from(decoder.expected_k() + 2).expect("small fixture");
+        decoder
+            .received
+            .extend(encoder.encode_all().into_iter().take(retained));
+        decoder.last_attempted_at_count = decoder.expected_k() + 1;
+        decoder.post_k_retry_step = 4;
+        assert!(!decoder.should_attempt_decode(decoder.first_repair_esi().unwrap() + 1));
+        assert_eq!(
+            decoder.finish().expect("decode final usable tail"),
+            Some(payload)
+        );
+        assert!(decoder.finish().expect("do not decode twice").is_none());
+    }
+
+    #[test]
+    fn decoder_finish_attempts_a_coalesced_finite_tail_only_once() {
+        let config = RaptorQConfig {
+            repair_ratio_bps: 10_000,
+            ..test_config()
+        };
+        let payload: Vec<u8> = (0..640_u32).map(|i| (i & 0xff) as u8).collect();
+        let encoder = RaptorQEncoder::new(&payload, &config).expect("encode fixture");
+        // An impossible hash makes the real codec exhaust each scheduled
+        // attempt. Twenty symbols leave a tail below the next retry threshold.
+        let oti = encoder.transmission_info().with_payload_hash([0xcd; 32]);
+        let mut decoder = RaptorQDecoder::new(oti, &config);
+        for (esi, bytes) in encoder.encode_all() {
+            assert!(
+                decoder
+                    .add_symbol(esi, bytes)
+                    .expect("bounded decode")
+                    .is_none()
+            );
+        }
+        assert!(decoder.received_count() > decoder.last_attempted_at_count);
+        assert!(decoder.finish().expect("final decode").is_none());
+        assert_eq!(decoder.last_attempted_at_count, decoder.received_count());
+        let retry_step = decoder.post_k_retry_step;
+        assert!(decoder.finish().expect("repeated finish").is_none());
+        assert_eq!(decoder.post_k_retry_step, retry_step);
+    }
+
+    #[test]
+    fn decoder_finish_preserves_incomplete_and_completed_streams() {
+        let config = test_config();
+        let payload = vec![0x5a; 11 * usize::from(config.symbol_size)];
+        let encoder = RaptorQEncoder::new(&payload, &config).expect("encode fixture");
+        let mut decoder = RaptorQDecoder::new(encoder.transmission_info(), &config);
+        assert!(decoder.finish().expect("empty finite input").is_none());
+        let mut source = encoder.encode_source();
+        let (last_esi, last_bytes) = source.pop().expect("last source symbol");
+        for (esi, bytes) in source {
+            assert!(
+                decoder
+                    .add_symbol(esi, bytes)
+                    .expect("source symbol")
+                    .is_none()
+            );
+        }
+        assert!(decoder.finish().expect("incomplete finite input").is_none());
+        assert_eq!(
+            decoder
+                .add_symbol(last_esi, last_bytes)
+                .expect("complete input"),
+            Some(payload)
+        );
+        assert!(decoder.finish().expect("already completed input").is_none());
+        let invalid = ObjectTransmissionInformation::new(64, 0, 1, 1, 8);
+        assert!(matches!(
+            RaptorQDecoder::new(invalid, &config).finish(),
+            Err(DecodeError::InvalidTransmissionInfo { .. })
+        ));
+    }
+
+    #[test]
+    fn decoder_first_repair_esi_matches_encoder_after_virtual_padding() {
+        let config = RaptorQConfig {
+            repair_ratio_bps: 10_000,
+            ..test_config()
+        };
+        for k in [1_usize, 10, 11, 100] {
+            let payload = vec![0x5a; k * usize::from(config.symbol_size)];
+            let encoder = RaptorQEncoder::new(&payload, &config).expect("encode fixture");
+            let decoder = RaptorQDecoder::new(encoder.transmission_info(), &config);
+            let first_repair = encoder
+                .encode_all()
+                .into_iter()
+                .find(|(esi, _)| *esi >= encoder.source_symbols())
+                .expect("fixture includes repair symbols")
+                .0;
+            assert_eq!(decoder.first_repair_esi().expect("valid OTI"), first_repair);
+            assert!(first_repair >= encoder.source_symbols());
+        }
+        let decoder = RaptorQDecoder::with_expected_symbols(11, 11 * 64, 64, &config);
+        assert_eq!(decoder.first_repair_esi().expect("K=11"), 12);
+    }
+
+    #[test]
+    fn decoder_first_repair_esi_rejects_invalid_or_overbudget_source_blocks() {
+        let config = test_config();
+        for oti in [
+            ObjectTransmissionInformation::new(64, 0, 1, 1, 8),
+            ObjectTransmissionInformation::new(64, 64, 2, 1, 8),
+            ObjectTransmissionInformation::new(64, 64, 1, 2, 8),
+            ObjectTransmissionInformation::new(64, 64, 1, 1, 1),
+            ObjectTransmissionInformation::new(0, 64, 1, 1, 8),
+            ObjectTransmissionInformation::new(u64::from(config.max_object_size) + 1, 64, 1, 1, 8),
+        ] {
+            assert!(
+                RaptorQDecoder::new(oti, &config)
+                    .first_repair_esi()
+                    .is_err()
+            );
+        }
+        let config = RaptorQConfig {
+            max_object_size: 8 * 1024 * 1024,
+            ..config
+        };
+        let decoder = RaptorQDecoder::with_expected_symbols(56_404, 56_404 * 64, 64, &config);
+        assert!(matches!(
+            decoder.first_repair_esi(),
+            Err(DecodeError::UnsupportedSourceBlockSize {
+                requested: 56_404,
+                max_supported: 56_403,
+            })
+        ));
     }
 
     #[test]

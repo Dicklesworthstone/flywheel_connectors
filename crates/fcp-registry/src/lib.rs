@@ -2617,7 +2617,137 @@ impl RegistryVerifier {
         Ok((bundle, verified))
     }
 
-    /// Load a previously mirrored binary symbol descriptor from the object store.
+    /// Recover and verify an exact retained bundle even when its binary object
+    /// is unavailable and only the manifest, descriptor, and repair symbols remain.
+    ///
+    /// The descriptor ID must come from the caller's trusted deployment or
+    /// registry record. Both retained objects are authenticated against that ID,
+    /// the zone, and the object-ID key before any symbol is decoded. Recovery
+    /// reads the advertised symbol range incrementally instead of collecting an
+    /// unbounded store inventory. Missing source symbols may be replaced by the
+    /// descriptor's repair symbols.
+    ///
+    /// Reconstructed bytes are not activation authority: current publisher,
+    /// registry, zone, target, and supply-chain policy are checked again. Adapter
+    /// evidence must be supplied by the caller, just as for `load_verified_mirror`.
+    /// No binary object is required or written, and this does not change a live
+    /// deployment or its rollback metadata.
+    ///
+    /// # Errors
+    /// Returns [`RegistryError`] for unauthenticated or inconsistent retained
+    /// objects, invalid codec bounds, missing/corrupt symbols, or failed current
+    /// verification policy.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    pub async fn load_verified_symbol_mirror(
+        &self,
+        descriptor_object_id: &ObjectId,
+        zone_id: &ZoneId,
+        object_id_key: &ObjectIdKey,
+        store: &dyn ObjectStore,
+        symbol_store: &dyn SymbolStore,
+        config: &RaptorQConfig,
+        zone_policy: Option<&ZonePolicyObject>,
+        supply_chain: Option<&SupplyChainEvidence>,
+        expected_target: Option<&ConnectorTarget>,
+    ) -> Result<(ConnectorBundle, VerifiedConnectorBundle), RegistryError> {
+        if let Some(policy) = zone_policy
+            && (&policy.zone_id != zone_id || &policy.header.zone_id != zone_id)
+        {
+            return Err(RegistryError::VerifiedBundleMismatch {
+                field: "zone policy",
+                expected: zone_id.to_string(),
+                actual: policy.zone_id.to_string(),
+            });
+        }
+
+        let descriptor_record = store.get(descriptor_object_id).await?;
+        authenticate_mirror_object(
+            &descriptor_record,
+            descriptor_object_id,
+            zone_id,
+            object_id_key,
+        )?;
+        let invalid_descriptor = |reason| RegistryError::MirrorObjectInvalid {
+            object_id: *descriptor_object_id,
+            reason,
+        };
+        let descriptor_schema = ConnectorBinarySymbolSet::schema();
+        if descriptor_record.header.schema != descriptor_schema {
+            return Err(invalid_descriptor("unexpected symbol descriptor schema"));
+        }
+        if descriptor_record.storage.retention != RetentionClass::Pinned {
+            return Err(invalid_descriptor("symbol descriptor is not pinned"));
+        }
+        let descriptor: ConnectorBinarySymbolSet =
+            CanonicalSerializer::deserialize(&descriptor_record.body, &descriptor_schema)?;
+        if descriptor_record.header.refs.as_slice()
+            != [descriptor.manifest_object_id, descriptor.binary_object_id]
+            || !descriptor_record.header.foreign_refs.is_empty()
+            || descriptor.manifest_object_id == descriptor.binary_object_id
+        {
+            return Err(invalid_descriptor(
+                "symbol descriptor does not bind its exact manifest and binary pair",
+            ));
+        }
+        if let Some(expected) = expected_target
+            && &descriptor.target != expected
+        {
+            return Err(RegistryError::TargetMismatch {
+                expected: expected.as_string(),
+                found: descriptor.target.as_string(),
+            });
+        }
+
+        let manifest_record = store.get(&descriptor.manifest_object_id).await?;
+        authenticate_mirror_object(
+            &manifest_record,
+            &descriptor.manifest_object_id,
+            zone_id,
+            object_id_key,
+        )?;
+        let invalid_manifest = |reason| RegistryError::MirrorObjectInvalid {
+            object_id: descriptor.manifest_object_id,
+            reason,
+        };
+        let manifest_schema = ConnectorManifestObject::schema();
+        if manifest_record.header.schema != manifest_schema {
+            return Err(invalid_manifest("unexpected manifest object schema"));
+        }
+        if !manifest_record.header.refs.is_empty()
+            || !manifest_record.header.foreign_refs.is_empty()
+        {
+            return Err(invalid_manifest("unexpected manifest object references"));
+        }
+        if manifest_record.storage.retention != RetentionClass::Pinned {
+            return Err(invalid_manifest(
+                "manifest is not retained as a pinned artifact",
+            ));
+        }
+        let manifest: ConnectorManifestObject =
+            CanonicalSerializer::deserialize(&manifest_record.body, &manifest_schema)?;
+        let actual_manifest_hash = hash_bytes(manifest.manifest_toml.as_bytes());
+        if actual_manifest_hash != manifest.manifest_hash {
+            return Err(RegistryError::ReconstructedManifestHashMismatch {
+                expected: manifest.manifest_hash,
+                actual: actual_manifest_hash,
+            });
+        }
+
+        let reconstructed =
+            reconstruct_retained_symbol_binary(&descriptor, zone_id, symbol_store, config).await?;
+        let bundle = ConnectorBundle {
+            manifest_toml: manifest.manifest_toml,
+            binary: reconstructed.binary,
+            target: reconstructed.target,
+        };
+        let verified = self.verify_bundle(&bundle, zone_policy, supply_chain, expected_target)?;
+        Ok((bundle, verified))
+    }
+
+    /// Load an unverified binary symbol descriptor for inspection.
+    ///
+    /// This low-level decoder does not authenticate the keyed object ID or
+    /// authorize activation. Use `load_verified_symbol_mirror` for recovery.
     ///
     /// # Errors
     /// Returns [`RegistryError`] if the descriptor cannot be read or decoded.
@@ -2680,64 +2810,21 @@ impl RegistryVerifier {
             }
         }
 
+        if maybe_decoded.is_none() {
+            maybe_decoded = rq_decoder.finish()?;
+        }
         let decoded = maybe_decoded.ok_or(RegistryError::IncompleteSymbols {
             received,
             needed: descriptor.source_symbols,
         })?;
-        if decoded.len() < expected_len {
-            return Err(RegistryError::ReconstructedBodyTooShort {
-                expected: expected_len,
-                actual: decoded.len(),
-            });
-        }
-
-        let body = &decoded[..expected_len];
-        let actual_body_hash = hash_bytes(body);
-        if actual_body_hash != descriptor.encoded_body_hash {
-            return Err(RegistryError::ReconstructedBodyHashMismatch {
-                expected: descriptor.encoded_body_hash.clone(),
-                actual: actual_body_hash,
-            });
-        }
-
-        let binary_schema = ConnectorBinaryObject::schema();
-        let binary_obj: ConnectorBinaryObject =
-            CanonicalSerializer::deserialize(body, &binary_schema)
-                .map_err(RegistryError::Canonical)?;
-
-        if binary_obj.binary_hash != descriptor.binary_hash {
-            return Err(RegistryError::ReconstructedBinaryHashMismatch {
-                expected: descriptor.binary_hash.clone(),
-                actual: binary_obj.binary_hash,
-            });
-        }
-        let actual_binary_hash = hash_bytes(&binary_obj.binary);
-        if actual_binary_hash != descriptor.binary_hash {
-            return Err(RegistryError::ReconstructedBinaryHashMismatch {
-                expected: descriptor.binary_hash.clone(),
-                actual: actual_binary_hash,
-            });
-        }
-
-        let actual_target = binary_obj.target.as_string();
-        let expected_target = descriptor.target.as_string();
-        if binary_obj.target != descriptor.target {
-            return Err(RegistryError::ReconstructedBinaryTargetMismatch {
-                expected: expected_target,
-                actual: actual_target,
-            });
-        }
-
-        Ok(ReconstructedConnectorBinary {
-            manifest_object_id: descriptor.manifest_object_id,
-            binary_object_id: descriptor.binary_object_id,
-            target: binary_obj.target,
-            binary_hash: descriptor.binary_hash.clone(),
-            binary: binary_obj.binary,
-        })
+        decode_reconstructed_binary(descriptor, &decoded, expected_len)
     }
 
-    /// Reconstruct a full connector bundle from a mirrored symbol descriptor.
+    /// Reconstruct an unverified connector bundle from a symbol descriptor.
+    ///
+    /// This low-level integrity helper does not authenticate retained object IDs
+    /// or apply current trust policy. Use `load_verified_symbol_mirror` before
+    /// activation or deployment recovery.
     ///
     /// # Errors
     /// Returns [`RegistryError`] if the descriptor or manifest object cannot be
@@ -2778,6 +2865,154 @@ impl RegistryVerifier {
     }
 }
 
+async fn reconstruct_retained_symbol_binary(
+    descriptor: &ConnectorBinarySymbolSet,
+    zone_id: &ZoneId,
+    symbol_store: &dyn SymbolStore,
+    config: &RaptorQConfig,
+) -> Result<ReconstructedConnectorBinary, RegistryError> {
+    let expected_len = usize::try_from(descriptor.oti.transfer_length).map_err(|_| {
+        RegistryError::TransferLengthOverflow {
+            len: descriptor.oti.transfer_length,
+        }
+    })?;
+    if expected_len > MAX_CANONICAL_OBJECT_BYTES {
+        return Err(RegistryError::ReconstructedBodyTooLarge {
+            len: expected_len,
+            max: MAX_CANONICAL_OBJECT_BYTES,
+        });
+    }
+    let oti = store_oti_from_descriptor(descriptor.oti);
+    let mut decoder = RaptorQDecoder::new(oti.to_oti(), config);
+    let repair_start = decoder.first_repair_esi()?;
+    // The producer's u16 repair ratio bounds the advertised search space even
+    // when every source symbol is missing. Do not trust a store-wide count or
+    // allocate a vector from caller-controlled descriptor counts.
+    let max_repairs = u64::from(descriptor.source_symbols) * u64::from(u16::MAX) / 10_000;
+    if descriptor.source_symbols != decoder.expected_k()
+        || descriptor.total_symbols < descriptor.source_symbols
+        || u64::from(descriptor.total_symbols - descriptor.source_symbols) > max_repairs
+    {
+        return Err(DecodeError::InvalidTransmissionInfo {
+            reason: "symbol descriptor counts disagree with its source block or repair bounds"
+                .to_string(),
+        }
+        .into());
+    }
+    let repairs = descriptor.total_symbols - descriptor.source_symbols;
+    let repair_end =
+        repair_start
+            .checked_add(repairs)
+            .ok_or_else(|| DecodeError::InvalidTransmissionInfo {
+                reason: "repair symbol range exceeds the ESI space".to_string(),
+            })?;
+    let metadata = symbol_store
+        .get_object_meta(&descriptor.binary_object_id)
+        .await?;
+    if metadata.object_id != descriptor.binary_object_id
+        || &metadata.zone_id != zone_id
+        || metadata.source_symbols != descriptor.source_symbols
+        || metadata.oti != oti
+    {
+        return Err(SymbolStoreError::InvalidSymbol {
+            reason: "symbol metadata disagrees with the authenticated descriptor and zone"
+                .to_string(),
+        }
+        .into());
+    }
+
+    for esi in (0..descriptor.source_symbols).chain(repair_start..repair_end) {
+        if decoder.is_timed_out() {
+            return Err(DecodeError::Timeout.into());
+        }
+        let symbol = match symbol_store
+            .get_symbol(&descriptor.binary_object_id, esi)
+            .await
+        {
+            Ok(symbol) => symbol,
+            Err(SymbolStoreError::NotFound { .. }) => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if symbol.meta.object_id != descriptor.binary_object_id
+            || &symbol.meta.zone_id != zone_id
+            || symbol.meta.esi != esi
+        {
+            return Err(SymbolStoreError::InvalidSymbol {
+                reason: "store returned a symbol outside the authenticated object, zone, or ESI"
+                    .to_string(),
+            }
+            .into());
+        }
+        // Validate length before cloning untrusted store bytes into the decoder.
+        if symbol.data.len() != usize::from(descriptor.oti.symbol_size) {
+            return Err(DecodeError::InvalidSymbol {
+                reason: "stored symbol length disagrees with the authenticated descriptor"
+                    .to_string(),
+            }
+            .into());
+        }
+        if let Some(decoded) = decoder.add_symbol(esi, symbol.data.to_vec())? {
+            return decode_reconstructed_binary(descriptor, &decoded, expected_len);
+        }
+    }
+    if let Some(decoded) = decoder.finish()? {
+        return decode_reconstructed_binary(descriptor, &decoded, expected_len);
+    }
+    Err(RegistryError::IncompleteSymbols {
+        received: decoder.received_count(),
+        needed: descriptor.source_symbols,
+    })
+}
+
+fn decode_reconstructed_binary(
+    descriptor: &ConnectorBinarySymbolSet,
+    decoded: &[u8],
+    expected_len: usize,
+) -> Result<ReconstructedConnectorBinary, RegistryError> {
+    if decoded.len() < expected_len {
+        return Err(RegistryError::ReconstructedBodyTooShort {
+            expected: expected_len,
+            actual: decoded.len(),
+        });
+    }
+    let body = &decoded[..expected_len];
+    let actual_body_hash = hash_bytes(body);
+    if actual_body_hash != descriptor.encoded_body_hash {
+        return Err(RegistryError::ReconstructedBodyHashMismatch {
+            expected: descriptor.encoded_body_hash.clone(),
+            actual: actual_body_hash,
+        });
+    }
+    let binary: ConnectorBinaryObject =
+        CanonicalSerializer::deserialize(body, &ConnectorBinaryObject::schema())?;
+    if binary.binary_hash != descriptor.binary_hash {
+        return Err(RegistryError::ReconstructedBinaryHashMismatch {
+            expected: descriptor.binary_hash.clone(),
+            actual: binary.binary_hash,
+        });
+    }
+    let actual_binary_hash = hash_bytes(&binary.binary);
+    if actual_binary_hash != descriptor.binary_hash {
+        return Err(RegistryError::ReconstructedBinaryHashMismatch {
+            expected: descriptor.binary_hash.clone(),
+            actual: actual_binary_hash,
+        });
+    }
+    if binary.target != descriptor.target {
+        return Err(RegistryError::ReconstructedBinaryTargetMismatch {
+            expected: descriptor.target.as_string(),
+            actual: binary.target.as_string(),
+        });
+    }
+    Ok(ReconstructedConnectorBinary {
+        manifest_object_id: descriptor.manifest_object_id,
+        binary_object_id: descriptor.binary_object_id,
+        target: binary.target,
+        binary_hash: descriptor.binary_hash.clone(),
+        binary: binary.binary,
+    })
+}
+
 fn authenticate_mirror_object(
     object: &StoredObject,
     expected_id: &ObjectId,
@@ -2793,6 +3028,16 @@ fn authenticate_mirror_object(
     }
     if &object.header.zone_id != zone_id {
         return Err(invalid("object belongs to a different zone"));
+    }
+    // Reject oversized store responses before keyed canonicalization clones
+    // their bodies or serializes attacker-controlled reference inventories.
+    if object.body.len() > MAX_CANONICAL_OBJECT_BYTES {
+        return Err(invalid(
+            "retained object body exceeds the canonical size limit",
+        ));
+    }
+    if object.header.refs.len() > 2 || !object.header.foreign_refs.is_empty() {
+        return Err(invalid("unexpected retained object reference inventory"));
     }
     if StoredObject::derive_id(&object.header, &object.body, object_id_key)? != *expected_id {
         return Err(invalid("header or body does not match its keyed object ID"));

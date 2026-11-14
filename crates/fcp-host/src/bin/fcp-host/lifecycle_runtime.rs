@@ -353,7 +353,9 @@ async fn retire_selected(
 fn validate_activation(entry: &RegistryEntry) -> HostResult<ValidatedConnectorConfig> {
     let retained_component = entry.admitted_wasi_component();
     if retained_component.is_some() {
-        entry.state_policy.require_admitted_manifest(&entry.config)?;
+        entry
+            .state_policy
+            .require_admitted_manifest(&entry.config)?;
     }
     let mut admitted = validate_registry_config(&entry.config)?;
     if let Some(component) = retained_component {
@@ -363,7 +365,9 @@ fn validate_activation(entry: &RegistryEntry) -> HostResult<ValidatedConnectorCo
         admitted.manifest_constraints = entry.manifest_constraints.clone();
         admitted.state_policy = entry.state_policy;
         admitted.wasi_component = Some(component.clone());
-        admitted.state_policy.require_admitted_manifest(&entry.config)?;
+        admitted
+            .state_policy
+            .require_admitted_manifest(&entry.config)?;
     }
     Ok(admitted)
 }

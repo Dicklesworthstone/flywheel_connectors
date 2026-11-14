@@ -2430,6 +2430,10 @@ Registries are **sources, not dependencies**:
 
 Connector binaries are content-addressed objects distributed via the symbol layer. Your mesh can install/update connectors fully offline from mirrored objects.
 
+The registry's `load_verified_symbol_mirror` API can recover a retained bundle when the original binary object is unavailable. The caller supplies a trusted symbol-descriptor object ID, the matching zone and object-ID key, and retained manifest and symbol stores. Recovery authenticates the descriptor and manifest, validates their references and retention, and reads the advertised source and repair symbols incrementally under codec and object-size limits. Repair-symbol numbering respects the codec's virtual padding, and a final bounded decode attempt handles a finite retained tail.
+
+Recovered bytes pass the current publisher, registry, zone, target, and supplied supply-chain policy before the API returns `VerifiedConnectorBundle` evidence. The low-level symbol reconstruction helpers return unverified data. Recovery does not change a live deployment or restore rollback history; those operations still need the host's deployment transaction.
+
 ### Supply Chain Verification
 
 Before execution, FCP verifies:

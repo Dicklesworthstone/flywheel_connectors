@@ -383,7 +383,10 @@ async fn wasi_component_inventory_apply_observes_same_path_replacements() {
     let config = fixture.connector.config.clone();
     let generation = fixture.host.registry.version();
     let fence = fixture.host.registry.inventory_fence(generation);
-    let replacement = format!("{}\n;; explicitly selected component\n", component_fixture());
+    let replacement = format!(
+        "{}\n;; explicitly selected component\n",
+        component_fixture()
+    );
     std::fs::write(&config.binary, &replacement).unwrap();
 
     let preview = fixture
@@ -1346,7 +1349,10 @@ async fn wasi_component_dormant_apply_binds_replacement_bytes_and_manifest() {
     .unwrap();
 
     let config = fixture.connector.config.clone();
-    let replacement = format!("{}\n;; dormant inventory replacement\n", component_fixture());
+    let replacement = format!(
+        "{}\n;; dormant inventory replacement\n",
+        component_fixture()
+    );
     std::fs::write(&config.binary, &replacement).unwrap();
     let manifest_path = config.manifest_path.as_ref().unwrap();
     let manifest = std::fs::read_to_string(manifest_path).unwrap();
@@ -1363,7 +1369,9 @@ async fn wasi_component_dormant_apply_binds_replacement_bytes_and_manifest() {
             .await
             .unwrap_err();
         assert!(
-            error.to_string().contains("manifest changed after state admission"),
+            error
+                .to_string()
+                .contains("manifest changed after state admission"),
             "{error}"
         );
     }

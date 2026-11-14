@@ -113,7 +113,9 @@ fn open_component_source(config: &ConnectorConfig) -> HostResult<std::fs::File> 
     let file = options
         .open(&config.binary)
         .map_err(|_| component_source_error(config))?;
-    let metadata = file.metadata().map_err(|_| component_source_error(config))?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| component_source_error(config))?;
     if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_COMPONENT_BYTES {
         return Err(component_source_error(config));
     }
