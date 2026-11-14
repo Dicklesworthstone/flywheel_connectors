@@ -3773,6 +3773,19 @@ fwc pipe github.search_issues slack.post_message \
 
 Pipes are the imperative shorthand; pipelines and recipes are the declarative form.
 
+`fwc pipe --timeout-ms 30000` gives the entire run one execution budget, including
+host setup, discovery, introspection, both preflight checks, and both operations.
+The default is 30 seconds; valid values are 1–86,400,000 milliseconds. Each
+invocation receives only the remaining budget, capped by the host's per-operation
+ceiling. The target is never started after the source exhausts the run budget.
+
+A timeout after source completion retains the source request identity and receipt
+in the failure evidence. Source payloads are included only with
+`--include-intermediate`. The host's separate response-finalization allowance can
+extend the command's wall-clock time: a definite completed response remains a
+known result, while an unusable response remains `outcome_unknown`. Neither
+outcome renews execution authority for a later stage.
+
 ### Batch Files (Heterogeneous Operations)
 
 `fwc batch-file` executes a JSONL file of arbitrary operations with explicit
