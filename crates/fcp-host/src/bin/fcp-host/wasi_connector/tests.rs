@@ -303,6 +303,159 @@ impl Fixture {
     }
 }
 
+#[test]
+fn wasi_component_admission_bounds_sources_and_captures_exact_bytes() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("component.wat");
+    let mut config = crate::tests::dispatcher_test_config(CONNECTOR);
+    config.binary = path.to_string_lossy().into_owned();
+
+    assert!(AdmittedWasiComponent::capture(&config).is_err());
+    std::fs::write(&path, b"").unwrap();
+    assert!(AdmittedWasiComponent::capture(&config).is_err());
+    std::fs::write(&path, b"first").unwrap();
+    let admitted = AdmittedWasiComponent::capture(&config).unwrap();
+    assert!(admitted.source_matches(&config).unwrap());
+
+    std::fs::write(&path, b"other").unwrap();
+    assert!(
+        !admitted.source_matches(&config).unwrap(),
+        "same-length source replacements must be detected"
+    );
+    assert_eq!(admitted.bytes.as_slice(), b"first");
+    std::fs::write(&path, b"a longer replacement").unwrap();
+    assert!(!admitted.source_matches(&config).unwrap());
+    std::fs::File::create(&path)
+        .unwrap()
+        .set_len(MAX_COMPONENT_BYTES + 1)
+        .unwrap();
+    assert!(AdmittedWasiComponent::capture(&config).is_err());
+    assert!(admitted.source_matches(&config).is_err());
+    assert_eq!(admitted.bytes.as_slice(), b"first");
+
+    config.binary = directory.path().to_string_lossy().into_owned();
+    assert!(AdmittedWasiComponent::capture(&config).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn wasi_component_admission_rejects_fifo_and_device_sources() {
+    let directory = tempfile::tempdir().unwrap();
+    let fifo = directory.path().join("component.fifo");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("create FIFO source")
+            .success()
+    );
+    let mut config = crate::tests::dispatcher_test_config(CONNECTOR);
+    config.binary = fifo.to_string_lossy().into_owned();
+    assert!(AdmittedWasiComponent::capture(&config).is_err());
+    config.binary = "/dev/null".into();
+    assert!(AdmittedWasiComponent::capture(&config).is_err());
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn wasi_component_admission_precedes_every_first_guest() {
+    let fixture = Fixture::new().await;
+    assert!(!fixture.connector.sessions.has_ready_session());
+    std::fs::write(
+        &fixture.connector.config.binary,
+        b"this replacement is not a WebAssembly component",
+    )
+    .unwrap();
+
+    for (zone, operation) in [(ZoneId::work(), ECHO), (ZoneId::private(), OTHER)] {
+        let prepared = fixture.prepare(zone.clone(), operation).await;
+        let input = json!({"admitted": operation});
+        let response = fixture
+            .invoke(fixture.request(&prepared.instance_id, zone, operation, input.clone()))
+            .await
+            .unwrap();
+        assert_eq!(response.result, Some(json!({"echo": input, "calls": 1})));
+    }
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn wasi_component_inventory_apply_observes_same_path_replacements() {
+    let fixture = Fixture::new().await;
+    let config = fixture.connector.config.clone();
+    let generation = fixture.host.registry.version();
+    let fence = fixture.host.registry.inventory_fence(generation);
+    let replacement = format!("{}\n;; explicitly selected component\n", component_fixture());
+    std::fs::write(&config.binary, &replacement).unwrap();
+
+    let preview = fixture
+        .host
+        .registry
+        .preview_configs_with_lifecycle(vec![config.clone()], &fixture.host.lifecycle)
+        .await
+        .unwrap();
+    assert_eq!(preview.updated, vec![CONNECTOR.to_owned()]);
+    assert!(preview.unchanged.is_empty());
+    assert_eq!(fixture.host.registry.version(), generation);
+    assert!(Arc::ptr_eq(
+        &fixture.connector,
+        &registered_runtime(&fixture).await
+    ));
+    assert!(!fixture.connector.sessions.has_ready_session());
+    fence.require_current().unwrap();
+
+    let applied = fixture
+        .host
+        .registry
+        .apply_configs_with_lifecycle(vec![config.clone()], &fixture.host.lifecycle)
+        .await
+        .unwrap();
+    assert_eq!(applied.updated, vec![CONNECTOR.to_owned()]);
+    assert_eq!(applied.registry_version, generation + 1);
+    assert!(fence.require_current().is_err());
+    let current = registered_runtime(&fixture).await;
+    assert!(!Arc::ptr_eq(&fixture.connector, &current));
+    assert_ne!(fixture.connector.component.digest, current.component.digest);
+    assert_eq!(current.component.bytes.as_slice(), replacement.as_bytes());
+    assert!(!current.sessions.has_ready_session());
+
+    let unchanged = fixture
+        .host
+        .registry
+        .apply_configs_with_lifecycle(vec![config.clone()], &fixture.host.lifecycle)
+        .await
+        .unwrap();
+    assert_eq!(unchanged.unchanged, vec![CONNECTOR.to_owned()]);
+    assert_eq!(unchanged.registry_version, generation + 1);
+    assert!(Arc::ptr_eq(&current, &registered_runtime(&fixture).await));
+
+    std::fs::rename(
+        &config.binary,
+        fixture._directory.path().join("retained-source.wat"),
+    )
+    .unwrap();
+    assert!(
+        fixture
+            .host
+            .registry
+            .apply_configs_with_lifecycle(vec![config], &fixture.host.lifecycle)
+            .await
+            .is_err(),
+        "an unavailable source cannot publish replacement inventory"
+    );
+    assert_eq!(fixture.host.registry.version(), generation + 1);
+    assert!(Arc::ptr_eq(&current, &registered_runtime(&fixture).await));
+    let prepared = fixture.prepare(ZoneId::work(), ECHO).await;
+    let response = current
+        .invoke_prepared(
+            fixture.request(&prepared.instance_id, ZoneId::work(), ECHO, json!({})),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.result.unwrap()["calls"], 1);
+}
+
 #[fcp_async_core::runtime::test(flavor = "multi_thread")]
 async fn wasi_conditional_retirement_preserves_other_sessions_and_replacements() {
     let fixture = Fixture::new().await;
@@ -1167,12 +1320,139 @@ fn lifecycle_request(action: fcp_host::LifecycleAction) -> LifecycleTransitionRe
 }
 
 #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn wasi_component_dormant_apply_binds_replacement_bytes_and_manifest() {
+    use fcp_host::{DesiredRuntimeState, LifecycleAction};
+
+    let fixture = Fixture::new().await;
+    let connector_id = ConnectorId::from_static(CONNECTOR);
+    fixture
+        .host
+        .lifecycle
+        .reconcile_registered_connectors(&fixture.host.registry.list().await)
+        .await
+        .unwrap();
+    fixture
+        .host
+        .lifecycle
+        .set_desired_state(&connector_id, DesiredRuntimeState::Enabled, None)
+        .await
+        .unwrap();
+    lifecycle_runtime::transition(
+        &fixture.host,
+        &connector_id,
+        &lifecycle_request(LifecycleAction::Disable),
+    )
+    .await
+    .unwrap();
+
+    let config = fixture.connector.config.clone();
+    let replacement = format!("{}\n;; dormant inventory replacement\n", component_fixture());
+    std::fs::write(&config.binary, &replacement).unwrap();
+    let manifest_path = config.manifest_path.as_ref().unwrap();
+    let manifest = std::fs::read_to_string(manifest_path).unwrap();
+    std::fs::write(
+        manifest_path,
+        format!("{manifest}\n# explicitly selected manifest\n"),
+    )
+    .unwrap();
+    let generation = fixture.host.registry.version();
+    for dry_run in [true, false] {
+        let mut request = lifecycle_request(LifecycleAction::Enable);
+        request.dry_run = dry_run;
+        let error = lifecycle_runtime::transition(&fixture.host, &connector_id, &request)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("manifest changed after state admission"),
+            "{error}"
+        );
+    }
+    assert_eq!(fixture.host.registry.version(), generation);
+    assert_eq!(
+        fixture
+            .host
+            .lifecycle
+            .connector_status(&connector_id)
+            .await
+            .unwrap()
+            .desired_state,
+        DesiredRuntimeState::Disabled
+    );
+
+    let preview = fixture
+        .host
+        .registry
+        .preview_configs_with_lifecycle(vec![config.clone()], &fixture.host.lifecycle)
+        .await
+        .unwrap();
+    assert_eq!(preview.updated, vec![CONNECTOR.to_owned()]);
+    {
+        let state = fixture.host.registry.state.read().await;
+        let entry = &state.connectors[&connector_id];
+        assert!(matches!(&entry.connector, ConnectorRuntime::Dormant(_)));
+        assert!(Arc::ptr_eq(
+            &fixture.connector.component.bytes,
+            &entry.admitted_wasi_component().unwrap().bytes
+        ));
+    }
+    assert_eq!(fixture.host.registry.version(), generation);
+
+    let applied = fixture
+        .host
+        .registry
+        .apply_configs_with_lifecycle(vec![config.clone()], &fixture.host.lifecycle)
+        .await
+        .unwrap();
+    assert_eq!(applied.updated, vec![CONNECTOR.to_owned()]);
+    let admitted_component = {
+        let state = fixture.host.registry.state.read().await;
+        let entry = &state.connectors[&connector_id];
+        assert!(matches!(&entry.connector, ConnectorRuntime::Dormant(_)));
+        let component = entry.admitted_wasi_component().unwrap().clone();
+        assert_eq!(component.bytes.as_slice(), replacement.as_bytes());
+        assert_ne!(component.digest, fixture.connector.component.digest);
+        component
+    };
+    std::fs::write(&config.binary, b"changed after dormant inventory apply").unwrap();
+
+    lifecycle_runtime::transition(
+        &fixture.host,
+        &connector_id,
+        &lifecycle_request(LifecycleAction::Enable),
+    )
+    .await
+    .unwrap();
+    let current = registered_runtime(&fixture).await;
+    assert!(Arc::ptr_eq(
+        &admitted_component.bytes,
+        &current.component.bytes
+    ));
+    let prepared = fixture.prepare(ZoneId::work(), ECHO).await;
+    let response = current
+        .invoke_prepared(
+            fixture.request(&prepared.instance_id, ZoneId::work(), ECHO, json!({})),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.result.unwrap()["calls"], 1);
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
 async fn lifecycle_disable_enable_restart_and_uninstall_control_all_wasi_guests() {
     use fcp_host::{DesiredRuntimeState, LifecycleAction, ObservedRuntimeState};
 
     let fixture = Fixture::new().await;
     let first = fixture.prepare(ZoneId::work(), ECHO).await;
     fixture.prepare(ZoneId::private(), OTHER).await;
+    let admitted_component = fixture.connector.component.clone();
+    std::fs::write(
+        &fixture.connector.config.binary,
+        b"lifecycle transitions must never reopen this replacement",
+    )
+    .unwrap();
     let connector_id = ConnectorId::from_static(CONNECTOR);
     fixture
         .host
@@ -1246,6 +1526,10 @@ async fn lifecycle_disable_enable_restart_and_uninstall_control_all_wasi_guests(
         );
         let current = registered_runtime(&fixture).await;
         assert!(!Arc::ptr_eq(&previous, &current));
+        assert!(Arc::ptr_eq(
+            &admitted_component.bytes,
+            &current.component.bytes
+        ));
         assert!(previous.sessions.require_open().is_err());
         assert!(!current.sessions.has_ready_session());
         let prepared = fixture.prepare(ZoneId::work(), ECHO).await;

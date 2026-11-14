@@ -77,10 +77,38 @@ and capability, and `connector.state.model = "stateless"`. Its admitted operatio
 schemas and security attributes drive discovery and policy admission. Its
 sandbox resource and filesystem limits configure the guest. Protect and deploy
 the component and manifest together; apply a new inventory generation after
-changing the manifest. Configure `FCP_HOST_CONNECTORS_FILE`, the trusted
+changing either artifact. Configure `FCP_HOST_CONNECTORS_FILE`, the trusted
 `FCP_HOST_CAPABILITY_PUBLIC_KEY` or `_FILE`, the execution zone policy through
 `FCP_HOST_ZONE_POLICIES_FILE`, and `FCP_HOST_ADMIN_BEARER_TOKEN` as for native
 connectors. The HTTP host needs the issuer's public verification key only.
+
+## Admitted component bytes and explicit updates
+
+When a WASI runtime is admitted, the host reads its component into an immutable
+snapshot before publishing the runtime. The source must be a readable, nonempty
+regular file no larger than 64 MiB. Every operation and zone loads that snapshot,
+including the first prepared guest. Changing or removing the source path cannot
+silently change an already admitted runtime.
+
+Disable, enable, restart, and session retirement retain the same component bytes
+within the running host process. Lifecycle enable and restart also retain the
+component's admitted operation catalog and state policy. A changed manifest
+refuses activation until an explicit inventory apply selects the new artifacts.
+A newly configured connector that has never been activated captures its first
+component when activation is authorized.
+
+Inventory preview and apply compare the current component contents and manifest
+against the admitted snapshots, even when their configured paths are unchanged.
+Preview creates no guest and changes no registry generation. A successful apply
+replaces changed inventory and captures the selected component for later use;
+this also applies to an already admitted connector that is currently disabled.
+A missing, unreadable, empty, special, or oversized component source makes the
+inventory operation fail without replacing the current runtime.
+
+The snapshot lasts for the host process lifetime. Starting a new host admits the
+configured files again. Component syntax and the FCP dispatch contract are
+validated when preparing a guest; retaining bytes alone is not publisher
+signature verification or a persistent deployment rollback record.
 
 ## Prepare the instance before issuing its token
 

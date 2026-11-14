@@ -13,6 +13,112 @@ use super::*;
 
 const MAX_RESIDENT_SESSIONS: usize = 8;
 const CONTROL_BYTES: usize = 64 * 1024;
+// Admission owns the actual component bytes. A growing or special source file
+// must not turn an inventory operation into unbounded memory use or a FIFO wait.
+const MAX_COMPONENT_BYTES: u64 = 64 * 1024 * 1024;
+
+#[derive(Clone)]
+pub(super) struct AdmittedWasiComponent {
+    bytes: Arc<Vec<u8>>,
+    digest: [u8; 32],
+}
+
+impl fmt::Debug for AdmittedWasiComponent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AdmittedWasiComponent")
+            .field("bytes", &self.bytes.len())
+            .field("digest", &hex::encode(self.digest))
+            .finish()
+    }
+}
+
+impl AdmittedWasiComponent {
+    /// Capture once, before publishing a runtime. Guest creation never reopens
+    /// the configured path, even if no operation has prepared a session yet.
+    pub(super) fn capture(config: &ConnectorConfig) -> HostResult<Self> {
+        let file = open_component_source(config)?;
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(
+            &mut std::io::Read::take(file, MAX_COMPONENT_BYTES + 1),
+            &mut bytes,
+        )
+        .map_err(|_| component_source_error(config))?;
+        if bytes.is_empty() || bytes.len() as u64 > MAX_COMPONENT_BYTES {
+            return Err(component_source_error(config));
+        }
+        Ok(Self {
+            digest: *blake3::hash(&bytes).as_bytes(),
+            bytes: Arc::new(bytes),
+        })
+    }
+
+    /// Used only by explicit inventory planning, never by guest execution.
+    /// Stream the comparison so preview does not allocate a second component.
+    pub(super) fn source_matches(&self, config: &ConnectorConfig) -> HostResult<bool> {
+        let file = open_component_source(config)?;
+        let expected_len = self.bytes.len() as u64;
+        if file
+            .metadata()
+            .map_err(|_| component_source_error(config))?
+            .len()
+            != expected_len
+        {
+            return Ok(false);
+        }
+        let mut source = std::io::Read::take(file, expected_len + 1);
+        let mut buffer = [0_u8; 8192];
+        let mut hasher = blake3::Hasher::new();
+        let mut total = 0_u64;
+        loop {
+            let read = match std::io::Read::read(&mut source, &mut buffer) {
+                Ok(read) => read,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return Err(component_source_error(config)),
+            };
+            if read == 0 {
+                break;
+            }
+            total += read as u64;
+            if total > expected_len {
+                return Ok(false);
+            }
+            hasher.update(&buffer[..read]);
+        }
+        Ok(total == expected_len && hasher.finalize().as_bytes() == &self.digest)
+    }
+}
+
+fn component_source_error(config: &ConnectorConfig) -> HostError {
+    HostError::RegistryError(format!(
+        "WASI connector '{}' requires a readable, nonempty regular component file no larger than {MAX_COMPONENT_BYTES} bytes",
+        config.id
+    ))
+}
+
+fn open_component_source(config: &ConnectorConfig) -> HostResult<std::fs::File> {
+    let metadata = std::fs::metadata(&config.binary).map_err(|_| component_source_error(config))?;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_COMPONENT_BYTES {
+        return Err(component_source_error(config));
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // A path replacement between metadata and open must not block on a
+        // FIFO. The opened descriptor's type and size are checked again below.
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(&config.binary)
+        .map_err(|_| component_source_error(config))?;
+    let metadata = file.metadata().map_err(|_| component_source_error(config))?;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_COMPONENT_BYTES {
+        return Err(component_source_error(config));
+    }
+    Ok(file)
+}
 
 #[derive(Default)]
 pub(super) struct WasiSessions {
@@ -352,10 +458,11 @@ impl WasiConnector {
             guest
         } else {
             let (runner, _) = self.runner_for_operation(operation, "", zone)?;
-            let bytes = self.component_bytes(operation)?;
-            let validated = runner.load_and_validate(bytes.as_ref()).map_err(|_| {
-                unavailable("WASI component cannot be loaded for session preparation")
-            })?;
+            let validated = runner
+                .load_and_validate(self.component.bytes.as_ref())
+                .map_err(|_| {
+                    unavailable("WASI component cannot be loaded for session preparation")
+                })?;
             let mut runtime = runner
                 .instantiate_session(&validated.component)
                 .await

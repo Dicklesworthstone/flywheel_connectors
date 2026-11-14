@@ -1879,7 +1879,7 @@ struct WasiConnector {
     manifest: ManifestOperationConstraintCatalog,
     capability_verifying_key: Option<[u8; PUBLIC_KEY_SIZE]>,
     sessions: wasi_connector::WasiSessions,
-    component_bytes: StdMutex<Option<Arc<Vec<u8>>>>,
+    component: wasi_connector::AdmittedWasiComponent,
 }
 
 impl WasiConnector {
@@ -1888,6 +1888,7 @@ impl WasiConnector {
         state_policy: ConnectorStatePolicy,
         manifest: ManifestOperationConstraintCatalog,
         capability_verifying_key: Option<[u8; PUBLIC_KEY_SIZE]>,
+        retained_component: Option<wasi_connector::AdmittedWasiComponent>,
     ) -> HostResult<Self> {
         if config.runtime_network_enforcement != RuntimeNetworkEnforcement::WasiSandbox {
             return Err(HostError::InvalidFilter(format!(
@@ -1896,6 +1897,12 @@ impl WasiConnector {
             )));
         }
         state_policy.reject_stateful_wasi(&config.id)?;
+        state_policy.require_admitted_manifest(&config)?;
+        let component = match retained_component {
+            Some(component) => component,
+            None => wasi_connector::AdmittedWasiComponent::capture(&config)?,
+        };
+        state_policy.require_admitted_manifest(&config)?;
         Ok(Self {
             summary: connector_summary_from_config(&config)?,
             config,
@@ -1903,7 +1910,7 @@ impl WasiConnector {
             manifest,
             capability_verifying_key,
             sessions: wasi_connector::WasiSessions::default(),
-            component_bytes: StdMutex::new(None),
+            component,
         })
     }
 
@@ -1997,28 +2004,6 @@ impl WasiConnector {
             ))
         })?;
         Ok((runner, config))
-    }
-
-    fn component_bytes(&self, operation: &OperationId) -> HostResult<Arc<Vec<u8>>> {
-        let mut cached = self.component_bytes.lock().map_err(|_| {
-            HostError::Internal(format!(
-                "WASI component cache lock poisoned for connector `{}`",
-                self.summary.id
-            ))
-        })?;
-        if let Some(bytes) = cached.as_ref() {
-            return Ok(Arc::clone(bytes));
-        }
-
-        let bytes = std::fs::read(&self.config.binary).map_err(|err| {
-            HostError::RegistryError(format!(
-                "failed to read WASI connector component `{}` for `{}` operation `{}`: {err}",
-                self.config.binary, self.summary.id, operation
-            ))
-        })?;
-        let bytes = Arc::new(bytes);
-        *cached = Some(Arc::clone(&bytes));
-        Ok(bytes)
     }
 
     async fn invoke(&self, request: InvokeRequest) -> HostResult<InvokeResponse> {
@@ -2215,6 +2200,7 @@ impl ConnectorRuntime {
                 state_policy,
                 admitted.manifest_constraints.clone(),
                 capability_verifying_key,
+                admitted.wasi_component.clone(),
             )?)));
         }
         let support = NativeProxyOnlySandboxSupport::current();
@@ -2372,6 +2358,16 @@ struct RegistryEntry {
 }
 
 impl RegistryEntry {
+    fn admitted_wasi_component(&self) -> Option<&wasi_connector::AdmittedWasiComponent> {
+        match &self.connector {
+            ConnectorRuntime::Wasi(connector) => Some(&connector.component),
+            ConnectorRuntime::Dormant(connector) => connector.admitted_wasi_component(),
+            ConnectorRuntime::Native(_)
+            | ConnectorRuntime::NativeWarmPool(_)
+            | ConnectorRuntime::UnavailableNativeProxyOnly(_) => None,
+        }
+    }
+
     /// These three fields are enforced from the current registry generation,
     /// never from the native process's startup configuration. Updating them
     /// must not restart a stateful writer just to revoke an operation.
@@ -2636,6 +2632,9 @@ impl ConnectorStatePolicy {
 struct ValidatedConnectorConfig {
     manifest_constraints: ManifestOperationConstraintCatalog,
     state_policy: ConnectorStatePolicy,
+    /// Retained only across lifecycle stops/restarts of the same deployment.
+    /// A managed inventory apply intentionally admits a new component snapshot.
+    wasi_component: Option<wasi_connector::AdmittedWasiComponent>,
 }
 
 /// br-l9tt6: atomic snapshot of a connector's allow-list governance
@@ -2926,6 +2925,7 @@ fn validate_registry_config_for_launch(
     Ok(ValidatedConnectorConfig {
         manifest_constraints,
         state_policy,
+        wasi_component: None,
     })
 }
 
@@ -2945,6 +2945,7 @@ async fn build_registry_entry_with_admission(
     let ValidatedConnectorConfig {
         manifest_constraints,
         state_policy,
+        ..
     } = admitted;
     Ok(RegistryEntry {
         config,
@@ -3359,7 +3360,7 @@ impl SubprocessRegistry {
     }
 
     async fn plan_configs(&self, configs: Vec<ConnectorConfig>) -> HostResult<RegistryConfigPlan> {
-        let (current_configs, current_state_policies, source_version) = {
+        let (current_configs, current_state_policies, current_wasi_components, source_version) = {
             let state = self.state.read().await;
             let current_configs = state
                 .connectors
@@ -3371,34 +3372,54 @@ impl SubprocessRegistry {
                 .iter()
                 .map(|(id, entry)| (id.clone(), entry.state_policy))
                 .collect::<HashMap<_, _>>();
+            let current_wasi_components = state
+                .connectors
+                .iter()
+                .filter_map(|(id, entry)| {
+                    entry
+                        .admitted_wasi_component()
+                        .map(|component| (id.clone(), component.clone()))
+                })
+                .collect::<HashMap<_, _>>();
             (
                 current_configs,
                 current_state_policies,
+                current_wasi_components,
                 self.version.load(Ordering::SeqCst),
             )
         };
 
         let mut plan = RegistryConfigPlan::new(&current_configs, configs, source_version)?;
-        let mut changed_manifests = HashSet::new();
+        let mut changed_artifacts = HashSet::new();
         for (connector_id, config) in &plan.next_configs {
-            if current_configs.get(connector_id) == Some(config)
-                && let Some(policy) = current_state_policies.get(connector_id)
+            if current_configs.get(connector_id) != Some(config) {
+                continue;
+            }
+            let manifest_changed = if let Some(policy) = current_state_policies.get(connector_id)
                 && policy.manifest_digest.is_some()
-                && !policy.manifest_matches_admission(config)?
             {
-                // An explicit preview/apply must observe file changes even
-                // when the managed path is unchanged. Do not alter the active
-                // policy here: preparation validates a new snapshot, and only
-                // successful publication may replace the admitted authority.
-                // Failed integrity reads propagate above; they must never
-                // manufacture a replacement of an otherwise unchanged runtime.
-                changed_manifests.insert(connector_id.to_string());
+                !policy.manifest_matches_admission(config)?
+            } else {
+                false
+            };
+            let component_changed =
+                if let Some(component) = current_wasi_components.get(connector_id) {
+                    !component.source_matches(config)?
+                } else {
+                    false
+                };
+            if manifest_changed || component_changed {
+                // Explicit preview/apply observes files even when their managed
+                // paths are unchanged. Preparation captures new authority; only
+                // successful publication replaces the active snapshot.
+                // Failed reads never manufacture an unchanged runtime.
+                changed_artifacts.insert(connector_id.to_string());
                 plan.updated.push(connector_id.to_string());
                 plan.replacement_ids.push(connector_id.clone());
             }
         }
-        if !changed_manifests.is_empty() {
-            plan.unchanged.retain(|id| !changed_manifests.contains(id));
+        if !changed_artifacts.is_empty() {
+            plan.unchanged.retain(|id| !changed_artifacts.contains(id));
             plan.updated.sort();
             plan.replacement_ids
                 .sort_by(|left, right| left.as_str().cmp(right.as_str()));
@@ -3427,8 +3448,28 @@ impl SubprocessRegistry {
             let authority =
                 lifecycle_runtime::LaunchAuthority::capture(lifecycle, connector_id).await?;
             let dormant = matches!(&authority, lifecycle_runtime::LaunchAuthority::Dormant(_));
-            let admitted =
+            let mut admitted =
                 validate_registry_config_for_launch(&plan.next_configs[connector_id], !dormant)?;
+            if dormant
+                && plan.next_configs[connector_id].runtime_network_enforcement
+                    == RuntimeNetworkEnforcement::WasiSandbox
+                && self
+                    .state
+                    .read()
+                    .await
+                    .connectors
+                    .get(connector_id)
+                    .is_some_and(|entry| entry.admitted_wasi_component().is_some())
+            {
+                // An explicit update of an already admitted dormant module
+                // selects its new bytes now, not at a later lifecycle enable.
+                admitted.wasi_component = Some(wasi_connector::AdmittedWasiComponent::capture(
+                    &plan.next_configs[connector_id],
+                )?);
+                admitted
+                    .state_policy
+                    .require_admitted_manifest(&plan.next_configs[connector_id])?;
+            }
             if let Some(entry) = self
                 .native_policy_update(connector_id, &plan.next_configs[connector_id], &admitted)
                 .await?
@@ -24668,10 +24709,13 @@ output_schema = {{ type = "object" }}
     async fn br_p3pd4_wasi_runtime_inventory_does_not_spawn_native_subprocess() {
         let connector_id = "fcp.test.p3pd4-wasi-no-native-spawn:utility:1.0.0";
         let operation_id = "test.echo";
+        let directory = tempfile::tempdir().unwrap();
+        let component = directory.path().join("non-executable-component.wat");
+        write_minimal_wasi_component(&component);
         let mut config = dispatcher_test_config(connector_id);
         config.runtime_network_enforcement = RuntimeNetworkEnforcement::WasiSandbox;
         config.allowed_operations.push(operation_id.to_string());
-        config.binary = "/definitely/missing/p3pd4/connector.wasm".to_string();
+        config.binary = component.to_string_lossy().into_owned();
         config.operation_network_constraints.insert(
             operation_id.to_string(),
             runtime_network_test_constraints(
@@ -24751,7 +24795,11 @@ output_schema = {{ type = "object" }}
         let connector_id = "fcp.test.p3pd4-wasi-exact-op:utility:1.0.0";
         let operation_a = "test.op_a";
         let operation_b = "test.op_b";
+        let directory = tempfile::tempdir().unwrap();
+        let component = directory.path().join("connector.wat");
+        write_minimal_wasi_component(&component);
         let mut config = dispatcher_test_config(connector_id);
+        config.binary = component.to_string_lossy().into_owned();
         config.runtime_network_enforcement = RuntimeNetworkEnforcement::WasiSandbox;
         config.allowed_operations = vec![operation_a.to_string(), operation_b.to_string()];
         config.operation_network_constraints.insert(
@@ -24930,7 +24978,11 @@ output_schema = {{ type = "object" }}
     async fn br_p3pd4_wasi_runtime_network_policy_e2e_jsonl_matrix() {
         let connector_id = "fcp.test.p3pd4-wasi-jsonl:utility:1.0.0";
         let operation_id = "matrix.send_message";
+        let directory = tempfile::tempdir().unwrap();
+        let component = directory.path().join("connector.wat");
+        write_minimal_wasi_component(&component);
         let mut config = dispatcher_test_config(connector_id);
+        config.binary = component.to_string_lossy().into_owned();
         config.runtime_network_enforcement = RuntimeNetworkEnforcement::WasiSandbox;
         config.allowed_operations.push(operation_id.to_string());
         config.config = Some(json!({"homeserver_url": "https://matrix.example.test:8448"}));
@@ -25033,6 +25085,7 @@ output_schema = {{ type = "object" }}
         ));
 
         let mut invalid_config = dispatcher_test_config(connector_id);
+        invalid_config.binary = component.to_string_lossy().into_owned();
         invalid_config.runtime_network_enforcement = RuntimeNetworkEnforcement::WasiSandbox;
         invalid_config
             .allowed_operations
@@ -25049,6 +25102,7 @@ output_schema = {{ type = "object" }}
             invalid_config,
             ConnectorStatePolicy::default(),
             ManifestOperationConstraintCatalog::default(),
+            None,
             None,
         )
         .expect("WASI connector");
@@ -33811,6 +33865,7 @@ done"#;
             ValidatedConnectorConfig {
                 manifest_constraints: catalog,
                 state_policy: policy,
+                wasi_component: None,
             },
         )
     }
@@ -37019,6 +37074,7 @@ done"#;
             let admitted = ValidatedConnectorConfig {
                 manifest_constraints,
                 state_policy,
+                wasi_component: None,
             };
             let error = NativeWarmPoolConnector::spawn(
                 config.clone(),
@@ -37287,6 +37343,9 @@ done"#;
             write_state_policy_test_manifest(directory.path(), Some("singleton_writer"), false);
         let mut config =
             state_policy_inventory_config(path.clone(), RuntimeNetworkEnforcement::WasiSandbox);
+        let component = directory.path().join("connector.wat");
+        write_minimal_wasi_component(&component);
+        config.binary = component.to_string_lossy().into_owned();
         let _guard = set_test_hrw_lease_routing_override(Some(state_policy_test_routing()));
         for model in ["singleton_writer", "crdt"] {
             std::fs::write(&path, state_policy_test_manifest(Some(model), false)).unwrap();

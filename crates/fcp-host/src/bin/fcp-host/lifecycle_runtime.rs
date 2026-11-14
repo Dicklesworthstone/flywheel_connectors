@@ -1,8 +1,9 @@
 //! Apply persisted lifecycle intent to actual connector runtime ownership.
 //!
-//! Dormant entries retain their managed configuration and admitted manifest but
-//! never start a process or prepare a guest. Native retirement uses the exact
-//! process owner, not a PID lookup or a replacement with the same connector ID.
+//! Dormant entries retain their managed configuration, admitted manifest and
+//! admitted WASI bytes without starting a process or preparing a guest.
+//! Native retirement uses the exact process owner, not a PID lookup or a
+//! replacement with the same connector ID.
 //! WASI retirement seals the exact runtime and drains all retained guest stores.
 //! Warm-pool retirement seals creation and drains every admitted physical child.
 
@@ -34,16 +35,29 @@ const fn denies_execution(desired: DesiredRuntimeState) -> bool {
 pub(super) struct DormantConnector {
     summary: ConnectorSummary,
     desired: DesiredRuntimeState,
+    wasi_component: Option<wasi_connector::AdmittedWasiComponent>,
 }
 
 impl DormantConnector {
-    fn new(config: &ConnectorConfig, desired: DesiredRuntimeState) -> HostResult<Self> {
+    fn new(
+        config: &ConnectorConfig,
+        desired: DesiredRuntimeState,
+        wasi_component: Option<wasi_connector::AdmittedWasiComponent>,
+    ) -> HostResult<Self> {
         let mut summary = connector_summary_from_config(config)?;
         summary.enabled = false;
         summary.health = ConnectorHealth::unavailable(
             "connector runtime is dormant under persisted lifecycle authority",
         );
-        Ok(Self { summary, desired })
+        Ok(Self {
+            summary,
+            desired,
+            wasi_component,
+        })
+    }
+
+    pub(super) fn admitted_wasi_component(&self) -> Option<&wasi_connector::AdmittedWasiComponent> {
+        self.wasi_component.as_ref()
     }
 
     pub(super) fn summary(&self) -> ConnectorSummary {
@@ -125,7 +139,11 @@ pub(super) fn dormant_entry(
     admitted: ValidatedConnectorConfig,
     desired: DesiredRuntimeState,
 ) -> HostResult<RegistryEntry> {
-    let connector = ConnectorRuntime::Dormant(Arc::new(DormantConnector::new(&config, desired)?));
+    let connector = ConnectorRuntime::Dormant(Arc::new(DormantConnector::new(
+        &config,
+        desired,
+        admitted.wasi_component,
+    )?));
     Ok(RegistryEntry {
         config,
         connector,
@@ -325,10 +343,29 @@ async fn retire_selected(
         ValidatedConnectorConfig {
             manifest_constraints: entry.manifest_constraints.clone(),
             state_policy: entry.state_policy,
+            wasi_component: entry.admitted_wasi_component().cloned(),
         },
         desired,
     )?;
     publish_entry(registry, connector_id, dormant, generation, None, deadline).await
+}
+
+fn validate_activation(entry: &RegistryEntry) -> HostResult<ValidatedConnectorConfig> {
+    let retained_component = entry.admitted_wasi_component();
+    if retained_component.is_some() {
+        entry.state_policy.require_admitted_manifest(&entry.config)?;
+    }
+    let mut admitted = validate_registry_config(&entry.config)?;
+    if let Some(component) = retained_component {
+        // Enable and Restart retain executable bytes and their exact admitted
+        // authority. Re-reading a changed manifest during validation must not
+        // silently pair old bytes with a new operation catalog or state policy.
+        admitted.manifest_constraints = entry.manifest_constraints.clone();
+        admitted.state_policy = entry.state_policy;
+        admitted.wasi_component = Some(component.clone());
+        admitted.state_policy.require_admitted_manifest(&entry.config)?;
+    }
+    Ok(admitted)
 }
 
 async fn activate_selected(
@@ -344,7 +381,7 @@ async fn activate_selected(
         HostError::Unavailable("connector inventory generation is exhausted".to_owned())
     })?;
     state.registry.require_generation(generation)?;
-    let admitted = validate_registry_config(&entry.config)?;
+    let admitted = validate_activation(entry)?;
     validate_state_policy_replacement(connector_id, entry, admitted.state_policy)?;
     // Explicit Enable/Restart authorizes preparation while durable dispatch
     // authority remains disabled. Preparation failure drops the candidate and
@@ -472,7 +509,7 @@ async fn transition_before(
             stateless_retirement_supported(&entry)?;
         }
         if request.action == LifecycleAction::Enable {
-            let admitted = validate_registry_config(&entry.config)?;
+            let admitted = validate_activation(&entry)?;
             if dormant {
                 validate_state_policy_replacement(connector_id, &entry, admitted.state_policy)?;
             }
