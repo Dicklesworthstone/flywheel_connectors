@@ -189,8 +189,10 @@ pub struct ConnectorRuntimeConfig {
     pub wall_clock_timeout: Duration,
     /// Timeout for graceful shutdown.
     pub shutdown_timeout: Duration,
-    /// Connector-facing host egress endpoint. When present, SDK egress helpers
-    /// use `/rpc/egress/*` instead of opening direct sockets.
+    /// Connector-facing host egress endpoint: an HTTP(S) URL or, on Unix,
+    /// `unix:///absolute/path.sock` (also accepts the bare absolute path).
+    /// When present, SDK egress helpers use `/rpc/egress/*` instead of opening
+    /// direct sockets. Unix socket paths are literal, without percent decoding.
     pub host_egress_proxy_url: Option<String>,
 }
 

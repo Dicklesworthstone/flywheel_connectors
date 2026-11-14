@@ -241,38 +241,76 @@ impl std::fmt::Debug for HostEgressProxyClient {
 
 #[cfg(feature = "connector-http")]
 impl HostEgressProxyClient {
-    /// Construct a host egress proxy client from a base URL such as
-    /// `http://127.0.0.1:7878`. Defaults to a 30-second total deadline and a
-    /// 16 MiB JSON response limit, including base64 encoding and metadata.
-    /// Rejection bodies are additionally capped at 64 KiB.
+    /// Construct a host egress proxy client from an HTTP(S) base URL or, on
+    /// Unix, a socket endpoint such as `unix:///run/fcp/host.sock` or
+    /// `/run/fcp/host.sock`. Socket paths are literal absolute paths, without
+    /// URL percent decoding. Unix transport never falls back to TCP.
+    ///
+    /// Defaults to a 30-second total deadline and a 16 MiB JSON response limit,
+    /// including base64 encoding and metadata. Rejection bodies are additionally
+    /// capped at 64 KiB.
     ///
     /// # Errors
     ///
-    /// Rejects invalid URLs, non-HTTP(S) schemes, URL credentials, queries, and
-    /// fragments. Also returns transport initialization failures.
+    /// Rejects invalid endpoints, relative socket paths, unsupported transports,
+    /// URL credentials, queries, fragments, and control characters. Also returns
+    /// transport initialization failures.
     pub fn new(base_url: impl Into<String>) -> Result<Self, HostEgressProxyError> {
         let base_url = base_url.into();
-        let url = reqwest::Url::parse(&base_url)
-            .map_err(|_| HostEgressProxyError::InvalidConfiguration("invalid host proxy URL"))?;
-        if !matches!(url.scheme(), "http" | "https")
-            || url.host_str().is_none()
-            || !url.username().is_empty()
-            || url.password().is_some()
-            || url.query().is_some()
-            || url.fragment().is_some()
-        {
+        if base_url.chars().any(char::is_control) {
             return Err(HostEgressProxyError::InvalidConfiguration(
-                "host proxy URL must use HTTP(S) without credentials, query, or fragment",
+                "host proxy endpoint must not contain control characters",
             ));
         }
-        let client = reqwest::Client::builder()
+        let builder = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never())
-            .no_proxy()
-            .build()
-            .map_err(host_egress_transport_error)?;
+            .no_proxy();
+        let socket_path = base_url
+            .strip_prefix("unix://")
+            .or_else(|| base_url.starts_with('/').then_some(base_url.as_str()));
+        let (base_url, builder) = if let Some(socket_path) = socket_path {
+            if !socket_path.starts_with('/')
+                || socket_path == "/"
+                || socket_path.contains(['?', '#'])
+            {
+                return Err(HostEgressProxyError::InvalidConfiguration(
+                    "host proxy socket must be an absolute path without query or fragment",
+                ));
+            }
+            #[cfg(not(unix))]
+            return Err(HostEgressProxyError::InvalidConfiguration(
+                "Unix host proxy sockets are unavailable on this platform",
+            ));
+            #[cfg(unix)]
+            {
+                // reqwest sends HTTP over this exact socket. The URL authority
+                // is only for HTTP framing and is never resolved or connected.
+                (
+                    "http://localhost".to_string(),
+                    builder.unix_socket(socket_path),
+                )
+            }
+        } else {
+            let url = reqwest::Url::parse(&base_url).map_err(|_| {
+                HostEgressProxyError::InvalidConfiguration("invalid host proxy URL")
+            })?;
+            if !matches!(url.scheme(), "http" | "https")
+                || url.host_str().is_none()
+                || !url.username().is_empty()
+                || url.password().is_some()
+                || url.query().is_some()
+                || url.fragment().is_some()
+            {
+                return Err(HostEgressProxyError::InvalidConfiguration(
+                    "host proxy URL must use HTTP(S) without credentials, query, or fragment",
+                ));
+            }
+            (url.as_str().trim_end_matches('/').to_string(), builder)
+        };
+        let client = builder.build().map_err(host_egress_transport_error)?;
         Ok(Self {
-            base_url: url.as_str().trim_end_matches('/').to_string(),
+            base_url,
             client,
             timeout: Duration::from_secs(30),
             max_response_bytes: 16 * 1024 * 1024,
@@ -1287,6 +1325,13 @@ mod tests {
             "https://secret-sentinel:password@host.test/",
             "https://host.test/?token=secret-sentinel",
             "https://host.test/#secret-sentinel",
+            "unix://",
+            "unix://relative-secret-sentinel.sock",
+            "unix:///",
+            "unix:///tmp/secret-sentinel.sock?token=secret-sentinel",
+            "/tmp/secret-sentinel.sock#fragment",
+            "unix:///tmp/secret-sentinel\0.sock",
+            "https://host.test/\nsecret-sentinel",
         ] {
             let error = HostEgressProxyClient::new(url).expect_err("unsafe endpoint");
             assert!(matches!(
@@ -1309,6 +1354,20 @@ mod tests {
         assert!(client.clone().with_timeout(Duration::ZERO).is_err());
         assert!(client.clone().with_timeout(Duration::MAX).is_err());
         assert!(client.with_max_response_bytes(0).is_err());
+    }
+
+    #[cfg(all(feature = "connector-http", not(unix)))]
+    #[test]
+    fn host_egress_client_rejects_unavailable_unix_transport() {
+        for endpoint in ["unix:///run/fcp/host.sock", "/run/fcp/host.sock"] {
+            let error = HostEgressProxyClient::new(endpoint).expect_err("Unix unavailable");
+            assert!(matches!(
+                error,
+                HostEgressProxyError::InvalidConfiguration(
+                    "Unix host proxy sockets are unavailable on this platform"
+                )
+            ));
+        }
     }
 
     #[cfg(feature = "connector-http")]

@@ -1,7 +1,7 @@
 #![cfg(feature = "connector-http")]
 
 use std::io::{Error, ErrorKind, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::sync::mpsc::{self, Receiver};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -11,6 +11,8 @@ use fcp_manifest::{
     Base64Bytes, HostEgressContext, HostEgressDecisionMetadata, HostEgressHttpHeader,
     HostEgressHttpRequest, HostEgressHttpResponse, HostEgressTcpRequest, HostEgressTcpResponse,
 };
+#[cfg(unix)]
+use fcp_sdk::migration::HostEgressProxyClient;
 use fcp_sdk::migration::HostEgressProxyError;
 use fcp_sdk::{ConnectorRuntime, ConnectorRuntimeConfig};
 use serde_json::{Value, json};
@@ -97,7 +99,7 @@ fn serve_one_proxy_request(
     Ok(captured)
 }
 
-fn read_proxy_request(stream: &mut TcpStream) -> std::io::Result<CapturedProxyRequest> {
+fn read_proxy_request(stream: &mut impl Read) -> std::io::Result<CapturedProxyRequest> {
     let mut header_bytes = Vec::new();
     let mut byte = [0_u8; 1];
     while !header_bytes.ends_with(b"\r\n\r\n") {
@@ -152,7 +154,7 @@ fn content_length_from_headers(headers: &str) -> std::io::Result<usize> {
 }
 
 fn write_proxy_response(
-    stream: &mut TcpStream,
+    stream: &mut impl Write,
     status: u16,
     body: &str,
     content_type: &str,
@@ -298,6 +300,265 @@ fn timestamp() -> String {
 
 fn elapsed_ms(started_at: Instant) -> u128 {
     started_at.elapsed().as_millis()
+}
+
+#[cfg(unix)]
+struct UnixProxy {
+    socket_path: std::path::PathBuf,
+    receiver: Receiver<Result<CapturedProxyRequest, String>>,
+    handle: Option<JoinHandle<()>>,
+}
+
+#[cfg(unix)]
+impl UnixProxy {
+    fn start(prefix: Vec<u8>, pause: Duration, suffix: Vec<u8>) -> Self {
+        use std::os::unix::net::UnixListener;
+
+        // Unix socket paths are short on macOS; its default TMPDIR can already
+        // consume most of that limit. Include literal percent escapes to catch
+        // accidental URL decoding.
+        let socket_path = std::path::Path::new("/tmp").join(format!(
+            "fcp-egress-{}-%20.sock",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let listener = UnixListener::bind(&socket_path).expect("bind Unix proxy");
+        listener.set_nonblocking(true).expect("bounded Unix accept");
+        let (sender, receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let result = (|| -> std::io::Result<CapturedProxyRequest> {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                            if Instant::now() >= deadline {
+                                return Err(Error::new(ErrorKind::TimedOut, "Unix proxy accept"));
+                            }
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(error) => return Err(error),
+                    }
+                };
+                stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+                stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+                let captured = read_proxy_request(&mut stream)?;
+                stream.write_all(&prefix)?;
+                if !pause.is_zero() {
+                    thread::sleep(pause);
+                }
+                // A deadline or size rejection may already have closed the client.
+                let _ = stream.write_all(&suffix);
+                Ok(captured)
+            })()
+            .map_err(|error| error.to_string());
+            let _ = sender.send(result);
+        });
+        Self {
+            socket_path,
+            receiver,
+            handle: Some(handle),
+        }
+    }
+
+    fn start_json(body: &Value) -> Self {
+        let mut response = Vec::new();
+        write_proxy_response(
+            &mut response,
+            200,
+            &serde_json::to_string(body).expect("Unix response JSON"),
+            "application/json",
+        )
+        .expect("encode Unix response");
+        Self::start(response, Duration::ZERO, Vec::new())
+    }
+
+    fn endpoint(&self, with_scheme: bool) -> String {
+        let path = self.socket_path.to_str().expect("UTF-8 socket path");
+        if with_scheme {
+            format!("unix://{path}")
+        } else {
+            path.to_string()
+        }
+    }
+
+    fn capture(mut self) -> CapturedProxyRequest {
+        let captured = self
+            .receiver
+            .recv_timeout(Duration::from_secs(6))
+            .expect("Unix proxy must capture a request")
+            .expect("Unix proxy request must parse");
+        self.handle
+            .take()
+            .expect("Unix proxy thread")
+            .join()
+            .expect("Unix proxy finish");
+        captured
+    }
+}
+
+#[cfg(unix)]
+impl Drop for UnixProxy {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.socket_path);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn host_egress_proxy_unix_routes_http_and_tcp_with_exact_authority() {
+    fcp_async_core::runtime::block_on_sync(async {
+        for with_scheme in [true, false] {
+            let http_request = http_request("unix-http", "unix-http-correlation");
+            let proxy = UnixProxy::start_json(&http_response(&http_request));
+            let runtime = ConnectorRuntime::new(
+                ConnectorRuntimeConfig::default()
+                    .with_host_egress_proxy_url(proxy.endpoint(with_scheme)),
+            );
+            let client = runtime
+                .host_egress_proxy_client()
+                .expect("Unix config")
+                .expect("Unix client");
+            let response = client
+                .http(&http_request)
+                .await
+                .expect("HTTP over Unix socket");
+            assert_eq!(response.status, 202);
+            let captured = proxy.capture();
+            assert_eq!(captured.method, "POST");
+            assert_eq!(captured.path, "/rpc/egress/http");
+            assert_eq!(
+                captured.body,
+                serde_json::to_value(&http_request).expect("HTTP request")
+            );
+
+            let tcp_request = tcp_request("unix-tcp", "unix-tcp-correlation");
+            let proxy = UnixProxy::start_json(&tcp_response(&tcp_request));
+            let client =
+                HostEgressProxyClient::new(proxy.endpoint(with_scheme)).expect("Unix client");
+            let response = client
+                .tcp(&tcp_request)
+                .await
+                .expect("TCP relay over Unix socket");
+            assert_eq!(response.read.as_bytes(), b"PONG");
+            let captured = proxy.capture();
+            assert_eq!(captured.path, "/rpc/egress/tcp");
+            assert_eq!(
+                captured.body,
+                serde_json::to_value(&tcp_request).expect("TCP request")
+            );
+        }
+    })
+    .expect("Unix egress runtime");
+}
+
+#[cfg(unix)]
+#[test]
+fn host_egress_proxy_unix_rejects_cross_request_authority_and_redirects() {
+    fcp_async_core::runtime::block_on_sync(async {
+        let request = http_request("unix-authority", "unix-authority-correlation");
+        let mut other = http_response(&request);
+        other["egress"]["request_id"] = json!("another-request");
+        let proxy = UnixProxy::start_json(&other);
+        let client = HostEgressProxyClient::new(proxy.endpoint(true)).expect("Unix client");
+        let error = client.http(&request).await.expect_err("cross-request result rejected");
+        assert!(matches!(error, HostEgressProxyError::InvalidResponse(_)));
+        assert_no_secret_material(&format!("{error:?} {error}"));
+        proxy.capture();
+
+        let destination = TcpListener::bind("127.0.0.1:0").expect("redirect destination");
+        destination.set_nonblocking(true).expect("nonblocking destination");
+        let response = format!(
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{}/steal\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            destination.local_addr().expect("redirect address")
+        );
+        let proxy = UnixProxy::start(response.into_bytes(), Duration::ZERO, Vec::new());
+        let client = HostEgressProxyClient::new(proxy.endpoint(true)).expect("Unix client");
+        let error = client.http(&request).await.expect_err("Unix redirect rejected");
+        assert_eq!(error.status(), Some(307));
+        assert_eq!(destination.accept().expect_err("redirect not contacted").kind(), ErrorKind::WouldBlock);
+        proxy.capture();
+    }).expect("Unix rejection runtime");
+}
+
+#[cfg(unix)]
+#[test]
+fn host_egress_proxy_unix_keeps_body_deadlines_and_size_bounds() {
+    fcp_async_core::runtime::block_on_sync(async {
+        let request = http_request("unix-bounds", "unix-bounds-correlation");
+        let proxy = UnixProxy::start(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\n".to_vec(),
+            Duration::ZERO,
+            Vec::new(),
+        );
+        let client = HostEgressProxyClient::new(proxy.endpoint(true))
+            .expect("Unix client")
+            .with_max_response_bytes(1024)
+            .expect("response bound");
+        let error = client
+            .http(&request)
+            .await
+            .expect_err("Unix oversized body rejected");
+        assert!(matches!(
+            error,
+            HostEgressProxyError::ResponseTooLarge { .. }
+        ));
+        proxy.capture();
+
+        let body = serde_json::to_vec(&http_response(&request)).expect("response JSON");
+        let prefix = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+        let proxy = UnixProxy::start(prefix.into_bytes(), Duration::from_millis(400), body);
+        let mut config =
+            ConnectorRuntimeConfig::default().with_host_egress_proxy_url(proxy.endpoint(false));
+        config.request_timeout = Duration::from_millis(100);
+        let runtime = ConnectorRuntime::new(config);
+        let client = runtime
+            .host_egress_proxy_client()
+            .expect("Unix config")
+            .expect("Unix client");
+        let error = client
+            .http(&request)
+            .await
+            .expect_err("Unix body deadline enforced");
+        assert!(matches!(&error, HostEgressProxyError::Transport(error) if error.is_timeout()));
+        assert_no_secret_material(&format!("{error:?} {error}"));
+        proxy.capture();
+    })
+    .expect("Unix bounded response runtime");
+}
+
+#[cfg(unix)]
+#[test]
+fn host_egress_proxy_missing_unix_socket_does_not_contact_target() {
+    fcp_async_core::runtime::block_on_sync(async {
+        let target = TcpListener::bind("127.0.0.1:0").expect("target listener");
+        target.set_nonblocking(true).expect("nonblocking target");
+        let mut request = http_request("unix-missing", "unix-missing-correlation");
+        request.url = format!(
+            "http://{}/target",
+            target.local_addr().expect("target address")
+        );
+        let missing = std::path::Path::new("/tmp").join(format!(
+            "fcp-missing-{}.sock",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let endpoint = format!("unix://{}", missing.display());
+        let client = HostEgressProxyClient::new(&endpoint)
+            .expect("valid socket endpoint")
+            .with_timeout(Duration::from_secs(1))
+            .expect("bounded missing socket");
+        let error = client
+            .http(&request)
+            .await
+            .expect_err("missing Unix socket rejected");
+        assert!(matches!(error, HostEgressProxyError::Transport(_)));
+        assert_no_secret_material(&format!("{error:?} {error}"));
+        assert!(!format!("{client:?}").contains(&endpoint));
+        assert_eq!(
+            target.accept().expect_err("target not contacted").kind(),
+            ErrorKind::WouldBlock
+        );
+    })
+    .expect("missing Unix socket runtime");
 }
 
 #[test]
