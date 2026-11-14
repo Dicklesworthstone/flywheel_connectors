@@ -2,6 +2,7 @@
 
 use std::io::Read;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use clap::Args;
@@ -167,6 +168,272 @@ pub(crate) fn dispatch(
         Ok(response) => Ok(lookup_result(args, &host.endpoint, response)),
         Err(error) => Ok(lookup_failure(args, Some(&host.endpoint), error)),
     }
+}
+
+/// Observe one invocation without ever submitting, replaying, or cancelling it.
+#[allow(clippy::too_many_lines)]
+pub(crate) fn watch(
+    args: &crate::WatchArgs,
+    explicit_host: Option<&str>,
+) -> Result<DispatchOutcome> {
+    let started = Instant::now();
+    let lookup = InvocationArgs {
+        operation_id: args.operation_id.clone(),
+        attempt_id: args.attempt_id,
+        admin_token_file: args.admin_token_file.clone(),
+    };
+    let interval = Duration::from_secs(args.interval);
+    let deadline = if args.timeout == 0 {
+        None
+    } else {
+        started.checked_add(Duration::from_secs(args.timeout))
+    };
+    let failure = |endpoint, failure| {
+        let mut outcome = lookup_failure(&lookup, endpoint, failure);
+        annotate_watch(&mut outcome, args, started, 0, None, false);
+        outcome
+    };
+    if lookup.operation_id.trim().is_empty()
+        || lookup.operation_id.len() > MAX_OPERATION_ID_BYTES
+        || lookup.operation_id.chars().any(char::is_control)
+        || lookup.attempt_id == Some(0)
+    {
+        return Ok(failure(None, LookupFailure::InvalidRequest));
+    }
+    if interval.is_zero()
+        || started.checked_add(interval).is_none()
+        || (args.timeout != 0 && deadline.is_none())
+    {
+        let mut outcome = failure(None, LookupFailure::InvalidRequest);
+        outcome.payload["error"] = json!({
+            "type": "invalid-watch-timing",
+            "message": "The poll interval must be positive and both durations must fit the monotonic clock; only --timeout 0 means no overall deadline.",
+            "recoverable": true,
+        });
+        return Ok(outcome);
+    }
+    let host = match resolve_host_config(explicit_host) {
+        Ok(Some(host)) => host,
+        Ok(None) => return Ok(failure(None, LookupFailure::MissingHost)),
+        Err(_) => return Ok(failure(None, LookupFailure::InvalidHost)),
+    };
+    let mut client = match HostAdminClient::new(&host.endpoint) {
+        Ok(client) => client,
+        Err(_) => return Ok(failure(Some(&host.endpoint), LookupFailure::InvalidHost)),
+    };
+    let token = match read_admin_token(args.admin_token_file.as_deref()) {
+        Ok(token) => token,
+        Err(error) => return Ok(failure(Some(&host.endpoint), error)),
+    };
+    let request = InvocationQueryRequest {
+        operation_id: args.operation_id.clone(),
+        attempt_id: args.attempt_id,
+    };
+    let configured_read_timeout = client.read_timeout;
+    let mut polls = 0_u64;
+    // Local and forwarding journals allocate independent attempt identities.
+    // Never follow a newer attempt (or another journal) under the same ID.
+    let mut selected: Option<(bool, u64)> = None;
+    let mut last = None;
+    loop {
+        if let Some(deadline) = deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(watch_stopped(
+                    &lookup,
+                    args,
+                    &host.endpoint,
+                    started,
+                    polls,
+                    selected,
+                    last,
+                    "invocation-watch-timeout",
+                    "The observation deadline expired. Watching did not cancel or replay the invocation; its effects must be reconciled from retained evidence.",
+                    true,
+                ));
+            }
+            // The request timeout includes response body consumption. Neither
+            // each poll nor the inter-poll wait receives a fresh overall budget.
+            client.read_timeout = configured_read_timeout.min(remaining);
+        }
+        polls = polls.saturating_add(1);
+        let response = match query_invocation(&client, &request, &token) {
+            Ok(response) => response,
+            Err(error) => {
+                let (kind, message, exit_code) = error.description();
+                let timed_out = deadline.is_some_and(|deadline| Instant::now() >= deadline)
+                    || (matches!(error, LookupFailure::Timeout)
+                        && client.read_timeout < configured_read_timeout);
+                let mut outcome = watch_stopped(
+                    &lookup,
+                    args,
+                    &host.endpoint,
+                    started,
+                    polls,
+                    selected,
+                    last,
+                    if timed_out { "invocation-watch-timeout" } else { kind },
+                    message,
+                    timed_out,
+                );
+                outcome.exit_code = exit_code;
+                if let LookupFailure::Http(status) = error {
+                    outcome.payload["error"]["http_status"] = json!(status);
+                }
+                return Ok(outcome);
+            }
+        };
+        let observed = response
+            .invocation
+            .as_ref()
+            .map(|record| (false, record.ticket.attempt_id))
+            .or_else(|| {
+                response
+                    .mesh_invocation
+                    .as_ref()
+                    .map(|record| (true, record.ticket.attempt_id))
+            });
+        if selected.is_some() && selected != observed {
+            return Ok(watch_stopped(
+                &lookup,
+                args,
+                &host.endpoint,
+                started,
+                polls,
+                selected,
+                last,
+                "invocation-watch-attempt-changed",
+                "The retained attempt disappeared or was replaced. The last observation is preserved; another attempt's activity or success cannot establish this attempt's effects.",
+                false,
+            ));
+        }
+        selected = observed.or(selected);
+        let terminal_exit = watch_terminal_exit(&response, args.attempt_id.is_some());
+        let mut outcome = lookup_result(&lookup, &host.endpoint, response);
+        annotate_watch(&mut outcome, args, started, polls, selected, false);
+        if let Some(exit_code) = terminal_exit {
+            outcome.exit_code = exit_code;
+            outcome.payload["watch"]["observation_complete"] = json!(true);
+            if !exit_code.is_success() {
+                outcome.payload["status"] = json!("error");
+                outcome.payload["error"] = json!({
+                    "type": "invocation-watch-unsuccessful",
+                    "message": "The retained invocation did not establish a successful finalized local result or a successful observed mesh response. Inspect its source outcome and finalization separately.",
+                    "recoverable": false,
+                });
+            }
+            return Ok(outcome);
+        }
+        last = Some(outcome);
+        let wait = deadline.map_or(interval, |deadline| {
+            interval.min(deadline.saturating_duration_since(Instant::now()))
+        });
+        std::thread::sleep(wait);
+    }
+}
+
+fn watch_terminal_exit(
+    response: &InvocationQueryResponse,
+    exact_attempt: bool,
+) -> Option<CliExitCode> {
+    // Liveness belongs to the operation ID, not to an exact historical ticket.
+    // A newer active job cannot keep an orphaned old attempt "running".
+    let latest_job_active = response.host_job_active && !exact_attempt;
+    if let Some(record) = &response.mesh_invocation {
+        return match record.terminal.as_ref().map(|terminal| terminal.outcome) {
+            Some(MeshInvocationOutcome::Succeeded) => Some(CliExitCode::Success),
+            Some(MeshInvocationOutcome::ConnectorError) => Some(CliExitCode::Connector),
+            Some(MeshInvocationOutcome::NotDelivered | MeshInvocationOutcome::OutcomeUnknown) => {
+                Some(CliExitCode::Transport)
+            }
+            None if latest_job_active => None,
+            None => Some(CliExitCode::Transport),
+        };
+    }
+    let Some(record) = response.invocation.as_ref() else {
+        return exact_attempt.then_some(CliExitCode::Transport);
+    };
+    let Some(terminal) = record.terminal.as_ref() else {
+        return (!latest_job_active).then_some(CliExitCode::Transport);
+    };
+    if terminal.outcome == InvocationOutcome::OutcomeUnknown {
+        return Some(CliExitCode::Transport);
+    }
+    let finalized = record.finalization.as_ref().filter(|finalization| {
+        finalization.response_http_status.is_some()
+            && finalization.sampling_completed != Some(false)
+    });
+    let Some(finalized) = finalized else {
+        return (!latest_job_active).then_some(CliExitCode::Transport);
+    };
+    Some(match terminal.outcome {
+        InvocationOutcome::Succeeded => {
+            if finalized
+                .response_http_status
+                .is_some_and(|status| (200..300).contains(&status))
+            {
+                CliExitCode::Success
+            } else {
+                CliExitCode::Transport
+            }
+        }
+        InvocationOutcome::ConnectorError | InvocationOutcome::Cancelled => CliExitCode::Connector,
+        InvocationOutcome::HostError
+        | InvocationOutcome::DeadlineExceeded
+        | InvocationOutcome::OutcomeUnknown => CliExitCode::Transport,
+    })
+}
+
+fn annotate_watch(
+    outcome: &mut DispatchOutcome,
+    args: &crate::WatchArgs,
+    started: Instant,
+    polls: u64,
+    selected: Option<(bool, u64)>,
+    timed_out: bool,
+) {
+    outcome.payload["command"] = json!("watch");
+    outcome.payload["operation_id"] = json!(args.operation_id);
+    outcome.payload["operation_status"] = outcome.payload["execution_state"].clone();
+    outcome.payload["watch"] = json!({
+        "polls": polls,
+        "poll_interval_seconds": args.interval,
+        "timeout_seconds": args.timeout,
+        "elapsed_ms": u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        "selected_attempt_id": selected.map(|(_, attempt)| attempt).or(args.attempt_id),
+        "record_kind": selected.map(|(mesh, _)| if mesh { "mesh-forward" } else { "executor-local" }),
+        "observation_complete": false,
+        "timed_out": timed_out,
+        "cancelled_invocation": false,
+        "replayed_invocation": false,
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn watch_stopped(
+    lookup: &InvocationArgs,
+    args: &crate::WatchArgs,
+    endpoint: &str,
+    started: Instant,
+    polls: u64,
+    selected: Option<(bool, u64)>,
+    last: Option<DispatchOutcome>,
+    error_type: &str,
+    message: &str,
+    timed_out: bool,
+) -> DispatchOutcome {
+    let mut outcome = last
+        .unwrap_or_else(|| lookup_failure(lookup, Some(endpoint), LookupFailure::Transport));
+    annotate_watch(&mut outcome, args, started, polls, selected, timed_out);
+    outcome.exit_code = CliExitCode::Transport;
+    outcome.payload["status"] = json!("error");
+    outcome.payload["watch"]["last_observation_only"] = json!(true);
+    outcome.payload["error"] = json!({
+        "type": error_type,
+        "message": message,
+        "recoverable": false,
+    });
+    outcome
 }
 
 pub(crate) fn read_admin_token(
@@ -852,97 +1119,103 @@ mod tests {
 
     impl TestHost {
         fn start(reply: Reply) -> Self {
+            Self::start_replies(vec![reply])
+        }
+
+        fn start_replies(replies: Vec<Reply>) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
             let endpoint = format!("http://{}", listener.local_addr().unwrap());
             let (release, released) = mpsc::channel();
             let (observed_request, observed) = mpsc::channel();
             let worker = thread::spawn(move || {
-                let deadline = Instant::now() + Duration::from_secs(5);
-                let mut stream = loop {
-                    match listener.accept() {
-                        Ok((stream, _)) => break stream,
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                        Err(error) => panic!("test host accept failed: {error}"),
-                    }
-                    match released.recv_timeout(Duration::from_millis(10)) {
-                        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
-                        Err(mpsc::RecvTimeoutError::Timeout) => {
-                            assert!(Instant::now() < deadline, "client did not connect");
+                for reply in replies {
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let mut stream = loop {
+                        match listener.accept() {
+                            Ok((stream, _)) => break stream,
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                            Err(error) => panic!("test host accept failed: {error}"),
                         }
-                    }
-                };
-                stream.set_nonblocking(false).unwrap();
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(5)))
-                    .unwrap();
-                stream
-                    .set_write_timeout(Some(Duration::from_secs(5)))
-                    .unwrap();
-                let mut reader = BufReader::new(stream.try_clone().unwrap());
-                let mut line = String::new();
-                reader.read_line(&mut line).unwrap();
-                let mut headers = BTreeMap::new();
-                loop {
-                    let mut header = String::new();
-                    if reader.read_line(&mut header).unwrap() == 0 || header == "\r\n" {
-                        break;
-                    }
-                    let (name, value) = header.split_once(':').expect("valid header");
-                    headers.insert(name.to_ascii_lowercase(), value.trim().to_owned());
-                }
-                let content_length = headers
-                    .get("content-length")
-                    .map_or(0, |value| value.parse::<usize>().unwrap());
-                assert!(content_length < 1_048_576);
-                let mut body = vec![0; content_length];
-                reader.read_exact(&mut body).unwrap();
-                observed_request
-                    .send(CapturedRequest {
-                        line: line.trim().to_owned(),
-                        headers,
-                        body: serde_json::from_slice(&body).unwrap(),
-                    })
-                    .unwrap();
-                match reply {
-                    Reply::Json(status, body) => {
-                        let body = serde_json::to_string(&body).unwrap();
-                        write!(
-                            stream,
-                            "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                            body.len(),
-                        )
+                        match released.recv_timeout(Duration::from_millis(10)) {
+                            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                            Err(mpsc::RecvTimeoutError::Timeout) => {
+                                assert!(Instant::now() < deadline, "client did not connect");
+                            }
+                        }
+                    };
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
                         .unwrap();
-                        stream.flush().unwrap();
-                    }
-                    Reply::Disconnect => {}
-                    Reply::Redirect(status, location) => {
-                        write!(
-                            stream,
-                            "HTTP/1.1 {status} Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                        )
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(5)))
                         .unwrap();
-                        stream.flush().unwrap();
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    let mut headers = BTreeMap::new();
+                    loop {
+                        let mut header = String::new();
+                        if reader.read_line(&mut header).unwrap() == 0 || header == "\r\n" {
+                            break;
+                        }
+                        let (name, value) = header.split_once(':').expect("valid header");
+                        headers.insert(name.to_ascii_lowercase(), value.trim().to_owned());
                     }
-                    Reply::StalledBody => {
-                        stream
-                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{")
-                            .unwrap();
-                        stream.flush().unwrap();
-                        let _ = released.recv_timeout(Duration::from_secs(5));
-                    }
-                    Reply::OversizedBody => {
-                        stream
-                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n")
-                            .unwrap();
-                        let body = json!({
-                            "invocation": null,
-                            "padding": "x".repeat(MAX_INVOCATION_RESPONSE_BYTES as usize),
+                    let content_length = headers
+                        .get("content-length")
+                        .map_or(0, |value| value.parse::<usize>().unwrap());
+                    assert!(content_length < 1_048_576);
+                    let mut body = vec![0; content_length];
+                    reader.read_exact(&mut body).unwrap();
+                    observed_request
+                        .send(CapturedRequest {
+                            line: line.trim().to_owned(),
+                            headers,
+                            body: serde_json::from_slice(&body).unwrap(),
                         })
-                        .to_string();
-                        // Rejection may close the socket before the full body
-                        // reaches the receiver, which is the behavior tested.
-                        let _ = stream.write_all(body.as_bytes());
+                        .unwrap();
+                    match reply {
+                        Reply::Json(status, body) => {
+                            let body = serde_json::to_string(&body).unwrap();
+                            write!(
+                                stream,
+                                "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len(),
+                            )
+                            .unwrap();
+                            stream.flush().unwrap();
+                        }
+                        Reply::Disconnect => {}
+                        Reply::Redirect(status, location) => {
+                            write!(
+                                stream,
+                                "HTTP/1.1 {status} Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            )
+                            .unwrap();
+                            stream.flush().unwrap();
+                        }
+                        Reply::StalledBody => {
+                            stream
+                                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{")
+                                .unwrap();
+                            stream.flush().unwrap();
+                            let _ = released.recv_timeout(Duration::from_secs(5));
+                        }
+                        Reply::OversizedBody => {
+                            stream
+                                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n")
+                                .unwrap();
+                            let body = json!({
+                                "invocation": null,
+                                "padding": "x".repeat(MAX_INVOCATION_RESPONSE_BYTES as usize),
+                            })
+                            .to_string();
+                            // Rejection may close the socket before the full body
+                            // reaches the receiver, which is the behavior tested.
+                            let _ = stream.write_all(body.as_bytes());
+                        }
                     }
                 }
             });
@@ -1071,6 +1344,254 @@ mod tests {
             attempt_id,
             admin_token_file: None,
         }
+    }
+
+    fn execute_watch(host: &str, interval: u64, timeout: u64) -> DispatchOutcome {
+        execute_watch_for_attempt(host, interval, timeout, None)
+    }
+
+    fn execute_watch_for_attempt(
+        host: &str,
+        interval: u64,
+        timeout: u64,
+        attempt_id: Option<u64>,
+    ) -> DispatchOutcome {
+        let directory = tempfile::tempdir().unwrap();
+        let token_path = directory.path().join("admin.token");
+        std::fs::write(&token_path, "fixture-admin-secret\n").unwrap();
+        watch(
+            &crate::WatchArgs {
+                operation_id: "req-inspect".to_owned(),
+                interval,
+                timeout,
+                attempt_id,
+                admin_token_file: Some(token_path),
+            },
+            Some(host),
+        )
+        .unwrap()
+    }
+
+    fn finalized_success() -> InvocationRecord {
+        let mut record = record(Some(InvocationOutcome::Succeeded), true);
+        record.finalization.as_mut().unwrap().response_http_status = Some(200);
+        record
+    }
+
+    #[test]
+    fn watch_polls_exact_invocation_through_source_and_final_response() {
+        let host = TestHost::start_replies(vec![
+            Reply::Json(
+                200,
+                json!({"invocation": record(None, false), "host_job_active": true}),
+            ),
+            Reply::Json(
+                200,
+                json!({"invocation": record(Some(InvocationOutcome::Succeeded), false), "host_job_active": true}),
+            ),
+            Reply::Json(
+                200,
+                json!({"invocation": finalized_success(), "host_job_active": false}),
+            ),
+        ]);
+        let started = Instant::now();
+        let outcome = execute_watch(&host.endpoint, 1, 5);
+        let captured = host.finish();
+        assert!(started.elapsed() >= Duration::from_secs(2));
+        assert_eq!(captured.line, "POST /rpc/admin/invocations HTTP/1.1");
+        assert_eq!(
+            captured.headers["authorization"],
+            "Bearer fixture-admin-secret"
+        );
+        assert_eq!(captured.headers["x-fcp-zone"], "z:owner");
+        assert_eq!(captured.body, json!({"operation_id": "req-inspect"}));
+        assert_eq!(outcome.exit_code, CliExitCode::Success);
+        assert_eq!(outcome.payload["command"], "watch");
+        assert_eq!(outcome.payload["execution_state"], "finalized");
+        assert_eq!(outcome.payload["watch"]["polls"], 3);
+        assert_eq!(outcome.payload["watch"]["selected_attempt_id"], 7);
+        assert_eq!(outcome.payload["watch"]["observation_complete"], true);
+        assert_eq!(outcome.payload["automatic_retry_allowed"], false);
+        assert!(!outcome.payload.to_string().contains("fixture-admin-secret"));
+    }
+
+    #[test]
+    fn watch_reports_recorded_failures_unknowns_and_incomplete_finalization() {
+        for (terminal, finalized, active, expected_exit) in [
+            (Some(InvocationOutcome::ConnectorError), true, false, CliExitCode::Connector),
+            (Some(InvocationOutcome::Cancelled), true, false, CliExitCode::Connector),
+            (Some(InvocationOutcome::DeadlineExceeded), true, false, CliExitCode::Transport),
+            (Some(InvocationOutcome::HostError), true, false, CliExitCode::Transport),
+            (Some(InvocationOutcome::OutcomeUnknown), false, true, CliExitCode::Transport),
+            (Some(InvocationOutcome::Succeeded), false, false, CliExitCode::Transport),
+            (Some(InvocationOutcome::Succeeded), true, false, CliExitCode::Transport),
+            (None, false, false, CliExitCode::Transport),
+        ] {
+            let host = TestHost::start(Reply::Json(
+                200,
+                json!({
+                    "invocation": record(terminal, finalized),
+                    "host_job_active": active,
+                }),
+            ));
+            let outcome = execute_watch(&host.endpoint, 1, 5);
+            host.finish();
+            assert_eq!(outcome.exit_code, expected_exit, "{terminal:?}");
+            assert_eq!(outcome.payload["status"], "error");
+            assert_eq!(outcome.payload["watch"]["polls"], 1);
+            assert_eq!(outcome.payload["automatic_retry_allowed"], false);
+        }
+    }
+
+    #[test]
+    fn watch_preserves_mesh_evidence_without_claiming_executor_finalization() {
+        for (terminal, expected_exit) in [
+            (MeshInvocationOutcome::Succeeded, CliExitCode::Success),
+            (MeshInvocationOutcome::ConnectorError, CliExitCode::Connector),
+            (MeshInvocationOutcome::NotDelivered, CliExitCode::Transport),
+            (MeshInvocationOutcome::OutcomeUnknown, CliExitCode::Transport),
+        ] {
+            let host = TestHost::start(Reply::Json(
+                200,
+                json!({
+                    "invocation": null,
+                    "mesh_invocation": forwarded_record(Some(terminal), true),
+                    "host_job_active": false,
+                }),
+            ));
+            let outcome = execute_watch(&host.endpoint, 1, 5);
+            host.finish();
+            assert_eq!(outcome.exit_code, expected_exit);
+            assert_eq!(outcome.payload["finalization_complete"], false);
+            assert_eq!(outcome.payload["watch"]["record_kind"], "mesh-forward");
+            assert_eq!(outcome.payload["selected_executor"], "peer-executor");
+            assert_eq!(outcome.payload["automatic_retry_allowed"], false);
+        }
+    }
+
+    #[test]
+    fn watch_bounds_poll_wait_and_preserves_last_running_observation() {
+        let host = TestHost::start(Reply::Json(
+            200,
+            json!({"invocation": record(None, false), "host_job_active": true}),
+        ));
+        let started = Instant::now();
+        let outcome = execute_watch(&host.endpoint, 60, 1);
+        host.finish();
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert_eq!(outcome.exit_code, CliExitCode::Transport);
+        assert_eq!(outcome.payload["error"]["type"], "invocation-watch-timeout");
+        assert_eq!(outcome.payload["watch"]["timed_out"], true);
+        assert_eq!(outcome.payload["watch"]["polls"], 1);
+        assert_eq!(outcome.payload["watch"]["last_observation_only"], true);
+        assert_eq!(outcome.payload["invocation"]["ticket"]["attempt_id"], 7);
+        assert_eq!(outcome.payload["watch"]["cancelled_invocation"], false);
+    }
+
+    #[test]
+    fn watch_bounds_stalled_response_body_by_overall_deadline() {
+        let host = TestHost::start(Reply::StalledBody);
+        let started = Instant::now();
+        let outcome = execute_watch(&host.endpoint, 1, 1);
+        host.finish();
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert_eq!(outcome.exit_code, CliExitCode::Transport);
+        assert_eq!(outcome.payload["error"]["type"], "invocation-watch-timeout");
+        assert_eq!(outcome.payload["watch"]["timed_out"], true);
+        assert_eq!(outcome.payload["automatic_retry_allowed"], false);
+    }
+
+    #[test]
+    fn watch_never_substitutes_a_new_attempt_or_another_journal() {
+        for switch_journal in [false, true] {
+            let replacement = if switch_journal {
+                let mut mesh = forwarded_record(Some(MeshInvocationOutcome::Succeeded), true);
+                mesh.ticket.attempt_id = 7;
+                json!({"invocation": null, "mesh_invocation": mesh})
+            } else {
+                let mut newer = finalized_success();
+                newer.ticket.attempt_id = 8;
+                json!({"invocation": newer})
+            };
+            let host = TestHost::start_replies(vec![
+                Reply::Json(
+                    200,
+                    json!({"invocation": record(None, false), "host_job_active": true}),
+                ),
+                Reply::Json(200, replacement),
+            ]);
+            let outcome = execute_watch(&host.endpoint, 1, 5);
+            host.finish();
+            assert_eq!(outcome.exit_code, CliExitCode::Transport);
+            assert_eq!(
+                outcome.payload["error"]["type"],
+                "invocation-watch-attempt-changed"
+            );
+            assert_eq!(outcome.payload["invocation"]["ticket"]["attempt_id"], 7);
+            assert_eq!(outcome.payload["source_outcome_known"], false);
+            assert_eq!(outcome.payload["watch"]["last_observation_only"], true);
+        }
+    }
+
+    #[test]
+    fn watch_exact_attempt_never_borrows_a_newer_jobs_liveness() {
+        for (body, attempt) in [
+            (
+                json!({"invocation": record(None, false), "host_job_active": true}),
+                7,
+            ),
+            (
+                json!({"invocation": record(Some(InvocationOutcome::Succeeded), false), "host_job_active": true}),
+                7,
+            ),
+            (
+                json!({"invocation": null, "mesh_invocation": forwarded_record(None, true), "host_job_active": true}),
+                8,
+            ),
+            (
+                json!({"invocation": null, "host_job_active": true}),
+                7,
+            ),
+        ] {
+            let host = TestHost::start(Reply::Json(200, body));
+            let outcome = execute_watch_for_attempt(&host.endpoint, 1, 0, Some(attempt));
+            let captured = host.finish();
+            assert_eq!(captured.body["attempt_id"], attempt);
+            assert_eq!(outcome.exit_code, CliExitCode::Transport);
+            assert_eq!(outcome.payload["watch"]["polls"], 1);
+            assert_eq!(outcome.payload["watch"]["observation_complete"], true);
+            assert_eq!(outcome.payload["automatic_retry_allowed"], false);
+            assert_ne!(outcome.payload["execution_state"], "running");
+            assert_ne!(outcome.payload["execution_state"], "mesh-forwarding");
+        }
+    }
+
+    #[test]
+    fn watch_rejects_wrong_request_identity_and_redacts_lookup_failure() {
+        let mut wrong = finalized_success();
+        wrong.ticket.operation_id = "req-inspect-suffix".to_owned();
+        let host = TestHost::start(Reply::Json(200, json!({"invocation": wrong})));
+        let outcome = execute_watch(&host.endpoint, 1, 5);
+        host.finish();
+        assert_eq!(outcome.exit_code, CliExitCode::Transport);
+        assert_eq!(
+            outcome.payload["error"]["type"],
+            "invalid-invocation-query-response"
+        );
+
+        let host = TestHost::start_replies(vec![
+            Reply::Json(
+                200,
+                json!({"invocation": record(None, false), "host_job_active": true}),
+            ),
+            Reply::Json(403, json!({"message": "fixture-admin-secret"})),
+        ]);
+        let outcome = execute_watch(&host.endpoint, 1, 5);
+        host.finish();
+        assert_eq!(outcome.exit_code, CliExitCode::PolicyDenied);
+        assert_eq!(outcome.payload["invocation"]["ticket"]["attempt_id"], 7);
+        assert_eq!(outcome.payload["watch"]["last_observation_only"], true);
+        assert!(!outcome.payload.to_string().contains("fixture-admin-secret"));
     }
 
     fn execute_lookup(

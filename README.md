@@ -1834,6 +1834,44 @@ MCP `notifications/cancelled` cancels the matching active call. Closing the inpu
 
 Host cancellation is best effort: acknowledgement means the cancellation request was accepted, and does not prove that provider effects were rolled back. Without the optional cancellation capability, an already dispatched host operation can continue until its normal deadline. Transport failures also signal cancellation; because portable blocking stdin cannot be interrupted, an output failure is returned after the input reader next unblocks.
 
+### Watch an Invocation
+
+Watch the exact request ID returned by an invocation using the selected host's
+protected execution history:
+
+```bash
+fwc watch REQUEST_ID --host http://127.0.0.1:8787 \
+    --admin-token-file admin.token --interval 2 --timeout 300
+
+# Inspect one retained historical attempt without borrowing a newer job's liveness
+fwc watch REQUEST_ID --host http://127.0.0.1:8787 \
+    --admin-token-file admin.token --attempt-id 7
+```
+
+The credential is the host admin bearer token, supplied by the file or
+`FCP_HOST_ADMIN_BEARER_TOKEN`. It is sent only to that host's invocation
+inspection endpoint with owner-zone access. Watching submits no invocation and
+does not replay or cancel work.
+
+The command polls at the requested positive interval until the retained attempt
+settles, becomes unresolvable, or the observation deadline expires. One monotonic
+budget covers all polling requests, response-body reads, and inter-poll waits.
+`--timeout 0` disables the overall deadline; individual reads remain bounded.
+Once an attempt is observed, a different attempt ID or a switch between local
+and mesh journals stops the watch instead of substituting another execution.
+
+The final output retains source outcome and host finalization as separate
+evidence. Exit success requires a successful finalized local response or a
+validated successful response observed by the mesh origin. A mesh observation
+does not establish executor-side finalization. Recorded failures, cancellation,
+incomplete finalization, and unknown outcomes return unsuccessful exit status.
+Missing history does not prove that an operation had no effects.
+
+A timeout or later lookup failure preserves the last observation and marks it
+as historical. Expiry of the watch's deadline is not expiry or cancellation of
+the operation itself. Use `fwc invocation REQUEST_ID --attempt-id N` for a
+single exact lookup when reconciling a stopped watch.
+
 ### Cancel a Live Operation
 
 Use the original host request ID from invocation output and a dedicated `host.cancel-self` capability belonging to that operation's owner:

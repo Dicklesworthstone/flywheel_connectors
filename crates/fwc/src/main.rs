@@ -1741,12 +1741,26 @@ struct WatchArgs {
     operation_id: String,
 
     /// Poll interval in seconds.
-    #[arg(long, default_value_t = 5)]
+    #[arg(
+        long,
+        default_value_t = 5,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
     interval: u64,
 
     /// Timeout in seconds (0 = no timeout).
     #[arg(long, default_value_t = 300)]
     timeout: u64,
+
+    /// Watch one exact retained attempt instead of selecting the latest attempt.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    attempt_id: Option<u64>,
+
+    /// Read the selected host's admin bearer secret from this file.
+    /// Defaults to FCP_HOST_ADMIN_BEARER_TOKEN.
+    #[arg(long, value_name = "PATH")]
+    #[serde(skip_serializing)]
+    admin_token_file: Option<PathBuf>,
 }
 
 #[derive(Args, Debug, Serialize)]
@@ -5090,75 +5104,7 @@ fn tail_dispatch(args: &TailArgs, explicit_host: Option<&str>) -> Result<Dispatc
 }
 
 fn watch_dispatch(args: &WatchArgs, explicit_host: Option<&str>) -> Result<DispatchOutcome> {
-    let Some(host) = resolve_host_config(explicit_host)? else {
-        return Ok(missing_host_dispatch(
-            "watch",
-            serde_json::to_value(args)?,
-            vec![
-                "fwc watch <operation-id> --host <endpoint>".to_owned(),
-                "Set `FWC_HOST` or `FCP_HOST_ENDPOINT`, or configure an active FCP context."
-                    .to_owned(),
-            ],
-        ));
-    };
-
-    // Query current event state for the operation.
-    let client = HostAdminClient::new(&host.endpoint)?;
-
-    let request = HostEventQueryRequest {
-        connector_id: None,
-        kind: None,
-        unacknowledged_only: false,
-        limit: 10,
-    };
-
-    let response = client.events(&request)?;
-
-    // Filter events that reference this operation ID.
-    let matching: Vec<_> = response
-        .events
-        .iter()
-        .filter(|event| host_event_matches_operation(event, &args.operation_id))
-        .collect();
-
-    let status_label = watch_operation_status(&matching);
-    let formatted: Vec<String> = matching
-        .iter()
-        .map(|event| host_event_to_connector_event(event).format_toon())
-        .collect();
-
-    let envelope = CommandEnvelope::new(CommandAvailability::LiveRuntime, "watch");
-    let mut payload = json!({
-        "status": "ok",
-        "command": "watch",
-        "source": "host-admin-api",
-        "operation_id": args.operation_id,
-        "operation_status": status_label,
-        "matching_events": matching.len(),
-        "latest_cursor": matching.last().map(|event| event.event_id.clone()),
-        "events": matching,
-        "formatted": formatted,
-        "poll_interval_seconds": args.interval,
-        "timeout_seconds": args.timeout,
-        "message": format!(
-            "Operation `{}` is currently `{}`. {} related event(s) found.",
-            args.operation_id,
-            status_label,
-            matching.len(),
-        ),
-        "next_actions": [
-            format!(
-                "fwc watch {} --interval {} --timeout {} --host {}",
-                args.operation_id, args.interval, args.timeout, host.endpoint,
-            ),
-            format!("fwc cancel {} --host {}", args.operation_id, host.endpoint),
-        ],
-    });
-    envelope.inject_into(&mut payload);
-    Ok(DispatchOutcome {
-        payload,
-        exit_code: CliExitCode::Success,
-    })
+    invocation_cmd::watch(args, explicit_host)
 }
 
 fn select_tail_events(
@@ -5268,61 +5214,6 @@ fn host_event_matches_type_filter(event: &HostAdminEvent, filter: &str) -> bool 
             HostEventKind::DriftDetected => normalized == "drift",
             HostEventKind::ConnectorStateChange => normalized == "connector-state",
         }
-}
-
-fn host_event_matches_operation(event: &HostAdminEvent, operation_id: &str) -> bool {
-    event.summary.contains(operation_id)
-        || event
-            .payload
-            .as_ref()
-            .is_some_and(|payload| payload_references_operation(payload, operation_id))
-}
-
-fn payload_references_operation(payload: &Value, operation_id: &str) -> bool {
-    ["request_id", "operation_id", "receipt_id", "event_id", "id"]
-        .iter()
-        .any(|key| payload.get(*key).and_then(Value::as_str) == Some(operation_id))
-}
-
-fn watch_operation_status(events: &[&HostAdminEvent]) -> &'static str {
-    if events.is_empty() {
-        return "pending";
-    }
-
-    for event in events.iter().rev() {
-        let summary = normalize_cli_token(&event.summary);
-        if summary.contains("cancelled") || summary.contains("canceled") {
-            return "cancelled";
-        }
-        if summary.contains("failed") || summary.contains("error") {
-            return "failed";
-        }
-        if summary.contains("completed")
-            || summary.contains("complete")
-            || summary.contains("succeeded")
-            || summary.contains("success")
-        {
-            return "completed";
-        }
-
-        if let Some(payload) = &event.payload {
-            for key in ["operation_status", "status", "phase", "state", "result"] {
-                if let Some(value) = payload.get(key).and_then(Value::as_str) {
-                    match normalize_cli_token(value).as_str() {
-                        "cancelled" | "canceled" => return "cancelled",
-                        "failed" | "error" => return "failed",
-                        "completed" | "complete" | "succeeded" | "success" | "ok" => {
-                            return "completed";
-                        }
-                        "pending" => return "pending",
-                        _ => {}
-                    }
-                }
-            }
-        }
-    }
-
-    "in-progress"
 }
 
 fn normalize_cli_token(raw: &str) -> String {
@@ -63253,6 +63144,8 @@ require_attestation_types = ["in-toto"]"#,
             operation_id: "req:abc123".to_owned(),
             interval: 5,
             timeout: 300,
+            attempt_id: None,
+            admin_token_file: None,
         };
         let outcome = super::watch_dispatch(&args, None).expect("should return missing-host");
         assert_eq!(outcome.exit_code, CliExitCode::Transport);
@@ -63396,54 +63289,10 @@ require_attestation_types = ["in-toto"]"#,
     }
 
     #[test]
-    fn watch_live_marks_completed_from_payload_status() {
-        let now = Utc::now();
-        let (host, server) = spawn_mock_host_sequence(vec![(
-            "POST /rpc/admin/events".to_owned(),
-            json!({
-                "events": [
-                    {
-                        "event_id": "evt-20",
-                        "kind": "rollout_decision",
-                        "connector_id": "fcp.github:enterprise:v1",
-                        "summary": "operation req-123 queued",
-                        "payload": { "request_id": "req-123", "status": "pending" },
-                        "timestamp": now.to_rfc3339(),
-                        "acknowledged": false
-                    },
-                    {
-                        "event_id": "evt-21",
-                        "kind": "rollout_decision",
-                        "connector_id": "fcp.github:enterprise:v1",
-                        "summary": "operation req-123 completed",
-                        "payload": { "request_id": "req-123", "status": "completed" },
-                        "timestamp": now.to_rfc3339(),
-                        "acknowledged": false
-                    }
-                ],
-                "unacknowledged_count": 2
-            }),
-        )]);
-
-        let args = super::WatchArgs {
-            operation_id: "req-123".to_owned(),
-            interval: 5,
-            timeout: 300,
-        };
-
-        let outcome =
-            super::watch_dispatch(&args, Some(&host)).expect("watch dispatch should succeed");
-        server.join().expect("mock host thread should complete");
-
-        assert_eq!(outcome.exit_code, CliExitCode::Success);
-        assert_eq!(outcome.payload["operation_status"], "completed");
-        assert_eq!(outcome.payload["matching_events"], 2);
-        assert_eq!(outcome.payload["latest_cursor"], "evt-21");
-        assert!(
-            outcome.payload["formatted"]
-                .as_array()
-                .is_some_and(|lines| !lines.is_empty())
-        );
+    fn watch_cli_rejects_zero_poll_interval() {
+        let error = Cli::try_parse_from(["fwc", "watch", "req-123", "--interval", "0"])
+            .expect_err("a zero interval would busy-loop against the host");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
     }
 
     // ── Auth gap tests (bead 1g7z0.27) ──────────────────────────────────
