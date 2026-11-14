@@ -1136,6 +1136,11 @@ impl FcpStoreConnectorStateStore {
     ///
     /// The same append gate covers comparison and retention. Dependencies are
     /// persisted before the root; authority is rechecked before each write.
+    /// Missing local state objects can be repaired from the validated bundle.
+    /// Before any write, the complete local history must validate using existing
+    /// bytes and a read-only fallback for absent objects. Corrupt/conflicting
+    /// objects, uncovered gaps and competing committed roots remain errors;
+    /// no stored object is overwritten and no older head becomes canonical.
     /// Cancellation or an error can leave admitted durable writes behind and
     /// must not be interpreted as rollback or permission for an automatic retry.
     /// The backing store must honor the immutable, read-after-write contract of
@@ -1176,10 +1181,27 @@ impl FcpStoreConnectorStateStore {
         // arrived. A private cache still forces a fresh scan at the commit gate.
         let mut canonical = self.clone();
         canonical.root_cache = Arc::new(RwLock::new(None));
+        // Only exact retention repairs lost ancestry. Advance-only import keeps
+        // its strict validation and mutation-free historical no-op semantics.
+        // The overlay contains already validated states, never extra roots that
+        // could change canonical selection before publication. Stored bytes take
+        // precedence, so neither corruption nor a fork can be hidden by a donor.
+        let repair_states = retain_exact_root.then(|| {
+            replica
+                .states
+                .iter()
+                .map(|object| (object.object_id, object))
+                .collect::<HashMap<_, _>>()
+        });
         let mut advances_root = true;
-        if let Some((current_id, current)) = canonical.read_root().await? {
+        if let Some((current_id, current)) = canonical
+            .read_root_with_repair(repair_states.as_ref())
+            .await?
+        {
             self.validate_replica_model(&current)?;
-            let current_seq = canonical.root_head_seq(&current).await?;
+            let current_seq = canonical
+                .root_head_seq_with_repair(&current, repair_states.as_ref())
+                .await?;
             if replica.root.head == current.head {
                 advances_root = replica
                     .head_seq
@@ -1212,7 +1234,12 @@ impl FcpStoreConnectorStateStore {
                                     is_ancestor = true;
                                     break;
                                 }
-                                let (_, state) = canonical.load_state_object(&object_id).await?;
+                                let (_, state) = canonical
+                                    .load_state_object_with_repair(
+                                        &object_id,
+                                        repair_states.as_ref(),
+                                    )
+                                    .await?;
                                 if Some(state.seq) <= replica.head_seq {
                                     break;
                                 }
@@ -1493,7 +1520,19 @@ impl FcpStoreConnectorStateStore {
     }
 
     async fn read_root_inner(&self) -> Result<Option<(ObjectId, ConnectorStateRoot)>> {
-        if let Some((object_id, root)) = self.cached_root() {
+        self.read_root_with_repair(None).await
+    }
+
+    /// Validate the committed local roots without publishing any donor bytes.
+    /// A successful overlay read is not durable state and must never enter the
+    /// shared root cache. Only an explicitly authorized retention supplies it.
+    async fn read_root_with_repair(
+        &self,
+        repair_states: Option<&HashMap<ObjectId, &StoredObject>>,
+    ) -> Result<Option<(ObjectId, ConnectorStateRoot)>> {
+        if repair_states.is_none()
+            && let Some((object_id, root)) = self.cached_root()
+        {
             return Ok(Some((object_id, root)));
         }
 
@@ -1530,7 +1569,7 @@ impl FcpStoreConnectorStateStore {
                     got: format!("{:?}", root.model),
                 });
             }
-            let head_seq = self.root_head_seq(&root).await?;
+            let head_seq = self.root_head_seq_with_repair(&root, repair_states).await?;
             roots.push((object_id, root.clone()));
 
             let replace = best
@@ -1549,9 +1588,11 @@ impl FcpStoreConnectorStateStore {
 
         let root = best.map(|(object_id, root, _head_seq)| (object_id, root));
         if let Some((object_id, root)) = &root {
-            self.validate_singleton_root_history(*object_id, root, &roots)
+            self.validate_singleton_root_history(*object_id, root, &roots, repair_states)
                 .await?;
-            self.cache_root(generation, *object_id, root.clone());
+            if repair_states.is_none() {
+                self.cache_root(generation, *object_id, root.clone());
+            }
         }
         Ok(root)
     }
@@ -1561,6 +1602,7 @@ impl FcpStoreConnectorStateStore {
         root_object_id: ObjectId,
         root: &ConnectorStateRoot,
         roots: &[(ObjectId, ConnectorStateRoot)],
+        repair_states: Option<&HashMap<ObjectId, &StoredObject>>,
     ) -> Result<()> {
         if !root.model.is_singleton_writer() {
             return Ok(());
@@ -1579,7 +1621,9 @@ impl FcpStoreConnectorStateStore {
             if !lineage.insert(object_id) {
                 return Err(ConnectorStateStoreError::ChainCycle(object_id));
             }
-            let (_, state) = self.load_state_object(&object_id).await?;
+            let (_, state) = self
+                .load_state_object_with_repair(&object_id, repair_states)
+                .await?;
             if let Some(newer) = &newer {
                 Self::validate_replay_transition(&root.model, &state, newer)?;
             }
@@ -1643,9 +1687,17 @@ impl FcpStoreConnectorStateStore {
     }
 
     async fn root_head_seq(&self, root: &ConnectorStateRoot) -> Result<Option<u64>> {
+        self.root_head_seq_with_repair(root, None).await
+    }
+
+    async fn root_head_seq_with_repair(
+        &self,
+        root: &ConnectorStateRoot,
+        repair_states: Option<&HashMap<ObjectId, &StoredObject>>,
+    ) -> Result<Option<u64>> {
         match root.head {
             Some(head_id) => self
-                .load_state_object(&head_id)
+                .load_state_object_with_repair(&head_id, repair_states)
                 .await
                 .map(|(_object_id, state)| Some(state.seq)),
             None => Ok(None),
@@ -2288,14 +2340,22 @@ impl FcpStoreConnectorStateStore {
         &self,
         object_id: &ObjectId,
     ) -> Result<(ObjectId, ConnectorStateObject)> {
-        let stored = self
-            .object_store
-            .get(object_id)
-            .await
-            .map_err(|err| match err {
-                ObjectStoreError::NotFound(_) => ConnectorStateStoreError::MissingHead(*object_id),
-                other => ConnectorStateStoreError::ObjectStore(other),
-            })?;
+        self.load_state_object_with_repair(object_id, None).await
+    }
+
+    async fn load_state_object_with_repair(
+        &self,
+        object_id: &ObjectId,
+        repair_states: Option<&HashMap<ObjectId, &StoredObject>>,
+    ) -> Result<(ObjectId, ConnectorStateObject)> {
+        let stored = match self.object_store.get(object_id).await {
+            Ok(stored) => stored,
+            Err(ObjectStoreError::NotFound(_)) => repair_states
+                .and_then(|states| states.get(object_id).copied())
+                .cloned()
+                .ok_or(ConnectorStateStoreError::MissingHead(*object_id))?,
+            Err(error) => return Err(error.into()),
+        };
         let state = self.load_state_from_stored(*object_id, &stored)?;
         if !self.state_belongs_to_store(&state) {
             return Err(ConnectorStateStoreError::IdentityMismatch {
@@ -8063,6 +8123,212 @@ mod tests {
             run_async(target.export_replica(newer.root_object_id, replica_limits())).unwrap(),
             newer,
         );
+    }
+
+    #[test]
+    fn exact_retention_repairs_missing_head_and_prefix_without_a_head_transition() {
+        let (_, bundle) = retention_history_pair();
+        let states: Vec<_> = bundle
+            .objects
+            .iter()
+            .filter(|object| {
+                object.header.schema == FcpStoreConnectorStateStore::state_object_schema_id()
+            })
+            .collect();
+        assert_eq!(states.len(), 2);
+        for missing in states {
+            let backing = store();
+            for object in &bundle.objects {
+                if object.object_id != missing.object_id {
+                    run_async(backing.put(object.clone())).unwrap();
+                }
+            }
+            let objects = Arc::new(FailNthPutObjectStore::new(backing, usize::MAX));
+            let target = test_store(objects.clone());
+            assert!(matches!(
+                run_async(target.read_root()),
+                Err(ConnectorStateStoreError::MissingHead(id)) if id == missing.object_id
+            ));
+            // Ordinary import still refuses to adopt over incomplete local
+            // history. Repair is an explicit exact-root retention operation.
+            assert!(matches!(
+                run_async(target.import_replica(bundle.clone(), replica_limits())),
+                Err(ConnectorStateStoreError::MissingHead(id)) if id == missing.object_id
+            ));
+            assert_eq!(objects.puts.load(Ordering::SeqCst), 0);
+            assert!(
+                run_async(
+                    target.retain_replica_checked(bundle.clone(), replica_limits(), || Ok(()),)
+                )
+                .unwrap()
+                .is_none()
+            );
+            assert_eq!(
+                run_async(target.read_root()).unwrap().unwrap().0,
+                bundle.root_object_id
+            );
+            assert_eq!(
+                run_async(target.export_replica(bundle.root_object_id, replica_limits())).unwrap(),
+                bundle
+            );
+        }
+    }
+
+    #[test]
+    fn historical_retention_repairs_a_newer_roots_missing_prefix_without_rollback() {
+        let (older, newer) = retention_history_pair();
+        let missing = older.objects[0].object_id;
+        let objects = store();
+        for object in &newer.objects {
+            if object.object_id != missing {
+                run_async(objects.put(object.clone())).unwrap();
+            }
+        }
+        let target = test_store(objects);
+        assert!(matches!(
+            run_async(target.read_root()),
+            Err(ConnectorStateStoreError::MissingHead(id)) if id == missing
+        ));
+        assert!(
+            run_async(target.retain_replica_checked(older.clone(), replica_limits(), || Ok(())))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            run_async(target.read_root()).unwrap().unwrap().0,
+            newer.root_object_id
+        );
+        for bundle in [older, newer] {
+            assert_eq!(
+                run_async(target.export_replica(bundle.root_object_id, replica_limits())).unwrap(),
+                bundle
+            );
+        }
+    }
+
+    #[test]
+    fn exact_retention_repair_rejects_uncovered_gaps_and_forks_before_writes() {
+        let (older, newer) = retention_history_pair();
+        let root = newer
+            .objects
+            .iter()
+            .find(|object| object.object_id == newer.root_object_id)
+            .unwrap();
+        let backing = store();
+        run_async(backing.put(root.clone())).unwrap();
+        let objects = Arc::new(FailNthPutObjectStore::new(backing, usize::MAX));
+        let target = test_store(objects.clone());
+        // The older bundle cannot supply the missing newer head. It must not
+        // partially heal this prefix or select its own older root instead.
+        assert!(matches!(
+            run_async(target.retain_replica_checked(older.clone(), replica_limits(), || Ok(()))),
+            Err(ConnectorStateStoreError::MissingHead(_))
+        ));
+        assert_eq!(objects.puts.load(Ordering::SeqCst), 0);
+        assert!(target.cached_root().is_none());
+
+        let fork = replica_with_states(&[state(0, None, lease_id(9))]);
+        for object in fork.objects {
+            run_async(objects.inner.put(object)).unwrap();
+        }
+        // A complete donor can now fill the missing lineage, but it cannot
+        // erase the independently committed competing root from consideration.
+        assert!(matches!(
+            run_async(target.retain_replica_checked(newer, replica_limits(), || Ok(()))),
+            Err(ConnectorStateStoreError::ForkDetected { .. })
+        ));
+        assert_eq!(objects.puts.load(Ordering::SeqCst), 0);
+        assert!(!run_async(objects.exists(&older.objects[0].object_id)));
+        assert!(target.cached_root().is_none());
+    }
+
+    #[test]
+    fn exact_retention_repair_never_replaces_corrupt_existing_state() {
+        let (_, bundle) = retention_history_pair();
+        let backing = store();
+        let corrupt_id = bundle.objects[0].object_id;
+        for object in &bundle.objects {
+            let mut stored = object.clone();
+            if stored.object_id == corrupt_id {
+                stored.body = Bytes::from_static(b"corrupt persisted state");
+            }
+            run_async(backing.put(stored)).unwrap();
+        }
+        let objects = Arc::new(FailNthPutObjectStore::new(backing, usize::MAX));
+        let target = test_store(objects.clone());
+        assert!(
+            run_async(target.retain_replica_checked(bundle, replica_limits(), || Ok(()))).is_err()
+        );
+        assert_eq!(objects.puts.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            run_async(objects.get(&corrupt_id)).unwrap().body,
+            Bytes::from_static(b"corrupt persisted state")
+        );
+        assert!(target.cached_root().is_none());
+    }
+
+    #[test]
+    fn failed_and_cancelled_repairs_never_cache_unpersisted_ancestry() {
+        let (_, bundle) = retention_history_pair();
+        let root = bundle
+            .objects
+            .iter()
+            .find(|object| object.object_id == bundle.root_object_id)
+            .unwrap();
+        let backing = store();
+        run_async(backing.put(root.clone())).unwrap();
+        let objects = Arc::new(FailNthPutObjectStore::new(backing, 2));
+        let target = test_store(objects.clone());
+        assert!(matches!(
+            run_async(target.retain_replica_checked(bundle.clone(), replica_limits(), || Ok(()))),
+            Err(ConnectorStateStoreError::ObjectStore(ObjectStoreError::Io(
+                _
+            )))
+        ));
+        assert!(run_async(objects.exists(&bundle.objects[0].object_id)));
+        assert!(target.cached_root().is_none());
+        assert!(matches!(
+            run_async(target.read_root()),
+            Err(ConnectorStateStoreError::MissingHead(_))
+        ));
+        assert!(
+            run_async(target.retain_replica_checked(bundle.clone(), replica_limits(), || Ok(())))
+                .unwrap()
+                .is_none()
+        );
+
+        run_async(async {
+            let objects = Arc::new(PausedPutObjectStore::new(1, true));
+            objects.inner.put(root.clone()).await.unwrap();
+            let target = test_store(objects.clone());
+            let mut repair = Box::pin(target.retain_replica_checked(
+                bundle.clone(),
+                replica_limits(),
+                || Ok(()),
+            ));
+            assert!(futures_util::poll!(repair.as_mut()).is_pending());
+            assert!(objects.exists(&bundle.objects[0].object_id).await);
+            assert!(target.cached_root().is_none());
+            drop(repair);
+            assert!(matches!(
+                target.read_root().await,
+                Err(ConnectorStateStoreError::MissingHead(_))
+            ));
+            assert!(
+                target
+                    .retain_replica_checked(bundle.clone(), replica_limits(), || Ok(()))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                target
+                    .export_replica(bundle.root_object_id, replica_limits())
+                    .await
+                    .unwrap(),
+                bundle
+            );
+        });
     }
 
     #[test]

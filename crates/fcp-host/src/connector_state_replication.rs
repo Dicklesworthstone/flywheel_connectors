@@ -689,7 +689,9 @@ impl ConnectorStateReplicationService {
         let canonical_bytes = canonical_size(&response.bundle, request.request.limits)?;
         // An advance-only import may skip an older comparable root entirely.
         // A successful exact-root transfer must retain that root as well as its
-        // ancestry, without selecting it over a newer canonical head.
+        // ancestry, without selecting it over a newer canonical head. Exact
+        // retention also repairs absent local ancestry from this authenticated
+        // bundle; corrupt stored bytes and competing histories remain errors.
         let change = store
             .retain_replica_checked(
                 response.bundle,
@@ -1388,6 +1390,57 @@ mod tests {
         .unwrap();
         assert!(!repeated.replica_root_published);
         assert!(repeated.replica_only);
+    }
+
+    #[test]
+    fn exact_root_transfer_repairs_missing_local_ancestry_without_claiming_a_new_root() {
+        let fixture = fixture();
+        let wire = export(&fixture);
+        let exported: ConnectorStateExportResponse = serde_json::from_str(&wire).unwrap();
+        let objects = Arc::new(MemoryObjectStore::new(MemoryObjectStoreConfig::default()));
+        let root = exported
+            .bundle
+            .objects
+            .iter()
+            .find(|object| object.object_id == exported.bundle.root_object_id)
+            .unwrap();
+        // Model an object-loss replica: its exact root remains, but the signed
+        // state it points at is absent. No donor root may replace this evidence.
+        run(objects.put(root.clone())).unwrap();
+        let replica = adapter(objects);
+        assert!(matches!(
+            run(replica.read_root()),
+            Err(ConnectorStateStoreError::MissingHead(_))
+        ));
+        let mut recipient = ConnectorStateReplicationService::new();
+        recipient
+            .register_store(
+                ConnectorStateTransferDirection::Import,
+                scope(),
+                Arc::clone(&replica),
+            )
+            .unwrap();
+        recipient
+            .add_grant(fixture.recipient.grants["restore-state"].grant.clone())
+            .unwrap();
+
+        let repaired = run(recipient.import_from_peer(&fixture.request, &wire, || Ok(()))).unwrap();
+        assert!(!repaired.replica_root_published);
+        assert!(repaired.replica_only);
+        assert_eq!(repaired.root_object_id, exported.bundle.root_object_id);
+        assert_eq!(
+            run(replica.export_replica(
+                repaired.root_object_id,
+                fixture.request.request.limits.store_limits(),
+            ))
+            .unwrap(),
+            exported.bundle
+        );
+        let inspection = run(recipient.inspect_replica(&fixture.request)).unwrap();
+        inspection.validate_for(&fixture.request).unwrap();
+        assert_eq!(inspection.status, ConnectorStateInspectionStatus::Verified);
+        assert_eq!(inspection.object_count, repaired.object_count);
+        assert_eq!(recipient.runtime.active(), 0);
     }
 
     #[test]
