@@ -14678,6 +14678,17 @@ struct AuthorizedHostEgress {
 }
 
 impl AuthorizedHostEgress {
+    fn remaining_budget(&self, started_at: Instant, transport: &str) -> HostResult<Duration> {
+        Duration::from_millis(u64::from(self.constraints.total_timeout_ms))
+            .checked_sub(started_at.elapsed())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| {
+                HostError::PreflightFailed(format!(
+                    "host-egress {transport} request deadline exhausted"
+                ))
+            })
+    }
+
     fn require_current(&self) -> HostResult<()> {
         self.inventory_fence.require_current()?;
         self.execution_fence.require_current()?;
@@ -15309,93 +15320,163 @@ async fn perform_authorized_host_http_egress_once(
     started_at: Instant,
 ) -> HostResult<HostEgressHttpResponse> {
     authorized.require_current()?;
-    // One budget covers DNS, authority refresh, pool contention and transport.
+    // One budget covers every redirect, DNS lookup, authority refresh, pool
+    // wait and response body. Automatic transport redirects would bypass the
+    // capability's resource scope and retain credentials from the first hop.
     fcp_async_core::time::timeout(
         egress_oauth::remaining_budget(authorized, started_at)?,
         async {
-            let original_request = EgressHttpRequest {
-                url: request.url.clone(),
-                method: request.method.clone(),
-                headers: request
-                    .headers
-                    .iter()
-                    .map(|header| HttpHeader {
-                        name: header.name.clone(),
-                        value: header.value.clone(),
-                    })
-                    .collect(),
-                body: request.body.as_ref().map(|body| body.as_bytes().to_vec()),
-                credential_id: request.credential_id.clone(),
-            };
-            // Validate the destination and credential grant before even resolving
-            // DNS. These prepared headers are never sent across an await.
-            let mut preliminary_request = original_request.clone();
-            let preliminary_injector = HostCredentialInjector::new(lease.cloned());
-            let noop = NoOpCredentialInjector;
-            let injector: &dyn CredentialInjector = if request.credential_id.is_some() {
-                &preliminary_injector
-            } else {
-                &noop
-            };
-            let mut decision = fcp_host::authorize_runtime_http_egress(
-                &authorized.decision_context(),
-                &authorized.constraints,
-                &mut preliminary_request,
-                injector,
-            )?;
-            let socket_addrs =
-                resolve_host_egress_decision(&mut decision, &authorized.constraints, "HTTP")
-                    .await?;
-            // DNS and refresh waits must not retain expired or revoked authority.
-            // Read the credential after all asynchronous preparation, then inject
-            // into the original headers so superseded API-key headers cannot linger.
-            let current_authority =
-                authorize_host_egress_context(state, &request.context, &request.url).await?;
-            let current_lease = match lease {
-                Some(lease) => Some(
-                    state
-                        .credential_pools
-                        .lock()
+            let mut request = request.clone();
+            let mut redirects = 0;
+            loop {
+                authorized.require_current()?;
+                // Resource authority is checked before DNS or credential use
+                // for this exact hop, including relative Location targets.
+                let hop_authority =
+                    authorize_host_egress_context(state, &request.context, &request.url)
                         .await
-                        .current_lease(lease, Utc::now())
-                        .map_err(|_| {
-                            HostError::PreflightFailed(
-                                "host-egress credential changed before dispatch".to_owned(),
-                            )
-                        })?,
-                ),
-                None => None,
-            };
-            authorized.require_current()?;
-            current_authority.require_current()?;
-            let leased_injector = HostCredentialInjector::new(current_lease);
-            let injector: &dyn CredentialInjector = if request.credential_id.is_some() {
-                &leased_injector
-            } else {
-                &noop
-            };
-            let mut guard_request = original_request;
-            let mut current_decision = fcp_host::authorize_runtime_http_egress(
-                &authorized.decision_context(),
-                &authorized.constraints,
-                &mut guard_request,
-                injector,
-            )?;
-            current_decision.resolved_ips = decision.resolved_ips;
-            let response = perform_host_http_egress(
-                authorized,
-                &guard_request,
-                &current_decision,
-                &authorized.constraints,
-                &socket_addrs,
-            )
-            .await?;
-            Ok(HostEgressHttpResponse {
-                status: response.status,
-                headers: response.headers,
-                body: response.body,
-                egress: authorized.metadata(&current_decision, started_at.elapsed().as_millis()),
-            })
+                        .map_err(|error| {
+                            redact_host_http_redirect_authorization(error, redirects)
+                        })?;
+                authorized.require_current()?;
+                let hop_lease = match lease {
+                    Some(lease) if redirects > 0 => Some(
+                        egress_oauth::prepare(
+                            state,
+                            &hop_authority,
+                            &request,
+                            lease,
+                            false,
+                            started_at,
+                        )
+                        .await?,
+                    ),
+                    _ => lease.cloned(),
+                };
+                authorized.require_current()?;
+                hop_authority.require_current()?;
+                let original_request = EgressHttpRequest {
+                    url: request.url.clone(),
+                    method: request.method.clone(),
+                    headers: request
+                        .headers
+                        .iter()
+                        .map(|header| HttpHeader {
+                            name: header.name.clone(),
+                            value: header.value.clone(),
+                        })
+                        .collect(),
+                    body: request.body.as_ref().map(|body| body.as_bytes().to_vec()),
+                    credential_id: request.credential_id.clone(),
+                };
+                // Validate the destination and credential grant before even
+                // resolving DNS. Prepared headers never cross a redirect.
+                let mut preliminary_request = original_request.clone();
+                let preliminary_injector = HostCredentialInjector::new(hop_lease.clone());
+                let noop = NoOpCredentialInjector;
+                let injector: &dyn CredentialInjector = if request.credential_id.is_some() {
+                    &preliminary_injector
+                } else {
+                    &noop
+                };
+                let mut decision = fcp_host::authorize_runtime_http_egress(
+                    &hop_authority.decision_context(),
+                    &hop_authority.constraints,
+                    &mut preliminary_request,
+                    injector,
+                )?;
+                let socket_addrs =
+                    resolve_host_egress_decision(&mut decision, &hop_authority.constraints, "HTTP")
+                        .await?;
+                // DNS and refresh waits must not retain expired or revoked
+                // authority. Read the credential after preparation, then
+                // inject into caller headers without stale injected values.
+                let current_authority =
+                    authorize_host_egress_context(state, &request.context, &request.url)
+                        .await
+                        .map_err(|error| {
+                            redact_host_http_redirect_authorization(error, redirects)
+                        })?;
+                let current_lease = match hop_lease.as_ref() {
+                    Some(lease) => Some(
+                        state
+                            .credential_pools
+                            .lock()
+                            .await
+                            .current_lease(lease, Utc::now())
+                            .map_err(|_| {
+                                HostError::PreflightFailed(
+                                    "host-egress credential changed before dispatch".to_owned(),
+                                )
+                            })?,
+                    ),
+                    None => None,
+                };
+                authorized.require_current()?;
+                hop_authority.require_current()?;
+                current_authority.require_current()?;
+                let leased_injector = HostCredentialInjector::new(current_lease);
+                let injector: &dyn CredentialInjector = if request.credential_id.is_some() {
+                    &leased_injector
+                } else {
+                    &noop
+                };
+                let mut guard_request = original_request;
+                let mut current_decision = fcp_host::authorize_runtime_http_egress(
+                    &current_authority.decision_context(),
+                    &current_authority.constraints,
+                    &mut guard_request,
+                    injector,
+                )?;
+                current_decision.resolved_ips = decision.resolved_ips;
+                let response = perform_host_http_egress(
+                    authorized,
+                    &guard_request,
+                    &current_decision,
+                    &current_authority.constraints,
+                    &socket_addrs,
+                )
+                .await?;
+                if !egress_auth::requires_original_target(&guard_request)
+                    && advance_host_http_redirect(
+                        &mut request,
+                        response.status().as_u16(),
+                        response.headers(),
+                        redirects,
+                        authorized.constraints.max_redirects,
+                    )?
+                {
+                    redirects += 1;
+                    // Rejected and intermediate bodies do not retain their
+                    // connection or consume an unbounded drain before retry.
+                    drop(response);
+                    continue;
+                }
+                let status = response.status().as_u16();
+                let headers = response
+                    .headers()
+                    .iter()
+                    .filter_map(|(name, value)| {
+                        value.to_str().ok().map(|value| HostEgressHttpHeader {
+                            name: name.as_str().to_string(),
+                            value: value.to_string(),
+                        })
+                    })
+                    .collect();
+                let body = read_bounded_reqwest_body(
+                    response,
+                    authorized.constraints.max_response_bytes,
+                    "host-egress HTTP response",
+                )
+                .await?;
+                return Ok(HostEgressHttpResponse {
+                    status,
+                    headers,
+                    body: fcp_manifest::Base64Bytes::from_vec(body),
+                    egress: authorized
+                        .metadata(&current_decision, started_at.elapsed().as_millis()),
+                });
+            }
         },
     )
     .await
@@ -15405,12 +15486,6 @@ async fn perform_authorized_host_http_egress_once(
             authorized.constraints.total_timeout_ms
         ))
     })?
-}
-
-struct RawHttpEgressResponse {
-    status: u16,
-    headers: Vec<HostEgressHttpHeader>,
-    body: fcp_manifest::Base64Bytes,
 }
 
 const HOST_EGRESS_EXTRA_CA_PEM_ENV: &str = "FCP_HOST_EGRESS_EXTRA_CA_PEM";
@@ -15631,7 +15706,7 @@ async fn perform_host_http_egress(
     decision: &fcp_sandbox::EgressDecision,
     constraints: &NetworkConstraints,
     socket_addrs: &[SocketAddr],
-) -> HostResult<RawHttpEgressResponse> {
+) -> HostResult<reqwest::Response> {
     let url = url::Url::parse(&request.url).map_err(|err| {
         HostError::PreflightFailed(format!("host-egress HTTP URL rejected after policy: {err}"))
     })?;
@@ -15657,13 +15732,9 @@ async fn perform_host_http_egress(
         .timeout(Duration::from_millis(u64::from(
             constraints.total_timeout_ms,
         )))
-        .redirect(if egress_auth::requires_original_target(request) {
-            // A SigV4 signature authorizes this exact method, path, query and
-            // body. Even a same-origin redirect changes its signed meaning.
-            reqwest::redirect::Policy::none()
-        } else {
-            host_http_redirect_policy(&url, constraints)?
-        });
+        // The host owns redirects so every target receives fresh capability,
+        // credential and network-policy admission before dispatch.
+        .redirect(reqwest::redirect::Policy::none());
     if is_https {
         builder = builder.tls_backend_preconfigured(host_egress_rustls_client_config(
             "HTTP",
@@ -15714,72 +15785,87 @@ async fn perform_host_http_egress(
         constraints.max_redirects
     );
     authorized.require_current()?;
-    let response = outbound.send().await.map_err(|err| {
+    outbound.send().await.map_err(|err| {
         map_reqwest_host_egress_error(err, &request_error_label, &decision.canonical_host)
-    })?;
-    let status = response.status().as_u16();
-    let headers = response
-        .headers()
-        .iter()
-        .filter_map(|(name, value)| {
-            value.to_str().ok().map(|value| HostEgressHttpHeader {
-                name: name.as_str().to_string(),
-                value: value.to_string(),
-            })
-        })
-        .collect::<Vec<_>>();
-    let body = read_bounded_reqwest_body(
-        response,
-        constraints.max_response_bytes,
-        "host-egress HTTP response",
-    )
-    .await?;
-    Ok(RawHttpEgressResponse {
-        status,
-        headers,
-        body: fcp_manifest::Base64Bytes::from_vec(body),
     })
 }
 
-fn host_http_redirect_policy(
-    url: &url::Url,
-    constraints: &NetworkConstraints,
-) -> HostResult<reqwest::redirect::Policy> {
-    let origin_scheme = url.scheme().to_string();
-    let origin_host = url.host_str().ok_or_else(|| {
-        HostError::PreflightFailed("host-egress HTTP URL missing host".to_string())
+fn redact_host_http_redirect_authorization(error: HostError, redirects: usize) -> HostError {
+    if redirects == 0 {
+        error
+    } else {
+        // ResourceNotAllowed includes the rejected URI. A provider's Location
+        // can contain query credentials that must not enter host diagnostics.
+        HostError::PreflightFailed(
+            "host-egress HTTP redirect target authorization rejected".to_owned(),
+        )
+    }
+}
+
+/// Prepare the next uncredentialed request. Admission happens in the caller's
+/// loop; this helper never grants authority to a Location value.
+fn advance_host_http_redirect(
+    request: &mut HostEgressHttpRequest,
+    status: u16,
+    headers: &reqwest::header::HeaderMap,
+    followed: usize,
+    max_redirects: u8,
+) -> HostResult<bool> {
+    if !matches!(status, 301 | 302 | 303 | 307 | 308) {
+        return Ok(false);
+    }
+    let mut locations = headers.get_all(reqwest::header::LOCATION).iter();
+    let Some(location) = locations.next() else {
+        return Ok(false);
+    };
+    if locations.next().is_some() {
+        return Err(HostError::PreflightFailed(
+            "host-egress HTTP redirect has ambiguous Location headers".to_owned(),
+        ));
+    }
+    if followed >= usize::from(max_redirects) {
+        return Err(HostError::PreflightFailed(format!(
+            "host-egress HTTP redirect limit exceeded: max_redirects={max_redirects}"
+        )));
+    }
+    let location = location.to_str().map_err(|_| {
+        HostError::PreflightFailed("host-egress HTTP redirect Location is invalid".to_owned())
     })?;
-    let origin_host = origin_host.to_ascii_lowercase();
-    let origin_port = url.port_or_known_default().ok_or_else(|| {
-        HostError::PreflightFailed(format!(
-            "host-egress HTTP URL `{url}` has no explicit or default port"
-        ))
+    let origin = url::Url::parse(&request.url).map_err(|_| {
+        HostError::PreflightFailed("host-egress HTTP redirect origin is invalid".to_owned())
     })?;
-    let max_redirects = usize::from(constraints.max_redirects);
-    Ok(reqwest::redirect::Policy::custom(move |attempt| {
-        if attempt.previous().len() > max_redirects {
-            return attempt.error(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                format!("host-egress HTTP redirect limit exceeded: max_redirects={max_redirects}"),
-            ));
+    let mut next = origin.join(location).map_err(|_| {
+        HostError::PreflightFailed("host-egress HTTP redirect target is invalid".to_owned())
+    })?;
+    if next.scheme() != origin.scheme()
+        || next.host_str() != origin.host_str()
+        || next.port_or_known_default() != origin.port_or_known_default()
+        || !next.username().is_empty()
+        || next.password().is_some()
+    {
+        // Do not echo Location: provider-supplied URLs may contain secrets.
+        return Err(HostError::PreflightFailed(
+            "host-egress HTTP redirect leaves the authorized origin or contains user information"
+                .to_owned(),
+        ));
+    }
+    // Fragments do not travel on the wire and cannot change resource scope.
+    next.set_fragment(None);
+    let discard_body = (matches!(status, 301 | 302) && request.method == "POST") || status == 303;
+    if discard_body {
+        if request.method != "HEAD" {
+            request.method = "GET".to_owned();
         }
-        let next = attempt.url();
-        let next_display = next.to_string();
-        let next_host = next.host_str().map(str::to_ascii_lowercase);
-        let next_port = next.port_or_known_default();
-        if next.scheme() != origin_scheme
-            || next_host.as_deref() != Some(origin_host.as_str())
-            || next_port != Some(origin_port)
-        {
-            return attempt.error(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                format!(
-                    "host-egress HTTP redirect denied: `{next_display}` leaves authorized origin {origin_scheme}://{origin_host}:{origin_port}"
-                ),
-            ));
-        }
-        attempt.follow()
-    }))
+        request.body = None;
+        request.headers.retain(|header| {
+            !matches!(
+                header.name.to_ascii_lowercase().as_str(),
+                "content-length" | "content-type" | "content-encoding" | "transfer-encoding"
+            )
+        });
+    }
+    request.url = next.to_string();
+    Ok(true)
 }
 
 async fn read_bounded_reqwest_body(
@@ -15805,6 +15891,9 @@ async fn read_bounded_reqwest_body(
 }
 
 fn map_reqwest_host_egress_error(err: reqwest::Error, label: &str, host: &str) -> HostError {
+    // Redirect Location values can carry provider query credentials. Neither
+    // the public error nor its Debug diagnostics may reproduce that URL.
+    let err = err.without_url();
     let category = if err.is_redirect() {
         "redirect denied"
     } else if err.is_timeout() {
@@ -16112,30 +16201,40 @@ async fn host_egress_tcp_handler(
     let authorized = authorize_host_egress_context(&state, &request.context, &resource_uri)
         .await
         .map_err(map_host_error)?;
-    let lease = acquire_host_egress_credential_lease(
-        &state,
-        &authorized.zone_id,
-        request.credential_id.as_deref(),
-        &authorized.credential_allow,
+    let lease = fcp_async_core::time::timeout(
+        authorized
+            .remaining_budget(started_at, "TCP")
+            .map_err(map_host_error)?,
+        acquire_host_egress_credential_lease(
+            &state,
+            &authorized.zone_id,
+            request.credential_id.as_deref(),
+            &authorized.credential_allow,
+        ),
     )
     .await
+    .map_err(|_| {
+        map_host_error(HostError::PreflightFailed(
+            "host-egress TCP credential acquisition deadline exhausted".to_owned(),
+        ))
+    })?
     .map_err(map_host_error)?;
-    let injector = HostCredentialInjector::new(lease.as_ref().map(|guard| guard.lease().clone()));
-    let noop = NoOpCredentialInjector;
-    let injector_ref: &dyn CredentialInjector = if request.credential_id.is_some() {
-        &injector
-    } else {
-        &noop
-    };
-    let result =
-        authorize_and_perform_host_tcp_egress(&authorized, request, injector_ref, started_at).await;
+    let result = authorize_and_perform_host_tcp_egress(
+        &state,
+        &authorized,
+        request,
+        lease.as_ref().map(CredentialLeaseGuard::lease),
+        started_at,
+    )
+    .await;
     result.map(Json).map_err(map_host_error)
 }
 
 async fn authorize_and_perform_host_tcp_egress(
+    state: &AppState,
     authorized: &AuthorizedHostEgress,
     request: HostEgressTcpRequest,
-    injector: &dyn CredentialInjector,
+    lease: Option<&CredentialLease>,
     started_at: Instant,
 ) -> HostResult<HostEgressTcpResponse> {
     authorized.require_current()?;
@@ -16146,16 +16245,27 @@ async fn authorize_and_perform_host_tcp_egress(
         sni_override: request.sni_override.clone(),
         credential_id: request.credential_id.clone(),
     };
+    let preliminary_injector = HostCredentialInjector::new(lease.cloned());
+    let noop = NoOpCredentialInjector;
+    let injector: &dyn CredentialInjector = if request.credential_id.is_some() {
+        &preliminary_injector
+    } else {
+        &noop
+    };
     let mut decision = fcp_host::authorize_runtime_tcp_egress(
         &authorized.decision_context(),
         &authorized.constraints,
         &guard_request,
         injector,
     )?;
+    // The preliminary check permits connection setup, not later disclosure of
+    // this payload snapshot. Only material reread through the live reservation
+    // after DNS/connect/TLS may be sent to the peer.
+    decision.tcp_auth = None;
     authorized.require_current()?;
     let response = fcp_async_core::time::timeout(
-        Duration::from_millis(u64::from(authorized.constraints.total_timeout_ms)),
-        perform_host_tcp_egress(&request, &mut decision, authorized),
+        authorized.remaining_budget(started_at, "TCP")?,
+        perform_host_tcp_egress(state, &request, &mut decision, authorized, lease),
     )
     .await
     .map_err(|_| {
@@ -16179,16 +16289,55 @@ struct RawTcpEgressResponse {
 }
 
 async fn perform_host_tcp_egress(
+    state: &AppState,
     request: &HostEgressTcpRequest,
     decision: &mut fcp_sandbox::EgressTcpDecision,
     authorized: &AuthorizedHostEgress,
+    lease: Option<&CredentialLease>,
 ) -> HostResult<RawTcpEgressResponse> {
     authorized.require_current()?;
     let constraints = &authorized.constraints;
     let mut stream = host_egress_tcp_io(request, &mut decision.decision, constraints).await?;
-    // DNS, socket connection and TLS negotiation may all outlive admission.
-    // Recheck before disclosing credentials or starting the requested effect.
+    // DNS, connection, TLS and pool contention may all outlive admission.
+    // A cloned credential payload is not a grant: replacement, removal,
+    // cooldown and explicit lease release must still prevent disclosure.
+    let current_lease = match lease {
+        Some(lease) => Some(
+            state
+                .credential_pools
+                .lock()
+                .await
+                .current_lease(lease, Utc::now())
+                .map_err(|_| {
+                    HostError::PreflightFailed(
+                        "host-egress TCP credential changed before dispatch".to_owned(),
+                    )
+                })?,
+        ),
+        None => None,
+    };
     authorized.require_current()?;
+    let current_injector = HostCredentialInjector::new(current_lease);
+    let noop = NoOpCredentialInjector;
+    let injector: &dyn CredentialInjector = if request.credential_id.is_some() {
+        &current_injector
+    } else {
+        &noop
+    };
+    let current_decision = fcp_host::authorize_runtime_tcp_egress(
+        &authorized.decision_context(),
+        constraints,
+        &EgressTcpConnectRequest {
+            host: request.host.clone(),
+            port: request.port,
+            tls: request.tls,
+            sni_override: request.sni_override.clone(),
+            credential_id: request.credential_id.clone(),
+        },
+        injector,
+    )?;
+    decision.tcp_auth = current_decision.tcp_auth;
+    decision.decision.credential_injected = current_decision.decision.credential_injected;
     let mut bytes_written = 0_u64;
     if let Some(auth) = decision.tcp_auth.as_deref() {
         stream.write_all(auth).await.map_err(|err| {
@@ -26396,6 +26545,388 @@ output_schema = {{ type = "object" }}
         );
     }
 
+    async fn d9us6_redirect_fixture(
+        addr: SocketAddr,
+        resource_allow: Vec<String>,
+        resource_deny: Vec<String>,
+    ) -> (Arc<AppState>, HostEgressHttpRequest) {
+        let connector_id = "fcp.test.redirect-authority:utility:1.0.0";
+        let operation_id = "test.egress_http";
+        let credential_id = CredentialId::parse("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb").unwrap();
+        let mut constraints = d9us6_loopback_constraints(addr.port());
+        constraints.max_redirects = 3;
+        let (state, signing_key) = d9us6_host_egress_state_with_constraints(
+            connector_id,
+            operation_id,
+            constraints,
+            credential_id,
+            json!({
+                "host_allow": ["127.0.0.1"],
+                "http": {"bearer_token": "redirect-fixture-secret"}
+            }),
+        )
+        .await;
+        let token = test_capability_token_with_constraints(
+            &signing_key,
+            "cap.test.egress",
+            operation_id,
+            ZoneId::work().as_str(),
+            &fcp_core::CapabilityConstraints {
+                resource_allow,
+                resource_deny,
+                credential_allow: vec![credential_id],
+                ..Default::default()
+            },
+        );
+        (
+            state,
+            HostEgressHttpRequest {
+                context: d9us6_host_egress_context(
+                    connector_id,
+                    operation_id,
+                    "req-redirect-authority",
+                    "corr-redirect-authority",
+                    &token,
+                ),
+                url: format!("http://{addr}/start"),
+                method: "GET".to_owned(),
+                headers: Vec::new(),
+                body: None,
+                credential_id: Some(credential_id.to_string()),
+            },
+        )
+    }
+
+    async fn d9us6_read_complete_http_request(
+        socket: &mut fcp_async_core::net::TcpStream,
+    ) -> String {
+        let mut bytes = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        loop {
+            let count = socket.read(&mut chunk).await.unwrap();
+            assert!(count > 0 && bytes.len() < 8192, "bounded fixture request");
+            bytes.extend_from_slice(&chunk[..count]);
+            if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                let headers = std::str::from_utf8(&bytes[..end]).unwrap();
+                let body_len = headers
+                    .lines()
+                    .filter_map(|line| line.split_once(':'))
+                    .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                    .map_or(0, |(_, value)| value.trim().parse::<usize>().unwrap());
+                assert!(body_len <= 4096, "bounded fixture body");
+                if bytes.len() >= end + 4 + body_len {
+                    return String::from_utf8(bytes).unwrap();
+                }
+            }
+        }
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn host_egress_http_redirect_reauthorizes_resource_scope_before_following() {
+        for case in ["allowed", "missing_allow", "explicit_deny"] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let next_url = format!("http://{addr}/next?token=redirect-query-secret");
+            let allow = match case {
+                "allowed" => vec![format!("http://{addr}/start"), next_url.clone()],
+                "missing_allow" => vec![format!("http://{addr}/start")],
+                _ => vec!["*".to_owned()],
+            };
+            let deny = if case == "explicit_deny" {
+                vec![next_url]
+            } else {
+                Vec::new()
+            };
+            let (state, request) = d9us6_redirect_fixture(addr, allow, deny).await;
+            let provider = task::spawn(async move {
+                let mut seen = Vec::new();
+                let count = if case == "allowed" { 2 } else { 1 };
+                for index in 0..count {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    seen.push(d9us6_read_complete_http_request(&mut socket).await);
+                    let response = if index == 0 {
+                        b"HTTP/1.1 302 Found\r\nLocation: /next?token=redirect-query-secret\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice()
+                    } else {
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK"
+                            .as_slice()
+                    };
+                    socket.write_all(response).await.unwrap();
+                    socket.flush().await.unwrap();
+                }
+                (listener, seen)
+            });
+            let result = host_egress_http_handler(State(state), Json(request)).await;
+            let (listener, seen) = provider.await.unwrap();
+            assert!(seen[0].starts_with("GET /start HTTP/1.1\r\n"));
+            assert!(seen[0].contains("Bearer redirect-fixture-secret"));
+            if case == "allowed" {
+                let response = result.expect("both target resources are authorized").0;
+                assert_eq!(response.status, 200);
+                assert_eq!(response.body.as_bytes(), b"OK");
+                assert!(response.egress.credential_injected);
+                assert!(seen[1].starts_with("GET /next?token=redirect-query-secret HTTP/1.1\r\n"));
+                assert!(seen[1].contains("Bearer redirect-fixture-secret"));
+            } else {
+                let error = result.expect_err("redirect target requires its own resource grant");
+                assert!(
+                    error.1.contains("redirect target authorization rejected"),
+                    "wrong denial for {case}: {error:?}"
+                );
+                assert!(!error.1.contains("redirect-fixture-secret"));
+                assert!(!error.1.contains("redirect-query-secret"));
+                assert!(
+                    fcp_async_core::time::timeout(Duration::from_millis(10), listener.accept())
+                        .await
+                        .is_err(),
+                    "denied target must not receive a connection"
+                );
+            }
+        }
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn host_egress_http_redirect_rechecks_lifecycle_and_credential_incarnations() {
+        for change in ["disable", "replace", "remove"] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (state, request) =
+                d9us6_redirect_fixture(addr, vec!["*".to_owned()], Vec::new()).await;
+            let credential_id =
+                CredentialId::parse(request.credential_id.as_deref().unwrap()).unwrap();
+            let connector_id = request.context.connector_id.parse().unwrap();
+            let provider_state = Arc::clone(&state);
+            let provider = task::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let first = d9us6_read_complete_http_request(&mut socket).await;
+                assert!(first.contains("Bearer redirect-fixture-secret"));
+                match change {
+                    "disable" => {
+                        provider_state
+                            .lifecycle
+                            .set_desired_state(
+                                &connector_id,
+                                fcp_host::DesiredRuntimeState::Disabled,
+                                None,
+                            )
+                            .await
+                            .unwrap();
+                    }
+                    "replace" => {
+                        provider_state
+                            .credential_pools
+                            .lock()
+                            .await
+                            .replace_payload_in_zone(
+                                &ZoneId::work(),
+                                credential_id,
+                                CredentialPayload::raw_json(json!({
+                                    "host_allow": ["127.0.0.1"],
+                                    "http": {"bearer_token": "redirect-replacement-secret"}
+                                })),
+                            )
+                            .unwrap();
+                    }
+                    _ => {
+                        let key = CredentialPoolKey::new(
+                            ProviderKey::new("d9us6-fixture").unwrap(),
+                            ZoneId::work(),
+                        );
+                        provider_state
+                            .credential_pools
+                            .lock()
+                            .await
+                            .remove_credential(&key, credential_id)
+                            .unwrap();
+                    }
+                }
+                socket
+                    .write_all(b"HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+                socket.flush().await.unwrap();
+                listener
+            });
+            let error = host_egress_http_handler(State(state), Json(request))
+                .await
+                .expect_err("authority changes must stop the next redirect hop");
+            assert!(
+                !error.1.contains("redirect-fixture-secret")
+                    && !error.1.contains("redirect-replacement-secret")
+            );
+            let listener = provider.await.unwrap();
+            assert!(
+                fcp_async_core::time::timeout(Duration::from_millis(10), listener.accept())
+                    .await
+                    .is_err(),
+                "{change} must prevent redirected credential disclosure"
+            );
+        }
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn host_egress_http_redirect_preserves_or_discards_method_and_body_explicitly() {
+        for (status, method, expected_method, keep_body) in [
+            (301, "POST", "GET", false),
+            (302, "POST", "GET", false),
+            (303, "PUT", "GET", false),
+            (303, "HEAD", "HEAD", false),
+            (307, "POST", "POST", true),
+            (308, "PUT", "PUT", true),
+            (302, "PUT", "PUT", true),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (state, mut request) =
+                d9us6_redirect_fixture(addr, vec!["*".to_owned()], Vec::new()).await;
+            request.method = method.to_owned();
+            request.body = Some(fcp_manifest::Base64Bytes::from_vec(b"payload".to_vec()));
+            request.headers.push(HostEgressHttpHeader {
+                name: "Content-Type".to_owned(),
+                value: "application/octet-stream".to_owned(),
+            });
+            let provider = task::spawn(async move {
+                let (mut first, _) = listener.accept().await.unwrap();
+                let sent = d9us6_read_complete_http_request(&mut first).await;
+                assert!(sent.starts_with(&format!("{method} /start HTTP/1.1\r\n")));
+                assert!(sent.ends_with("\r\n\r\npayload"));
+                first
+                    .write_all(format!("HTTP/1.1 {status} Redirect\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes())
+                    .await
+                    .unwrap();
+                first.flush().await.unwrap();
+                drop(first);
+                let (mut second, _) = listener.accept().await.unwrap();
+                let redirected = d9us6_read_complete_http_request(&mut second).await;
+                second
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+                second.flush().await.unwrap();
+                redirected
+            });
+            let response = host_egress_http_handler(State(state), Json(request))
+                .await
+                .expect("authorized redirect preserves standard request semantics")
+                .0;
+            assert_eq!(response.status, 200);
+            let redirected = provider.await.unwrap();
+            assert!(redirected.starts_with(&format!("{expected_method} /next HTTP/1.1\r\n")));
+            assert!(redirected.contains("Bearer redirect-fixture-secret"));
+            assert_eq!(redirected.ends_with("\r\n\r\npayload"), keep_body);
+            assert_eq!(
+                redirected
+                    .to_ascii_lowercase()
+                    .contains("content-type: application/octet-stream"),
+                keep_body
+            );
+        }
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn host_egress_http_redirect_keeps_the_original_remaining_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (state, request) = d9us6_redirect_fixture(addr, vec!["*".to_owned()], Vec::new()).await;
+        let authorized = authorize_host_egress_context(&state, &request.context, &request.url)
+            .await
+            .unwrap();
+        let lease = acquire_host_egress_credential_lease(
+            &state,
+            &authorized.zone_id,
+            request.credential_id.as_deref(),
+            &authorized.credential_allow,
+        )
+        .await
+        .unwrap();
+        let (release_tx, release_rx) = oneshot::channel();
+        let provider = task::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            d9us6_read_complete_http_request(&mut first).await;
+            first
+                .write_all(b"HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            first.flush().await.unwrap();
+            drop(first);
+            let (mut second, _) = listener.accept().await.unwrap();
+            let request = d9us6_read_complete_http_request(&mut second).await;
+            // Hold the second response until the caller's inherited budget
+            // expires, without relying on the transport's fresh 3s timeout.
+            release_rx.await.unwrap();
+            request
+        });
+        let started_at = Instant::now()
+            .checked_sub(Duration::from_millis(2_700))
+            .unwrap();
+        let result = fcp_async_core::time::timeout(
+            Duration::from_secs(1),
+            perform_authorized_host_http_egress_once(
+                &state,
+                &authorized,
+                &request,
+                lease.as_ref().map(CredentialLeaseGuard::lease),
+                started_at,
+            ),
+        )
+        .await;
+        release_tx.send(()).unwrap();
+        let observed = fcp_async_core::time::timeout(Duration::from_secs(2), provider)
+            .await
+            .expect("loopback provider must finish")
+            .unwrap();
+        assert!(observed.starts_with("GET /next HTTP/1.1\r\n"));
+        let error = result
+            .expect("redirects must not restart the 3s request budget")
+            .expect_err("pending response must exhaust the inherited deadline");
+        assert!(error.to_string().contains("timed out after 3000ms"));
+    }
+
+    #[test]
+    fn host_egress_http_redirect_rejects_ambiguous_targets_and_preserves_requests_on_denial() {
+        let request = HostEgressHttpRequest {
+            context: HostEgressContext {
+                connector_id: "fcp.test:utility:1.0.0".to_owned(),
+                operation_id: "test.http".to_owned(),
+                zone_id: "z:work".to_owned(),
+                request_id: "redirect-test".to_owned(),
+                correlation_id: None,
+                capability_token_cbor_b64: String::new(),
+            },
+            url: "https://example.test/start".to_owned(),
+            method: "POST".to_owned(),
+            headers: Vec::new(),
+            body: Some(fcp_manifest::Base64Bytes::from_vec(b"payload".to_vec())),
+            credential_id: None,
+        };
+        for target in [
+            "https://elsewhere.test/next",
+            "http://example.test/next",
+            "https://example.test:444/next",
+            "https://user:password@example.test/next",
+            "http://[invalid",
+        ] {
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(reqwest::header::LOCATION, target.parse().unwrap());
+            let mut denied = request.clone();
+            let error = advance_host_http_redirect(&mut denied, 302, &headers, 0, 3)
+                .expect_err("invalid or foreign redirect target");
+            assert_eq!(denied, request);
+            assert!(!error.to_string().contains("password"));
+        }
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.append(reqwest::header::LOCATION, "/next".parse().unwrap());
+        headers.append(reqwest::header::LOCATION, "/different".parse().unwrap());
+        assert!(advance_host_http_redirect(&mut request.clone(), 302, &headers, 0, 3).is_err());
+        headers.remove(reqwest::header::LOCATION);
+        headers.insert(reqwest::header::LOCATION, "/next#ignored".parse().unwrap());
+        assert!(advance_host_http_redirect(&mut request.clone(), 302, &headers, 3, 3).is_err());
+        let mut allowed = request;
+        assert!(advance_host_http_redirect(&mut allowed, 302, &headers, 2, 3).unwrap());
+        assert_eq!(allowed.url, "https://example.test/next");
+        assert_eq!(allowed.method, "GET");
+        assert!(allowed.body.is_none());
+    }
+
     #[fcp_async_core::runtime::test(flavor = "multi_thread")]
     async fn br_4kw5f_9_6_1_http_streaming_enforces_max_response_bytes_e2e_jsonl_matrix() {
         let body = b"0123456789abcdef0123456789abcdef";
@@ -28569,6 +29100,229 @@ output_schema = {{ type = "object" }}
         assert!(
             error.1.contains("HostNotAllowed") || error.1.contains("host not allowed"),
             "expected host denial, got: {error:?}"
+        );
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn host_tcp_egress_revalidates_credential_after_tls_negotiation() {
+        for mutation in ["replace", "remove", "cooldown", "unchanged"] {
+            let fixture = br_4kw5f_9_6_1_tls_fixture();
+            let acceptor = br_4kw5f_9_6_1_tls_acceptor(&fixture);
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let connector_id = "fcp.test.tcp-credential-fence:utility:1.0.0";
+            let operation_id = "test.egress_tcp";
+            let credential_id =
+                CredentialId::parse("0face000-1111-4111-8111-111111111111").unwrap();
+            let (state, signing_key) = d9us6_host_egress_state(
+                connector_id,
+                operation_id,
+                addr.port(),
+                credential_id,
+                json!({
+                    "host_allow": ["127.0.0.1"],
+                    "tcp": {"auth": "redaction-sentinel-stale-tcp-secret"}
+                }),
+            )
+            .await;
+            let server_state = Arc::clone(&state);
+            let server = task::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                // The host has already leased and checked the original
+                // credential, but cannot send application bytes until this
+                // deliberately delayed TLS handshake has completed.
+                let pool_key = CredentialPoolKey::new(
+                    ProviderKey::new("d9us6-fixture").unwrap(),
+                    ZoneId::work(),
+                );
+                {
+                    let mut pools = server_state.credential_pools.lock().await;
+                    assert_eq!(
+                        pools.redacted_view(&pool_key, Utc::now()).unwrap().entries[0]
+                            .active_leases,
+                        1,
+                        "mutation must happen after the real lease was acquired"
+                    );
+                    match mutation {
+                        "replace" => pools
+                            .replace_payload_in_zone(
+                                &ZoneId::work(),
+                                credential_id,
+                                CredentialPayload::raw_json(json!({
+                                    "host_allow": ["127.0.0.1"],
+                                    "tcp": {"auth": "replacement-tcp-secret"}
+                                })),
+                            )
+                            .unwrap(),
+                        "remove" => {
+                            pools.remove_credential(&pool_key, credential_id).unwrap();
+                        }
+                        "cooldown" => pools
+                            .set_cooldown(
+                                &pool_key,
+                                credential_id,
+                                Some(fcp_host::CredentialCooldown::Permanent),
+                            )
+                            .unwrap(),
+                        "unchanged" => {}
+                        _ => unreachable!(),
+                    }
+                }
+                let mut stream = acceptor.accept(socket).await.unwrap();
+                let mut received = Vec::new();
+                let mut buf = [0_u8; 128];
+                while !received.ends_with(b"PING") && received.len() < 1024 {
+                    // A denied request drops the TLS stream without requiring
+                    // close_notify; either EOF form still carries no app data.
+                    let count = stream.read(&mut buf).await.unwrap_or(0);
+                    if count == 0 {
+                        break;
+                    }
+                    received.extend_from_slice(&buf[..count]);
+                }
+                if mutation == "unchanged" {
+                    stream.write_all(b"PONG").await.unwrap();
+                    stream.flush().await.unwrap();
+                }
+                received
+            });
+            let token =
+                d9us6_token_with_credentials(&signing_key, operation_id, vec![credential_id]);
+            let result = host_egress_tcp_handler(
+                State(Arc::clone(&state)),
+                Json(HostEgressTcpRequest {
+                    context: d9us6_host_egress_context(
+                        connector_id,
+                        operation_id,
+                        "req-tcp-credential-fence",
+                        "corr-tcp-credential-fence",
+                        &token,
+                    ),
+                    host: "127.0.0.1".to_owned(),
+                    port: addr.port(),
+                    tls: true,
+                    sni_override: None,
+                    write: Some(fcp_manifest::Base64Bytes::from_vec(b"PING".to_vec())),
+                    read_limit_bytes: Some(4),
+                    credential_id: Some(credential_id.to_string()),
+                }),
+            )
+            .await;
+            let received = fcp_async_core::time::timeout(Duration::from_secs(2), server)
+                .await
+                .expect("the denied TLS transport must close")
+                .unwrap();
+            if mutation == "unchanged" {
+                let response = result.expect("an unchanged lease still authorizes TCP").0;
+                assert_eq!(response.read.as_bytes(), b"PONG");
+                assert_eq!(received, b"redaction-sentinel-stale-tcp-secretPING");
+            } else {
+                let error = result.expect_err("superseded TCP auth must never be sent");
+                assert!(error.1.contains("credential changed before dispatch"));
+                assert!(!error.1.contains("tcp-secret"));
+                assert!(received.is_empty(), "{mutation} leaked application bytes");
+            }
+            assert!(
+                state
+                    .credential_pools
+                    .lock()
+                    .await
+                    .redacted_views(Utc::now())
+                    .iter()
+                    .flat_map(|pool| &pool.entries)
+                    .all(|entry| entry.active_leases == 0),
+                "{mutation} must release the original reservation"
+            );
+        }
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn host_tcp_egress_bounds_credential_contention_by_original_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connector_id = "fcp.test.tcp-credential-budget:utility:1.0.0";
+        let operation_id = "test.egress_tcp";
+        let credential_id = CredentialId::parse("0face000-2222-4222-8222-222222222222").unwrap();
+        let mut constraints = d9us6_loopback_constraints(addr.port());
+        constraints.connect_timeout_ms = 20;
+        constraints.total_timeout_ms = 50;
+        let (state, signing_key) = d9us6_host_egress_state_with_constraints(
+            connector_id,
+            operation_id,
+            constraints,
+            credential_id,
+            json!({"host_allow": ["127.0.0.1"], "tcp": {"auth": "never-send"}}),
+        )
+        .await;
+        let token = d9us6_token_with_credentials(&signing_key, operation_id, vec![credential_id]);
+        let request = HostEgressTcpRequest {
+            context: d9us6_host_egress_context(
+                connector_id,
+                operation_id,
+                "req-tcp-credential-budget",
+                "corr-tcp-credential-budget",
+                &token,
+            ),
+            host: "127.0.0.1".to_owned(),
+            port: addr.port(),
+            tls: false,
+            sni_override: None,
+            write: Some(fcp_manifest::Base64Bytes::from_vec(b"PING".to_vec())),
+            read_limit_bytes: Some(4),
+            credential_id: Some(credential_id.to_string()),
+        };
+        let pools = state.credential_pools.lock().await;
+        let error = fcp_async_core::time::timeout(
+            Duration::from_secs(2),
+            host_egress_tcp_handler(State(Arc::clone(&state)), Json(request.clone())),
+        )
+        .await
+        .expect("pool contention must not outlive the TCP request budget")
+        .expect_err("the held pool lock must exhaust credential acquisition");
+        assert!(error.1.contains("deadline exhausted"));
+        assert!(
+            pools
+                .redacted_views(Utc::now())
+                .iter()
+                .flat_map(|pool| &pool.entries)
+                .all(|entry| entry.active_leases == 0)
+        );
+        drop(pools);
+
+        // Admission time is part of the same deadline. Dispatch must refuse
+        // an already exhausted request rather than granting a fresh 50ms.
+        let authorized = authorize_host_egress_context(
+            &state,
+            &request.context,
+            &format!("tcp://{}:{}", request.host, request.port),
+        )
+        .await
+        .unwrap();
+        let lease = acquire_host_egress_credential_lease(
+            &state,
+            &authorized.zone_id,
+            request.credential_id.as_deref(),
+            &authorized.credential_allow,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let expired_start = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
+        let error = authorize_and_perform_host_tcp_egress(
+            &state,
+            &authorized,
+            request,
+            Some(lease.lease()),
+            expired_start,
+        )
+        .await
+        .expect_err("elapsed admission time cannot renew the TCP budget");
+        assert!(error.to_string().contains("deadline exhausted"));
+        assert!(
+            fcp_async_core::time::timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err(),
+            "neither rejected request may connect to the provider"
         );
     }
 
