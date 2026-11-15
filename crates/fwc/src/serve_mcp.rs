@@ -6,6 +6,8 @@
 //! the CLI can reuse the existing invoke planning path.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use fcp_async_core::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
@@ -204,6 +206,10 @@ pub struct McpToolDefinition {
     /// connector after the tool's zone envelope has been checked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_connector_id: Option<String>,
+    /// Private binding to the host's deployment version and complete operation
+    /// descriptor, including authority fields absent from the MCP projection.
+    #[serde(skip)]
+    pub(crate) live_contract_digest: Option<[u8; 32]>,
     /// Operation within the connector.
     pub operation_id: String,
     /// Optional MCP annotations preserved from the export surface.
@@ -232,6 +238,7 @@ impl McpToolDefinition {
             input_schema,
             connector_id: connector_id.into(),
             runtime_connector_id: None,
+            live_contract_digest: None,
             operation_id: operation_id.into(),
             annotations: None,
             provenance: None,
@@ -259,6 +266,11 @@ impl McpToolDefinition {
     /// Attach an exact identity from authenticated host inventory.
     pub fn with_runtime_connector_id(mut self, connector_id: impl Into<String>) -> Self {
         self.runtime_connector_id = Some(connector_id.into());
+        self
+    }
+
+    pub(crate) fn with_live_contract_digest(mut self, digest: [u8; 32]) -> Self {
+        self.live_contract_digest = Some(digest);
         self
     }
 
@@ -1027,6 +1039,274 @@ where
         |request| handle_request(state, request),
         |request| prepare_stdio_tools_call(state, request),
         |(tool, id, arguments), context| tool_handler(tool, id, arguments, context),
+    )?;
+    Ok(())
+}
+
+/// One complete live inventory refresh shares this budget, including waiting
+/// for a concurrent refresh. Tool execution retains its separate host budget.
+pub const LIVE_INVENTORY_TIMEOUT: Duration = Duration::from_secs(10);
+/// Leave room for protocol wrappers within the transport's response bound.
+pub const MAX_LIVE_INVENTORY_BYTES: usize = 16 * 1024 * 1024;
+const MAX_LIVE_TOOLS: usize = 16_384;
+
+struct LiveInventoryState {
+    current: Arc<McpServerState>,
+    advertised: Arc<McpServerState>,
+    refreshing: bool,
+    last_refresh_ok: bool,
+}
+
+/// Only complete snapshots become visible. The last tools/list contract is
+/// retained separately so a refresh cannot silently retarget an accepted call
+/// to another connector version or a different input/risk/zone contract.
+struct LiveMcpInventory {
+    state: Mutex<LiveInventoryState>,
+    changed: Condvar,
+    config: McpServerConfig,
+    server_info: McpServerInfo,
+}
+
+impl LiveMcpInventory {
+    fn new(initial: &McpServerState) -> Result<Self> {
+        validate_live_tools(&initial.tools)?;
+        let initial = Arc::new(initial.clone());
+        Ok(Self {
+            state: Mutex::new(LiveInventoryState {
+                current: Arc::clone(&initial),
+                advertised: Arc::clone(&initial),
+                refreshing: false,
+                last_refresh_ok: true,
+            }),
+            changed: Condvar::new(),
+            config: initial.config.clone(),
+            server_info: initial.server_info.clone(),
+        })
+    }
+
+    fn advertised(&self) -> Arc<McpServerState> {
+        Arc::clone(
+            &self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .advertised,
+        )
+    }
+
+    fn refresh<F>(
+        &self,
+        loader: &F,
+        advertise: bool,
+        context: Option<&McpCallContext>,
+    ) -> Result<Arc<McpServerState>, JsonRpcError>
+    where
+        F: Fn(Instant) -> Result<Vec<McpToolDefinition>>,
+    {
+        let deadline = Instant::now() + LIVE_INVENTORY_TIMEOUT;
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.refreshing {
+            while state.refreshing {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() || context.is_some_and(McpCallContext::is_cancelled) {
+                    return Err(live_inventory_unavailable());
+                }
+                (state, _) = self
+                    .changed
+                    .wait_timeout(state, remaining)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            if !state.last_refresh_ok
+                || Instant::now() >= deadline
+                || context.is_some_and(McpCallContext::is_cancelled)
+            {
+                return Err(live_inventory_unavailable());
+            }
+            if advertise {
+                state.advertised = Arc::clone(&state.current);
+            }
+            return Ok(Arc::clone(&state.current));
+        }
+        if context.is_some_and(McpCallContext::is_cancelled) {
+            return Err(live_inventory_unavailable());
+        }
+        state.refreshing = true;
+        drop(state);
+
+        // A loader panic must also release waiting readers and calls. Loading
+        // performs metadata reads only; no connector effect has been admitted.
+        let refreshed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let tools = loader(deadline)?;
+            validate_live_tools(&tools)?;
+            let mut snapshot = state_from_tools(tools, self.config.clone());
+            snapshot.server_info = self.server_info.clone();
+            anyhow::ensure!(Instant::now() < deadline, "live inventory refresh expired");
+            Ok::<_, anyhow::Error>(Arc::new(snapshot))
+        }))
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("live inventory refresh panicked")));
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.refreshing = false;
+        state.last_refresh_ok = refreshed.is_ok();
+        if let Ok(snapshot) = refreshed {
+            state.current = snapshot;
+            if advertise {
+                state.advertised = Arc::clone(&state.current);
+            }
+        }
+        self.changed.notify_all();
+        if !state.last_refresh_ok || context.is_some_and(McpCallContext::is_cancelled) {
+            return Err(live_inventory_unavailable());
+        }
+        Ok(Arc::clone(&state.current))
+    }
+}
+
+fn validate_live_tools(tools: &[McpToolDefinition]) -> Result<()> {
+    anyhow::ensure!(
+        tools.len() <= MAX_LIVE_TOOLS,
+        "live MCP inventory has too many tools"
+    );
+    let mut names = BTreeSet::new();
+    for tool in tools {
+        anyhow::ensure!(
+            !tool.name.is_empty()
+                && !tool.connector_id.is_empty()
+                && !tool.operation_id.is_empty()
+                && tool
+                    .runtime_connector_id
+                    .as_ref()
+                    .is_some_and(|id| !id.is_empty())
+                && tool.live_contract_digest.is_some()
+                && tool.input_schema.is_object(),
+            "live MCP inventory contains an incomplete tool definition"
+        );
+        anyhow::ensure!(
+            names.insert(&tool.name),
+            "live MCP inventory contains a duplicate tool name"
+        );
+    }
+    anyhow::ensure!(
+        serde_json::to_vec(tools)?.len() <= MAX_LIVE_INVENTORY_BYTES,
+        "live MCP inventory exceeds its byte limit"
+    );
+    Ok(())
+}
+
+fn live_inventory_unavailable() -> JsonRpcError {
+    JsonRpcError::internal(
+        "Live tool inventory could not be refreshed. Retry tools/list after the host recovers; no connector invocation was sent.",
+    )
+    .with_data(json!({
+        "kind": "live_inventory_unavailable", "retryable": true, "invoked": false,
+    }))
+}
+
+fn same_live_tool_contract(listed: &McpToolDefinition, current: &McpToolDefinition) -> bool {
+    listed.execution_connector_id() == current.execution_connector_id()
+        && listed.live_contract_digest == current.live_contract_digest
+        && listed.connector_id == current.connector_id
+        && listed.operation_id == current.operation_id
+        && listed.input_schema == current.input_schema
+        && listed.supported_zones == current.supported_zones
+        && listed.annotations == current.annotations
+}
+
+/// Serve a live host inventory without restarting the MCP session. Listing
+/// tools/resources/prompts refreshes all metadata atomically. Every tool worker
+/// also refreshes before execution and requires the contract advertised to that
+/// call to remain valid. Host failures never authorize stale inventory.
+///
+/// Refresh callbacks must honor the supplied absolute deadline and bound their
+/// response bodies. Refreshes are coalesced; no background polling is started.
+/// Tools/list runs on the reader and can delay metadata/cancellation intake by
+/// at most one refresh budget. Tool-call refreshes run on the existing workers.
+pub fn run_live_stdio_transport_blocking<R, W, Refresh, F>(
+    initial: &McpServerState,
+    reader: R,
+    writer: W,
+    refresh: Refresh,
+    tool_handler: F,
+) -> Result<()>
+where
+    R: std::io::BufRead,
+    W: std::io::Write + Send,
+    Refresh: Fn(Instant) -> Result<Vec<McpToolDefinition>> + Sync,
+    F: Fn(&McpToolDefinition, Value, Value, McpCallContext) -> JsonRpcResponse + Sync,
+{
+    let inventory = LiveMcpInventory::new(initial)?;
+    transport::run_blocking(
+        reader,
+        writer,
+        transport::TransportLimits::default(),
+        |request| {
+            if matches!(
+                request.method.as_str(),
+                "tools/list" | "resources/list" | "resources/read" | "prompts/list" | "prompts/get"
+            ) {
+                return match inventory.refresh(&refresh, request.method == "tools/list", None) {
+                    Ok(state) => handle_request(&state, request),
+                    Err(error) => {
+                        JsonRpcResponse::error(request.id.clone().unwrap_or(Value::Null), error)
+                    }
+                };
+            }
+            let mut response = handle_request(initial, request);
+            if request.method == "initialize"
+                && let Some(result) = response.result.as_mut()
+            {
+                // These surfaces may become nonempty after initialization.
+                if initial.config.include_resources {
+                    result["capabilities"]["resources"] = json!({});
+                }
+                if initial.config.include_prompts {
+                    result["capabilities"]["prompts"] = json!({});
+                }
+            }
+            response
+        },
+        |request| {
+            let state = inventory.advertised();
+            let (tool, id, arguments) = prepare_stdio_tools_call(&state, request)?;
+            Ok((tool.clone(), id, arguments, request.clone()))
+        },
+        |(listed, id, arguments, request), context| {
+            let state = match inventory.refresh(&refresh, false, Some(&context)) {
+                Ok(state) => state,
+                Err(error) => return JsonRpcResponse::error(id, error),
+            };
+            let changed = || {
+                let error = JsonRpcError::invalid_params(
+                    "The tool definition changed. Call tools/list and review its current contract before invoking it again.",
+                ).with_data(json!({
+                    "kind": "tool_definition_changed", "tool": listed.name,
+                    "retryable": false, "invoked": false,
+                }));
+                JsonRpcResponse::error(id.clone(), error)
+            };
+            let Some(current) = state.find_tool(&listed.name) else {
+                return changed();
+            };
+            if let Err(error) = validate_tool_access(
+                &state,
+                current,
+                request.params.as_ref().unwrap_or(&Value::Null),
+            ) {
+                return JsonRpcResponse::error(id, error);
+            }
+            if !same_live_tool_contract(&listed, current) {
+                return changed();
+            }
+            if context.is_cancelled() {
+                return JsonRpcResponse::error(id, live_inventory_unavailable());
+            }
+            tool_handler(current, id, arguments, context)
+        },
     )?;
     Ok(())
 }
@@ -1984,6 +2264,7 @@ mod tests {
 
     fn sample_live_tool() -> McpToolDefinition {
         sample_tool()
+            .with_live_contract_digest([1; 32])
             .with_annotations(Some(export_tools::McpToolAnnotations {
                 risk_level: Some("low".to_owned()),
                 safety_tier: Some("safe".to_owned()),
@@ -2091,6 +2372,263 @@ mod tests {
             method: method.to_string(),
             params,
         }
+    }
+
+    struct LiveTestClient {
+        input: std::net::TcpStream,
+        output: std::io::BufReader<std::net::TcpStream>,
+        server: Option<std::thread::JoinHandle<Result<()>>>,
+    }
+
+    impl LiveTestClient {
+        fn start<Refresh, F>(initial: McpServerState, refresh: Refresh, handler: F) -> Self
+        where
+            Refresh: Fn(Instant) -> Result<Vec<McpToolDefinition>> + Send + Sync + 'static,
+            F: Fn(&McpToolDefinition, Value, Value, McpCallContext) -> JsonRpcResponse
+                + Send
+                + Sync
+                + 'static,
+        {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let input = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            input
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            input
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let output = std::io::BufReader::new(input.try_clone().unwrap());
+            let (server, _) = listener.accept().unwrap();
+            let worker = std::thread::spawn(move || {
+                run_live_stdio_transport_blocking(
+                    &initial,
+                    std::io::BufReader::new(server.try_clone().unwrap()),
+                    server,
+                    refresh,
+                    handler,
+                )
+            });
+            Self {
+                input,
+                output,
+                server: Some(worker),
+            }
+        }
+
+        fn send(&mut self, value: Value) {
+            use std::io::Write;
+            serde_json::to_writer(&mut self.input, &value).unwrap();
+            self.input.write_all(b"\n").unwrap();
+            self.input.flush().unwrap();
+        }
+
+        fn request(&mut self, method: &str, params: Value) -> JsonRpcResponse {
+            use std::io::BufRead;
+            self.send(json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}));
+            let mut line = String::new();
+            self.output.read_line(&mut line).unwrap();
+            serde_json::from_str(&line).unwrap()
+        }
+    }
+
+    impl Drop for LiveTestClient {
+        fn drop(&mut self) {
+            let _ = self.input.shutdown(std::net::Shutdown::Both);
+            if let Some(server) = self.server.take() {
+                let result = server.join();
+                if !std::thread::panicking() {
+                    result.unwrap().unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn live_stdio_refreshes_added_tools_resources_and_removals_without_reconnecting() {
+        let github = sample_live_tool().with_runtime_connector_id("fcp.github:utility:1.0.0");
+        let slack = McpToolDefinition::new(
+            "slack.channels",
+            "List channels",
+            json!({"type": "object"}),
+            "slack",
+            "slack.channels",
+        )
+        .with_runtime_connector_id("fcp.slack:utility:1.0.0")
+        .with_live_contract_digest([2; 32]);
+        let next = Arc::new(Mutex::new(vec![github.clone()]));
+        let loader = Arc::clone(&next);
+        let mut client = LiveTestClient::start(
+            state_from_tools([], McpServerConfig::default()),
+            move |_| Ok(loader.lock().unwrap().clone()),
+            |tool, id, _, _| {
+                JsonRpcResponse::success(id, json!({"executed": tool.execution_connector_id()}))
+            },
+        );
+        let initialized = client.request("initialize", json!({}));
+        assert!(
+            initialized.result().unwrap()["capabilities"]
+                .get("resources")
+                .is_some()
+        );
+        let first = client.request("tools/list", json!({}));
+        assert_eq!(
+            first.result().unwrap()["tools"].as_array().unwrap().len(),
+            1
+        );
+
+        *next.lock().unwrap() = vec![github, slack.clone()];
+        let resources = client.request("resources/list", json!({}));
+        assert!(
+            resources.result().unwrap()["resources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|resource| resource["uri"].as_str().unwrap().contains("/slack/"))
+        );
+        let added = client.request("tools/list", json!({}));
+        assert_eq!(
+            added.result().unwrap()["tools"].as_array().unwrap().len(),
+            2
+        );
+        let called = client.request(
+            "tools/call",
+            json!({"name": "slack.channels", "arguments": {}}),
+        );
+        assert_eq!(
+            called.result().unwrap()["executed"],
+            "fcp.slack:utility:1.0.0"
+        );
+
+        *next.lock().unwrap() = vec![slack];
+        let removed = client.request("tools/list", json!({}));
+        assert_eq!(
+            removed.result().unwrap()["tools"].as_array().unwrap().len(),
+            1
+        );
+        let missing = client.request(
+            "tools/call",
+            json!({"name": "github.list_issues", "arguments": {}}),
+        );
+        assert_eq!(missing.error.unwrap().code, INVALID_PARAMS);
+    }
+
+    #[test]
+    fn live_stdio_revalidates_listed_contracts_and_recovers_from_failed_refreshes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let original = sample_live_tool().with_runtime_connector_id("fcp.github:utility:1.0.0");
+        let next = Arc::new(Mutex::new(Some(vec![original.clone()])));
+        let loader = Arc::clone(&next);
+        let invoked = Arc::new(AtomicUsize::new(0));
+        let effects = Arc::clone(&invoked);
+        let mut client = LiveTestClient::start(
+            state_from_tools(
+                [original.clone()],
+                McpServerConfig::new().with_risk_max("low"),
+            ),
+            move |_| {
+                loader
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("host down"))
+            },
+            move |tool, id, _, _| {
+                effects.fetch_add(1, Ordering::SeqCst);
+                JsonRpcResponse::success(id, json!({"executed": tool.execution_connector_id()}))
+            },
+        );
+        for changed in [
+            original
+                .clone()
+                .with_runtime_connector_id("fcp.github:utility:2.0.0"),
+            original.clone().with_live_contract_digest([2; 32]),
+            {
+                let mut tool = original.clone();
+                tool.input_schema["required"] = json!(["new_required_field"]);
+                tool
+            },
+            {
+                let mut tool = original.clone();
+                tool.annotations.as_mut().unwrap().risk_level = Some("high".to_owned());
+                tool
+            },
+            original
+                .clone()
+                .with_supported_zones(vec!["z:private".to_owned()]),
+        ] {
+            *next.lock().unwrap() = Some(vec![original.clone()]);
+            assert!(!client.request("tools/list", json!({})).is_error());
+            *next.lock().unwrap() = Some(vec![changed]);
+            let refused = client.request(
+                "tools/call",
+                json!({"name": original.name, "arguments": {}}),
+            );
+            assert!(refused.is_error());
+            assert_eq!(invoked.load(Ordering::SeqCst), 0);
+        }
+        for unavailable in [None, Some(vec![original.clone(), original.clone()])] {
+            *next.lock().unwrap() = unavailable;
+            assert!(client.request("tools/list", json!({})).is_error());
+            let refused = client.request(
+                "tools/call",
+                json!({"name": original.name, "arguments": {}}),
+            );
+            assert_eq!(
+                refused.error.unwrap().data.unwrap()["kind"],
+                "live_inventory_unavailable"
+            );
+            assert_eq!(invoked.load(Ordering::SeqCst), 0);
+        }
+        let replacement = original.with_runtime_connector_id("fcp.github:utility:2.0.0");
+        *next.lock().unwrap() = Some(vec![replacement]);
+        assert!(!client.request("tools/list", json!({})).is_error());
+        let resumed = client.request(
+            "tools/call",
+            json!({"name": "github.list_issues", "arguments": {}}),
+        );
+        assert_eq!(
+            resumed.result().unwrap()["executed"],
+            "fcp.github:utility:2.0.0"
+        );
+        assert_eq!(invoked.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn live_stdio_keeps_cancellation_responsive_while_a_worker_refreshes_metadata() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let tool = sample_live_tool().with_runtime_connector_id("fcp.github:utility:1.0.0");
+        let (started, start) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let released = Mutex::new(released);
+        let invoked = Arc::new(AtomicUsize::new(0));
+        let effects = Arc::clone(&invoked);
+        let mut client = LiveTestClient::start(
+            state_from_tools([tool.clone()], McpServerConfig::default()),
+            move |_| {
+                started.send(()).unwrap();
+                released
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+                Ok(vec![tool.clone()])
+            },
+            move |_, id, _, _| {
+                effects.fetch_add(1, Ordering::SeqCst);
+                JsonRpcResponse::success(id, json!({}))
+            },
+        );
+        client.send(json!({"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+            "params": {"name": "github.list_issues", "arguments": {}}}));
+        start.recv_timeout(Duration::from_secs(5)).unwrap();
+        client.send(
+            json!({"jsonrpc": "2.0", "method": "notifications/cancelled",
+            "params": {"requestId": 7}}),
+        );
+        assert!(!client.request("ping", json!({})).is_error());
+        release.send(()).unwrap();
+        drop(client);
+        assert_eq!(invoked.load(Ordering::SeqCst), 0);
     }
 
     async fn connected_tcp_pair() -> (TcpStream, TcpStream) {

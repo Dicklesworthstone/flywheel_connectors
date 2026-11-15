@@ -1875,6 +1875,25 @@ so removing an installed version or operation cannot silently redirect a retaine
 MCP tool to a similarly named replacement. Normal host preflight, capabilities,
 approvals, and current admission rules still apply to every call.
 
+Live MCP sessions refresh the host's inventory when tools, catalog resources, or
+prompts are requested. Newly installed connectors and changed schemas become
+visible without reconnecting. An explicit connector selector stays bound to its
+original canonical identity. Every tool call refreshes metadata before dispatch
+and compares the listed tool's deployment version, schemas, operation authority,
+risk, and zone contract with the current definition. A changed or removed tool
+is refused until the client requests and reviews `tools/list` again. Host errors,
+partial responses, duplicate tool names, and inventory changes during collection
+produce an error without sending a connector invocation; they never authorize
+execution from a stale snapshot.
+
+Each complete inventory refresh has a shared 10-second deadline, with bounded
+response bodies and a 16-MiB tool inventory limit. Concurrent refreshes share the
+same in-flight collection. Tool-call refreshes run on the existing workers, so
+`ping` and cancellation remain responsive while those workers read metadata.
+A catalog request handled by the input reader can delay subsequent requests by
+up to one refresh deadline. There is no background polling or change-notification
+subscription; clients request `tools/list` to discover updates.
+
 The stdio server admits up to eight queued or running tool calls and continues reading requests while those calls execute. `ping` and tool discovery can respond while a provider call is pending. Requests and responses are limited to 32 MiB, and request IDs to 256 bytes. Calls beyond the concurrency limit receive a `server_busy` error before execution. Each accepted tool call has a fresh host request identity, including calls with identical arguments or a reused MCP request ID.
 
 MCP `notifications/cancelled` cancels the matching active call. Closing the input stream cancels all active calls and waits for their workers to drain. Cancellation prevents queued work and suppresses cancelled responses. To request cancellation of work already admitted by the host, supply a separate, host-issued `host.cancel-self` capability using `--cancel-capability-token-file` or `--cancel-capability-token`. It must have the same principal and zone as the invocation capability and cannot be holder-bound. The host verifies its signature, persisted issuance, validity, revocation, and operation ownership. Each call retains its original cancellation credential even if the file changes afterward.

@@ -3902,8 +3902,17 @@ fn execute_serve_mcp(prepared: &PreparedCli, args: &ServeMcpArgs) -> Result<Exec
             );
         }
     };
-    let client = HostAdminClient::new(&resolved_host.endpoint)?;
-    let (catalog, _) = client.catalog(None)?;
+    let startup_budget = pipe::budget::ExecutionBudget::start(
+        Some(u64::try_from(
+            serve_mcp::LIVE_INVENTORY_TIMEOUT.as_millis(),
+        )?),
+        std::time::Instant::now(),
+    );
+    let client = HostAdminClient::new(&resolved_host.endpoint)?
+        .with_read_budget(startup_budget)
+        .with_response_limit(MCP_INVENTORY_RESPONSE_LIMIT);
+    let (catalog, discovery) = client.catalog(None)?;
+    serve_mcp_discovery_binding(&discovery)?;
     let connectors = if let Some(selector) = &args.connector {
         let connector = match catalog.resolve_connector(selector) {
             Ok(connector) => connector,
@@ -3946,9 +3955,16 @@ fn execute_serve_mcp(prepared: &PreparedCli, args: &ServeMcpArgs) -> Result<Exec
     }
 
     let mut tools = Vec::new();
+    let mut inventory_bytes = 0usize;
     for connector in &connectors {
+        if !connector.summary.enabled {
+            continue;
+        }
         let (introspection, _) =
             client.introspect_with_provenance(connector.summary.id.as_str())?;
+        if !introspection.connector.enabled {
+            continue;
+        }
         let mut connector_tools = try_host_mcp_tool_definitions(connector, &introspection)?;
         if let Some(zone) = zone.as_ref() {
             anyhow::ensure!(
@@ -3962,9 +3978,24 @@ fn execute_serve_mcp(prepared: &PreparedCli, args: &ServeMcpArgs) -> Result<Exec
                 tool.supported_zones = vec![zone.to_string()];
             }
         }
+        inventory_bytes = inventory_bytes
+            .checked_add(serde_json::to_vec(&connector_tools)?.len())
+            .context("live MCP inventory size overflow")?;
+        anyhow::ensure!(
+            inventory_bytes <= serve_mcp::MAX_LIVE_INVENTORY_BYTES,
+            "live MCP inventory exceeds its byte limit"
+        );
         tools.extend(connector_tools);
     }
 
+    // An explicit selector remains pinned to the identity resolved at startup.
+    // A replacement with the same slug cannot silently broaden this session.
+    let selected_identity = args
+        .connector
+        .as_ref()
+        .and(connectors.first())
+        .map(|connector| connector.summary.id.to_string());
+    let inventory_zone = zone.clone();
     let zone = zone.map(|zone| zone.to_string());
     let state = serve_mcp::state_from_tools(tools, config);
     let stdin = std::io::stdin();
@@ -3973,10 +4004,18 @@ fn execute_serve_mcp(prepared: &PreparedCli, args: &ServeMcpArgs) -> Result<Exec
     let principal = args.principal.clone();
     let auth = args.auth.clone();
     let cancellation = args.cancellation.clone();
-    serve_mcp::run_stdio_transport_blocking(
+    serve_mcp::run_live_stdio_transport_blocking(
         &state,
         stdin.lock(),
         stdout,
+        move |deadline| {
+            refresh_serve_mcp_inventory(
+                &client,
+                selected_identity.as_deref(),
+                inventory_zone.as_ref(),
+                deadline,
+            )
+        },
         move |tool, id, arguments, context| {
             mcp_tool_call_response(
                 tool,
@@ -3996,6 +4035,132 @@ fn execute_serve_mcp(prepared: &PreparedCli, args: &ServeMcpArgs) -> Result<Exec
         text: String::new(),
         exit_code: ExitCode::SUCCESS,
     })
+}
+
+const MCP_INVENTORY_RESPONSE_LIMIT: u64 = 4 * 1024 * 1024;
+const MAX_MCP_INVENTORY_CONNECTORS: usize = 512;
+
+/// Bind the discovery fields that can change which tools this session exposes.
+/// Health timestamps are intentionally excluded: they are not catalog epochs.
+fn serve_mcp_discovery_binding(
+    response: &HostDiscoveryResponse,
+) -> Result<BTreeMap<String, Value>> {
+    anyhow::ensure!(
+        response.connectors.len() <= MAX_MCP_INVENTORY_CONNECTORS
+            && response.meta.as_ref().is_none_or(|meta| meta.status == 200),
+        "host returned an incomplete or oversized MCP connector inventory"
+    );
+    let mut binding = BTreeMap::new();
+    for connector in &response.connectors {
+        anyhow::ensure!(binding.insert(connector.id.to_string(), json!({
+            "version": connector.version, "enabled": connector.enabled,
+            "tool_count": connector.tool_count, "max_safety_tier": connector.max_safety_tier,
+        })).is_none(), "host returned duplicate MCP connector identities");
+    }
+    Ok(binding)
+}
+
+/// Collect all selected metadata before publishing anything to the MCP client.
+/// Each HTTP read and the final discovery check consume the same deadline.
+fn refresh_serve_mcp_inventory(
+    client: &HostAdminClient,
+    selected_identity: Option<&str>,
+    zone: Option<&ZoneId>,
+    deadline: std::time::Instant,
+) -> Result<Vec<serve_mcp::McpToolDefinition>> {
+    let now = std::time::Instant::now();
+    let remaining_ms = u64::try_from(deadline.saturating_duration_since(now).as_millis())?;
+    anyhow::ensure!(remaining_ms > 0, "MCP inventory refresh deadline expired");
+    let budget = pipe::budget::ExecutionBudget::start(Some(remaining_ms), now);
+    let client = client
+        .clone()
+        .with_read_budget(budget)
+        .with_response_limit(MCP_INVENTORY_RESPONSE_LIMIT);
+    let (catalog, discovery, _) = client.catalog_with_provenance(None)?;
+    let initial_binding = serve_mcp_discovery_binding(&discovery)?;
+    let mut tools = Vec::new();
+    let mut inventory_bytes = 0usize;
+    for mut connector in catalog.connectors {
+        let id = connector.summary.id.to_string();
+        if selected_identity.is_some_and(|selected| selected != id.as_str())
+            || !connector.summary.enabled
+        {
+            continue;
+        }
+        let zone_provenance = if let Some(zone) = zone {
+            let (inventory, provenance) = client.connector_with_provenance(&id)?;
+            anyhow::ensure!(
+                inventory
+                    .meta
+                    .as_ref()
+                    .is_none_or(|meta| meta.status == 200)
+                    && inventory.connector.version == connector.summary.version,
+                "connector inventory changed during MCP refresh"
+            );
+            let allowed = inventory
+                .allowed_zones
+                .context("host did not attest the connector's current zone envelope")?;
+            if !inventory.connector.enabled || !allowed.contains(zone) {
+                continue;
+            }
+            connector.summary = inventory.connector;
+            Some(provenance)
+        } else {
+            None
+        };
+        let (introspection, provenance) = client.introspect_with_provenance(&id)?;
+        anyhow::ensure!(
+            introspection
+                .meta
+                .as_ref()
+                .is_none_or(|meta| meta.status == 200),
+            "host returned incomplete MCP introspection"
+        );
+        if !introspection.connector.enabled {
+            continue;
+        }
+        anyhow::ensure!(
+            introspection.connector.tool_count == connector.summary.tool_count
+                && usize::try_from(introspection.connector.tool_count)?
+                    == introspection.tools.len(),
+            "host returned a partial MCP tool inventory"
+        );
+        if let Some(inventory_origin) = zone_provenance {
+            anyhow::ensure!(
+                inventory_origin
+                    .route
+                    .as_ref()
+                    .map(|route| (&route.entry_node, &route.served_by))
+                    == provenance
+                        .route
+                        .as_ref()
+                        .map(|route| (&route.entry_node, &route.served_by)),
+                "zone inventory and introspection came from different mesh executors"
+            );
+        }
+        let mut connector_tools = try_host_mcp_tool_definitions(&connector, &introspection)?;
+        if let Some(zone) = zone {
+            for tool in &mut connector_tools {
+                tool.supported_zones = vec![zone.to_string()];
+            }
+        }
+        inventory_bytes = inventory_bytes
+            .checked_add(serde_json::to_vec(&connector_tools)?.len())
+            .context("live MCP inventory size overflow")?;
+        anyhow::ensure!(
+            inventory_bytes <= serve_mcp::MAX_LIVE_INVENTORY_BYTES,
+            "live MCP inventory exceeds its byte limit"
+        );
+        tools.extend(connector_tools);
+    }
+    let (_, latest, _) = client.catalog_with_provenance(None)?;
+    anyhow::ensure!(
+        discovery.registry_version == latest.registry_version
+            && initial_binding == serve_mcp_discovery_binding(&latest)?,
+        "host connector inventory changed during MCP refresh; retry tools/list"
+    );
+    budget.remaining_ms(std::time::Instant::now())?;
+    Ok(tools)
 }
 
 fn serve_mcp_zone_connectors(
@@ -7328,6 +7493,14 @@ fn try_host_mcp_tool_definitions(
                 tool.name.clone(),
             )
             .with_runtime_connector_id(connector.summary.id.to_string())
+            .with_live_contract_digest(
+                *blake3::hash(&serde_json::to_vec(&json!({
+                    "connector_id": connector.summary.id,
+                    "version": connector.summary.version,
+                    "operation": tool,
+                }))?)
+                .as_bytes(),
+            )
             .with_annotations(exported.annotations)
             .with_provenance(catalog::tool_provenance(
                 &exported.name,
@@ -57929,6 +58102,193 @@ depends_on = ["missing"]
         assert_eq!(payload["command"], "serve-mcp");
         assert_eq!(payload["error"]["type"], "invalid-mcp-zone");
         assert_eq!(payload["tools_exposed"], false);
+    }
+
+    #[test]
+    fn live_mcp_contract_binds_version_output_schema_and_approval_without_changing_identity() {
+        let discovery: HostDiscoveryResponse =
+            serde_json::from_value(mock_discovery_response_json()).unwrap();
+        let connector = HostConnectorCatalog::from_response(&discovery)
+            .connectors
+            .remove(0);
+        let introspection: HostIntrospectionResponse =
+            serde_json::from_value(mock_introspection_response_json()).unwrap();
+        let initial = try_host_mcp_tool_definitions(&connector, &introspection).unwrap();
+        for case in ["version", "output", "approval"] {
+            let mut connector = connector.clone();
+            let mut introspection = introspection.clone();
+            match case {
+                "version" => {
+                    connector.summary.version.major += 1;
+                    introspection.connector.version = connector.summary.version.clone();
+                }
+                "output" => introspection.tools[0].output_schema = json!({"type": "string"}),
+                "approval" => {
+                    introspection.tools[0].approval_mode = Some(ApprovalMode::ElevationToken)
+                }
+                _ => unreachable!(),
+            }
+            let changed = try_host_mcp_tool_definitions(&connector, &introspection).unwrap();
+            assert_eq!(
+                changed[0].execution_connector_id(),
+                initial[0].execution_connector_id()
+            );
+            assert_ne!(
+                changed[0].live_contract_digest, initial[0].live_contract_digest,
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn live_mcp_refresh_updates_operations_and_withdraws_removed_exact_identity() {
+        let discovery = mock_discovery_response_json();
+        let mut changed = mock_introspection_response_json();
+        changed["tools"][1]["input_schema"]["required"] =
+            json!(["owner", "repo", "number", "revision"]);
+        let mut replacement = mock_connector_summary_json();
+        replacement["id"] = json!("fcp.github:enterprise:v2");
+        replacement["version"] = json!("2.0.0");
+        let replaced = mock_discovery_response_with_connectors(vec![replacement]);
+        let (host, server, requests) = spawn_mock_host_sequence_with_body_log(vec![
+            ("POST /rpc/discover".to_owned(), discovery.clone()),
+            (
+                "GET /rpc/introspect/fcp.github:enterprise:v1".to_owned(),
+                changed,
+            ),
+            ("POST /rpc/discover".to_owned(), discovery),
+            ("POST /rpc/discover".to_owned(), replaced.clone()),
+            ("POST /rpc/discover".to_owned(), replaced),
+        ]);
+        let client = super::HostAdminClient::new(&host).unwrap();
+        let refreshed = super::refresh_serve_mcp_inventory(
+            &client,
+            Some("fcp.github:enterprise:v1"),
+            None,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+        let read = refreshed
+            .iter()
+            .find(|tool| tool.operation_id == "github.get_issue")
+            .unwrap();
+        assert_eq!(read.execution_connector_id(), "fcp.github:enterprise:v1");
+        assert!(
+            read.input_schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("revision"))
+        );
+        let removed = super::refresh_serve_mcp_inventory(
+            &client,
+            Some("fcp.github:enterprise:v1"),
+            None,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+        server.join().unwrap();
+        assert!(
+            removed.is_empty(),
+            "a removed pin must not select another version by slug"
+        );
+        assert_eq!(requests.lock().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn live_mcp_refresh_rejects_partial_and_changing_snapshots() {
+        for case in ["partial", "epoch", "duplicate", "identity"] {
+            let discovery = mock_discovery_response_json();
+            let mut introspection = mock_introspection_response_json();
+            let mut latest = discovery.clone();
+            match case {
+                "partial" => {
+                    let _ = introspection["tools"].as_array_mut().unwrap().pop();
+                }
+                "epoch" => latest["registry_version"] = json!(8),
+                "duplicate" => latest["connectors"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(mock_connector_summary_json()),
+                "identity" => introspection["connector"]["id"] = json!("fcp.github:enterprise:v2"),
+                _ => unreachable!(),
+            }
+            let mut routes = vec![
+                ("POST /rpc/discover".to_owned(), discovery),
+                (
+                    "GET /rpc/introspect/fcp.github:enterprise:v1".to_owned(),
+                    introspection,
+                ),
+            ];
+            if matches!(case, "epoch" | "duplicate") {
+                routes.push(("POST /rpc/discover".to_owned(), latest));
+            }
+            let (host, server) = spawn_mock_host_sequence(routes);
+            let client = super::HostAdminClient::new(&host).unwrap();
+            assert!(
+                super::refresh_serve_mcp_inventory(
+                    &client,
+                    None,
+                    None,
+                    Instant::now() + Duration::from_secs(5),
+                )
+                .is_err(),
+                "{case} must not publish a usable subset"
+            );
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn live_mcp_refresh_withdraws_revoked_zone_and_shares_one_read_deadline() {
+        let discovery = mock_discovery_response_json();
+        let mut revoked = mock_inventory_response_json();
+        revoked["allowed_zones"] = json!(["z:private"]);
+        let (host, server, requests) = spawn_mock_host_sequence_with_body_log(vec![
+            ("POST /rpc/discover".to_owned(), discovery.clone()),
+            (
+                "GET /rpc/connectors/fcp.github:enterprise:v1".to_owned(),
+                revoked,
+            ),
+            ("POST /rpc/discover".to_owned(), discovery.clone()),
+        ]);
+        let client = super::HostAdminClient::new(&host).unwrap();
+        let tools = super::refresh_serve_mcp_inventory(
+            &client,
+            None,
+            Some(&ZoneId::work()),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+        server.join().unwrap();
+        assert!(tools.is_empty());
+        assert_eq!(requests.lock().unwrap().len(), 3);
+
+        let (host, server, requests) = spawn_mock_host_sequence_with_timing(vec![(
+            "POST /rpc/discover".to_owned(),
+            discovery,
+            Duration::from_millis(200),
+        )]);
+        let client = super::HostAdminClient::new(&host).unwrap();
+        assert!(super::refresh_serve_mcp_inventory(&client, None, None, Instant::now(),).is_err());
+        assert!(
+            requests.lock().unwrap().is_empty(),
+            "an exhausted budget sends no HTTP request"
+        );
+        assert!(
+            super::refresh_serve_mcp_inventory(
+                &client,
+                None,
+                None,
+                Instant::now() + Duration::from_millis(50),
+            )
+            .is_err()
+        );
+        server.join().unwrap();
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            1,
+            "an expired refresh never starts introspection"
+        );
     }
 
     #[test]
