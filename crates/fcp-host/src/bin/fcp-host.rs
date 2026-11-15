@@ -3106,6 +3106,26 @@ impl RegistryConfigPlan {
         !(self.added.is_empty() && self.updated.is_empty() && self.removed.is_empty())
     }
 
+    /// Removing an entry must respect the same state ownership boundary as
+    /// replacing it. Dropping a registry handle is not proof that a writer has
+    /// quiesced or that its canonical state has been handed off.
+    fn validate_removals(&self, current: &RegistryState) -> HostResult<()> {
+        for (connector_id, entry) in &current.connectors {
+            if !self.next_configs.contains_key(connector_id)
+                && entry.state_policy.is_stateful()
+                && !matches!(
+                    &entry.connector,
+                    ConnectorRuntime::Dormant(_) | ConnectorRuntime::UnavailableNativeProxyOnly(_)
+                )
+            {
+                return Err(HostError::InvalidFilter(format!(
+                    "connector '{connector_id}' stateful runtime removal requires quiescence and canonical state handoff; the active runtime and inventory are preserved because that handoff is not implemented"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn report(&self, registry_version: u64) -> ConnectorInventoryApplyReport {
         ConnectorInventoryApplyReport {
             added: self.added.clone(),
@@ -3526,6 +3546,11 @@ impl SubprocessRegistry {
         lifecycle: &HostAdminStateStore,
     ) -> HostResult<PreparedRegistryApply> {
         let plan = self.plan_configs(configs).await?;
+        {
+            let current = self.state.read().await;
+            self.require_generation(plan.source_version)?;
+            plan.validate_removals(&current)?;
+        }
         let mut replacement_entries = HashMap::new();
         let mut launch_fences = Vec::new();
         for connector_id in &plan.replacement_ids {
@@ -3684,6 +3709,11 @@ impl SubprocessRegistry {
         lifecycle: &HostAdminStateStore,
     ) -> HostResult<ConnectorInventoryApplyReport> {
         let plan = self.plan_configs(configs).await?;
+        {
+            let current = self.state.read().await;
+            self.require_generation(plan.source_version)?;
+            plan.validate_removals(&current)?;
+        }
         for connector_id in &plan.replacement_ids {
             let authority =
                 lifecycle_runtime::LaunchAuthority::capture(lifecycle, connector_id).await?;
@@ -3748,6 +3778,9 @@ impl SubprocessRegistry {
                     .to_string(),
             ));
         }
+        // Recheck actual ownership under the publication lock, even if the
+        // supplied plan omitted the removal from its diagnostic report.
+        prepared.plan.validate_removals(&state)?;
         let registry_version = if prepared.plan.changed() {
             source_version.checked_add(1).ok_or_else(|| {
                 HostError::Unavailable("connector inventory generation is exhausted".to_string())
@@ -37791,6 +37824,237 @@ done"#;
             };
             assert!(Arc::ptr_eq(retained, &connector));
         }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn registry_stateful_removal_preserves_writer_before_any_preparation_or_publication() {
+        for model in ["singleton_writer", "crdt"] {
+            let directory = tempfile::tempdir().expect("stateful removal directory");
+            let connector_id = "fcp.webhook-receiver";
+            let key = ConnectorId::from_static(connector_id);
+            let mut config = dispatcher_test_config(connector_id);
+            config.manifest_path = Some(write_state_policy_test_manifest(
+                directory.path(),
+                Some(model),
+                false,
+            ));
+            let requests = Arc::new(AtomicU64::new(0));
+            let observed = Arc::clone(&requests);
+            let (runner_tx, mut runner_rx) = mpsc::channel::<ConnectorRpcRequest>(4);
+            let runner_task = task::spawn(async move {
+                while let Some(request) = runner_rx.recv().await {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    let _ = request.response_tx.send(Ok(json!({
+                        "result": dispatcher_health_result()
+                    })));
+                }
+            });
+            let connector = dispatcher_test_connector(connector_id, runner_tx, runner_task);
+            let registry = dispatcher_registry_with_connector(
+                connector_id,
+                Arc::clone(&connector),
+                config.clone(),
+            );
+            let version = registry.version();
+            let original_fence = registry.inventory_fence(version);
+            let mut added = dispatcher_test_config("fcp.aaa.removal-candidate");
+            added.binary = directory
+                .path()
+                .join("must-not-spawn")
+                .display()
+                .to_string();
+
+            // Removal-only and mixed updates must reject before the first new
+            // runtime is prepared, regardless of replacement ordering.
+            for next_configs in [Vec::new(), vec![added]] {
+                let preview = registry
+                    .preview_configs(next_configs.clone())
+                    .await
+                    .expect_err("preview cannot authorize dropping an active state writer");
+                assert!(
+                    preview.to_string().contains("stateful runtime removal"),
+                    "{preview}"
+                );
+                let preparation = registry
+                    .prepare_configs(next_configs.clone())
+                    .await
+                    .err()
+                    .expect("removal must fail before candidate preparation");
+                assert!(
+                    preparation.to_string().contains("stateful runtime removal"),
+                    "{preparation}"
+                );
+
+                // Publication checks the actual omitted entries, rather than
+                // trusting preparation or the caller's diagnostic removed list.
+                let mut prepared = registry_publication_fixture(&registry, next_configs).await;
+                prepared.plan.removed.clear();
+                let publication = registry
+                    .publish_configs(prepared)
+                    .await
+                    .expect_err("publication cannot bypass canonical state handoff");
+                assert!(
+                    publication.to_string().contains("stateful runtime removal"),
+                    "{publication}"
+                );
+                assert_eq!(registry.version(), version);
+                assert_eq!(registry.inventory().await, vec![config.clone()]);
+                original_fence
+                    .require_current()
+                    .expect("failed removal must not revoke work");
+                let current = registry.state.read().await;
+                let ConnectorRuntime::Native(retained) = &current.connectors[&key].connector else {
+                    panic!("removal replaced the active writer");
+                };
+                assert!(Arc::ptr_eq(retained, &connector));
+            }
+            let lifecycle = HostAdminStateStore::new();
+            lifecycle
+                .reconcile_registered_connectors(std::slice::from_ref(&connector.summary))
+                .await
+                .unwrap();
+            lifecycle
+                .set_desired_state(&key, fcp_host::DesiredRuntimeState::Disabled, None)
+                .await
+                .unwrap();
+            let disabled = registry
+                .apply_configs_with_lifecycle(Vec::new(), &lifecycle)
+                .await
+                .expect_err("disabled intent alone does not prove a retained writer stopped");
+            assert!(
+                disabled.to_string().contains("stateful runtime removal"),
+                "{disabled}"
+            );
+            assert_eq!(registry.version(), version);
+            assert_eq!(registry.inventory().await, vec![config]);
+            assert_eq!(requests.load(Ordering::SeqCst), 0);
+            connector
+                .health()
+                .await
+                .expect("the retained writer remains usable");
+            assert_eq!(requests.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn registry_stateful_removal_uses_retained_authority_after_manifest_drift() {
+        let directory = tempfile::tempdir().expect("stateful removal manifest directory");
+        let connector_id = "fcp.webhook-receiver";
+        let mut config = dispatcher_test_config(connector_id);
+        let path = write_state_policy_test_manifest(directory.path(), Some("crdt"), false);
+        config.manifest_path = Some(path.clone());
+        let (runner_tx, mut runner_rx) = mpsc::channel::<ConnectorRpcRequest>(1);
+        let runner_task = task::spawn(async move {
+            assert!(
+                runner_rx.recv().await.is_none(),
+                "removal must not touch the runtime"
+            );
+        });
+        let connector = dispatcher_test_connector(connector_id, runner_tx, runner_task);
+        let registry = dispatcher_registry_with_connector(connector_id, connector, config.clone());
+        let version = registry.version();
+
+        std::fs::write(&path, state_policy_test_manifest(Some("stateless"), false)).unwrap();
+        for manifest_available in [true, false] {
+            if !manifest_available {
+                std::fs::rename(&path, directory.path().join("retired-manifest.toml")).unwrap();
+            }
+            let error = registry.apply_configs(Vec::new()).await.expect_err(
+                "removing the config cannot erase the runtime's admitted state authority",
+            );
+            assert!(
+                error.to_string().contains("stateful runtime removal"),
+                "{error}"
+            );
+            assert_eq!(registry.version(), version);
+            assert_eq!(registry.inventory().await, vec![config.clone()]);
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn registry_stateful_removal_accepts_entries_without_a_live_writer() {
+        for model in ["singleton_writer", "crdt"] {
+            for dormant in [false, true] {
+                let directory = tempfile::tempdir().expect("inactive stateful removal directory");
+                let key = ConnectorId::from_static("fcp.webhook-receiver");
+                let mut config = dispatcher_test_config("fcp.webhook-receiver");
+                config.manifest_path = Some(write_state_policy_test_manifest(
+                    directory.path(),
+                    Some(model),
+                    false,
+                ));
+                let registry = empty_registry(1);
+                let mut prepared =
+                    registry_publication_fixture(&registry, vec![config.clone()]).await;
+                if dormant {
+                    let entry = prepared.replacement_entries.get_mut(&key).unwrap();
+                    *entry = lifecycle_runtime::dormant_entry(
+                        config,
+                        ValidatedConnectorConfig {
+                            manifest_constraints: entry.manifest_constraints.clone(),
+                            state_policy: entry.state_policy,
+                            native_executable: None,
+                            wasi_component: None,
+                        },
+                        fcp_host::DesiredRuntimeState::Disabled,
+                    )
+                    .unwrap();
+                }
+                registry.publish_configs(prepared).await.unwrap();
+                let version = registry.version();
+                let preview = registry.preview_configs(Vec::new()).await.unwrap();
+                assert_eq!(preview.removed, vec![key.to_string()]);
+                assert_eq!(registry.version(), version);
+                let report = registry.apply_configs(Vec::new()).await.unwrap();
+                assert_eq!(report.removed, vec![key.to_string()]);
+                assert_eq!(report.registry_version, version + 1);
+                assert!(registry.inventory().await.is_empty());
+            }
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn registry_stateless_removal_fences_old_admission_and_retains_existing_owners() {
+        let directory = tempfile::tempdir().expect("stateless removal directory");
+        let connector_id = "fcp.webhook-receiver";
+        let key = ConnectorId::from_static(connector_id);
+        let mut config = dispatcher_test_config(connector_id);
+        config.manifest_path = Some(write_state_policy_test_manifest(
+            directory.path(),
+            Some("stateless"),
+            false,
+        ));
+        let (runner_tx, mut runner_rx) = mpsc::channel::<ConnectorRpcRequest>(1);
+        let runner_task = task::spawn(async move {
+            while let Some(request) = runner_rx.recv().await {
+                let _ = request.response_tx.send(Ok(json!({
+                    "result": dispatcher_health_result()
+                })));
+            }
+        });
+        let connector = dispatcher_test_connector(connector_id, runner_tx, runner_task);
+        let registry =
+            dispatcher_registry_with_connector(connector_id, Arc::clone(&connector), config);
+        let previous_generation = registry.version();
+        let queued = registry.inventory_fence(previous_generation);
+        let preview = registry.preview_configs(Vec::new()).await.unwrap();
+        assert_eq!(preview.removed, vec![key.to_string()]);
+        queued
+            .require_current()
+            .expect("preview preserves authority");
+
+        let report = registry.apply_configs(Vec::new()).await.unwrap();
+        assert_eq!(report.removed, vec![key.to_string()]);
+        assert_eq!(report.registry_version, previous_generation + 1);
+        assert!(queued.require_current().is_err());
+        assert!(!registry.state.read().await.connectors.contains_key(&key));
+        // Registry removal fences new and queued admission. It does not claim
+        // the physical stop required by the explicit lifecycle retirement API:
+        // already active stateless work may still hold its exact runtime owner.
+        connector
+            .health()
+            .await
+            .expect("existing stateless owner is retained");
     }
 
     #[fcp_async_core::runtime::test]
