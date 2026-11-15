@@ -239,6 +239,163 @@ pub struct ConnectorInventoryMutationResponse {
     pub admin_state: StartupReconciliationReport,
 }
 
+/// An explicit, pinned deployment to restore through the host rollback route.
+///
+/// The host validates the executable bytes and manifest before changing runtime
+/// ownership. A version label or a settings revision alone is not a target.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectorPinnedRollbackRequest {
+    /// Canonical identifier of the connector being restored.
+    pub connector_id: String,
+    /// Previous rollout version the supplied manifest must identify.
+    pub to_version: Version,
+    /// Complete operator-supplied inventory with a required executable pin.
+    pub connector: ManagedConnectorConfig,
+    /// Optional explanation recorded with the completed rollback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// A completed restoration of the supplied pinned deployment.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnectorPinnedRollbackResponse {
+    /// Canonical connector identifier.
+    pub connector_id: String,
+    /// Persisted rollout state after restoration.
+    pub state: LifecycleState,
+    /// Deployment replaced by the rollback.
+    pub from_version: Version,
+    /// Restored and pinned deployment version.
+    pub to_version: Version,
+    /// Operator-facing explanation of the restoration.
+    pub message: String,
+    /// Registry generation containing the restored deployment.
+    pub registry_version: u64,
+    /// Whether the exact verified deployment was published in the registry.
+    /// Disabled or uninstalled connectors retain it as a dormant deployment.
+    pub runtime_restored: bool,
+    /// Execution intent after restoration, preserving existing denial.
+    pub desired_state: DesiredRuntimeState,
+}
+
+/// Read-only lifecycle authority captured before preparing a rollback target.
+///
+/// This token belongs to one store instance and one connector journal revision.
+/// It is neither serializable nor sufficient to claim runtime restoration.
+#[derive(Debug, Clone)]
+pub struct ConnectorRollbackPreparation {
+    connector_id: ConnectorId,
+    from_version: Version,
+    to_version: Version,
+    lifecycle_state: LifecycleState,
+    original_desired_state: DesiredRuntimeState,
+    expected_journal_sequence: u64,
+    store_identity: Arc<AtomicBool>,
+}
+
+impl ConnectorRollbackPreparation {
+    /// Version whose runtime is being replaced.
+    #[must_use]
+    pub const fn from_version(&self) -> &Version {
+        &self.from_version
+    }
+
+    /// Previous version authorized as the rollback target.
+    #[must_use]
+    pub const fn to_version(&self) -> &Version {
+        &self.to_version
+    }
+
+    /// Whether the restored deployment may become executable.
+    #[must_use]
+    pub const fn should_activate(&self) -> bool {
+        desired_state_allows_execution(self.original_desired_state)
+    }
+
+    /// Execution intent captured before rollback began.
+    #[must_use]
+    pub const fn original_desired_state(&self) -> DesiredRuntimeState {
+        self.original_desired_state
+    }
+
+    fn require_snapshot<'a>(
+        &self,
+        snapshot: &'a HostAdminStateSnapshot,
+        expected_sequence: u64,
+        expected_desired: DesiredRuntimeState,
+    ) -> Result<&'a LifecycleRecord, LifecycleError> {
+        let state = snapshot.connectors.get(&self.connector_id).ok_or_else(|| {
+            LifecycleError::NotFound {
+                connector_id: self.connector_id.clone(),
+            }
+        })?;
+        if state.last_journal_sequence != expected_sequence
+            || state.desired_state != expected_desired
+        {
+            return Err(invocation_state_error(
+                "connector authority changed during runtime rollback; inspect current lifecycle state before retrying",
+            ));
+        }
+        let record = state.lifecycle.as_ref().ok_or_else(|| {
+            invocation_state_error("connector rollout record disappeared during runtime rollback")
+        })?;
+        if record.connector_id != self.connector_id
+            || record.version != self.from_version
+            || record.previous_version.as_ref() != Some(&self.to_version)
+            || record.state != self.lifecycle_state
+        {
+            return Err(invocation_state_error(
+                "connector rollout changed during runtime rollback; refusing stale finalization",
+            ));
+        }
+        if snapshot.next_journal_sequence == u64::MAX {
+            return Err(invocation_state_error(
+                "runtime rollback cannot exhaust the admin journal sequence",
+            ));
+        }
+        Ok(record)
+    }
+}
+
+/// Exclusive metadata authority after a rollback durably denied execution.
+///
+/// The host must retire the exact old runtime and publish the verified target
+/// before finalizing this token. Intervening connector metadata writes invalidate
+/// it, including another disable request that leaves the desired value unchanged.
+#[derive(Debug)]
+pub struct ConnectorRollbackGuard {
+    preparation: ConnectorRollbackPreparation,
+    expected_journal_sequence: u64,
+    reason: Option<String>,
+}
+
+impl ConnectorRollbackGuard {
+    /// Version whose runtime is being replaced.
+    #[must_use]
+    pub const fn from_version(&self) -> &Version {
+        self.preparation.from_version()
+    }
+
+    /// Previous version authorized as the rollback target.
+    #[must_use]
+    pub const fn to_version(&self) -> &Version {
+        self.preparation.to_version()
+    }
+
+    /// Whether the restored deployment may become executable.
+    #[must_use]
+    pub const fn should_activate(&self) -> bool {
+        self.preparation.should_activate()
+    }
+
+    /// Execution intent captured before rollback began.
+    #[must_use]
+    pub const fn original_desired_state(&self) -> DesiredRuntimeState {
+        self.preparation.original_desired_state()
+    }
+}
+
 // ── Lifecycle transition RPC types ──────────────────────────────────────────
 
 /// Lifecycle transition action requested via the host admin API.
@@ -2613,6 +2770,22 @@ pub enum AdminStateMutation {
         /// Current lifecycle state after the save.
         state: LifecycleState,
     },
+    /// A verified runtime rollback durably denied execution before retirement.
+    RuntimeRollbackStarted {
+        /// Deployment selected for replacement.
+        from_version: Version,
+        /// Explicit verified deployment selected for restoration.
+        to_version: Version,
+    },
+    /// The verified target was published before lifecycle and pin finalization.
+    RuntimeRollbackCompleted {
+        /// Deployment replaced by the rollback.
+        from_version: Version,
+        /// Restored deployment and new version pin.
+        to_version: Version,
+        /// Execution intent after restoring the target.
+        desired_state: DesiredRuntimeState,
+    },
     /// Desired runtime state changed.
     DesiredStateSet {
         /// New desired runtime target.
@@ -3734,6 +3907,202 @@ impl HostAdminStateStore {
             .connectors
             .get(connector_id)
             .cloned()
+    }
+
+    fn require_runtime_rollback_store(&self) -> Result<(), LifecycleError> {
+        if self.state_path.is_none() {
+            return Err(invocation_state_error(
+                "runtime rollback requires persistent admin state so execution denial survives a host restart",
+            ));
+        }
+        if self.persistence_failed.load(Ordering::Acquire) {
+            return Err(invocation_state_error(
+                "runtime rollback is fenced after an admin-state persistence failure",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Capture the current rollout revision before verifying a rollback target.
+    /// This does not mutate lifecycle state, pins, or runtime ownership.
+    ///
+    /// # Errors
+    ///
+    /// Refuses missing or failed persistence, an ineligible rollout, a target
+    /// other than its recorded previous version, or an exhausted journal.
+    pub async fn validate_runtime_rollback(
+        &self,
+        connector_id: &ConnectorId,
+        to_version: &Version,
+    ) -> Result<ConnectorRollbackPreparation, LifecycleError> {
+        let snapshot = self.state.read().await;
+        self.require_runtime_rollback_store()?;
+        let state =
+            snapshot
+                .connectors
+                .get(connector_id)
+                .ok_or_else(|| LifecycleError::NotFound {
+                    connector_id: connector_id.clone(),
+                })?;
+        let record = state
+            .lifecycle
+            .as_ref()
+            .ok_or_else(|| LifecycleError::NotFound {
+                connector_id: connector_id.clone(),
+            })?;
+        if !record.state.can_rollback() {
+            return Err(LifecycleError::InvalidTransition {
+                from: record.state,
+                to: LifecycleState::RolledBack,
+            });
+        }
+        if record.connector_id != *connector_id
+            || record.previous_version.as_ref() != Some(to_version)
+            || record.version == *to_version
+        {
+            return Err(LifecycleError::NoRollbackTarget);
+        }
+        if snapshot.next_journal_sequence >= u64::MAX - 1 {
+            return Err(invocation_state_error(
+                "runtime rollback requires two available admin journal sequences",
+            ));
+        }
+        Ok(ConnectorRollbackPreparation {
+            connector_id: connector_id.clone(),
+            from_version: record.version.clone(),
+            to_version: to_version.clone(),
+            lifecycle_state: record.state,
+            original_desired_state: state.desired_state,
+            expected_journal_sequence: state.last_journal_sequence,
+            store_identity: Arc::clone(&self.persistence_failed),
+        })
+    }
+
+    /// Durably deny execution before the host retires the selected runtime.
+    ///
+    /// The caller holds its inventory transaction and has already verified and
+    /// prepared the target. Failure after this point must leave the connector
+    /// denied until explicit recovery or successful guarded finalization.
+    ///
+    /// # Errors
+    ///
+    /// Refuses a token from another store, intervening connector mutations, or
+    /// persistence failure. It never changes the deployment version or pin.
+    pub async fn begin_runtime_rollback(
+        &self,
+        preparation: &ConnectorRollbackPreparation,
+        reason: Option<String>,
+    ) -> Result<ConnectorRollbackGuard, LifecycleError> {
+        self.require_runtime_rollback_store()?;
+        if !Arc::ptr_eq(&preparation.store_identity, &self.persistence_failed) {
+            return Err(invocation_state_error(
+                "runtime rollback preparation belongs to a different admin store",
+            ));
+        }
+        self.apply_mutation(|snapshot| {
+            preparation.require_snapshot(
+                snapshot,
+                preparation.expected_journal_sequence,
+                preparation.original_desired_state,
+            )?;
+            if snapshot.next_journal_sequence >= u64::MAX - 1 {
+                return Err(invocation_state_error(
+                    "runtime rollback requires two available admin journal sequences",
+                ));
+            }
+            let sequence = snapshot.append_journal(
+                &preparation.connector_id,
+                AdminStateMutation::RuntimeRollbackStarted {
+                    from_version: preparation.from_version.clone(),
+                    to_version: preparation.to_version.clone(),
+                },
+                Some("verified-runtime-rollback".to_owned()),
+            );
+            let state = snapshot.connector_state_mut(&preparation.connector_id);
+            state.desired_state = DesiredRuntimeState::Disabled;
+            state.last_journal_sequence = sequence;
+            Ok(ConnectorRollbackGuard {
+                preparation: preparation.clone(),
+                expected_journal_sequence: sequence,
+                reason,
+            })
+        })
+        .await
+    }
+
+    /// Finalize metadata only after the host published the exact verified target.
+    ///
+    /// The caller retains the inventory transaction through runtime retirement,
+    /// managed-file persistence, target publication and this call. The complete
+    /// metadata change is one durable mutation: version, pin, rollout result and
+    /// execution authority cannot be acknowledged separately. Existing disabled
+    /// or uninstalled intent remains denied, with a dormant restored deployment.
+    ///
+    /// # Errors
+    ///
+    /// Refuses a foreign or replayed guard, any intervening connector metadata
+    /// mutation, exhausted journal sequences, or failed persistence. A refusal
+    /// cannot reauthorize execution or claim that the target version is active.
+    pub async fn finalize_runtime_rollback(
+        &self,
+        guard: &ConnectorRollbackGuard,
+    ) -> Result<LifecycleRecord, LifecycleError> {
+        self.require_runtime_rollback_store()?;
+        if !Arc::ptr_eq(&guard.preparation.store_identity, &self.persistence_failed) {
+            return Err(invocation_state_error(
+                "runtime rollback guard belongs to a different admin store",
+            ));
+        }
+        self.apply_mutation(|snapshot| {
+            let preparation = &guard.preparation;
+            let mut record = preparation
+                .require_snapshot(
+                    snapshot,
+                    guard.expected_journal_sequence,
+                    DesiredRuntimeState::Disabled,
+                )?
+                .clone();
+            record.transition(
+                LifecycleState::RolledBack,
+                TransitionReason::ManualRollback {
+                    reason: guard.reason.clone(),
+                },
+            )?;
+            record.version = preparation.to_version.clone();
+            record.previous_version = None;
+            record.health = Default::default();
+            record.deployed_at = Utc::now();
+            let (desired_state, observed_state) = if preparation.should_activate() {
+                (DesiredRuntimeState::Enabled, ObservedRuntimeState::Degraded)
+            } else {
+                (
+                    preparation.original_desired_state,
+                    ObservedRuntimeState::Stopped,
+                )
+            };
+            let sequence = snapshot.append_journal(
+                &preparation.connector_id,
+                AdminStateMutation::RuntimeRollbackCompleted {
+                    from_version: preparation.from_version.clone(),
+                    to_version: preparation.to_version.clone(),
+                    desired_state,
+                },
+                Some("verified-runtime-rollback".to_owned()),
+            );
+            let state = snapshot.connector_state_mut(&preparation.connector_id);
+            state.lifecycle = Some(record.clone());
+            state.pinned_version = Some(preparation.to_version.clone());
+            state.desired_state = desired_state;
+            state.observed_state = observed_state;
+            // Neither the failed deployment's provenance nor its settings
+            // revision attests to this operator-supplied target. Managed
+            // inventory is the current config source until a new checkpoint.
+            state.artifact = None;
+            state.active_config_revision_id = None;
+            state.last_journal_sequence = sequence;
+            Ok(record)
+        })
+        .await
     }
 
     /// Return the full admin-state journal or only the entries for one connector.
@@ -7836,6 +8205,380 @@ mod tests {
                 "safe": "value"
             }
         })
+    }
+
+    async fn runtime_rollback_fixture() -> (tempfile::TempDir, HostAdminStateStore, ConnectorId) {
+        let directory = tempfile::tempdir().expect("rollback directory");
+        let store = HostAdminStateStore::with_state_path(directory.path().join("admin.json"))
+            .expect("persistent rollback store");
+        let connector_id = connector_id();
+        let mut record = LifecycleRecord::new(connector_id.clone(), Version::new(1, 5, 0))
+            .with_previous_version(Version::new(1, 4, 0));
+        record
+            .transition(
+                LifecycleState::Installing,
+                TransitionReason::InstallComplete,
+            )
+            .unwrap();
+        record
+            .transition(
+                LifecycleState::Canary,
+                TransitionReason::NewVersion {
+                    from_version: "1.4.0".to_owned(),
+                    to_version: "1.5.0".to_owned(),
+                },
+            )
+            .unwrap();
+        record.update_health(false, 25);
+        store.save(&record).await.unwrap();
+        store.pin(&connector_id, record.version).await.unwrap();
+        (directory, store, connector_id)
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn runtime_rollback_commits_restored_identity_pin_and_authority_together() {
+        let (_directory, store, connector_id) = runtime_rollback_fixture().await;
+        let target = Version::new(1, 4, 0);
+        store
+            .append_config_revision(&connector_id, config_payload("candidate"), None, None)
+            .await
+            .unwrap();
+        let registration = store
+            .register_connector_artifact(
+                &connector_id,
+                &ConnectorArtifactRegistrationRequest {
+                    dry_run: false,
+                    provenance: ArtifactProvenance {
+                        source_kind: ArtifactSourceKind::LocalPath,
+                        source_uri: "/verified/candidate".to_owned(),
+                        content_hash: "ab".repeat(32),
+                        hash_verified: true,
+                        signature_b64: None,
+                        signature_verified: false,
+                        manifest_version: Some("1.5.0".to_owned()),
+                        size_bytes: 1024,
+                    },
+                    placement: None,
+                    require_signature: false,
+                    max_size_bytes: None,
+                    initiated_by: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(registration.accepted);
+        let before = store.export_snapshot_json().await.unwrap();
+        let execution = store
+            .connector_execution_fence(&connector_id)
+            .await
+            .unwrap();
+        let preparation = store
+            .validate_runtime_rollback(&connector_id, &target)
+            .await
+            .unwrap();
+        assert!(preparation.should_activate());
+        assert_eq!(preparation.from_version(), &Version::new(1, 5, 0));
+        assert_eq!(preparation.to_version(), &target);
+        assert_eq!(store.export_snapshot_json().await.unwrap(), before);
+        let guard = store
+            .begin_runtime_rollback(&preparation, Some("restore known deployment".to_owned()))
+            .await
+            .unwrap();
+        assert!(execution.require_current().is_err());
+        assert!(
+            store
+                .connector_execution_fence(&connector_id)
+                .await
+                .is_err()
+        );
+        let path = store.state_path.clone().unwrap();
+        let interrupted = HostAdminStateStore::with_state_path(path.clone()).unwrap();
+        let interrupted = interrupted.connector_state(&connector_id).await.unwrap();
+        assert_eq!(interrupted.desired_state, DesiredRuntimeState::Disabled);
+        assert_eq!(interrupted.pinned_version, Some(Version::new(1, 5, 0)));
+        assert_eq!(
+            interrupted.lifecycle.unwrap().version,
+            Version::new(1, 5, 0)
+        );
+
+        // A mutation of another connector does not invalidate this connector's
+        // transaction. Runtime publication itself is covered by host tests.
+        store
+            .pin(&secondary_connector_id(), Version::new(9, 0, 0))
+            .await
+            .unwrap();
+        let record = store.finalize_runtime_rollback(&guard).await.unwrap();
+        assert_eq!(record.version, target);
+        assert_eq!(record.state, LifecycleState::RolledBack);
+        assert_eq!(record.previous_version, None);
+        assert_eq!(record.health.samples, 0);
+        assert!(matches!(
+            &record.transitions.last().unwrap().reason,
+            TransitionReason::ManualRollback { reason: Some(reason) }
+                if reason == "restore known deployment"
+        ));
+        let committed = store.connector_state(&connector_id).await.unwrap();
+        assert_eq!(committed.pinned_version, Some(target));
+        assert_eq!(committed.desired_state, DesiredRuntimeState::Enabled);
+        assert_eq!(committed.observed_state, ObservedRuntimeState::Degraded);
+        assert!(committed.artifact.is_none());
+        assert!(committed.active_config_revision_id.is_none());
+        assert_eq!(committed.config_revisions.len(), 1);
+        assert!(
+            execution.require_current().is_err(),
+            "old admission must stay fenced"
+        );
+        store
+            .connector_execution_fence(&connector_id)
+            .await
+            .unwrap();
+        let reopened = HostAdminStateStore::with_state_path(path).unwrap();
+        assert_eq!(
+            serde_json::to_value(reopened.connector_state(&connector_id).await.unwrap()).unwrap(),
+            serde_json::to_value(committed).unwrap()
+        );
+        let before_replay = store.export_snapshot_json().await.unwrap();
+        assert!(store.finalize_runtime_rollback(&guard).await.is_err());
+        assert_eq!(store.export_snapshot_json().await.unwrap(), before_replay);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn runtime_rollback_preserves_disabled_and_uninstalled_intent() {
+        for desired in [
+            DesiredRuntimeState::Disabled,
+            DesiredRuntimeState::Uninstalled,
+        ] {
+            let (_directory, store, connector_id) = runtime_rollback_fixture().await;
+            store
+                .set_desired_state(&connector_id, desired, None)
+                .await
+                .unwrap();
+            let preparation = store
+                .validate_runtime_rollback(&connector_id, &Version::new(1, 4, 0))
+                .await
+                .unwrap();
+            assert!(!preparation.should_activate());
+            assert_eq!(preparation.original_desired_state(), desired);
+            let guard = store
+                .begin_runtime_rollback(&preparation, None)
+                .await
+                .unwrap();
+            assert!(!guard.should_activate());
+            assert_eq!(guard.original_desired_state(), desired);
+            store.finalize_runtime_rollback(&guard).await.unwrap();
+            let reopened =
+                HostAdminStateStore::with_state_path(store.state_path.clone().unwrap()).unwrap();
+            let state = reopened.connector_state(&connector_id).await.unwrap();
+            assert_eq!(state.desired_state, desired);
+            assert_eq!(state.observed_state, ObservedRuntimeState::Stopped);
+            assert_eq!(state.pinned_version, Some(Version::new(1, 4, 0)));
+            assert!(
+                reopened
+                    .connector_execution_fence(&connector_id)
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn runtime_rollback_rejects_intervening_connector_mutations_without_overwriting_them() {
+        let (_directory, store, connector_id) = runtime_rollback_fixture().await;
+        let preparation = store
+            .validate_runtime_rollback(&connector_id, &Version::new(1, 4, 0))
+            .await
+            .unwrap();
+        store
+            .pin(&connector_id, Version::new(1, 5, 0))
+            .await
+            .unwrap();
+        let before = store.export_snapshot_json().await.unwrap();
+        assert!(
+            store
+                .begin_runtime_rollback(&preparation, None)
+                .await
+                .is_err()
+        );
+        assert_eq!(store.export_snapshot_json().await.unwrap(), before);
+
+        for mutation in [
+            "pin",
+            "disable_again",
+            "disable_enable_disable",
+            "uninstall",
+            "rollout",
+        ] {
+            let (_directory, store, connector_id) = runtime_rollback_fixture().await;
+            let preparation = store
+                .validate_runtime_rollback(&connector_id, &Version::new(1, 4, 0))
+                .await
+                .unwrap();
+            let guard = store
+                .begin_runtime_rollback(&preparation, None)
+                .await
+                .unwrap();
+            match mutation {
+                "pin" => store
+                    .pin(&connector_id, Version::new(2, 0, 0))
+                    .await
+                    .unwrap(),
+                "disable_again" => store
+                    .set_desired_state(&connector_id, DesiredRuntimeState::Disabled, None)
+                    .await
+                    .unwrap(),
+                "disable_enable_disable" => {
+                    store
+                        .set_desired_state(&connector_id, DesiredRuntimeState::Enabled, None)
+                        .await
+                        .unwrap();
+                    store
+                        .set_desired_state(&connector_id, DesiredRuntimeState::Disabled, None)
+                        .await
+                        .unwrap();
+                }
+                "uninstall" => store
+                    .set_desired_state(&connector_id, DesiredRuntimeState::Uninstalled, None)
+                    .await
+                    .unwrap(),
+                "rollout" => {
+                    let mut record = store.get(&connector_id).await.unwrap().unwrap();
+                    record.update_health(true, 10);
+                    store.save(&record).await.unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let before = store.export_snapshot_json().await.unwrap();
+            assert!(
+                store.finalize_runtime_rollback(&guard).await.is_err(),
+                "{mutation}"
+            );
+            assert_eq!(
+                store.export_snapshot_json().await.unwrap(),
+                before,
+                "{mutation}"
+            );
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn runtime_rollback_tokens_cannot_cross_a_store_reopen() {
+        let (_directory, store, connector_id) = runtime_rollback_fixture().await;
+        let preparation = store
+            .validate_runtime_rollback(&connector_id, &Version::new(1, 4, 0))
+            .await
+            .unwrap();
+        let path = store.state_path.clone().unwrap();
+        let reopened = HostAdminStateStore::with_state_path(path.clone()).unwrap();
+        let before = reopened.export_snapshot_json().await.unwrap();
+        assert!(
+            reopened
+                .begin_runtime_rollback(&preparation, None)
+                .await
+                .is_err()
+        );
+        assert_eq!(reopened.export_snapshot_json().await.unwrap(), before);
+        let guard = store
+            .begin_runtime_rollback(&preparation, None)
+            .await
+            .unwrap();
+        let reopened = HostAdminStateStore::with_state_path(path).unwrap();
+        let before = reopened.export_snapshot_json().await.unwrap();
+        assert!(reopened.finalize_runtime_rollback(&guard).await.is_err());
+        assert_eq!(reopened.export_snapshot_json().await.unwrap(), before);
+        assert!(
+            reopened
+                .connector_execution_fence(&connector_id)
+                .await
+                .is_err()
+        );
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn runtime_rollback_persistence_failure_never_advances_version_or_pin() {
+        for fail_at_finalization in [false, true] {
+            let (directory, mut store, connector_id) = runtime_rollback_fixture().await;
+            let original_path = store.state_path.clone().unwrap();
+            let preparation = store
+                .validate_runtime_rollback(&connector_id, &Version::new(1, 4, 0))
+                .await
+                .unwrap();
+            let guard = if fail_at_finalization {
+                Some(
+                    store
+                        .begin_runtime_rollback(&preparation, None)
+                        .await
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+            let obstruction = directory.path().join("not-a-directory");
+            std::fs::write(&obstruction, b"obstruction").unwrap();
+            store.state_path = Some(obstruction.join("admin.json"));
+            let before = store.export_snapshot_json().await.unwrap();
+            if let Some(guard) = guard.as_ref() {
+                assert!(store.finalize_runtime_rollback(guard).await.is_err());
+            } else {
+                assert!(
+                    store
+                        .begin_runtime_rollback(&preparation, None)
+                        .await
+                        .is_err()
+                );
+            }
+            assert_eq!(store.export_snapshot_json().await.unwrap(), before);
+            assert!(
+                store
+                    .connector_execution_fence(&connector_id)
+                    .await
+                    .is_err()
+            );
+            let reopened = HostAdminStateStore::with_state_path(original_path).unwrap();
+            let state = reopened.connector_state(&connector_id).await.unwrap();
+            assert_eq!(state.lifecycle.unwrap().version, Version::new(1, 5, 0));
+            assert_eq!(state.pinned_version, Some(Version::new(1, 5, 0)));
+            assert_eq!(
+                state.desired_state,
+                if fail_at_finalization {
+                    DesiredRuntimeState::Disabled
+                } else {
+                    DesiredRuntimeState::Enabled
+                }
+            );
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn runtime_rollback_validation_requires_a_durable_matching_target() {
+        let (_directory, store, connector_id) = runtime_rollback_fixture().await;
+        let before = store.export_snapshot_json().await.unwrap();
+        for wrong in [Version::new(1, 3, 0), Version::new(1, 5, 0)] {
+            assert!(matches!(
+                store.validate_runtime_rollback(&connector_id, &wrong).await,
+                Err(LifecycleError::NoRollbackTarget)
+            ));
+        }
+        assert_eq!(store.export_snapshot_json().await.unwrap(), before);
+        let in_memory = HostAdminStateStore::new();
+        in_memory
+            .save(&store.get(&connector_id).await.unwrap().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            in_memory
+                .validate_runtime_rollback(&connector_id, &Version::new(1, 4, 0))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("persistent admin state")
+        );
+        store.state.write().await.next_journal_sequence = u64::MAX - 1;
+        assert!(
+            store
+                .validate_runtime_rollback(&connector_id, &Version::new(1, 4, 0))
+                .await
+                .is_err()
+        );
     }
 
     #[fcp_async_core::runtime::test]

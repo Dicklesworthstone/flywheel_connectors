@@ -2,6 +2,10 @@
 //!
 //! Bead: bd-219o
 
+#[cfg(target_os = "linux")]
+#[path = "host_connector_integration/rollback_pinned.rs"]
+mod rollback_pinned;
+
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
 use std::net::TcpListener as StdTcpListener;

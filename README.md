@@ -2548,8 +2548,10 @@ accept ELF binaries; interpreted scripts are unsupported.
 The pin covers the main executable, while dynamic loaders, shared libraries, and
 other runtime files remain under the existing sandbox and deployment policies.
 Source-path replacement cannot change an already admitted sealed image or cached
-WASI buffer. Pinning provides executable identity; a full rollback still requires
-retained verified deployment history and coordinated runtime restoration.
+WASI buffer. Pinning provides executable identity. Explicit rollback can restore
+an operator-supplied complete, pinned stateless deployment through the host's
+coordinated runtime transaction; the host does not automatically retain historical
+deployment bundles.
 
 ---
 
@@ -2649,15 +2651,61 @@ fwc rollout set github --canary 10 --host http://127.0.0.1:8787
 fwc rollout status github --host http://127.0.0.1:8787
 fwc status github --host http://127.0.0.1:8787
 fwc doctor --zone z:work --all --host http://127.0.0.1:8787
-# Currently refused: verified runtime restoration is unavailable.
-fwc rollout rollback github --to 1.2.2 --host http://127.0.0.1:8787
+# Restore a complete saved inventory entry and its verified executable.
+fwc rollout rollback github --to 1.2.2 \
+    --target-config github-1.2.2.json --admin-token-file owner.token \
+    --host http://127.0.0.1:8787
 ```
 
-Manual rollback and automatic health evaluations that require rollback currently return HTTP 503 before changing lifecycle state or version pins. Saved configuration revisions contain settings, but cannot restore a verified prior executable and its complete deployment configuration. Restore the verified prior deployment through managed inventory before rescheduling; stateful replacement and canonical state handoff restrictions still apply. Healthy rollout promotion and hold decisions remain available.
+`--target-config` supplies one complete `ManagedConnectorConfig` JSON object from
+the known prior deployment, up to 1 MiB. The owner credential can come from
+`--admin-token-file` or `FCP_HOST_ADMIN_BEARER_TOKEN`. The target must include the
+same canonical connector `id`,
+an explicit `version` matching `--to`, `binary`, `binary_sha256`, `manifest_path`,
+and the current `allowed_zones` envelope, together with all required arguments,
+environment, settings, prewarm, operation, and network policy. Omitted optional
+fields take their ordinary defaults; they are not inherited from the failed
+deployment. Binary and manifest paths refer to files on the host. A sanitized
+`fwc config export` is a settings snapshot and is not a complete deployment file.
+
+The authenticated `POST /rpc/rollout/rollback/pinned` route binds the target to
+the rollout record's previous version, checks the manifest's identity and
+version, captures and verifies immutable executable bytes, and verifies a
+prepared native target's operation catalog for an enabled deployment before
+changing the current runtime.
+Both deployments must be admitted stateless connectors. Native restoration
+requires Linux immutable executable support; WASI restoration uses its retained
+verified component. The host requires a managed inventory file, persistent admin
+state, and supported directory synchronization. Stateful rollback still requires
+a canonical state handoff and is refused.
+
+The host then durably disables new execution, retires the exact old runtime,
+persists and synchronizes the supplied inventory, publishes the verified target,
+and atomically finalizes the restored version, pin, and lifecycle record. The
+replacement starts with fresh deployment health and circuit-breaker state while
+retaining configured resilience limits and shared load admission. A connector
+that was already disabled or uninstalled stays denied; its verified image is
+retained for an explicit later Enable. An enabled restoration is recorded as
+`rolled_back` with observed state `degraded`; successful restoration does not
+claim a completed stabilization period. A health read reports current health
+without changing that persisted lifecycle observation.
+
+Verification failures leave the current deployment unchanged. Failures after
+durable disable and before finalization leave execution denied across restart.
+If final persistence or the response is uncertain, inspect lifecycle state,
+the managed inventory, version pin, and health before taking another action;
+the response alone cannot establish whether finalization committed. The CLI
+does not automatically retry rollback. Keep the pinned source artifact and
+manifest available: a new host process admits them again from the saved paths.
+
+Rollback without `--target-config`, and automatic health evaluations that require
+rollback, still return HTTP 503 before changing lifecycle state or version pins.
+Saved configuration revisions cannot supply missing executable history. Healthy
+rollout promotion and hold decisions remain available.
 
 On Linux, native runtime admission retains the selected executable in a kernel-sealed memory file. On-demand launches, warm-pool replenishment, and lifecycle disable/enable or restart reuse those exact bytes and their admitted manifest authority. Replacing or rewriting the configured binary does not change running or replacement workers. Explicit inventory preview/apply detects binary changes at an unchanged path; apply captures the replacement, including when the connector is dormant. A failed capture preserves the prior inventory. Host-only operation-policy edits still retain an existing native runtime and its image.
 
-Linux native admission accepts executable regular ELF files up to 256 MiB and requires executable memfd support, immutable-byte seals, descriptor-bound execute access through `faccessat2` (Linux 5.8+), and access to `/proc/self/fd`. Source mode, ACL, and mount execution restrictions remain enforced. Missing kernel support or policy that prohibits executable memfds causes launch to fail before a connector starts; the host does not fall back to the mutable binary path. Executable names are resolved once through the managed `PATH` or the host's inherited `PATH`. The current process wrapper passes the descriptor path as `argv[0]`, so native executables must not depend on their invocation filename to select behavior. This retention is process-local, does not pin dynamic loaders/shared libraries or establish publisher trust, and does not implement historical rollback. macOS and Windows keep their existing native launch behavior; the retained-byte guarantee currently applies to Linux only.
+Linux native admission accepts executable regular ELF files up to 256 MiB and requires executable memfd support, immutable-byte seals, descriptor-bound execute access through `faccessat2` (Linux 5.8+), and access to `/proc/self/fd`. Source mode, ACL, and mount execution restrictions remain enforced. Missing kernel support or policy that prohibits executable memfds causes launch to fail before a connector starts; the host does not fall back to the mutable binary path. Executable names are resolved once through the managed `PATH` or the host's inherited `PATH`. The current process wrapper passes the descriptor path as `argv[0]`, so native executables must not depend on their invocation filename to select behavior. This retention is process-local, does not pin dynamic loaders/shared libraries or establish publisher trust, and does not retain deployment history automatically. macOS and Windows keep their existing native launch behavior; the retained-byte guarantee currently applies to Linux only.
 
 After every rollout or managed deployment restoration, re-check `rollout status`, `status`, `doctor`, and `mesh explain-availability`. If the active node degrades, promote the staged standby peer deliberately rather than assuming automatic lease handoff or automatic state convergence.
 
@@ -2686,7 +2734,7 @@ Proof anchors for deployment claims:
 | `FWC_HOST` | Default `fcp-host` endpoint URL (`fwc` consults this first) | None (requires `--host` or context) |
 | `FWC_CREDENTIAL_STORE_KEY_FILE` | Private file with an independent 32-byte raw or 64-digit hex encryption key for local credential-file fallback | None (file writes fail closed without it) |
 | `FCP_HOST_ENDPOINT` | Alternate name for the `fcp-host` endpoint URL (`fwc` consults this second) | None |
-| `FCP_HOST_ADMIN_BEARER_TOKEN` | Bearer for the protected host admin API; also used by `fwc` host auth commands when no admin token file is supplied | None |
+| `FCP_HOST_ADMIN_BEARER_TOKEN` | Bearer for the protected host admin API; also used by `fwc` host auth commands and pinned deployment rollback when no admin token file is supplied | None |
 | `FCP_HOST_BIND` | `fcp-host` listen address (also used by `fwc` as a third fallback for endpoint resolution) | `127.0.0.1:8787` |
 | `FCP_HOST_CONNECTORS_FILE` | Live connector inventory file mutated by `fcp-host` | None |
 | `FCP_HOST_LIFECYCLE_STATE_FILE` | Local admin-state snapshot for `fcp-host` | None |

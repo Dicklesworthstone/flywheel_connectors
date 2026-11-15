@@ -197,6 +197,8 @@ mod native_rpc;
 mod native_stream;
 #[path = "fcp-host/session.rs"]
 mod session;
+#[path = "fcp-host/verified_rollback.rs"]
+mod verified_rollback;
 #[path = "fcp-host/wasi_connector.rs"]
 mod wasi_connector;
 #[path = "fcp-host/webhook_ingress.rs"]
@@ -2949,6 +2951,12 @@ fn validate_registry_config_for_launch(
     config: &ConnectorConfig,
     launch: bool,
 ) -> HostResult<ValidatedConnectorConfig> {
+    validate_registry_config_settings(config)?;
+    let manifest_constraints = load_manifest_operation_constraints(config)?;
+    validate_registry_config_with_manifest(config, manifest_constraints, launch)
+}
+
+fn validate_registry_config_settings(config: &ConnectorConfig) -> HostResult<()> {
     connector_summary_from_config(config)?;
     if let Some(pin) = config.binary_sha256.as_deref() {
         ExecutableDigest::parse(pin)
@@ -2966,7 +2974,16 @@ fn validate_registry_config_for_launch(
     ] {
         configured_connector_state_mac_key(config, env_keys).map_err(HostError::InvalidFilter)?;
     }
-    let manifest_constraints = load_manifest_operation_constraints(config)?;
+    Ok(())
+}
+
+/// Share ordinary admission with callers that have already captured a bounded,
+/// version-checked manifest. No runtime is launched by either validation phase.
+fn validate_registry_config_with_manifest(
+    config: &ConnectorConfig,
+    manifest_constraints: ManifestOperationConstraintCatalog,
+    launch: bool,
+) -> HostResult<ValidatedConnectorConfig> {
     let state_policy = ConnectorStatePolicy::resolve(config, &manifest_constraints)?;
     validate_production_prewarm_policy(config, state_policy)?;
     validate_runtime_network_claim(
@@ -2997,6 +3014,11 @@ async fn build_registry_entry_with_admission(
     resilience: Arc<ResilienceLayer>,
     capability_verifying_key: Option<[u8; PUBLIC_KEY_SIZE]>,
 ) -> HostResult<RegistryEntry> {
+    // Failure history belongs to a physical deployment. A replacement must be
+    // able to prepare even if the old runtime is unhealthy or its circuit is
+    // open, without clearing that old runtime's gates while it still serves.
+    // The new layer retains configured limits and shares host load shedding.
+    let resilience = Arc::new(resilience.for_new_deployment());
     let connector = ConnectorRuntime::spawn(
         config.clone(),
         &admitted,
@@ -9709,6 +9731,10 @@ async fn async_main(telemetry_config: TelemetryConfig) -> HostResult<()> {
         .route(
             "/rpc/rollout/rollback",
             post(rollout_manual_rollback_handler),
+        )
+        .route(
+            "/rpc/rollout/rollback/pinned",
+            post(rollout_pinned_rollback_handler),
         )
         .route("/rpc/rollout/{connector_id}", get(rollout_status_handler))
         .route(
@@ -18361,6 +18387,7 @@ async fn rollout_pin_handler(
     Json(request): Json<PinRequest>,
 ) -> Result<Json<PinStateResponse>, (StatusCode, String)> {
     let connector_id = parse_connector_id(&connector_id)?;
+    let _transaction = state.registry.inventory_transaction.lock().await;
     ensure_registered_connector(&state, &connector_id).await?;
     let started_at = Instant::now();
     tracing::debug!(
@@ -18415,6 +18442,7 @@ async fn rollout_unpin_handler(
     Path(connector_id): Path<String>,
 ) -> Result<Json<PinStateResponse>, (StatusCode, String)> {
     let connector_id = parse_connector_id(&connector_id)?;
+    let _transaction = state.registry.inventory_transaction.lock().await;
     ensure_registered_connector(&state, &connector_id).await?;
     let started_at = Instant::now();
     tracing::debug!(
@@ -18450,6 +18478,7 @@ async fn rollout_schedule_handler(
         observed_at,
     } = request;
     let connector_id = parse_connector_id(&connector_id)?;
+    let _transaction = state.registry.inventory_transaction.lock().await;
     let observed_at = observed_at.unwrap_or_else(Utc::now);
     let started_at = Instant::now();
     tracing::debug!(
@@ -18510,6 +18539,9 @@ async fn rollout_evaluate_handler(
         observed_at,
     } = request;
     let connector_id = parse_connector_id(&connector_id)?;
+    // A delayed evaluation must not overwrite a completed executable rollback
+    // with the failed deployment's earlier lifecycle record.
+    let _transaction = state.registry.inventory_transaction.lock().await;
     let observed_at = observed_at.unwrap_or_else(Utc::now);
     let started_at = Instant::now();
     let pinned_version = state.lifecycle.pinned_version(&connector_id).await;
@@ -18565,6 +18597,16 @@ async fn rollout_evaluate_handler(
             Err(map_host_error(err))
         }
     }
+}
+
+async fn rollout_pinned_rollback_handler(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<fcp_host::ConnectorPinnedRollbackRequest>,
+) -> Result<Json<fcp_host::ConnectorPinnedRollbackResponse>, (StatusCode, String)> {
+    verified_rollback::execute(&state, request)
+        .await
+        .map(Json)
+        .map_err(map_host_error)
 }
 
 async fn rollout_manual_rollback_handler(
@@ -30992,11 +31034,10 @@ output_schema = { type = "object" }
             current_lease_seq: None,
         }));
 
-        let error =
-            match build_registry_entry(config, Arc::new(ResilienceLayer::default()), None).await {
-                Ok(_) => panic!("non-holder singleton_writer launch must be refused before spawn"),
-                Err(error) => error,
-            };
+        let error = match validate_registry_config(&config) {
+            Ok(_) => panic!("non-holder singleton_writer launch must be refused before spawn"),
+            Err(error) => error,
+        };
         let message = error.to_string();
         assert!(message.contains("HRW lease routing refused singleton_writer launch"));
         assert!(message.contains(r#""code":"NotSelectedCoordinator""#));
@@ -31022,13 +31063,12 @@ output_schema = { type = "object" }
         config.config = Some(json!({ "state": { "model": "singleton_writer" } }));
         let _guard = set_test_hrw_lease_routing_override(None);
 
-        let error =
-            match build_registry_entry(config, Arc::new(ResilienceLayer::default()), None).await {
-                Ok(_) => {
-                    panic!("singleton_writer launch must fail closed without HRW routing config")
-                }
-                Err(error) => error,
-            };
+        let error = match validate_registry_config(&config) {
+            Ok(_) => {
+                panic!("singleton_writer launch must fail closed without HRW routing config")
+            }
+            Err(error) => error,
+        };
         let message = error.to_string();
         assert!(message.contains("HRW lease routing refused singleton_writer launch"));
         assert!(message.contains(r#""code":"LeaseRoutingConfigMissing""#));
@@ -31068,9 +31108,16 @@ output_schema = { type = "object" }
             current_lease_seq: None,
         }));
 
-        let entry = build_registry_entry(config, Arc::new(ResilienceLayer::default()), None)
-            .await
-            .expect("elected holder should build singleton_writer registry entry");
+        let admitted = validate_registry_config(&config)
+            .expect("elected holder should pass admission before runtime preparation");
+        let entry = build_registry_entry_with_admission(
+            config,
+            admitted,
+            Arc::new(ResilienceLayer::default()),
+            None,
+        )
+        .await
+        .expect("elected holder should build singleton_writer registry entry");
         assert_eq!(entry.config.id, connector_id);
         assert!(matches!(
             entry.connector,
@@ -31099,11 +31146,10 @@ output_schema = { type = "object" }
             current_lease_seq: None,
         }));
 
-        let error =
-            match build_registry_entry(config, Arc::new(ResilienceLayer::default()), None).await {
-                Ok(_) => panic!("singleton_writer launch must fail before spawn without quorum"),
-                Err(error) => error,
-            };
+        let error = match validate_registry_config(&config) {
+            Ok(_) => panic!("singleton_writer launch must fail before spawn without quorum"),
+            Err(error) => error,
+        };
         let message = error.to_string();
         assert!(message.contains("HRW lease routing refused singleton_writer launch"));
         assert!(message.contains(r#""code":"LeaseQuorumConfigInvalid""#));

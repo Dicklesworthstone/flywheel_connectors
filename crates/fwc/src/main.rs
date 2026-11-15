@@ -332,7 +332,8 @@ use fcp_host::{
     ConnectorInventoryMutationKind as HostConnectorInventoryMutationKind,
     ConnectorInventoryMutationRequest as HostConnectorInventoryMutationRequest,
     ConnectorInventoryMutationResponse as HostConnectorInventoryMutationResponse,
-    ConnectorInventoryResponse as HostConnectorInventoryResponse, ConnectorPrewarmConfig,
+    ConnectorInventoryResponse as HostConnectorInventoryResponse, ConnectorPinnedRollbackRequest,
+    ConnectorPinnedRollbackResponse, ConnectorPrewarmConfig,
     DiscoveryFilter as HostDiscoveryFilter, DiscoveryResponse as HostDiscoveryResponse,
     DoctorReport as HostDoctorReport, DoctorRequest as HostDoctorRequest,
     EventQueryRequest as HostEventQueryRequest, EventQueryResponse as HostEventQueryResponse,
@@ -2141,6 +2142,17 @@ struct RolloutRollbackArgs {
     /// Version to roll back to.
     #[arg(long)]
     to: String,
+
+    /// Restore this complete ManagedConnectorConfig JSON (at most 1 MiB).
+    /// Binary and manifest paths refer to the selected host's filesystem.
+    #[arg(long, value_name = "FILE")]
+    #[serde(skip_serializing)]
+    target_config: Option<PathBuf>,
+
+    /// Read the host admin bearer secret from a file; defaults to FCP_HOST_ADMIN_BEARER_TOKEN.
+    #[arg(long, value_name = "PATH", requires = "target_config")]
+    #[serde(skip_serializing)]
+    admin_token_file: Option<PathBuf>,
 }
 
 #[derive(Args, Debug, Serialize)]
@@ -6634,6 +6646,32 @@ impl HostAdminClient {
                 "to_version": to_version,
             }),
         )
+    }
+
+    fn rollback_pinned(
+        &self,
+        request: &ConnectorPinnedRollbackRequest,
+    ) -> Result<ConnectorPinnedRollbackResponse> {
+        // This route is intentionally distinct: an older host must not ignore
+        // the supplied deployment and perform a metadata-only rollback.
+        // Configs may contain credentials, so never reflect response bodies or
+        // deserialization details, even on rejection or an incompatible peer.
+        let response: ConnectorPinnedRollbackResponse = self
+            .clone()
+            .with_response_limit(65_536)
+            .post_json_with_timeout("/rpc/rollout/rollback/pinned", request, self.read_timeout)?;
+        anyhow::ensure!(
+            response.connector_id == request.connector_id
+                && response.to_version == request.to_version,
+            "host returned a rollback result for a different connector or target version"
+        );
+        anyhow::ensure!(
+            response.runtime_restored
+                && response.state == LifecycleState::RolledBack
+                && response.desired_state != fcp_host::DesiredRuntimeState::Unspecified,
+            "host did not confirm restoration of the supplied pinned deployment"
+        );
+        Ok(response)
     }
 
     fn auth_profile_upsert(&self, provider: &str, request: &Value) -> Result<Value> {
@@ -18931,6 +18969,9 @@ fn rollout_dispatch(args: &RolloutArgs, explicit_host: Option<&str>) -> Result<D
                     ));
                 }
             };
+            if rollback_args.target_config.is_some() {
+                return pinned_rollout_rollback_dispatch(rollback_args, connector, &host);
+            }
             let version = rollback_args.to.parse::<semver::Version>().map_err(|error| {
                 anyhow::anyhow!(
                     "`fwc rollout rollback` requires an explicit semantic version target: {error}"
@@ -18983,6 +19024,239 @@ fn rollout_dispatch(args: &RolloutArgs, explicit_host: Option<&str>) -> Result<D
             })
         }
     }
+}
+
+const MAX_ROLLBACK_TARGET_BYTES: u64 = 1024 * 1024;
+
+fn read_rollback_target_config(
+    path: &Path,
+    connector_id: &str,
+    version: &semver::Version,
+) -> Result<ManagedConnectorConfig> {
+    let source_error = || {
+        anyhow::anyhow!(
+            "--target-config must name a readable regular JSON file no larger than 1 MiB"
+        )
+    };
+    let metadata = std::fs::metadata(path).map_err(|_| source_error())?;
+    anyhow::ensure!(
+        metadata.is_file() && metadata.len() <= MAX_ROLLBACK_TARGET_BYTES,
+        "--target-config must name a regular JSON file no larger than 1 MiB"
+    );
+    let file = std::fs::File::open(path).map_err(|_| source_error())?;
+    let metadata = file.metadata().map_err(|_| source_error())?;
+    anyhow::ensure!(
+        metadata.is_file() && metadata.len() <= MAX_ROLLBACK_TARGET_BYTES,
+        "--target-config must name a regular JSON file no larger than 1 MiB"
+    );
+    let mut raw = zeroize::Zeroizing::new(Vec::new());
+    file.take(MAX_ROLLBACK_TARGET_BYTES + 1)
+        .read_to_end(&mut raw)
+        .map_err(|_| source_error())?;
+    anyhow::ensure!(
+        raw.len() as u64 <= MAX_ROLLBACK_TARGET_BYTES,
+        "--target-config exceeds 1 MiB"
+    );
+    // Deserialize the actual type first, which also rejects duplicate known
+    // fields. Explicitly reject unknown fields instead of dropping a misspelled
+    // authority setting while forwarding the rest of the deployment.
+    let config: ManagedConnectorConfig = serde_json::from_slice(&raw).map_err(|_| {
+        anyhow::anyhow!(
+            "--target-config must contain one complete ManagedConnectorConfig JSON object"
+        )
+    })?;
+    let fields: BTreeMap<String, Value> = serde_json::from_slice(&raw)
+        .map_err(|_| anyhow::anyhow!("--target-config must contain a JSON object"))?;
+    const KNOWN_FIELDS: &[&str] = &[
+        "id",
+        "binary",
+        "binary_sha256",
+        "manifest_path",
+        "name",
+        "description",
+        "args",
+        "env",
+        "config",
+        "categories",
+        "version",
+        "allowed_zones",
+        "allowed_operations",
+        "enforce_operation_network_constraints",
+        "enforce_empty_allow_lists",
+        "runtime_network_enforcement",
+        "prewarm",
+        "operation_network_constraints",
+        "cancellation_deadline_ms",
+    ];
+    anyhow::ensure!(
+        fields
+            .keys()
+            .all(|field| KNOWN_FIELDS.contains(&field.as_str())),
+        "--target-config contains an unknown managed connector field"
+    );
+    anyhow::ensure!(
+        config.id.parse::<ConnectorId>().is_ok() && config.id == connector_id,
+        "--target-config must name the selected connector's exact canonical ID"
+    );
+    anyhow::ensure!(
+        config
+            .version
+            .as_deref()
+            .and_then(|value| value.parse::<semver::Version>().ok())
+            .as_ref()
+            == Some(version),
+        "--target-config must declare a semantic version matching --to"
+    );
+    anyhow::ensure!(
+        config
+            .binary_sha256
+            .as_deref()
+            .is_some_and(|pin| pin.len() == 64 && pin.bytes().all(|byte| byte.is_ascii_hexdigit())),
+        "--target-config requires binary_sha256 containing exactly 64 hexadecimal digits"
+    );
+    anyhow::ensure!(
+        !config.binary.trim().is_empty()
+            && config
+                .manifest_path
+                .as_deref()
+                .is_some_and(|path| !path.trim().is_empty()),
+        "--target-config requires executable and manifest paths on the selected host"
+    );
+    Ok(config)
+}
+
+fn pinned_rollout_rollback_failure(
+    connector: &HostConnectorRecord,
+    host: &ResolvedHostConfig,
+    message: &str,
+    submitted: bool,
+) -> DispatchOutcome {
+    DispatchOutcome {
+        payload: json!({
+            "status": "error", "command": "rollout", "subcommand": "rollback",
+            "source": "host-admin-api",
+            "connector": { "slug": connector.slug, "canonical_id": connector.summary.id },
+            "error": {
+                "type": if submitted { "pinned-rollback-unconfirmed" } else { "invalid-pinned-rollback-target" },
+                "message": message,
+                "retryable": false,
+            },
+            "outcome": if submitted { "unconfirmed" } else { "not_submitted" },
+            "next_actions": [
+                format!("fwc rollout status {} --host {}", connector.slug, host.endpoint),
+                format!("fwc status {} --host {}", connector.slug, host.endpoint),
+            ],
+        }),
+        exit_code: if submitted {
+            CliExitCode::Transport
+        } else {
+            CliExitCode::Validation
+        },
+    }
+}
+
+fn pinned_rollout_rollback_dispatch(
+    args: &RolloutRollbackArgs,
+    connector: &HostConnectorRecord,
+    host: &ResolvedHostConfig,
+) -> Result<DispatchOutcome> {
+    let prepared = (|| {
+        let version = args
+            .to
+            .parse::<semver::Version>()
+            .map_err(|_| anyhow::anyhow!("--to must be an explicit semantic version"))?;
+        let path = args
+            .target_config
+            .as_deref()
+            .context("--target-config is required for pinned rollback")?;
+        let target = read_rollback_target_config(path, connector.summary.id.as_str(), &version)?;
+        let client =
+            HostAdminClient::for_provider_auth(&host.endpoint, args.admin_token_file.as_deref())?;
+        Ok::<_, anyhow::Error>((
+            client,
+            ConnectorPinnedRollbackRequest {
+                connector_id: connector.summary.id.to_string(),
+                to_version: version,
+                connector: target,
+                reason: None,
+            },
+        ))
+    })();
+    let (client, request) = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            return Ok(pinned_rollout_rollback_failure(
+                connector,
+                host,
+                &error.to_string(),
+                false,
+            ));
+        }
+    };
+    let response = match client.rollback_pinned(&request) {
+        Ok(response) => response,
+        Err(error) => {
+            return Ok(pinned_rollout_rollback_failure(
+                connector,
+                host,
+                &format!(
+                    "Pinned rollback was not confirmed: {error}. Inspect lifecycle and inventory before retrying. No fallback or automatic retry was sent."
+                ),
+                true,
+            ));
+        }
+    };
+    let desired = match response.desired_state {
+        fcp_host::DesiredRuntimeState::Enabled => "enabled",
+        fcp_host::DesiredRuntimeState::Disabled => "disabled",
+        fcp_host::DesiredRuntimeState::Uninstalled => "uninstalled",
+        fcp_host::DesiredRuntimeState::Unspecified => unreachable!("validated rollback response"),
+    };
+    // Project only typed, nonsecret completion evidence. The host's free-form
+    // message and all supplied configuration remain outside CLI output.
+    let mut payload = json!({
+        "status": "ok", "command": "rollout", "subcommand": "rollback",
+        "source": "host-admin-api",
+        "message": format!(
+            "Restored verified deployment for `{}` from `{}` to `{}`. Desired state is `{desired}`; inspect health before promoting the rollout.",
+            connector.slug, response.from_version, response.to_version,
+        ),
+        "connector": { "slug": connector.slug, "canonical_id": connector.summary.id },
+        "rollback": {
+            "connector_id": response.connector_id, "state": response.state,
+            "from_version": response.from_version, "to_version": response.to_version,
+            "registry_version": response.registry_version,
+            "runtime_restored": response.runtime_restored, "desired_state": response.desired_state,
+        },
+        "next_actions": [
+            format!("fwc rollout status {} --host {}", connector.slug, host.endpoint),
+            format!("fwc status {} --host {}", connector.slug, host.endpoint),
+        ],
+    });
+    attach_install_contract(
+        &mut payload,
+        "rollout",
+        "host-admin-api",
+        "node-local-root-app",
+        "rollout-rollback-pinned",
+        Some(&host.endpoint),
+        true,
+        false,
+        false,
+        "The host confirmed publication of the verified target deployment and preserved its desired state. Restoration does not prove health or enable a disabled or uninstalled connector.",
+        vec![json!({
+            "kind": "rollout-rollback-pinned", "connector_id": response.connector_id,
+            "endpoint": host.endpoint, "state": response.state,
+            "from_version": response.from_version, "to_version": response.to_version,
+            "registry_version": response.registry_version, "runtime_restored": response.runtime_restored,
+            "desired_state": response.desired_state,
+        })],
+    );
+    CommandEnvelope::new(CommandAvailability::LiveRuntime, "rollout").inject_into(&mut payload);
+    Ok(DispatchOutcome {
+        payload,
+        exit_code: CliExitCode::Success,
+    })
 }
 
 fn auth_dispatch(args: &AuthArgs, explicit_host: Option<&str>) -> Result<DispatchOutcome> {
@@ -69806,6 +70080,232 @@ require_attestation_types = ["in-toto"]"#,
         assert_eq!(payload["rollback"]["state"], "rolled_back");
         assert_eq!(payload["rollback"]["to_version"], "1.2.2");
         assert_evidence_handle(&payload, "rollout-rollback");
+    }
+
+    fn pinned_rollback_target_json() -> Value {
+        json!({
+            "id": "fcp.github:enterprise:v1", "version": "1.2.2",
+            "binary": "/host/verified/previous-connector", "binary_sha256": "ab".repeat(32),
+            "manifest_path": "/host/verified/previous-manifest.toml",
+            "args": ["--stdio"], "env": {"PROVIDER_TOKEN": "target-secret-sentinel"},
+            "config": {"api_token": "config-secret-sentinel", "workspace": "prior"},
+            "allowed_zones": ["z:work"], "allowed_operations": ["github.get_issue"],
+            "enforce_empty_allow_lists": true, "runtime_network_enforcement": "host_egress_proxy",
+            "cancellation_deadline_ms": 250,
+        })
+    }
+
+    fn pinned_rollback_response_json(desired_state: &str) -> Value {
+        json!({
+            "connector_id": "fcp.github:enterprise:v1", "state": "rolled_back",
+            "from_version": "1.2.3", "to_version": "1.2.2",
+            "registry_version": 18, "runtime_restored": true, "desired_state": desired_state,
+            "message": "response-secret-sentinel",
+            "config": {"token": "response-config-secret-sentinel"},
+        })
+    }
+
+    #[test]
+    fn pinned_rollout_cli_submits_complete_target_and_preserves_desired_state() {
+        let directory = TempDir::new().unwrap();
+        let target_path = directory.path().join("target.json");
+        let admin_path = directory.path().join("admin-token.txt");
+        let target = pinned_rollback_target_json();
+        fs::write(&target_path, serde_json::to_vec(&target).unwrap()).unwrap();
+        fs::write(&admin_path, "admin-secret-sentinel\n").unwrap();
+        for desired in ["enabled", "disabled", "uninstalled"] {
+            let (host, server, requests) = spawn_mock_host_sequence_with_body_log(vec![
+                (
+                    "POST /rpc/discover".to_owned(),
+                    mock_discovery_response_json(),
+                ),
+                (
+                    "POST /rpc/rollout/rollback/pinned".to_owned(),
+                    pinned_rollback_response_json(desired),
+                ),
+            ]);
+            let (exit, payload) = execute_json(&[
+                "fwc",
+                "--json",
+                "--host",
+                &host,
+                "rollout",
+                "rollback",
+                "github",
+                "--to",
+                "1.2.2",
+                "--target-config",
+                target_path.to_str().unwrap(),
+                "--admin-token-file",
+                admin_path.to_str().unwrap(),
+            ]);
+            server.join().unwrap();
+            assert_eq!(exit, CliExitCode::Success.into(), "{payload}");
+            assert_eq!(payload["rollback"]["runtime_restored"], true);
+            assert_eq!(payload["rollback"]["registry_version"], 18);
+            assert_eq!(payload["rollback"]["desired_state"], desired);
+            assert_eq!(payload["rollback"]["state"], "rolled_back");
+            assert_install_contract(
+                &payload,
+                "host-admin-api",
+                "node-local-root-app",
+                "rollout-rollback-pinned",
+                true,
+                false,
+                false,
+            );
+            assert_evidence_handle(&payload, "rollout-rollback-pinned");
+            let rendered = payload.to_string();
+            assert!(!rendered.contains("secret-sentinel"));
+            assert!(!rendered.contains("/host/verified"));
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            let sent: super::ConnectorPinnedRollbackRequest =
+                serde_json::from_str(&requests[1].1).unwrap();
+            assert_eq!(
+                sent.connector,
+                serde_json::from_value::<ManagedConnectorConfig>(target.clone()).unwrap()
+            );
+            assert_eq!(sent.connector_id, "fcp.github:enterprise:v1");
+            assert_eq!(sent.to_version.to_string(), "1.2.2");
+        }
+    }
+
+    #[test]
+    fn pinned_rollout_cli_refuses_invalid_targets_before_mutation() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("target.json");
+        for case in [
+            "identity",
+            "version",
+            "missing-pin",
+            "invalid-pin",
+            "manifest",
+            "unknown",
+            "duplicate",
+            "malformed",
+            "oversized",
+        ] {
+            let mut target = pinned_rollback_target_json();
+            match case {
+                "identity" => target["id"] = json!("fcp.slack:enterprise:v1"),
+                "version" => target["version"] = json!("9.0.0"),
+                "missing-pin" => target["binary_sha256"] = Value::Null,
+                "invalid-pin" => target["binary_sha256"] = json!("target-secret-sentinel"),
+                "manifest" => target["manifest_path"] = Value::Null,
+                "unknown" => target["allowed_zone"] = json!(["z:private"]),
+                _ => {}
+            }
+            let raw = match case {
+                "duplicate" => format!(
+                    "{{\"id\":\"fcp.github:enterprise:v1\",{}",
+                    &target.to_string()[1..]
+                ),
+                "malformed" => "{\"config\":\"config-secret-sentinel\"".to_owned(),
+                _ => target.to_string(),
+            };
+            fs::write(&path, raw).unwrap();
+            if case == "oversized" {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_len(super::MAX_ROLLBACK_TARGET_BYTES + 1)
+                    .unwrap();
+            }
+            let (host, server, requests) = spawn_mock_host_sequence_with_body_log(vec![(
+                "POST /rpc/discover".to_owned(),
+                mock_discovery_response_json(),
+            )]);
+            let (exit, payload) = execute_json(&[
+                "fwc",
+                "--json",
+                "--host",
+                &host,
+                "rollout",
+                "rollback",
+                "github",
+                "--to",
+                "1.2.2",
+                "--target-config",
+                path.to_str().unwrap(),
+            ]);
+            server.join().unwrap();
+            assert_eq!(exit, CliExitCode::Validation.into(), "{case}: {payload}");
+            assert_eq!(payload["outcome"], "not_submitted");
+            assert_eq!(payload["error"]["type"], "invalid-pinned-rollback-target");
+            assert!(!payload.to_string().contains("secret-sentinel"));
+            assert_eq!(requests.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn pinned_rollout_cli_refuses_unbound_or_unconfirmed_completion() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("target.json");
+        fs::write(&path, pinned_rollback_target_json().to_string()).unwrap();
+        for (field, value) in [
+            ("connector_id", json!("fcp.slack:enterprise:v1")),
+            ("to_version", json!("9.0.0")),
+            ("runtime_restored", json!(false)),
+            ("state", json!("production")),
+            ("desired_state", json!("unspecified")),
+        ] {
+            let mut response = pinned_rollback_response_json("enabled");
+            response[field] = value;
+            let (host, server, requests) = spawn_mock_host_sequence_with_body_log(vec![
+                (
+                    "POST /rpc/discover".to_owned(),
+                    mock_discovery_response_json(),
+                ),
+                ("POST /rpc/rollout/rollback/pinned".to_owned(), response),
+            ]);
+            let (exit, payload) = execute_json(&[
+                "fwc",
+                "--json",
+                "--host",
+                &host,
+                "rollout",
+                "rollback",
+                "github",
+                "--to",
+                "1.2.2",
+                "--target-config",
+                path.to_str().unwrap(),
+            ]);
+            server.join().unwrap();
+            assert_eq!(exit, CliExitCode::Transport.into(), "{field}: {payload}");
+            assert_eq!(payload["outcome"], "unconfirmed");
+            assert_eq!(payload["error"]["retryable"], false);
+            assert!(!payload.to_string().contains("secret-sentinel"));
+            assert_eq!(requests.lock().unwrap().len(), 2);
+        }
+    }
+
+    #[test]
+    fn pinned_rollback_does_not_fall_back_to_an_old_host_or_reflect_its_error() {
+        let (host, server) = spawn_mock_host_with_response_status(
+            StdBTreeMap::from([(
+                "POST /rpc/rollout/rollback/pinned".to_owned(),
+                json!({
+                    "config": "target-secret-sentinel", "message": "response-secret-sentinel",
+                }),
+            )]),
+            1,
+            StdBTreeMap::new(),
+            404,
+        );
+        let request = super::ConnectorPinnedRollbackRequest {
+            connector_id: "fcp.github:enterprise:v1".to_owned(),
+            to_version: "1.2.2".parse().unwrap(),
+            connector: serde_json::from_value(pinned_rollback_target_json()).unwrap(),
+            reason: None,
+        };
+        let client = super::HostAdminClient::new(&host).unwrap();
+        let error = client.rollback_pinned(&request).unwrap_err();
+        server.join().unwrap();
+        assert!(error.to_string().contains("HTTP 404"));
+        assert!(!error.to_string().contains("secret-sentinel"));
     }
 
     #[test]

@@ -203,7 +203,7 @@ pub(super) fn require_dormant_replacement(current: Option<&RegistryEntry>) -> Ho
     Ok(())
 }
 
-fn stateless_retirement_supported(entry: &RegistryEntry) -> HostResult<()> {
+pub(super) fn stateless_retirement_supported(entry: &RegistryEntry) -> HostResult<()> {
     if matches!(
         &entry.connector,
         ConnectorRuntime::Dormant(_) | ConnectorRuntime::UnavailableNativeProxyOnly(_)
@@ -249,7 +249,7 @@ fn restart_supported(entry: &RegistryEntry) -> HostResult<()> {
     entry.state_policy.require_admitted_manifest(&entry.config)
 }
 
-async fn selected_entry(
+pub(super) async fn selected_entry(
     registry: &SubprocessRegistry,
     connector_id: &ConnectorId,
 ) -> HostResult<(RegistryEntry, u64)> {
@@ -265,7 +265,7 @@ async fn selected_entry(
 /// The caller holds the inventory transaction through preparation, durable
 /// intent changes, retirement and this publication. The generation check also
 /// protects against direct registry users outside the administrative handlers.
-async fn publish_entry(
+pub(super) async fn publish_entry(
     registry: &SubprocessRegistry,
     connector_id: &ConnectorId,
     entry: RegistryEntry,
@@ -328,7 +328,7 @@ async fn observe_transition(
     Ok(response)
 }
 
-async fn retire_selected(
+pub(super) async fn retire_selected(
     registry: &SubprocessRegistry,
     connector_id: &ConnectorId,
     entry: &RegistryEntry,

@@ -1549,7 +1549,7 @@ pub struct ResilienceLayer {
     config: ResilienceConfig,
     connectors: RwLock<HashMap<ConnectorId, Arc<ConnectorState>>>,
     health_router: HealthRouter,
-    load_shedder: LoadShedder,
+    load_shedder: Arc<LoadShedder>,
     backpressure_controller: BackpressureController,
 }
 
@@ -1577,11 +1577,28 @@ impl ResilienceLayer {
     #[must_use]
     pub fn new(config: ResilienceConfig) -> Self {
         Self {
-            load_shedder: LoadShedder::new(config.load_shed.clone()),
+            load_shedder: Arc::new(LoadShedder::new(config.load_shed.clone())),
             backpressure_controller: BackpressureController::default(),
             health_router: HealthRouter::new(config.health.clone()),
             config,
             connectors: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Start an independent deployment with the same configured protections.
+    ///
+    /// Circuit failures, health history, occupied bulkhead permits, and metrics
+    /// belong to the runtime that produced them. A replacement must not inherit
+    /// those gates or reset the old runtime while it can still serve requests.
+    /// Host load shedding remains shared, including later manual load updates.
+    #[must_use]
+    pub fn for_new_deployment(&self) -> Self {
+        Self {
+            config: self.config.clone(),
+            connectors: RwLock::new(HashMap::new()),
+            health_router: HealthRouter::new(self.config.health.clone()),
+            load_shedder: Arc::clone(&self.load_shedder),
+            backpressure_controller: self.backpressure_controller,
         }
     }
 
@@ -3436,6 +3453,164 @@ mod tests {
             admitted_count,
             shed_count,
         })
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn new_deployment_isolates_failures_and_preserves_timeout_and_health_limits() {
+        let operation_timeout = Duration::from_millis(10);
+        let original = ResilienceLayer::new(ResilienceConfig {
+            circuit_breaker: CircuitBreakerConfig {
+                failure_threshold: 1,
+                open_duration: Duration::from_secs(60),
+                ..CircuitBreakerConfig::default()
+            },
+            health: HealthRouterConfig {
+                unhealthy_threshold: 1,
+                probe_interval: Duration::from_secs(60),
+                ..HealthRouterConfig::default()
+            },
+            operation_timeout: Some(operation_timeout),
+            ..ResilienceConfig::default()
+        });
+        let connector_id = test_connector_id();
+        let failed = original
+            .execute(&connector_id, RequestPriority::Critical, "invoke", async {
+                Err::<(), _>("failed deployment")
+            })
+            .await;
+        assert!(matches!(
+            failed,
+            Err(ResilienceError::Inner("failed deployment"))
+        ));
+        assert_eq!(original.circuit_state(&connector_id), CircuitState::Open);
+        assert!(matches!(
+            original.connector_health(&connector_id),
+            ConnectorHealth::Unavailable { .. }
+        ));
+
+        let replacement = original.for_new_deployment();
+        assert_eq!(
+            replacement.metrics(&connector_id),
+            ResilienceMetricsSnapshot::default()
+        );
+        assert_eq!(
+            replacement.circuit_state(&connector_id),
+            CircuitState::Closed
+        );
+        assert!(matches!(
+            replacement.connector_health(&connector_id),
+            ConnectorHealth::Healthy
+        ));
+        replacement
+            .execute(&connector_id, RequestPriority::Critical, "invoke", async {
+                Ok::<(), &str>(())
+            })
+            .await
+            .expect("the replacement does not inherit the failed deployment's gates");
+        assert_eq!(original.circuit_state(&connector_id), CircuitState::Open);
+        assert!(matches!(
+            original.connector_health(&connector_id),
+            ConnectorHealth::Unavailable { .. }
+        ));
+
+        let timeout = time::timeout(
+            Duration::from_secs(1),
+            replacement.execute(
+                &connector_id,
+                RequestPriority::Critical,
+                "invoke",
+                std::future::pending::<Result<(), &str>>(),
+            ),
+        )
+        .await
+        .expect("the configured operation timeout must remain active");
+        assert!(
+            matches!(timeout, Err(ResilienceError::TimedOut { timeout }) if timeout == operation_timeout)
+        );
+        assert_eq!(replacement.circuit_state(&connector_id), CircuitState::Open);
+        assert!(matches!(
+            replacement.connector_health(&connector_id),
+            ConnectorHealth::Unavailable { .. }
+        ));
+        assert_eq!(replacement.metrics(&connector_id).timeouts, 1);
+        assert_eq!(original.metrics(&connector_id).timeouts, 0);
+        assert_eq!(original.metrics(&connector_id).failures, 1);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn new_deployment_preserves_bulkhead_limits_without_inheriting_occupied_permits() {
+        let original = ResilienceLayer::new(ResilienceConfig {
+            bulkhead: BulkheadConfig {
+                max_concurrent: 1,
+                max_queued: 0,
+                queue_timeout: Duration::from_millis(20),
+            },
+            ..ResilienceConfig::default()
+        });
+        let connector_id = test_connector_id();
+        let original_state = original.connector_state(&connector_id);
+        let original_permit = original_state
+            .bulkhead
+            .acquire()
+            .await
+            .expect("original permit");
+
+        let replacement = original.for_new_deployment();
+        replacement
+            .execute(&connector_id, RequestPriority::Critical, "invoke", async {
+                Ok::<(), &str>(())
+            })
+            .await
+            .expect("old requests do not occupy the replacement's bulkhead");
+        let replacement_state = replacement.connector_state(&connector_id);
+        let replacement_permit = replacement_state
+            .bulkhead
+            .acquire()
+            .await
+            .expect("replacement permit");
+        assert!(matches!(
+            replacement_state.bulkhead.acquire().await,
+            Err(BulkheadAcquireError::QueueFull)
+        ));
+        assert!(matches!(
+            original_state.bulkhead.acquire().await,
+            Err(BulkheadAcquireError::QueueFull)
+        ));
+        drop(replacement_permit);
+        drop(original_permit);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn new_deployment_keeps_live_host_load_shedding_shared() {
+        let original = ResilienceLayer::default();
+        let replacement = original.for_new_deployment();
+        let connector_id = test_connector_id();
+
+        // A load update after preparation must still apply to the replacement.
+        original.set_base_load_per_mille(1_000);
+        let shed = replacement
+            .execute(&connector_id, RequestPriority::Low, "invoke", async {
+                Ok::<(), &str>(())
+            })
+            .await;
+        assert!(matches!(
+            shed,
+            Err(ResilienceError::LoadShed {
+                load_per_mille: 1_000
+            })
+        ));
+        assert_eq!(replacement.metrics(&connector_id).load_shed, 1);
+        assert_eq!(original.metrics(&connector_id).load_shed, 0);
+
+        replacement.set_base_load_per_mille(0);
+        for layer in [&original, &replacement] {
+            layer
+                .execute(&connector_id, RequestPriority::Low, "invoke", async {
+                    Ok::<(), &str>(())
+                })
+                .await
+                .expect("lowering shared host load admits both deployments again");
+        }
     }
 
     #[fcp_async_core::runtime::test]
