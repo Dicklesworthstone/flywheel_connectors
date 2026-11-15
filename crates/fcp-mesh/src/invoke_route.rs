@@ -426,6 +426,21 @@ pub enum MeshForwardBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin_attempt_id: Option<u64>,
     },
+    /// Execute an invoke with executor-enforced host safety constraints.
+    ///
+    /// The exact request includes the `fcp.host.max_safety_tier` tag. A peer
+    /// that does not implement guarded dispatch rejects this distinct method;
+    /// the origin must never retry it as an ordinary `Invoke`.
+    InvokeGuarded {
+        /// JSON-encoded `InvokeRequest`, including its signed safety constraint.
+        request_json: String,
+        /// Principal the client asserted to the entry node, re-checked locally.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        asserted_principal: Option<String>,
+        /// Nonzero origin-local attempt id for cancellation of this dispatch.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin_attempt_id: Option<u64>,
+    },
     /// Cancel one origin-authenticated invocation attempt.
     Cancel {
         /// Exact JSON-encoded cancellation request signed by the origin.
@@ -436,6 +451,15 @@ pub enum MeshForwardBody {
     /// Evaluate the host preflight for a would-be invoke without executing.
     Preflight {
         /// JSON-encoded host preflight request, exactly as signed.
+        request_json: String,
+        /// Principal the client asserted to the entry node.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        asserted_principal: Option<String>,
+    },
+    /// Evaluate executor-local admission with the request's signed host safety
+    /// constraint, without executing. Unsupported peers reject this method.
+    PreflightGuarded {
+        /// Exact JSON-encoded `InvokeRequest`, including its signed safety context.
         request_json: String,
         /// Principal the client asserted to the entry node.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -509,8 +533,10 @@ impl MeshForwardBody {
     pub const fn method(&self) -> &'static str {
         match self {
             Self::Invoke { .. } => "invoke",
+            Self::InvokeGuarded { .. } => "invoke_guarded",
             Self::Cancel { .. } => "cancel",
             Self::Preflight { .. } => "preflight",
+            Self::PreflightGuarded { .. } => "preflight_guarded",
             Self::Simulate { .. } => "simulate",
             Self::Introspect { .. } => "introspect",
             Self::Inventory { .. } => "inventory",
@@ -531,6 +557,11 @@ impl MeshForwardBody {
                 request_json,
                 asserted_principal,
                 origin_attempt_id,
+            }
+            | Self::InvokeGuarded {
+                request_json,
+                asserted_principal,
+                origin_attempt_id,
             } => {
                 out.field(request_json.as_bytes())
                     .opt_field(asserted_principal.as_deref().map(str::as_bytes));
@@ -545,6 +576,10 @@ impl MeshForwardBody {
                 out.field(request_json.as_bytes()).u64(*origin_attempt_id);
             }
             Self::Preflight {
+                request_json,
+                asserted_principal,
+            }
+            | Self::PreflightGuarded {
                 request_json,
                 asserted_principal,
             }
@@ -583,7 +618,16 @@ impl MeshForwardBody {
                 asserted_principal,
                 ..
             }
+            | Self::InvokeGuarded {
+                request_json,
+                asserted_principal,
+                ..
+            }
             | Self::Preflight {
+                request_json,
+                asserted_principal,
+            }
+            | Self::PreflightGuarded {
                 request_json,
                 asserted_principal,
             }
@@ -611,6 +655,9 @@ impl MeshForwardBody {
         if matches!(
             self,
             Self::Invoke {
+                origin_attempt_id: Some(0),
+                ..
+            } | Self::InvokeGuarded {
                 origin_attempt_id: Some(0),
                 ..
             } | Self::Cancel {
@@ -1577,6 +1624,11 @@ mod tests {
                 asserted_principal: None,
                 origin_attempt_id: Some(0),
             },
+            MeshForwardBody::InvokeGuarded {
+                request_json: "{}".to_owned(),
+                asserted_principal: None,
+                origin_attempt_id: Some(0),
+            },
             MeshForwardBody::Cancel {
                 request_json: "{}".to_owned(),
                 origin_attempt_id: 0,
@@ -1755,6 +1807,130 @@ mod tests {
         envelope
             .verify(&mesh.directory("node-b"), NOW, 30_000)
             .expect("untampered preflight forward verifies");
+    }
+
+    #[test]
+    fn guarded_forwards_bind_safety_principals_attempts_and_distinct_methods() {
+        let mesh = Mesh::new(&["node-a", "node-b"]);
+        let directory = mesh.directory("node-b");
+        let request_json = r#"{"request_id":"guarded","tags":{"fcp.host.max_safety_tier":"safe"}}"#;
+        for origin_attempt_id in [None, Some(1), Some(u64::MAX)] {
+            for (body, method, unguarded_method) in [
+                (
+                    MeshForwardBody::InvokeGuarded {
+                        request_json: request_json.to_owned(),
+                        asserted_principal: Some("agent:test".to_owned()),
+                        origin_attempt_id,
+                    },
+                    "invoke_guarded",
+                    "invoke",
+                ),
+                (
+                    MeshForwardBody::PreflightGuarded {
+                        request_json: request_json.to_owned(),
+                        asserted_principal: Some("agent:test".to_owned()),
+                    },
+                    "preflight_guarded",
+                    "preflight",
+                ),
+            ] {
+                assert_eq!(body.method(), method);
+                let envelope = MeshForwardEnvelope::sign(
+                    mesh.key("node-a"),
+                    node("node-a"),
+                    node("node-b"),
+                    NOW,
+                    body,
+                )
+                .unwrap();
+                let wire = serde_json::to_value(&envelope).unwrap();
+                assert_eq!(wire["body"]["method"], method);
+                let decoded: MeshForwardEnvelope = serde_json::from_value(wire.clone()).unwrap();
+                assert_eq!(decoded, envelope);
+                decoded.verify(&directory, NOW, 30_000).unwrap();
+
+                // Keeping identical payload bytes cannot turn a guarded call
+                // into an ordinary call that would ignore the safety tag.
+                for (field, value) in [
+                    ("method", serde_json::json!(unguarded_method)),
+                    ("asserted_principal", serde_json::json!("agent:other")),
+                    (
+                        "request_json",
+                        serde_json::json!(request_json.replace("\"safe\"", "\"dangerous\"")),
+                    ),
+                ] {
+                    let mut changed = wire.clone();
+                    changed["body"][field] = value;
+                    let tampered: MeshForwardEnvelope = serde_json::from_value(changed).unwrap();
+                    assert!(matches!(
+                        tampered.verify(&directory, NOW, 30_000),
+                        Err(MeshForwardError::SignatureInvalid { .. })
+                    ));
+                }
+                if method == "invoke_guarded" {
+                    let mut changed = wire;
+                    changed["body"]["origin_attempt_id"] = match origin_attempt_id {
+                        None => serde_json::json!(1),
+                        Some(_) => serde_json::Value::Null,
+                    };
+                    let tampered: MeshForwardEnvelope = serde_json::from_value(changed).unwrap();
+                    assert!(matches!(
+                        tampered.verify(&directory, NOW, 30_000),
+                        Err(MeshForwardError::SignatureInvalid { .. })
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn guarded_forward_limits_include_principal_on_signing_and_receiving() {
+        let mesh = Mesh::new(&["node-a", "node-b"]);
+        let directory = mesh.directory("node-b");
+        for body in [
+            MeshForwardBody::InvokeGuarded {
+                request_json: "x".repeat(MAX_MESH_FORWARD_BODY_BYTES - 1),
+                asserted_principal: Some("a".to_owned()),
+                origin_attempt_id: Some(1),
+            },
+            MeshForwardBody::PreflightGuarded {
+                request_json: "x".repeat(MAX_MESH_FORWARD_BODY_BYTES - 1),
+                asserted_principal: Some("a".to_owned()),
+            },
+        ] {
+            let mut envelope = MeshForwardEnvelope::sign(
+                mesh.key("node-a"),
+                node("node-a"),
+                node("node-b"),
+                NOW,
+                body,
+            )
+            .unwrap();
+            envelope.verify(&directory, NOW, 30_000).unwrap();
+            match &mut envelope.body {
+                MeshForwardBody::InvokeGuarded { request_json, .. }
+                | MeshForwardBody::PreflightGuarded { request_json, .. } => request_json.push('x'),
+                _ => unreachable!(),
+            }
+            assert!(matches!(
+                MeshForwardEnvelope::sign(
+                    mesh.key("node-a"),
+                    node("node-a"),
+                    node("node-b"),
+                    NOW,
+                    envelope.body.clone(),
+                ),
+                Err(MeshForwardError::BodyTooLarge { .. })
+            ));
+            envelope.signature = mesh
+                .key("node-a")
+                .sign_with_context(FORWARD_SIGNING_CONTEXT, &envelope.signing_bytes())
+                .to_hex();
+            assert!(matches!(
+                envelope.verify(&directory, NOW, 30_000),
+                Err(MeshForwardError::BodyTooLarge { .. })
+            ));
+        }
     }
 
     fn connector_query_bodies(connector_id: &str) -> [MeshForwardBody; 4] {

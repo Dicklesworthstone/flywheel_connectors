@@ -1399,9 +1399,13 @@ zone, principal, canonical connector and operation stay fixed for the batch.
 
 Each action uses `/rpc/preflight/guarded` followed by `/rpc/invoke/guarded`. The
 host checks the registered ceiling against live operation metadata at admission
-and dispatch. Guarded execution requires these endpoints and stays on the
-selected host; it refuses mesh forwarding to peers whose ceiling enforcement is
-not established. The default action deadline is 30 seconds, configurable with
+and dispatch, including on a mesh executor. Mesh forwarding requires the signed
+`preflight_guarded` and `invoke_guarded` methods: older peers refuse them, and the
+host never downgrades a guarded call to an ordinary method. The full request
+retains its ceiling, capability, principal, and remaining deadline. A successful
+preflight does not authorize a later operation tier upgrade. Forwarded invokes
+retain durable delivery tracking: only proven non-delivery permits another
+executor. The default action deadline is 30 seconds, configurable with
 `--deadline-ms` up to 60 seconds. `run` reads a bounded JSONL file; `consume`
 processes one bounded batch from an existing native stream. Neither command
 starts a background subscription or continuous event daemon.

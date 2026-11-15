@@ -14,9 +14,9 @@ mod lease_e2e_support;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use fcp_core::{TailscaleNodeId, ZoneId};
+use fcp_core::{SafetyTier, TailscaleNodeId, ZoneId};
 use fcp_crypto::ed25519::Ed25519SigningKey;
-use fcp_host::{BatchInvokeResponse, BatchStatus, OperationResultStatus};
+use fcp_host::{BatchInvokeResponse, BatchStatus, HostGuardedInvokeRequest, OperationResultStatus};
 use fcp_kernel::{ConnectorId, InvokeResponse, InvokeStatus, InvokeTruthSource};
 use fcp_mesh::invoke_route::{
     MeshForwardBody, MeshForwardEnvelope, MeshForwardReply, advertised_connector_route_subject,
@@ -136,6 +136,284 @@ async fn post_raw(
         .await?;
     let status = response.status();
     Ok((status, response.text().await?))
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn guarded_mesh_preflight_and_invoke_enforce_the_executors_live_safety_tier()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _guard = host_e2e_lock().await;
+    let mesh = MeshFixture::new(&["node-a", "node-b"])?;
+    let safe_id = remote_connector();
+    let risky_id = ConnectorId::from_static("fcp.test.mesh-risky:utility:1.0.0");
+    let safe_marker = mesh._dir.path().join("safe-invoke-started.json");
+    let risky_marker = mesh._dir.path().join("risky-invoke-started.json");
+    let mut safe_config = plain_test_connector_config(&safe_id, "Safe Mesh Remote");
+    safe_config["env"]["FCP_TEST_INVOKE_STARTED_FILE"] = json!(safe_marker);
+    let mut risky_config = plain_test_connector_config(&risky_id, "Risky Mesh Remote");
+    risky_config["env"]["FCP_TEST_CONNECTOR_OPERATION_MODE"] = json!("irreversible");
+    risky_config["env"]["FCP_TEST_INVOKE_STARTED_FILE"] = json!(risky_marker);
+    let _executor = mesh
+        .spawn("node-b", vec![safe_config, risky_config])
+        .await?;
+    let entry = mesh.spawn("node-a", Vec::new()).await?;
+
+    let (mut request, _) = build_invoke_request(safe_id, &mesh.capability_key);
+    // The subprocess writes its marker only after entering invoke. A zero
+    // delay enables this evidence without adding any timing assumptions.
+    request.input["delay_ms"] = json!(0);
+    let guarded = HostGuardedInvokeRequest {
+        request,
+        max_safety_tier: SafetyTier::Safe,
+    };
+    let preflight: Value = http_post_json(
+        entry.client.clone(),
+        format!("{}/rpc/preflight/guarded", entry.base_url),
+        guarded.clone(),
+    )
+    .await?;
+    assert_eq!(preflight["allowed"], true, "{preflight}");
+    assert!(
+        !safe_marker.exists(),
+        "remote guarded preflight must not execute the connector"
+    );
+
+    let response: InvokeResponse = http_post_json(
+        entry.client.clone(),
+        format!("{}/rpc/invoke/guarded", entry.base_url),
+        guarded.clone(),
+    )
+    .await?;
+    assert_eq!(response.status, InvokeStatus::Ok);
+    assert_eq!(response.id, guarded.request.id);
+    assert_eq!(
+        response.result.as_ref().unwrap()["echo"],
+        guarded.request.input
+    );
+    let route = route_of(&response);
+    assert_eq!(route.truth_source, InvokeTruthSource::MeshBacked);
+    assert_eq!(route.entry_node.as_deref(), Some("node-a"));
+    assert_eq!(route.served_by.as_deref(), Some("node-b"));
+    let observed: Value = serde_json::from_slice(&std::fs::read(&safe_marker)?)?;
+    assert_eq!(observed["request_id"], guarded.request.id.to_string());
+
+    let (mut request, _) = build_invoke_request(risky_id, &mesh.capability_key);
+    request.input["delay_ms"] = json!(0);
+    let guarded = HostGuardedInvokeRequest {
+        request,
+        max_safety_tier: SafetyTier::Safe,
+    };
+    let preflight: Value = http_post_json(
+        entry.client.clone(),
+        format!("{}/rpc/preflight/guarded", entry.base_url),
+        guarded.clone(),
+    )
+    .await?;
+    assert_eq!(preflight["allowed"], false, "{preflight}");
+    assert!(
+        preflight.to_string().contains("safety ceiling"),
+        "the live Risky operation must fail the ceiling gate: {preflight}"
+    );
+    let (status, body) = post_raw(&entry, "/rpc/invoke/guarded", &guarded).await?;
+    assert!(status.is_client_error(), "{status}: {body}");
+    assert!(body.contains("safety ceiling"), "{body}");
+    assert!(
+        !risky_marker.exists(),
+        "neither denied guarded request may reach the Risky subprocess invoke"
+    );
+    Ok(())
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn guarded_mesh_signatures_bind_the_method_and_ceiling_before_execution()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _guard = host_e2e_lock().await;
+    let mesh = MeshFixture::new(&["node-a", "node-b"])?;
+    let connector_id = remote_connector();
+    let marker = mesh._dir.path().join("guarded-invoke-started.json");
+    let mut config = plain_test_connector_config(&connector_id, "Guarded Mesh Remote");
+    config["env"]["FCP_TEST_INVOKE_STARTED_FILE"] = json!(marker);
+    let executor = mesh.spawn("node-b", vec![config]).await?;
+    let (mut request, _) = build_invoke_request(connector_id, &mesh.capability_key);
+    request.input["delay_ms"] = json!(0);
+    request
+        .context
+        .get_or_insert_with(Default::default)
+        .request_tags
+        .insert("fcp.host.max_safety_tier".to_owned(), "safe".to_owned());
+    let request_json = serde_json::to_string(&request)?;
+    let directory = fcp_mesh::invoke_route::MeshPeerDirectory::from_json(
+        TailscaleNodeId::new("node-a"),
+        &mesh.peers_json,
+    )?;
+
+    let mut expired_request = request.clone();
+    expired_request.deadline_ms = Some(0);
+    let expired = MeshForwardEnvelope::sign(
+        &mesh.node("node-a").key,
+        TailscaleNodeId::new("node-a"),
+        TailscaleNodeId::new("node-b"),
+        fcp_host::mesh_routing::unix_now_ms(),
+        MeshForwardBody::PreflightGuarded {
+            request_json: serde_json::to_string(&expired_request)?,
+            asserted_principal: None,
+        },
+    )?;
+    let (status, text) = post_raw(&executor, "/rpc/mesh/forward", &expired).await?;
+    assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE, "{text}");
+    assert!(
+        text.contains("deadline"),
+        "an exhausted budget must fail before authentication or dispatch: {text}"
+    );
+    assert!(!marker.exists(), "an exhausted preflight must not invoke");
+
+    // Preflight comes first so its lack of effects is observable independently
+    // from the later successful invoke.
+    for (body, legacy_method) in [
+        (
+            MeshForwardBody::PreflightGuarded {
+                request_json: request_json.clone(),
+                asserted_principal: None,
+            },
+            "preflight",
+        ),
+        (
+            MeshForwardBody::InvokeGuarded {
+                request_json: request_json.clone(),
+                asserted_principal: None,
+                origin_attempt_id: None,
+            },
+            "invoke",
+        ),
+    ] {
+        let envelope = MeshForwardEnvelope::sign(
+            &mesh.node("node-a").key,
+            TailscaleNodeId::new("node-a"),
+            TailscaleNodeId::new("node-b"),
+            fcp_host::mesh_routing::unix_now_ms(),
+            body,
+        )?;
+        let mut downgraded = serde_json::to_value(&envelope)?;
+        downgraded["body"]["method"] = json!(legacy_method);
+        let (status, text) = post_raw(&executor, "/rpc/mesh/forward", &downgraded).await?;
+        assert_eq!(status, reqwest::StatusCode::UNAUTHORIZED, "{text}");
+        assert!(!marker.exists(), "a downgraded method must not execute");
+
+        let mut weakened_request = request.clone();
+        weakened_request
+            .context
+            .as_mut()
+            .unwrap()
+            .request_tags
+            .insert("fcp.host.max_safety_tier".to_owned(), "critical".to_owned());
+        let mut tampered = serde_json::to_value(&envelope)?;
+        tampered["body"]["request_json"] = json!(serde_json::to_string(&weakened_request)?);
+        let (status, text) = post_raw(&executor, "/rpc/mesh/forward", &tampered).await?;
+        assert_eq!(status, reqwest::StatusCode::UNAUTHORIZED, "{text}");
+        assert!(
+            !marker.exists(),
+            "a weakened unsigned ceiling must not execute"
+        );
+
+        for ceiling in [None, Some("invalid-ceiling")] {
+            let mut invalid_request = request.clone();
+            let tags = &mut invalid_request.context.as_mut().unwrap().request_tags;
+            if let Some(ceiling) = ceiling {
+                tags.insert("fcp.host.max_safety_tier".to_owned(), ceiling.to_owned());
+            } else {
+                tags.remove("fcp.host.max_safety_tier");
+            }
+            let request_json = serde_json::to_string(&invalid_request)?;
+            let body = if legacy_method == "invoke" {
+                MeshForwardBody::InvokeGuarded {
+                    request_json,
+                    asserted_principal: None,
+                    origin_attempt_id: None,
+                }
+            } else {
+                MeshForwardBody::PreflightGuarded {
+                    request_json,
+                    asserted_principal: None,
+                }
+            };
+            let invalid = MeshForwardEnvelope::sign(
+                &mesh.node("node-a").key,
+                TailscaleNodeId::new("node-a"),
+                TailscaleNodeId::new("node-b"),
+                fcp_host::mesh_routing::unix_now_ms(),
+                body,
+            )?;
+            let (status, text) = post_raw(&executor, "/rpc/mesh/forward", &invalid).await?;
+            assert_eq!(status, reqwest::StatusCode::OK, "{text}");
+            let denied: MeshForwardReply = serde_json::from_str(&text)?;
+            denied.verify_for(&invalid, &directory)?;
+            assert!(!denied.is_success(), "{text}");
+            assert_ne!(denied.status, reqwest::StatusCode::UNAUTHORIZED.as_u16());
+            assert!(denied.body_json.contains("ceiling"), "{text}");
+            assert!(
+                !marker.exists(),
+                "a signed guarded method without a valid ceiling must not execute"
+            );
+        }
+
+        let (status, text) = post_raw(&executor, "/rpc/mesh/forward", &envelope).await?;
+        assert_eq!(status, reqwest::StatusCode::OK, "{text}");
+        let reply: MeshForwardReply = serde_json::from_str(&text)?;
+        reply.verify_for(&envelope, &directory)?;
+        assert!(
+            reply.is_success(),
+            "the authentic guarded call must pass: {text}"
+        );
+        if legacy_method == "preflight" {
+            let preflight: Value = serde_json::from_str(&reply.body_json)?;
+            assert_eq!(preflight["allowed"], true, "{preflight}");
+        } else {
+            let response: InvokeResponse = serde_json::from_str(&reply.body_json)?;
+            assert_eq!(response.id, request.id);
+            assert_eq!(response.status, InvokeStatus::Ok);
+        }
+        assert_eq!(
+            marker.exists(),
+            legacy_method == "invoke",
+            "only the authentic invoke may reach the subprocess"
+        );
+        let (status, text) = post_raw(&executor, "/rpc/mesh/forward", &envelope).await?;
+        assert_eq!(status, reqwest::StatusCode::CONFLICT, "{text}");
+    }
+    Ok(())
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn guarded_mesh_calls_never_downgrade_when_an_older_peer_rejects_the_method()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _guard = host_e2e_lock().await;
+    let mesh = MeshFixture::new(&["node-a", "node-b"])?;
+    let legacy = SignedReadPeer::spawn_legacy(&mesh, "node-b")?;
+    let entry = mesh.spawn("node-a", Vec::new()).await?;
+    let (request, _) = build_invoke_request(remote_connector(), &mesh.capability_key);
+    let guarded = HostGuardedInvokeRequest {
+        request,
+        max_safety_tier: SafetyTier::Safe,
+    };
+
+    let preflight: Value = http_post_json(
+        entry.client.clone(),
+        format!("{}/rpc/preflight/guarded", entry.base_url),
+        guarded.clone(),
+    )
+    .await?;
+    assert_eq!(preflight["allowed"], false, "{preflight}");
+    let (status, body) = post_raw(&entry, "/rpc/invoke/guarded", &guarded).await?;
+    assert!(
+        !status.is_success(),
+        "an unsupported guard must fail: {body}"
+    );
+    assert_eq!(
+        legacy.methods(),
+        ["preflight_guarded", "invoke_guarded"],
+        "an old peer must never receive an unguarded retry"
+    );
+    assert_eq!(legacy.forwards(), 2);
+    Ok(())
 }
 
 #[fcp_async_core::runtime::test(flavor = "multi_thread")]
@@ -845,6 +1123,7 @@ struct SignedReadPeer {
     bind: SocketAddr,
     reply: std::sync::Arc<std::sync::Mutex<Option<(u16, String)>>>,
     forwards: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    methods: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
@@ -855,6 +1134,20 @@ impl SignedReadPeer {
         id: &str,
         status: u16,
         body: String,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::spawn_with_guarded_support(mesh, id, status, body, true)
+    }
+
+    fn spawn_legacy(mesh: &MeshFixture, id: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::spawn_with_guarded_support(mesh, id, 200, "{}".to_owned(), false)
+    }
+
+    fn spawn_with_guarded_support(
+        mesh: &MeshFixture,
+        id: &str,
+        status: u16,
+        body: String,
+        supports_guarded: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         use fcp_mesh::invoke_route::{
             AdvertisedConnector, MeshForwardReplayGuard, MeshPeerAdvertisement, MeshPeerDirectory,
@@ -872,9 +1165,11 @@ impl SignedReadPeer {
         let listener = std::net::TcpListener::bind(bind)?;
         let reply = Arc::new(std::sync::Mutex::new(Some((status, body))));
         let forwards = Arc::new(AtomicUsize::new(0));
+        let methods = Arc::new(std::sync::Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let thread_reply = Arc::clone(&reply);
         let thread_forwards = Arc::clone(&forwards);
+        let thread_methods = Arc::clone(&methods);
         let thread_stop = Arc::clone(&stop);
         let worker = std::thread::spawn(move || {
             let mut replay = MeshForwardReplayGuard::new(60_000, 128);
@@ -916,6 +1211,30 @@ impl SignedReadPeer {
                             .check_and_record(&envelope, now)
                             .expect("entry must use a fresh nonce for each attempt");
                         thread_forwards.fetch_add(1, Ordering::SeqCst);
+                        thread_methods
+                            .lock()
+                            .expect("methods lock")
+                            .push(envelope.body.method().to_owned());
+                        if !supports_guarded
+                            && matches!(
+                                &envelope.body,
+                                MeshForwardBody::InvokeGuarded { .. }
+                                    | MeshForwardBody::PreflightGuarded { .. }
+                            )
+                        {
+                            // Older hosts cannot decode the new tagged methods.
+                            // Match their unsigned HTTP rejection, so the origin
+                            // cannot mistake it for permission to weaken a call.
+                            let refusal = b"unsupported guarded mesh method";
+                            write!(
+                                stream,
+                                "HTTP/1.1 422 Unprocessable Entity\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                refusal.len()
+                            )
+                            .expect("write legacy rejection headers");
+                            stream.write_all(refusal).expect("write legacy rejection");
+                            continue;
+                        }
                         let selected = thread_reply.lock().expect("reply lock").clone();
                         let Some((status, body)) = selected else {
                             // Received and authenticated, then disconnected before a reply.
@@ -940,9 +1259,14 @@ impl SignedReadPeer {
             bind,
             reply,
             forwards,
+            methods,
             stop,
             worker: Some(worker),
         })
+    }
+
+    fn methods(&self) -> Vec<String> {
+        self.methods.lock().expect("methods lock").clone()
     }
 
     fn set_reply(&self, status: u16, body: String) {

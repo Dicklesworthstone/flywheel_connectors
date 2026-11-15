@@ -28,6 +28,23 @@ operation executes.
 `fwc invoke` reports `_truth_source: "mesh"` and a top-level `route` object when a peer executed
 the call, and `_truth_source: "host"` otherwise.
 
+### Guarded preflight and invocation
+
+`/rpc/preflight/guarded` and `/rpc/invoke/guarded` can use the same peer routing.
+They forward the full invocation through the distinct signed `preflight_guarded`
+and `invoke_guarded` methods. The signature covers the safety ceiling, capability,
+principal, and method; changing or removing the guard invalidates the signature.
+An executor also refuses a correctly signed guarded request with a missing or
+malformed ceiling. Older peers reject the new methods, and no caller falls back
+to an ordinary preflight or invoke to bypass that refusal.
+
+The executor checks its live operation tier during preflight and again before
+dispatch. Preflight creates no invocation reservation or connector effect, and
+a signed denial is authoritative. Read-only transport failover shares one
+shrinking request budget. Guarded invocation retains the ordinary durable
+ownership, authenticated origin, cancellation, and proven-non-delivery failover
+rules below; it never uses the read-only query retry path.
+
 ## Configuration
 
 The node identity, signing key, and peer directory are required together. A partial

@@ -906,9 +906,9 @@ fn invocation_state_error(reason: &str) -> LifecycleError {
 ///
 /// `/rpc/preflight/guarded` inspects this request without executing it;
 /// `/rpc/invoke/guarded` uses the ordinary authorized, owned invocation path.
-/// Both require the selected host to execute locally until mesh peers can
-/// attest support for the guard. Older hosts cannot silently ignore the
-/// ceiling because these are distinct RPC routes.
+/// Mesh forwarding uses distinct signed methods carrying the full request and
+/// ceiling. Older hosts cannot silently ignore the ceiling because both the
+/// public RPC routes and the signed mesh methods require guard support.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostGuardedInvokeRequest {

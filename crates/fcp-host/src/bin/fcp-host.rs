@@ -16483,7 +16483,7 @@ async fn route_invoke_with_deadline(
             return Err(map_host_error(HostError::PreflightFailed(reason)));
         }
     };
-    if let Err(error) = guarded_invoke::enforce_route(&request, decision.is_forward()) {
+    if let Err(error) = guarded_invoke::is_guarded(&request) {
         append_mesh_preflight_denial(
             state,
             &request,
@@ -17086,11 +17086,6 @@ async fn run_mesh_forward_job(
                 })?;
             let mut forwarded_request = request.clone();
             constrain_invoke_deadline(&mut forwarded_request, deadline);
-            let request_json = serde_json::to_string(&forwarded_request).map_err(|error| {
-                map_host_error(HostError::Internal(format!(
-                    "invoke request could not be encoded for mesh forwarding: {error}"
-                )))
-            })?;
             if registered_locally && let Err(error) = recheck_admitted_holder_proof(state, request)
             {
                 append_mesh_preflight_denial(
@@ -17109,11 +17104,12 @@ async fn run_mesh_forward_job(
                 )));
             }
             execution_fence.require_current().map_err(map_host_error)?;
-            Ok(fcp_mesh::invoke_route::MeshForwardBody::Invoke {
-                request_json,
-                asserted_principal: asserted_principal.map(str::to_owned),
-                origin_attempt_id: Some(ticket.attempt_id),
-            })
+            guarded_invoke::forward_invoke_body(
+                &forwarded_request,
+                asserted_principal,
+                ticket.attempt_id,
+            )
+            .map_err(map_host_error)
         }.await;
         let body = match prepared {
             Ok(body) => body,
@@ -17403,11 +17399,51 @@ async fn mesh_forward_query<T: serde::de::DeserializeOwned>(
         )));
     };
     let bindings = mesh_query_response_bindings(&body)?;
+    let guarded_preflight = match &body {
+        fcp_mesh::invoke_route::MeshForwardBody::PreflightGuarded { request_json, .. } => {
+            let request: InvokeRequest = serde_json::from_str(request_json).map_err(|_| {
+                map_host_error(HostError::InvalidFilter(
+                    "cannot forward an invalid guarded preflight request".to_owned(),
+                ))
+            })?;
+            guarded_invoke::require_ceiling(&request).map_err(map_host_error)?;
+            let deadline = http_batch::route_deadline(Instant::now(), request.deadline_ms, None);
+            Some((request, deadline))
+        }
+        _ => None,
+    };
     let method = body.method();
     let mut failures = Vec::new();
     let mut failure_status = StatusCode::SERVICE_UNAVAILABLE;
     for candidate in std::iter::once(target).chain(alternates) {
-        let failure = match router.forward(&candidate, body.clone()).await {
+        let mut attempt_body = body.clone();
+        if let Some((request, deadline)) = &guarded_preflight
+            && let fcp_mesh::invoke_route::MeshForwardBody::PreflightGuarded {
+                request_json, ..
+            } = &mut attempt_body
+        {
+            // Discovery, earlier peers and encoding all consume one budget.
+            // A new signed envelope must not renew the executor's allowance.
+            let mut request = request.clone();
+            constrain_invoke_deadline(&mut request, *deadline);
+            *request_json = serde_json::to_string(&request).map_err(|error| {
+                map_host_error(HostError::Internal(format!(
+                    "guarded preflight could not be encoded: {error}"
+                )))
+            })?;
+        }
+        let forwarded = if let Some((_, deadline)) = &guarded_preflight {
+            before_invoke_route_deadline(
+                *deadline,
+                router.forward(&candidate, attempt_body),
+                "guarded mesh preflight",
+            )
+            .await
+            .map_err(map_host_error)?
+        } else {
+            router.forward(&candidate, attempt_body).await
+        };
+        let failure = match forwarded {
             Ok(reply) if reply.is_success() => {
                 let decoded = serde_json::from_str::<Value>(&reply.body_json)
                     .map_err(|_| "response is not valid JSON")
@@ -17590,8 +17626,11 @@ fn mesh_query_response_bindings(
                 ),
             ])
         }
-        MeshForwardBody::Preflight { .. } => Ok(Vec::new()),
+        MeshForwardBody::Preflight { .. } | MeshForwardBody::PreflightGuarded { .. } => {
+            Ok(Vec::new())
+        }
         MeshForwardBody::Invoke { .. }
+        | MeshForwardBody::InvokeGuarded { .. }
         | MeshForwardBody::Cancel { .. }
         | MeshForwardBody::ConnectorStateExport { .. }
         | MeshForwardBody::StreamOpen { .. }
@@ -17761,16 +17800,31 @@ async fn mesh_forward_handler(
     // execution: signature verification and durable replay admission still
     // precede every local handler, including malformed-request responses.
     let prepared_invoke = match &envelope.body {
-        MeshForwardBody::Invoke { request_json, .. } => Some(
-            serde_json::from_str::<InvokeRequest>(request_json).map(|request| {
-                let deadline = mesh_inbound_invoke_deadline(
-                    request.deadline_ms,
-                    started_at,
-                    received_unix_ms,
-                    envelope.issued_at_ms,
-                );
-                (request, deadline)
-            }),
+        MeshForwardBody::Invoke { request_json, .. }
+        | MeshForwardBody::InvokeGuarded { request_json, .. }
+        | MeshForwardBody::PreflightGuarded { request_json, .. } => Some(
+            serde_json::from_str::<InvokeRequest>(request_json)
+                .map_err(|error| {
+                    HostError::InvalidFilter(format!(
+                        "forwarded request is not a valid InvokeRequest: {error}"
+                    ))
+                })
+                .and_then(|request| {
+                    if matches!(
+                        &envelope.body,
+                        MeshForwardBody::InvokeGuarded { .. }
+                            | MeshForwardBody::PreflightGuarded { .. }
+                    ) {
+                        guarded_invoke::require_ceiling(&request)?;
+                    }
+                    let deadline = mesh_inbound_invoke_deadline(
+                        request.deadline_ms,
+                        started_at,
+                        received_unix_ms,
+                        envelope.issued_at_ms,
+                    );
+                    Ok((request, deadline))
+                }),
         ),
         _ => None,
     };
@@ -17781,7 +17835,10 @@ async fn mesh_forward_handler(
     // Invocation origin continuity is captured before replay journal waits and
     // retained through final runtime selection. Cancellation attempt metadata
     // is optional and never determines whether this authority is required.
-    let admission = if matches!(&envelope.body, MeshForwardBody::Invoke { .. }) {
+    let admission = if matches!(
+        &envelope.body,
+        MeshForwardBody::Invoke { .. } | MeshForwardBody::InvokeGuarded { .. }
+    ) {
         admit_mesh_forward(deadline, router.accept_inbound_invoke_async(&envelope))
             .await
             .map(Some)
@@ -17820,6 +17877,11 @@ async fn mesh_forward_handler(
             asserted_principal,
             origin_attempt_id,
             ..
+        }
+        | MeshForwardBody::InvokeGuarded {
+            asserted_principal,
+            origin_attempt_id,
+            ..
         } => match prepared_invoke.ok_or_else(|| {
             map_host_error(HostError::Internal(
                 "mesh invocation was not decoded before admission".to_string(),
@@ -17843,10 +17905,25 @@ async fn mesh_forward_handler(
                 ))
                 .await,
             ),
-            Err(error) => mesh_reply_body::<()>(Err((
-                StatusCode::BAD_REQUEST,
-                format!("forwarded invoke request is not a valid InvokeRequest: {error}"),
-            ))),
+            Err(error) => mesh_reply_body::<()>(Err(map_host_error(error))),
+        },
+        MeshForwardBody::PreflightGuarded {
+            asserted_principal, ..
+        } => match prepared_invoke.ok_or_else(|| {
+            map_host_error(HostError::Internal(
+                "guarded mesh preflight was not decoded before admission".to_owned(),
+            ))
+        })? {
+            Ok((request, deadline)) => {
+                mesh_reply_body::<PreflightResponse>(Ok(guarded_invoke::local_preflight(
+                    &state,
+                    &request,
+                    asserted_principal.as_deref(),
+                    deadline,
+                )
+                .await))
+            }
+            Err(error) => mesh_reply_body::<()>(Err(map_host_error(error))),
         },
         MeshForwardBody::Cancel {
             request_json,

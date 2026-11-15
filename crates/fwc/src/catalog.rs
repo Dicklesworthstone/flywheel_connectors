@@ -115,7 +115,7 @@ pub const COMMAND_CLASSIFICATIONS: &[CommandClassification] = &[
         host_absent: HostAbsentBehavior::FailFast,
         requires_capability_token: true,
         may_need_approval: true,
-        transport_note: "Definitions, tests, previews and run --dry-run stay local; live run requires guarded host admission and durable replay protection, with no mesh forwarding",
+        transport_note: "Definitions, tests, previews and run --dry-run stay local; live run requires guarded host admission and durable replay protection, including signed guarded methods when forwarding through the mesh",
     },
     CommandClassification {
         command: "session",

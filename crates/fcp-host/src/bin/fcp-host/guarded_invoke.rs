@@ -3,8 +3,9 @@
 //! A separate RPC route makes support mandatory: an older host must reject the
 //! request instead of silently ignoring a new JSON field or request tag. The
 //! tag is retained in the owned invocation and its effect digest, then checked
-//! against live operation metadata at admission and dispatch. Guarded calls
-//! cannot be forwarded to a peer that may not implement the same restriction.
+//! against live operation metadata at admission and dispatch. Mesh forwarding
+//! uses distinct signed methods, so older peers reject guarded requests before
+//! execution and an intermediary cannot downgrade their safety contract.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -88,15 +89,81 @@ pub(super) fn enforce_tier(request: &InvokeRequest, actual: SafetyTier) -> HostR
     Ok(())
 }
 
-/// A remote peer might silently ignore an unknown tag. Refuse before delivery
-/// until the mesh protocol can attest that the executor enforces this guard.
-pub(super) fn enforce_route(request: &InvokeRequest, forwards: bool) -> HostResult<()> {
-    if requested_ceiling(request)?.is_some() && forwards {
+/// Select a distinct signed method whenever a caller carries a safety ceiling.
+/// A tag alone is insufficient: older peers may ignore it on ordinary invokes.
+pub(super) fn is_guarded(request: &InvokeRequest) -> HostResult<bool> {
+    requested_ceiling(request).map(|ceiling| ceiling.is_some())
+}
+
+/// Guarded wire methods require their constraint even when a trusted peer signs
+/// a malformed request. Peer authentication never substitutes for this contract.
+pub(super) fn require_ceiling(request: &InvokeRequest) -> HostResult<()> {
+    if !is_guarded(request)? {
         return Err(refusal(
-            "guarded invocation requires execution on the selected host; mesh forwarding does not attest safety-ceiling support",
+            "guarded mesh request requires an explicit invocation safety ceiling",
         ));
     }
     Ok(())
+}
+
+pub(super) fn forward_invoke_body(
+    request: &InvokeRequest,
+    asserted_principal: Option<&str>,
+    origin_attempt_id: u64,
+) -> HostResult<fcp_mesh::invoke_route::MeshForwardBody> {
+    use fcp_mesh::invoke_route::MeshForwardBody;
+
+    let guarded = is_guarded(request)?;
+    let request_json = serde_json::to_string(request).map_err(|error| {
+        HostError::Internal(format!(
+            "invoke request could not be encoded for mesh forwarding: {error}"
+        ))
+    })?;
+    let asserted_principal = asserted_principal.map(str::to_owned);
+    let origin_attempt_id = Some(origin_attempt_id);
+    Ok(if guarded {
+        MeshForwardBody::InvokeGuarded {
+            request_json,
+            asserted_principal,
+            origin_attempt_id,
+        }
+    } else {
+        MeshForwardBody::Invoke {
+            request_json,
+            asserted_principal,
+            origin_attempt_id,
+        }
+    })
+}
+
+/// The executor runs the complete local preflight under the budget captured
+/// before signature/replay admission. No connector invocation occurs here.
+pub(super) async fn local_preflight(
+    state: &AppState,
+    request: &InvokeRequest,
+    asserted_principal: Option<&str>,
+    deadline: Instant,
+) -> PreflightResponse {
+    let result = super::before_invoke_route_deadline(
+        deadline,
+        async {
+            require_ceiling(request)?;
+            request.validate_idempotency_key().map_err(|error| {
+                HostError::InvalidFilter(format!("invalid guarded invoke request: {error}"))
+            })?;
+            let fence = state
+                .lifecycle
+                .connector_execution_fence(&request.connector_id)
+                .await?;
+            let response = super::evaluate_live_preflight(state, request, asserted_principal).await;
+            fence.require_current()?;
+            Ok(response)
+        },
+        "guarded preflight",
+    )
+    .await
+    .and_then(std::convert::identity);
+    result.unwrap_or_else(super::preflight_response_from_error)
 }
 
 pub(super) fn routes() -> Router<Arc<AppState>> {
@@ -122,6 +189,10 @@ async fn preflight_handler(
             request.validate_idempotency_key().map_err(|error| {
                 HostError::InvalidFilter(format!("invalid guarded invoke request: {error}"))
             })?;
+            let fence = state
+                .lifecycle
+                .connector_execution_fence(&request.connector_id)
+                .await?;
             if let Some(router) = state.mesh.as_ref() {
                 let decision = super::mesh_route_decision(
                     &state,
@@ -131,12 +202,53 @@ async fn preflight_handler(
                     Some(request.operation.as_str()),
                 )
                 .await?;
-                enforce_route(&request, decision.is_forward())?;
+                if let fcp_mesh::invoke_route::InvokeRouteDecision::Forward { target, .. } =
+                    &decision
+                {
+                    if state
+                        .registry
+                        .allow_list_snapshot(&request.connector_id)
+                        .await
+                        .is_some()
+                    {
+                        let admission = super::evaluate_live_admission(
+                            &state,
+                            &request,
+                            asserted_principal.as_deref(),
+                            Some(target),
+                            super::RateLimitMode::Inspect,
+                        )
+                        .await;
+                        if !admission.allowed {
+                            return Ok(admission);
+                        }
+                    }
+                    let mut forwarded = request.clone();
+                    super::constrain_invoke_deadline(&mut forwarded, deadline);
+                    let request_json = serde_json::to_string(&forwarded).map_err(|error| {
+                        HostError::Internal(format!(
+                            "guarded preflight could not be encoded: {error}"
+                        ))
+                    })?;
+                    fence.require_current()?;
+                    let response = super::mesh_forward_query::<PreflightResponse>(
+                        router,
+                        decision,
+                        fcp_mesh::invoke_route::MeshForwardBody::PreflightGuarded {
+                            request_json,
+                            asserted_principal: asserted_principal.clone(),
+                        },
+                    )
+                    .await
+                    .map_err(|(_, message)| HostError::Unavailable(message))?;
+                    fence.require_current()?;
+                    return Ok(response.response);
+                }
             }
-            Ok(
-                super::evaluate_live_preflight(&state, &request, asserted_principal.as_deref())
-                    .await,
-            )
+            let response =
+                local_preflight(&state, &request, asserted_principal.as_deref(), deadline).await;
+            fence.require_current()?;
+            Ok(response)
         },
         "guarded preflight",
     )
@@ -320,25 +432,41 @@ mod tests {
     }
 
     #[test]
-    fn guarded_request_never_forwards_and_plain_requests_keep_their_routes() {
+    fn guarded_forwarding_selects_a_distinct_signed_method_and_preserves_authority() {
         let plain = request();
-        enforce_route(&plain, true).expect("ordinary mesh forwarding remains allowed");
-        enforce_route(&plain, false).unwrap();
+        assert!(!is_guarded(&plain).unwrap());
+        assert!(require_ceiling(&plain).is_err());
+        let ordinary = forward_invoke_body(&plain, Some("agent:test"), 7).unwrap();
+        assert_eq!(ordinary.method(), "invoke");
+
         let guarded = constrain_request(HostGuardedInvokeRequest {
             request: plain,
             max_safety_tier: SafetyTier::Safe,
         })
         .unwrap();
-        enforce_route(&guarded, false).expect("guarded local execution");
-        assert!(enforce_route(&guarded, true).is_err());
+        assert!(is_guarded(&guarded).unwrap());
+        require_ceiling(&guarded).expect("guarded local and remote execution");
+        let body = forward_invoke_body(&guarded, Some("agent:test"), 7).unwrap();
+        assert_eq!(body.method(), "invoke_guarded");
+        let encoded = serde_json::to_value(body).unwrap();
+        assert_eq!(encoded["asserted_principal"], "agent:test");
+        assert_eq!(encoded["origin_attempt_id"], 7);
+        let forwarded: InvokeRequest =
+            serde_json::from_str(encoded["request_json"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            serde_json::to_value(forwarded).unwrap(),
+            serde_json::to_value(guarded).unwrap()
+        );
+
         let mut malformed = request();
         malformed
             .context
             .get_or_insert_with(Default::default)
             .request_tags
             .insert(MAX_SAFETY_TIER_TAG.to_owned(), "garbage".to_owned());
-        assert!(enforce_route(&malformed, true).is_err());
-        assert!(enforce_route(&malformed, false).is_err());
+        assert!(is_guarded(&malformed).is_err());
+        assert!(require_ceiling(&malformed).is_err());
+        assert!(forward_invoke_body(&malformed, None, 7).is_err());
         assert!(enforce_tier(&malformed, SafetyTier::Safe).is_err());
     }
 

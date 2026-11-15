@@ -1053,7 +1053,10 @@ impl MeshRouter {
         self: &Arc<Self>,
         envelope: &MeshForwardEnvelope,
     ) -> Result<MeshInvokeOrigin, MeshForwardError> {
-        if !matches!(&envelope.body, MeshForwardBody::Invoke { .. }) {
+        if !matches!(
+            &envelope.body,
+            MeshForwardBody::Invoke { .. } | MeshForwardBody::InvokeGuarded { .. }
+        ) {
             return Err(MeshForwardError::Malformed {
                 field: "invoke_origin",
                 detail: "invoke origin authority requires an invocation envelope".to_owned(),
@@ -1406,41 +1409,50 @@ mod tests {
             .unwrap(),
         );
         for origin_attempt_id in [None, Some(7)] {
-            let envelope = MeshForwardEnvelope::sign(
-                &peer_key,
-                TailscaleNodeId::new("node-b"),
-                TailscaleNodeId::new("node-a"),
-                unix_now_ms(),
+            for body in [
                 MeshForwardBody::Invoke {
                     request_json: "{}".to_owned(),
                     asserted_principal: None,
                     origin_attempt_id,
                 },
-            )
-            .unwrap();
-            let mut forged = envelope.clone();
-            forged.signature = "00".repeat(64);
-            assert!(
-                fcp_async_core::runtime::block_on_sync(
-                    router.accept_inbound_invoke_async(&forged),
+                MeshForwardBody::InvokeGuarded {
+                    request_json: r#"{"tags":{"fcp.host.max_safety_tier":"safe"}}"#.to_owned(),
+                    asserted_principal: Some("agent:test".to_owned()),
+                    origin_attempt_id,
+                },
+            ] {
+                let envelope = MeshForwardEnvelope::sign(
+                    &peer_key,
+                    TailscaleNodeId::new("node-b"),
+                    TailscaleNodeId::new("node-a"),
+                    unix_now_ms(),
+                    body,
                 )
-                .unwrap()
-                .is_err()
-            );
-            let origin = fcp_async_core::runtime::block_on_sync(
-                router.accept_inbound_invoke_async(&envelope),
-            )
-            .unwrap()
-            .expect("failed authentication cannot consume the valid envelope's nonce");
-            origin.require_current().unwrap();
-            assert!(origin.clone().is_current_for_dispatch());
-            assert!(matches!(
-                fcp_async_core::runtime::block_on_sync(
+                .unwrap();
+                let mut forged = envelope.clone();
+                forged.signature = "00".repeat(64);
+                assert!(
+                    fcp_async_core::runtime::block_on_sync(
+                        router.accept_inbound_invoke_async(&forged),
+                    )
+                    .unwrap()
+                    .is_err()
+                );
+                let origin = fcp_async_core::runtime::block_on_sync(
                     router.accept_inbound_invoke_async(&envelope),
                 )
-                .unwrap(),
-                Err(MeshForwardError::Replayed { .. })
-            ));
+                .unwrap()
+                .expect("failed authentication cannot consume the valid envelope's nonce");
+                origin.require_current().unwrap();
+                assert!(origin.clone().is_current_for_dispatch());
+                assert!(matches!(
+                    fcp_async_core::runtime::block_on_sync(
+                        router.accept_inbound_invoke_async(&envelope),
+                    )
+                    .unwrap(),
+                    Err(MeshForwardError::Replayed { .. })
+                ));
+            }
         }
         let read = MeshForwardEnvelope::sign(
             &peer_key,
