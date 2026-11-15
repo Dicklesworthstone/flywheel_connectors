@@ -926,7 +926,10 @@ fn unresolved_bindings(
     unresolved.into_iter().collect()
 }
 
-fn apply_binding_awareness(compiled: &mut CompiledIntent, bindings: &BTreeMap<String, String>) {
+pub(crate) fn apply_binding_awareness(
+    compiled: &mut CompiledIntent,
+    bindings: &BTreeMap<String, String>,
+) {
     if bindings.contains_key("payload_json") || bindings.contains_key("payload_file") {
         compiled
             .missing_information

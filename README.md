@@ -1739,6 +1739,49 @@ When a `fwc` run fails, the shortest trustworthy debugging loop:
 
 `fwc plan`, `fwc explain`, and `fwc do` are not placeholder UX. The local intent compiler (`crates/fwc/src/intent.rs`) is ~6.3k lines with 267 inline tests and compiles natural-language goals into concrete `fwc` primitives plus workflow-truth metadata, ambiguity reporting, missing-information prompts, and suggested next actions. Resolution is strongest for the current curated connector profile set (~two dozen connectors with explicit aliases and domain keywords); connectors outside that set still participate through generic alias/keyword matching plus the manifest-backed operation index. `fwc do` is safe by default — it materializes the compiled workflow in simulation mode unless you explicitly pass `--approve`.
 
+Live connector operations in `fwc do`, `fwc task advance`, and `fwc task run`
+accept the same `--capability-token-file`, `--holder-key-file`, and repeatable
+`--approval-token-file` options as `fwc invoke` (inline token forms also work).
+Supply these credentials on each execution. For an existing GitHub issue-creation
+capsule, bind a payload containing `owner`, `repo`, and `title` before advancing:
+
+```bash
+fwc task bind w:7f3k9a1b payload_file=issue.json
+fwc --host http://127.0.0.1:8787 task advance w:7f3k9a1b \
+    --capability-token-file github.token --holder-key-file node-signing.key
+# Inspect the simulation, then approve the capsule before its mutating run.
+fwc task approve w:7f3k9a1b
+fwc --host http://127.0.0.1:8787 task run w:7f3k9a1b \
+    --capability-token-file github.token --holder-key-file node-signing.key \
+    --approval-token-file approved-request.json
+```
+
+Workflow credentials are passed in memory to the compiled connector's
+`invoke` and `simulate` primitives; task capsules, compiled commands, and
+execution receipts retain no credential material. An explicit workflow zone
+reaches those primitives unless the step specifies its own zone. Discovery and
+administrative commands do not receive invocation credentials. A step that
+changes the selected host or connector must provide its own complete authority;
+explicit step credentials never inherit another token's holder key or approvals.
+Workflow approval permits attempting a mutating step, while the host still
+checks capability and approval tokens for that exact operation.
+
+Provide an explicit operation payload to `fwc do` with `--input` or `--file`:
+
+```bash
+fwc --host http://127.0.0.1:8787 do "search GitHub issues for auth" \
+    --connector github --zone z:work \
+    --input '{"query":"repo:octocat/hello-world auth"}' \
+    --capability-token-file github.token
+```
+
+Saved tasks use `payload_json=...` or `payload_file=...` bindings for both
+read-only and mutating operations. Workflow execution reads and validates the
+payload before running any primitive and uses the same snapshot for simulation
+and invocation. The payload reaches parsed connector operations without being
+copied into generated command lines. A step's own explicit payload takes
+precedence, and supplying a payload does not approve a mutating operation.
+
 ### Output Formats
 
 `fwc` defaults to TOON, a token-efficient structured format optimized for AI agents:

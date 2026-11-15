@@ -1220,6 +1220,16 @@ struct DoIntentArgs {
     #[arg(long)]
     zone: Option<String>,
 
+    /// JSON payload for the compiled connector operation.
+    #[arg(long, conflicts_with = "file")]
+    #[serde(skip)]
+    input: Option<String>,
+
+    /// Read the compiled operation's JSON payload once before executing the workflow.
+    #[arg(long, conflicts_with = "input")]
+    #[serde(skip)]
+    file: Option<PathBuf>,
+
     /// Force simulation mode explicitly. If omitted, `do` still defaults to simulation.
     #[arg(long, default_value_t = false)]
     simulate: bool,
@@ -1227,6 +1237,11 @@ struct DoIntentArgs {
     /// Explicitly approve the compiled workflow so real mutating primitives may run.
     #[arg(long, default_value_t = false)]
     approve: bool,
+
+    /// Runtime authority for compiled connector operations; never saved in the workflow.
+    #[command(flatten)]
+    #[serde(skip)]
+    auth: LiveAuthArgs,
 }
 
 impl DoIntentArgs {
@@ -1270,7 +1285,7 @@ enum TaskCommand {
     Ask(TaskIdArgs),
 
     /// Advance a workflow capsule by executing the next safe stage.
-    Advance(TaskIdArgs),
+    Advance(TaskExecutionArgs),
 
     /// Bind resolved values such as connector ids, payload files, or resource identifiers.
     Bind(TaskBindArgs),
@@ -1279,13 +1294,24 @@ enum TaskCommand {
     Approve(TaskIdArgs),
 
     /// Execute the workflow capsule according to its current approvals and bindings.
-    Run(TaskIdArgs),
+    Run(TaskExecutionArgs),
 }
 
 #[derive(Args, Debug, Serialize)]
 struct TaskIdArgs {
     /// Workflow capsule id such as w:7f3k9a1b.
     task_id: String,
+}
+
+#[derive(Args, Debug, Serialize)]
+struct TaskExecutionArgs {
+    /// Workflow capsule id such as w:7f3k9a1b.
+    task_id: String,
+
+    /// Runtime authority for connector operations; supply it again on each execution.
+    #[command(flatten)]
+    #[serde(skip)]
+    auth: LiveAuthArgs,
 }
 
 #[derive(Args, Debug, Serialize)]
@@ -2704,6 +2730,7 @@ struct LiveAuthArgs {
 
     /// Read the capability token from a file containing base64, JSON, or raw CBOR bytes.
     #[arg(long, value_name = "PATH")]
+    #[serde(skip_serializing)]
     capability_token_file: Option<PathBuf>,
 
     /// Node signing key for holder-bound capabilities (32 raw bytes or 64 hexadecimal digits).
@@ -2718,7 +2745,20 @@ struct LiveAuthArgs {
 
     /// Read an approval token JSON payload from a file. Repeat for multiple approvals.
     #[arg(long = "approval-token-file", value_name = "PATH")]
+    #[serde(skip_serializing)]
     approval_token_file: Vec<PathBuf>,
+}
+
+impl LiveAuthArgs {
+    /// Credentials are inherited as one group: a child that supplies any
+    /// authority must not silently borrow the parent's token, key or approvals.
+    fn is_present(&self) -> bool {
+        self.capability_token.is_some()
+            || self.capability_token_file.is_some()
+            || self.holder_key_file.is_some()
+            || !self.approval_token.is_empty()
+            || !self.approval_token_file.is_empty()
+    }
 }
 
 #[derive(Args, Debug, Clone, Default, Serialize)]
@@ -35260,7 +35300,7 @@ fn task_approve_dispatch(args: &TaskIdArgs) -> Result<DispatchOutcome> {
 }
 
 fn task_advance_dispatch(
-    args: &TaskIdArgs,
+    args: &TaskExecutionArgs,
     explicit_host: Option<&str>,
 ) -> Result<DispatchOutcome> {
     let store = workflow::TaskStore::discover()?;
@@ -35282,8 +35322,13 @@ fn task_advance_dispatch(
 
     let approve = !task.has_side_effects();
     let bindings = workflow::effective_bindings(&task);
-    let execution =
-        materialize_compiled_steps(&task.compiled, approve, Some(&bindings), explicit_host);
+    let execution = materialize_compiled_steps(
+        &task.compiled,
+        approve,
+        Some(&bindings),
+        explicit_host,
+        Some(&args.auth),
+    );
     let task = match task_receipt_or_failure(
         store.append_execution(
             &args.task_id,
@@ -35322,7 +35367,10 @@ fn task_advance_dispatch(
     })
 }
 
-fn task_run_dispatch(args: &TaskIdArgs, explicit_host: Option<&str>) -> Result<DispatchOutcome> {
+fn task_run_dispatch(
+    args: &TaskExecutionArgs,
+    explicit_host: Option<&str>,
+) -> Result<DispatchOutcome> {
     let store = workflow::TaskStore::discover()?;
     let Some(task) = store.refresh(&args.task_id)? else {
         return Ok(missing_task_dispatch(&args.task_id));
@@ -35375,6 +35423,7 @@ fn task_run_dispatch(args: &TaskIdArgs, explicit_host: Option<&str>) -> Result<D
         task.approval.workflow,
         Some(&bindings),
         explicit_host,
+        Some(&args.auth),
     );
     let task = match task_receipt_or_failure(
         store.append_execution(
@@ -35559,7 +35608,26 @@ fn intent_explain_dispatch(request: &intent::IntentRequest) -> Result<DispatchOu
 }
 
 fn intent_do_dispatch(args: &DoIntentArgs, explicit_host: Option<&str>) -> Result<DispatchOutcome> {
-    let compiled = intent::compile(&args.request());
+    let mut bindings = BTreeMap::new();
+    if let Some(input) = &args.input {
+        bindings.insert("payload_json".to_owned(), input.clone());
+    }
+    if let Some(path) = &args.file {
+        bindings.insert("payload_file".to_owned(), path.display().to_string());
+    }
+    if let Some(payload) = match load_compiled_workflow_payload(Some(&bindings)) {
+        Ok(payload) => payload,
+        Err(error) => return Ok(compiled_workflow_input_error("do", error)),
+    } {
+        // Retain a single validated snapshot even when --file changes while
+        // discovery and simulation are running.
+        bindings.clear();
+        bindings.insert("payload_json".to_owned(), payload);
+    }
+    let mut compiled = intent::compile(&args.request());
+    if !bindings.is_empty() {
+        workflow::apply_binding_awareness(&mut compiled, &bindings);
+    }
 
     if compiled.status != "ready" {
         return Ok(DispatchOutcome {
@@ -35587,7 +35655,13 @@ fn intent_do_dispatch(args: &DoIntentArgs, explicit_host: Option<&str>) -> Resul
     }
 
     let approve = args.approve;
-    let execution = materialize_compiled_steps(&compiled, approve, None, explicit_host);
+    let execution = materialize_compiled_steps(
+        &compiled,
+        approve,
+        Some(&bindings),
+        explicit_host,
+        Some(&args.auth),
+    );
     let defaulted_to_simulation = !args.simulate && !args.approve;
 
     let envelope = CommandEnvelope::new(CommandAvailability::OfflineArtifact, "do");
@@ -35651,7 +35725,19 @@ fn materialize_safe_resolution_steps(
     let mut compiled = task.compiled.clone();
     compiled.steps = steps;
     let safe_step_count = compiled.steps.len();
-    let execution = materialize_compiled_steps(&compiled, true, Some(bindings), explicit_host);
+    // Discovery must remain available while the operation payload is still
+    // being authored. Retain identifier/query bindings without opening or
+    // validating a payload that these safe primitives do not consume.
+    let mut resolution_bindings = bindings.clone();
+    resolution_bindings.remove("payload_json");
+    resolution_bindings.remove("payload_file");
+    let execution = materialize_compiled_steps(
+        &compiled,
+        true,
+        Some(&resolution_bindings),
+        explicit_host,
+        None,
+    );
     (safe_step_count, execution)
 }
 
@@ -35718,12 +35804,87 @@ fn resolve_message(stop_reason: &str, until_ready: bool) -> &'static str {
     }
 }
 
+fn load_compiled_workflow_payload(
+    bindings: Option<&BTreeMap<String, String>>,
+) -> std::result::Result<Option<String>, InvokeInputError> {
+    let Some(bindings) = bindings else {
+        return Ok(None);
+    };
+    let input = bindings.get("payload_json");
+    let file = bindings.get("payload_file");
+    if input.is_some() && file.is_some() {
+        return Err(InvokeInputError {
+            error_type: "conflicting-input-sources",
+            message: "Choose one workflow payload source: inline JSON or a payload file.".to_owned(),
+            next_actions: vec!["Supply only --input or --file; for a saved task, bind only payload_json or payload_file.".to_owned()],
+            details: None,
+        });
+    }
+    let payload = if let Some(input) = input {
+        input.clone()
+    } else if let Some(file) = file {
+        std::fs::read_to_string(file).map_err(|_| InvokeInputError {
+            error_type: "unreadable-input-file",
+            message: "The workflow payload file could not be read before execution.".to_owned(),
+            next_actions: vec![
+                "Check that the selected payload file exists and is readable.".to_owned(),
+            ],
+            details: None,
+        })?
+    } else {
+        return Ok(None);
+    };
+    serde_json::from_str::<Value>(&payload).map_err(|error| InvokeInputError {
+        error_type: if file.is_some() {
+            "invalid-input-file"
+        } else {
+            "invalid-inline-input"
+        },
+        message: format!("The workflow payload is not valid JSON: {error}"),
+        next_actions: vec![
+            "Correct the JSON payload before running the workflow again.".to_owned(),
+        ],
+        details: None,
+    })?;
+    Ok(Some(payload))
+}
+
+fn compiled_workflow_input_error(command: &str, error: InvokeInputError) -> DispatchOutcome {
+    DispatchOutcome {
+        payload: json!({
+            "status": "stopped-on-primitive-error",
+            "command": command,
+            "exit_code": CliExitCode::Validation.as_u8(),
+            "error": {
+                "type": error.error_type,
+                "message": error.message,
+                "recoverable": true,
+            },
+            "next_actions": error.next_actions,
+            "executed_steps": [],
+            "withheld_steps": [],
+            "executed_count": 0,
+            "withheld_count": 0,
+            "stopped_before_side_effect": false,
+            "automatic_retry_allowed": false,
+        }),
+        exit_code: CliExitCode::Validation,
+    }
+}
+
 fn materialize_compiled_steps(
     compiled: &intent::CompiledIntent,
     approve: bool,
     bindings: Option<&BTreeMap<String, String>>,
     explicit_host: Option<&str>,
+    runtime_auth: Option<&LiveAuthArgs>,
 ) -> DispatchOutcome {
+    // Validate and snapshot bound files before the first primitive. Simulation
+    // and invocation must see the same payload even if a file changes later.
+    let workflow_payload = match load_compiled_workflow_payload(bindings) {
+        Ok(payload) => payload,
+        Err(error) => return compiled_workflow_input_error("workflow", error),
+    };
     let mut executed_steps = Vec::new();
     let mut withheld_steps = Vec::new();
     let mut stopped_before_side_effect = false;
@@ -35756,11 +35917,49 @@ fn materialize_compiled_steps(
             continue;
         }
 
-        let primitive = match parsed {
-            Ok(parsed) => dispatch(&parsed)
-                .unwrap_or_else(|error| internal_error_dispatch(&resolved_argv, &error)),
+        let mut primitive = match parsed {
+            Ok(mut parsed) => {
+                if let Err(error) = inherit_compiled_operation_payload(
+                    &mut parsed,
+                    compiled,
+                    explicit_host,
+                    workflow_payload.as_deref(),
+                ) {
+                    compiled_workflow_input_error(&step.command, error)
+                } else {
+                    match inherit_compiled_operation_context(
+                        &mut parsed,
+                        compiled,
+                        explicit_host,
+                        runtime_auth,
+                    ) {
+                        Ok(()) => dispatch(&parsed).unwrap_or_else(|error| {
+                            internal_error_dispatch(&resolved_argv, &error)
+                        }),
+                        Err(error) => live_auth_dispatch(&step.command, &error, &[]),
+                    }
+                }
+            }
             Err(error) => parse_failure_dispatch(&resolved_argv, &error),
         };
+        // Credential parsing can mention private file paths in its diagnostic.
+        // Workflow receipts are durable, so retain the error category and a
+        // useful remedy without retaining those execution-only details.
+        let safe_auth_message = match primitive.payload["error"]["type"].as_str() {
+            Some("invalid-capability-token") => Some(
+                "The runtime capability token could not be read or decoded. Check --capability-token or --capability-token-file before retrying.",
+            ),
+            Some("invalid-approval-token") => Some(
+                "A runtime approval token could not be read or decoded. Check --approval-token or --approval-token-file before retrying.",
+            ),
+            Some("invalid-holder-proof") => Some(
+                "The runtime holder proof could not be prepared. Supply the capability's matching node signing key with --holder-key-file.",
+            ),
+            _ => None,
+        };
+        if let Some(message) = safe_auth_message {
+            primitive.payload["error"]["message"] = json!(message);
+        }
         let primitive_succeeded = primitive.exit_code.is_success();
         let withhold_argument_echo = invocation_cmd::withhold_argument_echo(&primitive.payload)
             || connector_state_pull_cmd::withhold_argument_echo(&primitive.payload);
@@ -35812,6 +36011,129 @@ fn materialize_compiled_steps(
     }
 }
 
+/// Apply execution-only authority to connector primitives after parsing. Do
+/// not append credentials to argv: compiled plans and task receipts are durable
+/// evidence, while capability tokens, approval tokens and holder keys are not.
+fn inherit_compiled_operation_context(
+    parsed: &mut Cli,
+    compiled: &intent::CompiledIntent,
+    explicit_host: Option<&str>,
+    runtime_auth: Option<&LiveAuthArgs>,
+) -> std::result::Result<(), LiveAuthError> {
+    let request = match &mut parsed.command {
+        Commands::Invoke(request) => request,
+        Commands::Simulate(simulation) => &mut simulation.request,
+        // Discovery, administration, nested workflows and other primitives do
+        // not receive the connector's invocation credentials.
+        _ => return Ok(()),
+    };
+    if request.zone.is_none() {
+        request.zone.clone_from(&compiled.zone);
+    }
+    let Some(auth) = runtime_auth.filter(|auth| auth.is_present()) else {
+        return Ok(());
+    };
+    if request.auth.is_present() {
+        return Ok(());
+    }
+
+    validate_compiled_operation_target(
+        &request.connector,
+        parsed.host.as_deref(),
+        compiled,
+        explicit_host,
+        true,
+    )
+    .map_err(|message| LiveAuthError::InvalidWorkflowAuth {
+        message: message.to_owned(),
+    })?;
+    request.auth = auth.clone();
+    Ok(())
+}
+
+fn inherit_compiled_operation_payload(
+    parsed: &mut Cli,
+    compiled: &intent::CompiledIntent,
+    explicit_host: Option<&str>,
+    payload: Option<&str>,
+) -> std::result::Result<(), InvokeInputError> {
+    let Some(payload) = payload else {
+        return Ok(());
+    };
+    let request = match &mut parsed.command {
+        Commands::Invoke(request) => request,
+        Commands::Simulate(simulation) => &mut simulation.request,
+        _ => return Ok(()),
+    };
+    let explicit_file = request
+        .file
+        .as_ref()
+        .is_some_and(|path| path.to_str() != Some("./intent-payload.json"));
+    if request.input.is_some() || explicit_file || request.stdin || !request.set.is_empty() {
+        return Ok(());
+    }
+    validate_compiled_operation_target(
+        &request.connector,
+        parsed.host.as_deref(),
+        compiled,
+        explicit_host,
+        false,
+    )
+    .map_err(|message| InvokeInputError {
+        error_type: "invalid-workflow-input",
+        message: message.to_owned(),
+        next_actions: vec![
+            "Supply an explicit payload for a step that selects a different host or connector."
+                .to_owned(),
+        ],
+        details: None,
+    })?;
+    request.input = Some(payload.to_owned());
+    request.file = None;
+    Ok(())
+}
+
+fn validate_compiled_operation_target(
+    connector: &str,
+    step_host: Option<&str>,
+    compiled: &intent::CompiledIntent,
+    explicit_host: Option<&str>,
+    require_host: bool,
+) -> std::result::Result<(), &'static str> {
+    if compiled
+        .chosen_connector
+        .as_ref()
+        .is_none_or(|chosen| chosen.id != connector)
+    {
+        return Err(
+            "A compiled step that selects another connector must supply its own input and credentials.",
+        );
+    }
+    let Some(selected_host) = resolve_host_config(explicit_host)
+        .map_err(|_| "The selected workflow host could not be resolved.")?
+    else {
+        return if require_host || step_host.is_some() {
+            Err(
+                "Runtime workflow input and credentials require the selected host or active host context.",
+            )
+        } else {
+            Ok(())
+        };
+    };
+    let expected_endpoint = normalize_host_endpoint(&selected_host.endpoint)
+        .map_err(|_| "The selected workflow host endpoint is invalid.")?;
+    let step_endpoint = step_host
+        .map(normalize_host_endpoint)
+        .transpose()
+        .map_err(|_| "The compiled step's host endpoint is invalid.")?;
+    if step_endpoint.is_some_and(|endpoint| endpoint != expected_endpoint) {
+        return Err(
+            "A compiled step that overrides the selected host must supply its own input and credentials.",
+        );
+    }
+    Ok(())
+}
+
 fn parse_compiled_step_cli(
     argv: &mut Vec<String>,
     explicit_host: Option<&str>,
@@ -35834,7 +36156,9 @@ fn attach_compiled_execution_failure(payload: &mut Value, execution: &DispatchOu
     let failed_step = execution.payload["executed_steps"]
         .as_array()
         .and_then(|steps| steps.last());
-    let failure = failed_step.and_then(|step| step.get("result"));
+    let failure = failed_step
+        .and_then(|step| step.get("result"))
+        .or_else(|| execution.payload.get("error").map(|_| &execution.payload));
     payload["error"] = failure
         .and_then(|result| result.get("error"))
         .cloned()
@@ -35894,26 +36218,6 @@ fn resolve_step_argv(
     let mut index = 0;
 
     while index < step.argv.len() {
-        if step.argv[index] == "--file"
-            && step
-                .argv
-                .get(index + 1)
-                .is_some_and(|value| value == "./intent-payload.json")
-        {
-            if let Some(payload_json) = bindings.get("payload_json") {
-                argv.push("--input".to_owned());
-                argv.push(payload_json.clone());
-                index += 2;
-                continue;
-            }
-            if let Some(payload_file) = bindings.get("payload_file") {
-                argv.push("--file".to_owned());
-                argv.push(payload_file.clone());
-                index += 2;
-                continue;
-            }
-        }
-
         let segment = &step.argv[index];
         if let Some(name) = segment
             .strip_prefix('<')
@@ -37236,6 +37540,8 @@ fn is_sensitive_flag(flag: &str) -> bool {
         flag,
         "--capability-token"
             | "--capability-token-file"
+            | "--holder-key-file"
+            | "--approval-token-file"
             | "--admin-token-file"
             | "--aws-credentials-file"
             | "--setup-token-file"
@@ -43753,6 +44059,777 @@ deny_ptrace = true
     }
 
     #[test]
+    fn compiled_workflow_commands_accept_runtime_credentials_without_serializing_them() {
+        for command in ["do", "run", "advance"] {
+            let mut argv = if command == "do" {
+                vec!["fwc", "do", "search GitHub issues for auth"]
+            } else {
+                vec!["fwc", "task", command, "w:12345678"]
+            };
+            argv.extend([
+                "--capability-token",
+                "RUNTIME_CAPABILITY_SECRET",
+                "--holder-key-file",
+                "RUNTIME_HOLDER_PATH_SECRET",
+                "--approval-token",
+                "RUNTIME_APPROVAL_SECRET",
+                "--approval-token-file",
+                "RUNTIME_APPROVAL_PATH_SECRET",
+            ]);
+            let parsed = Cli::try_parse_from(&argv).unwrap();
+            let (auth, serialized) = match &parsed.command {
+                super::Commands::Do(args) => (&args.auth, serde_json::to_string(args).unwrap()),
+                super::Commands::Task(super::TaskArgs {
+                    command: super::TaskCommand::Run(args) | super::TaskCommand::Advance(args),
+                }) => (&args.auth, serde_json::to_string(args).unwrap()),
+                _ => panic!("expected a workflow execution command"),
+            };
+            assert_eq!(
+                auth.capability_token.as_deref(),
+                Some("RUNTIME_CAPABILITY_SECRET")
+            );
+            assert_eq!(auth.approval_token, ["RUNTIME_APPROVAL_SECRET"]);
+            assert!(!serialized.contains("RUNTIME_"));
+            let recorded = super::redact_sensitive_args(
+                &argv
+                    .iter()
+                    .map(|argument| (*argument).to_owned())
+                    .collect::<Vec<_>>(),
+            );
+            assert!(!recorded.join(" ").contains("RUNTIME_"));
+        }
+
+        for command in ["create", "show", "approve", "resolve"] {
+            assert!(
+                Cli::try_parse_from([
+                    "fwc",
+                    "task",
+                    command,
+                    "w:12345678",
+                    "--capability-token",
+                    "not-persistable",
+                ])
+                .is_err(),
+                "{command} must not persist execution credentials"
+            );
+        }
+    }
+
+    #[test]
+    fn compiled_workflow_authority_preserves_explicit_child_context() {
+        let host = "http://127.0.0.1:17700";
+        let mut compiled = compiled_workflow_test_plan(&[]);
+        compiled.zone = Some("z:private".to_owned());
+        let inherited = LiveAuthArgs {
+            capability_token: Some("parent-capability".to_owned()),
+            holder_key_file: Some(PathBuf::from("parent-holder")),
+            approval_token: vec!["parent-approval".to_owned()],
+            ..LiveAuthArgs::default()
+        };
+        for command in ["invoke", "simulate"] {
+            let mut parsed =
+                Cli::try_parse_from(["fwc", command, "github", "issues.create"]).unwrap();
+            super::inherit_compiled_operation_context(
+                &mut parsed,
+                &compiled,
+                Some(host),
+                Some(&inherited),
+            )
+            .unwrap();
+            let request = match &parsed.command {
+                super::Commands::Invoke(request) => request,
+                super::Commands::Simulate(simulation) => &simulation.request,
+                _ => unreachable!(),
+            };
+            assert_eq!(request.zone.as_deref(), Some("z:private"));
+            assert_eq!(request.auth.capability_token, inherited.capability_token);
+            assert_eq!(request.auth.holder_key_file, inherited.holder_key_file);
+            assert_eq!(request.auth.approval_token, inherited.approval_token);
+
+            let mut explicit = Cli::try_parse_from([
+                "fwc",
+                command,
+                "github",
+                "issues.create",
+                "--zone",
+                "z:project:inner",
+                "--capability-token",
+                "child-capability",
+                "--host",
+                "http://127.0.0.1:17701",
+            ])
+            .unwrap();
+            super::inherit_compiled_operation_context(
+                &mut explicit,
+                &compiled,
+                Some(host),
+                Some(&inherited),
+            )
+            .unwrap();
+            let request = match &explicit.command {
+                super::Commands::Invoke(request) => request,
+                super::Commands::Simulate(simulation) => &simulation.request,
+                _ => unreachable!(),
+            };
+            assert_eq!(request.zone.as_deref(), Some("z:project:inner"));
+            assert_eq!(
+                request.auth.capability_token.as_deref(),
+                Some("child-capability")
+            );
+            assert!(request.auth.holder_key_file.is_none());
+            assert!(request.auth.approval_token.is_empty());
+        }
+
+        for argv in [
+            vec![
+                "fwc",
+                "invoke",
+                "github",
+                "issues.create",
+                "--host",
+                "http://127.0.0.1:17701",
+            ],
+            vec!["fwc", "invoke", "slack", "post_message"],
+        ] {
+            let mut parsed = Cli::try_parse_from(argv).unwrap();
+            assert!(
+                super::inherit_compiled_operation_context(
+                    &mut parsed,
+                    &compiled,
+                    Some(host),
+                    Some(&inherited)
+                )
+                .is_err()
+            );
+            let super::Commands::Invoke(request) = &parsed.command else {
+                unreachable!()
+            };
+            assert!(!request.auth.is_present());
+        }
+
+        let mut nested =
+            Cli::try_parse_from(["fwc", "do", "search GitHub issues for auth"]).unwrap();
+        super::inherit_compiled_operation_context(
+            &mut nested,
+            &compiled,
+            Some(host),
+            Some(&inherited),
+        )
+        .unwrap();
+        let super::Commands::Do(nested) = nested.command else {
+            unreachable!()
+        };
+        assert!(
+            !nested.auth.is_present(),
+            "nested workflows need their own authority"
+        );
+    }
+
+    #[test]
+    fn compiled_workflow_payload_preserves_explicit_child_input_and_target_scope() {
+        let compiled = compiled_workflow_test_plan(&[]);
+        let host = "http://127.0.0.1:17700";
+        let payload = r#"{"query":"workflow input"}"#;
+        let capture_request = |parsed: &Cli| match &parsed.command {
+            super::Commands::Invoke(request) => serde_json::to_value(request).unwrap(),
+            super::Commands::Simulate(simulation) => {
+                serde_json::to_value(&simulation.request).unwrap()
+            }
+            _ => unreachable!(),
+        };
+        for command in ["invoke", "simulate"] {
+            for source in [vec![], vec!["--file", "./intent-payload.json"]] {
+                let mut argv = vec!["fwc", command, "github", "issues.search"];
+                argv.extend(source);
+                let mut parsed = Cli::try_parse_from(argv).unwrap();
+                super::inherit_compiled_operation_payload(
+                    &mut parsed,
+                    &compiled,
+                    Some(host),
+                    Some(payload),
+                )
+                .unwrap();
+                let request = match &parsed.command {
+                    super::Commands::Invoke(request) => request,
+                    super::Commands::Simulate(simulation) => &simulation.request,
+                    _ => unreachable!(),
+                };
+                assert_eq!(request.input.as_deref(), Some(payload));
+                assert!(request.file.is_none());
+            }
+            for source in [
+                vec!["--input", r#"{"query":"child input"}"#],
+                vec!["--file", "explicit-child.json"],
+                vec!["--stdin"],
+                vec!["--set", "query=child input"],
+            ] {
+                let mut argv = vec!["fwc", command, "github", "issues.search"];
+                argv.extend(source);
+                let mut parsed = Cli::try_parse_from(argv).unwrap();
+                let before = capture_request(&parsed);
+                super::inherit_compiled_operation_payload(
+                    &mut parsed,
+                    &compiled,
+                    Some(host),
+                    Some(payload),
+                )
+                .unwrap();
+                assert_eq!(capture_request(&parsed), before);
+            }
+        }
+        for argv in [
+            vec!["fwc", "invoke", "slack", "search"],
+            vec![
+                "fwc",
+                "invoke",
+                "github",
+                "issues.search",
+                "--host",
+                "http://127.0.0.1:17701",
+            ],
+        ] {
+            let mut parsed = Cli::try_parse_from(argv).unwrap();
+            let error = super::inherit_compiled_operation_payload(
+                &mut parsed,
+                &compiled,
+                Some(host),
+                Some(payload),
+            )
+            .unwrap_err();
+            assert_eq!(error.error_type, "invalid-workflow-input");
+            let super::Commands::Invoke(request) = &parsed.command else {
+                unreachable!()
+            };
+            assert!(request.input.is_none());
+        }
+        let mut nested = Cli::try_parse_from(["fwc", "do", "search GitHub issues"]).unwrap();
+        super::inherit_compiled_operation_payload(
+            &mut nested,
+            &compiled,
+            Some(host),
+            Some(payload),
+        )
+        .unwrap();
+        let super::Commands::Do(nested) = nested.command else {
+            unreachable!()
+        };
+        assert!(nested.input.is_none());
+        assert!(nested.file.is_none());
+    }
+
+    #[test]
+    fn compiled_workflow_rejects_invalid_payload_before_any_primitive() {
+        let temp = TempDir::new().unwrap();
+        let malformed_file = temp.path().join("malformed.json");
+        fs::write(&malformed_file, "{not-json").unwrap();
+        let compiled = compiled_workflow_test_plan(&[
+            &["fwc", "guide"],
+            &["fwc", "invoke", "github", "issues.create"],
+        ]);
+        for (bindings, error_type) in [
+            (
+                StdBTreeMap::from([("payload_json".to_owned(), "{not-json".to_owned())]),
+                "invalid-inline-input",
+            ),
+            (
+                StdBTreeMap::from([(
+                    "payload_file".to_owned(),
+                    malformed_file.display().to_string(),
+                )]),
+                "invalid-input-file",
+            ),
+            (
+                StdBTreeMap::from([(
+                    "payload_file".to_owned(),
+                    temp.path().join("missing.json").display().to_string(),
+                )]),
+                "unreadable-input-file",
+            ),
+            (
+                StdBTreeMap::from([
+                    ("payload_json".to_owned(), "{}".to_owned()),
+                    (
+                        "payload_file".to_owned(),
+                        malformed_file.display().to_string(),
+                    ),
+                ]),
+                "conflicting-input-sources",
+            ),
+        ] {
+            let execution = super::materialize_compiled_steps(
+                &compiled,
+                true,
+                Some(&bindings),
+                Some("http://127.0.0.1:1"),
+                None,
+            );
+            assert_eq!(execution.exit_code, CliExitCode::Validation);
+            assert_eq!(execution.payload["error"]["type"], error_type);
+            assert_eq!(execution.payload["executed_count"], 0);
+            let mut wrapper = json!({"command": "task"});
+            super::attach_compiled_execution_failure(&mut wrapper, &execution);
+            assert_eq!(wrapper["error"]["type"], error_type);
+            assert!(wrapper["failed_step"].is_null());
+        }
+
+        assert!(
+            Cli::try_parse_from([
+                "fwc",
+                "do",
+                "create a GitHub issue",
+                "--approve",
+                "--input",
+                "{}",
+                "--file",
+                "payload.json",
+            ])
+            .is_err()
+        );
+        let (exit_code, payload) = execute_json(&[
+            "fwc",
+            "--json",
+            "--host",
+            "http://127.0.0.1:1",
+            "do",
+            "create a GitHub issue",
+            "--approve",
+            "--input",
+            "{not-json",
+        ]);
+        assert_eq!(exit_code, CliExitCode::Validation.into());
+        assert_eq!(payload["error"]["type"], "invalid-inline-input");
+        assert_eq!(payload["executed_count"], 0);
+    }
+
+    #[test]
+    fn compiled_workflow_safe_resolution_does_not_consume_operation_payloads() {
+        let temp = TempDir::new().unwrap();
+        let store = super::workflow::TaskStore::at_path(temp.path().join("tasks-state"));
+        let mut task = store
+            .create(super::workflow::WorkflowRequest {
+                intent: "search GitHub issues".to_owned(),
+                connector_override: Some("github".to_owned()),
+                zone_override: Some("z:work".to_owned()),
+            })
+            .unwrap();
+        task.compiled = compiled_workflow_test_plan(&[&["fwc", "list"]]);
+        let (host, server, request_log) = spawn_mock_host_sequence_with_body_log(vec![
+            (
+                "POST /rpc/discover".to_owned(),
+                mock_discovery_response_json(),
+            ),
+            (
+                "POST /rpc/discover".to_owned(),
+                mock_discovery_response_json(),
+            ),
+        ]);
+        for binding in [
+            ("payload_json".to_owned(), "{not-json".to_owned()),
+            (
+                "payload_file".to_owned(),
+                temp.path().join("missing.json").display().to_string(),
+            ),
+        ] {
+            let (safe_count, execution) = super::materialize_safe_resolution_steps(
+                &task,
+                &StdBTreeMap::from([binding]),
+                Some(&host),
+            );
+            assert_eq!(safe_count, 1);
+            assert_eq!(
+                execution.exit_code,
+                CliExitCode::Success,
+                "{}",
+                execution.payload
+            );
+            assert_eq!(execution.payload["executed_count"], 1);
+        }
+        server.join().unwrap();
+        assert_eq!(request_log.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn compiled_workflow_auth_failures_do_not_persist_runtime_secret_paths() {
+        let temp = TempDir::new().unwrap();
+        let capability_file = temp.path().join("RUNTIME_SECRET_CAPABILITY_PATH");
+        let approval_file = temp.path().join("RUNTIME_SECRET_APPROVAL_PATH");
+        let holder_file = temp.path().join("RUNTIME_SECRET_HOLDER_PATH");
+        fs::write(&capability_file, "invalid capability").unwrap();
+        fs::write(&approval_file, "invalid approval").unwrap();
+        let (holder_token, _, _) = test_live_holder_auth(temp.path());
+        let compiled = compiled_workflow_test_plan(&[&[
+            "fwc",
+            "invoke",
+            "github",
+            "issues.create",
+            "--input",
+            "{}",
+        ]]);
+        for (auth, error_type) in [
+            (
+                LiveAuthArgs {
+                    capability_token_file: Some(capability_file),
+                    ..LiveAuthArgs::default()
+                },
+                "invalid-capability-token",
+            ),
+            (
+                LiveAuthArgs {
+                    capability_token: Some(test_capability_token_arg()),
+                    approval_token_file: vec![approval_file],
+                    ..LiveAuthArgs::default()
+                },
+                "invalid-approval-token",
+            ),
+            (
+                LiveAuthArgs {
+                    capability_token: Some(holder_token),
+                    holder_key_file: Some(holder_file),
+                    ..LiveAuthArgs::default()
+                },
+                "invalid-holder-proof",
+            ),
+        ] {
+            let execution = super::materialize_compiled_steps(
+                &compiled,
+                true,
+                None,
+                Some("http://127.0.0.1:1"),
+                Some(&auth),
+            );
+            assert_eq!(execution.exit_code, CliExitCode::Validation);
+            assert_eq!(
+                execution.payload["executed_steps"][0]["result"]["error"]["type"],
+                error_type
+            );
+            assert!(!execution.payload.to_string().contains("RUNTIME_SECRET_"));
+        }
+    }
+
+    #[test]
+    fn compiled_workflow_runtime_authority_reaches_host_without_persisting_credentials() {
+        let temp = TempDir::new().unwrap();
+        let (token, holder_path, signing_key) = test_live_holder_auth(temp.path());
+        let token_file = temp.path().join("runtime-capability.token");
+        fs::write(&token_file, &token).unwrap();
+        let approval = json!({
+            "token_id": "runtime-approval-secret",
+            "issued_at_ms": 0,
+            "expires_at_ms": u64::MAX,
+            "issuer": "runtime-approver",
+            "zone_id": "z:work",
+            "scope": {
+                "type": "execution",
+                "connector_id": "fcp.github:enterprise:v1",
+                "method_pattern": "github.create_issue",
+            },
+            "signature": [17, 29, 53, 97],
+        });
+        let approval_file = temp.path().join("runtime-approval.json");
+        fs::write(&approval_file, approval.to_string()).unwrap();
+        let input =
+            json!({"owner": "octocat", "repo": "hello-world", "title": "Runtime authority"});
+        let input_text = input.to_string();
+        let input_file = temp.path().join("workflow-input.json");
+        fs::write(&input_file, &input_text).unwrap();
+        let bindings = StdBTreeMap::from([(
+            "payload_file".to_owned(),
+            input_file.to_str().unwrap().to_owned(),
+        )]);
+        let mut compiled = compiled_workflow_test_plan(&[
+            &["fwc", "guide"],
+            &[
+                "fwc",
+                "simulate",
+                "github",
+                "issues.create",
+                "--file",
+                "./intent-payload.json",
+            ],
+            &["fwc", "invoke", "github", "issues.create"],
+        ]);
+        compiled.zone = Some("z:work".to_owned());
+        let compiled_before = serde_json::to_value(&compiled).unwrap();
+        let auth = LiveAuthArgs {
+            capability_token_file: Some(token_file.clone()),
+            holder_key_file: Some(holder_path.clone()),
+            approval_token_file: vec![approval_file.clone()],
+            ..LiveAuthArgs::default()
+        };
+        let mut simulation =
+            mock_simulate_response_json(&input, SimulatePhase::ConnectorReached, true);
+        simulation["request_id"] = json!(
+            derive_live_request_id(
+                "fcp.github:enterprise:v1",
+                "github.create_issue",
+                "z:work",
+                &input,
+                None,
+                None,
+            )
+            .unwrap()
+            .to_string()
+        );
+        simulation["receipt"]["operation"] = json!("github.create_issue");
+        let (host, server, request_log) = spawn_mock_host_sequence_with_body_log(vec![
+            (
+                "POST /rpc/discover".to_owned(),
+                mock_discovery_response_json(),
+            ),
+            (
+                "GET /rpc/introspect/fcp.github:enterprise:v1".to_owned(),
+                mock_introspection_response_json(),
+            ),
+            ("POST /rpc/simulate".to_owned(), simulation),
+            (
+                "POST /rpc/discover".to_owned(),
+                mock_discovery_response_json(),
+            ),
+            (
+                "GET /rpc/introspect/fcp.github:enterprise:v1".to_owned(),
+                mock_introspection_response_json(),
+            ),
+            (
+                "POST /rpc/preflight".to_owned(),
+                mock_preflight_response_json(true),
+            ),
+            (
+                "POST /rpc/invoke".to_owned(),
+                mock_invoke_response_json(json!({"number": 42})),
+            ),
+        ]);
+        let execution = super::materialize_compiled_steps(
+            &compiled,
+            true,
+            Some(&bindings),
+            Some(&host),
+            Some(&auth),
+        );
+        server.join().unwrap();
+        assert_eq!(
+            execution.exit_code,
+            CliExitCode::Success,
+            "{}",
+            execution.payload
+        );
+        assert_eq!(execution.payload["executed_count"], 3);
+        assert_eq!(serde_json::to_value(&compiled).unwrap(), compiled_before);
+        for (route, body) in request_log.lock().unwrap().iter() {
+            if !matches!(
+                route.as_str(),
+                "POST /rpc/simulate" | "POST /rpc/preflight" | "POST /rpc/invoke"
+            ) {
+                assert!(!body.contains("capability_token"));
+                assert!(!body.contains("approval_tokens"));
+                continue;
+            }
+            let request: Value = serde_json::from_str(body).unwrap();
+            assert_live_holder_request(&request, &signing_key);
+            assert_eq!(request["approval_tokens"], json!([approval]));
+            assert_eq!(request["zone_id"], "z:work");
+            if route != "POST /rpc/preflight" {
+                assert_eq!(request["input"], input);
+            }
+        }
+        for step in execution.payload["executed_steps"].as_array().unwrap() {
+            assert!(!step["argv"].to_string().contains(&input_text));
+            assert!(
+                !step["command_line"]
+                    .to_string()
+                    .contains(input_file.to_str().unwrap())
+            );
+        }
+
+        let store = super::workflow::TaskStore::at_path(temp.path().join("tasks-state"));
+        let task = store
+            .create(super::workflow::WorkflowRequest {
+                intent: "search GitHub issues for auth".to_owned(),
+                connector_override: Some("github".to_owned()),
+                zone_override: Some("z:work".to_owned()),
+            })
+            .unwrap();
+        let saved = store
+            .append_execution(&task.id, "run", "approve", execution.payload.clone())
+            .unwrap()
+            .unwrap();
+        let persisted = fs::read_to_string(
+            store
+                .root_dir()
+                .join("tasks")
+                .join(format!("{}.json", task.id.replace(':', "_"))),
+        )
+        .unwrap();
+        let serialized = serde_json::to_string(&saved).unwrap();
+        for evidence in [execution.payload.to_string(), serialized, persisted] {
+            for secret in [
+                token.as_str(),
+                "runtime-approval-secret",
+                token_file.to_str().unwrap(),
+                holder_path.to_str().unwrap(),
+                approval_file.to_str().unwrap(),
+            ] {
+                assert!(
+                    !evidence.contains(secret),
+                    "runtime credentials leaked into workflow evidence"
+                );
+            }
+            assert!(!evidence.contains("\"capability_token\""));
+            assert!(!evidence.contains("\"approval_tokens\""));
+        }
+    }
+
+    #[test]
+    fn execute_compiled_workflow_wrappers_forward_payload_and_runtime_authority() {
+        let intent = "search GitHub issues for auth";
+        let token = test_capability_token_arg();
+        let expected_token =
+            serde_json::to_value(super::parse_capability_token_str(&token, "test").unwrap())
+                .unwrap();
+        let input = json!({"query": "repo:octocat/hello-world is:open"});
+        let input_text = input.to_string();
+        let temp = TempDir::new().unwrap();
+        let input_file = temp.path().join("query.json");
+        fs::write(&input_file, &input_text).unwrap();
+        let compiled = super::intent::compile(&super::intent::IntentRequest {
+            intent: intent.to_owned(),
+            connector_override: Some("github".to_owned()),
+            zone_override: Some("z:work".to_owned()),
+            mode: super::intent::IntentMode::DoSimulate,
+            host_url: None,
+        });
+        assert_eq!(compiled.status, "ready");
+        assert!(compiled.steps.iter().any(|step| step.command == "invoke"));
+        assert!(compiled.steps.iter().all(|step| !step.side_effecting));
+        let introspection = mock_introspection_response_with_tools(
+            mock_connector_summary_json(),
+            vec![mock_tool_descriptor_json(
+                compiled.operation_hint.as_deref().unwrap(),
+                "github.issue_read",
+                "low",
+                "safe",
+                "strict",
+                Some("none"),
+                json!({
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"],
+                    "additionalProperties": false,
+                }),
+                json!({"type": "object"}),
+            )],
+        );
+        for (command, from_file) in [
+            ("do", false),
+            ("do", true),
+            ("run", false),
+            ("advance", true),
+        ] {
+            let task_id = if command == "do" {
+                None
+            } else {
+                let (exit_code, created) = execute_json(&[
+                    "fwc",
+                    "--json",
+                    "task",
+                    "create",
+                    intent,
+                    "--connector",
+                    "github",
+                    "--zone",
+                    "z:work",
+                ]);
+                assert_eq!(exit_code, CliExitCode::Success.into());
+                let task_id = created["task"]["id"].as_str().unwrap().to_owned();
+                let binding = if from_file {
+                    format!("payload_file={}", input_file.display())
+                } else {
+                    format!("payload_json={input_text}")
+                };
+                let (exit_code, bound) =
+                    execute_json(&["fwc", "--json", "task", "bind", &task_id, &binding]);
+                assert_eq!(exit_code, CliExitCode::Success.into(), "{bound}");
+                Some(task_id)
+            };
+            let mut routes = Vec::new();
+            for step in &compiled.steps {
+                assert!(matches!(
+                    step.command.as_str(),
+                    "show" | "ops" | "search" | "schema" | "examples" | "invoke"
+                ));
+                routes.push((
+                    "POST /rpc/discover".to_owned(),
+                    mock_discovery_response_json(),
+                ));
+                if matches!(step.command.as_str(), "show" | "schema") {
+                    routes.push((
+                        "GET /rpc/connectors/fcp.github:enterprise:v1".to_owned(),
+                        mock_inventory_response_json(),
+                    ));
+                }
+                routes.push((
+                    "GET /rpc/introspect/fcp.github:enterprise:v1".to_owned(),
+                    introspection.clone(),
+                ));
+                if step.command == "invoke" {
+                    routes.push((
+                        "POST /rpc/preflight".to_owned(),
+                        mock_preflight_response_json(true),
+                    ));
+                    routes.push((
+                        "POST /rpc/invoke".to_owned(),
+                        mock_invoke_response_json(json!({"items": []})),
+                    ));
+                }
+            }
+            let (host, server, request_log) = spawn_mock_host_sequence_with_body_log(routes);
+            let mut argv = vec!["fwc", "--json", "--host", &host];
+            if let Some(task_id) = task_id.as_deref() {
+                argv.extend(["task", command, task_id]);
+            } else {
+                argv.extend(["do", intent, "--connector", "github", "--zone", "z:work"]);
+                argv.extend(if from_file {
+                    ["--file", input_file.to_str().unwrap()]
+                } else {
+                    ["--input", input_text.as_str()]
+                });
+            }
+            argv.extend(["--capability-token", &token]);
+            let (exit_code, payload) = execute_json(&argv);
+            server.join().unwrap();
+            assert_eq!(
+                exit_code,
+                CliExitCode::Success.into(),
+                "{command}: {payload}"
+            );
+            let requests = request_log.lock().unwrap();
+            let invoke_body = requests
+                .iter()
+                .find(|(route, _)| route == "POST /rpc/invoke")
+                .unwrap();
+            let invocation: Value = serde_json::from_str(&invoke_body.1).unwrap();
+            assert_eq!(invocation["input"], input);
+            assert_eq!(invocation["capability_token"], expected_token);
+            assert_eq!(invocation["zone_id"], "z:work");
+            assert_eq!(payload["execution"]["executed_count"], compiled.steps.len());
+            assert!(!payload.to_string().contains(&token));
+            for step in payload["execution"]["executed_steps"].as_array().unwrap() {
+                assert!(!step["argv"].to_string().contains(&input_text));
+                assert!(
+                    !step["command_line"]
+                        .to_string()
+                        .contains(input_file.to_str().unwrap())
+                );
+            }
+            if let Some(task_id) = task_id {
+                let store = super::workflow::TaskStore::discover().unwrap();
+                let saved = store.load(&task_id).unwrap().unwrap();
+                assert_eq!(saved.execution_history.len(), 1);
+                assert!(!serde_json::to_string(&saved).unwrap().contains(&token));
+            }
+        }
+    }
+
+    #[test]
     fn compiled_workflow_keeps_selected_host_through_nested_dispatch() {
         // Warm the static connector/operation profile index before starting timed mock servers.
         let _ = compiled_workflow_test_plan(&[&["fwc", "list"]]);
@@ -43779,7 +44856,7 @@ deny_ptrace = true
             &["fwc", "do", "search GitHub issues for auth"],
             &["fwc", "guide"],
         ]);
-        let outcome = super::materialize_compiled_steps(&compiled, true, None, Some(&host));
+        let outcome = super::materialize_compiled_steps(&compiled, true, None, Some(&host), None);
 
         server
             .join()
@@ -43827,7 +44904,7 @@ deny_ptrace = true
                 &failed_argv,
                 &["fwc", "guide", "list"],
             ]);
-            let outcome = super::materialize_compiled_steps(&compiled, true, None, None);
+            let outcome = super::materialize_compiled_steps(&compiled, true, None, None, None);
             assert_eq!(outcome.exit_code, expected_exit);
             assert_eq!(outcome.payload["executed_count"], 2);
             assert_eq!(outcome.payload["executed_steps"][0]["status"], "executed");
