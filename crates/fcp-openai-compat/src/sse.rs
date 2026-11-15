@@ -2,7 +2,7 @@
 
 use std::collections::VecDeque;
 
-use bytes::{Buf as _, Bytes, BytesMut};
+use bytes::Bytes;
 
 use crate::{ChatChunk, NetworkError, OpenAiError, StreamingError, redact_sensitive_text};
 
@@ -16,58 +16,119 @@ pub enum OpenAiStreamEvent {
 }
 
 /// Incremental SSE decoder for OpenAI-compatible chat streams.
-#[derive(Debug, Default)]
+///
+/// An in-progress event and its partial line share a bounded allocation. Each
+/// `data` field retains its newline, including empty fields; there is no vector
+/// of per-line strings. Complete events are returned to the caller immediately.
+/// `[DONE]`, protocol errors and truncated EOF permanently terminate decoding.
+#[derive(Debug)]
 pub struct OpenAiSseDecoder {
-    buffer: BytesMut,
-    parse_cursor: usize,
-    event_type: Option<String>,
-    data_lines: Vec<String>,
+    /// Assembled event data followed by the current incomplete physical line.
+    buffer: Vec<u8>,
+    line_start: usize,
+    event_is_error: bool,
+    max_buffer_size: usize,
+    pending_cr_swallows_lf: bool,
+    first_line: bool,
+    terminal: bool,
     done: bool,
-    saw_chunk: bool,
+}
+
+const DEFAULT_MAX_SSE_BUFFER_SIZE: usize = 1024 * 1024;
+const MAX_SSE_BUFFER_SIZE: usize = 64 * 1024 * 1024;
+
+impl Default for OpenAiSseDecoder {
+    fn default() -> Self {
+        Self::with_max_buffer_size(DEFAULT_MAX_SSE_BUFFER_SIZE)
+    }
 }
 
 impl OpenAiSseDecoder {
-    /// Create an empty decoder.
+    /// Create an empty decoder with a 1 MiB retained framing limit.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Feed a chunk of bytes and return all complete stream events.
+    /// Set the retained framing limit, capped at 64 MiB.
+    ///
+    /// The limit covers assembled event data, its newline separators and the
+    /// current raw line. It does not limit the total lifetime of a stream or
+    /// the size of a transport chunk containing many complete events. Zero
+    /// rejects any nonempty field. Allocation capacity cannot exceed the limit.
+    pub fn with_max_buffer_size(max_buffer_size: usize) -> Self {
+        Self {
+            buffer: Vec::new(),
+            line_start: 0,
+            event_is_error: false,
+            max_buffer_size: max_buffer_size.min(MAX_SSE_BUFFER_SIZE),
+            pending_cr_swallows_lf: false,
+            first_line: true,
+            terminal: false,
+            done: false,
+        }
+    }
+
+    /// Feed bytes and return complete events followed by at most one error.
+    ///
+    /// The decoder stops at the first terminal event, even if the same input
+    /// chunk contains more bytes. Calls after termination return no events.
     pub fn feed(&mut self, bytes: &Bytes) -> Vec<Result<OpenAiStreamEvent, OpenAiError>> {
-        self.buffer.extend_from_slice(bytes);
+        if self.terminal || bytes.is_empty() {
+            return Vec::new();
+        }
         let mut output = Vec::new();
+        let mut remaining = bytes.as_ref();
 
-        while let Some(line_end) = self.find_line_end() {
-            let line = self.buffer.split_to(line_end);
-            if self.buffer.starts_with(b"\r\n") {
-                self.buffer.advance(2);
-            } else if self.buffer.starts_with(b"\n") || self.buffer.starts_with(b"\r") {
-                self.buffer.advance(1);
-            }
-            self.parse_cursor = 0;
-
-            let line = String::from_utf8_lossy(&line);
-            if line.is_empty() {
-                if let Some(event) = self.dispatch_event() {
-                    output.push(event);
+        while !remaining.is_empty() {
+            if self.pending_cr_swallows_lf {
+                self.pending_cr_swallows_lf = false;
+                if remaining[0] == b'\n' {
+                    remaining = &remaining[1..];
+                    continue;
                 }
-            } else if !line.starts_with(':') {
-                self.process_field(&line);
+            }
+
+            // Scan only newly received bytes. Never copy a complete transport
+            // chunk or rescan an incomplete line after every tiny fragment.
+            let line_end = remaining
+                .iter()
+                .position(|byte| matches!(byte, b'\r' | b'\n'))
+                .unwrap_or(remaining.len());
+            if let Err(error) = self.append_fragment(&remaining[..line_end]) {
+                self.terminate();
+                output.push(Err(error));
+                break;
+            }
+            remaining = &remaining[line_end..];
+            let Some(terminator) = remaining.first() else {
+                break;
+            };
+            self.pending_cr_swallows_lf = *terminator == b'\r';
+            remaining = &remaining[1..];
+
+            if let Some(event) = self.process_line() {
+                let terminal = matches!(&event, Ok(OpenAiStreamEvent::Done) | Err(_));
+                output.push(event);
+                if terminal {
+                    self.terminate();
+                    break;
+                }
             }
         }
 
         output
     }
 
-    /// Finish decoding and report a network drop if `[DONE]` was not observed.
+    /// End the stream and report truncation unless `[DONE]` or an error ended it.
+    ///
+    /// Empty, comment-only and unterminated streams are truncated too. EOF does
+    /// not dispatch a partial SSE block. The error is emitted only once.
     pub fn finish(&mut self) -> Option<Result<OpenAiStreamEvent, OpenAiError>> {
-        if self.done {
+        if self.terminal {
             return None;
         }
-        if !self.buffer.is_empty() || !self.data_lines.is_empty() || self.saw_chunk {
-            return Some(Err(OpenAiError::Network(NetworkError::ConnectionDropped)));
-        }
-        None
+        self.terminate();
+        Some(Err(OpenAiError::Network(NetworkError::ConnectionDropped)))
     }
 
     /// Whether a terminal `[DONE]` was observed.
@@ -75,62 +136,127 @@ impl OpenAiSseDecoder {
         self.done
     }
 
-    fn find_line_end(&mut self) -> Option<usize> {
-        let start = self.parse_cursor.min(self.buffer.len());
-        for (offset, byte) in self.buffer[start..].iter().enumerate() {
-            if *byte == b'\n' || *byte == b'\r' {
-                return Some(start + offset);
+    fn append_fragment(&mut self, bytes: &[u8]) -> Result<(), OpenAiError> {
+        let required = self.buffer.len().saturating_add(bytes.len());
+        if required > self.max_buffer_size {
+            return Err(self.overflow_error());
+        }
+        if required > self.buffer.capacity() {
+            // Grow geometrically without Vec's implicit capacity overshoot.
+            let capacity = required
+                .max(self.buffer.capacity().saturating_mul(2))
+                .max(64)
+                .min(self.max_buffer_size);
+            self.buffer
+                .try_reserve_exact(capacity - self.buffer.len())
+                .map_err(|_| self.overflow_error())?;
+            if self.buffer.capacity() > self.max_buffer_size {
+                return Err(self.overflow_error());
             }
         }
-        self.parse_cursor = self.buffer.len();
+        self.buffer.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    fn overflow_error(&self) -> OpenAiError {
+        OpenAiError::Streaming(StreamingError::MalformedPayload {
+            message: format!(
+                "SSE framing exceeds the retained buffer limit of {} bytes",
+                self.max_buffer_size
+            ),
+        })
+    }
+
+    fn terminate(&mut self) {
+        self.terminal = true;
+        self.buffer = Vec::new();
+        self.line_start = 0;
+        self.event_is_error = false;
+        self.pending_cr_swallows_lf = false;
+    }
+
+    fn process_line(&mut self) -> Option<Result<OpenAiStreamEvent, OpenAiError>> {
+        let mut start = self.line_start;
+        if self.first_line {
+            self.first_line = false;
+            if self.buffer[start..].starts_with(b"\xef\xbb\xbf") {
+                start += 3;
+            }
+        }
+        let line = &self.buffer[start..];
+        if line.is_empty() {
+            self.buffer.truncate(self.line_start);
+            return self.dispatch_event();
+        }
+        let (field, value_start) =
+            line.iter()
+                .position(|byte| *byte == b':')
+                .map_or((line, self.buffer.len()), |colon| {
+                    let mut value_start = start + colon + 1;
+                    if self.buffer.get(value_start) == Some(&b' ') {
+                        value_start += 1;
+                    }
+                    (&line[..colon], value_start)
+                });
+
+        if field == b"data" {
+            // Compact into the same allocation. Even an empty data field
+            // consumes its retained newline, without per-line heap objects.
+            let value_len = self.buffer.len() - value_start;
+            self.buffer.copy_within(value_start.., self.line_start);
+            self.buffer.truncate(self.line_start + value_len);
+            self.buffer.push(b'\n');
+            self.line_start = self.buffer.len();
+        } else {
+            if field == b"event" {
+                self.event_is_error = &self.buffer[value_start..] == b"error";
+            }
+            // Comments and unknown fields carry no retained event state.
+            self.buffer.truncate(self.line_start);
+        }
         None
     }
 
-    fn process_field(&mut self, line: &str) {
-        let (field, value) = line.find(':').map_or((line, ""), |colon| {
-            let field = &line[..colon];
-            let value = line[colon + 1..]
-                .strip_prefix(' ')
-                .unwrap_or_else(|| &line[colon + 1..]);
-            (field, value)
-        });
-
-        match field {
-            "event" => self.event_type = Some(value.to_string()),
-            "data" => self.data_lines.push(value.to_string()),
-            _ => {}
-        }
-    }
-
     fn dispatch_event(&mut self) -> Option<Result<OpenAiStreamEvent, OpenAiError>> {
-        if self.data_lines.is_empty() {
-            self.event_type = None;
+        let event_is_error = std::mem::take(&mut self.event_is_error);
+        if self.line_start == 0 {
             return None;
         }
-
-        let event_type = self.event_type.take();
-        let data = self.data_lines.join("\n");
-        self.data_lines.clear();
+        self.line_start = 0;
+        self.buffer.pop(); // SSE removes the last data-field newline.
+        let data = match String::from_utf8(std::mem::take(&mut self.buffer)) {
+            Ok(data) => data,
+            Err(_) => {
+                return Some(Err(OpenAiError::Streaming(
+                    StreamingError::MalformedPayload {
+                        message: "SSE data is not valid UTF-8".to_owned(),
+                    },
+                )));
+            }
+        };
 
         if data.trim() == "[DONE]" {
             self.done = true;
             return Some(Ok(OpenAiStreamEvent::Done));
         }
 
-        if event_type.as_deref() == Some("error") {
+        if event_is_error {
             return Some(Err(OpenAiError::Streaming(StreamingError::ProviderEvent {
                 message: redact_sensitive_text(&data),
             })));
         }
 
         match serde_json::from_str::<ChatChunk>(&data) {
-            Ok(chunk) => {
-                self.saw_chunk = true;
-                Some(Ok(OpenAiStreamEvent::Chunk(chunk)))
-            }
+            Ok(chunk) => Some(Ok(OpenAiStreamEvent::Chunk(chunk))),
             Err(err) => Some(Err(OpenAiError::Streaming(
                 StreamingError::MalformedPayload {
-                    message: redact_sensitive_text(&format!("{err}: {data}")),
+                    // Invalid JSON cannot be reliably structurally redacted.
+                    // Preserve the location, never the provider's raw payload.
+                    message: format!(
+                        "invalid chat chunk JSON at line {}, column {}",
+                        err.line(),
+                        err.column()
+                    ),
                 },
             ))),
         }
@@ -272,6 +398,241 @@ mod tests {
             output.last(),
             Some(Err(OpenAiError::Network(NetworkError::ConnectionDropped)))
         ));
+    }
+
+    #[test]
+    fn bom_multiline_data_and_line_endings_survive_every_fragment_boundary() {
+        let payload = chunk_json(Some("hi \u{feff} π 😀"), None);
+        let split = payload.find(',').expect("JSON has multiple fields") + 1;
+        let expected = vec![
+            Ok(OpenAiStreamEvent::Chunk(
+                serde_json::from_str(&payload).unwrap(),
+            )),
+            Ok(OpenAiStreamEvent::Done),
+        ];
+        for newline in ["\n", "\r\n", "\r"] {
+            let frame = format!(
+                "\u{feff}data: {}{newline}: heartbeat{newline}data: {}{newline}{newline}data: [DONE]{newline}{newline}",
+                &payload[..split],
+                &payload[split..],
+            );
+            for boundary in 0..=frame.len() {
+                let mut decoder = OpenAiSseDecoder::new();
+                let mut events =
+                    decoder.feed(&Bytes::copy_from_slice(&frame.as_bytes()[..boundary]));
+                events.extend(decoder.feed(&Bytes::new()));
+                events.extend(decoder.feed(&Bytes::copy_from_slice(&frame.as_bytes()[boundary..])));
+                assert_eq!(events, expected, "newline {newline:?}, boundary {boundary}");
+                assert!(decoder.is_done());
+                assert!(decoder.finish().is_none());
+                assert_eq!(decoder.buffer.capacity(), 0);
+            }
+            let mut decoder = OpenAiSseDecoder::new();
+            let mut events = Vec::new();
+            for byte in frame.bytes() {
+                events.extend(decoder.feed(&Bytes::copy_from_slice(&[byte])));
+                events.extend(decoder.feed(&Bytes::new()));
+            }
+            assert_eq!(events, expected, "one-byte fragments with {newline:?}");
+        }
+    }
+
+    #[test]
+    fn buffer_limit_applies_to_partial_events_not_whole_transport_chunks() {
+        let payload = chunk_json(Some("bounded"), None);
+        let frame = format!("data: {payload}\n\n");
+        let limit = frame.len();
+        let mut decoder = OpenAiSseDecoder::with_max_buffer_size(limit);
+        let input = format!("{}data: [DONE]\n\n", frame.repeat(32));
+        assert!(input.len() > limit * 32);
+        let events = decoder.feed(&Bytes::from(input));
+        assert_eq!(events.len(), 33);
+        assert!(
+            events[..32]
+                .iter()
+                .all(|event| matches!(event, Ok(OpenAiStreamEvent::Chunk(_))))
+        );
+        assert_eq!(events[32], Ok(OpenAiStreamEvent::Done));
+        assert!(decoder.finish().is_none());
+    }
+
+    #[test]
+    fn oversized_partial_lines_fail_before_unbounded_retention() {
+        for prefix in ["data: ", "event: ", ": ", "unknown: "] {
+            let mut decoder = OpenAiSseDecoder::with_max_buffer_size(64);
+            assert!(
+                decoder
+                    .feed(&Bytes::from_static(prefix.as_bytes()))
+                    .is_empty()
+            );
+            let mut errors = 0;
+            for _ in 0..128 {
+                for event in decoder.feed(&Bytes::from_static(b"x")) {
+                    assert!(matches!(
+                        event,
+                        Err(OpenAiError::Streaming(
+                            StreamingError::MalformedPayload { .. }
+                        ))
+                    ));
+                    errors += 1;
+                }
+                assert!(decoder.buffer.len() <= 64);
+                assert!(decoder.buffer.capacity() <= 64);
+            }
+            assert_eq!(errors, 1, "{prefix}");
+            assert_eq!(decoder.buffer.capacity(), 0);
+            assert!(!decoder.is_done());
+            assert!(decoder.finish().is_none());
+            assert!(
+                decoder
+                    .feed(&Bytes::from_static(b"data: [DONE]\n\n"))
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn empty_data_fields_consume_bounded_space_without_per_line_allocations() {
+        for field in [b"data:\n".as_slice(), b"data\n".as_slice()] {
+            let mut decoder = OpenAiSseDecoder::with_max_buffer_size(64);
+            let mut errors = 0;
+            for _ in 0..128 {
+                for event in decoder.feed(&Bytes::from_static(field)) {
+                    assert!(matches!(
+                        event,
+                        Err(OpenAiError::Streaming(
+                            StreamingError::MalformedPayload { .. }
+                        ))
+                    ));
+                    errors += 1;
+                }
+                assert!(decoder.buffer.len() <= 64);
+                assert!(decoder.buffer.capacity() <= 64);
+            }
+            assert_eq!(errors, 1);
+            assert_eq!(decoder.buffer.capacity(), 0);
+            assert!(decoder.finish().is_none());
+        }
+    }
+
+    #[test]
+    fn overflow_keeps_complete_prefix_and_fuses_before_trailing_done() {
+        let payload = chunk_json(Some("kept"), None);
+        let mut decoder = OpenAiSseDecoder::with_max_buffer_size(512);
+        let events = decoder.feed(&Bytes::from(format!(
+            "data: {payload}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            "x".repeat(513),
+        )));
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0],
+            Ok(OpenAiStreamEvent::Chunk(
+                serde_json::from_str(&payload).unwrap()
+            ))
+        );
+        assert!(matches!(
+            events[1],
+            Err(OpenAiError::Streaming(
+                StreamingError::MalformedPayload { .. }
+            ))
+        ));
+        assert!(!decoder.is_done());
+        assert!(decoder.finish().is_none());
+        assert_eq!(decoder.buffer.capacity(), 0);
+    }
+
+    #[test]
+    fn done_and_errors_are_sticky_and_ignore_same_chunk_suffixes() {
+        let payload = chunk_json(Some("prefix"), None);
+        for (terminal, done) in [
+            ("data: [DONE]\n\n", true),
+            ("event: error\ndata: {\"message\":\"failed\"}\n\n", false),
+            ("data: {not-json}\n\n", false),
+        ] {
+            let mut decoder = OpenAiSseDecoder::with_max_buffer_size(512);
+            let input = format!(
+                "data: {payload}\n\n{terminal}data: {payload}\n\ndata: {}",
+                "x".repeat(1024),
+            );
+            let events = decoder.feed(&Bytes::from(input));
+            assert_eq!(events.len(), 2, "{terminal}");
+            assert!(matches!(events[0], Ok(OpenAiStreamEvent::Chunk(_))));
+            if done {
+                assert_eq!(events[1], Ok(OpenAiStreamEvent::Done));
+            } else {
+                assert!(events[1].is_err());
+            }
+            assert_eq!(decoder.is_done(), done);
+            assert_eq!(decoder.buffer.capacity(), 0);
+            for _ in 0..3 {
+                assert!(
+                    decoder
+                        .feed(&Bytes::from_static(b"data: [DONE]\n\n"))
+                        .is_empty()
+                );
+                assert!(decoder.finish().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn every_eof_without_a_dispatched_done_is_one_truncation_error() {
+        let complete_chunk = format!("data: {}\n\n", chunk_json(Some("partial"), None));
+        for input in [
+            "",
+            ": heartbeat\n\n",
+            "event: message\n\n",
+            "data: [DONE]",
+            "data: [DONE]\n",
+            complete_chunk.as_str(),
+        ] {
+            let mut decoder = OpenAiSseDecoder::new();
+            let events = decoder.feed(&Bytes::copy_from_slice(input.as_bytes()));
+            assert!(events.iter().all(Result::is_ok));
+            assert!(!decoder.is_done());
+            assert_eq!(
+                decoder.finish(),
+                Some(Err(OpenAiError::Network(NetworkError::ConnectionDropped))),
+                "{input}"
+            );
+            assert_eq!(decoder.buffer.capacity(), 0);
+            assert!(decoder.finish().is_none());
+            assert!(
+                decoder
+                    .feed(&Bytes::from_static(b"data: [DONE]\n\n"))
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_utf8_is_terminal_and_malformed_errors_never_echo_payloads() {
+        let mut decoder = OpenAiSseDecoder::new();
+        let events = decoder.feed(&Bytes::from_static(b"data: \xff\n\ndata: [DONE]\n\n"));
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0],
+            Err(OpenAiError::Streaming(
+                StreamingError::MalformedPayload { .. }
+            ))
+        ));
+        assert!(decoder.finish().is_none());
+        let output = decode_all(&["data: {\"content\":\"private completion\",bad}\n\n"]);
+        let error = output[0].as_ref().unwrap_err().to_string();
+        assert!(!error.contains("private completion"));
+        assert!(error.contains("line"));
+    }
+
+    #[test]
+    fn configured_limits_are_finite_and_zero_never_allocates_for_fields() {
+        let decoder = OpenAiSseDecoder::with_max_buffer_size(usize::MAX);
+        assert_eq!(decoder.max_buffer_size, MAX_SSE_BUFFER_SIZE);
+        assert_eq!(decoder.buffer.capacity(), 0);
+        let mut decoder = OpenAiSseDecoder::with_max_buffer_size(0);
+        let events = decoder.feed(&Bytes::from_static(b"data:\n\n"));
+        assert_eq!(events.len(), 1);
+        assert!(events[0].is_err());
+        assert_eq!(decoder.buffer.capacity(), 0);
     }
 
     #[test]
