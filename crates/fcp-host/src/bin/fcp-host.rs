@@ -218,6 +218,9 @@ const CONNECTOR_STATE_OBJECT_MAC_KEY_ENV: &str = "FCP_CONNECTOR_STATE_OBJECT_MAC
 const FCP_HOST_CONNECTOR_STATE_OBJECT_MAC_KEY_ENV: &str = "FCP_HOST_CONNECTOR_STATE_OBJECT_MAC_KEY";
 const CONNECTOR_STATE_SYMBOL_MAC_KEY_ENV: &str = "FCP_CONNECTOR_STATE_SYMBOL_MAC_KEY";
 const FCP_HOST_CONNECTOR_STATE_SYMBOL_MAC_KEY_ENV: &str = "FCP_HOST_CONNECTOR_STATE_SYMBOL_MAC_KEY";
+const CONNECTOR_STATE_READ_AUTHORITY_ENV: &str = "FCP_HOST_CONNECTOR_STATE_READ_AUTHORITY";
+const MAX_CONNECTOR_STATE_READ_AUTHORITY_BYTES: usize = 8 * 1024;
+const MAX_CONNECTOR_STATE_TRUSTED_WRITERS: usize = 64;
 const FCP_CONFIG_DIR_ENV: &str = "FCP_CONFIG_DIR";
 const CONNECTOR_STATE_CANONICAL_STORE_DIR: &str = "store";
 const CONNECTOR_STATE_CANONICAL_OBJECTS_DIR: &str = "objects";
@@ -1052,8 +1055,14 @@ impl SubprocessConnector {
                 Some(termination),
             )
             .await?;
-        serde_json::from_value(result)
-            .map_err(|err| HostError::RegistryError(format!("invoke parse error: {err}")))
+        let response = serde_json::from_value(result).map_err(|_| {
+            HostError::RegistryError(
+                "connector returned an invalid invoke response; outcome is unknown; reconcile external effects before retry"
+                    .to_owned(),
+            )
+        })?;
+        invoke_jobs::validate_response(None, &request.operation, &request.id, &response)?;
+        Ok(response)
     }
 
     async fn simulate(&self, request: SimulateRequest) -> HostResult<SimulateResponse> {
@@ -2721,6 +2730,9 @@ struct ManifestOperationConstraintCatalog {
     // A runtime catalog is an observation, never authority to weaken it.
     // Snapshots share schemas instead of cloning every operation per invoke.
     operation_authorities: Arc<BTreeMap<String, ManifestOperationAuthority>>,
+    // Compile once at inventory admission and retain the exact validators
+    // through dispatch and response settlement, even across later updates.
+    operation_contracts: Option<Arc<fcp_manifest::OperationContractSet>>,
     network_constraints: HashMap<String, NetworkConstraints>,
     event_authorities: BTreeMap<String, fcp_manifest::EventSection>,
     sandbox: Option<fcp_manifest::SandboxSection>,
@@ -2800,6 +2812,14 @@ impl ManifestOperationConstraintCatalog {
             manifest_digest: None,
             manifest_bytes: 0,
             operation_authorities: Arc::new(operation_authorities),
+            operation_contracts: Some(Arc::new(
+                fcp_manifest::OperationContractSet::from_manifest(manifest).map_err(|_| {
+                    HostError::InvalidFilter(
+                        "connector manifest operation contracts are invalid or require external schema retrieval"
+                            .to_owned(),
+                    )
+                })?,
+            )),
             network_constraints,
             event_authorities: manifest.provides.events.clone(),
             sandbox: Some(manifest.sandbox.clone()),
@@ -2974,6 +2994,7 @@ fn validate_registry_config_settings(config: &ConnectorConfig) -> HostResult<()>
     ] {
         configured_connector_state_mac_key(config, env_keys).map_err(HostError::InvalidFilter)?;
     }
+    configured_connector_state_read_authority(config).map_err(HostError::InvalidFilter)?;
     Ok(())
 }
 
@@ -4721,6 +4742,107 @@ fn configured_connector_state_symbol_store_config(
     Ok(store)
 }
 
+/// Operator-owned read authority, independent of possession of object-ID or
+/// envelope MAC keys. The shape matches the existing state-transfer writer pins
+/// and instance scope; neither stored objects nor connector RPCs can set it.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfiguredConnectorStateReadAuthority {
+    trusted_writer_keys_hex: Vec<String>,
+    instance_id: Option<InstanceId>,
+}
+
+struct ConnectorStateReadAuthority {
+    writer_keys: Vec<[u8; PUBLIC_KEY_SIZE]>,
+    instance_id: Option<InstanceId>,
+}
+
+fn configured_connector_state_read_authority(
+    config: &ConnectorConfig,
+) -> Result<Option<ConnectorStateReadAuthority>, String> {
+    let Some(raw) = config.env.get(CONNECTOR_STATE_READ_AUTHORITY_ENV) else {
+        return Ok(None);
+    };
+    let invalid = || {
+        format!(
+            "connector state read authority `{CONNECTOR_STATE_READ_AUTHORITY_ENV}` must be a bounded JSON object with 1..64 distinct Ed25519 trusted_writer_keys_hex and an optional canonical instance_id"
+        )
+    };
+    if raw.len() > MAX_CONNECTOR_STATE_READ_AUTHORITY_BYTES {
+        return Err(invalid());
+    }
+    let configured: ConfiguredConnectorStateReadAuthority =
+        serde_json::from_str(raw).map_err(|_| invalid())?;
+    if configured.trusted_writer_keys_hex.is_empty()
+        || configured.trusted_writer_keys_hex.len() > MAX_CONNECTOR_STATE_TRUSTED_WRITERS
+    {
+        return Err(invalid());
+    }
+    let mut unique = HashSet::new();
+    let mut writer_keys = Vec::with_capacity(configured.trusted_writer_keys_hex.len());
+    for encoded in configured.trusted_writer_keys_hex {
+        let mut key = [0_u8; PUBLIC_KEY_SIZE];
+        hex::decode_to_slice(encoded, &mut key).map_err(|_| invalid())?;
+        Ed25519VerifyingKey::from_bytes(&key).map_err(|_| invalid())?;
+        if !unique.insert(key) {
+            return Err(invalid());
+        }
+        writer_keys.push(key);
+    }
+    Ok(Some(ConnectorStateReadAuthority {
+        writer_keys,
+        instance_id: configured.instance_id,
+    }))
+}
+
+/// Every host canonical reader applies the same writer and instance authority
+/// before opening existing storage. A shared zone key authenticates bytes; it
+/// must never implicitly authorize the writer of a self-signed state chain.
+fn open_configured_connector_state_reader(
+    config: &ConnectorConfig,
+    connector_id: &ConnectorId,
+    zone: &ZoneId,
+    object_store_dir: &StdPath,
+) -> Result<
+    (
+        Arc<dyn fcp_store::ObjectStore>,
+        fcp_store::FcpStoreConnectorStateStore,
+    ),
+    String,
+> {
+    let authority = configured_connector_state_read_authority(config)?.ok_or_else(|| {
+        format!(
+            "connector `{connector_id}` has no explicit `{CONNECTOR_STATE_READ_AUTHORITY_ENV}`; canonical state writer authority is unproven"
+        )
+    })?;
+    let object_id_key = configured_connector_state_object_id_key(config)?.ok_or_else(|| {
+        format!(
+            "connector `{connector_id}` has neither `{FCP_HOST_CONNECTOR_STATE_OBJECT_ID_KEY_ENV}` nor `{CONNECTOR_STATE_OBJECT_ID_KEY_ENV}` configured; canonical state object IDs cannot be verified"
+        )
+    })?;
+    let object_store = fcp_store::DurableObjectStore::open_read_only(
+        configured_connector_state_object_store_config(config, object_store_dir)?,
+    )
+    .map_err(|error| {
+        format!(
+            "Canonical fcp-store object store at `{}` could not be opened: {error}",
+            object_store_dir.display()
+        )
+    })?;
+    let object_store: Arc<dyn fcp_store::ObjectStore> = Arc::new(object_store);
+    let mut state_store = fcp_store::FcpStoreConnectorStateStore::new(
+        Arc::clone(&object_store),
+        object_id_key,
+        connector_id.clone(),
+        zone.clone(),
+    )
+    .with_trusted_writer_keys(authority.writer_keys);
+    if let Some(instance_id) = authority.instance_id {
+        state_store = state_store.with_instance_id(instance_id);
+    }
+    Ok((object_store, state_store))
+}
+
 fn connector_state_root_dir() -> PathBuf {
     if let Some(path) = non_empty_os_env(CONNECTOR_STATE_DIR_ENV) {
         return PathBuf::from(path);
@@ -4989,30 +5111,8 @@ async fn connector_state_canonical_status_from_config(
     if !object_store_dir.exists() {
         return Ok(None);
     }
-    let object_id_key = configured_connector_state_object_id_key(config)?.ok_or_else(|| {
-        format!(
-            "Canonical fcp-store object store exists at `{}`, but neither `{}` nor `{}` is configured; host explain cannot verify connector-state object IDs.",
-            object_store_dir.display(),
-            FCP_HOST_CONNECTOR_STATE_OBJECT_ID_KEY_ENV,
-            CONNECTOR_STATE_OBJECT_ID_KEY_ENV
-        )
-    })?;
-    let object_store = fcp_store::DurableObjectStore::open_read_only(
-        configured_connector_state_object_store_config(config, &object_store_dir)?,
-    )
-    .map_err(|error| {
-        format!(
-            "Canonical fcp-store object store at `{}` could not be opened: {error}",
-            object_store_dir.display()
-        )
-    })?;
-    let object_store: Arc<dyn fcp_store::ObjectStore> = Arc::new(object_store);
-    let state_store = fcp_store::FcpStoreConnectorStateStore::new(
-        object_store,
-        object_id_key,
-        connector_id.clone(),
-        zone.clone(),
-    );
+    let (_, state_store) =
+        open_configured_connector_state_reader(config, connector_id, zone, &object_store_dir)?;
     let symbol_store_dir = connector_state_canonical_symbol_store_dir(state_root, connector_id);
     if symbol_store_dir.exists() {
         let symbol_store = fcp_store::DurableSymbolStore::open_read_only(
@@ -5090,31 +5190,15 @@ async fn connector_lease_durable_evidence_from_config(
         }
     };
 
-    let store_config =
-        match configured_connector_state_object_store_config(config, &object_store_dir) {
-            Ok(store_config) => store_config,
+    let (object_store, state_store) =
+        match open_configured_connector_state_reader(config, connector_id, zone, &object_store_dir)
+        {
+            Ok(reader) => reader,
             Err(error) => {
                 evidence.warnings.push(error);
                 return evidence;
             }
         };
-    let object_store = match fcp_store::DurableObjectStore::open_read_only(store_config) {
-        Ok(store) => store,
-        Err(error) => {
-            evidence.warnings.push(format!(
-                "Canonical fcp-store object store at `{}` could not be opened for lease status: {error}",
-                object_store_dir.display()
-            ));
-            return evidence;
-        }
-    };
-    let object_store: Arc<dyn fcp_store::ObjectStore> = Arc::new(object_store);
-    let state_store = fcp_store::FcpStoreConnectorStateStore::new(
-        Arc::clone(&object_store),
-        object_id_key,
-        connector_id.clone(),
-        zone.clone(),
-    );
     let chain = match state_store.read_chain(None, usize::MAX).await {
         Ok(chain) => chain,
         Err(error) => {
@@ -5294,28 +5378,8 @@ async fn connector_lease_yield_flush_context_for_registered_connector(
     let state_root =
         configured_connector_state_root(&config).unwrap_or_else(connector_state_root_dir);
     let object_store_dir = connector_state_canonical_object_store_dir(&state_root, connector_id);
-    let object_id_key = configured_connector_state_object_id_key(&config)?.ok_or_else(|| {
-        format!(
-            "Cannot flush connector-state for `{connector_id}` before lease yield because neither `{}` nor `{}` is configured.",
-            FCP_HOST_CONNECTOR_STATE_OBJECT_ID_KEY_ENV, CONNECTOR_STATE_OBJECT_ID_KEY_ENV
-        )
-    })?;
-    let object_store = fcp_store::DurableObjectStore::open_read_only(
-        configured_connector_state_object_store_config(&config, &object_store_dir)?,
-    )
-    .map_err(|error| {
-        format!(
-            "Canonical fcp-store object store at `{}` could not be opened for lease-yield flush: {error}",
-            object_store_dir.display()
-        )
-    })?;
-    let object_store: Arc<dyn fcp_store::ObjectStore> = Arc::new(object_store);
-    let state_store = fcp_store::FcpStoreConnectorStateStore::new(
-        object_store,
-        object_id_key,
-        connector_id.clone(),
-        zone.clone(),
-    );
+    let (_, state_store) =
+        open_configured_connector_state_reader(&config, connector_id, zone, &object_store_dir)?;
     let flush = state_store
         .flush_before_lease_yield()
         .await
@@ -8147,6 +8211,15 @@ fn enforce_connector_allow_lists(
     let _ = snapshot
         .manifest_constraints
         .operation_authority(&request.connector_id, request.operation.as_str())?;
+    if let Some(contracts) = &snapshot.manifest_constraints.operation_contracts {
+        contracts
+            .validate_input(&request.operation, &request.input)
+            .map_err(|_| {
+                HostError::InvalidFilter(
+                    "operation input does not match its admitted manifest schema".to_owned(),
+                )
+            })?;
+    }
     Ok(())
 }
 
@@ -17088,7 +17161,7 @@ async fn run_mesh_forward_job(
         last_target = candidate.clone();
         let prepared = async {
             execution_fence.require_current().map_err(map_host_error)?;
-            if registered_locally {
+            let response_contracts = if registered_locally {
                 before_invoke_route_deadline(
                     deadline,
                     invoke_jobs::revalidate_dispatch_authority(state, request),
@@ -17096,8 +17169,10 @@ async fn run_mesh_forward_job(
                 )
                 .await
                 .and_then(std::convert::identity)
-                .map_err(map_host_error)?;
-            }
+                .map_err(map_host_error)?
+            } else {
+                None
+            };
             state
                 .invoke_audit
                 .append(
@@ -17135,10 +17210,11 @@ async fn run_mesh_forward_job(
                 asserted_principal,
                 ticket.attempt_id,
             )
+            .map(|body| (body, response_contracts))
             .map_err(map_host_error)
         }.await;
-        let body = match prepared {
-            Ok(body) => body,
+        let (body, response_contracts) = match prepared {
+            Ok(prepared) => prepared,
             Err(error) => {
                 state
                     .lifecycle
@@ -17209,18 +17285,43 @@ async fn run_mesh_forward_job(
                     duration_ms = elapsed_millis(started_at),
                     "invoke response observed from mesh peer"
                 );
-                let response = match mesh_reply_into_invoke_response(
+                let response_result = mesh_reply_into_invoke_response(
                     router,
                     request,
                     &candidate,
                     code,
                     failed_attempts,
                     &reply,
-                ) {
+                )
+                .and_then(|response| {
+                    invoke_jobs::validate_response(
+                        response_contracts.as_deref(),
+                        &request.operation,
+                        &request.id,
+                        &response,
+                    )
+                    .map_err(|error| (StatusCode::BAD_GATEWAY, error.to_string()))?;
+                    Ok(response)
+                });
+                let response = match response_result {
                     Ok(response) => response,
                     Err(error) => {
                         // Even a signed HTTP error may follow external effects.
                         // An undecodable or mismatched reply proves no outcome.
+                        if registered_locally {
+                            let _ = before_invoke_route_deadline(
+                                invoke_jobs::finalization_deadline(deadline),
+                                record_invoke_budget_usage(
+                                    state.budget.as_ref(),
+                                    Some(&request.zone_id),
+                                    &request.connector_id,
+                                    request.operation.as_str(),
+                                    None,
+                                ),
+                                "mesh invalid-response budget accounting",
+                            )
+                            .await;
+                        }
                         state
                             .lifecycle
                             .finish_mesh_invocation(
@@ -17376,26 +17477,15 @@ fn mesh_reply_into_invoke_response(
             format!("mesh executor `{}`: {message}", executor.as_str()),
         ));
     }
-    let mut response: InvokeResponse = serde_json::from_str(&reply.body_json).map_err(|error| {
+    let mut response: InvokeResponse = serde_json::from_str(&reply.body_json).map_err(|_| {
         (
             StatusCode::BAD_GATEWAY,
-            format!(
-                "mesh executor `{}` returned an undecodable invoke response: {error}",
-                executor.as_str()
-            ),
+            "mesh executor returned an invalid invoke response; outcome is unknown; reconcile external effects before retry"
+                .to_owned(),
         )
     })?;
-    if response.id != request.id {
-        return Err((
-            StatusCode::BAD_GATEWAY,
-            format!(
-                "mesh executor `{}` answered request `{}` instead of `{}`",
-                executor.as_str(),
-                response.id,
-                request.id
-            ),
-        ));
-    }
+    invoke_jobs::validate_response(None, &request.operation, &request.id, &response)
+        .map_err(|error| (StatusCode::BAD_GATEWAY, error.to_string()))?;
     let mut route = InvokeRouteProvenance::mesh_backed(
         router.local_node().as_str().to_owned(),
         executor.as_str().to_owned(),
@@ -19503,6 +19593,47 @@ output_schema = {{ type = "object" }}
             HashMap::from([(ZoneId::work(), host_runtime_policy(ZoneId::work()))]),
         );
         (state, invokes, introspects)
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn manifest_authority_rejects_invalid_inputs_before_durable_admission() {
+        let directory = tempfile::tempdir().expect("manifest authority directory");
+        let path = directory.path().join("manifest.toml");
+        std::fs::write(&path, manifest_authority_fixture("safe", "none"))
+            .expect("write admitted manifest");
+        let signing_key = fcp_crypto::ed25519::Ed25519SigningKey::generate();
+        let catalog = dispatcher_introspection("test.echo", "cap.test.echo", SafetyTier::Safe);
+        let (state, invokes, _) =
+            manifest_authority_dispatcher(&path, vec![catalog], &signing_key).await;
+        for input in [
+            json!("manifest-authority-private-invalid-input"),
+            json!(["manifest-authority-private-invalid-input"]),
+            Value::Null,
+        ] {
+            let mut request = warm_pool_test_invoke_request(
+                MANIFEST_AUTHORITY_TEST_CONNECTOR,
+                &signing_key,
+                "valid object replaced below",
+            );
+            request.input = input;
+            let request_id = request.id.to_string();
+            let (status, message) =
+                invoke_handler(State(Arc::clone(&state)), HeaderMap::new(), Json(request))
+                    .await
+                    .expect_err("invalid schema input must not reach the connector");
+            assert!(status.is_client_error(), "{status}: {message}");
+            assert!(message.contains("schema"), "{message}");
+            assert!(!message.contains("manifest-authority-private-invalid-input"));
+            assert_eq!(invokes.load(Ordering::SeqCst), 0);
+            assert!(
+                state
+                    .lifecycle
+                    .invocation_record(&request_id, None)
+                    .await
+                    .is_none(),
+                "invalid input must not create durable execution admission"
+            );
+        }
     }
 
     #[fcp_async_core::runtime::test(flavor = "multi_thread")]
@@ -30594,6 +30725,7 @@ output_schema = { type = "object" }
             CONNECTOR_STATE_OBJECT_ID_KEY_ENV.to_string(),
             hex::encode(object_id_key.as_bytes()),
         );
+        configure_state_read_authority_for_test(&mut config, &state_signing_key, None);
         config.env.insert(
             "FCP_CONNECTOR_STATE_MODEL".to_string(),
             "singleton_writer".to_string(),
@@ -30809,6 +30941,7 @@ output_schema = { type = "object" }
             CONNECTOR_STATE_OBJECT_ID_KEY_ENV.to_string(),
             hex::encode(object_id_key.as_bytes()),
         );
+        configure_state_read_authority_for_test(&mut config, &state_signing_key, None);
         config.env.insert(
             "FCP_CONNECTOR_STATE_MODEL".to_string(),
             "singleton_writer".to_string(),
@@ -41317,8 +41450,22 @@ done"#;
         fcp_core::ConnectorStateWriteAuthorization,
         fcp_crypto::ed25519::Ed25519SigningKey,
     ) {
+        connector_state_write_authorization_for_test_with_instance(
+            connector_id,
+            zone_id,
+            InstanceId::new(),
+        )
+    }
+
+    fn connector_state_write_authorization_for_test_with_instance(
+        connector_id: &ConnectorId,
+        zone_id: &ZoneId,
+        instance_id: InstanceId,
+    ) -> (
+        fcp_core::ConnectorStateWriteAuthorization,
+        fcp_crypto::ed25519::Ed25519SigningKey,
+    ) {
         let signing_key = fcp_crypto::ed25519::Ed25519SigningKey::generate();
-        let instance_id = InstanceId::new();
         let constraints = CapabilityConstraints {
             resource_allow: vec![fcp_core::connector_state_resource_uri(connector_id)],
             ..Default::default()
@@ -41355,6 +41502,21 @@ done"#;
         )
         .expect("test connector-state write token should authorize append");
         (authorization, signing_key)
+    }
+
+    fn configure_state_read_authority_for_test(
+        config: &mut ConnectorConfig,
+        signing_key: &fcp_crypto::ed25519::Ed25519SigningKey,
+        instance_id: Option<&InstanceId>,
+    ) {
+        config.env.insert(
+            CONNECTOR_STATE_READ_AUTHORITY_ENV.to_owned(),
+            json!({
+                "trusted_writer_keys_hex": [hex::encode(signing_key.verifying_key().to_bytes())],
+                "instance_id": instance_id,
+            })
+            .to_string(),
+        );
     }
 
     fn durable_connector_state_object_for_test(
@@ -41824,12 +41986,88 @@ done"#;
         }
     }
 
+    #[test]
+    fn canonical_state_read_authority_validates_bounded_operator_configuration() {
+        let mut config = dispatcher_test_config("fcp.test.state-read-authority:utility:1.0.0");
+        assert!(
+            configured_connector_state_read_authority(&config)
+                .unwrap()
+                .is_none()
+        );
+        let signing_key = fcp_crypto::ed25519::Ed25519SigningKey::generate();
+        let writer = hex::encode(signing_key.verifying_key().to_bytes());
+        let instance_id = InstanceId::new();
+        configure_state_read_authority_for_test(&mut config, &signing_key, Some(&instance_id));
+        validate_registry_config_settings(&config)
+            .expect("valid read authority is admitted statically");
+        let authority = configured_connector_state_read_authority(&config)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            authority.writer_keys,
+            vec![signing_key.verifying_key().to_bytes()]
+        );
+        assert_eq!(authority.instance_id, Some(instance_id));
+
+        let writers: Vec<_> = (0..64_u8)
+            .map(|seed| {
+                hex::encode(
+                    fcp_crypto::ed25519::Ed25519SigningKey::from_bytes(&[seed; 32])
+                        .unwrap()
+                        .verifying_key()
+                        .to_bytes(),
+                )
+            })
+            .collect();
+        config.env.insert(
+            CONNECTOR_STATE_READ_AUTHORITY_ENV.to_owned(),
+            json!({ "trusted_writer_keys_hex": writers }).to_string(),
+        );
+        let authority = configured_connector_state_read_authority(&config)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            authority.writer_keys.len(),
+            MAX_CONNECTOR_STATE_TRUSTED_WRITERS
+        );
+        assert!(
+            authority.instance_id.is_none(),
+            "omission means exactly instance-unscoped"
+        );
+
+        for invalid in [
+            String::new(),
+            "[]".to_owned(),
+            "null".to_owned(),
+            "{}".to_owned(),
+            json!({ "trusted_writer_keys_hex": [] }).to_string(),
+            json!({ "trusted_writer_keys_hex": ["invalid-key-sentinel"] }).to_string(),
+            json!({ "trusted_writer_keys_hex": [hex::encode([0_u8; 32])] }).to_string(),
+            json!({ "trusted_writer_keys_hex": [&writer, &writer.to_uppercase()] }).to_string(),
+            json!({ "trusted_writer_keys_hex": vec![writer.clone(); 65] }).to_string(),
+            json!({ "trusted_writer_keys_hex": [&writer], "instance_id": "Invalid Instance Sentinel" }).to_string(),
+            json!({ "trusted_writer_keys_hex": [&writer], "trust_all_writers": true }).to_string(),
+            format!("{{\"trusted_writer_keys_hex\":[\"{writer}\"],\"trusted_writer_keys_hex\":[]}}"),
+            " ".repeat(MAX_CONNECTOR_STATE_READ_AUTHORITY_BYTES + 1),
+        ] {
+            config.env.insert(CONNECTOR_STATE_READ_AUTHORITY_ENV.to_owned(), invalid);
+            let error = validate_registry_config_settings(&config)
+                .expect_err("invalid read authority must fail before runtime preparation")
+                .to_string();
+            assert!(error.contains(CONNECTOR_STATE_READ_AUTHORITY_ENV));
+            assert!(!error.contains("invalid-key-sentinel"));
+            assert!(!error.contains("Invalid Instance Sentinel"));
+            assert!(!error.contains(&writer));
+        }
+    }
+
     const CANONICAL_STATE_MAC_TEST_CONNECTOR: &str = "fcp.test.authenticated-state:utility:1.0.0";
 
     struct CanonicalStateMacFixture {
         config: ConnectorConfig,
         connector_id: ConnectorId,
         zone: ZoneId,
+        instance_id: Option<InstanceId>,
         state_root: PathBuf,
         root_object_id: ObjectId,
         head_object_id: ObjectId,
@@ -41843,6 +42081,14 @@ done"#;
 
     impl CanonicalStateMacFixture {
         async fn new(authenticated: bool, checkpointed: bool) -> Self {
+            Self::with_instance(authenticated, checkpointed, None).await
+        }
+
+        async fn with_instance(
+            authenticated: bool,
+            checkpointed: bool,
+            instance_id: Option<InstanceId>,
+        ) -> Self {
             let directory = tempfile::tempdir().unwrap();
             let state_root = directory.path().join("canonical-state");
             let connector_id = ConnectorId::from_static(CANONICAL_STATE_MAC_TEST_CONNECTOR);
@@ -41866,7 +42112,7 @@ done"#;
             let stored_lease = stored_core_lease_for_test(&lease, &object_id_key);
             let lease_object_id = stored_lease.object_id;
             object_store.put(stored_lease).await.unwrap();
-            let state_store = fcp_store::FcpStoreConnectorStateStore::new(
+            let mut state_store = fcp_store::FcpStoreConnectorStateStore::new(
                 object_store,
                 object_id_key,
                 connector_id.clone(),
@@ -41874,22 +42120,28 @@ done"#;
             )
             .with_snapshot_every_entries(0)
             .with_snapshot_every_secs(0);
+            if let Some(instance_id) = &instance_id {
+                state_store = state_store.with_instance_id(instance_id.clone());
+            }
             let (authorization, signing_key) =
-                connector_state_write_authorization_for_test_with_key(&connector_id, &zone);
+                connector_state_write_authorization_for_test_with_instance(
+                    &connector_id,
+                    &zone,
+                    instance_id.clone().unwrap_or_default(),
+                );
+            let mut state_object = durable_connector_state_object_for_test(
+                &connector_id,
+                &zone,
+                0,
+                None,
+                lease_object_id,
+            );
+            state_object.instance_id.clone_from(&instance_id);
             let appended = fcp_core::ConnectorStateStore::append_object(
                 &state_store,
                 &connector_id,
                 &authorization,
-                sign_durable_connector_state_object_for_test(
-                    durable_connector_state_object_for_test(
-                        &connector_id,
-                        &zone,
-                        0,
-                        None,
-                        lease_object_id,
-                    ),
-                    &signing_key,
-                ),
+                sign_durable_connector_state_object_for_test(state_object, &signing_key),
             )
             .await
             .unwrap();
@@ -41958,10 +42210,16 @@ done"#;
             ] {
                 config.env.insert(name.to_owned(), value);
             }
+            configure_state_read_authority_for_test(
+                &mut config,
+                &signing_key,
+                instance_id.as_ref(),
+            );
             Self {
                 config,
                 connector_id,
                 zone,
+                instance_id,
                 state_root,
                 root_object_id,
                 head_object_id,
@@ -42015,6 +42273,7 @@ done"#;
             assert_eq!(status.head_object_id, Some(self.head_object_id));
             assert_eq!(status.last_canonical_seq, Some(0));
             assert_eq!(status.mesh_replica_count, Some(1));
+            assert_eq!(status.instance_id, self.instance_id);
             let evidence = connector_lease_durable_evidence_from_config(
                 config,
                 ConnectorStatePolicy {
@@ -42041,6 +42300,145 @@ done"#;
             assert_eq!(context.flush.head_object_id, Some(self.head_object_id));
             assert_eq!(context.flush.lease_object_id, Some(self.lease_object_id));
             assert_eq!(context.flush.last_canonical_seq, Some(0));
+            assert_eq!(context.flush.instance_id, self.instance_id);
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn canonical_state_read_authority_rejects_untrusted_writers_on_every_host_path() {
+        for checkpointed in [false, true] {
+            let fixture = CanonicalStateMacFixture::new(true, checkpointed).await;
+            let before = fixture.files();
+            fixture.assert_readable(&fixture.config).await;
+            let other_writer = fcp_crypto::ed25519::Ed25519SigningKey::generate();
+            for missing in [false, true] {
+                let mut config = fixture.config.clone();
+                if missing {
+                    config.env.remove(CONNECTOR_STATE_READ_AUTHORITY_ENV);
+                } else {
+                    configure_state_read_authority_for_test(&mut config, &other_writer, None);
+                }
+                // The shared object-ID and MAC keys are still correct. Only
+                // independently admitted writer authority was removed/replaced.
+                let error = connector_state_canonical_status_from_config(
+                    &config,
+                    &fixture.connector_id,
+                    Some(&fixture.zone),
+                    &fixture.state_root,
+                )
+                .await
+                .expect_err("self-signed state cannot establish its writer's authority");
+                assert!(!error.is_empty());
+                let evidence = connector_lease_durable_evidence_from_config(
+                    &config,
+                    ConnectorStatePolicy {
+                        model: ConnectorStateKind::SingletonWriter,
+                        ..Default::default()
+                    },
+                    &fixture.connector_id,
+                    &fixture.zone,
+                    &fixture.state_root,
+                )
+                .await;
+                assert!(evidence.source.is_none());
+                assert!(evidence.lease_object_id.is_none());
+                assert!(evidence.validation_status.is_none());
+                assert!(!evidence.warnings.is_empty());
+                let state = fixture.app_state(config);
+                assert!(
+                    connector_lease_yield_flush_context_for_registered_connector(
+                        &state,
+                        &fixture.connector_id,
+                        &fixture.zone,
+                    )
+                    .await
+                    .is_err(),
+                    "untrusted canonical state cannot satisfy a yield barrier"
+                );
+                assert_eq!(
+                    fixture.files(),
+                    before,
+                    "refused reads must preserve the live store"
+                );
+            }
+
+            // A bounded roster may retain the old writer through an explicit
+            // rotation. Merely pinning an unrelated writer never grants it.
+            let mut rotated = fixture.config.clone();
+            let mut authority: Value =
+                serde_json::from_str(rotated.env.get(CONNECTOR_STATE_READ_AUTHORITY_ENV).unwrap())
+                    .unwrap();
+            authority["trusted_writer_keys_hex"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!(hex::encode(other_writer.verifying_key().to_bytes())));
+            rotated.env.insert(
+                CONNECTOR_STATE_READ_AUTHORITY_ENV.to_owned(),
+                authority.to_string(),
+            );
+            fixture.assert_readable(&rotated).await;
+            assert_eq!(fixture.files(), before);
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn canonical_state_read_authority_binds_the_exact_instance_on_every_host_path() {
+        for checkpointed in [false, true] {
+            let instance_id = InstanceId::new();
+            let fixture =
+                CanonicalStateMacFixture::with_instance(true, checkpointed, Some(instance_id))
+                    .await;
+            let before = fixture.files();
+            fixture.assert_readable(&fixture.config).await;
+            for selected_instance in [None, Some(InstanceId::new())] {
+                let mut config = fixture.config.clone();
+                let mut authority: Value = serde_json::from_str(
+                    config.env.get(CONNECTOR_STATE_READ_AUTHORITY_ENV).unwrap(),
+                )
+                .unwrap();
+                authority["instance_id"] = json!(selected_instance);
+                config.env.insert(
+                    CONNECTOR_STATE_READ_AUTHORITY_ENV.to_owned(),
+                    authority.to_string(),
+                );
+                let status = connector_state_canonical_status_from_config(
+                    &config,
+                    &fixture.connector_id,
+                    Some(&fixture.zone),
+                    &fixture.state_root,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert!(!status.root_present);
+                assert!(status.root_object_id.is_none());
+                let evidence = connector_lease_durable_evidence_from_config(
+                    &config,
+                    ConnectorStatePolicy {
+                        model: ConnectorStateKind::SingletonWriter,
+                        ..Default::default()
+                    },
+                    &fixture.connector_id,
+                    &fixture.zone,
+                    &fixture.state_root,
+                )
+                .await;
+                assert!(evidence.source.is_none());
+                assert!(evidence.lease_object_id.is_none());
+                let state = fixture.app_state(config);
+                let flush = connector_lease_yield_flush_context_for_registered_connector(
+                    &state,
+                    &fixture.connector_id,
+                    &fixture.zone,
+                )
+                .await
+                .unwrap();
+                assert!(flush.flush.root_object_id.is_none());
+                assert!(flush.flush.head_object_id.is_none());
+                assert!(flush.flush.lease_object_id.is_none());
+                assert_eq!(flush.flush.instance_id, selected_instance);
+                assert_eq!(fixture.files(), before, "scope selection is observational");
+            }
         }
     }
 
@@ -42230,6 +42628,7 @@ done"#;
             CONNECTOR_STATE_OBJECT_ID_KEY_ENV.to_string(),
             hex::encode(object_id_key.as_bytes()),
         );
+        configure_state_read_authority_for_test(&mut config, &signing_key, None);
         let registry = dispatcher_registry_with_connector(connector_id, connector, config);
         let lifecycle = Arc::new(HostAdminStateStore::new());
         let state = dispatcher_app_state(registry, lifecycle, None, HashMap::new());
@@ -42440,6 +42839,7 @@ done"#;
             CONNECTOR_STATE_OBJECT_ID_KEY_ENV.to_string(),
             hex::encode(object_id_key.as_bytes()),
         );
+        configure_state_read_authority_for_test(&mut config, &signing_key, None);
         config.env.insert(
             "FCP_CONNECTOR_STATE_MODEL".to_string(),
             "singleton_writer".to_string(),
@@ -42581,6 +42981,7 @@ done"#;
             CONNECTOR_STATE_OBJECT_ID_KEY_ENV.to_string(),
             hex::encode(object_id_key.as_bytes()),
         );
+        configure_state_read_authority_for_test(&mut config, &signing_key, None);
         config.env.insert(
             "FCP_CONNECTOR_STATE_MODEL".to_string(),
             "singleton_writer".to_string(),
@@ -42710,6 +43111,7 @@ done"#;
             CONNECTOR_STATE_OBJECT_ID_KEY_ENV.to_string(),
             hex::encode(object_id_key.as_bytes()),
         );
+        configure_state_read_authority_for_test(&mut config, &signing_key, None);
         config.env.insert(
             "FCP_CONNECTOR_STATE_MODEL".to_string(),
             "singleton_writer".to_string(),

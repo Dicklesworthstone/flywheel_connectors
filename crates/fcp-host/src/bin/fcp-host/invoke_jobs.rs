@@ -39,11 +39,34 @@ pub(super) type ForwardResult = Result<InvokeResponse, (axum::http::StatusCode, 
 pub(super) async fn revalidate_dispatch_authority(
     state: &super::AppState,
     request: &fcp_kernel::InvokeRequest,
-) -> HostResult<()> {
+) -> HostResult<Option<Arc<fcp_manifest::OperationContractSet>>> {
     let generation = state.registry.version.load(Ordering::SeqCst);
     dispatch_authority::revalidate(state, request, generation)
         .await
-        .map(|_| ())
+        .map(|(_, contracts)| contracts)
+}
+
+/// Withhold invalid connector data before durable outcome or receipt accounting.
+/// The validators belong to the inventory used at the final dispatch fence;
+/// rereading a manifest or catalog after effects could accept a different contract.
+pub(super) fn validate_response(
+    contracts: Option<&fcp_manifest::OperationContractSet>,
+    operation: &fcp_kernel::OperationId,
+    request_id: &fcp_kernel::RequestId,
+    response: &InvokeResponse,
+) -> HostResult<()> {
+    let validation = match contracts {
+        Some(contracts) => contracts.validate_response(operation, request_id, response),
+        None => {
+            fcp_manifest::OperationContractSet::validate_response_envelope(request_id, response)
+        }
+    };
+    validation.map_err(|_| {
+        HostError::RegistryError(
+            "connector response violates its admitted operation contract; outcome is unknown; reconcile external effects before retry"
+                .to_owned(),
+        )
+    })
 }
 
 #[must_use]
@@ -701,13 +724,15 @@ async fn dispatch(
     >::new());
     let authority_capture = std::sync::Arc::clone(&authority_observation);
     let request_id = request.id.clone();
+    let operation_id = request.operation.clone();
     let result = before_deadline(
         deadline,
         async move {
             // Admission may have waited for durable storage and runtime selection.
             // Revalidate without spending another quota permit, before any IO.
             let lifecycle_fence = state.lifecycle.capability_revocation_fence();
-            let tier = dispatch_authority::revalidate(state, &request, registry_generation).await?;
+            let (tier, contracts) =
+                dispatch_authority::revalidate(state, &request, registry_generation).await?;
             super::recheck_admitted_holder_proof(state, &request)?;
             let authority_guard = super::live_authority::LiveAuthorityDispatchGuard::new(
                 state,
@@ -734,7 +759,7 @@ async fn dispatch(
                 capture.bind_authority_guard(authority_guard.clone());
             }
             dispatch_started.store(true, std::sync::atomic::Ordering::SeqCst);
-            match runtime {
+            let response = match runtime {
                 super::ConnectorRuntime::Native(native) => match native_capture {
                     Some(capture) => native.invoke_with_termination(request, capture).await,
                     None => Err(HostError::Internal(
@@ -758,21 +783,14 @@ async fn dispatch(
                     }
                 }
                 runtime => runtime.invoke(request).await,
-            }
+            }?;
+            validate_response(contracts.as_deref(), &operation_id, &request_id, &response)?;
+            Ok(response)
         },
         "connector dispatch",
     )
     .await
     .and_then(std::convert::identity);
-    let result = result.and_then(|response| {
-        if response.id != request_id {
-            Err(HostError::RegistryError(
-                "connector returned an invoke response for a different request".to_string(),
-            ))
-        } else {
-            Ok(response)
-        }
-    });
     let dispatched = started.load(std::sync::atomic::Ordering::SeqCst)
         && !authority_observation
             .get()
@@ -1103,6 +1121,10 @@ mod tests {
         block_invoke: Arc<AtomicBool>,
         invoke_queued: oneshot::Receiver<()>,
         release_invoke: oneshot::Sender<()>,
+        response: Arc<Mutex<Option<InvokeResponse>>>,
+        block_response: Arc<AtomicBool>,
+        response_entered: oneshot::Receiver<()>,
+        release_response: oneshot::Sender<()>,
     }
 
     fn dispatch_fixture() -> DispatchFixture {
@@ -1122,10 +1144,16 @@ mod tests {
         let (release_catalog, release_rx) = oneshot::channel();
         let (queued_tx, invoke_queued) = oneshot::channel();
         let (release_invoke, release_invoke_rx) = oneshot::channel();
+        let (response_tx, response_entered) = oneshot::channel();
+        let (release_response, release_response_rx) = oneshot::channel();
         let block_catalog = Arc::new(AtomicBool::new(false));
         let catalog_gate = Arc::clone(&block_catalog);
         let block_invoke = Arc::new(AtomicBool::new(false));
         let invoke_gate = Arc::clone(&block_invoke);
+        let response = Arc::new(Mutex::new(None::<InvokeResponse>));
+        let configured_response = Arc::clone(&response);
+        let block_response = Arc::new(AtomicBool::new(false));
+        let response_gate = Arc::clone(&block_response);
         let invoke_count = Arc::new(AtomicUsize::new(0));
         let count = Arc::clone(&invoke_count);
         let runner_task = task::spawn(async move {
@@ -1133,6 +1161,8 @@ mod tests {
             let mut release_rx = Some(release_rx);
             let mut queued_tx = Some(queued_tx);
             let mut release_invoke_rx = Some(release_invoke_rx);
+            let mut response_tx = Some(response_tx);
+            let mut release_response_rx = Some(release_response_rx);
             while let Some(call) = runner_rx.recv().await {
                 if call.method == "invoke" && invoke_gate.swap(false, Ordering::SeqCst) {
                     queued_tx.take().unwrap().send(()).unwrap();
@@ -1163,11 +1193,25 @@ mod tests {
                         count.fetch_add(1, Ordering::SeqCst);
                         let request: fcp_kernel::InvokeRequest =
                             serde_json::from_value(call.params).unwrap();
-                        serde_json::to_value(InvokeResponse::ok(
-                            request.id,
-                            serde_json::json!({ "dispatched": true }),
-                        ))
-                        .unwrap()
+                        // This gate is after native effect selection, unlike the
+                        // queue gate above. Inventory changes cannot relabel an
+                        // already selected effect as an undispatched refusal.
+                        if response_gate.swap(false, Ordering::SeqCst) {
+                            response_tx.take().unwrap().send(()).unwrap();
+                            release_response_rx.take().unwrap().await.unwrap();
+                        }
+                        let response =
+                            configured_response
+                                .lock()
+                                .unwrap()
+                                .clone()
+                                .unwrap_or_else(|| {
+                                    InvokeResponse::ok(
+                                        request.id,
+                                        serde_json::json!({ "dispatched": true }),
+                                    )
+                                });
+                        serde_json::to_value(response).unwrap()
                     }
                     method => panic!("unexpected fixture method {method}"),
                 };
@@ -1222,6 +1266,317 @@ mod tests {
             block_invoke,
             invoke_queued,
             release_invoke,
+            response,
+            block_response,
+            response_entered,
+            release_response,
+        }
+    }
+
+    async fn set_dispatch_fixture_output_contract(
+        fixture: &DispatchFixture,
+        output_schema: &serde_json::Value,
+    ) {
+        // Manifest parsing and runtime catalog equality have separate integration
+        // coverage. Install the compiled inventory contract here to exercise the
+        // production admission, dispatch, response and finalization boundaries.
+        let contracts = fcp_manifest::OperationContractSet::from_operation_schemas(
+            &fixture.request.operation,
+            &serde_json::json!({ "type": "object" }),
+            output_schema,
+        )
+        .unwrap();
+        fixture
+            .state
+            .registry
+            .state
+            .write()
+            .await
+            .connectors
+            .get_mut(&fixture.request.connector_id)
+            .unwrap()
+            .manifest_constraints
+            .operation_contracts = Some(Arc::new(contracts));
+    }
+
+    async fn wait_for_dispatch_fixture_job_retirement(fixture: &DispatchFixture) {
+        fcp_async_core::time::timeout(Duration::from_secs(5), async {
+            loop {
+                fixture.state.invoke_jobs.reap_finished();
+                let retained = fixture
+                    .state
+                    .invoke_jobs
+                    .state
+                    .lock()
+                    .unwrap()
+                    .jobs
+                    .contains_key(&fixture.request.id.to_string());
+                if !retained {
+                    break;
+                }
+                fcp_async_core::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("owned invocation completes before testing persisted retry refusal");
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn invocation_contract_rejects_invalid_replies_without_receipts_or_unsafe_retry() {
+        for case in [
+            "output-schema",
+            "wrong-id",
+            "wrong-type",
+            "missing-result",
+            "success-with-error",
+            "missing-error",
+            "error-with-result",
+        ] {
+            let fixture = dispatch_fixture();
+            set_dispatch_fixture_output_contract(
+                &fixture,
+                &serde_json::json!({
+                    "type": "object",
+                    "required": ["accepted"],
+                    "properties": { "accepted": { "const": true } },
+                    "additionalProperties": false,
+                }),
+            )
+            .await;
+            let private_error = fcp_core::FcpError::Internal {
+                message: "private-contract-provider-detail".to_owned(),
+            };
+            let mut response = InvokeResponse::ok(
+                fixture.request.id.clone(),
+                serde_json::json!({ "accepted": true }),
+            );
+            response.receipt_id = Some(fcp_core::ObjectId::from_bytes([81; 32]));
+            match case {
+                "output-schema" => {
+                    response.result = Some(serde_json::json!({
+                        "private-contract-provider-detail": false,
+                    }));
+                }
+                "wrong-id" => {
+                    response.id = fcp_kernel::RequestId::new("private-contract-provider-detail");
+                }
+                "wrong-type" => response.r#type = "private-contract-provider-detail".to_owned(),
+                "missing-result" => response.result = None,
+                "success-with-error" => response.error = Some(private_error),
+                "missing-error" => {
+                    response.status = fcp_kernel::InvokeStatus::Error;
+                    response.result = None;
+                }
+                "error-with-result" => {
+                    response.status = fcp_kernel::InvokeStatus::Error;
+                    response.error = Some(private_error);
+                }
+                _ => unreachable!(),
+            }
+            *fixture.response.lock().unwrap() = Some(response);
+            let result = execute(
+                &fixture.state,
+                fixture.request.clone(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+            let message = result.expect_err(case).to_string();
+            assert!(message.contains("outcome is unknown"), "{case}: {message}");
+            assert!(
+                !message.contains("private-contract-provider-detail"),
+                "{case}"
+            );
+            assert!(!message.contains("private-dispatch-fixture"), "{case}");
+            assert_eq!(fixture.invoke_count.load(Ordering::SeqCst), 1, "{case}");
+            let record = fixture
+                .state
+                .lifecycle
+                .invocation_record(&fixture.request.id.to_string(), None)
+                .await
+                .expect("a dispatched invalid response retains its invocation");
+            let terminal = record.terminal.as_ref().unwrap();
+            assert_eq!(
+                terminal.outcome,
+                fcp_host::InvocationOutcome::OutcomeUnknown,
+                "{case}"
+            );
+            assert!(terminal.receipt_id.is_none(), "{case}");
+            assert!(
+                !record.finalization.as_ref().unwrap().receipt_recorded,
+                "{case}"
+            );
+            let receipts = fixture
+                .state
+                .lifecycle
+                .query_receipts(&fcp_host::ReceiptQueryRequest {
+                    connector_id: fixture.request.connector_id.to_string(),
+                    operation: Some(fixture.request.operation.to_string()),
+                    after: None,
+                    limit: 10,
+                })
+                .await;
+            assert_eq!(receipts.total_receipts, 0, "{case}");
+
+            // Retire the completed job so only persisted unknown-outcome
+            // evidence, rather than an in-flight task, can fence this replay.
+            wait_for_dispatch_fixture_job_retirement(&fixture).await;
+            assert!(
+                execute(
+                    &fixture.state,
+                    fixture.request.clone(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .is_err(),
+                "{case}: unknown effects must not be dispatched again"
+            );
+            assert_eq!(fixture.invoke_count.load(Ordering::SeqCst), 1, "{case}");
+            let after_retry = fixture
+                .state
+                .lifecycle
+                .invocation_record(&fixture.request.id.to_string(), None)
+                .await
+                .unwrap();
+            assert_eq!(after_retry.ticket, record.ticket, "{case}");
+            assert_eq!(after_retry.terminal, record.terminal, "{case}");
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn invocation_contract_preserves_valid_errors_and_explicit_null_results() {
+        for error_response in [false, true] {
+            let fixture = dispatch_fixture();
+            let output_schema = if error_response {
+                serde_json::json!(false)
+            } else {
+                serde_json::json!({ "type": "null" })
+            };
+            set_dispatch_fixture_output_contract(&fixture, &output_schema).await;
+            let mut expected = if error_response {
+                InvokeResponse::error(
+                    fixture.request.id.clone(),
+                    fcp_core::FcpError::InvalidRequest {
+                        code: 1003,
+                        message: "expected provider refusal".to_owned(),
+                    },
+                )
+            } else {
+                InvokeResponse::ok(fixture.request.id.clone(), serde_json::Value::Null)
+            };
+            expected.receipt_id = Some(fcp_core::ObjectId::from_bytes([82; 32]));
+            *fixture.response.lock().unwrap() = Some(expected.clone());
+            let response = execute(
+                &fixture.state,
+                fixture.request.clone(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("well-formed error or schema-valid null must survive native transport");
+            assert_eq!(
+                serde_json::to_value(response).unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
+            assert_eq!(fixture.invoke_count.load(Ordering::SeqCst), 1);
+            let record = fixture
+                .state
+                .lifecycle
+                .invocation_record(&fixture.request.id.to_string(), None)
+                .await
+                .unwrap();
+            let terminal = record.terminal.unwrap();
+            assert_eq!(
+                terminal.outcome,
+                if error_response {
+                    fcp_host::InvocationOutcome::ConnectorError
+                } else {
+                    fcp_host::InvocationOutcome::Succeeded
+                }
+            );
+            assert!(terminal.receipt_id.is_some());
+            assert!(record.finalization.unwrap().receipt_recorded);
+        }
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn invocation_contract_retains_admitted_output_schema_after_effect_selection() {
+        for originally_valid in [false, true] {
+            let fixture = dispatch_fixture();
+            set_dispatch_fixture_output_contract(
+                &fixture,
+                &serde_json::json!({ "const": { "accepted": true } }),
+            )
+            .await;
+            *fixture.response.lock().unwrap() = Some(InvokeResponse::ok(
+                fixture.request.id.clone(),
+                serde_json::json!({ "accepted": originally_valid }),
+            ));
+            fixture.block_response.store(true, Ordering::SeqCst);
+            let state = Arc::clone(&fixture.state);
+            let request = fixture.request.clone();
+            let pending =
+                task::spawn(
+                    async move { execute(&state, request, None, None, None, None, None).await },
+                );
+            fcp_async_core::time::timeout(Duration::from_secs(5), fixture.response_entered)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(fixture.invoke_count.load(Ordering::SeqCst), 1);
+            // Publish the opposite contract after the selected effect. This
+            // isolates inventory snapshot retention without replacing a live
+            // runtime. Both weakening and tightening must affect only new work.
+            let next_contracts = fcp_manifest::OperationContractSet::from_operation_schemas(
+                &fixture.request.operation,
+                &serde_json::json!({ "type": "object" }),
+                &serde_json::json!(!originally_valid),
+            )
+            .unwrap();
+            fixture
+                .state
+                .registry
+                .state
+                .write()
+                .await
+                .connectors
+                .get_mut(&fixture.request.connector_id)
+                .unwrap()
+                .manifest_constraints
+                .operation_contracts = Some(Arc::new(next_contracts));
+            fixture
+                .state
+                .registry
+                .version
+                .fetch_add(1, Ordering::SeqCst);
+            fixture.release_response.send(()).unwrap();
+            let result = pending.await.unwrap();
+            assert_eq!(result.is_ok(), originally_valid, "{result:?}");
+            let record = fixture
+                .state
+                .lifecycle
+                .invocation_record(&fixture.request.id.to_string(), None)
+                .await
+                .unwrap();
+            assert_eq!(
+                record.terminal.unwrap().outcome,
+                if originally_valid {
+                    fcp_host::InvocationOutcome::Succeeded
+                } else {
+                    fcp_host::InvocationOutcome::OutcomeUnknown
+                }
+            );
+            assert_eq!(fixture.invoke_count.load(Ordering::SeqCst), 1);
         }
     }
 

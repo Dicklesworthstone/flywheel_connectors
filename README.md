@@ -108,6 +108,16 @@ The admitted inventory snapshot remains authoritative until a new generation is
 applied; editing the manifest file alone cannot replace it. Install matching
 connector binaries and manifests together.
 
+The host also validates actual invocation inputs before durable execution
+admission and successful results before recording an outcome or receipt. Both
+checks use validators compiled from the admitted manifest; an invocation retains
+its dispatch generation's output contract even if inventory changes while it
+runs. Every reply must have the correct request ID and one consistent success
+or error envelope. Manifest-less inventory and transparent mesh relays receive
+those envelope checks without claiming schema validation. An invalid delivered
+reply may follow external effects: the host withholds its payload and receipt,
+retains an unknown outcome, and refuses automatic replay of that invocation.
+
 For continuously renewed revocation, configure an independently pinned owner-signed
 feed for each served zone with `FCP_HOST_REVOCATION_CONFIG_FILE`. The host checks
 current evidence at admission and dispatch, including issuer and ancestor key

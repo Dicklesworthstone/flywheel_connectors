@@ -70,6 +70,12 @@ on these read paths as well as its object-ID derivation key. Object and symbol
 stores may use different MAC keys; the host never derives either from the
 object-ID key or substitutes one store's key for the other.
 
+Every canonical reader also requires independently configured writer authority.
+A zone's object-ID key and a store MAC authenticate stored bytes; neither grants
+every key named inside those bytes permission to write this connector's state.
+The host checks each loaded state writer against the operator's pinned Ed25519
+public keys, including when the WAL and snapshot MACs are valid.
+
 Configure keys in the connector's managed inventory **`env` map**. These are
 per-connector declarations, not ambient variables read from the host shell:
 
@@ -79,7 +85,8 @@ per-connector declarations, not ambient variables read from the host shell:
     "FCP_CONNECTOR_STATE": "/srv/fcp/state",
     "FCP_HOST_CONNECTOR_STATE_OBJECT_ID_KEY": "<REDACTED_OBJECT_ID_KEY_64_HEX>",
     "FCP_HOST_CONNECTOR_STATE_OBJECT_MAC_KEY": "<REDACTED_OBJECT_STORE_MAC_KEY_64_HEX>",
-    "FCP_HOST_CONNECTOR_STATE_SYMBOL_MAC_KEY": "<REDACTED_SYMBOL_STORE_MAC_KEY_64_HEX>"
+    "FCP_HOST_CONNECTOR_STATE_SYMBOL_MAC_KEY": "<REDACTED_SYMBOL_STORE_MAC_KEY_64_HEX>",
+    "FCP_HOST_CONNECTOR_STATE_READ_AUTHORITY": "{\"trusted_writer_keys_hex\":[\"<WRITER_PUBLIC_KEY_64_HEX>\"],\"instance_id\":null}"
   }
 }
 ```
@@ -94,6 +101,22 @@ are also accepted. If both aliases for one store are supplied, they must
 decode to the same key. Blank, malformed, and conflicting declarations are
 rejected during static inventory validation before preparing a runtime.
 
+`FCP_HOST_CONNECTOR_STATE_READ_AUTHORITY` contains a JSON object of at most
+8 KiB. Its `trusted_writer_keys_hex` array must contain 1–64 distinct valid
+Ed25519 public keys, each encoded as exactly 64 hexadecimal digits without a
+prefix. Repeated keys, invalid or weak keys, unknown fields, and malformed
+instance identifiers fail static inventory validation. The public-key roster
+may retain both previous and current writers during an explicitly authorized
+rotation; the existing monotonic writer-fencing checks still apply.
+
+The optional `instance_id` names the exact persisted state instance. Omission
+or `null` selects only instance-unscoped state, and never selects another
+instance implicitly. Use the same scope and writer roster as the trusted state
+being inspected. These declarations are read from the managed inventory, never
+from connector introspection, stored self-signed records, or ambient shell
+variables. They are independent of state-transfer grants and do not authorize
+activation, replica import, lease issuance, or additional writes.
+
 The MACs must match the keys used by the store's writer. This configuration
 does not enable authenticated writes, rotate a key, or migrate existing data.
 With a MAC configured, an unauthenticated V1 envelope is refused; with no MAC
@@ -107,8 +130,12 @@ These operations open stores read-only, including while a writer holds its
 exclusive lock. They do not repair WAL tails, create snapshots, acquire writer
 ownership, or alter the persisted bytes. Wrong or missing keys leave canonical
 state unproven, and the yield barrier fails rather than reporting a successful
-flush. Canonical-state key values are redacted from inventory mutation
-responses; configuration snapshots, revision history, and diffs also redact
+flush. Missing writer authority or a chain signed by an unpinned writer also
+leaves state and lease evidence unproven and refuses the yield barrier. A valid
+authority for a different instance reports no matching root; it does not
+borrow another instance's head or lease. Canonical-state secret key values are
+redacted from inventory mutation responses; configuration snapshots, revision
+history, and diffs also redact
 MAC and object-ID key fields. A redacted response is not reusable key material.
 
 ## Retain an Exact Root on Another Host

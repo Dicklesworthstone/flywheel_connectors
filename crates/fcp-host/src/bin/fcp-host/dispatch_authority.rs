@@ -104,7 +104,10 @@ pub(super) async fn revalidate(
     state: &AppState,
     request: &InvokeRequest,
     admitted_generation: u64,
-) -> HostResult<SafetyTier> {
+) -> HostResult<(
+    SafetyTier,
+    Option<std::sync::Arc<fcp_manifest::OperationContractSet>>,
+)> {
     let execution_fence = state
         .lifecycle
         .connector_execution_fence(&request.connector_id)
@@ -225,7 +228,10 @@ pub(super) async fn revalidate(
     require_live_times(&claims, chrono::Utc::now().timestamp())?;
     state.registry.require_generation(admitted_generation)?;
     execution_fence.require_current()?;
-    Ok(tool.safety_tier)
+    Ok((
+        tool.safety_tier,
+        inventory.manifest_constraints.operation_contracts.clone(),
+    ))
 }
 
 #[cfg(test)]

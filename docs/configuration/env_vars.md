@@ -88,5 +88,17 @@ existing unkeyed stores but cannot read authenticated V2 envelopes. Failed
 authentication never falls back to an unkeyed read, and inspection never
 rewrites or migrates the store.
 
+`FCP_HOST_CONNECTOR_STATE_READ_AUTHORITY` is also required in that same managed
+`env` map before the host can report canonical state or durable lease evidence,
+or complete a canonical yield barrier. Its value is a JSON object with
+`trusted_writer_keys_hex` (1–64 distinct valid Ed25519 public keys, encoded as
+64 hexadecimal digits each) and optional `instance_id`. The entire value is
+limited to 8 KiB; unknown fields, malformed IDs, weak keys, and duplicate pins
+fail static validation. Omitted or null `instance_id` selects exactly unscoped
+state, not any available instance. Writer pins are public trust anchors and
+are independent of the MAC and object-ID keys. Missing authority or a validly
+self-signed chain outside that roster cannot produce positive canonical
+evidence. This setting grants no write, activation, or transfer authority.
+
 See [authenticated canonical state inspection](../runbooks/connector_state_externalization.md#inspect-authenticated-canonical-stores)
 for inventory examples, storage paths, and failure behavior.
