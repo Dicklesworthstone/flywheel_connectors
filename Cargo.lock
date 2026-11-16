@@ -6990,6 +6990,7 @@ dependencies = [
  "futures-util",
  "hex",
  "hmac 0.12.1",
+ "jsonschema",
  "percent-encoding",
  "reqwest 0.13.2",
  "semver",
