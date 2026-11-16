@@ -1,8 +1,11 @@
 #![forbid(unsafe_code)]
 
-use std::io::{BufRead, Write};
+use std::io::{self, BufRead, Write};
 
 use anyhow::Result;
+use fcp_prelude::{FcpConnector, FcpError, FcpResult};
+use fcp_sdk::prelude::{JsonlConfig, dispatch_raw_invoke, serve_jsonl};
+use serde_json::{Value, json};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 use fcp_lm_studio::LmStudioConnector;
@@ -18,101 +21,63 @@ fn main() -> Result<()> {
 
 fn run_fcp_loop() -> Result<()> {
     let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout();
+    let stdout = std::io::stdout();
     let mut connector = LmStudioConnector::new();
-
-    for line in stdin.lock().lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        let response =
-            fcp_async_core::runtime::block_on_sync(handle_message(&mut connector, &line))
-                .unwrap_or_else(|error| {
-                    serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "error": {
-                            "code": "FCP-9001",
-                            "message": format!("Runtime error: {error}")
-                        }
-                    })
-                });
-
-        writeln!(stdout, "{}", serde_json::to_string(&response)?)?;
-        stdout.flush()?;
-    }
-
+    serve(stdin.lock(), stdout.lock(), &mut connector)?;
     Ok(())
 }
 
-async fn handle_message(connector: &mut LmStudioConnector, message: &str) -> serde_json::Value {
-    let request: serde_json::Value = match serde_json::from_str(message) {
-        Ok(value) => value,
-        Err(error) => {
-            return serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": null,
-                "error": {
-                    "code": "FCP-1001",
-                    "message": format!("Invalid JSON: {error}")
-                }
-            });
-        }
-    };
+fn serve(
+    reader: impl BufRead,
+    writer: impl Write,
+    connector: &mut LmStudioConnector,
+) -> io::Result<()> {
+    serve_jsonl(reader, writer, JsonlConfig::default(), |method, params| {
+        fcp_async_core::runtime::block_on_sync(handle_request(connector, method, params))
+            .unwrap_or_else(|error| {
+                Err(FcpError::Internal {
+                    message: format!("Runtime error: {error}"),
+                })
+            })
+    })
+}
 
-    let method = request
-        .get("method")
-        .and_then(|value| value.as_str())
-        .unwrap_or("");
-    let id = request.get("id").cloned();
-    let params = request
-        .get("params")
-        .cloned()
-        .unwrap_or_else(|| serde_json::json!({}));
-
-    let result = match method {
+async fn handle_request(
+    connector: &mut LmStudioConnector,
+    method: &str,
+    params: Value,
+) -> FcpResult<Value> {
+    match method {
         "configure" => connector.handle_configure(params).await,
         "handshake" => connector.handle_handshake(params).await,
-        "health" => connector.handle_health().await,
+        "health" => {
+            let mut snapshot = connector.health().await;
+            let mut details = connector.handle_health().await?;
+            details["instance_id"] = json!(connector.instance_id());
+            snapshot.details = Some(details);
+            encode_response(snapshot)
+        }
         "doctor" => connector.handle_doctor().await,
         "self_check" => connector.handle_self_check().await,
         "introspect" => connector.handle_introspect().await,
-        "invoke" => connector.handle_invoke(params).await,
-        "simulate" => connector.handle_simulate(params).await,
+        "invoke" => dispatch_raw_invoke(params, |params| connector.handle_invoke(params)).await,
+        "simulate" => {
+            let request = serde_json::from_value(params).map_err(|_| FcpError::InvalidRequest {
+                code: 1003,
+                message: "Invalid FCP simulate request".into(),
+            })?;
+            encode_response(connector.simulate(request).await?)
+        }
         "shutdown" => connector.handle_shutdown(params).await,
-        _ => Err(fcp_core::FcpError::InvalidRequest {
+        _ => Err(FcpError::InvalidRequest {
             code: 1002,
             message: format!("Unknown method: {method}"),
         }),
-    };
-
-    match result {
-        Ok(value) => {
-            let mut response = serde_json::json!({
-                "jsonrpc": "2.0",
-                "result": value
-            });
-            if let Some(id) = id {
-                response
-                    .as_object_mut()
-                    .unwrap()
-                    .insert("id".to_string(), id);
-            }
-            response
-        }
-        Err(error) => {
-            let mut response = serde_json::json!({
-                "jsonrpc": "2.0",
-                "error": error.to_response()
-            });
-            if let Some(id) = id {
-                response
-                    .as_object_mut()
-                    .unwrap()
-                    .insert("id".to_string(), id);
-            }
-            response
-        }
     }
+}
+
+fn encode_response(value: impl serde::Serialize) -> FcpResult<Value> {
+    serde_json::to_value(value).map_err(|_| FcpError::Internal {
+        message: "Failed to encode FCP response".into(),
+    })
 }
