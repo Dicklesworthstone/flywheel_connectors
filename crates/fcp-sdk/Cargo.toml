@@ -28,7 +28,6 @@ fcp-cbor = { path = "../fcp-cbor", optional = true }
 fcp-manifest = { path = "../fcp-manifest" }
 fcp-policy = { path = "../fcp-policy" }
 fcp-store = { path = "../fcp-store", optional = true }
-jsonschema.workspace = true
 reqwest = { workspace = true, optional = true }
 semver = { workspace = true, optional = true }
 serde.workspace = true

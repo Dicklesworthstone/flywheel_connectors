@@ -20,6 +20,7 @@ fcp-crypto = { path = "../fcp-crypto" }
 fcp-prelude = { path = "../fcp-prelude" }
 hex.workspace = true
 ipnet = "2.9"
+jsonschema.workspace = true
 semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true

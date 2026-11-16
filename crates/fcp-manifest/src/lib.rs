@@ -7,6 +7,9 @@
 
 #![forbid(unsafe_code)]
 
+mod operation_contracts;
+pub use operation_contracts::OperationContractSet;
+
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::net::IpAddr;
