@@ -36,7 +36,9 @@ pub use rate_limit::{
     parse_rate_limit_headers, parse_retry_after, upsert_header,
 };
 pub use sse::{
-    OpenAiSseDecoder, OpenAiStreamEvent, accumulate_chunks, accumulate_chunks_with_reasoning,
+    ChatStreamAccumulator, ChatStreamChoice, ChatStreamChunkMetadata, ChatStreamLimits,
+    ChatStreamSummary, OpenAiSseDecoder, OpenAiStreamEvent, accumulate_chunks,
+    accumulate_chunks_with_reasoning, collect_chat_stream,
 };
 pub use tools::Tools;
 pub use types::*;

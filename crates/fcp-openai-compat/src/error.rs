@@ -3,7 +3,6 @@
 use std::fmt;
 use std::time::Duration;
 
-use fcp_async_core::http::HttpClientError;
 use serde_json::Value;
 use thiserror::Error;
 
@@ -31,14 +30,6 @@ pub enum NetworkError {
     /// Stream ended before `[DONE]`.
     #[error("stream connection dropped before completion")]
     ConnectionDropped,
-}
-
-impl From<HttpClientError> for NetworkError {
-    fn from(value: HttpClientError) -> Self {
-        Self::Http {
-            message: redact_sensitive_text(&value.to_string()),
-        }
-    }
 }
 
 /// Streaming protocol error details.

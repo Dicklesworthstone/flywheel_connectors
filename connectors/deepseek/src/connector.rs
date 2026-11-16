@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use fcp_manifest::{ConnectorManifest, OperationSection};
-use fcp_openai_compat::{ChatChunk, ChatMessage, OpenAiError, RateLimitPolicy};
+use fcp_openai_compat::{ChatMessage, RateLimitPolicy};
 use fcp_prelude::{
     ApprovalMode, BaseConnector, CapabilityGrant, CapabilityId, CapabilityToken,
     CapabilityVerifier, ConnectorId, ConnectorMetrics, EventCaps, FcpConnector, FcpError,
@@ -13,7 +13,6 @@ use fcp_prelude::{
     SessionId, ShutdownRequest, SimulateRequest, SimulateResponse, SubscribeRequest,
     SubscribeResponse, UnsubscribeRequest, ZoneId,
 };
-use futures_util::StreamExt as _;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tracing::info;
@@ -721,61 +720,10 @@ fn assistant_parts(message: &ChatMessage) -> (Option<String>, Option<String>) {
 async fn collect_stream_response(
     stream: fcp_openai_compat::ChatCompletionStream,
 ) -> FcpResult<Value> {
-    let mut chunk_count = 0_u64;
-    let mut content = String::new();
-    let mut reasoning_content = String::new();
-    let mut finish_reason = None;
-    let mut tool_call_delta_count = 0_u64;
-    let mut chunk_metadata = Vec::new();
-
-    let chunks = stream
-        .collect::<Vec<Result<ChatChunk, OpenAiError>>>()
-        .await;
-    for chunk in chunks {
-        let chunk = chunk.map_err(|err| openai_error_to_fcp(&err))?;
-        chunk_count += 1;
-        let mut content_delta_bytes = 0_usize;
-        let mut reasoning_delta_bytes = 0_usize;
-        for choice in &chunk.choices {
-            if let Some(delta) = &choice.delta.reasoning_content {
-                reasoning_delta_bytes = reasoning_delta_bytes.saturating_add(delta.len());
-                reasoning_content.push_str(delta);
-            }
-            if let Some(delta) = &choice.delta.content {
-                content_delta_bytes = content_delta_bytes.saturating_add(delta.len());
-                content.push_str(delta);
-            }
-            if choice
-                .delta
-                .tool_calls
-                .as_ref()
-                .is_some_and(|calls| !calls.is_empty())
-            {
-                tool_call_delta_count += 1;
-            }
-            if finish_reason.is_none() {
-                finish_reason.clone_from(&choice.finish_reason);
-            }
-        }
-        chunk_metadata.push(json!({
-            "id": chunk.id,
-            "choice_count": chunk.choices.len(),
-            "model": chunk.model,
-            "content_delta_bytes": content_delta_bytes,
-            "reasoning_delta_bytes": reasoning_delta_bytes,
-        }));
-    }
-
-    Ok(json!({
-        "content": content,
-        "reasoning_content": reasoning_content,
-        "content_bytes": content.len(),
-        "reasoning_content_bytes": reasoning_content.len(),
-        "chunk_count": chunk_count,
-        "finish_reason": finish_reason,
-        "tool_call_delta_count": tool_call_delta_count,
-        "chunks": chunk_metadata,
-    }))
+    fcp_openai_compat::collect_chat_stream(stream)
+        .await
+        .map(|summary| json!(summary))
+        .map_err(|err| openai_error_to_fcp(&err))
 }
 
 #[allow(clippy::too_many_arguments)]

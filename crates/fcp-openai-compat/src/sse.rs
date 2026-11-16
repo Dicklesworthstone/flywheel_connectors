@@ -1,10 +1,16 @@
 //! OpenAI-compatible SSE decoding.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::{self, Write};
 
 use bytes::Bytes;
+use futures_util::{Stream, StreamExt};
+use serde::Serialize;
 
-use crate::{ChatChunk, NetworkError, OpenAiError, StreamingError, redact_sensitive_text};
+use crate::{
+    ChatChunk, ChatMessage, FunctionCall, NetworkError, OpenAiError, ProviderExtensions,
+    StreamingError, ToolCall, Usage, redact_sensitive_text,
+};
 
 /// Decoded stream event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -263,49 +269,473 @@ impl OpenAiSseDecoder {
     }
 }
 
-/// Accumulate streamed content and tool-call argument deltas for tests and
-/// callers that need whole-message materialization.
-pub fn accumulate_chunks(chunks: &[ChatChunk]) -> (String, Vec<String>) {
-    let (content, _reasoning_content, tool_arguments) = accumulate_chunks_with_reasoning(chunks);
-    (content, tool_arguments)
+/// Bounds for materializing a streaming completion into one invoke response.
+///
+/// The byte budget applies to all consumed chunk JSON and to the final response
+/// JSON. Counting retains no payload bytes. Cardinality limits also bound map
+/// and metadata overhead, even for empty deltas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChatStreamLimits {
+    /// Maximum aggregate encoded bytes (10 MiB by default).
+    pub max_bytes: usize,
+    /// Maximum chunks, including usage-only chunks.
+    pub max_chunks: usize,
+    /// Maximum choice count and exclusive choice-index bound.
+    pub max_choices: usize,
+    /// Maximum tool count and exclusive tool-index bound within each choice.
+    pub max_tool_calls_per_choice: usize,
 }
 
-/// Accumulate streamed final content, reasoning content, and tool-call argument
-/// deltas while preserving the distinction between reasoning and final answer.
-pub fn accumulate_chunks_with_reasoning(chunks: &[ChatChunk]) -> (String, String, Vec<String>) {
-    let mut content = String::new();
-    let mut reasoning_content = String::new();
-    let mut tool_arguments: VecDeque<String> = VecDeque::new();
-    for chunk in chunks {
-        for choice in &chunk.choices {
-            if let Some(delta) = &choice.delta.content {
-                content.push_str(delta);
+impl Default for ChatStreamLimits {
+    fn default() -> Self {
+        Self {
+            max_bytes: 10 * 1024 * 1024,
+            max_chunks: 65_536,
+            max_choices: 128,
+            max_tool_calls_per_choice: 128,
+        }
+    }
+}
+
+/// Per-chunk metadata without completion text, reasoning, or tool arguments.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ChatStreamChunkMetadata {
+    /// Provider chunk identity.
+    pub id: String,
+    /// Number of choices in this chunk.
+    pub choice_count: usize,
+    /// Provider model identity.
+    pub model: String,
+    /// Bytes of final-content deltas across all choices.
+    pub content_delta_bytes: usize,
+    /// Bytes of reasoning deltas across all choices.
+    pub reasoning_delta_bytes: usize,
+    /// Whether this chunk contains usage accounting.
+    pub has_usage: bool,
+}
+
+/// One assembled choice. Tool indexes are local to this choice.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ChatStreamChoice {
+    /// Original provider choice index.
+    pub index: u32,
+    /// Assistant message with assembled text, reasoning, and tool calls.
+    pub message: ChatMessage,
+    /// Provider terminal reason; `length` and `content_filter` remain visible.
+    pub finish_reason: String,
+    /// Uninterpreted provider-specific delta fields, in arrival order.
+    /// Their merge semantics are provider-specific; retain the fragments rather
+    /// than silently discard reasoning details, refusals, or other extensions.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub provider_deltas: Vec<ProviderExtensions>,
+}
+
+/// Bounded materialization of a complete chat stream.
+///
+/// Convenience fields describe choice zero; `choices` preserves alternatives
+/// without mixing their text or tool arguments. Arguments remain JSON strings:
+/// callers must validate them against their tool schemas before execution and
+/// inspect each finish reason before using possibly truncated model output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ChatStreamSummary {
+    /// Final text for choice zero (empty for pure tool-call responses).
+    pub content: String,
+    /// Reasoning text for choice zero, when exposed by the provider.
+    pub reasoning_content: String,
+    /// Final-text length in bytes for choice zero.
+    pub content_bytes: usize,
+    /// Reasoning-text length in bytes for choice zero.
+    pub reasoning_content_bytes: usize,
+    /// Terminal reason for choice zero.
+    pub finish_reason: String,
+    /// Assembled choice-zero tool calls, ordered by tool index.
+    pub tool_calls: Vec<ToolCall>,
+    /// All choices in ascending index order.
+    pub choices: Vec<ChatStreamChoice>,
+    /// Last provider usage snapshot, including a trailing usage-only chunk.
+    pub usage: Option<Usage>,
+    /// Last provider system fingerprint.
+    pub system_fingerprint: Option<String>,
+    /// Number of consumed chunks.
+    pub chunk_count: u64,
+    /// Number of choice deltas carrying one or more tool-call fragments.
+    pub tool_call_delta_count: u64,
+    /// Number of choice deltas carrying reasoning content.
+    pub reasoning_delta_count: u64,
+    /// Payload-free metadata in original chunk order.
+    pub chunks: Vec<ChatStreamChunkMetadata>,
+}
+
+#[derive(Debug, Default)]
+struct AccumulatedToolCall {
+    id: Option<String>,
+    tool_type: Option<String>,
+    name: String,
+    arguments: String,
+}
+
+#[derive(Debug, Default)]
+struct AccumulatedChoice {
+    content: Option<String>,
+    reasoning_content: Option<String>,
+    tools: BTreeMap<u32, AccumulatedToolCall>,
+    finish_reason: Option<String>,
+    provider_deltas: Vec<ProviderExtensions>,
+}
+
+/// Incremental, bounded completion collector shared by provider connectors.
+///
+/// No raw chunks or vectors indexed by provider input are retained. A rejected
+/// chunk poisons the collector and releases payloads, preventing publication of
+/// a partial completion after an error.
+#[derive(Debug, Default)]
+pub struct ChatStreamAccumulator {
+    limits: ChatStreamLimits,
+    bytes: usize,
+    choices: BTreeMap<u32, AccumulatedChoice>,
+    chunks: Vec<ChatStreamChunkMetadata>,
+    usage: Option<Usage>,
+    system_fingerprint: Option<String>,
+    tool_call_delta_count: u64,
+    reasoning_delta_count: u64,
+    failed: bool,
+}
+
+impl ChatStreamAccumulator {
+    /// Construct a collector using the default limits.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Construct a collector using caller-controlled limits.
+    pub fn with_limits(limits: ChatStreamLimits) -> Self {
+        Self {
+            limits,
+            ..Self::default()
+        }
+    }
+
+    /// Apply one chunk, preserving choice and tool-call identities.
+    pub fn push(&mut self, chunk: ChatChunk) -> Result<(), OpenAiError> {
+        if self.failed {
+            return Err(aggregation_error(
+                "completion collector is already terminated",
+            ));
+        }
+        let result = self.push_inner(chunk);
+        if result.is_err() {
+            self.failed = true;
+            self.choices.clear();
+            self.chunks = Vec::new();
+            self.system_fingerprint = None;
+        }
+        result
+    }
+
+    fn push_inner(&mut self, chunk: ChatChunk) -> Result<(), OpenAiError> {
+        if self.chunks.len() >= self.limits.max_chunks {
+            return Err(aggregation_error("completion exceeds the chunk limit"));
+        }
+        self.bytes +=
+            encoded_size_with_limit(&chunk, self.limits.max_bytes.saturating_sub(self.bytes))?;
+        if chunk.choices.len() > self.limits.max_choices {
+            return Err(aggregation_error("completion exceeds the choice limit"));
+        }
+
+        let mut seen_choices = BTreeSet::new();
+        let mut metadata = ChatStreamChunkMetadata {
+            id: chunk.id,
+            choice_count: chunk.choices.len(),
+            model: chunk.model,
+            content_delta_bytes: 0,
+            reasoning_delta_bytes: 0,
+            has_usage: chunk.usage.is_some(),
+        };
+        for choice in chunk.choices {
+            if usize::try_from(choice.index).map_or(true, |index| index >= self.limits.max_choices)
+            {
+                return Err(aggregation_error(
+                    "choice index exceeds the configured limit",
+                ));
             }
-            if let Some(delta) = &choice.delta.reasoning_content {
-                reasoning_content.push_str(delta);
+            if !seen_choices.insert(choice.index) {
+                return Err(aggregation_error("duplicate choice index in one chunk"));
             }
-            if let Some(tool_calls) = &choice.delta.tool_calls {
-                for tool_call in tool_calls {
-                    let index = usize::try_from(tool_call.index).unwrap_or(usize::MAX);
-                    while tool_arguments.len() <= index {
-                        tool_arguments.push_back(String::new());
+            if choice
+                .delta
+                .role
+                .as_deref()
+                .is_some_and(|role| role != "assistant")
+            {
+                return Err(aggregation_error(
+                    "completion delta has a non-assistant role",
+                ));
+            }
+            let state = self.choices.entry(choice.index).or_default();
+            if state.finish_reason.is_some() {
+                return Err(aggregation_error(
+                    "received a delta after the choice finished",
+                ));
+            }
+            if let Some(content) = choice.delta.content {
+                metadata.content_delta_bytes += content.len();
+                state
+                    .content
+                    .get_or_insert_with(String::new)
+                    .push_str(&content);
+            }
+            if let Some(reasoning) = choice.delta.reasoning_content {
+                metadata.reasoning_delta_bytes += reasoning.len();
+                self.reasoning_delta_count += 1;
+                state
+                    .reasoning_content
+                    .get_or_insert_with(String::new)
+                    .push_str(&reasoning);
+            }
+            if let Some(tools) = choice.delta.tool_calls {
+                if tools.len() > self.limits.max_tool_calls_per_choice {
+                    return Err(aggregation_error("completion exceeds the tool-call limit"));
+                }
+                if !tools.is_empty() {
+                    self.tool_call_delta_count += 1;
+                }
+                let mut seen_tools = BTreeSet::new();
+                for tool in tools {
+                    if usize::try_from(tool.index)
+                        .map_or(true, |index| index >= self.limits.max_tool_calls_per_choice)
+                    {
+                        return Err(aggregation_error("tool index exceeds the configured limit"));
                     }
-                    if let Some(function) = &tool_call.function {
-                        if let Some(arguments) = &function.arguments {
-                            if let Some(slot) = tool_arguments.get_mut(index) {
-                                slot.push_str(arguments);
+                    if !seen_tools.insert(tool.index) {
+                        return Err(aggregation_error(
+                            "duplicate tool index in one choice delta",
+                        ));
+                    }
+                    let accumulated = state.tools.entry(tool.index).or_default();
+                    if let Some(id) = tool.id.filter(|id| !id.is_empty()) {
+                        if accumulated
+                            .id
+                            .as_ref()
+                            .is_some_and(|existing| *existing != id)
+                        {
+                            return Err(aggregation_error("tool-call identity changed mid-stream"));
+                        }
+                        accumulated.id = Some(id);
+                    }
+                    if let Some(tool_type) = tool.tool_type.filter(|kind| !kind.is_empty()) {
+                        if tool_type != "function" {
+                            return Err(aggregation_error("unsupported streamed tool-call type"));
+                        }
+                        accumulated.tool_type = Some(tool_type);
+                    }
+                    if let Some(function) = tool.function {
+                        if let Some(name) = function.name {
+                            if !accumulated.name.is_empty()
+                                && !name.is_empty()
+                                && accumulated.name != name
+                            {
+                                return Err(aggregation_error(
+                                    "tool-call function changed mid-stream",
+                                ));
                             }
+                            if !name.is_empty() {
+                                accumulated.name = name;
+                            }
+                        }
+                        if let Some(arguments) = function.arguments {
+                            accumulated.arguments.push_str(&arguments);
                         }
                     }
                 }
             }
+            if !choice.delta.provider_extensions.is_empty() {
+                state.provider_deltas.push(choice.delta.provider_extensions);
+            }
+            if let Some(reason) = choice.finish_reason {
+                if reason.is_empty() {
+                    return Err(aggregation_error("empty completion finish reason"));
+                }
+                state.finish_reason = Some(reason);
+            }
+        }
+        if let Some(usage) = chunk.usage {
+            self.usage = Some(usage);
+        }
+        if let Some(fingerprint) = chunk.system_fingerprint {
+            self.system_fingerprint = Some(fingerprint);
+        }
+        self.chunks.push(metadata);
+        Ok(())
+    }
+
+    /// Finish after the transport has completed successfully.
+    ///
+    /// Every choice must have a finish reason. Missing tool identity metadata,
+    /// duplicate tool IDs, and a missing choice zero are rejected. The native
+    /// `ChatCompletionStream` additionally requires the SSE `[DONE]` marker.
+    pub fn finish(self) -> Result<ChatStreamSummary, OpenAiError> {
+        if self.failed {
+            return Err(aggregation_error(
+                "completion collector is already terminated",
+            ));
+        }
+        if !self.choices.contains_key(&0) {
+            return Err(aggregation_error("completed stream has no choice zero"));
+        }
+        let mut choices = Vec::with_capacity(self.choices.len());
+        for (index, state) in self.choices {
+            let finish_reason = state
+                .finish_reason
+                .ok_or(OpenAiError::Network(NetworkError::ConnectionDropped))?;
+            let mut tool_ids = BTreeSet::new();
+            let mut tool_calls = Vec::with_capacity(state.tools.len());
+            for tool in state.tools.into_values() {
+                let id = tool.id.filter(|id| !id.is_empty()).ok_or_else(|| {
+                    aggregation_error("completed tool call is missing its identity")
+                })?;
+                if !tool_ids.insert(id.clone()) {
+                    return Err(aggregation_error(
+                        "distinct tool indexes share one identity",
+                    ));
+                }
+                let tool_type = tool
+                    .tool_type
+                    .ok_or_else(|| aggregation_error("completed tool call is missing its type"))?;
+                if tool.name.is_empty() {
+                    return Err(aggregation_error(
+                        "completed tool call is missing its function name",
+                    ));
+                }
+                tool_calls.push(ToolCall {
+                    id,
+                    tool_type,
+                    function: FunctionCall {
+                        name: tool.name,
+                        arguments: tool.arguments,
+                    },
+                });
+            }
+            if finish_reason == "tool_calls" && tool_calls.is_empty() {
+                return Err(aggregation_error(
+                    "tool-call finish reason has no tool calls",
+                ));
+            }
+            choices.push(ChatStreamChoice {
+                index,
+                message: ChatMessage::Assistant {
+                    content: state.content,
+                    reasoning_content: state.reasoning_content,
+                    tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
+                    name: None,
+                    provider_extensions: ProviderExtensions::new(),
+                },
+                finish_reason,
+                provider_deltas: state.provider_deltas,
+            });
+        }
+        let first = &choices[0];
+        let (content, reasoning_content, tool_calls) = match &first.message {
+            ChatMessage::Assistant {
+                content,
+                reasoning_content,
+                tool_calls,
+                ..
+            } => (
+                content.clone().unwrap_or_default(),
+                reasoning_content.clone().unwrap_or_default(),
+                tool_calls.clone().unwrap_or_default(),
+            ),
+            _ => unreachable!("the collector only creates assistant messages"),
+        };
+        let summary = ChatStreamSummary {
+            content_bytes: content.len(),
+            reasoning_content_bytes: reasoning_content.len(),
+            content,
+            reasoning_content,
+            finish_reason: first.finish_reason.clone(),
+            tool_calls,
+            choices,
+            usage: self.usage,
+            system_fingerprint: self.system_fingerprint,
+            chunk_count: u64::try_from(self.chunks.len()).unwrap_or(u64::MAX),
+            tool_call_delta_count: self.tool_call_delta_count,
+            reasoning_delta_count: self.reasoning_delta_count,
+            chunks: self.chunks,
+        };
+        encoded_size_with_limit(&summary, self.limits.max_bytes)?;
+        Ok(summary)
+    }
+}
+
+fn aggregation_error(message: &'static str) -> OpenAiError {
+    OpenAiError::Streaming(StreamingError::MalformedPayload {
+        message: message.to_owned(),
+    })
+}
+
+fn encoded_size_with_limit(value: &impl Serialize, limit: usize) -> Result<usize, OpenAiError> {
+    struct Counter {
+        bytes: usize,
+        limit: usize,
+    }
+    impl Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if bytes.len() > self.limit.saturating_sub(self.bytes) {
+                return Err(io::Error::other("completion byte limit exceeded"));
+            }
+            self.bytes += bytes.len();
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
         }
     }
-    (
-        content,
-        reasoning_content,
-        tool_arguments.into_iter().collect(),
-    )
+    let mut counter = Counter { bytes: 0, limit };
+    serde_json::to_writer(&mut counter, value)
+        .map_err(|_| aggregation_error("completion exceeds the aggregate byte limit"))?;
+    Ok(counter.bytes)
+}
+
+/// Consume a completion stream incrementally and return one bounded result.
+///
+/// Any transport, provider, cancellation, framing, or aggregation error drops the
+/// stream immediately. No further chunks are polled or partial output published.
+pub async fn collect_chat_stream(
+    stream: impl Stream<Item = Result<ChatChunk, OpenAiError>>,
+) -> Result<ChatStreamSummary, OpenAiError> {
+    let mut stream = std::pin::pin!(stream);
+    let mut accumulator = ChatStreamAccumulator::new();
+    while let Some(chunk) = stream.next().await {
+        accumulator.push(chunk?)?;
+    }
+    accumulator.finish()
+}
+
+/// Materialize choice-zero content and tool arguments from a bounded chunk list.
+pub fn accumulate_chunks(chunks: &[ChatChunk]) -> Result<(String, Vec<String>), OpenAiError> {
+    let (content, _reasoning_content, tool_arguments) = accumulate_chunks_with_reasoning(chunks)?;
+    Ok((content, tool_arguments))
+}
+
+/// Materialize choice-zero final text, reasoning, and tool arguments separately.
+pub fn accumulate_chunks_with_reasoning(
+    chunks: &[ChatChunk],
+) -> Result<(String, String, Vec<String>), OpenAiError> {
+    let mut accumulator = ChatStreamAccumulator::new();
+    for chunk in chunks {
+        accumulator.push(chunk.clone())?;
+    }
+    let summary = accumulator.finish()?;
+    Ok((
+        summary.content,
+        summary.reasoning_content,
+        summary
+            .tool_calls
+            .into_iter()
+            .map(|tool| tool.function.arguments)
+            .collect(),
+    ))
 }
 
 #[cfg(test)]
@@ -679,7 +1109,7 @@ mod tests {
         .map(|value| serde_json::from_value(value).expect("chunk fixture is valid"))
         .collect();
 
-        let (content, tool_args) = accumulate_chunks(&chunks);
+        let (content, tool_args) = accumulate_chunks(&chunks).expect("complete tool response");
         assert_eq!(content, "hello");
         assert_eq!(tool_args, vec!["{\"q\":\"x\"}".to_string()]);
     }
@@ -714,13 +1144,313 @@ mod tests {
         .map(|value| serde_json::from_value(value).expect("chunk fixture is valid"))
         .collect();
 
-        let (content, reasoning_content, tool_args) = accumulate_chunks_with_reasoning(&chunks);
+        let (content, reasoning_content, tool_args) =
+            accumulate_chunks_with_reasoning(&chunks).expect("complete reasoning response");
         assert_eq!(content, "answer");
         assert_eq!(reasoning_content, "think ");
         assert!(tool_args.is_empty());
 
-        let (legacy_content, legacy_tool_args) = accumulate_chunks(&chunks);
+        let (legacy_content, legacy_tool_args) =
+            accumulate_chunks(&chunks).expect("complete response");
         assert_eq!(legacy_content, "answer");
         assert!(legacy_tool_args.is_empty());
+    }
+
+    fn aggregation_chunk(choices: serde_json::Value) -> ChatChunk {
+        serde_json::from_value(json!({
+            "id": "completion-1", "object": "chat.completion.chunk",
+            "created": 1, "model": "fixture", "choices": choices,
+        }))
+        .expect("valid aggregation fixture")
+    }
+
+    #[test]
+    fn accumulator_preserves_interleaved_choices_tools_reasoning_and_final_usage() {
+        let mut collector = ChatStreamAccumulator::new();
+        collector
+            .push(aggregation_chunk(json!([
+                {"index": 1, "delta": {"content": "alternative", "tool_calls": [
+                    {"index": 0, "id": "other-choice", "type": "function",
+                     "function": {"name": "other", "arguments": "{\"b\":"}}
+                ]}},
+                {"index": 0, "delta": {"role": "assistant", "content": "primary ",
+                    "reasoning_content": "private reasoning", "provider_detail": {"ref": 1},
+                    "tool_calls": [
+                        {"index": 1, "id": "second", "type": "function",
+                         "function": {"name": "second_tool", "arguments": "["}},
+                        {"index": 0, "id": "first", "type": "function",
+                         "function": {"name": "first_tool", "arguments": "{\"a\":"}}
+                    ]}}
+            ])))
+            .expect("initial interleaved deltas");
+        collector
+            .push(aggregation_chunk(json!([
+                {"index": 0, "delta": {"content": "answer", "tool_calls": [
+                    {"index": 0, "id": "first", "type": "function",
+                     "function": {"name": "first_tool", "arguments": "1}"}},
+                {"index": 1, "id": "", "type": "", "function": {"name": "", "arguments": "2]"}}
+                ]}, "finish_reason": "tool_calls"},
+                {"index": 1, "delta": {"tool_calls": [
+                    {"index": 0, "function": {"arguments": "3}"}}
+                ]}, "finish_reason": "tool_calls"}
+            ])))
+            .expect("terminal deltas");
+        let mut usage = aggregation_chunk(json!([]));
+        usage.usage = Some(Usage {
+            prompt_tokens: 5,
+            completion_tokens: 8,
+            total_tokens: 13,
+        });
+        usage.system_fingerprint = Some("fingerprint".into());
+        collector.push(usage).expect("usage-only chunk");
+
+        let summary = collector.finish().expect("complete stream");
+        assert_eq!(summary.content, "primary answer");
+        assert_eq!(summary.reasoning_content, "private reasoning");
+        assert_eq!(summary.tool_calls[0].id, "first");
+        assert_eq!(summary.tool_calls[0].function.name, "first_tool");
+        assert_eq!(summary.tool_calls[0].function.arguments, "{\"a\":1}");
+        assert_eq!(summary.tool_calls[1].id, "second");
+        assert_eq!(summary.tool_calls[1].function.arguments, "[2]");
+        assert_eq!(summary.choices[0].index, 0);
+        assert_eq!(summary.choices[1].index, 1);
+        let secondary = serde_json::to_value(&summary.choices[1]).expect("serializable choice");
+        assert_eq!(secondary["message"]["content"], "alternative");
+        assert_eq!(
+            secondary["message"]["tool_calls"][0]["function"]["arguments"],
+            "{\"b\":3}"
+        );
+        assert_eq!(summary.usage.expect("usage").total_tokens, 13);
+        assert_eq!(summary.system_fingerprint.as_deref(), Some("fingerprint"));
+        assert_eq!(summary.chunk_count, 3);
+        assert_eq!(summary.tool_call_delta_count, 4);
+        assert_eq!(summary.reasoning_delta_count, 1);
+        assert!(summary.chunks[2].has_usage);
+        assert_eq!(summary.chunks[2].choice_count, 0);
+        assert_eq!(
+            summary.choices[0].provider_deltas[0]["provider_detail"],
+            json!({"ref": 1})
+        );
+        let metadata = serde_json::to_string(&summary.chunks).expect("serializable metadata");
+        assert!(!metadata.contains("primary answer"));
+        assert!(!metadata.contains("private reasoning"));
+        assert!(!metadata.contains("first_tool"));
+    }
+
+    #[test]
+    fn accumulator_rejects_huge_and_duplicate_indexes_without_retained_state() {
+        for choices in [
+            json!([{"index": u32::MAX, "delta": {}}]),
+            json!([{"index": 0, "delta": {}}, {"index": 0, "delta": {}}]),
+            json!([{"index": 0, "delta": {"tool_calls": [{"index": u32::MAX}]}}]),
+            json!([{"index": 0, "delta": {"tool_calls": [{"index": 0}, {"index": 0}]}}]),
+        ] {
+            let mut collector = ChatStreamAccumulator::new();
+            let error = collector
+                .push(aggregation_chunk(choices))
+                .expect_err("invalid indexes");
+            assert!(matches!(error, OpenAiError::Streaming(_)));
+            assert!(collector.choices.is_empty());
+            assert!(collector.chunks.is_empty());
+            assert!(collector.push(aggregation_chunk(json!([]))).is_err());
+            assert!(collector.finish().is_err());
+        }
+    }
+
+    #[test]
+    fn accumulator_handles_sparse_tool_indexes_without_dense_allocation() {
+        let mut collector = ChatStreamAccumulator::new();
+        collector
+            .push(aggregation_chunk(json!([{
+                "index": 0, "delta": {"tool_calls": [{
+                    "index": 127, "id": "sparse", "type": "function",
+                    "function": {"name": "lookup", "arguments": "{}"}
+                }]}, "finish_reason": "tool_calls"
+            }])))
+            .expect("bounded sparse index");
+        assert_eq!(collector.choices[&0].tools.len(), 1);
+        let summary = collector.finish().expect("complete sparse call");
+        assert_eq!(summary.tool_calls.len(), 1);
+        assert_eq!(summary.tool_calls[0].id, "sparse");
+    }
+
+    #[test]
+    fn accumulator_rejects_conflicting_tool_metadata_and_post_finish_deltas() {
+        for delta in [
+            json!({"tool_calls": [{"index": 0, "id": "replacement"}]}),
+            json!({"tool_calls": [{"index": 0, "function": {"name": "replacement"}}]}),
+            json!({"tool_calls": [{"index": 0, "type": "custom"}]}),
+            json!({"role": "user"}),
+        ] {
+            let mut collector = ChatStreamAccumulator::new();
+            collector
+                .push(aggregation_chunk(json!([{"index": 0, "delta": {
+                    "tool_calls": [{"index": 0, "id": "original", "type": "function",
+                        "function": {"name": "lookup", "arguments": ""}}]
+                }}])))
+                .expect("initial identity");
+            assert!(
+                collector
+                    .push(aggregation_chunk(json!([{"index": 0, "delta": delta}])))
+                    .is_err()
+            );
+            assert!(collector.finish().is_err());
+        }
+        let mut collector = ChatStreamAccumulator::new();
+        collector
+            .push(aggregation_chunk(json!([{
+                "index": 0, "delta": {"content": "done"}, "finish_reason": "stop"
+            }])))
+            .expect("finished choice");
+        assert!(
+            collector
+                .push(aggregation_chunk(json!([{
+                    "index": 0, "delta": {"content": "late"}
+                }])))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn accumulator_refuses_missing_terminal_or_tool_identity_metadata() {
+        for choices in [
+            json!([]),
+            json!([{"index": 0, "delta": {"content": "unfinished"}}]),
+            json!([{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]),
+            json!([{"index": 0, "delta": {"tool_calls": [{
+                "index": 0, "type": "function", "function": {"name": "missing_id", "arguments": "{}"}
+            }]}, "finish_reason": "tool_calls"}]),
+            json!([{"index": 0, "delta": {"tool_calls": [{
+                "index": 0, "id": "missing_type", "function": {"name": "lookup", "arguments": "{}"}
+            }]}, "finish_reason": "tool_calls"}]),
+            json!([{"index": 0, "delta": {"tool_calls": [{
+                "index": 0, "id": "missing_name", "type": "function", "function": {"arguments": "{}"}
+            }]}, "finish_reason": "tool_calls"}]),
+            json!([{"index": 0, "delta": {"tool_calls": [
+                {"index": 0, "id": "duplicate", "type": "function", "function": {"name": "a"}},
+                {"index": 1, "id": "duplicate", "type": "function", "function": {"name": "b"}}
+            ]}, "finish_reason": "tool_calls"}]),
+        ] {
+            let mut collector = ChatStreamAccumulator::new();
+            collector
+                .push(aggregation_chunk(choices))
+                .expect("decodable fragment");
+            assert!(
+                collector.finish().is_err(),
+                "incomplete completion must not succeed"
+            );
+        }
+    }
+
+    #[test]
+    fn accumulator_enforces_input_output_and_cardinality_budgets() {
+        let chunk = aggregation_chunk(json!([{
+            "index": 0, "delta": {"content": "hello"}, "finish_reason": "stop"
+        }]));
+        let encoded = serde_json::to_vec(&chunk).expect("encode fixture").len();
+        let mut too_small = ChatStreamAccumulator::with_limits(ChatStreamLimits {
+            max_bytes: encoded - 1,
+            ..ChatStreamLimits::default()
+        });
+        assert!(too_small.push(chunk.clone()).is_err());
+
+        let mut baseline = ChatStreamAccumulator::new();
+        baseline.push(chunk.clone()).expect("baseline input");
+        let summary = baseline.finish().expect("baseline summary");
+        let summary_size = serde_json::to_vec(&summary).expect("encode summary").len();
+        assert!(summary_size > encoded);
+        for (limit, succeeds) in [(summary_size, true), (summary_size - 1, false)] {
+            let mut collector = ChatStreamAccumulator::with_limits(ChatStreamLimits {
+                max_bytes: limit,
+                ..ChatStreamLimits::default()
+            });
+            collector.push(chunk.clone()).expect("input fits");
+            assert_eq!(collector.finish().is_ok(), succeeds);
+        }
+
+        let mut chunk_limited = ChatStreamAccumulator::with_limits(ChatStreamLimits {
+            max_chunks: 1,
+            ..ChatStreamLimits::default()
+        });
+        chunk_limited.push(chunk).expect("one chunk allowed");
+        assert!(chunk_limited.push(aggregation_chunk(json!([]))).is_err());
+        assert!(chunk_limited.finish().is_err());
+
+        let mut choice_limited = ChatStreamAccumulator::with_limits(ChatStreamLimits {
+            max_choices: 1,
+            ..ChatStreamLimits::default()
+        });
+        assert!(
+            choice_limited
+                .push(aggregation_chunk(json!([{"index": 1, "delta": {}}])))
+                .is_err()
+        );
+        let mut tool_limited = ChatStreamAccumulator::with_limits(ChatStreamLimits {
+            max_tool_calls_per_choice: 1,
+            ..ChatStreamLimits::default()
+        });
+        assert!(
+            tool_limited
+                .push(aggregation_chunk(json!([{
+                    "index": 0, "delta": {"tool_calls": [{"index": 1}]}
+                }])))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn collector_stops_immediately_on_provider_and_limit_errors() {
+        use futures_util::FutureExt as _;
+
+        let error = OpenAiError::Network(NetworkError::ConnectionDropped);
+        let chunks =
+            futures_util::stream::iter([Err(error.clone())]).chain(futures_util::stream::pending());
+        let result = collect_chat_stream(chunks)
+            .now_or_never()
+            .expect("must not await more chunks");
+        assert_eq!(result.expect_err("transport error preserved"), error);
+
+        let invalid = aggregation_chunk(json!([{"index": u32::MAX, "delta": {}}]));
+        let chunks =
+            futures_util::stream::iter([Ok(invalid)]).chain(futures_util::stream::pending());
+        assert!(
+            collect_chat_stream(chunks)
+                .now_or_never()
+                .expect("limit stops collection")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn collector_preserves_finish_reasons_but_refuses_truncated_transport() {
+        use futures_util::FutureExt as _;
+
+        for reason in ["stop", "length", "content_filter"] {
+            let frame = format!(
+                "data: {}\n\n",
+                chunk_json(Some("partial or full"), Some(reason))
+            );
+            for completed in [false, true] {
+                let terminal = if completed { "data: [DONE]\n\n" } else { "" };
+                let chunks = decode_all(&[&frame, terminal])
+                    .into_iter()
+                    .filter_map(|event| match event {
+                        Ok(OpenAiStreamEvent::Chunk(chunk)) => Some(Ok(chunk)),
+                        Ok(OpenAiStreamEvent::Done) => None,
+                        Err(error) => Some(Err(error)),
+                    });
+                let result = collect_chat_stream(futures_util::stream::iter(chunks))
+                    .now_or_never()
+                    .expect("ready fixture");
+                if completed {
+                    assert_eq!(result.expect("complete transport").finish_reason, reason);
+                } else {
+                    assert_eq!(
+                        result.expect_err("missing DONE"),
+                        OpenAiError::Network(NetworkError::ConnectionDropped)
+                    );
+                }
+            }
+        }
     }
 }

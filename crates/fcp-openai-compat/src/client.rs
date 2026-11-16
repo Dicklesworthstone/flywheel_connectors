@@ -11,13 +11,15 @@ use bytes::Bytes;
 use fcp_async_core::bytes::Buf as _;
 use fcp_async_core::http::body::Body as _;
 use fcp_async_core::http::client_io::ClientIo;
-use fcp_async_core::http::{ClientIncomingBody, HttpClient, Method};
+use fcp_async_core::http::{ClientIncomingBody, HttpClient, HttpClientError, Method};
 use fcp_async_core::{Cx, Deadline, time, wait_for_cx_cancellation};
 use futures_util::Stream;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::error::{NetworkError, OpenAiError, StreamingError, truncate_response_body};
+use crate::error::{
+    NetworkError, OpenAiError, StreamingError, redact_sensitive_text, truncate_response_body,
+};
 use crate::rate_limit::{
     HeaderList, RateLimitConfig, RateLimitPolicy, RateLimitSnapshot, parse_rate_limit_headers,
     upsert_header,
@@ -35,6 +37,14 @@ const JSON_CONTENT_TYPE: &str = "application/json";
 const USER_AGENT_HEADER: &str = "User-Agent";
 
 static DEFAULT_ERROR_MAPPER: DefaultOpenAiErrorMapper = DefaultOpenAiErrorMapper;
+
+impl From<HttpClientError> for NetworkError {
+    fn from(value: HttpClientError) -> Self {
+        Self::Http {
+            message: redact_sensitive_text(&value.to_string()),
+        }
+    }
+}
 
 /// Mutable request metadata passed to provider auth hooks.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

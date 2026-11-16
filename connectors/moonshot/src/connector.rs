@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use fcp_manifest::{ConnectorManifest, OperationSection};
-use fcp_openai_compat::{ChatChunk, OpenAiError, RateLimitPolicy};
+use fcp_openai_compat::RateLimitPolicy;
 use fcp_prelude::{
     ApprovalMode, BaseConnector, CapabilityGrant, CapabilityId, CapabilityToken,
     CapabilityVerifier, ConnectorId, ConnectorMetrics, EventCaps, FcpConnector, FcpError,
@@ -13,7 +13,6 @@ use fcp_prelude::{
     SessionId, ShutdownRequest, SimulateRequest, SimulateResponse, SubscribeRequest,
     SubscribeResponse, UnsubscribeRequest, ZoneId,
 };
-use futures_util::StreamExt as _;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tracing::info;
@@ -774,55 +773,12 @@ async fn collect_stream_response(
     stream: fcp_openai_compat::ChatCompletionStream,
     context_window_class: &'static str,
 ) -> FcpResult<Value> {
-    let mut chunk_count = 0_u64;
-    let mut content = String::new();
-    let mut finish_reason = None;
-    let mut reasoning_delta_count = 0_u64;
-    let mut tool_call_delta_count = 0_u64;
-    let mut chunk_metadata = Vec::new();
-
-    let chunks = stream
-        .collect::<Vec<Result<ChatChunk, OpenAiError>>>()
-        .await;
-    for chunk in chunks {
-        let chunk = chunk.map_err(|err| openai_error_to_fcp(&err))?;
-        chunk_count += 1;
-        for choice in &chunk.choices {
-            if let Some(delta) = &choice.delta.content {
-                content.push_str(delta);
-            }
-            if choice.delta.reasoning_content.is_some() {
-                reasoning_delta_count += 1;
-            }
-            if choice
-                .delta
-                .tool_calls
-                .as_ref()
-                .is_some_and(|calls| !calls.is_empty())
-            {
-                tool_call_delta_count += 1;
-            }
-            if finish_reason.is_none() {
-                finish_reason.clone_from(&choice.finish_reason);
-            }
-        }
-        chunk_metadata.push(json!({
-            "id": chunk.id,
-            "choice_count": chunk.choices.len(),
-            "model": chunk.model,
-            "has_usage": chunk.usage.is_some(),
-        }));
-    }
-
-    Ok(json!({
-        "content": content,
-        "chunk_count": chunk_count,
-        "finish_reason": finish_reason,
-        "reasoning_delta_count": reasoning_delta_count,
-        "tool_call_delta_count": tool_call_delta_count,
-        "context_window_class": context_window_class,
-        "chunks": chunk_metadata,
-    }))
+    let summary = fcp_openai_compat::collect_chat_stream(stream)
+        .await
+        .map_err(|err| openai_error_to_fcp(&err))?;
+    let mut response = json!(summary);
+    response["context_window_class"] = json!(context_window_class);
+    Ok(response)
 }
 
 #[must_use]

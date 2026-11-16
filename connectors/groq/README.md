@@ -41,6 +41,17 @@ Important runtime truths the contract preserves:
 - FCP subscribe is not implemented; streaming is exposed as the bounded invoke operation `groq.chat.completions_stream`.
 - Runtime handshake returns a SHA-256 hash of the bundled `manifest.toml`.
 
+### Streaming response
+
+`groq.chat.completions_stream` returns a bounded materialized response containing
+the complete assistant choices, assembled tool-call IDs, names and arguments,
+and provider usage when supplied. Top-level content, reasoning, finish reason,
+and tool calls describe choice zero; `chunks` remains payload-free metadata.
+The collector rejects incomplete transport termination and malformed or oversized
+streams without publishing partial success. See the
+[shared streaming response contract](../../crates/fcp-openai-compat/README.md#streaming-completion-results)
+for field meanings, termination requirements, and resource limits.
+
 ## First-Slice Scope
 
 The first Groq README slice documents the existing runtime surface:

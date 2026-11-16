@@ -20,6 +20,7 @@ const BEAD_ID: &str = "flywheel_connectors-bky21.3.6.13";
 const ACCEPTANCE_SUITE_CLASS: &str = "local_non_mock";
 const API_KEY: &str = "groq-local-acceptance-key";
 const OP_CHAT: &str = "groq.chat.completions";
+const OP_CHAT_STREAM: &str = "groq.chat.completions_stream";
 const OP_MODELS: &str = "groq.models.list";
 const OP_LEGACY: &str = "groq.completions.legacy";
 const CAP_CHAT: &str = "groq.chat";
@@ -64,7 +65,12 @@ impl LoopbackServer {
                     .expect("captured request should be delivered to test");
 
                 let mut raw_response = format!("HTTP/1.1 {}\r\n", response.status);
-                raw_response.push_str("content-type: application/json\r\n");
+                write!(
+                    &mut raw_response,
+                    "content-type: {}\r\n",
+                    response.content_type
+                )
+                .expect("content type should format");
                 write!(
                     &mut raw_response,
                     "content-length: {}\r\n",
@@ -113,6 +119,7 @@ impl LoopbackServer {
 
 struct HttpResponse {
     status: &'static str,
+    content_type: &'static str,
     headers: Vec<(&'static str, &'static str)>,
     body: &'static str,
 }
@@ -121,6 +128,16 @@ impl HttpResponse {
     const fn json(status: &'static str, body: &'static str) -> Self {
         Self {
             status,
+            content_type: "application/json",
+            headers: Vec::new(),
+            body,
+        }
+    }
+
+    const fn sse(body: &'static str) -> Self {
+        Self {
+            status: "200 OK",
+            content_type: "text/event-stream",
             headers: Vec::new(),
             body,
         }
@@ -363,6 +380,103 @@ async fn local_non_mock_chat_completions_posts_body_and_maps_output() {
             "path": "/openai/v1/chat/completions",
             "request_fields": ["model", "messages", "stream", "max_tokens", "temperature"],
             "response_fields": ["id", "model", "content", "finish_reason", "usage", "raw"]
+        }),
+    );
+}
+
+#[fcp_async_core::runtime::test]
+async fn local_non_mock_stream_preserves_parallel_tool_calls_and_usage() {
+    let body = concat!(
+        r#"data: {"id":"stream-local","object":"chat.completion.chunk","created":1,"model":"fixture","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":1,"id":"second-call","type":"function","function":{"name":"second","arguments":"["}},{"index":0,"id":"first-call","type":"function","function":{"name":"lookup","arguments":"{\"q\":"}}]},"finish_reason":null}]}"#,
+        "\n\n",
+        r#"data: {"id":"stream-local","object":"chat.completion.chunk","created":1,"model":"fixture","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"private argument\"}"}},{"index":1,"function":{"arguments":"2]"}}]},"finish_reason":"tool_calls"}]}"#,
+        "\n\n",
+        r#"data: {"id":"stream-local","object":"chat.completion.chunk","created":1,"model":"fixture","choices":[],"usage":{"prompt_tokens":4,"completion_tokens":7,"total_tokens":11}}"#,
+        "\n\n",
+        "data: [DONE]\n\n"
+    );
+    let server = LoopbackServer::start(vec![HttpResponse::sse(body)]);
+    let (connector, signing_key) = setup_connector(&server.provider_base_url(), &[CAP_CHAT]).await;
+    let result = invoke(
+        &connector,
+        &signing_key,
+        OP_CHAT_STREAM,
+        CAP_CHAT,
+        json!({
+            "messages": [{"role": "user", "content": "private prompt"}],
+            "tools": [{"type": "function", "function": {"name": "lookup"}}]
+        }),
+    )
+    .await
+    .expect("real HTTP streaming invoke should preserve tool results");
+
+    let captured = server.take();
+    assert_request(&captured, "POST", "/openai/v1/chat/completions");
+    assert_eq!(captured.body.expect("request body")["stream"], true);
+    server.join();
+    assert_eq!(result["content"], "");
+    assert_eq!(result["finish_reason"], "tool_calls");
+    assert_eq!(result["chunk_count"], 3);
+    assert_eq!(result["tool_call_delta_count"], 2);
+    assert_eq!(result["tool_calls"][0]["id"], "first-call");
+    assert_eq!(result["tool_calls"][0]["function"]["name"], "lookup");
+    assert_eq!(
+        result["tool_calls"][0]["function"]["arguments"],
+        "{\"q\":\"private argument\"}"
+    );
+    assert_eq!(result["tool_calls"][1]["id"], "second-call");
+    assert_eq!(result["tool_calls"][1]["function"]["arguments"], "[2]");
+    assert_eq!(
+        result["choices"][0]["message"]["tool_calls"],
+        result["tool_calls"]
+    );
+    assert_eq!(result["usage"]["total_tokens"], 11);
+    assert_eq!(result["chunks"][2]["has_usage"], true);
+    assert!(!result["chunks"].to_string().contains("private argument"));
+    assert!(!result.to_string().contains("private prompt"));
+    assert!(!result.to_string().contains(API_KEY));
+
+    print_artifact(
+        "stream_tool_materialization",
+        &json!({
+            "method": "POST", "path": "/openai/v1/chat/completions",
+            "tool_count": 2, "chunk_count": 3, "usage_preserved": true,
+            "response_fields": ["choices", "tool_calls", "usage", "chunks"],
+            "provider_payloads_logged": false
+        }),
+    );
+}
+
+#[fcp_async_core::runtime::test]
+async fn local_non_mock_stream_refuses_truncated_completion() {
+    let body = concat!(
+        r#"data: {"id":"truncated","object":"chat.completion.chunk","created":1,"model":"fixture","choices":[{"index":0,"delta":{"content":"private partial completion"},"finish_reason":"stop"}]}"#,
+        "\n\n"
+    );
+    let server = LoopbackServer::start(vec![HttpResponse::sse(body)]);
+    let (connector, signing_key) = setup_connector(&server.provider_base_url(), &[CAP_CHAT]).await;
+    let error = invoke(
+        &connector,
+        &signing_key,
+        OP_CHAT_STREAM,
+        CAP_CHAT,
+        json!({"messages": [{"role": "user", "content": "private prompt"}]}),
+    )
+    .await
+    .expect_err("EOF before DONE must not publish partial completion as success");
+    let captured = server.take();
+    assert_request(&captured, "POST", "/openai/v1/chat/completions");
+    server.join();
+    let diagnostic = error.to_string();
+    assert!(!diagnostic.contains("private partial completion"));
+    assert!(!diagnostic.contains("private prompt"));
+    assert!(!diagnostic.contains(API_KEY));
+    print_artifact(
+        "stream_truncation_denied",
+        &json!({
+            "method": "POST", "path": "/openai/v1/chat/completions",
+            "missing_done_rejected": true, "partial_success": false,
+            "provider_payloads_logged": false
         }),
     );
 }
