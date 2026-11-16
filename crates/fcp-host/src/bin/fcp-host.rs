@@ -91,7 +91,8 @@ use fcp_host::{
     PrewarmHealthState, PrewarmManifestState, PrewarmPoolState, PrewarmSandboxState,
     PrewarmStrategy, PrewarmZoneBinding, ProviderKey, ReceiptQueryRequest, ReceiptQueryResponse,
     ReceiptSummary, RequestPriority, ResilienceError, ResilienceLayer, RevocationCascadeVerifier,
-    RolloutController, RolloutObservation, RolloutOutcome, RuntimeNetworkEnforcement,
+    RolloutController, RolloutEvaluateResponse, RolloutEvaluation, RolloutObservation,
+    RolloutOutcome, RuntimeNetworkEnforcement,
     SafetyTierExt, SanitizedConnectorConfig, SimulateCostConfidence, SimulateCostEstimate,
     SimulatePhase, SimulateReceipt, SimulateReceiptQueryRequest, SimulateReceiptQueryResponse,
     SimulateResourceAvailability, StartupReconciliationReport, StickyCredentialPolicy,
@@ -8877,6 +8878,10 @@ struct RolloutEvaluateRequest {
     policy: RolloutPolicy,
     #[serde(default)]
     observed_at: Option<DateTime<Utc>>,
+    /// Complete pinned inventory, used only when the policy selects rollback.
+    /// This request does not retain automatic deployment history.
+    #[serde(default)]
+    rollback_target: Option<ManagedConnectorConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -18617,9 +18622,61 @@ async fn rollout_schedule_handler(
 async fn rollout_evaluate_handler(
     State(state): State<Arc<AppState>>,
     Json(request): Json<RolloutEvaluateRequest>,
-) -> Result<Json<RolloutOutcome>, (StatusCode, String)> {
+) -> Result<Json<RolloutEvaluateResponse>, (StatusCode, String)> {
+    let connector_id = parse_connector_id(&request.connector_id)?;
+    let started_at = Instant::now();
+    let deadline = started_at + verified_rollback::ROLLBACK_TIMEOUT;
+    let result = match fcp_async_core::time::timeout(
+        verified_rollback::ROLLBACK_TIMEOUT,
+        rollout_evaluate_before(&state, &connector_id, request, deadline),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(rollout_evaluation_timeout_error()),
+    };
+    match result {
+        Ok(response) => {
+            tracing::info!(
+                event = "rollout_evaluate_response",
+                connector_id = %connector_id,
+                state = %response.outcome.record.state,
+                decision = ?response.outcome.decision,
+                reason_code = %response.outcome.audit_event.reason_code,
+                runtime_restored = response.runtime_rollback.is_some(),
+                duration_ms = started_at.elapsed().as_millis() as u64,
+                "rollout evaluate request complete"
+            );
+            Ok(Json(response))
+        }
+        Err(err) => {
+            tracing::warn!(
+                event = "rollout_evaluate_error",
+                connector_id = %connector_id,
+                error = %err,
+                duration_ms = started_at.elapsed().as_millis() as u64,
+                "rollout evaluate request failed"
+            );
+            Err(map_host_error(err))
+        }
+    }
+}
+
+fn rollout_evaluation_timeout_error() -> HostError {
+    HostError::Unavailable(
+        "rollout evaluation or restoration exceeded its deadline; inspect persisted lifecycle and inventory before retrying"
+            .to_owned(),
+    )
+}
+
+async fn rollout_evaluate_before(
+    state: &AppState,
+    connector_id: &ConnectorId,
+    request: RolloutEvaluateRequest,
+    deadline: Instant,
+) -> HostResult<RolloutEvaluateResponse> {
     let RolloutEvaluateRequest {
-        connector_id,
+        connector_id: _,
         invocation_succeeded,
         latency_ms,
         uptime_secs,
@@ -18627,14 +18684,16 @@ async fn rollout_evaluate_handler(
         crashed,
         policy,
         observed_at,
+        rollback_target,
     } = request;
-    let connector_id = parse_connector_id(&connector_id)?;
-    // A delayed evaluation must not overwrite a completed executable rollback
-    // with the failed deployment's earlier lifecycle record.
-    let _transaction = state.registry.inventory_transaction.lock().await;
+    // Evaluation, target preparation, retirement and finalization share one
+    // inventory transaction. Queueing and all work consume the same deadline.
+    let transaction = state.registry.inventory_transaction.lock().await;
+    if Instant::now() >= deadline {
+        return Err(rollout_evaluation_timeout_error());
+    }
     let observed_at = observed_at.unwrap_or_else(Utc::now);
-    let started_at = Instant::now();
-    let pinned_version = state.lifecycle.pinned_version(&connector_id).await;
+    let pinned_version = state.lifecycle.pinned_version(connector_id).await;
     let effective_pinned = pinned_version.is_some();
     if pinned != effective_pinned {
         tracing::warn!(
@@ -18663,28 +18722,35 @@ async fn rollout_evaluate_handler(
     if let Some(latency_ms) = latency_ms {
         observation = observation.with_latency_ms(latency_ms);
     }
-    match state.rollout.evaluate(&connector_id, observation).await {
-        Ok(outcome) => {
-            tracing::info!(
-                event = "rollout_evaluate_response",
-                connector_id = %connector_id,
-                state = %outcome.record.state,
-                decision = ?outcome.decision,
-                reason_code = %outcome.audit_event.reason_code,
-                duration_ms = started_at.elapsed().as_millis() as u64,
-                "rollout evaluate request complete"
-            );
-            Ok(Json(outcome))
-        }
-        Err(err) => {
-            tracing::warn!(
-                event = "rollout_evaluate_error",
-                connector_id = %connector_id,
-                error = %err,
-                duration_ms = started_at.elapsed().as_millis() as u64,
-                "rollout evaluate request failed"
-            );
-            Err(map_host_error(err))
+    match state
+        .rollout
+        .evaluate_for_runtime(connector_id, observation)
+        .await?
+    {
+        RolloutEvaluation::Complete(outcome) => Ok(RolloutEvaluateResponse {
+            outcome: *outcome,
+            runtime_rollback: None,
+        }),
+        RolloutEvaluation::RollbackRequired(required) => {
+            let connector = rollback_target.ok_or_else(|| required.unavailable_error())?;
+            required.require_automatic_rollback()?;
+            let request = fcp_host::ConnectorPinnedRollbackRequest {
+                connector_id: connector_id.to_string(),
+                to_version: required.target_version().clone(),
+                connector,
+                reason: Some(required.reason()),
+            };
+            let completed =
+                verified_rollback::execute_locked(state, request, deadline, &transaction).await?;
+            let outcome = state.rollout.complete_runtime_rollback(
+                *required,
+                completed.record,
+                &completed.response,
+            )?;
+            Ok(RolloutEvaluateResponse {
+                outcome,
+                runtime_rollback: Some(completed.response),
+            })
         }
     }
 }
@@ -40367,14 +40433,16 @@ done"#;
                 crashed: false,
                 policy,
                 observed_at: Some(scheduled_at + chrono::Duration::seconds(180)),
+                rollback_target: None,
             }),
         )
         .await
         .expect("handler should succeed");
 
-        assert_eq!(outcome.decision, RolloutDecision::Hold);
-        assert_eq!(outcome.audit_event.reason_code, "pinned");
-        assert!(outcome.evidence.pinned);
+        assert_eq!(outcome.outcome.decision, RolloutDecision::Hold);
+        assert_eq!(outcome.outcome.audit_event.reason_code, "pinned");
+        assert!(outcome.outcome.evidence.pinned);
+        assert!(outcome.runtime_rollback.is_none());
     }
 
     // ── ConnectorSummary defaults in SubprocessConnector ──

@@ -279,6 +279,21 @@ pub struct ConnectorPinnedRollbackResponse {
     pub desired_state: DesiredRuntimeState,
 }
 
+/// A health-policy evaluation, optionally followed by verified restoration.
+///
+/// The flattened fields retain the ordinary rollout outcome contract. Runtime
+/// restoration is reported separately and only after the pinned deployment,
+/// managed inventory, and durable lifecycle authority were all published.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RolloutEvaluateResponse {
+    /// Persisted rollout result and evidence for the observed deployment.
+    #[serde(flatten)]
+    pub outcome: fcp_kernel::RolloutOutcome,
+    /// Verified restoration selected by this evaluation's rollback policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_rollback: Option<ConnectorPinnedRollbackResponse>,
+}
+
 /// Read-only lifecycle authority captured before preparing a rollback target.
 ///
 /// This token belongs to one store instance and one connector journal revision.

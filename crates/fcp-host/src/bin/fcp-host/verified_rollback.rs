@@ -11,9 +11,16 @@ use fcp_host::{
 
 use super::*;
 
-const ROLLBACK_TIMEOUT: Duration = Duration::from_secs(30);
+pub(super) const ROLLBACK_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_MANIFEST_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_REASON_BYTES: usize = 4096;
+
+/// The exact record finalized while the caller still holds inventory ownership.
+/// Returning it avoids a later, racy lifecycle read to build rollout evidence.
+pub(super) struct CompletedRollback {
+    pub(super) response: ConnectorPinnedRollbackResponse,
+    pub(super) record: fcp_kernel::LifecycleRecord,
+}
 
 fn require_deadline(deadline: Instant) -> HostResult<()> {
     if Instant::now() >= deadline {
@@ -22,7 +29,7 @@ fn require_deadline(deadline: Instant) -> HostResult<()> {
     Ok(())
 }
 
-fn timeout_error() -> HostError {
+pub(super) fn timeout_error() -> HostError {
     HostError::Unavailable(
         "verified rollback exceeded its deadline; inspect persisted lifecycle and inventory before retrying"
             .to_owned(),
@@ -206,6 +213,26 @@ pub(super) async fn execute(
     state: &AppState,
     request: ConnectorPinnedRollbackRequest,
 ) -> HostResult<ConnectorPinnedRollbackResponse> {
+    let deadline = Instant::now() + ROLLBACK_TIMEOUT;
+    let completed = fcp_async_core::time::timeout(ROLLBACK_TIMEOUT, async {
+        let transaction = state.registry.inventory_transaction.lock().await;
+        execute_locked(state, request, deadline, &transaction).await
+    })
+    .await
+    .map_err(|_| timeout_error())??;
+    Ok(completed.response)
+}
+
+/// Reuse the enclosing evaluation transaction and its original deadline.
+/// The guard must belong to this state's registry and remain held through
+/// outcome construction; no re-lock or fresh execution budget is permitted.
+pub(super) async fn execute_locked(
+    state: &AppState,
+    request: ConnectorPinnedRollbackRequest,
+    deadline: Instant,
+    _transaction: &futures_util::lock::MutexGuard<'_, ()>,
+) -> HostResult<CompletedRollback> {
+    require_deadline(deadline)?;
     if !cfg!(unix) {
         return Err(HostError::Unavailable(
             "verified rollback requires supported inventory directory synchronization".to_owned(),
@@ -218,23 +245,10 @@ pub(super) async fn execute(
     {
         return Err(invalid("verified rollback reason exceeds 4096 bytes"));
     }
-    let deadline = Instant::now() + ROLLBACK_TIMEOUT;
-    fcp_async_core::time::timeout(ROLLBACK_TIMEOUT, execute_before(state, request, deadline))
-        .await
-        .map_err(|_| timeout_error())?
-}
-
-async fn execute_before(
-    state: &AppState,
-    request: ConnectorPinnedRollbackRequest,
-    deadline: Instant,
-) -> HostResult<ConnectorPinnedRollbackResponse> {
     let connector_id = request
         .connector_id
         .parse::<ConnectorId>()
         .map_err(|_| invalid("verified rollback connector identifier is invalid"))?;
-    let _transaction = state.registry.inventory_transaction.lock().await;
-    require_deadline(deadline)?;
     let inventory_path = state.connectors_file.as_ref().ok_or_else(|| {
         HostError::Unavailable("verified rollback requires a managed connectors file".to_owned())
     })?;
@@ -372,10 +386,11 @@ async fn execute_before(
         registry_version, desired_state = ?desired_state,
         "verified connector deployment restored"
     );
-    Ok(ConnectorPinnedRollbackResponse {
+    let response = ConnectorPinnedRollbackResponse {
         connector_id: connector_id.to_string(), state: record.state,
-        from_version: guard.from_version().clone(), to_version: record.version,
+        from_version: guard.from_version().clone(), to_version: record.version.clone(),
         message: "Verified target executable and managed inventory restored; inspect health before resuming rollout promotion".to_owned(),
         registry_version, runtime_restored: true, desired_state,
-    })
+    };
+    Ok(CompletedRollback { response, record })
 }

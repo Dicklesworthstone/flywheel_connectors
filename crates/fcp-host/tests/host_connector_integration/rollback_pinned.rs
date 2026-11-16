@@ -162,6 +162,18 @@ impl RollbackFixture {
         })
     }
 
+    fn evaluation_request(&self) -> Value {
+        json!({
+            "connector_id": self.connector_id.as_str(),
+            "invocation_succeeded": false,
+            "latency_ms": 350,
+            "uptime_secs": 300,
+            "policy": test_rollout_rollback_policy(),
+            "observed_at": Utc::now(),
+            "rollback_target": self.target,
+        })
+    }
+
     async fn spawn(&self) -> Result<HttpHostProcess, Box<dyn std::error::Error>> {
         let public_key = capability_public_key_hex(&self.signing_key);
         let mut host = HttpHostProcess::spawn_with_connectors_file(
@@ -634,6 +646,266 @@ async fn pinned_rollback_inventory_write_failure_stays_disabled_after_host_resta
         !status.is_success(),
         "failed rollback resumed a connector: {error}"
     );
+    assert_eq!(std::fs::read(&fixture.current_marker)?, marker_before);
+    assert!(!fixture.target_marker.exists());
+    Ok(())
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn rollout_evaluation_restores_the_explicit_image_and_retains_failed_health_evidence()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = RollbackFixture::new()?;
+    let mut host = fixture.spawn().await?;
+    let original_pid = fixture.invoke_image(&host, false).await?;
+    let restored: fcp_host::RolloutEvaluateResponse = http_post_json(
+        host.client.clone(),
+        format!("{}/rpc/rollout/evaluate", host.base_url),
+        fixture.evaluation_request(),
+    )
+    .await?;
+    let outcome = restored.outcome;
+    assert_eq!(outcome.decision, RolloutDecision::Rollback);
+    assert_eq!(outcome.record.state, LifecycleState::RolledBack);
+    assert_eq!(outcome.record.version, semver::Version::parse(TARGET_VERSION)?);
+    assert_eq!(outcome.record.health.samples, 0, "restored health starts fresh");
+    assert_eq!(outcome.evidence.samples, 1, "retain the triggering failure");
+    assert_eq!(outcome.evidence.error_rate_bps, 10_000);
+    assert_eq!(outcome.evidence.failure_streak, 1);
+    assert_eq!(outcome.evidence.state_before, LifecycleState::Canary);
+    assert_eq!(outcome.evidence.state_after, LifecycleState::RolledBack);
+    assert_eq!(outcome.audit_event.evidence_digest, outcome.evidence.digest());
+    let response = restored.runtime_rollback.expect("actual restoration evidence");
+    assert!(response.runtime_restored);
+    assert_eq!(response.from_version, semver::Version::parse(CURRENT_VERSION)?);
+    assert_eq!(response.to_version, outcome.record.version);
+    assert_eq!(response.desired_state, DesiredRuntimeState::Enabled);
+    assert!(!Path::new(&format!("/proc/{original_pid}/exe")).exists());
+    assert_ne!(fixture.invoke_image(&host, true).await?, original_pid);
+    assert_rollout_metadata(
+        &host,
+        &fixture,
+        TARGET_VERSION,
+        LifecycleState::RolledBack,
+        DesiredRuntimeState::Enabled,
+    )
+    .await?;
+
+    restart_from_inventory(&mut host, &fixture.signing_key).await?;
+    fixture.invoke_image(&host, true).await?;
+    assert_rollout_metadata(
+        &host,
+        &fixture,
+        TARGET_VERSION,
+        LifecycleState::RolledBack,
+        DesiredRuntimeState::Enabled,
+    )
+    .await?;
+    Ok(())
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn rollout_evaluation_refuses_missing_or_invalid_targets_before_deployment_mutation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = RollbackFixture::new()?;
+    let host = fixture.spawn().await?;
+    let original_pid = fixture.invoke_image(&host, false).await?;
+    let mut missing_target = fixture.evaluation_request();
+    missing_target.as_object_mut().unwrap().remove("rollback_target");
+    let mut missing_pin = fixture.evaluation_request();
+    missing_pin["rollback_target"].as_object_mut().unwrap().remove("binary_sha256");
+    let mut wrong_pin = fixture.evaluation_request();
+    wrong_pin["rollback_target"]["binary_sha256"] = json!("00".repeat(32));
+    let mut wrong_version = fixture.evaluation_request();
+    wrong_version["rollback_target"]["version"] = json!("9.0.0");
+    let mut wrong_connector = fixture.evaluation_request();
+    wrong_connector["rollback_target"]["id"] = json!("fcp.test.other:utility:1.0.0");
+    for (case, request) in [
+        ("missing target", missing_target),
+        ("missing pin", missing_pin),
+        ("wrong executable", wrong_pin),
+        ("wrong rollout version", wrong_version),
+        ("wrong connector", wrong_connector),
+    ] {
+        let inventory_path = host.lifecycle_state_dir.path().join("connectors.json");
+        let lifecycle_path = host.lifecycle_state_dir.path().join("lifecycle-state.json");
+        let inventory_before = std::fs::read(&inventory_path)?;
+        let lifecycle_before = std::fs::read(&lifecycle_path)?;
+        let (status, error) = request_status_text(
+            host.client.clone(),
+            reqwest::Method::POST,
+            format!("{}/rpc/rollout/evaluate", host.base_url),
+            Some(request),
+            Some(admin_auth_headers()),
+        )
+        .await?;
+        assert!(!status.is_success(), "{case}: {error}");
+        assert_ne!(status, reqwest::StatusCode::NOT_FOUND, "missing evaluate route");
+        if case == "missing target" {
+            assert!(error.contains("verified executable and inventory restoration is unavailable"));
+        }
+        assert_eq!(std::fs::read(inventory_path)?, inventory_before, "{case}");
+        assert_eq!(std::fs::read(lifecycle_path)?, lifecycle_before, "{case}");
+        assert_eq!(fixture.invoke_image(&host, false).await?, original_pid, "{case}");
+        assert!(!fixture.target_marker.exists(), "{case}");
+    }
+    Ok(())
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn rollout_evaluation_hold_and_promotion_do_not_open_the_supplied_target()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = RollbackFixture::new()?;
+    let host = fixture.spawn().await?;
+    let original_pid = fixture.invoke_image(&host, false).await?;
+    let mut request = fixture.evaluation_request();
+    request["invocation_succeeded"] = json!(true);
+    request["rollback_target"]["binary"] = json!(fixture.directory.path().join("absent-target"));
+    request["rollback_target"]["manifest_path"] =
+        json!(fixture.directory.path().join("absent-manifest"));
+    let held: fcp_host::RolloutEvaluateResponse = http_post_json(
+        host.client.clone(),
+        format!("{}/rpc/rollout/evaluate", host.base_url),
+        request.clone(),
+    )
+    .await?;
+    assert_eq!(held.outcome.decision, RolloutDecision::Hold);
+    assert_eq!(held.outcome.audit_event.reason_code, "pinned");
+    assert!(held.runtime_rollback.is_none());
+    assert_eq!(fixture.invoke_image(&host, false).await?, original_pid);
+
+    let _: PinStateResponse = http_delete_json(
+        host.client.clone(),
+        format!("{}/rpc/rollout/pin/{}", host.base_url, fixture.connector_id),
+    )
+    .await?;
+    let promoted: fcp_host::RolloutEvaluateResponse = http_post_json(
+        host.client.clone(),
+        format!("{}/rpc/rollout/evaluate", host.base_url),
+        request,
+    )
+    .await?;
+    assert_eq!(promoted.outcome.decision, RolloutDecision::Promote);
+    assert_eq!(promoted.outcome.record.state, LifecycleState::Production);
+    assert!(promoted.runtime_rollback.is_none());
+    assert_eq!(fixture.invoke_image(&host, false).await?, original_pid);
+    assert!(!fixture.target_marker.exists());
+    Ok(())
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn rollout_evaluation_requires_automatic_policy_permission_even_for_failed_self_check()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut fixture = RollbackFixture::new()?;
+    fixture.current["env"]["FCP_TEST_CONNECTOR_HEALTH"] = json!("error");
+    let host = fixture.spawn().await?;
+    let mut request = fixture.evaluation_request();
+    request["policy"]["rollback_rules"]["auto_rollback"] = json!(false);
+    let inventory_path = host.lifecycle_state_dir.path().join("connectors.json");
+    let lifecycle_path = host.lifecycle_state_dir.path().join("lifecycle-state.json");
+    let inventory_before = std::fs::read(&inventory_path)?;
+    let lifecycle_before = std::fs::read(&lifecycle_path)?;
+    let (status, error) = request_status_text(
+        host.client.clone(),
+        reqwest::Method::POST,
+        format!("{}/rpc/rollout/evaluate", host.base_url),
+        Some(request),
+        Some(admin_auth_headers()),
+    )
+    .await?;
+    assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert!(error.contains("policy disables automatic rollback"), "{error}");
+    assert_eq!(std::fs::read(inventory_path)?, inventory_before);
+    assert_eq!(std::fs::read(lifecycle_path)?, lifecycle_before);
+    assert!(!fixture.target_marker.exists());
+    Ok(())
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn rollout_evaluation_preserves_disabled_intent_when_it_restores_the_target()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = RollbackFixture::new()?;
+    let host = fixture.spawn().await?;
+    let original_pid = fixture.invoke_image(&host, false).await?;
+    let _: Value = http_post_json(
+        host.client.clone(),
+        format!("{}/rpc/lifecycle/{}", host.base_url, fixture.connector_id),
+        json!({ "action": "disable" }),
+    )
+    .await?;
+    let restored: fcp_host::RolloutEvaluateResponse = http_post_json(
+        host.client.clone(),
+        format!("{}/rpc/rollout/evaluate", host.base_url),
+        fixture.evaluation_request(),
+    )
+    .await?;
+    assert_eq!(restored.outcome.decision, RolloutDecision::Rollback);
+    let restored = restored.runtime_rollback.expect("dormant restoration");
+    assert!(restored.runtime_restored);
+    assert_eq!(restored.desired_state, DesiredRuntimeState::Disabled);
+    assert!(!Path::new(&format!("/proc/{original_pid}/exe")).exists());
+    assert!(!fixture.target_marker.exists());
+    assert_rollout_metadata(
+        &host,
+        &fixture,
+        TARGET_VERSION,
+        LifecycleState::RolledBack,
+        DesiredRuntimeState::Disabled,
+    )
+    .await?;
+    Ok(())
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn rollout_evaluation_failed_publication_keeps_runtime_denied_across_restart()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = RollbackFixture::new()?;
+    let mut host = fixture.spawn().await?;
+    let original_pid = fixture.invoke_image(&host, false).await?;
+    let marker_before = std::fs::read(&fixture.current_marker)?;
+    let inventory_path = host.lifecycle_state_dir.path().join("connectors.json");
+    let inventory_before = std::fs::read(&inventory_path)?;
+    std::fs::create_dir(host.lifecycle_state_dir.path().join("connectors.json.tmp"))?;
+    let (status, error) = request_status_text(
+        host.client.clone(),
+        reqwest::Method::POST,
+        format!("{}/rpc/rollout/evaluate", host.base_url),
+        Some(fixture.evaluation_request()),
+        Some(admin_auth_headers()),
+    )
+    .await?;
+    assert!(status.is_server_error(), "{status}: {error}");
+    assert!(error.contains("connectors file"), "{error}");
+    assert_eq!(std::fs::read(&inventory_path)?, inventory_before);
+    assert!(!Path::new(&format!("/proc/{original_pid}/exe")).exists());
+    assert_rollout_metadata(
+        &host,
+        &fixture,
+        CURRENT_VERSION,
+        LifecycleState::Canary,
+        DesiredRuntimeState::Disabled,
+    )
+    .await?;
+
+    restart_from_inventory(&mut host, &fixture.signing_key).await?;
+    assert_rollout_metadata(
+        &host,
+        &fixture,
+        CURRENT_VERSION,
+        LifecycleState::Canary,
+        DesiredRuntimeState::Disabled,
+    )
+    .await?;
+    let (mut request, _) = build_invoke_request(fixture.connector_id.clone(), &fixture.signing_key);
+    request.input = json!({ "delay_ms": 0 });
+    let (status, error) = request_status_text(
+        host.client.clone(),
+        reqwest::Method::POST,
+        format!("{}/rpc/invoke", host.base_url),
+        Some(serde_json::to_value(request)?),
+        None,
+    )
+    .await?;
+    assert!(!status.is_success(), "failed restoration reenabled execution: {error}");
     assert_eq!(std::fs::read(&fixture.current_marker)?, marker_before);
     assert!(!fixture.target_marker.exists());
     Ok(())

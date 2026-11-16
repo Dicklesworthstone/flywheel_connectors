@@ -508,27 +508,80 @@ fwc rollout set github --canary 10 --host http://127.0.0.1:8787
 fwc rollout status github --host http://127.0.0.1:8787
 fwc status github --host http://127.0.0.1:8787
 fwc doctor --zone z:work --all --host http://127.0.0.1:8787
-# Currently refused: verified runtime restoration is unavailable.
-fwc rollout rollback github --to 1.2.2 --host http://127.0.0.1:8787
 ```
+
+For a rollout whose recorded previous version is `1.2.2`, explicitly restore its
+verified executable and complete deployment inventory with:
+
+```bash
+fwc rollout rollback github --to 1.2.2 \
+  --target-config ./github-1.2.2.inventory.json \
+  --admin-token-file /run/secrets/fcp-host-admin-token \
+  --host http://127.0.0.1:8787
+```
+
+The target file is one complete `ManagedConnectorConfig` JSON object, using the
+same shape as an entry in the host's managed connectors file. It must include
+the target `version`, `binary_sha256`, and `manifest_path`, plus the deployment's
+execution settings and allowed zones. Binary and manifest paths refer to files
+on the host. The manifest must identify the same connector and selected previous
+version, and the target must preserve the current zone envelope. Both current
+and target deployments must be admitted stateless deployments; stateful
+restoration still requires a canonical state handoff.
+
+Health-policy evaluation can use that same explicit target through the
+authenticated `POST /rpc/rollout/evaluate` route. Starting with an evaluation
+document containing the actual observation and rollout policy, attach the full
+inventory object and explicitly permit automatic rollback:
+
+```bash
+jq --slurpfile target ./github-1.2.2.inventory.json \
+  '.rollback_target = $target[0] | .policy.rollback_rules.auto_rollback = true' \
+  rollout-observation.json > rollout-evaluation.json
+
+curl --fail-with-body --silent --show-error \
+  --header "Authorization: Bearer ${FCP_HOST_ADMIN_BEARER_TOKEN:?}" \
+  --header 'X-FCP-Zone: z:owner' \
+  --header 'Content-Type: application/json' \
+  --data-binary @rollout-evaluation.json \
+  http://127.0.0.1:8787/rpc/rollout/evaluate
+```
+
+The evaluation document's `connector_id` must identify the same connector as
+the target. Its existing `invocation_succeeded`, optional latency and uptime,
+and policy thresholds remain the inputs to the decision. An explicit target
+does not override the policy: `policy.rollback_rules.auto_rollback` must be
+true before the evaluator can restore an executable. Hold and Promote decisions
+do not open or prepare the target's binary or manifest.
 
 Read the truth contract literally:
 
-- `rollout set` proves that the active node accepted the canary mutation
-- `rollout status` proves the current node-local rollout state snapshot
-- `rollout rollback` currently returns HTTP 503 without changing lifecycle state,
-  version pins, or the active runtime
-- none of those answers by themselves prove later runtime stabilization
+- `rollout set` records the active node's canary mutation, and `rollout status`
+  reports its current node-local rollout state.
+- `rollout rollback --target-config ...` reports `runtime_restored: true` only
+  after the verified target, managed inventory, and lifecycle authority have
+  been published. Existing disabled or uninstalled intent remains denied; a
+  restored target can be dormant.
+- A completed health-triggered rollback retains the existing top-level
+  `record`, `decision`, `audit_event`, and `evidence` fields and adds
+  `runtime_rollback`. The evidence retains the failed deployment's observation;
+  the restored record starts with fresh health counters. Hold and Promote
+  responses omit `runtime_rollback`.
+- Missing or invalid target verification fails before retiring the deployment
+  or rewriting its lifecycle state. Failure after retirement and before lifecycle
+  finalization keeps execution durably denied, including after a host restart.
+- The metadata-only rollback command without `--target-config`, and an
+  evaluation requiring rollback without `rollback_target`, still refuse to
+  claim completed runtime restoration.
+- Restoration does not certify the target's health. After a timeout or lost
+  reply, inspect persisted lifecycle and inventory before retrying: the host
+  may already have retired or restored a deployment.
 
-Automatic health evaluations that request rollback return the same unavailability
-before recording a completed rollback. Healthy promotion and hold decisions still
-work. Retained configuration revisions contain connector settings; they do not
-retain a verified executable and its complete deployment configuration. Restore
-a verified prior deployment through managed inventory before rescheduling the
-rollout. Existing stateful replacement and canonical state handoff restrictions
-still apply.
+The evaluation target is supplied per request. This does not add a background
+rollback scheduler or retain executable deployment history. Configuration
+revisions alone contain settings and cannot reconstruct a prior executable.
 
-The stabilization check is always the same follow-up loop:
+After restoration, run the stabilization checks:
 
 1. `fwc rollout status ...`
 2. `fwc status ...`

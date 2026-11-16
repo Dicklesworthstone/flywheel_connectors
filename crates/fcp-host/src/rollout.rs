@@ -25,7 +25,76 @@ pub use fcp_kernel::{
 };
 use fcp_prelude::RolloutPolicy;
 
-use crate::{ConnectorRegistry, HostError, HostResult};
+use crate::{ConnectorPinnedRollbackResponse, ConnectorRegistry, HostError, HostResult};
+
+/// A persisted evaluation or an uncommitted request for runtime restoration.
+///
+/// A rollback recommendation is deliberately not a successful rollout outcome.
+/// The host must restore the verified deployment before completing it.
+#[derive(Debug)]
+#[must_use]
+pub enum RolloutEvaluation {
+    /// Hold or promotion was persisted by the controller.
+    Complete(Box<RolloutOutcome>),
+    /// Health requires restoration, but no lifecycle metadata has changed.
+    RollbackRequired(Box<RolloutRollbackRequired>),
+}
+
+/// Health evidence bound to the deployment that requires restoration.
+///
+/// This value is neither serializable nor evidence that rollback occurred.
+#[derive(Debug)]
+pub struct RolloutRollbackRequired {
+    record: LifecycleRecord,
+    target_version: semver::Version,
+    evidence: RolloutEvidence,
+}
+
+impl RolloutRollbackRequired {
+    /// Previous version selected by the currently evaluated rollout.
+    #[must_use]
+    pub const fn target_version(&self) -> &semver::Version {
+        &self.target_version
+    }
+
+    /// Stable health reason carried into the restoration journal.
+    ///
+    /// Provider diagnostics remain in the evaluation evidence instead of being
+    /// copied into the administrative transition's free-text reason.
+    #[must_use]
+    pub fn reason(&self) -> String {
+        format!("rollout health policy: {}", self.evidence.reason_code)
+    }
+
+    /// Require policy permission before automatically restoring an executable.
+    ///
+    /// Health failures can recommend rollback even when automatic actions are
+    /// disabled. An explicit target does not silently change that policy.
+    ///
+    /// # Errors
+    /// Returns unavailable when the policy disables automatic rollback.
+    pub fn require_automatic_rollback(&self) -> HostResult<()> {
+        if !self.evidence.auto_rollback {
+            return Err(HostError::Unavailable(
+                "rollout health requires restoration, but its policy disables automatic rollback; use an explicit verified rollback or enable auto_rollback"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Explain why a caller without a verified restoration path must refuse.
+    #[must_use]
+    pub fn unavailable_error(&self) -> HostError {
+        HostError::Unavailable(format!(
+            "connector '{}' requires rollback to v{} ({}: {}), but verified executable and inventory restoration is unavailable; supply an explicit pinned rollback target or restore a verified prior deployment through managed inventory before rescheduling. Lifecycle state and version pins were not changed",
+            self.record.connector_id,
+            self.target_version,
+            self.evidence.reason_code,
+            self.evidence.message,
+        ))
+    }
+}
 
 /// Configuration for rollout-controller health gating.
 #[derive(Debug, Clone)]
@@ -196,12 +265,34 @@ where
     /// invalid, or the lifecycle manager rejects the transition/persistence.
     /// Rollback decisions are refused until verified runtime restoration is
     /// available; a lifecycle transition alone cannot restore an executable.
-    #[allow(clippy::too_many_lines)]
     pub async fn evaluate(
         &self,
         connector_id: &ConnectorId,
         observation: RolloutObservation,
     ) -> HostResult<RolloutOutcome> {
+        match self.evaluate_for_runtime(connector_id, observation).await? {
+            RolloutEvaluation::Complete(outcome) => Ok(*outcome),
+            RolloutEvaluation::RollbackRequired(required) => Err(required.unavailable_error()),
+        }
+    }
+
+    /// Evaluate health without claiming an unperformed runtime rollback.
+    ///
+    /// Hold and promotion are persisted normally. A rollback recommendation
+    /// retains the failed deployment's sample and policy evidence in memory,
+    /// leaving durable lifecycle metadata unchanged for target verification.
+    /// The production host serializes evaluation and restoration with its
+    /// inventory transaction.
+    ///
+    /// # Errors
+    /// Returns errors for unknown connectors, invalid policies, missing rollback
+    /// targets, or failed persistence of a hold or promotion.
+    #[allow(clippy::too_many_lines)]
+    pub async fn evaluate_for_runtime(
+        &self,
+        connector_id: &ConnectorId,
+        observation: RolloutObservation,
+    ) -> HostResult<RolloutEvaluation> {
         observation
             .policy
             .validate()
@@ -253,13 +344,29 @@ where
                 let target = record
                     .previous_version
                     .as_ref()
-                    .ok_or_else(|| map_lifecycle_error(LifecycleError::NoRollbackTarget))?;
-                // Registry discovery and lifecycle persistence cannot restore a
-                // previous executable or its admitted inventory. Preserve the
-                // deployed record instead of reporting a completed rollback.
-                return Err(HostError::Unavailable(format!(
-                    "connector '{connector_id}' requires rollback to v{target} ({}: {}), but verified executable and inventory restoration is unavailable; restore a verified prior deployment through managed inventory before rescheduling. Lifecycle state and version pins were not changed",
-                    decision_plan.reason_code, decision_plan.message
+                    .ok_or_else(|| map_lifecycle_error(LifecycleError::NoRollbackTarget))?
+                    .clone();
+                let evidence = build_evidence(&BuildEvidenceInput {
+                    record: &record,
+                    state_before,
+                    decision: RolloutDecision::Rollback,
+                    reason_code: decision_plan.reason_code,
+                    message: &decision_plan.message,
+                    pinned: observation.pinned,
+                    crash_loop_detected: runtime_state.crash_loop_detected,
+                    failure_streak: runtime_state.failure_streak,
+                    self_check: &self_check,
+                    connector_health: &summary.health,
+                    uptime_secs: observation.uptime_secs,
+                    policy: &observation.policy,
+                    observed_at: observation.observed_at,
+                });
+                return Ok(RolloutEvaluation::RollbackRequired(Box::new(
+                    RolloutRollbackRequired {
+                        record,
+                        target_version: target,
+                        evidence,
+                    },
                 )));
             }
             RolloutDecision::Hold => RolloutDecision::Hold,
@@ -307,9 +414,63 @@ where
             "rollout decision"
         );
 
-        Ok(RolloutOutcome {
+        Ok(RolloutEvaluation::Complete(Box::new(RolloutOutcome {
             record,
             decision,
+            audit_event,
+            evidence,
+        })))
+    }
+
+    /// Attach a completed verified restoration to its triggering health evidence.
+    ///
+    /// This does not save metadata: the runtime executor has already finalized
+    /// the returned record atomically with its version pin and execution intent.
+    /// Only the failed deployment's health evidence is retained; the restored
+    /// deployment starts with fresh health and crash-loop accounting.
+    ///
+    /// # Errors
+    /// Refuses results that do not identify the exact evaluated deployment and
+    /// selected previous version, or do not report completed runtime restoration.
+    pub fn complete_runtime_rollback(
+        &self,
+        required: RolloutRollbackRequired,
+        record: LifecycleRecord,
+        restored: &ConnectorPinnedRollbackResponse,
+    ) -> HostResult<RolloutOutcome> {
+        required.require_automatic_rollback()?;
+        if record.connector_id != required.record.connector_id
+            || record.version != required.target_version
+            || record.state != LifecycleState::RolledBack
+            || record.previous_version.is_some()
+            || !restored.runtime_restored
+            || restored.connector_id != required.record.connector_id.as_str()
+            || restored.from_version != required.record.version
+            || restored.to_version != record.version
+            || restored.state != record.state
+        {
+            return Err(HostError::Unavailable(
+                "verified rollback result does not match its rollout evaluation; inspect the persisted deployment before retrying"
+                    .to_owned(),
+            ));
+        }
+        let mut evidence = required.evidence;
+        evidence.state_after = record.state;
+        evidence.message = format!(
+            "{}; verified deployment v{} restored in registry generation {}",
+            evidence.message, record.version, restored.registry_version,
+        );
+        let audit_event = build_audit_event(
+            &record.connector_id,
+            evidence.state_before,
+            record.state,
+            RolloutDecision::Rollback,
+            &evidence,
+        );
+        self.reset_runtime_state(&record.connector_id);
+        Ok(RolloutOutcome {
+            record,
+            decision: RolloutDecision::Rollback,
             audit_event,
             evidence,
         })
@@ -1193,6 +1354,91 @@ mod tests {
         assert_eq!(
             serde_json::to_value(after).expect("serialize preserved record"),
             serde_json::to_value(before).expect("serialize original record")
+        );
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn runtime_rollback_completion_binds_evidence_without_resaving_failed_metadata() {
+        let registry = Arc::new(TestRegistry {
+            summary: connector_summary(ConnectorHealth::healthy()),
+            self_check: SelfCheckReport::failed("self_check_failed", "database unavailable"),
+        });
+        let lifecycle = Arc::new(InMemoryLifecycleManager::new());
+        let controller = scheduled_record(
+            registry,
+            lifecycle.clone(),
+            Utc::now() - chrono::Duration::seconds(180),
+        )
+        .await;
+        let original = lifecycle.get(&connector_id()).await.unwrap().unwrap();
+        let evaluation = controller
+            .evaluate_for_runtime(
+                &connector_id(),
+                RolloutObservation::new(false, rollout_policy())
+                    .with_latency_ms(250)
+                    .with_uptime_secs(180),
+            )
+            .await
+            .unwrap();
+        let RolloutEvaluation::RollbackRequired(required) = evaluation else {
+            panic!("failed self-check requires actual restoration");
+        };
+        required.require_automatic_rollback().unwrap();
+        let after = lifecycle.get(&connector_id()).await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&after).unwrap(),
+            serde_json::to_value(&original).unwrap(),
+            "preparation cannot persist a rollback or the uncommitted failed sample"
+        );
+
+        // Model only the executor's finalized-record boundary. The integration
+        // tests separately prove actual image, inventory and durable restoration.
+        let mut record = original.clone();
+        record
+            .transition(
+                LifecycleState::RolledBack,
+                TransitionReason::ManualRollback { reason: None },
+            )
+            .unwrap();
+        record.version = required.target_version().clone();
+        record.previous_version = None;
+        record.health = Default::default();
+        let response = ConnectorPinnedRollbackResponse {
+            connector_id: connector_id().to_string(),
+            state: record.state,
+            from_version: original.version.clone(),
+            to_version: record.version.clone(),
+            message: "verified test boundary".to_owned(),
+            registry_version: 7,
+            runtime_restored: true,
+            desired_state: crate::DesiredRuntimeState::Enabled,
+        };
+        let mismatched = RolloutRollbackRequired {
+            record: required.record.clone(),
+            target_version: required.target_version.clone(),
+            evidence: required.evidence.clone(),
+        };
+        let mut wrong_response = response.clone();
+        wrong_response.from_version = semver::Version::new(9, 0, 0);
+        assert!(controller
+            .complete_runtime_rollback(mismatched, record.clone(), &wrong_response)
+            .is_err());
+        assert!(controller.state.lock().unwrap().contains_key(&connector_id()));
+
+        let outcome = controller
+            .complete_runtime_rollback(*required, record, &response)
+            .unwrap();
+        assert_eq!(outcome.record.health.samples, 0);
+        assert_eq!(outcome.evidence.samples, 1);
+        assert_eq!(outcome.evidence.error_rate_bps, 10_000);
+        assert_eq!(outcome.evidence.failure_streak, 1);
+        assert_eq!(outcome.evidence.state_after, LifecycleState::RolledBack);
+        assert_eq!(outcome.audit_event.evidence_digest, outcome.evidence.digest());
+        assert!(!controller.state.lock().unwrap().contains_key(&connector_id()));
+        assert_eq!(
+            serde_json::to_value(lifecycle.get(&connector_id()).await.unwrap().unwrap()).unwrap(),
+            serde_json::to_value(original).unwrap(),
+            "completion builds evidence without saving the old deployment's record"
         );
     }
 
