@@ -106,6 +106,24 @@ struct StalledServer {
 
 impl StalledServer {
     fn start(send_headers: bool, cancel_after_request: Option<fcp_async_core::Cx>) -> Self {
+        Self::with_response(
+            send_headers.then(|| b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 1024\r\nConnection: close\r\n\r\n".to_vec()),
+            cancel_after_request,
+        )
+    }
+
+    fn with_response(
+        response: Option<Vec<u8>>,
+        cancel_after_request: Option<fcp_async_core::Cx>,
+    ) -> Self {
+        Self::with_response_lifetime(response, cancel_after_request, false)
+    }
+
+    fn with_response_lifetime(
+        response: Option<Vec<u8>>,
+        cancel_after_request: Option<fcp_async_core::Cx>,
+        close_after_response: bool,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind stalled server");
         let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
         listener.set_nonblocking(true).unwrap();
@@ -140,15 +158,15 @@ impl StalledServer {
                 request.extend_from_slice(&buffer[..count]);
                 assert!(request.len() <= 65536, "unexpected oversized test request");
             }
-            if send_headers {
-                socket
-                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 1024\r\nConnection: close\r\n\r\n")
-                    .expect("send headers without a body");
+            if let Some(response) = response {
+                socket.write_all(&response).expect("send partial response");
             }
             if let Some(cx) = cancel_after_request {
                 cx.set_cancel_requested(true);
             }
-            let _ = released.recv_timeout(Duration::from_secs(5));
+            if !close_after_response {
+                let _ = released.recv_timeout(Duration::from_secs(5));
+            }
         });
         Self {
             base_url,
@@ -301,6 +319,7 @@ async fn streaming_chat_tool_call_and_done_are_decoded() {
     );
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
+        .and(header("accept", "text/event-stream"))
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("content-type", "text/event-stream")
@@ -320,6 +339,175 @@ async fn streaming_chat_tool_call_and_done_are_decoded() {
 
     let content = collect_stream(stream).await.expect("stream should decode");
     assert_eq!(content, "hello");
+}
+
+#[fcp_async_core::runtime::test]
+async fn streaming_rejection_preserves_structured_provider_error_and_redaction() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(header("accept", "text/event-stream"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": {
+                "message": "Unsupported model; Bearer private-token",
+                "param": "model",
+                "code": "unsupported_model"
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let error = client(provider(&server, "fixture"), RateLimitPolicy::FailFast)
+        .chat_completions_stream(
+            &fcp_async_core::compatibility_cx(),
+            ChatCompletionsRequest::new("fixture", vec![ChatMessage::user_text("hello")]),
+        )
+        .await
+        .err()
+        .expect("provider should reject the stream");
+    assert!(matches!(
+        &error,
+        OpenAiError::InvalidRequest { message, param, code }
+            if message.contains("Unsupported model")
+                && param.as_deref() == Some("model")
+                && code.as_deref() == Some("unsupported_model")
+    ));
+    assert!(!format!("{error:?}").contains("private-token"));
+}
+
+#[fcp_async_core::runtime::test]
+async fn streaming_provider_error_type_can_trigger_one_bounded_retry() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(409)
+                .insert_header("retry-after", "0")
+                .set_body_json(json!({"error": {
+                    "type": "rate_limit_error", "message": "provider rate limit"
+                }})),
+        )
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("data: [DONE]\n\n"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let stream = client(provider(&server, "fixture"), RateLimitPolicy::WaitForever)
+        .chat_completions_stream(
+            &fcp_async_core::compatibility_cx(),
+            ChatCompletionsRequest::new("fixture", vec![ChatMessage::user_text("hello")]),
+        )
+        .await
+        .expect("body-based rate limit mapping should allow a retry");
+    assert!(collect_stream(stream).await.unwrap().is_empty());
+}
+
+#[fcp_async_core::runtime::test]
+async fn streaming_error_body_limit_preserves_status_without_parsing_a_prefix() {
+    let server = MockServer::start().await;
+    for (size, expected) in [(65536, "limited response"), (65537, "HTTP 401")] {
+        let mut body = json!({"error": {"message": "limited response"}}).to_string();
+        body.extend(std::iter::repeat_n(' ', size - body.len()));
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(401).set_body_string(body))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        let error = client(provider(&server, "fixture"), RateLimitPolicy::WaitForever)
+            .chat_completions_stream(
+                &fcp_async_core::compatibility_cx(),
+                ChatCompletionsRequest::new("fixture", vec![ChatMessage::user_text("hello")]),
+            )
+            .await
+            .err()
+            .expect("authentication rejection must survive the size cap");
+        assert!(matches!(error, OpenAiError::Authentication { message } if message == expected));
+    }
+}
+
+#[fcp_async_core::runtime::test]
+async fn streaming_chunked_error_body_is_bounded_without_waiting_for_eof() {
+    let mut response =
+        b"HTTP/1.1 403 Forbidden\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+            .to_vec();
+    response.extend_from_slice(b"10000\r\n");
+    response.extend(std::iter::repeat_n(b'x', 65536));
+    response.extend_from_slice(b"\r\n1\r\nx\r\n");
+    let server = StalledServer::with_response(Some(response), None);
+    let error = fcp_async_core::time::timeout(
+        Duration::from_secs(2),
+        client(server.provider(), RateLimitPolicy::FailFast).chat_completions_stream(
+            &fcp_async_core::compatibility_cx(),
+            ChatCompletionsRequest::new("fixture", vec![ChatMessage::user_text("hello")]),
+        ),
+    )
+    .await
+    .expect("body overflow must drop the socket before the stalled EOF")
+    .err()
+    .expect("oversized error response must preserve HTTP rejection");
+    assert!(matches!(error, OpenAiError::PermissionDenied { message } if message == "HTTP 403"));
+}
+
+#[fcp_async_core::runtime::test]
+async fn streaming_error_body_wait_honors_deadline_and_cancellation() {
+    for cancel in [false, true] {
+        let cx = fcp_async_core::Cx::for_testing();
+        let server = StalledServer::with_response(
+            Some(b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0\r\nContent-Length: 100\r\nConnection: close\r\n\r\n".to_vec()),
+            cancel.then(|| cx.clone()),
+        );
+        let error = client_with_timeout(
+            server.provider(),
+            RateLimitPolicy::WaitForever,
+            Duration::from_millis(200),
+        )
+        .chat_completions_stream(
+            &cx,
+            ChatCompletionsRequest::new("fixture", vec![ChatMessage::user_text("hello")]),
+        )
+        .await
+        .err()
+        .expect("a stalled error body cannot bypass the request budget");
+        cx.set_cancel_requested(false);
+        if cancel {
+            assert!(matches!(
+                error,
+                OpenAiError::Network(NetworkError::Cancelled { .. })
+            ));
+        } else {
+            assert!(matches!(
+                error,
+                OpenAiError::Network(NetworkError::DeadlineExceeded { .. })
+            ));
+        }
+        assert!(!error.is_retryable());
+    }
+}
+
+#[fcp_async_core::runtime::test]
+async fn streaming_incomplete_error_body_preserves_nonretryable_http_rejection() {
+    let server = StalledServer::with_response_lifetime(
+        Some(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n{\"error\":{\"message\":\"incomplete".to_vec()),
+        None,
+        true,
+    );
+    let error = client(server.provider(), RateLimitPolicy::WaitForever)
+        .chat_completions_stream(
+            &fcp_async_core::compatibility_cx(),
+            ChatCompletionsRequest::new("fixture", vec![ChatMessage::user_text("hello")]),
+        )
+        .await
+        .err()
+        .expect("a truncated error body cannot replace the known HTTP status");
+    assert!(matches!(&error, OpenAiError::Authentication { message } if message == "HTTP 401"));
+    assert!(!error.is_retryable());
 }
 
 #[fcp_async_core::runtime::test]

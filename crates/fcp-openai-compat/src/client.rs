@@ -35,6 +35,7 @@ const AUTHORIZATION_HEADER: &str = "Authorization";
 const CONTENT_TYPE_HEADER: &str = "Content-Type";
 const JSON_CONTENT_TYPE: &str = "application/json";
 const USER_AGENT_HEADER: &str = "User-Agent";
+const MAX_STREAM_ERROR_BODY_BYTES: usize = 64 * 1024;
 
 static DEFAULT_ERROR_MAPPER: DefaultOpenAiErrorMapper = DefaultOpenAiErrorMapper;
 
@@ -135,7 +136,11 @@ impl ErrorMapper for DefaultOpenAiErrorMapper {
         body: &[u8],
         rate_limits: RateLimitSnapshot,
     ) -> OpenAiError {
-        let body_text = truncate_response_body(body);
+        // Redact before truncating: cutting a JSON object first can turn it into
+        // plain text and expose credentials that the structured redactor masks.
+        let body_text = truncate_response_body(
+            redact_sensitive_text(&String::from_utf8_lossy(body)).as_bytes(),
+        );
         let parsed = serde_json::from_slice::<ProviderErrorEnvelope>(body)
             .ok()
             .and_then(|envelope| envelope.error);
@@ -150,11 +155,18 @@ impl ErrorMapper for DefaultOpenAiErrorMapper {
                     body_text.clone()
                 }
             });
+        let message = redact_sensitive_text(&message);
         let error_type = parsed
             .as_ref()
             .and_then(|error| error.error_type.as_deref());
-        let param = parsed.as_ref().and_then(|error| error.param.clone());
-        let code = parsed.as_ref().and_then(|error| error.code.clone());
+        let param = parsed
+            .as_ref()
+            .and_then(|error| error.param.as_deref())
+            .map(redact_sensitive_text);
+        let code = parsed
+            .as_ref()
+            .and_then(|error| error.code.as_deref())
+            .map(redact_sensitive_text);
 
         match status {
             400 => OpenAiError::InvalidRequest {
@@ -544,7 +556,7 @@ impl<P: OpenAiCompatProvider> OpenAiCompatClient<P> {
                     cx,
                     Method::Post,
                     &url,
-                    self.headers_for(model),
+                    self.streaming_headers_for(model),
                     body_bytes.clone(),
                 ))
                 .await?
@@ -554,16 +566,22 @@ impl<P: OpenAiCompatProvider> OpenAiCompatClient<P> {
                     &response.head.headers,
                     self.provider.rate_limit_overrides().as_ref(),
                 );
+                // A streaming request still receives an ordinary error body
+                // before any SSE stream exists. Give provider-specific mappers
+                // the same structured response as the JSON request path, under
+                // the original operation deadline and a small allocation cap.
+                let body = budget.run(read_stream_error_body(response.body)).await?;
                 let error = self.provider.error_mapper().map_response(
                     self.provider.provider_name(),
                     response.head.status,
                     &response.head.headers,
-                    response.head.reason.as_bytes(),
+                    body.as_deref().unwrap_or_default(),
                     rate_limits,
                 );
-                // No response stream has been exposed. Drop the rejected body
-                // before any backoff so it cannot retain a live connection.
-                drop(response);
+                // The body (and its connection) has already been dropped before
+                // backoff. An oversized or incomplete error body falls back to
+                // the received HTTP status and retry headers, never a
+                // truncated JSON prefix or a newly retryable transport error.
                 if !attempted_rate_limit_retry {
                     if let Some(delay) =
                         retry_delay_for_policy(&error, self.config.rate_limit_policy)
@@ -602,9 +620,36 @@ impl<P: OpenAiCompatProvider> OpenAiCompatClient<P> {
         request.headers
     }
 
+    fn streaming_headers_for(&self, model: &str) -> HeaderList {
+        let mut headers = self.headers_for(model);
+        headers.retain(|(name, _)| !name.eq_ignore_ascii_case(ACCEPT_HEADER));
+        headers.push((ACCEPT_HEADER.to_owned(), "text/event-stream".to_owned()));
+        headers
+    }
+
     fn url(&self, path: &str) -> String {
         format!("{}{}", self.provider.base_url().trim_end_matches('/'), path)
     }
+}
+
+async fn read_stream_error_body(body: ClientIncomingBody<ClientIo>) -> Option<Vec<u8>> {
+    let mut body = std::pin::pin!(body);
+    let mut bytes = Vec::with_capacity(MAX_STREAM_ERROR_BODY_BYTES);
+    while let Some(frame) = std::future::poll_fn(|cx| body.as_mut().poll_frame(cx)).await {
+        let frame = frame.ok()?;
+        if let Some(mut data) = frame.into_data() {
+            if data.remaining() > MAX_STREAM_ERROR_BODY_BYTES.saturating_sub(bytes.len()) {
+                return None;
+            }
+            while data.has_remaining() {
+                let chunk = data.chunk();
+                let length = chunk.len();
+                bytes.extend_from_slice(chunk);
+                data.advance(length);
+            }
+        }
+    }
+    Some(bytes)
 }
 
 fn retry_delay_for_policy(error: &OpenAiError, policy: RateLimitPolicy) -> Option<Duration> {
@@ -761,6 +806,18 @@ mod tests {
         fn provider_name(&self) -> &'static str {
             "test"
         }
+
+        fn extra_request_headers(&self, model: &str) -> HeaderList {
+            if model == "custom-accept" {
+                vec![
+                    ("Accept".into(), "application/json".into()),
+                    ("accept".into(), "application/problem+json".into()),
+                    ("x-provider-model".into(), model.into()),
+                ]
+            } else {
+                Vec::new()
+            }
+        }
     }
 
     #[test]
@@ -791,6 +848,33 @@ mod tests {
     }
 
     #[test]
+    fn streaming_headers_replace_all_provider_accept_values() {
+        let client = OpenAiCompatClient::new(
+            TestProvider {
+                base_url: "https://example.invalid/v1".into(),
+            },
+            fcp_async_core::http::HttpClientBuilder::new().build(),
+        );
+        let headers = client.streaming_headers_for("custom-accept");
+        let accepts: Vec<_> = headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case(ACCEPT_HEADER))
+            .map(|(_, value)| value.as_str())
+            .collect();
+        assert_eq!(accepts, ["text/event-stream"]);
+        assert!(
+            headers
+                .iter()
+                .any(|(name, value)| name == "x-provider-model" && value == "custom-accept")
+        );
+        assert!(
+            headers
+                .iter()
+                .any(|(name, value)| name == AUTHORIZATION_HEADER && value == "Bearer test-token")
+        );
+    }
+
+    #[test]
     fn default_error_mapper_maps_provider_taxonomy() {
         let body = json!({
             "error": {
@@ -816,6 +900,48 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn error_mapper_redacts_structured_fields_before_returning_them() {
+        let body = json!({
+            "error": {
+                "message": "rejected Bearer message-secret",
+                "param": "Bearer parameter-secret",
+                "code": "Bearer code-secret"
+            }
+        })
+        .to_string();
+        let error = DefaultOpenAiErrorMapper.map_response(
+            "test",
+            400,
+            &Vec::new(),
+            body.as_bytes(),
+            RateLimitSnapshot::default(),
+        );
+        let debug = format!("{error:?}");
+        for secret in ["message-secret", "parameter-secret", "code-secret"] {
+            assert!(
+                !debug.contains(secret),
+                "structured errors must be redacted"
+            );
+        }
+        assert!(matches!(error, OpenAiError::InvalidRequest { .. }));
+    }
+
+    #[test]
+    fn error_mapper_redacts_json_before_truncating_its_fallback() {
+        let body =
+            json!({"api_key": "private-provider-key", "detail": "x".repeat(8192)}).to_string();
+        let error = DefaultOpenAiErrorMapper.map_response(
+            "test",
+            418,
+            &Vec::new(),
+            body.as_bytes(),
+            RateLimitSnapshot::default(),
+        );
+        assert!(!format!("{error:?}").contains("private-provider-key"));
+        assert!(matches!(error, OpenAiError::Provider { body, .. } if body.ends_with('…')));
     }
 
     #[test]
