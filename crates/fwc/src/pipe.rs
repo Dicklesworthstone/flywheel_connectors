@@ -568,9 +568,17 @@ pub struct PlannedPipelineStep {
     pub on_error: PipelineErrorPolicy,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trigger: Option<PipelineTrigger>,
+    /// Authored input evaluated exactly once at execution. Parameter values in
+    /// the rendered preview are data and must never become new templates.
+    pub input_template: Value,
+    /// Parameter-rendered preview for inspection, not an executable template.
     pub input: Value,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub unresolved_templates: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub condition_template: Option<String>,
+    /// Parameter-rendered preview; execution uses `condition_template` so a
+    /// string parameter cannot become condition syntax.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub condition: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -1669,7 +1677,7 @@ pub fn build_pipeline_plan(
             .get(step_id.as_str())
             .ok_or_else(|| format!("pipeline step `{step_id}` disappeared during planning"))?;
         let input = toml_to_json(&step.input)?;
-        let rendered_input = render_value_with_params(input, &param_values);
+        let rendered_input = render_value_with_params(input.clone(), &param_values);
         let (condition, unresolved_condition_templates) =
             step.condition
                 .as_deref()
@@ -1688,8 +1696,10 @@ pub fn build_pipeline_plan(
             trigger: triggers
                 .get(step.id.as_str())
                 .map(|source| PipelineTrigger::OnError((*source).to_owned())),
+            input_template: input,
             input: rendered_input.value,
             unresolved_templates: rendered_input.unresolved,
+            condition_template: step.condition.clone(),
             condition,
             unresolved_condition_templates,
         });
@@ -4000,6 +4010,67 @@ default = 1
 
         assert_eq!(plan.steps[0].input["owner"], "octocat");
         assert_eq!(plan.steps[0].input["pull_number"], 1);
+    }
+
+    #[test]
+    fn build_pipeline_plan_binds_authored_templates_even_when_previews_match() {
+        let definition = parse_pipeline_definition(
+            r#"
+[pipeline]
+name = "literal-parameter"
+
+[[steps]]
+id = "fetch"
+operation = "github.search_issues"
+input = { query = "{{params.query}}" }
+condition = "{{params.enabled}}"
+
+[params.query]
+type = "string"
+default = "{{steps.previous.output.secret}}"
+
+[params.enabled]
+type = "string"
+default = "true"
+"#,
+        )
+        .unwrap();
+        let params = bind_pipeline_params(&definition, &[]).unwrap();
+        let plan = build_pipeline_plan(&definition, &params).unwrap();
+        assert_eq!(plan.steps[0].input["query"], params["query"].value);
+        assert_eq!(plan.steps[0].input_template["query"], "{{params.query}}");
+        assert_eq!(plan.steps[0].condition.as_deref(), Some("true"));
+        assert_eq!(
+            plan.steps[0].condition_template.as_deref(),
+            Some("{{params.enabled}}")
+        );
+
+        // Identical previews can describe different effects. A checkpoint must
+        // bind the authored expressions, not just the substituted preview.
+        let mut changed = definition.clone();
+        changed.steps[0].input = toml::Value::try_from(&plan.steps[0].input).unwrap();
+        changed.steps[0].condition = plan.steps[0].condition.clone();
+        let other = build_pipeline_plan(&changed, &params).unwrap();
+        assert_eq!(plan.steps[0].input, other.steps[0].input);
+        assert_eq!(plan.steps[0].condition, other.steps[0].condition);
+        assert_ne!(
+            checkpoint::RunBinding::new(
+                "pipeline",
+                &plan,
+                "http://127.0.0.1:8080",
+                "z:work",
+                &plan.execution_order,
+            )
+            .unwrap(),
+            checkpoint::RunBinding::new(
+                "pipeline",
+                &other,
+                "http://127.0.0.1:8080",
+                "z:work",
+                &other.execution_order,
+            )
+            .unwrap(),
+        );
     }
 
     #[test]

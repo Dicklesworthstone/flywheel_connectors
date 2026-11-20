@@ -31915,8 +31915,37 @@ fn pipeline_filter_expression(expr: &str) -> String {
     }
 }
 
+/// Preserve the planner's simple parameter paths, whose object keys may contain
+/// punctuation that jq would otherwise interpret as operators. Only path
+/// components enter the filter; parameter values stay in the execution context.
+fn pipeline_parameter_filter(expr: &str, context: &Value) -> Option<String> {
+    let path = expr.trim().strip_prefix('.').unwrap_or(expr.trim());
+    if !path.starts_with("params.") || path.contains('|') || path.contains(' ') {
+        return None;
+    }
+    let mut current = context;
+    let mut components = Vec::new();
+    for segment in path.split('.').filter(|segment| !segment.is_empty()) {
+        if let Some((key, rest)) = segment.split_once('[') {
+            if !key.is_empty() {
+                current = current.get(key)?;
+                components.push(Value::String(key.to_owned()));
+            }
+            let index: usize = rest.strip_suffix(']')?.parse().ok()?;
+            current = current.as_array()?.get(index)?;
+            components.push(Value::from(index));
+        } else {
+            current = current.get(segment)?;
+            components.push(Value::String(segment.to_owned()));
+        }
+    }
+    Some(format!("getpath({})", Value::Array(components)))
+}
+
 fn pipeline_eval_expression(context: &Value, expr: &str) -> Result<Value> {
-    render::apply_extract_filter(context, &pipeline_filter_expression(expr))
+    let filter = pipeline_parameter_filter(expr, context)
+        .unwrap_or_else(|| pipeline_filter_expression(expr));
+    render::apply_extract_filter(context, &filter)
 }
 
 fn pipeline_value_to_text(value: &Value) -> Result<String> {
@@ -31930,8 +31959,9 @@ fn pipeline_value_to_text(value: &Value) -> Result<String> {
 }
 
 fn pipeline_exact_placeholder_expr(template: &str) -> Option<&str> {
-    let trimmed = template.trim();
-    let inner = trimmed.strip_prefix("{{")?.strip_suffix("}}")?;
+    // Surrounding whitespace is authored text, matching the planning preview.
+    // Only a placeholder that occupies the entire string preserves JSON types.
+    let inner = template.strip_prefix("{{")?.strip_suffix("}}")?;
     (!inner.contains("{{") && !inner.contains("}}")).then_some(inner.trim())
 }
 
@@ -31986,22 +32016,112 @@ fn pipeline_render_value(value: &Value, context: &Value) -> Result<Value> {
     }
 }
 
-fn pipeline_condition_filter(template: &str) -> Result<String> {
-    let mut rendered = String::new();
+fn pipeline_condition_filter(template: &str, context: &Value) -> Result<String> {
+    #[derive(Clone, Copy)]
+    enum Scope {
+        Expression(usize),
+        String,
+        Escape,
+        Comment,
+    }
+
+    if !template.contains("{{") {
+        return Ok(template.to_owned());
+    }
+
+    // Each placeholder starts from the workflow context, even when surrounding
+    // jq pipes or map calls change their current input. Keep evaluation in jq
+    // so authored lexical variables and short-circuiting still work.
+    let mut root_variable = "$__fcp_pipeline_context".to_owned();
+    while template.contains(&root_variable) {
+        root_variable.push('_');
+    }
+    let mut rendered = format!(". as {root_variable} | ");
     let mut cursor = 0usize;
+    // Track quoted strings and native jq string interpolations separately:
+    // a placeholder in `"text {{params.x}}"` is text, while one in
+    // `"\({{params.x}})"` is already inside an expression.
+    let mut scopes = vec![Scope::Expression(0)];
 
     while let Some(relative_start) = template[cursor..].find("{{") {
         let start = cursor + relative_start;
-        rendered.push_str(&template[cursor..start]);
+        let literal = &template[cursor..start];
+        for (offset, character) in literal.char_indices() {
+            match scopes.last().copied().unwrap_or(Scope::Expression(0)) {
+                Scope::Expression(depth) => match character {
+                    '"' => scopes.push(Scope::String),
+                    '#' => scopes.push(Scope::Comment),
+                    ')' if depth == 1 && scopes.len() > 1 => {
+                        scopes.pop();
+                    }
+                    '(' | ')' => {
+                        if let Some(scope) = scopes.last_mut() {
+                            *scope = Scope::Expression(if character == '(' {
+                                depth.saturating_add(1)
+                            } else {
+                                depth.saturating_sub(1)
+                            });
+                        }
+                    }
+                    _ => {}
+                },
+                Scope::String => match character {
+                    '"' => {
+                        scopes.pop();
+                    }
+                    '\\' => scopes.push(Scope::Escape),
+                    _ => {}
+                },
+                Scope::Escape => {
+                    scopes.pop();
+                    if character == '(' {
+                        scopes.push(Scope::Expression(1));
+                    }
+                }
+                Scope::Comment => {
+                    if character == '\n' {
+                        // Jaq continues a comment across LF or CRLF when the
+                        // preceding line ends in an odd number of backslashes.
+                        let before = &template[..cursor + offset];
+                        let before = before.strip_suffix('\r').unwrap_or(before);
+                        if before
+                            .bytes()
+                            .rev()
+                            .take_while(|byte| *byte == b'\\')
+                            .count()
+                            .is_multiple_of(2)
+                        {
+                            scopes.pop();
+                        }
+                    }
+                }
+            }
+        }
+        rendered.push_str(literal);
         let search_start = start + 2;
         let Some(relative_end) = template[search_start..].find("}}") else {
             bail!("unterminated pipeline condition placeholder in `{template}`");
         };
         let end = search_start + relative_end;
         let expr = template[search_start..end].trim();
-        rendered.push('(');
-        rendered.push_str(&pipeline_filter_expression(expr));
-        rendered.push(')');
+        anyhow::ensure!(
+            !matches!(scopes.last(), Some(Scope::Escape)),
+            "a pipeline condition placeholder cannot follow an unpaired string escape"
+        );
+        // Preserve authored quoted comparisons without substituting parameter
+        // text into the program. Jq string interpolation renders the value as
+        // data even when it contains quotes, operators, or more placeholders.
+        if matches!(scopes.last(), Some(Scope::String)) {
+            rendered.push_str("\\(");
+        } else {
+            rendered.push('(');
+        }
+        let filter = pipeline_parameter_filter(expr, context)
+            .unwrap_or_else(|| pipeline_filter_expression(expr));
+        rendered.push_str(&root_variable);
+        rendered.push_str(" | (");
+        rendered.push_str(&filter);
+        rendered.push_str("))");
         cursor = end + 2;
     }
 
@@ -32010,7 +32130,8 @@ fn pipeline_condition_filter(template: &str) -> Result<String> {
 }
 
 fn pipeline_evaluate_condition(template: &str, context: &Value) -> Result<bool> {
-    let value = render::apply_extract_filter(context, &pipeline_condition_filter(template)?)?;
+    let value =
+        render::apply_extract_filter(context, &pipeline_condition_filter(template, context)?)?;
     match value {
         Value::Bool(flag) => Ok(flag),
         Value::Null => Ok(false),
@@ -32028,9 +32149,9 @@ fn pipeline_value_uses_dynamic_outputs(value: &Value) -> bool {
 }
 
 fn pipeline_step_uses_dynamic_outputs(step: &pipe::PlannedPipelineStep) -> bool {
-    pipeline_value_uses_dynamic_outputs(&step.input)
+    pipeline_value_uses_dynamic_outputs(&step.input_template)
         || step
-            .condition
+            .condition_template
             .as_deref()
             .is_some_and(|condition| condition.contains("{{steps."))
 }
@@ -32603,7 +32724,7 @@ fn execute_live_pipeline_plan(
 
         let context = pipeline_execution_context(&plan.params, &step_outputs, &step_errors);
         let condition_evaluation = match step
-            .condition
+            .condition_template
             .as_ref()
             .map(|condition| pipeline_evaluate_condition(condition, &context))
             .transpose()
@@ -32655,14 +32776,14 @@ fn execute_live_pipeline_plan(
                 "reason": "condition-false",
                 "depends_on": &step.depends_on,
                 "condition": {
-                    "template": &step.condition,
+                    "template": &step.condition_template,
                     "allowed": false,
                 },
             }));
             continue;
         }
 
-        let rendered_input = match pipeline_render_value(&step.input, &context) {
+        let rendered_input = match pipeline_render_value(&step.input_template, &context) {
             Ok(input) => input,
             Err(_) => {
                 error_steps += 1;
@@ -32721,7 +32842,7 @@ fn execute_live_pipeline_plan(
                 "depends_on": &step.depends_on,
                 "condition": condition_evaluation.map(|allowed| {
                     json!({
-                        "template": &step.condition,
+                        "template": &step.condition_template,
                         "allowed": allowed,
                     })
                 }),
@@ -32939,7 +33060,7 @@ fn execute_live_pipeline_plan(
                     "depends_on": &step.depends_on,
                     "condition": condition_evaluation.map(|allowed| {
                         json!({
-                            "template": &step.condition,
+                            "template": &step.condition_template,
                             "allowed": allowed,
                         })
                     }),
@@ -32985,7 +33106,7 @@ fn execute_live_pipeline_plan(
                 "depends_on": &step.depends_on,
                 "condition": condition_evaluation.map(|allowed| {
                     json!({
-                        "template": &step.condition,
+                        "template": &step.condition_template,
                         "allowed": allowed,
                     })
                 }),
@@ -33243,7 +33364,7 @@ fn execute_live_pipeline_plan(
                         "depends_on": &step.depends_on,
                         "condition": condition_evaluation.map(|allowed| {
                             json!({
-                                "template": &step.condition,
+                                "template": &step.condition_template,
                                 "allowed": allowed,
                             })
                         }),
@@ -33307,7 +33428,7 @@ fn execute_live_pipeline_plan(
                         "depends_on": &step.depends_on,
                         "condition": condition_evaluation.map(|allowed| {
                             json!({
-                                "template": &step.condition,
+                                "template": &step.condition_template,
                                 "allowed": allowed,
                             })
                         }),
@@ -54343,6 +54464,385 @@ deny_ptrace = true
         let (exit_code, payload) = execute_json(&invalid);
         assert_eq!(exit_code, CliExitCode::Validation.into(), "{payload}");
         assert_eq!(payload["error"]["type"], "invalid-mapping");
+    }
+
+    #[test]
+    fn pipeline_templates_substitute_parameter_and_output_values_exactly_once() {
+        let definition = super::pipe::parse_pipeline_definition(
+            r#"
+[pipeline]
+name = "literal-values"
+
+[[steps]]
+id = "consume"
+operation = "github.search_issues"
+input = { exact = "{{params.text}}", embedded = "before {{params.text}} after", nested = "{{params.object}}", list = "{{params.array}}", count = "{{params.count}}", spaced = " {{params.count}} ", source = "{{steps.previous.output}}", fallback = "{{params.absent // .params.text}}", error = "{{steps.previous.error.message}}" }
+condition = "{{params.enabled}} and {{params.count}} > 0"
+
+[params.text]
+type = "string"
+default = "{{steps.previous.output.secret}}"
+
+[params.object]
+type = "object"
+default = { nested = { literal = "{{params.count}}" } }
+
+[params.array]
+type = "array"
+default = ["{{params.count}}", { literal = "{{steps.previous.output.secret}}" }]
+
+[params.count]
+type = "integer"
+default = 7
+
+[params.enabled]
+type = "boolean"
+default = true
+"#,
+        )
+        .unwrap();
+        let params = super::pipe::bind_pipeline_params(&definition, &[]).unwrap();
+        let plan = super::pipe::build_pipeline_plan(&definition, &params).unwrap();
+        let source = json!({"secret": "private-value", "literal": "{{params.count}}"});
+        let error = json!({"message": "{{params.count}}"});
+        let context = super::pipeline_execution_context(
+            &params,
+            &StdBTreeMap::from([("previous".to_owned(), source.clone())]),
+            &StdBTreeMap::from([("previous".to_owned(), error)]),
+        );
+        let step = &plan.steps[0];
+        let input = super::pipeline_render_value(&step.input_template, &context).unwrap();
+        assert_eq!(input["exact"], params["text"].value);
+        assert_eq!(
+            input["embedded"],
+            "before {{steps.previous.output.secret}} after"
+        );
+        assert_eq!(input["nested"], params["object"].value);
+        assert_eq!(input["list"], params["array"].value);
+        assert_eq!(input["count"], 7);
+        assert_eq!(input["spaced"], " 7 ");
+        assert_eq!(input["source"], source);
+        assert_eq!(input["fallback"], params["text"].value);
+        assert_eq!(input["error"], "{{params.count}}");
+        assert!(
+            super::pipeline_evaluate_condition(
+                step.condition_template.as_deref().unwrap(),
+                &context,
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn pipeline_conditions_keep_quoted_parameter_values_out_of_program_syntax() {
+        let context = json!({
+            "params": {
+                "status": "OPEN",
+                "injected": "\" or true or \"",
+                "literal": "{{params.status}}",
+                "count": 7,
+                "numbers": [7, 8],
+                "invalid_number": "not-a-number",
+            },
+        });
+        for expression in [
+            r#""{{params.status}}" == "OPEN""#,
+            r#""before {{params.status}} after" == "before OPEN after""#,
+            r#""say \"{{params.status}}\"" == "say \"OPEN\"""#,
+            r#""\({{params.status}})" == "OPEN""#,
+            r#""\("prefix " + {{params.status}})" == "prefix OPEN""#,
+            r#""\("prefix {{params.status}}")" == "prefix OPEN""#,
+            "# A quote in a comment: \"\n{{params.status}} == \"OPEN\"",
+            "{{params.count}} | . == {{params.count}}",
+            "{{params.numbers}} | map(. >= {{params.count}}) | all",
+            r#""moved" | "{{params.status}}" == "OPEN""#,
+            r#""moved" | "\({{params.status}})" == "OPEN""#,
+            "0 as $index | {{params.numbers[$index]}} == 7",
+            "false as $__fcp_pipeline_context | false as $__fcp_pipeline_context_ | {{params.count}} | . == {{params.count}} and ($__fcp_pipeline_context == false) and ($__fcp_pipeline_context_ == false)",
+            "# {{params.invalid_number | tonumber}}\ntrue",
+            "{{params.count}} == 7 # trailing authored comment",
+        ] {
+            assert!(
+                super::pipeline_evaluate_condition(expression, &context).unwrap(),
+                "{expression}"
+            );
+        }
+        assert!(
+            !super::pipeline_evaluate_condition(r#""{{params.injected}}" == "OPEN""#, &context,)
+                .unwrap()
+        );
+        assert!(
+            !super::pipeline_evaluate_condition(r#""{{params.literal}}" == "OPEN""#, &context,)
+                .unwrap()
+        );
+        assert!(
+            !super::pipeline_evaluate_condition(
+                "false and {{params.invalid_number | tonumber}}",
+                &context,
+            )
+            .unwrap()
+        );
+        assert!(
+            super::pipeline_condition_filter(r#""\{{params.status}}" == "OPEN""#, &context)
+                .is_err()
+        );
+        for value in ["true", "false or true", "{{params.status}}"] {
+            let context = json!({"params": {"enabled": value}});
+            assert!(
+                super::pipeline_evaluate_condition("{{params.enabled}}", &context).is_err(),
+                "string parameter became a condition program: {value}"
+            );
+        }
+        for newline in ["\n", "\r\n"] {
+            for backslashes in [1, 3] {
+                let expression = format!(
+                    "# continued {}{newline}\"ignored quote{newline}{{{{params.count}}}} == 7",
+                    "\\".repeat(backslashes),
+                );
+                assert!(
+                    super::pipeline_evaluate_condition(&expression, &context).unwrap(),
+                    "{expression:?}"
+                );
+            }
+            for backslashes in [0, 2] {
+                let expression = format!(
+                    "# ended {}{newline}\"{{{{params.status}}}}\" == \"OPEN\"",
+                    "\\".repeat(backslashes),
+                );
+                assert!(
+                    super::pipeline_evaluate_condition(&expression, &context).unwrap(),
+                    "{expression:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pipeline_templates_preserve_literal_parameter_path_keys() {
+        let definition = super::pipe::parse_pipeline_definition(
+            r#"
+[pipeline]
+name = "literal-keys"
+
+[[steps]]
+id = "consume"
+operation = "github.search_issues"
+input = { query = "{{params.query-text}}", nested = "{{params.settings.nested-key[0].a/b}}", unicode = "{{params.日本語}}", quoted = '{{params.settings.a"b}}' }
+condition = '"{{params.query-text}}" == "{{params.settings.nested-key[0].a/b}}"'
+
+[params.query-text]
+type = "string"
+default = "{{params.secret}}"
+
+[params.settings]
+type = "object"
+default = { nested-key = [{ "a/b" = "{{params.secret}}" }], 'a"b' = 'literal\(1+1)' }
+
+[params."日本語"]
+type = "string"
+default = "literal"
+"#,
+        )
+        .unwrap();
+        let params = super::pipe::bind_pipeline_params(&definition, &[]).unwrap();
+        let plan = super::pipe::build_pipeline_plan(&definition, &params).unwrap();
+        let context =
+            super::pipeline_execution_context(&params, &StdBTreeMap::new(), &StdBTreeMap::new());
+        let step = &plan.steps[0];
+        let rendered = super::pipeline_render_value(&step.input_template, &context).unwrap();
+        assert_eq!(rendered, step.input);
+        assert_eq!(rendered["query"], "{{params.secret}}");
+        assert_eq!(rendered["nested"], "{{params.secret}}");
+        assert_eq!(rendered["unicode"], "literal");
+        assert_eq!(rendered["quoted"], r"literal\(1+1)");
+        assert!(
+            super::pipeline_evaluate_condition(
+                step.condition_template.as_deref().unwrap(),
+                &context,
+            )
+            .unwrap()
+        );
+        // Arithmetic and jq bracket paths still work when the simple path
+        // does not name a bound value.
+        let context = json!({"params": {"count": 7, "a.b": "dotted-key"}});
+        assert_eq!(
+            super::pipeline_eval_expression(&context, "params.count-1").unwrap(),
+            6
+        );
+        assert_eq!(
+            super::pipeline_eval_expression(&context, r#"params["a.b"]"#).unwrap(),
+            "dotted-key"
+        );
+    }
+
+    #[test]
+    fn recipe_templates_keep_parameter_and_provider_data_literal() {
+        let recipe = super::pipe::load_builtin_recipe("github-pr-review-notify").unwrap();
+        let params = super::pipe::bind_pipeline_params(
+            &recipe.definition,
+            &[
+                "owner={{params.repo}}".to_owned(),
+                "channel={{steps.fetch.output.secret}}".to_owned(),
+            ],
+        )
+        .unwrap();
+        let plan = super::pipe::build_pipeline_plan(&recipe.definition, &params).unwrap();
+        let context = super::pipeline_execution_context(
+            &params,
+            &StdBTreeMap::from([(
+                "fetch".to_owned(),
+                json!({"pull_request": {"title": "Provider {{params.owner}} text"}}),
+            )]),
+            &StdBTreeMap::new(),
+        );
+        let fetch = super::pipeline_render_value(&plan.steps[0].input_template, &context).unwrap();
+        let notify = super::pipeline_render_value(&plan.steps[1].input_template, &context).unwrap();
+        assert_eq!(fetch["owner"], "{{params.repo}}");
+        assert_eq!(notify["channel"], "{{steps.fetch.output.secret}}");
+        let text = notify["text"].as_str().unwrap();
+        assert!(text.contains("{{params.repo}}/"));
+        assert!(text.ends_with("Provider {{params.owner}} text"));
+    }
+
+    #[test]
+    fn execute_pipeline_keeps_parameter_templates_literal_in_live_effect_inputs() {
+        for mode in ["run", "dry-run"] {
+            let tempdir = TempDir::new().unwrap();
+            let _history = super::install_test_history_path(tempdir.path().join("history.jsonl"));
+            let path = tempdir.path().join("literal-parameters.toml");
+            fs::write(
+                &path,
+                r#"
+[pipeline]
+name = "literal-parameters"
+
+[[steps]]
+id = "fetch"
+operation = "github.search_issues"
+input = { query = "first" }
+
+[[steps]]
+id = "consume"
+operation = "github.search_issues"
+depends_on = ["fetch"]
+input = { query = "message={{params.message}}; title={{steps.fetch.output.title}}" }
+condition = "{{params.enabled}}"
+
+[params.message]
+type = "string"
+default = "{{steps.fetch.output.secret}}"
+
+[params.enabled]
+type = "boolean"
+default = true
+"#,
+            )
+            .unwrap();
+            let mut routes = pipe_mock_catalog(false);
+            routes.truncate(2);
+            routes.extend([
+                (
+                    "POST /rpc/preflight".to_owned(),
+                    mock_preflight_response_json(true),
+                ),
+                (
+                    "POST /rpc/invoke".to_owned(),
+                    mock_invoke_response_json(json!({
+                        "title": "visible-result",
+                        "secret": "private-value",
+                    })),
+                ),
+                (
+                    "POST /rpc/preflight".to_owned(),
+                    mock_preflight_response_json(true),
+                ),
+                (
+                    "POST /rpc/invoke".to_owned(),
+                    mock_invoke_response_json(json!({"title": "complete"})),
+                ),
+            ]);
+            let (host, server, request_log) = spawn_mock_host_sequence_with_body_log(routes);
+            let token = test_capability_token_arg();
+            let (exit_code, payload) = execute_json(&[
+                "fwc",
+                "--json",
+                "--host",
+                &host,
+                "pipeline",
+                mode,
+                &path.display().to_string(),
+                "--capability-token",
+                &token,
+            ]);
+            server.join().unwrap();
+            assert_eq!(exit_code, CliExitCode::Success.into(), "{mode}: {payload}");
+            let requests = request_log.lock().unwrap();
+            assert_eq!(requests.len(), 6);
+            let preflight: Value = serde_json::from_str(&requests[4].1).unwrap();
+            let invocation: Value = serde_json::from_str(&requests[5].1).unwrap();
+            let expected = "message={{steps.fetch.output.secret}}; title=visible-result";
+            assert_eq!(preflight["params"]["query"], expected);
+            assert_eq!(invocation["input"]["query"], expected);
+            assert_eq!(preflight["request_id"], invocation["id"]);
+            assert!(!requests[5].1.contains("private-value"));
+            assert_eq!(payload["execution"]["steps"][1]["input"]["query"], expected);
+        }
+    }
+
+    #[test]
+    fn execute_pipeline_refuses_string_parameters_as_condition_programs() {
+        for expression in ["true", "false or true", "{{params.other}}"] {
+            let tempdir = TempDir::new().unwrap();
+            let path = tempdir.path().join("literal-condition.toml");
+            fs::write(
+                &path,
+                r#"
+[pipeline]
+name = "literal-condition"
+
+[[steps]]
+id = "guarded"
+operation = "github.search_issues"
+input = { query = "must-not-run" }
+condition = "{{params.enabled}}"
+
+[params.enabled]
+type = "string"
+required = true
+"#,
+            )
+            .unwrap();
+            let mut routes = pipe_mock_catalog(false);
+            routes.truncate(2);
+            let (host, server, request_log) = spawn_mock_host_sequence_with_body_log(routes);
+            let token = test_capability_token_arg();
+            let binding = format!("enabled={}", serde_json::to_string(expression).unwrap());
+            let (exit_code, payload) = execute_json(&[
+                "fwc",
+                "--json",
+                "--host",
+                &host,
+                "pipeline",
+                "run",
+                &path.display().to_string(),
+                "--param",
+                &binding,
+                "--capability-token",
+                &token,
+            ]);
+            server.join().unwrap();
+            assert_eq!(
+                exit_code,
+                CliExitCode::Validation.into(),
+                "{expression}: {payload}"
+            );
+            assert_eq!(payload["error"]["type"], "pipeline-condition-failed");
+            assert_eq!(
+                payload["execution"]["steps"][0]["reason"],
+                "invalid-condition"
+            );
+            assert_eq!(request_log.lock().unwrap().len(), 2);
+        }
     }
 
     #[test]
