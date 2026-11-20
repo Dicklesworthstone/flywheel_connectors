@@ -147,7 +147,7 @@ use fcp_provider_auth::{
     OAuthRefreshTokenTransport, OAuthTokens, TokenRefreshActor, TokenRefreshDecision,
     TokenRefreshOutcome, TokenRefreshPolicy,
 };
-use fcp_ratelimit::{BackpressureThresholds, RateLimiter, TokenBucket};
+use fcp_ratelimit::{BackpressureThresholds, RateLimiter, TokenBucket, TokenBucketRegistry};
 use fcp_sandbox::{
     CredentialInjector, DefaultTlsVerifier, EgressError, EgressGuard, EgressHttpRequest,
     EgressTcpConnectRequest, HttpHeader, NoOpCredentialInjector, TlsVerifier, WasiConfig,
@@ -3187,21 +3187,55 @@ struct PreparedRegistryApply {
     launch_fences: Vec<fcp_host::ConnectorExecutionFence>,
 }
 
+/// Fixed-size, domain-separated identities bound both bucket count and retained
+/// key memory. Length prefixes keep distinct scopes unambiguous without storing
+/// raw principal identifiers for the lifetime of the host.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct HostRateLimitBucketKey {
-    connector_id: String,
-    zone_id: String,
-    pool_id: String,
-    scope: String,
-    principal_id: Option<String>,
-    window_nanos: u128,
-    requests: u32,
-    burst: Option<u32>,
+struct HostRateLimitBucketKey([u8; 32]);
+
+impl HostRateLimitBucketKey {
+    fn new(request: &InvokeRequest, principal: &str, pool: &RateLimitPool) -> Self {
+        let mut hasher = blake3::Hasher::new_derive_key("fcp.host.invoke-rate-limit-bucket.v1");
+        for field in [
+            request.connector_id.as_str(),
+            request.zone_id.as_str(),
+            pool.id.as_str(),
+            rate_limit_scope_label(pool.scope),
+        ] {
+            hasher.update(&(field.len() as u128).to_le_bytes());
+            hasher.update(field.as_bytes());
+        }
+        if matches!(pool.scope, RateLimitScope::Credential) {
+            hasher.update(&[1]);
+            hasher.update(&(principal.len() as u128).to_le_bytes());
+            hasher.update(principal.as_bytes());
+        } else {
+            hasher.update(&[0]);
+        }
+        hasher.update(&pool.config.window.as_nanos().to_le_bytes());
+        hasher.update(&pool.config.requests.to_le_bytes());
+        if let Some(burst) = pool.config.burst {
+            hasher.update(&[1]);
+            hasher.update(&burst.to_le_bytes());
+        } else {
+            hasher.update(&[0]);
+        }
+        Self(*hasher.finalize().as_bytes())
+    }
 }
 
-#[derive(Default)]
+const MAX_HOST_RATE_LIMIT_BUCKETS: usize = 16_384;
+
 struct HostRateLimiterStore {
-    buckets: StdMutex<HashMap<HostRateLimitBucketKey, Arc<TokenBucket>>>,
+    buckets: TokenBucketRegistry<HostRateLimitBucketKey>,
+}
+
+impl Default for HostRateLimiterStore {
+    fn default() -> Self {
+        Self {
+            buckets: TokenBucketRegistry::new(MAX_HOST_RATE_LIMIT_BUCKETS),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3218,17 +3252,13 @@ impl HostRateLimiterStore {
         key: HostRateLimitBucketKey,
         pool: &RateLimitPool,
     ) -> HostResult<Arc<TokenBucket>> {
-        let mut buckets = self.buckets.lock().map_err(|_| {
-            HostError::Internal("host rate-limit bucket store mutex poisoned".to_string())
-        })?;
-        if let Some(bucket) = buckets.get(&key) {
-            return Ok(Arc::clone(bucket));
-        }
-
         let config = rate_limiter_config_from_pool(pool)?;
-        let bucket = Arc::new(TokenBucket::from_config(&config));
-        buckets.insert(key, Arc::clone(&bucket));
-        Ok(bucket)
+        self.buckets.get_or_insert(key, &config).map_err(|_| {
+            HostError::Unavailable(
+                "host rate-limit identity capacity is exhausted; existing quotas are preserved; retry after idle buckets refill"
+                    .to_owned(),
+            )
+        })
     }
 }
 
@@ -4278,18 +4308,7 @@ impl SubprocessRegistry {
         pool: &RateLimitPool,
         mode: RateLimitMode,
     ) -> HostResult<()> {
-        let principal_id =
-            matches!(pool.scope, RateLimitScope::Credential).then(|| principal.to_string());
-        let key = HostRateLimitBucketKey {
-            connector_id: request.connector_id.to_string(),
-            zone_id: request.zone_id.to_string(),
-            pool_id: pool.id.clone(),
-            scope: rate_limit_scope_label(pool.scope).to_string(),
-            principal_id,
-            window_nanos: pool.config.window.as_nanos(),
-            requests: pool.config.requests,
-            burst: pool.config.burst,
-        };
+        let key = HostRateLimitBucketKey::new(request, principal, pool);
         let bucket = self.rate_limiters.bucket_for(key, pool)?;
         let retry_after_ms = match mode {
             RateLimitMode::Inspect => {
@@ -19514,6 +19533,119 @@ deny_ptrace = true
             provenance: None,
             approval_tokens: Vec::new(),
         }
+    }
+
+    fn host_rate_limit_test_pool() -> RateLimitPool {
+        RateLimitPool {
+            id: "shared-pool".to_owned(),
+            description: String::new(),
+            config: fcp_kernel::RateLimitConfig {
+                requests: 1,
+                window: Duration::from_secs(3600),
+                burst: None,
+                unit: RateLimitUnit::Requests,
+            },
+            enforcement: RateLimitEnforcement::Hard,
+            scope: RateLimitScope::Credential,
+        }
+    }
+
+    #[test]
+    fn host_rate_limit_identity_binds_exact_scope_and_policy() {
+        let mut request = operation_network_request("op.a");
+        let pool = host_rate_limit_test_pool();
+        let key = HostRateLimitBucketKey::new(&request, "alice", &pool);
+        assert_eq!(std::mem::size_of_val(&key), 32);
+        assert_ne!(key, HostRateLimitBucketKey::new(&request, "bob", &pool));
+        request.operation = OperationId::from_static("op.b");
+        assert_eq!(key, HostRateLimitBucketKey::new(&request, "alice", &pool));
+        request.zone_id = ZoneId::private();
+        assert_ne!(key, HostRateLimitBucketKey::new(&request, "alice", &pool));
+        request.zone_id = ZoneId::work();
+        request.connector_id = ConnectorId::from_static("fcp.test:other:1.0.0");
+        assert_ne!(key, HostRateLimitBucketKey::new(&request, "alice", &pool));
+        request.connector_id = ConnectorId::from_static("fcp.test:network:1.0.0");
+
+        let mut changed = pool.clone();
+        changed.id = "different-pool".to_owned();
+        assert_ne!(
+            key,
+            HostRateLimitBucketKey::new(&request, "alice", &changed)
+        );
+        changed = pool.clone();
+        changed.config.requests = 2;
+        assert_ne!(
+            key,
+            HostRateLimitBucketKey::new(&request, "alice", &changed)
+        );
+        changed = pool.clone();
+        changed.config.window += Duration::from_nanos(1);
+        assert_ne!(
+            key,
+            HostRateLimitBucketKey::new(&request, "alice", &changed)
+        );
+        changed = pool.clone();
+        changed.config.burst = Some(0);
+        assert_ne!(
+            key,
+            HostRateLimitBucketKey::new(&request, "alice", &changed)
+        );
+
+        for scope in [RateLimitScope::Instance, RateLimitScope::Global] {
+            changed = pool.clone();
+            changed.scope = scope;
+            let scoped = HostRateLimitBucketKey::new(&request, "alice", &changed);
+            assert_ne!(key, scoped);
+            assert_eq!(
+                scoped,
+                HostRateLimitBucketKey::new(&request, "bob", &changed)
+            );
+        }
+
+        let mut left = pool.clone();
+        left.id = "a".to_owned();
+        let mut right = pool;
+        right.id = "ab".to_owned();
+        assert_ne!(
+            HostRateLimitBucketKey::new(&request, "bc", &left),
+            HostRateLimitBucketKey::new(&request, "c", &right)
+        );
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn host_rate_limit_capacity_preserves_quota_and_refuses_new_principals() {
+        let mut registry = SubprocessRegistry::from_configs(Vec::new(), None)
+            .await
+            .unwrap();
+        registry.rate_limiters = Arc::new(HostRateLimiterStore {
+            buckets: TokenBucketRegistry::new(1),
+        });
+        let request = operation_network_request("op.a");
+        let mut pool = host_rate_limit_test_pool();
+        registry
+            .enforce_rate_limit_pool(&request, "alice", &pool, RateLimitMode::Consume)
+            .await
+            .unwrap();
+        for mode in [RateLimitMode::Inspect, RateLimitMode::Consume] {
+            let error = registry
+                .enforce_rate_limit_pool(&request, "bob", &pool, mode)
+                .await
+                .expect_err("new identity must not evict spent quota");
+            assert!(matches!(error, HostError::Unavailable(_)));
+            let error = registry
+                .enforce_rate_limit_pool(&request, "alice", &pool, mode)
+                .await
+                .expect_err("the original principal remains rate limited");
+            assert!(matches!(error, HostError::PreflightFailed(_)));
+        }
+        pool.enforcement = RateLimitEnforcement::Soft;
+        assert!(matches!(
+            registry
+                .enforce_rate_limit_pool(&request, "bob", &pool, RateLimitMode::Consume)
+                .await,
+            Err(HostError::Unavailable(_))
+        ));
+        assert_eq!(registry.rate_limiters.buckets.len(), 1);
     }
 
     #[test]

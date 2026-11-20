@@ -2,6 +2,9 @@
 //!
 //! Classic token bucket algorithm with burst support.
 
+use std::collections::HashMap;
+use std::hash::Hash;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
@@ -11,6 +14,111 @@ use parking_lot::Mutex;
 use async_trait::async_trait;
 
 use crate::{RateLimitConfig, RateLimitError, RateLimitState, RateLimiter};
+
+/// A new identity cannot be admitted without discarding live quota accounting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("rate-limit identity capacity ({capacity} buckets) is exhausted")]
+pub struct TokenBucketRegistryFull {
+    /// Maximum retained identities configured for this registry.
+    pub capacity: usize,
+}
+
+/// Bounded, shared token buckets with quota-preserving reclamation.
+///
+/// The key must include both the authority scope and every rate/burst setting.
+/// Use fixed-size keys, or independently bound their size, to bound retained
+/// memory as well as identity count. A lookup never resets an existing bucket.
+///
+/// Under pressure, only completely refilled buckets with no outstanding strong
+/// **or weak** handles can be reclaimed. Evicting a spent bucket would grant a
+/// new burst; evicting a referenced bucket would create two independent quotas
+/// for one identity. New identities are refused when neither is safe. Existing
+/// identities remain usable even when capacity is exhausted.
+pub struct TokenBucketRegistry<K> {
+    state: Mutex<TokenBucketRegistryState<K>>,
+    capacity: usize,
+}
+
+struct TokenBucketRegistryState<K> {
+    buckets: HashMap<K, Arc<TokenBucket>>,
+    next_reclamation: Option<Instant>,
+}
+
+/// Bound maintenance work under a flood of distinct identities. A capacity
+/// refusal may persist for this long after a bucket becomes reclaimable.
+const REGISTRY_RECLAMATION_INTERVAL: Duration = Duration::from_secs(1);
+
+impl<K: Eq + Hash> TokenBucketRegistry<K> {
+    /// Create a registry with a hard identity count limit. Zero refuses all
+    /// insertions. Storage is allocated on demand, never up front at capacity.
+    #[must_use]
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            state: Mutex::new(TokenBucketRegistryState {
+                buckets: HashMap::new(),
+                next_reclamation: None,
+            }),
+            capacity,
+        }
+    }
+
+    /// Return the existing quota, or admit a fresh identity if there is room.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TokenBucketRegistryFull`] when no safe slot is available.
+    pub fn get_or_insert(
+        &self,
+        key: K,
+        config: &RateLimitConfig,
+    ) -> Result<Arc<TokenBucket>, TokenBucketRegistryFull> {
+        self.get_or_insert_at(key, config, Instant::now())
+    }
+
+    fn get_or_insert_at(
+        &self,
+        key: K,
+        config: &RateLimitConfig,
+        now: Instant,
+    ) -> Result<Arc<TokenBucket>, TokenBucketRegistryFull> {
+        let mut state = self.state.lock();
+        if let Some(bucket) = state.buckets.get(&key) {
+            return Ok(Arc::clone(bucket));
+        }
+
+        if state.buckets.len() >= self.capacity
+            && state.next_reclamation.is_none_or(|next| now >= next)
+        {
+            state.buckets.retain(|_, bucket| {
+                // Arc::get_mut also excludes concurrent Weak::upgrade. A
+                // strong_count check alone cannot establish exclusive custody.
+                !Arc::get_mut(bucket).is_some_and(|bucket| bucket.remaining() == bucket.capacity)
+            });
+            state.next_reclamation = now.checked_add(REGISTRY_RECLAMATION_INTERVAL);
+        }
+        if state.buckets.len() >= self.capacity {
+            return Err(TokenBucketRegistryFull {
+                capacity: self.capacity,
+            });
+        }
+
+        let bucket = Arc::new(TokenBucket::from_config(config));
+        state.buckets.insert(key, Arc::clone(&bucket));
+        Ok(bucket)
+    }
+
+    /// Number of identities currently retained, including unreclaimed idle ones.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.state.lock().buckets.len()
+    }
+
+    /// Whether the registry retains any identities.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.state.lock().buckets.is_empty()
+    }
+}
 
 /// Token bucket rate limiter.
 ///
@@ -316,6 +424,158 @@ impl RateLimiter for TokenBucket {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registry_zero_capacity_refuses_without_allocating_a_bucket() {
+        let registry = TokenBucketRegistry::new(0);
+        assert_eq!(
+            registry
+                .get_or_insert("principal", &RateLimitConfig::default())
+                .err(),
+            Some(TokenBucketRegistryFull { capacity: 0 })
+        );
+        assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn registry_preserves_spent_quota_under_identity_churn() {
+        let registry = TokenBucketRegistry::new(2);
+        let config = RateLimitConfig::new(1, Duration::from_secs(3600));
+        for key in [1, 2] {
+            let bucket = registry.get_or_insert(key, &config).unwrap();
+            assert!(bucket.try_consume(1));
+        }
+        for key in 3..1000 {
+            assert!(registry.get_or_insert(key, &config).is_err());
+            assert_eq!(registry.len(), 2);
+        }
+        for key in [1, 2] {
+            let bucket = registry.get_or_insert(key, &config).unwrap();
+            assert_eq!(bucket.remaining(), 0);
+            assert!(!bucket.try_consume(1));
+        }
+    }
+
+    #[test]
+    fn registry_reclaims_only_unreferenced_full_buckets() {
+        let registry = TokenBucketRegistry::new(2);
+        let config = RateLimitConfig::new(3, Duration::from_secs(3600));
+        let retained = registry.get_or_insert("active", &config).unwrap();
+        drop(registry.get_or_insert("idle", &config).unwrap());
+
+        let replacement = registry.get_or_insert("new", &config).unwrap();
+        assert_eq!(registry.len(), 2);
+        assert!(Arc::ptr_eq(
+            &retained,
+            &registry.get_or_insert("active", &config).unwrap()
+        ));
+        assert!(registry.get_or_insert("extra", &config).is_err());
+        assert_eq!(replacement.remaining(), 3);
+    }
+
+    #[test]
+    fn registry_weak_handle_cannot_revive_an_evicted_parallel_quota() {
+        let registry = TokenBucketRegistry::new(1);
+        let config = RateLimitConfig::default();
+        let bucket = registry.get_or_insert("original", &config).unwrap();
+        let weak = Arc::downgrade(&bucket);
+        drop(bucket);
+
+        assert!(registry.get_or_insert("different", &config).is_err());
+        let upgraded = weak.upgrade().expect("referenced quota must be retained");
+        assert!(Arc::ptr_eq(
+            &upgraded,
+            &registry.get_or_insert("original", &config).unwrap()
+        ));
+    }
+
+    #[test]
+    fn registry_reclaims_after_complete_burst_refill() {
+        let registry = TokenBucketRegistry::new(1);
+        let config = RateLimitConfig::new(1, Duration::from_secs(10)).with_burst(3);
+        let bucket = registry.get_or_insert("spent", &config).unwrap();
+        assert!(bucket.try_consume(3));
+        *bucket.last_refill.lock() = Instant::now() - Duration::from_secs(20);
+        drop(bucket);
+
+        let now = Instant::now();
+        assert!(registry.get_or_insert_at("new", &config, now).is_err());
+        let bucket = registry.get_or_insert("spent", &config).unwrap();
+        assert_eq!(bucket.remaining(), 2, "partial refill must preserve debt");
+        *bucket.last_refill.lock() = Instant::now() - Duration::from_secs(10);
+        drop(bucket);
+
+        assert!(
+            registry
+                .get_or_insert_at("new", &config, now + REGISTRY_RECLAMATION_INTERVAL)
+                .is_ok()
+        );
+        assert_eq!(registry.len(), 1);
+        assert!(!registry.state.lock().buckets.contains_key("spent"));
+    }
+
+    #[test]
+    fn registry_bounds_reclamation_work_during_capacity_pressure() {
+        let registry = TokenBucketRegistry::new(1);
+        let config = RateLimitConfig::default();
+        let active = registry.get_or_insert("active", &config).unwrap();
+        let now = Instant::now();
+        assert!(registry.get_or_insert_at("new", &config, now).is_err());
+        drop(active);
+
+        for _ in 0..100 {
+            assert!(registry.get_or_insert_at("new", &config, now).is_err());
+        }
+        assert!(
+            registry
+                .get_or_insert_at("new", &config, now + REGISTRY_RECLAMATION_INTERVAL)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn registry_concurrent_same_identity_shares_one_burst() {
+        let registry = Arc::new(TokenBucketRegistry::new(1));
+        let config = RateLimitConfig::new(7, Duration::from_secs(3600));
+        let workers = (0..32)
+            .map(|_| {
+                let registry = Arc::clone(&registry);
+                let config = config.clone();
+                std::thread::spawn(move || {
+                    registry
+                        .get_or_insert("shared", &config)
+                        .unwrap()
+                        .try_consume(1)
+                })
+            })
+            .collect::<Vec<_>>();
+        let permitted = workers
+            .into_iter()
+            .map(|worker| usize::from(worker.join().unwrap()))
+            .sum::<usize>();
+        assert_eq!(permitted, 7);
+        assert_eq!(registry.len(), 1);
+        assert_eq!(
+            registry
+                .get_or_insert("shared", &config)
+                .unwrap()
+                .remaining(),
+            0
+        );
+    }
+
+    #[test]
+    fn registry_partial_quota_references_keep_the_same_identity() {
+        let registry = TokenBucketRegistry::new(1);
+        let config = RateLimitConfig::new(10, Duration::from_secs(3600));
+        let original = registry.get_or_insert("shared", &config).unwrap();
+        assert!(original.try_consume(4));
+        let same = registry.get_or_insert("shared", &config).unwrap();
+        assert!(Arc::ptr_eq(&original, &same));
+        assert!(registry.get_or_insert("other", &config).is_err());
+        assert!(same.try_consume(6));
+        assert!(!original.try_consume(1));
+    }
 
     // ── Basic behavior ──────────────────────────────────────────────────
 

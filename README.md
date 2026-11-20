@@ -2154,6 +2154,17 @@ RFC 9052 + RFC 8392:
 
 Operational FCP rate limits flow through `config_from_core` into `TokenBucket::from_config`, using a phase-preserving refill anchor: `last_refill = now - (elapsed % refill_interval)`. This avoids drift accumulation. Jitter in retry backoff uses `[0.5x, 1.5x)` of the base delay.
 
+Host invoke admission retains at most **16,384 rate-limit identities** through
+the shared `TokenBucketRegistry`. Each identity uses a fixed-size hash of its
+connector, zone, pool, principal scope and rate settings. When capacity is full,
+existing identities keep their quota accounting; a new identity receives an
+unavailable response until space can be reclaimed. Reclamation runs at most once
+per second under pressure and only removes completely refilled buckets with no
+outstanding strong or weak handles. It never forgets spent quota or creates two
+live buckets for the same identity. This bound applies to both preflight and
+invoke, including soft-limit pools; changing principals cannot turn capacity
+pressure into additional burst credit.
+
 ### Egress Proxy
 
 ```
