@@ -92,19 +92,18 @@ use fcp_host::{
     PrewarmStrategy, PrewarmZoneBinding, ProviderKey, ReceiptQueryRequest, ReceiptQueryResponse,
     ReceiptSummary, RequestPriority, ResilienceError, ResilienceLayer, RevocationCascadeVerifier,
     RolloutController, RolloutEvaluateResponse, RolloutEvaluation, RolloutObservation,
-    RolloutOutcome, RuntimeNetworkEnforcement,
-    SafetyTierExt, SanitizedConnectorConfig, SimulateCostConfidence, SimulateCostEstimate,
-    SimulatePhase, SimulateReceipt, SimulateReceiptQueryRequest, SimulateReceiptQueryResponse,
-    SimulateResourceAvailability, StartupReconciliationReport, StickyCredentialPolicy,
-    SupplyChainGate, SupplyChainGateConfig, TRUTH_PRECEDENCE_BOOT_CONFIG_EXIT_CODE, ToolDescriptor,
-    TruthPrecedenceBootError, TruthPrecedenceBootResolution, TruthPrecedenceBootSelection,
-    V2_DEFAULT_GRADUATED_ENV, V2_INSUFFICIENT_PEERS_BEHAVIOR_ENV, V2_MIN_HEALTHY_MESH_PEERS_ENV,
-    WARM_POOL_EVIDENCE_EVENT, WarmPoolEntrySnapshot, WarmPoolKey, WarmPoolPressureSnapshot,
-    admit_safety_tier, capability_constraint_audit_descriptor, classify_deployment_mode,
-    diff_sanitized_config_values, emit_boot_log, emit_capability_constraint_denial_audit_event,
-    merge_connector_health, native_proxy_only_sandbox_decision,
-    resolve_truth_precedence_boot_resolution, validate_runtime_network_claim,
-    wasi_config_for_operation_network_policy,
+    RolloutOutcome, RuntimeNetworkEnforcement, SafetyTierExt, SanitizedConnectorConfig,
+    SimulateCostConfidence, SimulateCostEstimate, SimulatePhase, SimulateReceipt,
+    SimulateReceiptQueryRequest, SimulateReceiptQueryResponse, SimulateResourceAvailability,
+    StartupReconciliationReport, StickyCredentialPolicy, SupplyChainGate, SupplyChainGateConfig,
+    TRUTH_PRECEDENCE_BOOT_CONFIG_EXIT_CODE, ToolDescriptor, TruthPrecedenceBootError,
+    TruthPrecedenceBootResolution, TruthPrecedenceBootSelection, V2_DEFAULT_GRADUATED_ENV,
+    V2_INSUFFICIENT_PEERS_BEHAVIOR_ENV, V2_MIN_HEALTHY_MESH_PEERS_ENV, WARM_POOL_EVIDENCE_EVENT,
+    WarmPoolEntrySnapshot, WarmPoolKey, WarmPoolPressureSnapshot, admit_safety_tier,
+    capability_constraint_audit_descriptor, classify_deployment_mode, diff_sanitized_config_values,
+    emit_boot_log, emit_capability_constraint_denial_audit_event, merge_connector_health,
+    native_proxy_only_sandbox_decision, resolve_truth_precedence_boot_resolution,
+    validate_runtime_network_claim, wasi_config_for_operation_network_policy,
 };
 #[cfg(test)]
 use fcp_host::{BatchStatus, RolloutDecision};
@@ -153,6 +152,7 @@ use fcp_sandbox::{
     EgressTcpConnectRequest, HttpHeader, NoOpCredentialInjector, TlsVerifier, WasiConfig,
     WasiConnectorRunner, host_matches_allow_list,
 };
+use fcp_store::ObjectStore as _;
 use fcp_telemetry::{TelemetryConfig, TelemetryError, metrics, otlp_readiness};
 #[cfg(test)]
 use futures_util::future::join_all;
@@ -220,8 +220,10 @@ const FCP_HOST_CONNECTOR_STATE_OBJECT_MAC_KEY_ENV: &str = "FCP_HOST_CONNECTOR_ST
 const CONNECTOR_STATE_SYMBOL_MAC_KEY_ENV: &str = "FCP_CONNECTOR_STATE_SYMBOL_MAC_KEY";
 const FCP_HOST_CONNECTOR_STATE_SYMBOL_MAC_KEY_ENV: &str = "FCP_HOST_CONNECTOR_STATE_SYMBOL_MAC_KEY";
 const CONNECTOR_STATE_READ_AUTHORITY_ENV: &str = "FCP_HOST_CONNECTOR_STATE_READ_AUTHORITY";
+const CONNECTOR_STATE_READ_LIMITS_ENV: &str = "FCP_HOST_CONNECTOR_STATE_READ_LIMITS";
 const MAX_CONNECTOR_STATE_READ_AUTHORITY_BYTES: usize = 8 * 1024;
 const MAX_CONNECTOR_STATE_TRUSTED_WRITERS: usize = 64;
+const MAX_CONCURRENT_CONNECTOR_STATE_READS: u64 = 4;
 const FCP_CONFIG_DIR_ENV: &str = "FCP_CONFIG_DIR";
 const CONNECTOR_STATE_CANONICAL_STORE_DIR: &str = "store";
 const CONNECTOR_STATE_CANONICAL_OBJECTS_DIR: &str = "objects";
@@ -2996,6 +2998,7 @@ fn validate_registry_config_settings(config: &ConnectorConfig) -> HostResult<()>
         configured_connector_state_mac_key(config, env_keys).map_err(HostError::InvalidFilter)?;
     }
     configured_connector_state_read_authority(config).map_err(HostError::InvalidFilter)?;
+    configured_connector_state_read_limits(config).map_err(HostError::InvalidFilter)?;
     Ok(())
 }
 
@@ -4815,52 +4818,299 @@ fn configured_connector_state_read_authority(
     }))
 }
 
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ConnectorStateReadLimits {
+    max_recovery_bytes: u64,
+    max_live_bytes: u64,
+    max_object_reads: u64,
+    timeout_ms: u64,
+}
+
+impl Default for ConnectorStateReadLimits {
+    fn default() -> Self {
+        Self {
+            max_recovery_bytes: 64 * 1024 * 1024,
+            max_live_bytes: 64 * 1024 * 1024,
+            max_object_reads: 65_536,
+            timeout_ms: 10_000,
+        }
+    }
+}
+
+fn configured_connector_state_read_limits(
+    config: &ConnectorConfig,
+) -> Result<ConnectorStateReadLimits, String> {
+    let Some(raw) = config.env.get(CONNECTOR_STATE_READ_LIMITS_ENV) else {
+        return Ok(ConnectorStateReadLimits::default());
+    };
+    let invalid = || {
+        format!(
+            "{CONNECTOR_STATE_READ_LIMITS_ENV} must be a JSON object of at most 1024 bytes with positive max_recovery_bytes/max_live_bytes <= 1073741824, max_object_reads <= 1000000, and timeout_ms <= 60000"
+        )
+    };
+    if raw.len() > 1024 {
+        return Err(invalid());
+    }
+    let limits: ConnectorStateReadLimits = serde_json::from_str(raw).map_err(|_| invalid())?;
+    if limits.max_recovery_bytes == 0
+        || limits.max_recovery_bytes > 1024 * 1024 * 1024
+        || limits.max_live_bytes == 0
+        || limits.max_live_bytes > 1024 * 1024 * 1024
+        || limits.max_object_reads == 0
+        || limits.max_object_reads > 1_000_000
+        || limits.timeout_ms == 0
+        || limits.timeout_ms > 60_000
+    {
+        return Err(invalid());
+    }
+    Ok(limits)
+}
+
+/// Retain admission for the complete inspection and any disk work that outlives
+/// a cancelled waiter. No request can turn cancellation into an unbounded worker
+/// queue. Each permit also fixes the deadline before recovery starts.
+struct ConnectorStateReadPermit {
+    active: Arc<AtomicU64>,
+    deadline: Instant,
+}
+
+impl ConnectorStateReadPermit {
+    fn acquire(active: Arc<AtomicU64>, timeout: Duration) -> Result<Arc<Self>, String> {
+        active
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count < MAX_CONCURRENT_CONNECTOR_STATE_READS).then(|| count + 1)
+            })
+            .map_err(|_| "canonical state inspection capacity is exhausted; retry after current inspections finish".to_owned())?;
+        Ok(Arc::new(Self {
+            active,
+            deadline: Instant::now() + timeout,
+        }))
+    }
+
+    fn require_time(&self) -> Result<(), String> {
+        if Instant::now() >= self.deadline {
+            Err("canonical state inspection exceeded its execution deadline".to_owned())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Drop for ConnectorStateReadPermit {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn connector_state_read_capacity() -> Arc<AtomicU64> {
+    static ACTIVE: OnceLock<Arc<AtomicU64>> = OnceLock::new();
+    Arc::clone(ACTIVE.get_or_init(|| Arc::new(AtomicU64::new(0))))
+}
+
+async fn run_connector_state_disk_read<T: Send + 'static>(
+    permit: Arc<ConnectorStateReadPermit>,
+    read: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    permit.require_time()?;
+    let remaining = permit.deadline.saturating_duration_since(Instant::now());
+    let completion_permit = Arc::clone(&permit);
+    let (sender, receiver) = oneshot::channel();
+    std::thread::Builder::new()
+        .name("fcp-state-inspection".to_owned())
+        .spawn(move || {
+            let result = permit
+                .require_time()
+                .and_then(|()| read())
+                .and_then(|value| {
+                    permit.require_time()?;
+                    Ok(value)
+                });
+            let _ = sender.send(result);
+            // The worker, not its dropped/timed-out waiter, releases this share.
+            drop(permit);
+        })
+        .map_err(|_| "canonical state inspection worker could not start".to_owned())?;
+    let value = fcp_async_core::time::timeout(remaining, receiver)
+        .await
+        .map_err(|_| "canonical state inspection exceeded its execution deadline".to_owned())?
+        .map_err(|_| "canonical state inspection worker failed".to_owned())??;
+    completion_permit.require_time()?;
+    Ok(value)
+}
+
+/// One budget spans root discovery, full ancestry/fork validation, and the
+/// caller's later chain/lease reads. Returning a limited result must not hide
+/// the cost of verifying the complete committed history first.
+struct HostCanonicalObjectReader {
+    inner: fcp_store::DurableObjectStore,
+    remaining_reads: AtomicU64,
+    permit: Arc<ConnectorStateReadPermit>,
+}
+
+impl HostCanonicalObjectReader {
+    async fn charge_read(&self) -> Result<(), fcp_store::ObjectStoreError> {
+        self.permit
+            .require_time()
+            .map_err(fcp_store::ObjectStoreError::Io)?;
+        let previous = self
+            .remaining_reads
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .map_err(|_| {
+                fcp_store::ObjectStoreError::Io(
+                    "canonical state inspection exceeded its object-read work budget".to_owned(),
+                )
+            })?;
+        if previous % 64 == 0 {
+            task::yield_now().await;
+            self.permit
+                .require_time()
+                .map_err(fcp_store::ObjectStoreError::Io)?;
+        }
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl fcp_store::ObjectStore for HostCanonicalObjectReader {
+    async fn put(&self, object: StoredObject) -> Result<(), fcp_store::ObjectStoreError> {
+        self.inner.put(object).await
+    }
+
+    async fn get(&self, id: &ObjectId) -> Result<StoredObject, fcp_store::ObjectStoreError> {
+        self.charge_read().await?;
+        self.inner.get(id).await
+    }
+
+    async fn exists(&self, id: &ObjectId) -> bool {
+        self.charge_read().await.is_ok() && self.inner.exists(id).await
+    }
+
+    async fn delete(&self, id: &ObjectId) -> Result<(), fcp_store::ObjectStoreError> {
+        self.inner.delete(id).await
+    }
+
+    async fn get_header(
+        &self,
+        id: &ObjectId,
+    ) -> Result<fcp_core::ObjectHeader, fcp_store::ObjectStoreError> {
+        self.charge_read().await?;
+        self.inner.get_header(id).await
+    }
+
+    async fn get_storage_meta(
+        &self,
+        id: &ObjectId,
+    ) -> Result<fcp_core::StorageMeta, fcp_store::ObjectStoreError> {
+        self.charge_read().await?;
+        self.inner.get_storage_meta(id).await
+    }
+
+    async fn set_retention(
+        &self,
+        id: &ObjectId,
+        retention: fcp_core::RetentionClass,
+    ) -> Result<(), fcp_store::ObjectStoreError> {
+        self.inner.set_retention(id, retention).await
+    }
+
+    async fn list_zone(&self, zone: &ZoneId) -> Vec<ObjectId> {
+        self.inner.list_zone(zone).await
+    }
+
+    async fn storage_used(&self) -> u64 {
+        self.inner.storage_used().await
+    }
+
+    async fn storage_quota(&self) -> u64 {
+        self.inner.storage_quota().await
+    }
+}
+
+struct HostCanonicalStateReader {
+    object_store: Arc<dyn fcp_store::ObjectStore>,
+    state_store: fcp_store::FcpStoreConnectorStateStore,
+    permit: Arc<ConnectorStateReadPermit>,
+    limits: ConnectorStateReadLimits,
+}
+
+/// Only a genuinely missing path is absent evidence. Permission, I/O, and
+/// invalid-type errors must not be reported as an empty canonical store. Call
+/// this only inside the admitted disk worker, never on the async executor.
+fn canonical_store_directory_exists(path: &StdPath) -> Result<bool, String> {
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.is_dir() => Ok(true),
+        Ok(_) => Err("canonical state store path is not a directory".to_owned()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "canonical state store metadata could not be read: {error}"
+        )),
+    }
+}
+
 /// Every host canonical reader applies the same writer and instance authority
 /// before opening existing storage. A shared zone key authenticates bytes; it
 /// must never implicitly authorize the writer of a self-signed state chain.
-fn open_configured_connector_state_reader(
+async fn open_configured_connector_state_reader(
     config: &ConnectorConfig,
     connector_id: &ConnectorId,
     zone: &ZoneId,
     object_store_dir: &StdPath,
-) -> Result<
-    (
-        Arc<dyn fcp_store::ObjectStore>,
-        fcp_store::FcpStoreConnectorStateStore,
-    ),
-    String,
-> {
-    let authority = configured_connector_state_read_authority(config)?.ok_or_else(|| {
-        format!(
-            "connector `{connector_id}` has no explicit `{CONNECTOR_STATE_READ_AUTHORITY_ENV}`; canonical state writer authority is unproven"
-        )
-    })?;
-    let object_id_key = configured_connector_state_object_id_key(config)?.ok_or_else(|| {
-        format!(
-            "connector `{connector_id}` has neither `{FCP_HOST_CONNECTOR_STATE_OBJECT_ID_KEY_ENV}` nor `{CONNECTOR_STATE_OBJECT_ID_KEY_ENV}` configured; canonical state object IDs cannot be verified"
-        )
-    })?;
-    let object_store = fcp_store::DurableObjectStore::open_read_only(
-        configured_connector_state_object_store_config(config, object_store_dir)?,
-    )
-    .map_err(|error| {
-        format!(
-            "Canonical fcp-store object store at `{}` could not be opened: {error}",
-            object_store_dir.display()
-        )
-    })?;
-    let object_store: Arc<dyn fcp_store::ObjectStore> = Arc::new(object_store);
-    let mut state_store = fcp_store::FcpStoreConnectorStateStore::new(
-        Arc::clone(&object_store),
-        object_id_key,
-        connector_id.clone(),
-        zone.clone(),
-    )
-    .with_trusted_writer_keys(authority.writer_keys);
-    if let Some(instance_id) = authority.instance_id {
-        state_store = state_store.with_instance_id(instance_id);
-    }
-    Ok((object_store, state_store))
+) -> Result<Option<HostCanonicalStateReader>, String> {
+    let limits = configured_connector_state_read_limits(config)?;
+    let permit = ConnectorStateReadPermit::acquire(
+        connector_state_read_capacity(),
+        Duration::from_millis(limits.timeout_ms),
+    )?;
+    let config = config.clone();
+    let connector_id = connector_id.clone();
+    let zone = zone.clone();
+    let object_store_dir = object_store_dir.to_owned();
+    run_connector_state_disk_read(Arc::clone(&permit), move || {
+        if !canonical_store_directory_exists(&object_store_dir)? {
+            return Ok(None);
+        }
+        let authority = configured_connector_state_read_authority(&config)?.ok_or_else(|| {
+            format!(
+                "connector `{connector_id}` has no explicit `{CONNECTOR_STATE_READ_AUTHORITY_ENV}`; canonical state writer authority is unproven"
+            )
+        })?;
+        let object_id_key = configured_connector_state_object_id_key(&config)?.ok_or_else(|| {
+            format!(
+                "connector `{connector_id}` has neither `{FCP_HOST_CONNECTOR_STATE_OBJECT_ID_KEY_ENV}` nor `{CONNECTOR_STATE_OBJECT_ID_KEY_ENV}` configured; canonical state object IDs cannot be verified"
+            )
+        })?;
+        let mut store_config =
+            configured_connector_state_object_store_config(&config, &object_store_dir)?;
+        store_config.max_bytes = limits.max_live_bytes;
+        let object_store = fcp_store::DurableObjectStore::open_read_only_bounded(
+            store_config,
+            limits.max_recovery_bytes,
+        ).map_err(|error| format!("Canonical fcp-store object recovery was refused: {error}"))?;
+        let object_store: Arc<dyn fcp_store::ObjectStore> = Arc::new(HostCanonicalObjectReader {
+            inner: object_store,
+            remaining_reads: AtomicU64::new(limits.max_object_reads),
+            permit: Arc::clone(&permit),
+        });
+        let mut state_store = fcp_store::FcpStoreConnectorStateStore::new(
+            Arc::clone(&object_store),
+            object_id_key,
+            connector_id,
+            zone,
+        ).with_trusted_writer_keys(authority.writer_keys);
+        if let Some(instance_id) = authority.instance_id {
+            state_store = state_store.with_instance_id(instance_id);
+        }
+        Ok(Some(HostCanonicalStateReader {
+            object_store,
+            state_store,
+            permit,
+            limits,
+        }))
+    })
+    .await
 }
 
 fn connector_state_root_dir() -> PathBuf {
@@ -5128,43 +5378,46 @@ async fn connector_state_canonical_status_from_config(
         return Ok(None);
     };
     let object_store_dir = connector_state_canonical_object_store_dir(state_root, connector_id);
-    if !object_store_dir.exists() {
+    let Some(reader) =
+        open_configured_connector_state_reader(config, connector_id, zone, &object_store_dir)
+            .await?
+    else {
         return Ok(None);
-    }
-    let (_, state_store) =
-        open_configured_connector_state_reader(config, connector_id, zone, &object_store_dir)?;
+    };
     let symbol_store_dir = connector_state_canonical_symbol_store_dir(state_root, connector_id);
-    if symbol_store_dir.exists() {
-        let symbol_store = fcp_store::DurableSymbolStore::open_read_only(
-            configured_connector_state_symbol_store_config(config, &symbol_store_dir)?,
+    let symbol_config = config.clone();
+    let limits = reader.limits;
+    let symbol_store = run_connector_state_disk_read(Arc::clone(&reader.permit), move || {
+        if !canonical_store_directory_exists(&symbol_store_dir)? {
+            return Ok(None);
+        }
+        let mut symbol_config =
+            configured_connector_state_symbol_store_config(&symbol_config, &symbol_store_dir)?;
+        symbol_config.max_bytes = limits.max_live_bytes;
+        fcp_store::DurableSymbolStore::open_read_only_bounded(
+            symbol_config,
+            limits.max_recovery_bytes,
         )
-        .map_err(|error| {
-            format!(
-                "Canonical fcp-store symbol store at `{}` could not be opened: {error}",
-                symbol_store_dir.display()
-            )
-        })?;
-        return state_store
-            .canonical_status(Some(&symbol_store))
-            .await
-            .map(Some)
-            .map_err(|error| {
-                format!(
-                    "Canonical fcp-store status at `{}` could not be read: {error}",
-                    object_store_dir.display()
-                )
-            });
-    }
-    state_store
-        .canonical_status(None)
-        .await
         .map(Some)
+        .map_err(|error| format!("Canonical fcp-store symbol recovery was refused: {error}"))
+    })
+    .await?;
+    let status = reader
+        .state_store
+        .canonical_status(
+            symbol_store
+                .as_ref()
+                .map(|store| store as &dyn fcp_store::SymbolStore),
+        )
+        .await
         .map_err(|error| {
             format!(
                 "Canonical fcp-store status at `{}` could not be read: {error}",
                 object_store_dir.display()
             )
-        })
+        })?;
+    reader.permit.require_time()?;
+    Ok(Some(status))
 }
 
 async fn connector_lease_durable_evidence_from_config(
@@ -5183,13 +5436,27 @@ async fn connector_lease_durable_evidence_from_config(
     }
 
     let object_store_dir = connector_state_canonical_object_store_dir(state_root, connector_id);
-    if !object_store_dir.exists() {
-        evidence.warnings.push(format!(
-            "No canonical fcp-store object store exists at `{}`; durable signed lease expiry and quorum signatures are unavailable.",
-            object_store_dir.display()
-        ));
-        return evidence;
-    }
+    let reader = match open_configured_connector_state_reader(
+        config,
+        connector_id,
+        zone,
+        &object_store_dir,
+    )
+    .await
+    {
+        Ok(Some(reader)) => reader,
+        Ok(None) => {
+            evidence.warnings.push(format!(
+                    "No canonical fcp-store object store exists at `{}`; durable signed lease expiry and quorum signatures are unavailable.",
+                    object_store_dir.display()
+                ));
+            return evidence;
+        }
+        Err(error) => {
+            evidence.warnings.push(error);
+            return evidence;
+        }
+    };
 
     let object_id_key = match configured_connector_state_object_id_key(config) {
         Ok(Some(key)) => key,
@@ -5210,16 +5477,7 @@ async fn connector_lease_durable_evidence_from_config(
         }
     };
 
-    let (object_store, state_store) =
-        match open_configured_connector_state_reader(config, connector_id, zone, &object_store_dir)
-        {
-            Ok(reader) => reader,
-            Err(error) => {
-                evidence.warnings.push(error);
-                return evidence;
-            }
-        };
-    let chain = match state_store.read_chain(None, usize::MAX).await {
+    let chain = match reader.state_store.read_chain(None, usize::MAX).await {
         Ok(chain) => chain,
         Err(error) => {
             evidence.warnings.push(format!(
@@ -5240,7 +5498,7 @@ async fn connector_lease_durable_evidence_from_config(
     evidence.lease_object_id = Some(head.lease_object_id);
     evidence.lease_seq = Some(head.lease_seq);
 
-    let stored = match object_store.get(&head.lease_object_id).await {
+    let stored = match reader.object_store.get(&head.lease_object_id).await {
         Ok(stored) => stored,
         Err(error) => {
             evidence.warnings.push(format!(
@@ -5348,6 +5606,12 @@ async fn connector_lease_durable_evidence_from_config(
             ));
         }
     }
+    if let Err(error) = reader.permit.require_time() {
+        return ConnectorLeaseDurableEvidence {
+            warnings: vec![error],
+            ..Default::default()
+        };
+    }
     evidence
 }
 
@@ -5398,9 +5662,20 @@ async fn connector_lease_yield_flush_context_for_registered_connector(
     let state_root =
         configured_connector_state_root(&config).unwrap_or_else(connector_state_root_dir);
     let object_store_dir = connector_state_canonical_object_store_dir(&state_root, connector_id);
-    let (_, state_store) =
-        open_configured_connector_state_reader(&config, connector_id, zone, &object_store_dir)?;
-    let flush = state_store
+    let reader = open_configured_connector_state_reader(
+        &config,
+        connector_id,
+        zone,
+        &object_store_dir,
+    )
+    .await?
+    .ok_or_else(|| {
+        format!(
+            "No canonical fcp-store object store exists at `{}`; refusing lease-yield flush",
+            object_store_dir.display()
+        )
+    })?;
+    let flush = reader.state_store
         .flush_before_lease_yield()
         .await
         .map_err(|error| {
@@ -5409,6 +5684,7 @@ async fn connector_lease_yield_flush_context_for_registered_connector(
                 object_store_dir.display()
             )
         })?;
+    reader.permit.require_time()?;
     Ok(HostConnectorLeaseYieldFlushContext {
         state_root,
         flush,
@@ -30419,6 +30695,7 @@ output_schema = {{ type = "object" }}
 
     #[fcp_async_core::runtime::test(flavor = "multi_thread")]
     async fn invoke_handler_hrw_lease_refuses_non_holder_and_admits_elected_holder() {
+        let _inspection_serial = canonical_state_test_serial().lock().await;
         let connector_id = "fcp.test.hrw-lease-refuse:utility:1.0.0";
         let manifest_directory = tempfile::tempdir().expect("manifest state directory");
         let manifest_path = write_state_policy_test_manifest_for(
@@ -30802,6 +31079,7 @@ output_schema = { type = "object" }
 
     #[fcp_async_core::runtime::test(flavor = "multi_thread")]
     async fn invoke_handler_hrw_not_selected_flushes_singleton_writer_state_before_yield() {
+        let _inspection_serial = canonical_state_test_serial().lock().await;
         let connector_id = "fcp.test.hrw-yield-flush:utility:1.0.0";
         let operation_id = "test.singleton";
         let capability_id = "cap.test.singleton";
@@ -31018,6 +31296,7 @@ output_schema = { type = "object" }
     #[fcp_async_core::runtime::test(flavor = "multi_thread")]
     async fn hrw_three_node_handoff_flushes_old_holder_and_new_holder_reads_state()
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let _inspection_serial = canonical_state_test_serial().lock().await;
         let connector_id = "fcp.test.hrw-three-node-handoff:utility:1.0.0";
         let operation_id = "test.singleton";
         let capability_id = "cap.test.singleton";
@@ -42044,6 +42323,7 @@ done"#;
     #[fcp_async_core::runtime::test]
     async fn connector_state_explain_admin_route_uses_managed_connector_state_root()
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let _inspection_serial = canonical_state_test_serial().lock().await;
         let tempdir = tempfile::tempdir().expect("connector state tempdir");
         let state_root = tempdir.path().join("managed-state");
         let connector_id = "fcp.test.state:utility:1.0.0";
@@ -42261,7 +42541,272 @@ done"#;
         }
     }
 
+    #[test]
+    fn canonical_state_read_limits_validate_before_runtime_preparation() {
+        let mut config = dispatcher_test_config("fcp.test.state-read-limits:utility:1.0.0");
+        assert_eq!(
+            configured_connector_state_read_limits(&config)
+                .unwrap()
+                .max_recovery_bytes,
+            64 * 1024 * 1024
+        );
+        for raw in [
+            "null",
+            "[]",
+            "",
+            "{\"max_object_reads\":0}",
+            "{\"timeout_ms\":60001}",
+            "{\"max_live_bytes\":1073741825}",
+            "{\"max_recovery_bytes\":0}",
+            "{\"max_object_reads\":1000001}",
+            "{\"unknown\":\"private-sentinel\"}",
+            "{\"timeout_ms\":1,\"timeout_ms\":2}",
+        ] {
+            config
+                .env
+                .insert(CONNECTOR_STATE_READ_LIMITS_ENV.to_owned(), raw.to_owned());
+            let error = validate_registry_config_settings(&config)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(CONNECTOR_STATE_READ_LIMITS_ENV));
+            assert!(!error.contains("private-sentinel"));
+        }
+        for raw in [
+            "{}",
+            "{\"max_object_reads\":1,\"timeout_ms\":1}",
+            "{\"max_recovery_bytes\":1073741824,\"max_live_bytes\":1073741824,\"max_object_reads\":1000000,\"timeout_ms\":60000}",
+        ] {
+            config
+                .env
+                .insert(CONNECTOR_STATE_READ_LIMITS_ENV.to_owned(), raw.to_owned());
+            validate_registry_config_settings(&config).unwrap();
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn canonical_state_read_worker_keeps_admission_after_waiter_cancellation() {
+        use std::future::{Future, poll_fn};
+        use std::task::Poll;
+        let active = Arc::new(AtomicU64::new(0));
+        let permit =
+            ConnectorStateReadPermit::acquire(Arc::clone(&active), Duration::from_secs(5)).unwrap();
+        let (entered, started) = oneshot::channel();
+        let (release, resume) = std::sync::mpsc::channel();
+        let mut read = Box::pin(run_connector_state_disk_read(permit, move || {
+            entered.send(()).unwrap();
+            resume.recv_timeout(Duration::from_secs(5)).unwrap();
+            Ok(())
+        }));
+        poll_fn(|cx| {
+            assert!(read.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        started.await.unwrap();
+        drop(read);
+        assert_eq!(active.load(Ordering::Acquire), 1);
+        let held: Vec<_> = (1..MAX_CONCURRENT_CONNECTOR_STATE_READS)
+            .map(|_| {
+                ConnectorStateReadPermit::acquire(Arc::clone(&active), Duration::from_secs(5))
+                    .unwrap()
+            })
+            .collect();
+        assert!(
+            ConnectorStateReadPermit::acquire(Arc::clone(&active), Duration::from_secs(5)).is_err()
+        );
+        release.send(()).unwrap();
+        fcp_async_core::time::timeout(Duration::from_secs(5), async {
+            while active.load(Ordering::Acquire) != MAX_CONCURRENT_CONNECTOR_STATE_READS - 1 {
+                task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(held);
+        assert_eq!(active.load(Ordering::Acquire), 0);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn canonical_state_read_worker_bounds_waits_and_reports_panics() {
+        let active = Arc::new(AtomicU64::new(0));
+        let permit =
+            ConnectorStateReadPermit::acquire(Arc::clone(&active), Duration::from_millis(100))
+                .unwrap();
+        let (entered, started) = oneshot::channel();
+        let (release, resume) = std::sync::mpsc::channel();
+        let read = run_connector_state_disk_read(permit, move || {
+            entered.send(()).unwrap();
+            resume.recv_timeout(Duration::from_secs(5)).unwrap();
+            Ok(())
+        });
+        let (result, started) = futures_util::future::join(read, started).await;
+        started.unwrap();
+        assert!(result.unwrap_err().contains("deadline"));
+        assert_eq!(active.load(Ordering::Acquire), 1);
+        release.send(()).unwrap();
+        fcp_async_core::time::timeout(Duration::from_secs(5), async {
+            while active.load(Ordering::Acquire) != 0 {
+                task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let permit =
+            ConnectorStateReadPermit::acquire(Arc::clone(&active), Duration::from_secs(5)).unwrap();
+        let error =
+            run_connector_state_disk_read::<()>(permit, || panic!("intentional worker failure"))
+                .await
+                .unwrap_err();
+        assert!(error.contains("worker failed"));
+        fcp_async_core::time::timeout(Duration::from_secs(5), async {
+            while active.load(Ordering::Acquire) != 0 {
+                task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn canonical_state_read_worker_refuses_expired_permits_before_disk_probe() {
+        let active = Arc::new(AtomicU64::new(0));
+        let permit =
+            ConnectorStateReadPermit::acquire(Arc::clone(&active), Duration::ZERO).unwrap();
+        let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_entered = Arc::clone(&entered);
+        let error = run_connector_state_disk_read(permit, move || {
+            worker_entered.store(true, Ordering::Release);
+            Ok(())
+        })
+        .await
+        .unwrap_err();
+        assert!(error.contains("deadline"));
+        assert!(!entered.load(Ordering::Acquire));
+        assert_eq!(active.load(Ordering::Acquire), 0);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn canonical_state_read_missing_paths_are_absent_and_metadata_errors_fail_closed() {
+        let _inspection_serial = canonical_state_test_serial().lock().await;
+        let directory = tempfile::tempdir().unwrap();
+        let state_root = directory.path().join("missing-state");
+        let connector_id = ConnectorId::from_static(CANONICAL_STATE_MAC_TEST_CONNECTOR);
+        let zone = ZoneId::work();
+        let mut config = dispatcher_test_config(CANONICAL_STATE_MAC_TEST_CONNECTOR);
+        config.env.insert(
+            CONNECTOR_STATE_DIR_ENV.to_owned(),
+            state_root.display().to_string(),
+        );
+        config.env.insert(
+            "FCP_CONNECTOR_STATE_MODEL".to_owned(),
+            "singleton_writer".to_owned(),
+        );
+        let state_policy = ConnectorStatePolicy {
+            model: ConnectorStateKind::SingletonWriter,
+            ..Default::default()
+        };
+        // Missing storage remains absent evidence even before writer authority
+        // or keys are configured. Inspection must not create that storage.
+        assert!(
+            connector_state_canonical_status_from_config(
+                &config,
+                &connector_id,
+                Some(&zone),
+                &state_root,
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        let evidence = connector_lease_durable_evidence_from_config(
+            &config,
+            state_policy,
+            &connector_id,
+            &zone,
+            &state_root,
+        )
+        .await;
+        assert!(evidence.source.is_none());
+        assert!(
+            evidence
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("No canonical"))
+        );
+        let state = dispatcher_app_state(
+            runtime_network_test_registry(CANONICAL_STATE_MAC_TEST_CONNECTOR, config.clone()),
+            Arc::new(HostAdminStateStore::new()),
+            None,
+            HashMap::new(),
+        );
+        let error = connector_lease_yield_flush_context_for_registered_connector(
+            &state,
+            &connector_id,
+            &zone,
+        )
+        .await
+        .err()
+        .expect("missing storage must refuse the yield barrier");
+        assert!(error.contains("No canonical"));
+        assert!(!state_root.exists());
+
+        let object_directory =
+            connector_state_canonical_object_store_dir(&state_root, &connector_id);
+        std::fs::create_dir_all(object_directory.parent().unwrap()).unwrap();
+        std::fs::write(&object_directory, b"not a directory").unwrap();
+        let error = connector_state_canonical_status_from_config(
+            &config,
+            &connector_id,
+            Some(&zone),
+            &state_root,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("not a directory"));
+        let evidence = connector_lease_durable_evidence_from_config(
+            &config,
+            state_policy,
+            &connector_id,
+            &zone,
+            &state_root,
+        )
+        .await;
+        assert!(evidence.source.is_none());
+        assert!(
+            evidence
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("not a directory"))
+        );
+        assert!(
+            !evidence
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("No canonical"))
+        );
+
+        #[cfg(unix)]
+        {
+            let loop_path = directory.path().join("looped-store");
+            std::os::unix::fs::symlink(&loop_path, &loop_path).unwrap();
+            let error =
+                open_configured_connector_state_reader(&config, &connector_id, &zone, &loop_path)
+                    .await
+                    .err()
+                    .expect("metadata I/O failures must not masquerade as absence");
+            assert!(error.contains("metadata could not be read"));
+        }
+    }
+
     const CANONICAL_STATE_MAC_TEST_CONNECTOR: &str = "fcp.test.authenticated-state:utility:1.0.0";
+
+    // Real inspection tests share the production admission counter. Keep these
+    // fixture groups separate under Cargo's default parallel test runner;
+    // dedicated capacity/cancellation tests use isolated counters instead.
+    fn canonical_state_test_serial() -> &'static futures_util::lock::Mutex<()> {
+        static SERIAL: OnceLock<futures_util::lock::Mutex<()>> = OnceLock::new();
+        SERIAL.get_or_init(|| futures_util::lock::Mutex::new(()))
+    }
 
     struct CanonicalStateMacFixture {
         config: ConnectorConfig,
@@ -42277,6 +42822,7 @@ done"#;
         _objects: Arc<fcp_store::DurableObjectStore>,
         _symbols: fcp_store::DurableSymbolStore,
         _directory: tempfile::TempDir,
+        _inspection_serial: futures_util::lock::MutexGuard<'static, ()>,
     }
 
     impl CanonicalStateMacFixture {
@@ -42289,6 +42835,7 @@ done"#;
             checkpointed: bool,
             instance_id: Option<InstanceId>,
         ) -> Self {
+            let inspection_serial = canonical_state_test_serial().lock().await;
             let directory = tempfile::tempdir().unwrap();
             let state_root = directory.path().join("canonical-state");
             let connector_id = ConnectorId::from_static(CANONICAL_STATE_MAC_TEST_CONNECTOR);
@@ -42427,6 +42974,7 @@ done"#;
                 _objects: objects,
                 _symbols: symbols,
                 _directory: directory,
+                _inspection_serial: inspection_serial,
             }
         }
 
@@ -42502,6 +43050,164 @@ done"#;
             assert_eq!(context.flush.last_canonical_seq, Some(0));
             assert_eq!(context.flush.instance_id, self.instance_id);
         }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn canonical_state_read_budgets_cover_recovery_and_all_host_evidence_paths() {
+        for checkpointed in [false, true] {
+            let fixture = CanonicalStateMacFixture::new(true, checkpointed).await;
+            let meta =
+                fcp_store::SymbolStore::get_object_meta(&fixture._symbols, &fixture.root_object_id)
+                    .await
+                    .unwrap();
+            // Historical idempotent records consume input budget even though
+            // live symbol state does not grow. Make this WAL larger than the
+            // object store so the symbol-side refusal is independently visible.
+            for _ in 0..128 {
+                fcp_store::SymbolStore::put_object_meta(&fixture._symbols, meta.clone())
+                    .await
+                    .unwrap();
+            }
+            let before = fixture.files();
+            let bytes_for = |kind: &str| -> u64 {
+                before
+                    .iter()
+                    .filter(|(path, _)| {
+                        path.file_name()
+                            .unwrap()
+                            .to_str()
+                            .unwrap()
+                            .starts_with(kind)
+                    })
+                    .map(|(_, (bytes, _))| bytes.len() as u64)
+                    .sum()
+            };
+            let object_bytes = bytes_for("objects.");
+            let symbol_bytes = bytes_for("symbols.");
+            assert!(symbol_bytes > object_bytes);
+            let mut config = fixture.config.clone();
+            config.env.insert(
+                CONNECTOR_STATE_READ_LIMITS_ENV.to_owned(),
+                json!({
+                    "max_recovery_bytes": symbol_bytes,
+                })
+                .to_string(),
+            );
+            fixture.assert_readable(&config).await;
+
+            config.env.insert(
+                CONNECTOR_STATE_READ_LIMITS_ENV.to_owned(),
+                json!({
+                    "max_recovery_bytes": symbol_bytes - 1,
+                })
+                .to_string(),
+            );
+            let symbol_error = connector_state_canonical_status_from_config(
+                &config,
+                &fixture.connector_id,
+                Some(&fixture.zone),
+                &fixture.state_root,
+            )
+            .await
+            .unwrap_err();
+            assert!(symbol_error.contains("symbol recovery"));
+            assert!(symbol_error.contains("recovery byte budget"));
+
+            for limits in [
+                json!({"max_recovery_bytes": object_bytes - 1}),
+                json!({"max_live_bytes": 1}),
+                json!({"max_object_reads": 1}),
+            ] {
+                config.env.insert(
+                    CONNECTOR_STATE_READ_LIMITS_ENV.to_owned(),
+                    limits.to_string(),
+                );
+                assert!(
+                    connector_state_canonical_status_from_config(
+                        &config,
+                        &fixture.connector_id,
+                        Some(&fixture.zone),
+                        &fixture.state_root
+                    )
+                    .await
+                    .is_err()
+                );
+                let evidence = connector_lease_durable_evidence_from_config(
+                    &config,
+                    ConnectorStatePolicy {
+                        model: ConnectorStateKind::SingletonWriter,
+                        ..Default::default()
+                    },
+                    &fixture.connector_id,
+                    &fixture.zone,
+                    &fixture.state_root,
+                )
+                .await;
+                assert_ne!(evidence.validation_status, Some("valid"));
+                assert!(!evidence.warnings.is_empty());
+                let app = fixture.app_state(config.clone());
+                assert!(
+                    connector_lease_yield_flush_context_for_registered_connector(
+                        &app,
+                        &fixture.connector_id,
+                        &fixture.zone
+                    )
+                    .await
+                    .is_err()
+                );
+            }
+            assert_eq!(fixture.files(), before);
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn canonical_state_read_object_budget_is_shared_and_exact() {
+        let fixture = CanonicalStateMacFixture::new(true, false).await;
+        let mut config = fixture.config.clone();
+        config.env.insert(
+            CONNECTOR_STATE_READ_LIMITS_ENV.to_owned(),
+            "{\"max_object_reads\":2}".to_owned(),
+        );
+        let directory =
+            connector_state_canonical_object_store_dir(&fixture.state_root, &fixture.connector_id);
+        let reader = open_configured_connector_state_reader(
+            &config,
+            &fixture.connector_id,
+            &fixture.zone,
+            &directory,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        reader
+            .object_store
+            .get(&fixture.head_object_id)
+            .await
+            .unwrap();
+        reader
+            .object_store
+            .get_header(&fixture.lease_object_id)
+            .await
+            .unwrap();
+        let error = reader
+            .object_store
+            .get_storage_meta(&fixture.root_object_id)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("object-read work budget"));
+        // Root discovery and authentication do not obtain a fresh allowance.
+        assert!(
+            reader
+                .state_store
+                .read_root()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("object-read work budget")
+        );
+        drop(reader);
+        // A new inspection obtains a new bounded view, not the exhausted one.
+        fixture.assert_readable(&fixture.config).await;
     }
 
     #[fcp_async_core::runtime::test]
@@ -42757,6 +43463,7 @@ done"#;
     #[fcp_async_core::runtime::test]
     async fn connector_state_explain_admin_route_reads_durable_fcp_store_status()
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let _inspection_serial = canonical_state_test_serial().lock().await;
         let tempdir = tempfile::tempdir().expect("connector state tempdir");
         let state_root = tempdir.path().join("managed-state");
         let connector_id = "fcp.test.state:utility:1.0.0";
@@ -42886,6 +43593,7 @@ done"#;
     #[fcp_async_core::runtime::test]
     async fn connector_lease_status_admin_route_defaults_to_singleton_allowed_zone()
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let _inspection_serial = canonical_state_test_serial().lock().await;
         let connector_id = "fcp.test.lease-status-default-zone:utility:1.0.0";
         let connector_key = ConnectorId::from_static(connector_id);
         let zone_id: ZoneId = "z:community".parse().expect("test zone should parse");
@@ -42943,6 +43651,7 @@ done"#;
     #[fcp_async_core::runtime::test]
     async fn connector_lease_status_admin_route_reports_hrw_holder_and_fencing()
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let _inspection_serial = canonical_state_test_serial().lock().await;
         let tempdir = tempfile::tempdir().expect("connector state tempdir");
         let state_root = tempdir.path().join("managed-state");
         let connector_id = "fcp.test.lease-status:utility:1.0.0";
@@ -43110,6 +43819,7 @@ done"#;
     #[fcp_async_core::runtime::test]
     async fn connector_lease_flush_before_yield_admin_route_reports_durable_state_barrier()
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let _inspection_serial = canonical_state_test_serial().lock().await;
         let tempdir = tempfile::tempdir().expect("connector state tempdir");
         let state_root = tempdir.path().join("managed-state");
         let connector_id = "fcp.test.lease-flush:utility:1.0.0";
@@ -43239,6 +43949,7 @@ done"#;
     #[fcp_async_core::runtime::test]
     async fn connector_lease_flush_before_yield_admin_route_defaults_to_singleton_allowed_zone()
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let _inspection_serial = canonical_state_test_serial().lock().await;
         let tempdir = tempfile::tempdir().expect("connector state tempdir");
         let state_root = tempdir.path().join("managed-state");
         let connector_id = "fcp.test.lease-flush-default-zone:utility:1.0.0";

@@ -138,6 +138,50 @@ redacted from inventory mutation responses; configuration snapshots, revision
 history, and diffs also redact
 MAC and object-ID key fields. A redacted response is not reusable key material.
 
+### Bound Canonical Inspection Work
+
+State explanation, durable lease evidence, and the yield barrier share bounded
+observational readers. Each store may consume at most 64 MiB of encoded snapshot
+plus WAL input and retain at most 64 MiB of charged live object or symbol state
+by default. Historical WAL records count even when their effects are already
+checkpointed or idempotent. The reader captures the WAL length at open, so a
+live writer cannot extend an inspection indefinitely by continuing to append.
+
+One inspection has a 10-second deadline and a shared allowance of 65,536 object
+reads. Root discovery, writer-signature and fork verification, ancestry traversal,
+and subsequent lease reads all consume that same allowance. A requested result
+limit does not replace full-history authentication. If authentication cannot
+finish within the allowance, state remains unproven and yielding the lease is
+refused; the host never returns a partially verified chain as authoritative.
+
+For larger operational stores, configure `FCP_HOST_CONNECTOR_STATE_READ_LIMITS`
+in the same managed inventory `env` map. It contains JSON of at most 1 KiB;
+omitted fields retain their defaults:
+
+```json
+{
+  "max_recovery_bytes": 134217728,
+  "max_live_bytes": 134217728,
+  "max_object_reads": 131072,
+  "timeout_ms": 20000
+}
+```
+
+Byte limits apply independently to each object and symbol store. Values must
+be positive; the maximum is 1 GiB for each byte limit, 1,000,000 object reads,
+and 60,000 milliseconds. Unknown or duplicate fields and invalid values fail
+static inventory admission. These limits control observation, not the writer's
+storage quota. Increase them deliberately for known store sizes, or compact the
+WAL through its owning writer; the observing host never repairs or compacts it.
+
+At most four complete inspections are admitted concurrently. Excess requests
+receive an explicit capacity error. Directory metadata checks and disk recovery
+run off the asynchronous executor, and an expired or cancelled caller does not free a worker's slot
+until its outstanding disk operation actually exits. A stuck filesystem can
+therefore occupy a slot after the response deadline, but cannot create an
+unbounded queue of replacement workers. Successful recovery preserves the
+same read-only, MAC, object-ID, writer-pin, and instance checks described above.
+
 ## Retain an Exact Root on Another Host
 
 Singleton state history preserves writer ownership across recovery. A state

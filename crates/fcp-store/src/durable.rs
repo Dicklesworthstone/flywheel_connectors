@@ -1244,9 +1244,37 @@ impl DurableSymbolStore {
         Self::open_with_access(config, DurableAccess::ReadOnly)
     }
 
+    /// Read an observational view under one snapshot-plus-WAL input budget.
+    ///
+    /// The budget includes historical records already covered by a snapshot.
+    /// Input is bounded before decoding, and a concurrently growing WAL cannot
+    /// extend the captured view. Recovered symbols and their metadata must also
+    /// fit `config.max_bytes`. No files are created, repaired or checkpointed.
+    ///
+    /// # Errors
+    /// Returns observational-open errors, or an error for a zero input budget,
+    /// excess encoded input, or recovered state exceeding the storage quota.
+    pub fn open_read_only_bounded(
+        config: DurableSymbolStoreConfig,
+        max_recovery_bytes: u64,
+    ) -> Result<Self, SymbolStoreError> {
+        if max_recovery_bytes == 0 {
+            return Err(symbol_io("read-only recovery byte budget must be nonzero"));
+        }
+        Self::open_with_recovery_budget(config, DurableAccess::ReadOnly, Some(max_recovery_bytes))
+    }
+
     fn open_with_access(
         config: DurableSymbolStoreConfig,
         access: DurableAccess,
+    ) -> Result<Self, SymbolStoreError> {
+        Self::open_with_recovery_budget(config, access, None)
+    }
+
+    fn open_with_recovery_budget(
+        config: DurableSymbolStoreConfig,
+        access: DurableAccess,
+        max_recovery_bytes: Option<u64>,
     ) -> Result<Self, SymbolStoreError> {
         let writer_lock = if access == DurableAccess::ReadWrite {
             fs::create_dir_all(&config.root_dir).map_err(symbol_io)?;
@@ -1269,6 +1297,7 @@ impl DurableSymbolStore {
             config.mac_key.as_ref(),
             config.allow_legacy_unauth,
             access,
+            max_recovery_bytes,
         )?;
         #[allow(clippy::used_underscore_binding)]
         {
@@ -1717,13 +1746,14 @@ fn load_durable_symbol_state(
     mac_key: Option<&[u8; 32]>,
     allow_legacy_unauth: bool,
     access: DurableAccess,
+    mut remaining_recovery_bytes: Option<u64>,
 ) -> Result<(DurableSymbolState, u64), SymbolStoreError> {
     let (mut state, last_snapshot_seq) = match read_snapshot::<SymbolSnapshot>(
         snapshot_path,
         mac_key,
         allow_legacy_unauth,
         MAX_SNAPSHOT_BYTES,
-        &mut None,
+        &mut remaining_recovery_bytes,
     )
     .map_err(symbol_io_durable)?
     {
@@ -1739,7 +1769,7 @@ fn load_durable_symbol_state(
         allow_legacy_unauth,
         access,
         MAX_WAL_RECORD_BYTES,
-        &mut None,
+        &mut remaining_recovery_bytes,
         |record| {
             // Authentication does not establish semantic validity: metadata,
             // symbol sizes, zones and conflicting bytes still need checking.
@@ -2896,6 +2926,71 @@ mod tests {
                 DurableObjectStore::open_read_only_bounded(
                     DurableObjectStoreConfig::new(&root),
                     budget
+                )
+                .is_err()
+            );
+            assert!(!root.exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_symbol_observer_shares_snapshot_and_wal_budget_without_writes() {
+        let directory = TempDir::new().unwrap();
+        for mac_key in [None, Some(TEST_MAC_KEY)] {
+            let mut config =
+                DurableSymbolStoreConfig::new(directory.path().join(mac_key.is_some().to_string()));
+            config.mac_key = mac_key;
+            config.checkpoint_after_ops = 0;
+            let writer = DurableSymbolStore::open(config.clone()).unwrap();
+            writer.put_object_meta(test_symbol_meta(1)).await.unwrap();
+            writer.put_symbol(test_symbol(1, 0, 2)).await.unwrap();
+            writer.checkpoint().await.unwrap();
+            writer.put_symbol(test_symbol(1, 1, 2)).await.unwrap();
+            let snapshot_bytes = fs::metadata(&writer.snapshot_path).unwrap().len();
+            let total_bytes = snapshot_bytes + fs::metadata(&writer.wal_path).unwrap().len();
+            let before = stored_file_bytes(&config.root_dir);
+
+            for budget in [0, snapshot_bytes - 1, total_bytes - 1] {
+                assert!(
+                    DurableSymbolStore::open_read_only_bounded(config.clone(), budget).is_err()
+                );
+                assert_eq!(stored_file_bytes(&config.root_dir), before);
+            }
+            let reader =
+                DurableSymbolStore::open_read_only_bounded(config.clone(), total_bytes).unwrap();
+            assert_eq!(reader.symbol_count(&test_object_id(1)).await, 2);
+            assert!(reader.put_symbol(test_symbol(1, 2, 2)).await.is_err());
+            assert!(reader.checkpoint().await.is_err());
+            assert_eq!(stored_file_bytes(&config.root_dir), before);
+
+            let mut insufficient_live_quota = config.clone();
+            insufficient_live_quota.max_bytes = writer.storage_used().await - 1;
+            assert!(matches!(
+                DurableSymbolStore::open_read_only_bounded(insufficient_live_quota, total_bytes),
+                Err(SymbolStoreError::QuotaExceeded { .. })
+            ));
+            assert_eq!(stored_file_bytes(&config.root_dir), before);
+
+            writer.put_symbol(test_symbol(1, 2, 2)).await.unwrap();
+            assert_eq!(reader.symbol_count(&test_object_id(1)).await, 2);
+            assert!(
+                DurableSymbolStore::open_read_only_bounded(config.clone(), total_bytes).is_err()
+            );
+            let grown_bytes = snapshot_bytes + fs::metadata(&writer.wal_path).unwrap().len();
+            let fresh = DurableSymbolStore::open_read_only_bounded(config, grown_bytes).unwrap();
+            assert_eq!(fresh.symbol_count(&test_object_id(1)).await, 3);
+        }
+    }
+
+    #[test]
+    fn bounded_symbol_observer_never_creates_missing_storage() {
+        let directory = TempDir::new().unwrap();
+        let root = directory.path().join("missing");
+        for budget in [0, 1, 1024] {
+            assert!(
+                DurableSymbolStore::open_read_only_bounded(
+                    DurableSymbolStoreConfig::new(&root),
+                    budget,
                 )
                 .is_err()
             );
