@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use fcp_async_core::CancellationToken;
 use fcp_async_core::channel::mpsc;
 use fcp_async_core::process::Child;
-use fcp_core::InvokeResponse;
+use fcp_core::{InvokeResponse, ShutdownRequest};
 use fcp_host::{
     CancellationController, CancellationRegistration, CancellationTerminator, HostError, HostResult,
 };
@@ -513,14 +513,34 @@ impl NativeRpc {
     /// Transfer process custody before clearing the runner's active command.
     /// Child::Drop alone only requests asynchronous reaping, not confirmed exit.
     pub(super) fn retire(&self, mut child: Child) {
-        if let Err(error) = child.start_kill() {
+        // A cooperative lifecycle shutdown may already have reaped this child.
+        // Do not send a forced signal after observing its natural exit.
+        let exited = child.try_wait().is_ok_and(|status| status.is_some());
+        if !exited && let Err(error) = child.start_kill() {
             tracing::warn!(%error, "native connector termination signal failed");
         }
         let mut state = self.state.lock().expect("native RPC state lock");
         if matches!(state.phase, RpcPhase::Active) {
             state.transport_retired = true;
-            state.phase = RpcPhase::Retiring(child);
+            state.phase = if exited {
+                RpcPhase::Settled
+            } else {
+                RpcPhase::Retiring(child)
+            };
         }
+    }
+
+    /// Publish an exit already observed while this ticket owned the runner.
+    /// asupersync's `try_wait` consumes the OS handle on success, so probing it
+    /// again would lose the only successful observation and strand custody.
+    fn settle_observed_exit(&self, child: Child) {
+        let mut state = self.state.lock().expect("native RPC state lock");
+        if matches!(state.phase, RpcPhase::Active) {
+            state.transport_retired = true;
+            state.phase = RpcPhase::Settled;
+        }
+        drop(state);
+        drop(child);
     }
 
     /// This callback is nonblocking and must run outside controller map locks.
@@ -644,6 +664,100 @@ impl Drop for NativeRpcQueue {
     }
 }
 
+/// Give an explicitly retired stateless runtime a bounded chance to drain its
+/// connector resources. The queue is already sealed and the runner retains its
+/// exact child throughout every await; cancellation or actor destruction still
+/// falls back to the ordinary forced-retirement custody path.
+///
+/// A shutdown reply alone is never exit evidence or canonical-state evidence.
+/// Both the reply and actual process exit must fit one graceful deadline, with
+/// time reserved inside the original caller budget for forced cleanup.
+async fn cooperative_shutdown(runner: &mut ConnectorProcessRunner, rpc: &NativeRpc) {
+    let remaining = rpc.remaining();
+    let cleanup_reserve = RETIREMENT_GRACE.min(remaining / 2);
+    let grace = remaining
+        .saturating_sub(cleanup_reserve)
+        .min(CONNECTOR_RPC_IO_TIMEOUT);
+    if rpc.is_cancelled() || grace.as_millis() == 0 {
+        return;
+    }
+    let deadline = deadline_after(Instant::now(), grace).min(rpc.deadline);
+    let request = ShutdownRequest {
+        r#type: "shutdown".to_owned(),
+        deadline_ms: u64::try_from(grace.as_millis()).unwrap_or(u64::MAX),
+        drain: true,
+        reason: Some("host runtime retirement".to_owned()),
+    };
+    let Ok(params) = serde_json::to_value(request) else {
+        return;
+    };
+    let shutdown = async {
+        let response = runner
+            .request_with_timeout(
+                "shutdown",
+                params,
+                deadline.saturating_duration_since(Instant::now()),
+            )
+            .await?;
+        if response.get("jsonrpc").and_then(serde_json::Value::as_str) != Some("2.0")
+            || response.get("error").is_some()
+            || !response
+                .get("result")
+                .is_some_and(serde_json::Value::is_object)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "native shutdown did not return a successful protocol response",
+            ));
+        }
+        runner
+            .event_transport
+            .close_stdin(deadline.saturating_duration_since(Instant::now()))
+            .await?;
+        loop {
+            let child = runner.child.as_mut().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "native shutdown no longer owns its child",
+                )
+            })?;
+            if child.try_wait()?.is_some() {
+                // Preserve the successful observation before another poll or
+                // Drop path can touch the consumed asupersync child handle.
+                let child = runner.child.take().expect("observed native child exit");
+                runner.runtime_retirement.record(rpc.clone());
+                rpc.settle_observed_exit(child);
+                runner.active_rpc = None;
+                return Ok(());
+            }
+            fcp_async_core::time::sleep(
+                RETIREMENT_POLL.min(deadline.saturating_duration_since(Instant::now())),
+            )
+            .await;
+        }
+    };
+    let cancelled = pin!(rpc.cancelled());
+    let shutdown = pin!(fcp_async_core::time::timeout(
+        deadline.saturating_duration_since(Instant::now()),
+        shutdown,
+    ));
+    if matches!(
+        select(cancelled, shutdown).await,
+        Either::Right((Ok(Ok(())), _))
+    ) {
+        tracing::debug!(
+            event = "native_runtime_graceful_exit",
+            "native connector acknowledged shutdown and exited"
+        );
+    } else {
+        // Do not log provider-controlled reply/error content during cleanup.
+        tracing::debug!(
+            event = "native_runtime_forced_retirement",
+            "native connector did not finish cooperative shutdown; retaining forced-exit custody"
+        );
+    }
+}
+
 /// The production actor owns one command through response or child retirement.
 pub(super) fn run_dispatcher(
     mut runner: ConnectorProcessRunner,
@@ -675,9 +789,11 @@ pub(super) fn run_dispatcher(
             runner.active_rpc = Some(rpc.clone());
             if request.method == RETIRE_RUNTIME_METHOD {
                 // A lifecycle stop waits behind already selected work. Once
-                // selected, it closes admission before killing the exact child;
-                // retained Arc callers cannot revive this dispatcher.
+                // selected, it closes admission before requesting bounded
+                // cooperative shutdown. Retained Arc callers cannot revive
+                // this dispatcher, including while shutdown is in progress.
                 receiver.close();
+                cooperative_shutdown(&mut runner, &rpc).await;
                 runner.retire_child();
                 rpc.wait_for_settlement().await;
                 let response = if runner.runtime_retirement.is_exited() {
@@ -2244,16 +2360,25 @@ mod runtime_retirement_tests {
     }
 
     #[fcp_async_core::runtime::test(flavor = "multi_thread")]
-    async fn idle_native_retirement_confirms_exit_without_sending_provider_rpc() {
+    async fn idle_native_retirement_drains_then_closes_stdin_and_confirms_exit() {
         let directory = tempfile::tempdir().unwrap();
         let ready = directory.path().join("ready");
         let calls = directory.path().join("calls");
+        let exited = directory.path().join("exited");
         let environment = BTreeMap::from([
             ("READY".to_owned(), ready.to_string_lossy().into_owned()),
             ("CALLS".to_owned(), calls.to_string_lossy().into_owned()),
+            ("EXITED".to_owned(), exited.to_string_lossy().into_owned()),
         ]);
         let connector = connector(
-            ": > \"$READY\"; while IFS= read -r request; do printf '%s\\n' \"$request\" >> \"$CALLS\"; done",
+            r#"
+: > "$READY"
+IFS= read -r request || exit 1
+printf '%s\n' "$request" > "$CALLS"
+printf '%s\n' '{"jsonrpc":"2.0","id":"0:0","result":{"status":"shutdown"}}'
+while IFS= read -r request; do printf '%s\n' "$request" >> "$CALLS"; done
+: > "$EXITED"
+"#,
             &environment,
         )
         .await;
@@ -2267,9 +2392,24 @@ mod runtime_retirement_tests {
         assert!(connector.runtime_retirement.is_exited());
         assert!(connector.runner_tx.is_closed());
         assert!(
-            !calls.exists(),
-            "host retirement must never reach provider stdin"
+            exited.exists(),
+            "the child must observe input EOF and exit naturally before forced cleanup"
         );
+        let calls_before = std::fs::read_to_string(&calls).unwrap();
+        let frames: Vec<serde_json::Value> = calls_before
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(frames.len(), 1, "only one shutdown request is permitted");
+        assert_eq!(frames[0]["jsonrpc"], "2.0");
+        assert_eq!(frames[0]["id"], "0:0");
+        assert_eq!(frames[0]["method"], "shutdown");
+        let shutdown: ShutdownRequest =
+            serde_json::from_value(frames[0]["params"].clone()).unwrap();
+        assert_eq!(shutdown.r#type, "shutdown");
+        assert!(shutdown.drain);
+        assert!(shutdown.deadline_ms > 0 && shutdown.deadline_ms <= 3_000);
+        assert_eq!(shutdown.reason.as_deref(), Some("host runtime retirement"));
         retained
             .retire_runtime(Instant::now() + Duration::from_secs(1))
             .await
@@ -2278,7 +2418,126 @@ mod runtime_retirement_tests {
             .await
             .expect("a retained reference must fail promptly")
             .expect_err("retained references cannot revive a stopped dispatcher");
-        assert!(!calls.exists());
+        retained
+            .event_transport
+            .as_ref()
+            .unwrap()
+            .close_stream("retained-stream")
+            .await
+            .expect_err("retained stream controls cannot write after shutdown");
+        assert_eq!(std::fs::read_to_string(&calls).unwrap(), calls_before);
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn native_retirement_forces_exit_after_failed_or_incomplete_shutdown() {
+        for response in [
+            None,
+            Some("not-json"),
+            Some(r#"{"jsonrpc":"2.0","id":"0:0","error":{"code":-32601}}"#),
+            Some(r#"{"jsonrpc":"2.0","id":"0:0","result":null}"#),
+            Some(r#"{"jsonrpc":"2.0","id":"0:0","result":{},"error":{}}"#),
+            Some(r#"{"jsonrpc":"2.0","id":"wrong","result":{}}"#),
+            // A correct acknowledgement also fails to prove process exit.
+            Some(r#"{"jsonrpc":"2.0","id":"0:0","result":{}}"#),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let calls = directory.path().join("calls");
+            let mut environment =
+                BTreeMap::from([("CALLS".to_owned(), calls.to_string_lossy().into_owned())]);
+            if let Some(response) = response {
+                environment.insert("RESPONSE".to_owned(), response.to_owned());
+            }
+            let connector = connector(
+                r#"
+IFS= read -r request || exit 1
+printf '%s\n' "$request" > "$CALLS"
+if [ -n "$RESPONSE" ]; then printf '%s\n' "$RESPONSE"; fi
+exec sleep 30
+"#,
+                &environment,
+            )
+            .await;
+            fcp_async_core::time::timeout(
+                Duration::from_secs(2),
+                connector.retire_runtime(Instant::now() + Duration::from_millis(750)),
+            )
+            .await
+            .expect("retirement must not renew the original caller deadline")
+            .expect("failed shutdown falls back to confirmed physical exit");
+            assert!(connector.runtime_retirement.is_exited());
+            assert!(connector.runner_tx.is_closed());
+            let frame: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&calls).unwrap()).unwrap();
+            assert_eq!(frame["method"], "shutdown");
+            assert_eq!(frame["params"]["drain"], true);
+            assert!(frame["params"]["deadline_ms"].as_u64().unwrap() <= 375);
+            connector
+                .rpc("invoke", json!({}))
+                .await
+                .expect_err("forced cleanup cannot reopen a failed dispatcher");
+        }
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn native_retirement_accepts_eof_only_after_confirming_physical_exit() {
+        let directory = tempfile::tempdir().unwrap();
+        let exited = directory.path().join("exited");
+        let connector = connector(
+            "IFS= read -r request || exit 1; : > \"$EXITED\"; exit 0",
+            &BTreeMap::from([("EXITED".to_owned(), exited.to_string_lossy().into_owned())]),
+        )
+        .await;
+        connector
+            .retire_runtime(Instant::now() + Duration::from_secs(2))
+            .await
+            .expect("EOF without an acknowledgement can only succeed with physical exit proof");
+        assert!(exited.exists());
+        assert!(connector.runtime_retirement.is_exited());
+        assert!(connector.runner_tx.is_closed());
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn abandoning_cooperative_shutdown_forces_cleanup_without_reopening_admission() {
+        for acknowledge in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let ready = directory.path().join("shutdown-selected");
+            let environment = BTreeMap::from([
+                ("READY".to_owned(), ready.to_string_lossy().into_owned()),
+                ("ACKNOWLEDGE".to_owned(), acknowledge.to_string()),
+            ]);
+            let connector = connector(
+                r#"
+IFS= read -r request || exit 1
+if [ "$ACKNOWLEDGE" = true ]; then
+  printf '%s\n' '{"jsonrpc":"2.0","id":"0:0","result":{}}'
+fi
+: > "$READY"
+exec sleep 30
+"#,
+                &environment,
+            )
+            .await;
+            let mut stop =
+                Box::pin(connector.retire_runtime(Instant::now() + Duration::from_secs(30)));
+            assert!(futures_util::poll!(stop.as_mut()).is_pending());
+            wait_for_file(&ready).await;
+            assert!(connector.runner_tx.is_closed());
+            assert!(
+                !connector.runtime_retirement.is_exited(),
+                "an acknowledgement must not masquerade as a stopped process"
+            );
+            drop(stop);
+            connector
+                .runtime_retirement
+                .wait_for_exit(Instant::now() + Duration::from_secs(2))
+                .await
+                .expect("caller cancellation must interrupt the graceful wait immediately");
+            assert!(connector.runner_tx.is_closed());
+            connector
+                .retire_runtime(Instant::now() + Duration::from_secs(1))
+                .await
+                .expect("a retry observes the same completed retirement");
+        }
     }
 
     #[fcp_async_core::runtime::test(flavor = "multi_thread")]
@@ -2333,7 +2592,8 @@ printf '%s\n' "$request" >> "$CALLS"
 printf '%s\n' '{"jsonrpc":"2.0","id":"0:1","result":{"alive":true}}'
 IFS= read -r request || exit 0
 printf '%s\n' "$request" >> "$CALLS"
-exec sleep 30
+printf '%s\n' '{"jsonrpc":"2.0","id":"0:2","result":{}}'
+while IFS= read -r request; do exit 2; done
 "#;
         let connector = connector(script, &environment).await;
         let active = Arc::clone(&connector);
@@ -2394,12 +2654,20 @@ exec sleep 30
         let mut actor = Box::pin(run_dispatcher(runner, receiver));
         let _ = futures_util::poll!(actor.as_mut());
         assert!(
-            rpc.transport_retired(),
-            "the selected control must first transfer its child"
+            rpc.is_active(),
+            "the graceful shutdown retains active ownership until exit or forced retirement"
+        );
+        assert!(
+            sender.is_closed(),
+            "selection must seal queue admission first"
         );
         drop(response_rx);
         drop(waiter);
         drop(actor);
+        assert!(
+            rpc.transport_retired(),
+            "actor loss must transfer exact child custody"
+        );
         retirement
             .wait_for_exit(Instant::now() + Duration::from_secs(5))
             .await
@@ -2534,7 +2802,7 @@ while IFS= read -r request; do :; done
         let mut stop = Box::pin(pool.retire(Instant::now() + Duration::from_secs(5)));
         assert!(futures_util::poll!(stop.as_mut()).is_pending());
         idle.runtime_retirement
-            .wait_for_exit(Instant::now() + Duration::from_secs(2))
+            .wait_for_exit(Instant::now() + Duration::from_secs(4))
             .await
             .expect("one active worker must not hold idle worker retirement behind it");
         assert!(!active.runtime_retirement.is_exited());

@@ -107,7 +107,7 @@ fn validate_stream_id(stream_id: &str) -> io::Result<()> {
 /// Shared controls for one physical subprocess, never a replacement worker.
 #[derive(Clone)]
 pub(super) struct NativeEventTransport {
-    writer: Arc<futures_util::lock::Mutex<ChildStdin>>,
+    writer: Arc<futures_util::lock::Mutex<Option<ChildStdin>>>,
     sink: Arc<Mutex<Option<NativeEventSink>>>,
     failure: Arc<Mutex<Option<(io::ErrorKind, String)>>>,
     failed: CancellationToken,
@@ -117,7 +117,7 @@ pub(super) struct NativeEventTransport {
 impl NativeEventTransport {
     pub(super) fn new(stdin: ChildStdin) -> Self {
         Self {
-            writer: Arc::new(futures_util::lock::Mutex::new(stdin)),
+            writer: Arc::new(futures_util::lock::Mutex::new(Some(stdin))),
             sink: Arc::new(Mutex::new(None)),
             failure: Arc::new(Mutex::new(None)),
             failed: CancellationToken::new(),
@@ -177,6 +177,19 @@ impl NativeEventTransport {
         self.write_json_with_authority(value, timeout, None).await
     }
 
+    /// Close the exact child's input after its shutdown reply. Most connector
+    /// protocol loops exit on EOF rather than exiting inside `shutdown`.
+    /// Taking the shared writer also fences retained ACK/close handles: no
+    /// subsequent caller can write through an independently held transport.
+    pub(super) async fn close_stdin(&self, timeout: Duration) -> io::Result<()> {
+        fcp_async_core::time::timeout(timeout, async {
+            let stdin = self.writer.lock().await.take();
+            drop(stdin);
+        })
+        .await
+        .map_err(|_| connector_io_timeout_error("stdin close", timeout))
+    }
+
     async fn write_json_with_authority(
         &self,
         value: &Value,
@@ -191,6 +204,12 @@ impl NativeEventTransport {
             if self.failed.is_cancelled() {
                 return Err(self.failure_error());
             }
+            let writer = writer.as_mut().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "native connector input is closed for runtime retirement",
+                )
+            })?;
             if let Some(authority) = authority
                 && authority
                     .refresh()
@@ -570,6 +589,60 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[fcp_async_core::runtime::test]
+    async fn closing_stdin_is_bounded_idempotent_and_fences_retained_writers() {
+        let mut runner = spawn_fixture(
+            r#"
+IFS= read -r request || exit 1
+printf '%s\n' '{"jsonrpc":"2.0","id":"0:0","result":{}}'
+while IFS= read -r request; do exit 2; done
+exit 0
+"#,
+            &[],
+        )
+        .await;
+        let transport = runner.event_transport.clone();
+        let retained = transport.clone();
+        let owner = transport.writer.lock().await;
+        assert_eq!(
+            retained
+                .close_stdin(Duration::from_millis(20))
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert!(
+            owner.is_some(),
+            "an expired close cannot revoke an active writer"
+        );
+        drop(owner);
+        runner.request("shutdown", json!({})).await.unwrap();
+        transport.close_stdin(Duration::from_secs(1)).await.unwrap();
+        retained.close_stdin(Duration::from_secs(1)).await.unwrap();
+        retained
+            .write_json(&json!({"method": "invoke"}), Duration::from_secs(1))
+            .await
+            .expect_err("closed stdin and the child's EOF must both refuse retained writers");
+        fcp_async_core::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(status) = runner.child.as_mut().unwrap().try_wait().unwrap() {
+                    assert!(
+                        status.success(),
+                        "the connector must exit on EOF without extra frames"
+                    );
+                    // try_wait consumes asupersync's handle on a ready result.
+                    runner.child.take();
+                    break;
+                }
+                fcp_async_core::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("taking the last shared stdin owner must deliver EOF");
     }
 
     #[cfg(unix)]
