@@ -9,10 +9,14 @@
 
 use std::io::{BufRead, Write};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use fcp_core::{CostEstimate, CostEstimateConfidence, ResourceAvailability};
+use fcp_core::{
+    CapabilityGrant, CapabilityToken, CapabilityVerifier, CostEstimate, CostEstimateConfidence,
+    InstanceId, ResourceAvailability,
+};
 use fcp_host::ConnectorArchetype;
 use fcp_kernel::{
     AgentHint, ApprovalMode, AuthCaps, ConnectorId, EventCaps, FcpError, HandshakeRequest,
@@ -398,6 +402,8 @@ struct TestConnectorProfile {
     artifact_policy: FixtureArtifactPolicy,
     handshake_mode: FixtureHandshakeMode,
     require_handshake: bool,
+    /// Exercise the production verifier at the subprocess effect boundary.
+    require_instance_binding: bool,
 }
 
 impl TestConnectorProfile {
@@ -411,6 +417,8 @@ impl TestConnectorProfile {
             artifact_policy: FixtureArtifactPolicy::from_env(),
             handshake_mode: FixtureHandshakeMode::from_env(),
             require_handshake: std::env::var("FCP_TEST_CONNECTOR_REQUIRE_HANDSHAKE")
+                .is_ok_and(|value| value == "1"),
+            require_instance_binding: std::env::var("FCP_TEST_CONNECTOR_REQUIRE_INSTANCE_BINDING")
                 .is_ok_and(|value| value == "1"),
         }
     }
@@ -445,6 +453,32 @@ impl TestConnectorProfile {
     }
 }
 
+struct FixtureBoundAuthority {
+    instance_id: InstanceId,
+    verifier: Option<CapabilityVerifier>,
+    capability_granted: bool,
+    authorized_invocations: AtomicU64,
+}
+
+impl Default for FixtureBoundAuthority {
+    fn default() -> Self {
+        Self {
+            instance_id: InstanceId::new(),
+            verifier: None,
+            capability_granted: false,
+            authorized_invocations: AtomicU64::new(0),
+        }
+    }
+}
+
+impl FixtureBoundAuthority {
+    fn invalidate(&mut self) {
+        self.instance_id = InstanceId::new();
+        self.verifier = None;
+        self.capability_granted = false;
+    }
+}
+
 struct TestConnector {
     id: ConnectorId,
     start_time: Instant,
@@ -452,6 +486,7 @@ struct TestConnector {
     handshaken_zone: Option<ZoneId>,
     handshake_count: Mutex<u32>,
     profile: TestConnectorProfile,
+    bound_authority: FixtureBoundAuthority,
 }
 
 impl TestConnector {
@@ -463,6 +498,7 @@ impl TestConnector {
             handshaken_zone: None,
             handshake_count: Mutex::new(0),
             profile: TestConnectorProfile::from_env(),
+            bound_authority: FixtureBoundAuthority::default(),
         }
     }
 
@@ -479,6 +515,7 @@ impl TestConnector {
     ) -> Result<serde_json::Value, FcpError> {
         self.configured = true;
         self.handshaken_zone = None;
+        self.bound_authority.invalidate();
         Ok(json!({ "status": "ok" }))
     }
 
@@ -486,6 +523,15 @@ impl TestConnector {
         &mut self,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, FcpError> {
+        if self.profile.require_instance_binding {
+            // Failed negotiation invalidates old authority too. The instance
+            // is generated here, never accepted from caller-controlled fields.
+            self.bound_authority.invalidate();
+            self.handshaken_zone = None;
+            if !self.configured {
+                return Err(FcpError::NotConfigured);
+            }
+        }
         *self
             .handshake_count
             .lock()
@@ -497,6 +543,15 @@ impl TestConnector {
                 message: format!("Invalid handshake request: {err}"),
             })?;
 
+        if self.profile.require_instance_binding
+            && !matches!(req.protocol_version.as_str(), "2.0" | "2.0.0")
+        {
+            return Err(FcpError::InvalidRequest {
+                code: 1003,
+                message: "Instance-bound fixture handshake requires protocol 2.0 or 2.0.0".into(),
+            });
+        }
+
         let (status, nonce, handshaken) = match self.profile.handshake_mode {
             FixtureHandshakeMode::Accepted => ("accepted".to_string(), req.nonce, true),
             FixtureHandshakeMode::Rejected => ("rejected".to_string(), req.nonce, false),
@@ -506,9 +561,26 @@ impl TestConnector {
                 ("accepted".to_string(), nonce, true)
             }
         };
+        let mut capabilities_granted = Vec::new();
+        if self.profile.require_instance_binding && handshaken && nonce == req.nonce {
+            let capability = CapabilityId::from_static(self.profile.archetype.capability_id());
+            self.bound_authority.capability_granted =
+                req.capabilities_requested.contains(&capability);
+            if self.bound_authority.capability_granted {
+                capabilities_granted.push(CapabilityGrant {
+                    capability,
+                    operation: None,
+                });
+            }
+            self.bound_authority.verifier = Some(CapabilityVerifier::new(
+                req.host_public_key,
+                req.zone.clone(),
+                self.bound_authority.instance_id.clone(),
+            ));
+        }
         let response = HandshakeResponse {
             status,
-            capabilities_granted: Vec::new(),
+            capabilities_granted,
             session_id: SessionId::new(),
             manifest_hash: "sha256:fcp-test-connector".to_string(),
             nonce,
@@ -524,11 +596,22 @@ impl TestConnector {
     }
 
     fn handle_health(&self) -> Result<serde_json::Value, FcpError> {
-        let snapshot = self.profile.health_mode.snapshot(
+        let mut snapshot = self.profile.health_mode.snapshot(
             self.start_time.elapsed().as_millis() as u64,
             self.configured,
             &self.profile,
         );
+        if self.profile.require_instance_binding
+            && let Some(details) = snapshot.details.as_mut().and_then(serde_json::Value::as_object_mut)
+        {
+            details.insert("handshaken".into(), json!(self.bound_authority.verifier.is_some()));
+            details.insert("instance_id".into(), json!(self.bound_authority.instance_id));
+            details.insert("pid".into(), json!(std::process::id()));
+            details.insert(
+                "authorized_invocations".into(),
+                json!(self.bound_authority.authorized_invocations.load(Ordering::SeqCst)),
+            );
+        }
 
         serde_json::to_value(snapshot).map_err(|err| FcpError::Internal {
             message: format!("Failed to serialize health snapshot: {err}"),
@@ -564,6 +647,36 @@ impl TestConnector {
         serde_json::to_value(introspection).map_err(|err| FcpError::Internal {
             message: format!("Failed to serialize introspection: {err}"),
         })
+    }
+
+    fn authorize_bound(
+        &self,
+        zone: &ZoneId,
+        operation: &OperationId,
+        token: &CapabilityToken,
+    ) -> Result<(), FcpError> {
+        if !self.profile.require_instance_binding {
+            return Ok(());
+        }
+        if !self.configured {
+            return Err(FcpError::NotConfigured);
+        }
+        let verifier = self.bound_authority.verifier.as_ref().ok_or(FcpError::NotHandshaken)?;
+        if self.handshaken_zone.as_ref() != Some(zone) {
+            return Err(FcpError::InvalidRequest {
+                code: 1007,
+                message: "Invocation zone differs from the negotiated fixture zone".into(),
+            });
+        }
+        let capability = CapabilityId::from_static(self.profile.archetype.capability_id());
+        if !self.bound_authority.capability_granted {
+            return Err(FcpError::CapabilityDenied {
+                capability: capability.to_string(),
+                reason: "Required fixture capability was not negotiated".into(),
+            });
+        }
+        verifier.verify_bound(token.clone(), &capability, operation, &[])?;
+        Ok(())
     }
 
     fn handle_invoke(&self, params: serde_json::Value) -> Result<serde_json::Value, FcpError> {
@@ -611,6 +724,8 @@ impl TestConnector {
             });
         }
 
+        self.authorize_bound(&req.zone_id, &req.operation, &req.capability_token)?;
+
         if self.profile.artifact_policy == FixtureArtifactPolicy::RejectFake
             && req
                 .input
@@ -622,6 +737,10 @@ impl TestConnector {
                 code: 1005,
                 message: "fake artifact provenance rejected".to_string(),
             });
+        }
+
+        if self.profile.require_instance_binding {
+            self.bound_authority.authorized_invocations.fetch_add(1, Ordering::SeqCst);
         }
 
         if let Some(delay_ms) = req
@@ -653,6 +772,12 @@ impl TestConnector {
                 "operation_mode": self.profile.operation_mode.as_env(),
             }),
         );
+        if self.profile.require_instance_binding
+            && let Some(result) = response.result.as_mut()
+        {
+            result["instance_id"] = json!(self.bound_authority.instance_id);
+            result["pid"] = json!(std::process::id());
+        }
         response.receipt_id = Some(ObjectId::from_unscoped_bytes(b"test-receipt"));
 
         serde_json::to_value(response).map_err(|err| FcpError::Internal {
@@ -704,6 +829,8 @@ impl TestConnector {
                 ),
             });
         }
+
+        self.authorize_bound(&req.zone_id, &req.operation, &req.capability_token)?;
 
         if let Some(delay_ms) = req
             .input
@@ -851,8 +978,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fcp_crypto::{cose::CapabilityTokenBuilder, ed25519::Ed25519SigningKey};
     use fcp_kernel::RequestId;
-    use fcp_prelude::{CapabilityToken, ZoneId};
 
     fn test_profile(require_handshake: bool) -> TestConnectorProfile {
         TestConnectorProfile {
@@ -864,6 +991,7 @@ mod tests {
             artifact_policy: FixtureArtifactPolicy::Echo,
             handshake_mode: FixtureHandshakeMode::Accepted,
             require_handshake,
+            require_instance_binding: false,
         }
     }
 
@@ -926,6 +1054,7 @@ mod tests {
             artifact_policy: FixtureArtifactPolicy::Echo,
             handshake_mode: FixtureHandshakeMode::from_env(),
             require_handshake: false,
+            require_instance_binding: false,
         };
         let operation = profile
             .operation_info()
@@ -952,6 +1081,7 @@ mod tests {
             handshaken_zone: None,
             handshake_count: Mutex::new(0),
             profile: test_profile(true),
+            bound_authority: FixtureBoundAuthority::default(),
         };
 
         let err = connector
@@ -970,6 +1100,7 @@ mod tests {
             handshaken_zone: Some(ZoneId::work()),
             handshake_count: Mutex::new(0),
             profile: test_profile(false),
+            bound_authority: FixtureBoundAuthority::default(),
         };
 
         let err = connector
@@ -988,6 +1119,7 @@ mod tests {
             handshaken_zone: None,
             handshake_count: Mutex::new(0),
             profile: test_profile(true),
+            bound_authority: FixtureBoundAuthority::default(),
         };
 
         assert_eq!(connector.handshake_count(), 0);
@@ -1011,5 +1143,147 @@ mod tests {
                 "handshake_count": 2
             }))
         );
+    }
+
+    fn bound_handshake_request(key: &Ed25519SigningKey) -> serde_json::Value {
+        let mut request = handshake_request();
+        request["protocol_version"] = json!("2.0.0");
+        request["host_public_key"] = json!(key.verifying_key().to_bytes());
+        request["capabilities_requested"] = json!(["cap.test.echo"]);
+        request
+    }
+
+    fn bound_fixture(key: &Ed25519SigningKey) -> TestConnector {
+        let mut connector = TestConnector {
+            id: ConnectorId::from_static("fcp.test.bound:utility:1.0.0"),
+            start_time: Instant::now(),
+            configured: true,
+            handshaken_zone: None,
+            handshake_count: Mutex::new(0),
+            profile: TestConnectorProfile {
+                require_instance_binding: true,
+                ..test_profile(true)
+            },
+            bound_authority: FixtureBoundAuthority::default(),
+        };
+        connector.handle_handshake(bound_handshake_request(key)).unwrap();
+        connector
+    }
+
+    fn bound_token(key: &Ed25519SigningKey, instance: Option<&InstanceId>) -> CapabilityToken {
+        let now = chrono::Utc::now();
+        let mut builder = CapabilityTokenBuilder::new()
+            .capability_id("cap.test.echo")
+            .zone_id("z:work")
+            .principal("user:test")
+            .issuer("node:test")
+            .audience("*")
+            .operations(&["test.echo"])
+            .validity(now - chrono::Duration::seconds(1), now + chrono::Duration::minutes(5));
+        if let Some(instance) = instance {
+            builder = builder.target_instance(instance.as_str());
+        }
+        let constraints = fcp_core::CapabilityConstraints {
+            resource_allow: vec!["*".into()],
+            ..Default::default()
+        };
+        let mut cbor = Vec::new();
+        ciborium::into_writer(&constraints, &mut cbor).unwrap();
+        CapabilityToken::from_raw(builder.try_constraints_cbor(&cbor).unwrap().sign(key).unwrap())
+    }
+
+    fn bound_invoke_request(connector: &TestConnector, token: CapabilityToken) -> serde_json::Value {
+        serde_json::to_value(InvokeRequest {
+            r#type: "invoke".into(),
+            id: RequestId::new("bound-fixture-invoke"),
+            connector_id: connector.id.clone(),
+            operation: OperationId::from_static("test.echo"),
+            zone_id: ZoneId::work(),
+            input: json!({"message": "bound effect"}),
+            capability_token: token,
+            holder_proof: None,
+            context: None,
+            idempotency_key: None,
+            lease_seq: None,
+            deadline_ms: None,
+            correlation_id: None,
+            provenance: None,
+            approval_tokens: Vec::new(),
+        }).unwrap()
+    }
+
+    fn bound_simulate_request(connector: &TestConnector, token: CapabilityToken) -> serde_json::Value {
+        let mut request = simulate_request(&connector.id, "test.echo");
+        request["capability_token"] = serde_json::to_value(token).unwrap();
+        request
+    }
+
+    fn assert_bound_rejected(connector: &TestConnector, token: CapabilityToken) {
+        let effects = connector.bound_authority.authorized_invocations.load(Ordering::SeqCst);
+        assert!(connector.handle_invoke(bound_invoke_request(connector, token.clone())).is_err());
+        assert!(connector.handle_simulate(bound_simulate_request(connector, token)).is_err());
+        assert_eq!(connector.bound_authority.authorized_invocations.load(Ordering::SeqCst), effects);
+    }
+
+    #[test]
+    fn instance_bound_fixture_checks_signature_and_exact_worker_before_effects() {
+        let key = Ed25519SigningKey::generate();
+        let first = bound_fixture(&key);
+        let second = bound_fixture(&key);
+        assert_ne!(first.bound_authority.instance_id, second.bound_authority.instance_id);
+        let token = bound_token(&key, Some(&first.bound_authority.instance_id));
+        let health = first.handle_health().unwrap();
+        assert_eq!(health["details"]["instance_id"], json!(first.bound_authority.instance_id));
+        assert_eq!(health["details"]["configured"], true);
+        assert_eq!(health["details"]["handshaken"], true);
+
+        let response = first.handle_invoke(bound_invoke_request(&first, token.clone())).unwrap();
+        assert_eq!(response["result"]["instance_id"], health["details"]["instance_id"]);
+        assert_eq!(response["result"]["pid"], json!(std::process::id()));
+        first.handle_simulate(bound_simulate_request(&first, token.clone())).unwrap();
+        assert_eq!(first.handle_health().unwrap()["details"]["authorized_invocations"], 1);
+        assert_bound_rejected(&second, token);
+        assert_bound_rejected(&first, bound_token(&key, None));
+        assert_bound_rejected(&first, bound_token(&Ed25519SigningKey::generate(), Some(&first.bound_authority.instance_id)));
+        assert_eq!(second.handle_health().unwrap()["details"]["authorized_invocations"], 0);
+    }
+
+    #[test]
+    fn instance_bound_fixture_never_accepts_caller_selected_identity_or_unnegotiated_grants() {
+        let key = Ed25519SigningKey::generate();
+        let mut connector = bound_fixture(&key);
+        let supplied = InstanceId::new();
+        let mut handshake = bound_handshake_request(&key);
+        handshake["requested_instance_id"] = json!(supplied);
+        handshake["capabilities_requested"] = json!([]);
+        let response = connector.handle_handshake(handshake).unwrap();
+        assert_eq!(response["capabilities_granted"], json!([]));
+        assert_ne!(connector.bound_authority.instance_id, supplied);
+        assert_bound_rejected(&connector, bound_token(&key, Some(&connector.bound_authority.instance_id)));
+    }
+
+    #[test]
+    fn instance_bound_fixture_reconfiguration_and_failed_handshake_revoke_old_authority() {
+        let key = Ed25519SigningKey::generate();
+        let mut connector = bound_fixture(&key);
+        let old_instance = connector.bound_authority.instance_id.clone();
+        let old_token = bound_token(&key, Some(&old_instance));
+        connector.handle_configure(json!({})).unwrap();
+        assert_ne!(connector.bound_authority.instance_id, old_instance);
+        assert_eq!(connector.handle_health().unwrap()["details"]["handshaken"], false);
+        assert_bound_rejected(&connector, old_token.clone());
+        connector.handle_handshake(bound_handshake_request(&key)).unwrap();
+        assert_bound_rejected(&connector, old_token);
+        let token = bound_token(&key, Some(&connector.bound_authority.instance_id));
+        assert!(connector.handle_handshake(json!({"protocol_version": "2.0"})).is_err());
+        assert_bound_rejected(&connector, token);
+        assert_eq!(connector.handle_health().unwrap()["details"]["handshaken"], false);
+
+        for mode in [FixtureHandshakeMode::Rejected, FixtureHandshakeMode::BadNonce] {
+            connector.profile.handshake_mode = mode;
+            connector.handle_handshake(bound_handshake_request(&key)).unwrap();
+            assert_eq!(connector.handle_health().unwrap()["details"]["handshaken"], false);
+            assert_bound_rejected(&connector, bound_token(&key, Some(&connector.bound_authority.instance_id)));
+        }
     }
 }
