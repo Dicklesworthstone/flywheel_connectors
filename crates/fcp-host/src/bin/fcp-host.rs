@@ -8892,6 +8892,15 @@ async fn verify_live_request_for_target(
         principal,
         constraint_resource_uri.as_deref(),
     )?;
+    if execution_target.is_none() {
+        // Preflight only observes the local executor's remaining allowance.
+        // Durable admission performs the atomic debit; an origin forwarding
+        // this request must not also spend its own independent account.
+        state
+            .lifecycle
+            .check_capability_usage(request, capability_key, principal)
+            .await?;
+    }
     state
         .registry
         .enforce_invoke_rate_limits(request, &introspection, principal, rate_limit_mode)

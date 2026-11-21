@@ -912,9 +912,16 @@ async fn run_owned(
             asserted_principal.as_deref(),
         )?,
     };
+    let capability_key = state.capability_verifying_key.as_ref().ok_or_else(|| {
+        HostError::PreflightFailed(
+            "capability usage requires a trusted verification key".to_owned(),
+        )
+    })?;
     let ticket = match before_deadline(
         deadline,
-        state.lifecycle.admit_invocation(admission),
+        state
+            .lifecycle
+            .admit_capability_invocation(admission, &request, capability_key),
         "durable invocation admission",
     )
     .await
@@ -922,13 +929,10 @@ async fn run_owned(
     {
         Ok(ticket) => ticket,
         Err(error) => {
-            let _ = append_dispatch_audit(
-                state,
-                &audit,
-                &Err(HostError::Unavailable(error.to_string())),
-                super::elapsed_millis(started_at),
-            );
-            return Err(error);
+            let result = Err(error);
+            let _ =
+                append_dispatch_audit(state, &audit, &result, super::elapsed_millis(started_at));
+            return result;
         }
     };
 
@@ -1319,6 +1323,113 @@ mod tests {
         })
         .await
         .expect("owned invocation completes before testing persisted retry refusal");
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn live_capability_usage_previews_do_not_spend_and_unknown_dispatch_never_refunds() {
+        for uncertain_reply in [false, true] {
+            let mut fixture = dispatch_fixture();
+            let constraints = fcp_core::CapabilityConstraints {
+                resource_allow: vec!["*".to_owned()],
+                max_calls: Some(1),
+                ..Default::default()
+            };
+            let mut encoded = Vec::new();
+            ciborium::into_writer(&constraints, &mut encoded).unwrap();
+            let claims = fixture
+                .request
+                .capability_token
+                .raw()
+                .verify(&fixture.signing_key.verifying_key())
+                .unwrap()
+                .token_id(b"live-dispatch-usage-token")
+                .try_constraints_cbor(&encoded)
+                .unwrap();
+            fixture.request.capability_token = fcp_core::CapabilityToken::from_raw(
+                fcp_crypto::cose::CoseToken::sign(&fixture.signing_key, &claims).unwrap(),
+            );
+
+            // Ordinary preflight and rejected requests cannot spend the one
+            // permitted invocation before the real executor owns its ticket.
+            for _ in 0..2 {
+                let preview =
+                    crate::evaluate_live_preflight(&fixture.state, &fixture.request, None).await;
+                assert!(preview.allowed, "{:?}", preview.reason);
+            }
+            let mut wrong_zone = fixture.request.clone();
+            wrong_zone.zone_id = fcp_core::ZoneId::public();
+            assert!(
+                execute(&fixture.state, wrong_zone, None, None, None, None, None)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(fixture.invoke_count.load(Ordering::SeqCst), 0);
+            if uncertain_reply {
+                *fixture.response.lock().unwrap() = Some(InvokeResponse::ok(
+                    fcp_kernel::RequestId::new("unexpected-reply-id"),
+                    serde_json::json!({ "dispatched": true }),
+                ));
+            }
+            let first = execute(
+                &fixture.state,
+                fixture.request.clone(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+            if uncertain_reply {
+                assert!(
+                    first
+                        .unwrap_err()
+                        .to_string()
+                        .contains("outcome is unknown")
+                );
+            } else {
+                first.unwrap();
+            }
+            wait_for_dispatch_fixture_job_retirement(&fixture).await;
+            assert_eq!(fixture.invoke_count.load(Ordering::SeqCst), 1);
+
+            // A fresh request ID cannot evade either a successful debit or an
+            // ambiguous external effect, even without an idempotency key.
+            fixture.request.id = fcp_kernel::RequestId::random();
+            // Forwarding origins do not own the destination's quota. The
+            // destination repeats local admission and spends its own ledger.
+            let peer = fcp_core::TailscaleNodeId::new("usage-destination");
+            crate::verify_live_request_for_target(
+                &fixture.state,
+                &fixture.request,
+                None,
+                Some(&peer),
+                crate::RateLimitMode::Inspect,
+            )
+            .await
+            .unwrap();
+            let preview =
+                crate::evaluate_live_preflight(&fixture.state, &fixture.request, None).await;
+            assert!(!preview.allowed);
+            assert!(preview.reason.unwrap().contains("call budget exhausted"));
+            let second = execute(
+                &fixture.state,
+                fixture.request.clone(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+            assert!(
+                second
+                    .unwrap_err()
+                    .to_string()
+                    .contains("call budget exhausted")
+            );
+            assert_eq!(fixture.invoke_count.load(Ordering::SeqCst), 1);
+        }
     }
 
     #[fcp_async_core::runtime::test]

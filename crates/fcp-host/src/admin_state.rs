@@ -32,7 +32,9 @@ use crate::{
     discovery::ConnectorSummary, supervisor::ConnectorPrewarmConfig,
 };
 
+mod capability_usage;
 mod mesh_invocations;
+use capability_usage::{CapabilityUsageLedger, CapabilityUsageScope};
 pub use mesh_invocations::*;
 
 const HOST_ADMIN_STATE_SNAPSHOT_VERSION: u32 = 1;
@@ -3206,6 +3208,8 @@ pub struct HostAdminStateSnapshot {
     invocations: Vec<InvocationRecord>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     mesh_invocations: Vec<MeshInvocationRecord>,
+    #[serde(default, skip_serializing_if = "CapabilityUsageLedger::is_empty")]
+    capability_usage: CapabilityUsageLedger,
     #[serde(
         default = "initial_invocation_attempt_id",
         skip_serializing_if = "is_initial_invocation_attempt_id"
@@ -3242,6 +3246,7 @@ impl Default for HostAdminStateSnapshot {
             simulate_receipts: Vec::new(),
             invocations: Vec::new(),
             mesh_invocations: Vec::new(),
+            capability_usage: CapabilityUsageLedger::default(),
             next_invocation_attempt_id: initial_invocation_attempt_id(),
         }
     }
@@ -3732,6 +3737,7 @@ impl HostAdminStateStore {
             Some(path) => load_admin_state_snapshot(path)?,
             None => HostAdminStateSnapshot::default(),
         };
+        state.capability_usage.validate()?;
         // No executor job survives constructing a fresh store. Never silently
         // replay an admission that has no committed terminal observation.
         if state.recover_invocations_after_restart(Utc::now())? {
@@ -5705,6 +5711,10 @@ impl HostAdminStateStore {
 
     /// Admit one host-owned invocation before dispatching external work.
     ///
+    /// This records admission metadata only. Live executor paths use
+    /// [`Self::admit_capability_invocation`] to reserve signed usage allowances
+    /// in the same transaction as the invocation ticket.
+    ///
     /// Filesystem-backed Unix stores synchronize both the new snapshot and its
     /// directory. Explicit in-memory stores remain usable and report
     /// `InvocationRecord::durable == false`.
@@ -5723,6 +5733,14 @@ impl HostAdminStateStore {
     pub async fn admit_invocation(
         &self,
         admission: InvocationAdmission,
+    ) -> HostResult<InvocationTicket> {
+        self.admit_invocation_with_usage(admission, None).await
+    }
+
+    async fn admit_invocation_with_usage(
+        &self,
+        admission: InvocationAdmission,
+        usage: Option<CapabilityUsageScope>,
     ) -> HostResult<InvocationTicket> {
         for (name, value) in [
             ("operation_id", admission.operation_id.as_str()),
@@ -5768,6 +5786,12 @@ impl HostAdminStateStore {
                 admission.idempotency.as_ref(),
                 admission.transport_idempotency.as_ref(),
             )?;
+            // Reserve usage in the same synchronized snapshot as the ticket.
+            // No side effect can be selected after a lost quota-only write,
+            // and concurrent admission cannot spend the same final allowance.
+            if let Some(scope) = &usage {
+                snapshot.capability_usage.reserve(scope, now)?;
+            }
             // Local and forwarded work share one bound. Unknown effects and
             // incomplete finalization are never reclaimed to admit more work.
             snapshot.reserve_invocation_history_slot()?;
@@ -5792,7 +5816,10 @@ impl HostAdminStateStore {
             Ok(ticket)
         })
         .await
-        .map_err(|error| HostError::Unavailable(error.to_string()))
+        .map_err(|error| match error {
+            LifecycleError::InvalidPolicy { reason } => HostError::PreflightFailed(reason),
+            other => HostError::Unavailable(other.to_string()),
+        })
     }
 
     /// Persist an observed connector outcome before follow-on awaits.
