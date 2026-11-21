@@ -1804,6 +1804,13 @@ persistence. Concurrent execution or mutation returns `task-in-use`; `task show`
 can still inspect the latest saved state. Before dispatch, the CLI durably records
 an execution fence so an interrupted process cannot silently replay the task.
 
+Each execution also snapshots its ordered steps. Before sending an invocation,
+the CLI saves its exact request ID, selected host, connector, operation, zone,
+and token/effect digests. Default idempotency keys and request IDs include the
+task attempt and step ordinal. Runtime credentials stay out of these records.
+Each redacted step receipt is synced before the next primitive may run; a
+journal write failure stops execution and preserves the uncertainty fence.
+
 A completed `materialized` capsule, including a completed read-only run, rejects
 another run or advance with `task-already-executed`. An interrupted attempt stays
 `execution-pending`; an unknown invocation outcome or partially completed effect

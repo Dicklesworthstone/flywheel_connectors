@@ -80,6 +80,48 @@ pub struct TaskExecutionFence {
     pub mode: String,
     pub revision: u64,
     pub state: TaskExecutionState,
+    /// Older capsules retain their fence without inventing a recoverable
+    /// identity for requests that may already have reached a host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub journal: Option<TaskExecutionJournal>,
+}
+
+/// Ordered, durable progress for one exact capsule attempt. The plan snapshot
+/// remains stable if a later CLI version compiles the same intent differently.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TaskExecutionJournal {
+    pub steps: Vec<TaskStepExecution>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TaskStepExecution {
+    pub ordinal: usize,
+    pub command: String,
+    pub side_effecting: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invocation: Option<TaskInvocationBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<String>,
+    /// The executor supplies its redacted primitive receipt, never argv with
+    /// runtime authority or the request's raw capability token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<Value>,
+}
+
+/// Payload-free identity synced after preflight and before an actual invoke.
+/// The transport binding commits to the exact token, idempotency key and
+/// effect-affecting request without treating a token subject hint as authority.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TaskInvocationBinding {
+    pub request_id: String,
+    pub host: String,
+    pub connector_id: String,
+    pub operation: String,
+    pub zone_id: String,
+    pub principal: Option<String>,
+    pub transport_idempotency: fcp_host::InvocationIdempotency,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -129,6 +171,13 @@ impl std::error::Error for TaskAccessError {}
 pub struct TaskExecutionTicket {
     attempt_id: String,
     revision: u64,
+}
+
+impl TaskExecutionTicket {
+    #[must_use]
+    pub fn attempt_id(&self) -> &str {
+        &self.attempt_id
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -396,6 +445,9 @@ impl TaskStore {
                 fence.revision == task.revision && !fence.attempt_id.is_empty(),
                 "workflow execution fence does not match its capsule revision"
             );
+            if let Some(journal) = &fence.journal {
+                validate_execution_journal(journal)?;
+            }
         }
         recompute_task(&mut task, false);
         Ok(Some(task))
@@ -876,10 +928,135 @@ impl TaskLease<'_> {
             mode: mode.to_owned(),
             revision: task.revision,
             state: TaskExecutionState::Pending,
+            journal: Some(TaskExecutionJournal {
+                steps: task
+                    .compiled
+                    .steps
+                    .iter()
+                    .map(|step| TaskStepExecution {
+                        ordinal: step.ordinal,
+                        command: step.command.clone(),
+                        side_effecting: step.side_effecting,
+                        started_at: None,
+                        invocation: None,
+                        finished_at: None,
+                        receipt: None,
+                    })
+                    .collect(),
+            }),
         });
         recompute_task(&mut task, true);
         self.store.save(&task)?;
         Ok(ticket)
+    }
+
+    /// Sync the next primitive's identity before even a non-invoke primitive
+    /// can run. An interrupted unsupported effect remains visible and fenced.
+    pub fn record_step_started(
+        &self,
+        ticket: &TaskExecutionTicket,
+        ordinal: usize,
+    ) -> Result<()> {
+        let mut task = self.pending_execution(ticket)?;
+        let journal = pending_journal_mut(&mut task)?;
+        let index = journal
+            .steps
+            .iter()
+            .position(|step| step.ordinal == ordinal)
+            .context("workflow primitive is not in the retained execution plan")?;
+        ensure!(
+            journal.steps[..index].iter().all(step_succeeded),
+            "workflow primitive cannot run before earlier receipts are durably successful"
+        );
+        let step = &mut journal.steps[index];
+        ensure!(
+            step.started_at.is_none(),
+            "workflow primitive has already started; it cannot be dispatched again"
+        );
+        step.started_at = Some(now_rfc3339());
+        recompute_task(&mut task, true);
+        self.store.save(&task)
+    }
+
+    /// This successful sync is the last permission gate before the caller may
+    /// dispatch an invoke. A failed write leaves the capsule fenced and must
+    /// prevent the request from being sent.
+    pub fn record_invocation_binding(
+        &self,
+        ticket: &TaskExecutionTicket,
+        ordinal: usize,
+        binding: TaskInvocationBinding,
+    ) -> Result<()> {
+        validate_invocation_binding(&binding)?;
+        let mut task = self.pending_execution(ticket)?;
+        let journal = pending_journal_mut(&mut task)?;
+        ensure!(
+            journal.steps.iter().all(|step| {
+                step.invocation
+                    .as_ref()
+                    .is_none_or(|existing| existing.request_id != binding.request_id)
+            }),
+            "workflow request identity is already bound to a primitive"
+        );
+        let step = journal
+            .steps
+            .iter_mut()
+            .find(|step| step.ordinal == ordinal)
+            .context("workflow primitive is not in the retained execution plan")?;
+        ensure!(
+            step.command == "invoke"
+                && step.started_at.is_some()
+                && step.finished_at.is_none()
+                && step.invocation.is_none(),
+            "workflow invocation can only bind once to its pending invoke primitive"
+        );
+        step.invocation = Some(binding);
+        recompute_task(&mut task, true);
+        self.store.save(&task)
+    }
+
+    /// Save the executor's redacted outcome before the next primitive can run.
+    /// The original request binding remains available even when the outcome is
+    /// uncertain or the final aggregate workflow receipt is lost.
+    pub fn record_step_finished(
+        &self,
+        ticket: &TaskExecutionTicket,
+        ordinal: usize,
+        receipt: Value,
+    ) -> Result<()> {
+        let mut task = self.pending_execution(ticket)?;
+        let step = pending_journal_mut(&mut task)?
+            .steps
+            .iter_mut()
+            .find(|step| step.ordinal == ordinal)
+            .context("workflow primitive is not in the retained execution plan")?;
+        ensure!(
+            step.started_at.is_some() && step.finished_at.is_none() && step.receipt.is_none(),
+            "workflow primitive receipt does not own an unfinished primitive"
+        );
+        validate_step_receipt(step, &receipt)?;
+        step.finished_at = Some(now_rfc3339());
+        step.receipt = Some(receipt);
+        recompute_task(&mut task, true);
+        self.store.save(&task)
+    }
+
+    fn pending_execution(&self, ticket: &TaskExecutionTicket) -> Result<WorkflowTask> {
+        let task = self
+            .load()?
+            .context("workflow capsule disappeared during execution")?;
+        let fence = task
+            .execution_fence
+            .as_ref()
+            .context("workflow execution fence is missing")?;
+        ensure!(
+            fence.state == TaskExecutionState::Pending
+                && fence.attempt_id == ticket.attempt_id
+                && fence.revision == ticket.revision
+                && task.revision == ticket.revision,
+            "workflow execution attempt no longer owns the capsule"
+        );
+        Ok(task)
     }
 
     /// Save the terminal evidence and the fence transition in one atomic write.
@@ -908,7 +1085,19 @@ impl TaskLease<'_> {
         );
         let trigger = fence.trigger.clone();
         let mode = fence.mode.clone();
-        if let Some(state) = execution_fence_after(&execution) {
+        let mut next_state = execution_fence_after(&execution);
+        if let Some(journal) = &fence.journal
+            && ((next_state == Some(TaskExecutionState::Completed)
+                && (!journal.steps.iter().all(step_succeeded)
+                    || !journal_matches_execution(journal, &execution)))
+                || (journal.steps.iter().any(|step| step.started_at.is_some())
+                    && !journal_matches_execution(journal, &execution)))
+        {
+            // A lost incremental receipt or contradictory aggregate must not
+            // hide already-dispatched work or falsely complete a partial plan.
+            next_state = Some(TaskExecutionState::NeedsReview);
+        }
+        if let Some(state) = next_state {
             task.execution_fence
                 .as_mut()
                 .expect("fence checked above")
@@ -921,6 +1110,145 @@ impl TaskLease<'_> {
         self.store.save(&task)?;
         Ok(Some(task))
     }
+}
+
+fn pending_journal_mut(task: &mut WorkflowTask) -> Result<&mut TaskExecutionJournal> {
+    task.execution_fence
+        .as_mut()
+        .and_then(|fence| fence.journal.as_mut())
+        .context("workflow execution has no retained primitive identities")
+}
+
+fn step_succeeded(step: &TaskStepExecution) -> bool {
+    step.receipt
+        .as_ref()
+        .is_some_and(|receipt| receipt["status"] == "executed" && receipt["exit_code"] == 0)
+}
+
+fn validate_invocation_binding(binding: &TaskInvocationBinding) -> Result<()> {
+    let valid_metadata = |value: &str| {
+        !value.trim().is_empty() && value.len() <= 512 && !value.chars().any(char::is_control)
+    };
+    ensure!(
+        [
+            binding.request_id.as_str(),
+            binding.host.as_str(),
+            binding.connector_id.as_str(),
+            binding.operation.as_str(),
+            binding.zone_id.as_str(),
+        ]
+        .into_iter()
+        .all(valid_metadata)
+            && binding.principal.as_deref().is_none_or(valid_metadata),
+        "workflow invocation binding contains invalid identity metadata"
+    );
+    ensure!(
+        crate::normalize_host_endpoint(&binding.host)
+            .is_ok_and(|normalized| normalized == binding.host),
+        "workflow invocation binding requires a normalized credential-free host endpoint"
+    );
+    ensure!(
+        [
+            &binding.transport_idempotency.scope_digest,
+            &binding.transport_idempotency.effect_digest,
+        ]
+        .into_iter()
+        .all(|digest| {
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        }),
+        "workflow invocation binding has invalid transport digests"
+    );
+    Ok(())
+}
+
+fn validate_step_receipt(step: &TaskStepExecution, receipt: &Value) -> Result<()> {
+    ensure!(
+        receipt["ordinal"].as_u64() == u64::try_from(step.ordinal).ok()
+            && receipt["command"] == step.command
+            && receipt["side_effecting"] == step.side_effecting
+            && receipt["primitive_dispatched"].is_boolean()
+            && receipt["result"].is_object(),
+        "workflow primitive receipt does not match its retained identity"
+    );
+    let status = receipt["status"].as_str();
+    ensure!(
+        receipt["exit_code"].as_u64().is_some_and(|code| {
+            code <= u64::from(u8::MAX)
+                && ((status == Some("executed") && code == 0)
+                    || (status == Some("failed") && code != 0))
+        }),
+        "workflow primitive receipt has inconsistent outcome metadata"
+    );
+    if let Some(binding) = &step.invocation {
+        // Normal invokes retain the request identity inside `request` and the
+        // response envelope. Unknown outcomes also repeat it at the top level
+        // and in the inspection hint. Every present identity must agree.
+        let request_ids = [
+            "/result/request_id",
+            "/result/request/request_id",
+            "/result/response/id",
+            "/result/inspection/operation_id",
+        ]
+        .into_iter()
+        .filter_map(|pointer| receipt.pointer(pointer))
+        .collect::<Vec<_>>();
+        ensure!(
+            receipt["primitive_dispatched"] == true
+                && !request_ids.is_empty()
+                && request_ids
+                    .iter()
+                    .all(|id| id.as_str() == Some(binding.request_id.as_str())),
+            "workflow primitive receipt contradicts its dispatched request identity"
+        );
+    }
+    Ok(())
+}
+
+fn validate_execution_journal(journal: &TaskExecutionJournal) -> Result<()> {
+    let mut ordinals = BTreeSet::new();
+    let mut request_ids = BTreeSet::new();
+    for step in &journal.steps {
+        ensure!(
+            ordinals.insert(step.ordinal)
+                && !step.command.is_empty()
+                && (step.started_at.is_some()
+                    || (step.invocation.is_none() && step.finished_at.is_none()))
+                && step.finished_at.is_some() == step.receipt.is_some(),
+            "workflow execution journal has inconsistent primitive state"
+        );
+        if let Some(binding) = &step.invocation {
+            ensure!(
+                step.command == "invoke" && request_ids.insert(binding.request_id.as_str()),
+                "workflow execution journal has an ambiguous invocation identity"
+            );
+            validate_invocation_binding(binding)?;
+        }
+        if let Some(receipt) = &step.receipt {
+            validate_step_receipt(step, receipt)?;
+        }
+    }
+    Ok(())
+}
+
+fn journal_matches_execution(journal: &TaskExecutionJournal, execution: &Value) -> bool {
+    if journal
+        .steps
+        .iter()
+        .any(|step| step.started_at.is_some() && step.receipt.is_none())
+    {
+        return false;
+    }
+    let Some(executed) = execution["executed_steps"].as_array() else {
+        return false;
+    };
+    journal
+        .steps
+        .iter()
+        .filter_map(|step| step.receipt.as_ref())
+        .eq(executed)
 }
 
 fn validate_task_id(task_id: &str) -> Result<()> {
@@ -1861,6 +2189,356 @@ mod tests {
         task
     }
 
+    fn successful_step_receipt(step: &super::TaskStepExecution) -> serde_json::Value {
+        json!({
+            "ordinal": step.ordinal,
+            "command": step.command,
+            "side_effecting": step.side_effecting,
+            "primitive_dispatched": true,
+            "status": "executed",
+            "exit_code": 0,
+            "result": {"status": "ok", "phase": "execution"},
+        })
+    }
+
+    fn invocation_binding(request_id: &str) -> super::TaskInvocationBinding {
+        super::TaskInvocationBinding {
+            request_id: request_id.to_owned(),
+            host: "https://host.example.test".to_owned(),
+            connector_id: "github".to_owned(),
+            operation: "github.search_issues".to_owned(),
+            zone_id: "z:work".to_owned(),
+            principal: None,
+            transport_idempotency: fcp_host::InvocationIdempotency {
+                scope_digest: "a".repeat(64),
+                effect_digest: "b".repeat(64),
+            },
+        }
+    }
+
+    #[test]
+    fn task_execution_journal_uses_existing_host_transport_shapes() {
+        let mut binding = invocation_binding("req-binding");
+        assert!(super::validate_invocation_binding(&binding).is_ok());
+        #[cfg(unix)]
+        for endpoint in ["unix:///tmp/fcp-task.sock", "/tmp/fcp-task.sock"] {
+            binding.host = endpoint.to_owned();
+            assert!(super::validate_invocation_binding(&binding).is_ok());
+        }
+        binding.host = "https://user:SECRET@host.example.test".to_owned();
+        let error = super::validate_invocation_binding(&binding).unwrap_err();
+        assert!(!format!("{error:#}").contains("SECRET"));
+        binding.host = "https://host.example.test".to_owned();
+        binding.transport_idempotency.scope_digest = "A".repeat(64);
+        assert!(super::validate_invocation_binding(&binding).is_err());
+    }
+
+    #[test]
+    fn task_execution_journal_retains_request_identity_and_progress_after_interruption() {
+        let store = store();
+        let task = ready_task(&store);
+        let lease = store.lock_task(&task.id).unwrap();
+        let ticket = lease.begin_execution("run", "approve").unwrap();
+        let journal = lease
+            .load()
+            .unwrap()
+            .unwrap()
+            .execution_fence
+            .unwrap()
+            .journal
+            .unwrap();
+        let invoke = journal
+            .steps
+            .iter()
+            .find(|step| step.command == "invoke")
+            .expect("ready search workflow has a live invocation");
+        for step in &journal.steps {
+            lease.record_step_started(&ticket, step.ordinal).unwrap();
+            if step.ordinal == invoke.ordinal {
+                lease
+                    .record_invocation_binding(&ticket, step.ordinal, invocation_binding("req-crash"))
+                    .unwrap();
+                break;
+            }
+            lease
+                .record_step_finished(&ticket, step.ordinal, successful_step_receipt(step))
+                .unwrap();
+        }
+        let attempt = ticket.attempt_id().to_owned();
+        drop(lease);
+
+        let reopened = TaskStore::at_path(store.root_dir().to_path_buf());
+        let snapshot = reopened.load(&task.id).unwrap().unwrap();
+        let fence = snapshot.execution_fence.unwrap();
+        assert_eq!(fence.attempt_id, attempt);
+        assert_eq!(fence.state, super::TaskExecutionState::Pending);
+        let saved = fence.journal.unwrap();
+        let bound = saved
+            .steps
+            .iter()
+            .find(|step| step.ordinal == invoke.ordinal)
+            .unwrap();
+        assert_eq!(bound.invocation, Some(invocation_binding("req-crash")));
+        assert!(bound.started_at.is_some());
+        assert!(bound.receipt.is_none());
+        assert!(
+            saved
+                .steps
+                .iter()
+                .take_while(|step| step.ordinal != invoke.ordinal)
+                .all(super::step_succeeded)
+        );
+        assert!(snapshot.execution_history.is_empty());
+        assert!(
+            reopened
+                .lock_task(&task.id)
+                .unwrap()
+                .begin_execution("run", "approve")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn task_execution_journal_enforces_order_attempt_and_receipt_identity() {
+        let store = store();
+        let task = ready_task(&store);
+        let lease = store.lock_task(&task.id).unwrap();
+        let ticket = lease.begin_execution("run", "approve").unwrap();
+        let journal = lease
+            .load()
+            .unwrap()
+            .unwrap()
+            .execution_fence
+            .unwrap()
+            .journal
+            .unwrap();
+        assert!(journal.steps.len() > 1);
+        assert!(
+            lease
+                .record_step_started(&ticket, journal.steps[1].ordinal)
+                .is_err(),
+            "a successor cannot outrun a missing durable predecessor receipt"
+        );
+        let first = &journal.steps[0];
+        let foreign = super::TaskExecutionTicket {
+            attempt_id: "a-different-attempt".to_owned(),
+            revision: ticket.revision,
+        };
+        assert!(lease.record_step_started(&foreign, first.ordinal).is_err());
+        lease.record_step_started(&ticket, first.ordinal).unwrap();
+        assert!(lease.record_step_started(&ticket, first.ordinal).is_err());
+        let mut wrong_receipt = successful_step_receipt(first);
+        wrong_receipt["command"] = json!("another-primitive");
+        assert!(
+            lease
+                .record_step_finished(&ticket, first.ordinal, wrong_receipt)
+                .is_err()
+        );
+        let receipt = successful_step_receipt(first);
+        lease
+            .record_step_finished(&ticket, first.ordinal, receipt.clone())
+            .unwrap();
+        assert!(
+            lease
+                .record_step_finished(&ticket, first.ordinal, receipt)
+                .is_err(),
+            "a saved outcome cannot be replaced"
+        );
+        lease
+            .record_step_started(&ticket, journal.steps[1].ordinal)
+            .unwrap();
+    }
+
+    #[test]
+    fn task_execution_journal_prevents_aggregate_from_hiding_unfinished_work() {
+        for aggregate in [
+            json!({"status":"materialized", "executed_count":0, "executed_steps":[]}),
+            json!({"status":"stopped-on-primitive-error", "executed_count":0, "executed_steps":[]}),
+        ] {
+            let store = store();
+            let task = ready_task(&store);
+            let lease = store.lock_task(&task.id).unwrap();
+            let ticket = lease.begin_execution("run", "approve").unwrap();
+            lease
+                .record_step_started(&ticket, task.compiled.steps[0].ordinal)
+                .unwrap();
+            let saved = lease.finish_execution(&ticket, aggregate).unwrap().unwrap();
+            assert_eq!(
+                saved.execution_blocker(),
+                Some(super::TaskExecutionState::NeedsReview)
+            );
+            assert!(saved.execution_fence.unwrap().journal.unwrap().steps[0].receipt.is_none());
+        }
+    }
+
+    #[test]
+    fn task_execution_journal_rejects_completion_before_any_primitive_started() {
+        let store = store();
+        let task = ready_task(&store);
+        let lease = store.lock_task(&task.id).unwrap();
+        let ticket = lease.begin_execution("run", "approve").unwrap();
+        let saved = lease
+            .finish_execution(
+                &ticket,
+                json!({"status":"materialized", "executed_count":0, "executed_steps":[]}),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            saved.execution_blocker(),
+            Some(super::TaskExecutionState::NeedsReview)
+        );
+        assert!(saved.execution_fence.unwrap().journal.unwrap().steps.iter().all(|step| {
+            step.started_at.is_none() && step.receipt.is_none()
+        }));
+    }
+
+    #[test]
+    fn task_execution_journal_checks_normal_and_unknown_invocation_identities() {
+        for unknown in [false, true] {
+            let store = store();
+            let task = ready_task(&store);
+            let lease = store.lock_task(&task.id).unwrap();
+            let ticket = lease.begin_execution("run", "approve").unwrap();
+            let journal = lease
+                .load()
+                .unwrap()
+                .unwrap()
+                .execution_fence
+                .unwrap()
+                .journal
+                .unwrap();
+            for step in &journal.steps {
+                lease.record_step_started(&ticket, step.ordinal).unwrap();
+                if step.command != "invoke" {
+                    lease
+                        .record_step_finished(&ticket, step.ordinal, successful_step_receipt(step))
+                        .unwrap();
+                    continue;
+                }
+                lease
+                    .record_invocation_binding(&ticket, step.ordinal, invocation_binding("req-bound"))
+                    .unwrap();
+                let mut receipt = successful_step_receipt(step);
+                assert!(
+                    lease
+                        .record_step_finished(&ticket, step.ordinal, receipt.clone())
+                        .is_err(),
+                    "a bound invocation cannot accept an anonymous outcome"
+                );
+                if unknown {
+                    receipt["status"] = json!("failed");
+                    receipt["exit_code"] = json!(1);
+                    receipt["result"] = json!({
+                        "phase":"execution", "status":"error",
+                        "request_id":"req-bound", "request":{"request_id":"req-bound"},
+                        "inspection":{"operation_id":"req-bound"},
+                        "error":{"type":"invoke-outcome-unknown"},
+                    });
+                } else {
+                    receipt["result"] = json!({
+                        "phase":"execution", "status":"ok",
+                        "request":{"request_id":"req-bound"},
+                        "response":{"id":"req-bound", "status":"ok"},
+                    });
+                }
+                for pointer in [
+                    "/result/request_id",
+                    "/result/request/request_id",
+                    "/result/response/id",
+                    "/result/inspection/operation_id",
+                ] {
+                    let mut contradictory = receipt.clone();
+                    let Some(value) = contradictory.pointer_mut(pointer) else {
+                        continue;
+                    };
+                    *value = json!("req-different");
+                    assert!(
+                        lease
+                            .record_step_finished(&ticket, step.ordinal, contradictory)
+                            .is_err()
+                    );
+                }
+                lease
+                    .record_step_finished(&ticket, step.ordinal, receipt)
+                    .unwrap();
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn task_execution_journal_preserves_complete_incremental_evidence() {
+        let store = store();
+        let task = ready_task(&store);
+        let lease = store.lock_task(&task.id).unwrap();
+        let ticket = lease.begin_execution("run", "approve").unwrap();
+        let journal = lease
+            .load()
+            .unwrap()
+            .unwrap()
+            .execution_fence
+            .unwrap()
+            .journal
+            .unwrap();
+        let mut receipts = Vec::new();
+        for step in &journal.steps {
+            lease.record_step_started(&ticket, step.ordinal).unwrap();
+            let receipt = successful_step_receipt(step);
+            lease
+                .record_step_finished(&ticket, step.ordinal, receipt.clone())
+                .unwrap();
+            receipts.push(receipt);
+        }
+        let saved = lease
+            .finish_execution(
+                &ticket,
+                json!({"status":"materialized", "executed_count":receipts.len(),
+                    "executed_steps":receipts, "withheld_count":0}),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            saved.execution_blocker(),
+            Some(super::TaskExecutionState::Completed)
+        );
+        assert!(
+            saved
+                .execution_fence
+                .unwrap()
+                .journal
+                .unwrap()
+                .steps
+                .iter()
+                .all(super::step_succeeded)
+        );
+    }
+
+    #[test]
+    fn task_execution_legacy_fence_does_not_invent_recoverable_identities() {
+        let store = store();
+        let task = ready_task(&store);
+        let lease = store.lock_task(&task.id).unwrap();
+        lease.begin_execution("run", "approve").unwrap();
+        let mut legacy = serde_json::to_value(lease.load().unwrap().unwrap()).unwrap();
+        legacy["execution_fence"]
+            .as_object_mut()
+            .unwrap()
+            .remove("journal");
+        std::fs::write(
+            store.task_path(&task.id),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+        let loaded = lease.load().unwrap().unwrap();
+        assert!(loaded.execution_fence.as_ref().unwrap().journal.is_none());
+        assert_eq!(
+            loaded.execution_blocker(),
+            Some(super::TaskExecutionState::Pending)
+        );
+        assert!(lease.begin_execution("run", "approve").is_err());
+    }
+
     #[test]
     fn task_execution_lock_covers_read_dispatch_and_every_mutation() {
         let store = store();
@@ -1949,11 +2627,26 @@ mod tests {
         let task = ready_task(&store);
         let lease = store.lock_task(&task.id).unwrap();
         let ticket = lease.begin_execution("advance", "approve").unwrap();
+        let journal = lease
+            .load()
+            .unwrap()
+            .unwrap()
+            .execution_fence
+            .unwrap()
+            .journal
+            .unwrap();
+        let mut receipts = Vec::new();
+        for step in &journal.steps {
+            lease.record_step_started(&ticket, step.ordinal).unwrap();
+            let receipt = successful_step_receipt(step);
+            lease
+                .record_step_finished(&ticket, step.ordinal, receipt.clone())
+                .unwrap();
+            receipts.push(receipt);
+        }
         let result = json!({
-            "status":"materialized", "executed_count":1, "withheld_count":0,
-            "executed_steps":[{"command":"invoke", "side_effecting":false,
-                "primitive_dispatched":true,
-                "result":{"status":"ok", "phase":"execution", "response":{"result":{"answer":42}}}}]
+            "status":"materialized", "executed_count":receipts.len(), "withheld_count":0,
+            "executed_steps":receipts,
         });
         let finished = lease
             .finish_execution(&ticket, result.clone())

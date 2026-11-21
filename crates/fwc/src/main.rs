@@ -4340,8 +4340,15 @@ fn mcp_tool_call_response(
         }
     };
 
-    match invoke_dispatch_host_controlled("invoke", &invoke_args, host, None, Some(&control), None)
-    {
+    match invoke_dispatch_host_controlled(
+        "invoke",
+        &invoke_args,
+        host,
+        None,
+        Some(&control),
+        None,
+        None,
+    ) {
         Ok(dispatch) => {
             let mut structured_content = dispatch.payload;
             let message = structured_content["message"]
@@ -26750,6 +26757,48 @@ fn preflight_dispatch_without_host(args: &PreflightArgs) -> Result<DispatchOutco
 
 // ── Invoke dispatch ─────────────────────────────────────────────────
 
+/// One saved workflow step owns its request identity and durable reservation.
+/// The lease remains held through preparation, dispatch and receipt persistence.
+struct TaskInvocationContext<'a, 'store> {
+    lease: &'a workflow::TaskLease<'store>,
+    ticket: &'a workflow::TaskExecutionTicket,
+    ordinal: usize,
+}
+
+impl TaskInvocationContext<'_, '_> {
+    fn scope_salt(&self) -> String {
+        format!("fwc-task:{}:{}", self.ticket.attempt_id(), self.ordinal)
+    }
+
+    fn reserve(
+        &self,
+        host: &str,
+        request: &InvokeRequest,
+        principal: Option<&str>,
+    ) -> Result<()> {
+        // HTTP invoke carries no asserted-principal header. Bind the exact
+        // capability/effects alias retained by both local and forwarding jobs;
+        // unverified token claims are only an additional expected-principal check.
+        let binding = workflow::TaskInvocationBinding {
+            request_id: request.id.to_string(),
+            host: normalize_host_endpoint(host)?,
+            connector_id: request.connector_id.to_string(),
+            operation: request.operation.to_string(),
+            zone_id: request.zone_id.to_string(),
+            principal: principal.map(str::to_owned),
+            transport_idempotency: fcp_host::InvocationIdempotency::from_relay_request(request, None)?
+                .context("saved task invocation requires an idempotency binding")?,
+        };
+        self.lease
+            .record_invocation_binding(self.ticket, self.ordinal, binding)
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "saved task invocation could not be durably reserved; no invocation was sent"
+                )
+            })
+    }
+}
+
 fn invoke_dispatch(
     command: &str,
     args: &InvokeArgs,
@@ -26768,7 +26817,7 @@ fn invoke_dispatch_host(
     host: &ResolvedHostConfig,
     simulation: Option<&SimulateArgs>,
 ) -> Result<DispatchOutcome> {
-    invoke_dispatch_host_controlled(command, args, host, simulation, None, None)
+    invoke_dispatch_host_controlled(command, args, host, simulation, None, None, None)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -26779,10 +26828,15 @@ fn invoke_dispatch_host_controlled(
     simulation: Option<&SimulateArgs>,
     control: Option<&serve_mcp_host::McpInvocationControl>,
     mut guard: Option<&mut rules_host::InvocationGuard<'_>>,
+    task: Option<&TaskInvocationContext<'_, '_>>,
 ) -> Result<DispatchOutcome> {
     anyhow::ensure!(
         guard.is_none() || (simulation.is_none() && control.is_none()),
         "guarded rule execution cannot use simulation or MCP invocation control"
+    );
+    anyhow::ensure!(
+        task.is_none() || (simulation.is_none() && control.is_none() && guard.is_none()),
+        "saved task invocation cannot share a simulation, MCP or rule execution owner"
     );
     if let Some(control) = control {
         control.checkpoint()?;
@@ -26913,13 +26967,17 @@ fn invoke_dispatch_host_controlled(
             operation.name
         )
     })?;
+    let task_scope = task.map(TaskInvocationContext::scope_salt);
+    let idempotency_key = args.idempotency_key.clone().or_else(|| task_scope.clone());
     let request_id = derive_live_request_id(
         connector.summary.id.as_str(),
         &operation.name,
         &zone,
         &prepared_payload,
-        args.idempotency_key.as_deref(),
-        control.map(serve_mcp_host::McpInvocationControl::scope_salt),
+        idempotency_key.as_deref(),
+        task_scope
+            .as_deref()
+            .or_else(|| control.map(serve_mcp_host::McpInvocationControl::scope_salt)),
     )?;
     let effective_principal = args
         .principal
@@ -26976,7 +27034,7 @@ fn invoke_dispatch_host_controlled(
             "zone": &zone,
             "principal": &effective_principal,
             "request_id": request_id.to_string(),
-            "idempotency_key": args.idempotency_key.clone(),
+            "idempotency_key": idempotency_key.clone(),
             "lease_seq": args.lease_seq,
             "deadline_ms": args.deadline_ms,
             "approval_token_count": auth.approval_tokens.len(),
@@ -27125,7 +27183,7 @@ fn invoke_dispatch_host_controlled(
             &prepared_payload,
             Some(&response_value),
             response.failure_reason.clone(),
-            args.idempotency_key.as_deref(),
+            idempotency_key.as_deref(),
             latency_ms,
         );
         let envelope = if response.preflight_allowed {
@@ -27148,7 +27206,7 @@ fn invoke_dispatch_host_controlled(
         capability_token: auth.capability_token.clone(),
         holder_proof: holder_proof.clone(),
         context: None,
-        idempotency_key: args.idempotency_key.clone(),
+        idempotency_key: idempotency_key.clone(),
         lease_seq: args.lease_seq,
         deadline_ms: args.deadline_ms,
         correlation_id: None,
@@ -27165,7 +27223,7 @@ fn invoke_dispatch_host_controlled(
         connector_id: connector_id.clone(),
         operation: operation.name.clone(),
         params: Some(prepared_payload.clone()),
-        principal: effective_principal,
+        principal: effective_principal.clone(),
         zone_id: Some(zone_id.clone()),
         lease_seq: args.lease_seq,
         capability_token: Some(auth.capability_token.clone()),
@@ -27197,7 +27255,7 @@ fn invoke_dispatch_host_controlled(
             &prepared_payload,
             Some(&serde_json::to_value(&preflight)?),
             Some(reason.clone()),
-            args.idempotency_key.as_deref(),
+            idempotency_key.as_deref(),
             0,
         );
         payload["status"] = json!("denied");
@@ -27230,6 +27288,15 @@ fn invoke_dispatch_host_controlled(
         // Successful fsync of the pending attempt is the last fallible step
         // before dispatch. Never send the request if reservation fails.
         guard.reserve(&invoke_request)?;
+    }
+    if let Some(task) = task {
+        // The durable binding is the last fallible step before invocation I/O.
+        // A failed write must never be followed by the external operation.
+        task.reserve(
+            &host.endpoint,
+            &invoke_request,
+            effective_principal.as_deref(),
+        )?;
     }
     let started_at = std::time::Instant::now();
     let invocation = if let Some(request) = &guarded_request {
@@ -27267,7 +27334,7 @@ fn invoke_dispatch_host_controlled(
         &prepared_payload,
         Some(&response_value),
         response.error.as_ref().map(ToString::to_string),
-        args.idempotency_key.as_deref(),
+        idempotency_key.as_deref(),
         latency_ms,
     );
 
@@ -36284,6 +36351,7 @@ fn task_advance_dispatch(
         Some(&bindings),
         explicit_host,
         Some(&args.auth),
+        Some((&lease, &ticket)),
     );
     let task = match task_receipt_or_failure(
         lease.finish_execution(&ticket, execution.payload.clone()),
@@ -36384,6 +36452,7 @@ fn task_run_dispatch(
         Some(&bindings),
         explicit_host,
         Some(&args.auth),
+        Some((&lease, &ticket)),
     );
     let task = match task_receipt_or_failure(
         lease.finish_execution(&ticket, execution.payload.clone()),
@@ -36619,6 +36688,7 @@ fn intent_do_dispatch(args: &DoIntentArgs, explicit_host: Option<&str>) -> Resul
         Some(&bindings),
         explicit_host,
         Some(&args.auth),
+        None,
     );
     let defaulted_to_simulation = !args.simulate && !args.approve;
 
@@ -36694,6 +36764,7 @@ fn materialize_safe_resolution_steps(
         true,
         Some(&resolution_bindings),
         explicit_host,
+        None,
         None,
     );
     (safe_step_count, execution)
@@ -36836,6 +36907,7 @@ fn materialize_compiled_steps(
     bindings: Option<&BTreeMap<String, String>>,
     explicit_host: Option<&str>,
     runtime_auth: Option<&LiveAuthArgs>,
+    task_execution: Option<(&workflow::TaskLease<'_>, &workflow::TaskExecutionTicket)>,
 ) -> DispatchOutcome {
     // Validate and snapshot bound files before the first primitive. Simulation
     // and invocation must see the same payload even if a file changes later.
@@ -36875,6 +36947,21 @@ fn materialize_compiled_steps(
             continue;
         }
 
+        if let Some((lease, ticket)) = task_execution
+            && lease.record_step_started(ticket, step.ordinal).is_err()
+        {
+            return task_step_journal_failure(
+                executed_steps,
+                withheld_steps,
+                step.ordinal,
+                "before-primitive",
+            );
+        }
+        let task_invocation = task_execution.map(|(lease, ticket)| TaskInvocationContext {
+            lease,
+            ticket,
+            ordinal: step.ordinal,
+        });
         let mut primitive_dispatched = false;
         let mut primitive = match parsed {
             Ok(mut parsed) => {
@@ -36894,9 +36981,10 @@ fn materialize_compiled_steps(
                     ) {
                         Ok(()) => {
                             primitive_dispatched = true;
-                            dispatch(&parsed).unwrap_or_else(|error| {
-                                internal_error_dispatch(&resolved_argv, &error)
-                            })
+                            dispatch_compiled_primitive(&parsed, task_invocation.as_ref())
+                                .unwrap_or_else(|error| {
+                                    internal_error_dispatch(&resolved_argv, &error)
+                                })
                         }
                         Err(error) => live_auth_dispatch(&step.command, &error, &[]),
                     }
@@ -36943,6 +37031,24 @@ fn materialize_compiled_steps(
             "result": primitive.payload,
         }));
 
+        if let Some((lease, ticket)) = task_execution
+            && lease
+                .record_step_finished(
+                    ticket,
+                    step.ordinal,
+                    executed_steps.last().expect("step just appended").clone(),
+                )
+                .is_err()
+        {
+            // Stop before another primitive. The durable binding survives
+            // even if this result or the final aggregate cannot be saved.
+            return task_step_journal_failure(
+                executed_steps,
+                withheld_steps,
+                step.ordinal,
+                "after-primitive",
+            );
+        }
         if !primitive_succeeded {
             return DispatchOutcome {
                 payload: json!({
@@ -36971,6 +37077,47 @@ fn materialize_compiled_steps(
             "stopped_before_side_effect": stopped_before_side_effect,
         }),
         exit_code: CliExitCode::Success,
+    }
+}
+
+fn dispatch_compiled_primitive(
+    parsed: &Cli,
+    task: Option<&TaskInvocationContext<'_, '_>>,
+) -> Result<DispatchOutcome> {
+    if let (Some(task), Commands::Invoke(args)) = (task, &parsed.command) {
+        if let Some(host) = resolve_host_config(parsed.host.as_deref())? {
+            return invoke_dispatch_host_controlled(
+                "invoke", args, &host, None, None, None, Some(task),
+            );
+        }
+        return invoke_dispatch_without_host("invoke", args);
+    }
+    dispatch(parsed)
+}
+
+fn task_step_journal_failure(
+    executed_steps: Vec<Value>,
+    withheld_steps: Vec<Value>,
+    ordinal: usize,
+    phase: &'static str,
+) -> DispatchOutcome {
+    DispatchOutcome {
+        payload: json!({
+            "status": "execution-journal-failed",
+            "error": {
+                "type": "task-step-not-persisted",
+                "message": "The workflow step journal could not be persisted. Execution stopped; retain this report and inspect the saved task before deciding on further work.",
+                "recoverable": false,
+            },
+            "journal_phase": phase,
+            "step_ordinal": ordinal,
+            "executed_steps": executed_steps,
+            "withheld_steps": withheld_steps,
+            "executed_count": executed_steps.len(),
+            "withheld_count": withheld_steps.len(),
+            "automatic_retry_allowed": false,
+        }),
+        exit_code: CliExitCode::Internal,
     }
 }
 
@@ -40508,6 +40655,26 @@ max_state_replication_staleness_secs = 120
     fn spawn_mock_host_sequence_with_timing(
         routes: Vec<(String, Value, Duration)>,
     ) -> (String, thread::JoinHandle<()>, MockHostRequestLog) {
+        let (endpoint, handle, request_log, stop) =
+            spawn_mock_host_sequence_with_observer(routes, |_, _| {});
+        drop(stop);
+        (endpoint, handle, request_log)
+    }
+
+    /// Keep the listener alive until the caller has finished dispatching, so a
+    /// forbidden extra request fails the test instead of hitting a closed port.
+    fn spawn_mock_host_sequence_with_observer<F>(
+        routes: Vec<(String, Value, Duration)>,
+        mut observe: F,
+    ) -> (
+        String,
+        thread::JoinHandle<()>,
+        MockHostRequestLog,
+        std::sync::mpsc::Sender<()>,
+    )
+    where
+        F: FnMut(&str, &str) + Send + 'static,
+    {
         let listener = TcpListener::bind("127.0.0.1:0").expect("mock host should bind");
         listener
             .set_nonblocking(true)
@@ -40529,12 +40696,21 @@ max_state_replication_staleness_secs = 120
             .collect::<Vec<_>>();
         let request_log = Arc::new(StdMutex::new(Vec::new()));
         let thread_log = Arc::clone(&request_log);
+        let (stop, stopped) = std::sync::mpsc::channel();
 
         let handle = thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(30);
             let mut served = 0usize;
 
-            while served < expected_requests && Instant::now() < deadline {
+            while Instant::now() < deadline {
+                if served == expected_requests
+                    && !matches!(
+                        stopped.try_recv(),
+                        Err(std::sync::mpsc::TryRecvError::Empty)
+                    )
+                {
+                    break;
+                }
                 let (mut stream, _) = match listener.accept() {
                     Ok(connection) => connection,
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -40547,6 +40723,12 @@ max_state_replication_staleness_secs = 120
                 stream
                     .set_nonblocking(false)
                     .expect("mock host stream should switch back to blocking mode");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .expect("mock host should bound request reads");
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .expect("mock host should bound response writes");
 
                 let mut reader =
                     BufReader::new(stream.try_clone().expect("mock host should clone socket"));
@@ -40600,6 +40782,7 @@ max_state_replication_staleness_secs = 120
                     "unexpected mock host request order at position {}",
                     served + 1
                 );
+                observe(&key, &body_text);
                 let body = bind_mock_invoke_response(&key, body, &body_text);
                 thread_log
                     .lock()
@@ -40630,7 +40813,7 @@ max_state_replication_staleness_secs = 120
             );
         });
 
-        (endpoint, handle, request_log)
+        (endpoint, handle, request_log, stop)
     }
 
     fn mock_connector_summary_json() -> Value {
@@ -45462,6 +45645,7 @@ deny_ptrace = true
                 Some(&bindings),
                 Some("http://127.0.0.1:1"),
                 None,
+                None,
             );
             assert_eq!(execution.exit_code, CliExitCode::Validation);
             assert_eq!(execution.payload["error"]["type"], error_type);
@@ -45596,6 +45780,7 @@ deny_ptrace = true
                 None,
                 Some("http://127.0.0.1:1"),
                 Some(&auth),
+                None,
             );
             assert_eq!(execution.exit_code, CliExitCode::Validation);
             assert_eq!(
@@ -45704,6 +45889,7 @@ deny_ptrace = true
             Some(&bindings),
             Some(&host),
             Some(&auth),
+            None,
         );
         server.join().unwrap();
         assert_eq!(
@@ -45776,6 +45962,412 @@ deny_ptrace = true
             assert!(!evidence.contains("\"capability_token\""));
             assert!(!evidence.contains("\"approval_tokens\""));
         }
+    }
+
+    fn task_journal_fixture(
+        store: &super::workflow::TaskStore,
+    ) -> super::workflow::WorkflowTask {
+        let task = store
+            .create(super::workflow::WorkflowRequest {
+                intent: "search GitHub issues for auth".to_owned(),
+                connector_override: Some("github".to_owned()),
+                zone_override: Some("z:work".to_owned()),
+            })
+            .unwrap();
+        let task = store
+            .bind(
+                &task.id,
+                [(
+                    "payload_json".to_owned(),
+                    json!({"query": "auth"}).to_string(),
+                )],
+            )
+            .unwrap()
+            .unwrap();
+        assert!(super::workflow::ready_for_execution(&task));
+        task
+    }
+
+    fn task_journal_fixture_path(store: &super::workflow::TaskStore, task_id: &str) -> PathBuf {
+        store
+            .root_dir()
+            .join("tasks")
+            .join(format!("{}.json", task_id.replace(':', "_")))
+    }
+
+    fn task_journal_repeated_invoke_plan(
+        store: &super::workflow::TaskStore,
+        task: &super::workflow::WorkflowTask,
+    ) -> super::intent::CompiledIntent {
+        let mut compiled = task.compiled.clone();
+        let invoke = compiled
+            .steps
+            .iter()
+            .find(|step| step.command == "invoke")
+            .expect("natural search plan includes a real invoke")
+            .clone();
+        // Isolate two identical operation inputs so only the retained task
+        // attempt and primitive ordinal can distinguish their identities.
+        // Production begin_execution has already established the real fence;
+        // only this fixture's immutable plan snapshot is shortened here.
+        compiled.steps = (1..=2)
+            .map(|ordinal| {
+                let mut step = invoke.clone();
+                step.ordinal = ordinal;
+                step
+            })
+            .collect();
+        let path = task_journal_fixture_path(store, &task.id);
+        let mut pending: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(pending["execution_fence"]["state"], "pending");
+        pending["execution_fence"]["journal"]["steps"] = json!(
+            compiled
+                .steps
+                .iter()
+                .map(|step| json!({
+                    "ordinal": step.ordinal,
+                    "command": step.command,
+                    "side_effecting": step.side_effecting,
+                }))
+                .collect::<Vec<_>>()
+        );
+        let mut file = fs::File::create(path).unwrap();
+        serde_json::to_writer(&mut file, &pending).unwrap();
+        file.sync_all().unwrap();
+        compiled
+    }
+
+    fn task_journal_host_routes(
+        compiled: &super::intent::CompiledIntent,
+        invocations: usize,
+    ) -> Vec<(String, Value, Duration)> {
+        let introspection = mock_introspection_response_with_tools(
+            mock_connector_summary_json(),
+            vec![mock_tool_descriptor_json(
+                compiled.operation_hint.as_deref().unwrap(),
+                "github.issue_read",
+                "low",
+                "safe",
+                "strict",
+                Some("none"),
+                json!({
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"],
+                    "additionalProperties": false,
+                }),
+                json!({"type": "object"}),
+            )],
+        );
+        let mut routes = Vec::new();
+        for _ in 0..invocations {
+            routes.extend([
+                (
+                    "POST /rpc/discover".to_owned(),
+                    mock_discovery_response_json(),
+                    Duration::ZERO,
+                ),
+                (
+                    "GET /rpc/introspect/fcp.github:enterprise:v1".to_owned(),
+                    introspection.clone(),
+                    Duration::ZERO,
+                ),
+                (
+                    "POST /rpc/preflight".to_owned(),
+                    mock_preflight_response_json(true),
+                    Duration::ZERO,
+                ),
+                (
+                    "POST /rpc/invoke".to_owned(),
+                    mock_invoke_response_json(json!({"items": []})),
+                    Duration::ZERO,
+                ),
+            ]);
+        }
+        routes
+    }
+
+    #[test]
+    fn task_journal_binding_is_persisted_before_send_and_scoped_to_attempt_and_ordinal() {
+        let temp = TempDir::new().unwrap();
+        let store = super::workflow::TaskStore::at_path(temp.path().join("task-state"));
+        let (token, holder_path, holder_key) = test_live_holder_auth(temp.path());
+        let token_file = temp.path().join("PRIVATE_RUNTIME_CAPABILITY.token");
+        let approval_file = temp.path().join("PRIVATE_RUNTIME_APPROVAL.json");
+        fs::write(&token_file, &token).unwrap();
+        fs::write(
+            &approval_file,
+            json!({
+                "token_id": "PRIVATE_RUNTIME_APPROVAL_TOKEN",
+                "issued_at_ms": 0,
+                "expires_at_ms": u64::MAX,
+                "issuer": "test-approver",
+                "zone_id": "z:work",
+                "scope": {
+                    "type": "execution",
+                    "connector_id": "fcp.github:enterprise:v1",
+                    "method_pattern": "*",
+                },
+                "signature": [17, 29, 53, 97],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let auth = LiveAuthArgs {
+            capability_token_file: Some(token_file.clone()),
+            holder_key_file: Some(holder_path.clone()),
+            approval_token_file: vec![approval_file.clone()],
+            ..LiveAuthArgs::default()
+        };
+        let secrets = vec![
+            token.clone(),
+            "PRIVATE_RUNTIME_APPROVAL_TOKEN".to_owned(),
+            token_file.display().to_string(),
+            holder_path.display().to_string(),
+            approval_file.display().to_string(),
+        ];
+        let mut request_ids = std::collections::BTreeSet::new();
+        let mut scope_digests = std::collections::BTreeSet::new();
+
+        for _ in 0..2 {
+            let task = task_journal_fixture(&store);
+            let lease = store.lock_task(&task.id).unwrap();
+            let ticket = lease.begin_execution("run", "approve").unwrap();
+            let compiled = task_journal_repeated_invoke_plan(&store, &task);
+            let observed_root = store.root_dir().to_path_buf();
+            let observed_task_id = task.id.clone();
+            let observed_path = task_journal_fixture_path(&store, &task.id);
+            let observed_attempt = ticket.attempt_id().to_owned();
+            let observed_secrets = secrets.clone();
+            let mut invocation_count = 0usize;
+            let (host, server, requests, stop) = spawn_mock_host_sequence_with_observer(
+                task_journal_host_routes(&compiled, 2),
+                move |route, body| {
+                    if route != "POST /rpc/invoke" {
+                        return;
+                    }
+                    invocation_count += 1;
+                    let request: fcp_kernel::InvokeRequest = serde_json::from_str(body).unwrap();
+                    let persisted = fs::read_to_string(&observed_path).unwrap();
+                    for secret in &observed_secrets {
+                        assert!(!persisted.contains(secret), "runtime authority was persisted");
+                    }
+                    assert!(!persisted.contains("\"capability_token\""));
+                    assert!(!persisted.contains("\"approval_tokens\""));
+                    let saved = super::workflow::TaskStore::at_path(observed_root.clone())
+                        .load(&observed_task_id)
+                        .unwrap()
+                        .unwrap();
+                    assert!(saved.execution_history.is_empty());
+                    let fence = saved.execution_fence.as_ref().unwrap();
+                    assert_eq!(fence.attempt_id, observed_attempt);
+                    assert_eq!(fence.state, super::workflow::TaskExecutionState::Pending);
+                    let steps = &fence.journal.as_ref().unwrap().steps;
+                    let step = &steps[invocation_count - 1];
+                    assert!(step.started_at.is_some());
+                    assert!(step.finished_at.is_none());
+                    assert!(step.receipt.is_none());
+                    assert!(steps[..invocation_count - 1].iter().all(|prior| {
+                        prior
+                            .receipt
+                            .as_ref()
+                            .is_some_and(|receipt| receipt["status"] == "executed")
+                    }));
+                    assert!(
+                        steps[invocation_count..]
+                            .iter()
+                            .all(|next| next.started_at.is_none())
+                    );
+                    let binding = step
+                        .invocation
+                        .as_ref()
+                        .expect("binding precedes network send");
+                    assert_eq!(binding.request_id, request.id.to_string());
+                    assert_eq!(binding.connector_id, request.connector_id.to_string());
+                    assert_eq!(binding.operation, request.operation.to_string());
+                    assert_eq!(binding.zone_id, request.zone_id.to_string());
+                    assert_eq!(
+                        binding.transport_idempotency,
+                        fcp_host::InvocationIdempotency::from_relay_request(&request, None)
+                            .unwrap()
+                            .unwrap()
+                    );
+                    let scope = format!("fwc-task:{}:{}", observed_attempt, step.ordinal);
+                    assert_eq!(request.idempotency_key.as_deref(), Some(scope.as_str()));
+                    assert_eq!(
+                        request.id,
+                        derive_live_request_id(
+                            request.connector_id.as_str(),
+                            request.operation.as_str(),
+                            request.zone_id.as_str(),
+                            &request.input,
+                            Some(&scope),
+                            Some(&scope),
+                        )
+                        .unwrap()
+                    );
+                },
+            );
+            let execution = super::materialize_compiled_steps(
+                &compiled,
+                true,
+                Some(&super::workflow::effective_bindings(&task)),
+                Some(&host),
+                Some(&auth),
+                Some((&lease, &ticket)),
+            );
+            let _ = stop.send(());
+            server.join().unwrap();
+            assert_eq!(
+                execution.exit_code,
+                CliExitCode::Success,
+                "{}",
+                execution.payload
+            );
+            assert_eq!(execution.payload["executed_count"], 2);
+            for (route, body) in requests.lock().unwrap().iter() {
+                if route == "POST /rpc/invoke" {
+                    let request: Value = serde_json::from_str(body).unwrap();
+                    assert_live_holder_request(&request, &holder_key);
+                    assert_eq!(
+                        request["approval_tokens"][0]["token_id"],
+                        "PRIVATE_RUNTIME_APPROVAL_TOKEN"
+                    );
+                    assert!(request_ids.insert(request["id"].as_str().unwrap().to_owned()));
+                }
+            }
+            let saved = lease
+                .finish_execution(&ticket, execution.payload.clone())
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                saved.execution_blocker(),
+                Some(super::workflow::TaskExecutionState::Completed)
+            );
+            assert_eq!(saved.execution_history.len(), 1);
+            let saved_steps = &saved
+                .execution_fence
+                .as_ref()
+                .unwrap()
+                .journal
+                .as_ref()
+                .unwrap()
+                .steps;
+            for step in saved_steps {
+                let binding = step.invocation.as_ref().unwrap();
+                assert_eq!(binding.host, host);
+                assert!(scope_digests.insert(binding.transport_idempotency.scope_digest.clone()));
+            }
+            let persisted = fs::read_to_string(task_journal_fixture_path(&store, &task.id)).unwrap();
+            for secret in &secrets {
+                assert!(!persisted.contains(secret));
+                assert!(!execution.payload.to_string().contains(secret));
+            }
+        }
+        assert_eq!(
+            request_ids.len(),
+            4,
+            "identical operations never reuse another primitive's identity"
+        );
+        assert_eq!(
+            scope_digests.len(),
+            4,
+            "each task attempt and ordinal owns its host key scope"
+        );
+    }
+
+    fn assert_task_journal_store_loss_stops_dispatch(before_invoke: bool) {
+        let temp = TempDir::new().unwrap();
+        let store = super::workflow::TaskStore::at_path(temp.path().join("task-state"));
+        let task = task_journal_fixture(&store);
+        let lease = store.lock_task(&task.id).unwrap();
+        let ticket = lease.begin_execution("run", "approve").unwrap();
+        let compiled = task_journal_repeated_invoke_plan(&store, &task);
+        let tasks_dir = store.root_dir().join("tasks");
+        let archived_dir = store.root_dir().join("interrupted-tasks");
+        let observed_tasks = tasks_dir.clone();
+        let observed_archive = archived_dir.clone();
+        let mut routes = task_journal_host_routes(&compiled, 1);
+        let interrupt_at = if before_invoke {
+            "POST /rpc/preflight"
+        } else {
+            "POST /rpc/invoke"
+        };
+        if before_invoke {
+            routes.pop();
+        }
+        let (host, server, requests, stop) =
+            spawn_mock_host_sequence_with_observer(routes, move |route, _| {
+                if route == interrupt_at {
+                    fs::rename(&observed_tasks, &observed_archive).unwrap();
+                }
+            });
+        let auth = LiveAuthArgs {
+            capability_token: Some(test_capability_token_arg()),
+            ..LiveAuthArgs::default()
+        };
+        let execution = super::materialize_compiled_steps(
+            &compiled,
+            true,
+            Some(&super::workflow::effective_bindings(&task)),
+            Some(&host),
+            Some(&auth),
+            Some((&lease, &ticket)),
+        );
+        let _ = stop.send(());
+        server.join().unwrap();
+        assert_eq!(execution.exit_code, CliExitCode::Internal);
+        assert_eq!(execution.payload["status"], "execution-journal-failed");
+        assert_eq!(execution.payload["executed_count"], 1);
+        assert_eq!(execution.payload["automatic_retry_allowed"], false);
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(route, _)| route == "POST /rpc/invoke")
+                .count(),
+            usize::from(!before_invoke)
+        );
+        if !before_invoke {
+            assert_eq!(execution.payload["executed_steps"][0]["status"], "executed");
+        }
+        assert!(
+            lease
+                .finish_execution(&ticket, execution.payload)
+                .unwrap()
+                .is_none()
+        );
+        fs::rename(&archived_dir, &tasks_dir).unwrap();
+        let recovered = lease.load().unwrap().unwrap();
+        let fence = recovered.execution_fence.as_ref().unwrap();
+        assert_eq!(fence.attempt_id, ticket.attempt_id());
+        assert_eq!(fence.state, super::workflow::TaskExecutionState::Pending);
+        let steps = &fence.journal.as_ref().unwrap().steps;
+        assert!(steps[0].started_at.is_some());
+        assert!(steps[0].receipt.is_none());
+        assert_eq!(steps[0].invocation.is_some(), !before_invoke);
+        assert!(steps[1].started_at.is_none());
+        assert!(steps[1].invocation.is_none());
+        drop(lease);
+        assert!(
+            store
+                .lock_task(&task.id)
+                .unwrap()
+                .begin_execution("run", "approve")
+                .is_err(),
+            "restored storage must not authorize replay or an unstarted successor"
+        );
+    }
+
+    #[test]
+    fn task_journal_store_loss_before_binding_sends_no_invocation() {
+        assert_task_journal_store_loss_stops_dispatch(true);
+    }
+
+    #[test]
+    fn task_journal_store_loss_after_invoke_never_dispatches_successor() {
+        assert_task_journal_store_loss_stops_dispatch(false);
     }
 
     #[test]
@@ -46020,7 +46612,8 @@ deny_ptrace = true
             &["fwc", "do", "search GitHub issues for auth"],
             &["fwc", "guide"],
         ]);
-        let outcome = super::materialize_compiled_steps(&compiled, true, None, Some(&host), None);
+        let outcome =
+            super::materialize_compiled_steps(&compiled, true, None, Some(&host), None, None);
 
         server
             .join()
@@ -46068,7 +46661,7 @@ deny_ptrace = true
                 &failed_argv,
                 &["fwc", "guide", "list"],
             ]);
-            let outcome = super::materialize_compiled_steps(&compiled, true, None, None, None);
+            let outcome = super::materialize_compiled_steps(&compiled, true, None, None, None, None);
             assert_eq!(outcome.exit_code, expected_exit);
             assert_eq!(outcome.payload["executed_count"], 2);
             assert_eq!(outcome.payload["executed_steps"][0]["status"], "executed");

@@ -783,6 +783,7 @@ impl RuleExecutor for HostRuleExecutor {
             None,
             None,
             Some(&mut guard),
+            None,
         )?;
         Ok(InvocationResult {
             success: outcome.exit_code == CliExitCode::Success,
