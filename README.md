@@ -1796,6 +1796,37 @@ and invocation. The payload reaches parsed connector operations without being
 copied into generated command lines. A step's own explicit payload takes
 precedence, and supplying a payload does not approve a mutating operation.
 
+#### Saved task execution and recovery
+
+A saved capsule represents one intended execution. `task run` and `task advance`
+hold an exclusive local lock from loading the task through dispatch and receipt
+persistence. Concurrent execution or mutation returns `task-in-use`; `task show`
+can still inspect the latest saved state. Before dispatch, the CLI durably records
+an execution fence so an interrupted process cannot silently replay the task.
+
+A completed `materialized` capsule, including a completed read-only run, rejects
+another run or advance with `task-already-executed`. An interrupted attempt stays
+`execution-pending`; an unknown invocation outcome or partially completed effect
+leaves `execution-needs-review`. Both require inspection before new work.
+Binding, approval and resolution cannot clear these fences. This protects local
+capsule execution; it does not guarantee exactly-once effects at an external
+provider.
+
+```bash
+# Inspect the fence, attempt identity and complete retained execution history.
+fwc --json task show w:7f3k9a1b
+
+# After reconciling prior host/provider effects, create a separate capsule
+# only when another execution is intended. Bind and approve its returned ID.
+fwc task create 'create a GitHub issue titled "Additional follow-up"' \
+    --connector github --zone z:work
+```
+
+Successful simulations and definite failures before an effect can still be
+corrected and executed. Binding changes advance the capsule revision without
+erasing earlier execution receipts. `task show` includes that full history;
+`last_execution` describes only the current revision.
+
 ### Output Formats
 
 `fwc` defaults to TOON, a token-efficient structured format optimized for AI agents:
@@ -3970,9 +4001,31 @@ dependency ordering and typed references to earlier results:
 ```
 
 ```bash
-fwc batch-file operations.jsonl --dry-run
-fwc batch-file operations.jsonl
+fwc --host http://127.0.0.1:8787 batch-file operations.jsonl --zone z:work \
+    --member-capability-token-file issue=github.token \
+    --member-holder-key-file issue=github-holder.key \
+    --member-approval-token-file issue=issue-approval.json \
+    --member-capability-token-file notify=slack.token \
+    --member-holder-key-file notify=slack-holder.key \
+    --member-approval-token-file notify=notification-approval.json
 ```
+
+Member credential flags select the JSONL `id` (`issue` or `notify` above), not the
+connector name. Each explicitly authorized member needs exactly one
+`--member-capability-token ID=TOKEN` or `--member-capability-token-file ID=PATH`.
+Supply its matching `--member-holder-key-file ID=PATH` when the capability is
+holder-bound, and repeat `--member-approval-token ID=JSON` or
+`--member-approval-token-file ID=PATH` for its required approvals. These runtime
+credentials stay outside the reusable JSONL definition.
+
+An explicit member's capability, holder key and approvals form one independent
+authority group; missing parts do not inherit from the global credential flags.
+Global `--capability-token-file`, `--holder-key-file` and `--approval-token-file`
+remain available for members targeting one resolved connector and effective
+zone. A mixed connector or mixed zone batch needs explicit member credentials
+for any additional authority groups. All groups are validated before member
+preflight or execution. Add `--dry-run` to the command above to inspect preflight
+results, or `--stream` to receive live NDJSON with the same member credentials.
 
 A reference replaces its whole JSON value with the selected value; numbers,
 objects, arrays and booleans keep their types. Its source must appear explicitly

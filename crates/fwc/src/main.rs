@@ -2796,6 +2796,39 @@ struct WorkflowAuthArgs {
     step_holder_key_file: Vec<String>,
 }
 
+#[derive(Args, Debug, Clone, Default, Serialize)]
+struct BatchAuthArgs {
+    /// Default credentials for batch members targeting one connector and zone.
+    #[command(flatten)]
+    #[serde(flatten)]
+    default_auth: LiveAuthArgs,
+
+    /// Capability for one batch member, identified by its JSONL id.
+    #[arg(long = "member-capability-token", value_name = "ID=TOKEN")]
+    #[serde(skip_serializing)]
+    member_capability_token: Vec<String>,
+
+    /// Read one batch member's capability from a base64, JSON, or raw CBOR file.
+    #[arg(long = "member-capability-token-file", value_name = "ID=PATH")]
+    #[serde(skip_serializing)]
+    member_capability_token_file: Vec<String>,
+
+    /// Holder signing key for this member's explicitly assigned capability.
+    #[arg(long = "member-holder-key-file", value_name = "ID=PATH")]
+    #[serde(skip_serializing)]
+    member_holder_key_file: Vec<String>,
+
+    /// Approval JSON for this independently authorized member. Repeat for multiple approvals.
+    #[arg(long = "member-approval-token", value_name = "ID=JSON")]
+    #[serde(skip_serializing)]
+    member_approval_token: Vec<String>,
+
+    /// Read approval JSON for this independently authorized member. Repeat as needed.
+    #[arg(long = "member-approval-token-file", value_name = "ID=PATH")]
+    #[serde(skip_serializing)]
+    member_approval_token_file: Vec<String>,
+}
+
 #[derive(Args, Debug, Serialize)]
 struct InvokeArgs {
     /// Connector id, alias, or family name.
@@ -3558,7 +3591,7 @@ struct BatchFileArgs {
     idempotency_key: Option<String>,
 
     #[command(flatten)]
-    auth: LiveAuthArgs,
+    auth: BatchAuthArgs,
 }
 
 fn main() -> ExitCode {
@@ -6056,15 +6089,14 @@ impl HostAdminClient {
     // Explicitly opt auth-administration clients into owner credentials. Ordinary
     // discovery/invoke clients never acquire this bearer as ambient authority.
     fn for_provider_auth(endpoint: &str, token_file: Option<&Path>) -> Result<Self> {
-        let token = if token_file.is_some()
-            || std::env::var_os("FCP_HOST_ADMIN_BEARER_TOKEN").is_some()
-        {
-            Some(mesh_inventory_credential(token_file).map_err(|_| {
-                anyhow::anyhow!("host admin credential must be a nonempty bounded ASCII token")
-            })?)
-        } else {
-            None
-        };
+        let token =
+            if token_file.is_some() || std::env::var_os("FCP_HOST_ADMIN_BEARER_TOKEN").is_some() {
+                Some(mesh_inventory_credential(token_file).map_err(|_| {
+                    anyhow::anyhow!("host admin credential must be a nonempty bounded ASCII token")
+                })?)
+            } else {
+                None
+            };
         Self::new_with_admin_credential(endpoint, token.as_ref().map(|value| value.as_str()))
     }
 
@@ -6084,11 +6116,15 @@ impl HostAdminClient {
         // the invocation journal instead of the HTTP transport.
         let mut headers = reqwest::header::HeaderMap::new();
         if let Some(token) = token {
-            let mut authorization = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
-                .map_err(|_| anyhow::anyhow!("invalid host admin credential"))?;
+            let mut authorization =
+                reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+                    .map_err(|_| anyhow::anyhow!("invalid host admin credential"))?;
             authorization.set_sensitive(true);
             headers.insert(reqwest::header::AUTHORIZATION, authorization);
-            headers.insert("x-fcp-zone", reqwest::header::HeaderValue::from_static("z:owner"));
+            headers.insert(
+                "x-fcp-zone",
+                reqwest::header::HeaderValue::from_static("z:owner"),
+            );
         }
         let builder = BlockingClientBuilder::new()
             .redirect(reqwest::redirect::Policy::none())
@@ -6484,26 +6520,22 @@ impl HostAdminClient {
         request: &HostGuardedInvokeRequest,
         timeout: Duration,
     ) -> Result<InvokeResponse> {
-        self.post_json_with_timeout(
-            "/rpc/invoke/guarded",
-            request,
-            timeout,
-        )
-        .and_then(|response: InvokeResponse| {
-            anyhow::ensure!(
-                response.id == request.request.id,
-                "host returned a guarded invoke response for a different request"
-            );
-            Ok(response)
-        })
-        .map_err(|error| {
-            invocation_cmd::InvokeOutcomeUnknown::from_request(
-                &request.request,
-                &self.endpoint,
-                &error,
-            )
-            .into()
-        })
+        self.post_json_with_timeout("/rpc/invoke/guarded", request, timeout)
+            .and_then(|response: InvokeResponse| {
+                anyhow::ensure!(
+                    response.id == request.request.id,
+                    "host returned a guarded invoke response for a different request"
+                );
+                Ok(response)
+            })
+            .map_err(|error| {
+                invocation_cmd::InvokeOutcomeUnknown::from_request(
+                    &request.request,
+                    &self.endpoint,
+                    &error,
+                )
+                .into()
+            })
     }
 
     fn cancel(
@@ -6675,9 +6707,8 @@ impl HostAdminClient {
     }
 
     fn auth_profile_upsert(&self, provider: &str, request: &Value) -> Result<Value> {
-        let response: AuthProfileAdminResponse = self.post_auth_json(
-            &format!("/rpc/admin/auth/profiles/{provider}"), request,
-        )?;
+        let response: AuthProfileAdminResponse =
+            self.post_auth_json(&format!("/rpc/admin/auth/profiles/{provider}"), request)?;
         Ok(serde_json::to_value(response)?)
     }
 
@@ -6859,15 +6890,21 @@ impl HostAdminClient {
         // Authentication endpoints can receive secret material. Never reflect
         // an error body or JSON deserialization error back into CLI diagnostics.
         const MAX_AUTH_RESPONSE_BYTES: u64 = 65_536;
-        let response = self.client.post(format!("{}{}", self.base_url, path))
-            .json(body).timeout(self.read_timeout).send()
+        let response = self
+            .client
+            .post(format!("{}{}", self.base_url, path))
+            .json(body)
+            .timeout(self.read_timeout)
+            .send()
             .map_err(|_| anyhow::anyhow!("host auth administration request failed"))?;
         let status = response.status();
         if !status.is_success() {
             bail!("host auth administration returned HTTP {}", status.as_u16());
         }
         let mut bytes = zeroize::Zeroizing::new(Vec::new());
-        response.take(MAX_AUTH_RESPONSE_BYTES + 1).read_to_end(&mut bytes)
+        response
+            .take(MAX_AUTH_RESPONSE_BYTES + 1)
+            .read_to_end(&mut bytes)
             .map_err(|_| anyhow::anyhow!("host auth administration response could not be read"))?;
         if bytes.len() as u64 > MAX_AUTH_RESPONSE_BYTES {
             bail!("host auth administration response exceeded 65,536 bytes");
@@ -19440,10 +19477,12 @@ fn read_auth_login_file(
     path: &Path,
 ) -> Result<zeroize::Zeroizing<String>, DispatchOutcome> {
     const MAX_BYTES: u64 = 65_536;
-    let invalid = || auth_login_validation_error(
-        args,
-        format!("`--{field}` must name a readable regular UTF-8 file of at most 65,536 bytes."),
-    );
+    let invalid = || {
+        auth_login_validation_error(
+            args,
+            format!("`--{field}` must name a readable regular UTF-8 file of at most 65,536 bytes."),
+        )
+    };
     if !std::fs::metadata(path).map_err(|_| invalid())?.is_file() {
         return Err(invalid());
     }
@@ -19452,7 +19491,9 @@ fn read_auth_login_file(
         return Err(invalid());
     }
     let mut raw = zeroize::Zeroizing::new(String::new());
-    file.take(MAX_BYTES + 1).read_to_string(&mut raw).map_err(|_| invalid())?;
+    file.take(MAX_BYTES + 1)
+        .read_to_string(&mut raw)
+        .map_err(|_| invalid())?;
     if raw.len() as u64 > MAX_BYTES {
         return Err(invalid());
     }
@@ -19468,16 +19509,24 @@ fn auth_login_credential_is_valid(value: &str, max_bytes: usize) -> bool {
 fn auth_login_scope_is_valid(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 64
-        && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
 }
 
 fn auth_login_request(args: &AuthLoginArgs) -> Result<(Value, &'static str), DispatchOutcome> {
     if validate_connector_id(&args.provider).is_err()
         || matches!(args.provider.as_str(), "." | "..")
         || args.profile.trim().is_empty()
-        || args.label.as_ref().is_some_and(|label| label.trim().is_empty())
+        || args
+            .label
+            .as_ref()
+            .is_some_and(|label| label.trim().is_empty())
     {
-        return Err(auth_login_validation_error(args, "Provider must be a path-safe identifier, and profile and label must be nonempty."));
+        return Err(auth_login_validation_error(
+            args,
+            "Provider must be a path-safe identifier, and profile and label must be nonempty.",
+        ));
     }
     let method_count = usize::from(args.api_key.is_some())
         + usize::from(args.oauth_device)
@@ -19490,25 +19539,46 @@ fn auth_login_request(args: &AuthLoginArgs) -> Result<(Value, &'static str), Dis
             "Choose exactly one login method: `--api-key`, `--oauth-device`, `--oauth-auth-code`, `--sigv4`, or `--setup-token-file`.",
         ));
     }
-    if !args.sigv4 && (args.aws_credentials_file.is_some() || args.region.is_some() || args.service.is_some()) {
-        return Err(auth_login_validation_error(args, "AWS credentials, region, and service require `--sigv4`."));
+    if !args.sigv4
+        && (args.aws_credentials_file.is_some() || args.region.is_some() || args.service.is_some())
+    {
+        return Err(auth_login_validation_error(
+            args,
+            "AWS credentials, region, and service require `--sigv4`.",
+        ));
     }
     if args.setup_token_file.is_none() && args.expires_at.is_some() {
-        return Err(auth_login_validation_error(args, "`--expires-at` requires `--setup-token-file`."));
+        return Err(auth_login_validation_error(
+            args,
+            "`--expires-at` requires `--setup-token-file`.",
+        ));
     }
     if args.api_key.is_none() && args.value_prefix.is_some() {
-        return Err(auth_login_validation_error(args, "`--value-prefix` only applies to `--api-key`."));
+        return Err(auth_login_validation_error(
+            args,
+            "`--value-prefix` only applies to `--api-key`.",
+        ));
     }
     if args.api_key.is_none() && args.setup_token_file.is_none() && args.header_name.is_some() {
-        return Err(auth_login_validation_error(args, "`--header-name` only applies to `--api-key` or `--setup-token-file`."));
+        return Err(auth_login_validation_error(
+            args,
+            "`--header-name` only applies to `--api-key` or `--setup-token-file`.",
+        ));
     }
     if (args.sigv4 || args.setup_token_file.is_some())
-        && (args.client_id.is_some() || args.client_secret.is_some()
-            || args.device_code_url.is_some() || args.authorize_url.is_some()
-            || args.token_url.is_some() || args.redirect_uri.is_some()
-            || !args.scope.is_empty() || args.no_pkce)
+        && (args.client_id.is_some()
+            || args.client_secret.is_some()
+            || args.device_code_url.is_some()
+            || args.authorize_url.is_some()
+            || args.token_url.is_some()
+            || args.redirect_uri.is_some()
+            || !args.scope.is_empty()
+            || args.no_pkce)
     {
-        return Err(auth_login_validation_error(args, "OAuth options cannot be combined with SigV4 or setup-token login."));
+        return Err(auth_login_validation_error(
+            args,
+            "OAuth options cannot be combined with SigV4 or setup-token login.",
+        ));
     }
 
     let label = args.label.clone().unwrap_or_else(|| args.profile.clone());
@@ -19516,27 +19586,45 @@ fn auth_login_request(args: &AuthLoginArgs) -> Result<(Value, &'static str), Dis
         let region = require_auth_login_field(args, "region", args.region.as_ref())?;
         let service = require_auth_login_field(args, "service", args.service.as_ref())?;
         if !auth_login_scope_is_valid(&region) || !auth_login_scope_is_valid(&service) {
-            return Err(auth_login_validation_error(args, "AWS region and service must contain 1 to 64 ASCII letters, digits, or hyphens."));
+            return Err(auth_login_validation_error(
+                args,
+                "AWS region and service must contain 1 to 64 ASCII letters, digits, or hyphens.",
+            ));
         }
         let path = args.aws_credentials_file.as_deref().ok_or_else(|| {
-            auth_login_validation_error(args, "`--aws-credentials-file` is required for SigV4 login.")
+            auth_login_validation_error(
+                args,
+                "`--aws-credentials-file` is required for SigV4 login.",
+            )
         })?;
         let raw = read_auth_login_file(args, "aws-credentials-file", path)?;
         let credentials: AwsCredentialsFile = serde_json::from_str(&raw).map_err(|_| {
             auth_login_validation_error(args, "AWS credential file must be a JSON object with access_key_id, secret_access_key, and optional session_token; unknown or duplicate fields are refused.")
         })?;
         if !auth_login_credential_is_valid(&credentials.access_key_id, 128)
-            || !credentials.access_key_id.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+            || !credentials
+                .access_key_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
             || !auth_login_credential_is_valid(&credentials.secret_access_key, 4096)
-            || credentials.session_token.as_ref().is_some_and(|token| !auth_login_credential_is_valid(token, 16_384))
+            || credentials
+                .session_token
+                .as_ref()
+                .is_some_and(|token| !auth_login_credential_is_valid(token, 16_384))
         {
-            return Err(auth_login_validation_error(args, "AWS credential file contains empty, oversized, or unsafe credential material."));
+            return Err(auth_login_validation_error(
+                args,
+                "AWS credential file contains empty, oversized, or unsafe credential material.",
+            ));
         }
-        return Ok((json!({
-            "profile_id": args.profile, "method": "sigv4", "label": label, "priority": args.priority,
-            "access_key_id": credentials.access_key_id, "secret_access_key": credentials.secret_access_key,
-            "session_token": credentials.session_token, "region": region, "service": service
-        }), "sigv4"));
+        return Ok((
+            json!({
+                "profile_id": args.profile, "method": "sigv4", "label": label, "priority": args.priority,
+                "access_key_id": credentials.access_key_id, "secret_access_key": credentials.secret_access_key,
+                "session_token": credentials.session_token, "region": region, "service": service
+            }),
+            "sigv4",
+        ));
     }
     if let Some(path) = args.setup_token_file.as_deref() {
         let expiry = require_auth_login_field(args, "expires_at", args.expires_at.as_ref())?;
@@ -19544,27 +19632,50 @@ fn auth_login_request(args: &AuthLoginArgs) -> Result<(Value, &'static str), Dis
             auth_login_validation_error(args, "`--expires-at` must be an RFC3339 timestamp.")
         })?;
         if expiry <= Utc::now() {
-            return Err(auth_login_validation_error(args, "Setup token expiry must be in the future."));
+            return Err(auth_login_validation_error(
+                args,
+                "Setup token expiry must be in the future.",
+            ));
         }
         let header_name = args.header_name.as_deref().unwrap_or("Authorization");
         let normalized = header_name.to_ascii_lowercase();
         if reqwest::header::HeaderName::from_bytes(header_name.as_bytes()).is_err()
             || normalized.starts_with("x-fcp-")
-            || matches!(normalized.as_str(), "host" | "content-length" | "transfer-encoding" | "connection"
-                | "trailer" | "te" | "upgrade" | "proxy-authorization" | "proxy-connection"
-                | "keep-alive" | "proxy-authenticate")
+            || matches!(
+                normalized.as_str(),
+                "host"
+                    | "content-length"
+                    | "transfer-encoding"
+                    | "connection"
+                    | "trailer"
+                    | "te"
+                    | "upgrade"
+                    | "proxy-authorization"
+                    | "proxy-connection"
+                    | "keep-alive"
+                    | "proxy-authenticate"
+            )
         {
-            return Err(auth_login_validation_error(args, "Setup tokens require a valid credential header, not a routing, framing, or host-authority header."));
+            return Err(auth_login_validation_error(
+                args,
+                "Setup tokens require a valid credential header, not a routing, framing, or host-authority header.",
+            ));
         }
         let raw = read_auth_login_file(args, "setup-token-file", path)?;
         let token = raw.trim();
         if !auth_login_credential_is_valid(token, 16_384) {
-            return Err(auth_login_validation_error(args, "Setup token must contain 1 to 16,384 visible ASCII bytes without whitespace."));
+            return Err(auth_login_validation_error(
+                args,
+                "Setup token must contain 1 to 16,384 visible ASCII bytes without whitespace.",
+            ));
         }
-        return Ok((json!({
-            "profile_id": args.profile, "method": "setup_token", "label": label, "priority": args.priority,
-            "token": token, "expires_at": expiry, "header_name": header_name
-        }), "setup_token"));
+        return Ok((
+            json!({
+                "profile_id": args.profile, "method": "setup_token", "label": label, "priority": args.priority,
+                "token": token, "expires_at": expiry, "header_name": header_name
+            }),
+            "setup_token",
+        ));
     }
     if let Some(api_key) = args.api_key.as_ref() {
         let mut request = json!({
@@ -19643,7 +19754,8 @@ fn auth_login_dispatch(
         Ok(host) => host,
         Err(outcome) => return Ok(outcome),
     };
-    let client = HostAdminClient::for_provider_auth(&host.endpoint, args.admin_token_file.as_deref())?;
+    let client =
+        HostAdminClient::for_provider_auth(&host.endpoint, args.admin_token_file.as_deref())?;
     let response = client.auth_profile_upsert(&args.provider, &request)?;
     let oauth_start = match method {
         "oauth_device" => Some(client.auth_oauth_device_start(&args.provider, &args.profile)?),
@@ -19725,9 +19837,14 @@ fn auth_bind_profile_dispatch(
     if validate_connector_id(&args.provider).is_err()
         || matches!(args.provider.as_str(), "." | "..")
         || args.profile.trim().is_empty()
-        || args.label.as_ref().is_some_and(|label| label.trim().is_empty())
+        || args
+            .label
+            .as_ref()
+            .is_some_and(|label| label.trim().is_empty())
     {
-        return Ok(invalid("Provider must be a path-safe identifier, and profile and label must be nonempty."));
+        return Ok(invalid(
+            "Provider must be a path-safe identifier, and profile and label must be nonempty.",
+        ));
     }
     let credential_id = match fcp_core::CredentialId::parse(&args.credential_id) {
         Ok(id) => id,
@@ -19738,12 +19855,19 @@ fn auth_bind_profile_dispatch(
         Err(_) => return Ok(invalid("--zone must be a valid FCP zone id.")),
     };
     if args.host_allow.is_empty() || args.host_allow.len() > 128 {
-        return Ok(invalid("Supply 1 to 128 explicit --host-allow destinations."));
+        return Ok(invalid(
+            "Supply 1 to 128 explicit --host-allow destinations.",
+        ));
     }
     let mut host_allow = Vec::with_capacity(args.host_allow.len());
     for host in &args.host_allow {
-        if host.len() > 253 || host.trim() != host || host.contains(['*', '/', '@', '?', '#', '[', ']']) {
-            return Ok(invalid("--host-allow accepts exact hostnames or IP addresses without wildcards, ports, or URL syntax."));
+        if host.len() > 253
+            || host.trim() != host
+            || host.contains(['*', '/', '@', '?', '#', '[', ']'])
+        {
+            return Ok(invalid(
+                "--host-allow accepts exact hostnames or IP addresses without wildcards, ports, or URL syntax.",
+            ));
         }
         let canonical = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
             ip.to_string()
@@ -19751,10 +19875,17 @@ fn auth_bind_profile_dispatch(
             let Ok(canonical) = fcp_sandbox::canonicalize_hostname(host) else {
                 return Ok(invalid("--host-allow contains an invalid hostname."));
             };
-            if canonical.len() > 253 || canonical.split('.').any(|label| {
-                label.is_empty() || label.len() > 63 || label.starts_with('-') || label.ends_with('-')
-                    || !label.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-            }) {
+            if canonical.len() > 253
+                || canonical.split('.').any(|label| {
+                    label.is_empty()
+                        || label.len() > 63
+                        || label.starts_with('-')
+                        || label.ends_with('-')
+                        || !label
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                })
+            {
                 return Ok(invalid("--host-allow contains an invalid hostname."));
             }
             canonical
@@ -19772,15 +19903,20 @@ fn auth_bind_profile_dispatch(
         Ok(host) => host,
         Err(outcome) => return Ok(outcome),
     };
-    let client = HostAdminClient::for_provider_auth(&host.endpoint, args.admin_token_file.as_deref())?;
-    let response = client.auth_profile_bind(&args.provider, zone.as_str(), &json!({
-        "profile_credential": {
-            "credential_id": credential_id, "profile_id": args.profile,
-            "label": args.label.as_ref().unwrap_or(&args.profile),
-            "priority": args.priority, "host_allow": host_allow,
-        },
-        "mode": if args.replace { "replace_existing" } else { "reject_existing" },
-    }))?;
+    let client =
+        HostAdminClient::for_provider_auth(&host.endpoint, args.admin_token_file.as_deref())?;
+    let response = client.auth_profile_bind(
+        &args.provider,
+        zone.as_str(),
+        &json!({
+            "profile_credential": {
+                "credential_id": credential_id, "profile_id": args.profile,
+                "label": args.label.as_ref().unwrap_or(&args.profile),
+                "priority": args.priority, "host_allow": host_allow,
+            },
+            "mode": if args.replace { "replace_existing" } else { "reject_existing" },
+        }),
+    )?;
     let mut payload = json!({
         "status": "ok", "command": "auth", "subcommand": "bind-profile",
         "source": "host-admin-api", "provider": args.provider, "profile_id": args.profile,
@@ -19789,11 +19925,18 @@ fn auth_bind_profile_dispatch(
         "message": "Bound the current profile to a zone-scoped credential. Later profile edits require an explicit rebind with --replace.",
     });
     attach_auth_host_contract(
-        &mut payload, &host.endpoint, &args.provider, Some(&args.profile),
-        "provider-auth-profile-bind", true,
+        &mut payload,
+        &host.endpoint,
+        &args.provider,
+        Some(&args.profile),
+        "provider-auth-profile-bind",
+        true,
     );
     CommandEnvelope::new(CommandAvailability::LiveRuntime, "auth").inject_into(&mut payload);
-    Ok(DispatchOutcome { payload, exit_code: CliExitCode::Success })
+    Ok(DispatchOutcome {
+        payload,
+        exit_code: CliExitCode::Success,
+    })
 }
 
 fn auth_login_poll_dispatch(
@@ -25888,6 +26031,7 @@ enum LiveAuthError {
     InvalidApprovalToken { source: String, message: String },
     InvalidHolderProof { message: String },
     InvalidWorkflowAuth { message: String },
+    InvalidBatchAuth { message: String },
 }
 
 impl LiveAuthError {
@@ -25899,6 +26043,7 @@ impl LiveAuthError {
             Self::InvalidApprovalToken { .. } => "invalid-approval-token",
             Self::InvalidHolderProof { .. } => "invalid-holder-proof",
             Self::InvalidWorkflowAuth { .. } => "invalid-workflow-auth",
+            Self::InvalidBatchAuth { .. } => "invalid-batch-auth",
         }
     }
 
@@ -25912,7 +26057,9 @@ impl LiveAuthError {
             Self::InvalidApprovalToken { source, message } => {
                 format!("Failed to parse an approval token from {source}: {message}")
             }
-            Self::InvalidHolderProof { message } | Self::InvalidWorkflowAuth { message } => {
+            Self::InvalidHolderProof { message }
+            | Self::InvalidWorkflowAuth { message }
+            | Self::InvalidBatchAuth { message } => {
                 message.clone()
             }
         }
@@ -28712,25 +28859,25 @@ fn batch_submission_failure(
     run_key: &str,
     error: &anyhow::Error,
 ) -> DispatchOutcome {
-        let mut outcome = error
-            .downcast_ref::<invocation_cmd::BatchOutcomeUnknown>()
-            .map_or_else(
-                || {
-                    invocation_cmd::BatchOutcomeUnknown::from_requests(
-                        request
-                            .operations
-                            .iter()
-                            .map(|member| (member.id.as_str(), &member.request)),
-                        &client.endpoint,
-                        error,
-                    )
-                    .dispatch(command)
-                },
-                |unknown| unknown.dispatch(command),
-            );
-        // Batch result IDs name members, not the host invocation identities.
-        // Preserve both and the run namespace even when the reply is unusable.
-        outcome.payload["execution"] = batch_execution_evidence(run_key, request);
+    let mut outcome = error
+        .downcast_ref::<invocation_cmd::BatchOutcomeUnknown>()
+        .map_or_else(
+            || {
+                invocation_cmd::BatchOutcomeUnknown::from_requests(
+                    request
+                        .operations
+                        .iter()
+                        .map(|member| (member.id.as_str(), &member.request)),
+                    &client.endpoint,
+                    error,
+                )
+                .dispatch(command)
+            },
+            |unknown| unknown.dispatch(command),
+        );
+    // Batch result IDs name members, not the host invocation identities.
+    // Preserve both and the run namespace even when the reply is unusable.
+    outcome.payload["execution"] = batch_execution_evidence(run_key, request);
     outcome.payload["execution"]["submitted"] = Value::Bool(true);
     if let Some(failure) = error.downcast_ref::<batch_stream::BatchStreamFailure>() {
         let observed = failure
@@ -28756,7 +28903,7 @@ fn batch_submission_failure(
                 "The stream did not complete. Validated results are retained; reconcile member request IDs before repeating any work.".to_owned(),
             );
     }
-        outcome
+    outcome
 }
 
 fn narrow_batch_execution_budget(
@@ -28842,7 +28989,9 @@ fn preflight_status_label(preflights: &[Value]) -> (&'static str, CliExitCode) {
 #[allow(clippy::missing_const_for_fn)]
 fn batch_status_label(response: &HostBatchInvokeResponse) -> (&'static str, CliExitCode) {
     if response.status == fcp_host::BatchStatus::Success
-        && response.failed == 0 && response.skipped == 0 {
+        && response.failed == 0
+        && response.skipped == 0
+    {
         ("ok", CliExitCode::Success)
     } else if response.completed > 0 {
         ("partial", CliExitCode::Connector)
@@ -32403,6 +32552,172 @@ fn resolve_workflow_auth(
     Ok(auth_by_step)
 }
 
+fn parse_batch_member_bindings(
+    values: &[String],
+    flag: &str,
+    member_ids: &BTreeSet<&str>,
+    repeated: bool,
+) -> std::result::Result<BTreeMap<String, Vec<String>>, LiveAuthError> {
+    let mut bindings = BTreeMap::<String, Vec<String>>::new();
+    for raw in values {
+        let Some((member_id, value)) = raw.split_once('=') else {
+            return Err(LiveAuthError::InvalidBatchAuth {
+                message: format!("{flag} requires ID=VALUE."),
+            });
+        };
+        let member_id = member_id.trim();
+        if !member_ids.contains(member_id) {
+            // A bare padded token can look like an ID=VALUE binding. Never
+            // reflect an unknown key or its value into diagnostics.
+            return Err(LiveAuthError::InvalidBatchAuth {
+                message: format!("{flag} must name an existing batch member's JSONL id."),
+            });
+        }
+        if value.trim().is_empty() {
+            return Err(LiveAuthError::InvalidBatchAuth {
+                message: format!("{flag} has an empty value for member `{member_id}`."),
+            });
+        }
+        let entries = bindings.entry(member_id.to_owned()).or_default();
+        if !repeated && !entries.is_empty() {
+            return Err(LiveAuthError::InvalidBatchAuth {
+                message: format!("{flag} was specified more than once for member `{member_id}`."),
+            });
+        }
+        entries.push(value.to_owned());
+    }
+    Ok(bindings)
+}
+
+/// Resolve every authority group before any member can reach preflight or
+/// dispatch. JSONL remains a reusable, credential-free operation recipe.
+#[allow(clippy::too_many_lines)]
+fn resolve_batch_auth(
+    args: &BatchAuthArgs,
+    batch: &batch_file::BatchFile,
+    catalog: &HostConnectorCatalog,
+    default_zone: &str,
+) -> std::result::Result<BTreeMap<String, ResolvedLiveAuth>, LiveAuthError> {
+    let member_ids = batch.operations.iter().map(|op| op.id.as_str()).collect();
+    let inline = parse_batch_member_bindings(
+        &args.member_capability_token,
+        "--member-capability-token",
+        &member_ids,
+        false,
+    )?;
+    let files = parse_batch_member_bindings(
+        &args.member_capability_token_file,
+        "--member-capability-token-file",
+        &member_ids,
+        false,
+    )?;
+    let holder_keys = parse_batch_member_bindings(
+        &args.member_holder_key_file,
+        "--member-holder-key-file",
+        &member_ids,
+        false,
+    )?;
+    let approvals = parse_batch_member_bindings(
+        &args.member_approval_token,
+        "--member-approval-token",
+        &member_ids,
+        true,
+    )?;
+    let approval_files = parse_batch_member_bindings(
+        &args.member_approval_token_file,
+        "--member-approval-token-file",
+        &member_ids,
+        true,
+    )?;
+    let explicit_members = inline
+        .keys()
+        .chain(files.keys())
+        .chain(holder_keys.keys())
+        .chain(approvals.keys())
+        .chain(approval_files.keys())
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    for member_id in &explicit_members {
+        let has_inline = inline.contains_key(*member_id);
+        let has_file = files.contains_key(*member_id);
+        if has_inline == has_file {
+            return Err(LiveAuthError::InvalidBatchAuth {
+                message: format!(
+                    "Member `{member_id}` requires exactly one of --member-capability-token or --member-capability-token-file. Member credentials never inherit the default token, holder key, or approvals."
+                ),
+            });
+        }
+    }
+
+    let mut default_targets = BTreeSet::new();
+    for op in &batch.operations {
+        let zone = op.zone.as_deref().unwrap_or(default_zone);
+        if zone.parse::<ZoneId>().is_err() {
+            return Err(LiveAuthError::InvalidBatchAuth {
+                message: format!("Member `{}` requires a valid FCP execution zone.", op.id),
+            });
+        }
+        if !explicit_members.contains(op.id.as_str()) {
+            let connector = catalog.resolve_connector(&op.connector).map_err(|_| {
+                LiveAuthError::InvalidBatchAuth {
+                    message: format!("Member `{}` requires an unambiguous live connector before default credentials can be assigned.", op.id),
+                }
+            })?;
+            default_targets.insert((connector.summary.id.as_str().to_owned(), zone.to_owned()));
+        }
+    }
+    if default_targets.len() > 1 {
+        return Err(LiveAuthError::InvalidBatchAuth {
+            message: "Batch members using default credentials target multiple connectors or zones. Assign --member-capability-token-file ID=PATH to each separately authorized member; defaults may cover only one connector and zone.".to_owned(),
+        });
+    }
+    // Validate explicitly supplied defaults even when all members override
+    // them. Silently ignoring malformed authority hides operator mistakes.
+    let default_auth = if args.default_auth.is_present() || !default_targets.is_empty() {
+        Some(resolve_live_auth(&args.default_auth)?)
+    } else {
+        None
+    };
+    let mut auth_by_member = BTreeMap::new();
+    for op in &batch.operations {
+        let auth = if explicit_members.contains(op.id.as_str()) {
+            let member_args = LiveAuthArgs {
+                capability_token: inline
+                    .get(&op.id)
+                    .and_then(|values| values.first())
+                    .cloned(),
+                capability_token_file: files
+                    .get(&op.id)
+                    .and_then(|values| values.first())
+                    .map(PathBuf::from),
+                holder_key_file: holder_keys
+                    .get(&op.id)
+                    .and_then(|values| values.first())
+                    .map(PathBuf::from),
+                approval_token: approvals.get(&op.id).cloned().unwrap_or_default(),
+                approval_token_file: approval_files
+                    .get(&op.id)
+                    .map(|values| values.iter().map(PathBuf::from).collect())
+                    .unwrap_or_default(),
+            };
+            resolve_live_auth(&member_args).map_err(|error| LiveAuthError::InvalidBatchAuth {
+                // Parsers can include provider-defined enum values or private
+                // paths in errors. Report only the safe error classification.
+                message: format!(
+                    "Invalid credentials for batch member `{}` ({}). Supply that member's capability, its holder key when bound, and its required approval tokens.",
+                    op.id, error.error_type()
+                ),
+            })?
+        } else {
+            default_auth
+                .clone()
+                .ok_or(LiveAuthError::MissingCapabilityToken)?
+        };
+        auth_by_member.insert(op.id.clone(), auth);
+    }
+    Ok(auth_by_member)
+}
+
 fn live_pipeline_operation_metadata(
     operations: &BTreeMap<String, ResolvedHostOperation>,
 ) -> BTreeMap<String, pipe::PipelineOperationMetadata> {
@@ -34880,11 +35195,11 @@ fn map_dispatch_with_stream(
         operations,
         options: build_host_batch_options(args.concurrency, on_error, args.timeout_ms),
     };
-    let submission = match submit_namespaced_batch(&client, &mut request, "map", &run_key, run_budget, writer)
-    {
-        Ok(response) => response,
-        Err(outcome) => return Ok(outcome),
-    };
+    let submission =
+        match submit_namespaced_batch(&client, &mut request, "map", &run_key, run_budget, writer) {
+            Ok(response) => response,
+            Err(outcome) => return Ok(outcome),
+        };
     let (status, exit_code) = batch_status_label(&submission.response);
 
     let envelope = CommandEnvelope::new(CommandAvailability::LiveRuntime, "map");
@@ -35011,7 +35326,7 @@ fn batch_file_dispatch_with_stream(
         }
         Err(error) => return Err(error),
     };
-    let auth = resolve_live_auth(&args.auth);
+    let auth = resolve_batch_auth(&args.auth, &batch, &catalog, &default_zone);
     if run_budget.remaining_ms(std::time::Instant::now()).is_err() {
         return Ok(batch_setup_deadline_dispatch(
             "batch-file",
@@ -35028,11 +35343,11 @@ fn batch_file_dispatch_with_stream(
                 &error,
                 &[
                     format!(
-                        "fwc batch-file {} --host {} --capability-token-file <token.cbor>",
+                        "fwc batch-file {} --host {} --member-capability-token-file <id>=<token.cbor>",
                         args.file.display(),
                         host.endpoint
                     ),
-                    "Provide approval tokens with `--approval-token-file` when batch operations require explicit authorization.".to_owned(),
+                    "Use --member-holder-key-file ID=PATH and --member-approval-token-file ID=PATH for each independently authorized member. Default credentials may cover only one connector and zone.".to_owned(),
                 ],
             ));
         }
@@ -35042,6 +35357,7 @@ fn batch_file_dispatch_with_stream(
     let mut preflights = Vec::new();
     let mut introspection_cache: BTreeMap<String, HostIntrospectionResponse> = BTreeMap::new();
     for op in &batch.operations {
+        let member_auth = &auth[&op.id];
         if run_budget.remaining_ms(std::time::Instant::now()).is_err() {
             return Ok(batch_setup_deadline_dispatch(
                 "batch-file",
@@ -35150,7 +35466,7 @@ fn batch_file_dispatch_with_stream(
                 continue;
             }
             let preflight_request = HostPreflightRequest {
-                holder_proof: auth.holder_proof_for(&request_id, &operation.name)?,
+                holder_proof: member_auth.holder_proof_for(&request_id, &operation.name)?,
                 request_id,
                 connector_id: connector.summary.id.as_str().parse().map_err(|error| {
                     anyhow::anyhow!(
@@ -35165,8 +35481,8 @@ fn batch_file_dispatch_with_stream(
                     anyhow::anyhow!("`{zone}` is not a valid FCP zone for `batch-file`: {error}")
                 })?),
                 lease_seq: op.lease_seq,
-                capability_token: Some(auth.capability_token.clone()),
-                approval_tokens: auth.approval_tokens.clone(),
+                capability_token: Some(member_auth.capability_token.clone()),
+                approval_tokens: member_auth.approval_tokens.clone(),
             };
             let response = match client.workflow_preflight(&preflight_request, run_budget) {
                 Ok(response) => response,
@@ -35202,7 +35518,7 @@ fn batch_file_dispatch_with_stream(
             &zone,
             op.input.clone(),
             request_id,
-            &auth,
+            member_auth,
             idempotency_key,
             op.lease_seq,
             None,
@@ -35290,11 +35606,17 @@ fn batch_file_dispatch_with_stream(
         operations: request_operations,
         options: build_host_batch_options(args.concurrency, on_error, args.timeout_ms),
     };
-    let submission =
-        match submit_namespaced_batch(&client, &mut request, "batch-file", &run_key, run_budget, writer) {
-            Ok(response) => response,
-            Err(outcome) => return Ok(outcome),
-        };
+    let submission = match submit_namespaced_batch(
+        &client,
+        &mut request,
+        "batch-file",
+        &run_key,
+        run_budget,
+        writer,
+    ) {
+        Ok(response) => response,
+        Err(outcome) => return Ok(outcome),
+    };
     let (status, exit_code) = batch_status_label(&submission.response);
 
     let envelope = CommandEnvelope::new(CommandAvailability::LiveRuntime, "batch");
@@ -35533,7 +35855,7 @@ fn discovery_error(
 }
 
 fn task_dispatch(args: &TaskArgs, explicit_host: Option<&str>) -> Result<DispatchOutcome> {
-    match &args.command {
+    let result = match &args.command {
         TaskCommand::Create(args) => task_create_dispatch(args),
         TaskCommand::Show(args) => task_show_dispatch(args),
         TaskCommand::List(args) => task_list_dispatch(args),
@@ -35543,6 +35865,66 @@ fn task_dispatch(args: &TaskArgs, explicit_host: Option<&str>) -> Result<Dispatc
         TaskCommand::Bind(args) => task_bind_dispatch(args),
         TaskCommand::Approve(args) => task_approve_dispatch(args),
         TaskCommand::Run(args) => task_run_dispatch(args, explicit_host),
+    };
+    match result {
+        Err(error) => {
+            if let Some(access) = error.downcast_ref::<workflow::TaskAccessError>() {
+                return Ok(task_access_failure(args, access));
+            }
+            Err(error)
+        }
+        outcome => outcome,
+    }
+}
+
+fn task_access_failure(args: &TaskArgs, error: &workflow::TaskAccessError) -> DispatchOutcome {
+    let (subcommand, task_id) = match &args.command {
+        TaskCommand::Show(args) => ("show", Some(args.task_id.as_str())),
+        TaskCommand::Resolve(args) => ("resolve", Some(args.task_id.as_str())),
+        TaskCommand::Ask(args) => ("ask", Some(args.task_id.as_str())),
+        TaskCommand::Advance(args) => ("advance", Some(args.task_id.as_str())),
+        TaskCommand::Bind(args) => ("bind", Some(args.task_id.as_str())),
+        TaskCommand::Approve(args) => ("approve", Some(args.task_id.as_str())),
+        TaskCommand::Run(args) => ("run", Some(args.task_id.as_str())),
+        TaskCommand::Create(_) => ("create", None),
+        TaskCommand::List(_) => ("list", None),
+    };
+    let (error_type, recoverable) = match error {
+        workflow::TaskAccessError::Busy => ("task-in-use", true),
+        workflow::TaskAccessError::ExecutionBlocked(workflow::TaskExecutionState::Completed) => {
+            ("task-already-executed", false)
+        }
+        workflow::TaskAccessError::ExecutionBlocked(_) => ("task-execution-needs-review", false),
+    };
+    let mut next_actions = vec![task_id.map_or_else(
+        || "Inspect the workflow task store before retrying.".to_owned(),
+        |id| format!("Inspect the retained evidence with `fwc task show {id}`."),
+    )];
+    next_actions.push(if recoverable {
+        "Wait for the current task owner to finish, then inspect its state before trying again.".to_owned()
+    } else {
+        "Reconcile completed or unknown effects first. Explicitly create a new task only for intended new work; rebinding or approving this capsule cannot bypass the execution fence.".to_owned()
+    });
+    let mut payload = json!({
+        "status": "error",
+        "command": "task",
+        "subcommand": subcommand,
+        "task_id": task_id,
+        "invoke_attempted": false,
+        "automatic_retry_allowed": false,
+        "error": {
+            "type": error_type,
+            "message": error.to_string(),
+            "recoverable": recoverable,
+        },
+        "next_actions": next_actions,
+    });
+    let mut envelope = CommandEnvelope::new(CommandAvailability::OfflineArtifact, "task");
+    envelope.recoverable = recoverable;
+    envelope.inject_into(&mut payload);
+    DispatchOutcome {
+        payload,
+        exit_code: CliExitCode::Validation,
     }
 }
 
@@ -35584,6 +35966,7 @@ fn task_show_dispatch(args: &TaskIdArgs) -> Result<DispatchOutcome> {
         "task": task_payload_view(&task),
         "state_root": store.root_dir().display().to_string(),
     });
+    payload["task"]["execution_history"] = serde_json::to_value(&task.execution_history)?;
     envelope.inject_into(&mut payload);
     Ok(DispatchOutcome {
         payload,
@@ -35615,9 +35998,13 @@ fn task_resolve_dispatch(
     explicit_host: Option<&str>,
 ) -> Result<DispatchOutcome> {
     let store = workflow::TaskStore::discover()?;
-    let Some(mut task) = store.refresh(&args.task_id)? else {
+    let lease = store.lock_task(&args.task_id)?;
+    let Some(mut task) = lease.refresh()? else {
         return Ok(missing_task_dispatch(&args.task_id));
     };
+    if let Some(state) = task.execution_blocker() {
+        return Err(workflow::TaskAccessError::ExecutionBlocked(state).into());
+    }
 
     let until_ready = args.should_resolve_until_ready();
     let mode = if until_ready {
@@ -35661,14 +36048,7 @@ fn task_resolve_dispatch(
         safe_step_count += pass_safe_step_count;
 
         let applied = match task_receipt_or_failure(
-            store.append_resolution(
-                &args.task_id,
-                "resolve",
-                mode,
-                pass_count,
-                safe_step_count,
-                patch,
-            ),
+            lease.append_resolution("resolve", mode, pass_count, safe_step_count, patch),
             &task,
             "resolve",
             &safe_execution,
@@ -35872,9 +36252,13 @@ fn task_advance_dispatch(
     explicit_host: Option<&str>,
 ) -> Result<DispatchOutcome> {
     let store = workflow::TaskStore::discover()?;
-    let Some(task) = store.refresh(&args.task_id)? else {
+    let lease = store.lock_task(&args.task_id)?;
+    let Some(task) = lease.refresh()? else {
         return Ok(missing_task_dispatch(&args.task_id));
     };
+    if let Some(state) = task.execution_blocker() {
+        return Err(workflow::TaskAccessError::ExecutionBlocked(state).into());
+    }
     if !workflow::ready_for_execution(&task) {
         return Ok(DispatchOutcome {
             payload: json!({
@@ -35890,6 +36274,10 @@ fn task_advance_dispatch(
 
     let approve = !task.has_side_effects();
     let bindings = workflow::effective_bindings(&task);
+    let ticket = lease.begin_execution("advance", if approve { "approve" } else { "simulate" })?;
+    let pending_task = lease
+        .load()?
+        .context("workflow capsule disappeared before dispatch")?;
     let execution = materialize_compiled_steps(
         &task.compiled,
         approve,
@@ -35898,13 +36286,8 @@ fn task_advance_dispatch(
         Some(&args.auth),
     );
     let task = match task_receipt_or_failure(
-        store.append_execution(
-            &args.task_id,
-            "advance",
-            if approve { "approve" } else { "simulate" },
-            execution.payload.clone(),
-        ),
-        &task,
+        lease.finish_execution(&ticket, execution.payload.clone()),
+        &pending_task,
         "advance",
         &execution,
     ) {
@@ -35940,9 +36323,13 @@ fn task_run_dispatch(
     explicit_host: Option<&str>,
 ) -> Result<DispatchOutcome> {
     let store = workflow::TaskStore::discover()?;
-    let Some(task) = store.refresh(&args.task_id)? else {
+    let lease = store.lock_task(&args.task_id)?;
+    let Some(task) = lease.refresh()? else {
         return Ok(missing_task_dispatch(&args.task_id));
     };
+    if let Some(state) = task.execution_blocker() {
+        return Err(workflow::TaskAccessError::ExecutionBlocked(state).into());
+    }
     if !workflow::ready_for_execution(&task) {
         return Ok(DispatchOutcome {
             payload: json!({
@@ -35986,25 +36373,21 @@ fn task_run_dispatch(
     }
 
     let bindings = workflow::effective_bindings(&task);
+    let approve = task.approval.workflow || !task.has_side_effects();
+    let ticket = lease.begin_execution("run", if approve { "approve" } else { "simulate" })?;
+    let pending_task = lease
+        .load()?
+        .context("workflow capsule disappeared before dispatch")?;
     let execution = materialize_compiled_steps(
         &task.compiled,
-        task.approval.workflow,
+        approve,
         Some(&bindings),
         explicit_host,
         Some(&args.auth),
     );
     let task = match task_receipt_or_failure(
-        store.append_execution(
-            &args.task_id,
-            "run",
-            if task.approval.workflow {
-                "approve"
-            } else {
-                "simulate"
-            },
-            execution.payload.clone(),
-        ),
-        &task,
+        lease.finish_execution(&ticket, execution.payload.clone()),
+        &pending_task,
         "run",
         &execution,
     ) {
@@ -36019,7 +36402,7 @@ fn task_run_dispatch(
         "subcommand": "run",
         "message": if !execution.exit_code.is_success() {
             "The workflow capsule stopped on a failed primitive. Its completed steps and failure are retained."
-        } else if task.approval.workflow {
+        } else if approve {
             "Ran the approved workflow capsule and surfaced the live result of each primitive step."
         } else {
             "Ran the workflow capsule in non-side-effecting mode."
@@ -36071,8 +36454,12 @@ fn task_receipt_or_failure<T>(
     envelope.recoverable = false;
     envelope.next_actions = vec![
         "Preserve this execution report before repairing the local task store.".to_owned(),
-        "Inspect completed or unknown effects before deciding which steps can be repeated."
-            .to_owned(),
+        if task.execution_blocker().is_some() {
+            "The capsule remains fenced. Reconcile completed or unknown effects before explicitly creating a new task for intended new work.".to_owned()
+        } else {
+            "Inspect completed or unknown effects before deciding which steps can be repeated."
+                .to_owned()
+        },
     ];
     envelope.inject_into(&mut payload);
     attach_compiled_execution_failure(&mut payload, execution);
@@ -36089,6 +36476,7 @@ fn task_receipt_or_failure<T>(
 fn task_payload_view(task: &workflow::WorkflowTask) -> Value {
     json!({
         "schema_version": task.schema_version,
+        "revision": task.revision,
         "id": task.id,
         "created_at": task.created_at,
         "updated_at": task.updated_at,
@@ -36109,11 +36497,13 @@ fn task_payload_view(task: &workflow::WorkflowTask) -> Value {
         },
         "execution_history_count": task.execution_history.len(),
         "last_execution": task.last_execution().map(execution_receipt_summary),
+        "execution_fence": task.execution_fence,
     })
 }
 
 fn execution_receipt_summary(receipt: &workflow::ExecutionReceipt) -> Value {
     json!({
+        "revision": receipt.revision,
         "recorded_at": receipt.recorded_at,
         "trigger": receipt.trigger,
         "mode": receipt.mode,
@@ -36485,6 +36875,7 @@ fn materialize_compiled_steps(
             continue;
         }
 
+        let mut primitive_dispatched = false;
         let mut primitive = match parsed {
             Ok(mut parsed) => {
                 if let Err(error) = inherit_compiled_operation_payload(
@@ -36501,9 +36892,12 @@ fn materialize_compiled_steps(
                         explicit_host,
                         runtime_auth,
                     ) {
-                        Ok(()) => dispatch(&parsed).unwrap_or_else(|error| {
-                            internal_error_dispatch(&resolved_argv, &error)
-                        }),
+                        Ok(()) => {
+                            primitive_dispatched = true;
+                            dispatch(&parsed).unwrap_or_else(|error| {
+                                internal_error_dispatch(&resolved_argv, &error)
+                            })
+                        }
                         Err(error) => live_auth_dispatch(&step.command, &error, &[]),
                     }
                 }
@@ -36542,6 +36936,7 @@ fn materialize_compiled_steps(
             "argument_echo_withheld": withhold_argument_echo,
             "approval_required": step.approval_required,
             "side_effecting": step.side_effecting,
+            "primitive_dispatched": primitive_dispatched,
             "notes": step.notes,
             "status": if primitive_succeeded { "executed" } else { "failed" },
             "exit_code": primitive.exit_code.as_u8(),
@@ -38119,6 +38514,11 @@ fn is_sensitive_flag(flag: &str) -> bool {
             | "--step-capability-token"
             | "--step-capability-token-file"
             | "--step-holder-key-file"
+            | "--member-capability-token"
+            | "--member-capability-token-file"
+            | "--member-holder-key-file"
+            | "--member-approval-token"
+            | "--member-approval-token-file"
             | "--approval-token"
             | "--token"
             | "--api-token"
@@ -42891,6 +43291,76 @@ deny_ptrace = true
     }
 
     #[test]
+    fn batch_auth_diagnostics_and_serialization_never_retain_member_credentials() {
+        let args = [
+            "fwc",
+            "--json",
+            "batch-file",
+            "not-opened.jsonl",
+            "--member-capability-token=source=INLINE_SECRET",
+            "--member-capability-token-file",
+            "dependent=TOKEN_PATH_SECRET",
+            "--member-holder-key-file=source=KEY_PATH_SECRET",
+            "--member-approval-token",
+            "dependent=APPROVAL_SECRET",
+            "--member-approval-token-file=dependent=APPROVAL_PATH_SECRET",
+        ]
+        .map(str::to_owned);
+        let cli = Cli::try_parse_from(&args).expect("member credentials should parse");
+        let Commands::BatchFile(batch_args) = cli.command else {
+            panic!("expected batch-file command");
+        };
+        let serialized = serde_json::to_string(&batch_args).unwrap();
+        let mut diagnostic_args = args.to_vec();
+        diagnostic_args.insert(2, "--extract".to_owned());
+        diagnostic_args.insert(3, ".connector[".to_owned());
+        let (exit, payload) = execute_json(
+            &diagnostic_args
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(exit, CliExitCode::Validation.into());
+        assert_eq!(payload["error"]["type"], "invalid-extract-filter");
+        for view in ["received", "normalized"] {
+            let arguments = payload["input"][view].as_array().unwrap();
+            for flag in [
+                "--member-capability-token=<redacted>",
+                "--member-holder-key-file=<redacted>",
+                "--member-approval-token-file=<redacted>",
+            ] {
+                assert!(arguments.iter().any(|argument| argument == flag));
+            }
+            for flag in ["--member-capability-token-file", "--member-approval-token"] {
+                let index = arguments
+                    .iter()
+                    .position(|argument| argument == flag)
+                    .unwrap();
+                assert_eq!(arguments[index + 1], "<redacted>");
+            }
+        }
+        for secret in [
+            "INLINE_SECRET",
+            "TOKEN_PATH_SECRET",
+            "KEY_PATH_SECRET",
+            "APPROVAL_SECRET",
+            "APPROVAL_PATH_SECRET",
+        ] {
+            assert!(!serialized.contains(secret));
+            assert!(!payload.to_string().contains(secret));
+        }
+        for field in [
+            "member_capability_token",
+            "member_capability_token_file",
+            "member_holder_key_file",
+            "member_approval_token",
+            "member_approval_token_file",
+        ] {
+            assert!(!serialized.contains(field));
+        }
+    }
+
+    #[test]
     fn mcp_auth_diagnostics_redact_cancellation_credentials() {
         for credential in [
             "--cancel-capability-token=CANCEL_TOKEN_SECRET",
@@ -44031,6 +44501,67 @@ deny_ptrace = true
     }
 
     #[test]
+    fn execute_task_fence_blocks_concurrent_and_interrupted_mutations() {
+        let store = super::workflow::TaskStore::discover().unwrap();
+        let task = store
+            .create(super::workflow::WorkflowRequest {
+                intent: "search GitHub issues for auth".to_owned(),
+                connector_override: Some("github".to_owned()),
+                zone_override: Some("z:work".to_owned()),
+            })
+            .unwrap();
+        let lease = store.lock_task(&task.id).unwrap();
+        for command in ["run", "advance", "resolve", "approve", "bind", "ask"] {
+            let mut argv = vec!["fwc", "--json", "task", command, &task.id];
+            if command == "bind" {
+                argv.push("zone=z:private");
+            }
+            let (exit, payload) = execute_json(&argv);
+            assert_eq!(exit, CliExitCode::Validation.into(), "{command}: {payload}");
+            assert_eq!(payload["error"]["type"], "task-in-use");
+            assert_eq!(payload["invoke_attempted"], false);
+        }
+        let ticket = lease.begin_execution("run", "approve").unwrap();
+        let (exit, shown) = execute_json(&["fwc", "--json", "task", "show", &task.id]);
+        assert_eq!(exit, CliExitCode::Success.into());
+        assert_eq!(shown["task"]["capsule_status"], "execution-pending");
+        assert_eq!(shown["task"]["execution_fence"]["state"], "pending");
+        // Losing the owner releases the OS lock without clearing the durable
+        // uncertainty marker. No runtime credentials or host are needed to
+        // observe the refusal on a subsequent invocation.
+        drop(ticket);
+        drop(lease);
+        for command in ["run", "advance", "resolve", "approve", "bind"] {
+            let mut argv = vec!["fwc", "--json", "task", command, &task.id];
+            if command == "bind" {
+                argv.push("zone=z:private");
+            }
+            let (exit, payload) = execute_json(&argv);
+            assert_eq!(exit, CliExitCode::Validation.into(), "{command}: {payload}");
+            assert_eq!(payload["error"]["type"], "task-execution-needs-review");
+            assert_eq!(payload["invoke_attempted"], false);
+            assert_eq!(payload["automatic_retry_allowed"], false);
+            assert!(
+                payload["next_actions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|action| {
+                        action
+                            .as_str()
+                            .is_some_and(|text| text.contains("new task"))
+                    })
+            );
+        }
+        let preserved = store.load(&task.id).unwrap().unwrap();
+        assert_eq!(
+            preserved.execution_blocker(),
+            Some(super::workflow::TaskExecutionState::Pending)
+        );
+        assert!(preserved.execution_history.is_empty());
+    }
+
+    #[test]
     fn execute_task_bind_and_approve_updates_capsule_state() {
         let create_args = vec![
             "fwc".to_owned(),
@@ -44318,7 +44849,7 @@ deny_ptrace = true
     }
 
     #[test]
-    fn execute_task_bind_after_advance_clears_stale_execution_history() {
+    fn execute_task_bind_after_advance_preserves_prior_revision_evidence() {
         let create_args = vec![
             "fwc".to_owned(),
             "--json".to_owned(),
@@ -44364,7 +44895,8 @@ deny_ptrace = true
             rebound_payload["task"]["capsule_status"],
             "ready-to-simulate"
         );
-        assert_eq!(rebound_payload["task"]["execution_history_count"], 0);
+        assert_eq!(rebound_payload["task"]["execution_history_count"], 1);
+        assert_eq!(rebound_payload["task"]["revision"], 1);
         assert!(rebound_payload["task"]["last_execution"].is_null());
     }
 
@@ -45247,7 +45779,7 @@ deny_ptrace = true
     }
 
     #[test]
-    fn execute_compiled_workflow_wrappers_forward_payload_and_runtime_authority() {
+    fn execute_compiled_workflow_wrappers_forward_authority_and_fence_task_execution() {
         let intent = "search GitHub issues for auth";
         let token = test_capability_token_arg();
         let expected_token =
@@ -45286,11 +45818,13 @@ deny_ptrace = true
                 json!({"type": "object"}),
             )],
         );
-        for (command, from_file) in [
-            ("do", false),
-            ("do", true),
-            ("run", false),
-            ("advance", true),
+        for (command, from_file, uncertain_response) in [
+            ("do", false, false),
+            ("do", true, false),
+            ("run", false, false),
+            ("advance", true, false),
+            ("run", false, true),
+            ("advance", true, true),
         ] {
             let task_id = if command == "do" {
                 None
@@ -45345,7 +45879,11 @@ deny_ptrace = true
                     ));
                     routes.push((
                         "POST /rpc/invoke".to_owned(),
-                        mock_invoke_response_json(json!({"items": []})),
+                        if uncertain_response {
+                            json!({"unusable_response": true})
+                        } else {
+                            mock_invoke_response_json(json!({"items": []}))
+                        },
                     ));
                 }
             }
@@ -45364,11 +45902,21 @@ deny_ptrace = true
             argv.extend(["--capability-token", &token]);
             let (exit_code, payload) = execute_json(&argv);
             server.join().unwrap();
-            assert_eq!(
-                exit_code,
-                CliExitCode::Success.into(),
-                "{command}: {payload}"
-            );
+            if uncertain_response {
+                assert_ne!(
+                    exit_code,
+                    CliExitCode::Success.into(),
+                    "{command}: {payload}"
+                );
+                assert_eq!(payload["error"]["type"], "invoke-outcome-unknown");
+                assert_eq!(payload["task"]["capsule_status"], "execution-needs-review");
+            } else {
+                assert_eq!(
+                    exit_code,
+                    CliExitCode::Success.into(),
+                    "{command}: {payload}"
+                );
+            }
             let requests = request_log.lock().unwrap();
             let invoke_body = requests
                 .iter()
@@ -45379,6 +45927,13 @@ deny_ptrace = true
             assert_eq!(invocation["capability_token"], expected_token);
             assert_eq!(invocation["zone_id"], "z:work");
             assert_eq!(payload["execution"]["executed_count"], compiled.steps.len());
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|(route, _)| route == "POST /rpc/invoke")
+                    .count(),
+                1
+            );
             assert!(!payload.to_string().contains(&token));
             for step in payload["execution"]["executed_steps"].as_array().unwrap() {
                 assert!(!step["argv"].to_string().contains(&input_text));
@@ -45392,7 +45947,48 @@ deny_ptrace = true
                 let store = super::workflow::TaskStore::discover().unwrap();
                 let saved = store.load(&task_id).unwrap().unwrap();
                 assert_eq!(saved.execution_history.len(), 1);
+                assert_eq!(
+                    saved.execution_blocker(),
+                    Some(if uncertain_response {
+                        super::workflow::TaskExecutionState::NeedsReview
+                    } else {
+                        super::workflow::TaskExecutionState::Completed
+                    })
+                );
                 assert!(!serde_json::to_string(&saved).unwrap().contains(&token));
+                // The host has closed. Re-execution and every mutation that
+                // could conceal the prior attempt must stop at the capsule,
+                // before even trying discovery or requesting fresh authority.
+                for retry in ["run", "advance", "resolve", "approve", "bind"] {
+                    let mut retry_argv =
+                        vec!["fwc", "--json", "--host", &host, "task", retry, &task_id];
+                    if retry == "bind" {
+                        retry_argv.push("zone=z:private");
+                    }
+                    let (retry_exit, blocked) = execute_json(&retry_argv);
+                    assert_eq!(
+                        retry_exit,
+                        CliExitCode::Validation.into(),
+                        "{retry}: {blocked}"
+                    );
+                    assert_eq!(
+                        blocked["error"]["type"],
+                        if uncertain_response {
+                            "task-execution-needs-review"
+                        } else {
+                            "task-already-executed"
+                        }
+                    );
+                    assert_eq!(blocked["invoke_attempted"], false);
+                    assert_eq!(blocked["automatic_retry_allowed"], false);
+                }
+                let (show_exit, shown) = execute_json(&["fwc", "--json", "task", "show", &task_id]);
+                assert_eq!(show_exit, CliExitCode::Success.into());
+                assert_eq!(shown["task"]["execution_history_count"], 1);
+                assert_eq!(
+                    shown["task"]["execution_history"][0]["execution"],
+                    payload["execution"]
+                );
             }
         }
     }
@@ -59068,7 +59664,10 @@ depends_on = ["missing"]
     #[test]
     fn execute_serve_mcp_rejects_unknown_host_zone_envelope() {
         let (host, server) = spawn_mock_host_sequence(vec![
-            ("POST /rpc/discover".to_owned(), mock_discovery_response_json()),
+            (
+                "POST /rpc/discover".to_owned(),
+                mock_discovery_response_json(),
+            ),
             (
                 "GET /rpc/connectors/fcp.github:enterprise:v1".to_owned(),
                 mock_inventory_response_json(),
@@ -59112,13 +59711,9 @@ depends_on = ["missing"]
                 serde_json::from_value(mock_discovery_response_json()).unwrap();
             let connectors = HostConnectorCatalog::from_response(&response).connectors;
             let client = super::HostAdminClient::new(&host).unwrap();
-            let failure = super::serve_mcp_zone_connectors(
-                &client,
-                connectors,
-                &ZoneId::work(),
-                true,
-            )
-            .expect_err("an unpermitted or disabled connector must not expose tools");
+            let failure =
+                super::serve_mcp_zone_connectors(&client, connectors, &ZoneId::work(), true)
+                    .expect_err("an unpermitted or disabled connector must not expose tools");
             server.join().unwrap();
             assert_eq!(failure.exit_code, CliExitCode::PolicyDenied);
             assert_eq!(failure.payload["error"]["type"], error_type);
@@ -59147,7 +59742,10 @@ depends_on = ["missing"]
         .expect_err("another connector's envelope cannot authorize exposure");
         server.join().unwrap();
         assert_eq!(failure.exit_code, CliExitCode::Transport);
-        assert_eq!(failure.payload["error"]["type"], "mcp-zone-inventory-unavailable");
+        assert_eq!(
+            failure.payload["error"]["type"],
+            "mcp-zone-inventory-unavailable"
+        );
     }
 
     #[test]
@@ -59184,13 +59782,9 @@ depends_on = ["missing"]
             .collect();
         let (host, server) = spawn_mock_host_sequence(routes);
         let client = super::HostAdminClient::new(&host).unwrap();
-        let selected = super::serve_mcp_zone_connectors(
-            &client,
-            catalog.connectors,
-            &ZoneId::work(),
-            false,
-        )
-        .expect("the matching live connector should remain");
+        let selected =
+            super::serve_mcp_zone_connectors(&client, catalog.connectors, &ZoneId::work(), false)
+                .expect("the matching live connector should remain");
         server.join().unwrap();
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].summary.id.as_str(), "fcp.github:enterprise:v1");
@@ -59220,7 +59814,10 @@ depends_on = ["missing"]
                     "GET /rpc/connectors/fcp.github:enterprise:v1".to_owned(),
                     inventory.clone(),
                 ),
-                ("POST /rpc/discover".to_owned(), invocation_inventory.clone()),
+                (
+                    "POST /rpc/discover".to_owned(),
+                    invocation_inventory.clone(),
+                ),
                 (
                     "GET /rpc/introspect/fcp.github:enterprise:v1".to_owned(),
                     mock_introspection_response_json(),
@@ -59250,9 +59847,7 @@ depends_on = ["missing"]
                 .iter()
                 .find(|tool| tool.operation_id == "github.get_issue")
                 .unwrap();
-            let tool = tool
-                .clone()
-                .with_supported_zones(vec!["z:work".to_owned()]);
+            let tool = tool.clone().with_supported_zones(vec!["z:work".to_owned()]);
             let config =
                 super::serve_mcp_config(Some(&selected[0]), None).with_zone_filter("z:work");
             let state = serve_mcp::state_from_tools(vec![tool.clone()], config);
@@ -59291,9 +59886,10 @@ depends_on = ["missing"]
             server.join().unwrap();
             assert_eq!(result.result().unwrap()["isError"], !allowed);
             let requests = requests.lock().unwrap();
-            for (route, body) in requests.iter().filter(|(route, _)| {
-                route == "POST /rpc/preflight" || route == "POST /rpc/invoke"
-            }) {
+            for (route, body) in requests
+                .iter()
+                .filter(|(route, _)| route == "POST /rpc/preflight" || route == "POST /rpc/invoke")
+            {
                 let body: Value = serde_json::from_str(body).unwrap();
                 assert_eq!(body["connector_id"], "fcp.github:enterprise:v1", "{route}");
                 assert_eq!(body["zone_id"], "z:work", "{route}");
@@ -59380,7 +59976,10 @@ depends_on = ["missing"]
         replacement_tool["name"] = json!("github.get_issue_bulk");
         replacement["tools"] = json!([replacement_tool]);
         let (endpoint, server) = spawn_mock_host_sequence(vec![
-            ("POST /rpc/discover".to_owned(), mock_discovery_response_json()),
+            (
+                "POST /rpc/discover".to_owned(),
+                mock_discovery_response_json(),
+            ),
             (
                 "GET /rpc/introspect/fcp.github:enterprise:v1".to_owned(),
                 replacement,
@@ -59479,7 +60078,10 @@ depends_on = ["missing"]
         assert_eq!(tools.len(), 2);
         assert_eq!(tools[0].name, "github.create_issue");
         assert_eq!(tools[0].connector_id, "github");
-        assert_eq!(tools[0].execution_connector_id(), "fcp.github:enterprise:v1");
+        assert_eq!(
+            tools[0].execution_connector_id(),
+            "fcp.github:enterprise:v1"
+        );
         assert_eq!(tools[0].operation_id, "github.create_issue");
         assert_eq!(
             tools[0]
@@ -63567,6 +64169,567 @@ depends_on = ["missing"]
         assert_eq!(cli_stream_records(&writer.bytes)[0]["type"], "start");
         assert!(
             matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+    }
+
+    fn batch_member_approval_fixture(id: &str, connector: &str, operation: &str) -> Value {
+        json!({
+            "token_id": id,
+            "issued_at_ms": 0,
+            "expires_at_ms": u64::MAX,
+            "issuer": "batch-approver",
+            "zone_id": "z:work",
+            "scope": {
+                "type": "execution",
+                "connector_id": connector,
+                "method_pattern": operation,
+            },
+            "signature": [17, 29, 53, 97],
+        })
+    }
+
+    fn assert_batch_member_holder_request(
+        request: &Value,
+        expected_token: &str,
+        key: &Ed25519SigningKey,
+    ) {
+        let token = super::parse_capability_token_str(expected_token, "batch fixture").unwrap();
+        assert_eq!(
+            request["capability_token"],
+            serde_json::to_value(&token).unwrap()
+        );
+        let claims = token.raw().claims_unverified().unwrap();
+        let request_id: RequestId = serde_json::from_value(
+            request
+                .get("request_id")
+                .or_else(|| request.get("id"))
+                .unwrap()
+                .clone(),
+        )
+        .unwrap();
+        let operation: fcp_core::OperationId =
+            serde_json::from_value(request["operation"].clone()).unwrap();
+        let proof: fcp_core::HolderProof =
+            serde_json::from_value(request["holder_proof"].clone()).unwrap();
+        assert_eq!(
+            proof.holder_node.as_str(),
+            claims.get_holder_node().unwrap()
+        );
+        key.verifying_key()
+            .verify(
+                &fcp_core::HolderProof::signable_bytes(
+                    &request_id,
+                    &operation,
+                    claims.get_jti().unwrap(),
+                ),
+                &fcp_crypto::Ed25519Signature::from_bytes(&proof.signature),
+            )
+            .expect("batch holder proof must bind this member's token and actual request");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn execute_batch_file_binds_distinct_credentials_and_canonical_defaults() {
+        let directory = TempDir::new().unwrap();
+        let fetch = test_workflow_holder_auth(directory.path(), "fetch", 0xa1);
+        let again = test_workflow_holder_auth(directory.path(), "again", 0xa2);
+        let notify = test_workflow_holder_auth(directory.path(), "notify", 0xa3);
+        let path = directory.path().join("member-auth.jsonl");
+        let recipe = [
+            json!({"id":"fetch","connector":"github","operation":"search_issues",
+                "lease_seq":41,"input":{"query":"first"}})
+            .to_string(),
+            json!({"id":"again","connector":"GitHub","operation":"search_issues",
+                "lease_seq":42,"input":{"query":"second"}})
+            .to_string(),
+            json!({"id":"notify","connector":"slack","operation":"post_message",
+                "lease_seq":7,"input":{"text":"independently authorized"}})
+            .to_string(),
+        ]
+        .join("\n");
+        fs::write(&path, &recipe).unwrap();
+        let notify_token_path = directory.path().join("notify=capability.cbor");
+        fs::write(
+            &notify_token_path,
+            super::parse_capability_token_str(&notify.0, "batch fixture")
+                .unwrap()
+                .raw()
+                .to_cbor()
+                .unwrap(),
+        )
+        .unwrap();
+        let default_approval = batch_member_approval_fixture(
+            "default-approval-secret",
+            "fcp.github:enterprise:v1",
+            "github.search_issues",
+        );
+        let approvals = ["inline-one", "inline-two", "file-one", "file-two"]
+            .map(|id| batch_member_approval_fixture(id, "fcp.slack:team:v1", "slack.post_message"));
+        let approval_files = [
+            directory.path().join("notify=approval-one.json"),
+            directory.path().join("notify-approval-two.json"),
+        ];
+        fs::write(&approval_files[0], approvals[2].to_string()).unwrap();
+        fs::write(&approval_files[1], json!([approvals[3]]).to_string()).unwrap();
+
+        for dry_run in [false, true] {
+            for use_default in [false, true] {
+                let metadata = pipe_mock_catalog(false);
+                let routes = if dry_run {
+                    vec![
+                        metadata[0].clone(),
+                        metadata[1].clone(),
+                        (
+                            "POST /rpc/preflight".into(),
+                            mock_preflight_response_json(true),
+                        ),
+                        (
+                            "POST /rpc/preflight".into(),
+                            mock_preflight_response_json(true),
+                        ),
+                        metadata[2].clone(),
+                        (
+                            "POST /rpc/preflight".into(),
+                            mock_preflight_response_json(true),
+                        ),
+                    ]
+                } else {
+                    let mut routes = metadata;
+                    routes.push((
+                        "POST /rpc/batch".into(),
+                        mock_batch_response_json(&["fetch", "again", "notify"]),
+                    ));
+                    routes
+                };
+                let (host, server, request_log) = spawn_mock_host_sequence_with_body_log(routes);
+                let mut args = vec![
+                    "fwc".into(),
+                    "--json".into(),
+                    "--host".into(),
+                    host,
+                    "batch-file".into(),
+                    path.display().to_string(),
+                ];
+                if dry_run {
+                    args.push("--dry-run".into());
+                }
+                if use_default {
+                    args.extend([
+                        "--capability-token".into(),
+                        fetch.0.clone(),
+                        "--holder-key-file".into(),
+                        fetch.1.display().to_string(),
+                        "--approval-token".into(),
+                        default_approval.to_string(),
+                    ]);
+                } else {
+                    for (id, auth) in [("fetch", &fetch), ("again", &again)] {
+                        args.extend([
+                            "--member-capability-token".into(),
+                            format!("{id}={}", auth.0),
+                            "--member-holder-key-file".into(),
+                            format!("{id}={}", auth.1.display()),
+                        ]);
+                    }
+                }
+                args.extend([
+                    "--member-capability-token-file".into(),
+                    format!("notify={}", notify_token_path.display()),
+                    "--member-holder-key-file".into(),
+                    format!("notify={}", notify.1.display()),
+                ]);
+                for approval in &approvals[..2] {
+                    args.extend([
+                        "--member-approval-token".into(),
+                        format!("notify={approval}"),
+                    ]);
+                }
+                for file in &approval_files {
+                    args.extend([
+                        "--member-approval-token-file".into(),
+                        format!("notify={}", file.display()),
+                    ]);
+                }
+                let (exit, payload) =
+                    execute_json(&args.iter().map(String::as_str).collect::<Vec<_>>());
+                server.join().unwrap();
+                assert_eq!(
+                    exit,
+                    CliExitCode::Success.into(),
+                    "dry_run={dry_run}, default={use_default}: {payload}"
+                );
+                let requests = request_log.lock().unwrap();
+                let sent = if dry_run {
+                    requests
+                        .iter()
+                        .filter(|(route, _)| route == "POST /rpc/preflight")
+                        .map(|(_, body)| serde_json::from_str::<Value>(body).unwrap())
+                        .collect::<Vec<_>>()
+                } else {
+                    let batch: Value = serde_json::from_str(&requests.last().unwrap().1).unwrap();
+                    batch["operations"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|member| member["request"].clone())
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(sent.len(), 3);
+                for (index, (auth, connector, lease)) in [
+                    (&fetch, "fcp.github:enterprise:v1", 41),
+                    (
+                        if use_default { &fetch } else { &again },
+                        "fcp.github:enterprise:v1",
+                        42,
+                    ),
+                    (&notify, "fcp.slack:team:v1", 7),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    assert_batch_member_holder_request(&sent[index], &auth.0, &auth.2);
+                    assert_eq!(sent[index]["connector_id"], connector);
+                    assert_eq!(sent[index]["zone_id"], "z:work");
+                    assert_eq!(sent[index]["lease_seq"], lease);
+                    let expected_approvals = if index == 2 {
+                        json!(approvals)
+                    } else if use_default {
+                        json!([default_approval])
+                    } else {
+                        json!([])
+                    };
+                    assert_eq!(
+                        sent[index]
+                            .get("approval_tokens")
+                            .cloned()
+                            .unwrap_or_else(|| json!([])),
+                        expected_approvals
+                    );
+                }
+                let id_field = if dry_run { "request_id" } else { "id" };
+                assert_ne!(sent[0][id_field], sent[1][id_field]);
+                assert_ne!(sent[0]["holder_proof"], sent[1]["holder_proof"]);
+                assert!(!payload.to_string().contains("default-approval-secret"));
+                assert!(!payload.to_string().contains(&notify.0));
+                assert_eq!(fs::read_to_string(&path).unwrap(), recipe);
+            }
+        }
+    }
+
+    #[test]
+    fn execute_batch_file_rejects_default_authority_across_connectors_or_zones() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("default-boundary.jsonl");
+        let token = test_capability_token_arg();
+        for (connector, operation, zone, input) in [
+            (
+                "slack",
+                "post_message",
+                "z:work",
+                json!({"text":"separate connector"}),
+            ),
+            (
+                "GitHub",
+                "search_issues",
+                "z:private",
+                json!({"query":"separate zone"}),
+            ),
+        ] {
+            fs::write(
+                &path,
+                [
+                    json!({"id":"first","connector":"github","operation":"search_issues",
+                    "zone":"z:work","input":{"query":"first"}})
+                    .to_string(),
+                    json!({"id":"later","connector":connector,"operation":operation,
+                    "zone":zone,"input":input})
+                    .to_string(),
+                ]
+                .join("\n"),
+            )
+            .unwrap();
+            for dry_run in [false, true] {
+                let (host, server, requests) = spawn_mock_host_sequence_with_body_log(
+                    pipe_mock_catalog(false).into_iter().take(1).collect(),
+                );
+                let mut args = vec![
+                    "fwc".to_owned(),
+                    "--json".into(),
+                    "--host".into(),
+                    host,
+                    "batch-file".into(),
+                    path.display().to_string(),
+                    "--capability-token".into(),
+                    token.clone(),
+                ];
+                if dry_run {
+                    args.push("--dry-run".into());
+                }
+                let (exit, payload) =
+                    execute_json(&args.iter().map(String::as_str).collect::<Vec<_>>());
+                server.join().unwrap();
+                assert_eq!(exit, CliExitCode::Validation.into(), "{payload}");
+                assert_eq!(payload["error"]["type"], "invalid-batch-auth");
+                assert_eq!(
+                    requests.lock().unwrap().len(),
+                    1,
+                    "only discovery may occur"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn execute_batch_file_rejects_invalid_later_authority_before_any_preflight_or_invoke() {
+        let directory = TempDir::new().unwrap();
+        let first = test_workflow_holder_auth(directory.path(), "first", 0xb1);
+        let later = test_workflow_holder_auth(directory.path(), "later", 0xb2);
+        let path = directory.path().join("invalid-member-auth.jsonl");
+        fs::write(
+            &path,
+            [
+                json!({"id":"first","connector":"github","operation":"get_issue",
+                "input":{"owner":"octocat","repo":"hello-world","number":1}})
+                .to_string(),
+                json!({"id":"later","connector":"github","operation":"get_issue",
+                "input":{"owner":"octocat","repo":"hello-world","number":2}})
+                .to_string(),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        let token_binding = format!("later={}", later.0);
+        let key_binding = format!("later={}", later.1.display());
+        let approval = batch_member_approval_fixture(
+            "LATER_APPROVAL_SECRET",
+            "fcp.github:enterprise:v1",
+            "github.get_issue",
+        );
+        let cases = [
+            (
+                "never-inherit-holder-key",
+                true,
+                vec!["--member-capability-token".into(), token_binding.clone()],
+            ),
+            (
+                "approval-only-needs-capability",
+                true,
+                vec![
+                    "--member-approval-token".into(),
+                    format!("later={approval}"),
+                ],
+            ),
+            (
+                "key-only-needs-capability",
+                true,
+                vec!["--member-holder-key-file".into(), key_binding.clone()],
+            ),
+            (
+                "duplicate-capability",
+                true,
+                vec![
+                    "--member-capability-token".into(),
+                    token_binding.clone(),
+                    "--member-capability-token".into(),
+                    token_binding.clone(),
+                ],
+            ),
+            (
+                "conflicting-capability-sources",
+                true,
+                vec![
+                    "--member-capability-token".into(),
+                    token_binding.clone(),
+                    "--member-capability-token-file".into(),
+                    "later=UNOPENED_SECRET_PATH".into(),
+                ],
+            ),
+            (
+                "invalid-later-capability",
+                true,
+                vec![
+                    "--member-capability-token".into(),
+                    "later=INVALID_CAPABILITY_SECRET".into(),
+                    "--member-holder-key-file".into(),
+                    key_binding.clone(),
+                ],
+            ),
+            (
+                "invalid-later-approval",
+                true,
+                vec![
+                    "--member-capability-token".into(),
+                    token_binding.clone(),
+                    "--member-holder-key-file".into(),
+                    key_binding.clone(),
+                    "--member-approval-token".into(),
+                    "later=INVALID_APPROVAL_SECRET".into(),
+                ],
+            ),
+            (
+                "missing-default",
+                false,
+                vec![
+                    "--member-capability-token".into(),
+                    token_binding.clone(),
+                    "--member-holder-key-file".into(),
+                    key_binding.clone(),
+                ],
+            ),
+            (
+                "unknown-member",
+                true,
+                vec![
+                    "--member-capability-token".into(),
+                    "UNKNOWN_MEMBER_SECRET=opaque".into(),
+                ],
+            ),
+            (
+                "malformed-binding",
+                true,
+                vec![
+                    "--member-capability-token".into(),
+                    "MALFORMED_BINDING_SECRET".into(),
+                ],
+            ),
+        ];
+        for dry_run in [false, true] {
+            for (label, use_default, overrides) in &cases {
+                let (host, server, requests) = spawn_mock_host_sequence_with_body_log(vec![(
+                    "POST /rpc/discover".into(),
+                    mock_discovery_response_json(),
+                )]);
+                let mut args = vec![
+                    "fwc".to_owned(),
+                    "--json".into(),
+                    "--host".into(),
+                    host,
+                    "batch-file".into(),
+                    path.display().to_string(),
+                ];
+                if dry_run {
+                    args.push("--dry-run".into());
+                }
+                if *use_default {
+                    args.extend([
+                        "--capability-token".into(),
+                        first.0.clone(),
+                        "--holder-key-file".into(),
+                        first.1.display().to_string(),
+                    ]);
+                }
+                args.extend(overrides.iter().cloned());
+                let (exit, payload) =
+                    execute_json(&args.iter().map(String::as_str).collect::<Vec<_>>());
+                server.join().unwrap();
+                assert_eq!(
+                    exit,
+                    CliExitCode::Validation.into(),
+                    "{label}, dry_run={dry_run}: {payload}"
+                );
+                assert_eq!(
+                    payload["error"]["type"],
+                    if *use_default {
+                        "invalid-batch-auth"
+                    } else {
+                        "missing-capability-token"
+                    }
+                );
+                assert_eq!(
+                    requests.lock().unwrap().len(),
+                    1,
+                    "{label}: later authority must resolve before the first preflight"
+                );
+                assert!(
+                    !payload.to_string().contains("_SECRET"),
+                    "{label}: credentials leaked"
+                );
+                assert!(!payload.to_string().contains(&later.0));
+            }
+        }
+    }
+
+    #[test]
+    fn execute_batch_file_stream_preserves_deferred_member_authority_without_inheritance() {
+        let directory = TempDir::new().unwrap();
+        let source = test_workflow_holder_auth(directory.path(), "source", 0xc1);
+        let dependent = test_workflow_holder_auth(directory.path(), "dependent", 0xc2);
+        let path = directory.path().join("stream-member-auth.jsonl");
+        let reference = json!({"$fcp_batch_ref":{"operation":"source","pointer":"/result/title"}});
+        fs::write(
+            &path,
+            [
+                json!({"id":"source","connector":"github","operation":"get_issue",
+                "input":{"owner":"octocat","repo":"hello-world","number":1}})
+                .to_string(),
+                json!({"id":"dependent","connector":"github","operation":"create_issue",
+                "depends_on":["source"],
+                "input":{"owner":"octocat","repo":"hello-world","title":reference}})
+                .to_string(),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        let default_approval = batch_member_approval_fixture(
+            "STREAM_DEFAULT_APPROVAL_SECRET",
+            "fcp.github:enterprise:v1",
+            "github.get_issue",
+        );
+        let start = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mock = spawn_cli_stream_mock(
+            Some(cli_stream_success_reply(&["source", "dependent"], false)),
+            Arc::clone(&start),
+        );
+        let mut args = cli_stream_args("batch-file", &mock.endpoint, &path, &source.0, &source.1);
+        args.extend([
+            "--approval-token".into(),
+            default_approval.to_string(),
+            "--member-capability-token".into(),
+            format!("dependent={}", dependent.0),
+            "--member-holder-key-file".into(),
+            format!("dependent={}", dependent.1.display()),
+        ]);
+        let prepared = prepare_cli(&args).unwrap();
+        let mut writer = CliStreamWriter {
+            bytes: Vec::new(),
+            flushed: 0,
+            start_flushed: start,
+            result_flushed: None,
+        };
+        let exit = super::execute_streaming_batch_with_writer(&prepared, &mut writer).unwrap();
+        let requests = mock.finish(1);
+        assert_eq!(exit, CliExitCode::Success.into());
+        assert!(
+            !requests[2].headers.contains_key("x-principal"),
+            "mixed principals must remain per-member"
+        );
+        let members = requests[2].body["operations"].as_array().unwrap();
+        assert_batch_member_holder_request(&members[0]["request"], &source.0, &source.2);
+        assert_batch_member_holder_request(&members[1]["request"], &dependent.0, &dependent.2);
+        assert_eq!(
+            members[0]["request"]["approval_tokens"],
+            json!([default_approval])
+        );
+        let decoded: fcp_core::InvokeRequest =
+            serde_json::from_value(members[1]["request"].clone()).unwrap();
+        assert!(
+            decoded.approval_tokens.is_empty(),
+            "explicit capability must never borrow default approvals"
+        );
+        assert_eq!(members[1]["request"]["input"]["title"], reference);
+        assert_eq!(members[1]["depends_on"], json!(["source"]));
+        let output = std::str::from_utf8(&writer.bytes).unwrap();
+        for secret in [
+            source.0.as_str(),
+            dependent.0.as_str(),
+            default_approval["token_id"].as_str().unwrap(),
+        ] {
+            assert!(!output.contains(secret));
+        }
+        assert_eq!(
+            cli_stream_records(&writer.bytes).last().unwrap()["type"],
+            "complete"
         );
     }
 
@@ -71043,16 +72206,24 @@ require_attestation_types = ["in-toto"]"#,
         let aws_file = temp.path().join("aws.json");
         let setup_file = temp.path().join("setup.txt");
         let admin_file = temp.path().join("admin.txt");
-        fs::write(&aws_file, json!({
-            "access_key_id": "AKIAEXAMPLE", "secret_access_key": "aws-secret-sentinel",
-            "session_token": "aws-session-sentinel",
-        }).to_string()).expect("AWS fixture");
+        fs::write(
+            &aws_file,
+            json!({
+                "access_key_id": "AKIAEXAMPLE", "secret_access_key": "aws-secret-sentinel",
+                "session_token": "aws-session-sentinel",
+            })
+            .to_string(),
+        )
+        .expect("AWS fixture");
         fs::write(&setup_file, "setup-secret-sentinel\n").expect("setup fixture");
         fs::write(&admin_file, "admin-secret-sentinel\n").expect("admin fixture");
         let expiry = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
         let listener = TcpListener::bind("127.0.0.1:0").expect("auth mock bind");
         listener.set_nonblocking(true).expect("nonblocking accept");
-        let host = format!("http://{}", listener.local_addr().expect("auth mock address"));
+        let host = format!(
+            "http://{}",
+            listener.local_addr().expect("auth mock address")
+        );
         let server = thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(15);
             let mut requests = Vec::new();
@@ -71065,7 +72236,9 @@ require_attestation_types = ["in-toto"]"#,
                     }
                     Err(error) => panic!("auth accept failed: {error}"),
                 };
-                stream.set_read_timeout(Some(Duration::from_secs(3))).expect("request timeout");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .expect("request timeout");
                 let mut reader = BufReader::new(stream.try_clone().expect("auth socket clone"));
                 let mut request_line = String::new();
                 reader.read_line(&mut request_line).expect("request line");
@@ -71075,21 +72248,34 @@ require_attestation_types = ["in-toto"]"#,
                 loop {
                     let mut header = String::new();
                     reader.read_line(&mut header).expect("request header");
-                    if header == "\r\n" || header.is_empty() { break; }
+                    if header == "\r\n" || header.is_empty() {
+                        break;
+                    }
                     if let Some((name, value)) = header.split_once(':') {
                         match name.to_ascii_lowercase().as_str() {
-                            "content-length" => content_length = value.trim().parse::<usize>().expect("body length"),
-                            "authorization" => authorization = value.trim() == "Bearer admin-secret-sentinel",
+                            "content-length" => {
+                                content_length = value.trim().parse::<usize>().expect("body length")
+                            }
+                            "authorization" => {
+                                authorization = value.trim() == "Bearer admin-secret-sentinel"
+                            }
                             "x-fcp-zone" => owner_zone = value.trim() == "z:owner",
                             _ => {}
                         }
                     }
                 }
-                assert!(authorization && owner_zone, "owner authorization is required on every auth request");
+                assert!(
+                    authorization && owner_zone,
+                    "owner authorization is required on every auth request"
+                );
                 let mut body = vec![0; content_length];
                 reader.read_exact(&mut body).expect("request body");
                 let body: Value = serde_json::from_slice(&body).expect("JSON request");
-                let provider = if request_line.contains("test-aws") { "test-aws" } else { "test-setup" };
+                let provider = if request_line.contains("test-aws") {
+                    "test-aws"
+                } else {
+                    "test-setup"
+                };
                 let rejected = requests.len() == 4;
                 let response = if rejected {
                     body.clone()
@@ -71113,20 +72299,52 @@ require_attestation_types = ["in-toto"]"#,
                 write!(stream, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).expect("response");
                 requests.push((request_line, body));
             }
-            assert_eq!(requests.len(), 5, "login and bind both providers, then reject a credential echo");
+            assert_eq!(
+                requests.len(),
+                5,
+                "login and bind both providers, then reject a credential echo"
+            );
             requests
         });
 
         for method in ["sigv4", "setup_token"] {
-            let provider = if method == "sigv4" { "test-aws" } else { "test-setup" };
-            let mut args = vec!["fwc", "--json", "--host", host.as_str(), "auth", "login", provider,
-                "--profile", "primary", "--admin-token-file", admin_file.to_str().expect("admin path")];
-            if method == "sigv4" {
-                args.extend(["--sigv4", "--aws-credentials-file", aws_file.to_str().expect("AWS path"),
-                    "--region", "us-east-1", "--service", "s3"]);
+            let provider = if method == "sigv4" {
+                "test-aws"
             } else {
-                args.extend(["--setup-token-file", setup_file.to_str().expect("setup path"),
-                    "--expires-at", expiry.as_str(), "--header-name", "X-Setup-Token"]);
+                "test-setup"
+            };
+            let mut args = vec![
+                "fwc",
+                "--json",
+                "--host",
+                host.as_str(),
+                "auth",
+                "login",
+                provider,
+                "--profile",
+                "primary",
+                "--admin-token-file",
+                admin_file.to_str().expect("admin path"),
+            ];
+            if method == "sigv4" {
+                args.extend([
+                    "--sigv4",
+                    "--aws-credentials-file",
+                    aws_file.to_str().expect("AWS path"),
+                    "--region",
+                    "us-east-1",
+                    "--service",
+                    "s3",
+                ]);
+            } else {
+                args.extend([
+                    "--setup-token-file",
+                    setup_file.to_str().expect("setup path"),
+                    "--expires-at",
+                    expiry.as_str(),
+                    "--header-name",
+                    "X-Setup-Token",
+                ]);
             }
             let (exit, payload) = execute_json(&args);
             assert_eq!(exit, CliExitCode::Success.into(), "{payload}");
@@ -71136,17 +72354,35 @@ require_attestation_types = ["in-toto"]"#,
             assert!(!payload.to_string().contains("secret-sentinel"));
             assert!(!payload.to_string().contains("session-sentinel"));
 
-            let (exit, payload) = execute_json(&["fwc", "--json", "--host", &host,
-                "auth", "bind-profile", provider, "--profile", "primary",
-                "--credential-id", "57300000-0000-4000-8000-000000000001", "--zone", "z:work",
-                "--host-allow", "API.EXAMPLE.COM.", "--host-allow", "api.example.com",
-                "--admin-token-file", admin_file.to_str().expect("admin path"), "--replace"]);
+            let (exit, payload) = execute_json(&[
+                "fwc",
+                "--json",
+                "--host",
+                &host,
+                "auth",
+                "bind-profile",
+                provider,
+                "--profile",
+                "primary",
+                "--credential-id",
+                "57300000-0000-4000-8000-000000000001",
+                "--zone",
+                "z:work",
+                "--host-allow",
+                "API.EXAMPLE.COM.",
+                "--host-allow",
+                "api.example.com",
+                "--admin-token-file",
+                admin_file.to_str().expect("admin path"),
+                "--replace",
+            ]);
             assert_eq!(exit, CliExitCode::Success.into(), "{payload}");
             assert_eq!(payload["binding"], "snapshot");
             assert_eq!(payload["host_allow"], json!(["api.example.com"]));
             assert!(!payload.to_string().contains("secret-sentinel"));
         }
-        let client = super::HostAdminClient::for_provider_auth(&host, Some(&admin_file)).expect("auth client");
+        let client = super::HostAdminClient::for_provider_auth(&host, Some(&admin_file))
+            .expect("auth client");
         let error = client.auth_profile_upsert("test-error", &json!({
             "method": "sigv4", "access_key_id": "AKIAEXAMPLE", "secret_access_key": "echo-secret-sentinel",
             "session_token": "echo-session-sentinel"
@@ -71156,15 +72392,26 @@ require_attestation_types = ["in-toto"]"#,
         assert!(!diagnostic.contains("sentinel"));
         assert!(!diagnostic.contains("AKIAEXAMPLE"));
         let requests = server.join().expect("auth mock should finish");
-        assert!(requests[0].0.starts_with("POST /rpc/admin/auth/profiles/test-aws "));
+        assert!(
+            requests[0]
+                .0
+                .starts_with("POST /rpc/admin/auth/profiles/test-aws ")
+        );
         assert_eq!(requests[0].1["method"], "sigv4");
         assert_eq!(requests[0].1["secret_access_key"], "aws-secret-sentinel");
         assert_eq!(requests[0].1["session_token"], "aws-session-sentinel");
         assert_eq!(requests[0].1["region"], "us-east-1");
         assert_eq!(requests[0].1["service"], "s3");
-        assert!(requests[1].0.starts_with("POST /rpc/admin/credentials/pools/test-aws/z:work/credentials "));
+        assert!(
+            requests[1]
+                .0
+                .starts_with("POST /rpc/admin/credentials/pools/test-aws/z:work/credentials ")
+        );
         assert_eq!(requests[1].1["profile_credential"]["profile_id"], "primary");
-        assert_eq!(requests[1].1["profile_credential"]["host_allow"], json!(["api.example.com"]));
+        assert_eq!(
+            requests[1].1["profile_credential"]["host_allow"],
+            json!(["api.example.com"])
+        );
         assert_eq!(requests[1].1["mode"], "replace_existing");
         assert!(requests[1].1.get("credential").is_none());
         assert!(!requests[1].1.to_string().contains("secret-sentinel"));
@@ -71172,7 +72419,11 @@ require_attestation_types = ["in-toto"]"#,
         assert_eq!(requests[2].1["token"], "setup-secret-sentinel");
         assert_eq!(requests[2].1["header_name"], "X-Setup-Token");
         assert!(requests[2].1["expires_at"].is_string());
-        assert!(requests[3].0.starts_with("POST /rpc/admin/credentials/pools/test-setup/z:work/credentials "));
+        assert!(
+            requests[3]
+                .0
+                .starts_with("POST /rpc/admin/credentials/pools/test-setup/z:work/credentials ")
+        );
     }
 
     #[test]
@@ -71180,7 +72431,8 @@ require_attestation_types = ["in-toto"]"#,
         let temp = tempfile::tempdir().expect("credential fixtures");
         let path = temp.path().join("credentials");
         let path_str = path.to_str().expect("credential path");
-        let valid = json!({"access_key_id": "AKIAEXAMPLE", "secret_access_key": "secret-sentinel"}).to_string();
+        let valid = json!({"access_key_id": "AKIAEXAMPLE", "secret_access_key": "secret-sentinel"})
+            .to_string();
         for contents in [
             "{not-json secret-sentinel}".to_owned(),
             json!({"access_key_id": "AKIAEXAMPLE", "secret_access_key": "secret-sentinel", "unexpected": "secret-sentinel"}).to_string(),
@@ -71199,22 +72451,51 @@ require_attestation_types = ["in-toto"]"#,
         }
         fs::write(&path, &valid).expect("valid AWS fixture");
         for region in ["", "us-east-1/s3", "us east 1"] {
-            let (exit, payload) = execute_json(&["fwc", "--json", "--host", "http://127.0.0.1:9",
-                "auth", "login", "test-aws", "--sigv4", "--aws-credentials-file", path_str,
-                "--region", region, "--service", "s3"]);
+            let (exit, payload) = execute_json(&[
+                "fwc",
+                "--json",
+                "--host",
+                "http://127.0.0.1:9",
+                "auth",
+                "login",
+                "test-aws",
+                "--sigv4",
+                "--aws-credentials-file",
+                path_str,
+                "--region",
+                region,
+                "--service",
+                "s3",
+            ]);
             assert_eq!(exit, CliExitCode::Validation.into(), "{payload}");
         }
         fs::write(&path, "setup-secret-sentinel\n").expect("setup fixture");
         let future = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
         for (expiry, header) in [
-            ("2020-01-01T00:00:00Z", "Authorization"), ("not-a-time", "Authorization"),
-            (future.as_str(), "Host"), (future.as_str(), "Content-Length"),
-            (future.as_str(), "x-fcp-zone"), (future.as_str(), "Keep-Alive"),
-            (future.as_str(), "Proxy-Authenticate"), (future.as_str(), "X-Bad\r\nHeader"),
+            ("2020-01-01T00:00:00Z", "Authorization"),
+            ("not-a-time", "Authorization"),
+            (future.as_str(), "Host"),
+            (future.as_str(), "Content-Length"),
+            (future.as_str(), "x-fcp-zone"),
+            (future.as_str(), "Keep-Alive"),
+            (future.as_str(), "Proxy-Authenticate"),
+            (future.as_str(), "X-Bad\r\nHeader"),
         ] {
-            let (exit, payload) = execute_json(&["fwc", "--json", "--host", "http://127.0.0.1:9",
-                "auth", "login", "test-setup", "--setup-token-file", path_str,
-                "--expires-at", expiry, "--header-name", header]);
+            let (exit, payload) = execute_json(&[
+                "fwc",
+                "--json",
+                "--host",
+                "http://127.0.0.1:9",
+                "auth",
+                "login",
+                "test-setup",
+                "--setup-token-file",
+                path_str,
+                "--expires-at",
+                expiry,
+                "--header-name",
+                header,
+            ]);
             assert_eq!(exit, CliExitCode::Validation.into(), "{payload}");
             assert!(!payload.to_string().contains("secret-sentinel"));
         }
@@ -71223,17 +72504,59 @@ require_attestation_types = ["in-toto"]"#,
     #[test]
     fn auth_profile_binding_rejects_invalid_authority_before_network() {
         for (provider, credential, zone, host) in [
-            ("test/other", "57300000-0000-4000-8000-000000000001", "z:work", "api.example.com"),
-            ("..", "57300000-0000-4000-8000-000000000001", "z:work", "api.example.com"),
+            (
+                "test/other",
+                "57300000-0000-4000-8000-000000000001",
+                "z:work",
+                "api.example.com",
+            ),
+            (
+                "..",
+                "57300000-0000-4000-8000-000000000001",
+                "z:work",
+                "api.example.com",
+            ),
             ("test", "invalid-uuid", "z:work", "api.example.com"),
-            ("test", "57300000-0000-4000-8000-000000000001", "bad-zone", "api.example.com"),
-            ("test", "57300000-0000-4000-8000-000000000001", "z:work", "*.example.com"),
-            ("test", "57300000-0000-4000-8000-000000000001", "z:work", "https://api.example.com"),
-            ("test", "57300000-0000-4000-8000-000000000001", "z:work", "api.example.com:443"),
+            (
+                "test",
+                "57300000-0000-4000-8000-000000000001",
+                "bad-zone",
+                "api.example.com",
+            ),
+            (
+                "test",
+                "57300000-0000-4000-8000-000000000001",
+                "z:work",
+                "*.example.com",
+            ),
+            (
+                "test",
+                "57300000-0000-4000-8000-000000000001",
+                "z:work",
+                "https://api.example.com",
+            ),
+            (
+                "test",
+                "57300000-0000-4000-8000-000000000001",
+                "z:work",
+                "api.example.com:443",
+            ),
         ] {
-            let (exit, payload) = execute_json(&["fwc", "--json", "--host", "http://127.0.0.1:9",
-                "auth", "bind-profile", provider, "--credential-id", credential, "--zone", zone,
-                "--host-allow", host]);
+            let (exit, payload) = execute_json(&[
+                "fwc",
+                "--json",
+                "--host",
+                "http://127.0.0.1:9",
+                "auth",
+                "bind-profile",
+                provider,
+                "--credential-id",
+                credential,
+                "--zone",
+                zone,
+                "--host-allow",
+                host,
+            ]);
             assert_eq!(exit, CliExitCode::Validation.into(), "{payload}");
             assert_eq!(payload["error"]["type"], "invalid-auth-profile-binding");
         }
@@ -71241,12 +72564,18 @@ require_attestation_types = ["in-toto"]"#,
 
     #[test]
     fn auth_admin_response_decoding_bounds_untrusted_content_and_body_waits() {
-        for response in [json!({"profile": {"created_at": "response-secret-sentinel"}}), json!("s".repeat(65_537))] {
+        for response in [
+            json!({"profile": {"created_at": "response-secret-sentinel"}}),
+            json!("s".repeat(65_537)),
+        ] {
             let (host, server) = spawn_mock_host_sequence(vec![(
-                "POST /rpc/admin/auth/profiles/test-bounded".to_owned(), response,
+                "POST /rpc/admin/auth/profiles/test-bounded".to_owned(),
+                response,
             )]);
             let client = super::HostAdminClient::new(&host).expect("host client");
-            let error = client.auth_profile_upsert("test-bounded", &json!({})).expect_err("invalid response");
+            let error = client
+                .auth_profile_upsert("test-bounded", &json!({}))
+                .expect_err("invalid response");
             assert!(!format!("{error:#}").contains("sentinel"));
             server.join().expect("bounded response mock");
         }
@@ -71257,7 +72586,10 @@ require_attestation_types = ["in-toto"]"#,
         held.release.send(()).expect("release held response");
         held.server.join().expect("held response mock");
         assert!(result.is_err(), "auth response body must obey the deadline");
-        assert!(elapsed < Duration::from_secs(2), "auth body read exceeded its deadline");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "auth body read exceeded its deadline"
+        );
     }
 
     #[test]

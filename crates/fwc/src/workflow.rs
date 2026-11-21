@@ -1,11 +1,12 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    env, fs,
+    env,
+    fs::{self, File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -54,6 +55,10 @@ pub struct ApprovalState {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExecutionReceipt {
+    /// Revision of the capsule that produced this evidence. Older receipts
+    /// remain inspectable after a binding change without driving current state.
+    #[serde(default)]
+    pub revision: u64,
     pub recorded_at: String,
     pub trigger: String,
     pub mode: String,
@@ -62,6 +67,68 @@ pub struct ExecutionReceipt {
     pub withheld_count: usize,
     pub stopped_before_side_effect: bool,
     pub execution: Value,
+}
+
+/// A capsule is one execution, not an implicit retry instruction. This fence
+/// is synced before materialization and survives process interruption, even
+/// when the host observed a result the CLI never received.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TaskExecutionFence {
+    pub attempt_id: String,
+    pub started_at: String,
+    pub trigger: String,
+    pub mode: String,
+    pub revision: u64,
+    pub state: TaskExecutionState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskExecutionState {
+    Pending,
+    NeedsReview,
+    Completed,
+}
+
+impl TaskExecutionState {
+    #[must_use]
+    pub const fn status(self) -> &'static str {
+        match self {
+            Self::Pending => "execution-pending",
+            Self::NeedsReview => "execution-needs-review",
+            Self::Completed => "materialized",
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum TaskAccessError {
+    Busy,
+    ExecutionBlocked(TaskExecutionState),
+}
+
+impl std::fmt::Display for TaskAccessError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Busy => formatter.write_str("the workflow capsule is already in use"),
+            Self::ExecutionBlocked(TaskExecutionState::Completed) => formatter.write_str(
+                "this workflow capsule has already executed; inspect its evidence and explicitly create a new task for new work",
+            ),
+            Self::ExecutionBlocked(_) => formatter.write_str(
+                "this workflow capsule may have dispatched effects; reconcile its retained evidence before explicitly creating a new task",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TaskAccessError {}
+
+/// A ticket cannot be constructed from CLI input. Finalization must match the
+/// exact pending attempt and revision while an exclusive lease is held.
+#[derive(Debug)]
+pub struct TaskExecutionTicket {
+    attempt_id: String,
+    revision: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -120,6 +187,8 @@ pub struct ResolutionPatch {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkflowTask {
     pub schema_version: u32,
+    #[serde(default)]
+    pub revision: u64,
     pub id: String,
     pub created_at: String,
     pub updated_at: String,
@@ -134,6 +203,8 @@ pub struct WorkflowTask {
     pub resolution: ResolutionState,
     #[serde(default)]
     pub execution_history: Vec<ExecutionReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_fence: Option<TaskExecutionFence>,
 }
 
 impl WorkflowTask {
@@ -144,7 +215,25 @@ impl WorkflowTask {
 
     #[must_use]
     pub fn last_execution(&self) -> Option<&ExecutionReceipt> {
-        self.execution_history.last()
+        self.execution_history
+            .iter()
+            .rev()
+            .find(|receipt| receipt.revision == self.revision)
+    }
+
+    /// Inspect every retained revision. Rebinding a capsule must never hide a
+    /// completed or uncertain effect, including evidence written before fences
+    /// were introduced.
+    #[must_use]
+    pub fn execution_blocker(&self) -> Option<TaskExecutionState> {
+        self.execution_fence
+            .as_ref()
+            .map(|fence| fence.state)
+            .or_else(|| {
+                self.execution_history
+                    .iter()
+                    .find_map(|receipt| execution_fence_after(&receipt.execution))
+            })
     }
 
     #[must_use]
@@ -174,6 +263,16 @@ pub struct TaskStore {
     root_dir: PathBuf,
 }
 
+/// Exclusive ownership of a task from its initial read through final receipt
+/// persistence. Every store mutation takes the same stable companion lock.
+/// Dropping the lease releases ownership, but never clears a persisted fence.
+#[derive(Debug)]
+pub struct TaskLease<'a> {
+    store: &'a TaskStore,
+    task_id: String,
+    _lock: File,
+}
+
 #[derive(Clone, Debug)]
 pub struct AppliedResolution {
     pub task: WorkflowTask,
@@ -198,12 +297,54 @@ impl TaskStore {
         &self.root_dir
     }
 
+    /// Acquire an exclusive OS lock for one canonical task ID without waiting.
+    /// Keep the returned lease alive across execution, not only across writes.
+    pub fn lock_task(&self, task_id: &str) -> Result<TaskLease<'_>> {
+        validate_task_id(task_id)?;
+        self.ensure_tasks_dir()?;
+        let lock_path = self.task_path(task_id).with_extension("lock");
+        ensure_regular_task_file(&lock_path)?;
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let lock = options
+            .open(&lock_path)
+            .context("could not open workflow capsule lock")?;
+        ensure!(
+            lock.metadata()?.is_file(),
+            "workflow capsule lock must be a regular file"
+        );
+        ensure_regular_task_file(&lock_path)?;
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => return Err(TaskAccessError::Busy.into()),
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(error).context("could not acquire workflow capsule lock");
+            }
+        }
+        Ok(TaskLease {
+            store: self,
+            task_id: task_id.to_owned(),
+            _lock: lock,
+        })
+    }
+
     pub fn create(&self, request: WorkflowRequest) -> Result<WorkflowTask> {
         self.ensure_tasks_dir()?;
-
+        let task_id = self.allocate_task_id()?;
+        let _lease = self.lock_task(&task_id)?;
+        ensure!(
+            !self.task_path(&task_id).exists(),
+            "workflow capsule already exists"
+        );
         let mut task = WorkflowTask {
             schema_version: TASK_SCHEMA_VERSION,
-            id: self.allocate_task_id()?,
+            revision: 0,
+            id: task_id,
             created_at: now_rfc3339(),
             updated_at: now_rfc3339(),
             capsule_status: "new".to_owned(),
@@ -215,6 +356,7 @@ impl TaskStore {
             next_actions: Vec::new(),
             resolution: ResolutionState::default(),
             execution_history: Vec::new(),
+            execution_fence: None,
         };
         recompute_task(&mut task, true);
         self.save(&task)?;
@@ -222,7 +364,9 @@ impl TaskStore {
     }
 
     pub fn load(&self, task_id: &str) -> Result<Option<WorkflowTask>> {
+        validate_task_id(task_id)?;
         let path = self.task_path(task_id);
+        ensure_regular_task_file(&path)?;
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -233,6 +377,26 @@ impl TaskStore {
         };
         let mut task: WorkflowTask = serde_json::from_slice(&bytes)
             .with_context(|| format!("failed to parse workflow capsule `{task_id}`"))?;
+        ensure!(
+            task.id == task_id,
+            "workflow capsule identity does not match its path"
+        );
+        ensure!(
+            task.schema_version == TASK_SCHEMA_VERSION,
+            "unsupported workflow capsule schema"
+        );
+        ensure!(
+            task.execution_history
+                .iter()
+                .all(|receipt| receipt.revision <= task.revision),
+            "workflow capsule contains evidence from a future revision"
+        );
+        if let Some(fence) = &task.execution_fence {
+            ensure!(
+                fence.revision == task.revision && !fence.attempt_id.is_empty(),
+                "workflow execution fence does not match its capsule revision"
+            );
+        }
         recompute_task(&mut task, false);
         Ok(Some(task))
     }
@@ -308,9 +472,18 @@ impl TaskStore {
         task_id: &str,
         bindings: impl IntoIterator<Item = (String, String)>,
     ) -> Result<Option<WorkflowTask>> {
+        self.lock_task(task_id)?.bind(bindings)
+    }
+
+    fn bind_locked(
+        &self,
+        task_id: &str,
+        bindings: impl IntoIterator<Item = (String, String)>,
+    ) -> Result<Option<WorkflowTask>> {
         let Some(mut task) = self.load(task_id)? else {
             return Ok(None);
         };
+        require_unfenced(&task)?;
         let previous_effective_bindings = effective_bindings(&task);
         let mut invalidated_resolution = false;
         let mut approval_should_reset = false;
@@ -356,7 +529,7 @@ impl TaskStore {
             reset_approval(&mut task);
         }
         if execution_should_reset {
-            reset_execution_history(&mut task);
+            advance_revision(&mut task)?;
         }
 
         recompute_task(&mut task, true);
@@ -373,9 +546,28 @@ impl TaskStore {
         safe_step_count: usize,
         patch: ResolutionPatch,
     ) -> Result<Option<AppliedResolution>> {
+        self.lock_task(task_id)?.append_resolution(
+            trigger,
+            mode,
+            pass_count,
+            safe_step_count,
+            patch,
+        )
+    }
+
+    fn append_resolution_locked(
+        &self,
+        task_id: &str,
+        trigger: &str,
+        mode: &str,
+        pass_count: usize,
+        safe_step_count: usize,
+        patch: ResolutionPatch,
+    ) -> Result<Option<AppliedResolution>> {
         let Some(mut task) = self.load(task_id)? else {
             return Ok(None);
         };
+        require_unfenced(&task)?;
 
         let status_before = task.capsule_status.clone();
         let previous_effective_bindings = effective_bindings(&task);
@@ -432,7 +624,7 @@ impl TaskStore {
         recompute_task(&mut task, true);
         if changed {
             if effective_bindings(&task) != previous_effective_bindings {
-                reset_execution_history(&mut task);
+                advance_revision(&mut task)?;
             }
             reset_approval(&mut task);
             recompute_task(&mut task, true);
@@ -469,9 +661,14 @@ impl TaskStore {
     }
 
     pub fn approve(&self, task_id: &str) -> Result<Option<WorkflowTask>> {
+        self.lock_task(task_id)?.approve()
+    }
+
+    fn approve_locked(&self, task_id: &str) -> Result<Option<WorkflowTask>> {
         let Some(mut task) = self.load(task_id)? else {
             return Ok(None);
         };
+        require_unfenced(&task)?;
 
         task.approval.workflow = true;
         task.approval.approved_at = Some(now_rfc3339());
@@ -481,6 +678,10 @@ impl TaskStore {
     }
 
     pub fn refresh(&self, task_id: &str) -> Result<Option<WorkflowTask>> {
+        self.lock_task(task_id)?.refresh()
+    }
+
+    fn refresh_locked(&self, task_id: &str) -> Result<Option<WorkflowTask>> {
         let Some(mut task) = self.load(task_id)? else {
             return Ok(None);
         };
@@ -497,28 +698,22 @@ impl TaskStore {
         mode: &str,
         execution: Value,
     ) -> Result<Option<WorkflowTask>> {
+        self.lock_task(task_id)?
+            .append_execution(trigger, mode, execution)
+    }
+
+    fn append_execution_locked(
+        &self,
+        task_id: &str,
+        trigger: &str,
+        mode: &str,
+        execution: Value,
+    ) -> Result<Option<WorkflowTask>> {
         let Some(mut task) = self.load(task_id)? else {
             return Ok(None);
         };
-
-        task.execution_history.push(ExecutionReceipt {
-            recorded_at: now_rfc3339(),
-            trigger: trigger.to_owned(),
-            mode: mode.to_owned(),
-            status: execution["status"].as_str().unwrap_or("unknown").to_owned(),
-            executed_count: execution["executed_count"]
-                .as_u64()
-                .and_then(|count| usize::try_from(count).ok())
-                .unwrap_or_default(),
-            withheld_count: execution["withheld_count"]
-                .as_u64()
-                .and_then(|count| usize::try_from(count).ok())
-                .unwrap_or_default(),
-            stopped_before_side_effect: execution["stopped_before_side_effect"]
-                .as_bool()
-                .unwrap_or(false),
-            execution,
-        });
+        require_unfenced(&task)?;
+        append_execution_receipt(&mut task, trigger, mode, execution);
         recompute_task(&mut task, true);
         self.save(&task)?;
         Ok(Some(task))
@@ -536,10 +731,19 @@ impl TaskStore {
     }
 
     fn save(&self, task: &WorkflowTask) -> Result<()> {
+        validate_task_id(&task.id)?;
         self.ensure_tasks_dir()?;
         let final_path = self.task_path(&task.id);
+        ensure_regular_task_file(&final_path)?;
         let temp_path = final_path.with_extension(format!("tmp.{}", Uuid::new_v4().simple()));
-        let file = fs::File::create(&temp_path).with_context(|| {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(&temp_path).with_context(|| {
             format!(
                 "failed to create temporary workflow capsule file `{}`",
                 temp_path.display()
@@ -551,6 +755,9 @@ impl TaskStore {
         writer.write_all(b"\n")?;
         writer.flush()?;
         file.sync_all()?;
+        drop(writer);
+        drop(file);
+        ensure_regular_task_file(&final_path)?;
         fs::rename(&temp_path, &final_path).with_context(|| {
             format!(
                 "failed to atomically persist workflow capsule `{}` to `{}`",
@@ -558,6 +765,11 @@ impl TaskStore {
                 final_path.display()
             )
         })?;
+        // A synced temporary file alone does not make its rename durable.
+        #[cfg(unix)]
+        File::open(self.tasks_dir())?
+            .sync_all()
+            .context("could not sync workflow capsule directory")?;
         Ok(())
     }
 
@@ -578,6 +790,269 @@ impl TaskStore {
     fn tasks_dir(&self) -> PathBuf {
         self.root_dir.join("tasks")
     }
+}
+
+impl TaskLease<'_> {
+    pub fn load(&self) -> Result<Option<WorkflowTask>> {
+        self.store.load(&self.task_id)
+    }
+
+    pub fn refresh(&self) -> Result<Option<WorkflowTask>> {
+        self.store.refresh_locked(&self.task_id)
+    }
+
+    pub fn bind(
+        &self,
+        bindings: impl IntoIterator<Item = (String, String)>,
+    ) -> Result<Option<WorkflowTask>> {
+        self.store.bind_locked(&self.task_id, bindings)
+    }
+
+    pub fn approve(&self) -> Result<Option<WorkflowTask>> {
+        self.store.approve_locked(&self.task_id)
+    }
+
+    pub fn append_resolution(
+        &self,
+        trigger: &str,
+        mode: &str,
+        pass_count: usize,
+        safe_step_count: usize,
+        patch: ResolutionPatch,
+    ) -> Result<Option<AppliedResolution>> {
+        self.store.append_resolution_locked(
+            &self.task_id,
+            trigger,
+            mode,
+            pass_count,
+            safe_step_count,
+            patch,
+        )
+    }
+
+    pub fn append_execution(
+        &self,
+        trigger: &str,
+        mode: &str,
+        execution: Value,
+    ) -> Result<Option<WorkflowTask>> {
+        self.store
+            .append_execution_locked(&self.task_id, trigger, mode, execution)
+    }
+
+    /// Persist the uncertainty fence before any primitive is dispatched. A
+    /// failed write never grants permission to execute. All subsequent task
+    /// mutations and new executions remain blocked until this exact attempt is
+    /// finalized while the exclusive lease is held.
+    pub fn begin_execution(&self, trigger: &str, mode: &str) -> Result<TaskExecutionTicket> {
+        let mut task = self
+            .load()?
+            .context("workflow capsule disappeared before execution")?;
+        require_unfenced(&task)?;
+        ensure!(
+            ready_for_execution(&task),
+            "workflow capsule is not ready for execution"
+        );
+        ensure!(
+            matches!(trigger, "advance" | "run"),
+            "invalid workflow execution trigger"
+        );
+        ensure!(
+            matches!(mode, "simulate" | "approve"),
+            "invalid workflow execution mode"
+        );
+        ensure!(
+            mode != "approve" || !task.has_side_effects() || task.approval.workflow,
+            "workflow capsule requires approval before side effects"
+        );
+        let ticket = TaskExecutionTicket {
+            attempt_id: Uuid::new_v4().to_string(),
+            revision: task.revision,
+        };
+        task.execution_fence = Some(TaskExecutionFence {
+            attempt_id: ticket.attempt_id.clone(),
+            started_at: now_rfc3339(),
+            trigger: trigger.to_owned(),
+            mode: mode.to_owned(),
+            revision: task.revision,
+            state: TaskExecutionState::Pending,
+        });
+        recompute_task(&mut task, true);
+        self.store.save(&task)?;
+        Ok(ticket)
+    }
+
+    /// Save the terminal evidence and the fence transition in one atomic write.
+    /// A complete materialized result consumes the capsule. Unknown or partial
+    /// effects require review; a definite pre-effect failure or simulation may
+    /// be corrected and tried again. This does not prove provider rollback or
+    /// provide an external exactly-once guarantee.
+    pub fn finish_execution(
+        &self,
+        ticket: &TaskExecutionTicket,
+        execution: Value,
+    ) -> Result<Option<WorkflowTask>> {
+        let Some(mut task) = self.load()? else {
+            return Ok(None);
+        };
+        let fence = task
+            .execution_fence
+            .as_ref()
+            .context("workflow execution fence is missing")?;
+        ensure!(
+            fence.state == TaskExecutionState::Pending
+                && fence.attempt_id == ticket.attempt_id
+                && fence.revision == ticket.revision
+                && task.revision == ticket.revision,
+            "workflow execution attempt no longer owns the capsule"
+        );
+        let trigger = fence.trigger.clone();
+        let mode = fence.mode.clone();
+        if let Some(state) = execution_fence_after(&execution) {
+            task.execution_fence
+                .as_mut()
+                .expect("fence checked above")
+                .state = state;
+        } else {
+            task.execution_fence = None;
+        }
+        append_execution_receipt(&mut task, &trigger, &mode, execution);
+        recompute_task(&mut task, true);
+        self.store.save(&task)?;
+        Ok(Some(task))
+    }
+}
+
+fn validate_task_id(task_id: &str) -> Result<()> {
+    ensure!(
+        task_id.strip_prefix("w:").is_some_and(|suffix| {
+            !suffix.is_empty()
+                && suffix.len() <= 64
+                && suffix
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        }),
+        "invalid workflow capsule id; expected w:<lowercase-id>"
+    );
+    Ok(())
+}
+
+fn ensure_regular_task_file(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => ensure!(
+            metadata.is_file() && !metadata.file_type().is_symlink(),
+            "workflow capsule artifacts must be regular files, not symlinks"
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("could not inspect workflow capsule artifact"),
+    }
+    Ok(())
+}
+
+fn require_unfenced(task: &WorkflowTask) -> Result<()> {
+    if let Some(state) = task.execution_blocker() {
+        return Err(TaskAccessError::ExecutionBlocked(state).into());
+    }
+    Ok(())
+}
+
+fn append_execution_receipt(task: &mut WorkflowTask, trigger: &str, mode: &str, execution: Value) {
+    task.execution_history.push(ExecutionReceipt {
+        revision: task.revision,
+        recorded_at: now_rfc3339(),
+        trigger: trigger.to_owned(),
+        mode: mode.to_owned(),
+        status: execution["status"].as_str().unwrap_or("unknown").to_owned(),
+        executed_count: execution["executed_count"]
+            .as_u64()
+            .and_then(|count| usize::try_from(count).ok())
+            .unwrap_or_default(),
+        withheld_count: execution["withheld_count"]
+            .as_u64()
+            .and_then(|count| usize::try_from(count).ok())
+            .unwrap_or_default(),
+        stopped_before_side_effect: execution["stopped_before_side_effect"]
+            .as_bool()
+            .unwrap_or(false),
+        execution,
+    });
+}
+
+fn execution_fence_after(execution: &Value) -> Option<TaskExecutionState> {
+    match execution["status"].as_str() {
+        Some("materialized") => return Some(TaskExecutionState::Completed),
+        Some("simulated" | "stopped-on-primitive-error") => {}
+        _ => return Some(TaskExecutionState::NeedsReview),
+    }
+    let Some(steps) = execution["executed_steps"].as_array() else {
+        // Historical simulation receipts did not always retain the full
+        // primitive array. An incomplete failed execution is not safe to retry.
+        return (execution["status"] != "simulated"
+            && execution["executed_count"].as_u64() != Some(0))
+        .then_some(TaskExecutionState::NeedsReview);
+    };
+    if execution["executed_count"]
+        .as_u64()
+        .is_some_and(|count| count != steps.len() as u64)
+    {
+        return Some(TaskExecutionState::NeedsReview);
+    }
+    for step in steps {
+        let result = &step["result"];
+        if result["error"]["type"] == "invoke-outcome-unknown" || result["outcome"] == "unknown" {
+            return Some(TaskExecutionState::NeedsReview);
+        }
+        if step["primitive_dispatched"] == false {
+            if result["phase"] == "execution" || result.get("response").is_some() {
+                return Some(TaskExecutionState::NeedsReview);
+            }
+            continue;
+        }
+        let (Some(side_effecting), Some(command)) =
+            (step["side_effecting"].as_bool(), step["command"].as_str())
+        else {
+            return Some(TaskExecutionState::NeedsReview);
+        };
+        let effectful = side_effecting || command == "invoke";
+        if !effectful {
+            continue;
+        }
+        if execution["status"] == "simulated"
+            && step["side_effecting"] == false
+            && result["status"] == "ok"
+        {
+            continue;
+        }
+        if result["phase"] == "execution" || result.get("response").is_some() {
+            return Some(TaskExecutionState::NeedsReview);
+        }
+        // Refuse malformed/unknown evidence by default. Only known pre-effect
+        // refusals can release the fence; a connector error is not a rollback.
+        let refused = result["invoke_attempted"] == false
+            || (result["phase"] == "preflight" && result["preflight"]["allowed"] == false)
+            || (result["phase"] == "input-authoring" && result["status"] == "error")
+            || matches!(
+                result["error"]["type"].as_str(),
+                Some(
+                    "missing-host-endpoint"
+                        | "missing-capability-token"
+                        | "invalid-capability-token"
+                        | "invalid-approval-token"
+                        | "invalid-holder-proof"
+                        | "invalid-workflow-auth"
+                        | "invalid-workflow-input"
+                        | "conflicting-input-sources"
+                        | "unreadable-input-file"
+                        | "invalid-input-file"
+                        | "invalid-inline-input"
+                        | "parse-error"
+                )
+            );
+        if !refused {
+            return Some(TaskExecutionState::NeedsReview);
+        }
+    }
+    None
 }
 
 pub fn validate_binding_entries(entries: &[String]) -> Result<Vec<(String, String)>> {
@@ -635,7 +1110,8 @@ pub fn effective_bindings(task: &WorkflowTask) -> BTreeMap<String, String> {
 
 #[must_use]
 pub fn ready_for_execution(task: &WorkflowTask) -> bool {
-    task.compiled.status == "ready"
+    task.execution_blocker().is_none()
+        && task.compiled.status == "ready"
         && task.unresolved_bindings.is_empty()
         && task.resolution.pending_question.is_none()
 }
@@ -662,8 +1138,12 @@ fn reset_approval(task: &mut WorkflowTask) {
     task.approval.approved_at = None;
 }
 
-fn reset_execution_history(task: &mut WorkflowTask) {
-    task.execution_history.clear();
+fn advance_revision(task: &mut WorkflowTask) -> Result<()> {
+    task.revision = task
+        .revision
+        .checked_add(1)
+        .context("workflow capsule revision exhausted")?;
+    Ok(())
 }
 
 fn clear_conflicting_payload_bindings(task: &mut WorkflowTask, key: &str) {
@@ -693,6 +1173,17 @@ fn resolution_stop_reason(task: &WorkflowTask, changed: bool) -> String {
 }
 
 pub(crate) fn current_workflow_truth(task: &WorkflowTask) -> WorkflowTruth {
+    if matches!(
+        task.execution_blocker(),
+        Some(TaskExecutionState::Pending | TaskExecutionState::NeedsReview)
+    ) {
+        return WorkflowTruth::from_execution_receipt(
+            CommandAvailability::Unknown,
+            false,
+            false,
+            "A prior task execution may have dispatched effects; inspect retained evidence before creating another task.".to_owned(),
+        );
+    }
     if let Some(receipt) = task.last_execution()
         && let Some(truth) = execution_receipt_truth(receipt)
     {
@@ -762,6 +1253,9 @@ fn execution_failure_capsule_status(execution: &Value) -> Option<&'static str> {
 }
 
 fn derive_capsule_status(task: &WorkflowTask) -> String {
+    if let Some(state) = task.execution_blocker() {
+        return state.status().to_owned();
+    }
     if task.compiled.status != "ready" {
         return task.compiled.status.clone();
     }
@@ -805,6 +1299,20 @@ fn derive_capsule_status(task: &WorkflowTask) -> String {
 }
 
 fn build_task_next_actions(task: &WorkflowTask) -> Vec<String> {
+    if let Some(state) = task.execution_blocker() {
+        return vec![
+            format!(
+                "Inspect the retained execution evidence with `fwc task show {}`.",
+                task.id
+            ),
+            if state == TaskExecutionState::Completed {
+                "This capsule has executed. Explicitly create a new task if you intend new work."
+                    .to_owned()
+            } else {
+                "Reconcile any completed or unknown host/provider effects before explicitly creating a new task. Rebinding or approving this capsule cannot make a retry safe.".to_owned()
+            },
+        ];
+    }
     let mut actions = Vec::new();
 
     if task.compiled.status != "ready" {
@@ -867,7 +1375,7 @@ fn build_task_next_actions(task: &WorkflowTask) -> Vec<String> {
         ));
     }
 
-    if task.execution_history.is_empty() {
+    if task.last_execution().is_none() {
         actions.push(format!(
             "Run `fwc task advance {}` to materialize the next safe step.",
             task.id
@@ -1341,6 +1849,362 @@ mod tests {
         assert_eq!(reloaded.capsule_status, "ready-to-simulate");
     }
 
+    fn ready_task(store: &TaskStore) -> super::WorkflowTask {
+        let task = store
+            .create(WorkflowRequest {
+                intent: "search GitHub issues for auth".to_owned(),
+                connector_override: Some("github".to_owned()),
+                zone_override: Some("z:work".to_owned()),
+            })
+            .expect("create executable task");
+        assert!(ready_for_execution(&task));
+        task
+    }
+
+    #[test]
+    fn task_execution_lock_covers_read_dispatch_and_every_mutation() {
+        let store = store();
+        let task = ready_task(&store);
+        let other = TaskStore::at_path(store.root_dir().to_path_buf());
+        let lease = store.lock_task(&task.id).expect("first task owner");
+        assert!(
+            other.load(&task.id).unwrap().is_some(),
+            "atomic snapshots remain readable"
+        );
+        for failure in [
+            other.lock_task(&task.id).unwrap_err(),
+            other.approve(&task.id).unwrap_err(),
+            other.refresh(&task.id).unwrap_err(),
+            other
+                .bind(&task.id, [("zone".to_owned(), "z:private".to_owned())])
+                .unwrap_err(),
+            other
+                .append_resolution(
+                    &task.id,
+                    "resolve",
+                    "single-pass",
+                    1,
+                    0,
+                    ResolutionPatch::default(),
+                )
+                .unwrap_err(),
+            other
+                .append_execution(&task.id, "run", "approve", json!({"status":"materialized"}))
+                .unwrap_err(),
+        ] {
+            assert!(matches!(
+                failure.downcast_ref::<super::TaskAccessError>(),
+                Some(super::TaskAccessError::Busy)
+            ));
+        }
+        let pending = lease
+            .begin_execution("run", "approve")
+            .expect("persist pending fence");
+        let snapshot = other.load(&task.id).unwrap().unwrap();
+        assert_eq!(snapshot.capsule_status, "execution-pending");
+        assert_eq!(
+            snapshot.execution_fence.as_ref().unwrap().attempt_id,
+            pending.attempt_id
+        );
+        assert!(
+            lease.approve().is_err(),
+            "owning the lock does not bypass the durable fence"
+        );
+        assert!(
+            lease
+                .bind([("zone".to_owned(), "z:private".to_owned())])
+                .is_err()
+        );
+        drop(lease);
+        let reopened = other
+            .lock_task(&task.id)
+            .expect("OS lock releases with owner");
+        assert!(matches!(
+            reopened
+                .begin_execution("run", "approve")
+                .unwrap_err()
+                .downcast_ref::<super::TaskAccessError>(),
+            Some(super::TaskAccessError::ExecutionBlocked(
+                super::TaskExecutionState::Pending
+            ))
+        ));
+        let refreshed = reopened.refresh().unwrap().unwrap();
+        assert_eq!(refreshed.capsule_status, "execution-pending");
+        assert!(!ready_for_execution(&refreshed));
+        assert_eq!(
+            current_workflow_truth(&refreshed).availability,
+            CommandAvailability::Unknown
+        );
+        assert!(
+            refreshed
+                .next_actions
+                .iter()
+                .all(|action| !action.contains("task run"))
+        );
+    }
+
+    #[test]
+    fn task_execution_completed_capsule_cannot_be_rebound_or_reapproved() {
+        let store = store();
+        let task = ready_task(&store);
+        let lease = store.lock_task(&task.id).unwrap();
+        let ticket = lease.begin_execution("advance", "approve").unwrap();
+        let result = json!({
+            "status":"materialized", "executed_count":1, "withheld_count":0,
+            "executed_steps":[{"command":"invoke", "side_effecting":false,
+                "primitive_dispatched":true,
+                "result":{"status":"ok", "phase":"execution", "response":{"result":{"answer":42}}}}]
+        });
+        let finished = lease
+            .finish_execution(&ticket, result.clone())
+            .unwrap()
+            .unwrap();
+        assert_eq!(finished.capsule_status, "materialized");
+        assert_eq!(
+            finished.execution_blocker(),
+            Some(super::TaskExecutionState::Completed)
+        );
+        assert_eq!(finished.execution_history[0].execution, result);
+        assert!(
+            lease
+                .finish_execution(&ticket, json!({"status":"simulated"}))
+                .is_err()
+        );
+        drop(lease);
+        assert!(
+            store
+                .bind(&task.id, [("payload_json".to_owned(), "{}".to_owned())])
+                .is_err()
+        );
+        assert!(store.approve(&task.id).is_err());
+        assert!(
+            store
+                .append_resolution(
+                    &task.id,
+                    "resolve",
+                    "single-pass",
+                    1,
+                    0,
+                    ResolutionPatch::default()
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .append_execution(
+                    &task.id,
+                    "advance",
+                    "simulate",
+                    json!({"status":"simulated"})
+                )
+                .is_err()
+        );
+        let reloaded = store.load(&task.id).unwrap().unwrap();
+        assert_eq!(reloaded.execution_history.len(), 1);
+        assert!(
+            ready_for_execution(&ready_task(&store)),
+            "new work receives a new capsule"
+        );
+    }
+
+    #[test]
+    fn task_execution_uncertain_and_partial_results_stay_fenced() {
+        for execution in [
+            json!({"status":"stopped-on-primitive-error", "executed_count":1,
+                "executed_steps":[{"command":"invoke", "side_effecting":true,
+                    "result":{"error":{"type":"invoke-outcome-unknown"}, "request_id":"req-uncertain"}}]}),
+            json!({"status":"stopped-on-primitive-error", "executed_count":2,
+                "executed_steps":[
+                    {"command":"invoke", "side_effecting":true, "result":{"phase":"execution", "status":"ok"}},
+                    {"command":"invoke", "side_effecting":true, "primitive_dispatched":false,
+                        "result":{"error":{"type":"invalid-workflow-auth"}}}]}),
+            json!({"status":"stopped-on-primitive-error", "executed_count":1,
+                "executed_steps":[{"command":"invoke", "side_effecting":true,
+                    "result":{"phase":"execution", "status":"error", "invoke_attempted":false}}]}),
+            json!({"status":"stopped-on-primitive-error", "executed_count":1,
+                "executed_steps":[{"command":"invoke", "side_effecting":true,
+                    "primitive_dispatched":false,
+                    "result":{"error":{"type":"invoke-outcome-unknown"}}}]}),
+            json!({"status":"stopped-on-primitive-error", "executed_count":1,
+                "executed_steps":[{"result":{"status":"error"}}]}),
+            json!({"status":"stopped-on-primitive-error", "executed_count":1, "executed_steps":[]}),
+            json!({"status":"stopped-on-primitive-error"}),
+            json!({"status":"stopped-on-primitive-error", "executed_count":1}),
+            json!({"status":"unexpected"}),
+        ] {
+            let store = store();
+            let task = ready_task(&store);
+            let lease = store.lock_task(&task.id).unwrap();
+            let ticket = lease.begin_execution("run", "approve").unwrap();
+            let finished = lease
+                .finish_execution(&ticket, execution.clone())
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                finished.execution_blocker(),
+                Some(super::TaskExecutionState::NeedsReview),
+                "{execution}"
+            );
+            assert_eq!(finished.capsule_status, "execution-needs-review");
+            drop(lease);
+            let retained = store.load(&task.id).unwrap().unwrap();
+            assert_eq!(retained.execution_history[0].execution, execution);
+            assert!(store.approve(&task.id).is_err());
+        }
+    }
+
+    #[test]
+    fn task_execution_definite_pre_effect_failures_and_simulation_allow_correction() {
+        for execution in [
+            json!({"status":"simulated", "executed_count":1, "executed_steps":[
+                {"command":"invoke", "side_effecting":false,
+                    "result":{"phase":"execution", "status":"ok"}}]}),
+            json!({"status":"stopped-on-primitive-error", "executed_count":1,
+                "executed_steps":[{"command":"invoke", "side_effecting":true,
+                    "primitive_dispatched":false, "result":{"error":{"type":"argument-parse"}}}]}),
+            json!({"status":"stopped-on-primitive-error", "executed_count":1,
+                "executed_steps":[{"command":"invoke", "side_effecting":true,
+                    "result":{"phase":"preflight", "status":"denied", "preflight":{"allowed":false}}}]}),
+            json!({"status":"stopped-on-primitive-error", "executed_count":0, "executed_steps":[]}),
+        ] {
+            let store = store();
+            let task = ready_task(&store);
+            let lease = store.lock_task(&task.id).unwrap();
+            let old_ticket = lease.begin_execution("run", "approve").unwrap();
+            let finished = lease
+                .finish_execution(&old_ticket, execution.clone())
+                .unwrap()
+                .unwrap();
+            assert!(finished.execution_blocker().is_none(), "{execution}");
+            let new_ticket = lease.begin_execution("run", "approve").unwrap();
+            assert_ne!(old_ticket.attempt_id, new_ticket.attempt_id);
+            assert!(
+                lease
+                    .finish_execution(&old_ticket, json!({"status":"simulated"}))
+                    .is_err(),
+                "stale finalizers cannot release a new attempt's fence"
+            );
+            assert_eq!(
+                lease
+                    .load()
+                    .unwrap()
+                    .unwrap()
+                    .execution_fence
+                    .unwrap()
+                    .attempt_id,
+                new_ticket.attempt_id
+            );
+        }
+    }
+
+    #[test]
+    fn task_execution_lost_receipt_retains_pending_fence_after_store_recovery() {
+        let store = store();
+        let task = ready_task(&store);
+        let lease = store.lock_task(&task.id).unwrap();
+        let ticket = lease.begin_execution("run", "approve").unwrap();
+        // Model a disappeared task store without destroying its durable data.
+        let archived = store.root_dir().join("interrupted-tasks");
+        std::fs::rename(store.tasks_dir(), &archived).unwrap();
+        assert!(
+            lease
+                .finish_execution(&ticket, json!({"status":"materialized"}))
+                .unwrap()
+                .is_none()
+        );
+        std::fs::rename(&archived, store.tasks_dir()).unwrap();
+        drop(lease);
+        let pending = store.load(&task.id).unwrap().unwrap();
+        assert_eq!(
+            pending.execution_blocker(),
+            Some(super::TaskExecutionState::Pending)
+        );
+        assert!(pending.execution_history.is_empty());
+        assert!(
+            store
+                .lock_task(&task.id)
+                .unwrap()
+                .begin_execution("run", "approve")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn task_execution_legacy_effect_evidence_cannot_be_hidden_by_rebinding() {
+        let store = store();
+        let task = ready_task(&store);
+        let completed = store
+            .append_execution(
+                &task.id,
+                "run",
+                "approve",
+                json!({
+                    "status":"materialized", "executed_count":1,
+                }),
+            )
+            .unwrap()
+            .unwrap();
+        // Existing capsules have no revision or fence fields. Loading them
+        // must retain the already-executed meaning of their original receipt.
+        let mut legacy = serde_json::to_value(&completed).unwrap();
+        legacy.as_object_mut().unwrap().remove("revision");
+        legacy.as_object_mut().unwrap().remove("execution_fence");
+        legacy["execution_history"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("revision");
+        std::fs::write(
+            store.task_path(&task.id),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+        let completed = store.load(&task.id).unwrap().unwrap();
+        assert_eq!(completed.revision, 0);
+        assert_eq!(completed.execution_history[0].revision, 0);
+        assert!(
+            completed.execution_fence.is_none(),
+            "legacy evidence has no new fence field"
+        );
+        assert_eq!(
+            completed.execution_blocker(),
+            Some(super::TaskExecutionState::Completed)
+        );
+        assert!(
+            store
+                .bind(&task.id, [("zone".to_owned(), "z:private".to_owned())])
+                .is_err()
+        );
+        assert!(!ready_for_execution(
+            &store.load(&task.id).unwrap().unwrap()
+        ));
+    }
+
+    #[test]
+    fn task_execution_lock_ids_cannot_alias_paths_or_other_capsules() {
+        let store = store();
+        for id in [
+            "../w:test",
+            "w:../test",
+            "w_test",
+            "w:a:b",
+            "w:a_b",
+            "w:A",
+            "w:",
+        ] {
+            assert!(store.lock_task(id).is_err(), "{id}");
+            assert!(store.load(id).is_err(), "{id}");
+        }
+        let task = ready_task(&store);
+        let mut mismatched = task.clone();
+        mismatched.id = "w:different".to_owned();
+        std::fs::write(
+            store.task_path(&task.id),
+            serde_json::to_vec(&mismatched).unwrap(),
+        )
+        .unwrap();
+        assert!(store.load(&task.id).is_err());
+    }
+
     #[test]
     fn bind_updates_overrides_and_unresolved_bindings() {
         let store = store();
@@ -1511,6 +2375,8 @@ mod tests {
                     "withheld_count": 0,
                     "stopped_before_side_effect": false,
                     "executed_steps": [{
+                        "command": "show",
+                        "side_effecting": false,
                         "result": {
                             "availability": {
                                 "availability": "denied",
@@ -1554,6 +2420,8 @@ mod tests {
                     "withheld_count": 0,
                     "stopped_before_side_effect": false,
                     "executed_steps": [{
+                        "command": "show",
+                        "side_effecting": false,
                         "result": {
                             "availability": {
                                 "availability": "unavailable",
@@ -1801,7 +2669,7 @@ mod tests {
     }
 
     #[test]
-    fn bind_clears_stale_execution_history_when_effective_state_changes() {
+    fn bind_preserves_evidence_but_excludes_prior_revision_from_current_state() {
         let store = store();
         let task = store
             .create(WorkflowRequest {
@@ -1838,7 +2706,10 @@ mod tests {
             .expect("bind should succeed")
             .expect("task should exist");
 
-        assert!(rebound.execution_history.is_empty());
+        assert_eq!(rebound.execution_history.len(), 1);
+        assert_eq!(rebound.execution_history[0].revision, simulated.revision);
+        assert_eq!(rebound.revision, simulated.revision + 1);
+        assert!(rebound.last_execution().is_none());
         assert_eq!(rebound.capsule_status, "ready-to-simulate");
     }
 
@@ -1877,7 +2748,7 @@ mod tests {
     }
 
     #[test]
-    fn append_resolution_clears_stale_execution_history_when_bindings_change() {
+    fn append_resolution_preserves_prior_revision_execution_evidence() {
         let store = store();
         let task = store
             .create(WorkflowRequest {
@@ -1922,7 +2793,13 @@ mod tests {
             .expect("resolution should persist")
             .expect("task should exist");
 
-        assert!(applied.task.execution_history.is_empty());
+        assert_eq!(applied.task.execution_history.len(), 1);
+        assert_eq!(
+            applied.task.execution_history[0].revision,
+            simulated.revision
+        );
+        assert_eq!(applied.task.revision, simulated.revision + 1);
+        assert!(applied.task.last_execution().is_none());
         assert_eq!(applied.task.capsule_status, "ready-to-simulate");
     }
 
@@ -2794,6 +3671,8 @@ mod tests {
                     "withheld_count": 0,
                     "stopped_before_side_effect": false,
                     "executed_steps": [{
+                        "command": "show",
+                        "side_effecting": false,
                         "result": {
                             "availability": {
                                 "availability": "denied",
@@ -2883,6 +3762,7 @@ mod tests {
     #[test]
     fn execution_receipt_serde_round_trip() {
         let receipt = super::ExecutionReceipt {
+            revision: 0,
             recorded_at: "2026-03-07T12:00:00Z".to_owned(),
             trigger: "advance".to_owned(),
             mode: "simulate".to_owned(),
@@ -3541,6 +4421,8 @@ mod tests {
                     "withheld_count": 0,
                     "stopped_before_side_effect": false,
                     "executed_steps": [{
+                        "command": "show",
+                        "side_effecting": false,
                         "result": {
                             "availability": {
                                 "availability": "planned",
@@ -3579,6 +4461,8 @@ mod tests {
                     "withheld_count": 0,
                     "stopped_before_side_effect": false,
                     "executed_steps": [{
+                        "command": "show",
+                        "side_effecting": false,
                         "result": {
                             "availability": {
                                 "availability": "unknown",
@@ -4316,7 +5200,7 @@ mod tests {
     }
 
     #[test]
-    fn capsule_status_execution_error_when_no_steps() {
+    fn capsule_status_requires_review_when_execution_evidence_is_incomplete() {
         let store = store();
         let task = store
             .create(WorkflowRequest {
@@ -4336,13 +5220,14 @@ mod tests {
                     "executed_count": 1,
                     "withheld_count": 0,
                     "stopped_before_side_effect": false,
-                    // No "executed_steps" => fallback to "execution-error"
+                    // A reported dispatch without its evidence cannot prove
+                    // that replaying this capsule would be safe.
                 }),
             )
             .expect("should succeed")
             .expect("task should exist");
 
-        assert_eq!(updated.capsule_status, "execution-error");
+        assert_eq!(updated.capsule_status, "execution-needs-review");
     }
 
     // ── WorkflowTask metadata ─────────────────────────────────────────
