@@ -18154,6 +18154,31 @@ fn mesh_forward_error_status(error: &fcp_mesh::invoke_route::MeshForwardError) -
     }
 }
 
+/// Admission errors may precede peer authentication. Never reflect details:
+/// schema strings, claimed identities, and storage diagnostics may contain
+/// untrusted or private data, even when the decoded envelope fits its cap.
+fn mesh_forward_error_message(error: &fcp_mesh::invoke_route::MeshForwardError) -> &'static str {
+    use fcp_mesh::invoke_route::MeshForwardError;
+    match error {
+        MeshForwardError::InvalidDirectory(_) => "mesh peer directory is invalid",
+        MeshForwardError::SchemaMismatch { .. } => "mesh forward schema is unsupported",
+        MeshForwardError::WrongTarget { .. } => "mesh forward is addressed to a different node",
+        MeshForwardError::UnknownPeer(_) => "mesh forward origin is not trusted",
+        MeshForwardError::SignatureInvalid { .. } => "mesh forward signature is invalid",
+        MeshForwardError::Malformed {
+            field: "replay_journal",
+            ..
+        } => "mesh forward replay admission is unavailable",
+        MeshForwardError::Malformed { .. } => "mesh forward envelope is malformed",
+        MeshForwardError::HopLimitExceeded { .. } => "mesh forward hop limit was exceeded",
+        MeshForwardError::Stale { .. } => "mesh forward envelope is not fresh",
+        MeshForwardError::Replayed { .. } => "mesh forward nonce was already accepted",
+        MeshForwardError::ReplayCacheSaturated { .. } => "mesh forward replay admission is at capacity",
+        MeshForwardError::ReplyBindingMismatch(_) => "mesh forward reply binding is invalid",
+        MeshForwardError::BodyTooLarge { .. } => "mesh forward body exceeds its method limit",
+    }
+}
+
 /// Encode a local result as a signed-reply body: the JSON value on success,
 /// a JSON string error message otherwise.
 fn mesh_reply_body<T: Serialize>(result: Result<T, (StatusCode, String)>) -> (u16, String) {
@@ -18201,7 +18226,12 @@ async fn admit_mesh_forward<T>(
         }
         None => admission.await,
     };
-    admitted.map_err(|error| (mesh_forward_error_status(&error), error.to_string()))
+    admitted.map_err(|error| {
+        (
+            mesh_forward_error_status(&error),
+            mesh_forward_error_message(&error).to_owned(),
+        )
+    })
 }
 
 /// Peer-facing endpoint: execute a signed forward from a mesh peer.
@@ -18284,9 +18314,8 @@ async fn mesh_forward_admitted_handler(
         Err(error) => {
             tracing::warn!(
                 event = "mesh_forward_rejected",
-                origin_node = envelope.origin_node.as_str(),
                 method = envelope.body.method(),
-                error = %error.1,
+                status = error.0.as_u16(),
                 "rejected mesh forward envelope"
             );
             return Err(error);
@@ -22841,7 +22870,7 @@ output_schema = {{ type = "object" }}
     }
 
     #[fcp_async_core::runtime::test(flavor = "multi_thread")]
-    async fn mesh_http_intake_releases_capacity_after_authentication_and_replay_errors() {
+    async fn mesh_http_intake_redacts_admission_failures_and_preserves_replay_capacity() {
         use fcp_host::mesh_routing::{MeshRouter, MeshRoutingSettings, unix_now_ms};
         use fcp_mesh::invoke_route::{MeshForwardBody, MeshForwardEnvelope, MeshForwardReply};
 
@@ -22894,6 +22923,34 @@ output_schema = {{ type = "object" }}
             },
         )
         .expect("signed envelope");
+        // Schema validation precedes signature verification. A claimed known
+        // peer must not be able to reflect a large private string into the
+        // HTTP response or rejection log without proving its identity.
+        let mut unsupported_schema = envelope.clone();
+        unsupported_schema.schema_version = "submitted-capability-secret-canary".repeat(32 * 1024);
+        unsupported_schema.signature.clear();
+        let schema_body = serde_json::to_vec(&unsupported_schema).unwrap();
+        assert!(schema_body.len() > 1024 * 1024);
+        assert!(schema_body.len() < MESH_FORWARD_HTTP_BODY_LIMIT_BYTES);
+        let response = app.clone().oneshot(request(schema_body)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 128).await.unwrap(),
+            "mesh forward schema is unsupported"
+        );
+        let mut unknown_origin = envelope.clone();
+        unknown_origin.origin_node = TailscaleNodeId::new("private-origin-canary");
+        unknown_origin.signature.clear();
+        let response = app
+            .clone()
+            .oneshot(request(serde_json::to_vec(&unknown_origin).unwrap()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 128).await.unwrap(),
+            "mesh forward origin is not trusted"
+        );
         let mut forged = envelope.clone();
         forged.signature = "00".repeat(64);
         let forged = serde_json::to_vec(&forged).unwrap();
@@ -22902,6 +22959,10 @@ output_schema = {{ type = "object" }}
         for _ in 0..5 {
             let response = app.clone().oneshot(request(forged.clone())).await.unwrap();
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                axum::body::to_bytes(response.into_body(), 128).await.unwrap(),
+                "mesh forward signature is invalid"
+            );
         }
         let malformed = app
             .clone()
@@ -22924,6 +22985,10 @@ output_schema = {{ type = "object" }}
         for _ in 0..5 {
             let response = app.clone().oneshot(request(body.clone())).await.unwrap();
             assert_eq!(response.status(), StatusCode::CONFLICT);
+            assert_eq!(
+                axum::body::to_bytes(response.into_body(), 128).await.unwrap(),
+                "mesh forward nonce was already accepted"
+            );
         }
     }
 

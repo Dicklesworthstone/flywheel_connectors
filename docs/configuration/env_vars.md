@@ -128,8 +128,10 @@ The `/rpc/mesh/forward` endpoint admits at most four pending envelopes per
 host. It rejects additional uploads immediately with HTTP 503. Each admitted
 request has a 24 MiB encoded body limit and a five-second total upload
 deadline, including chunked bodies. Oversized bodies receive HTTP 413 and
-expired uploads receive HTTP 408. Error responses do not include submitted
-credentials, JSON values, or body-stream diagnostics.
+expired uploads receive HTTP 408. Intake and admission rejection responses
+use bounded messages that do not include submitted credentials, JSON values,
+or body-stream diagnostics. Admission rejection logs record the method and
+HTTP status without echoing claimed peer identities or error details.
 
 An intake slot stays reserved through envelope decoding, signature
 verification, and replay admission. Rejected requests and disconnected
