@@ -57,6 +57,17 @@ pub use token::*;
 
 use std::time::Duration;
 
+/// Build a transport whose credential-bearing requests remain at the exact
+/// configured endpoint. A 307/308 redirect preserves a POST body, including
+/// client secrets, authorization codes, PKCE verifiers, or refresh tokens.
+/// Header stripping alone cannot protect those credentials. Apply this policy
+/// after all caller customization so it cannot be replaced accidentally.
+fn oauth_http_client(
+    builder: fcp_async_core::http::HttpClientBuilder,
+) -> fcp_async_core::http::HttpClient {
+    builder.no_redirects().no_retries().build()
+}
+
 /// Default token refresh threshold (refresh when less than this time remaining).
 pub const DEFAULT_REFRESH_THRESHOLD: Duration = Duration::from_secs(300); // 5 minutes
 

@@ -13,7 +13,7 @@ use hmac::{Hmac, Mac};
 use sha1::Sha1;
 use url::Url;
 
-use crate::{OAuthError, OAuthResult};
+use crate::{OAuthError, OAuthResult, oauth_http_client};
 
 const FORM_CONTENT_TYPE: &str = "application/x-www-form-urlencoded";
 const OAUTH1_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -140,22 +140,22 @@ impl OAuth1Client {
     /// Create a new OAuth 1.0a client.
     #[must_use]
     pub fn new(config: OAuth1Config) -> Self {
-        Self {
+        Self::with_http_client_builder(
             config,
-            http_client: Arc::new(
-                HttpClientBuilder::new()
-                    .user_agent("fcp-oauth/0.1.0")
-                    .build(),
-            ),
-        }
+            HttpClientBuilder::new().user_agent("fcp-oauth/0.1.0"),
+        )
     }
 
-    /// Create with a custom HTTP client.
+    /// Create with a customized HTTP transport builder.
+    ///
+    /// Redirects and automatic retries are always disabled after caller
+    /// customization. OAuth signatures bind the exact endpoint, and access
+    /// token requests contain the one-time verifier in their POST body.
     #[must_use]
-    pub fn with_http_client(config: OAuth1Config, http_client: HttpClient) -> Self {
+    pub fn with_http_client_builder(config: OAuth1Config, builder: HttpClientBuilder) -> Self {
         Self {
             config,
-            http_client: Arc::new(http_client),
+            http_client: Arc::new(oauth_http_client(builder)),
         }
     }
 
@@ -1081,8 +1081,8 @@ mod tests {
     #[test]
     fn test_oauth1_client_with_custom_http_client() {
         let config = test_config();
-        let http_client = HttpClientBuilder::new().build();
-        let client = OAuth1Client::with_http_client(config, http_client);
+        let builder = HttpClientBuilder::new();
+        let client = OAuth1Client::with_http_client_builder(config, builder);
         assert_eq!(client.config().consumer_key, "consumer_key");
     }
 

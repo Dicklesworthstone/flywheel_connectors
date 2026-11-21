@@ -17,7 +17,7 @@ use url::Url;
 
 use crate::{
     GrantType, OAuthError, OAuthResult, OAuthTokens, Pkce, PkceMethod, ResponseMode, TokenResponse,
-    normalize_registered_redirect_uri, validate_oauth_endpoint_url,
+    normalize_registered_redirect_uri, oauth_http_client, validate_oauth_endpoint_url,
 };
 
 const FORM_CONTENT_TYPE: &str = "application/x-www-form-urlencoded";
@@ -407,29 +407,32 @@ impl OAuth2Client {
     /// Returns an error when the configured authorization URL, token URL,
     /// or redirect URI is invalid.
     pub fn new(config: OAuth2Config) -> OAuthResult<Self> {
-        let config = validate_oauth2_config(config)?;
-
-        Ok(Self {
+        Self::with_http_client_builder(
             config,
-            http_client: Arc::new(
-                HttpClientBuilder::new()
-                    .user_agent("fcp-oauth/0.1.0")
-                    .build(),
-            ),
-        })
+            HttpClientBuilder::new().user_agent("fcp-oauth/0.1.0"),
+        )
     }
 
-    /// Create with a custom HTTP client.
+    /// Create with a customized HTTP transport builder.
+    ///
+    /// Connection pools, TLS roots, and other transport settings may be
+    /// customized. Redirects and automatic retries are always disabled before
+    /// the client is built: token requests must reach only the configured
+    /// endpoint, and a one-time authorization grant must not be replayed by the
+    /// transport. A prebuilt client cannot enforce this policy.
     ///
     /// # Errors
     /// Returns an error when the configured authorization URL, token URL,
     /// or redirect URI is invalid.
-    pub fn with_http_client(config: OAuth2Config, http_client: HttpClient) -> OAuthResult<Self> {
+    pub fn with_http_client_builder(
+        config: OAuth2Config,
+        builder: HttpClientBuilder,
+    ) -> OAuthResult<Self> {
         let config = validate_oauth2_config(config)?;
 
         Ok(Self {
             config,
-            http_client: Arc::new(http_client),
+            http_client: Arc::new(oauth_http_client(builder)),
         })
     }
 
@@ -1835,31 +1838,27 @@ mod tests {
                     let responding_store = store.clone();
                     Mock::given(method("POST"))
                         .and(path("/token"))
-                        .and(body_string_contains("refresh_token=unchanged-refresh-token"))
+                        .and(body_string_contains(
+                            "refresh_token=unchanged-refresh-token",
+                        ))
                         .respond_with(move |_: &wiremock::Request| {
                             // Mutate after the real HTTP request arrives and
                             // before its response: admission has already run.
                             match mutation {
-                                "store" => responding_store.store(
-                                    "user",
-                                    fixture("replacement-access-token", 3600),
-                                ),
+                                "store" => responding_store
+                                    .store("user", fixture("replacement-access-token", 3600)),
                                 "update" => responding_store
                                     .update("user", fixture("replacement-access-token", 3600))
                                     .unwrap(),
                                 "remove_reinsert" => {
                                     assert!(responding_store.remove("user").is_some());
-                                    responding_store.store(
-                                        "user",
-                                        fixture("replacement-access-token", 3600),
-                                    );
+                                    responding_store
+                                        .store("user", fixture("replacement-access-token", 3600));
                                 }
                                 "clear_reinsert" => {
                                     responding_store.clear();
-                                    responding_store.store(
-                                        "user",
-                                        fixture("replacement-access-token", 3600),
-                                    );
+                                    responding_store
+                                        .store("user", fixture("replacement-access-token", 3600));
                                 }
                                 "remove" => {
                                     assert!(responding_store.remove("user").is_some());
@@ -3262,13 +3261,13 @@ mod tests {
         assert_ne!(s2, s3);
     }
 
-    // ── Expanded tests: OAuth2Client with custom HTTP client ──
+    // ── Expanded tests: OAuth2Client with custom HTTP transport ──
 
     #[test]
     fn test_client_with_custom_http_client() {
         let config = test_config();
-        let http_client = HttpClientBuilder::new().build();
-        let client = OAuth2Client::with_http_client(config, http_client).unwrap();
+        let builder = HttpClientBuilder::new();
+        let client = OAuth2Client::with_http_client_builder(config, builder).unwrap();
         assert_eq!(client.config().client_id, "test_client_id");
     }
 
@@ -3277,8 +3276,8 @@ mod tests {
         let config = test_config()
             .with_scopes(vec!["admin".into()])
             .with_auth_style(AuthStyle::Basic);
-        let http_client = HttpClientBuilder::new().build();
-        let client = OAuth2Client::with_http_client(config, http_client).unwrap();
+        let builder = HttpClientBuilder::new();
+        let client = OAuth2Client::with_http_client_builder(config, builder).unwrap();
         assert_eq!(client.config().default_scopes, vec!["admin"]);
         assert_eq!(client.config().auth_style, AuthStyle::Basic);
     }
@@ -3292,8 +3291,8 @@ mod tests {
             "https://auth.example.com/token",
         )
         .with_redirect_uri("http://attacker.example/callback");
-        let http_client = HttpClientBuilder::new().build();
-        let err = OAuth2Client::with_http_client(config, http_client).unwrap_err();
+        let builder = HttpClientBuilder::new();
+        let err = OAuth2Client::with_http_client_builder(config, builder).unwrap_err();
         assert!(matches!(
             err,
             OAuthError::InvalidConfig(ref m) if m.contains("https or loopback http")

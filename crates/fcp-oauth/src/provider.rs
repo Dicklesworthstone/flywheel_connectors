@@ -164,7 +164,6 @@ fn linear_config(client_id: &str, client_secret: &str) -> OAuth2Config {
         "https://api.linear.app/oauth/token",
     )
     .with_pkce(false)
-    .with_auth_param("response_type", "code")
 }
 
 /// Discord OAuth 2.0 configuration.
@@ -850,12 +849,50 @@ mod tests {
     }
 
     #[test]
-    fn test_linear_config_has_response_type_param() {
+    fn test_linear_client_emits_one_authorization_response_type() {
         let config = OAuthProvider::Linear.oauth2_config("id", "sec").unwrap();
-        assert_eq!(
-            config.extra_auth_params.get("response_type"),
-            Some(&"code".to_string())
-        );
+        let client = crate::OAuth2Client::new(config).expect("usable Linear provider config");
+        let (authorization_url, _) = client.authorization_url(&[]).unwrap();
+        let url = url::Url::parse(&authorization_url).unwrap();
+        let response_types: Vec<_> = url
+            .query_pairs()
+            .filter(|(key, _)| key == "response_type")
+            .map(|(_, value)| value.into_owned())
+            .collect();
+        assert_eq!(response_types, ["code"]);
+    }
+
+    #[test]
+    fn test_all_oauth2_provider_configs_build_usable_clients() {
+        for provider in [
+            OAuthProvider::Google,
+            OAuthProvider::GitHub,
+            OAuthProvider::Twitter,
+            OAuthProvider::Slack,
+            OAuthProvider::Notion,
+            OAuthProvider::Linear,
+            OAuthProvider::Discord,
+            OAuthProvider::Spotify,
+            OAuthProvider::Microsoft,
+            OAuthProvider::Dropbox,
+        ] {
+            let config = provider.oauth2_config("id", "secret").unwrap();
+            let client = crate::OAuth2Client::new(config)
+                .unwrap_or_else(|error| panic!("unusable {provider:?} config: {error}"));
+            let session = client
+                .authorization_session(&["read"])
+                .expect("provider authorization session");
+            let url = url::Url::parse(session.authorization_url()).unwrap();
+            assert_eq!(url.scheme(), "https");
+            assert!(!session.state().is_empty());
+            assert_eq!(
+                url.query_pairs()
+                    .filter(|(name, _)| name == "state")
+                    .count(),
+                1,
+                "{provider:?} state must come only from the session"
+            );
+        }
     }
 
     #[test]
