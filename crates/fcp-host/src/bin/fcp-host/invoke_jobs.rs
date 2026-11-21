@@ -967,7 +967,7 @@ async fn run_owned(
     let audit_persistence = append_dispatch_audit(state, &audit, &source_result, duration_ms);
     let audit_event_id = audit_persistence.as_ref().ok().cloned();
     let audit_persisted = audit_event_id.is_some();
-    let budget_recorded = before_deadline(
+    let budget_finalization = before_deadline(
         finalize_by,
         super::record_invoke_budget_usage(
             state.budget.as_ref(),
@@ -978,8 +978,12 @@ async fn run_owned(
         ),
         "source budget accounting",
     )
-    .await
-    .unwrap_or(false);
+    .await;
+    // A zone without a configured policy still completes budget finalization.
+    // Preserve that completed decision separately from a timed-out accounting
+    // attempt, without claiming that any budget usage was actually recorded.
+    let budget_finalized = budget_finalization.is_ok();
+    let budget_recorded = budget_finalization.unwrap_or(false);
     let receipt_recorded = match source_result.as_ref() {
         Ok(response) => before_deadline(
             finalize_by,
@@ -1000,11 +1004,13 @@ async fn run_owned(
     let sampling = request.operation.as_str() == super::MCP_SAMPLING_HANDLE_OPERATION;
     let mut finalization = fcp_host::InvocationFinalization {
         budget_recorded,
+        budget_finalized,
         receipt_recorded,
         audit_event_id,
         sampling_completed: None,
         sampling_operation_id: None,
         response_http_status: None,
+        response_status: None,
     };
 
     // A sampling child can await IO. First retain the source's completed
@@ -1051,6 +1057,7 @@ async fn run_owned(
             Ok(_) => axum::http::StatusCode::OK.as_u16(),
             Err(error) => super::host_error_status(error).as_u16(),
         });
+        finalization.response_status = result.as_ref().ok().map(|response| response.status);
     }
     // This is the final write for this ticket. Unresolved sampling keeps its
     // parent fenced, even though the source observation itself is definite.
@@ -1520,6 +1527,7 @@ mod tests {
                 !record.finalization.as_ref().unwrap().receipt_recorded,
                 "{case}"
             );
+            assert_eq!(record.finalization.as_ref().unwrap().response_status, None);
             let receipts = fixture
                 .state
                 .lifecycle
@@ -1616,8 +1624,49 @@ mod tests {
                 }
             );
             assert!(terminal.receipt_id.is_some());
-            assert!(record.finalization.unwrap().receipt_recorded);
+            let finalization = record.finalization.unwrap();
+            assert!(finalization.receipt_recorded);
+            assert!(finalization.budget_finalized);
+            assert!(!finalization.budget_recorded);
+            assert_eq!(
+                finalization.response_status,
+                Some(if error_response {
+                    fcp_kernel::InvokeStatus::Error
+                } else {
+                    fcp_kernel::InvokeStatus::Ok
+                })
+            );
         }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn invocation_finalization_records_no_budget_and_no_receipt_success() {
+        let fixture = dispatch_fixture();
+        execute(
+            &fixture.state,
+            fixture.request.clone(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let record = fixture
+            .state
+            .lifecycle
+            .invocation_record(&fixture.request.id.to_string(), None)
+            .await
+            .unwrap();
+        assert!(record.terminal.unwrap().receipt_id.is_none());
+        let finalization = record.finalization.unwrap();
+        assert!(finalization.budget_finalized);
+        assert!(!finalization.budget_recorded);
+        assert!(!finalization.receipt_recorded);
+        assert!(finalization.audit_event_id.is_some());
+        assert_eq!(finalization.response_http_status, Some(200));
+        assert_eq!(finalization.response_status, Some(fcp_kernel::InvokeStatus::Ok));
     }
 
     #[fcp_async_core::runtime::test(flavor = "multi_thread")]

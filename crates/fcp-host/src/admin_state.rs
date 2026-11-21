@@ -959,6 +959,12 @@ pub struct InvocationTerminal {
 pub struct InvocationFinalization {
     /// Budget accounting was recorded.
     pub budget_recorded: bool,
+    /// The budget decision completed, including a zone with no budget policy.
+    ///
+    /// False on older records and when accounting exceeded its deadline. A
+    /// false `budget_recorded` flag alone cannot distinguish those cases.
+    #[serde(default)]
+    pub budget_finalized: bool,
     /// The connector receipt summary was persisted, if one was available.
     pub receipt_recorded: bool,
     /// Hash-linked host audit event identifier, if recorded.
@@ -977,6 +983,13 @@ pub struct InvocationFinalization {
     /// Final HTTP response status after any enrichment, if observed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_http_status: Option<u16>,
+    /// Exact final invoke envelope status after optional sampling enrichment.
+    ///
+    /// A successful source observation and HTTP 200 can still produce a
+    /// connector-error envelope when a sampling child fails. Older records
+    /// omit this evidence; clients must not infer it from the source outcome.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_status: Option<fcp_kernel::InvokeStatus>,
 }
 
 /// Retained, payload-free evidence of one host-owned invocation attempt.
@@ -5929,7 +5942,16 @@ impl HostAdminStateStore {
                     "refusing to replace an observed final response status",
                 ));
             }
+            if previous.response_status.is_some()
+                && finalization.response_status.is_some()
+                && previous.response_status != finalization.response_status
+            {
+                return Err(invocation_state_error(
+                    "refusing to replace an observed final invoke envelope status",
+                ));
+            }
             previous.budget_recorded |= finalization.budget_recorded;
+            previous.budget_finalized |= finalization.budget_finalized;
             previous.receipt_recorded |= finalization.receipt_recorded;
             if finalization.audit_event_id.is_some() {
                 previous.audit_event_id = finalization.audit_event_id;
@@ -5944,6 +5966,19 @@ impl HostAdminStateStore {
                 };
             if finalization.response_http_status.is_some() {
                 previous.response_http_status = finalization.response_http_status;
+            }
+            if finalization.response_status.is_some() {
+                previous.response_status = finalization.response_status;
+            }
+            if previous.response_status.is_some()
+                && (!previous
+                    .response_http_status
+                    .is_some_and(|status| (200..=299).contains(&status))
+                    || previous.sampling_completed == Some(false))
+            {
+                return Err(invocation_state_error(
+                    "a final invoke envelope requires a successful HTTP response and resolved sampling",
+                ));
             }
             Ok(())
         })
@@ -6770,6 +6805,119 @@ mod tests {
     }
 
     #[test]
+    fn invocation_finalization_legacy_fields_do_not_invent_completion() {
+        let legacy: InvocationFinalization = serde_json::from_value(serde_json::json!({
+            "budget_recorded": true,
+            "receipt_recorded": true,
+            "audit_event_id": "legacy-audit",
+            "sampling_completed": true,
+            "response_http_status": 200,
+        }))
+        .unwrap();
+        assert!(!legacy.budget_finalized);
+        assert_eq!(legacy.response_status, None);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn invocation_finalization_retains_exact_envelope_and_budget_decision() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("final-envelope.json");
+        let store = HostAdminStateStore::with_state_path(path.clone()).unwrap();
+        let ticket = store
+            .admit_invocation(invocation_admission("enriched-source"))
+            .await
+            .unwrap();
+        store
+            .finish_invocation(&ticket, successful_invocation())
+            .await
+            .unwrap();
+        // A known source success can yield a connector-error final envelope.
+        // No configured budget is a completed decision, not a recorded debit.
+        let finalization = InvocationFinalization {
+            budget_finalized: true,
+            receipt_recorded: true,
+            audit_event_id: Some("audit-enriched-source".to_owned()),
+            sampling_operation_id: Some("sampling-child".to_owned()),
+            sampling_completed: Some(true),
+            response_http_status: Some(200),
+            response_status: Some(fcp_kernel::InvokeStatus::Error),
+            ..Default::default()
+        };
+        store
+            .record_invocation_finalization(&ticket, finalization.clone())
+            .await
+            .unwrap();
+        // Partial repeat writes cannot erase the completed budget decision or
+        // turn the final envelope into the source's successful observation.
+        store
+            .record_invocation_finalization(&ticket, InvocationFinalization::default())
+            .await
+            .unwrap();
+        assert!(
+            store
+                .record_invocation_finalization(
+                    &ticket,
+                    InvocationFinalization {
+                        response_status: Some(fcp_kernel::InvokeStatus::Ok),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .is_err()
+        );
+        let reopened = HostAdminStateStore::with_state_path(path).unwrap();
+        let record = reopened
+            .invocation_record(&ticket.operation_id, Some(ticket.attempt_id))
+            .await
+            .unwrap();
+        assert_eq!(record.terminal, Some(successful_invocation()));
+        assert_eq!(record.finalization, Some(finalization));
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn invocation_finalization_rejects_envelope_without_resolved_response() {
+        let store = HostAdminStateStore::new();
+        let ticket = store
+            .admit_invocation(invocation_admission("unfinished-response"))
+            .await
+            .unwrap();
+        store
+            .finish_invocation(&ticket, successful_invocation())
+            .await
+            .unwrap();
+        for (http_status, sampling_completed) in [
+            (None, None),
+            (Some(502), None),
+            (Some(200), Some(false)),
+        ] {
+            assert!(
+                store
+                    .record_invocation_finalization(
+                        &ticket,
+                        InvocationFinalization {
+                            budget_finalized: true,
+                            response_http_status: http_status,
+                            response_status: Some(fcp_kernel::InvokeStatus::Ok),
+                            sampling_completed,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .is_err()
+            );
+            assert!(
+                store
+                    .invocation_record(&ticket.operation_id, Some(ticket.attempt_id))
+                    .await
+                    .unwrap()
+                    .finalization
+                    .is_none(),
+                "contradictory updates are rejected atomically"
+            );
+        }
+    }
+
+    #[test]
     fn invocation_idempotency_scope_digest_matches_admission_without_input_or_credentials() {
         let request = keyed_invocation_request("scope-only");
         let binding = InvocationIdempotency::from_request(&request, "owner")
@@ -7297,11 +7445,13 @@ mod tests {
                 &first,
                 InvocationFinalization {
                     budget_recorded: true,
+                    budget_finalized: true,
                     receipt_recorded: true,
                     audit_event_id: Some("audit-1".to_string()),
                     sampling_operation_id: None,
                     sampling_completed: None,
                     response_http_status: Some(200),
+                    response_status: Some(fcp_kernel::InvokeStatus::Ok),
                 },
             )
             .await
@@ -7473,11 +7623,13 @@ mod tests {
                 &ticket,
                 InvocationFinalization {
                     budget_recorded: true,
+                    budget_finalized: true,
                     receipt_recorded: false,
                     audit_event_id: Some("audit-source".to_string()),
                     sampling_operation_id: None,
                     sampling_completed: None,
                     response_http_status: None,
+                    response_status: None,
                 },
             )
             .await

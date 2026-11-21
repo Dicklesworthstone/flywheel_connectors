@@ -21397,9 +21397,11 @@ output_schema = {{ type = "object" }}
         );
         let finalization = record.finalization.as_ref().expect("finalization");
         assert!(finalization.budget_recorded);
+        assert!(finalization.budget_finalized);
         assert!(finalization.receipt_recorded);
         assert_eq!(finalization.sampling_completed, None);
         assert_eq!(finalization.response_http_status, Some(200));
+        assert_eq!(finalization.response_status, Some(InvokeStatus::Ok));
         let audit_id = finalization
             .audit_event_id
             .as_ref()
@@ -21502,6 +21504,7 @@ output_schema = {{ type = "object" }}
         let mcp_invokes = Arc::new(AtomicU64::new(0));
         let llm_invokes = Arc::new(AtomicU64::new(0));
         let ambiguous_llm_reply = Arc::new(AtomicBool::new(false));
+        let failed_llm_reply = Arc::new(AtomicBool::new(false));
         let llm_rpc_count = Arc::new(AtomicU64::new(0));
 
         let (mcp_tx, mut mcp_rx) = mpsc::channel::<ConnectorRpcRequest>(8);
@@ -21563,6 +21566,7 @@ output_schema = {{ type = "object" }}
         let (llm_tx, mut llm_rx) = mpsc::channel::<ConnectorRpcRequest>(8);
         let llm_counter = Arc::clone(&llm_invokes);
         let ambiguous_reply = Arc::clone(&ambiguous_llm_reply);
+        let failed_reply = Arc::clone(&failed_llm_reply);
         let child_lifecycle = Arc::clone(&lifecycle);
         let child_rpc_count = Arc::clone(&llm_rpc_count);
         let llm_task = task::spawn(async move {
@@ -21611,8 +21615,16 @@ output_schema = {{ type = "object" }}
                         } else {
                             invoke_request.id
                         };
-                        let _ = request.response_tx.send(Ok(json!({
-                            "result": InvokeResponse::ok(
+                        let response = if failed_reply.load(Ordering::SeqCst) {
+                            InvokeResponse::error(
+                                response_id,
+                                fcp_core::FcpError::InvalidRequest {
+                                    code: 1003,
+                                    message: "sampling child refused the request".to_owned(),
+                                },
+                            )
+                        } else {
+                            InvokeResponse::ok(
                                 response_id,
                                 json!({
                                     "choices": [{
@@ -21621,7 +21633,9 @@ output_schema = {{ type = "object" }}
                                     "usage": {"prompt_tokens": 2, "completion_tokens": 1}
                                 }),
                             )
-                            .with_usage_metrics(vec![UsageMetric::requests(3)]),
+                        };
+                        let _ = request.response_tx.send(Ok(json!({
+                            "result": response.with_usage_metrics(vec![UsageMetric::requests(3)]),
                         })));
                     }
                     method => {
@@ -21759,6 +21773,9 @@ output_schema = {{ type = "object" }}
                 .sampling_completed,
             Some(true)
         );
+        let source_finalization = source_record.finalization.as_ref().unwrap();
+        assert!(source_finalization.budget_finalized);
+        assert_eq!(source_finalization.response_status, Some(InvokeStatus::Ok));
         let child_id = result["host_dispatch"]["request_id"]
             .as_str()
             .expect("child request id");
@@ -21826,6 +21843,7 @@ output_schema = {{ type = "object" }}
             .expect("failed enrichment metadata");
         assert_eq!(finalization.sampling_completed, Some(false));
         assert_eq!(finalization.response_http_status, None);
+        assert_eq!(finalization.response_status, None);
         assert_eq!(mcp_invokes.load(Ordering::SeqCst), 2);
         assert_eq!(llm_invokes.load(Ordering::SeqCst), 1);
         assert_eq!(
@@ -21915,6 +21933,7 @@ output_schema = {{ type = "object" }}
             .expect("sampling ambiguity retained");
         assert_eq!(finalization.sampling_completed, Some(false));
         assert_eq!(finalization.response_http_status, None);
+        assert_eq!(finalization.response_status, None);
         assert!(
             lifecycle
                 .admit_invocation(ambiguous_source.admission)
@@ -21925,12 +21944,45 @@ output_schema = {{ type = "object" }}
         invoke_handler(
             State(Arc::clone(&state)),
             HeaderMap::new(),
-            Json(ambiguous_request),
+            Json(ambiguous_request.clone()),
         )
         .await
         .expect_err("same parent id cannot retry an unresolved child");
         assert_eq!(mcp_invokes.load(Ordering::SeqCst), 3);
         assert_eq!(llm_invokes.load(Ordering::SeqCst), 2);
+
+        // A valid connector-error child is resolved, but the final parent
+        // envelope is an error even though the source succeeded and HTTP is 200.
+        ambiguous_llm_reply.store(false, Ordering::SeqCst);
+        failed_llm_reply.store(true, Ordering::SeqCst);
+        let mut child_error_request = ambiguous_request;
+        child_error_request.id = RequestId::random();
+        let child_error_source_id = child_error_request.id.to_string();
+        let response = invoke_handler(
+            State(Arc::clone(&state)),
+            HeaderMap::new(),
+            Json(child_error_request),
+        )
+        .await
+        .expect("a known child failure returns its invoke error envelope")
+        .0;
+        assert_eq!(response.status, InvokeStatus::Error);
+        let source = lifecycle
+            .invocation_record(&child_error_source_id, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            source.terminal.unwrap().outcome,
+            fcp_host::InvocationOutcome::Succeeded
+        );
+        let finalization = source.finalization.unwrap();
+        assert!(finalization.budget_finalized);
+        assert_eq!(finalization.sampling_completed, Some(true));
+        assert!(finalization.sampling_operation_id.is_some());
+        assert_eq!(finalization.response_http_status, Some(200));
+        assert_eq!(finalization.response_status, Some(InvokeStatus::Error));
+        assert_eq!(mcp_invokes.load(Ordering::SeqCst), 4);
+        assert_eq!(llm_invokes.load(Ordering::SeqCst), 3);
         state
             .invoke_jobs
             .shutdown(Duration::from_secs(1))
