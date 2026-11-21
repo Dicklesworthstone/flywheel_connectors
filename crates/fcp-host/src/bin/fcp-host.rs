@@ -186,6 +186,8 @@ mod lifecycle_runtime;
 mod live_authority;
 #[path = "fcp-host/mesh_cancel.rs"]
 mod mesh_cancel;
+#[path = "fcp-host/mesh_forward_intake.rs"]
+mod mesh_forward_intake;
 #[path = "fcp-host/native_artifact.rs"]
 mod native_artifact;
 #[path = "fcp-host/native_events.rs"]
@@ -10296,9 +10298,11 @@ async fn async_main(telemetry_config: TelemetryConfig) -> HostResult<()> {
             fcp_host::mesh_routing::MESH_FORWARD_ROUTE,
             // A forwarded request is JSON embedded as a JSON string, so
             // escaping can inflate a maximal client body several-fold.
-            post(mesh_forward_handler).layer(axum::extract::DefaultBodyLimit::max(
-                MESH_FORWARD_HTTP_BODY_LIMIT_BYTES,
-            )),
+            post(mesh_forward_admitted_handler)
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    MESH_FORWARD_HTTP_BODY_LIMIT_BYTES,
+                ))
+                .layer(axum::Extension(mesh_forward_intake::Intake::default())),
         )
         .route(
             fcp_host::mesh_routing::MESH_ADVERTISEMENT_ROUTE,
@@ -18206,9 +18210,12 @@ async fn admit_mesh_forward<T>(
 /// fresh, and unreplayed. The forwarded request then runs the full local
 /// pipeline — capability token, zone binding, HRW admission, policy — so a
 /// peer's signature only authenticates the relay, never the operation.
-async fn mesh_forward_handler(
+async fn mesh_forward_admitted_handler(
     State(state): State<Arc<AppState>>,
-    Json(envelope): Json<fcp_mesh::invoke_route::MeshForwardEnvelope>,
+    mesh_forward_intake::AdmittedJson {
+        value: envelope,
+        permit: intake_permit,
+    }: mesh_forward_intake::AdmittedJson<fcp_mesh::invoke_route::MeshForwardEnvelope>,
 ) -> Result<Json<fcp_mesh::invoke_route::MeshForwardReply>, (StatusCode, String)> {
     use fcp_mesh::invoke_route::MeshForwardBody;
 
@@ -18285,6 +18292,11 @@ async fn mesh_forward_handler(
             return Err(error);
         }
     };
+    // Body collection, JSON decoding, signature verification and replay
+    // journal waits all retain the unauthenticated intake reservation. Release
+    // it before executing admitted work so long invokes do not occupy the
+    // upload slots needed by cancellation and stream control requests.
+    drop(intake_permit);
     let (status, body_json) = match &envelope.body {
         MeshForwardBody::ConnectorStateExport { request_json } => {
             connector_state_transfer::export_reply(&state, &router, &envelope, request_json).await
@@ -18427,6 +18439,21 @@ async fn mesh_forward_handler(
         "served mesh forward"
     );
     Ok(Json(router.sign_reply(&envelope, status, body_json)))
+}
+
+/// Direct-dispatch fixtures exercise authenticated operation behavior without
+/// HTTP framing. This adapter is excluded from production; the live route
+/// always requires the bounded intake extractor and its shared reservation.
+#[cfg(test)]
+async fn mesh_forward_handler(
+    state: State<Arc<AppState>>,
+    Json(envelope): Json<fcp_mesh::invoke_route::MeshForwardEnvelope>,
+) -> Result<Json<fcp_mesh::invoke_route::MeshForwardReply>, (StatusCode, String)> {
+    mesh_forward_admitted_handler(
+        state,
+        mesh_forward_intake::AdmittedJson::for_test(envelope),
+    )
+    .await
 }
 
 /// The connectors this host executes, as mesh advertisement entries.
@@ -22811,6 +22838,93 @@ output_schema = {{ type = "object" }}
             .await
             .expect_err("restart must retain the consumed nonce");
         assert_eq!(rejected.0, StatusCode::CONFLICT);
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn mesh_http_intake_releases_capacity_after_authentication_and_replay_errors() {
+        use fcp_host::mesh_routing::{MeshRouter, MeshRoutingSettings, unix_now_ms};
+        use fcp_mesh::invoke_route::{MeshForwardBody, MeshForwardEnvelope, MeshForwardReply};
+
+        let origin_key = fcp_crypto::ed25519::Ed25519SigningKey::generate();
+        let mut state = dispatcher_app_state(
+            dispatcher_registry_with_connectors(Vec::new()),
+            Arc::new(HostAdminStateStore::new()),
+            None,
+            HashMap::new(),
+        );
+        Arc::get_mut(&mut state).expect("exclusive test state").mesh = Some(Arc::new(
+            MeshRouter::new(MeshRoutingSettings {
+                node_id: TailscaleNodeId::new("executor"),
+                signing_key: fcp_crypto::ed25519::Ed25519SigningKey::generate(),
+                peers_json: json!([{
+                    "node_id": "origin",
+                    "endpoint": "http://127.0.0.1:1",
+                    "public_key_hex": hex::encode(origin_key.verifying_key().to_bytes()),
+                }])
+                .to_string(),
+                forward_timeout: Duration::from_secs(1),
+            })
+            .expect("mesh executor router"),
+        ));
+        let app = Router::new()
+            .route(
+                fcp_host::mesh_routing::MESH_FORWARD_ROUTE,
+                post(mesh_forward_admitted_handler)
+                    .layer(axum::extract::DefaultBodyLimit::max(
+                        MESH_FORWARD_HTTP_BODY_LIMIT_BYTES,
+                    ))
+                    .layer(axum::Extension(mesh_forward_intake::Intake::default())),
+            )
+            .with_state(state);
+        let request = |body: Vec<u8>| {
+            Request::builder()
+                .method("POST")
+                .uri(fcp_host::mesh_routing::MESH_FORWARD_ROUTE)
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .expect("mesh HTTP request")
+        };
+        let envelope = MeshForwardEnvelope::sign(
+            &origin_key,
+            TailscaleNodeId::new("origin"),
+            TailscaleNodeId::new("executor"),
+            unix_now_ms(),
+            MeshForwardBody::Introspect {
+                connector_id: "fcp.test.missing:utility:1.0.0".to_owned(),
+            },
+        )
+        .expect("signed envelope");
+        let mut forged = envelope.clone();
+        forged.signature = "00".repeat(64);
+        let forged = serde_json::to_vec(&forged).unwrap();
+        // More sequential failures than the four intake slots prove that
+        // rejecting authentication cannot leak reservations or burn the nonce.
+        for _ in 0..5 {
+            let response = app.clone().oneshot(request(forged.clone())).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        let malformed = app
+            .clone()
+            .oneshot(request(b"{\"secret-canary\":".to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            axum::body::to_bytes(malformed.into_body(), 256).await.unwrap(),
+            "mesh forward envelope is invalid"
+        );
+        let body = serde_json::to_vec(&envelope).unwrap();
+        let response = app.clone().oneshot(request(body.clone())).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let reply: MeshForwardReply = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 4096).await.unwrap(),
+        )
+        .expect("authenticated mesh reply");
+        assert_eq!(reply.status, StatusCode::NOT_FOUND.as_u16());
+        for _ in 0..5 {
+            let response = app.clone().oneshot(request(body.clone())).await.unwrap();
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+        }
     }
 
     #[fcp_async_core::runtime::test(flavor = "multi_thread")]

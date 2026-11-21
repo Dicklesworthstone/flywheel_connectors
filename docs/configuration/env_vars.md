@@ -121,3 +121,22 @@ Mesh peer HTTP clients ignore ambient `HTTP_PROXY`, `HTTPS_PROXY`, and
 `ALL_PROXY` settings, including lowercase variants. This also keeps permitted
 loopback traffic local. Peer URLs are explicit trust configuration; redirects
 and automatic HTTP retries remain disabled.
+
+### Inbound Mesh Forward Admission
+
+The `/rpc/mesh/forward` endpoint admits at most four pending envelopes per
+host. It rejects additional uploads immediately with HTTP 503. Each admitted
+request has a 24 MiB encoded body limit and a five-second total upload
+deadline, including chunked bodies. Oversized bodies receive HTTP 413 and
+expired uploads receive HTTP 408. Error responses do not include submitted
+credentials, JSON values, or body-stream diagnostics.
+
+An intake slot stays reserved through envelope decoding, signature
+verification, and replay admission. Rejected requests and disconnected
+clients release their slots. Successfully authenticated requests release the
+slot before operation execution, allowing cancellation and stream
+acknowledgement to proceed while other operations run.
+
+The four slots bound concurrently retained wire bodies, not total process
+memory or connections that have not sent request headers. JSON decoding and
+authenticated operation execution have their own resource costs.
