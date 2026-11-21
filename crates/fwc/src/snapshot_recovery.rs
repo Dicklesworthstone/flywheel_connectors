@@ -279,6 +279,7 @@ mod tests {
             ],
             "task" => &[
                 "create", "show", "list", "resolve", "ask", "advance", "bind", "approve", "run",
+                "reconcile",
             ],
             "pipeline" => &["create", "run", "show", "list", "validate"],
             "approvals" => &["list", "create", "revoke", "show"],

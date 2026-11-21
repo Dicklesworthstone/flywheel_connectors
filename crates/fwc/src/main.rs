@@ -277,6 +277,8 @@ mod snapshot_recovery;
 mod snapshot_workflow;
 mod supply_chain_cmd;
 mod swarm_evidence_cmd;
+mod task_reconcile;
+mod task_reconcile_cmd;
 mod template;
 #[allow(dead_code)] // Handlebars-style template rendering with --template flag.
 mod template_render;
@@ -1296,6 +1298,9 @@ enum TaskCommand {
 
     /// Execute the workflow capsule according to its current approvals and bindings.
     Run(TaskExecutionArgs),
+
+    /// Reconcile retained host completion evidence without invoking or replaying a step.
+    Reconcile(task_reconcile_cmd::TaskReconcileArgs),
 }
 
 #[derive(Args, Debug, Serialize)]
@@ -6107,8 +6112,37 @@ impl HostAdminClient {
         Self::new_with_admin_credential(endpoint, token.as_ref().map(|value| value.as_str()))
     }
 
+    fn for_invocation_inspection(endpoint: &str) -> Result<Self> {
+        Self::new_with_transport(endpoint, None, true).map_err(|_| {
+            anyhow::anyhow!(
+                "invocation inspection requires HTTPS, literal loopback HTTP, or a Unix socket with a valid host read deadline"
+            )
+        })
+    }
+
     fn new_with_admin_credential(endpoint: &str, token: Option<&str>) -> Result<Self> {
+        Self::new_with_transport(endpoint, token, false)
+    }
+
+    fn new_with_transport(
+        endpoint: &str,
+        token: Option<&str>,
+        protected_inspection: bool,
+    ) -> Result<Self> {
         let endpoint = normalize_host_endpoint(endpoint)?;
+        let unix_socket = cfg!(unix)
+            && (endpoint.starts_with("unix://") || endpoint.starts_with('/'));
+        if protected_inspection && !unix_socket {
+            let url = Url::parse(&endpoint)?;
+            let literal_loopback = match url.host() {
+                Some(url::Host::Ipv4(address)) => address.is_loopback(),
+                Some(url::Host::Ipv6(address)) => address.is_loopback(),
+                _ => false,
+            };
+            if url.scheme() != "https" && !(url.scheme() == "http" && literal_loopback) {
+                bail!("invocation inspection requires a confidential host transport");
+            }
+        }
         let configured_timeout = match std::env::var(HOST_READ_TIMEOUT_ENV) {
             Ok(value) => Some(value),
             Err(std::env::VarError::NotPresent) => None,
@@ -6137,6 +6171,13 @@ impl HostAdminClient {
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never())
             .default_headers(headers);
+        // Invocation inspection carries owner authority. A host selected by the
+        // caller must never inherit a proxy from the process environment.
+        let builder = if protected_inspection {
+            builder.no_proxy()
+        } else {
+            builder
+        };
 
         #[cfg(unix)]
         {
@@ -35932,6 +35973,7 @@ fn task_dispatch(args: &TaskArgs, explicit_host: Option<&str>) -> Result<Dispatc
         TaskCommand::Bind(args) => task_bind_dispatch(args),
         TaskCommand::Approve(args) => task_approve_dispatch(args),
         TaskCommand::Run(args) => task_run_dispatch(args, explicit_host),
+        TaskCommand::Reconcile(args) => task_reconcile_cmd::dispatch(args, explicit_host),
     };
     match result {
         Err(error) => {
@@ -35953,6 +35995,7 @@ fn task_access_failure(args: &TaskArgs, error: &workflow::TaskAccessError) -> Di
         TaskCommand::Bind(args) => ("bind", Some(args.task_id.as_str())),
         TaskCommand::Approve(args) => ("approve", Some(args.task_id.as_str())),
         TaskCommand::Run(args) => ("run", Some(args.task_id.as_str())),
+        TaskCommand::Reconcile(args) => ("reconcile", Some(args.task_id.as_str())),
         TaskCommand::Create(_) => ("create", None),
         TaskCommand::List(_) => ("list", None),
     };
@@ -40066,6 +40109,160 @@ max_state_replication_staleness_secs = 120
     }
 
     #[test]
+    fn invocation_inspection_transport_accepts_https_and_literal_loopback() {
+        for (endpoint, expected) in [
+            (
+                "https://inspection.example.test",
+                "https://inspection.example.test",
+            ),
+            ("https://192.0.2.10:8787/", "https://192.0.2.10:8787"),
+            ("http://127.0.0.1:8787", "http://127.0.0.1:8787"),
+            ("http://127.0.0.2:8787", "http://127.0.0.2:8787"),
+            ("http://[::1]:8787/", "http://[::1]:8787"),
+            ("tcp://127.0.0.1:8787/", "http://127.0.0.1:8787"),
+            (" 127.0.0.1:8787/ ", "http://127.0.0.1:8787"),
+        ] {
+            let client = super::HostAdminClient::for_invocation_inspection(endpoint)
+                .expect("confidential inspection endpoint should build");
+            assert_eq!(client.endpoint, expected);
+            assert_eq!(client.base_url, expected);
+        }
+
+        super::HostAdminClient::new("http://ordinary-host.example.test")
+            .expect("ordinary host discovery keeps its existing transport policy");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invocation_inspection_transport_accepts_unix_sockets() {
+        for endpoint in [
+            "unix:///tmp/fcp-invocation-inspection.sock",
+            "/tmp/fcp-invocation-inspection.sock",
+        ] {
+            let client = super::HostAdminClient::for_invocation_inspection(endpoint)
+                .expect("Unix inspection endpoint should build without opening the socket");
+            assert_eq!(client.endpoint, endpoint);
+            assert_eq!(client.base_url, "http://localhost");
+        }
+    }
+
+    #[test]
+    fn invocation_inspection_transport_rejects_unprotected_or_secret_endpoints() {
+        for endpoint in [
+            "http://localhost:8787",
+            "http://inspection.example.test:8787",
+            "http://192.0.2.10:8787",
+            "http://[2001:db8::1]:8787",
+            "http://127.0.0.1.example.test:8787",
+            "https://user:PRIVATE-INSPECTION-MARKER@inspection.example.test",
+            "https://inspection.example.test?token=PRIVATE-INSPECTION-MARKER",
+            "https://inspection.example.test#PRIVATE-INSPECTION-MARKER",
+            "PRIVATE-INSPECTION-MARKER://inspection.example.test",
+            "",
+        ] {
+            let error = super::HostAdminClient::for_invocation_inspection(endpoint)
+                .err()
+                .expect("unprotected or invalid inspection endpoint must be refused");
+            let message = format!("{error:#}");
+            assert_eq!(
+                message,
+                "invocation inspection requires HTTPS, literal loopback HTTP, or a Unix socket with a valid host read deadline"
+            );
+            assert!(!message.contains("PRIVATE-INSPECTION-MARKER"));
+            assert!(!message.contains("inspection.example.test"));
+        }
+    }
+
+    #[test]
+    fn invocation_inspection_transport_ignores_ambient_proxies() {
+        const CHILD_MARKER: &str = "FWC_TEST_INVOCATION_INSPECTION_NO_PROXY";
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            let mut command = std::process::Command::new(
+                std::env::current_exe().expect("test executable should be available"),
+            );
+            command
+                .arg("--exact")
+                .arg("tests::invocation_inspection_transport_ignores_ambient_proxies")
+                .arg("--nocapture")
+                .env(CHILD_MARKER, "1")
+                .env(super::HOST_READ_TIMEOUT_ENV, "2000");
+            for name in [
+                "HTTP_PROXY",
+                "http_proxy",
+                "HTTPS_PROXY",
+                "https_proxy",
+                "ALL_PROXY",
+                "all_proxy",
+            ] {
+                command.env(name, "http://127.0.0.1:1");
+            }
+            command.env("NO_PROXY", "").env("no_proxy", "");
+            let mut child = command
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("isolated inspection transport test should start");
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                if child
+                    .try_wait()
+                    .expect("isolated inspection transport test should be observable")
+                    .is_some()
+                {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let output = child
+                        .wait_with_output()
+                        .expect("timed-out inspection transport test should be reaped");
+                    panic!(
+                        "isolated inspection transport test exceeded 20 seconds:\n{}\n{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr),
+                    );
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            let output = child
+                .wait_with_output()
+                .expect("isolated inspection transport test output should be captured");
+            assert!(
+                output.status.success(),
+                "isolated inspection transport test failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+
+        let (endpoint, server, requests) = spawn_mock_host_sequence_with_timing(vec![(
+            "POST /rpc/admin/invocations".to_owned(),
+            json!({ "invocation": null, "mesh_invocation": null }),
+            Duration::ZERO,
+        )]);
+        let client = super::HostAdminClient::for_invocation_inspection(&endpoint)
+            .expect("literal loopback inspection should build");
+        let response = super::invocation_cmd::query_invocation(
+            &client,
+            &fcp_host::InvocationQueryRequest {
+                operation_id: "proxy-isolation-fixture".to_owned(),
+                attempt_id: None,
+            },
+            "fixture-owner-bearer",
+        )
+        .expect("inspection must reach the selected host despite ambient proxy settings");
+        assert!(response.invocation.is_none());
+        assert!(response.mesh_invocation.is_none());
+        server.join().expect("mock inspection server should finish");
+        assert_eq!(
+            requests.lock().expect("request log lock").len(),
+            1,
+            "inspection must perform exactly one protected lookup"
+        );
+    }
+
+    #[test]
     fn execute_context_current_returns_node_local_truth_source() {
         let (_tempdir, _path, _guard) = temp_context_config();
 
@@ -42447,6 +42644,62 @@ deny_ptrace = true
                 .expect_err("op show should not auto-correct");
         assert_eq!(error.exit_code, CliExitCode::AmbiguousCorrection);
         assert_eq!(error.payload["error"]["type"], "ambiguous-verb-object");
+    }
+
+    #[test]
+    fn prepare_cli_keeps_task_reconcile_distinct_from_create_intent() {
+        let received = [
+            "fwc",
+            "--host",
+            "https://inspection.example.test",
+            "task",
+            "reconcile",
+            "w:12345678",
+            "--admin-token-file",
+            "/tmp/PRIVATE-RECONCILE-CREDENTIAL",
+        ]
+        .map(str::to_owned);
+        let prepared = prepare_cli(&received).expect("task reconcile should parse");
+        assert_eq!(prepared.normalized_args, received);
+        assert!(prepared.corrections.is_empty());
+        assert_eq!(
+            prepared.cli.host.as_deref(),
+            Some("https://inspection.example.test")
+        );
+        let Commands::Task(args) = &prepared.cli.command else {
+            panic!("expected task command");
+        };
+        let super::TaskCommand::Reconcile(reconcile) = &args.command else {
+            panic!("reconcile must not become a create intent");
+        };
+        assert_eq!(reconcile.task_id, "w:12345678");
+        let serialized = serde_json::to_string(args).expect("task arguments should serialize");
+        assert!(serialized.contains("reconcile"));
+        assert!(!serialized.contains("PRIVATE-RECONCILE-CREDENTIAL"));
+        assert!(!serialized.contains("admin_token_file"));
+
+        let minimal = prepare_cli(
+            &["fwc", "task", "reconcile", "w:12345678"].map(str::to_owned),
+        )
+        .expect("task reconcile should allow the configured credential source");
+        assert!(matches!(
+            minimal.cli.command,
+            Commands::Task(super::TaskArgs {
+                command: super::TaskCommand::Reconcile(_),
+            })
+        ));
+
+        let intent = prepare_cli(
+            &["fwc", "task", "search GitHub issues for auth"].map(str::to_owned),
+        )
+        .expect("natural-language task intent should retain implicit creation");
+        let Commands::Task(super::TaskArgs {
+            command: super::TaskCommand::Create(args),
+        }) = intent.cli.command
+        else {
+            panic!("natural-language task intent should create a capsule");
+        };
+        assert_eq!(args.intent, "search GitHub issues for auth");
     }
 
     #[test]

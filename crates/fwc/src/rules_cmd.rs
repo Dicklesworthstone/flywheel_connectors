@@ -11,6 +11,7 @@ use chrono::{DateTime, Duration, Utc};
 use clap::{Args, Subcommand};
 use fcp_core::{EventEnvelope, Provenance, ProvenanceStep, SafetyTier, TailscaleNodeId};
 use fcp_host::{InvocationIdempotency, InvocationOutcome, InvocationQueryResponse};
+use fcp_kernel::InvokeStatus;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -1039,18 +1040,21 @@ fn verify_completion(
     let finished_at = record
         .finished_at
         .context("host completion time is not retained")?;
+    // A missing budget policy can still be finalized without recording usage.
+    // Source success and HTTP 200 do not establish a sampling child's final result.
     ensure!(
         record.durable
             && terminal.outcome == InvocationOutcome::Succeeded
             && (200..300).contains(&terminal.http_status)
             && finished_at >= record.admitted_at
-            && finalization.budget_recorded
+            && finalization.budget_finalized
             && finalization.sampling_completed != Some(false)
             && (finalization.sampling_operation_id.is_none()
                 || finalization.sampling_completed == Some(true))
             && finalization
                 .response_http_status
                 .is_some_and(|status| (200..300).contains(&status))
+            && finalization.response_status == Some(InvokeStatus::Ok)
             && (terminal.receipt_id.is_none() || finalization.receipt_recorded),
         "the host has not durably finalized a successful action; the reservation is unchanged"
     );
@@ -6255,9 +6259,11 @@ mod tests {
                 finished_at: Some(now),
                 finalization: Some(InvocationFinalization {
                     budget_recorded: true,
+                    budget_finalized: true,
                     receipt_recorded: true,
                     audit_event_id: Some("private-audit-reference".into()),
                     response_http_status: Some(200),
+                    response_status: Some(InvokeStatus::Ok),
                     ..Default::default()
                 }),
                 durable: true,
@@ -6393,6 +6399,105 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_accepts_finalized_success_without_a_configured_budget() {
+        let (_temp, args, mut executor) = fixture(vec![rule()], &[event("one")]);
+        executor.replies.push_back(FakeReply::Unknown);
+        assert!(run(&args, &mut executor).unwrap().rejected);
+        let (reconcile_args, mut evidence, key) = reconciliation_fixture(&args, &executor);
+        let finalization = evidence
+            .response
+            .invocation
+            .as_mut()
+            .unwrap()
+            .finalization
+            .as_mut()
+            .unwrap();
+        finalization.budget_recorded = false;
+        assert!(finalization.budget_finalized);
+        assert_eq!(finalization.response_status, Some(InvokeStatus::Ok));
+
+        let result = reconcile(&reconcile_args, &mut evidence).unwrap();
+        assert!(!result.rejected);
+        assert_eq!(result.payload["data"]["executed"], 0);
+        assert_eq!(executor.calls, 1);
+        let (state, _) = load_run_state(&executor.state_path).unwrap();
+        assert_eq!(state.attempts[&key].status, AttemptStatus::Completed);
+        assert!(state.attempts[&key].reconciliation.is_some());
+        let mut replay = FakeExecutor::new(executor.state_path);
+        assert!(!run(&args, &mut replay).unwrap().rejected);
+        assert_eq!(replay.calls, 0);
+    }
+
+    #[test]
+    fn reconcile_rejects_source_success_when_a_completed_child_returns_an_error() {
+        let mut sampling_rule = rule();
+        sampling_rule.action.connector = "mcp".into();
+        sampling_rule.action.operation = "mcp.sampling.handle".into();
+        let (_temp, args, mut executor) = fixture(vec![sampling_rule], &[event("one")]);
+        executor.scope.connector = "fcp.mcp:utility:1.0.0".into();
+        executor.scope.operation = "mcp.sampling.handle".into();
+        executor.replies.push_back(FakeReply::Unknown);
+        assert!(run(&args, &mut executor).unwrap().rejected);
+        let bytes = fs::read(&executor.state_path).unwrap();
+        let (reconcile_args, mut evidence, key) = reconciliation_fixture(&args, &executor);
+        let record = evidence.response.invocation.as_mut().unwrap();
+        assert_eq!(
+            record.terminal.as_ref().unwrap().outcome,
+            InvocationOutcome::Succeeded
+        );
+        let finalization = record.finalization.as_mut().unwrap();
+        finalization.sampling_operation_id = Some("completed-sampling-child".into());
+        finalization.sampling_completed = Some(true);
+        finalization.response_status = Some(InvokeStatus::Error);
+        assert_eq!(finalization.response_http_status, Some(200));
+
+        assert!(reconcile(&reconcile_args, &mut evidence).is_err());
+        assert_eq!(fs::read(&executor.state_path).unwrap(), bytes);
+        assert_eq!(executor.calls, 1);
+        let (state, _) = load_run_state(&executor.state_path).unwrap();
+        assert_eq!(state.attempts[&key].status, AttemptStatus::Unknown);
+        assert!(state.attempts[&key].reconciliation.is_none());
+    }
+
+    #[test]
+    fn reconcile_legacy_finalization_defaults_never_establish_new_success() {
+        for missing in [
+            vec!["budget_finalized"],
+            vec!["response_status"],
+            vec!["budget_finalized", "response_status"],
+        ] {
+            let (_temp, args, mut executor) = fixture(vec![rule()], &[event("one")]);
+            executor.replies.push_back(FakeReply::Unknown);
+            assert!(run(&args, &mut executor).unwrap().rejected);
+            let bytes = fs::read(&executor.state_path).unwrap();
+            let (reconcile_args, mut evidence, key) = reconciliation_fixture(&args, &executor);
+            let mut historical = serde_json::to_value(&evidence.response).unwrap();
+            let finalization = historical["invocation"]["finalization"]
+                .as_object_mut()
+                .unwrap();
+            for field in missing {
+                assert!(finalization.remove(field).is_some());
+            }
+            evidence.response = serde_json::from_value(historical).unwrap();
+            let finalization = evidence
+                .response
+                .invocation
+                .as_ref()
+                .unwrap()
+                .finalization
+                .as_ref()
+                .unwrap();
+            assert!(!finalization.budget_finalized || finalization.response_status.is_none());
+            assert!(reconcile(&reconcile_args, &mut evidence).is_err());
+            assert_eq!(fs::read(&executor.state_path).unwrap(), bytes);
+            assert_eq!(executor.calls, 1);
+            let (state, _) = load_run_state(&executor.state_path).unwrap();
+            assert_eq!(state.attempts[&key].status, AttemptStatus::Unknown);
+            assert!(state.attempts[&key].reconciliation.is_none());
+        }
+    }
+
+    #[test]
     fn reconcile_requires_complete_durable_success_with_the_exact_authorized_key() {
         fn record(response: &mut InvocationQueryResponse) -> &mut fcp_host::InvocationRecord {
             response.invocation.as_mut().unwrap()
@@ -6448,7 +6553,7 @@ mod tests {
                 retained.finished_at = Some(retained.admitted_at - Duration::seconds(1));
             },
             |response| record(response).finalization = None,
-            |response| finalization(response).budget_recorded = false,
+            |response| finalization(response).budget_finalized = false,
             |response| finalization(response).receipt_recorded = false,
             |response| finalization(response).sampling_completed = Some(false),
             |response| {
@@ -6456,6 +6561,8 @@ mod tests {
             },
             |response| finalization(response).response_http_status = None,
             |response| finalization(response).response_http_status = Some(502),
+            |response| finalization(response).response_status = None,
+            |response| finalization(response).response_status = Some(InvokeStatus::Error),
         ];
         for (index, mutate) in mutations.iter().enumerate() {
             let (_temp, args, mut executor) = fixture(vec![rule()], &[event("one")]);

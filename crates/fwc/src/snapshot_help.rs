@@ -283,6 +283,7 @@ mod tests {
                 examples: vec!["fwc task create \"deploy to staging\"", "fwc task list"],
                 subcommands: vec![
                     "create", "show", "list", "resolve", "ask", "advance", "bind", "approve", "run",
+                    "reconcile",
                 ],
                 hidden: false,
                 advanced: false,

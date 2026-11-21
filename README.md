@@ -1440,9 +1440,13 @@ fwc --host ORIGINAL_HOST rules reconcile REQUEST_ID \
 
 Reconciliation checks the original rule definition, canonical host, zone,
 verified principal, target operation, and authorized idempotency binding. It
-requires successful durable completion, including the host's finalization
-obligations. Missing or pruned history, forwarding records, ephemeral records,
-failed or unknown outcomes, and mismatched evidence leave the reservation intact.
+requires successful durable completion, including an explicit successful final
+invoke envelope and a completed budget decision. A zone without a budget policy
+can complete that decision without recording a debit. A failed sampling child
+cannot be mistaken for success merely because the source succeeded and HTTP
+returned 200. Older records missing these finalization markers remain unresolved.
+Missing or pruned history, forwarding records, ephemeral records, failed or
+unknown outcomes, and mismatched evidence leave the reservation intact.
 The original action and trigger must still be defined; throttle, safety-ceiling,
 and enable/disable edits do not change that effect identity.
 
@@ -1823,11 +1827,43 @@ provider.
 # Inspect the fence, attempt identity and complete retained execution history.
 fwc --json task show w:7f3k9a1b
 
+# Reconcile the saved attempt against its original host without sending work.
+fwc --json --host http://127.0.0.1:8787 task reconcile w:7f3k9a1b \
+    --admin-token-file host-admin.token
+
 # After reconciling prior host/provider effects, create a separate capsule
 # only when another execution is intended. Bind and approve its returned ID.
 fwc task create 'create a GitHub issue titled "Additional follow-up"' \
     --connector github --zone z:work
 ```
+
+`task reconcile` compares the retained request, connector, operation, zone and
+opaque token/effect binding with the selected host's protected invocation history.
+The selected endpoint must match the host recorded before dispatch. Supply its
+admin bearer through `--admin-token-file` or `FCP_HOST_ADMIN_BEARER_TOKEN`.
+These inspection reads accept HTTPS, literal loopback HTTP, or Unix sockets;
+they do not follow redirects, use ambient proxies, or retry requests.
+
+The first matching observation pins the host's local or mesh journal and attempt
+number, even while the job is active or its result remains unknown. Later reads
+cannot switch to a newer attempt. Local completion requires durable success plus
+explicit final response, budget, audit, receipt and sampling evidence as
+applicable. Mesh completion is labeled as a durable observation at the origin
+host, without claiming that all executor finalization is known.
+
+A capsule completes only when every planned step has a saved successful receipt
+or matching completion proof. If the process died after the last receipt but
+before saving the aggregate result, reconciliation can finish entirely from the
+local journal. Unstarted downstream steps, missing history, failed responses,
+incomplete finalization and older fences without step bindings remain fenced.
+Older hosts without the new final-envelope and budget-completion markers cannot
+provide automatic proof of local completion.
+
+Reconciliation preserves the original receipts, including lost-response errors,
+and adds completion references. It reports `result_recovered: false`: missing
+result bodies are not reconstructed. It does not resume downstream work or send
+another invocation. A completed capsule remains consumed; repeated reconciliation
+is idempotent and does not authorize another run.
 
 Successful simulations and definite failures before an effect can still be
 corrected and executed. Binding changes advance the capsule revision without
@@ -1964,8 +2000,10 @@ fwc watch REQUEST_ID --host http://127.0.0.1:8787 \
 
 The credential is the host admin bearer token, supplied by the file or
 `FCP_HOST_ADMIN_BEARER_TOKEN`. It is sent only to that host's invocation
-inspection endpoint with owner-zone access. Watching submits no invocation and
-does not replay or cancel work.
+inspection endpoint with owner-zone access. `invocation` and `watch` require
+HTTPS, literal loopback HTTP, or a Unix socket, and disable ambient proxies,
+redirects and transport retries. Watching submits no invocation and does not
+replay or cancel work.
 
 The command polls at the requested positive interval until the retained attempt
 settles, becomes unresolvable, or the observation deadline expires. One monotonic

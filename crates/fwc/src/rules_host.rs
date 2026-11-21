@@ -189,7 +189,7 @@ impl HostRuleReconciler {
     fn new(host: &ResolvedHostConfig, options: &RulesReconcileOptions) -> Result<Self> {
         let endpoint = canonical_host(&host.endpoint)
             .map_err(|_| anyhow::anyhow!("invalid reconciliation host endpoint"))?;
-        let client = HostAdminClient::new(&endpoint)
+        let client = HostAdminClient::for_invocation_inspection(&endpoint)
             .map_err(|_| anyhow::anyhow!("could not construct the reconciliation host client"))?;
         let token = read_admin_token(options.admin_token_file.as_deref())?;
         Ok(Self {

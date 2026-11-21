@@ -15,12 +15,13 @@ use uuid::Uuid;
 use crate::{
     intent::{self, CompiledIntent, IntentMode, WorkflowTruth},
     readiness::CommandAvailability,
+    task_reconcile::{TaskInvocationAttempt, TaskInvocationCompletion},
 };
 
 const TASK_SCHEMA_VERSION: u32 = 1;
 const PAYLOAD_PLACEHOLDER: &str = "./intent-payload.json";
 const TASK_SUBCOMMANDS: &[&str] = &[
-    "create", "show", "list", "resolve", "ask", "advance", "bind", "approve", "run",
+    "create", "show", "list", "resolve", "ask", "advance", "bind", "approve", "run", "reconcile",
 ];
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -102,12 +103,39 @@ pub struct TaskStepExecution {
     pub started_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invocation: Option<TaskInvocationBinding>,
+    /// The first exact host observation pins the journal and generation even
+    /// while the result remains active, missing, or otherwise uncertain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_attempt: Option<TaskInvocationAttempt>,
+    /// Completion metadata supplements the original receipt. It never replaces
+    /// a lost result body or supplies input for undispatched downstream work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconciliation: Option<TaskInvocationCompletion>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<String>,
     /// The executor supplies its redacted primitive receipt, never argv with
     /// runtime authority or the request's raw capability token.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub receipt: Option<Value>,
+}
+
+impl TaskStepExecution {
+    /// A retained refusal or definitive connector failure cannot be replaced
+    /// with a later successful host observation.
+    #[must_use]
+    pub fn completion_conflicts_with_receipt(&self) -> bool {
+        receipt_contradicts_completion(self.receipt.as_ref())
+    }
+
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        step_succeeded(self)
+            || self.reconciliation.as_ref().is_some_and(|completion| {
+                self.invocation.is_some()
+                    && self.observed_attempt.as_ref() == Some(&completion.attempt())
+                    && !receipt_contradicts_completion(self.receipt.as_ref())
+            })
+    }
 }
 
 /// Payload-free identity synced after preflight and before an actual invoke.
@@ -939,6 +967,8 @@ impl TaskLease<'_> {
                         side_effecting: step.side_effecting,
                         started_at: None,
                         invocation: None,
+                        observed_attempt: None,
+                        reconciliation: None,
                         finished_at: None,
                         receipt: None,
                     })
@@ -1059,6 +1089,181 @@ impl TaskLease<'_> {
         Ok(task)
     }
 
+    /// Pin the first identity-matching host journal and generation before the
+    /// caller interprets completion. A pending or unsuccessful observation is
+    /// still retained, so a later lookup cannot silently select another attempt.
+    pub fn record_invocation_observation(
+        &self,
+        expected_task_attempt_id: &str,
+        ordinal: usize,
+        observation: TaskInvocationAttempt,
+    ) -> Result<()> {
+        let mut task = self.reconciliation_task(expected_task_attempt_id)?;
+        let completed = task.execution_fence.as_ref().expect("fence checked").state
+            == TaskExecutionState::Completed;
+        let step = reconciliation_step_mut(&mut task, ordinal)?;
+        ensure!(
+            observation.attempt_id > 0,
+            "workflow host observation has an invalid attempt generation"
+        );
+        if let Some(previous) = &step.observed_attempt {
+            ensure!(
+                previous == &observation,
+                "workflow host observation changed its pinned journal or attempt"
+            );
+            return Ok(());
+        }
+        ensure!(
+            !completed,
+            "completed workflow evidence cannot acquire a different host observation"
+        );
+        step.observed_attempt = Some(observation);
+        recompute_task(&mut task, true);
+        self.store.save(&task)
+    }
+
+    /// Attach already-verified, payload-free completion to the exact pinned
+    /// invocation. Original receipts, including lost-response diagnostics, are
+    /// preserved. The entire plan must be covered before its fence completes.
+    pub fn record_invocation_completion(
+        &self,
+        expected_task_attempt_id: &str,
+        ordinal: usize,
+        completion: TaskInvocationCompletion,
+    ) -> Result<WorkflowTask> {
+        let mut task = self.reconciliation_task(expected_task_attempt_id)?;
+        let completed = task.execution_fence.as_ref().expect("fence checked").state
+            == TaskExecutionState::Completed;
+        let step = reconciliation_step_mut(&mut task, ordinal)?;
+        validate_step_completion(step, &completion)?;
+        if let Some(previous) = &step.reconciliation {
+            ensure!(
+                previous == &completion,
+                "workflow completion evidence changed after it was retained"
+            );
+            return Ok(task);
+        }
+        ensure!(
+            !completed,
+            "completed workflow evidence cannot acquire a different completion proof"
+        );
+        step.reconciliation = Some(completion);
+        self.save_reconciliation(task, true)
+    }
+
+    /// Finish from retained evidence only. This also recovers a lost aggregate
+    /// receipt when every primitive outcome was already saved successfully.
+    /// Unstarted, unsupported, or uncertain steps remain fenced for review.
+    pub fn finish_reconciliation(
+        &self,
+        expected_task_attempt_id: &str,
+    ) -> Result<WorkflowTask> {
+        let task = self.reconciliation_task(expected_task_attempt_id)?;
+        if task.execution_fence.as_ref().expect("fence checked").state
+            == TaskExecutionState::Completed
+        {
+            return Ok(task);
+        }
+        self.save_reconciliation(task, false)
+    }
+
+    fn reconciliation_task(&self, expected_task_attempt_id: &str) -> Result<WorkflowTask> {
+        let task = self
+            .load()?
+            .context("workflow capsule disappeared before reconciliation")?;
+        let fence = task
+            .execution_fence
+            .as_ref()
+            .context("workflow capsule has no retained execution attempt")?;
+        ensure!(
+            fence.attempt_id == expected_task_attempt_id && fence.revision == task.revision,
+            "workflow reconciliation no longer owns the retained attempt and revision"
+        );
+        ensure!(
+            fence.journal.is_some(),
+            "legacy workflow execution has no exact primitive identities to reconcile"
+        );
+        Ok(task)
+    }
+
+    fn save_reconciliation(
+        &self,
+        mut task: WorkflowTask,
+        force_write: bool,
+    ) -> Result<WorkflowTask> {
+        let fence = task.execution_fence.as_ref().expect("fence checked");
+        let journal = fence.journal.as_ref().expect("journal checked");
+        let completed_count = journal.steps.iter().filter(|step| step.is_complete()).count();
+        let unresolved_count = journal.steps.len() - completed_count;
+        let completed = unresolved_count == 0;
+        let state = if completed {
+            TaskExecutionState::Completed
+        } else {
+            TaskExecutionState::NeedsReview
+        };
+        let executed_steps = journal
+            .steps
+            .iter()
+            .filter_map(|step| step.receipt.as_ref())
+            .collect::<Vec<_>>();
+        let reconciled_steps = journal
+            .steps
+            .iter()
+            .filter_map(|step| {
+                step.reconciliation.as_ref().map(|completion| {
+                    json!({
+                        "ordinal": step.ordinal,
+                        "command": step.command,
+                        "request_id": step.invocation.as_ref().map(|binding| &binding.request_id),
+                        "host": step.invocation.as_ref().map(|binding| &binding.host),
+                        "completion": completion,
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        let unresolved_steps = journal
+            .steps
+            .iter()
+            .filter(|step| !step.is_complete())
+            .map(|step| {
+                json!({
+                    "ordinal": step.ordinal,
+                    "command": step.command,
+                    "side_effecting": step.side_effecting,
+                    "started": step.started_at.is_some(),
+                    "request_id": step.invocation.as_ref().map(|binding| &binding.request_id),
+                    "observed_attempt": step.observed_attempt,
+                })
+            })
+            .collect::<Vec<_>>();
+        let execution = json!({
+            "status": if completed { "materialized" } else { "execution-needs-review" },
+            "reconciliation_status": if completed { "completed" } else if completed_count > 0 { "partial" } else { "unresolved" },
+            "attempt_id": fence.attempt_id,
+            "planned_count": journal.steps.len(),
+            "completed_count": completed_count,
+            "unresolved_count": unresolved_count,
+            "executed_count": executed_steps.len(),
+            "executed_steps": executed_steps,
+            "reconciled_steps": reconciled_steps,
+            "unresolved_steps": unresolved_steps,
+            "automatic_retry_allowed": false,
+            "completion_only": true,
+            "outputs_reconstructed": false,
+        });
+        let unchanged = fence.state == state
+            && task.last_execution().is_some_and(|receipt| {
+                receipt.trigger == "reconcile" && receipt.execution == execution
+            });
+        if force_write || !unchanged {
+            task.execution_fence.as_mut().expect("fence checked").state = state;
+            append_execution_receipt(&mut task, "reconcile", "observe", execution);
+            recompute_task(&mut task, true);
+            self.store.save(&task)?;
+        }
+        Ok(task)
+    }
+
     /// Save the terminal evidence and the fence transition in one atomic write.
     /// A complete materialized result consumes the capsule. Unknown or partial
     /// effects require review; a definite pre-effect failure or simulation may
@@ -1119,10 +1324,83 @@ fn pending_journal_mut(task: &mut WorkflowTask) -> Result<&mut TaskExecutionJour
         .context("workflow execution has no retained primitive identities")
 }
 
+fn reconciliation_step_mut(
+    task: &mut WorkflowTask,
+    ordinal: usize,
+) -> Result<&mut TaskStepExecution> {
+    let step = pending_journal_mut(task)?
+        .steps
+        .iter_mut()
+        .find(|step| step.ordinal == ordinal)
+        .context("workflow reconciliation primitive is not in the retained plan")?;
+    ensure!(
+        step.command == "invoke" && step.started_at.is_some() && step.invocation.is_some(),
+        "workflow primitive has no exact dispatched invocation to reconcile"
+    );
+    Ok(step)
+}
+
 fn step_succeeded(step: &TaskStepExecution) -> bool {
-    step.receipt
-        .as_ref()
-        .is_some_and(|receipt| receipt["status"] == "executed" && receipt["exit_code"] == 0)
+    step.receipt.as_ref().is_some_and(|receipt| {
+        receipt["status"] == "executed"
+            && receipt["exit_code"] == 0
+            && receipt["primitive_dispatched"] == true
+            && (step.command != "invoke"
+                || (receipt["result"]["error"]["type"] != "invoke-outcome-unknown"
+                    && !matches!(
+                        receipt["result"]["outcome"].as_str(),
+                        Some("unknown" | "outcome_unknown")
+                    )
+                    && !receipt_contradicts_completion(Some(receipt))))
+    })
+}
+
+fn receipt_contradicts_completion(receipt: Option<&Value>) -> bool {
+    let Some(receipt) = receipt else {
+        return false;
+    };
+    let result = &receipt["result"];
+    let unknown = result["error"]["type"] == "invoke-outcome-unknown"
+        || matches!(result["outcome"].as_str(), Some("unknown" | "outcome_unknown"));
+    receipt["primitive_dispatched"] == false
+        || result["invoke_attempted"] == false
+        || matches!(result["phase"].as_str(), Some("preflight" | "input-authoring"))
+        || result["response"]["status"] == "error"
+        || result["response"]
+            .get("error")
+            .is_some_and(|error| !error.is_null())
+        || (result["phase"] == "execution" && result["status"] == "error" && !unknown)
+}
+
+fn validate_step_completion(
+    step: &TaskStepExecution,
+    completion: &TaskInvocationCompletion,
+) -> Result<()> {
+    ensure!(
+        step.command == "invoke"
+            && step.invocation.is_some()
+            && step.started_at.is_some()
+            && completion.attempt_id > 0
+            && step.observed_attempt.as_ref() == Some(&completion.attempt())
+            && completion.finished_at >= completion.admitted_at,
+        "workflow completion does not match its durably pinned invocation attempt"
+    );
+    ensure!(
+        !receipt_contradicts_completion(step.receipt.as_ref()),
+        "workflow completion contradicts a retained definitive primitive outcome"
+    );
+    ensure!(
+        [completion.receipt_id.as_deref(), completion.audit_event_id.as_deref()]
+            .into_iter()
+            .flatten()
+            .all(|value| {
+                !value.trim().is_empty()
+                    && value.len() <= 512
+                    && !value.chars().any(char::is_control)
+            }),
+        "workflow completion contains invalid evidence references"
+    );
+    Ok(())
 }
 
 fn validate_invocation_binding(binding: &TaskInvocationBinding) -> Result<()> {
@@ -1225,6 +1503,15 @@ fn validate_execution_journal(journal: &TaskExecutionJournal) -> Result<()> {
                 "workflow execution journal has an ambiguous invocation identity"
             );
             validate_invocation_binding(binding)?;
+        }
+        if let Some(observation) = &step.observed_attempt {
+            ensure!(
+                step.invocation.is_some() && observation.attempt_id > 0,
+                "workflow execution journal has an invalid host attempt pin"
+            );
+        }
+        if let Some(completion) = &step.reconciliation {
+            validate_step_completion(step, completion)?;
         }
         if let Some(receipt) = &step.receipt {
             validate_step_receipt(step, receipt)?;
@@ -1628,7 +1915,7 @@ fn derive_capsule_status(task: &WorkflowTask) -> String {
 
 fn build_task_next_actions(task: &WorkflowTask) -> Vec<String> {
     if let Some(state) = task.execution_blocker() {
-        return vec![
+        let mut actions = vec![
             format!(
                 "Inspect the retained execution evidence with `fwc task show {}`.",
                 task.id
@@ -1640,6 +1927,18 @@ fn build_task_next_actions(task: &WorkflowTask) -> Vec<String> {
                 "Reconcile any completed or unknown host/provider effects before explicitly creating a new task. Rebinding or approving this capsule cannot make a retry safe.".to_owned()
             },
         ];
+        if state != TaskExecutionState::Completed
+            && task
+                .execution_fence
+                .as_ref()
+                .is_some_and(|fence| fence.journal.is_some())
+        {
+            actions.push(format!(
+                "Inspect completion without repeating work with `fwc task reconcile {} --host <original-host> --admin-token-file <path>`.",
+                task.id
+            ));
+        }
+        return actions;
     }
     let mut actions = Vec::new();
 
@@ -2216,6 +2515,293 @@ mod tests {
         }
     }
 
+    fn pending_invoke(
+        store: &TaskStore,
+    ) -> (
+        super::WorkflowTask,
+        super::TaskLease<'_>,
+        super::TaskExecutionTicket,
+        super::TaskStepExecution,
+    ) {
+        let task = ready_task(store);
+        let lease = store.lock_task(&task.id).unwrap();
+        let ticket = lease.begin_execution("run", "approve").unwrap();
+        let journal = lease
+            .load()
+            .unwrap()
+            .unwrap()
+            .execution_fence
+            .unwrap()
+            .journal
+            .unwrap();
+        for step in journal.steps {
+            lease.record_step_started(&ticket, step.ordinal).unwrap();
+            if step.command == "invoke" {
+                lease
+                    .record_invocation_binding(
+                        &ticket,
+                        step.ordinal,
+                        invocation_binding("req-reconcile"),
+                    )
+                    .unwrap();
+                return (task, lease, ticket, step);
+            }
+            lease
+                .record_step_finished(&ticket, step.ordinal, successful_step_receipt(&step))
+                .unwrap();
+        }
+        panic!("ready search workflow must contain an invocation");
+    }
+
+    fn completion_proof(attempt_id: u64) -> crate::task_reconcile::TaskInvocationCompletion {
+        crate::task_reconcile::TaskInvocationCompletion {
+            source: crate::task_reconcile::TaskInvocationCompletionSource::LocalFinalized,
+            attempt_id,
+            admitted_at: "2026-05-01T12:00:00Z".parse().unwrap(),
+            finished_at: "2026-05-01T12:00:01Z".parse().unwrap(),
+            receipt_id: Some("receipt:reconciled".to_owned()),
+            audit_event_id: Some("audit:reconciled".to_owned()),
+        }
+    }
+
+    #[test]
+    fn task_reconcile_recovers_lost_response_and_preserves_original_evidence() {
+        let store = store();
+        let (task, lease, ticket, step) = pending_invoke(&store);
+        let mut unknown = successful_step_receipt(&step);
+        unknown["status"] = json!("failed");
+        unknown["exit_code"] = json!(1);
+        unknown["result"] = json!({
+            "request_id":"req-reconcile", "phase":"execution", "status":"error",
+            "error":{"type":"invoke-outcome-unknown"}, "outcome":"outcome_unknown",
+        });
+        lease
+            .record_step_finished(&ticket, step.ordinal, unknown.clone())
+            .unwrap();
+        drop(lease);
+
+        let reopened = TaskStore::at_path(store.root_dir().to_path_buf());
+        let lease = reopened.lock_task(&task.id).unwrap();
+        let proof = completion_proof(3);
+        lease
+            .record_invocation_observation(ticket.attempt_id(), step.ordinal, proof.attempt())
+            .unwrap();
+        let recovered = lease
+            .record_invocation_completion(ticket.attempt_id(), step.ordinal, proof.clone())
+            .unwrap();
+        assert_eq!(recovered.capsule_status, "materialized");
+        let saved_step = recovered
+            .execution_fence
+            .as_ref()
+            .unwrap()
+            .journal
+            .as_ref()
+            .unwrap()
+            .steps
+            .iter()
+            .find(|saved| saved.ordinal == step.ordinal)
+            .unwrap();
+        assert_eq!(saved_step.receipt.as_ref(), Some(&unknown));
+        assert_eq!(saved_step.reconciliation.as_ref(), Some(&proof));
+        assert!(saved_step.is_complete());
+        let receipt = recovered.last_execution().unwrap();
+        assert_eq!(receipt.execution["reconciliation_status"], "completed");
+        assert_eq!(receipt.execution["automatic_retry_allowed"], false);
+        assert_eq!(receipt.execution["outputs_reconstructed"], false);
+        let repeated = lease
+            .record_invocation_completion(ticket.attempt_id(), step.ordinal, proof.clone())
+            .unwrap();
+        assert_eq!(
+            repeated.execution_history.len(),
+            recovered.execution_history.len()
+        );
+        let mut changed = proof;
+        changed.receipt_id = Some("receipt:different".to_owned());
+        assert!(
+            lease
+                .record_invocation_completion(ticket.attempt_id(), step.ordinal, changed)
+                .is_err()
+        );
+        assert!(lease.record_step_started(&ticket, step.ordinal).is_err());
+        assert!(lease.begin_execution("run", "approve").is_err());
+    }
+
+    #[test]
+    fn task_reconcile_persists_attempt_selection_before_completion_is_proven() {
+        let store = store();
+        let (task, lease, ticket, step) = pending_invoke(&store);
+        let proof = completion_proof(7);
+        assert!(
+            lease
+                .record_invocation_completion(ticket.attempt_id(), step.ordinal, proof.clone())
+                .is_err(),
+            "completion cannot be accepted before its attempt pin is durable"
+        );
+        lease
+            .record_invocation_observation(ticket.attempt_id(), step.ordinal, proof.attempt())
+            .unwrap();
+        drop(lease);
+        let reopened = TaskStore::at_path(store.root_dir().to_path_buf());
+        let lease = reopened.lock_task(&task.id).unwrap();
+        let retained = lease.load().unwrap().unwrap();
+        let bound = retained
+            .execution_fence
+            .unwrap()
+            .journal
+            .unwrap()
+            .steps
+            .into_iter()
+            .find(|saved| saved.ordinal == step.ordinal)
+            .unwrap();
+        assert_eq!(bound.observed_attempt, Some(proof.attempt()));
+        assert!(bound.reconciliation.is_none());
+        assert!(bound.receipt.is_none());
+        for changed in [
+            completion_proof(8).attempt(),
+            crate::task_reconcile::TaskInvocationAttempt {
+                source: crate::task_reconcile::TaskInvocationSource::Mesh,
+                attempt_id: 7,
+            },
+        ] {
+            assert!(
+                lease
+                    .record_invocation_observation(ticket.attempt_id(), step.ordinal, changed)
+                    .is_err()
+            );
+        }
+        assert!(
+            lease
+                .record_invocation_completion(ticket.attempt_id(), step.ordinal, completion_proof(8))
+                .is_err()
+        );
+        let unresolved = lease.finish_reconciliation(ticket.attempt_id()).unwrap();
+        assert_eq!(unresolved.capsule_status, "execution-needs-review");
+        assert!(lease.finish_reconciliation("different-task-attempt").is_err());
+    }
+
+    #[test]
+    fn task_reconcile_does_not_resume_unstarted_or_unsupported_downstream_work() {
+        let store = store();
+        let (_task, lease, ticket, mut downstream) = pending_invoke(&store);
+        let invoke_ordinal = downstream.ordinal;
+        downstream.ordinal += 1;
+        downstream.command = "unsupported-effect".to_owned();
+        downstream.side_effecting = true;
+        let mut interrupted = lease.load().unwrap().unwrap();
+        interrupted
+            .execution_fence
+            .as_mut()
+            .unwrap()
+            .journal
+            .as_mut()
+            .unwrap()
+            .steps
+            .push(downstream.clone());
+        store.save(&interrupted).unwrap();
+        let proof = completion_proof(2);
+        lease
+            .record_invocation_observation(ticket.attempt_id(), invoke_ordinal, proof.attempt())
+            .unwrap();
+        let partial = lease
+            .record_invocation_completion(ticket.attempt_id(), invoke_ordinal, proof)
+            .unwrap();
+        assert_eq!(partial.capsule_status, "execution-needs-review");
+        let receipt = partial.last_execution().unwrap();
+        assert_eq!(receipt.execution["reconciliation_status"], "partial");
+        assert_eq!(receipt.execution["unresolved_count"], 1);
+        assert_eq!(receipt.execution["unresolved_steps"][0]["started"], false);
+        let repeated = lease.finish_reconciliation(ticket.attempt_id()).unwrap();
+        assert_eq!(
+            repeated.execution_history.len(),
+            partial.execution_history.len()
+        );
+        assert!(
+            lease
+                .record_invocation_observation(
+                    ticket.attempt_id(),
+                    downstream.ordinal,
+                    completion_proof(3).attempt(),
+                )
+                .is_err()
+        );
+        assert!(lease.approve().is_err());
+        assert!(lease.begin_execution("run", "approve").is_err());
+    }
+
+    #[test]
+    fn task_reconcile_cannot_overwrite_a_definitive_connector_error() {
+        let store = store();
+        let (_task, lease, ticket, step) = pending_invoke(&store);
+        let mut failed = successful_step_receipt(&step);
+        failed["status"] = json!("failed");
+        failed["exit_code"] = json!(1);
+        failed["result"] = json!({
+            "phase":"execution", "status":"error",
+            "request":{"request_id":"req-reconcile"},
+            "response":{"id":"req-reconcile", "status":"error", "error":{"code":"denied"}},
+        });
+        lease
+            .record_step_finished(&ticket, step.ordinal, failed.clone())
+            .unwrap();
+        let proof = completion_proof(4);
+        lease
+            .record_invocation_observation(ticket.attempt_id(), step.ordinal, proof.attempt())
+            .unwrap();
+        assert!(
+            lease
+                .record_invocation_completion(ticket.attempt_id(), step.ordinal, proof.clone())
+                .is_err()
+        );
+        let retained = lease.finish_reconciliation(ticket.attempt_id()).unwrap();
+        assert_eq!(retained.capsule_status, "execution-needs-review");
+        let saved_step = retained
+            .execution_fence
+            .unwrap()
+            .journal
+            .unwrap()
+            .steps
+            .into_iter()
+            .find(|saved| saved.ordinal == step.ordinal)
+            .unwrap();
+        assert_eq!(saved_step.receipt, Some(failed));
+        assert_eq!(saved_step.observed_attempt, Some(proof.attempt()));
+        assert!(saved_step.reconciliation.is_none());
+    }
+
+    #[test]
+    fn task_reconcile_recovers_a_lost_aggregate_from_saved_successes() {
+        let store = store();
+        let task = ready_task(&store);
+        let lease = store.lock_task(&task.id).unwrap();
+        let ticket = lease.begin_execution("run", "approve").unwrap();
+        let journal = lease
+            .load()
+            .unwrap()
+            .unwrap()
+            .execution_fence
+            .unwrap()
+            .journal
+            .unwrap();
+        for step in &journal.steps {
+            lease.record_step_started(&ticket, step.ordinal).unwrap();
+            lease
+                .record_step_finished(&ticket, step.ordinal, successful_step_receipt(step))
+                .unwrap();
+        }
+        let completed = lease.finish_reconciliation(ticket.attempt_id()).unwrap();
+        assert_eq!(completed.capsule_status, "materialized");
+        assert_eq!(
+            completed.last_execution().unwrap().execution["reconciled_steps"],
+            json!([])
+        );
+        let repeated = lease.finish_reconciliation(ticket.attempt_id()).unwrap();
+        assert_eq!(
+            repeated.execution_history.len(),
+            completed.execution_history.len()
+        );
+        assert!(lease.begin_execution("run", "approve").is_err());
+    }
+
     #[test]
     fn task_execution_journal_uses_existing_host_transport_shapes() {
         let mut binding = invocation_binding("req-binding");
@@ -2532,6 +3118,11 @@ mod tests {
         .unwrap();
         let loaded = lease.load().unwrap().unwrap();
         assert!(loaded.execution_fence.as_ref().unwrap().journal.is_none());
+        assert!(
+            lease
+                .finish_reconciliation(&loaded.execution_fence.as_ref().unwrap().attempt_id)
+                .is_err()
+        );
         assert_eq!(
             loaded.execution_blocker(),
             Some(super::TaskExecutionState::Pending)
@@ -5473,15 +6064,15 @@ mod tests {
     fn task_subcommands_contains_all_expected() {
         let subs = super::task_subcommands();
         for expected in &[
-            "create", "show", "list", "resolve", "ask", "advance", "bind", "approve", "run",
+            "create", "show", "list", "resolve", "ask", "advance", "bind", "approve", "run", "reconcile",
         ] {
             assert!(subs.contains(expected), "missing subcommand '{}'", expected);
         }
     }
 
     #[test]
-    fn task_subcommands_count_is_nine() {
-        assert_eq!(super::task_subcommands().len(), 9);
+    fn task_subcommands_count_is_ten() {
+        assert_eq!(super::task_subcommands().len(), 10);
     }
 
     // ── TaskStore::bind — zone override path ─────────────────────────

@@ -75,7 +75,7 @@ impl LookupFailure {
             ),
             Self::InvalidHost => (
                 "invalid-invocation-host",
-                "The configured host endpoint or host read deadline could not be used.",
+                "Invocation inspection requires HTTPS, literal loopback HTTP, or a Unix socket with a valid host read deadline.",
                 CliExitCode::Validation,
             ),
             Self::MissingCredential => (
@@ -146,7 +146,7 @@ pub(crate) fn dispatch(
         Ok(None) => return Ok(lookup_failure(args, None, LookupFailure::MissingHost)),
         Err(_) => return Ok(lookup_failure(args, None, LookupFailure::InvalidHost)),
     };
-    let client = match HostAdminClient::new(&host.endpoint) {
+    let client = match HostAdminClient::for_invocation_inspection(&host.endpoint) {
         Ok(client) => client,
         Err(_) => {
             return Ok(lookup_failure(
@@ -217,7 +217,7 @@ pub(crate) fn watch(
         Ok(None) => return Ok(failure(None, LookupFailure::MissingHost)),
         Err(_) => return Ok(failure(None, LookupFailure::InvalidHost)),
     };
-    let mut client = match HostAdminClient::new(&host.endpoint) {
+    let mut client = match HostAdminClient::for_invocation_inspection(&host.endpoint) {
         Ok(client) => client,
         Err(_) => return Ok(failure(Some(&host.endpoint), LookupFailure::InvalidHost)),
     };
