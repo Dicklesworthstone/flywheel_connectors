@@ -102,3 +102,22 @@ evidence. This setting grants no write, activation, or transfer authority.
 
 See [authenticated canonical state inspection](../runbooks/connector_state_externalization.md#inspect-authenticated-canonical-stores)
 for inventory examples, storage paths, and failure behavior.
+
+## Mesh Peer Transport
+
+Peer endpoints come from `FCP_HOST_MESH_PEERS` or
+`FCP_HOST_MESH_PEERS_FILE`. Invocation, preflight, simulation, cancellation,
+connector-state export, and stream requests carry private inputs or authority.
+These forwards require HTTPS, except for HTTP to a literal loopback IP address
+such as `127.0.0.1` or `[::1]`. A DNS name such as `localhost` does not qualify
+for that exception, and a remote tailnet IP alone does not qualify either.
+Configure a valid HTTPS endpoint for a remote peer.
+
+The host refuses an unsafe endpoint before signing, reserving outbound
+capacity, or sending the request. A signed envelope authenticates its contents;
+it does not encrypt capability tokens or connector data.
+
+Mesh peer HTTP clients ignore ambient `HTTP_PROXY`, `HTTPS_PROXY`, and
+`ALL_PROXY` settings, including lowercase variants. This also keeps permitted
+loopback traffic local. Peer URLs are explicit trust configuration; redirects
+and automatic HTTP retries remain disabled.

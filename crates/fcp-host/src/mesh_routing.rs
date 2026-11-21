@@ -538,6 +538,10 @@ impl MeshRouter {
         let client = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(settings.forward_timeout)
+            // Peer endpoints are explicit trust configuration. In particular,
+            // the literal-loopback HTTP exception must never send credentials
+            // through an ambient HTTP(S)_PROXY or ALL_PROXY intermediary.
+            .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             // Only the mesh layer may decide whether another delivery is safe.
             .retry(reqwest::retry::never())
@@ -1137,20 +1141,33 @@ impl MeshRouter {
                 detail: "peer is not in the local mesh directory".to_owned(),
             });
         };
-        if matches!(
-            &body,
-            MeshForwardBody::ConnectorStateExport { .. }
-                | MeshForwardBody::StreamOpen { .. }
-                | MeshForwardBody::StreamPoll { .. }
-                | MeshForwardBody::StreamAck { .. }
-                | MeshForwardBody::StreamClose { .. }
-        ) {
-            require_confidential_endpoint(&peer.endpoint).map_err(|error| {
-                MeshForwardFailure::NotDelivered {
-                    peer: peer_label.clone(),
-                    detail: error.to_string(),
-                }
-            })?;
+        // Signatures authenticate the sender and bytes; they do not hide
+        // capability tokens, caller inputs, cancellation authority or results.
+        // Keep this match exhaustive so new methods must choose their transport
+        // policy explicitly before signing, reserving resources or sending.
+        match &body {
+            MeshForwardBody::Invoke { .. }
+            | MeshForwardBody::InvokeGuarded { .. }
+            | MeshForwardBody::Cancel { .. }
+            | MeshForwardBody::Preflight { .. }
+            | MeshForwardBody::PreflightGuarded { .. }
+            | MeshForwardBody::Simulate { .. }
+            | MeshForwardBody::ConnectorStateExport { .. }
+            | MeshForwardBody::StreamOpen { .. }
+            | MeshForwardBody::StreamPoll { .. }
+            | MeshForwardBody::StreamAck { .. }
+            | MeshForwardBody::StreamClose { .. } => {
+                require_confidential_endpoint(&peer.endpoint).map_err(|error| {
+                    MeshForwardFailure::NotDelivered {
+                        peer: peer_label.clone(),
+                        detail: error.to_string(),
+                    }
+                })?;
+            }
+            MeshForwardBody::Introspect { .. }
+            | MeshForwardBody::Inventory { .. }
+            | MeshForwardBody::Status { .. }
+            | MeshForwardBody::SelfCheck { .. } => {}
         }
         let envelope = MeshForwardEnvelope::sign(
             &self.signing_key,
@@ -1883,7 +1900,7 @@ mod tests {
     }
 
     #[test]
-    fn generic_forward_cannot_bypass_state_or_stream_confidentiality() {
+    fn generic_forward_cannot_disclose_credentials_or_state_over_remote_http() {
         let local_key = Ed25519SigningKey::generate();
         let peer_key = Ed25519SigningKey::generate();
         let router = MeshRouter::new(MeshRoutingSettings {
@@ -1898,31 +1915,76 @@ mod tests {
             forward_timeout: Duration::from_secs(5),
         })
         .unwrap();
+        let request_json =
+            r#"{"capability_token":"must-not-leak","input":{"private":"caller data"}}"#;
         for body in [
+            MeshForwardBody::Invoke {
+                request_json: request_json.to_owned(),
+                asserted_principal: Some("private-principal".to_owned()),
+                origin_attempt_id: None,
+            },
+            MeshForwardBody::InvokeGuarded {
+                request_json: request_json.to_owned(),
+                asserted_principal: Some("private-principal".to_owned()),
+                origin_attempt_id: Some(1),
+            },
+            MeshForwardBody::Cancel {
+                request_json: request_json.to_owned(),
+                origin_attempt_id: 1,
+            },
+            MeshForwardBody::Preflight {
+                request_json: request_json.to_owned(),
+                asserted_principal: Some("private-principal".to_owned()),
+            },
+            MeshForwardBody::PreflightGuarded {
+                request_json: request_json.to_owned(),
+                asserted_principal: Some("private-principal".to_owned()),
+            },
+            MeshForwardBody::Simulate {
+                request_json: request_json.to_owned(),
+                asserted_principal: Some("private-principal".to_owned()),
+            },
             MeshForwardBody::ConnectorStateExport {
-                request_json: "{}".to_owned(),
+                request_json: request_json.to_owned(),
             },
             MeshForwardBody::StreamOpen {
-                request_json: "{}".to_owned(),
+                request_json: request_json.to_owned(),
             },
             MeshForwardBody::StreamPoll {
-                request_json: "{}".to_owned(),
+                request_json: request_json.to_owned(),
             },
             MeshForwardBody::StreamAck {
-                request_json: "{}".to_owned(),
+                request_json: request_json.to_owned(),
             },
             MeshForwardBody::StreamClose {
-                request_json: "{}".to_owned(),
+                request_json: request_json.to_owned(),
             },
         ] {
+            let method = body.method();
             let result = fcp_async_core::runtime::block_on_sync(
                 router.forward(&TailscaleNodeId::new("node-b"), body),
             )
             .unwrap();
-            assert!(
-                matches!(result, Err(MeshForwardFailure::NotDelivered { detail, .. }) if detail.contains("HTTPS"))
+            let Err(MeshForwardFailure::NotDelivered { detail, .. }) = result else {
+                panic!("{method} must refuse plaintext transport before delivery");
+            };
+            assert!(detail.contains("HTTPS"), "{method}: {detail}");
+            assert!(!detail.contains("must-not-leak"));
+            assert!(!detail.contains("caller data"));
+            assert!(!detail.contains("private-principal"));
+            assert_eq!(router.forward_usage().unwrap(), MeshForwardUsage::default());
+            assert_eq!(
+                router.cancellation_usage().unwrap(),
+                MeshForwardUsage::default()
             );
-            assert_eq!(router.forward_usage().unwrap().in_flight, 0);
+            assert_eq!(
+                router.stream_polls.snapshot().unwrap(),
+                MeshForwardUsage::default()
+            );
+            assert_eq!(
+                router.stream_settlements.snapshot().unwrap(),
+                MeshForwardUsage::default()
+            );
         }
     }
 
@@ -2251,7 +2313,7 @@ mod tests {
         let result = fcp_async_core::runtime::block_on_sync(router.forward(
             &TailscaleNodeId::new("node-b"),
             MeshForwardBody::Invoke {
-                request_json: "{\"operation\":\"non_idempotent_write\"}".to_owned(),
+                request_json: r#"{"operation":"non_idempotent_write","capability_token":"private-test-token","input":{"private":"caller data"}}"#.to_owned(),
                 asserted_principal: Some("test-principal".to_owned()),
                 origin_attempt_id: None,
             },
@@ -2291,6 +2353,77 @@ mod tests {
                     .contains("secret-from-unsigned-error-body")
             );
         }
+    }
+
+    #[test]
+    fn forward_loopback_credentials_ignore_ambient_proxy_configuration() {
+        const CHILD_MARKER: &str = "FCP_TEST_MESH_FORWARD_PROXY_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let reply = forward_after_receipt(|envelope, peer_key| {
+                let reply = MeshForwardReply::sign(
+                    &peer_key,
+                    TailscaleNodeId::new("node-b"),
+                    &envelope,
+                    200,
+                    "{\"direct_peer\":true}".to_owned(),
+                );
+                Some((200, serde_json::to_string(&reply).unwrap()))
+            })
+            .expect("literal-loopback requests must reach the authenticated peer directly");
+            assert_eq!(reply.body_json, "{\"direct_peer\":true}");
+            return;
+        }
+
+        // Use a child test process so parallel tests never observe mutated
+        // process-global proxy settings. An inherited bypass list is explicitly
+        // cleared: only the router's policy may exempt the loopback request.
+        let proxy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        proxy.set_nonblocking(true).unwrap();
+        let proxy_url = format!("http://{}", proxy.local_addr().unwrap());
+        let current_test = std::thread::current();
+        let test_name = current_test.name().expect("named test thread");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child.args(["--exact", test_name, "--nocapture"]);
+        child.env(CHILD_MARKER, "1");
+        for name in [
+            "HTTP_PROXY",
+            "http_proxy",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+        ] {
+            child.env(name, &proxy_url);
+        }
+        child.env("NO_PROXY", "").env("no_proxy", "");
+        child
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = child.spawn().expect("proxy-isolated mesh test process");
+        let child_deadline = Instant::now() + Duration::from_secs(20);
+        while child.try_wait().expect("inspect child test status").is_none() {
+            if Instant::now() >= child_deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("proxy-isolated mesh test exceeded its process deadline");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().expect("collect child test result");
+        assert!(
+            matches!(proxy.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "mesh transport must not open a connection to an ambient proxy"
+        );
+        assert!(
+            output.status.success(),
+            "direct mesh transport failed with ambient proxies: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "the child process must execute the selected regression test"
+        );
     }
 
     #[test]
