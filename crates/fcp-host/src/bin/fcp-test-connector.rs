@@ -602,14 +602,27 @@ impl TestConnector {
             &self.profile,
         );
         if self.profile.require_instance_binding
-            && let Some(details) = snapshot.details.as_mut().and_then(serde_json::Value::as_object_mut)
+            && let Some(details) = snapshot
+                .details
+                .as_mut()
+                .and_then(serde_json::Value::as_object_mut)
         {
-            details.insert("handshaken".into(), json!(self.bound_authority.verifier.is_some()));
-            details.insert("instance_id".into(), json!(self.bound_authority.instance_id));
+            details.insert(
+                "handshaken".into(),
+                json!(self.bound_authority.verifier.is_some()),
+            );
+            details.insert(
+                "instance_id".into(),
+                json!(self.bound_authority.instance_id),
+            );
             details.insert("pid".into(), json!(std::process::id()));
             details.insert(
                 "authorized_invocations".into(),
-                json!(self.bound_authority.authorized_invocations.load(Ordering::SeqCst)),
+                json!(
+                    self.bound_authority
+                        .authorized_invocations
+                        .load(Ordering::SeqCst)
+                ),
             );
         }
 
@@ -661,7 +674,11 @@ impl TestConnector {
         if !self.configured {
             return Err(FcpError::NotConfigured);
         }
-        let verifier = self.bound_authority.verifier.as_ref().ok_or(FcpError::NotHandshaken)?;
+        let verifier = self
+            .bound_authority
+            .verifier
+            .as_ref()
+            .ok_or(FcpError::NotHandshaken)?;
         if self.handshaken_zone.as_ref() != Some(zone) {
             return Err(FcpError::InvalidRequest {
                 code: 1007,
@@ -740,7 +757,9 @@ impl TestConnector {
         }
 
         if self.profile.require_instance_binding {
-            self.bound_authority.authorized_invocations.fetch_add(1, Ordering::SeqCst);
+            self.bound_authority
+                .authorized_invocations
+                .fetch_add(1, Ordering::SeqCst);
         }
 
         if let Some(delay_ms) = req
@@ -1166,7 +1185,9 @@ mod tests {
             },
             bound_authority: FixtureBoundAuthority::default(),
         };
-        connector.handle_handshake(bound_handshake_request(key)).unwrap();
+        connector
+            .handle_handshake(bound_handshake_request(key))
+            .unwrap();
         connector
     }
 
@@ -1179,7 +1200,10 @@ mod tests {
             .issuer("node:test")
             .audience("*")
             .operations(&["test.echo"])
-            .validity(now - chrono::Duration::seconds(1), now + chrono::Duration::minutes(5));
+            .validity(
+                now - chrono::Duration::seconds(1),
+                now + chrono::Duration::minutes(5),
+            );
         if let Some(instance) = instance {
             builder = builder.target_instance(instance.as_str());
         }
@@ -1189,10 +1213,19 @@ mod tests {
         };
         let mut cbor = Vec::new();
         ciborium::into_writer(&constraints, &mut cbor).unwrap();
-        CapabilityToken::from_raw(builder.try_constraints_cbor(&cbor).unwrap().sign(key).unwrap())
+        CapabilityToken::from_raw(
+            builder
+                .try_constraints_cbor(&cbor)
+                .unwrap()
+                .sign(key)
+                .unwrap(),
+        )
     }
 
-    fn bound_invoke_request(connector: &TestConnector, token: CapabilityToken) -> serde_json::Value {
+    fn bound_invoke_request(
+        connector: &TestConnector,
+        token: CapabilityToken,
+    ) -> serde_json::Value {
         serde_json::to_value(InvokeRequest {
             r#type: "invoke".into(),
             id: RequestId::new("bound-fixture-invoke"),
@@ -1209,20 +1242,41 @@ mod tests {
             correlation_id: None,
             provenance: None,
             approval_tokens: Vec::new(),
-        }).unwrap()
+        })
+        .unwrap()
     }
 
-    fn bound_simulate_request(connector: &TestConnector, token: CapabilityToken) -> serde_json::Value {
+    fn bound_simulate_request(
+        connector: &TestConnector,
+        token: CapabilityToken,
+    ) -> serde_json::Value {
         let mut request = simulate_request(&connector.id, "test.echo");
         request["capability_token"] = serde_json::to_value(token).unwrap();
         request
     }
 
     fn assert_bound_rejected(connector: &TestConnector, token: CapabilityToken) {
-        let effects = connector.bound_authority.authorized_invocations.load(Ordering::SeqCst);
-        assert!(connector.handle_invoke(bound_invoke_request(connector, token.clone())).is_err());
-        assert!(connector.handle_simulate(bound_simulate_request(connector, token)).is_err());
-        assert_eq!(connector.bound_authority.authorized_invocations.load(Ordering::SeqCst), effects);
+        let effects = connector
+            .bound_authority
+            .authorized_invocations
+            .load(Ordering::SeqCst);
+        assert!(
+            connector
+                .handle_invoke(bound_invoke_request(connector, token.clone()))
+                .is_err()
+        );
+        assert!(
+            connector
+                .handle_simulate(bound_simulate_request(connector, token))
+                .is_err()
+        );
+        assert_eq!(
+            connector
+                .bound_authority
+                .authorized_invocations
+                .load(Ordering::SeqCst),
+            effects
+        );
     }
 
     #[test]
@@ -1230,22 +1284,47 @@ mod tests {
         let key = Ed25519SigningKey::generate();
         let first = bound_fixture(&key);
         let second = bound_fixture(&key);
-        assert_ne!(first.bound_authority.instance_id, second.bound_authority.instance_id);
+        assert_ne!(
+            first.bound_authority.instance_id,
+            second.bound_authority.instance_id
+        );
         let token = bound_token(&key, Some(&first.bound_authority.instance_id));
         let health = first.handle_health().unwrap();
-        assert_eq!(health["details"]["instance_id"], json!(first.bound_authority.instance_id));
+        assert_eq!(
+            health["details"]["instance_id"],
+            json!(first.bound_authority.instance_id)
+        );
         assert_eq!(health["details"]["configured"], true);
         assert_eq!(health["details"]["handshaken"], true);
 
-        let response = first.handle_invoke(bound_invoke_request(&first, token.clone())).unwrap();
-        assert_eq!(response["result"]["instance_id"], health["details"]["instance_id"]);
+        let response = first
+            .handle_invoke(bound_invoke_request(&first, token.clone()))
+            .unwrap();
+        assert_eq!(
+            response["result"]["instance_id"],
+            health["details"]["instance_id"]
+        );
         assert_eq!(response["result"]["pid"], json!(std::process::id()));
-        first.handle_simulate(bound_simulate_request(&first, token.clone())).unwrap();
-        assert_eq!(first.handle_health().unwrap()["details"]["authorized_invocations"], 1);
+        first
+            .handle_simulate(bound_simulate_request(&first, token.clone()))
+            .unwrap();
+        assert_eq!(
+            first.handle_health().unwrap()["details"]["authorized_invocations"],
+            1
+        );
         assert_bound_rejected(&second, token);
         assert_bound_rejected(&first, bound_token(&key, None));
-        assert_bound_rejected(&first, bound_token(&Ed25519SigningKey::generate(), Some(&first.bound_authority.instance_id)));
-        assert_eq!(second.handle_health().unwrap()["details"]["authorized_invocations"], 0);
+        assert_bound_rejected(
+            &first,
+            bound_token(
+                &Ed25519SigningKey::generate(),
+                Some(&first.bound_authority.instance_id),
+            ),
+        );
+        assert_eq!(
+            second.handle_health().unwrap()["details"]["authorized_invocations"],
+            0
+        );
     }
 
     #[test]
@@ -1259,7 +1338,10 @@ mod tests {
         let response = connector.handle_handshake(handshake).unwrap();
         assert_eq!(response["capabilities_granted"], json!([]));
         assert_ne!(connector.bound_authority.instance_id, supplied);
-        assert_bound_rejected(&connector, bound_token(&key, Some(&connector.bound_authority.instance_id)));
+        assert_bound_rejected(
+            &connector,
+            bound_token(&key, Some(&connector.bound_authority.instance_id)),
+        );
     }
 
     #[test]
@@ -1270,20 +1352,43 @@ mod tests {
         let old_token = bound_token(&key, Some(&old_instance));
         connector.handle_configure(json!({})).unwrap();
         assert_ne!(connector.bound_authority.instance_id, old_instance);
-        assert_eq!(connector.handle_health().unwrap()["details"]["handshaken"], false);
+        assert_eq!(
+            connector.handle_health().unwrap()["details"]["handshaken"],
+            false
+        );
         assert_bound_rejected(&connector, old_token.clone());
-        connector.handle_handshake(bound_handshake_request(&key)).unwrap();
+        connector
+            .handle_handshake(bound_handshake_request(&key))
+            .unwrap();
         assert_bound_rejected(&connector, old_token);
         let token = bound_token(&key, Some(&connector.bound_authority.instance_id));
-        assert!(connector.handle_handshake(json!({"protocol_version": "2.0"})).is_err());
+        assert!(
+            connector
+                .handle_handshake(json!({"protocol_version": "2.0"}))
+                .is_err()
+        );
         assert_bound_rejected(&connector, token);
-        assert_eq!(connector.handle_health().unwrap()["details"]["handshaken"], false);
+        assert_eq!(
+            connector.handle_health().unwrap()["details"]["handshaken"],
+            false
+        );
 
-        for mode in [FixtureHandshakeMode::Rejected, FixtureHandshakeMode::BadNonce] {
+        for mode in [
+            FixtureHandshakeMode::Rejected,
+            FixtureHandshakeMode::BadNonce,
+        ] {
             connector.profile.handshake_mode = mode;
-            connector.handle_handshake(bound_handshake_request(&key)).unwrap();
-            assert_eq!(connector.handle_health().unwrap()["details"]["handshaken"], false);
-            assert_bound_rejected(&connector, bound_token(&key, Some(&connector.bound_authority.instance_id)));
+            connector
+                .handle_handshake(bound_handshake_request(&key))
+                .unwrap();
+            assert_eq!(
+                connector.handle_health().unwrap()["details"]["handshaken"],
+                false
+            );
+            assert_bound_rejected(
+                &connector,
+                bound_token(&key, Some(&connector.bound_authority.instance_id)),
+            );
         }
     }
 }

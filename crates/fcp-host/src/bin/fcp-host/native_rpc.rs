@@ -938,6 +938,15 @@ impl NativeInvocationTermination {
         Ok(())
     }
 
+    /// Preserve a definitive refusal when instance selection fails before the
+    /// effect RPC. The shared marker still retains uncertainty if dispatch
+    /// already began, so this cannot erase evidence of possible effects.
+    pub(super) fn record_dispatch_refusal(&self) {
+        if let Some(guard) = self.state.authority_guard.get() {
+            guard.record_dispatch_refusal();
+        }
+    }
+
     pub(super) fn bind_registration(
         &self,
         controller: &Arc<CancellationController>,

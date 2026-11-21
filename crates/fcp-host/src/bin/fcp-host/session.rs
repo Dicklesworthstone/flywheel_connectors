@@ -216,10 +216,13 @@ pub(super) fn prepared_from_health(
 
 /// POST /rpc/admin/connectors/{connector_id}/session
 ///
-/// Uses the on-demand native executor or the selected retained WASI guest,
-/// never a warm-pool control process. WASI preparation requires operation_id.
+/// Uses the on-demand native executor, an actual warm-pool worker, or the
+/// selected retained WASI guest. The pool's control process never supplies
+/// invocation authority. WASI preparation requires operation_id.
 /// Instance identity is a snapshot, not a lease: reconfiguration or process
-/// replacement can invalidate it before the issuer signs its token.
+/// replacement can invalidate it before the issuer signs its token. A pooled
+/// instance can also be busy or evicted; invocation never substitutes another
+/// worker for the instance named by the signed token.
 /// One end-to-end deadline includes registry and session admission. Expiration
 /// drops only this preparation future, preserving per-command cancellation and
 /// process-custody rules; it never aborts a shared runner by connector ID.
@@ -270,15 +273,7 @@ pub(super) async fn prepare_session_for_operation(
             .get(&connector_id)
             .ok_or_else(|| failure(StatusCode::NOT_FOUND, "connector is not registered"))?;
         require_zone(&entry.config.allowed_zones, &zone_id)?;
-        match &entry.connector {
-            ConnectorRuntime::Native(_) | ConnectorRuntime::Wasi(_) => entry.connector.clone(),
-            _ => {
-                return Err(failure(
-                    StatusCode::CONFLICT,
-                    "on-demand native or WASI connector required; warm-pool sessions unsupported",
-                ));
-            }
-        }
+        entry.connector.clone()
     };
     execution_fence.require_current().map_err(map_host_error)?;
     let prepared =
@@ -297,6 +292,17 @@ pub(super) async fn prepare_session_for_operation(
                     "connector session preparation failed; no instance authority was returned"))?;
                 prepared_from_health(connector_id.clone(), zone_id.clone(), health)?
             }
+            ConnectorRuntime::NativeWarmPool(pool) => {
+                if pool.capability_verifying_key.is_none() {
+                    return Err(failure(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "host capability verification is not configured",
+                    ));
+                }
+                pool.prepare_session(&zone_id)
+                    .await
+                    .map_err(map_host_error)?
+            }
             ConnectorRuntime::Wasi(wasi) => {
                 let operation = operation_id.as_ref().ok_or_else(|| {
                     failure(
@@ -308,7 +314,12 @@ pub(super) async fn prepare_session_for_operation(
                     .await
                     .map_err(map_host_error)?
             }
-            _ => unreachable!("runtime form was checked while selecting the connector"),
+            ConnectorRuntime::Dormant(_) | ConnectorRuntime::UnavailableNativeProxyOnly(_) => {
+                return Err(failure(
+                    StatusCode::CONFLICT,
+                    "connector runtime cannot prepare an execution session",
+                ));
+            }
         };
     // Ensure the process wasn't replaced during I/O. No registry lock is
     // held across subprocess I/O, and no snapshot can guarantee future life.
@@ -325,6 +336,10 @@ pub(super) async fn prepare_session_for_operation(
             (ConnectorRuntime::Native(current), ConnectorRuntime::Native(selected)) => {
                 Arc::ptr_eq(current, selected)
             }
+            (
+                ConnectorRuntime::NativeWarmPool(current),
+                ConnectorRuntime::NativeWarmPool(selected),
+            ) => Arc::ptr_eq(current, selected),
             (ConnectorRuntime::Wasi(current), ConnectorRuntime::Wasi(selected)) => {
                 Arc::ptr_eq(current, selected)
             }

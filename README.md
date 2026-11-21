@@ -2806,6 +2806,35 @@ Linux native admission accepts executable regular ELF files up to 256 MiB and re
 
 After every rollout or managed deployment restoration, re-check `rollout status`, `status`, `doctor`, and `mesh explain-availability`. If the active node degrades, promote the staged standby peer deliberately rather than assuming automatic lease handoff or automatic state convergence.
 
+### Preparing Authority for Native Warm Pools
+
+Native warm pools require a validated stateless manifest and a configured host
+capability verification key. Prepare an actual idle worker through the protected
+`POST /rpc/admin/connectors/{connector_id}/session` endpoint with
+`{"zone_id":"z:work"}`. The response identifies a configured, handshaken, ready
+worker in that zone; the pool's separate control process never supplies the
+invocation instance. Preparation does not invoke an operation or issue a token.
+Have the trusted issuer bind the operation capability to the returned
+`instance_id`, using `CapabilityTokenBuilder::target_instance` or
+`CapabilityIssuanceRequest.instance_id`.
+
+Both invoke and simulate verify the signed operation, zone, resource scope, and
+instance binding, then select only that exact prepared worker. A missing,
+malformed, expired, or incorrectly signed binding cannot choose a worker. A busy,
+evicted, stopped, or replaced instance is unavailable; the host never sends its
+token to another worker or creates a substitute process. The selected worker's
+ready instance identity is checked again before dispatch, and successful reuse
+keeps its original handshake while preserving distinct request identities.
+
+Preparation returns a snapshot, not a reservation. Pool retention, memory
+pressure, concurrent work, inventory changes, and lifecycle operations can
+invalidate that snapshot before invocation. Obtain a fresh preparation and token
+when needed, but inspect durable invocation evidence before retrying any request
+whose effect outcome is uncertain. Existing signed capabilities are never
+rewritten or widened by the pool, and preparation remains subject to the same
+admin authentication, zone admission, total deadline, lifecycle epoch, and
+runtime identity checks as on-demand execution.
+
 ### Provisioning and Secret Flow
 
 - Treat `FCP_HOST_CONNECTORS_FILE` as the live connector inventory source that `fcp-host` mutates.

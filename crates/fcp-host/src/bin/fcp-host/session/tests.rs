@@ -75,6 +75,10 @@ fn reply(request: &HandshakeRequest) -> HandshakeResponse {
 
 fn health_value() -> Value {
     let instance = InstanceId::new();
+    health_value_for(&instance)
+}
+
+fn health_value_for(instance: &InstanceId) -> Value {
     json!({
         "status": {"state": "ready"}, "uptime_ms": 10,
         "configured": true, "handshaken": true, "instance_id": instance,
@@ -283,6 +287,7 @@ fn malformed_identity_and_contradictory_authority_fail_without_payload_echo() {
 
 struct Dispatcher {
     connector: SubprocessConnector,
+    instance_id: InstanceId,
     calls: Arc<StdMutex<Vec<(String, Value)>>>,
     reject_handshake: Arc<AtomicBool>,
     reject_configure: Arc<AtomicBool>,
@@ -297,6 +302,8 @@ fn dispatcher() -> Dispatcher {
     let seen = Arc::clone(&calls);
     let reject_h = Arc::clone(&reject_handshake);
     let reject_c = Arc::clone(&reject_configure);
+    let instance_id = InstanceId::new();
+    let instance_health = health_value_for(&instance_id);
     let runner_task = task::spawn(async move {
         while let Some(request) = runner_rx.recv().await {
             if !request.rpc.try_begin() {
@@ -311,7 +318,7 @@ fn dispatcher() -> Dispatcher {
                     let value: HandshakeRequest = serde_json::from_value(request.params).unwrap();
                     json!({"result": reply(&value)})
                 }
-                "health" => json!({"result": health_value()}),
+                "health" => json!({"result": instance_health}),
                 "configure" if !reject_c.load(Ordering::SeqCst) => json!({"result": {}}),
                 _ => json!({"error": {"message": "fixture rejection"}}),
             };
@@ -349,6 +356,7 @@ fn dispatcher() -> Dispatcher {
     };
     Dispatcher {
         connector,
+        instance_id,
         calls,
         reject_handshake,
         reject_configure,
@@ -366,6 +374,260 @@ fn preparation_host(
         crate::tests::dispatcher_test_config("fcp.fixture"),
     );
     crate::tests::dispatcher_app_state(registry, lifecycle, None, HashMap::new())
+}
+
+struct PooledPreparation {
+    host: Arc<AppState>,
+    pool: Arc<NativeWarmPoolConnector>,
+    worker: Arc<SubprocessConnector>,
+    worker_calls: Arc<StdMutex<Vec<(String, Value)>>>,
+    control_calls: Arc<StdMutex<Vec<(String, Value)>>>,
+    worker_instance: InstanceId,
+    control_instance: InstanceId,
+    _directories: Vec<tempfile::TempDir>,
+}
+
+async fn pooled_preparation_host(
+    lifecycle: Arc<HostAdminStateStore>,
+    verifying_key: Option<[u8; PUBLIC_KEY_SIZE]>,
+) -> PooledPreparation {
+    let worker = dispatcher();
+    let control = dispatcher();
+    let worker_instance = worker.instance_id;
+    let control_instance = control.instance_id;
+    let worker_calls = Arc::clone(&worker.calls);
+    let control_calls = Arc::clone(&control.calls);
+    let directories = vec![worker._state_dir, control._state_dir];
+    let worker = Arc::new(worker.connector);
+    let control = Arc::new(control.connector);
+    let mut config = crate::tests::dispatcher_test_config("fcp.fixture");
+    config.prewarm = fcp_host::ConnectorPrewarmConfig::warm_pool(
+        0,
+        2,
+        Duration::from_secs(300),
+        Duration::from_millis(50),
+    );
+    let (manifest_directory, admitted) =
+        crate::tests::configure_stateless_pool_test_manifest(&mut config);
+    let pool = Arc::new(NativeWarmPoolConnector {
+        config: config.clone(),
+        admitted_executable: None,
+        state_policy: admitted.state_policy,
+        manifest_constraints: admitted.manifest_constraints,
+        connector_id: ConnectorId::from_static("fcp.fixture"),
+        control: Arc::clone(&control),
+        resilience: Arc::clone(&control.resilience),
+        capability_verifying_key: verifying_key,
+        controller: AdaptiveWarmPoolController::new(AdaptiveWarmPoolConfig::new(
+            2,
+            2 * NATIVE_WARM_POOL_ESTIMATED_RSS_BYTES,
+        )),
+        entries: Mutex::new(Vec::new()),
+        preparation: futures_util::lock::Mutex::new(()),
+        prepared_instances: StdMutex::new(HashMap::new()),
+        runtime_retirement: native_rpc::NativePoolRetirement::default(),
+        maintainer: Mutex::new(None),
+    });
+    let now = Instant::now();
+    pool.entries.lock().await.push(NativeWarmPoolEntry {
+        key: pool.warm_pool_key(&ZoneId::work()),
+        connector: Arc::clone(&worker),
+        instance_id: None,
+        created_at: now,
+        last_used_at: now,
+        rss_bytes: NATIVE_WARM_POOL_ESTIMATED_RSS_BYTES,
+        last_health: PrewarmHealthState::Ready,
+    });
+    let registry = crate::tests::dispatcher_registry_with_connector("fcp.fixture", control, config);
+    registry
+        .state
+        .write()
+        .await
+        .connectors
+        .get_mut(&ConnectorId::from_static("fcp.fixture"))
+        .unwrap()
+        .connector = ConnectorRuntime::NativeWarmPool(Arc::clone(&pool));
+    let mut host = crate::tests::dispatcher_app_state(registry, lifecycle, None, HashMap::new());
+    Arc::get_mut(&mut host).unwrap().admin_bearer_token = Some(Arc::from("fixture-admin"));
+    let mut directories = directories;
+    directories.push(manifest_directory);
+    PooledPreparation {
+        host,
+        pool,
+        worker,
+        worker_calls,
+        control_calls,
+        worker_instance,
+        control_instance,
+        _directories: directories,
+    }
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn pooled_session_preparation_returns_worker_authority_through_protected_handler() {
+    let fixture = pooled_preparation_host(
+        Arc::new(HostAdminStateStore::new()),
+        Some([1; PUBLIC_KEY_SIZE]),
+    )
+    .await;
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::AUTHORIZATION,
+        HeaderValue::from_static("Bearer fixture-admin"),
+    );
+    let (response_headers, Json(prepared)) = prepare_handler(
+        State(Arc::clone(&fixture.host)),
+        Path("fcp.fixture".into()),
+        headers,
+        Json(PrepareSessionRequest {
+            zone_id: ZoneId::work(),
+            operation_id: None,
+        }),
+    )
+    .await
+    .expect("the protected endpoint must prepare a real pooled executor");
+    assert_eq!(response_headers[CACHE_CONTROL], "no-store");
+    assert_eq!(prepared.instance_id, fixture.worker_instance);
+    assert_ne!(prepared.instance_id, fixture.control_instance);
+    assert_eq!(prepared.zone_id, ZoneId::work());
+    assert!(prepared.operation_id.is_none());
+    assert!(fixture.control_calls.lock().unwrap().is_empty());
+    assert!(
+        fixture
+            .worker_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(method, _)| matches!(method.as_str(), "introspect" | "handshake" | "health"))
+    );
+    let entries = fixture.pool.entries.lock().await;
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].instance_id.as_ref(), Some(&prepared.instance_id));
+    assert!(Arc::ptr_eq(&entries[0].connector, &fixture.worker));
+    let output = serde_json::to_value(prepared).unwrap();
+    assert!(output.get("capability_token").is_none());
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn pooled_session_preparation_requires_admin_zone_and_verification_key_before_io() {
+    let fixture = pooled_preparation_host(Arc::new(HostAdminStateStore::new()), None).await;
+    let error = prepare_handler(
+        State(Arc::clone(&fixture.host)),
+        Path("fcp.fixture".into()),
+        HeaderMap::new(),
+        Json(PrepareSessionRequest {
+            zone_id: ZoneId::work(),
+            operation_id: None,
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.0, StatusCode::UNAUTHORIZED);
+    for (zone, expected) in [
+        (ZoneId::private(), StatusCode::FORBIDDEN),
+        (ZoneId::work(), StatusCode::SERVICE_UNAVAILABLE),
+    ] {
+        let error = prepare_session_for_operation(
+            fixture.host.as_ref(),
+            ConnectorId::from_static("fcp.fixture"),
+            zone,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.0, expected);
+    }
+    assert!(fixture.worker_calls.lock().unwrap().is_empty());
+    assert!(fixture.control_calls.lock().unwrap().is_empty());
+    assert_eq!(fixture.pool.entries.lock().await.len(), 1);
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn pooled_session_preparation_cannot_revive_authority_after_disable_and_reenable() {
+    let lifecycle = Arc::new(HostAdminStateStore::new());
+    let fixture = pooled_preparation_host(Arc::clone(&lifecycle), Some([1; PUBLIC_KEY_SIZE])).await;
+    let connector_id = ConnectorId::from_static("fcp.fixture");
+    for desired in [
+        DesiredRuntimeState::Disabled,
+        DesiredRuntimeState::Uninstalled,
+    ] {
+        lifecycle
+            .set_desired_state(&connector_id, desired, None)
+            .await
+            .unwrap();
+        let error = prepare_session_for_operation(
+            fixture.host.as_ref(),
+            connector_id.clone(),
+            ZoneId::work(),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.0, StatusCode::FORBIDDEN);
+        assert!(fixture.worker_calls.lock().unwrap().is_empty());
+    }
+    lifecycle
+        .set_desired_state(&connector_id, DesiredRuntimeState::Enabled, None)
+        .await
+        .unwrap();
+    let session = fixture.worker.handshaken_zone.lock().await;
+    let mut preparation = Box::pin(prepare_session_for_operation(
+        fixture.host.as_ref(),
+        connector_id.clone(),
+        ZoneId::work(),
+        None,
+    ));
+    assert!(futures_util::poll!(preparation.as_mut()).is_pending());
+    lifecycle
+        .set_desired_state(&connector_id, DesiredRuntimeState::Disabled, None)
+        .await
+        .unwrap();
+    lifecycle
+        .set_desired_state(&connector_id, DesiredRuntimeState::Enabled, None)
+        .await
+        .unwrap();
+    drop(session);
+    let error = preparation.await.unwrap_err();
+    assert_eq!(error.0, StatusCode::FORBIDDEN);
+    let (_, Json(prepared)) =
+        prepare_session_for_operation(fixture.host.as_ref(), connector_id, ZoneId::work(), None)
+            .await
+            .expect("a new admission may prepare the still-registered worker");
+    assert_eq!(prepared.instance_id, fixture.worker_instance);
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn pooled_session_preparation_rejects_runtime_replacement_during_negotiation() {
+    let fixture = pooled_preparation_host(
+        Arc::new(HostAdminStateStore::new()),
+        Some([1; PUBLIC_KEY_SIZE]),
+    )
+    .await;
+    let session = fixture.worker.handshaken_zone.lock().await;
+    let mut preparation = Box::pin(prepare_session_for_operation(
+        fixture.host.as_ref(),
+        ConnectorId::from_static("fcp.fixture"),
+        ZoneId::work(),
+        None,
+    ));
+    assert!(futures_util::poll!(preparation.as_mut()).is_pending());
+    let replacement = dispatcher();
+    fixture
+        .host
+        .registry
+        .state
+        .write()
+        .await
+        .connectors
+        .get_mut(&ConnectorId::from_static("fcp.fixture"))
+        .unwrap()
+        .connector = ConnectorRuntime::Native(Arc::new(replacement.connector));
+    fixture.host.registry.version.fetch_add(1, Ordering::SeqCst);
+    drop(session);
+    let error = preparation.await.unwrap_err();
+    assert_eq!(error.0, StatusCode::CONFLICT);
+    assert!(error.1.contains("changed during session preparation"));
+    assert!(fixture.control_calls.lock().unwrap().is_empty());
 }
 
 #[fcp_async_core::runtime::test(flavor = "multi_thread")]

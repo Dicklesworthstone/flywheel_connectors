@@ -1218,6 +1218,9 @@ const NATIVE_WARM_POOL_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(30);
 struct NativeWarmPoolEntry {
     key: WarmPoolKey,
     connector: Arc<SubprocessConnector>,
+    /// Identity observed from this exact executor after negotiated readiness.
+    /// Unprepared workers cannot receive instance-bound operations.
+    instance_id: Option<InstanceId>,
     created_at: Instant,
     last_used_at: Instant,
     rss_bytes: u64,
@@ -1247,6 +1250,16 @@ struct NativeWarmPoolCheckout {
     activation_latency_ms: u64,
 }
 
+/// Borrow the original operation authority without rewriting its signed token.
+#[derive(Clone, Copy)]
+struct NativeWarmPoolAuthority<'a> {
+    connector_id: &'a ConnectorId,
+    zone_id: &'a ZoneId,
+    operation: &'a OperationId,
+    input: &'a Value,
+    capability_token: &'a fcp_core::CapabilityToken,
+}
+
 struct NativeWarmPoolConnector {
     config: ConnectorConfig,
     admitted_executable: Option<native_artifact::AdmittedNativeExecutable>,
@@ -1258,6 +1271,12 @@ struct NativeWarmPoolConnector {
     capability_verifying_key: Option<[u8; PUBLIC_KEY_SIZE]>,
     controller: AdaptiveWarmPoolController,
     entries: Mutex<Vec<NativeWarmPoolEntry>>,
+    /// Serialize preparation only, so concurrent issuers cannot all cold-start
+    /// replacements while one preparation temporarily owns the last idle slot.
+    preparation: futures_util::lock::Mutex<()>,
+    /// Identity ownership survives checkout without keeping a worker alive.
+    /// Never await or acquire the idle-pool lock while holding this registry.
+    prepared_instances: StdMutex<HashMap<InstanceId, std::sync::Weak<SubprocessConnector>>>,
     runtime_retirement: native_rpc::NativePoolRetirement,
     /// Background maintenance task handle. Dropping the pool drops the handle,
     /// which aborts the task (the task itself only holds a `Weak` back-pointer
@@ -1266,6 +1285,245 @@ struct NativeWarmPoolConnector {
 }
 
 impl NativeWarmPoolConnector {
+    fn register_prepared_instance(
+        &self,
+        instance: &InstanceId,
+        connector: &Arc<SubprocessConnector>,
+    ) -> HostResult<()> {
+        let mut instances = self.prepared_instances.lock().map_err(|_| {
+            HostError::Unavailable(
+                "native warm-pool identity registry is unavailable".to_owned(),
+            )
+        })?;
+        instances.retain(|_, owner| owner.strong_count() > 0);
+        if let Some(owner) = instances.get(instance).and_then(std::sync::Weak::upgrade)
+            && !Arc::ptr_eq(&owner, connector)
+        {
+            return Err(HostError::Unavailable(
+                "native warm-pool executors reported an ambiguous instance identity".to_owned(),
+            ));
+        }
+        instances.insert(instance.clone(), Arc::downgrade(connector));
+        Ok(())
+    }
+
+    fn require_prepared_zone(&self, zone: &ZoneId) -> HostResult<()> {
+        if !self
+            .config
+            .allowed_zones
+            .iter()
+            .any(|allowed| allowed == zone.as_str())
+        {
+            return Err(HostError::PreflightFailed(
+                "native warm pool is not admitted in the requested zone".to_owned(),
+            ));
+        }
+        self.runtime_retirement.require_open()?;
+        self.state_policy.require_current_manifest(&self.config)
+    }
+
+    /// Authenticate the signed selection before touching the idle pool. The
+    /// admitted manifest supplies the capability; neither the token nor a
+    /// control process may choose a different operation authority.
+    fn verified_target_instance(
+        &self,
+        request: NativeWarmPoolAuthority<'_>,
+    ) -> HostResult<InstanceId> {
+        self.require_prepared_zone(request.zone_id)?;
+        if request.connector_id != &self.connector_id {
+            return Err(HostError::PreflightFailed(
+                "native warm-pool request targets another connector".to_owned(),
+            ));
+        }
+        if (self.config.allowed_operations.is_empty() && self.config.enforce_empty_allow_lists)
+            || (!self.config.allowed_operations.is_empty()
+                && !self.config.allowed_operations.iter().any(|operation| {
+                    operation == request.operation.as_str()
+                }))
+        {
+            return Err(HostError::PreflightFailed(
+                "native warm-pool operation is not allowed by inventory".to_owned(),
+            ));
+        }
+        let authority = self
+            .manifest_constraints
+            .operation_authority(&self.connector_id, request.operation.as_str())?
+            .ok_or_else(|| {
+                HostError::PreflightFailed(
+                    "native warm-pool operation requires admitted manifest authority".to_owned(),
+                )
+            })?;
+        let key = self.capability_verifying_key.ok_or_else(|| {
+            HostError::PreflightFailed(
+                "host capability verification is not configured".to_owned(),
+            )
+        })?;
+        let resources = live_constraint_resource_uri(request.input)
+            .into_iter()
+            .collect::<Vec<_>>();
+        let denied = || {
+            HostError::PreflightFailed(
+                "capability does not authorize the requested prepared native warm-pool instance"
+                    .to_owned(),
+            )
+        };
+        let verified = CapabilityVerifier::without_instance_binding(key, request.zone_id.clone())
+            .verify_unbound(
+                request.capability_token.clone(),
+                &authority.capability,
+                request.operation,
+                &resources,
+            )
+            .map_err(|_| denied())?;
+        let instance = verified
+            .claims()
+            .get(fcp2_claims::INSTANCE_ID)
+            .and_then(ciborium::Value::as_text)
+            .ok_or_else(denied)?;
+        let instance = InstanceId::try_from(instance.to_owned()).map_err(|_| denied())?;
+        verified.promote_with_instance(&instance).map_err(|_| denied())?;
+        Ok(instance)
+    }
+
+    /// Return a snapshot of one retained executor's actual negotiated identity.
+    /// Preparation does not reserve execution authority or prevent later eviction.
+    async fn prepare_session(&self, zone: &ZoneId) -> HostResult<session::PreparedSession> {
+        self.require_prepared_zone(zone)?;
+        if self.capability_verifying_key.is_none() {
+            return Err(HostError::PreflightFailed(
+                "host capability verification is not configured".to_owned(),
+            ));
+        }
+        let _preparation = self.preparation.lock().await;
+        self.require_prepared_zone(zone)?;
+        let checkout = self.checkout(zone).await?;
+        let warm_checkout = checkout.warm_checkout;
+        let activation_latency_ms = checkout.activation_latency_ms;
+        let mut entry = checkout.entry;
+        let prepared = {
+            let mut handshaken_zone = entry.connector.handshaken_zone.lock().await;
+            entry.connector.handshake_if_needed(zone, &mut handshaken_zone, None).await?;
+            let health = entry.connector.rpc("health", json!({})).await?;
+            session::prepared_from_health(self.connector_id.clone(), zone.clone(), health)
+                .map_err(|_| HostError::Unavailable(
+                    "native warm-pool executor did not report a ready authenticated instance"
+                        .to_owned(),
+                ))?
+        };
+        if entry.instance_id.as_ref().is_some_and(|previous| previous != &prepared.instance_id) {
+            return Err(HostError::Unavailable(
+                "prepared native warm-pool instance changed; prepare a new executor".to_owned(),
+            ));
+        }
+        self.register_prepared_instance(&prepared.instance_id, &entry.connector)?;
+        entry.instance_id = Some(prepared.instance_id.clone());
+        entry.last_health = PrewarmHealthState::Ready;
+        entry.last_used_at = Instant::now();
+        let selected = Arc::clone(&entry.connector);
+        let mut entries = self.entries.lock().await;
+        self.require_prepared_zone(zone)?;
+        if entries.iter().any(|other| {
+            other.instance_id.as_ref() == Some(&prepared.instance_id)
+                && !Arc::ptr_eq(&other.connector, &selected)
+        }) {
+            return Err(HostError::Unavailable(
+                "native warm-pool executors reported an ambiguous instance identity".to_owned(),
+            ));
+        }
+        entries.push(entry);
+        self.apply_retention_locked(&mut entries);
+        if !entries.iter().any(|entry| Arc::ptr_eq(&entry.connector, &selected)) {
+            return Err(HostError::Unavailable(
+                "prepared native warm-pool executor could not be retained under current pool limits"
+                    .to_owned(),
+            ));
+        }
+        tracing::info!(
+            event = WARM_POOL_EVIDENCE_EVENT,
+            action = "prepared",
+            connector_id = %self.connector_id,
+            zone_hash = %warm_pool_log_label("zone", zone.as_str()),
+            warm_checkout,
+            activation_latency_ms,
+            "prepared retained native warm-pool executor"
+        );
+        Ok(prepared)
+    }
+
+    /// An exact signed instance is never replaced by another idle or cold worker.
+    async fn checkout_prepared(
+        &self,
+        zone: &ZoneId,
+        instance: &InstanceId,
+    ) -> HostResult<NativeWarmPoolEntry> {
+        self.require_prepared_zone(zone)?;
+        let key = self.warm_pool_key(zone);
+        let mut entries = self.entries.lock().await;
+        self.require_prepared_zone(zone)?;
+        self.apply_retention_locked(&mut entries);
+        let index = entries.iter().position(|entry| {
+            entry.key == key && entry.instance_id.as_ref() == Some(instance)
+        }).ok_or_else(|| HostError::Unavailable(
+            "prepared native warm-pool instance is unavailable or busy; prepare an available instance and obtain its capability before retrying".to_owned(),
+        ))?;
+        Ok(entries.remove(index))
+    }
+
+    /// Called with the selected worker's session lock held until the operation
+    /// RPC completes. Reconfiguration cannot race between health and dispatch.
+    async fn validate_prepared_entry(
+        &self,
+        entry: &NativeWarmPoolEntry,
+        request: NativeWarmPoolAuthority<'_>,
+        handshaken_zone: &mut Option<ZoneId>,
+        termination: Option<&NativeInvocationTermination>,
+    ) -> HostResult<()> {
+        entry.connector.handshake_if_needed(request.zone_id, handshaken_zone, termination).await?;
+        let health = entry.connector.rpc_with_termination("health", json!({}), termination).await?;
+        let prepared = session::prepared_from_health(
+            self.connector_id.clone(), request.zone_id.clone(), health,
+        ).map_err(|_| HostError::Unavailable(
+            "prepared native warm-pool executor is no longer ready; prepare a new executor".to_owned(),
+        ))?;
+        if entry.instance_id.as_ref() != Some(&prepared.instance_id) {
+            return Err(HostError::Unavailable(
+                "prepared native warm-pool instance changed before dispatch".to_owned(),
+            ));
+        }
+        let observation = PrewarmCheckoutObservation {
+            pool_state: PrewarmPoolState::WarmHit,
+            manifest: PrewarmManifestState::Current,
+            zone_binding: PrewarmZoneBinding::Bound,
+            sandbox: PrewarmSandboxState::LimitsActive,
+            credential: PrewarmCredentialState::Deferred,
+            health: PrewarmHealthState::Ready,
+            entry_age: entry.created_at.elapsed(),
+            previous_exit: None,
+        };
+        if !matches!(self.config.prewarm.decide_checkout(&observation), PrewarmCheckoutDecision::AdmitWarm { .. }) {
+            return Err(HostError::Unavailable(
+                "prepared native warm-pool executor no longer satisfies checkout policy".to_owned(),
+            ));
+        }
+        // A mutex or health RPC may outlive the token or a host admission fence.
+        if self.verified_target_instance(request)? != prepared.instance_id {
+            return Err(HostError::PreflightFailed(
+                "capability does not authorize the selected native warm-pool instance".to_owned(),
+            ));
+        }
+        if let Some(termination) = termination {
+            termination.require_current_deployment()?;
+            termination.require_current_inventory()?;
+            termination.require_current_authority()?;
+            if termination.is_cancel_requested() {
+                return Err(HostError::PreflightFailed(
+                    "native warm-pool operation was cancelled before dispatch".to_owned(),
+                ));
+            }
+        }
+        self.require_prepared_zone(request.zone_id)
+    }
+
     async fn spawn(
         config: ConnectorConfig,
         admitted: &ValidatedConnectorConfig,
@@ -1322,6 +1580,8 @@ impl NativeWarmPoolConnector {
                 global_rss_cap_bytes,
             )),
             entries: Mutex::new(Vec::new()),
+            preparation: futures_util::lock::Mutex::new(()),
+            prepared_instances: StdMutex::new(HashMap::new()),
             runtime_retirement,
             maintainer: Mutex::new(None),
         });
@@ -1495,48 +1755,82 @@ impl NativeWarmPoolConnector {
         request: InvokeRequest,
         termination: &WarmPoolTermination,
     ) -> HostResult<InvokeResponse> {
-        termination.invocation.require_current_deployment()?;
-        termination.invocation.require_current_inventory()?;
-        termination.invocation.require_current_authority()?;
-        let checkout = self
-            .checkout_with_termination(&request.zone_id, Some(&termination.invocation))
-            .await?;
-        self.runtime_retirement.require_open()?;
-        termination.invocation.require_current_deployment()?;
-        termination.invocation.require_current_inventory()?;
-        termination.invocation.require_current_authority()?;
-        if termination.is_cancel_requested() {
-            return Err(HostError::RegistryError(
-                "warm-pool invocation cancelled before worker dispatch".into(),
-            ));
+        let authority = NativeWarmPoolAuthority {
+            connector_id: &request.connector_id,
+            zone_id: &request.zone_id,
+            operation: &request.operation,
+            input: &request.input,
+            capability_token: &request.capability_token,
+        };
+        let checkout = async {
+            termination.invocation.require_current_deployment()?;
+            termination.invocation.require_current_inventory()?;
+            termination.invocation.require_current_authority()?;
+            if termination.is_cancel_requested() {
+                return Err(HostError::RegistryError(
+                    "warm-pool invocation cancelled before worker dispatch".into(),
+                ));
+            }
+            // Verify the original signed grant before touching idle capacity.
+            // An absent or busy target must never select or spawn a substitute.
+            let instance = self.verified_target_instance(authority)?;
+            self.checkout_prepared(&request.zone_id, &instance).await
         }
-        self.state_policy.require_current_manifest(&self.config)?;
+        .await;
+        let mut entry = match checkout {
+            Ok(entry) => entry,
+            Err(error) => {
+                termination.invocation.record_dispatch_refusal();
+                return Err(error);
+            }
+        };
+        let params = serde_json::to_value(&request).map_err(|err| {
+            termination.invocation.record_dispatch_refusal();
+            HostError::RegistryError(format!("invoke encode error: {err}"))
+        })?;
+        let mut handshaken_zone = entry.connector.handshaken_zone.lock().await;
+        if let Err(error) = self
+            .validate_prepared_entry(
+                &entry,
+                authority,
+                &mut handshaken_zone,
+                Some(&termination.invocation),
+            )
+            .await
+        {
+            termination.invocation.record_dispatch_refusal();
+            return Err(error);
+        }
         tracing::info!(
             event = WARM_POOL_EVIDENCE_EVENT,
-            action = if checkout.warm_checkout {
-                "reused"
-            } else {
-                "created"
-            },
-            connector_id = %checkout.entry.key.connector_id,
-            zone_hash = %warm_pool_log_label("zone", &checkout.entry.key.zone),
-            manifest_hash = %checkout.entry.key.manifest_hash,
-            reason = if checkout.warm_checkout {
-                "warm_checkout"
-            } else {
-                "cold_start"
-            },
-            idle_ms = checkout.entry.snapshot(Instant::now()).idle_ms,
-            rss_bytes = checkout.entry.rss_bytes,
-            activation_latency_ms = checkout.activation_latency_ms,
-            "native warm-pool checkout"
+            action = "reused",
+            connector_id = %entry.key.connector_id,
+            zone_hash = %warm_pool_log_label("zone", &entry.key.zone),
+            manifest_hash = %entry.key.manifest_hash,
+            reason = "prepared_instance",
+            idle_ms = entry.snapshot(Instant::now()).idle_ms,
+            rss_bytes = entry.rss_bytes,
+            "native warm-pool instance-bound checkout"
         );
 
-        let mut entry = checkout.entry;
-        let response = entry
-            .connector
-            .invoke_rpc(request, &termination.invocation)
-            .await;
+        // Keep the selected worker's handshake stable through the writer's
+        // final authority/cancellation checks and the original-token RPC.
+        let response = async {
+            let result = entry
+                .connector
+                .rpc_with_termination("invoke", params, Some(&termination.invocation))
+                .await?;
+            let response = serde_json::from_value(result).map_err(|_| {
+                HostError::RegistryError(
+                    "connector returned an invalid invoke response; outcome is unknown; reconcile external effects before retry"
+                        .to_owned(),
+                )
+            })?;
+            invoke_jobs::validate_response(None, &request.operation, &request.id, &response)?;
+            Ok(response)
+        }
+        .await;
+        drop(handshaken_zone);
         termination.invocation.ensure_settled().await?;
         let reusable = response
             .as_ref()
@@ -1592,11 +1886,27 @@ impl NativeWarmPoolConnector {
     }
 
     async fn simulate(&self, request: SimulateRequest) -> HostResult<SimulateResponse> {
-        let checkout = self.checkout(&request.zone_id).await?;
-        self.runtime_retirement.require_open()?;
-        self.state_policy.require_current_manifest(&self.config)?;
-        let mut entry = checkout.entry;
-        let response = entry.connector.simulate(request).await;
+        let authority = NativeWarmPoolAuthority {
+            connector_id: &request.connector_id,
+            zone_id: &request.zone_id,
+            operation: &request.operation,
+            input: &request.input,
+            capability_token: &request.capability_token,
+        };
+        let instance = self.verified_target_instance(authority)?;
+        let mut entry = self.checkout_prepared(&request.zone_id, &instance).await?;
+        let params = serde_json::to_value(&request)
+            .map_err(|err| HostError::RegistryError(format!("simulate encode error: {err}")))?;
+        let mut handshaken_zone = entry.connector.handshaken_zone.lock().await;
+        self.validate_prepared_entry(&entry, authority, &mut handshaken_zone, None)
+            .await?;
+        let response = async {
+            let result = entry.connector.rpc("simulate", params).await?;
+            serde_json::from_value(result)
+                .map_err(|err| HostError::RegistryError(format!("simulate parse error: {err}")))
+        }
+        .await;
+        drop(handshaken_zone);
         match response {
             Ok(response) => {
                 entry.last_used_at = Instant::now();
@@ -1760,6 +2070,7 @@ impl NativeWarmPoolConnector {
         Ok(NativeWarmPoolEntry {
             key: self.warm_pool_key(zone),
             connector,
+            instance_id: None,
             created_at: now,
             last_used_at: now,
             rss_bytes: NATIVE_WARM_POOL_ESTIMATED_RSS_BYTES,
@@ -35675,6 +35986,23 @@ done"#;
         }
     }
 
+    fn warm_pool_test_bound_invoke_request(
+        connector_id: &str,
+        signing_key: &fcp_crypto::ed25519::Ed25519SigningKey,
+        instance: &InstanceId,
+        message: &str,
+    ) -> InvokeRequest {
+        let mut request = warm_pool_test_invoke_request(connector_id, signing_key, message);
+        request.capability_token = test_capability_token_for_instance(
+            signing_key,
+            "cap.test.echo",
+            "test.echo",
+            ZoneId::work().as_str(),
+            instance,
+        );
+        request
+    }
+
     fn state_policy_test_manifest(model: Option<&str>, legacy_singleton: bool) -> String {
         state_policy_test_manifest_for("fcp.webhook-receiver", model, legacy_singleton)
     }
@@ -35845,16 +36173,36 @@ done"#;
             .expect("stateless fixture policy")
     }
 
-    fn configure_stateless_pool_test_manifest(
+    pub(super) fn configure_stateless_pool_test_manifest(
         config: &mut ConnectorConfig,
     ) -> (tempfile::TempDir, ValidatedConnectorConfig) {
         let directory = tempfile::tempdir().expect("pool manifest directory");
-        config.manifest_path = Some(write_state_policy_test_manifest_for(
-            directory.path(),
-            &config.id,
-            Some("stateless"),
-            false,
-        ));
+        let mut manifest = two_operation_network_manifest();
+        manifest.connector.id = config.id.parse().expect("fixture connector id");
+        let mut echo = manifest
+            .provides
+            .operations
+            .remove("op.a")
+            .expect("fixture operation template");
+        echo.capability = "cap.test.echo".parse().expect("fixture capability");
+        echo.idempotency = fcp_core::IdempotencyClass::BestEffort;
+        echo.network_constraints = None;
+        manifest.capabilities.required = vec![echo.capability.clone()];
+        manifest.capabilities.optional.clear();
+        manifest.provides.operations.clear();
+        manifest.provides.operations.insert("test.echo".to_owned(), echo);
+        manifest.manifest.interface_hash = manifest
+            .compute_interface_hash()
+            .expect("fixture interface hash");
+        let raw = toml::to_string(&manifest).expect("serialize pool manifest");
+        ConnectorManifest::parse_str(&raw).expect("fully validated pool manifest");
+        let path = directory.path().join("manifest.toml");
+        std::fs::write(&path, raw).expect("write pool manifest");
+        config.manifest_path = Some(path.to_string_lossy().into_owned());
+        config.env.insert(
+            "FCP_TEST_CONNECTOR_REQUIRE_INSTANCE_BINDING".to_owned(),
+            "1".to_owned(),
+        );
         let catalog = load_manifest_operation_constraints(config).expect("validated pool manifest");
         let policy =
             ConnectorStatePolicy::resolve(config, &catalog).expect("stateless pool policy");
@@ -35919,15 +36267,23 @@ done"#;
         .expect("native warm-pool connector should spawn");
         let prewarmed = only_native_warm_pool_entry(&connector).await;
         assert_eq!(subprocess_handshake_count(&prewarmed).await, 1);
+        let prepared = connector
+            .prepare_session(&ZoneId::work())
+            .await
+            .expect("prepare the actual warm executor");
 
+        let first_request = warm_pool_test_bound_invoke_request(
+            connector_id,
+            &signing_key,
+            &prepared.instance_id,
+            "first warm request",
+        );
+        let first_id = first_request.id.clone();
         let first = connector
-            .invoke(warm_pool_test_invoke_request(
-                connector_id,
-                &signing_key,
-                "first warm request",
-            ))
+            .invoke(first_request)
             .await
             .expect("first warm-pool invoke should succeed");
+        assert_eq!(first.id, first_id);
         assert_eq!(first.status, InvokeStatus::Ok);
         assert_eq!(
             first.result.expect("result")["echo"]["message"],
@@ -35937,14 +36293,19 @@ done"#;
         assert!(Arc::ptr_eq(&prewarmed, &pooled_after_first));
         assert_eq!(subprocess_handshake_count(&pooled_after_first).await, 1);
 
+        let second_request = warm_pool_test_bound_invoke_request(
+            connector_id,
+            &signing_key,
+            &prepared.instance_id,
+            "second warm request",
+        );
+        let second_id = second_request.id.clone();
+        assert_ne!(second_id, first_id);
         let second = connector
-            .invoke(warm_pool_test_invoke_request(
-                connector_id,
-                &signing_key,
-                "second warm request",
-            ))
+            .invoke(second_request)
             .await
             .expect("second warm-pool invoke should succeed");
+        assert_eq!(second.id, second_id);
         assert_eq!(second.status, InvokeStatus::Ok);
         assert_eq!(
             second.result.expect("result")["echo"]["message"],
@@ -36000,6 +36361,324 @@ done"#;
                 .contains("admitted manifest is unavailable"),
             "{error}"
         );
+    }
+
+    async fn strict_native_warm_pool_fixture(
+        connector_id: &str,
+        signing_key: &fcp_crypto::ed25519::Ed25519SigningKey,
+    ) -> (tempfile::TempDir, Arc<NativeWarmPoolConnector>) {
+        let mut config = subprocess_test_connector_config_requiring_handshake(connector_id);
+        config.prewarm = fcp_host::ConnectorPrewarmConfig::warm_pool(
+            2,
+            2,
+            Duration::from_secs(30),
+            Duration::from_millis(50),
+        );
+        let (directory, admitted) = configure_stateless_pool_test_manifest(&mut config);
+        let connector = NativeWarmPoolConnector::spawn(
+            config,
+            &admitted,
+            Arc::new(ResilienceLayer::default()),
+            Some(signing_key.verifying_key().to_bytes()),
+        )
+        .await
+        .expect("strict instance-bound warm pool");
+        (directory, connector)
+    }
+
+    fn warm_pool_test_simulate_request(request: InvokeRequest) -> SimulateRequest {
+        SimulateRequest {
+            r#type: "simulate".to_owned(),
+            id: request.id,
+            connector_id: request.connector_id,
+            operation: request.operation,
+            zone_id: request.zone_id,
+            input: request.input,
+            capability_token: request.capability_token,
+            estimate_cost: false,
+            check_availability: false,
+            context: None,
+            correlation_id: None,
+        }
+    }
+
+    async fn warm_pool_authorized_invocations(connector: &SubprocessConnector) -> u64 {
+        connector
+            .rpc("health", json!({}))
+            .await
+            .expect("strict worker health")["details"]["authorized_invocations"]
+            .as_u64()
+            .expect("strict fixture counts authorized invokes")
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn native_warm_pool_routes_signed_instance_past_other_idle_workers() {
+        if maybe_compiled_test_connector_binary().is_none() {
+            eprintln!("compiled fcp-test-connector missing; skipping instance routing test");
+            return;
+        }
+        let connector_id = "fcp.test.pool-instance-route:utility:1.0.0";
+        let key = fcp_crypto::ed25519::Ed25519SigningKey::generate();
+        let (_directory, pool) = strict_native_warm_pool_fixture(connector_id, &key).await;
+        let first = pool.prepare_session(&ZoneId::work()).await.unwrap();
+        let second = pool.prepare_session(&ZoneId::work()).await.unwrap();
+        assert_ne!(first.instance_id, second.instance_id);
+        let (first_worker, second_worker) = {
+            let entries = pool.entries.lock().await;
+            assert_eq!(entries.len(), 2);
+            assert_eq!(entries[0].instance_id.as_ref(), Some(&first.instance_id));
+            assert_eq!(entries[1].instance_id.as_ref(), Some(&second.instance_id));
+            (
+                Arc::clone(&entries[0].connector),
+                Arc::clone(&entries[1].connector),
+            )
+        };
+        let request = warm_pool_test_bound_invoke_request(
+            connector_id,
+            &key,
+            &second.instance_id,
+            "the signed target is not first in the pool",
+        );
+        let request_id = request.id.clone();
+        let result = pool.invoke(request).await.expect("exact second executor");
+        assert_eq!(result.id, request_id);
+        assert_eq!(
+            result.result.expect("strict fixture result")["instance_id"],
+            json!(second.instance_id.as_str()),
+        );
+        assert_eq!(warm_pool_authorized_invocations(&first_worker).await, 0);
+        assert_eq!(warm_pool_authorized_invocations(&second_worker).await, 1);
+        pool.simulate(warm_pool_test_simulate_request(
+            warm_pool_test_bound_invoke_request(
+                connector_id,
+                &key,
+                &first.instance_id,
+                "simulate with the original bound grant",
+            ),
+        ))
+        .await
+        .expect("bound simulation reaches its prepared executor");
+        assert_eq!(warm_pool_authorized_invocations(&first_worker).await, 0);
+        assert_eq!(warm_pool_authorized_invocations(&second_worker).await, 1);
+        assert_eq!(pool.entries.lock().await.len(), 2);
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn native_warm_pool_rejects_identity_collision_with_checked_out_worker() {
+        if maybe_compiled_test_connector_binary().is_none() {
+            eprintln!("compiled fcp-test-connector missing; skipping pool identity collision test");
+            return;
+        }
+        let connector_id = "fcp.test.pool-instance-collision:utility:1.0.0";
+        let key = fcp_crypto::ed25519::Ed25519SigningKey::generate();
+        let (_directory, pool) = strict_native_warm_pool_fixture(connector_id, &key).await;
+        let original = pool.prepare_session(&ZoneId::work()).await.unwrap();
+        let other = pool.prepare_session(&ZoneId::work()).await.unwrap();
+        let checked_out = pool
+            .checkout_prepared(&ZoneId::work(), &original.instance_id)
+            .await
+            .unwrap();
+        let original_worker = Arc::clone(&checked_out.connector);
+        let other_worker = {
+            let entries = pool.entries.lock().await;
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].instance_id.as_ref(), Some(&other.instance_id));
+            Arc::clone(&entries[0].connector)
+        };
+
+        // The original owner is absent from the idle vector, but remains live.
+        let error = pool
+            .register_prepared_instance(&original.instance_id, &other_worker)
+            .unwrap_err();
+        assert!(error.to_string().contains("ambiguous instance identity"), "{error}");
+        pool.register_prepared_instance(&original.instance_id, &original_worker)
+            .expect("the same live owner can be prepared again");
+        {
+            let instances = pool.prepared_instances.lock().unwrap();
+            let owner = instances
+                .get(&original.instance_id)
+                .and_then(std::sync::Weak::upgrade)
+                .expect("original live identity owner");
+            assert!(Arc::ptr_eq(&owner, &original_worker));
+            assert_eq!(instances.len(), 2);
+        }
+        {
+            let entries = pool.entries.lock().await;
+            assert_eq!(entries.len(), 1, "collision must not change idle capacity");
+            assert!(Arc::ptr_eq(&entries[0].connector, &other_worker));
+        }
+        assert_eq!(warm_pool_authorized_invocations(&original_worker).await, 0);
+        assert_eq!(warm_pool_authorized_invocations(&other_worker).await, 0);
+        pool.insert_pool_entry(checked_out).await;
+        assert_eq!(pool.entries.lock().await.len(), 2);
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn native_warm_pool_rejects_invalid_grants_before_worker_selection() {
+        if maybe_compiled_test_connector_binary().is_none() {
+            eprintln!("compiled fcp-test-connector missing; skipping pool grant test");
+            return;
+        }
+        let connector_id = "fcp.test.pool-instance-grants:utility:1.0.0";
+        let key = fcp_crypto::ed25519::Ed25519SigningKey::generate();
+        let (_directory, pool) = strict_native_warm_pool_fixture(connector_id, &key).await;
+        let prepared = pool.prepare_session(&ZoneId::work()).await.unwrap();
+        let second = pool.prepare_session(&ZoneId::work()).await.unwrap();
+        let workers = {
+            let entries = pool.entries.lock().await;
+            entries
+                .iter()
+                .map(|entry| Arc::clone(&entry.connector))
+                .collect::<Vec<_>>()
+        };
+        let valid = warm_pool_test_bound_invoke_request(
+            connector_id,
+            &key,
+            &prepared.instance_id,
+            "must not reach an executor",
+        );
+        let mut requests = vec![(
+            "missing instance binding",
+            warm_pool_test_invoke_request(connector_id, &key, "unbound"),
+        )];
+        let mut forged = valid.clone();
+        forged.capability_token = test_capability_token_for_instance(
+            &fcp_crypto::ed25519::Ed25519SigningKey::generate(),
+            "cap.test.echo",
+            "test.echo",
+            "z:work",
+            &prepared.instance_id,
+        );
+        requests.push(("forged signature", forged));
+        for (label, capability, operation, zone) in [
+            ("wrong capability", "cap.test.other", "test.echo", "z:work"),
+            ("wrong operation grant", "cap.test.echo", "test.other", "z:work"),
+            ("wrong signed zone", "cap.test.echo", "test.echo", "z:private"),
+        ] {
+            let mut request = valid.clone();
+            request.capability_token = test_capability_token_for_instance(
+                &key,
+                capability,
+                operation,
+                zone,
+                &prepared.instance_id,
+            );
+            requests.push((label, request));
+        }
+        let mut wrong_connector = valid.clone();
+        wrong_connector.connector_id = "fcp.test.other-pool:utility:1.0.0".parse().unwrap();
+        requests.push(("wrong connector", wrong_connector));
+        let mut wrong_zone = valid.clone();
+        wrong_zone.zone_id = ZoneId::private();
+        requests.push(("wrong request zone", wrong_zone));
+        let mut absent = valid.clone();
+        absent.capability_token = test_capability_token_for_instance(
+            &key,
+            "cap.test.echo",
+            "test.echo",
+            "z:work",
+            &InstanceId::new(),
+        );
+        requests.push(("absent signed instance", absent));
+        let mut expired = valid;
+        let now = Utc::now();
+        expired.capability_token = fcp_core::CapabilityToken::from_raw(
+            fcp_crypto::cose::CapabilityTokenBuilder::new()
+                .capability_id("cap.test.echo")
+                .zone_id("z:work")
+                .principal("user:test")
+                .issuer("node:test")
+                .audience("*")
+                .operations(&["test.echo"])
+                .target_instance(prepared.instance_id.as_str())
+                .validity(
+                    now - chrono::Duration::hours(2),
+                    now - chrono::Duration::hours(1),
+                )
+                .try_constraints_cbor(&wildcard_constraints_cbor())
+                .unwrap()
+                .sign(&key)
+                .unwrap(),
+        );
+        requests.push(("expired grant", expired));
+        for (label, request) in requests {
+            assert!(pool.invoke(request.clone()).await.is_err(), "{label}");
+            assert!(
+                pool.simulate(warm_pool_test_simulate_request(request))
+                    .await
+                    .is_err(),
+                "simulation must preserve the same authority: {label}",
+            );
+            let entries = pool.entries.lock().await;
+            assert_eq!(entries.len(), workers.len(), "{label}");
+            for worker in &workers {
+                assert!(
+                    entries.iter().any(|entry| Arc::ptr_eq(&entry.connector, worker)),
+                    "invalid authority must not consume or replace a worker: {label}",
+                );
+            }
+        }
+        for worker in workers {
+            assert_eq!(warm_pool_authorized_invocations(&worker).await, 0);
+        }
+        assert_ne!(prepared.instance_id, second.instance_id);
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn native_warm_pool_never_substitutes_for_busy_or_stale_prepared_instance() {
+        if maybe_compiled_test_connector_binary().is_none() {
+            eprintln!("compiled fcp-test-connector missing; skipping stale pool instance test");
+            return;
+        }
+        let connector_id = "fcp.test.pool-instance-stale:utility:1.0.0";
+        let key = fcp_crypto::ed25519::Ed25519SigningKey::generate();
+        let (_directory, pool) = strict_native_warm_pool_fixture(connector_id, &key).await;
+        let target = pool.prepare_session(&ZoneId::work()).await.unwrap();
+        let other = pool.prepare_session(&ZoneId::work()).await.unwrap();
+        let checked_out = pool
+            .checkout_prepared(&ZoneId::work(), &target.instance_id)
+            .await
+            .unwrap();
+        let target_worker = Arc::clone(&checked_out.connector);
+        let other_worker = {
+            let entries = pool.entries.lock().await;
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].instance_id.as_ref(), Some(&other.instance_id));
+            Arc::clone(&entries[0].connector)
+        };
+        let request = warm_pool_test_bound_invoke_request(
+            connector_id,
+            &key,
+            &target.instance_id,
+            "busy target must not select the other worker",
+        );
+        let error = pool.invoke(request.clone()).await.unwrap_err();
+        assert!(error.to_string().contains("unavailable or busy"), "{error}");
+        let error = pool
+            .simulate(warm_pool_test_simulate_request(request.clone()))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("unavailable or busy"), "{error}");
+        assert_eq!(pool.entries.lock().await.len(), 1, "no cold substitute");
+        assert_eq!(warm_pool_authorized_invocations(&other_worker).await, 0);
+        pool.insert_pool_entry(checked_out).await;
+
+        // A configuration change rotates the same process's session identity.
+        // Its cached prepared grant may not gain authority over that new session.
+        target_worker.configure(json!({})).await.unwrap();
+        let error = pool
+            .simulate(warm_pool_test_simulate_request(request.clone()))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("instance changed"), "{error}");
+        let error = pool.invoke(request).await.unwrap_err();
+        assert!(error.to_string().contains("unavailable or busy"), "{error}");
+        let entries = pool.entries.lock().await;
+        assert_eq!(entries.len(), 1, "stale target must not trigger replacement");
+        assert!(Arc::ptr_eq(&entries[0].connector, &other_worker));
+        drop(entries);
+        assert_eq!(warm_pool_authorized_invocations(&target_worker).await, 0);
+        assert_eq!(warm_pool_authorized_invocations(&other_worker).await, 0);
     }
 
     #[fcp_async_core::runtime::test(flavor = "multi_thread")]
