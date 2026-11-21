@@ -5,7 +5,7 @@ min_mesh_version = "2.0.0"
 min_protocol = "fcp2-sym/2.0"
 protocol_features = []
 max_datagram_bytes = 65000
-interface_hash = "blake3-256:fcp.interface.v2:ba198b829faf33057ee13238a05202bd9013ff30c0b1c8f386ca89ad9a038da5"
+interface_hash = "blake3-256:fcp.interface.v2:13a8da0d12b5288e56e7271cc2f0fd3948afeb61918069e5ce7567dbd4f93bc7"
 
 [connector]
 id = "fcp.asana"
@@ -49,6 +49,7 @@ optional = [
     "asana.tasks.delete",
     "asana.tasks.read",
     "asana.workspaces.read",
+    "asana.sections.read",
 ]
 forbidden = [
     "system.exec",
@@ -66,10 +67,10 @@ requires_approval = "none"
 idempotency = "strict"
 
 [provides.operations."asana.projects.list".input_schema]
-required = ["workspace"]
+required = ["workspace_gid"]
 type = "object"
 
-[provides.operations."asana.projects.list".input_schema.properties.workspace]
+[provides.operations."asana.projects.list".input_schema.properties.workspace_gid]
 description = "Workspace GID"
 type = "string"
 
@@ -100,8 +101,8 @@ max_response_bytes = 10485760
 
 [provides.operations."asana.projects.list".ai_hints]
 when_to_use = "List projects in an Asana workspace."
-common_mistakes = ["Passing a project GID instead of a workspace GID; the workspace parameter must be the workspace's numeric GID, not a project identifier."]
-examples = ['{"workspace": "1234567890"}']
+common_mistakes = ["Passing a project GID instead of a workspace GID; the workspace_gid parameter must be the workspace's numeric GID, not a project identifier."]
+examples = ['{"workspace_gid": "1234567890"}']
 related = [
     "asana.workspaces.list",
     "asana.tasks.list",
@@ -184,7 +185,6 @@ type = "string"
 type = "string"
 
 [provides.operations."asana.tasks.update".input_schema.properties.task_gid]
-description = "Task GID"
 type = "string"
 
 [provides.operations."asana.tasks.update".output_schema]
@@ -227,13 +227,13 @@ capability = "asana.tasks.delete"
 risk_level = "high"
 safety_tier = "dangerous"
 requires_approval = "interactive"
-idempotency = "strict"
+idempotency = "none"
 
 [provides.operations."asana.tasks.delete".input_schema]
-required = ["task"]
+required = ["task_gid"]
 type = "object"
 
-[provides.operations."asana.tasks.delete".input_schema.properties.task]
+[provides.operations."asana.tasks.delete".input_schema.properties.task_gid]
 description = "Task GID"
 type = "string"
 
@@ -261,7 +261,7 @@ max_response_bytes = 1048576
 [provides.operations."asana.tasks.delete".ai_hints]
 when_to_use = "Delete a task. Cannot be undone."
 common_mistakes = ["Deleting a task also removes all of its subtasks permanently; verify the task has no subtasks you want to keep before deleting."]
-examples = ['{"task": "1234567890"}']
+examples = ['{"task_gid": "1234567890"}']
 related = ["asana.tasks.list"]
 
 [provides.operations."asana.tasks.list"]
@@ -273,10 +273,10 @@ requires_approval = "none"
 idempotency = "strict"
 
 [provides.operations."asana.tasks.list".input_schema]
-required = ["project"]
+required = ["project_gid"]
 type = "object"
 
-[provides.operations."asana.tasks.list".input_schema.properties.project]
+[provides.operations."asana.tasks.list".input_schema.properties.project_gid]
 description = "Project GID"
 type = "string"
 
@@ -308,7 +308,7 @@ max_response_bytes = 10485760
 [provides.operations."asana.tasks.list".ai_hints]
 when_to_use = "List tasks in an Asana project."
 common_mistakes = ["Only top-level tasks in the project are returned; subtasks are not included and must be fetched separately using the parent task's GID."]
-examples = ['{"project": "1234567890"}']
+examples = ['{"project_gid": "1234567890"}']
 related = [
     "asana.tasks.create",
     "asana.projects.list",
@@ -356,6 +356,193 @@ when_to_use = "List Asana workspaces."
 common_mistakes = ["Confusing workspaces with organizations; both are returned by this endpoint and organizations are a type of workspace with additional features."]
 examples = ["{}"]
 related = ["asana.projects.list"]
+
+[provides.operations."asana.projects.get"]
+description = "Get a single project"
+capability = "asana.projects.read"
+risk_level = "low"
+safety_tier = "safe"
+requires_approval = "none"
+idempotency = "strict"
+
+[provides.operations."asana.projects.get".input_schema]
+required = ["project_gid"]
+type = "object"
+
+[provides.operations."asana.projects.get".input_schema.properties.project_gid]
+type = "string"
+
+[provides.operations."asana.projects.get".output_schema]
+required = ["data"]
+type = "object"
+
+[provides.operations."asana.projects.get".output_schema.properties.data]
+type = "object"
+
+[provides.operations."asana.projects.get".network_constraints]
+host_allow = ["app.asana.com"]
+port_allow = [443]
+ip_allow = []
+cidr_deny = []
+deny_localhost = true
+deny_private_ranges = true
+deny_tailnet_ranges = true
+require_sni = true
+spki_pins = []
+deny_ip_literals = true
+require_host_canonicalization = true
+dns_max_ips = 16
+max_redirects = 3
+connect_timeout_ms = 10000
+total_timeout_ms = 30000
+max_response_bytes = 10485760
+
+[provides.operations."asana.projects.get".ai_hints]
+when_to_use = "Retrieve a single Asana project by its GID."
+common_mistakes = ["Using a workspace GID instead of a project GID."]
+examples = ['{"project_gid": "1234567890"}']
+related = ["asana.projects.list"]
+
+[provides.operations."asana.tasks.get"]
+description = "Get a single task"
+capability = "asana.tasks.read"
+risk_level = "low"
+safety_tier = "safe"
+requires_approval = "none"
+idempotency = "strict"
+
+[provides.operations."asana.tasks.get".input_schema]
+required = ["task_gid"]
+type = "object"
+
+[provides.operations."asana.tasks.get".input_schema.properties.task_gid]
+type = "string"
+
+[provides.operations."asana.tasks.get".output_schema]
+required = ["data"]
+type = "object"
+
+[provides.operations."asana.tasks.get".output_schema.properties.data]
+type = "object"
+
+[provides.operations."asana.tasks.get".network_constraints]
+host_allow = ["app.asana.com"]
+port_allow = [443]
+ip_allow = []
+cidr_deny = []
+deny_localhost = true
+deny_private_ranges = true
+deny_tailnet_ranges = true
+require_sni = true
+spki_pins = []
+deny_ip_literals = true
+require_host_canonicalization = true
+dns_max_ips = 16
+max_redirects = 3
+connect_timeout_ms = 10000
+total_timeout_ms = 30000
+max_response_bytes = 10485760
+
+[provides.operations."asana.tasks.get".ai_hints]
+when_to_use = "Retrieve a single Asana task by its GID."
+common_mistakes = ["Confusing task GID with task name or project GID."]
+examples = ['{"task_gid": "1234567890"}']
+related = ["asana.tasks.list"]
+
+[provides.operations."asana.sections.list"]
+description = "List sections in a project"
+capability = "asana.sections.read"
+risk_level = "low"
+safety_tier = "safe"
+requires_approval = "none"
+idempotency = "strict"
+
+[provides.operations."asana.sections.list".input_schema]
+required = ["project_gid"]
+type = "object"
+
+[provides.operations."asana.sections.list".input_schema.properties.project_gid]
+type = "string"
+
+[provides.operations."asana.sections.list".output_schema]
+required = ["data"]
+type = "object"
+
+[provides.operations."asana.sections.list".output_schema.properties.data]
+type = "array"
+
+[provides.operations."asana.sections.list".network_constraints]
+host_allow = ["app.asana.com"]
+port_allow = [443]
+ip_allow = []
+cidr_deny = []
+deny_localhost = true
+deny_private_ranges = true
+deny_tailnet_ranges = true
+require_sni = true
+spki_pins = []
+deny_ip_literals = true
+require_host_canonicalization = true
+dns_max_ips = 16
+max_redirects = 3
+connect_timeout_ms = 10000
+total_timeout_ms = 30000
+max_response_bytes = 10485760
+
+[provides.operations."asana.sections.list".ai_hints]
+when_to_use = "List sections within an Asana project."
+common_mistakes = ["Using a workspace GID instead of a project GID for the project_gid parameter."]
+examples = ['{"project_gid": "1234567890"}']
+related = ["asana.projects.list"]
+
+[provides.operations."asana.tasks.search"]
+description = "Search tasks in a workspace"
+capability = "asana.tasks.read"
+risk_level = "low"
+safety_tier = "safe"
+requires_approval = "none"
+idempotency = "strict"
+
+[provides.operations."asana.tasks.search".input_schema]
+required = ["workspace_gid", "query"]
+type = "object"
+
+[provides.operations."asana.tasks.search".input_schema.properties.workspace_gid]
+type = "string"
+
+[provides.operations."asana.tasks.search".input_schema.properties.query]
+type = "string"
+
+[provides.operations."asana.tasks.search".output_schema]
+required = ["data"]
+type = "object"
+
+[provides.operations."asana.tasks.search".output_schema.properties.data]
+type = "array"
+
+[provides.operations."asana.tasks.search".network_constraints]
+host_allow = ["app.asana.com"]
+port_allow = [443]
+ip_allow = []
+cidr_deny = []
+deny_localhost = true
+deny_private_ranges = true
+deny_tailnet_ranges = true
+require_sni = true
+spki_pins = []
+deny_ip_literals = true
+require_host_canonicalization = true
+dns_max_ips = 16
+max_redirects = 3
+connect_timeout_ms = 10000
+total_timeout_ms = 30000
+max_response_bytes = 10485760
+
+[provides.operations."asana.tasks.search".ai_hints]
+when_to_use = "Search for tasks across a workspace by keyword."
+common_mistakes = ["Using a project GID instead of a workspace GID; search operates at the workspace level."]
+examples = ['{"workspace_gid": "1234567890", "query": "login bug"}']
+related = ["asana.tasks.list", "asana.workspaces.list"]
 
 [sandbox]
 profile = "strict"
@@ -405,6 +592,13 @@ window_ms = 60000
 burst = 10
 scope = "instance"
 
+[[rate_limits.pools]]
+id = "asana.sections.read"
+requests = 200
+window_ms = 60000
+burst = 20
+scope = "instance"
+
 [rate_limits.operation_pools]
 "asana.tasks.list" = ["asana.tasks.read"]
 "asana.workspaces.list" = ["asana.workspaces.read"]
@@ -412,3 +606,7 @@ scope = "instance"
 "asana.tasks.update" = ["asana.tasks.write"]
 "asana.tasks.delete" = ["asana.tasks.delete"]
 "asana.projects.list" = ["asana.projects.read"]
+"asana.projects.get" = ["asana.projects.read"]
+"asana.tasks.get" = ["asana.tasks.read"]
+"asana.sections.list" = ["asana.sections.read"]
+"asana.tasks.search" = ["asana.tasks.read"]

@@ -11,11 +11,17 @@
     clippy::unused_async
 )]
 
-use serde_json::json;
-use wiremock::matchers::{header, method, path, query_param};
+use std::collections::BTreeSet;
+
+use fcp_core::{OperationId, OperationInfo, SafetyTier};
+use fcp_manifest::{ConnectorManifest, ManifestApprovalMode, OperationContractSet};
+use serde_json::{Value, json};
+use wiremock::matchers::{body_json, header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use fcp_asana::connector::AsanaConnector;
+
+const MANIFEST_TOML: &str = include_str!("../manifest.toml");
 
 async fn setup_connector(mock_url: &str) -> AsanaConnector {
     let mut c = AsanaConnector::new();
@@ -100,6 +106,190 @@ async fn lifecycle_introspect() {
     let c = setup_connector(&server.uri()).await;
     let intro = c.handle_introspect().await.unwrap();
     assert_eq!(intro["operations"].as_array().unwrap().len(), 10);
+}
+
+#[fcp_async_core::runtime::test]
+async fn manifest_matches_runtime_operation_contracts() {
+    let manifest = ConnectorManifest::parse_str(MANIFEST_TOML)
+        .expect("Asana manifest and interface hash must validate");
+    let server = MockServer::start().await;
+    let mut connector = setup_connector(&server.uri()).await;
+    let introspection = connector.handle_introspect().await.unwrap();
+    let operations: Vec<OperationInfo> =
+        serde_json::from_value(introspection["operations"].clone()).unwrap();
+    let runtime_ids: BTreeSet<_> = operations.iter().map(|op| op.id.as_str()).collect();
+    let manifest_ids: BTreeSet<_> = manifest
+        .provides
+        .operations
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(runtime_ids.len(), operations.len(), "unique runtime IDs");
+    assert_eq!(runtime_ids, manifest_ids, "complete host-admitted catalog");
+    assert_eq!(runtime_ids.len(), 10);
+
+    let rate_limits = manifest.rate_limits.as_ref().unwrap();
+    assert_eq!(rate_limits.operation_pools.len(), operations.len());
+    for runtime in &operations {
+        let id = runtime.id.as_str();
+        let declared = manifest.provides.operations.get(id).unwrap();
+        assert_eq!(declared.input_schema, runtime.input_schema, "{id} input");
+        assert_eq!(declared.output_schema, runtime.output_schema, "{id} output");
+        assert_eq!(declared.capability, runtime.capability, "{id} capability");
+        assert_eq!(declared.risk_level, runtime.risk_level, "{id} risk");
+        assert_eq!(declared.safety_tier, runtime.safety_tier, "{id} safety");
+        assert_eq!(declared.idempotency, runtime.idempotency, "{id} replay");
+        assert!(manifest.capabilities.optional.contains(&runtime.capability));
+        let approval = match runtime.safety_tier {
+            SafetyTier::Safe => ManifestApprovalMode::None,
+            SafetyTier::Risky => ManifestApprovalMode::Policy,
+            SafetyTier::Dangerous => ManifestApprovalMode::Interactive,
+            other => panic!("review the approval contract for {id}: {other:?}"),
+        };
+        assert_eq!(declared.requires_approval, approval, "{id} approval");
+        let pools = rate_limits.operation_pools.get(id).unwrap();
+        assert_eq!(
+            pools.iter().map(String::as_str).collect::<Vec<_>>(),
+            vec![runtime.capability.as_str()],
+            "{id} rate-limit coverage"
+        );
+        let network = declared.network_constraints.as_ref().unwrap();
+        assert_eq!(network.host_allow, ["app.asana.com"]);
+        assert_eq!(network.port_allow, [443]);
+        assert!(network.require_sni && network.deny_localhost && network.deny_private_ranges);
+        assert!(network.deny_tailnet_ranges && network.deny_ip_literals);
+    }
+
+    let handshake = connector
+        .handle_handshake(json!({"session_id": "manifest-contract"}))
+        .await
+        .unwrap();
+    let advertised: BTreeSet<_> = handshake["capabilities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|capability| capability.as_str().unwrap())
+        .collect();
+    let declared: BTreeSet<_> = manifest
+        .capabilities
+        .optional
+        .iter()
+        .map(fcp_core::CapabilityId::as_str)
+        .collect();
+    assert_eq!(advertised, declared, "handshake and manifest authority");
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[test]
+fn manifest_rejects_obsolete_gid_fields_and_invalid_operation_data() {
+    let contracts = OperationContractSet::from_manifest_toml(MANIFEST_TOML)
+        .expect("host operation validators must compile");
+    for (id, valid, obsolete) in [
+        (
+            "asana.projects.list",
+            json!({"workspace_gid": "123"}),
+            json!({"workspace": "123"}),
+        ),
+        (
+            "asana.tasks.list",
+            json!({"project_gid": "123"}),
+            json!({"project": "123"}),
+        ),
+        (
+            "asana.tasks.delete",
+            json!({"task_gid": "123"}),
+            json!({"task": "123"}),
+        ),
+        (
+            "asana.tasks.create",
+            json!({"workspace": "123", "name": "Contract fixture"}),
+            json!({"workspace_gid": "123", "name": "Contract fixture"}),
+        ),
+    ] {
+        let operation = OperationId::from_static(id);
+        contracts.validate_input(&operation, &valid).unwrap();
+        assert!(
+            contracts.validate_input(&operation, &obsolete).is_err(),
+            "{id}"
+        );
+    }
+    let search = OperationId::from_static("asana.tasks.search");
+    for invalid in [
+        json!({"workspace_gid": "123"}),
+        json!({"workspace_gid": 123, "query": "contract"}),
+        json!({"workspace_gid": "123", "query": []}),
+    ] {
+        assert!(contracts.validate_input(&search, &invalid).is_err());
+    }
+    for invalid in [json!({}), json!({"data": {}}), json!({"data": null})] {
+        assert!(contracts.validate_result(&search, &invalid).is_err());
+    }
+    assert!(
+        contracts
+            .validate_input(&OperationId::from_static("asana.tasks.unknown"), &json!({}))
+            .is_err()
+    );
+}
+
+#[fcp_async_core::runtime::test]
+async fn manifest_examples_execute_against_provider_contracts() {
+    let manifest = ConnectorManifest::parse_str(MANIFEST_TOML).unwrap();
+    let contracts = OperationContractSet::from_manifest(&manifest).unwrap();
+    let server = MockServer::start().await;
+    let connector = setup_connector(&server.uri()).await;
+
+    for (id, declared) in &manifest.provides.operations {
+        let operation: OperationId = id.parse().unwrap();
+        let input: Value = serde_json::from_str(&declared.ai_hints.examples[0]).unwrap();
+        let (verb, endpoint) = match id.as_str() {
+            "asana.workspaces.list" => ("GET", "/workspaces"),
+            "asana.projects.list" => ("GET", "/workspaces/1234567890/projects"),
+            "asana.projects.get" => ("GET", "/projects/1234567890"),
+            "asana.tasks.list" => ("GET", "/projects/1234567890/tasks"),
+            "asana.tasks.get" => ("GET", "/tasks/1234567890"),
+            "asana.tasks.create" => ("POST", "/tasks"),
+            "asana.tasks.update" => ("PUT", "/tasks/1234567890"),
+            "asana.tasks.delete" => ("DELETE", "/tasks/1234567890"),
+            "asana.sections.list" => ("GET", "/projects/1234567890/sections"),
+            "asana.tasks.search" => ("GET", "/workspaces/1234567890/tasks/search"),
+            other => panic!("add a provider contract fixture for {other}"),
+        };
+        let expected = if id.ends_with(".list") || id.ends_with(".search") {
+            json!({"data": [{"gid": "fixture-result", "name": "Contract fixture"}]})
+        } else if id.ends_with(".delete") {
+            json!({})
+        } else {
+            json!({"data": {"gid": "fixture-result", "name": "Contract fixture"}})
+        };
+        let mut provider = Mock::given(method(verb))
+            .and(path(endpoint))
+            .and(header("Authorization", "Bearer 1/test_pat_token_123"));
+        if id == "asana.tasks.search" {
+            provider = provider.and(query_param("text", "login bug"));
+        } else if id == "asana.tasks.create" {
+            provider = provider.and(body_json(json!({"data": {
+                "workspace": "1234567890",
+                "name": "Fix login timeout",
+                "notes": "Users report 30s timeouts"
+            }})));
+        } else if id == "asana.tasks.update" {
+            provider = provider.and(body_json(json!({"data": {"name": "Updated task name"}})));
+        }
+        provider
+            .respond_with(ResponseTemplate::new(200).set_body_json(expected.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        contracts.validate_input(&operation, &input).unwrap();
+        let result = connector
+            .handle_invoke(json!({"operation_id": id, "input": input}))
+            .await
+            .unwrap();
+        contracts.validate_result(&operation, &result).unwrap();
+        assert_eq!(result, expected, "{id} provider result");
+    }
+    assert_eq!(server.received_requests().await.unwrap().len(), 10);
 }
 
 // -- Workspaces List --

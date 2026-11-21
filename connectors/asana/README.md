@@ -1,7 +1,8 @@
 # Asana Connector V3 Contract
 
-> **Status**: runtime contract documented; manifest drift documented
+> **Status**: all 10 runtime operations declared in the validated manifest
 > **Bead**: `flywheel_connectors-4kw5f.12`
+> **Contract repair**: `flywheel_connectors-asana-contract-zyoy5`
 > **Parent**: `flywheel_connectors-4kw5f`
 > **Verification script**: none tracked; use the commands below
 > **Primary upstream**: https://developers.asana.com/docs/quick-start
@@ -48,17 +49,34 @@ Important runtime truths the contract preserves:
 - `health` is local connector state, not a live provider probe.
 - `self_check` reports local provisioning readiness and does not call Asana.
 
-## Manifest Drift In This Checkout
+## Manifest And Runtime Contract
 
-The runtime and manifest are not fully aligned in this checkout:
+`manifest.toml` declares all 10 operations exposed by dispatch and introspection,
+including their input and output schemas, capability requirements, risk, safety,
+and idempotency. Project retrieval, task retrieval, section listing, and task
+search therefore participate in host admission and discovery alongside the
+other operations. Every operation has a rate-limit pool and the same bounded
+Asana egress policy. `asana.sections.read` is declared in both the manifest and
+the handshake.
 
-- Runtime dispatch and introspection expose 10 operations.
-- `manifest.toml` currently defines only 5 operations: `asana.workspaces.list`, `asana.projects.list`, `asana.tasks.list`, `asana.tasks.create`, and `asana.tasks.delete`.
-- Runtime input fields use `workspace_gid`, `project_gid`, and `task_gid`; the manifest still uses `workspace`, `project`, and `task` for some operations.
-- Runtime handshake advertises `asana.sections.read`, but the manifest optional capability list does not include it.
-- Runtime supports `asana.projects.get`, `asana.tasks.get`, `asana.tasks.update`, `asana.sections.list`, and `asana.tasks.search`; these are absent from the manifest operation catalog.
+Identifier fields follow the runtime contract:
 
-This README documents the runtime truth while keeping the manifest drift visible. A follow-up manifest/schema parity bead should reconcile the catalog before treating the Asana connector as production-complete.
+- `asana.projects.list` and `asana.tasks.search` require `workspace_gid`.
+- `asana.projects.get`, `asana.tasks.list`, and `asana.sections.list` require `project_gid`.
+- `asana.tasks.get`, `asana.tasks.update`, and `asana.tasks.delete` require `task_gid`.
+- `asana.tasks.create` retains the provider field `workspace`, plus `name`; it forwards those fields inside the Asana `data` envelope.
+- `asana.tasks.search` also requires a string `query`.
+
+Task deletion is `Dangerous` / `High`, requires interactive approval in the
+manifest, and has idempotency `None`; the host must not treat it as a strictly
+replayable operation. Creation remains policy-gated and non-idempotent, while
+updates remain policy-gated and `Strict`.
+
+The existing integration suite checks the complete introspection/manifest
+contract, rejects obsolete identifier names before dispatch, and exercises all
+10 manifest examples against a loopback Asana fixture with the host's real
+input and output validators. These checks cover contract consistency; live
+provider verification remains a separate operator step.
 
 ## First-Slice Scope
 
@@ -90,7 +108,7 @@ The first Asana README slice documents the existing runtime surface:
   - `asana.tasks.read` gates task listing, task retrieval, and task search.
   - `asana.tasks.write` gates task creation and task update.
   - `asana.tasks.delete` gates task deletion.
-  - `asana.sections.read` gates section listing in the runtime, but is not yet declared in the manifest optional capabilities.
+  - `asana.sections.read` gates section listing.
 - The connector does not persist workspaces, projects, sections, tasks, access tokens, credential IDs, or search results beyond process memory.
 - Credential-id mode forwards a host credential reference header; host-side credential materialization remains outside this connector.
 - Actions made through a personal access token are attributed by Asana to the token owner.
@@ -118,7 +136,7 @@ The first Asana README slice documents the existing runtime surface:
 | `asana.tasks.read` | List, retrieve, and search tasks. |
 | `asana.tasks.write` | Create and update tasks. |
 | `asana.tasks.delete` | Delete tasks. |
-| `asana.sections.read` | List project sections in the runtime surface; missing from the manifest capability list. |
+| `asana.sections.read` | List project sections. |
 
 ## Operation Inventory
 
@@ -168,6 +186,7 @@ These are excluded on purpose:
 The deterministic integration evidence is anchored on WireMock and connector-local tests covering:
 
 - lifecycle health, handshake, reconfigure, shutdown, self-check, doctor, and introspection
+- complete manifest/introspection schema and authority parity, interface-hash validation, and provider execution of all manifest examples
 - bearer auth header behavior
 - workspace listing, project listing, project retrieval, task listing, task retrieval, task creation, task update, task deletion, section listing, and task search
 - required-field validation for all operation families
@@ -179,11 +198,11 @@ The deterministic integration evidence is anchored on WireMock and connector-loc
 
 ## Source Notes
 
-- `connectors/asana/src/connector.rs` defines configuration parsing, auth mode selection, base URL policy, lifecycle handlers, operation dispatch, diagnostics, simulation, operation metadata, provisioning recipe metadata, and manifest drift tests.
+- `connectors/asana/src/connector.rs` defines configuration parsing, auth mode selection, base URL policy, lifecycle handlers, operation dispatch, diagnostics, simulation, operation metadata, provisioning recipe metadata, and capability contract tests.
 - `connectors/asana/src/client.rs` defines Asana REST calls, bearer/credential headers, default base URL, request timeout, path-segment validation, query encoding, response parsing, and provider error mapping.
 - `connectors/asana/src/types.rs` defines provider error response parsing.
 - `connectors/asana/manifest.toml` defines the current manifest operation catalog, network constraints, sandbox boundary, zone policy, rate-limit pools, and operation AI hints.
-- `connectors/asana/tests/integration.rs` covers deterministic WireMock operation behavior, lifecycle diagnostics, error handling, simulation, and counters.
+- `connectors/asana/tests/integration.rs` covers manifest/runtime parity, host schema validation, deterministic WireMock operation behavior, lifecycle diagnostics, error handling, simulation, and counters.
 
 ## Verification Bundle
 
