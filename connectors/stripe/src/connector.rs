@@ -25,10 +25,10 @@ use subtle::ConstantTimeEq;
 use tracing::{info, instrument};
 
 use crate::{
-    client::{DEFAULT_API_URL, StripeAuth, StripeClient},
+    client::{DEFAULT_API_URL, StripeAuth, StripeClient, validate_pagination},
     error::StripeError,
     limits,
-    types::StripeWebhookEvent,
+    types::{ListResponse, StripeWebhookEvent},
 };
 
 const DEFAULT_WEBHOOK_TOLERANCE_SECONDS: i64 = 300;
@@ -946,11 +946,17 @@ impl StripeConnector {
             .and_then(|v| v.as_u64())
             .and_then(|v| u32::try_from(v).ok());
         let email = input.get("email").and_then(|v| v.as_str());
+        let starting_after = input
+            .get("starting_after")
+            .and_then(serde_json::Value::as_str);
+        let ending_before = input
+            .get("ending_before")
+            .and_then(serde_json::Value::as_str);
         let result = client
-            .list_customers(limit, email)
+            .list_customers(limit, email, starting_after, ending_before)
             .await
             .map_err(|e: StripeError| e.to_fcp_error())?;
-        Ok(json!({ "data": result.data, "has_more": result.has_more }))
+        list_page_output(&input, result)
     }
 
     async fn invoke_update_customer(
@@ -1233,11 +1239,17 @@ impl StripeConnector {
             .get("limit")
             .and_then(|v| v.as_u64())
             .and_then(|v| u32::try_from(v).ok());
+        let starting_after = input
+            .get("starting_after")
+            .and_then(serde_json::Value::as_str);
+        let ending_before = input
+            .get("ending_before")
+            .and_then(serde_json::Value::as_str);
         let result = client
-            .list_subscriptions(customer, status, limit)
+            .list_subscriptions(customer, status, limit, starting_after, ending_before)
             .await
             .map_err(|e: StripeError| e.to_fcp_error())?;
-        Ok(json!({ "data": result.data, "has_more": result.has_more }))
+        list_page_output(&input, result)
     }
 
     async fn invoke_cancel_subscription(
@@ -1274,11 +1286,17 @@ impl StripeConnector {
             .get("limit")
             .and_then(|v| v.as_u64())
             .and_then(|v| u32::try_from(v).ok());
+        let starting_after = input
+            .get("starting_after")
+            .and_then(serde_json::Value::as_str);
+        let ending_before = input
+            .get("ending_before")
+            .and_then(serde_json::Value::as_str);
         let result = client
-            .list_invoices(customer, limit)
+            .list_invoices(customer, limit, starting_after, ending_before)
             .await
             .map_err(|e: StripeError| e.to_fcp_error())?;
-        Ok(json!({ "data": result.data, "has_more": result.has_more }))
+        list_page_output(&input, result)
     }
 
     async fn invoke_get_invoice(&self, input: serde_json::Value) -> FcpResult<serde_json::Value> {
@@ -1580,10 +1598,34 @@ fn validate_simulate_input(operation: &str, input: &serde_json::Value) -> FcpRes
             require_str(input, "payload")?;
             require_str(input, "stripe_signature")?;
         }
-        "stripe.list_customers"
-        | "stripe.list_subscriptions"
-        | "stripe.list_invoices"
-        | "stripe.get_balance" => {}
+        "stripe.list_customers" | "stripe.list_subscriptions" | "stripe.list_invoices" => {
+            let limit = input
+                .get("limit")
+                .map(|value| {
+                    value
+                        .as_u64()
+                        .and_then(|value| u32::try_from(value).ok())
+                        .ok_or_else(|| FcpError::InvalidRequest {
+                            code: 1003,
+                            message: "limit must be an integer between 1 and 100".into(),
+                        })
+                })
+                .transpose()?;
+            validate_pagination(
+                limit,
+                input
+                    .get("starting_after")
+                    .and_then(serde_json::Value::as_str),
+                input
+                    .get("ending_before")
+                    .and_then(serde_json::Value::as_str),
+            )
+            .map_err(|error| FcpError::InvalidRequest {
+                code: 1003,
+                message: error.to_string(),
+            })?;
+        }
+        "stripe.get_balance" => {}
         _ => {
             return Err(FcpError::OperationNotGranted {
                 operation: operation.into(),
@@ -1591,6 +1633,50 @@ fn validate_simulate_input(operation: &str, input: &serde_json::Value) -> FcpRes
         }
     }
     Ok(())
+}
+
+/// Return a reusable next-page input, preserving all admitted filters. Each
+/// page remains a separate authorized invocation; no unbounded auto-fetch runs.
+fn list_page_output(input: &serde_json::Value, page: ListResponse) -> FcpResult<serde_json::Value> {
+    let invalid_page = || FcpError::External {
+        service: "stripe".into(),
+        message: "Stripe returned a list without a valid advancing continuation".into(),
+        status_code: None,
+        retryable: false,
+        retry_after: None,
+    };
+    if page.object != "list" {
+        return Err(invalid_page());
+    }
+    let next_page = if page.has_more {
+        let backwards = input.get("ending_before").is_some();
+        let item = if backwards {
+            page.data.first()
+        } else {
+            page.data.last()
+        };
+        let cursor = item
+            .and_then(|item| item.get("id"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(invalid_page)?;
+        validate_pagination(None, Some(cursor), None).map_err(|_| invalid_page())?;
+        let direction = if backwards {
+            "ending_before"
+        } else {
+            "starting_after"
+        };
+        if input.get(direction).and_then(serde_json::Value::as_str) == Some(cursor) {
+            return Err(invalid_page());
+        }
+        let mut next = input.as_object().cloned().ok_or_else(invalid_page)?;
+        next.remove("starting_after");
+        next.remove("ending_before");
+        next.insert(direction.into(), json!(cursor));
+        Some(next)
+    } else {
+        None
+    };
+    Ok(json!({ "data": page.data, "has_more": page.has_more, "next_page": next_page }))
 }
 
 fn resource_uris_for_operation(

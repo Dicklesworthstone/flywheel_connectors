@@ -5,7 +5,7 @@ min_mesh_version = "2.0.0"
 min_protocol = "fcp2-sym/2.0"
 protocol_features = []
 max_datagram_bytes = 65000
-interface_hash = "blake3-256:fcp.interface.v2:04e53b1687ee072c35e4ea9f21859202ca255fd9d174a6745b45e5b856995040"
+interface_hash = "blake3-256:fcp.interface.v2:1e54e1953322fdba352fafd0c6915c149ca9f5c91b03710751fd7b2d88ca7aba"
 
 [connector]
 id = "fcp.stripe"
@@ -921,17 +921,31 @@ revocation_freshness = "safe"
 [provides.operations."stripe.list_customers".input_schema]
 required = []
 type = "object"
+not = { required = ["starting_after", "ending_before"] }
 
 [provides.operations."stripe.list_customers".input_schema.properties.email]
 type = "string"
 
 [provides.operations."stripe.list_customers".input_schema.properties.limit]
 type = "integer"
+minimum = 1
+maximum = 100
+
+[provides.operations."stripe.list_customers".input_schema.properties.starting_after]
+type = "string"
+minLength = 1
+maxLength = 255
+
+[provides.operations."stripe.list_customers".input_schema.properties.ending_before]
+type = "string"
+minLength = 1
+maxLength = 255
 
 [provides.operations."stripe.list_customers".output_schema]
 required = [
     "data",
     "has_more",
+    "next_page",
 ]
 type = "object"
 
@@ -940,6 +954,10 @@ type = "array"
 
 [provides.operations."stripe.list_customers".output_schema.properties.has_more]
 type = "boolean"
+
+[provides.operations."stripe.list_customers".output_schema.properties.next_page]
+type = ["object", "null"]
+description = "Input for the next page in the requested direction, preserving the current filters and page size; null when complete."
 
 [provides.operations."stripe.list_customers".network_constraints]
 host_allow = ["api.stripe.com"]
@@ -977,17 +995,31 @@ revocation_freshness = "safe"
 [provides.operations."stripe.list_invoices".input_schema]
 required = []
 type = "object"
+not = { required = ["starting_after", "ending_before"] }
 
 [provides.operations."stripe.list_invoices".input_schema.properties.customer]
 type = "string"
 
 [provides.operations."stripe.list_invoices".input_schema.properties.limit]
 type = "integer"
+minimum = 1
+maximum = 100
+
+[provides.operations."stripe.list_invoices".input_schema.properties.starting_after]
+type = "string"
+minLength = 1
+maxLength = 255
+
+[provides.operations."stripe.list_invoices".input_schema.properties.ending_before]
+type = "string"
+minLength = 1
+maxLength = 255
 
 [provides.operations."stripe.list_invoices".output_schema]
 required = [
     "data",
     "has_more",
+    "next_page",
 ]
 type = "object"
 
@@ -996,6 +1028,10 @@ type = "array"
 
 [provides.operations."stripe.list_invoices".output_schema.properties.has_more]
 type = "boolean"
+
+[provides.operations."stripe.list_invoices".output_schema.properties.next_page]
+type = ["object", "null"]
+description = "Input for the next page in the requested direction, preserving the current filters and page size; null when complete."
 
 [provides.operations."stripe.list_invoices".network_constraints]
 host_allow = ["api.stripe.com"]
@@ -1036,12 +1072,25 @@ revocation_freshness = "safe"
 [provides.operations."stripe.list_subscriptions".input_schema]
 required = []
 type = "object"
+not = { required = ["starting_after", "ending_before"] }
 
 [provides.operations."stripe.list_subscriptions".input_schema.properties.customer]
 type = "string"
 
 [provides.operations."stripe.list_subscriptions".input_schema.properties.limit]
 type = "integer"
+minimum = 1
+maximum = 100
+
+[provides.operations."stripe.list_subscriptions".input_schema.properties.starting_after]
+type = "string"
+minLength = 1
+maxLength = 255
+
+[provides.operations."stripe.list_subscriptions".input_schema.properties.ending_before]
+type = "string"
+minLength = 1
+maxLength = 255
 
 [provides.operations."stripe.list_subscriptions".input_schema.properties.status]
 type = "string"
@@ -1050,6 +1099,7 @@ type = "string"
 required = [
     "data",
     "has_more",
+    "next_page",
 ]
 type = "object"
 
@@ -1058,6 +1108,10 @@ type = "array"
 
 [provides.operations."stripe.list_subscriptions".output_schema.properties.has_more]
 type = "boolean"
+
+[provides.operations."stripe.list_subscriptions".output_schema.properties.next_page]
+type = ["object", "null"]
+description = "Input for the next page in the requested direction, preserving the current filters and page size; null when complete."
 
 [provides.operations."stripe.list_subscriptions".network_constraints]
 host_allow = ["api.stripe.com"]

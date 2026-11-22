@@ -846,7 +846,7 @@ async fn list_subscriptions_success() {
         .with_api_url(&format!("{}/v1", mock_server.uri()));
 
     let result = client
-        .list_subscriptions(Some("cus_42"), Some("active"), Some(10))
+        .list_subscriptions(Some("cus_42"), Some("active"), Some(10), None, None)
         .await
         .unwrap();
     assert_eq!(result.data.len(), 1);
@@ -898,7 +898,10 @@ async fn list_invoices_success() {
         .unwrap()
         .with_api_url(&format!("{}/v1", mock_server.uri()));
 
-    let result = client.list_invoices(None, Some(10)).await.unwrap();
+    let result = client
+        .list_invoices(None, Some(10), None, None)
+        .await
+        .unwrap();
     assert_eq!(result.data.len(), 1);
     assert!(!result.has_more);
 }

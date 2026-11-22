@@ -81,12 +81,20 @@ This README documents runtime truth and keeps current drift visible:
 - Official Stripe idempotency guidance says all `POST` requests accept idempotency keys and `GET`/`DELETE` idempotency keys have no effect. Runtime derives or forwards idempotency keys for some delete operations as well.
 - `stripe.ingest_webhook_event` validates Stripe signatures inside the connector, but the connector does not open an HTTP listener, register Stripe webhook endpoints, or persist delivery state.
 - Webhook replay protection stores only in-memory event IDs and evicts by tolerance window and cache size.
-- List operations expose only narrow filters and `limit`; they do not expose full Stripe pagination cursors, search endpoints, expand parameters, or API version selection.
+- Customer, subscription and invoice lists expose their existing filters, `limit` (1–100), and mutually exclusive `starting_after` / `ending_before` cursors. Search endpoints, expand parameters and API version selection remain unavailable.
 - Manifest declares the shipped executable as `native`.
 - `connectors/stripe/tests/local_non_mock.rs` exercises the production connector invoke path against a deterministic loopback Stripe fixture for read, write, and payment/refund operations.
-- `connectors/stripe/tests/native_host.rs` exercises the shipped binary over JSONL and real loopback HTTP, including health/session negotiation, signed admission, form mutations, deadline cancellation, lifecycle revocation and webhook verification.
+- `connectors/stripe/tests/native_host.rs` exercises the shipped binary over JSONL and real loopback HTTP, including health/session negotiation, signed admission, form mutations, deadline cancellation, lifecycle revocation, webhook verification and cursor pagination.
 
-Full pagination/search/expand support and durable webhook delivery remain outside this bounded connector surface.
+Search/expand support and durable webhook delivery remain outside this bounded connector surface.
+
+### Traversing list results
+
+`stripe.list_customers`, `stripe.list_subscriptions` and `stripe.list_invoices` return `data`, `has_more` and `next_page`. When more results exist, pass the complete `next_page` object as the input of the next invocation of the same operation. It preserves the original filters and page limit while advancing the cursor. `next_page` is `null` at the end of the list.
+
+For example, an invoice page requested with `{"customer":"cus_123","limit":100}` can return `"next_page":{"customer":"cus_123","limit":100,"starting_after":"in_last"}`. A backwards request using `ending_before` advances from the first object in the returned page. Cursor values are encoded as individual query values; a cursor cannot add another provider parameter.
+
+Each invocation retrieves one page and requires fresh admission under the current session, resource scope, deadline and remaining signed allowance. Simulation does not fetch pages or spend calls. The connector does not automatically drain a list. A provider response claiming more results without a valid advancing boundary object fails without a retry or an admission refund.
 
 ## First-Slice Scope
 
@@ -201,7 +209,7 @@ The current implementation does not include:
 
 - Checkout Sessions, Prices, Products, Coupons, Promotion Codes, Tax, Billing Portal, Quotes, Payouts, Disputes, Mandates, SetupIntents, PaymentMethods, Transfers, Connect accounts, Terminal, Treasury, or Radar operations
 - payment method collection, 3DS/browser confirmation flows, customer portal sessions, hosted invoices, or client-side publishable-key flows
-- Stripe API version configuration, response expansion, search endpoints, full pagination cursors, connected-account headers, restricted-key provisioning, or API-key rotation
+- Stripe API version configuration, response expansion, search endpoints, automatic list draining, connected-account headers, restricted-key provisioning, or API-key rotation
 - webhook endpoint registration, inbound HTTP serving, durable webhook replay, persistent event cursoring, event fanout, or event destination management
 - connector-local storage of secrets, customers, invoices, payment objects, subscriptions, webhook payloads, replay state, counters, or provider responses beyond process memory
 

@@ -73,6 +73,52 @@ use crate::{
     },
 };
 
+/// Stripe list endpoints accept one cursor direction and a bounded page size.
+pub(crate) fn validate_pagination(
+    limit: Option<u32>,
+    starting_after: Option<&str>,
+    ending_before: Option<&str>,
+) -> StripeResult<()> {
+    let invalid_cursor = [starting_after, ending_before]
+        .into_iter()
+        .flatten()
+        .any(|cursor| {
+            cursor.is_empty()
+                || cursor.len() > 255
+                || !cursor.bytes().all(|byte| byte.is_ascii_graphic())
+        });
+    if limit.is_some_and(|limit| !(1..=100).contains(&limit))
+        || (starting_after.is_some() && ending_before.is_some())
+        || invalid_cursor
+    {
+        return Err(StripeError::Api {
+            status_code: Some(400),
+            message: "Pagination requires limit 1..=100 and at most one nonempty visible ASCII cursor up to 255 bytes".into(),
+            error_type: Some("invalid_request_error".into()),
+        });
+    }
+    Ok(())
+}
+
+fn append_pagination(
+    params: &mut Vec<String>,
+    starting_after: Option<&str>,
+    ending_before: Option<&str>,
+) {
+    if let Some(cursor) = starting_after {
+        params.push(format!(
+            "starting_after={}",
+            StripeClient::encode_query_value(cursor)
+        ));
+    }
+    if let Some(cursor) = ending_before {
+        params.push(format!(
+            "ending_before={}",
+            StripeClient::encode_query_value(cursor)
+        ));
+    }
+}
+
 /// Default Stripe API URL.
 pub const DEFAULT_API_URL: &str = "https://api.stripe.com/v1";
 
@@ -278,7 +324,10 @@ impl StripeClient {
         &self,
         limit: Option<u32>,
         email: Option<&str>,
+        starting_after: Option<&str>,
+        ending_before: Option<&str>,
     ) -> StripeResult<ListResponse> {
+        validate_pagination(limit, starting_after, ending_before)?;
         let mut url = format!("{}/customers", self.api_url);
         let mut params = Vec::new();
         if let Some(l) = limit {
@@ -287,6 +336,7 @@ impl StripeClient {
         if let Some(e) = email {
             params.push(format!("email={}", Self::encode_query_value(e)));
         }
+        append_pagination(&mut params, starting_after, ending_before);
         if !params.is_empty() {
             url = format!("{url}?{}", params.join("&"));
         }
@@ -468,7 +518,10 @@ impl StripeClient {
         customer: Option<&str>,
         status: Option<&str>,
         limit: Option<u32>,
+        starting_after: Option<&str>,
+        ending_before: Option<&str>,
     ) -> StripeResult<ListResponse> {
+        validate_pagination(limit, starting_after, ending_before)?;
         let mut url = format!("{}/subscriptions", self.api_url);
         let mut params = Vec::new();
         if let Some(c) = customer {
@@ -480,6 +533,7 @@ impl StripeClient {
         if let Some(l) = limit {
             params.push(format!("limit={l}"));
         }
+        append_pagination(&mut params, starting_after, ending_before);
         if !params.is_empty() {
             url = format!("{url}?{}", params.join("&"));
         }
@@ -520,7 +574,10 @@ impl StripeClient {
         &self,
         customer: Option<&str>,
         limit: Option<u32>,
+        starting_after: Option<&str>,
+        ending_before: Option<&str>,
     ) -> StripeResult<ListResponse> {
+        validate_pagination(limit, starting_after, ending_before)?;
         let mut url = format!("{}/invoices", self.api_url);
         let mut params = Vec::new();
         if let Some(c) = customer {
@@ -529,6 +586,7 @@ impl StripeClient {
         if let Some(l) = limit {
             params.push(format!("limit={l}"));
         }
+        append_pagination(&mut params, starting_after, ending_before);
         if !params.is_empty() {
             url = format!("{url}?{}", params.join("&"));
         }
@@ -688,7 +746,8 @@ impl StripeClient {
                             // Preserve actionable authentication/resource errors
                             // unless the provider explicitly requests recovery.
                             // Both remain non-retryable under a `false` hint.
-                            if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+                            if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN
+                            {
                                 return AttemptOutcome::Terminal(StripeError::Unauthorized);
                             }
                             if status == StatusCode::NOT_FOUND {
@@ -1034,19 +1093,31 @@ mod replay_scope_tests {
 
     #[test]
     fn idempotency_key_validation_has_exact_boundaries_and_does_not_echo_keys() {
-        for key in ["!".to_owned(), "a".repeat(255), "order:payment/1".to_owned()] {
+        for key in [
+            "!".to_owned(),
+            "a".repeat(255),
+            "order:payment/1".to_owned(),
+        ] {
             validate_idempotency_key(&key).unwrap();
         }
         for key in [
-            String::new(), " ".to_owned(), "a".repeat(256),
-            "private-key\r\nInjected: yes".to_owned(), "private-key\t".to_owned(),
-            "private-key\0".to_owned(), "private-key\u{7f}".to_owned(),
-            "private-keyé".to_owned(), " private-key".to_owned(),
+            String::new(),
+            " ".to_owned(),
+            "a".repeat(256),
+            "private-key\r\nInjected: yes".to_owned(),
+            "private-key\t".to_owned(),
+            "private-key\0".to_owned(),
+            "private-key\u{7f}".to_owned(),
+            "private-keyé".to_owned(),
+            " private-key".to_owned(),
         ] {
             let error = validate_idempotency_key(&key).unwrap_err();
             assert!(!error.to_string().contains("private-key"));
             assert!(!error.is_retryable());
-            assert!(matches!(error.to_fcp_error(), FcpError::InvalidRequest { code: 1005, .. }));
+            assert!(matches!(
+                error.to_fcp_error(),
+                FcpError::InvalidRequest { code: 1005, .. }
+            ));
         }
     }
 
@@ -1061,14 +1132,20 @@ mod replay_scope_tests {
             assert!(ConnectorErrorMapping::retry_after(&error).is_none());
             assert!(matches!(
                 error.to_fcp_error(),
-                FcpError::External { retryable: false, retry_after: None, .. }
+                FcpError::External {
+                    retryable: false,
+                    retry_after: None,
+                    ..
+                }
             ));
         }
     }
 
     #[test]
     fn response_classification_fails_closed() {
-        for status in [200, 201, 204, 301, 307, 308, 408, 409, 424, 500, 502, 503, 504] {
+        for status in [
+            200, 201, 204, 301, 307, 308, 408, 409, 424, 500, 502, 503, 504,
+        ] {
             let ambiguous = AtomicBool::new(false);
             {
                 let mut guard = AttemptReplayGuard::new(&ambiguous);
@@ -1113,7 +1190,11 @@ mod replay_scope_tests {
         assert!(ConnectorErrorMapping::retry_after(&error).is_none());
         assert!(matches!(
             ConnectorErrorMapping::to_fcp_error(&error),
-            FcpError::External { retryable: false, retry_after: None, .. }
+            FcpError::External {
+                retryable: false,
+                retry_after: None,
+                ..
+            }
         ));
     }
 
@@ -1130,8 +1211,8 @@ mod replay_scope_tests {
     fn caller_key_preserves_retryable_errors() {
         let ambiguous = AtomicBool::new(true);
         let result: StripeResult<()> = Err(StripeError::RateLimited { retry_after_ms: 7 });
-        let error = finish_stripe_attempts(result, ReplayScope::AcrossInvocations, &ambiguous)
-            .unwrap_err();
+        let error =
+            finish_stripe_attempts(result, ReplayScope::AcrossInvocations, &ambiguous).unwrap_err();
         assert!(error.is_retryable());
         assert_eq!(error.retry_after(), Some(Duration::from_millis(7)));
     }
@@ -1434,7 +1515,10 @@ mod tests {
             .unwrap()
             .with_api_url(&format!("{}/v1", server.uri()));
 
-        let result = client.list_customers(Some(10), None).await.unwrap();
+        let result = client
+            .list_customers(Some(10), None, None, None)
+            .await
+            .unwrap();
         assert_eq!(result.data.len(), 2);
         assert!(!result.has_more);
         server.finish();
@@ -1993,7 +2077,7 @@ mod tests {
 
         // Should not panic or produce malformed URL with special chars in email
         let result = client
-            .list_customers(Some(10), Some("user+tag@example.com"))
+            .list_customers(Some(10), Some("user+tag@example.com"), None, None)
             .await
             .unwrap();
         assert_eq!(result.data.len(), 0);
@@ -2019,7 +2103,13 @@ mod tests {
 
         // Malicious status value should be safely encoded
         let result = client
-            .list_subscriptions(Some("cus_123"), Some("active&admin=true"), Some(10))
+            .list_subscriptions(
+                Some("cus_123"),
+                Some("active&admin=true"),
+                Some(10),
+                None,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(result.data.len(), 0);

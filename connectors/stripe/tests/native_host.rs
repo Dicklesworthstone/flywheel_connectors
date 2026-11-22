@@ -38,6 +38,14 @@ struct ProviderResponse {
 }
 
 impl ProviderResponse {
+    fn list(data: Value, has_more: bool) -> Self {
+        Self {
+            status: 200,
+            body: json!({"object": "list", "data": data, "has_more": has_more}),
+            retry_after: None,
+        }
+    }
+
     fn customer() -> Self {
         Self {
             status: 200,
@@ -400,6 +408,268 @@ fn success(response: &Value, id: &str) -> Value {
     assert_eq!(response.status, InvokeStatus::Ok);
     assert!(response.error.is_none());
     response.result.unwrap()
+}
+
+fn query(request: &CapturedRequest) -> HashMap<String, String> {
+    reqwest::Url::parse(&format!("http://loopback{}", request.target))
+        .unwrap()
+        .query_pairs()
+        .into_owned()
+        .collect()
+}
+
+#[test]
+fn native_list_pages_preserve_filters_and_spend_only_the_requested_pages() {
+    for (operation, endpoint, prefix, input, resource) in [
+        (
+            "stripe.list_customers",
+            "customers",
+            "cus",
+            json!({"email": "native+lists@example.test", "limit": 2}),
+            "stripe:account:self",
+        ),
+        (
+            "stripe.list_subscriptions",
+            "subscriptions",
+            "sub",
+            json!({"customer": "cus_native", "status": "active", "limit": 2}),
+            "stripe:customer:cus_native",
+        ),
+        (
+            "stripe.list_invoices",
+            "invoices",
+            "in",
+            json!({"customer": "cus_native", "limit": 2}),
+            "stripe:customer:cus_native",
+        ),
+    ] {
+        let last = format!("{prefix}_second");
+        let server = LoopbackServer::start(vec![
+            ProviderResponse::list(
+                json!([{"id": format!("{prefix}_first")}, {"id": last}]),
+                true,
+            ),
+            ProviderResponse::list(json!([{"id": format!("{prefix}_third")}]), false),
+        ]);
+        let mut process = NativeProcess::start();
+        configure(&mut process, Some(&server));
+        let key = Ed25519SigningKey::generate();
+        let instance = handshake(&mut process, &key, &["stripe.read"]);
+        let token = grant(
+            &key,
+            &instance,
+            operation,
+            b"two-pages",
+            &constraints(resource, 2),
+        );
+        let first = success(
+            &process.rpc(
+                "first-page",
+                "invoke",
+                request("first-page", operation, input.clone(), token.clone()),
+            ),
+            "first-page",
+        );
+        assert_eq!(first["data"].as_array().unwrap().len(), 2);
+        assert_eq!(first["has_more"], true);
+        let mut next_input = input.clone();
+        next_input["starting_after"] = json!(last);
+        assert_eq!(first["next_page"], next_input);
+        let observed = server.receive();
+        assert_eq!(observed.method, "GET");
+        assert!(observed.target.starts_with(&format!("/v1/{endpoint}?")));
+        let mut expected: HashMap<String, String> = input
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(key, value)| {
+                (
+                    key.clone(),
+                    value
+                        .as_str()
+                        .map_or_else(|| value.to_string(), str::to_owned),
+                )
+            })
+            .collect();
+        assert_eq!(query(&observed), expected);
+        server.assert_no_requests();
+        if resource != "stripe:account:self" {
+            let mut wrong_scope = next_input.clone();
+            wrong_scope["customer"] = json!("cus_other");
+            denied(&process.rpc(
+                "changed-customer",
+                "invoke",
+                request("changed-customer", operation, wrong_scope, token.clone()),
+            ));
+            server.assert_no_requests();
+        }
+        let second = success(
+            &process.rpc(
+                "second-page",
+                "invoke",
+                request(
+                    "second-page",
+                    operation,
+                    first["next_page"].clone(),
+                    token.clone(),
+                ),
+            ),
+            "second-page",
+        );
+        assert_eq!(second["data"][0]["id"], format!("{prefix}_third"));
+        assert_eq!(second["has_more"], false);
+        assert!(second["next_page"].is_null());
+        expected.insert("starting_after".into(), last);
+        assert_eq!(query(&server.receive()), expected);
+        denied(&process.rpc(
+            "spent-pages",
+            "invoke",
+            request("spent-pages", operation, next_input, token),
+        ));
+        server.assert_no_requests();
+        process.shutdown();
+        server.finish();
+    }
+}
+
+#[test]
+fn native_backward_pages_use_first_object_and_encode_cursor_as_one_query_value() {
+    let server = LoopbackServer::start(vec![ProviderResponse::list(
+        json!([{"id": "cus_first"}, {"id": "cus_last"}]),
+        true,
+    )]);
+    let mut process = NativeProcess::start();
+    configure(&mut process, Some(&server));
+    let key = Ed25519SigningKey::generate();
+    let instance = handshake(&mut process, &key, &["stripe.read"]);
+    let input =
+        json!({"email": "native@example.test", "limit": 2, "ending_before": "cus_old&limit=100"});
+    let result = success(
+        &process.rpc(
+            "backward-page",
+            "invoke",
+            request(
+                "backward-page",
+                "stripe.list_customers",
+                input,
+                grant(
+                    &key,
+                    &instance,
+                    "stripe.list_customers",
+                    b"backward",
+                    &constraints("stripe:account:self", 1),
+                ),
+            ),
+        ),
+        "backward-page",
+    );
+    assert_eq!(
+        result["next_page"],
+        json!({"email": "native@example.test", "limit": 2, "ending_before": "cus_first"})
+    );
+    let query = query(&server.receive());
+    assert_eq!(query["ending_before"], "cus_old&limit=100");
+    assert_eq!(query["limit"], "2");
+    assert_eq!(query.len(), 3);
+    server.assert_no_requests();
+    process.shutdown();
+    server.finish();
+}
+
+#[test]
+fn native_pagination_validation_and_preview_never_spend_a_call() {
+    let server = LoopbackServer::start(vec![ProviderResponse::list(json!([]), false)]);
+    let mut process = NativeProcess::start();
+    configure(&mut process, Some(&server));
+    let key = Ed25519SigningKey::generate();
+    let instance = handshake(&mut process, &key, &["stripe.read"]);
+    let token = grant(
+        &key,
+        &instance,
+        "stripe.list_customers",
+        b"validated-page",
+        &constraints("stripe:account:self", 1),
+    );
+    for input in [
+        json!({"starting_after": "cus_a", "ending_before": "cus_b"}),
+        json!({"limit": 0}),
+        json!({"limit": 101}),
+        json!({"limit": 4_294_967_297_u64}),
+        json!({"limit": 1.5}),
+        json!({"starting_after": ""}),
+        json!({"ending_before": "cus_with space"}),
+        json!({"starting_after": "x".repeat(256)}),
+        json!({"starting_after": 42}),
+    ] {
+        denied(&process.rpc(
+            "invalid-page",
+            "invoke",
+            request(
+                "invalid-page",
+                "stripe.list_customers",
+                input,
+                token.clone(),
+            ),
+        ));
+    }
+    let valid = request(
+        "valid-page",
+        "stripe.list_customers",
+        json!({"limit": 100}),
+        token,
+    );
+    let mut preview = valid.clone();
+    preview["type"] = json!("simulate");
+    let preview: SimulateResponse =
+        serde_json::from_value(process.rpc("page-preview", "simulate", preview)["result"].clone())
+            .unwrap();
+    assert!(preview.would_succeed);
+    server.assert_no_requests();
+    let result = success(&process.rpc("valid-page", "invoke", valid), "valid-page");
+    assert_eq!(result["data"], json!([]));
+    assert_eq!(result["has_more"], false);
+    assert!(result["next_page"].is_null());
+    assert_eq!(query(&server.receive())["limit"], "100");
+    server.assert_no_requests();
+    process.shutdown();
+    server.finish();
+}
+
+#[test]
+fn native_malformed_continuation_fails_without_retry_or_refunding_admission() {
+    for data in [
+        json!([]),
+        json!([{}]),
+        json!([{"id": "cus_previous"}]),
+        json!([{"id": ""}]),
+    ] {
+        let server = LoopbackServer::start(vec![ProviderResponse::list(data, true)]);
+        let mut process = NativeProcess::start();
+        configure(&mut process, Some(&server));
+        let key = Ed25519SigningKey::generate();
+        let instance = handshake(&mut process, &key, &["stripe.read"]);
+        let token = grant(
+            &key,
+            &instance,
+            "stripe.list_customers",
+            b"bad-continuation",
+            &constraints("stripe:account:self", 1),
+        );
+        let req = request(
+            "invalid-provider-page",
+            "stripe.list_customers",
+            json!({"starting_after": "cus_previous"}),
+            token,
+        );
+        denied(&process.rpc("bad-page", "invoke", req.clone()));
+        server.receive();
+        let mut repeated = req;
+        repeated["id"] = json!("try-again");
+        denied(&process.rpc("retained-debit", "invoke", repeated));
+        server.assert_no_requests();
+        process.shutdown();
+        server.finish();
+    }
 }
 
 #[test]
