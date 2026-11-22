@@ -4,7 +4,6 @@ use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use bytes::Bytes;
 use fcp_prelude::CredentialId;
 use fcp_sdk::migration::{AttemptOutcome, HttpRetryConfig, RetryLoop};
 use fcp_sdk::{ConnectorRuntime, ConnectorRuntimeConfig};
@@ -32,6 +31,13 @@ use crate::{
 pub const DEFAULT_BASE_URL: &str = "https://api.openai.com";
 const MAX_RETRY_AFTER_MS: u64 = 300_000;
 const MAX_ERROR_MESSAGE_CHARS: usize = 512;
+// These are upstream-byte ceilings from the operation manifests. Error bodies
+// get a separate small bound, including failures from media endpoints.
+const MAX_JSON_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
+const MAX_IMAGE_RESPONSE_BYTES: usize = 50 * 1024 * 1024;
+const MAX_AUDIO_RESPONSE_BYTES: usize = 50 * 1024 * 1024;
+const MAX_VIDEO_RESPONSE_BYTES: usize = 100 * 1024 * 1024;
+const MAX_ERROR_RESPONSE_BYTES: usize = 64 * 1024;
 const DEFAULT_VIDEO_POLL_INTERVAL_MS: u64 = 2_500;
 const DEFAULT_VIDEO_MAX_POLL_ATTEMPTS: u32 = 120;
 
@@ -124,6 +130,8 @@ impl OpenAIClient {
     pub fn new_with_auth(auth: OpenAIAuth) -> OpenAIResult<Self> {
         let client = Client::builder()
             .timeout(Duration::from_secs(120))
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
             .build()
             .map_err(OpenAIError::Http)?;
 
@@ -224,7 +232,7 @@ impl OpenAIClient {
         let response = request.send().await?;
         let status = response.status();
         let headers = response.headers().clone();
-        let bytes = response.bytes().await?;
+        let bytes = read_bounded_response(response, MAX_JSON_RESPONSE_BYTES).await?;
         if status.is_success() {
             Ok(())
         } else {
@@ -547,10 +555,10 @@ impl OpenAIClient {
             .and_then(|value| value.to_str().ok())
             .unwrap_or("video/mp4")
             .to_string();
-        let bytes = response.bytes().await?;
+        let bytes = read_bounded_response(response, MAX_VIDEO_RESPONSE_BYTES).await?;
 
         if status.is_success() {
-            Ok((bytes.to_vec(), mime_type))
+            Ok((bytes, mime_type))
         } else {
             Err(parse_error_response(status, &headers, &bytes))
         }
@@ -598,7 +606,7 @@ impl OpenAIClient {
         let response = request.multipart(form).send().await?;
         let status = response.status();
         let headers = response.headers().clone();
-        let bytes = response.bytes().await?;
+        let bytes = read_bounded_response(response, MAX_JSON_RESPONSE_BYTES).await?;
 
         if status.is_success() {
             serde_json::from_slice(&bytes).map_err(OpenAIError::from)
@@ -643,10 +651,10 @@ impl OpenAIClient {
         let response = request.json(&request_body).send().await?;
         let status = response.status();
         let headers = response.headers().clone();
-        let bytes = response.bytes().await?;
+        let bytes = read_bounded_response(response, MAX_AUDIO_RESPONSE_BYTES).await?;
 
         if status.is_success() {
-            Ok(bytes.to_vec())
+            Ok(bytes)
         } else {
             Err(parse_error_response(status, &headers, &bytes))
         }
@@ -674,7 +682,7 @@ impl OpenAIClient {
         let response = request.json(request_body).send().await?;
         let status = response.status();
         let headers = response.headers().clone();
-        let bytes = response.bytes().await?;
+        let bytes = read_bounded_response(response, MAX_JSON_RESPONSE_BYTES).await?;
 
         if status.is_success() {
             serde_json::from_slice(&bytes).map_err(OpenAIError::from)
@@ -766,7 +774,7 @@ impl OpenAIClient {
         let response = request.send().await?;
         let status = response.status();
         let headers = response.headers().clone();
-        let bytes = response.bytes().await?;
+        let bytes = read_bounded_response(response, MAX_JSON_RESPONSE_BYTES).await?;
 
         if status.is_success() {
             serde_json::from_slice(&bytes).map_err(OpenAIError::from)
@@ -815,7 +823,7 @@ impl OpenAIClient {
         let response = request.send().await?;
         let status = response.status();
         let headers = response.headers().clone();
-        let bytes = response.bytes().await?;
+        let bytes = read_bounded_response(response, MAX_JSON_RESPONSE_BYTES).await?;
 
         if status.is_success() {
             serde_json::from_slice(&bytes).map_err(OpenAIError::from)
@@ -833,6 +841,11 @@ impl OpenAIClient {
         let url = format!("{}{endpoint}", self.base_url);
         let ctx = self.runtime.request_context();
         let policy = self.retry_config.to_retry_policy();
+        let response_limit = if endpoint == "/v1/images/generations" {
+            MAX_IMAGE_RESPONSE_BYTES
+        } else {
+            MAX_JSON_RESPONSE_BYTES
+        };
 
         RetryLoop::execute(&ctx, &policy, |attempt| {
             let url = &url;
@@ -847,7 +860,7 @@ impl OpenAIClient {
                 let request = self.apply_auth(request);
 
                 match request.json(body).send().await {
-                    Ok(response) => match self.handle_response(response).await {
+                    Ok(response) => match self.handle_response(response, response_limit).await {
                         Ok(data) => AttemptOutcome::Success(data),
                         Err(e) if e.is_retryable() => AttemptOutcome::Retryable {
                             retry_after: e.retry_after(),
@@ -855,7 +868,10 @@ impl OpenAIClient {
                         },
                         Err(e) => AttemptOutcome::Terminal(e),
                     },
-                    Err(e) if e.is_timeout() || e.is_connect() => AttemptOutcome::Retryable {
+                    // A timeout can occur after the provider accepted a billed
+                    // generation or mutation. Only a connection failure proves
+                    // the request did not reach the provider.
+                    Err(e) if e.is_connect() => AttemptOutcome::Retryable {
                         error: OpenAIError::Http(e),
                         retry_after: None,
                     },
@@ -885,7 +901,7 @@ impl OpenAIClient {
         let status = response.status();
         if !status.is_success() {
             let headers = response.headers().clone();
-            let bytes = response.bytes().await?;
+            let bytes = read_bounded_response(response, MAX_JSON_RESPONSE_BYTES).await?;
             return Err(parse_error_response(status, &headers, &bytes));
         }
 
@@ -893,13 +909,13 @@ impl OpenAIClient {
     }
 
     /// Handle a response.
-    async fn handle_response<R>(&self, response: Response) -> OpenAIResult<R>
+    async fn handle_response<R>(&self, response: Response, response_limit: usize) -> OpenAIResult<R>
     where
         R: serde::de::DeserializeOwned + Send,
     {
         let status = response.status();
         let headers = response.headers().clone();
-        let bytes = response.bytes().await?;
+        let bytes = read_bounded_response(response, response_limit).await?;
 
         if status.is_success() {
             serde_json::from_slice(&bytes).map_err(OpenAIError::from)
@@ -922,7 +938,7 @@ impl OpenAIClient {
         let response = request.send().await?;
         let status = response.status();
         let headers = response.headers().clone();
-        let bytes = response.bytes().await?;
+        let bytes = read_bounded_response(response, MAX_JSON_RESPONSE_BYTES).await?;
 
         if status.is_success() {
             serde_json::from_slice(&bytes).map_err(OpenAIError::from)
@@ -942,7 +958,7 @@ impl OpenAIClient {
         let response = request.send().await?;
         let status = response.status();
         let headers = response.headers().clone();
-        let bytes = response.bytes().await?;
+        let bytes = read_bounded_response(response, MAX_JSON_RESPONSE_BYTES).await?;
 
         if status.is_success() {
             serde_json::from_slice(&bytes).map_err(OpenAIError::from)
@@ -966,7 +982,7 @@ impl OpenAIClient {
         let response = request.send().await?;
         let status = response.status();
         let headers = response.headers().clone();
-        let bytes = response.bytes().await?;
+        let bytes = read_bounded_response(response, MAX_JSON_RESPONSE_BYTES).await?;
 
         if status.is_success() {
             serde_json::from_slice(&bytes).map_err(OpenAIError::from)
@@ -1249,7 +1265,7 @@ impl OpenAIClient {
         let response = request.json(body).send().await?;
         let status = response.status();
         let headers = response.headers().clone();
-        let bytes = response.bytes().await?;
+        let bytes = read_bounded_response(response, MAX_JSON_RESPONSE_BYTES).await?;
 
         if status.is_success() {
             serde_json::from_slice(&bytes).map_err(OpenAIError::from)
@@ -1257,6 +1273,46 @@ impl OpenAIClient {
             Err(parse_error_response(status, &headers, &bytes))
         }
     }
+}
+
+/// Bound provider bytes before retaining or parsing them, even without a
+/// Content-Length header. A rejected or incomplete body follows dispatch and
+/// does not authorize replay of a possibly completed generation or mutation.
+async fn read_bounded_response(response: Response, success_limit: usize) -> OpenAIResult<Vec<u8>> {
+    let limit = if response.status().is_success() {
+        success_limit
+    } else {
+        MAX_ERROR_RESPONSE_BYTES
+    };
+    let too_large = || OpenAIError::Api {
+        error_type: "response_too_large".into(),
+        message: format!("OpenAI response exceeded {limit} bytes; provider outcome may be unknown"),
+        status_code: None,
+    };
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err(too_large());
+    }
+    let mut body = Vec::new();
+    let mut stream = Box::pin(response.bytes_stream());
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| OpenAIError::Api {
+            error_type: "response_body_incomplete".into(),
+            message: "OpenAI response body was incomplete; provider outcome may be unknown".into(),
+            status_code: None,
+        })?;
+        if body
+            .len()
+            .checked_add(chunk.len())
+            .is_none_or(|length| length > limit)
+        {
+            return Err(too_large());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 /// Parse OpenAI's Go-style duration strings (e.g. "1s", "6m0s", "1h30m").
@@ -1309,7 +1365,7 @@ fn parse_openai_reset(s: &str) -> Option<u64> {
 fn parse_error_response(
     status: StatusCode,
     headers: &reqwest::header::HeaderMap,
-    bytes: &Bytes,
+    bytes: &[u8],
 ) -> OpenAIError {
     let mut retry_after_ms = 30_000; // Default 30s
     if let Some(reset) = headers
@@ -1522,6 +1578,167 @@ fn parse_sse_event(event_str: &str) -> Option<OpenAIResult<ChatCompletionChunk>>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
+
+    fn raw_response_server(response: &'static [u8]) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = [0_u8; 4096];
+            let received = stream.read(&mut request).unwrap();
+            assert!(received > 0);
+            stream.write_all(response).unwrap();
+        });
+        (url, worker)
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn response_reader_bounds_declared_chunked_and_incomplete_bodies() {
+        for raw in [
+            b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\nabcdefghijkl".as_slice(),
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n6\r\nabcdef\r\n6\r\nghijkl\r\n0\r\n\r\n".as_slice(),
+        ] {
+            let (url, worker) = raw_response_server(raw);
+            let response = Client::new().get(url).send().await.unwrap();
+            let error = read_bounded_response(response, 8).await.unwrap_err();
+            assert!(matches!(
+                &error,
+                OpenAIError::Api { error_type, .. } if error_type == "response_too_large"
+            ));
+            assert!(!error.is_retryable());
+            worker.join().unwrap();
+        }
+
+        let (url, worker) = raw_response_server(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n4\r\nabcd\r\n4\r\nefgh\r\n0\r\n\r\n",
+        );
+        let response = Client::new().get(url).send().await.unwrap();
+        assert_eq!(
+            read_bounded_response(response, 8).await.unwrap(),
+            b"abcdefgh"
+        );
+        worker.join().unwrap();
+
+        let (url, worker) = raw_response_server(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\nshort",
+        );
+        let response = Client::new().get(url).send().await.unwrap();
+        let error = read_bounded_response(response, 32).await.unwrap_err();
+        assert!(matches!(
+            &error,
+            OpenAIError::Api { error_type, .. } if error_type == "response_body_incomplete"
+        ));
+        assert!(!error.is_retryable());
+        worker.join().unwrap();
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn oversized_provider_errors_are_not_retried_or_returned_as_unbounded_text() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(429).set_body_bytes(vec![
+                b'x';
+                MAX_ERROR_RESPONSE_BYTES
+                    + 1
+            ]))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = OpenAIClient::new("test-key")
+            .unwrap()
+            .with_base_url(server.uri())
+            .with_retry_config(3, 1, 1);
+        let request: ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model", "input": "hello"
+        }))
+        .unwrap();
+        let error = client.create_response(&request).await.unwrap_err();
+        assert!(matches!(
+            &error,
+            OpenAIError::Api { error_type, .. } if error_type == "response_too_large"
+        ));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        assert_eq!(client.total_prompt_tokens(), 0);
+        assert_eq!(client.total_completion_tokens(), 0);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn response_timeout_does_not_replay_an_accepted_generation() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(500)))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut client = OpenAIClient::new("test-key")
+            .unwrap()
+            .with_base_url(server.uri())
+            .with_retry_config(3, 1, 1);
+        client.client = Client::builder()
+            .timeout(Duration::from_millis(40))
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .build()
+            .unwrap();
+        let request: ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model", "input": "hello"
+        }))
+        .unwrap();
+        let error = client.create_response(&request).await.unwrap_err();
+        assert!(matches!(&error, OpenAIError::Http(error) if error.is_timeout()));
+        assert!(matches!(
+            error.to_fcp_error(),
+            fcp_prelude::FcpError::External {
+                retryable: false,
+                ..
+            }
+        ));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn provider_redirects_do_not_forward_generation_bodies() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        let origin = MockServer::start().await;
+        let destination = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .insert_header("location", format!("{}/stolen", destination.uri())),
+            )
+            .expect(1)
+            .mount(&origin)
+            .await;
+        let client = OpenAIClient::new("test-key")
+            .unwrap()
+            .with_base_url(origin.uri());
+        let request: ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model", "input": "private prompt"
+        }))
+        .unwrap();
+        assert!(client.create_response(&request).await.is_err());
+        assert!(destination.received_requests().await.unwrap().is_empty());
+        assert_eq!(origin.received_requests().await.unwrap().len(), 1);
+    }
 
     #[test]
     fn sanitize_path_segment_accepts_opaque_ids() {

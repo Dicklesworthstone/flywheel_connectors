@@ -131,7 +131,9 @@ impl OpenAIError {
                 service: "openai".into(),
                 message: e.to_string(),
                 status_code: e.status().map(|s| s.as_u16()),
-                retryable: e.is_timeout() || e.is_connect(),
+                // A timeout or broken response does not prove that a mutation
+                // failed. Preserve that uncertainty for the caller.
+                retryable: e.is_connect(),
                 retry_after: None,
             },
             Self::Json(e) => FcpError::MalformedFrame {
