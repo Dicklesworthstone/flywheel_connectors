@@ -1,18 +1,19 @@
 //! FCP OpenAI Connector implementation.
 
-use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use fcp_async_core::time;
+use fcp_manifest::ConnectorManifest;
 use fcp_prelude::{
-    AgentHint, ApprovalMode, BaseConnector, CapabilityGrant, CapabilityId, CapabilityToken,
-    CapabilityVerifier, ConnectorId, CredentialId, EventCaps, FcpError, FcpResult,
-    HandshakeRequest, HandshakeResponse, IdempotencyClass, Introspection, OperationId,
-    OperationInfo, RiskLevel, SafetyTier, SelfCheckReport, SessionId, SimulateRequest,
-    SimulateResponse,
+    ApprovalMode, BaseConnector, CapabilityId, ConnectorId, CredentialId, FcpError, FcpResult,
+    HandshakeRequest, HealthSnapshot, HealthState, InstanceId, Introspection, InvokeRequest,
+    InvokeResponse, OperationId, OperationInfo, SelfCheckReport, SessionId, SimulateRequest,
+    SimulateResponse, ZoneId,
 };
+use fcp_sdk::prelude::{OperationContractSet, StandaloneSession};
 use fcp_streaming::{StreamError, WsClient, WsConfig, WsMessage};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -1963,40 +1964,190 @@ fn normalize_base_url(base_url: &str) -> FcpResult<String> {
     Ok(parsed.to_string().trim_end_matches('/').to_string())
 }
 
+const OPERATION_IDS: [&str; 27] = [
+    "openai.chat",
+    "openai.simple_chat",
+    "openai.get_usage",
+    "openai.embeddings",
+    "openai.images.generate",
+    "openai.videos.generate",
+    "openai.audio.transcribe",
+    "openai.realtime.transcribe",
+    "openai.realtime.voice",
+    "openai.realtime.browser_session",
+    "openai.audio.tts",
+    "openai.finetune.create",
+    "openai.finetune.list",
+    "openai.finetune.get",
+    "openai.finetune.cancel",
+    "openai.finetune.events",
+    "openai.assistants.create",
+    "openai.assistants.list",
+    "openai.assistants.get",
+    "openai.assistants.delete",
+    "openai.threads.create",
+    "openai.threads.get",
+    "openai.threads.messages.create",
+    "openai.threads.messages.list",
+    "openai.threads.runs.create",
+    "openai.threads.runs.get",
+    "openai.threads.runs.cancel",
+];
+
+fn manifest() -> FcpResult<&'static ConnectorManifest> {
+    static MANIFEST: OnceLock<FcpResult<ConnectorManifest>> = OnceLock::new();
+    MANIFEST
+        .get_or_init(|| {
+            let manifest = ConnectorManifest::parse_str(MANIFEST_TOML).map_err(|error| {
+                FcpError::Internal {
+                    message: format!("Invalid embedded OpenAI manifest: {error}"),
+                }
+            })?;
+            if manifest.connector.id.as_str() != "fcp.openai"
+                || manifest.provides.operations.len() != OPERATION_IDS.len()
+                || OPERATION_IDS
+                    .iter()
+                    .any(|id| !manifest.provides.operations.contains_key(*id))
+            {
+                return Err(FcpError::Internal {
+                    message: "OpenAI manifest does not match the implemented operation set".into(),
+                });
+            }
+            Ok(manifest)
+        })
+        .as_ref()
+        .map_err(Clone::clone)
+}
+
+fn operation_contracts() -> FcpResult<&'static OperationContractSet> {
+    static CONTRACTS: OnceLock<FcpResult<OperationContractSet>> = OnceLock::new();
+    CONTRACTS
+        .get_or_init(|| OperationContractSet::from_manifest_toml(MANIFEST_TOML))
+        .as_ref()
+        .map_err(Clone::clone)
+}
+
+fn operations_info() -> FcpResult<&'static [OperationInfo]> {
+    static OPERATIONS: OnceLock<FcpResult<Vec<OperationInfo>>> = OnceLock::new();
+    OPERATIONS
+        .get_or_init(|| {
+            let manifest = manifest()?;
+            OPERATION_IDS
+                .into_iter()
+                .map(|id| {
+                    let operation =
+                        manifest
+                            .provides
+                            .operations
+                            .get(id)
+                            .ok_or_else(|| FcpError::Internal {
+                                message: format!("OpenAI manifest is missing {id}"),
+                            })?;
+                    Ok(OperationInfo {
+                        id: OperationId::from_static(id),
+                        summary: operation.description.clone(),
+                        description: Some(operation.description.clone()),
+                        input_schema: operation.input_schema.clone(),
+                        output_schema: operation.output_schema.clone(),
+                        capability: operation.capability.clone(),
+                        risk_level: operation.risk_level,
+                        safety_tier: operation.safety_tier,
+                        idempotency: operation.idempotency,
+                        ai_hints: operation.ai_hints.clone(),
+                        rate_limit: operation.rate_limit.as_ref().map(|limit| limit.0.clone()),
+                        requires_approval: Some(ApprovalMode::from(operation.requires_approval)),
+                    })
+                })
+                .collect()
+        })
+        .as_deref()
+        .map_err(Clone::clone)
+}
+
 fn capability_for_operation(operation: &str) -> FcpResult<CapabilityId> {
-    let capability = match operation {
-        "openai.chat" | "openai.simple_chat" | "openai.get_usage" => "openai.chat",
-        "openai.embeddings" => "openai.embeddings",
-        "openai.images.generate" => "openai.images",
-        "openai.videos.generate" => "openai.videos",
-        "openai.audio.transcribe" => "openai.audio.transcribe",
-        "openai.realtime.transcribe" => "openai.realtime.transcribe",
-        "openai.realtime.voice" => "openai.realtime.voice",
-        "openai.realtime.browser_session" => "openai.realtime.browser_session",
-        "openai.audio.tts" => "openai.audio.tts",
-        "openai.finetune.create" => "openai.finetune.create",
-        "openai.finetune.list" => "openai.finetune.list",
-        "openai.finetune.get" => "openai.finetune.get",
-        "openai.finetune.cancel" => "openai.finetune.cancel",
-        "openai.finetune.events" => "openai.finetune.events",
-        "openai.assistants.create" => "openai.assistants.create",
-        "openai.assistants.list" => "openai.assistants.list",
-        "openai.assistants.get" => "openai.assistants.get",
-        "openai.assistants.delete" => "openai.assistants.delete",
-        "openai.threads.create" => "openai.threads.create",
-        "openai.threads.get" => "openai.threads.get",
-        "openai.threads.messages.create" => "openai.threads.messages.create",
-        "openai.threads.messages.list" => "openai.threads.messages.list",
-        "openai.threads.runs.create" => "openai.threads.runs.create",
-        "openai.threads.runs.get" => "openai.threads.runs.get",
-        "openai.threads.runs.cancel" => "openai.threads.runs.cancel",
-        _ => {
-            return Err(FcpError::OperationNotGranted {
-                operation: operation.into(),
+    operations_info()?
+        .iter()
+        .find(|metadata| metadata.id.as_str() == operation)
+        .map(|metadata| metadata.capability.clone())
+        .ok_or_else(|| FcpError::OperationNotGranted {
+            operation: operation.into(),
+        })
+}
+
+/// Reserve the complete JSON result, including base64 expansion for binary APIs.
+/// The manifest's network limit describes upstream bytes, not the JSON envelope.
+fn response_byte_limit(operation: &OperationId) -> FcpResult<u64> {
+    let upstream_limit = manifest()?
+        .provides
+        .operations
+        .get(operation.as_str())
+        .and_then(|metadata| metadata.network_constraints.as_ref())
+        .map(|network| network.max_response_bytes)
+        .ok_or_else(|| FcpError::Internal {
+            message: "OpenAI operation is missing a response byte limit".into(),
+        })?;
+    let payload_limit = if matches!(
+        operation.as_str(),
+        "openai.videos.generate" | "openai.audio.tts"
+    ) {
+        upstream_limit
+            .checked_add(2)
+            .map(|bytes| bytes / 3)
+            .and_then(|groups| groups.checked_mul(4))
+    } else {
+        Some(upstream_limit)
+    };
+    payload_limit
+        .and_then(|bytes| bytes.checked_add(64 * 1024))
+        .ok_or_else(|| FcpError::Internal {
+            message: "OpenAI response byte limit overflow".into(),
+        })
+}
+
+fn parse_chat_messages(input: &serde_json::Value) -> FcpResult<Vec<Message>> {
+    let messages_json = input.get("messages").ok_or(FcpError::InvalidRequest {
+        code: 1003,
+        message: "Missing messages".into(),
+    })?;
+    let messages: Vec<Message> =
+        serde_json::from_value(messages_json.clone()).map_err(|error| {
+            FcpError::InvalidRequest {
+                code: 1003,
+                message: format!("Invalid messages format: {error}"),
+            }
+        })?;
+    if messages.is_empty() {
+        return Err(FcpError::InvalidRequest {
+            code: 1003,
+            message: "Messages array cannot be empty".into(),
+        });
+    }
+    for message in &messages {
+        if matches!(&message.content, MessageContent::Null)
+            && (message.role != Role::Assistant
+                || !message
+                    .tool_calls
+                    .as_ref()
+                    .is_some_and(|calls| !calls.is_empty()))
+        {
+            return Err(FcpError::InvalidRequest {
+                code: 1003,
+                message: "Only assistant messages with tool calls may omit content".into(),
             });
         }
-    };
-    Ok(CapabilityId::from_static(capability))
+        if message.role == Role::Tool
+            && !message
+                .tool_call_id
+                .as_ref()
+                .is_some_and(|id| !id.trim().is_empty())
+        {
+            return Err(FcpError::InvalidRequest {
+                code: 1003,
+                message: "Tool messages require a non-empty tool_call_id".into(),
+            });
+        }
+    }
+    Ok(messages)
 }
 
 fn parse_video_duration(input: &serde_json::Value) -> FcpResult<Option<VideoDurationSeconds>> {
@@ -2150,12 +2301,15 @@ impl DoctorResult {
 
 /// FCP OpenAI Connector.
 pub struct OpenAIConnector {
-    base: Arc<BaseConnector>,
+    base: BaseConnector,
     config: Option<OpenAIConfig>,
     client: Option<OpenAIClient>,
     total_cost: AtomicU64, // Store as fixed-point (cost * 1_000_000_000)
-    verifier: Option<CapabilityVerifier>,
+    authority: Option<StandaloneSession>,
     session_id: Option<SessionId>,
+    bound_zone: Option<ZoneId>,
+    started_at: Instant,
+    stopping: bool,
 }
 
 impl OpenAIConnector {
@@ -2163,12 +2317,15 @@ impl OpenAIConnector {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            base: Arc::new(BaseConnector::new(ConnectorId::from_static("openai"))),
+            base: BaseConnector::new(ConnectorId::from_static("fcp.openai")),
             config: None,
             client: None,
             total_cost: AtomicU64::new(0),
-            verifier: None,
+            authority: None,
             session_id: None,
+            bound_zone: None,
+            started_at: Instant::now(),
+            stopping: false,
         }
     }
 
@@ -2300,6 +2457,23 @@ impl OpenAIConnector {
         resource_uris
     }
 
+    fn invalidate_authority(&mut self) {
+        self.authority = None;
+        self.session_id = None;
+        self.base.set_handshaken(false);
+        self.base.instance_id = InstanceId::new();
+    }
+
+    fn clear_configuration(&mut self) {
+        self.invalidate_authority();
+        self.bound_zone = None;
+        self.base.set_configured(false);
+        self.config = None;
+        if let Some(client) = self.client.take() {
+            client.shutdown();
+        }
+    }
+
     /// Handle configure method.
     ///
     /// # Errors
@@ -2310,6 +2484,11 @@ impl OpenAIConnector {
         &mut self,
         params: serde_json::Value,
     ) -> FcpResult<serde_json::Value> {
+        // Every attempt revokes the old account and grants, including failures.
+        self.clear_configuration();
+        self.stopping = false;
+        manifest()?;
+        operation_contracts()?;
         let config = OpenAIConfig::from_params(&params)?;
         let mut client =
             OpenAIClient::new_with_auth(config.auth.clone()).map_err(|e| FcpError::Internal {
@@ -2336,96 +2515,103 @@ impl OpenAIConnector {
         Ok(json!({ "status": "configured" }))
     }
 
-    /// Handle handshake method.
+    /// Negotiate a manifest-backed, instance-bound standalone session.
     ///
     /// # Errors
     ///
-    /// Returns an error if the handshake request is malformed or serialization fails.
+    /// Rejects unconfigured, malformed, unsupported or forbidden handshakes.
     pub async fn handle_handshake(
         &mut self,
         params: serde_json::Value,
     ) -> FcpResult<serde_json::Value> {
-        let req: HandshakeRequest =
-            serde_json::from_value(params).map_err(|e| FcpError::InvalidRequest {
+        self.invalidate_authority();
+        if self.client.is_none() || self.config.is_none() {
+            return Err(FcpError::NotConfigured);
+        }
+        let request: HandshakeRequest =
+            serde_json::from_value(params).map_err(|_| FcpError::InvalidRequest {
                 code: 1003,
-                message: format!("Invalid handshake request: {e}"),
+                message: "Invalid handshake request".into(),
             })?;
-
-        // Set up verifier
-        self.verifier = Some(CapabilityVerifier::new(
-            req.host_public_key,
-            req.zone.clone(),
-            self.base.instance_id.clone(),
-        ));
-
-        let session_id = SessionId::new();
-        self.session_id = Some(session_id.clone());
+        if self
+            .bound_zone
+            .as_ref()
+            .is_some_and(|zone| zone != &request.zone)
+        {
+            return Err(FcpError::CapabilityDenied {
+                capability: "openai.handshake".into(),
+                reason: "Reconfigure before binding this account to another zone".into(),
+            });
+        }
+        let zone = request.zone.clone();
+        let mut authority = StandaloneSession::new(MANIFEST_TOML)?;
+        let response = authority.handshake(request)?;
+        let mut result = serde_json::to_value(&response).map_err(|error| FcpError::Internal {
+            message: format!("Failed to serialize handshake: {error}"),
+        })?;
+        result["instance_id"] = json!(authority.instance_id());
+        result["connector_id"] = json!("fcp.openai");
+        result["protocol_version"] = json!("2.0");
+        self.base.instance_id = authority.instance_id().clone();
+        self.session_id = Some(response.session_id);
+        self.bound_zone = Some(zone);
+        self.authority = Some(authority);
         self.base.set_handshaken(true);
-
-        // Convert capability IDs to grants
-        let capabilities_granted: Vec<CapabilityGrant> = req
-            .capabilities_requested
-            .into_iter()
-            .map(|cap| CapabilityGrant {
-                capability: cap,
-                operation: None,
-            })
-            .collect();
-
-        let response = HandshakeResponse {
-            status: "accepted".into(),
-            capabilities_granted,
-            session_id,
-            manifest_hash: Self::manifest_hash(),
-            nonce: req.nonce,
-            event_caps: Some(EventCaps {
-                streaming: true,
-                replay: false,
-                min_buffer_events: 0,
-                requires_ack: false,
-            }),
-            auth_caps: None,
-            op_catalog_hash: None,
-        };
-
-        serde_json::to_value(response).map_err(|e| FcpError::Internal {
-            message: format!("Failed to serialize response: {e}"),
-        })
+        Ok(result)
     }
 
-    /// Handle health check.
+    /// Report canonical lifecycle health and the actual token-binding identity.
     ///
     /// # Errors
     ///
     /// Returns an error if health status serialization fails.
     pub async fn handle_health(&self) -> FcpResult<serde_json::Value> {
-        let configured = self.config.is_some();
-        let auth = self
-            .config
-            .as_ref()
-            .map(|c| c.auth.redacted_label())
-            .unwrap_or_else(|| "unconfigured".to_string());
-        let base_url = self
-            .config
-            .as_ref()
-            .map(|c| c.base_url.clone())
-            .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
-        let deployment_profile = self
-            .config
-            .as_ref()
-            .and_then(|c| c.deployment_profile_name())
-            .map(str::to_string);
-        Ok(json!({
-            "status": if configured { "healthy" } else { "not_configured" },
-            "auth": auth,
-            "base_url": base_url,
-            "deployment_profile": deployment_profile,
+        let configured = self.client.is_some() && self.config.is_some() && !self.stopping;
+        let handshaken = configured
+            && self
+                .authority
+                .as_ref()
+                .is_some_and(StandaloneSession::is_established);
+        let mut health = HealthSnapshot::ready();
+        health.status = if self.stopping {
+            HealthState::Stopping
+        } else if handshaken {
+            HealthState::Ready
+        } else if configured {
+            HealthState::Degraded {
+                reason: "handshake required".into(),
+            }
+        } else {
+            HealthState::Degraded {
+                reason: "not configured".into(),
+            }
+        };
+        health.uptime_ms = u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        health.details = Some(json!({
+            "connector_id": self.base.id,
+            "configured": configured,
+            "handshaken": handshaken,
+            "instance_id": self.base.instance_id,
+            "zone": self.bound_zone,
+            "session_id": self.session_id,
+            "auth_mode": self.config.as_ref().map(|config| config.auth.redacted_label()),
+            "api_url": self.config.as_ref().map(|config| config.base_url.as_str()),
+            "deployment_profile": self.config.as_ref()
+                .and_then(OpenAIConfig::deployment_profile_name),
             "metrics": {
                 "requests_total": self.total_requests(),
                 "requests_error": self.total_errors(),
-                "total_cost_usd": self.total_cost()
+                "total_cost_usd": self.total_cost(),
+            },
+            "runtime_boundary": {
+                "authority": "private_host_channel",
+                "usage_budgets": "process_local",
+                "egress_policy": "requires_trusted_host",
             }
-        }))
+        }));
+        serde_json::to_value(health).map_err(|error| FcpError::Internal {
+            message: format!("Failed to serialize health: {error}"),
+        })
     }
 
     /// Handle doctor checks.
@@ -2555,1574 +2741,95 @@ impl OpenAIConnector {
     /// Returns an error if introspection serialization fails.
     pub async fn handle_introspect(&self) -> FcpResult<serde_json::Value> {
         let introspection = Introspection {
-            operations: vec![
-                OperationInfo {
-                    id: OperationId::from_static("openai.chat"),
-                    summary: "Send a chat completion request".into(),
-                    input_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "model": {
-                                "type": "string",
-                                "enum": ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-4", "gpt-3.5-turbo"],
-                                "default": "gpt-4o"
-                            },
-                            "messages": {
-                                "type": "array",
-                                "minItems": 1,
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "role": { "type": "string", "enum": ["system", "user", "assistant", "tool"] },
-                                        "content": { "type": ["string", "array", "null"] },
-                                        "tool_calls": { "type": "array" },
-                                        "tool_call_id": { "type": "string", "minLength": 1 }
-                                    },
-                                    "required": ["role"],
-                                    "anyOf": [
-                                        {
-                                            "required": ["content"],
-                                            "properties": { "content": { "type": ["string", "array"] } }
-                                        },
-                                        {
-                                            "required": ["tool_calls"],
-                                            "properties": {
-                                                "role": { "const": "assistant" },
-                                                "tool_calls": { "type": "array", "minItems": 1 }
-                                            }
-                                        }
-                                    ],
-                                    "allOf": [{
-                                        "if": { "properties": { "role": { "const": "tool" } } },
-                                        "then": { "required": ["tool_call_id"] }
-                                    }]
-                                }
-                            },
-                            "max_tokens": { "type": "integer", "default": 4096 },
-                            "temperature": { "type": "number", "minimum": 0, "maximum": 2 },
-                            "tools": { "type": "array" },
-                            "tool_choice": {
-                                "oneOf": [
-                                    { "type": "string", "enum": ["none", "auto", "required"] },
-                                    {
-                                        "type": "object",
-                                        "required": ["type", "function"],
-                                        "properties": {
-                                            "type": { "const": "function" },
-                                            "function": {
-                                                "type": "object",
-                                                "required": ["name"],
-                                                "properties": { "name": { "type": "string" } }
-                                            }
-                                        }
-                                    }
-                                ]
-                            }
-                        },
-                        "required": ["messages"]
-                    }),
-                    output_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "id": { "type": "string" },
-                            "content": { "type": "string" },
-                            "model": { "type": "string" },
-                            "finish_reason": { "type": ["string", "null"] },
-                            "tool_calls": { "type": "array" },
-                            "usage": {
-                                "type": "object",
-                                "properties": {
-                                    "prompt_tokens": { "type": "integer" },
-                                    "completion_tokens": { "type": "integer" },
-                                    "total_tokens": { "type": "integer" }
-                                }
-                            },
-                            "cost_usd": { "type": "number" }
-                        }
-                    }),
-                    capability: CapabilityId::from_static("openai.chat"),
-                    risk_level: RiskLevel::Medium,
-                    description: None,
-                    rate_limit: None,
-                    requires_approval: None,
-                    safety_tier: SafetyTier::Safe,
-                    idempotency: IdempotencyClass::None,
-                    ai_hints: AgentHint {
-                        when_to_use: "Send a chat completion request to OpenAI models.".into(),
-                        common_mistakes: vec![
-                            "Not providing messages array".into(),
-                            "Exceeding context length".into(),
-                        ],
-                        examples: vec![
-                            r#"{"messages": [{"role": "user", "content": "Hello!"}]}"#.into(),
-                        ],
-                        related: vec![],
-                    },
-                },
-                OperationInfo {
-                    id: OperationId::from_static("openai.simple_chat"),
-                    summary: "Simple chat with GPT (single message)".into(),
-                    input_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "model": {
-                                "type": "string",
-                                "enum": ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-4", "gpt-3.5-turbo"],
-                                "default": "gpt-4o"
-                            },
-                            "message": { "type": "string" },
-                            "system": { "type": "string" },
-                            "max_tokens": { "type": "integer", "default": 4096 }
-                        },
-                        "required": ["message"]
-                    }),
-                    output_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "response": { "type": "string" },
-                            "usage": {
-                                "type": "object",
-                                "properties": {
-                                    "prompt_tokens": { "type": "integer" },
-                                    "completion_tokens": { "type": "integer" },
-                                    "total_tokens": { "type": "integer" }
-                                }
-                            },
-                            "cost_usd": { "type": "number" }
-                        }
-                    }),
-                    capability: CapabilityId::from_static("openai.chat"),
-                    risk_level: RiskLevel::Medium,
-                    description: None,
-                    rate_limit: None,
-                    requires_approval: None,
-                    safety_tier: SafetyTier::Safe,
-                    idempotency: IdempotencyClass::None,
-                    ai_hints: AgentHint {
-                        when_to_use: "Simple single-turn chat with GPT models.".into(),
-                        common_mistakes: vec![],
-                        examples: vec![r#"{"message": "What is 2+2?"}"#.into()],
-                        related: vec![],
-                    },
-                },
-                OperationInfo {
-                    id: OperationId::from_static("openai.get_usage"),
-                    summary: "Get current usage and cost statistics".into(),
-                    input_schema: json!({
-                        "type": "object",
-                        "properties": {}
-                    }),
-                    output_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "total_prompt_tokens": { "type": "integer" },
-                            "total_completion_tokens": { "type": "integer" },
-                            "total_cost_usd": { "type": "number" },
-                            "requests_total": { "type": "integer" },
-                            "requests_error": { "type": "integer" }
-                        }
-                    }),
-                    capability: CapabilityId::from_static("openai.chat"),
-                    risk_level: RiskLevel::Low,
-                    description: None,
-                    rate_limit: None,
-                    requires_approval: None,
-                    safety_tier: SafetyTier::Safe,
-                    idempotency: IdempotencyClass::Strict,
-                    ai_hints: AgentHint {
-                        when_to_use: "Check usage and costs for this session.".into(),
-                        common_mistakes: vec![],
-                        examples: vec![],
-                        related: vec![],
-                    },
-                },
-                OperationInfo {
-                    id: OperationId::from_static("openai.embeddings"),
-                    summary: "Generate text embeddings".into(),
-                    input_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "model": {
-                                "type": "string",
-                                "enum": ["text-embedding-3-small", "text-embedding-3-large", "text-embedding-ada-002"],
-                                "default": "text-embedding-3-small"
-                            },
-                            "input": {
-                                "oneOf": [
-                                    { "type": "string", "minLength": 1 },
-                                    { "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1, "maxItems": 2048 }
-                                ]
-                            },
-                            "dimensions": {
-                                "type": "integer",
-                                "minimum": 1,
-                                "maximum": 3072
-                            }
-                        },
-                        "required": ["input"]
-                    }),
-                    output_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "model": { "type": "string" },
-                            "data": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "index": { "type": "integer" },
-                                        "embedding": { "type": "array", "items": { "type": "number" } }
-                                    }
-                                }
-                            },
-                            "usage": {
-                                "type": "object",
-                                "properties": {
-                                    "prompt_tokens": { "type": "integer" },
-                                    "total_tokens": { "type": "integer" }
-                                }
-                            },
-                            "cost_usd": { "type": "number" }
-                        }
-                    }),
-                    capability: CapabilityId::from_static("openai.embeddings"),
-                    risk_level: RiskLevel::Low,
-                    description: None,
-                    rate_limit: None,
-                    requires_approval: None,
-                    safety_tier: SafetyTier::Safe,
-                    idempotency: IdempotencyClass::None,
-                    ai_hints: AgentHint {
-                        when_to_use: "Generate vector embeddings from text for semantic search, clustering, or similarity comparisons.".into(),
-                        common_mistakes: vec![
-                            "Exceeding 8191 token input limit".into(),
-                            "Sending empty input text".into(),
-                        ],
-                        examples: vec![
-                            r#"{"input": "Hello world"}"#.into(),
-                            r#"{"input": ["text one", "text two"], "model": "text-embedding-3-large"}"#.into(),
-                        ],
-                        related: vec![],
-                    },
-                },
-                OperationInfo {
-                    id: OperationId::from_static("openai.images.generate"),
-                    summary: "Generate images from text prompts".into(),
-                    input_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "prompt": { "type": "string", "minLength": 1 },
-                            "model": {
-                                "type": "string",
-                                "enum": ["dall-e-3", "dall-e-2"],
-                                "default": "dall-e-3"
-                            },
-                            "n": { "type": "integer", "minimum": 1, "maximum": 10, "default": 1 },
-                            "size": {
-                                "type": "string",
-                                "enum": ["256x256", "512x512", "1024x1024", "1792x1024", "1024x1792"],
-                                "default": "1024x1024"
-                            },
-                            "quality": {
-                                "type": "string",
-                                "enum": ["standard", "hd"],
-                                "default": "standard"
-                            }
-                        },
-                        "required": ["prompt"]
-                    }),
-                    output_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "created": { "type": "integer" },
-                            "data": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "b64_json": { "type": "string" },
-                                        "revised_prompt": { "type": "string" }
-                                    }
-                                }
-                            }
-                        }
-                    }),
-                    capability: CapabilityId::from_static("openai.images"),
-                    risk_level: RiskLevel::Medium,
-                    description: None,
-                    rate_limit: None,
-                    requires_approval: None,
-                    safety_tier: SafetyTier::Safe,
-                    idempotency: IdempotencyClass::None,
-                    ai_hints: AgentHint {
-                        when_to_use: "Generate images from text descriptions using DALL-E models.".into(),
-                        common_mistakes: vec![
-                            "Empty prompt string".into(),
-                            "Using DALL-E 2 sizes with DALL-E 3".into(),
-                        ],
-                        examples: vec![
-                            r#"{"prompt": "A sunset over mountains"}"#.into(),
-                            r#"{"prompt": "A cat", "model": "dall-e-3", "size": "1792x1024", "quality": "hd"}"#.into(),
-                        ],
-                        related: vec![],
-                    },
-                },
-                OperationInfo {
-                    id: OperationId::from_static("openai.videos.generate"),
-                    summary: "Generate videos from text prompts".into(),
-                    input_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "prompt": { "type": "string", "minLength": 1 },
-                            "model": {
-                                "type": "string",
-                                "enum": ["sora-2", "sora-2-pro"],
-                                "default": "sora-2"
-                            },
-                            "duration_seconds": {
-                                "type": "integer",
-                                "enum": [4, 8, 12]
-                            },
-                            "size": {
-                                "type": "string",
-                                "enum": ["720x1280", "1280x720", "1024x1792", "1792x1024"]
-                            },
-                            "aspect_ratio": {
-                                "type": "string",
-                                "enum": ["9:16", "16:9", "4:7", "7:4"]
-                            },
-                            "poll_interval_ms": {
-                                "type": "integer",
-                                "minimum": 1,
-                                "maximum": 60000,
-                                "default": 2500
-                            },
-                            "max_poll_attempts": {
-                                "type": "integer",
-                                "minimum": 1,
-                                "maximum": 120,
-                                "default": 120
-                            }
-                        },
-                        "required": ["prompt"]
-                    }),
-                    output_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "video_id": { "type": "string" },
-                            "model": { "type": "string" },
-                            "status": { "type": "string" },
-                            "seconds": { "type": "string" },
-                            "size": { "type": "string" },
-                            "mime_type": { "type": "string" },
-                            "video_b64": { "type": "string" }
-                        }
-                    }),
-                    capability: CapabilityId::from_static("openai.videos"),
-                    risk_level: RiskLevel::Medium,
-                    description: None,
-                    rate_limit: None,
-                    requires_approval: None,
-                    safety_tier: SafetyTier::Safe,
-                    idempotency: IdempotencyClass::None,
-                    ai_hints: AgentHint {
-                        when_to_use: "Generate a short OpenAI video, poll the provider job, and return the downloaded video bytes as base64.".into(),
-                        common_mistakes: vec![
-                            "Expecting the provider to return video bytes in the initial submit response".into(),
-                            "Using unsupported durations or video sizes".into(),
-                        ],
-                        examples: vec![
-                            r#"{"prompt": "A product shot rotating on a white table", "duration_seconds": 4, "size": "1280x720"}"#.into(),
-                        ],
-                        related: vec![CapabilityId::from_static("openai.images.generate")],
-                    },
-                },
-                OperationInfo {
-                    id: OperationId::from_static("openai.audio.transcribe"),
-                    summary: "Transcribe audio to text using Whisper".into(),
-                    input_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "audio_b64": {
-                                "type": "string",
-                                "description": "Base64-encoded audio data"
-                            },
-                            "filename": {
-                                "type": "string",
-                                "description": "Original filename with extension (e.g. recording.mp3)",
-                                "default": "audio.mp3"
-                            },
-                            "model": {
-                                "type": "string",
-                                "enum": ["whisper-1"],
-                                "default": "whisper-1"
-                            },
-                            "language": {
-                                "type": "string",
-                                "description": "ISO-639-1 language code (optional)"
-                            }
-                        },
-                        "required": ["audio_b64"]
-                    }),
-                    output_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "text": {
-                                "type": "string",
-                                "description": "Transcribed text"
-                            }
-                        },
-                        "required": ["text"]
-                    }),
-                    capability: CapabilityId::from_static("openai.audio.transcribe"),
-                    risk_level: RiskLevel::Medium,
-                    description: None,
-                    rate_limit: None,
-                    requires_approval: None,
-                    safety_tier: SafetyTier::Safe,
-                    idempotency: IdempotencyClass::None,
-                    ai_hints: AgentHint {
-                        when_to_use: "Transcribe audio files to text using OpenAI Whisper.".into(),
-                        common_mistakes: vec![
-                            "Sending empty audio data".into(),
-                            "Exceeding 25MB file size limit".into(),
-                        ],
-                        examples: vec![
-                            r#"{"audio_b64": "<base64-data>", "filename": "recording.mp3"}"#.into(),
-                        ],
-                        related: vec![],
-                    },
-                },
-                OperationInfo {
-                    id: OperationId::from_static("openai.realtime.transcribe"),
-                    summary: "Transcribe streaming audio over an OpenAI Realtime WebSocket session"
-                        .into(),
-                    input_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "audio_b64": {
-                                "type": "string",
-                                "description": "Base64-encoded audio chunk to append to the realtime input buffer"
-                            },
-                            "audio_chunks_b64": {
-                                "type": "array",
-                                "items": { "type": "string" },
-                                "description": "Ordered base64-encoded audio chunks to stream before commit"
-                            },
-                            "session_id": {
-                                "type": "string",
-                                "description": "Optional caller session identifier for event correlation"
-                            },
-                            "model": {
-                                "type": "string",
-                                "enum": [
-                                    "whisper-1",
-                                    "gpt-4o-transcribe",
-                                    "gpt-4o-mini-transcribe",
-                                    "gpt-4o-transcribe-latest"
-                                ],
-                                "default": OPENAI_REALTIME_TRANSCRIPTION_DEFAULT_MODEL
-                            },
-                            "audio_format": {
-                                "type": "string",
-                                "enum": ["pcm16", "g711_ulaw", "g711_alaw"],
-                                "default": OPENAI_REALTIME_TRANSCRIPTION_DEFAULT_AUDIO_FORMAT
-                            },
-                            "language": {
-                                "type": "string",
-                                "description": "Optional ISO-639-1 language code"
-                            },
-                            "prompt": {
-                                "type": "string",
-                                "description": "Optional transcription prompt or keyword list"
-                            },
-                            "include_logprobs": {
-                                "type": "boolean",
-                                "default": false
-                            },
-                            "server_vad": {
-                                "type": "boolean",
-                                "default": true
-                            },
-                            "vad_threshold": {
-                                "type": "number",
-                                "minimum": 0,
-                                "maximum": 1,
-                                "default": OPENAI_REALTIME_TRANSCRIPTION_DEFAULT_VAD_THRESHOLD
-                            },
-                            "prefix_padding_ms": {
-                                "type": "integer",
-                                "minimum": 0,
-                                "maximum": 10000,
-                                "default": OPENAI_REALTIME_TRANSCRIPTION_DEFAULT_PREFIX_PADDING_MS
-                            },
-                            "silence_duration_ms": {
-                                "type": "integer",
-                                "minimum": 0,
-                                "maximum": 30000,
-                                "default": OPENAI_REALTIME_TRANSCRIPTION_DEFAULT_SILENCE_DURATION_MS
-                            },
-                            "noise_reduction": {
-                                "type": "string",
-                                "enum": ["near_field", "far_field", "none"],
-                                "default": "near_field"
-                            },
-                            "commit_audio_buffer": {
-                                "type": "boolean",
-                                "default": true
-                            },
-                            "connect_timeout_ms": {
-                                "type": "integer",
-                                "minimum": 100,
-                                "maximum": 120000,
-                                "default": OPENAI_REALTIME_TRANSCRIPTION_DEFAULT_CONNECT_TIMEOUT_MS
-                            },
-                            "timeout_ms": {
-                                "type": "integer",
-                                "minimum": 100,
-                                "maximum": 300000,
-                                "default": OPENAI_REALTIME_TRANSCRIPTION_DEFAULT_TIMEOUT_MS
-                            },
-                            "max_events": {
-                                "type": "integer",
-                                "minimum": 1,
-                                "maximum": OPENAI_REALTIME_TRANSCRIPTION_MAX_EVENTS,
-                                "default": OPENAI_REALTIME_TRANSCRIPTION_DEFAULT_MAX_EVENTS
-                            },
-                            "max_reconnect_attempts": {
-                                "type": "integer",
-                                "minimum": 0,
-                                "maximum": OPENAI_REALTIME_TRANSCRIPTION_MAX_RECONNECT_ATTEMPTS,
-                                "default": 0
-                            },
-                            "reconnect_delay_ms": {
-                                "type": "integer",
-                                "minimum": OPENAI_REALTIME_TRANSCRIPTION_MIN_RECONNECT_DELAY_MS,
-                                "maximum": OPENAI_REALTIME_TRANSCRIPTION_MAX_RECONNECT_DELAY_MS,
-                                "default": OPENAI_REALTIME_TRANSCRIPTION_DEFAULT_RECONNECT_DELAY_MS
-                            }
-                        },
-                        "oneOf": [
-                            { "required": ["audio_b64"] },
-                            { "required": ["audio_chunks_b64"] }
-                        ]
-                    }),
-                    output_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "session_id": { "type": "string" },
-                            "provider_session_id": { "type": ["string", "null"] },
-                            "model": { "type": "string" },
-                            "audio_format": { "type": "string" },
-                            "text": { "type": "string" },
-                            "transcripts": { "type": "array" },
-                            "partials": { "type": "array" },
-                            "audio_commits": { "type": "array" },
-                            "events_seen": { "type": "integer" },
-                            "reconnect_attempts": { "type": "integer" }
-                        },
-                        "required": ["session_id", "model", "audio_format", "text"]
-                    }),
-                    capability: CapabilityId::from_static("openai.realtime.transcribe"),
-                    risk_level: RiskLevel::Medium,
-                    description: None,
-                    rate_limit: None,
-                    requires_approval: None,
-                    safety_tier: SafetyTier::Safe,
-                    idempotency: IdempotencyClass::None,
-                    ai_hints: AgentHint {
-                        when_to_use: "Stream microphone or chunked audio through OpenAI Realtime transcription and collect completed transcript events.".into(),
-                        common_mistakes: vec![
-                            "Sending audio in a format different from audio_format".into(),
-                            "Expecting the session to generate model responses; transcription mode only emits transcript events".into(),
-                            "Treating delta events as final text instead of waiting for completed transcript events".into(),
-                        ],
-                        examples: vec![
-                            r#"{"audio_b64": "<base64-pcm16-audio>", "model": "gpt-4o-transcribe", "language": "en"}"#.into(),
-                        ],
-                        related: vec![CapabilityId::from_static("openai.audio.transcribe")],
-                    },
-                },
-                OperationInfo {
-                    id: OperationId::from_static("openai.realtime.voice"),
-                    summary: "Run a supervised OpenAI Realtime voice WebSocket session".into(),
-                    input_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "audio_b64": {
-                                "type": "string",
-                                "description": "Base64-encoded input audio chunk"
-                            },
-                            "audio_chunks_b64": {
-                                "type": "array",
-                                "items": { "type": "string" },
-                                "description": "Ordered base64-encoded audio chunks to drain after session.updated"
-                            },
-                            "message": {
-                                "type": "string",
-                                "description": "Optional user text message to send before response.create"
-                            },
-                            "session_id": { "type": "string" },
-                            "model": {
-                                "type": "string",
-                                "default": OPENAI_REALTIME_VOICE_DEFAULT_MODEL
-                            },
-                            "voice": {
-                                "type": "string",
-                                "enum": ["alloy", "ash", "ballad", "cedar", "coral", "echo", "marin", "sage", "shimmer", "verse"],
-                                "default": OPENAI_REALTIME_VOICE_DEFAULT_VOICE
-                            },
-                            "instructions": { "type": "string" },
-                            "audio_format": {
-                                "type": "string",
-                                "enum": ["pcm16", "g711_ulaw", "g711_alaw"],
-                                "default": OPENAI_REALTIME_VOICE_DEFAULT_AUDIO_FORMAT
-                            },
-                            "output_audio_format": {
-                                "type": "string",
-                                "enum": ["pcm16", "g711_ulaw", "g711_alaw"],
-                                "default": OPENAI_REALTIME_VOICE_DEFAULT_AUDIO_FORMAT
-                            },
-                            "input_transcription_model": {
-                                "type": "string",
-                                "enum": ["whisper-1", "gpt-4o-transcribe", "gpt-4o-mini-transcribe", "gpt-4o-transcribe-latest"],
-                                "default": "whisper-1"
-                            },
-                            "server_vad": { "type": "boolean", "default": false },
-                            "auto_respond_to_audio": { "type": "boolean", "default": true },
-                            "interrupt_response": { "type": "boolean", "default": true },
-                            "commit_audio_buffer": { "type": "boolean", "default": true },
-                            "create_response": { "type": "boolean", "default": true },
-                            "connect_timeout_ms": {
-                                "type": "integer",
-                                "minimum": 100,
-                                "maximum": 120000,
-                                "default": OPENAI_REALTIME_VOICE_DEFAULT_CONNECT_TIMEOUT_MS
-                            },
-                            "timeout_ms": {
-                                "type": "integer",
-                                "minimum": 100,
-                                "maximum": 300000,
-                                "default": OPENAI_REALTIME_VOICE_DEFAULT_TIMEOUT_MS
-                            },
-                            "max_events": {
-                                "type": "integer",
-                                "minimum": 1,
-                                "maximum": OPENAI_REALTIME_VOICE_MAX_EVENTS,
-                                "default": OPENAI_REALTIME_VOICE_DEFAULT_MAX_EVENTS
-                            }
-                        },
-                        "anyOf": [
-                            { "required": ["audio_b64"] },
-                            { "required": ["audio_chunks_b64"] },
-                            { "required": ["message"] }
-                        ]
-                    }),
-                    output_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "session_id": { "type": "string" },
-                            "provider_session_id": { "type": ["string", "null"] },
-                            "model": { "type": "string" },
-                            "voice": { "type": "string" },
-                            "audio_b64": { "type": ["string", "null"] },
-                            "audio_chunks_b64": { "type": "array" },
-                            "assistant_transcript": { "type": "string" },
-                            "assistant_transcripts": { "type": "array" },
-                            "user_transcripts": { "type": "array" },
-                            "stats": { "type": "object" }
-                        },
-                        "required": ["session_id", "model", "voice", "audio_chunks_b64"]
-                    }),
-                    capability: CapabilityId::from_static("openai.realtime.voice"),
-                    risk_level: RiskLevel::Medium,
-                    description: None,
-                    rate_limit: None,
-                    requires_approval: None,
-                    safety_tier: SafetyTier::Safe,
-                    idempotency: IdempotencyClass::None,
-                    ai_hints: AgentHint {
-                        when_to_use: "Use for supervised Realtime voice sessions that stream queued audio after session readiness and return assistant audio/transcript events.".into(),
-                        common_mistakes: vec![
-                            "Sending a voice name that is only valid for legacy TTS".into(),
-                            "Starting audio before the session.updated readiness event".into(),
-                            "Treating output audio transcript deltas as final transcript text".into(),
-                        ],
-                        examples: vec![
-                            r#"{"audio_b64": "<base64-pcm16-audio>", "voice": "marin", "instructions": "Be concise."}"#.into(),
-                        ],
-                        related: vec![CapabilityId::from_static("openai.realtime.transcribe")],
-                    },
-                },
-                OperationInfo {
-                    id: OperationId::from_static("openai.realtime.browser_session"),
-                    summary: "Create an ephemeral OpenAI Realtime browser client secret".into(),
-                    input_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "model": {
-                                "type": "string",
-                                "default": OPENAI_REALTIME_VOICE_DEFAULT_MODEL
-                            },
-                            "voice": {
-                                "type": "string",
-                                "enum": ["alloy", "ash", "ballad", "cedar", "coral", "echo", "marin", "sage", "shimmer", "verse"],
-                                "default": OPENAI_REALTIME_VOICE_DEFAULT_VOICE
-                            },
-                            "instructions": { "type": "string" },
-                            "audio_format": {
-                                "type": "string",
-                                "enum": ["pcm16", "g711_ulaw", "g711_alaw"],
-                                "default": OPENAI_REALTIME_VOICE_DEFAULT_AUDIO_FORMAT
-                            },
-                            "output_audio_format": {
-                                "type": "string",
-                                "enum": ["pcm16", "g711_ulaw", "g711_alaw"],
-                                "default": OPENAI_REALTIME_VOICE_DEFAULT_AUDIO_FORMAT
-                            },
-                            "expires_after_seconds": {
-                                "type": "integer",
-                                "minimum": 1,
-                                "maximum": OPENAI_REALTIME_BROWSER_SESSION_MAX_TTL_SECONDS,
-                                "default": OPENAI_REALTIME_BROWSER_SESSION_DEFAULT_TTL_SECONDS
-                            },
-                            "audit_context": {
-                                "type": "string",
-                                "default": "fcp-openai-realtime-browser-session"
-                            }
-                        }
-                    }),
-                    output_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "provider": { "type": "string" },
-                            "transport": { "type": "string" },
-                            "client_secret": { "type": "string" },
-                            "offer_url": { "type": "string" },
-                            "model": { "type": "string" },
-                            "voice": { "type": "string" },
-                            "expires_at": { "type": ["integer", "null"] },
-                            "audit_context": { "type": "string" }
-                        },
-                        "required": ["provider", "transport", "client_secret", "offer_url", "model", "voice"]
-                    }),
-                    capability: CapabilityId::from_static("openai.realtime.browser_session"),
-                    risk_level: RiskLevel::Medium,
-                    description: None,
-                    rate_limit: None,
-                    requires_approval: None,
-                    safety_tier: SafetyTier::Safe,
-                    idempotency: IdempotencyClass::None,
-                    ai_hints: AgentHint {
-                        when_to_use: "Create a short-lived Realtime client secret for a browser WebRTC SDP offer flow.".into(),
-                        common_mistakes: vec![
-                            "Logging or persisting the returned ephemeral client secret".into(),
-                            "Trying to use non-OpenAI-compatible base URLs for browser client secrets".into(),
-                        ],
-                        examples: vec![
-                            r#"{"voice": "cedar", "instructions": "Keep responses short."}"#.into(),
-                        ],
-                        related: vec![CapabilityId::from_static("openai.realtime.voice")],
-                    },
-                },
-                OperationInfo {
-                    id: OperationId::from_static("openai.audio.tts"),
-                    summary: "Convert text to speech audio".into(),
-                    input_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "input": {
-                                "type": "string",
-                                "description": "Text to convert to speech (max 4096 characters)",
-                                "maxLength": 4096,
-                                "minLength": 1
-                            },
-                            "model": {
-                                "type": "string",
-                                "enum": ["tts-1", "tts-1-hd"],
-                                "default": "tts-1"
-                            },
-                            "voice": {
-                                "type": "string",
-                                "enum": ["alloy", "echo", "fable", "onyx", "nova", "shimmer"],
-                                "default": "alloy"
-                            },
-                            "response_format": {
-                                "type": "string",
-                                "enum": ["mp3", "opus", "aac", "flac"],
-                                "default": "mp3"
-                            },
-                            "speed": {
-                                "type": "number",
-                                "minimum": 0.25,
-                                "maximum": 4.0,
-                                "default": 1.0
-                            }
-                        },
-                        "required": ["input"]
-                    }),
-                    output_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "audio_b64": {
-                                "type": "string",
-                                "description": "Base64-encoded audio data"
-                            },
-                            "format": {
-                                "type": "string",
-                                "description": "Audio format (mp3, opus, aac, flac)"
-                            },
-                            "mime_type": {
-                                "type": "string",
-                                "description": "MIME type of the audio"
-                            },
-                            "input_chars": {
-                                "type": "integer",
-                                "description": "Number of input characters"
-                            }
-                        },
-                        "required": ["audio_b64", "format"]
-                    }),
-                    capability: CapabilityId::from_static("openai.audio.tts"),
-                    risk_level: RiskLevel::Medium,
-                    description: None,
-                    rate_limit: None,
-                    requires_approval: None,
-                    safety_tier: SafetyTier::Safe,
-                    idempotency: IdempotencyClass::None,
-                    ai_hints: AgentHint {
-                        when_to_use: "Convert text to speech audio using OpenAI TTS models.".into(),
-                        common_mistakes: vec![
-                            "Exceeding 4096 character input limit".into(),
-                            "Sending empty input text".into(),
-                        ],
-                        examples: vec![
-                            r#"{"input": "Hello, world!"}"#.into(),
-                            r#"{"input": "Welcome!", "voice": "nova", "model": "tts-1-hd"}"#.into(),
-                        ],
-                        related: vec![],
-                    },
-                },
-                OperationInfo {
-                    id: OperationId::from_static("openai.finetune.create"),
-                    summary: "Create a fine-tuning job".into(),
-                    input_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "training_file": {
-                                "type": "string",
-                                "description": "Training file ID (from OpenAI Files API)"
-                            },
-                            "model": {
-                                "type": "string",
-                                "description": "Base model to fine-tune",
-                                "enum": ["gpt-4o-mini-2024-07-18", "gpt-3.5-turbo-0125"],
-                                "default": "gpt-4o-mini-2024-07-18"
-                            },
-                            "validation_file": {
-                                "type": "string",
-                                "description": "Optional validation file ID"
-                            },
-                            "suffix": {
-                                "type": "string",
-                                "description": "Suffix for the fine-tuned model name (max 18 chars)",
-                                "maxLength": 18
-                            },
-                            "n_epochs": {
-                                "description": "Number of training epochs (integer or 'auto')",
-                                "default": "auto"
-                            },
-                            "batch_size": {
-                                "description": "Batch size (integer or 'auto')",
-                                "default": "auto"
-                            },
-                            "learning_rate_multiplier": {
-                                "description": "Learning rate multiplier (number or 'auto')",
-                                "default": "auto"
-                            }
-                        },
-                        "required": ["training_file"]
-                    }),
-                    output_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "id": { "type": "string", "description": "Fine-tuning job ID" },
-                            "model": { "type": "string" },
-                            "status": { "type": "string" },
-                            "training_file": { "type": "string" },
-                            "created_at": { "type": "integer" }
-                        },
-                        "required": ["id", "status"]
-                    }),
-                    capability: CapabilityId::from_static("openai.finetune.create"),
-                    risk_level: RiskLevel::High,
-                    description: None,
-                    rate_limit: None,
-                    requires_approval: Some(ApprovalMode::ElevationToken),
-                    safety_tier: SafetyTier::Risky,
-                    idempotency: IdempotencyClass::None,
-                    ai_hints: AgentHint {
-                        when_to_use: "Create a fine-tuning job to train a custom model on your data.".into(),
-                        common_mistakes: vec![
-                            "Missing training_file ID".into(),
-                            "Using unsupported base model".into(),
-                        ],
-                        examples: vec![
-                            r#"{"training_file": "file-abc123"}"#.into(),
-                            r#"{"training_file": "file-abc123", "model": "gpt-4o-mini-2024-07-18", "suffix": "my-model"}"#.into(),
-                        ],
-                        related: vec![],
-                    },
-                },
-                OperationInfo {
-                    id: OperationId::from_static("openai.finetune.list"),
-                    summary: "List fine-tuning jobs".into(),
-                    input_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "limit": {
-                                "type": "integer",
-                                "description": "Max number of jobs to return",
-                                "default": 20,
-                                "minimum": 1,
-                                "maximum": 100
-                            },
-                            "after": {
-                                "type": "string",
-                                "description": "Cursor for pagination"
-                            }
-                        }
-                    }),
-                    output_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "data": { "type": "array" },
-                            "has_more": { "type": "boolean" }
-                        },
-                        "required": ["data", "has_more"]
-                    }),
-                    capability: CapabilityId::from_static("openai.finetune.list"),
-                    risk_level: RiskLevel::Low,
-                    description: None,
-                    rate_limit: None,
-                    requires_approval: None,
-                    safety_tier: SafetyTier::Safe,
-                    idempotency: IdempotencyClass::Strict,
-                    ai_hints: AgentHint {
-                        when_to_use: "List fine-tuning jobs to check status of training runs.".into(),
-                        common_mistakes: vec![],
-                        examples: vec![
-                            r"{}".into(),
-                            r#"{"limit": 10}"#.into(),
-                        ],
-                        related: vec![],
-                    },
-                },
-                OperationInfo {
-                    id: OperationId::from_static("openai.finetune.get"),
-                    summary: "Get a fine-tuning job by ID".into(),
-                    input_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "job_id": {
-                                "type": "string",
-                                "description": "Fine-tuning job ID"
-                            }
-                        },
-                        "required": ["job_id"]
-                    }),
-                    output_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "id": { "type": "string" },
-                            "model": { "type": "string" },
-                            "status": { "type": "string" },
-                            "fine_tuned_model": { "type": "string" },
-                            "training_file": { "type": "string" },
-                            "created_at": { "type": "integer" },
-                            "finished_at": { "type": "integer" },
-                            "trained_tokens": { "type": "integer" }
-                        },
-                        "required": ["id", "status"]
-                    }),
-                    capability: CapabilityId::from_static("openai.finetune.get"),
-                    risk_level: RiskLevel::Low,
-                    description: None,
-                    rate_limit: None,
-                    requires_approval: None,
-                    safety_tier: SafetyTier::Safe,
-                    idempotency: IdempotencyClass::Strict,
-                    ai_hints: AgentHint {
-                        when_to_use: "Get details and status of a specific fine-tuning job.".into(),
-                        common_mistakes: vec!["Missing job_id".into()],
-                        examples: vec![
-                            r#"{"job_id": "ftjob-abc123"}"#.into(),
-                        ],
-                        related: vec![],
-                    },
-                },
-                OperationInfo {
-                    id: OperationId::from_static("openai.finetune.cancel"),
-                    summary: "Cancel a fine-tuning job".into(),
-                    input_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "job_id": {
-                                "type": "string",
-                                "description": "Fine-tuning job ID to cancel"
-                            }
-                        },
-                        "required": ["job_id"]
-                    }),
-                    output_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "id": { "type": "string" },
-                            "status": { "type": "string" }
-                        },
-                        "required": ["id", "status"]
-                    }),
-                    capability: CapabilityId::from_static("openai.finetune.cancel"),
-                    risk_level: RiskLevel::High,
-                    description: None,
-                    rate_limit: None,
-                    requires_approval: Some(ApprovalMode::ElevationToken),
-                    safety_tier: SafetyTier::Risky,
-                    idempotency: IdempotencyClass::None,
-                    ai_hints: AgentHint {
-                        when_to_use: "Cancel a running or queued fine-tuning job.".into(),
-                        common_mistakes: vec!["Missing job_id".into()],
-                        examples: vec![
-                            r#"{"job_id": "ftjob-abc123"}"#.into(),
-                        ],
-                        related: vec![],
-                    },
-                },
-                OperationInfo {
-                    id: OperationId::from_static("openai.finetune.events"),
-                    summary: "List events for a fine-tuning job".into(),
-                    input_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "job_id": {
-                                "type": "string",
-                                "description": "Fine-tuning job ID"
-                            },
-                            "limit": {
-                                "type": "integer",
-                                "description": "Max events to return",
-                                "default": 20,
-                                "minimum": 1,
-                                "maximum": 100
-                            },
-                            "after": {
-                                "type": "string",
-                                "description": "Cursor for pagination"
-                            }
-                        },
-                        "required": ["job_id"]
-                    }),
-                    output_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "data": { "type": "array" },
-                            "has_more": { "type": "boolean" }
-                        },
-                        "required": ["data", "has_more"]
-                    }),
-                    capability: CapabilityId::from_static("openai.finetune.events"),
-                    risk_level: RiskLevel::Low,
-                    description: None,
-                    rate_limit: None,
-                    requires_approval: None,
-                    safety_tier: SafetyTier::Safe,
-                    idempotency: IdempotencyClass::Strict,
-                    ai_hints: AgentHint {
-                        when_to_use: "View training progress events for a fine-tuning job.".into(),
-                        common_mistakes: vec!["Missing job_id".into()],
-                        examples: vec![
-                            r#"{"job_id": "ftjob-abc123"}"#.into(),
-                        ],
-                        related: vec![],
-                    },
-                },
-                // ─────────────── Assistants ───────────────
-                OperationInfo {
-                    id: OperationId::from_static("openai.assistants.create"),
-                    summary: "Create an assistant".into(),
-                    input_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "model": { "type": "string" },
-                            "name": { "type": "string" },
-                            "instructions": { "type": "string" },
-                            "tools": { "type": "array" },
-                            "metadata": { "type": "object" }
-                        },
-                        "required": ["model"]
-                    }),
-                    output_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "id": { "type": "string" },
-                            "model": { "type": "string" },
-                            "name": { "type": "string" },
-                            "created_at": { "type": "integer" }
-                        },
-                        "required": ["id", "model"]
-                    }),
-                    capability: CapabilityId::from_static("openai.assistants.create"),
-                    risk_level: RiskLevel::Medium,
-                    description: None,
-                    rate_limit: None,
-                    requires_approval: None,
-                    safety_tier: SafetyTier::Safe,
-                    idempotency: IdempotencyClass::None,
-                    ai_hints: AgentHint {
-                        when_to_use: "Create a new assistant with model, instructions, and tools."
-                            .into(),
-                        common_mistakes: vec!["Missing model".into()],
-                        examples: vec![
-                            r#"{"model": "gpt-4o", "name": "Math Tutor", "instructions": "You help with math."}"#.into(),
-                        ],
-                        related: vec![CapabilityId::from_static("openai.assistants.get"), CapabilityId::from_static("openai.threads.create")],
-                    },
-                },
-                OperationInfo {
-                    id: OperationId::from_static("openai.assistants.list"),
-                    summary: "List assistants".into(),
-                    input_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "limit": { "type": "integer" },
-                            "after": { "type": "string" }
-                        }
-                    }),
-                    output_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "data": { "type": "array" },
-                            "has_more": { "type": "boolean" }
-                        },
-                        "required": ["data", "has_more"]
-                    }),
-                    capability: CapabilityId::from_static("openai.assistants.list"),
-                    risk_level: RiskLevel::Low,
-                    description: None,
-                    rate_limit: None,
-                    requires_approval: None,
-                    safety_tier: SafetyTier::Safe,
-                    idempotency: IdempotencyClass::Strict,
-                    ai_hints: AgentHint {
-                        when_to_use: "List assistants with optional pagination.".into(),
-                        common_mistakes: vec![],
-                        examples: vec![r"{}".into()],
-                        related: vec![CapabilityId::from_static("openai.assistants.get")],
-                    },
-                },
-                OperationInfo {
-                    id: OperationId::from_static("openai.assistants.get"),
-                    summary: "Get an assistant".into(),
-                    input_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "assistant_id": { "type": "string" }
-                        },
-                        "required": ["assistant_id"]
-                    }),
-                    output_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "id": { "type": "string" },
-                            "model": { "type": "string" },
-                            "name": { "type": "string" }
-                        },
-                        "required": ["id", "model"]
-                    }),
-                    capability: CapabilityId::from_static("openai.assistants.get"),
-                    risk_level: RiskLevel::Low,
-                    description: None,
-                    rate_limit: None,
-                    requires_approval: None,
-                    safety_tier: SafetyTier::Safe,
-                    idempotency: IdempotencyClass::Strict,
-                    ai_hints: AgentHint {
-                        when_to_use: "Get details of a specific assistant.".into(),
-                        common_mistakes: vec!["Missing assistant_id".into()],
-                        examples: vec![r#"{"assistant_id": "asst_abc123"}"#.into()],
-                        related: vec![CapabilityId::from_static("openai.assistants.list")],
-                    },
-                },
-                OperationInfo {
-                    id: OperationId::from_static("openai.assistants.delete"),
-                    summary: "Delete an assistant".into(),
-                    input_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "assistant_id": { "type": "string" }
-                        },
-                        "required": ["assistant_id"]
-                    }),
-                    output_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "id": { "type": "string" },
-                            "deleted": { "type": "boolean" }
-                        },
-                        "required": ["id", "deleted"]
-                    }),
-                    capability: CapabilityId::from_static("openai.assistants.delete"),
-                    risk_level: RiskLevel::High,
-                    description: None,
-                    rate_limit: None,
-                    requires_approval: Some(ApprovalMode::ElevationToken),
-                    safety_tier: SafetyTier::Risky,
-                    idempotency: IdempotencyClass::None,
-                    ai_hints: AgentHint {
-                        when_to_use: "Delete an assistant permanently.".into(),
-                        common_mistakes: vec!["Missing assistant_id".into()],
-                        examples: vec![r#"{"assistant_id": "asst_abc123"}"#.into()],
-                        related: vec![],
-                    },
-                },
-                // ─────────────── Threads ───────────────
-                OperationInfo {
-                    id: OperationId::from_static("openai.threads.create"),
-                    summary: "Create a conversation thread".into(),
-                    input_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "messages": { "type": "array" },
-                            "metadata": { "type": "object" }
-                        }
-                    }),
-                    output_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "id": { "type": "string" },
-                            "created_at": { "type": "integer" }
-                        },
-                        "required": ["id"]
-                    }),
-                    capability: CapabilityId::from_static("openai.threads.create"),
-                    risk_level: RiskLevel::Low,
-                    description: None,
-                    rate_limit: None,
-                    requires_approval: None,
-                    safety_tier: SafetyTier::Safe,
-                    idempotency: IdempotencyClass::None,
-                    ai_hints: AgentHint {
-                        when_to_use: "Create a new conversation thread, optionally with initial messages.".into(),
-                        common_mistakes: vec![],
-                        examples: vec![r"{}".into()],
-                        related: vec![CapabilityId::from_static("openai.threads.messages.create"), CapabilityId::from_static("openai.threads.runs.create")],
-                    },
-                },
-                OperationInfo {
-                    id: OperationId::from_static("openai.threads.get"),
-                    summary: "Retrieve a thread".into(),
-                    input_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "thread_id": { "type": "string" }
-                        },
-                        "required": ["thread_id"]
-                    }),
-                    output_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "id": { "type": "string" },
-                            "created_at": { "type": "integer" }
-                        },
-                        "required": ["id"]
-                    }),
-                    capability: CapabilityId::from_static("openai.threads.get"),
-                    risk_level: RiskLevel::Low,
-                    description: None,
-                    rate_limit: None,
-                    requires_approval: None,
-                    safety_tier: SafetyTier::Safe,
-                    idempotency: IdempotencyClass::Strict,
-                    ai_hints: AgentHint {
-                        when_to_use: "Retrieve a thread by ID.".into(),
-                        common_mistakes: vec!["Missing thread_id".into()],
-                        examples: vec![r#"{"thread_id": "thread_abc123"}"#.into()],
-                        related: vec![CapabilityId::from_static("openai.threads.create")],
-                    },
-                },
-                // ─────────────── Thread Messages ───────────────
-                OperationInfo {
-                    id: OperationId::from_static("openai.threads.messages.create"),
-                    summary: "Add a message to a thread".into(),
-                    input_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "thread_id": { "type": "string" },
-                            "role": { "type": "string", "enum": ["user"] },
-                            "content": { "type": "string" },
-                            "metadata": { "type": "object" }
-                        },
-                        "required": ["thread_id", "role", "content"]
-                    }),
-                    output_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "id": { "type": "string" },
-                            "thread_id": { "type": "string" },
-                            "role": { "type": "string" },
-                            "content": { "type": "array" }
-                        },
-                        "required": ["id", "thread_id"]
-                    }),
-                    capability: CapabilityId::from_static("openai.threads.messages.create"),
-                    risk_level: RiskLevel::Low,
-                    description: None,
-                    rate_limit: None,
-                    requires_approval: None,
-                    safety_tier: SafetyTier::Safe,
-                    idempotency: IdempotencyClass::None,
-                    ai_hints: AgentHint {
-                        when_to_use: "Add a user message to a thread before creating a run.".into(),
-                        common_mistakes: vec!["Missing content".into(), "Using 'assistant' role".into()],
-                        examples: vec![
-                            r#"{"thread_id": "thread_abc123", "role": "user", "content": "Hello"}"#.into(),
-                        ],
-                        related: vec![CapabilityId::from_static("openai.threads.messages.list"), CapabilityId::from_static("openai.threads.runs.create")],
-                    },
-                },
-                OperationInfo {
-                    id: OperationId::from_static("openai.threads.messages.list"),
-                    summary: "List messages in a thread".into(),
-                    input_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "thread_id": { "type": "string" },
-                            "limit": { "type": "integer" },
-                            "after": { "type": "string" }
-                        },
-                        "required": ["thread_id"]
-                    }),
-                    output_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "data": { "type": "array" },
-                            "has_more": { "type": "boolean" }
-                        },
-                        "required": ["data", "has_more"]
-                    }),
-                    capability: CapabilityId::from_static("openai.threads.messages.list"),
-                    risk_level: RiskLevel::Low,
-                    description: None,
-                    rate_limit: None,
-                    requires_approval: None,
-                    safety_tier: SafetyTier::Safe,
-                    idempotency: IdempotencyClass::Strict,
-                    ai_hints: AgentHint {
-                        when_to_use: "List messages in a thread to see conversation history.".into(),
-                        common_mistakes: vec!["Missing thread_id".into()],
-                        examples: vec![r#"{"thread_id": "thread_abc123"}"#.into()],
-                        related: vec![CapabilityId::from_static("openai.threads.messages.create")],
-                    },
-                },
-                // ─────────────── Runs ───────────────
-                OperationInfo {
-                    id: OperationId::from_static("openai.threads.runs.create"),
-                    summary: "Execute an assistant on a thread".into(),
-                    input_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "thread_id": { "type": "string" },
-                            "assistant_id": { "type": "string" },
-                            "instructions": { "type": "string" },
-                            "metadata": { "type": "object" }
-                        },
-                        "required": ["thread_id", "assistant_id"]
-                    }),
-                    output_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "id": { "type": "string" },
-                            "thread_id": { "type": "string" },
-                            "assistant_id": { "type": "string" },
-                            "status": { "type": "string" }
-                        },
-                        "required": ["id", "status"]
-                    }),
-                    capability: CapabilityId::from_static("openai.threads.runs.create"),
-                    risk_level: RiskLevel::Medium,
-                    description: None,
-                    rate_limit: None,
-                    requires_approval: None,
-                    safety_tier: SafetyTier::Safe,
-                    idempotency: IdempotencyClass::None,
-                    ai_hints: AgentHint {
-                        when_to_use: "Execute an assistant on a thread to generate a response.".into(),
-                        common_mistakes: vec!["Missing assistant_id".into(), "Missing thread_id".into()],
-                        examples: vec![
-                            r#"{"thread_id": "thread_abc123", "assistant_id": "asst_abc123"}"#.into(),
-                        ],
-                        related: vec![CapabilityId::from_static("openai.threads.runs.get"), CapabilityId::from_static("openai.threads.messages.list")],
-                    },
-                },
-                OperationInfo {
-                    id: OperationId::from_static("openai.threads.runs.get"),
-                    summary: "Get run status".into(),
-                    input_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "thread_id": { "type": "string" },
-                            "run_id": { "type": "string" }
-                        },
-                        "required": ["thread_id", "run_id"]
-                    }),
-                    output_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "id": { "type": "string" },
-                            "status": { "type": "string" },
-                            "started_at": { "type": "integer" },
-                            "completed_at": { "type": "integer" }
-                        },
-                        "required": ["id", "status"]
-                    }),
-                    capability: CapabilityId::from_static("openai.threads.runs.get"),
-                    risk_level: RiskLevel::Low,
-                    description: None,
-                    rate_limit: None,
-                    requires_approval: None,
-                    safety_tier: SafetyTier::Safe,
-                    idempotency: IdempotencyClass::Strict,
-                    ai_hints: AgentHint {
-                        when_to_use: "Check the status of a run to know when it completes.".into(),
-                        common_mistakes: vec!["Missing thread_id or run_id".into()],
-                        examples: vec![
-                            r#"{"thread_id": "thread_abc123", "run_id": "run_abc123"}"#.into(),
-                        ],
-                        related: vec![CapabilityId::from_static("openai.threads.runs.create"), CapabilityId::from_static("openai.threads.runs.cancel")],
-                    },
-                },
-                OperationInfo {
-                    id: OperationId::from_static("openai.threads.runs.cancel"),
-                    summary: "Cancel a run".into(),
-                    input_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "thread_id": { "type": "string" },
-                            "run_id": { "type": "string" }
-                        },
-                        "required": ["thread_id", "run_id"]
-                    }),
-                    output_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "id": { "type": "string" },
-                            "status": { "type": "string" }
-                        },
-                        "required": ["id", "status"]
-                    }),
-                    capability: CapabilityId::from_static("openai.threads.runs.cancel"),
-                    risk_level: RiskLevel::Medium,
-                    description: None,
-                    rate_limit: None,
-                    requires_approval: None,
-                    safety_tier: SafetyTier::Safe,
-                    idempotency: IdempotencyClass::None,
-                    ai_hints: AgentHint {
-                        when_to_use: "Cancel a run that is in progress or queued.".into(),
-                        common_mistakes: vec!["Missing thread_id or run_id".into()],
-                        examples: vec![
-                            r#"{"thread_id": "thread_abc123", "run_id": "run_abc123"}"#.into(),
-                        ],
-                        related: vec![CapabilityId::from_static("openai.threads.runs.get")],
-                    },
-                },
-            ],
+            operations: operations_info()?.to_vec(),
             events: vec![],
             resource_types: vec![],
             auth_caps: None,
             event_caps: None,
         };
-
-        serde_json::to_value(introspection).map_err(|e| FcpError::Internal {
-            message: format!("Failed to serialize introspection: {e}"),
+        serde_json::to_value(introspection).map_err(|error| FcpError::Internal {
+            message: format!("Failed to serialize introspection: {error}"),
         })
     }
 
-    /// Handle simulate method.
+    /// Preflight the same authority, schema and resource scopes as invocation.
     ///
     /// # Errors
     ///
-    /// Returns an error if the simulate request is malformed or serialization fails.
+    /// Returns an error for a malformed request or response serialization failure.
     pub async fn handle_simulate(&self, params: serde_json::Value) -> FcpResult<serde_json::Value> {
-        let req: SimulateRequest =
-            serde_json::from_value(params).map_err(|e| FcpError::InvalidRequest {
+        let request: SimulateRequest =
+            serde_json::from_value(params).map_err(|_| FcpError::InvalidRequest {
                 code: 1003,
-                message: format!("Invalid simulate request: {e}"),
+                message: "Invalid simulate request".into(),
             })?;
-
-        let capability = match capability_for_operation(req.operation.as_str()) {
-            Ok(capability) => capability,
-            Err(error) => {
-                let response =
-                    SimulateResponse::denied(req.id, error.to_string(), error.error_code());
-                return serde_json::to_value(response).map_err(|e| FcpError::Internal {
-                    message: format!("Failed to serialize response: {e}"),
-                });
-            }
-        };
-
-        if self.config.is_none() || self.client.is_none() {
-            let response = SimulateResponse::denied(
-                req.id,
-                "Connector is not configured",
-                FcpError::NotConfigured.error_code(),
-            );
-            return serde_json::to_value(response).map_err(|e| FcpError::Internal {
-                message: format!("Failed to serialize response: {e}"),
+        if request.r#type != "simulate" || request.id.0.is_empty() || !request.input.is_object() {
+            return Err(FcpError::InvalidRequest {
+                code: 1003,
+                message: "Simulation requires a typed request, non-empty ID and object input"
+                    .into(),
             });
         }
-
-        let Some(verifier) = &self.verifier else {
-            let response = SimulateResponse::denied(
-                req.id,
-                "Connector handshake not completed",
-                FcpError::NotHandshaken.error_code(),
-            );
-            return serde_json::to_value(response).map_err(|e| FcpError::Internal {
-                message: format!("Failed to serialize response: {e}"),
+        let authorization = self
+            .validate_operation(&request.operation, &request.input)
+            .and_then(|resources| {
+                self.authority
+                    .as_ref()
+                    .ok_or(FcpError::NotHandshaken)?
+                    .authorize(
+                        &request.connector_id,
+                        &request.zone_id,
+                        &request.operation,
+                        request.capability_token,
+                        &resources,
+                    )
+                    .map(drop)
             });
-        };
-
-        let resource_uris = self.resource_uris_for_operation(req.operation.as_str(), &req.input);
-        let response = match verifier.verify_bound(
-            req.capability_token,
-            &capability,
-            &req.operation,
-            &resource_uris,
-        ) {
-            Ok(_) => SimulateResponse::allowed(req.id),
+        let response = match authorization {
+            Ok(()) => SimulateResponse::allowed(request.id),
             Err(error) => {
                 let mut response =
-                    SimulateResponse::denied(req.id, error.to_string(), error.error_code());
-                if error.error_code() == "FCP-3001" {
-                    response =
-                        response.with_missing_capabilities(vec![capability.as_str().to_string()]);
+                    SimulateResponse::denied(request.id, error.to_string(), error.error_code());
+                if matches!(
+                    error,
+                    FcpError::CapabilityDenied { .. } | FcpError::OperationNotGranted { .. }
+                ) && let Some(operation) = operations_info()?
+                    .iter()
+                    .find(|operation| operation.id == request.operation)
+                {
+                    response = response
+                        .with_missing_capabilities(vec![operation.capability.as_str().to_owned()]);
                 }
                 response
             }
         };
-
-        serde_json::to_value(response).map_err(|e| FcpError::Internal {
-            message: format!("Failed to serialize response: {e}"),
+        serde_json::to_value(response).map_err(|error| FcpError::Internal {
+            message: format!("Failed to serialize simulation: {error}"),
         })
     }
 
-    /// Handle invoke method.
+    fn validate_operation(
+        &self,
+        operation: &OperationId,
+        input: &serde_json::Value,
+    ) -> FcpResult<Vec<String>> {
+        self.base.check_ready()?;
+        if self.client.is_none() || self.config.is_none() {
+            return Err(FcpError::NotConfigured);
+        }
+        capability_for_operation(operation.as_str())?;
+        operation_contracts()?.validate_input(operation, input)?;
+        if operation.as_str() == "openai.chat" {
+            parse_chat_messages(input)?;
+        }
+        Ok(self.resource_uris_for_operation(operation.as_str(), input))
+    }
+
+    /// Execute a complete FCP invocation after bounded, instance-bound admission.
     ///
     /// # Errors
     ///
-    /// Returns an error if the operation is invalid, capability token verification fails,
-    /// required parameters are missing, or the API call fails.
+    /// Rejects invalid envelopes, inputs, authority and budgets before provider work.
     pub async fn handle_invoke(&self, params: serde_json::Value) -> FcpResult<serde_json::Value> {
         let result = Box::pin(self.handle_invoke_internal(params)).await;
         self.base.record_request(result.is_ok());
@@ -4133,45 +2840,64 @@ impl OpenAIConnector {
         &self,
         params: serde_json::Value,
     ) -> FcpResult<serde_json::Value> {
-        let operation =
-            params
-                .get("operation")
-                .and_then(|v| v.as_str())
-                .ok_or(FcpError::InvalidRequest {
-                    code: 1003,
-                    message: "Missing operation".into(),
-                })?;
-
-        let input = params.get("input").cloned().unwrap_or(json!({}));
-        self.base.check_ready()?;
-
-        // Extract and verify capability token
-        let token_value = params
-            .get("capability_token")
-            .ok_or(FcpError::InvalidRequest {
+        let request: InvokeRequest =
+            serde_json::from_value(params).map_err(|_| FcpError::InvalidRequest {
                 code: 1003,
-                message: "Missing capability_token".into(),
+                message: "Invalid FCP invoke request".into(),
             })?;
+        if request.r#type != "invoke"
+            || request.id.0.is_empty()
+            || !request.input.is_object()
+            || request.deadline_ms == Some(0)
+        {
+            return Err(FcpError::InvalidRequest {
+                code: 1003,
+                message: "Invocation requires a typed request, non-empty ID, object input and a nonzero deadline".into(),
+            });
+        }
+        let resources = self.validate_operation(&request.operation, &request.input)?;
+        let witness = self
+            .authority
+            .as_ref()
+            .ok_or(FcpError::NotHandshaken)?
+            .admit_bounded(
+                &request,
+                &resources,
+                response_byte_limit(&request.operation)?,
+            )?;
+        let execution = self.dispatch_operation(request.operation.as_str(), request.input);
+        let result = if let Some(deadline_ms) = request.deadline_ms {
+            Box::pin(time::timeout(Duration::from_millis(deadline_ms), execution))
+                .await
+                .unwrap_or_else(|_| {
+                    Err(FcpError::UpstreamTimeout {
+                        service: "openai".into(),
+                    })
+                })
+        } else {
+            Box::pin(execution).await
+        };
+        // Move large media payloads into the envelope rather than cloning them.
+        let response = match result {
+            Ok(value) => InvokeResponse::ok(request.id.clone(), value),
+            Err(error) => InvokeResponse::error(request.id.clone(), error),
+        };
+        operation_contracts()?.validate_response(&request.operation, &request.id, &response)?;
+        witness.finish_response(&response)?;
+        match (response.result, response.error) {
+            (Some(value), None) => Ok(value),
+            (None, Some(error)) => Err(error),
+            _ => Err(FcpError::Internal {
+                message: "Validated invocation response has no unique outcome".into(),
+            }),
+        }
+    }
 
-        let capability =
-            serde_json::from_value::<CapabilityToken>(token_value.clone()).map_err(|e| {
-                FcpError::InvalidRequest {
-                    code: 1003,
-                    message: format!("Invalid capability_token format: {e}"),
-                }
-            })?;
-
-        // Verify token
-        let op_id: OperationId = operation.parse().map_err(|_| FcpError::InvalidRequest {
-            code: 1003,
-            message: "Invalid operation ID format".into(),
-        })?;
-        let cap_id = capability_for_operation(operation)?;
-        let resource_uris = self.resource_uris_for_operation(operation, &input);
-
-        let verifier = self.verifier.as_ref().ok_or(FcpError::NotHandshaken)?;
-        verifier.verify_bound(capability, &cap_id, &op_id, &resource_uris)?;
-
+    async fn dispatch_operation(
+        &self,
+        operation: &str,
+        input: serde_json::Value,
+    ) -> FcpResult<serde_json::Value> {
         match operation {
             "openai.chat" => self.invoke_chat(input).await,
             "openai.simple_chat" => self.invoke_simple_chat(input).await,
@@ -4236,51 +2962,7 @@ impl OpenAIConnector {
             }
         };
 
-        // Parse messages
-        let messages_json = input.get("messages").ok_or(FcpError::InvalidRequest {
-            code: 1003,
-            message: "Missing messages".into(),
-        })?;
-
-        let messages: Vec<Message> =
-            serde_json::from_value(messages_json.clone()).map_err(|e| {
-                FcpError::InvalidRequest {
-                    code: 1003,
-                    message: format!("Invalid messages format: {e}"),
-                }
-            })?;
-
-        if messages.is_empty() {
-            return Err(FcpError::InvalidRequest {
-                code: 1003,
-                message: "Messages array cannot be empty".into(),
-            });
-        }
-        for message in &messages {
-            if matches!(&message.content, MessageContent::Null)
-                && (message.role != Role::Assistant
-                    || !message
-                        .tool_calls
-                        .as_ref()
-                        .is_some_and(|calls| !calls.is_empty()))
-            {
-                return Err(FcpError::InvalidRequest {
-                    code: 1003,
-                    message: "Only assistant messages with tool calls may omit content".into(),
-                });
-            }
-            if message.role == Role::Tool
-                && !message
-                    .tool_call_id
-                    .as_ref()
-                    .is_some_and(|id| !id.trim().is_empty())
-            {
-                return Err(FcpError::InvalidRequest {
-                    code: 1003,
-                    message: "Tool messages require a non-empty tool_call_id".into(),
-                });
-            }
-        }
+        let messages = parse_chat_messages(&input)?;
 
         let max_tokens = input.get("max_tokens").and_then(|v| v.as_u64()).map(|v| {
             if v > u64::from(u32::MAX) {
@@ -6072,9 +4754,11 @@ impl OpenAIConnector {
     ///
     /// Returns an error if shutdown serialization fails.
     pub async fn handle_shutdown(
-        &self,
+        &mut self,
         _params: serde_json::Value,
     ) -> FcpResult<serde_json::Value> {
+        self.clear_configuration();
+        self.stopping = true;
         info!("OpenAI connector shutting down");
         Ok(json!({ "status": "shutdown" }))
     }
@@ -6092,7 +4776,7 @@ mod tests {
     use chrono::{Duration, SecondsFormat, Utc};
     use fcp_crypto::cose::CapabilityTokenBuilder;
     use fcp_crypto::ed25519::Ed25519SigningKey;
-    use fcp_prelude::CredentialId;
+    use fcp_prelude::{CapabilityToken, CredentialId};
     use fcp_testkit::LogCapture;
     use std::time::Instant;
     use uuid::Uuid;
@@ -6274,7 +4958,7 @@ mod tests {
             .expect("configure should succeed");
         connector
             .handle_handshake(json!({
-                "protocol_version": "1.0.0",
+                "protocol_version": "2.0.0",
                 "zone": "z:work",
                 "host_public_key": signing_key.verifying_key().to_bytes(),
                 "nonce": vec![0u8; 32],
@@ -6282,6 +4966,49 @@ mod tests {
             }))
             .await
             .expect("handshake should succeed");
+    }
+
+    fn invocation(
+        operation: &str,
+        input: serde_json::Value,
+        capability_token: CapabilityToken,
+    ) -> serde_json::Value {
+        json!({
+            "type": "invoke",
+            "id": "openai-unit-invoke",
+            "connector_id": "fcp.openai",
+            "operation": operation,
+            "zone_id": "z:work",
+            "input": input,
+            "capability_token": capability_token,
+        })
+    }
+
+    fn scoped_token(
+        key: &Ed25519SigningKey,
+        capability: &str,
+        operations: &[&str],
+        instance_id: &str,
+        constraints: &fcp_core::CapabilityConstraints,
+    ) -> CapabilityToken {
+        let mut cbor = Vec::new();
+        ciborium::into_writer(constraints, &mut cbor).unwrap();
+        let now = Utc::now();
+        let token_id = Uuid::new_v4();
+        let raw = CapabilityTokenBuilder::new()
+            .capability_id(capability)
+            .zone_id("z:work")
+            .principal("user:test")
+            .operations(operations)
+            .issuer("node:test")
+            .target_instance(instance_id)
+            .token_id(token_id.as_bytes())
+            .validity(now, now + Duration::hours(1))
+            .try_constraints_cbor(&cbor)
+            .unwrap()
+            .sign(key)
+            .unwrap();
+        CapabilityToken::from_raw(raw)
     }
 
     fn invalid_request_message<T: std::fmt::Debug>(result: FcpResult<T>) -> String {
@@ -6294,19 +5021,41 @@ mod tests {
     #[fcp_async_core::runtime::test]
     async fn test_handshake() {
         let mut connector = OpenAIConnector::new();
+        let key = Ed25519SigningKey::generate();
+        connector
+            .handle_configure(json!({"api_key": "sk-test"}))
+            .await
+            .unwrap();
+        let requested_instance = connector.instance_id().to_owned();
         let result = connector
             .handle_handshake(json!({
-                "protocol_version": "1.0.0",
+                "protocol_version": "2.0.0",
                 "zone": "z:work",
-                "host_public_key": vec![0u8; 32],
-                "nonce": vec![0u8; 32],
-                "capabilities_requested": ["openai.chat"]
+                "host_public_key": key.verifying_key().to_bytes(),
+                "nonce": vec![7u8; 32],
+                "requested_instance_id": requested_instance,
+                "capabilities_requested": [
+                    "openai.chat", "openai.chat", "openai.simple_chat", "unknown.capability"
+                ]
             }))
             .await
             .unwrap();
-
-        assert!(result.get("session_id").is_some());
-        assert_eq!(result["status"], "accepted");
+        let response: fcp_core::HandshakeResponse = serde_json::from_value(result.clone()).unwrap();
+        assert_eq!(response.status, "accepted");
+        assert_eq!(response.manifest_hash, OpenAIConnector::manifest_hash());
+        assert_eq!(response.nonce, [7u8; 32]);
+        assert_eq!(response.capabilities_granted.len(), 1);
+        assert_eq!(
+            response.capabilities_granted[0].capability.as_str(),
+            "openai.chat"
+        );
+        assert!(!response.event_caps.unwrap().streaming);
+        assert_ne!(connector.instance_id(), requested_instance);
+        assert_eq!(result["instance_id"], connector.instance_id());
+        assert_eq!(result["connector_id"], "fcp.openai");
+        let health: HealthSnapshot =
+            serde_json::from_value(connector.handle_health().await.unwrap()).unwrap();
+        assert!(matches!(health.status, HealthState::Ready));
     }
 
     #[fcp_async_core::runtime::test]
@@ -6370,7 +5119,9 @@ mod tests {
         let connector = OpenAIConnector::new();
         let result = connector.handle_health().await.unwrap();
 
-        assert_eq!(result["status"], "not_configured");
+        let health: HealthSnapshot = serde_json::from_value(result).unwrap();
+        assert!(matches!(health.status, HealthState::Degraded { .. }));
+        assert_eq!(health.details.unwrap()["configured"], false);
     }
 
     #[fcp_async_core::runtime::test]
@@ -6447,36 +5198,17 @@ mod tests {
 
     #[fcp_async_core::runtime::test]
     async fn test_invoke_without_config() {
-        let mut connector = OpenAIConnector::new();
-
-        let signing_key = Ed25519SigningKey::generate();
-        let verifying_key = signing_key.verifying_key();
-
-        connector
-            .handle_handshake(json!({
-                "protocol_version": "1.0.0",
-                "zone": "z:work",
-                "host_public_key": verifying_key.to_bytes(),
-                "nonce": vec![0u8; 32],
-                "capabilities_requested": ["openai.simple_chat"]
-            }))
-            .await
-            .unwrap();
-
-        let capability = generate_valid_token(&signing_key, "openai.simple_chat");
-
+        let connector = OpenAIConnector::new();
+        let key = Ed25519SigningKey::generate();
+        let token = generate_valid_bound_token(&key, "openai.simple_chat", connector.instance_id());
         let result = connector
-            .handle_invoke(json!({
-                "operation": "openai.simple_chat",
-                "input": {
-                    "message": "Hello"
-                },
-                "capability_token": capability
-            }))
+            .handle_invoke(invocation(
+                "openai.simple_chat",
+                json!({"message": "Hello"}),
+                token,
+            ))
             .await;
-
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), FcpError::NotConfigured));
+        assert!(matches!(result, Err(FcpError::NotConfigured)));
     }
 
     #[fcp_async_core::runtime::test]
@@ -6489,18 +5221,14 @@ mod tests {
             generate_valid_bound_token(&signing_key, "openai.chat", connector.instance_id());
 
         let result = connector
-            .handle_invoke(json!({
-                "operation": "openai.chat",
-                "input": {},
-                "capability_token": capability
-            }))
+            .handle_invoke(invocation("openai.chat", json!({}), capability))
             .await;
 
         assert!(result.is_err());
         let err = result.unwrap_err();
         match err {
             FcpError::InvalidRequest { message, .. } => {
-                assert!(message.contains("messages"));
+                assert!(message.contains("declared schema"));
             }
             _ => assert!(
                 false,
@@ -6520,11 +5248,7 @@ mod tests {
             generate_valid_bound_token(&signing_key, "openai.get_usage", connector.instance_id());
 
         let result = connector
-            .handle_invoke(json!({
-                "operation": "openai.get_usage",
-                "input": {},
-                "capability_token": capability
-            }))
+            .handle_invoke(invocation("openai.get_usage", json!({}), capability))
             .await
             .unwrap();
 
@@ -7425,17 +6149,19 @@ mod tests {
             .handle_configure(json!({ "api_key": "sk-test" }))
             .await
             .unwrap();
-
-        let result = connector.handle_health().await.unwrap();
-        assert_eq!(result["status"], "healthy");
+        let health: HealthSnapshot =
+            serde_json::from_value(connector.handle_health().await.unwrap()).unwrap();
+        assert!(matches!(health.status, HealthState::Degraded { .. }));
+        let details = health.details.unwrap();
+        assert_eq!(details["configured"], true);
+        assert_eq!(details["handshaken"], false);
         assert!(
-            result["auth"]
+            details["auth_mode"]
                 .as_str()
                 .unwrap()
                 .contains("api_key:redacted")
         );
-        assert!(result.get("metrics").is_some());
-        assert_eq!(result["metrics"]["requests_total"], 0);
+        assert_eq!(details["metrics"]["requests_total"], 0);
     }
 
     #[fcp_async_core::runtime::test]
@@ -7452,7 +6178,8 @@ mod tests {
             .unwrap();
 
         let result = connector.handle_health().await.unwrap();
-        assert_eq!(result["deployment_profile"], "staging");
+        let health: HealthSnapshot = serde_json::from_value(result).unwrap();
+        assert_eq!(health.details.unwrap()["deployment_profile"], "staging");
     }
 
     #[fcp_async_core::runtime::test]
@@ -7478,9 +6205,14 @@ mod tests {
 
     #[fcp_async_core::runtime::test]
     async fn shutdown_returns_status() {
-        let connector = OpenAIConnector::new();
+        let mut connector = OpenAIConnector::new();
+        let previous_instance = connector.instance_id().to_owned();
         let result = connector.handle_shutdown(json!({})).await.unwrap();
         assert_eq!(result["status"], "shutdown");
+        assert_ne!(connector.instance_id(), previous_instance);
+        let health: HealthSnapshot =
+            serde_json::from_value(connector.handle_health().await.unwrap()).unwrap();
+        assert!(matches!(health.status, HealthState::Stopping));
     }
 
     #[fcp_async_core::runtime::test]
@@ -7496,10 +6228,10 @@ mod tests {
             .handle_simulate(json!({
                 "type": "simulate",
                 "id": "sim-123",
-                "connector_id": "openai",
+                "connector_id": "fcp.openai",
                 "operation": "openai.chat",
                 "zone_id": "z:work",
-                "input": {},
+                "input": {"messages": [{"role": "user", "content": "hello"}]},
                 "capability_token": capability
             }))
             .await
@@ -7514,7 +6246,7 @@ mod tests {
             .handle_simulate(json!({
                 "type": "simulate",
                 "id": "sim-unconfigured",
-                "connector_id": "openai",
+                "connector_id": "fcp.openai",
                 "operation": "openai.chat",
                 "zone_id": "z:work",
                 "input": {},
@@ -7540,7 +6272,7 @@ mod tests {
             .handle_simulate(json!({
                 "type": "simulate",
                 "id": "sim-unhandshaken",
-                "connector_id": "openai",
+                "connector_id": "fcp.openai",
                 "operation": "openai.chat",
                 "zone_id": "z:work",
                 "input": {},
@@ -7564,10 +6296,10 @@ mod tests {
             .handle_simulate(json!({
                 "type": "simulate",
                 "id": "sim-wrong-operation",
-                "connector_id": "openai",
+                "connector_id": "fcp.openai",
                 "operation": "openai.chat",
                 "zone_id": "z:work",
-                "input": {},
+                "input": {"messages": [{"role": "user", "content": "hello"}]},
                 "capability_token": capability
             }))
             .await
@@ -7608,84 +6340,320 @@ mod tests {
     #[fcp_async_core::runtime::test]
     async fn invoke_unknown_operation() {
         let mut connector = OpenAIConnector::new();
-        connector
-            .handle_configure(json!({ "api_key": "sk-test" }))
-            .await
-            .unwrap();
-
-        let signing_key = Ed25519SigningKey::generate();
-        let verifying_key = signing_key.verifying_key();
-
-        connector
-            .handle_handshake(json!({
-                "protocol_version": "1.0.0",
-                "zone": "z:work",
-                "host_public_key": verifying_key.to_bytes(),
-                "nonce": vec![0u8; 32],
-                "capabilities_requested": ["openai.nonexistent"]
-            }))
-            .await
-            .unwrap();
-
-        let capability = generate_valid_token(&signing_key, "openai.nonexistent");
-
+        let key = Ed25519SigningKey::generate();
+        configure_and_handshake(&mut connector, &key, &["openai.chat"]).await;
+        let token = generate_valid_bound_token(&key, "openai.nonexistent", connector.instance_id());
         let result = connector
-            .handle_invoke(json!({
-                "operation": "openai.nonexistent",
-                "input": {},
-                "capability_token": capability
-            }))
+            .handle_invoke(invocation("openai.nonexistent", json!({}), token))
             .await;
-
-        assert!(result.is_err());
+        assert!(matches!(result, Err(FcpError::OperationNotGranted { .. })));
     }
 
     #[fcp_async_core::runtime::test]
     async fn invoke_missing_operation_field() {
         let mut connector = OpenAIConnector::new();
-        connector
-            .handle_configure(json!({ "api_key": "sk-test" }))
-            .await
-            .unwrap();
-
-        let signing_key = Ed25519SigningKey::generate();
-        let verifying_key = signing_key.verifying_key();
-
-        connector
-            .handle_handshake(json!({
-                "protocol_version": "1.0.0",
-                "zone": "z:work",
-                "host_public_key": verifying_key.to_bytes(),
-                "nonce": vec![0u8; 32],
-                "capabilities_requested": ["openai.chat"]
-            }))
-            .await
-            .unwrap();
-
-        let result = connector
-            .handle_invoke(json!({
-                "input": {},
-                "capability_token": {"raw": []}
-            }))
-            .await;
-
+        let key = Ed25519SigningKey::generate();
+        configure_and_handshake(&mut connector, &key, &["openai.chat"]).await;
+        let token = generate_valid_bound_token(&key, "openai.get_usage", connector.instance_id());
+        let mut request = invocation("openai.get_usage", json!({}), token);
+        request.as_object_mut().unwrap().remove("operation");
+        let result = connector.handle_invoke(request).await;
         assert!(matches!(result, Err(FcpError::InvalidRequest { .. })));
     }
 
     #[fcp_async_core::runtime::test]
     async fn invoke_missing_capability_token() {
         let mut connector = OpenAIConnector::new();
-        let signing_key = Ed25519SigningKey::generate();
-        configure_and_handshake(&mut connector, &signing_key, &["openai.chat"]).await;
-
-        let result = connector
-            .handle_invoke(json!({
-                "operation": "openai.chat",
-                "input": {}
-            }))
-            .await;
-
+        let key = Ed25519SigningKey::generate();
+        configure_and_handshake(&mut connector, &key, &["openai.chat"]).await;
+        let token = generate_valid_bound_token(&key, "openai.get_usage", connector.instance_id());
+        let mut request = invocation("openai.get_usage", json!({}), token);
+        request.as_object_mut().unwrap().remove("capability_token");
+        let result = connector.handle_invoke(request).await;
         assert!(matches!(result, Err(FcpError::InvalidRequest { .. })));
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn lifecycle_attempts_revoke_authority_and_never_revive_old_tokens() {
+        for transition in [
+            "configure",
+            "failed_configure",
+            "handshake",
+            "failed_handshake",
+            "cross_zone",
+            "shutdown",
+        ] {
+            let mut connector = OpenAIConnector::new();
+            let key = Ed25519SigningKey::generate();
+            configure_and_handshake(&mut connector, &key, &["openai.chat"]).await;
+            let old_instance = connector.instance_id().to_owned();
+            let old_token = generate_valid_bound_token(&key, "openai.get_usage", &old_instance);
+            let request = invocation("openai.get_usage", json!({}), old_token);
+            assert!(connector.handle_invoke(request.clone()).await.is_ok());
+
+            let result = match transition {
+                "configure" => connector.handle_configure(json!({"api_key": "sk-reconfigured"})).await,
+                "failed_configure" => connector.handle_configure(json!({})).await,
+                "shutdown" => connector.handle_shutdown(json!({})).await,
+                _ => connector.handle_handshake(json!({
+                    "protocol_version": if transition == "failed_handshake" { "1.0.0" } else { "2.0" },
+                    "zone": if transition == "cross_zone" { "z:personal" } else { "z:work" },
+                    "host_public_key": key.verifying_key().to_bytes(),
+                    "nonce": vec![9u8; 32],
+                    "requested_instance_id": old_instance,
+                    "capabilities_requested": ["openai.chat"],
+                })).await,
+            };
+            assert_eq!(
+                result.is_err(),
+                matches!(
+                    transition,
+                    "failed_configure" | "failed_handshake" | "cross_zone"
+                ),
+                "{transition}",
+            );
+            assert_ne!(connector.instance_id(), old_instance, "{transition}");
+            assert!(
+                connector.handle_invoke(request.clone()).await.is_err(),
+                "{transition}"
+            );
+
+            configure_and_handshake(&mut connector, &key, &["openai.chat"]).await;
+            assert!(
+                connector.handle_invoke(request).await.is_err(),
+                "{transition}"
+            );
+            let fresh =
+                generate_valid_bound_token(&key, "openai.get_usage", connector.instance_id());
+            assert!(
+                connector
+                    .handle_invoke(invocation("openai.get_usage", json!({}), fresh))
+                    .await
+                    .is_ok()
+            );
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn handshake_requires_configuration_and_rejects_manifest_forbidden_zone() {
+        let mut connector = OpenAIConnector::new();
+        let key = Ed25519SigningKey::generate();
+        let request = json!({
+            "protocol_version": "2.0",
+            "zone": "z:public",
+            "host_public_key": key.verifying_key().to_bytes(),
+            "nonce": vec![0u8; 32],
+            "capabilities_requested": ["openai.chat"],
+        });
+        assert!(matches!(
+            connector.handle_handshake(request.clone()).await,
+            Err(FcpError::NotConfigured),
+        ));
+        connector
+            .handle_configure(json!({"api_key": "sk-test"}))
+            .await
+            .unwrap();
+        assert!(matches!(
+            connector.handle_handshake(request).await,
+            Err(FcpError::CapabilityDenied { .. }),
+        ));
+        let health: HealthSnapshot =
+            serde_json::from_value(connector.handle_health().await.unwrap()).unwrap();
+        assert!(matches!(health.status, HealthState::Degraded { .. }));
+        assert_eq!(health.details.unwrap()["handshaken"], false);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn invocation_rejects_wrong_target_zone_type_and_zero_deadline() {
+        let mut connector = OpenAIConnector::new();
+        let key = Ed25519SigningKey::generate();
+        configure_and_handshake(&mut connector, &key, &["openai.chat"]).await;
+        let token = generate_valid_bound_token(&key, "openai.get_usage", connector.instance_id());
+        let valid = invocation("openai.get_usage", json!({}), token);
+        for (field, value) in [
+            ("connector_id", json!("fcp.anthropic")),
+            ("zone_id", json!("z:personal")),
+        ] {
+            let mut request = valid.clone();
+            request[field] = value;
+            assert!(matches!(
+                connector.handle_invoke(request).await,
+                Err(FcpError::CapabilityDenied { .. }),
+            ));
+        }
+        for (field, value) in [
+            ("type", json!("simulate")),
+            ("id", json!("")),
+            ("deadline_ms", json!(0)),
+            ("input", json!([])),
+        ] {
+            let mut request = valid.clone();
+            request[field] = value;
+            assert!(matches!(
+                connector.handle_invoke(request).await,
+                Err(FcpError::InvalidRequest { .. }),
+            ));
+        }
+        assert!(connector.handle_invoke(valid).await.is_ok());
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn actual_model_scope_and_negotiated_grants_are_required() {
+        let mut connector = OpenAIConnector::new();
+        let key = Ed25519SigningKey::generate();
+        configure_and_handshake(&mut connector, &key, &["openai.chat"]).await;
+        let token = scoped_token(
+            &key,
+            "openai.chat",
+            &["openai.chat"],
+            connector.instance_id(),
+            &fcp_core::CapabilityConstraints {
+                resource_allow: vec!["openai:model:gpt-4o-mini".into()],
+                ..Default::default()
+            },
+        );
+        let request = invocation(
+            "openai.chat",
+            json!({
+                "model": "gpt-4o",
+                "messages": [{"role": "user", "content": "hello"}],
+            }),
+            token,
+        );
+        assert!(matches!(
+            connector.handle_invoke(request).await,
+            Err(FcpError::ResourceNotAllowed { .. }),
+        ));
+        let token = generate_valid_bound_token(&key, "openai.embeddings", connector.instance_id());
+        assert!(matches!(
+            connector
+                .handle_invoke(invocation(
+                    "openai.embeddings",
+                    json!({"input": "hello"}),
+                    token,
+                ))
+                .await,
+            Err(FcpError::CapabilityDenied { .. }),
+        ));
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn previews_do_not_spend_call_budget_and_exhaustion_blocks_execution() {
+        let mut connector = OpenAIConnector::new();
+        let key = Ed25519SigningKey::generate();
+        configure_and_handshake(&mut connector, &key, &["openai.chat"]).await;
+        let token = scoped_token(
+            &key,
+            "openai.chat",
+            &["openai.get_usage"],
+            connector.instance_id(),
+            &fcp_core::CapabilityConstraints {
+                resource_allow: vec!["*".into()],
+                max_calls: Some(1),
+                ..Default::default()
+            },
+        );
+        let request = invocation("openai.get_usage", json!({}), token);
+        let mut simulation = request.clone();
+        simulation["type"] = json!("simulate");
+        for _ in 0..3 {
+            assert_eq!(
+                connector.handle_simulate(simulation.clone()).await.unwrap()["would_succeed"],
+                true,
+            );
+        }
+        assert_eq!(connector.total_requests(), 0);
+        assert!(connector.handle_invoke(request.clone()).await.is_ok());
+        assert!(matches!(
+            connector.handle_invoke(request).await,
+            Err(FcpError::CapabilityDenied { .. }),
+        ));
+        assert_eq!(
+            connector.handle_simulate(simulation).await.unwrap()["would_succeed"],
+            false,
+        );
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn signed_byte_budget_rejects_before_local_operation_execution() {
+        let mut connector = OpenAIConnector::new();
+        let key = Ed25519SigningKey::generate();
+        configure_and_handshake(&mut connector, &key, &["openai.chat"]).await;
+        let token = scoped_token(
+            &key,
+            "openai.chat",
+            &["openai.get_usage"],
+            connector.instance_id(),
+            &fcp_core::CapabilityConstraints {
+                resource_allow: vec!["*".into()],
+                max_bytes: Some(1),
+                ..Default::default()
+            },
+        );
+        assert!(matches!(
+            connector
+                .handle_invoke(invocation("openai.get_usage", json!({}), token))
+                .await,
+            Err(FcpError::CapabilityDenied { .. }),
+        ));
+        assert_eq!(connector.total_errors(), 1);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn invalid_tool_message_does_not_consume_the_signed_call_budget() {
+        let mut connector = OpenAIConnector::new();
+        let key = Ed25519SigningKey::generate();
+        configure_and_handshake(&mut connector, &key, &["openai.chat"]).await;
+        let token = scoped_token(
+            &key,
+            "openai.chat",
+            &["openai.chat", "openai.get_usage"],
+            connector.instance_id(),
+            &fcp_core::CapabilityConstraints {
+                resource_allow: vec!["*".into()],
+                max_calls: Some(1),
+                ..Default::default()
+            },
+        );
+        let request = invocation(
+            "openai.chat",
+            json!({
+                "messages": [{"role": "tool", "content": "result", "tool_call_id": "   "}],
+            }),
+            token.clone(),
+        );
+        let mut simulation = request.clone();
+        simulation["type"] = json!("simulate");
+        assert_eq!(
+            connector.handle_simulate(simulation).await.unwrap()["would_succeed"],
+            false,
+        );
+        assert!(matches!(
+            connector.handle_invoke(request).await,
+            Err(FcpError::InvalidRequest { code: 1003, .. }),
+        ));
+        assert!(
+            connector
+                .handle_invoke(invocation("openai.get_usage", json!({}), token))
+                .await
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn media_response_limits_preserve_manifest_capacity_and_base64_expansion() {
+        let video =
+            response_byte_limit(&OperationId::from_static("openai.videos.generate")).unwrap();
+        let image =
+            response_byte_limit(&OperationId::from_static("openai.images.generate")).unwrap();
+        let usage = response_byte_limit(&OperationId::from_static("openai.get_usage")).unwrap();
+        assert!(video > 100 * 1024 * 1024);
+        assert!(video < 150 * 1024 * 1024);
+        assert!(image >= 50 * 1024 * 1024);
+        assert!(usage < 1024 * 1024);
+        for operation in OPERATION_IDS {
+            assert!(response_byte_limit(&OperationId::from_static(operation)).unwrap() > 0);
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════════

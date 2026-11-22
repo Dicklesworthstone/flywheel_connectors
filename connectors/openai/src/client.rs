@@ -169,6 +169,11 @@ impl OpenAIClient {
         self
     }
 
+    /// Cancel requests owned by this client's runtime during connector teardown.
+    pub fn shutdown(&self) {
+        self.runtime.shutdown();
+    }
+
     /// Get total prompt tokens used.
     #[must_use]
     pub fn total_prompt_tokens(&self) -> u64 {

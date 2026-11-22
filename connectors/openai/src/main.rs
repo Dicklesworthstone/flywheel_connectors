@@ -30,156 +30,114 @@
 use std::io::{BufRead, Write};
 
 use anyhow::Result;
+use fcp_async_core::runtime::Builder;
+use fcp_core::{FcpError, FcpResult};
+use fcp_sdk::prelude::{JsonlConfig, dispatch_raw_invoke, serve_jsonl};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 use fcp_openai::connector::OpenAIConnector;
 
+// The existing transcription API accepts 25 MiB of decoded audio. Its base64
+// input alone exceeds the SDK's default 16 MiB line limit.
+const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
+
 fn main() -> Result<()> {
-    // Initialize tracing
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
         .init();
 
     tracing::info!("FCP OpenAI Connector starting");
-
-    // Run the FCP protocol loop on stdin/stdout
-    run_fcp_loop()?;
-
-    Ok(())
-}
-
-/// Run the FCP JSON-RPC style protocol loop.
-fn run_fcp_loop() -> Result<()> {
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
+    run_fcp_loop_with_io(stdin.lock(), &mut stdout)
+}
+
+fn run_fcp_loop_with_io<R: BufRead, W: Write>(reader: R, writer: W) -> Result<()> {
     let mut connector = OpenAIConnector::new();
-
-    for line in stdin.lock().lines() {
-        let line = line?;
-        if should_skip_protocol_line(&line) {
-            continue;
-        }
-
-        let response =
-            fcp_async_core::runtime::block_on_sync(handle_message(&mut connector, &line))
-                .unwrap_or_else(|e| {
-                    serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "error": {
-                            "code": "FCP-9001",
-                            "message": format!("Runtime error: {e}")
-                        }
-                    })
-                });
-
-        let response_json = serde_json::to_string(&response)?;
-        writeln!(stdout, "{response_json}")?;
-        stdout.flush()?;
-    }
-
+    let runtime = Builder::new_multi_thread().enable_all().build()?;
+    let result = serve_jsonl(
+        reader,
+        writer,
+        JsonlConfig {
+            max_request_bytes: MAX_REQUEST_BYTES,
+        },
+        |method, params| {
+            runtime.block_on(Box::pin(dispatch_message(&mut connector, method, params)))
+        },
+    );
+    // EOF, invalid framing and broken stdout revoke the process authority too.
+    let _ = runtime.block_on(connector.handle_shutdown(serde_json::json!({})));
+    result?;
     Ok(())
 }
 
-fn should_skip_protocol_line(line: &str) -> bool {
-    line.trim().is_empty()
-}
-
-fn parse_error_response(error: impl std::fmt::Display) -> serde_json::Value {
-    serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": null,
-        "error": {
-            "code": "FCP-1001",
-            "message": format!("Invalid JSON: {error}")
-        }
-    })
-}
-
-/// Handle a single FCP message.
-async fn handle_message(connector: &mut OpenAIConnector, message: &str) -> serde_json::Value {
-    let request: serde_json::Value = match serde_json::from_str(message) {
-        Ok(v) => v,
-        Err(e) => return parse_error_response(e),
-    };
-
-    let method = request.get("method").and_then(|v| v.as_str()).unwrap_or("");
-    let id = request.get("id").cloned();
-    let params = request
-        .get("params")
-        .cloned()
-        .unwrap_or(serde_json::json!({}));
-
-    let result = match method {
+async fn dispatch_message(
+    connector: &mut OpenAIConnector,
+    method: &str,
+    params: serde_json::Value,
+) -> FcpResult<serde_json::Value> {
+    match method {
         "configure" => connector.handle_configure(params).await,
         "handshake" => connector.handle_handshake(params).await,
         "health" => connector.handle_health().await,
         "doctor" => connector.handle_doctor().await,
         "self_check" => connector.handle_self_check().await,
         "introspect" => connector.handle_introspect().await,
-        "invoke" => connector.handle_invoke(params).await,
+        // handle_invoke validates the complete typed envelope before admission.
+        // The SDK preserves the inner invocation ID independently of the RPC ID.
+        "invoke" => dispatch_raw_invoke(params, |params| connector.handle_invoke(params)).await,
         "simulate" => connector.handle_simulate(params).await,
         "shutdown" => connector.handle_shutdown(params).await,
-        _ => Err(fcp_core::FcpError::InvalidRequest {
+        _ => Err(FcpError::InvalidRequest {
             code: 1002,
             message: format!("Unknown method: {method}"),
         }),
-    };
-
-    match result {
-        Ok(value) => {
-            let mut response = serde_json::json!({
-                "jsonrpc": "2.0",
-                "result": value
-            });
-            if let Some(id) = id {
-                response
-                    .as_object_mut()
-                    .unwrap()
-                    .insert("id".to_string(), id);
-            }
-            response
-        }
-        Err(e) => {
-            let err_response = e.to_response();
-            let mut response = serde_json::json!({
-                "jsonrpc": "2.0",
-                "error": err_response
-            });
-            if let Some(id) = id {
-                response
-                    .as_object_mut()
-                    .unwrap()
-                    .insert("id".to_string(), id);
-            }
-            response
-        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::{Value, json};
 
-    #[test]
-    fn protocol_loop_skips_whitespace_only_lines() {
-        assert!(should_skip_protocol_line(""));
-        assert!(should_skip_protocol_line(" \t "));
-        assert!(!should_skip_protocol_line("{\"jsonrpc\":\"2.0\"}"));
+    fn exchange(input: &str) -> Vec<Value> {
+        let mut output = Vec::new();
+        run_fcp_loop_with_io(input.as_bytes(), &mut output).expect("protocol loop");
+        String::from_utf8(output)
+            .expect("UTF-8 responses")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("JSON response"))
+            .collect()
     }
 
-    #[fcp_async_core::runtime::test]
-    async fn invalid_json_is_wrapped_in_jsonrpc_parse_error() {
-        let mut connector = OpenAIConnector::new();
-        let response = handle_message(&mut connector, "{not json").await;
+    #[test]
+    fn malformed_json_has_a_correlated_protocol_error() {
+        let responses = exchange("{not json\n");
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0]["jsonrpc"], "2.0");
+        assert!(responses[0]["id"].is_null());
+        assert_eq!(responses[0]["error"]["code"], "FCP-1001");
+    }
 
-        assert_eq!(response["jsonrpc"], "2.0");
-        assert!(response["id"].is_null());
-        assert_eq!(response["error"]["code"], "FCP-1001");
-        assert!(
-            response["error"]["message"]
-                .as_str()
-                .is_some_and(|message| message.starts_with("Invalid JSON:"))
+    #[test]
+    fn shutdown_stops_before_the_next_queued_request() {
+        let input = format!(
+            "  \n{}\n{}\n{}\n",
+            json!({"jsonrpc": "2.0", "id": 1, "method": "health", "params": {}}),
+            json!({"jsonrpc": "2.0", "id": 2, "method": "shutdown", "params": {}}),
+            json!({"jsonrpc": "2.0", "id": 3, "method": "health", "params": {}}),
         );
+        let responses = exchange(&input);
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0]["id"], 1);
+        let health: fcp_core::HealthSnapshot =
+            serde_json::from_value(responses[0]["result"].clone()).expect("canonical health");
+        assert!(matches!(
+            health.status,
+            fcp_core::HealthState::Degraded { .. }
+        ));
+        assert_eq!(responses[1]["id"], 2);
+        assert_eq!(responses[1]["result"]["status"], "shutdown");
     }
 }

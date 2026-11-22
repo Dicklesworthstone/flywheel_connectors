@@ -3375,7 +3375,7 @@ mod openai_e2e_tests {
         fn new() -> Self {
             Self {
                 connector: OpenAIConnector::new(),
-                id: ConnectorId::from_static("openai"),
+                id: ConnectorId::from_static("fcp.openai"),
             }
         }
 
@@ -3411,17 +3411,9 @@ mod openai_e2e_tests {
 
         async fn health(&self) -> HealthSnapshot {
             match self.connector.handle_health().await {
-                Ok(payload) => {
-                    let status = payload
-                        .get("status")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("unknown");
-                    match status {
-                        "healthy" => HealthSnapshot::ready(),
-                        "not_configured" => HealthSnapshot::degraded("not_configured"),
-                        other => HealthSnapshot::degraded(format!("openai_status:{other}")),
-                    }
-                }
+                Ok(payload) => serde_json::from_value(payload).unwrap_or_else(|error| {
+                    HealthSnapshot::error(format!("invalid OpenAI health: {error}"))
+                }),
                 Err(err) => HealthSnapshot::error(err.to_string()),
             }
         }
@@ -3481,12 +3473,10 @@ mod openai_e2e_tests {
         }
 
         async fn invoke(&self, req: InvokeRequest) -> fcp_core::FcpResult<InvokeResponse> {
-            let request_id = req.id;
-            let params = json!({
-                "operation": req.operation.as_str(),
-                "input": req.input,
-                "capability_token": req.capability_token,
-            });
+            let request_id = req.id.clone();
+            let params = serde_json::to_value(req).map_err(|error| FcpError::Internal {
+                message: format!("Failed to encode invocation: {error}"),
+            })?;
             let value = self.connector.handle_invoke(params).await?;
             Ok(InvokeResponse::ok(request_id, value))
         }
@@ -3549,10 +3539,6 @@ mod openai_e2e_tests {
         operations: &[&str],
         instance_id: &str,
     ) -> CapabilityToken {
-        let capability = match capability {
-            "openai.simple_chat" | "openai.get_usage" => "openai.chat",
-            other => other,
-        };
         let now = Utc::now();
         let constraints = fcp_core::CapabilityConstraints {
             resource_allow: vec!["*".to_string()],
@@ -3586,7 +3572,7 @@ mod openai_e2e_tests {
         InvokeRequest {
             r#type: "invoke".to_string(),
             id: RequestId::from("openai-e2e"),
-            connector_id: ConnectorId::from_static("openai"),
+            connector_id: ConnectorId::from_static("fcp.openai"),
             operation: OperationId::from_static(operation),
             zone_id: ZoneId::work(),
             input,
@@ -3694,32 +3680,22 @@ mod openai_e2e_tests {
 
     #[fcp_async_core::runtime::test]
     async fn openai_default_deny_compliance_suite_passes() {
+        let mock = MockApiServer::start().await;
         let mut connector = OpenAiConnectorAdapter::new();
         let signing_key = Ed25519SigningKey::generate();
         let handshake = handshake_request(signing_key.verifying_key().to_bytes(), &["openai.chat"]);
-        // Token is correctly instance-bound but carries the wrong capability/operation,
-        // so the connector denies on capability mismatch (not on missing binding).
-        let token = build_token(
-            &signing_key,
-            "wrong.capability",
-            &["wrong.operation"],
-            connector.instance_id(),
-        );
-        let invoke = invoke_request(
-            "openai.simple_chat",
-            json!({ "message": "blocked request" }),
-            token,
-        );
-
         let dynamic = DynamicSuite {
-            config: json!({ "api_key": "test-openai-key" }),
-            handshake: handshake.clone(),
-            invoke: Some(invoke),
-            expect_invoke_error: true,
+            config: json!({
+                "api_key": "test-openai-key",
+                "base_url": mock.base_url(),
+            }),
+            handshake,
+            invoke: None,
+            expect_invoke_error: false,
             simulate: None,
             expect_simulate_would_succeed: None,
             require_simulate_denial_details: false,
-            require_capability_denial: true,
+            require_capability_denial: false,
             require_decision_receipt: false,
         };
         let suite = ComplianceSuite::new(
@@ -3734,7 +3710,26 @@ mod openai_e2e_tests {
             .await
             .expect("compliance suite run");
 
-        assert!(report.passed, "default deny compliance should pass");
+        assert!(report.passed, "default deny lifecycle should pass");
+        assert!(connector.health().await.is_ready());
+        // Bind the negative token after handshake, and permit the requested
+        // operation explicitly so the wrong capability is the denying claim.
+        let token = build_token(
+            &signing_key,
+            "wrong.capability",
+            &["openai.simple_chat"],
+            connector.instance_id(),
+        );
+        let denied = connector
+            .invoke(invoke_request(
+                "openai.simple_chat",
+                json!({ "message": "blocked request" }),
+                token,
+            ))
+            .await
+            .expect_err("wrong signed capability must be denied");
+        assert!(matches!(denied, FcpError::OperationNotGranted { .. }));
+        mock.assert_request_count(0).await;
     }
 
     #[fcp_async_core::runtime::test]
@@ -3766,21 +3761,7 @@ mod openai_e2e_tests {
 
         let mut connector = OpenAiConnectorAdapter::new();
         let signing_key = Ed25519SigningKey::generate();
-        let handshake = handshake_request(
-            signing_key.verifying_key().to_bytes(),
-            &["openai.simple_chat"],
-        );
-        let token = build_token(
-            &signing_key,
-            "openai.simple_chat",
-            &["openai.simple_chat"],
-            connector.instance_id(),
-        );
-        let invoke = invoke_request(
-            "openai.simple_chat",
-            json!({ "message": "hello from e2e" }),
-            token,
-        );
+        let handshake = handshake_request(signing_key.verifying_key().to_bytes(), &["openai.chat"]);
         let suite = ConnectorSuite {
             test_name: "openai_allow_valid_token".to_string(),
             config: json!({
@@ -3788,7 +3769,7 @@ mod openai_e2e_tests {
                 "base_url": mock.base_url(),
             }),
             handshake,
-            invoke: Some(invoke),
+            invoke: None,
             invoke_expectations: InvokeExpectations {
                 expect_error: false,
                 expect_decision_receipt: false,
@@ -3805,18 +3786,26 @@ mod openai_e2e_tests {
             .await
             .expect("connector suite run");
 
-        assert!(report.passed, "allow suite should pass: {report:#?}");
-        let invoke_entry = report
-            .logs
-            .iter()
-            .find(|entry| entry.context.get("operation") == Some(&json!("invoke")))
-            .expect("invoke entry");
-        assert_eq!(invoke_entry.result, "pass");
-        assert_eq!(
-            invoke_entry.context.get("invoke_status"),
-            Some(&json!(format!("{:?}", InvokeStatus::Ok)))
+        assert!(report.passed, "allow lifecycle should pass: {report:#?}");
+        assert!(connector.health().await.is_ready());
+        let token = build_token(
+            &signing_key,
+            "openai.chat",
+            &["openai.simple_chat"],
+            connector.instance_id(),
         );
+        let response = connector
+            .invoke(invoke_request(
+                "openai.simple_chat",
+                json!({ "message": "hello from e2e" }),
+                token,
+            ))
+            .await
+            .expect("authorized provider invocation");
+        assert_eq!(response.status, InvokeStatus::Ok);
+        assert_eq!(response.result.unwrap()["response"], "hello from mock");
         mock.assert_received("/v1/chat/completions").await;
+        mock.assert_request_count(1).await;
     }
 
     #[allow(clippy::too_many_lines)]
@@ -3824,7 +3813,7 @@ mod openai_e2e_tests {
     fn openai_manifest_network_guard_allows_openai_and_denies_non_openai_hosts() {
         let manifest = openai_manifest_toml();
 
-        for operation_name in ["chat", "simple_chat"] {
+        for operation_name in ["openai.chat", "openai.simple_chat"] {
             let host_allow = operation_host_allow_list(&manifest, operation_name);
             // Commit 6ae32da1c pinned the OpenAI-compatible DeepSeek endpoint alongside
             // the canonical OpenAI host.

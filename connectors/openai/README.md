@@ -60,6 +60,18 @@ Important runtime truths the contract preserves:
 - FCP subscribe is not implemented; streaming and realtime operations are bounded invoke paths.
 - Runtime handshake returns a SHA-256 hash of the bundled `manifest.toml`.
 
+## Native Host Session
+
+The executable uses bounded JSONL RPC frames and a single async runtime. Configure the account, negotiate protocol `2.0` or `2.0.0`, and mint capability tokens against the returned `instance_id`. Reconfiguration and every new handshake revoke the previous authority; changing the account's zone requires reconfiguration.
+
+Invoke parameters are complete FCP requests: `type: "invoke"`, a non-empty `id`, `connector_id: "fcp.openai"`, `zone_id`, `operation`, object `input`, and a host-signed `capability_token`. Native replies contain a typed `InvokeResponse` with the invocation ID inside the JSON-RPC response. Health is a `HealthSnapshot`; configuration, instance identity and redacted diagnostics are under `details`.
+
+All operation metadata and input/output validation come from the bundled manifest. Admission enforces negotiated capabilities, bound model/resource scopes, signed call and byte budgets, and idempotency constraints. Simulation validates the same input contracts and authorization without calling the provider or consuming the invocation budget. A nonzero `deadline_ms` bounds provider execution.
+
+Native input is limited to 64 MiB so the existing audio-upload limit remains usable after base64 encoding. Output limits follow each operation's manifest allowance, including binary media expansion. Shutdown cancels the client runtime, revokes account authority, and terminates before processing another buffered request.
+
+Authority and budget counters are process-local. The trusted host remains responsible for egress policy, credential injection and any durable or cross-process accounting. These boundaries are also reported in `health.details.runtime_boundary`.
+
 ## First-Slice Scope
 
 The first OpenAI README slice documents the existing runtime surface:
@@ -200,6 +212,7 @@ The deterministic integration evidence is anchored on WireMock and connector-loc
 - `connectors/openai/src/types.rs` defines model IDs, pricing, message and tool shapes, embeddings, images, video, audio, TTS, fine-tune, Assistants, Threads, runs, and response types.
 - `connectors/openai/manifest.toml` defines the broad operation catalog, network constraints, sandbox boundary, event capability metadata, and no-listener/no-storage/no-exec posture.
 - `connectors/openai/tests/integration.rs` covers deterministic loopback, error behavior, capability boundaries, lifecycle, realtime WebSocket fixtures, and validation.
+- `connectors/openai/tests/native_host.rs` exercises the shipped executable with real loopback HTTP, a complete tool-call conversation, signed budgets, malformed frames and terminal shutdown.
 - `connectors/openai/tests/live_verification.rs` emits live skip/pass results when `OPENAI_API_KEY` is absent or present.
 
 ## Verification Bundle
@@ -235,7 +248,7 @@ The verification surface captures:
 
 **Common remediation**:
 
-- If `health` reports `not_configured`, configure with exactly one of `api_key` or `credential_id`, then run handshake.
+- If `health.details.configured` is false, configure with exactly one of `api_key` or `credential_id`, then negotiate an FCP 2.0 handshake.
 - If `self_check` reports credential injection is required, run behind the host egress injection layer or switch to direct API-key mode for live probes.
 - If base URL validation fails, use an allowed OpenAI-compatible origin or localhost for tests.
 - If a Codex OAuth/device-code field is rejected, move that credential into host credential flows and reference it by `credential_id`.

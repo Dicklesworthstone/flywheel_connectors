@@ -40,13 +40,55 @@ use wiremock::{
 use base64::Engine;
 use fcp_manifest::{ConnectorManifest, NetworkConstraints};
 use fcp_openai::client::{OpenAIClient, VideoPollingOptions};
-use fcp_openai::connector::OpenAIConnector;
+use fcp_openai::connector::OpenAIConnector as ProductionOpenAIConnector;
 use fcp_openai::error::OpenAIError;
 use fcp_openai::types::{Model, VideoDurationSeconds, VideoModel, VideoSize, VideoStatus};
 
 // ============================================================================
 // Helpers
 // ============================================================================
+
+/// Supply protocol metadata for operation-focused fixtures. Payloads, tokens,
+/// and explicitly supplied envelope fields pass through unchanged. Native
+/// envelope rejection tests below call the production connector directly.
+struct OpenAIConnector(ProductionOpenAIConnector);
+
+impl OpenAIConnector {
+    fn new() -> Self {
+        Self(ProductionOpenAIConnector::new())
+    }
+
+    async fn handle_invoke(
+        &self,
+        mut params: serde_json::Value,
+    ) -> fcp_core::FcpResult<serde_json::Value> {
+        if let Some(request) = params.as_object_mut() {
+            request.entry("type").or_insert_with(|| json!("invoke"));
+            request
+                .entry("id")
+                .or_insert_with(|| json!("integration-invoke"));
+            request
+                .entry("connector_id")
+                .or_insert_with(|| json!("fcp.openai"));
+            request.entry("zone_id").or_insert_with(|| json!("z:work"));
+        }
+        self.0.handle_invoke(params).await
+    }
+}
+
+impl std::ops::Deref for OpenAIConnector {
+    type Target = ProductionOpenAIConnector;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for OpenAIConnector {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
 
 /// Map an operation ID to the capability ID that governs it.
 fn capability_for_operation(op: &str) -> &str {
@@ -268,7 +310,7 @@ async fn setup_handshake(connector: &mut OpenAIConnector, caps: &[&str]) -> Ed25
 
     connector
         .handle_handshake(json!({
-            "protocol_version": "1.0.0",
+            "protocol_version": "2.0.0",
             "zone": "z:work",
             "host_public_key": verifying_key.to_bytes(),
             "nonce": vec![0u8; 32],
@@ -1727,7 +1769,19 @@ async fn capability_no_handshake_fails() {
 #[fcp_async_core::runtime::test]
 async fn capability_no_configure_fails() {
     let mut connector = OpenAIConnector::new();
-    let signing_key = setup_handshake(&mut connector, &["openai.chat"]).await;
+    let signing_key = Ed25519SigningKey::generate();
+    assert!(matches!(
+        connector
+            .handle_handshake(json!({
+                "protocol_version": "2.0.0",
+                "zone": "z:work",
+                "host_public_key": signing_key.verifying_key().to_bytes(),
+                "nonce": vec![0_u8; 32],
+                "capabilities_requested": ["openai.chat"]
+            }))
+            .await,
+        Err(FcpError::NotConfigured)
+    ));
     let token = generate_valid_token(&signing_key, "openai.simple_chat");
 
     let result = connector
@@ -1801,24 +1855,40 @@ async fn capability_unknown_operation_fails() {
 // Lifecycle Tests
 // ============================================================================
 
-/// Health before configure returns `not_configured`.
+/// Health before configure reports the canonical unconfigured snapshot.
 #[fcp_async_core::runtime::test]
 async fn lifecycle_health_before_configure() {
     let connector = OpenAIConnector::new();
-    let result = connector.handle_health().await.unwrap();
-    assert_eq!(result["status"], "not_configured");
+    let health: fcp_core::HealthSnapshot =
+        serde_json::from_value(connector.handle_health().await.unwrap()).unwrap();
+    assert!(!health.is_ready());
+    assert_eq!(health.details.unwrap()["configured"], false);
 }
 
-/// Health after configure returns healthy.
+/// A configured account becomes ready only after a successful handshake.
 #[fcp_async_core::runtime::test]
 async fn lifecycle_health_after_configure() {
     let mock = MockApiServer::start().await;
     let mut connector = OpenAIConnector::new();
     setup_configure(&mut connector, &mock.base_url()).await;
 
-    let result = connector.handle_health().await.unwrap();
-    assert_eq!(result["status"], "healthy");
-    assert!(result.get("metrics").is_some());
+    let health: fcp_core::HealthSnapshot =
+        serde_json::from_value(connector.handle_health().await.unwrap()).unwrap();
+    assert!(!health.is_ready());
+    let details = health.details.unwrap();
+    assert_eq!(details["configured"], true);
+    assert_eq!(details["handshaken"], false);
+    assert!(details.get("metrics").is_some());
+
+    setup_handshake(&mut connector, &["openai.chat"]).await;
+    let health: fcp_core::HealthSnapshot =
+        serde_json::from_value(connector.handle_health().await.unwrap()).unwrap();
+    assert!(health.is_ready());
+    assert_eq!(
+        health.details.unwrap()["instance_id"],
+        connector.instance_id()
+    );
+    mock.assert_request_count(0).await;
 }
 
 /// Configure rejects off-policy public hosts before any bearer token can be used.
@@ -1844,13 +1914,15 @@ async fn lifecycle_configure_rejects_untrusted_base_url() {
 /// Handshake grants capabilities.
 #[fcp_async_core::runtime::test]
 async fn lifecycle_handshake_grants_capabilities() {
+    let mock = MockApiServer::start().await;
     let mut connector = OpenAIConnector::new();
+    setup_configure(&mut connector, &mock.base_url()).await;
     let signing_key = Ed25519SigningKey::generate();
     let verifying_key = signing_key.verifying_key();
 
     let result = connector
         .handle_handshake(json!({
-            "protocol_version": "1.0.0",
+            "protocol_version": "2.0.0",
             "zone": "z:work",
             "host_public_key": verifying_key.to_bytes(),
             "nonce": vec![0u8; 32],
@@ -1863,12 +1935,56 @@ async fn lifecycle_handshake_grants_capabilities() {
     assert!(result.get("session_id").is_some());
     let caps = result["capabilities_granted"].as_array().unwrap();
     assert!(!caps.is_empty(), "should grant capabilities");
+    assert_eq!(result["connector_id"], "fcp.openai");
+    assert_eq!(result["instance_id"], connector.instance_id());
+    mock.assert_request_count(0).await;
+}
+
+/// Complete envelopes bypass fixture defaults and reject altered host identity.
+#[fcp_async_core::runtime::test]
+async fn strict_invoke_envelopes_reject_missing_and_mismatched_fields() {
+    let mock = MockApiServer::start().await;
+    let mut connector = OpenAIConnector::new();
+    setup_configure(&mut connector, &mock.base_url()).await;
+    let key = setup_handshake(&mut connector, &["openai.chat"]).await;
+    let request = json!({
+        "type": "invoke",
+        "id": "full-envelope",
+        "connector_id": "fcp.openai",
+        "zone_id": "z:work",
+        "operation": "openai.get_usage",
+        "input": {},
+        "capability_token": generate_valid_token(&key, "openai.get_usage")
+    });
+    for (field, value, expected_code) in [
+        ("type", "simulate", 1003),
+        ("id", "", 1003),
+        ("connector_id", "fcp.other", 3001),
+        ("zone_id", "z:private", 3001),
+    ] {
+        let mut invalid = request.clone();
+        invalid[field] = json!(value);
+        let error = connector.0.handle_invoke(invalid).await.unwrap_err();
+        assert_eq!(error.numeric_code(), expected_code, "{field}: {error}");
+    }
+    let mut missing = request.clone();
+    missing.as_object_mut().unwrap().remove("connector_id");
+    assert!(matches!(
+        connector.0.handle_invoke(missing).await,
+        Err(FcpError::InvalidRequest { code: 1003, .. })
+    ));
+    connector
+        .0
+        .handle_invoke(request)
+        .await
+        .expect("complete valid envelope");
+    mock.assert_request_count(0).await;
 }
 
 /// Shutdown returns clean status.
 #[fcp_async_core::runtime::test]
 async fn lifecycle_shutdown_clean() {
-    let connector = OpenAIConnector::new();
+    let mut connector = OpenAIConnector::new();
     let result = connector.handle_shutdown(json!({})).await.unwrap();
     assert_eq!(result["status"], "shutdown");
 }
@@ -2039,17 +2155,12 @@ async fn validation_simple_chat_missing_message_fails() {
         }))
         .await;
 
-    assert!(result.is_err());
-    let err = result.unwrap_err();
-    match err {
-        fcp_core::FcpError::InvalidRequest { message, .. } => {
-            assert!(
-                message.contains("message"),
-                "error should mention missing message: {message}"
-            );
-        }
-        _ => panic!("expected InvalidRequest, got: {err:?}"),
-    }
+    let error = result.expect_err("invalid input must be rejected locally");
+    assert!(
+        matches!(error, FcpError::InvalidRequest { code: 1003, .. }),
+        "expected InvalidRequest1003, got: {error:?}"
+    );
+    mock.assert_request_count(0).await;
 }
 
 // ============================================================================
@@ -2331,16 +2442,12 @@ async fn embeddings_empty_input_string() {
         }))
         .await;
 
-    assert!(result.is_err());
-    match result.unwrap_err() {
-        fcp_core::FcpError::InvalidRequest { message, .. } => {
-            assert!(
-                message.contains("empty"),
-                "error should mention 'empty': {message}"
-            );
-        }
-        other => panic!("Expected InvalidRequest, got: {other:?}"),
-    }
+    let error = result.expect_err("invalid input must be rejected locally");
+    assert!(
+        matches!(error, FcpError::InvalidRequest { code: 1003, .. }),
+        "expected InvalidRequest1003, got: {error:?}"
+    );
+    mock.assert_request_count(0).await;
 }
 
 /// Empty input array returns error.
@@ -2360,16 +2467,12 @@ async fn embeddings_empty_input_array() {
         }))
         .await;
 
-    assert!(result.is_err());
-    match result.unwrap_err() {
-        fcp_core::FcpError::InvalidRequest { message, .. } => {
-            assert!(
-                message.contains("empty"),
-                "error should mention 'empty': {message}"
-            );
-        }
-        other => panic!("Expected InvalidRequest, got: {other:?}"),
-    }
+    let error = result.expect_err("invalid input must be rejected locally");
+    assert!(
+        matches!(error, FcpError::InvalidRequest { code: 1003, .. }),
+        "expected InvalidRequest1003, got: {error:?}"
+    );
+    mock.assert_request_count(0).await;
 }
 
 /// Wrong capability token is rejected.
@@ -2428,16 +2531,12 @@ async fn embeddings_unknown_model() {
         }))
         .await;
 
-    assert!(result.is_err());
-    match result.unwrap_err() {
-        fcp_core::FcpError::InvalidRequest { message, .. } => {
-            assert!(
-                message.contains("Unknown embedding model"),
-                "error should mention unknown model: {message}"
-            );
-        }
-        other => panic!("Expected InvalidRequest, got: {other:?}"),
-    }
+    let error = result.expect_err("invalid input must be rejected locally");
+    assert!(
+        matches!(error, FcpError::InvalidRequest { code: 1003, .. }),
+        "expected InvalidRequest1003, got: {error:?}"
+    );
+    mock.assert_request_count(0).await;
 }
 
 // ============================================================================
@@ -2550,16 +2649,12 @@ async fn images_generate_missing_prompt() {
         }))
         .await;
 
-    assert!(result.is_err());
-    match result.unwrap_err() {
-        fcp_core::FcpError::InvalidRequest { message, .. } => {
-            assert!(
-                message.contains("prompt"),
-                "error should mention 'prompt': {message}"
-            );
-        }
-        other => panic!("Expected InvalidRequest for missing prompt, got: {other:?}"),
-    }
+    let error = result.expect_err("invalid input must be rejected locally");
+    assert!(
+        matches!(error, FcpError::InvalidRequest { code: 1003, .. }),
+        "expected InvalidRequest1003, got: {error:?}"
+    );
+    mock.assert_request_count(0).await;
 }
 
 /// Empty prompt string returns error.
@@ -2579,16 +2674,12 @@ async fn images_generate_empty_prompt() {
         }))
         .await;
 
-    assert!(result.is_err());
-    match result.unwrap_err() {
-        fcp_core::FcpError::InvalidRequest { message, .. } => {
-            assert!(
-                message.contains("empty"),
-                "error should mention 'empty': {message}"
-            );
-        }
-        other => panic!("Expected InvalidRequest for empty prompt, got: {other:?}"),
-    }
+    let error = result.expect_err("invalid input must be rejected locally");
+    assert!(
+        matches!(error, FcpError::InvalidRequest { code: 1003, .. }),
+        "expected InvalidRequest1003, got: {error:?}"
+    );
+    mock.assert_request_count(0).await;
 }
 
 /// Unknown image model returns error.
@@ -2608,16 +2699,12 @@ async fn images_generate_unknown_model() {
         }))
         .await;
 
-    assert!(result.is_err());
-    match result.unwrap_err() {
-        fcp_core::FcpError::InvalidRequest { message, .. } => {
-            assert!(
-                message.contains("Unknown image model"),
-                "error should mention unknown image model: {message}"
-            );
-        }
-        other => panic!("Expected InvalidRequest for unknown model, got: {other:?}"),
-    }
+    let error = result.expect_err("invalid input must be rejected locally");
+    assert!(
+        matches!(error, FcpError::InvalidRequest { code: 1003, .. }),
+        "expected InvalidRequest1003, got: {error:?}"
+    );
+    mock.assert_request_count(0).await;
 }
 
 /// Unknown image size returns error.
@@ -2637,16 +2724,12 @@ async fn images_generate_unknown_size() {
         }))
         .await;
 
-    assert!(result.is_err());
-    match result.unwrap_err() {
-        fcp_core::FcpError::InvalidRequest { message, .. } => {
-            assert!(
-                message.contains("Unknown image size"),
-                "error should mention unknown size: {message}"
-            );
-        }
-        other => panic!("Expected InvalidRequest for unknown size, got: {other:?}"),
-    }
+    let error = result.expect_err("invalid input must be rejected locally");
+    assert!(
+        matches!(error, FcpError::InvalidRequest { code: 1003, .. }),
+        "expected InvalidRequest1003, got: {error:?}"
+    );
+    mock.assert_request_count(0).await;
 }
 
 /// Wrong capability token is rejected for image generation.
@@ -2776,16 +2859,12 @@ async fn videos_generate_rejects_unsupported_duration() {
         }))
         .await;
 
-    assert!(result.is_err());
-    match result.unwrap_err() {
-        fcp_core::FcpError::InvalidRequest { message, .. } => {
-            assert!(
-                message.contains("duration_seconds"),
-                "error should mention duration_seconds: {message}"
-            );
-        }
-        other => panic!("Expected InvalidRequest for unsupported duration, got: {other:?}"),
-    }
+    let error = result.expect_err("invalid input must be rejected locally");
+    assert!(
+        matches!(error, FcpError::InvalidRequest { code: 1003, .. }),
+        "expected InvalidRequest1003, got: {error:?}"
+    );
+    mock.assert_request_count(0).await;
 }
 
 #[fcp_async_core::runtime::test]
@@ -2912,12 +2991,12 @@ async fn transcribe_missing_audio() {
         }))
         .await;
 
-    assert!(result.is_err());
-    let message = format!("{:?}", result.unwrap_err());
+    let error = result.expect_err("invalid input must be rejected locally");
     assert!(
-        message.contains("audio_b64"),
-        "error should mention audio_b64: {message}"
+        matches!(error, FcpError::InvalidRequest { code: 1003, .. }),
+        "expected InvalidRequest1003, got: {error:?}"
     );
+    mock.assert_request_count(0).await;
 }
 
 /// Empty `audio_b64` field.
@@ -3179,12 +3258,12 @@ async fn realtime_transcribe_rejects_invalid_audio_format() {
         }))
         .await;
 
-    assert!(result.is_err());
-    let message = format!("{:?}", result.unwrap_err());
+    let error = result.expect_err("invalid input must be rejected locally");
     assert!(
-        message.contains("audio_format"),
-        "error should mention audio_format: {message}"
+        matches!(error, FcpError::InvalidRequest { code: 1003, .. }),
+        "expected InvalidRequest1003, got: {error:?}"
     );
+    mock.assert_request_count(0).await;
 }
 
 /// Realtime transcription requires its own streaming capability.
@@ -3615,12 +3694,12 @@ async fn realtime_browser_session_rejects_invalid_voice() {
         }))
         .await;
 
-    assert!(result.is_err());
-    let message = format!("{:?}", result.unwrap_err());
+    let error = result.expect_err("invalid input must be rejected locally");
     assert!(
-        message.contains("realtime voice"),
-        "error should mention realtime voice validation: {message}"
+        matches!(error, FcpError::InvalidRequest { code: 1003, .. }),
+        "expected InvalidRequest1003, got: {error:?}"
     );
+    mock.assert_request_count(0).await;
 }
 
 // ============================================================================
@@ -3778,12 +3857,12 @@ async fn tts_input_too_long() {
         }))
         .await;
 
-    assert!(result.is_err());
-    let message = format!("{:?}", result.unwrap_err());
+    let error = result.expect_err("invalid input must be rejected locally");
     assert!(
-        message.contains("4096"),
-        "error should mention limit: {message}"
+        matches!(error, FcpError::InvalidRequest { code: 1003, .. }),
+        "expected InvalidRequest1003, got: {error:?}"
     );
+    mock.assert_request_count(0).await;
 }
 
 /// TTS unknown voice.
@@ -3803,12 +3882,12 @@ async fn tts_unknown_voice() {
         }))
         .await;
 
-    assert!(result.is_err());
-    let message = format!("{:?}", result.unwrap_err());
+    let error = result.expect_err("invalid input must be rejected locally");
     assert!(
-        message.contains("voice"),
-        "error should mention voice: {message}"
+        matches!(error, FcpError::InvalidRequest { code: 1003, .. }),
+        "expected InvalidRequest1003, got: {error:?}"
     );
+    mock.assert_request_count(0).await;
 }
 
 /// TTS invalid speed.
@@ -3828,12 +3907,12 @@ async fn tts_invalid_speed() {
         }))
         .await;
 
-    assert!(result.is_err());
-    let message = format!("{:?}", result.unwrap_err());
+    let error = result.expect_err("invalid input must be rejected locally");
     assert!(
-        message.contains("speed") || message.contains("Speed"),
-        "error should mention speed: {message}"
+        matches!(error, FcpError::InvalidRequest { code: 1003, .. }),
+        "expected InvalidRequest1003, got: {error:?}"
     );
+    mock.assert_request_count(0).await;
 }
 
 /// TTS requires correct capability.
@@ -3972,12 +4051,12 @@ async fn finetune_create_missing_training_file() {
         }))
         .await;
 
-    assert!(result.is_err());
-    let message = format!("{:?}", result.unwrap_err());
+    let error = result.expect_err("invalid input must be rejected locally");
     assert!(
-        message.contains("training_file"),
-        "error should mention training_file: {message}"
+        matches!(error, FcpError::InvalidRequest { code: 1003, .. }),
+        "expected InvalidRequest1003, got: {error:?}"
     );
+    mock.assert_request_count(0).await;
 }
 
 /// Create fine-tuning job: empty `training_file`.
@@ -4020,12 +4099,12 @@ async fn finetune_create_suffix_too_long() {
         }))
         .await;
 
-    assert!(result.is_err());
-    let message = format!("{:?}", result.unwrap_err());
+    let error = result.expect_err("invalid input must be rejected locally");
     assert!(
-        message.contains("Suffix") || message.contains("suffix"),
-        "error should mention suffix: {message}"
+        matches!(error, FcpError::InvalidRequest { code: 1003, .. }),
+        "expected InvalidRequest1003, got: {error:?}"
     );
+    mock.assert_request_count(0).await;
 }
 
 /// List fine-tuning jobs: happy path.
@@ -4143,12 +4222,12 @@ async fn finetune_get_missing_job_id() {
         }))
         .await;
 
-    assert!(result.is_err());
-    let message = format!("{:?}", result.unwrap_err());
+    let error = result.expect_err("invalid input must be rejected locally");
     assert!(
-        message.contains("job_id"),
-        "error should mention job_id: {message}"
+        matches!(error, FcpError::InvalidRequest { code: 1003, .. }),
+        "expected InvalidRequest1003, got: {error:?}"
     );
+    mock.assert_request_count(0).await;
 }
 
 /// Get fine-tuning job: empty `job_id`.

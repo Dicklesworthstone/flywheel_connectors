@@ -22,6 +22,7 @@ workspace = true
 [dependencies]
 fcp-async-core = { path = "../../crates/fcp-async-core" }
 fcp-core = { path = "../../crates/fcp-core" }
+fcp-manifest = { path = "../../crates/fcp-manifest" }
 fcp-prelude = { path = "../../crates/fcp-prelude" }
 fcp-sdk = { path = "../../crates/fcp-sdk", features = ["connector-http"] }
 fcp-streaming = { path = "../../crates/fcp-streaming" }
@@ -51,5 +52,4 @@ base64.workspace = true
 wiremock.workspace = true
 futures-util.workspace = true
 fcp-crypto = { path = "../../crates/fcp-crypto" }
-fcp-manifest = { path = "../../crates/fcp-manifest" }
 fcp-testkit = { path = "../../crates/fcp-testkit" }

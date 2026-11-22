@@ -106,7 +106,7 @@ async fn setup_live_connector(connector: &mut OpenAIConnector, api_key: &str) ->
 
     connector
         .handle_handshake(json!({
-            "protocol_version": "1.0.0",
+            "protocol_version": "2.0.0",
             "zone": "z:work",
             "host_public_key": verifying_key.to_bytes(),
             "nonce": vec![0u8; 32],
@@ -133,6 +133,10 @@ async fn live_chat_completions() {
 
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "live-chat",
+            "connector_id": "fcp.openai",
+            "zone_id": "z:work",
             "operation": "openai.simple_chat",
             "input": {
                 "message": "Say the word 'hello' and nothing else.",
@@ -144,11 +148,7 @@ async fn live_chat_completions() {
         .expect("simple_chat invoke should succeed");
 
     // Verify response has content
-    let reply = result["reply"]
-        .as_str()
-        .or_else(|| result["content"].as_str())
-        .or_else(|| result["message"].as_str())
-        .or_else(|| result["text"].as_str());
+    let reply = result["response"].as_str();
     assert!(
         reply.is_some(),
         "response should contain a text reply field: {result}"
@@ -185,7 +185,7 @@ async fn live_error_mapping_invalid_key() {
 
     connector
         .handle_handshake(json!({
-            "protocol_version": "1.0.0",
+            "protocol_version": "2.0.0",
             "zone": "z:work",
             "host_public_key": verifying_key.to_bytes(),
             "nonce": vec![0u8; 32],
@@ -199,6 +199,10 @@ async fn live_error_mapping_invalid_key() {
 
     let err = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "live-auth-error",
+            "connector_id": "fcp.openai",
+            "zone_id": "z:work",
             "operation": "openai.simple_chat",
             "input": {
                 "message": "Hello"
@@ -235,17 +239,23 @@ async fn live_health_check() {
     let mut connector = OpenAIConnector::new();
     let _signing_key = setup_live_connector(&mut connector, &api_key).await;
 
-    let health = connector
-        .handle_health()
-        .await
-        .expect("health check should succeed");
-
+    let health: fcp_core::HealthSnapshot = serde_json::from_value(
+        connector
+            .handle_health()
+            .await
+            .expect("health check should succeed"),
+    )
+    .expect("health must use the canonical host snapshot");
     assert!(
-        health.get("status").is_some() || health.get("healthy").is_some(),
-        "health response should contain status or healthy field: {health}"
+        health.is_ready(),
+        "configured and handshaken account should be ready"
+    );
+    assert_eq!(
+        health.details.as_ref().unwrap()["instance_id"],
+        connector.instance_id()
     );
 
-    eprintln!("PASS: live_health_check — {health}");
+    eprintln!("PASS: live_health_check — {health:?}");
 }
 
 #[fcp_async_core::test]
