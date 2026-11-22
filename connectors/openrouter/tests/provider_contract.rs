@@ -1,4 +1,7 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use chrono::{Duration, Utc};
+use fcp_core::{CapabilityConstraints, CapabilityToken};
+use fcp_crypto::{cose::CapabilityTokenBuilder, ed25519::Ed25519SigningKey};
 use fcp_openrouter::OpenRouterConnector;
 use fcp_testkit::provider_contract::{
     ProviderAuthMethodContract, ProviderBaseUrlContract, ProviderContract,
@@ -158,14 +161,47 @@ async fn video_generate_polls_and_strips_auth_from_cross_origin_urls() {
         }))
         .await
         .expect("configure");
+    let signing_key = Ed25519SigningKey::generate();
     connector
-        .handle_handshake(json!({}))
+        .handle_handshake(json!({
+            "protocol_version": "2.0.0",
+            "zone": "z:work",
+            "host_public_key": signing_key.verifying_key().to_bytes(),
+            "nonce": vec![3_u8; 32],
+            "capabilities_requested": ["openrouter.video"]
+        }))
         .await
         .expect("handshake");
+    let constraints = CapabilityConstraints {
+        resource_allow: vec!["*".into()],
+        ..Default::default()
+    };
+    let mut constraints_cbor = Vec::new();
+    ciborium::into_writer(&constraints, &mut constraints_cbor).unwrap();
+    let now = Utc::now();
+    let token = CapabilityToken::from_raw(
+        CapabilityTokenBuilder::new()
+            .capability_id("openrouter.video")
+            .operations(&["openrouter.videos.generate"])
+            .zone_id("z:work")
+            .principal("user:provider-contract")
+            .issuer("node:provider-contract")
+            .target_instance(connector.instance_id().as_str())
+            .validity(now, now + Duration::hours(1))
+            .try_constraints_cbor(&constraints_cbor)
+            .unwrap()
+            .sign(&signing_key)
+            .unwrap(),
+    );
 
     let result = connector
         .handle_invoke(json!({
-            "operation_id": "openrouter.videos.generate",
+            "type": "invoke",
+            "id": "provider-video",
+            "connector_id": "fcp.openrouter",
+            "zone_id": "z:work",
+            "operation": "openrouter.videos.generate",
+            "capability_token": token,
             "input": {
                 "prompt": "A chrome sphere glides across a quiet moonlit beach",
                 "model": "google/veo-3.1",

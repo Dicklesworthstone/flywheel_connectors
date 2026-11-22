@@ -1,6 +1,6 @@
-# OpenRouter Connector V3 Contract
+# OpenRouter Connector Runtime Contract
 
-> **Status**: runtime contract documented; manifest/introspection/API drift documented
+> **Status**: canonical FCP 2 native protocol, signed session admission, bounded provider operations
 > **Bead**: `flywheel_connectors-4kw5f.12`
 > **Parent**: `flywheel_connectors-4kw5f`
 > **Verification script**: `scripts/e2e/openrouter_connector_verification.sh`
@@ -46,18 +46,19 @@ Important runtime truths the contract preserves:
 - Optional `app_name` becomes the `X-Title` provider header.
 - Optional `app_url` becomes the `HTTP-Referer` provider header.
 - Default request timeout is 60000 ms.
-- Runtime `handle_configure()` creates the HTTP client, stores config, and marks the base configured.
-- Runtime `handle_handshake()` is a local JSON handshake, not a typed FCP `HandshakeRequest`.
-- Runtime `handle_handshake()` requires prior configuration, accepts an optional `session_id`, defaults to `openrouter-local-session`, and returns the static capabilities `openrouter.chat`, `openrouter.models`, and `openrouter.video`.
-- Runtime `handle_handshake()` does not install a `CapabilityVerifier`, does not return a manifest hash, and does not validate requested capabilities.
-- Runtime `handle_health()` reports local configured/handshaken state, whether live requests are supported, request/error counters, and base URL. It does not call OpenRouter.
+- Every configure attempt revokes previous authority and clears the old account, including attempts that fail validation. A successful configuration creates the HTTP client and compiles the embedded manifest contracts.
+- `handle_handshake()` parses a full FCP `HandshakeRequest`, accepts protocol `2.0` or `2.0.0`, and uses the shared SDK `StandaloneSession`. It returns a canonical `HandshakeResponse`, manifest hash, and the actual fresh `instance_id` to which the host must bind tokens.
+- Only requested capabilities declared by the manifest are granted. An empty request grants nothing. `z:public` is forbidden, and rebinding an account to a different zone requires reconfiguration.
+- Every handshake attempt invalidates previous authority, including malformed and rejected handshakes. A repeated host-preferred instance ID cannot preserve old tokens.
+- `handle_health()` returns a canonical `HealthSnapshot`; configured/handshaken state, actual instance, zone/session, live-request readiness, counters, and base URL are in `details`. It does not call OpenRouter.
 - Runtime `handle_doctor()` checks local configuration, client initialization, credential-injection readiness, handshake state, and documented surface boundary. It does not call OpenRouter.
 - Runtime `handle_self_check()` calls `GET /models` in direct API-key mode.
 - Runtime `handle_self_check()` reports degraded in `credential_id` mode because host credential injection is not implemented.
-- Runtime `handle_invoke()` accepts `operation_id` or `operation` plus optional `input`.
-- Runtime `handle_invoke()` does not require or verify a capability token.
-- Runtime `handle_simulate()` only checks known operation, `credential_id` blocking, and `stream=true` blocking for chat.
-- Runtime `handle_shutdown()` clears client, config, session, and configured/handshaken flags.
+- `handle_invoke()` requires a complete typed `InvokeRequest`, including `type`, nonempty request ID, `connector_id`, `zone_id`, operation, object input, and signed capability token. It checks manifest input schemas and local provider semantics before admission.
+- Shared admission verifies negotiated capability, signature, expiry, operation, actual instance, zone, resources, signed call/byte ceilings, and any signed idempotency-key scope. This does not replace host holder-proof, revocation, approval, lease, or mesh-wide enforcement.
+- `handle_simulate()` requires a typed `SimulateRequest` and checks the same schemas, provider semantics, resource scopes, and session authority. It performs no provider I/O and does not reserve or debit usage; an allowed preview cannot guarantee later admission.
+- `handle_shutdown()` revokes authority, cancels the client execution context, and clears configuration. The native process flushes its shutdown response and exits without waiting for stdin to close.
+- The executable uses bounded shared SDK JSONL framing (16 MiB per request) and wraps operation outputs in canonical, correlated `InvokeResponse` messages. Malformed envelopes recover with a parse error; an oversized frame terminates the transport.
 - Runtime events and resource types are empty.
 - Streaming is not supported.
 
@@ -79,6 +80,7 @@ Chat behavior:
 - Runtime forwards only this subset of optional chat fields: `max_tokens`, `temperature`, `top_p`, `response_format`, `tools`, and `tool_choice`.
 - Runtime does not forward provider-routing fields, transforms, web-search plugins, reasoning parameters, `models`, `modalities`, `metadata`, or streaming-only debug options.
 - Runtime output is a normalized object with `id`, `model`, `content`, `finish_reason`, `usage`, and `raw`.
+- Null assistant content requires nonempty tool calls; tool messages require a nonempty, unpadded `tool_call_id`. Tool definitions are limited to named function tools.
 
 Video behavior:
 
@@ -92,13 +94,26 @@ Video behavior:
 - Non-empty `input_videos` is rejected.
 - `poll_interval_ms` defaults to 5000, is capped at 60000, and may be 0.
 - `max_poll_attempts` defaults to 120 and is clamped to 1 through 120.
-- `max_download_bytes` defaults to 128 MiB and is enforced before and after reading the generated video body.
+- `max_download_bytes` defaults to 128 MiB and can only narrow that hard ceiling. It is enforced while receiving the asset, including chunked responses without a `Content-Length`.
 - If OpenRouter returns `unsigned_urls`, the runtime downloads the first non-empty URL.
 - If no unsigned URL is present, runtime falls back to `videos/{job_id}/content?index=0`.
 - Provider auth headers are included only for same-origin polling or download URLs.
 - Cross-origin polling or unsigned download URLs are fetched without provider auth headers.
+- HTTP redirects are disabled so that a checked URL and credential decision cannot be replaced by an implicit redirect.
 - Download URLs must use HTTPS, except localhost URLs are allowed only when the configured base URL is also localhost.
 - Output embeds the downloaded video as base64 with MIME type, byte length, and a stable file name.
+- One invocation deadline covers submission, polling, polling sleeps, and download: at most 600 seconds for video and 60 seconds for chat/catalog, narrowed by `deadline_ms` when supplied. `request_timeout_ms` still bounds each HTTP exchange.
+- After successful submission, polling/download failures are nonretryable at the whole-operation boundary and identify the submitted job. Retrying the whole operation could create a second paid job. Ambiguous submission timeouts and server failures also remain nonretryable.
+
+## Resource And Usage Admission
+
+Signed resource constraints bind the values actually forwarded to the provider. Chat and video use `openrouter:model:<model>`; caller-supplied media URLs use `openrouter:input_url:<canonical-url>`; chat file IDs use `openrouter:file:<id>`; video callbacks use `openrouter:callback_url:<canonical-url>`. URLs are canonicalized with `url::Url` and require HTTP(S), a host, and no credentials or fragment. Inline data URLs contain caller-supplied bytes and do not represent an external resource lookup.
+
+Literal `%`, `?`, and `*` in resource suffixes are encoded as `%25`, `%3F`, and `%2A` respectively. This keeps URL queries and literal wildcard characters from becoming capability glob syntax. For example, `HTTPS://EXAMPLE.COM/a?b=1` is scoped as `openrouter:input_url:https://example.com/a%3Fb=1`, distinct from `/axb=1`.
+
+The SDK atomically reserves a signed call and compact serialized request/response bytes before provider dispatch. Responses are checked against the manifest and the exact reservation before release. Chat/catalog have a bounded JSON response allowance; video also reserves headroom for base64 expansion. Failed or interrupted calls retain their reservation. These process-local counters reset only with rotated instance authority; they are not a durable billing ledger or business-level result deduplication.
+
+Provider JSON bodies are capped at 10 MiB, error bodies at 64 KiB, and video bodies at the selected bounded download size. These limits apply during receipt. The final FCP envelope has an independent byte limit, so a response that cannot fit its signed allowance is withheld with an uncertain-outcome error.
 
 ## Drift Visible In This Checkout
 
@@ -110,15 +125,12 @@ This README documents runtime truth and keeps current drift visible:
 - The manifest declares no durable state and no event surface. Runtime matches that.
 - The manifest declares network constraints for `openrouter.ai`, but runtime also permits localhost base URLs for tests.
 - Runtime accepts `credential_id`, but all live operations are blocked in that mode because host-side credential injection is not implemented in this connector slice.
-- Runtime `handle_handshake()` does not parse a full `HandshakeRequest`, does not install a `CapabilityVerifier`, and does not return a manifest hash.
-- Runtime `handle_invoke()` does not require capability tokens or approval tokens.
-- Runtime `handle_simulate()` does not validate full input schema, configured state, handshake state, provider quota, model availability, billing status, moderation policy, or asset size beyond its lightweight local checks.
+- Simulation proves local schema and session admission, not provider quota, model availability, billing status, moderation policy, or the future size of generated assets.
 - Runtime request/error counters increment only through `handle_invoke()`.
-- Runtime video generation downloads the completed asset into memory and returns base64, so large generated videos are bounded only by `max_download_bytes` and process memory.
-- Runtime polling can occupy a request for up to `poll_interval_ms * max_poll_attempts`; defaults are 5000 ms and 120 attempts.
+- Video generation still returns a bounded in-memory base64 asset. Host blob storage and durable generation tracking remain future work.
 - A dedicated tracked verification shell script exists at `scripts/e2e/openrouter_connector_verification.sh`; it records manifest, build, test, local evidence, redaction, and clippy artifacts under `artifacts/e2e/openrouter/<run-id>/`.
 
-A follow-up parity bead should add typed FCP handshake and capability verification, implement or remove `credential_id` mode, decide whether streaming chat should be supported through an event surface, widen chat parameter forwarding where safe, add provider-scope/billing/model availability diagnostics, expose generation metadata reads if needed, and avoid returning large video assets inline when the host has a better blob path.
+A follow-up parity bead can implement host credential injection, decide whether streaming chat should use an event surface, widen chat parameter forwarding where safe, add provider-scope/billing/model availability diagnostics, expose generation metadata reads, and integrate host blob storage for generated assets.
 
 ## First-Slice Scope
 
@@ -129,7 +141,7 @@ The current OpenRouter README slice documents the existing runtime surface:
 - Local health, doctor, live self-check, introspection, simulate, invoke, and shutdown behavior
 - Header handling for `Authorization`, `X-Title`, and `HTTP-Referer`
 - Video polling, cross-origin credential stripping, generated-asset size caps, and base64 return behavior
-- Runtime/manifest/provider-doc drift around streaming, broad request schemas, credential injection, typed FCP handshake, capability tokens, and large media handling
+- Runtime/manifest/provider-doc boundaries around streaming, broad request schemas, credential injection, and inline media handling
 - Existing integration-test orientation through provider contracts, connector suite tests, manifest schema checks, and WireMock-backed OpenRouter flows
 
 ## Auth And Zone Boundary

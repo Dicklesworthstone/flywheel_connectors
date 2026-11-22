@@ -7,6 +7,9 @@ use std::net::{TcpListener, TcpStream};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use chrono::{Duration as ChronoDuration, Utc};
+use fcp_core::{CapabilityConstraints, CapabilityToken};
+use fcp_crypto::{cose::CapabilityTokenBuilder, ed25519::Ed25519SigningKey};
 use fcp_openrouter::OpenRouterConnector;
 use serde_json::{Value, json};
 
@@ -150,7 +153,7 @@ fn has_header(headers: &[String], name: &str, expected_value: &str) -> bool {
     })
 }
 
-async fn configured_connector(base_url: &str) -> OpenRouterConnector {
+async fn configured_connector(base_url: &str) -> (OpenRouterConnector, Ed25519SigningKey) {
     let mut connector = OpenRouterConnector::new();
     connector
         .handle_configure(json!({
@@ -162,11 +165,47 @@ async fn configured_connector(base_url: &str) -> OpenRouterConnector {
         }))
         .await
         .expect("configure OpenRouter connector against loopback fixture");
+    let signing_key = Ed25519SigningKey::generate();
     connector
-        .handle_handshake(json!({ "session_id": "openrouter-local-non-mock" }))
+        .handle_handshake(json!({
+            "protocol_version": "2.0.0",
+            "zone": "z:work",
+            "host_public_key": signing_key.verifying_key().to_bytes(),
+            "nonce": vec![5_u8; 32],
+            "capabilities_requested": ["openrouter.chat", "openrouter.models"]
+        }))
         .await
         .expect("handshake OpenRouter connector");
-    connector
+    (connector, signing_key)
+}
+
+fn capability_token(
+    connector: &OpenRouterConnector,
+    signing_key: &Ed25519SigningKey,
+    capability: &str,
+    operation: &str,
+) -> CapabilityToken {
+    let constraints = CapabilityConstraints {
+        resource_allow: vec!["*".into()],
+        ..Default::default()
+    };
+    let mut constraints_cbor = Vec::new();
+    ciborium::into_writer(&constraints, &mut constraints_cbor).unwrap();
+    let now = Utc::now();
+    CapabilityToken::from_raw(
+        CapabilityTokenBuilder::new()
+            .capability_id(capability)
+            .operations(&[operation])
+            .zone_id("z:work")
+            .principal("user:local-acceptance")
+            .issuer("node:local-acceptance")
+            .target_instance(connector.instance_id().as_str())
+            .validity(now, now + ChronoDuration::hours(1))
+            .try_constraints_cbor(&constraints_cbor)
+            .unwrap()
+            .sign(signing_key)
+            .unwrap(),
+    )
 }
 
 fn print_artifact(case_name: &str, boundary: &Value) {
@@ -204,11 +243,22 @@ async fn local_non_mock_models_list_uses_loopback_boundary() {
             ]
         }),
     );
-    let connector = configured_connector(fixture.base_url()).await;
+    let (connector, signing_key) = configured_connector(fixture.base_url()).await;
+    let token = capability_token(
+        &connector,
+        &signing_key,
+        "openrouter.models",
+        OP_MODELS_LIST,
+    );
 
     let response = connector
         .handle_invoke(json!({
-            "operation_id": OP_MODELS_LIST,
+            "type": "invoke",
+            "id": "local-models",
+            "connector_id": "fcp.openrouter",
+            "zone_id": "z:work",
+            "operation": OP_MODELS_LIST,
+            "capability_token": token,
             "input": {}
         }))
         .await
@@ -270,11 +320,22 @@ async fn local_non_mock_chat_completions_posts_openai_compatible_body() {
             }
         }),
     );
-    let connector = configured_connector(fixture.base_url()).await;
+    let (connector, signing_key) = configured_connector(fixture.base_url()).await;
+    let token = capability_token(
+        &connector,
+        &signing_key,
+        "openrouter.chat",
+        OP_CHAT_COMPLETIONS,
+    );
 
     let response = connector
         .handle_invoke(json!({
-            "operation_id": OP_CHAT_COMPLETIONS,
+            "type": "invoke",
+            "id": "local-chat",
+            "connector_id": "fcp.openrouter",
+            "zone_id": "z:work",
+            "operation": OP_CHAT_COMPLETIONS,
+            "capability_token": token,
             "input": {
                 "model": "openai/gpt-4.1-mini",
                 "messages": [

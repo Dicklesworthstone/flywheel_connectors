@@ -37,6 +37,9 @@ tracing-subscriber.workspace = true
 url.workspace = true
 
 [dev-dependencies]
+chrono.workspace = true
+ciborium.workspace = true
+fcp-crypto = { path = "../../crates/fcp-crypto" }
 fcp-e2e = { path = "../../crates/fcp-e2e", default-features = false }
 fcp-testkit = { path = "../../crates/fcp-testkit" }
 jsonschema.workspace = true

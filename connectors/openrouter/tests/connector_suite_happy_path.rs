@@ -7,14 +7,16 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use chrono::{Duration as ChronoDuration, Utc};
+use fcp_crypto::{cose::CapabilityTokenBuilder, ed25519::Ed25519SigningKey};
 use fcp_e2e::{ConnectorSuite, E2eRunner, InvokeExpectations};
 use fcp_openrouter::OpenRouterConnector;
 use fcp_prelude::{
-    AgentHint, CapabilityGrant, CapabilityId, CapabilityToken, ConnectorId, ConnectorMetrics,
+    AgentHint, CapabilityConstraints, CapabilityId, CapabilityToken, ConnectorId, ConnectorMetrics,
     FcpConnector, FcpError, HandshakeRequest, HandshakeResponse, HealthSnapshot, IdempotencyClass,
     InstanceId, Introspection, InvokeRequest, InvokeResponse, OperationId, OperationInfo,
-    RequestId, RiskLevel, SafetyTier, SessionId, ShutdownRequest, SimulateRequest,
-    SimulateResponse, SubscribeRequest, SubscribeResponse, UnsubscribeRequest, ZoneId,
+    RequestId, RiskLevel, SafetyTier, ShutdownRequest, SimulateRequest, SimulateResponse,
+    SubscribeRequest, SubscribeResponse, UnsubscribeRequest, ZoneId,
 };
 use serde_json::{Value, json};
 use wiremock::{
@@ -269,38 +271,20 @@ impl FcpConnector for OpenRouterSuiteAdapter {
     }
 
     async fn handshake(&mut self, req: HandshakeRequest) -> fcp_core::FcpResult<HandshakeResponse> {
-        self.connector
-            .handle_handshake(json!({ "session_id": "openrouter-connector-suite" }))
-            .await?;
-
-        let capabilities_granted = req
-            .capabilities_requested
-            .into_iter()
-            .map(|capability| CapabilityGrant {
-                capability,
-                operation: None,
-            })
-            .collect();
-
-        Ok(HandshakeResponse {
-            status: "accepted".into(),
-            capabilities_granted,
-            session_id: SessionId::new(),
-            manifest_hash: "sha256:openrouter-connector-suite".into(),
-            nonce: req.nonce,
-            event_caps: None,
-            auth_caps: None,
-            op_catalog_hash: None,
+        let request = serde_json::to_value(req).map_err(|error| FcpError::Internal {
+            message: format!("Failed to encode handshake: {error}"),
+        })?;
+        let response = self.connector.handle_handshake(request).await?;
+        serde_json::from_value(response).map_err(|error| FcpError::Internal {
+            message: format!("Failed to decode handshake: {error}"),
         })
     }
 
     async fn health(&self) -> HealthSnapshot {
         match self.connector.handle_health().await {
-            Ok(payload) => match payload.get("status").and_then(serde_json::Value::as_str) {
-                Some("healthy") => HealthSnapshot::ready(),
-                Some(other) => HealthSnapshot::degraded(format!("openrouter_status:{other}")),
-                None => HealthSnapshot::error("openrouter_status:missing"),
-            },
+            Ok(payload) => serde_json::from_value(payload).unwrap_or_else(|error| {
+                HealthSnapshot::error(format!("Invalid OpenRouter health snapshot: {error}"))
+            }),
             Err(error) => HealthSnapshot::error(error.to_string()),
         }
     }
@@ -342,41 +326,22 @@ impl FcpConnector for OpenRouterSuiteAdapter {
     }
 
     async fn invoke(&self, req: InvokeRequest) -> fcp_core::FcpResult<InvokeResponse> {
-        let request_id = req.id;
-        let operation_id = req.operation.as_str().to_string();
-        let value = self
-            .connector
-            .handle_invoke(json!({
-                "operation_id": operation_id,
-                "input": req.input,
-            }))
-            .await?;
+        let request_id = req.id.clone();
+        let request = serde_json::to_value(req).map_err(|error| FcpError::Internal {
+            message: format!("Failed to encode invocation: {error}"),
+        })?;
+        let value = self.connector.handle_invoke(request).await?;
         Ok(InvokeResponse::ok(request_id, value))
     }
 
     async fn simulate(&self, req: SimulateRequest) -> fcp_core::FcpResult<SimulateResponse> {
-        let request_id = req.id;
-        let operation_id = req.operation.as_str().to_string();
-        let value = self
-            .connector
-            .handle_simulate(json!({
-                "operation_id": operation_id,
-                "input": req.input,
-            }))
-            .await?;
-        if value
-            .get("allowed")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-        {
-            Ok(SimulateResponse::allowed(request_id))
-        } else {
-            Ok(SimulateResponse::denied(
-                request_id,
-                "operation is not supported",
-                "FCP-3010",
-            ))
-        }
+        let request = serde_json::to_value(req).map_err(|error| FcpError::Internal {
+            message: format!("Failed to encode simulation: {error}"),
+        })?;
+        let response = self.connector.handle_simulate(request).await?;
+        serde_json::from_value(response).map_err(|error| FcpError::Internal {
+            message: format!("Failed to decode simulation: {error}"),
+        })
     }
 
     async fn subscribe(&self, _req: SubscribeRequest) -> fcp_core::FcpResult<SubscribeResponse> {
@@ -388,12 +353,12 @@ impl FcpConnector for OpenRouterSuiteAdapter {
     }
 }
 
-fn handshake_request() -> HandshakeRequest {
+fn handshake_request(host_public_key: [u8; 32]) -> HandshakeRequest {
     HandshakeRequest {
         protocol_version: "2.0.0".into(),
         zone: ZoneId::work(),
         zone_dir: None,
-        host_public_key: [31u8; 32],
+        host_public_key,
         nonce: [37u8; 32],
         capabilities_requested: vec![CapabilityId::from_static(CAP_MODELS)],
         host: None,
@@ -402,7 +367,36 @@ fn handshake_request() -> HandshakeRequest {
     }
 }
 
-fn models_invoke(id: &'static str) -> InvokeRequest {
+fn signed_token(
+    key: &Ed25519SigningKey,
+    instance: &InstanceId,
+    capability: &str,
+    operation: &str,
+) -> CapabilityToken {
+    let constraints = CapabilityConstraints {
+        resource_allow: vec!["*".into()],
+        ..Default::default()
+    };
+    let mut constraints_cbor = Vec::new();
+    ciborium::into_writer(&constraints, &mut constraints_cbor).unwrap();
+    let now = Utc::now();
+    CapabilityToken::from_raw(
+        CapabilityTokenBuilder::new()
+            .capability_id(capability)
+            .operations(&[operation])
+            .zone_id("z:work")
+            .principal("user:connector-suite")
+            .issuer("node:connector-suite")
+            .target_instance(instance.as_str())
+            .validity(now, now + ChronoDuration::hours(1))
+            .try_constraints_cbor(&constraints_cbor)
+            .unwrap()
+            .sign(key)
+            .unwrap(),
+    )
+}
+
+fn models_invoke(id: &'static str, token: CapabilityToken) -> InvokeRequest {
     InvokeRequest {
         r#type: "invoke".into(),
         id: RequestId::new(id),
@@ -410,7 +404,7 @@ fn models_invoke(id: &'static str) -> InvokeRequest {
         operation: OperationId::from_static(OP_MODELS_LIST),
         zone_id: ZoneId::work(),
         input: json!({}),
-        capability_token: CapabilityToken::test_token(),
+        capability_token: token,
         holder_proof: None,
         context: None,
         idempotency_key: None,
@@ -422,19 +416,17 @@ fn models_invoke(id: &'static str) -> InvokeRequest {
     }
 }
 
-fn suite(server: &MockServer, test_name: &'static str, expect_error: bool) -> ConnectorSuite {
+fn suite(server: &MockServer, test_name: &'static str, key: &Ed25519SigningKey) -> ConnectorSuite {
     ConnectorSuite {
         test_name: test_name.into(),
         config: json!({
             "api_key": "openrouter_test_key",
             "base_url": server.uri()
         }),
-        handshake: handshake_request(),
-        invoke: Some(models_invoke(test_name)),
-        invoke_expectations: InvokeExpectations {
-            expect_error,
-            ..InvokeExpectations::default()
-        },
+        handshake: handshake_request(key.verifying_key().to_bytes()),
+        // The host signs for the identity learned from this handshake.
+        invoke: None,
+        invoke_expectations: InvokeExpectations::default(),
     }
 }
 
@@ -454,6 +446,7 @@ async fn connector_suite_models_happy_path_uses_mock_server() {
         .await;
 
     let mut connector = OpenRouterSuiteAdapter::new();
+    let signing_key = Ed25519SigningKey::generate();
     let mut runner = E2eRunner::new("fcp-openrouter");
     let report = runner
         .run_connector_suite(
@@ -461,7 +454,7 @@ async fn connector_suite_models_happy_path_uses_mock_server() {
             suite(
                 &server,
                 "openrouter_models_connector_suite_happy_path",
-                false,
+                &signing_key,
             ),
         )
         .await
@@ -469,6 +462,23 @@ async fn connector_suite_models_happy_path_uses_mock_server() {
 
     assert!(report.passed, "connector suite should pass");
     assert!(!report.logs.is_empty(), "structured logs should be present");
+    assert!(connector.health().await.is_ready());
+    let token = signed_token(
+        &signing_key,
+        connector.connector.instance_id(),
+        CAP_MODELS,
+        OP_MODELS_LIST,
+    );
+    let response = connector
+        .invoke(models_invoke("models-happy-path", token))
+        .await
+        .expect("authorized model listing should reach the provider");
+    assert_eq!(response.status, fcp_core::InvokeStatus::Ok);
+    assert_eq!(
+        response.result.unwrap()["data"][0]["id"],
+        "openai/gpt-4.1-mini"
+    );
+    server.verify().await;
 }
 
 #[fcp_async_core::runtime::test]
@@ -489,6 +499,7 @@ async fn connector_suite_models_error_path_is_expected() {
         .await;
 
     let mut connector = OpenRouterSuiteAdapter::new();
+    let signing_key = Ed25519SigningKey::generate();
     let mut runner = E2eRunner::new("fcp-openrouter");
     let report = runner
         .run_connector_suite(
@@ -496,13 +507,25 @@ async fn connector_suite_models_error_path_is_expected() {
             suite(
                 &server,
                 "openrouter_models_connector_suite_error_path",
-                true,
+                &signing_key,
             ),
         )
         .await
         .expect("connector suite run");
 
-    assert!(report.passed, "expected upstream error should pass suite");
+    assert!(report.passed, "connector lifecycle should pass");
+    let token = signed_token(
+        &signing_key,
+        connector.connector.instance_id(),
+        CAP_MODELS,
+        OP_MODELS_LIST,
+    );
+    let error = connector
+        .invoke(models_invoke("models-provider-rate-limit", token))
+        .await
+        .expect_err("authorized invocation should preserve provider rate limiting");
+    assert!(matches!(error, FcpError::RateLimited { .. }));
+    server.verify().await;
 }
 
 async fn invoke_video_generate(
@@ -519,12 +542,30 @@ async fn invoke_video_generate(
 
     let mut connector = OpenRouterConnector::new();
     connector.handle_configure(Value::Object(config)).await?;
+    let signing_key = Ed25519SigningKey::generate();
     connector
-        .handle_handshake(json!({"session_id": "openrouter-video-loopback"}))
+        .handle_handshake(json!({
+            "protocol_version": "2.0.0",
+            "zone": "z:work",
+            "host_public_key": signing_key.verifying_key().to_bytes(),
+            "nonce": vec![7_u8; 32],
+            "capabilities_requested": ["openrouter.video"]
+        }))
         .await?;
+    let token = signed_token(
+        &signing_key,
+        connector.instance_id(),
+        "openrouter.video",
+        OP_VIDEO_GENERATE,
+    );
     connector
         .handle_invoke(json!({
-            "operation_id": OP_VIDEO_GENERATE,
+            "type": "invoke",
+            "id": "video-loopback",
+            "connector_id": "fcp.openrouter",
+            "zone_id": "z:work",
+            "operation": OP_VIDEO_GENERATE,
+            "capability_token": token,
             "input": input,
         }))
         .await
@@ -689,14 +730,21 @@ async fn video_generate_real_loopback_e2e_error_modes_are_logged() {
         None,
     )
     .await
-    .expect_err("429 should map to FCP rate limit");
+    .expect_err("polling failure must not authorize another video generation");
     assert!(matches!(
-        rate_error,
-        FcpError::RateLimited {
-            retry_after_ms: 1000,
+        &rate_error,
+        FcpError::External {
+            retryable: false,
             ..
         }
     ));
+    assert!(rate_error.to_string().contains("job-rate-limited"));
+    assert!(
+        rate_error
+            .to_string()
+            .to_lowercase()
+            .contains("rate limited")
+    );
     let _ = rate_limited_api.finish();
     let (_, rate_logs) = rate_limited_status.finish();
     assert_eq!(rate_logs[0]["response_status"], 429);
@@ -765,7 +813,14 @@ async fn video_generate_real_loopback_e2e_error_modes_are_logged() {
     )
     .await
     .expect_err("oversized video should fail before returning bytes");
-    assert!(matches!(oversized_error, FcpError::InvalidRequest { .. }));
+    assert!(matches!(
+        &oversized_error,
+        FcpError::External {
+            retryable: false,
+            ..
+        }
+    ));
+    assert!(oversized_error.to_string().contains("byte limit"));
     let _ = oversized_api.finish();
     let (_, oversized_logs) = oversized_cdn.finish();
     assert_eq!(oversized_logs[0]["response_status"], 200);
@@ -781,7 +836,18 @@ async fn video_generate_real_loopback_e2e_error_modes_are_logged() {
         invoke_video_generate(timeout_api.uri(), json!({"prompt": "timeout"}), Some(10))
             .await
             .expect_err("delayed loopback response should trip request timeout");
-    assert!(matches!(timeout_error, FcpError::UpstreamTimeout { .. }));
+    assert!(matches!(
+        &timeout_error,
+        FcpError::External {
+            retryable: false,
+            ..
+        }
+    ));
+    assert!(
+        timeout_error
+            .to_string()
+            .contains("provider outcome may be unknown")
+    );
     let (_, timeout_logs) = timeout_api.finish();
     assert_eq!(timeout_logs[0]["response_status"], 200);
 }

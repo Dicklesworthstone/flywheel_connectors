@@ -1,13 +1,17 @@
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use fcp_async_core::ExecutionContext;
 use fcp_manifest::{ConnectorManifest, ManifestApprovalMode};
 use fcp_prelude::{
-    ApprovalMode, BaseConnector, ConnectorId, FcpError, FcpResult, OperationId, OperationInfo,
+    ApprovalMode, BaseConnector, ConnectorId, FcpError, FcpResult, HandshakeRequest,
+    HealthSnapshot, InstanceId, InvokeRequest, InvokeResponse, OperationId, OperationInfo,
+    SessionId, SimulateRequest, SimulateResponse, ZoneId,
 };
+use fcp_sdk::prelude::{OperationContractSet, StandaloneSession};
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Client, Method, RequestBuilder, StatusCode};
 use serde_json::{Map, Value, json};
@@ -23,6 +27,10 @@ const MAX_VIDEO_POLL_INTERVAL_MS: u64 = 60_000;
 const MAX_VIDEO_POLL_ATTEMPTS: u64 = 120;
 const MAX_VIDEO_INPUT_IMAGES: usize = 4;
 const DEFAULT_MAX_VIDEO_DOWNLOAD_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_JSON_RESPONSE_BYTES: u64 = 10 * 1024 * 1024;
+const MAX_ERROR_RESPONSE_BYTES: u64 = 64 * 1024;
+const RESPONSE_ENVELOPE_HEADROOM: u64 = 64 * 1024;
+const DEFAULT_CHAT_MODEL: &str = "openai/gpt-4.1-mini";
 const OPENROUTER_MANIFEST_TOML: &str = include_str!("../manifest.toml");
 const OPERATION_ORDER: [&str; 3] = [
     "openrouter.chat.completions",
@@ -142,12 +150,17 @@ struct OpenRouterClient {
     base_url: String,
     app_name: Option<HeaderValue>,
     app_url: Option<HeaderValue>,
+    execution: ExecutionContext,
 }
 
 impl OpenRouterClient {
     fn new(config: &OpenRouterConfig) -> FcpResult<Self> {
         let http = Client::builder()
             .timeout(Duration::from_millis(config.request_timeout_ms))
+            // Every provider-supplied polling/download URL is checked before
+            // sending credentials. An implicit redirect must not bypass it.
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
             .build()
             .map_err(|error| FcpError::Internal {
                 message: format!("Failed to build OpenRouter HTTP client: {error}"),
@@ -159,7 +172,19 @@ impl OpenRouterClient {
             base_url: config.base_url.clone(),
             app_name: config.app_name.clone(),
             app_url: config.app_url.clone(),
+            execution: ExecutionContext::background(),
         })
+    }
+
+    fn invocation_context(&self, operation: &str, deadline_ms: Option<u64>) -> ExecutionContext {
+        let ceiling = if operation == "openrouter.videos.generate" {
+            600_000
+        } else {
+            60_000
+        };
+        self.execution.child().with_deadline(Duration::from_millis(
+            deadline_ms.unwrap_or(ceiling).min(ceiling),
+        ))
     }
 
     fn request(&self, method: Method, path: &str) -> RequestBuilder {
@@ -182,11 +207,16 @@ impl OpenRouterClient {
     }
 
     async fn get_json(&self, path: &str) -> FcpResult<Value> {
-        send_json(self.request(Method::GET, path), "openrouter").await
+        send_json(self.request(Method::GET, path), "openrouter", true).await
     }
 
     async fn post_json(&self, path: &str, body: Value) -> FcpResult<Value> {
-        send_json(self.request(Method::POST, path).json(&body), "openrouter").await
+        send_json(
+            self.request(Method::POST, path).json(&body),
+            "openrouter",
+            false,
+        )
+        .await
     }
 
     async fn get_json_url(&self, raw_url: &str) -> FcpResult<Value> {
@@ -195,6 +225,7 @@ impl OpenRouterClient {
         send_json(
             self.request_resolved_url(Method::GET, resolved, include_provider_headers)?,
             "openrouter",
+            true,
         )
         .await
     }
@@ -233,10 +264,13 @@ struct DownloadedVideo {
 }
 
 pub struct OpenRouterConnector {
-    base: Arc<BaseConnector>,
+    base: BaseConnector,
     config: Option<OpenRouterConfig>,
     client: Option<Arc<OpenRouterClient>>,
-    session_id: Option<String>,
+    authority: Option<StandaloneSession>,
+    session_id: Option<SessionId>,
+    bound_zone: Option<ZoneId>,
+    started_at: Instant,
     request_count: AtomicU64,
     error_count: AtomicU64,
 }
@@ -246,16 +280,45 @@ impl OpenRouterConnector {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            base: Arc::new(BaseConnector::new(ConnectorId::from_static(CONNECTOR_ID))),
+            base: BaseConnector::new(ConnectorId::from_static(CONNECTOR_ID)),
             config: None,
             client: None,
+            authority: None,
             session_id: None,
+            bound_zone: None,
+            started_at: Instant::now(),
             request_count: AtomicU64::new(0),
             error_count: AtomicU64::new(0),
         }
     }
 
+    /// The actual instance that the host must use when signing capabilities.
+    #[must_use]
+    pub fn instance_id(&self) -> &InstanceId {
+        &self.base.instance_id
+    }
+
+    fn invalidate_authority(&mut self) {
+        self.authority = None;
+        self.session_id = None;
+        self.base.set_handshaken(false);
+        self.base.instance_id = InstanceId::new();
+    }
+
+    fn clear_configuration(&mut self) {
+        self.invalidate_authority();
+        self.bound_zone = None;
+        self.base.set_configured(false);
+        self.config = None;
+        if let Some(client) = self.client.take() {
+            client.execution.cancel();
+        }
+    }
+
     pub async fn handle_configure(&mut self, params: Value) -> FcpResult<Value> {
+        // Failed replacements revoke the previous account and its grants too.
+        self.clear_configuration();
+        operation_contracts()?;
         let config = OpenRouterConfig::from_params(&params)?;
         let client = OpenRouterClient::new(&config)?;
         self.client = Some(Arc::new(client));
@@ -270,24 +333,40 @@ impl OpenRouterConnector {
     }
 
     pub async fn handle_handshake(&mut self, params: Value) -> FcpResult<Value> {
-        if self.config.is_none() {
+        self.invalidate_authority();
+        if self.config.is_none() || self.client.is_none() {
             return Err(FcpError::NotConfigured);
         }
-
-        self.session_id = params
-            .get("session_id")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned)
-            .or_else(|| Some("openrouter-local-session".into()));
+        let request: HandshakeRequest =
+            serde_json::from_value(params).map_err(|_| FcpError::InvalidRequest {
+                code: 1003,
+                message: "Invalid handshake request".into(),
+            })?;
+        if self
+            .bound_zone
+            .as_ref()
+            .is_some_and(|zone| zone != &request.zone)
+        {
+            return Err(FcpError::CapabilityDenied {
+                capability: "openrouter.handshake".into(),
+                reason: "Reconfigure before binding this account to another zone".into(),
+            });
+        }
+        let zone = request.zone.clone();
+        let mut authority = StandaloneSession::new(OPENROUTER_MANIFEST_TOML)?;
+        let response = authority.handshake(request)?;
+        let mut result = serde_json::to_value(&response).map_err(|error| FcpError::Internal {
+            message: format!("Failed to serialize handshake: {error}"),
+        })?;
+        result["instance_id"] = json!(authority.instance_id());
+        result["connector_id"] = json!(CONNECTOR_ID);
+        result["protocol_version"] = json!("2.0");
+        self.base.instance_id = authority.instance_id().clone();
+        self.session_id = Some(response.session_id);
+        self.bound_zone = Some(zone);
+        self.authority = Some(authority);
         self.base.set_handshaken(true);
-
-        Ok(json!({
-            "connector_id": CONNECTOR_ID,
-            "connector_version": CONNECTOR_VERSION,
-            "protocol_version": "2.0",
-            "capabilities": ["openrouter.chat", "openrouter.models", "openrouter.video"],
-            "streaming_supported": false,
-        }))
+        Ok(result)
     }
 
     pub async fn handle_health(&self) -> FcpResult<Value> {
@@ -295,15 +374,35 @@ impl OpenRouterConnector {
             .config
             .as_ref()
             .is_some_and(|config| !config.auth.is_secretless());
-        Ok(json!({
-            "status": health_status(self.config.is_some(), self.session_id.is_some(), live_requests_supported),
+        let handshaken = self
+            .authority
+            .as_ref()
+            .is_some_and(StandaloneSession::is_established);
+        let mut health = if handshaken && live_requests_supported {
+            HealthSnapshot::ready()
+        } else if self.config.is_none() {
+            HealthSnapshot::degraded("not configured")
+        } else if !live_requests_supported {
+            HealthSnapshot::degraded("host credential injection is unavailable")
+        } else {
+            HealthSnapshot::degraded("handshake required")
+        };
+        health.uptime_ms = u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        health.details = Some(json!({
+            "connector_id": CONNECTOR_ID,
             "configured": self.config.is_some(),
-            "handshaken": self.session_id.is_some(),
+            "handshaken": handshaken,
+            "instance_id": self.base.instance_id,
+            "session_id": self.session_id,
+            "zone": self.bound_zone,
             "live_requests_supported": live_requests_supported,
             "requests": self.request_count.load(Ordering::Relaxed),
             "errors": self.error_count.load(Ordering::Relaxed),
             "base_url": self.config.as_ref().map(|config| config.base_url.clone()),
-        }))
+        }));
+        serde_json::to_value(health).map_err(|error| FcpError::Internal {
+            message: format!("Failed to serialize health: {error}"),
+        })
     }
 
     pub async fn handle_doctor(&self) -> FcpResult<Value> {
@@ -407,90 +506,158 @@ impl OpenRouterConnector {
 
     pub async fn handle_invoke(&self, params: Value) -> FcpResult<Value> {
         self.base.check_ready()?;
-        let client = self.client.as_ref().ok_or_else(|| FcpError::Internal {
-            message: "OpenRouter client not initialized".into(),
-        })?;
-        if self
-            .config
+        let request: InvokeRequest =
+            serde_json::from_value(params).map_err(|_| FcpError::InvalidRequest {
+                code: 1003,
+                message: "Invalid FCP invoke request".into(),
+            })?;
+        if !request.input.is_object() || request.deadline_ms == Some(0) {
+            return Err(invalid_input(
+                "Invocation requires object input and a nonzero deadline when supplied",
+            ));
+        }
+        let client = self.client.as_ref().ok_or(FcpError::NotConfigured)?;
+        let context = client.invocation_context(request.operation.as_str(), request.deadline_ms);
+        let resources = self.validate_operation(&request.operation, &request.input)?;
+        let witness = self
+            .authority
             .as_ref()
-            .is_some_and(|config| config.auth.is_secretless())
-        {
+            .ok_or(FcpError::NotHandshaken)?
+            .admit_bounded(
+                &request,
+                &resources,
+                response_byte_limit(request.operation.as_str()),
+            )?;
+        self.request_count.fetch_add(1, Ordering::Relaxed);
+
+        // One caller-narrowed budget covers submission, polling, sleeps and
+        // generated-asset download. Dropped or timed-out work keeps its debit.
+        let result = context.run(async {
+            match request.operation.as_str() {
+                "openrouter.chat.completions" => self.invoke_chat(client, &request.input).await,
+                "openrouter.models.list" => client.get_json("/models").await,
+                "openrouter.videos.generate" => self.invoke_video_generate(client, &request.input).await,
+                _ => Err(FcpError::OperationNotGranted { operation: request.operation.as_str().into() }),
+            }
+        }).await.unwrap_or_else(|_| Err(FcpError::External {
+            service: "openrouter".into(),
+            message: "Invocation deadline exhausted or execution cancelled; provider outcome may be unknown".into(),
+            status_code: None,
+            retryable: false,
+            retry_after: None,
+        }));
+        if result.is_err() {
+            self.error_count.fetch_add(1, Ordering::Relaxed);
+        }
+        let response = match &result {
+            Ok(value) => InvokeResponse::ok(request.id.clone(), value.clone()),
+            Err(error) => InvokeResponse::error(request.id.clone(), error.clone()),
+        };
+        operation_contracts()?.validate_response(&request.operation, &request.id, &response)?;
+        witness.finish_response(&response)?;
+        result
+    }
+
+    fn validate_operation(&self, operation: &OperationId, input: &Value) -> FcpResult<Vec<String>> {
+        self.base.check_ready()?;
+        let config = self.config.as_ref().ok_or(FcpError::NotConfigured)?;
+        if !OPERATION_ORDER.contains(&operation.as_str()) {
+            return Err(FcpError::OperationNotGranted {
+                operation: operation.as_str().into(),
+            });
+        }
+        operation_contracts()?.validate_input(operation, input)?;
+        if config.auth.is_secretless() {
             return Err(FcpError::InvalidRequest {
                 code: 1003,
                 message: "credential_id mode requires host-side credential injection, which this connector slice does not implement".into(),
             });
         }
-
-        let operation = params
-            .get("operation_id")
-            .or_else(|| params.get("operation"))
-            .and_then(Value::as_str)
-            .ok_or_else(|| FcpError::InvalidRequest {
-                code: 1003,
-                message: "Missing operation_id".into(),
-            })?;
-        let input = params.get("input").cloned().unwrap_or_else(|| json!({}));
-
-        self.request_count.fetch_add(1, Ordering::Relaxed);
-
-        let result = match operation {
-            "openrouter.chat.completions" => self.invoke_chat(client, &input).await,
-            "openrouter.models.list" => client.get_json("/models").await,
-            "openrouter.videos.generate" => self.invoke_video_generate(client, &input).await,
-            _ => Err(FcpError::InvalidRequest {
-                code: 1002,
-                message: format!("Unknown operation: {operation}"),
-            }),
-        };
-
-        if result.is_err() {
-            self.error_count.fetch_add(1, Ordering::Relaxed);
+        let mut resources = Vec::new();
+        match operation.as_str() {
+            "openrouter.chat.completions" => {
+                let model = input
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .unwrap_or(DEFAULT_CHAT_MODEL);
+                resources.push(resource_uri("model", canonical_identifier(model)?));
+                validate_chat_messages(input, &mut resources)?;
+            }
+            "openrouter.videos.generate" => {
+                // Run the exact request builder before admission, so a local
+                // rejection cannot consume a call or turn into provider work.
+                let request = VideoGenerateRequest::from_input(input)?;
+                resources.push(resource_uri("model", canonical_identifier(&request.model)?));
+                if let Some(model) = input.get("model").and_then(Value::as_str) {
+                    canonical_identifier(model)?;
+                }
+                for image in &request.input_images {
+                    if let Some(uri) = input_url_resource(&image.url)? {
+                        resources.push(uri);
+                    }
+                }
+                if let Some(callback) = &request.callback_url {
+                    resources.push(resource_uri(
+                        "callback_url",
+                        canonical_http_url(callback)?.as_str(),
+                    ));
+                }
+            }
+            _ => {}
         }
-        result
+        // Configuration validation owns the provider origin, while per-call
+        // resources bind caller-selected models and outbound asset references.
+        resources.sort();
+        resources.dedup();
+        Ok(resources)
     }
 
     pub async fn handle_simulate(&self, params: Value) -> FcpResult<Value> {
-        let operation = params
-            .get("operation_id")
-            .or_else(|| params.get("operation"))
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        let input = params.get("input").cloned().unwrap_or_else(|| json!({}));
-        let supported = matches!(
-            operation,
-            "openrouter.chat.completions" | "openrouter.models.list" | "openrouter.videos.generate"
-        );
-        let blocked_by_secretless_auth = supported
-            && self
-                .config
-                .as_ref()
-                .is_some_and(|config| config.auth.is_secretless());
-        let blocked_by_streaming_boundary = operation == "openrouter.chat.completions"
-            && input
-                .get("stream")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-        Ok(json!({
-            "allowed": supported && !blocked_by_secretless_auth && !blocked_by_streaming_boundary,
-            "reason": if blocked_by_secretless_auth {
-                "credential_id mode requires host-side credential injection, which this connector slice does not implement."
-            } else if blocked_by_streaming_boundary {
-                "stream=true is not exposed by the first OpenRouter connector slice."
-            } else if supported {
-                "Supported operation."
-            } else {
-                "Unknown operation."
-            },
-        }))
+        let request: SimulateRequest = serde_json::from_value(params)
+            .map_err(|_| invalid_input("Invalid FCP simulate request"))?;
+        if request.r#type != "simulate" || request.id.0.is_empty() || !request.input.is_object() {
+            return Err(invalid_input(
+                "Simulation requires a typed request, non-empty ID and object input",
+            ));
+        }
+        let authorization = self
+            .validate_operation(&request.operation, &request.input)
+            .and_then(|resources| {
+                self.authority
+                    .as_ref()
+                    .ok_or(FcpError::NotHandshaken)?
+                    .authorize(
+                        &request.connector_id,
+                        &request.zone_id,
+                        &request.operation,
+                        request.capability_token,
+                        &resources,
+                    )
+                    .map(drop)
+            });
+        let response = match authorization {
+            Ok(()) => SimulateResponse::allowed(request.id),
+            Err(error) => {
+                let mut response =
+                    SimulateResponse::denied(request.id, error.to_string(), error.error_code());
+                if matches!(
+                    error,
+                    FcpError::CapabilityDenied { .. } | FcpError::OperationNotGranted { .. }
+                ) && let Some(capability) = operation_capability(request.operation.as_str())
+                {
+                    response = response.with_missing_capabilities(vec![capability.into()]);
+                }
+                response
+            }
+        };
+        serde_json::to_value(response).map_err(|error| FcpError::Internal {
+            message: format!("Failed to serialize simulation: {error}"),
+        })
     }
 
     pub async fn handle_shutdown(&mut self, _params: Value) -> FcpResult<Value> {
-        self.client = None;
-        self.config = None;
-        self.session_id = None;
-        self.base.set_configured(false);
-        self.base.set_handshaken(false);
-        Ok(json!({}))
+        self.clear_configuration();
+        Ok(json!({"status": "shutdown"}))
     }
 
     async fn invoke_chat(&self, client: &OpenRouterClient, input: &Value) -> FcpResult<Value> {
@@ -516,7 +683,7 @@ impl OpenRouterConnector {
             })?;
 
         let mut body = json!({
-            "model": input.get("model").and_then(Value::as_str).unwrap_or("openai/gpt-4.1-mini"),
+            "model": input.get("model").and_then(Value::as_str).unwrap_or(DEFAULT_CHAT_MODEL),
             "messages": messages,
         });
 
@@ -554,6 +721,7 @@ impl OpenRouterConnector {
             .post_json("/videos", request.to_openrouter_body())
             .await?;
         let job_id = required_non_empty_string(&submitted, "id", "video generation job id")?;
+        let result = async {
         let completed = if normalized_status(&submitted) == Some("completed") {
             submitted.clone()
         } else {
@@ -585,7 +753,7 @@ impl OpenRouterConnector {
             .await?;
 
         Ok(json!({
-            "job_id": job_id,
+            "job_id": job_id.clone(),
             "status": completed.get("status").cloned().unwrap_or_else(|| json!("completed")),
             "generation_id": completed.get("generation_id").cloned().unwrap_or(Value::Null),
             "model": completed.get("model").cloned().unwrap_or_else(|| json!(request.model)),
@@ -598,6 +766,16 @@ impl OpenRouterConnector {
             },
             "raw": completed,
         }))
+        }.await;
+        // This operation owns submission as well as polling. Retrying a read
+        // failure after a successful submission would create another paid job.
+        result.map_err(|error: FcpError| FcpError::External {
+            service: "openrouter".into(),
+            message: format!("OpenRouter video job {job_id} was submitted but its result could not be completed: {error}; provider outcome may be unknown"),
+            status_code: None,
+            retryable: false,
+            retry_after: None,
+        })
     }
 }
 
@@ -655,9 +833,13 @@ impl VideoGenerateRequest {
         let max_poll_attempts = optional_u64(input, "max_poll_attempts")
             .unwrap_or(DEFAULT_VIDEO_MAX_POLL_ATTEMPTS)
             .clamp(1, MAX_VIDEO_POLL_ATTEMPTS);
-        let max_download_bytes = optional_u64(input, "max_download_bytes")
-            .unwrap_or(DEFAULT_MAX_VIDEO_DOWNLOAD_BYTES)
-            .max(1);
+        let max_download_bytes =
+            optional_u64(input, "max_download_bytes").unwrap_or(DEFAULT_MAX_VIDEO_DOWNLOAD_BYTES);
+        if !(1..=DEFAULT_MAX_VIDEO_DOWNLOAD_BYTES).contains(&max_download_bytes) {
+            return Err(invalid_input(
+                "max_download_bytes must be between 1 and 134217728",
+            ));
+        }
 
         Ok(Self {
             model: optional_string(input, "model").unwrap_or_else(|| DEFAULT_VIDEO_MODEL.into()),
@@ -893,6 +1075,161 @@ impl Default for OpenRouterConnector {
     }
 }
 
+fn invalid_input(message: &str) -> FcpError {
+    FcpError::InvalidRequest {
+        code: 1003,
+        message: message.into(),
+    }
+}
+
+fn operation_contracts() -> FcpResult<&'static OperationContractSet> {
+    static CONTRACTS: OnceLock<FcpResult<OperationContractSet>> = OnceLock::new();
+    CONTRACTS
+        .get_or_init(|| OperationContractSet::from_manifest_toml(OPENROUTER_MANIFEST_TOML))
+        .as_ref()
+        .map_err(Clone::clone)
+}
+
+fn operation_capability(operation: &str) -> Option<&'static str> {
+    match operation {
+        "openrouter.chat.completions" => Some("openrouter.chat"),
+        "openrouter.models.list" => Some("openrouter.models"),
+        "openrouter.videos.generate" => Some("openrouter.video"),
+        _ => None,
+    }
+}
+
+fn response_byte_limit(operation: &str) -> u64 {
+    // Chat repeats selected provider fields alongside raw JSON. Video also
+    // carries base64, which expands each three downloaded bytes into four.
+    let json = 2 * MAX_JSON_RESPONSE_BYTES + RESPONSE_ENVELOPE_HEADROOM;
+    if operation == "openrouter.videos.generate" {
+        DEFAULT_MAX_VIDEO_DOWNLOAD_BYTES.div_ceil(3) * 4 + json
+    } else {
+        json
+    }
+}
+
+fn canonical_identifier(value: &str) -> FcpResult<&str> {
+    if value.is_empty() || value != value.trim() || value.chars().any(char::is_control) {
+        return Err(invalid_input(
+            "Resource identifiers must be nonempty and unpadded",
+        ));
+    }
+    Ok(value)
+}
+
+fn resource_uri(kind: &str, value: &str) -> String {
+    // Capability resource rules use globs. Escaping is injective, including
+    // literal percent signs, so URL query '?' never becomes a wildcard.
+    let value = value
+        .replace('%', "%25")
+        .replace('?', "%3F")
+        .replace('*', "%2A");
+    format!("openrouter:{kind}:{value}")
+}
+
+fn canonical_http_url(value: &str) -> FcpResult<Url> {
+    canonical_identifier(value)?;
+    let parsed = Url::parse(value).map_err(|_| invalid_input("Invalid resource URL"))?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(invalid_input(
+            "Resource URLs require HTTP(S), a host, and no credentials or fragment",
+        ));
+    }
+    Ok(parsed)
+}
+
+fn input_url_resource(value: &str) -> FcpResult<Option<String>> {
+    if value.starts_with("data:image/") && value.contains(";base64,") {
+        return Ok(None);
+    }
+    Ok(Some(resource_uri(
+        "input_url",
+        canonical_http_url(value)?.as_str(),
+    )))
+}
+
+fn validate_chat_messages(input: &Value, resources: &mut Vec<String>) -> FcpResult<()> {
+    let messages = input["messages"]
+        .as_array()
+        .ok_or_else(|| invalid_input("messages must be an array"))?;
+    for message in messages {
+        let assistant_tools = message["role"] == "assistant"
+            && message
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .is_some_and(|calls| !calls.is_empty());
+        if message.get("content").is_none_or(Value::is_null) && !assistant_tools {
+            return Err(invalid_input(
+                "Null message content requires an assistant tool call",
+            ));
+        }
+        if message["role"] == "tool"
+            && message
+                .get("tool_call_id")
+                .and_then(Value::as_str)
+                .is_none_or(|id| id.trim().is_empty() || id != id.trim())
+        {
+            return Err(invalid_input(
+                "Tool messages require a nonempty, unpadded tool_call_id",
+            ));
+        }
+        if let Some(parts) = message.get("content").and_then(Value::as_array) {
+            for part in parts {
+                if !part.is_object() {
+                    return Err(invalid_input("Message content parts must be objects"));
+                }
+                for field in ["image_url", "video_url"] {
+                    if let Some(value) = part.get(field) {
+                        let raw = value
+                            .as_str()
+                            .or_else(|| value.get("url").and_then(Value::as_str))
+                            .ok_or_else(|| invalid_input("Message media requires a URL string"))?;
+                        if let Some(uri) = input_url_resource(raw)? {
+                            resources.push(uri);
+                        }
+                    }
+                }
+                if let Some(file) = part.get("file") {
+                    if let Some(id) = file.get("file_id") {
+                        let id = id
+                            .as_str()
+                            .ok_or_else(|| invalid_input("file_id must be a string"))?;
+                        resources.push(resource_uri("file", canonical_identifier(id)?));
+                    }
+                    if let Some(data) = file.get("file_data").and_then(Value::as_str)
+                        && !data.starts_with("data:")
+                    {
+                        resources.push(resource_uri(
+                            "input_url",
+                            canonical_http_url(data)?.as_str(),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    if let Some(tools) = input.get("tools").and_then(Value::as_array) {
+        for tool in tools {
+            if tool["type"] != "function"
+                || tool
+                    .pointer("/function/name")
+                    .and_then(Value::as_str)
+                    .is_none_or(|name| name.trim().is_empty())
+            {
+                return Err(invalid_input("Only named function tools are supported"));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn operations_info() -> FcpResult<Vec<Value>> {
     static OPERATIONS: OnceLock<FcpResult<Vec<Value>>> = OnceLock::new();
     OPERATIONS
@@ -972,20 +1309,6 @@ fn operation_info_from_manifest(
             .as_ref()
             .map(|rate_limit| rate_limit.0.clone()),
         requires_approval: approval_mode_from_manifest(operation.requires_approval),
-    }
-}
-
-const fn health_status(
-    configured: bool,
-    handshaken: bool,
-    live_requests_supported: bool,
-) -> &'static str {
-    if configured && handshaken && live_requests_supported {
-        "healthy"
-    } else if configured {
-        "degraded"
-    } else {
-        "unconfigured"
     }
 }
 
@@ -1187,18 +1510,20 @@ fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
         .map(Duration::from_secs)
 }
 
-async fn send_json(request: RequestBuilder, service: &'static str) -> FcpResult<Value> {
+async fn send_json(
+    request: RequestBuilder,
+    service: &'static str,
+    retry_safe: bool,
+) -> FcpResult<Value> {
     let response = request
         .send()
         .await
-        .map_err(|error| map_reqwest_error(service, &error))?;
+        .map_err(|error| map_reqwest_error(service, &error, retry_safe))?;
     let status = response.status();
     if !status.is_success() {
         let retry_after = parse_retry_after(response.headers());
-        let body = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "<unreadable response body>".into());
+        let bytes = read_bounded_body(response, MAX_ERROR_RESPONSE_BYTES, service).await?;
+        let body = String::from_utf8_lossy(&bytes);
         if status == StatusCode::TOO_MANY_REQUESTS {
             let retry_after_ms =
                 retry_after.map_or(30_000, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
@@ -1209,22 +1534,24 @@ async fn send_json(request: RequestBuilder, service: &'static str) -> FcpResult<
         }
         return Err(FcpError::External {
             service: service.into(),
-            message: format!("HTTP {status}: {body}"),
+            message: if !retry_safe && status.is_server_error() {
+                format!("HTTP {status}: {body}; provider outcome may be unknown")
+            } else {
+                format!("HTTP {status}: {body}")
+            },
             status_code: Some(status.as_u16()),
-            retryable: status.is_server_error(),
+            retryable: retry_safe && status.is_server_error(),
             retry_after,
         });
     }
-    response
-        .json::<Value>()
-        .await
-        .map_err(|error| FcpError::External {
-            service: service.into(),
-            message: format!("Failed to decode JSON response: {error}"),
-            status_code: None,
-            retryable: false,
-            retry_after: None,
-        })
+    let bytes = read_bounded_body(response, MAX_JSON_RESPONSE_BYTES, service).await?;
+    serde_json::from_slice(&bytes).map_err(|error| FcpError::External {
+        service: service.into(),
+        message: format!("Failed to decode JSON response: {error}"),
+        status_code: None,
+        retryable: false,
+        retry_after: None,
+    })
 }
 
 async fn send_bytes(
@@ -1235,14 +1562,12 @@ async fn send_bytes(
     let response = request
         .send()
         .await
-        .map_err(|error| map_reqwest_error(service, &error))?;
+        .map_err(|error| map_reqwest_error(service, &error, true))?;
     let status = response.status();
     if !status.is_success() {
         let retry_after = parse_retry_after(response.headers());
-        let body = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "<unreadable response body>".into());
+        let bytes = read_bounded_body(response, MAX_ERROR_RESPONSE_BYTES, service).await?;
+        let body = String::from_utf8_lossy(&bytes);
         if status == StatusCode::TOO_MANY_REQUESTS {
             let retry_after_ms =
                 retry_after.map_or(30_000, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
@@ -1260,17 +1585,6 @@ async fn send_bytes(
         });
     }
 
-    if let Some(content_length) = response.content_length() {
-        if content_length > max_bytes {
-            return Err(FcpError::InvalidRequest {
-                code: 1003,
-                message: format!(
-                    "OpenRouter generated video exceeds max_download_bytes ({content_length} > {max_bytes})"
-                ),
-            });
-        }
-    }
-
     let mime_type = response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -1279,22 +1593,12 @@ async fn send_bytes(
         .filter(|value| !value.is_empty())
         .unwrap_or("video/mp4")
         .to_string();
-    let bytes = response.bytes().await.map_err(|error| FcpError::External {
-        service: service.into(),
-        message: format!("Failed to read video response body: {error}"),
-        status_code: None,
-        retryable: false,
-        retry_after: None,
-    })?;
-    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_bytes {
-        return Err(FcpError::InvalidRequest {
-            code: 1003,
-            message: format!(
-                "OpenRouter generated video exceeds max_download_bytes ({} > {max_bytes})",
-                bytes.len()
-            ),
-        });
-    }
+    let bytes = read_bounded_body(
+        response,
+        max_bytes.min(DEFAULT_MAX_VIDEO_DOWNLOAD_BYTES),
+        service,
+    )
+    .await?;
 
     Ok(DownloadedVideo {
         mime_type,
@@ -1303,8 +1607,63 @@ async fn send_bytes(
     })
 }
 
-fn map_reqwest_error(service: &'static str, error: &reqwest::Error) -> FcpError {
-    if error.is_timeout() {
+/// Enforce the bound while receiving, including missing/false Content-Length
+/// and chunked responses. Provider effects may precede a body-limit failure.
+async fn read_bounded_body(
+    mut response: reqwest::Response,
+    limit: u64,
+    service: &'static str,
+) -> FcpResult<Vec<u8>> {
+    let too_large = || FcpError::External {
+        service: service.into(),
+        message:
+            "Provider response exceeds the configured byte limit; provider outcome may be unknown"
+                .into(),
+        status_code: Some(response.status().as_u16()),
+        retryable: false,
+        retry_after: None,
+    };
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit)
+    {
+        return Err(too_large());
+    }
+    let status = response.status().as_u16();
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| FcpError::External {
+        service: service.into(),
+        message: "Provider response body was interrupted; provider outcome may be unknown".into(),
+        status_code: Some(status),
+        retryable: false,
+        retry_after: None,
+    })? {
+        if u64::try_from(body.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX))
+            > limit
+        {
+            return Err(FcpError::External {
+                service: service.into(),
+                message: "Provider response exceeds the configured byte limit; provider outcome may be unknown".into(),
+                status_code: Some(status), retryable: false, retry_after: None,
+            });
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+fn map_reqwest_error(service: &'static str, error: &reqwest::Error, retry_safe: bool) -> FcpError {
+    if !retry_safe && !error.is_connect() {
+        FcpError::External {
+            service: service.into(),
+            message: "Provider request did not complete; provider outcome may be unknown".into(),
+            status_code: None,
+            retryable: false,
+            retry_after: None,
+        }
+    } else if error.is_timeout() {
         FcpError::UpstreamTimeout {
             service: service.into(),
         }
@@ -1322,9 +1681,54 @@ fn map_reqwest_error(service: &'static str, error: &reqwest::Error) -> FcpError 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{Duration as ChronoDuration, Utc};
+    use fcp_core::{CapabilityConstraints, CapabilityToken, HealthSnapshot, Introspection};
+    use fcp_crypto::{cose::CapabilityTokenBuilder, ed25519::Ed25519SigningKey};
 
     const MANIFEST_TOML: &str = OPENROUTER_MANIFEST_TOML;
     const EXPECTED_OPERATION_IDS: [&str; 3] = OPERATION_ORDER;
+
+    fn handshake(key: &Ed25519SigningKey) -> Value {
+        json!({
+            "protocol_version": "2.0.0", "zone": "z:work",
+            "host_public_key": key.verifying_key().to_bytes(), "nonce": vec![7_u8; 32],
+            "capabilities_requested": ["openrouter.chat", "openrouter.models", "openrouter.video"]
+        })
+    }
+
+    fn signed_request(
+        connector: &OpenRouterConnector,
+        key: &Ed25519SigningKey,
+        operation: &str,
+        input: Value,
+        token_id: &[u8],
+        constraints: &CapabilityConstraints,
+    ) -> Value {
+        let now = Utc::now();
+        let mut cbor = Vec::new();
+        ciborium::into_writer(constraints, &mut cbor).unwrap();
+        let raw = CapabilityTokenBuilder::new()
+            .capability_id(operation_capability(operation).unwrap())
+            .operations(&[operation])
+            .zone_id("z:work")
+            .principal("user:test")
+            .issuer("node:test")
+            .target_instance(connector.instance_id().as_str())
+            .token_id(token_id)
+            .validity(now, now + ChronoDuration::hours(1))
+            .try_constraints_cbor(&cbor)
+            .unwrap()
+            .sign(key)
+            .unwrap();
+        json!({"type": "invoke", "id": "test-request", "connector_id": CONNECTOR_ID,
+            "zone_id": "z:work", "operation": operation, "input": input,
+            "capability_token": CapabilityToken::from_raw(raw)})
+    }
+
+    fn preview(mut request: Value) -> Value {
+        request["type"] = json!("simulate");
+        request
+    }
 
     fn openrouter_manifest() -> Result<toml::Value, String> {
         toml::from_str(MANIFEST_TOML)
@@ -1450,7 +1854,7 @@ mod tests {
     }
 
     #[fcp_async_core::runtime::test]
-    async fn handshake_without_session_id_reports_handshaken_state() {
+    async fn typed_handshake_reports_actual_instance_and_canonical_health() {
         let mut connector = OpenRouterConnector::new();
         connector
             .handle_configure(json!({
@@ -1459,14 +1863,22 @@ mod tests {
             .await
             .expect("expected configure to succeed");
 
-        connector
-            .handle_handshake(json!({}))
+        let key = Ed25519SigningKey::generate();
+        let response = connector
+            .handle_handshake(handshake(&key))
             .await
             .expect("expected handshake to succeed");
 
-        let health = connector.handle_health().await.expect("expected health");
-        assert_eq!(health["status"], "healthy");
-        assert_eq!(health["handshaken"], true);
+        let health: HealthSnapshot =
+            serde_json::from_value(connector.handle_health().await.unwrap()).unwrap();
+        assert!(health.is_ready());
+        let details = health.details.unwrap();
+        assert_eq!(details["handshaken"], true);
+        assert_eq!(details["instance_id"], response["instance_id"]);
+        assert_eq!(details["connector_id"], CONNECTOR_ID);
+        let catalog: Introspection =
+            serde_json::from_value(connector.handle_introspect().await.unwrap()).unwrap();
+        assert_eq!(catalog.operations.len(), 3);
 
         let doctor = connector.handle_doctor().await.expect("expected doctor");
         assert_eq!(doctor["checks"][2]["passed"], true);
@@ -1497,14 +1909,16 @@ mod tests {
             .await
             .expect("expected configure to succeed");
 
+        let key = Ed25519SigningKey::generate();
         connector
-            .handle_handshake(json!({}))
+            .handle_handshake(handshake(&key))
             .await
             .expect("expected handshake to succeed");
 
         let health = connector.handle_health().await.expect("expected health");
-        assert_eq!(health["status"], "degraded");
-        assert_eq!(health["live_requests_supported"], false);
+        let typed_health: HealthSnapshot = serde_json::from_value(health.clone()).unwrap();
+        assert!(!typed_health.is_ready());
+        assert_eq!(health["details"]["live_requests_supported"], false);
 
         let doctor = connector.handle_doctor().await.expect("expected doctor");
         assert_eq!(doctor["status"], "degraded");
@@ -1517,12 +1931,19 @@ mod tests {
         assert_eq!(self_check["reason_code"], "credential_injection_required");
 
         let simulate = connector
-            .handle_simulate(json!({"operation_id": "openrouter.models.list"}))
+            .handle_simulate(preview(signed_request(
+                &connector,
+                &key,
+                "openrouter.models.list",
+                json!({}),
+                b"secretless",
+                &CapabilityConstraints::default(),
+            )))
             .await
             .expect("expected simulate");
-        assert_eq!(simulate["allowed"], false);
+        assert_eq!(simulate["would_succeed"], false);
         assert!(
-            simulate["reason"]
+            simulate["failure_reason"]
                 .as_str()
                 .expect("reason should be a string")
                 .contains("credential_id mode")
@@ -1539,22 +1960,265 @@ mod tests {
             .await
             .expect("expected configure to succeed");
 
+        let key = Ed25519SigningKey::generate();
+        connector.handle_handshake(handshake(&key)).await.unwrap();
         let simulate = connector
-            .handle_simulate(json!({
-                "operation_id": "openrouter.chat.completions",
-                "input": {
+            .handle_simulate(preview(signed_request(
+                &connector,
+                &key,
+                "openrouter.chat.completions",
+                json!({
                     "stream": true,
                     "messages": [{"role": "user", "content": "hi"}]
-                }
-            }))
+                }),
+                b"stream",
+                &CapabilityConstraints::default(),
+            )))
             .await
             .expect("expected simulate");
-        assert_eq!(simulate["allowed"], false);
+        assert_eq!(simulate["would_succeed"], false);
+        assert_eq!(simulate["denial_code"], "FCP-1003");
+    }
+
+    #[test]
+    fn resource_encoding_distinguishes_query_globs_and_literal_escapes() {
+        assert_eq!(
+            input_url_resource("HTTPS://EXAMPLE.COM/a?b=1").unwrap(),
+            Some("openrouter:input_url:https://example.com/a%3Fb=1".into())
+        );
+        assert_ne!(
+            input_url_resource("https://example.com/a?b=1").unwrap(),
+            input_url_resource("https://example.com/axb=1").unwrap()
+        );
+        assert_ne!(resource_uri("model", "a?b"), resource_uri("model", "a%3Fb"));
+        assert_eq!(resource_uri("model", "a*b"), "openrouter:model:a%2Ab");
+        assert!(canonical_http_url(" https://example.com/a").is_err());
+        assert!(canonical_http_url("https://user:secret@example.com/a").is_err());
+        assert!(canonical_identifier(" model ").is_err());
         assert!(
-            simulate["reason"]
-                .as_str()
-                .expect("reason should be a string")
-                .contains("stream=true")
+            input_url_resource("data:image/png;base64,YQ==")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn failed_lifecycle_attempts_revoke_tokens_and_reconfiguration_resets_zone() {
+        let mut connector = OpenRouterConnector::new();
+        let key = Ed25519SigningKey::generate();
+        connector
+            .handle_configure(json!({"api_key": "test-key"}))
+            .await
+            .unwrap();
+        connector.handle_handshake(handshake(&key)).await.unwrap();
+        let request = signed_request(
+            &connector,
+            &key,
+            "openrouter.models.list",
+            json!({}),
+            b"lifecycle",
+            &CapabilityConstraints::default(),
+        );
+        let old_instance = connector.instance_id().clone();
+        assert_eq!(
+            connector
+                .handle_simulate(preview(request.clone()))
+                .await
+                .unwrap()["would_succeed"],
+            true
+        );
+        assert!(connector.handle_handshake(json!({})).await.is_err());
+        assert_ne!(connector.instance_id(), &old_instance);
+        assert!(matches!(
+            connector.handle_invoke(request.clone()).await,
+            Err(FcpError::NotHandshaken)
+        ));
+        let mut other_zone = handshake(&key);
+        other_zone["zone"] = json!("z:private");
+        assert!(matches!(
+            connector.handle_handshake(other_zone.clone()).await,
+            Err(FcpError::CapabilityDenied { .. })
+        ));
+        connector.handle_handshake(handshake(&key)).await.unwrap();
+        assert!(connector.handle_invoke(request).await.is_err());
+        assert!(connector.handle_configure(json!({})).await.is_err());
+        let health: HealthSnapshot =
+            serde_json::from_value(connector.handle_health().await.unwrap()).unwrap();
+        assert!(!health.is_ready());
+        assert_eq!(health.details.unwrap()["configured"], false);
+        assert!(matches!(
+            connector.handle_handshake(handshake(&key)).await,
+            Err(FcpError::NotConfigured)
+        ));
+        connector
+            .handle_configure(json!({"api_key": "replacement"}))
+            .await
+            .unwrap();
+        connector.handle_handshake(other_zone).await.unwrap();
+        let mut public = handshake(&key);
+        public["zone"] = json!("z:public");
+        connector
+            .handle_configure(json!({"api_key": "replacement"}))
+            .await
+            .unwrap();
+        assert!(matches!(
+            connector.handle_handshake(public).await,
+            Err(FcpError::CapabilityDenied { .. })
+        ));
+        connector.handle_shutdown(json!({})).await.unwrap();
+        assert!(matches!(
+            connector.handle_handshake(handshake(&key)).await,
+            Err(FcpError::NotConfigured)
+        ));
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn empty_grants_and_invalid_envelopes_do_not_authorize_simulation() {
+        let mut connector = OpenRouterConnector::new();
+        let key = Ed25519SigningKey::generate();
+        connector
+            .handle_configure(json!({"api_key": "test-key"}))
+            .await
+            .unwrap();
+        let mut no_grants = handshake(&key);
+        no_grants["capabilities_requested"] = json!([]);
+        let response = connector.handle_handshake(no_grants).await.unwrap();
+        assert_eq!(response["capabilities_granted"], json!([]));
+        let request = signed_request(
+            &connector,
+            &key,
+            "openrouter.models.list",
+            json!({}),
+            b"empty-grants",
+            &CapabilityConstraints::default(),
+        );
+        let denied = connector
+            .handle_simulate(preview(request.clone()))
+            .await
+            .unwrap();
+        assert_eq!(denied["denial_code"], "FCP-3001");
+        assert_eq!(denied["missing_capabilities"], json!(["openrouter.models"]));
+        assert!(matches!(
+            connector.handle_invoke(request.clone()).await,
+            Err(FcpError::CapabilityDenied { .. })
+        ));
+        let mut malformed = preview(request);
+        malformed["id"] = json!("");
+        assert!(matches!(
+            connector.handle_simulate(malformed).await,
+            Err(FcpError::InvalidRequest { code: 1003, .. })
+        ));
+        assert!(matches!(
+            connector
+                .handle_invoke(json!({"operation_id": "openrouter.models.list"}))
+                .await,
+            Err(FcpError::InvalidRequest { code: 1003, .. })
+        ));
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn simulation_and_rejected_input_preserve_a_single_signed_provider_call() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"data": [{"id": "openai/test"}]})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut connector = OpenRouterConnector::new();
+        let key = Ed25519SigningKey::generate();
+        connector
+            .handle_configure(json!({"api_key": "test-key", "base_url": server.uri()}))
+            .await
+            .unwrap();
+        connector.handle_handshake(handshake(&key)).await.unwrap();
+        let request = signed_request(
+            &connector,
+            &key,
+            "openrouter.models.list",
+            json!({}),
+            b"one-call",
+            &CapabilityConstraints {
+                max_calls: Some(1),
+                max_bytes: Some(1_000_000),
+                ..Default::default()
+            },
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                connector
+                    .handle_simulate(preview(request.clone()))
+                    .await
+                    .unwrap()["would_succeed"],
+                true
+            );
+        }
+        let mut invalid = request.clone();
+        invalid["input"] = json!({"unexpected": true});
+        assert!(matches!(
+            connector.handle_invoke(invalid).await,
+            Err(FcpError::InvalidRequest { code: 1003, .. })
+        ));
+        let mut invalid = request.clone();
+        invalid["type"] = json!("simulate");
+        assert!(matches!(
+            connector.handle_invoke(invalid).await,
+            Err(FcpError::InvalidRequest { code: 1003, .. })
+        ));
+        assert!(server.received_requests().await.unwrap().is_empty());
+        assert_eq!(
+            connector.handle_invoke(request.clone()).await.unwrap()["data"][0]["id"],
+            "openai/test"
+        );
+        assert!(matches!(
+            connector.handle_invoke(request.clone()).await,
+            Err(FcpError::CapabilityDenied { .. })
+        ));
+        assert_eq!(
+            connector.handle_simulate(preview(request)).await.unwrap()["would_succeed"],
+            false
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn media_caps_and_whole_invocation_deadlines_are_bounded() {
+        let config = OpenRouterConfig::from_params(&json!({"api_key": "test-key"})).unwrap();
+        let client = OpenRouterClient::new(&config).unwrap();
+        assert!(
+            client
+                .invocation_context("openrouter.videos.generate", Some(u64::MAX))
+                .remaining_budget()
+                .unwrap()
+                <= Duration::from_secs(600)
+        );
+        assert!(
+            client
+                .invocation_context("openrouter.chat.completions", Some(10))
+                .remaining_budget()
+                .unwrap()
+                <= Duration::from_millis(10)
+        );
+        assert!(
+            VideoGenerateRequest::from_input(
+                &json!({"prompt": "hi", "max_download_bytes": u64::MAX})
+            )
+            .is_err()
+        );
+        assert!(
+            response_byte_limit("openrouter.videos.generate") > DEFAULT_MAX_VIDEO_DOWNLOAD_BYTES
+        );
+        client.execution.cancel();
+        assert!(
+            client
+                .invocation_context("openrouter.models.list", None)
+                .is_cancelled()
         );
     }
 
