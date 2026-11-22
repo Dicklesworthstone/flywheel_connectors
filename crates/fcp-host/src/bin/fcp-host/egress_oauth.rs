@@ -217,6 +217,8 @@ impl RefreshTransport {
             // A token endpoint redirect must never forward refresh material
             // to a destination that the operator did not configure.
             .redirect(reqwest::redirect::Policy::none())
+            // A rotated refresh token must never be replayed by transport policy.
+            .retry(reqwest::retry::never())
             .build()
             .map_err(|_| {
                 HostError::PreflightFailed("host-egress OAuth transport unavailable".to_owned())

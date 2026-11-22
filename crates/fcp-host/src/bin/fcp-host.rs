@@ -11592,6 +11592,10 @@ struct BlockingOAuthTransport {
     client: reqwest::blocking::Client,
 }
 
+// Token and device-code responses are small protocol objects. Apply the same
+// bound as host egress refresh, including when Content-Length is absent.
+const MAX_HOST_OAUTH_RESPONSE_BYTES: usize = 64 * 1024;
+
 const fn default_auth_code_pkce() -> bool {
     true
 }
@@ -11615,17 +11619,32 @@ fn invalid_oauth_provider_response(method: &'static str, reason: impl Into<Strin
     }
 }
 
-fn oauth_safe_text(value: impl AsRef<str>) -> String {
-    let value = value.as_ref();
-    let mut safe = value
-        .chars()
-        .filter(|character| !matches!(character, '\r' | '\n'))
-        .take(512)
-        .collect::<String>();
-    if safe.trim().is_empty() {
-        safe = "provider returned an empty error".to_owned();
+fn oauth_safe_error_code(value: &str) -> Option<&'static str> {
+    // Provider strings can echo client secrets, codes, token material or URLs.
+    // Preserve standard machine-readable failures without treating arbitrary
+    // printable text as redacted merely because it contains no line breaks.
+    match value {
+        "invalid_request" => Some("invalid_request"),
+        "invalid_client" => Some("invalid_client"),
+        "invalid_grant" => Some("invalid_grant"),
+        "unauthorized_client" => Some("unauthorized_client"),
+        "unsupported_grant_type" => Some("unsupported_grant_type"),
+        "unsupported_response_type" => Some("unsupported_response_type"),
+        "invalid_scope" => Some("invalid_scope"),
+        "access_denied" => Some("access_denied"),
+        "authorization_pending" => Some("authorization_pending"),
+        "slow_down" => Some("slow_down"),
+        "expired_token" => Some("expired_token"),
+        "server_error" => Some("server_error"),
+        "temporarily_unavailable" => Some("temporarily_unavailable"),
+        "invalid_token" => Some("invalid_token"),
+        "insufficient_scope" => Some("insufficient_scope"),
+        "interaction_required" => Some("interaction_required"),
+        "login_required" => Some("login_required"),
+        "consent_required" => Some("consent_required"),
+        "account_selection_required" => Some("account_selection_required"),
+        _ => None,
     }
-    safe
 }
 
 fn oauth_required_string(
@@ -11703,20 +11722,15 @@ fn oauth_provider_error_parts(value: &Value, status: Option<StatusCode>) -> (Str
     let code = value
         .get("error")
         .and_then(Value::as_str)
-        .map(oauth_safe_text)
+        .and_then(oauth_safe_error_code)
+        .map(str::to_owned)
         .unwrap_or_else(|| {
             status.map_or_else(
                 || "provider_error".to_owned(),
                 |status| format!("http_{}", status.as_u16()),
             )
         });
-    let reason = value
-        .get("error_description")
-        .or_else(|| value.get("error_uri"))
-        .or_else(|| value.get("error"))
-        .and_then(Value::as_str)
-        .map(oauth_safe_text)
-        .unwrap_or_else(|| code.clone());
+    let reason = "provider rejected the OAuth request; response details withheld".to_owned();
     (code, reason)
 }
 
@@ -11758,7 +11772,10 @@ fn oauth_challenge_from_value(
     let expires_in = oauth_duration_field(value, "expires_in", "oauth_device")?
         .ok_or_else(|| invalid_oauth_provider_response("oauth_device", "missing `expires_in`"))?;
     let expires_delta = chrono::TimeDelta::from_std(expires_in)
-        .map_err(|error| invalid_oauth_provider_response("oauth_device", error.to_string()))?;
+        .map_err(|_| invalid_oauth_provider_response("oauth_device", "invalid expiry duration"))?;
+    let expires_at = Utc::now().checked_add_signed(expires_delta).ok_or_else(|| {
+        invalid_oauth_provider_response("oauth_device", "expiry timestamp is out of range")
+    })?;
     OAuthDeviceCodeChallenge::new(
         oauth_required_string(value, "device_code", "oauth_device")?,
         oauth_required_string(value, "user_code", "oauth_device")?,
@@ -11768,7 +11785,7 @@ fn oauth_challenge_from_value(
             "oauth_device",
         )?,
         oauth_optional_string(value, "verification_uri_complete", "oauth_device")?,
-        Utc::now() + expires_delta,
+        expires_at,
         oauth_duration_field(value, "interval", "oauth_device")?
             .unwrap_or(config.default_poll_interval),
     )
@@ -11779,8 +11796,16 @@ impl BlockingOAuthTransport {
     fn new() -> Result<Self, AuthError> {
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(30))
+            .user_agent(concat!("fcp-host/", env!("CARGO_PKG_VERSION")))
+            // These POST bodies carry single-use grants and credentials. A
+            // redirect is not authority to send them to another endpoint,
+            // even when the destination shares the configured origin.
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
             .build()
-            .map_err(|error| invalid_oauth_provider_response("oauth_http", error.to_string()))?;
+            .map_err(|_| {
+                invalid_oauth_provider_response("oauth_http", "OAuth transport unavailable")
+            })?;
         Ok(Self { client })
     }
 
@@ -11790,23 +11815,70 @@ impl BlockingOAuthTransport {
         url: &str,
         form: &[(String, String)],
     ) -> Result<Value, AuthError> {
+        use std::io::Read as _;
+
         let response = self
             .client
             .post(url)
             .form(form)
             .send()
-            .map_err(|error| invalid_oauth_provider_response(method, error.to_string()))?;
+            .map_err(|error| {
+                let reason = if error.is_timeout() {
+                    "OAuth provider request timed out"
+                } else if error.is_connect() {
+                    "could not connect to OAuth provider endpoint"
+                } else {
+                    "OAuth provider request failed"
+                };
+                invalid_oauth_provider_response(method, reason)
+            })?;
         let status = response.status();
-        let body = response
-            .text()
-            .map_err(|error| invalid_oauth_provider_response(method, error.to_string()))?;
-        let value = serde_json::from_str::<Value>(&body).map_err(|error| {
-            invalid_oauth_provider_response(method, format!("invalid JSON response: {error}"))
+        if status.is_redirection() {
+            return Err(invalid_oauth_provider_response(
+                method,
+                format!(
+                    "provider endpoint returned HTTP {}; OAuth redirects are not permitted",
+                    status.as_u16()
+                ),
+            ));
+        }
+
+        let size_limit = MAX_HOST_OAUTH_RESPONSE_BYTES as u64;
+        if response
+            .content_length()
+            .is_some_and(|length| length > size_limit)
+        {
+            return Err(invalid_oauth_provider_response(
+                method,
+                "OAuth provider response exceeds size limit",
+            ));
+        }
+        let mut body = zeroize::Zeroizing::new(Vec::new());
+        response
+            .take(size_limit + 1)
+            .read_to_end(&mut body)
+            .map_err(|_| {
+                invalid_oauth_provider_response(method, "could not read OAuth provider response")
+            })?;
+        if body.len() > MAX_HOST_OAUTH_RESPONSE_BYTES {
+            return Err(invalid_oauth_provider_response(
+                method,
+                "OAuth provider response exceeds size limit",
+            ));
+        }
+        let value: Value = serde_json::from_slice(body.as_slice()).map_err(|_| {
+            invalid_oauth_provider_response(method, "OAuth provider response is not valid JSON")
         })?;
+        if !value.is_object() {
+            return Err(invalid_oauth_provider_response(
+                method,
+                "OAuth provider response must be a JSON object",
+            ));
+        }
         if !status.is_success() && value.get("error").is_none() {
             return Err(invalid_oauth_provider_response(
                 method,
-                format!("provider endpoint returned HTTP {status}"),
+                format!("provider endpoint returned HTTP {}", status.as_u16()),
             ));
         }
         Ok(value)
@@ -42878,6 +42950,377 @@ done"#;
         let body_end = header_end + content_length.min(buffer.len().saturating_sub(header_end));
         let body = String::from_utf8_lossy(&buffer[header_end..body_end]).to_string();
         Some((method, path, body))
+    }
+
+
+    // Exercise the actual host OAuth transport against raw HTTP, so redirect
+    // behavior, chunked bodies and absent Content-Length cannot be hidden by a
+    // JSON-only provider fixture.
+    struct HostOAuthTransportTestServer {
+        base_url: String,
+        stop: Arc<AtomicBool>,
+        worker: Option<thread::JoinHandle<Vec<(String, String, String)>>>,
+    }
+
+    impl HostOAuthTransportTestServer {
+        fn start(response: impl FnOnce(&str) -> Vec<u8>) -> Self {
+            let listener = StdTcpListener::bind("127.0.0.1:0").expect("OAuth test listener");
+            listener.set_nonblocking(true).expect("nonblocking listener");
+            let base_url = format!("http://{}", listener.local_addr().unwrap());
+            let response = response(&base_url);
+            let stop = Arc::new(AtomicBool::new(false));
+            let worker_stop = Arc::clone(&stop);
+            let worker = thread::spawn(move || {
+                let mut observed = Vec::new();
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !worker_stop.load(Ordering::Acquire) && Instant::now() < deadline {
+                    let (mut stream, _) = match listener.accept() {
+                        Ok(connection) => connection,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(1));
+                            continue;
+                        }
+                        Err(error) => panic!("OAuth test accept: {error}"),
+                    };
+                    let request = read_host_oauth_loopback_request(&mut stream)
+                        .unwrap_or_else(|| ("incomplete".into(), String::new(), String::new()));
+                    observed.push(request);
+                    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+                    if observed.len() == 1 {
+                        // Early refusal of oversized/redirect responses may
+                        // close the socket before the body is written.
+                        let _ = stream.write_all(&response);
+                    } else {
+                        // If redirects are accidentally enabled, let the
+                        // redirected exchange finish instead of hanging.
+                        let _ = stream.write_all(&host_oauth_success_http_response());
+                    }
+                }
+                observed
+            });
+            Self {
+                base_url,
+                stop,
+                worker: Some(worker),
+            }
+        }
+
+        fn finish(mut self) -> Vec<(String, String, String)> {
+            self.stop.store(true, Ordering::Release);
+            self.worker
+                .take()
+                .expect("OAuth test worker")
+                .join()
+                .expect("OAuth test worker completed")
+        }
+    }
+
+    impl Drop for HostOAuthTransportTestServer {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+        }
+    }
+
+    fn host_oauth_http_response(
+        status: u16,
+        extra_headers: &str,
+        body: &[u8],
+        chunked: bool,
+    ) -> Vec<u8> {
+        let framing = if chunked {
+            "Transfer-Encoding: chunked\r\n".to_owned()
+        } else {
+            format!("Content-Length: {}\r\n", body.len())
+        };
+        let mut response = format!(
+            "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\n\
+             Connection: close\r\n{framing}{extra_headers}\r\n"
+        )
+        .into_bytes();
+        if chunked {
+            response.extend_from_slice(format!("{:x}\r\n", body.len()).as_bytes());
+            response.extend_from_slice(body);
+            response.extend_from_slice(b"\r\n0\r\n\r\n");
+        } else {
+            response.extend_from_slice(body);
+        }
+        response
+    }
+
+    fn host_oauth_success_http_response() -> Vec<u8> {
+        let body = serde_json::to_vec(&json!({
+            "access_token": "host-access-secret",
+            "refresh_token": "host-refresh-secret",
+            "token_type": "Bearer",
+            "expires_in": 300,
+            "scope": "repo",
+            "device_code": "host-device-secret",
+            "user_code": "HOST-USER",
+            "verification_uri": "https://provider.example/device",
+            "interval": 1
+        }))
+        .unwrap();
+        host_oauth_http_response(200, "", &body, false)
+    }
+
+    async fn host_oauth_transport_test_exchange(
+        flow: &str,
+        base_url: &str,
+    ) -> Result<(), AuthError> {
+        let transport = BlockingOAuthTransport::new()?;
+        let token_url = format!("{base_url}/token?secret=host-query-secret");
+        let cx = fcp_async_core::compatibility_cx();
+        match flow {
+            "device-start" => {
+                let config = OAuthDeviceCodeConfig::new(
+                    "host-client",
+                    format!("{base_url}/device"),
+                    token_url,
+                    "repo",
+                )?;
+                OAuthDeviceCodeFlow::start(&cx, config, &transport)
+                    .await
+                    .map(|_| ())
+            }
+            "device-poll" => {
+                let config = OAuthDeviceCodeConfig::new(
+                    "host-client",
+                    format!("{base_url}/device"),
+                    token_url,
+                    "repo",
+                )?;
+                let challenge = OAuthDeviceCodeChallenge::new(
+                    "host-device-secret",
+                    "HOST-USER",
+                    "https://provider.example/device",
+                    Option::<String>::None,
+                    Utc::now() + chrono::TimeDelta::minutes(5),
+                    Duration::from_secs(1),
+                )?;
+                transport.poll(&config, &challenge).await.map(|_| ())
+            }
+            "auth-code" => {
+                let config = OAuthAuthCodeConfig::confidential_client(
+                    "host-client",
+                    "host-client-secret",
+                    "https://provider.example/authorize",
+                    token_url,
+                    "http://127.0.0.1/callback",
+                    "repo",
+                    true,
+                )?;
+                let flow = OAuthAuthCodeFlow::start(config)?;
+                let callback = OAuthAuthCodeCallback::authorized(
+                    "host-code-secret",
+                    flow.request().state().expose_secret(),
+                )?;
+                let grant = flow.complete_callback(callback)?;
+                flow.exchange(&cx, &transport, &grant).await.map(|_| ())
+            }
+            "refresh" => {
+                let config = OAuthRefreshTokenConfig::confidential_client(
+                    "host-client",
+                    "host-client-secret",
+                    token_url,
+                    Some("repo"),
+                )?;
+                let grant = OAuthRefreshTokenGrant::new("host-refresh-secret")?;
+                fcp_provider_auth::OAuthRefreshTokenFlow::refresh(
+                    &cx,
+                    &config,
+                    &grant,
+                    &transport,
+                )
+                .await
+                .map(|_| ())
+            }
+            _ => panic!("unknown OAuth fixture flow"),
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn host_oauth_transport_refuses_same_and_cross_origin_redirects_for_every_flow() {
+        for status in [301, 302, 303, 307, 308] {
+            for cross_origin in [false, true] {
+                for flow in ["device-start", "device-poll", "auth-code", "refresh"] {
+                    let target = HostOAuthTransportTestServer::start(|_| {
+                        host_oauth_success_http_response()
+                    });
+                    let source = HostOAuthTransportTestServer::start(|source_url| {
+                        let destination = if cross_origin {
+                            target.base_url.as_str()
+                        } else {
+                            source_url
+                        };
+                        host_oauth_http_response(
+                            status,
+                            &format!(
+                                "Location: {destination}/redirect?secret=host-location-secret\r\n"
+                            ),
+                            br#"{"access_token":"host-response-secret","token_type":"Bearer"}"#,
+                            false,
+                        )
+                    });
+                    let error = host_oauth_transport_test_exchange(flow, &source.base_url)
+                        .await
+                        .expect_err("credential-bearing OAuth redirects must be refused");
+                    let diagnostic = error.to_string();
+                    assert!(diagnostic.contains(&format!("HTTP {status}")));
+                    assert!(diagnostic.contains("redirects are not permitted"));
+                    for secret in [
+                        "host-query-secret",
+                        "host-location-secret",
+                        "host-response-secret",
+                        "host-client-secret",
+                        "host-code-secret",
+                        "host-device-secret",
+                        "host-refresh-secret",
+                    ] {
+                        assert!(!diagnostic.contains(secret));
+                    }
+                    let source_requests = source.finish();
+                    let target_requests = target.finish();
+                    assert_eq!(source_requests.len(), 1, "{flow}, {status}, {cross_origin}");
+                    assert!(target_requests.is_empty(), "{flow}, {status}, {cross_origin}");
+                    assert_eq!(source_requests[0].0, "POST");
+                    assert!(source_requests[0].2.contains("client_id=host-client"));
+                    match flow {
+                        "device-poll" => {
+                            assert!(source_requests[0].2.contains("device_code=host-device-secret"));
+                        }
+                        "auth-code" => {
+                            assert!(source_requests[0].2.contains("code=host-code-secret"));
+                            assert!(source_requests[0].2.contains("code_verifier="));
+                            assert!(source_requests[0].2.contains("client_secret=host-client-secret"));
+                        }
+                        "refresh" => {
+                            assert!(source_requests[0].2.contains("refresh_token=host-refresh-secret"));
+                            assert!(source_requests[0].2.contains("client_secret=host-client-secret"));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn host_oauth_transport_preserves_successful_provider_exchanges() {
+        for flow in ["device-start", "device-poll", "auth-code", "refresh"] {
+            let provider =
+                HostOAuthTransportTestServer::start(|_| host_oauth_success_http_response());
+            host_oauth_transport_test_exchange(flow, &provider.base_url)
+                .await
+                .expect("normal provider responses remain usable");
+            assert_eq!(provider.finish().len(), 1, "{flow}");
+        }
+    }
+
+    #[test]
+    fn host_oauth_transport_bounds_fixed_and_chunked_responses_at_the_same_limit() {
+        let transport = BlockingOAuthTransport::new().unwrap();
+        for chunked in [false, true] {
+            for extra in [0, 1] {
+                let body = serde_json::to_vec(&json!({
+                    "pad": "x".repeat(MAX_HOST_OAUTH_RESPONSE_BYTES - 10 + extra)
+                }))
+                .unwrap();
+                assert_eq!(body.len(), MAX_HOST_OAUTH_RESPONSE_BYTES + extra);
+                let provider = HostOAuthTransportTestServer::start(|_| {
+                    host_oauth_http_response(200, "", &body, chunked)
+                });
+                let result = transport.post_form_json("oauth_refresh", &provider.base_url, &[]);
+                if extra == 0 {
+                    assert!(result.unwrap()["pad"].is_string());
+                } else {
+                    assert!(result.unwrap_err().to_string().contains("size limit"));
+                }
+                assert_eq!(provider.finish().len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn host_oauth_transport_refuses_malformed_and_non_success_token_responses() {
+        let transport = BlockingOAuthTransport::new().unwrap();
+        for (status, body, expected) in [
+            (200, "host-body-secret", "not valid JSON"),
+            (200, "[\"host-body-secret\"]", "JSON object"),
+            (
+                503,
+                "{\"access_token\":\"host-body-secret\"}",
+                "HTTP 503",
+            ),
+            (307, "{\"access_token\":\"host-body-secret\"}", "redirects are not permitted"),
+        ] {
+            let provider = HostOAuthTransportTestServer::start(|_| {
+                host_oauth_http_response(status, "", body.as_bytes(), false)
+            });
+            let error = transport
+                .post_form_json("oauth_refresh", &provider.base_url, &[])
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected));
+            assert!(!error.contains("host-body-secret"));
+            assert_eq!(provider.finish().len(), 1);
+        }
+        let error = transport
+            .post_form_json("oauth_refresh", "http://[host-url-secret", &[])
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("host-url-secret"));
+    }
+
+    #[test]
+    fn host_oauth_provider_errors_preserve_codes_without_reflecting_secret_material() {
+        for code in ["invalid_grant", "slow_down", "host-error-secret"] {
+            let body = json!({
+                "error": code,
+                "error_description": "host-description-secret",
+                "error_uri": "https://provider.example/error?token=host-uri-secret"
+            });
+            let (actual, reason) = oauth_provider_error_parts(&body, None);
+            assert_eq!(
+                actual,
+                if code == "host-error-secret" { "provider_error" } else { code }
+            );
+            assert!(reason.contains("withheld"));
+            let error = oauth_provider_rejection("oauth_refresh", &body, None).to_string();
+            for secret in ["host-error-secret", "host-description-secret", "host-uri-secret"] {
+                assert!(!error.contains(secret));
+            }
+        }
+        assert_eq!(
+            oauth_provider_error_parts(&json!({}), Some(StatusCode::BAD_REQUEST)).0,
+            "http_400"
+        );
+    }
+
+    #[test]
+    fn host_oauth_device_expiry_overflow_is_rejected_without_panicking() {
+        let config = OAuthDeviceCodeConfig::new(
+            "host-client",
+            "https://provider.example/device",
+            "https://provider.example/token",
+            "repo",
+        )
+        .unwrap();
+        let error = oauth_challenge_from_value(
+            &config,
+            &json!({
+                "device_code": "host-device-secret",
+                "user_code": "HOST-USER",
+                "verification_uri": "https://provider.example/device",
+                "expires_in": 10_000_000_000_000_u64,
+                "interval": 1
+            }),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("expiry"));
+        assert!(!error.to_string().contains("host-device-secret"));
     }
 
     fn host_oauth_query_value(url: &str, field: &str) -> Option<String> {
