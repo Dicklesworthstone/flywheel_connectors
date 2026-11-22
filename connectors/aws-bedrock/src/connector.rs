@@ -1,27 +1,39 @@
 //! AWS Bedrock connector implementation.
 
+use std::sync::OnceLock;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use fcp_async_core::time;
 use fcp_prelude::{
-    AgentHint, BaseConnector, CapabilityGrant, CapabilityId, CapabilityVerifier, ConnectorId,
-    ConnectorMetrics, EventCaps, FcpConnector, FcpError, FcpResult, HandshakeRequest,
-    HandshakeResponse, HealthSnapshot, IdempotencyClass, Introspection, InvokeRequest,
-    InvokeResponse, OperationId, OperationInfo, RiskLevel, SafetyTier, SelfCheckReport, SessionId,
-    ShutdownRequest, SimulateRequest, SimulateResponse, SubscribeRequest, SubscribeResponse,
-    UnsubscribeRequest,
+    AgentHint, BaseConnector, CapabilityId, ConnectorId, ConnectorMetrics, EventCaps,
+    FcpConnector, FcpError, FcpResult, HandshakeRequest, HandshakeResponse, HealthSnapshot,
+    IdempotencyClass, Introspection, InvokeRequest, InvokeResponse, OperationId, OperationInfo,
+    RiskLevel, SafetyTier, SelfCheckReport, ShutdownRequest, SimulateRequest, SimulateResponse,
+    SubscribeRequest, SubscribeResponse, UnsubscribeRequest, ZoneId,
 };
 use fcp_sdk::migration::HttpRetryConfig;
+use fcp_sdk::prelude::{OperationContractSet, StandaloneSession};
 use fcp_sdk::{ConnectorRuntime, ConnectorRuntimeConfig};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use url::Url;
 
 use crate::client::BedrockClient;
-use crate::types::{BedrockAuth, ConverseInput, InvokeModelInput, ListModelsInput};
+use crate::types::{BedrockAuth, ConverseInput, InvokeModelInput, ListModelsInput, ModelListSource};
 
 const MANIFEST_TOML: &str = include_str!("../manifest.toml");
+// Complete serialized FCP response bytes, not a claim about upstream HTTP bytes.
+const MAX_NATIVE_RESPONSE_BYTES: u64 = 32 * 1024 * 1024;
+
+fn operation_contracts() -> FcpResult<&'static OperationContractSet> {
+    static CONTRACTS: OnceLock<FcpResult<OperationContractSet>> = OnceLock::new();
+    CONTRACTS
+        .get_or_init(|| OperationContractSet::from_manifest_toml(MANIFEST_TOML))
+        .as_ref()
+        .map_err(Clone::clone)
+}
 
 const OP_CONVERSE: &str = "aws_bedrock.converse";
 const OP_CONVERSE_STREAM: &str = "aws_bedrock.converse_stream";
@@ -333,14 +345,39 @@ impl DoctorResult {
     }
 }
 
-#[derive(Debug)]
 pub struct BedrockConnector {
     base: BaseConnector,
     config: Option<BedrockConfig>,
     client: Option<BedrockClient>,
     runtime: Option<ConnectorRuntime>,
     started_at: Instant,
-    verifier: Option<CapabilityVerifier>,
+    authority: Option<StandaloneSession>,
+    configured_zone: Option<ZoneId>,
+}
+
+impl std::fmt::Debug for BedrockConnector {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BedrockConnector")
+            .field("id", &self.base.id)
+            .field("instance_id", &self.base.instance_id)
+            .field("configured", &self.config.is_some())
+            .field("handshaken", &self.session_established())
+            .finish_non_exhaustive()
+    }
+}
+
+enum PreparedOperation {
+    Converse {
+        input: Box<ConverseInput>,
+        streaming: bool,
+    },
+    InvokeModel {
+        input: Box<InvokeModelInput>,
+        streaming: bool,
+    },
+    ListModels(ListModelsInput),
+    Health,
 }
 
 impl BedrockConnector {
@@ -351,12 +388,62 @@ impl BedrockConnector {
             client: None,
             runtime: None,
             started_at: Instant::now(),
-            verifier: None,
+            authority: None,
+            configured_zone: None,
         }
     }
 
     pub fn instance_id(&self) -> &fcp_prelude::InstanceId {
         &self.base.instance_id
+    }
+
+    fn session_established(&self) -> bool {
+        self.base.handshaken.load(Ordering::Acquire)
+            && self.authority.as_ref().is_some_and(StandaloneSession::is_established)
+    }
+
+    /// Revoke the old grant before parsing a new native lifecycle request.
+    /// A malformed handshake must not leave its predecessor usable.
+    pub fn invalidate_session(&mut self) {
+        self.base.set_handshaken(false);
+        if let Some(authority) = self.authority.as_mut() {
+            authority.invalidate();
+            self.base.instance_id = authority.instance_id().clone();
+        } else {
+            self.base.instance_id = fcp_prelude::InstanceId::new();
+        }
+    }
+
+    fn clear_configuration(&mut self) {
+        self.invalidate_session();
+        self.base.set_configured(false);
+        self.authority = None;
+        self.configured_zone = None;
+        self.client = None;
+        self.config = None;
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown();
+        }
+    }
+
+    /// Decode a native invocation without restarting its deadline after parsing.
+    pub async fn handle_invoke(&self, params: Value) -> FcpResult<InvokeResponse> {
+        let started_at = Instant::now();
+        let request = serde_json::from_value(params).map_err(|_| FcpError::InvalidRequest {
+            code: 1003,
+            message: "Invalid FCP invoke request".into(),
+        })?;
+        self.invoke_started(request, started_at).await
+    }
+
+    async fn invoke_started(
+        &self,
+        request: InvokeRequest,
+        started_at: Instant,
+    ) -> FcpResult<InvokeResponse> {
+        let result = self.invoke_inner(request, started_at).await;
+        self.base.record_request(result.is_ok());
+        result
     }
 
     fn manifest_hash() -> String {
@@ -452,7 +539,8 @@ impl BedrockConnector {
             "configured": self.config.is_some(),
             "client_initialized": self.client.is_some(),
             "runtime_initialized": self.runtime.is_some(),
-            "handshaken": self.base.handshaken.load(Ordering::Acquire),
+            "handshaken": self.session_established(),
+            "instance_id": self.instance_id(),
             "manifest_hash": Self::manifest_hash(),
             "verification_script": VERIFICATION_SCRIPT_PATH,
             "artifact_root_hint": ARTIFACT_ROOT_HINT,
@@ -930,11 +1018,11 @@ impl FcpConnector for BedrockConnector {
     }
 
     async fn configure(&mut self, config: serde_json::Value) -> FcpResult<()> {
+        // Clear credentials and authority before any fallible replacement work.
+        self.clear_configuration();
         let cfg = BedrockConfig::from_value(config)?;
-        self.runtime = Some(ConnectorRuntime::new(
-            ConnectorRuntimeConfig::default()
-                .with_request_timeout(Duration::from_millis(cfg.request_timeout_ms)),
-        ));
+        operation_contracts()?;
+        let authority = StandaloneSession::new(MANIFEST_TOML)?;
         let client = BedrockClient::new(
             cfg.auth.clone(),
             &cfg.region,
@@ -948,47 +1036,50 @@ impl FcpConnector for BedrockConnector {
         .map_err(|error| FcpError::Internal {
             message: format!("Client init: {error}"),
         })?;
+        let runtime = ConnectorRuntime::new(
+            ConnectorRuntimeConfig::default()
+                .with_request_timeout(Duration::from_millis(cfg.request_timeout_ms)),
+        );
+        self.base.instance_id = authority.instance_id().clone();
+        self.authority = Some(authority);
+        self.runtime = Some(runtime);
         self.client = Some(client);
         self.config = Some(cfg);
-        self.verifier = None;
         self.base.set_configured(true);
-        self.base.set_handshaken(false);
         Ok(())
     }
 
     async fn handshake(&mut self, req: HandshakeRequest) -> FcpResult<HandshakeResponse> {
-        if !self.base.configured.load(Ordering::Acquire) {
+        self.invalidate_session();
+        if !self.base.configured.load(Ordering::Acquire)
+            || self.config.is_none()
+            || self.client.is_none()
+            || self.runtime.is_none()
+        {
             return Err(FcpError::NotConfigured);
         }
+        if !matches!(req.zone.as_str(), "z:work" | "z:private")
+            || self.configured_zone.as_ref().is_some_and(|zone| zone != &req.zone)
+        {
+            return Err(FcpError::CapabilityDenied {
+                capability: "aws_bedrock.handshake".into(),
+                reason: "Bedrock requires an allowed zone matching the configured session; reconfigure before changing zones".into(),
+            });
+        }
+        let zone = req.zone.clone();
+        let authority = self.authority.as_mut().ok_or(FcpError::NotConfigured)?;
+        let result = authority.handshake(req);
+        self.base.instance_id = authority.instance_id().clone();
+        let mut response = result?;
+        self.configured_zone = Some(zone);
         self.base.set_handshaken(true);
-        self.verifier = Some(CapabilityVerifier::new(
-            req.host_public_key,
-            req.zone.clone(),
-            self.base.instance_id.clone(),
-        ));
-        let capabilities_granted = req
-            .capabilities_requested
-            .into_iter()
-            .map(|capability| CapabilityGrant {
-                capability,
-                operation: None,
-            })
-            .collect();
-        Ok(HandshakeResponse {
-            status: "accepted".into(),
-            capabilities_granted,
-            session_id: SessionId::new(),
-            manifest_hash: Self::manifest_hash(),
-            nonce: req.nonce,
-            event_caps: Some(EventCaps {
-                streaming: true,
-                replay: false,
-                min_buffer_events: 0,
-                requires_ack: false,
-            }),
-            auth_caps: None,
-            op_catalog_hash: None,
-        })
+        response.event_caps = Some(EventCaps {
+            streaming: true,
+            replay: false,
+            min_buffer_events: 0,
+            requires_ack: false,
+        });
+        Ok(response)
     }
 
     async fn health(&self) -> HealthSnapshot {
@@ -1000,20 +1091,20 @@ impl FcpConnector for BedrockConnector {
             None => HealthSnapshot::degraded("not configured"),
             Some(_) if self.client.is_none() => HealthSnapshot::error("client not initialized"),
             Some(_) if self.runtime.is_none() => HealthSnapshot::error("runtime not initialized"),
-            Some(readiness) if readiness.default_control_plane_would_touch_aws => {
-                HealthSnapshot::degraded(
-                    "default Bedrock endpoints configured; self_check abstains from production AWS",
-                )
+            Some(_) if !self.session_established() => {
+                HealthSnapshot::degraded("not handshaken")
             }
             Some(_) => HealthSnapshot::ready(),
         };
         snapshot.uptime_ms =
             u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
         snapshot.details = Some(json!({
-            "configured": self.config.is_some(),
+            "configured": self.config.is_some() && self.base.configured.load(Ordering::Acquire),
             "client_initialized": self.client.is_some(),
             "runtime_initialized": self.runtime.is_some(),
-            "handshaken": self.base.handshaken.load(Ordering::Acquire),
+            "handshaken": self.session_established(),
+            "instance_id": self.instance_id(),
+            "readiness_scope": "configured local runtime and negotiated authority; not a live AWS health proof",
             "manifest_hash": Self::manifest_hash(),
             "verification_script": VERIFICATION_SCRIPT_PATH,
             "artifact_root_hint": ARTIFACT_ROOT_HINT,
@@ -1073,42 +1164,43 @@ impl FcpConnector for BedrockConnector {
     }
 
     async fn simulate(&self, req: SimulateRequest) -> FcpResult<SimulateResponse> {
-        let capability = match required_capability(req.operation.as_str()) {
-            Ok(capability) => capability,
+        if req.r#type != "simulate" || req.id.0.is_empty() || !req.input.is_object() {
+            return Err(FcpError::InvalidRequest {
+                code: 1003,
+                message: "Simulation requires a typed request, non-empty ID and object input".into(),
+            });
+        }
+        let authorization = self
+            .prepare_operation(&req.operation, &req.input)
+            .and_then(|(_, resources)| {
+                self.authority
+                    .as_ref()
+                    .ok_or(FcpError::NotHandshaken)?
+                    .authorize(
+                        &req.connector_id,
+                        &req.zone_id,
+                        &req.operation,
+                        req.capability_token,
+                        &resources,
+                    )
+                    .map(drop)
+            });
+        Ok(match authorization {
+            Ok(()) => SimulateResponse::allowed(req.id),
             Err(error) => {
-                return Ok(SimulateResponse::denied(
-                    req.id,
-                    error.to_string(),
-                    error.error_code(),
-                ));
+                let mut response =
+                    SimulateResponse::denied(req.id, error.to_string(), error.error_code());
+                if matches!(
+                    error,
+                    FcpError::CapabilityDenied { .. } | FcpError::OperationNotGranted { .. }
+                ) && let Ok(capability) = required_capability(req.operation.as_str())
+                {
+                    response = response
+                        .with_missing_capabilities(vec![capability.as_str().to_owned()]);
+                }
+                response
             }
-        };
-        if self.client.is_none() || self.runtime.is_none() {
-            return Ok(SimulateResponse::denied(
-                req.id,
-                "Connector is not configured",
-                FcpError::NotConfigured.error_code(),
-            ));
-        }
-        let Some(verifier) = self.verifier.as_ref() else {
-            return Ok(SimulateResponse::denied(
-                req.id,
-                "Connector has not completed handshake",
-                FcpError::NotHandshaken.error_code(),
-            ));
-        };
-        if let Err(error) =
-            verifier.verify_bound(req.capability_token, &capability, &req.operation, &[])
-        {
-            let mut response =
-                SimulateResponse::denied(req.id, error.to_string(), error.error_code());
-            if error.error_code() == "FCP-3001" {
-                response =
-                    response.with_missing_capabilities(vec![capability.as_str().to_string()]);
-            }
-            return Ok(response);
-        }
-        Ok(SimulateResponse::allowed(req.id))
+        })
     }
 
     fn metrics(&self) -> ConnectorMetrics {
@@ -1116,15 +1208,7 @@ impl FcpConnector for BedrockConnector {
     }
 
     async fn shutdown(&mut self, _req: ShutdownRequest) -> FcpResult<()> {
-        if let Some(runtime) = &self.runtime {
-            runtime.shutdown();
-        }
-        self.runtime = None;
-        self.client = None;
-        self.config = None;
-        self.verifier = None;
-        self.base.set_configured(false);
-        self.base.set_handshaken(false);
+        self.clear_configuration();
         Ok(())
     }
 
@@ -1144,9 +1228,7 @@ impl FcpConnector for BedrockConnector {
     }
 
     async fn invoke(&self, req: InvokeRequest) -> FcpResult<InvokeResponse> {
-        let result = self.invoke_inner(req).await;
-        self.base.record_request(result.is_ok());
-        result
+        self.invoke_started(req, Instant::now()).await
     }
 
     async fn subscribe(&self, _req: SubscribeRequest) -> FcpResult<SubscribeResponse> {
@@ -1159,90 +1241,297 @@ impl FcpConnector for BedrockConnector {
 }
 
 impl BedrockConnector {
-    async fn invoke_inner(&self, req: InvokeRequest) -> FcpResult<InvokeResponse> {
+    fn prepare_operation(
+        &self,
+        operation: &OperationId,
+        input: &Value,
+    ) -> FcpResult<(PreparedOperation, Vec<String>)> {
         self.base.check_ready()?;
-        let operation = req.operation.as_str();
-        let capability = required_capability(operation)?;
-        let Some(verifier) = &self.verifier else {
-            return Err(FcpError::Internal {
-                message: "connector ready state missing capability verifier".into(),
-            });
-        };
-        verifier.verify_bound(req.capability_token, &capability, &req.operation, &[])?;
-
-        let runtime = self.runtime.as_ref().ok_or_else(|| FcpError::Internal {
-            message: "connector ready state missing runtime".into(),
-        })?;
-        let client = self.client.as_ref().ok_or_else(|| FcpError::Internal {
-            message: "connector ready state missing Bedrock client".into(),
-        })?;
-
-        let output = match operation {
-            OP_CONVERSE => {
-                let input: ConverseInput = serde_json::from_value(req.input.clone())
+        let config = self.config.as_ref().ok_or(FcpError::NotConfigured)?;
+        if self.client.is_none() || self.runtime.is_none() {
+            return Err(FcpError::NotConfigured);
+        }
+        required_capability(operation.as_str())?;
+        operation_contracts()?.validate_input(operation, input)?;
+        match operation.as_str() {
+            OP_CONVERSE | OP_CONVERSE_STREAM => {
+                let input: ConverseInput = serde_json::from_value(input.clone())
                     .map_err(|error| invalid_invoke_input(&error))?;
-                client
-                    .converse(runtime, &input)
-                    .await
-                    .map_err(|error| error.to_fcp_error())?
+                require_route_credentials(config, false)?;
+                validate_native_model_id(&input.model_id)?;
+                let resources = vec![model_resource(&input.model_id)];
+                Ok((
+                    PreparedOperation::Converse {
+                        input: Box::new(input),
+                        streaming: operation.as_str() == OP_CONVERSE_STREAM,
+                    },
+                    resources,
+                ))
             }
-            OP_CONVERSE_STREAM => {
-                let input: ConverseInput = serde_json::from_value(req.input.clone())
+            OP_INVOKE_MODEL | OP_INVOKE_MODEL_STREAM => {
+                let input: InvokeModelInput = serde_json::from_value(input.clone())
                     .map_err(|error| invalid_invoke_input(&error))?;
-                serde_json::to_value(
-                    client
-                        .converse_stream(runtime, &input)
-                        .await
-                        .map_err(|error| error.to_fcp_error())?,
-                )
-                .map_err(|error| serialize_error(&error))?
-            }
-            OP_INVOKE_MODEL => {
-                let input: InvokeModelInput = serde_json::from_value(req.input.clone())
-                    .map_err(|error| invalid_invoke_input(&error))?;
-                client
-                    .invoke_model(runtime, &input)
-                    .await
-                    .map_err(|error| error.to_fcp_error())?
-            }
-            OP_INVOKE_MODEL_STREAM => {
-                let input: InvokeModelInput = serde_json::from_value(req.input.clone())
-                    .map_err(|error| invalid_invoke_input(&error))?;
-                serde_json::to_value(
-                    client
-                        .invoke_model_stream(runtime, &input)
-                        .await
-                        .map_err(|error| error.to_fcp_error())?,
-                )
-                .map_err(|error| serialize_error(&error))?
+                let streaming = operation.as_str() == OP_INVOKE_MODEL_STREAM;
+                let mantle = input.is_mantle_anthropic_messages();
+                require_route_credentials(config, mantle)?;
+                if mantle {
+                    // Validate the final body, including raw-body precedence and
+                    // extra_body overrides, before authorizing the selected model.
+                    let body = input
+                        .mantle_anthropic_body(streaming)
+                        .map_err(|error| error.to_fcp_error())?;
+                    validate_mantle_body(&input.model_id, &body, streaming)?;
+                    validate_request_header(&input.mantle_beta_header())?;
+                } else {
+                    validate_native_model_id(&input.model_id)?;
+                    input.request_body().map_err(|error| error.to_fcp_error())?;
+                    for value in [
+                        Some(input.accept()),
+                        Some(input.content_type()),
+                        input.trace.as_deref(),
+                        input.guardrail_identifier.as_deref(),
+                        input.guardrail_version.as_deref(),
+                        input.performance_config_latency.as_deref(),
+                        input.service_tier.as_deref(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        validate_request_header(value)?;
+                    }
+                }
+                let resources = vec![model_resource(&input.model_id)];
+                Ok((
+                    PreparedOperation::InvokeModel {
+                        input: Box::new(input),
+                        streaming,
+                    },
+                    resources,
+                ))
             }
             OP_MODELS_LIST => {
-                let input: ListModelsInput = serde_json::from_value(req.input.clone())
+                let input: ListModelsInput = serde_json::from_value(input.clone())
                     .map_err(|error| invalid_invoke_input(&error))?;
-                serde_json::to_value(
-                    client
-                        .list_models(runtime, &input)
-                        .await
-                        .map_err(|error| error.to_fcp_error())?,
-                )
-                .map_err(|error| serialize_error(&error))?
+                let mantle = matches!(input.source, Some(ModelListSource::Mantle));
+                require_route_credentials(config, mantle)?;
+                let resource = if mantle {
+                    "aws-bedrock://models/mantle"
+                } else {
+                    "aws-bedrock://models/native"
+                };
+                Ok((PreparedOperation::ListModels(input), vec![resource.into()]))
             }
-            OP_HEALTH => serde_json::to_value(
+            OP_HEALTH => {
+                require_route_credentials(config, false)?;
+                Ok((
+                    PreparedOperation::Health,
+                    vec!["aws-bedrock://models/native".into()],
+                ))
+            }
+            _ => Err(FcpError::InvalidRequest {
+                code: 1004,
+                message: "Unknown Bedrock operation".into(),
+            }),
+        }
+    }
+
+    async fn invoke_inner(
+        &self,
+        req: InvokeRequest,
+        started_at: Instant,
+    ) -> FcpResult<InvokeResponse> {
+        if req.r#type != "invoke"
+            || req.id.0.is_empty()
+            || !req.input.is_object()
+            || req.deadline_ms == Some(0)
+        {
+            return Err(FcpError::InvalidRequest {
+                code: 1003,
+                message: "Invocation requires a typed request, non-empty ID, object input and a nonzero deadline".into(),
+            });
+        }
+        let (prepared, resources) = self.prepare_operation(&req.operation, &req.input)?;
+        let timeout_ms = self
+            .config
+            .as_ref()
+            .ok_or(FcpError::NotConfigured)?
+            .request_timeout_ms;
+        let budget = Duration::from_millis(
+            req.deadline_ms.unwrap_or(timeout_ms).min(timeout_ms),
+        );
+        let witness = self
+            .authority
+            .as_ref()
+            .ok_or(FcpError::NotHandshaken)?
+            .admit_bounded(&req, &resources, MAX_NATIVE_RESPONSE_BYTES)?;
+        // The witness owns the request identity and reservation. The typed
+        // operation owns its input, so release the original input before I/O.
+        drop(req.input);
+        let remaining = budget.saturating_sub(started_at.elapsed());
+        let result = if remaining.is_zero() {
+            // Never poll a provider future after preflight exhausted the budget.
+            Err(invocation_deadline())
+        } else {
+            time::timeout(remaining, self.dispatch_operation(prepared))
+                .await
+                .unwrap_or_else(|_| Err(invocation_deadline()))
+        };
+        let response = match result {
+            Ok(output) => InvokeResponse::ok(req.id.clone(), output),
+            Err(error) => InvokeResponse::error(req.id.clone(), error),
+        };
+        operation_contracts()?.validate_response(&req.operation, &req.id, &response)?;
+        // A ready provider future can finish synchronous decoding or contract
+        // checks after the timer's last poll. Do not publish that late result.
+        if started_at.elapsed() >= budget {
+            return Err(invocation_deadline());
+        }
+        witness.finish_response(&response)?;
+        match response {
+            InvokeResponse { error: Some(error), .. } => Err(error),
+            response => Ok(response),
+        }
+    }
+
+    async fn dispatch_operation(&self, operation: PreparedOperation) -> FcpResult<Value> {
+        let runtime = self.runtime.as_ref().ok_or(FcpError::NotConfigured)?;
+        let client = self.client.as_ref().ok_or(FcpError::NotConfigured)?;
+        match operation {
+            PreparedOperation::Converse { input, streaming: false } => client
+                .converse(runtime, &input)
+                .await
+                .map_err(|error| error.to_fcp_error()),
+            PreparedOperation::Converse { input, streaming: true } => serde_json::to_value(
+                client
+                    .converse_stream(runtime, &input)
+                    .await
+                    .map_err(|error| error.to_fcp_error())?,
+            )
+            .map_err(|error| serialize_error(&error)),
+            PreparedOperation::InvokeModel { input, streaming: false } => client
+                .invoke_model(runtime, &input)
+                .await
+                .map_err(|error| error.to_fcp_error()),
+            PreparedOperation::InvokeModel { input, streaming: true } => serde_json::to_value(
+                client
+                    .invoke_model_stream(runtime, &input)
+                    .await
+                    .map_err(|error| error.to_fcp_error())?,
+            )
+            .map_err(|error| serialize_error(&error)),
+            PreparedOperation::ListModels(input) => serde_json::to_value(
+                client
+                    .list_models(runtime, &input)
+                    .await
+                    .map_err(|error| error.to_fcp_error())?,
+            )
+            .map_err(|error| serialize_error(&error)),
+            PreparedOperation::Health => serde_json::to_value(
                 client
                     .health_check(runtime)
                     .await
                     .map_err(|error| error.to_fcp_error())?,
             )
-            .map_err(|error| serialize_error(&error))?,
-            _ => {
-                return Err(FcpError::InvalidRequest {
-                    code: 1004,
-                    message: format!("Unknown operation: {operation}"),
-                });
-            }
-        };
+            .map_err(|error| serialize_error(&error)),
+        }
+    }
+}
 
-        Ok(InvokeResponse::ok(req.id, output))
+fn require_route_credentials(config: &BedrockConfig, mantle: bool) -> FcpResult<()> {
+    let available = if mantle {
+        config.mantle_bearer_token.is_some()
+    } else {
+        config.auth.has_sigv4_credentials()
+    };
+    if available {
+        Ok(())
+    } else {
+        Err(FcpError::Unauthorized {
+            code: 2001,
+            message: if mantle {
+                "This operation requires configured Bedrock Mantle bearer credentials"
+            } else {
+                "This operation requires configured AWS SigV4 credentials"
+            }
+            .into(),
+        })
+    }
+}
+
+fn validate_native_model_id(model_id: &str) -> FcpResult<()> {
+    // The client interpolates this identifier as one URL path segment. Refuse
+    // characters the URL parser could reinterpret, including percent escapes.
+    if model_id.is_empty()
+        || model_id == "."
+        || model_id.contains("..")
+        || !model_id.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':')
+        })
+    {
+        return Err(FcpError::InvalidRequest {
+            code: 1003,
+            message: "Native model_id must be one literal Bedrock model or inference-profile identifier without path, query, fragment or encoding syntax".into(),
+        });
+    }
+    Ok(())
+}
+
+fn model_resource(model_id: &str) -> String {
+    // Encode literal wildcard and percent bytes too: distinct model IDs must
+    // remain distinct resources under capability glob matching.
+    use std::fmt::Write as _;
+    let mut resource = String::from("aws-bedrock://model/");
+    for byte in model_id.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            resource.push(char::from(byte));
+        } else {
+            write!(resource, "%{byte:02X}").expect("writing to a String cannot fail");
+        }
+    }
+    resource
+}
+
+fn validate_mantle_body(model_id: &str, body: &Value, streaming: bool) -> FcpResult<()> {
+    let actual_stream = match body.get("stream") {
+        None => Some(false),
+        Some(value) => value.as_bool(),
+    };
+    if body.get("model").and_then(Value::as_str) != Some(model_id)
+        || actual_stream != Some(streaming)
+    {
+        return Err(FcpError::InvalidRequest {
+            code: 1003,
+            message: "Rendered Mantle body must preserve model_id and the operation's stream mode".into(),
+        });
+    }
+    if !body.get("messages").and_then(Value::as_array).is_some_and(|messages| {
+        !messages.is_empty() && messages.iter().all(Value::is_object)
+    }) || !body.get("max_tokens").and_then(Value::as_u64).is_some_and(|limit| limit > 0)
+    {
+        return Err(FcpError::InvalidRequest {
+            code: 1003,
+            message: "Rendered Mantle body requires nonempty object messages and positive max_tokens".into(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_request_header(value: &str) -> FcpResult<()> {
+    reqwest::header::HeaderValue::from_str(value)
+        .map(drop)
+        .map_err(|_| FcpError::InvalidRequest {
+            code: 1003,
+            message: "Invalid Bedrock request header value".into(),
+        })
+}
+
+fn invocation_deadline() -> FcpError {
+    FcpError::External {
+        service: "aws-bedrock".into(),
+        message: "Bedrock invocation deadline exceeded; outcome is unknown; reconcile provider effects before retry".into(),
+        status_code: None,
+        retryable: false,
+        retry_after: None,
     }
 }
 
@@ -1262,6 +1551,57 @@ fn serialize_error(error: &serde_json::Error) -> FcpError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_resources_keep_wildcards_and_percent_encodings_distinct() {
+        assert_eq!(
+            model_resource("anthropic.claude-v2:1"),
+            "aws-bedrock://model/anthropic.claude-v2%3A1"
+        );
+        assert_eq!(model_resource("literal*model"), "aws-bedrock://model/literal%2Amodel");
+        assert_eq!(model_resource("literal%2Amodel"), "aws-bedrock://model/literal%252Amodel");
+        assert_ne!(model_resource("literal*model"), model_resource("literal%2Amodel"));
+        assert_ne!(model_resource("model:1"), model_resource("model%3A1"));
+        assert_eq!(model_resource("雪"), "aws-bedrock://model/%E9%9B%AA");
+    }
+
+    #[test]
+    fn native_model_routes_reject_url_normalization_and_escape_syntax() {
+        assert!(validate_native_model_id("us.anthropic.claude-v2:1").is_ok());
+        for model in [
+            "", ".", "..", "model..suffix", "model/other", "model\\other",
+            "model?route=other", "model#fragment", "model%2Fother",
+            "model%252Fother", " model", "model\n", "model*",
+        ] {
+            assert!(validate_native_model_id(model).is_err(), "{model:?}");
+        }
+    }
+
+    #[test]
+    fn rendered_mantle_contract_checks_effective_model_stream_and_messages() {
+        let body = json!({
+            "model": "model-a",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 1
+        });
+        assert!(validate_mantle_body("model-a", &body, false).is_ok());
+        assert!(validate_mantle_body("model-b", &body, false).is_err());
+        assert!(validate_mantle_body("model-a", &body, true).is_err());
+        for (field, value) in [
+            ("stream", json!("false")),
+            ("messages", json!([])),
+            ("messages", json!(["not an object"])),
+            ("max_tokens", json!(0)),
+        ] {
+            let mut invalid = body.clone();
+            invalid[field] = value;
+            assert!(validate_mantle_body("model-a", &invalid, false).is_err());
+        }
+        let mut streaming = body;
+        streaming["stream"] = json!(true);
+        assert!(validate_mantle_body("model-a", &streaming, true).is_ok());
+        assert!(validate_mantle_body("model-a", &streaming, false).is_err());
+    }
 
     const EXPECTED_MANIFEST_SCHEMA_OPS: &[(&str, &str)] = &[
         (OP_CONVERSE, "aws_bedrock.converse"),
@@ -1425,6 +1765,7 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn manifest_operation_schemas_compile_and_validate_core_payloads() -> Result<(), String> {
+        operation_contracts().map_err(|error| error.to_string())?;
         let manifest = bedrock_manifest()?;
         let operations = manifest_operations(&manifest)?;
         let operation_catalog = BedrockConnector::new().introspect().operations;
