@@ -280,18 +280,22 @@ const DEFAULT_TELEGRAM_WEBHOOK_INGRESS_MAX_BODY_BYTES: usize = 1024 * 1024;
 const DEFAULT_TELEGRAM_WEBHOOK_INGRESS_TIMEOUT_MS: u64 = 5_000;
 
 static AUTH_PROFILE_STORE: OnceLock<Arc<InMemoryAuthProfileStore>> = OnceLock::new();
-static AUTH_OAUTH_PENDING_STORE: OnceLock<Arc<Mutex<AuthOAuthPendingStore>>> = OnceLock::new();
+// These guards span in-memory vault awaits in Axum handlers. The compatibility
+// mutex guard is !Send; futures_util's guard preserves the handler Send bound.
+static AUTH_OAUTH_PENDING_STORE: OnceLock<Arc<futures_util::lock::Mutex<AuthOAuthPendingStore>>> =
+    OnceLock::new();
 static AUTH_OAUTH_LOGIN_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 fn auth_profile_store() -> Arc<InMemoryAuthProfileStore> {
     Arc::clone(AUTH_PROFILE_STORE.get_or_init(|| Arc::new(InMemoryAuthProfileStore::new())))
 }
 
-fn auth_oauth_pending_store() -> Arc<Mutex<AuthOAuthPendingStore>> {
-    Arc::clone(
-        AUTH_OAUTH_PENDING_STORE
-            .get_or_init(|| Arc::new(Mutex::new(AuthOAuthPendingStore::default()))),
-    )
+fn auth_oauth_pending_store() -> Arc<futures_util::lock::Mutex<AuthOAuthPendingStore>> {
+    Arc::clone(AUTH_OAUTH_PENDING_STORE.get_or_init(|| {
+        Arc::new(futures_util::lock::Mutex::new(
+            AuthOAuthPendingStore::default(),
+        ))
+    }))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -11660,18 +11664,157 @@ struct AuthOAuthPendingStore {
     auth_code: BTreeMap<String, PendingAuthCodeLogin>,
 }
 
-#[derive(Debug, Clone)]
+// A removed flow cannot be cloned or polled concurrently. Its slot remains
+// until the claim finishes, so logout/replacement can revoke it during I/O.
+#[derive(Debug)]
 struct PendingDeviceCodeLogin {
-    provider: String,
-    profile_id: String,
-    flow: OAuthDeviceCodeFlow,
+    profile: AuthProfile,
+    flow: Option<OAuthDeviceCodeFlow>,
+    claim: Arc<()>,
+    expires_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct PendingAuthCodeLogin {
-    provider: String,
-    profile_id: String,
+    profile: AuthProfile,
     flow: OAuthAuthCodeFlow,
+    expires_at: DateTime<Utc>,
+}
+
+const AUTH_OAUTH_LOGIN_TTL_SECS: i64 = 15 * 60;
+
+fn auth_oauth_login_conflict() -> (StatusCode, String) {
+    (
+        StatusCode::CONFLICT,
+        "OAuth login is no longer current or is already being completed; start a new login if needed"
+            .to_owned(),
+    )
+}
+
+fn auth_oauth_login_deadline() -> Result<DateTime<Utc>, (StatusCode, String)> {
+    Utc::now()
+        .checked_add_signed(chrono::Duration::seconds(AUTH_OAUTH_LOGIN_TTL_SECS))
+        .ok_or_else(auth_oauth_login_conflict)
+}
+
+fn auth_oauth_profile_matches(profile: &AuthProfile, provider: &str, profile_id: &str) -> bool {
+    profile.provider.eq_ignore_ascii_case(provider.trim()) && profile.id == profile_id
+}
+
+impl AuthOAuthPendingStore {
+    fn retain_live(&mut self, now: DateTime<Utc>) {
+        self.device.retain(|_, pending| pending.expires_at > now);
+        self.auth_code.retain(|_, pending| pending.expires_at > now);
+    }
+
+    fn invalidate_profile(&mut self, provider: &str, profile_id: &str) {
+        self.device.retain(|_, pending| {
+            !auth_oauth_profile_matches(&pending.profile, provider, profile_id)
+        });
+        self.auth_code.retain(|_, pending| {
+            !auth_oauth_profile_matches(&pending.profile, provider, profile_id)
+        });
+    }
+
+    fn claim_device(
+        &mut self,
+        login_id: &str,
+        provider: &str,
+        profile_id: &str,
+    ) -> Result<(AuthProfile, OAuthDeviceCodeFlow, Arc<()>), (StatusCode, String)> {
+        self.retain_live(Utc::now());
+        let pending = self
+            .device
+            .get_mut(login_id)
+            .ok_or_else(auth_oauth_login_conflict)?;
+        if !auth_oauth_profile_matches(&pending.profile, provider, profile_id) {
+            return Err(map_auth_profile_error(invalid_auth_config(
+                "login_id",
+                "device-code login does not match provider/profile",
+            )));
+        }
+        let flow = pending.flow.take().ok_or_else(auth_oauth_login_conflict)?;
+        Ok((pending.profile.clone(), flow, Arc::clone(&pending.claim)))
+    }
+
+    fn remove_device(&mut self, login_id: &str, claim: &Arc<()>) -> bool {
+        if self
+            .device
+            .get(login_id)
+            .is_some_and(|pending| Arc::ptr_eq(&pending.claim, claim))
+        {
+            self.device.remove(login_id);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn restore_device(
+        &mut self,
+        login_id: &str,
+        claim: &Arc<()>,
+        flow: OAuthDeviceCodeFlow,
+    ) -> Result<DateTime<Utc>, (StatusCode, String)> {
+        let now = Utc::now();
+        self.retain_live(now);
+        if now >= flow.challenge().expires_at {
+            self.remove_device(login_id, claim);
+            return Err(auth_oauth_login_conflict());
+        }
+        let pending = self
+            .device
+            .get_mut(login_id)
+            .ok_or_else(auth_oauth_login_conflict)?;
+        if !Arc::ptr_eq(&pending.claim, claim) || pending.flow.is_some() {
+            return Err(auth_oauth_login_conflict());
+        }
+        pending.expires_at = pending.expires_at.min(flow.challenge().expires_at);
+        pending.flow = Some(flow);
+        Ok(pending.expires_at)
+    }
+}
+
+async fn commit_auth_oauth_login(
+    store: &InMemoryAuthProfileStore,
+    mut profile: AuthProfile,
+    tokens: OAuthTokens,
+) -> Result<AuthProfile, (StatusCode, String)> {
+    let expected_refresh_token = profile
+        .method
+        .refresh_token_material()
+        .map(|token| zeroize::Zeroizing::new(token.to_owned()));
+    match &mut profile.method {
+        AuthMethodKind::OAuthDeviceCode(method) => method.apply_tokens(tokens),
+        AuthMethodKind::OAuthAuthCode(method) => method.apply_tokens(tokens),
+        _ => {
+            return Err(map_auth_profile_error(AuthError::UnsupportedMethod {
+                method: profile.method.id(),
+                operation: "oauth_login_complete",
+            }));
+        }
+    }
+    let provider = profile.provider.clone();
+    let profile_id = profile.id.clone();
+    // Callers hold the pending-store guard through this commit and reread,
+    // serializing success reporting with host profile replacement/logout.
+    // The saved profile carries the store's original incarnation/revision and
+    // auth snapshot. Never re-read by name and graft old-client tokens onto a
+    // replacement profile; metadata-only edits remain intact.
+    if !store
+        .save_profile_if_unchanged(
+            profile,
+            expected_refresh_token.as_ref().map(|token| token.as_str()),
+        )
+        .await
+        .map_err(map_auth_profile_error)?
+    {
+        return Err(auth_oauth_login_conflict());
+    }
+    store
+        .get_profile(&provider, &profile_id)
+        .await
+        .map_err(map_auth_profile_error)
 }
 
 #[derive(Debug, Deserialize)]
@@ -11727,6 +11870,7 @@ struct AuthOAuthAuthCodeStartResponse {
     method: &'static str,
     authorization_url: String,
     redirect_uri: String,
+    expires_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Serialize)]
@@ -12498,10 +12642,13 @@ async fn auth_profile_upsert_handler(
         .await
         .map_err(map_auth_profile_error)?;
     let store = auth_profile_store();
+    let pending_store = auth_oauth_pending_store();
+    let mut pending = pending_store.lock().await;
     store
         .save_profile(profile.clone())
         .await
         .map_err(map_auth_profile_error)?;
+    pending.invalidate_profile(&profile.provider, &profile.id);
     Ok(Json(AuthProfileResponse {
         profile: auth_profile_view(profile),
     }))
@@ -12511,10 +12658,13 @@ async fn auth_profile_delete_handler(
     Path((provider, profile_id)): Path<(String, String)>,
 ) -> Result<Json<AuthProfileDeleteResponse>, (StatusCode, String)> {
     let store = auth_profile_store();
+    let pending_store = auth_oauth_pending_store();
+    let mut pending = pending_store.lock().await;
     store
         .delete_profile(&provider, &profile_id)
         .await
         .map_err(map_auth_profile_error)?;
+    pending.invalidate_profile(&provider, &profile_id);
     Ok(Json(AuthProfileDeleteResponse {
         provider,
         profile_id,
@@ -12527,6 +12677,10 @@ async fn auth_profile_priority_handler(
     Json(request): Json<AuthProfilePriorityRequest>,
 ) -> Result<Json<AuthProfileResponse>, (StatusCode, String)> {
     let store = auth_profile_store();
+    // Serialize snapshot edits with logout/replacement so a stale metadata
+    // writer cannot recreate a deleted profile or overwrite a new incarnation.
+    let pending_store = auth_oauth_pending_store();
+    let _pending = pending_store.lock().await;
     let mut profile = store
         .get_profile(&provider, &profile_id)
         .await
@@ -12583,27 +12737,46 @@ async fn auth_profile_oauth_device_start_handler(
     Path((provider, profile_id)): Path<(String, String)>,
 ) -> Result<Json<AuthOAuthDeviceStartResponse>, (StatusCode, String)> {
     let store = auth_profile_store();
-    let profile = store
-        .get_profile(&provider, &profile_id)
-        .await
-        .map_err(map_auth_profile_error)?;
-    let config = oauth_device_config_from_profile(&profile).map_err(map_auth_profile_error)?;
+    let pending_store = auth_oauth_pending_store();
     let transport = BlockingOAuthTransport::new().map_err(map_auth_profile_error)?;
-    let flow = OAuthDeviceCodeFlow::start(&fcp_async_core::compatibility_cx(), config, &transport)
-        .await
-        .map_err(map_auth_profile_error)?;
-    let challenge = flow.challenge().clone();
     let login_id = next_auth_oauth_login_id("oauth-device");
-    let pending = PendingDeviceCodeLogin {
-        provider: profile.provider.clone(),
-        profile_id: profile.id.clone(),
-        flow,
+    let claim = Arc::new(());
+    let (profile, config) = {
+        // Reserve before provider I/O. Profile replacement/logout uses this
+        // same lock and can remove the slot while the challenge is in flight.
+        let mut pending = pending_store.lock().await;
+        pending.retain_live(Utc::now());
+        let profile = store
+            .get_profile(&provider, &profile_id)
+            .await
+            .map_err(map_auth_profile_error)?;
+        let config = oauth_device_config_from_profile(&profile).map_err(map_auth_profile_error)?;
+        pending.device.insert(
+            login_id.clone(),
+            PendingDeviceCodeLogin {
+                profile: profile.clone(),
+                flow: None,
+                claim: Arc::clone(&claim),
+                expires_at: auth_oauth_login_deadline()?,
+            },
+        );
+        (profile, config)
     };
-    auth_oauth_pending_store()
+    let flow =
+        match OAuthDeviceCodeFlow::start(&fcp_async_core::compatibility_cx(), config, &transport)
+            .await
+        {
+            Ok(flow) => flow,
+            Err(error) => {
+                pending_store.lock().await.remove_device(&login_id, &claim);
+                return Err(map_auth_profile_error(error));
+            }
+        };
+    let challenge = flow.challenge().clone();
+    let expires_at = pending_store
         .lock()
         .await
-        .device
-        .insert(login_id.clone(), pending);
+        .restore_device(&login_id, &claim, flow)?;
     Ok(Json(AuthOAuthDeviceStartResponse {
         provider: profile.provider,
         profile_id: profile.id,
@@ -12612,7 +12785,7 @@ async fn auth_profile_oauth_device_start_handler(
         user_code: challenge.user_code,
         verification_uri: challenge.verification_uri,
         verification_uri_complete: challenge.verification_uri_complete,
-        expires_at: challenge.expires_at,
+        expires_at,
         interval_secs: challenge.interval.as_secs(),
     }))
 }
@@ -12622,37 +12795,23 @@ async fn auth_profile_oauth_device_poll_handler(
     Json(request): Json<AuthOAuthPollRequest>,
 ) -> Result<Json<AuthOAuthDevicePollResponse>, (StatusCode, String)> {
     let pending_store = auth_oauth_pending_store();
-    let Some(mut pending) = pending_store
-        .lock()
-        .await
-        .device
-        .get(&request.login_id)
-        .cloned()
-    else {
-        return Err(map_auth_profile_error(invalid_auth_config(
-            "login_id",
-            "device-code login was not found",
-        )));
-    };
-    if pending.provider != provider || pending.profile_id != profile_id {
-        return Err(map_auth_profile_error(invalid_auth_config(
-            "login_id",
-            "device-code login does not match provider/profile",
-        )));
-    }
-
     let transport = BlockingOAuthTransport::new().map_err(map_auth_profile_error)?;
-    let poll = pending
-        .flow
+    let (profile, mut flow, claim) =
+        pending_store
+            .lock()
+            .await
+            .claim_device(&request.login_id, &provider, &profile_id)?;
+    match flow
         .poll(&fcp_async_core::compatibility_cx(), &transport)
-        .await;
-    match poll {
+        .await
+    {
         Ok(OAuthDeviceCodePoll::Pending { retry_after }) => {
+            // Only a definite pending/slow_down response rearms the same
+            // claimed slot. A revoked or expired slot can never be recreated.
             pending_store
                 .lock()
                 .await
-                .device
-                .insert(request.login_id.clone(), pending);
+                .restore_device(&request.login_id, &claim, flow)?;
             Ok(Json(AuthOAuthDevicePollResponse {
                 provider,
                 profile_id,
@@ -12664,23 +12823,13 @@ async fn auth_profile_oauth_device_poll_handler(
             }))
         }
         Ok(OAuthDeviceCodePoll::Authorized(tokens)) => {
-            pending_store.lock().await.device.remove(&request.login_id);
+            let mut sessions = pending_store.lock().await;
+            sessions.retain_live(Utc::now());
+            if !sessions.remove_device(&request.login_id, &claim) {
+                return Err(auth_oauth_login_conflict());
+            }
             let store = auth_profile_store();
-            let mut profile = store
-                .get_profile(&provider, &profile_id)
-                .await
-                .map_err(map_auth_profile_error)?;
-            let AuthMethodKind::OAuthDeviceCode(method) = &mut profile.method else {
-                return Err(map_auth_profile_error(AuthError::UnsupportedMethod {
-                    method: profile.method.id(),
-                    operation: "oauth_device_poll",
-                }));
-            };
-            method.apply_tokens(tokens);
-            store
-                .save_profile(profile.clone())
-                .await
-                .map_err(map_auth_profile_error)?;
+            let profile = commit_auth_oauth_login(&store, profile, tokens).await?;
             Ok(Json(AuthOAuthDevicePollResponse {
                 provider: profile.provider.clone(),
                 profile_id: profile.id.clone(),
@@ -12692,7 +12841,11 @@ async fn auth_profile_oauth_device_poll_handler(
             }))
         }
         Err(error) => {
-            pending_store.lock().await.device.remove(&request.login_id);
+            // Transport failures may follow a spent grant. Never reinsert it.
+            pending_store
+                .lock()
+                .await
+                .remove_device(&request.login_id, &claim);
             Err(map_auth_profile_error(error))
         }
     }
@@ -12702,6 +12855,9 @@ async fn auth_profile_oauth_auth_code_start_handler(
     Path((provider, profile_id)): Path<(String, String)>,
 ) -> Result<Json<AuthOAuthAuthCodeStartResponse>, (StatusCode, String)> {
     let store = auth_profile_store();
+    let pending_store = auth_oauth_pending_store();
+    let mut pending = pending_store.lock().await;
+    pending.retain_live(Utc::now());
     let profile = store
         .get_profile(&provider, &profile_id)
         .await
@@ -12711,16 +12867,15 @@ async fn auth_profile_oauth_auth_code_start_handler(
     let flow = OAuthAuthCodeFlow::start(config).map_err(map_auth_profile_error)?;
     let request = flow.request().clone();
     let login_id = next_auth_oauth_login_id("oauth-auth-code");
-    let pending = PendingAuthCodeLogin {
-        provider: profile.provider.clone(),
-        profile_id: profile.id.clone(),
-        flow,
-    };
-    auth_oauth_pending_store()
-        .lock()
-        .await
-        .auth_code
-        .insert(login_id.clone(), pending);
+    let expires_at = auth_oauth_login_deadline()?;
+    pending.auth_code.insert(
+        login_id.clone(),
+        PendingAuthCodeLogin {
+            profile: profile.clone(),
+            flow,
+            expires_at,
+        },
+    );
     Ok(Json(AuthOAuthAuthCodeStartResponse {
         provider: profile.provider,
         profile_id: profile.id,
@@ -12728,6 +12883,7 @@ async fn auth_profile_oauth_auth_code_start_handler(
         method: "oauth_auth_code",
         authorization_url: request.authorization_url().to_owned(),
         redirect_uri,
+        expires_at,
     }))
 }
 
@@ -12735,26 +12891,6 @@ async fn auth_profile_oauth_auth_code_complete_handler(
     Path((provider, profile_id)): Path<(String, String)>,
     Json(request): Json<AuthOAuthAuthCodeCompleteRequest>,
 ) -> Result<Json<AuthOAuthAuthCodeCompleteResponse>, (StatusCode, String)> {
-    let pending_store = auth_oauth_pending_store();
-    let Some(pending) = pending_store
-        .lock()
-        .await
-        .auth_code
-        .get(&request.login_id)
-        .cloned()
-    else {
-        return Err(map_auth_profile_error(invalid_auth_config(
-            "login_id",
-            "authorization-code login was not found",
-        )));
-    };
-    if pending.provider != provider || pending.profile_id != profile_id {
-        return Err(map_auth_profile_error(invalid_auth_config(
-            "login_id",
-            "authorization-code login does not match provider/profile",
-        )));
-    }
-
     let callback = if let Some(error) = request.error {
         OAuthAuthCodeCallback::rejected(error, request.error_description, request.state)
     } else {
@@ -12773,38 +12909,52 @@ async fn auth_profile_oauth_auth_code_complete_handler(
         OAuthAuthCodeCallback::authorized(code, state)
     }
     .map_err(map_auth_profile_error)?;
-    let grant = pending
-        .flow
-        .complete_callback(callback)
-        .map_err(map_auth_profile_error)?;
+    let pending_store = auth_oauth_pending_store();
+    let (pending, grant) = {
+        let mut sessions = pending_store.lock().await;
+        sessions.retain_live(Utc::now());
+        let pending = sessions
+            .auth_code
+            .get(&request.login_id)
+            .ok_or_else(auth_oauth_login_conflict)?;
+        if !auth_oauth_profile_matches(&pending.profile, &provider, &profile_id) {
+            return Err(map_auth_profile_error(invalid_auth_config(
+                "login_id",
+                "authorization-code login does not match provider/profile",
+            )));
+        }
+        // State validation and claiming are one atomic operation. Invalid
+        // callbacks do not consume a valid session; a submitted grant does.
+        let grant = match pending.flow.complete_callback(callback) {
+            Ok(grant) => grant,
+            Err(error) => {
+                if matches!(error, AuthError::ProviderRejected { .. }) {
+                    sessions.auth_code.remove(&request.login_id);
+                }
+                return Err(map_auth_profile_error(error));
+            }
+        };
+        let pending = sessions
+            .auth_code
+            .remove(&request.login_id)
+            .ok_or_else(auth_oauth_login_conflict)?;
+        (pending, grant)
+    };
     let transport = BlockingOAuthTransport::new().map_err(map_auth_profile_error)?;
     let tokens = pending
         .flow
         .exchange(&fcp_async_core::compatibility_cx(), &transport, &grant)
         .await
         .map_err(map_auth_profile_error)?;
-
+    // The session stays consumed on provider error, expiry or a stale-profile
+    // refusal. Repeating an uncertain exchange requires a new login.
+    let mut sessions = pending_store.lock().await;
+    sessions.retain_live(Utc::now());
+    if Utc::now() >= pending.expires_at {
+        return Err(auth_oauth_login_conflict());
+    }
     let store = auth_profile_store();
-    let mut profile = store
-        .get_profile(&provider, &profile_id)
-        .await
-        .map_err(map_auth_profile_error)?;
-    let AuthMethodKind::OAuthAuthCode(method) = &mut profile.method else {
-        return Err(map_auth_profile_error(AuthError::UnsupportedMethod {
-            method: profile.method.id(),
-            operation: "oauth_auth_code_complete",
-        }));
-    };
-    method.apply_tokens(tokens);
-    store
-        .save_profile(profile.clone())
-        .await
-        .map_err(map_auth_profile_error)?;
-    pending_store
-        .lock()
-        .await
-        .auth_code
-        .remove(&request.login_id);
+    let profile = commit_auth_oauth_login(&store, pending.profile, tokens).await?;
     Ok(Json(AuthOAuthAuthCodeCompleteResponse {
         provider: profile.provider.clone(),
         profile_id: profile.id.clone(),
@@ -46960,6 +47110,566 @@ while IFS= read -r request; do exit 2; done
             }
         }
         Ok(())
+    }
+
+    fn host_oauth_session_profile(provider: &str, base_url: &str, auth_code: bool) -> AuthProfile {
+        let mut method = if auth_code {
+            AuthMethodKind::OAuthAuthCode(
+                OAuthAuthCodeAuth::public_client(
+                    "session-client",
+                    "https://provider.example/authorize",
+                    format!("{base_url}/token"),
+                    "http://127.0.0.1/callback",
+                    "repo",
+                    true,
+                )
+                .unwrap(),
+            )
+        } else {
+            AuthMethodKind::OAuthDeviceCode(
+                OAuthDeviceCodeAuth::new(
+                    "session-client",
+                    format!("{base_url}/device"),
+                    format!("{base_url}/token"),
+                    "repo",
+                )
+                .unwrap(),
+            )
+        };
+        let tokens = OAuthTokens::bearer(
+            "session-old-access",
+            Some(Duration::from_secs(3600)),
+            Some("session-old-refresh"),
+            Some("repo"),
+        )
+        .unwrap();
+        match &mut method {
+            AuthMethodKind::OAuthDeviceCode(method) => method.apply_tokens(tokens),
+            AuthMethodKind::OAuthAuthCode(method) => method.apply_tokens(tokens),
+            _ => unreachable!(),
+        }
+        AuthProfile::new("primary", provider, method, "original login profile", 0).unwrap()
+    }
+
+    fn host_oauth_session_challenge() -> HostOAuthLoopbackExpectedRequest {
+        HostOAuthLoopbackExpectedRequest {
+            method: "POST",
+            path: "/device",
+            body_contains: vec!["client_id=session-client"],
+            response: json!({
+                "device_code": "session-device-code",
+                "user_code": "SESSION-123",
+                "verification_uri": "https://provider.example/device",
+                "expires_in": 3600,
+                "interval": 1,
+            }),
+        }
+    }
+
+    fn host_oauth_session_token(response: Value) -> HostOAuthLoopbackExpectedRequest {
+        HostOAuthLoopbackExpectedRequest {
+            method: "POST",
+            path: "/token",
+            body_contains: vec!["client_id=session-client", "grant_type="],
+            response,
+        }
+    }
+
+    fn host_oauth_session_tokens() -> Value {
+        json!({
+            "access_token": "session-new-access",
+            "token_type": "Bearer",
+            "expires_in": 3600,
+            "refresh_token": "session-new-refresh",
+            "scope": "repo",
+        })
+    }
+
+    async fn host_oauth_session_start(provider: &str, auth_code: bool) -> (String, Option<String>) {
+        if auth_code {
+            let Json(started) = auth_profile_oauth_auth_code_start_handler(Path((
+                provider.to_owned(),
+                "primary".to_owned(),
+            )))
+            .await
+            .unwrap();
+            let state = host_oauth_query_value(&started.authorization_url, "state").unwrap();
+            (started.login_id, Some(state))
+        } else {
+            let Json(started) = auth_profile_oauth_device_start_handler(Path((
+                provider.to_owned(),
+                "primary".to_owned(),
+            )))
+            .await
+            .unwrap();
+            (started.login_id, None)
+        }
+    }
+
+    async fn host_oauth_session_complete(
+        provider: &str,
+        login_id: &str,
+        state: Option<&str>,
+        auth_code: bool,
+    ) -> Result<AuthProfileView, (StatusCode, String)> {
+        if auth_code {
+            auth_profile_oauth_auth_code_complete_handler(
+                Path((provider.to_owned(), "primary".to_owned())),
+                Json(AuthOAuthAuthCodeCompleteRequest {
+                    login_id: login_id.to_owned(),
+                    code: Some("session-code".to_owned()),
+                    state: state.map(str::to_owned),
+                    error: None,
+                    error_description: None,
+                }),
+            )
+            .await
+            .map(|Json(response)| response.profile)
+        } else {
+            auth_profile_oauth_device_poll_handler(
+                Path((provider.to_owned(), "primary".to_owned())),
+                Json(AuthOAuthPollRequest {
+                    login_id: login_id.to_owned(),
+                }),
+            )
+            .await
+            .map(|Json(response)| response.profile.expect("successful device completion"))
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn auth_oauth_login_completion_fences_profile_replacement_and_preserves_metadata() {
+        for auth_code in [false, true] {
+            for change in ["logout", "recreate", "configuration", "metadata"] {
+                let provider = format!("test-login-fence-{auth_code}-{change}");
+                let hook_provider = provider.clone();
+                let store = auth_profile_store();
+                let hook_store = Arc::clone(&store);
+                let mut expected = Vec::new();
+                if !auth_code {
+                    expected.push(host_oauth_session_challenge());
+                }
+                expected.push(host_oauth_session_token(host_oauth_session_tokens()));
+                let mut responses = 0;
+                let oauth = HostOAuthLoopbackServer::start_before_response(expected, move || {
+                    responses += 1;
+                    if !auth_code && responses == 1 {
+                        return;
+                    }
+                    fcp_async_core::runtime::block_on_sync(async {
+                        let mut profile = hook_store.get_profile(&hook_provider, "primary").await?;
+                        if change == "logout" || change == "recreate" {
+                            hook_store.delete_profile(&hook_provider, "primary").await?;
+                        }
+                        if change != "logout" {
+                            profile.label = "new operator metadata".to_owned();
+                            profile.priority = 37;
+                            if change == "configuration" {
+                                match &mut profile.method {
+                                    AuthMethodKind::OAuthDeviceCode(method) => {
+                                        method.token_url =
+                                            "https://replacement.example/token".to_owned();
+                                    }
+                                    AuthMethodKind::OAuthAuthCode(method) => {
+                                        method.token_url =
+                                            "https://replacement.example/token".to_owned();
+                                    }
+                                    _ => unreachable!(),
+                                }
+                            }
+                            hook_store.save_profile(profile).await?;
+                        }
+                        Ok::<(), AuthError>(())
+                    })
+                    .expect("profile race runtime")
+                    .expect("profile race edit");
+                });
+                store
+                    .save_profile(host_oauth_session_profile(
+                        &provider,
+                        &oauth.base_url,
+                        auth_code,
+                    ))
+                    .await
+                    .unwrap();
+                let (login_id, state) = host_oauth_session_start(&provider, auth_code).await;
+                let result =
+                    host_oauth_session_complete(&provider, &login_id, state.as_deref(), auth_code)
+                        .await;
+                let (observed, errors) = oauth.join();
+                assert!(errors.is_empty(), "{errors:?}");
+                assert_eq!(observed.len(), if auth_code { 1 } else { 2 });
+                if change == "metadata" {
+                    let view = result.unwrap();
+                    assert_eq!(view.label, "new operator metadata");
+                    assert_eq!(view.priority, 37);
+                    assert!(
+                        !serde_json::to_string(&view)
+                            .unwrap()
+                            .contains("session-new")
+                    );
+                } else {
+                    let (status, message) = result.unwrap_err();
+                    assert_eq!(
+                        status,
+                        if change == "logout" {
+                            StatusCode::NOT_FOUND
+                        } else {
+                            StatusCode::CONFLICT
+                        }
+                    );
+                    assert!(!message.contains("session-new"));
+                }
+                let pending_store = auth_oauth_pending_store();
+                let pending = pending_store.lock().await;
+                assert!(!pending.device.contains_key(&login_id));
+                assert!(!pending.auth_code.contains_key(&login_id));
+                drop(pending);
+                if change == "logout" {
+                    assert!(matches!(
+                        store.get_profile(&provider, "primary").await,
+                        Err(AuthError::ProfileNotFound { .. })
+                    ));
+                } else {
+                    let current = store.get_profile(&provider, "primary").await.unwrap();
+                    assert_eq!(current.label, "new operator metadata");
+                    assert_eq!(current.priority, 37);
+                    assert_eq!(
+                        current.method.refresh_token_material(),
+                        Some(if change == "metadata" {
+                            "session-new-refresh"
+                        } else {
+                            "session-old-refresh"
+                        })
+                    );
+                }
+            }
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn auth_oauth_device_poll_is_exclusive_and_preserves_pending_state() {
+        let provider = "test-device-single-flight";
+        let login = Arc::new(StdMutex::new(None::<String>));
+        let hook_login = Arc::clone(&login);
+        let conflicts = Arc::new(StdMutex::new(Vec::new()));
+        let hook_conflicts = Arc::clone(&conflicts);
+        let oauth = HostOAuthLoopbackServer::start_before_response(
+            vec![
+                host_oauth_session_challenge(),
+                host_oauth_session_token(json!({"error": "authorization_pending"})),
+                host_oauth_session_token(json!({"error": "slow_down"})),
+                host_oauth_session_token(host_oauth_session_tokens()),
+            ],
+            move || {
+                let Some(login_id) = hook_login.lock().unwrap().clone() else {
+                    return;
+                };
+                let result =
+                    fcp_async_core::runtime::block_on_sync(auth_profile_oauth_device_poll_handler(
+                        Path((provider.to_owned(), "primary".to_owned())),
+                        Json(AuthOAuthPollRequest { login_id }),
+                    ))
+                    .expect("concurrent poll runtime");
+                hook_conflicts.lock().unwrap().push(result.unwrap_err().0);
+            },
+        );
+        auth_profile_store()
+            .save_profile(host_oauth_session_profile(provider, &oauth.base_url, false))
+            .await
+            .unwrap();
+        let before = Utc::now();
+        let Json(started) = auth_profile_oauth_device_start_handler(Path((
+            provider.to_owned(),
+            "primary".to_owned(),
+        )))
+        .await
+        .unwrap();
+        assert!(
+            started.expires_at <= before + chrono::Duration::seconds(AUTH_OAUTH_LOGIN_TTL_SECS + 1)
+        );
+        *login.lock().unwrap() = Some(started.login_id.clone());
+        for retry_after in [1, 6] {
+            let Json(response) = auth_profile_oauth_device_poll_handler(
+                Path((provider.to_owned(), "primary".to_owned())),
+                Json(AuthOAuthPollRequest {
+                    login_id: started.login_id.clone(),
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status, "pending");
+            assert_eq!(response.retry_after_secs, Some(retry_after));
+            assert_eq!(
+                auth_oauth_pending_store().lock().await.device[&started.login_id].expires_at,
+                started.expires_at
+            );
+        }
+        host_oauth_session_complete(provider, &started.login_id, None, false)
+            .await
+            .unwrap();
+        let repeated = host_oauth_session_complete(provider, &started.login_id, None, false)
+            .await
+            .unwrap_err();
+        assert_eq!(repeated.0, StatusCode::CONFLICT);
+        assert_eq!(*conflicts.lock().unwrap(), vec![StatusCode::CONFLICT; 3]);
+        let (observed, errors) = oauth.join();
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(observed.len(), 4);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn auth_oauth_device_revocation_during_start_or_pending_never_restores_session() {
+        for during_start in [true, false] {
+            for replacement in [false, true] {
+                let provider = format!("test-device-revoke-{during_start}-{replacement}");
+                let hook_provider = provider.clone();
+                let mut expected = vec![host_oauth_session_challenge()];
+                if !during_start {
+                    expected.push(host_oauth_session_token(
+                        json!({"error": "authorization_pending"}),
+                    ));
+                }
+                let mut responses = 0;
+                let oauth = HostOAuthLoopbackServer::start_before_response(expected, move || {
+                    responses += 1;
+                    if responses != if during_start { 1 } else { 2 } {
+                        return;
+                    }
+                    fcp_async_core::runtime::block_on_sync(async {
+                        if replacement {
+                            let request = AuthProfileUpsertRequest {
+                                profile_id: "primary".to_owned(),
+                                label: "replacement profile".to_owned(),
+                                priority: 0,
+                                method: AuthProfileMethodRequest::OAuthDevice {
+                                    client_id: "replacement-client".to_owned(),
+                                    device_code_url: "https://replacement.example/device"
+                                        .to_owned(),
+                                    token_url: "https://replacement.example/token".to_owned(),
+                                    scope: "repo".to_owned(),
+                                },
+                            };
+                            auth_profile_upsert_handler(
+                                Path(hook_provider.to_ascii_uppercase()),
+                                Json(request),
+                            )
+                            .await
+                            .map(|_| ())
+                        } else {
+                            auth_profile_delete_handler(Path((
+                                hook_provider.to_ascii_uppercase(),
+                                "primary".to_owned(),
+                            )))
+                            .await
+                            .map(|_| ())
+                        }
+                    })
+                    .expect("revocation runtime")
+                    .expect("revoke login profile");
+                });
+                let store = auth_profile_store();
+                store
+                    .save_profile(host_oauth_session_profile(
+                        &provider,
+                        &oauth.base_url,
+                        false,
+                    ))
+                    .await
+                    .unwrap();
+                let result = auth_profile_oauth_device_start_handler(Path((
+                    provider.clone(),
+                    "primary".to_owned(),
+                )))
+                .await;
+                if during_start {
+                    assert_eq!(result.unwrap_err().0, StatusCode::CONFLICT);
+                } else {
+                    let Json(started) = result.unwrap();
+                    let result = auth_profile_oauth_device_poll_handler(
+                        Path((provider.clone(), "primary".to_owned())),
+                        Json(AuthOAuthPollRequest {
+                            login_id: started.login_id,
+                        }),
+                    )
+                    .await;
+                    assert_eq!(result.unwrap_err().0, StatusCode::CONFLICT);
+                }
+                let pending_store = auth_oauth_pending_store();
+                let pending = pending_store.lock().await;
+                assert!(
+                    pending
+                        .device
+                        .values()
+                        .all(|entry| entry.profile.provider != provider)
+                );
+                drop(pending);
+                if replacement {
+                    let profile = store.get_profile(&provider, "primary").await.unwrap();
+                    assert_eq!(profile.label, "replacement profile");
+                    assert_eq!(profile.method.refresh_token_material(), None);
+                } else {
+                    assert!(store.get_profile(&provider, "primary").await.is_err());
+                }
+                let (observed, errors) = oauth.join();
+                assert!(errors.is_empty(), "{errors:?}");
+                assert_eq!(observed.len(), if during_start { 1 } else { 2 });
+            }
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn auth_oauth_auth_code_exchange_is_consumed_on_success_or_provider_failure() {
+        for rejected in [false, true] {
+            let provider = format!("test-auth-code-single-use-{rejected}");
+            let hook_provider = provider.clone();
+            let login = Arc::new(StdMutex::new(None::<(String, String)>));
+            let hook_login = Arc::clone(&login);
+            let duplicate_status = Arc::new(StdMutex::new(None));
+            let hook_status = Arc::clone(&duplicate_status);
+            let response = if rejected {
+                json!({"error": "invalid_grant"})
+            } else {
+                host_oauth_session_tokens()
+            };
+            let oauth = HostOAuthLoopbackServer::start_before_response(
+                vec![host_oauth_session_token(response)],
+                move || {
+                    let (login_id, state) = hook_login.lock().unwrap().clone().unwrap();
+                    let duplicate = fcp_async_core::runtime::block_on_sync(
+                        host_oauth_session_complete(&hook_provider, &login_id, Some(&state), true),
+                    )
+                    .expect("duplicate completion runtime")
+                    .unwrap_err();
+                    *hook_status.lock().unwrap() = Some(duplicate.0);
+                },
+            );
+            auth_profile_store()
+                .save_profile(host_oauth_session_profile(&provider, &oauth.base_url, true))
+                .await
+                .unwrap();
+            let (login_id, state) = host_oauth_session_start(&provider, true).await;
+            let state = state.unwrap();
+            *login.lock().unwrap() = Some((login_id.clone(), state.clone()));
+            let result =
+                host_oauth_session_complete(&provider, &login_id, Some(&state), true).await;
+            if rejected {
+                assert_eq!(result.unwrap_err().0, StatusCode::CONFLICT);
+            } else {
+                result.unwrap();
+            }
+            assert_eq!(
+                *duplicate_status.lock().unwrap(),
+                Some(StatusCode::CONFLICT)
+            );
+            assert_eq!(
+                host_oauth_session_complete(&provider, &login_id, Some(&state), true)
+                    .await
+                    .unwrap_err()
+                    .0,
+                StatusCode::CONFLICT
+            );
+            assert!(
+                !auth_oauth_pending_store()
+                    .lock()
+                    .await
+                    .auth_code
+                    .contains_key(&login_id)
+            );
+            let (observed, errors) = oauth.join();
+            assert!(errors.is_empty(), "{errors:?}");
+            assert_eq!(observed.len(), 1);
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn auth_oauth_auth_code_callbacks_and_expiry_preserve_single_use() {
+        let provider = "test-auth-code-callback-lifecycle";
+        auth_profile_store()
+            .save_profile(host_oauth_session_profile(
+                provider,
+                "http://127.0.0.1:1",
+                true,
+            ))
+            .await
+            .unwrap();
+        let Json(started) = auth_profile_oauth_auth_code_start_handler(Path((
+            provider.to_owned(),
+            "primary".to_owned(),
+        )))
+        .await
+        .unwrap();
+        let state = host_oauth_query_value(&started.authorization_url, "state").unwrap();
+        assert!(started.expires_at > Utc::now());
+        assert!(
+            started.expires_at <= Utc::now() + chrono::Duration::seconds(AUTH_OAUTH_LOGIN_TTL_SECS)
+        );
+        assert_eq!(
+            auth_oauth_pending_store().lock().await.auth_code[&started.login_id].expires_at,
+            started.expires_at
+        );
+        let wrong_state =
+            host_oauth_session_complete(provider, &started.login_id, Some("wrong-state"), true)
+                .await
+                .unwrap_err();
+        assert_eq!(wrong_state.0, StatusCode::BAD_REQUEST);
+        assert!(
+            auth_oauth_pending_store()
+                .lock()
+                .await
+                .auth_code
+                .contains_key(&started.login_id)
+        );
+        let denied = auth_profile_oauth_auth_code_complete_handler(
+            Path((provider.to_owned(), "primary".to_owned())),
+            Json(AuthOAuthAuthCodeCompleteRequest {
+                login_id: started.login_id.clone(),
+                code: None,
+                state: Some(state.clone()),
+                error: Some("access_denied".to_owned()),
+                error_description: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(denied.0, StatusCode::CONFLICT);
+        assert!(
+            !auth_oauth_pending_store()
+                .lock()
+                .await
+                .auth_code
+                .contains_key(&started.login_id)
+        );
+        assert_eq!(
+            host_oauth_session_complete(provider, &started.login_id, Some(&state), true)
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::CONFLICT
+        );
+
+        let (login_id, state) = host_oauth_session_start(provider, true).await;
+        auth_oauth_pending_store()
+            .lock()
+            .await
+            .auth_code
+            .get_mut(&login_id)
+            .unwrap()
+            .expires_at = Utc::now() - chrono::Duration::seconds(1);
+        assert_eq!(
+            host_oauth_session_complete(provider, &login_id, state.as_deref(), true)
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::CONFLICT
+        );
+        assert!(
+            !auth_oauth_pending_store()
+                .lock()
+                .await
+                .auth_code
+                .contains_key(&login_id)
+        );
     }
 
     #[fcp_async_core::runtime::test]

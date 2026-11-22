@@ -3869,6 +3869,18 @@ Used by interactive operators. PKCE (RFC 7636) protects against authorization-co
 5. Host receives tokens, stores in credential pool
 ```
 
+Host login sessions expire after 15 minutes; device sessions also honor the
+provider's earlier expiry. Both start responses report the actual `expires_at`.
+A callback submits a grant at most once, and a device poll has a single active
+claim. Only a definite pending or slow-down response permits another poll of
+that same live session. After an uncertain token exchange, start a new login.
+
+Replacing or deleting a profile invalidates its pending sessions. An in-flight
+login can save tokens only into the unchanged profile incarnation and auth
+configuration it started with. Priority edits remain allowed and preserve
+current credentials. A stale or expired login is refused instead of attaching
+its tokens to a replacement profile.
+
 The credential pool's strategy determines what happens when this AuthProfile is leased: round-robin if multiple equivalent profiles exist, sticky-restick if the previous lease holder has a hot connection, max-use to retire heavily-used credentials before they trigger provider rate limits.
 
 ---
