@@ -480,7 +480,7 @@ async fn configured_connector(config: Value, capabilities: &[&str]) -> Configure
     let verifying_key = signing_key.verifying_key();
     connector
         .handle_handshake(json!({
-            "protocol_version": "1.0.0",
+            "protocol_version": "2.0.0",
             "zone": "z:work",
             "host_public_key": verifying_key.to_bytes(),
             "nonce": vec![0_u8; 32],
@@ -505,6 +505,10 @@ async fn invoke(
     let capability_grant = valid_token(signing_key, connector.instance_id(), capability, operation);
     connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "advanced-fixture",
+            "connector_id": "fcp.anthropic",
+            "zone_id": "z:work",
             "operation": operation,
             "input": input,
             "capability_token": capability_grant

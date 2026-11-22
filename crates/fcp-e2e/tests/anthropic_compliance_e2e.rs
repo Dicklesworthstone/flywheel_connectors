@@ -1,7 +1,7 @@
 //! E2E Anthropic connector compliance tests (flywheel_connectors-lszk.4.5).
 //!
 //! Exercises the Anthropic connector through the E2E compliance harness:
-//! - Default deny (missing capability → error + decision receipt)
+//! - Default deny (signed token with the wrong capability → rejection before HTTP)
 //! - Allow with valid token (happy path invoke)
 //! - Network guard allow/deny (manifest `host_allow` validation)
 //! - Streaming backpressure (deterministic SSE consumption with inter-chunk delay)
@@ -53,7 +53,7 @@ impl AnthropicConnectorAdapter {
     fn new() -> Self {
         Self {
             connector: AnthropicConnector::new(),
-            id: ConnectorId::from_static("anthropic"),
+            id: ConnectorId::from_static("fcp.anthropic"),
         }
     }
 
@@ -86,17 +86,9 @@ impl FcpConnector for AnthropicConnectorAdapter {
 
     async fn health(&self) -> HealthSnapshot {
         match self.connector.handle_health().await {
-            Ok(payload) => {
-                let status = payload
-                    .get("status")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("unknown");
-                match status {
-                    "healthy" => HealthSnapshot::ready(),
-                    "not_configured" => HealthSnapshot::degraded("not_configured"),
-                    other => HealthSnapshot::degraded(format!("anthropic_status:{other}")),
-                }
-            }
+            Ok(payload) => serde_json::from_value(payload).unwrap_or_else(|error| {
+                HealthSnapshot::error(format!("invalid Anthropic health: {error}"))
+            }),
             Err(err) => HealthSnapshot::error(err.to_string()),
         }
     }
@@ -156,12 +148,10 @@ impl FcpConnector for AnthropicConnectorAdapter {
     }
 
     async fn invoke(&self, req: InvokeRequest) -> fcp_core::FcpResult<InvokeResponse> {
-        let request_id = req.id;
-        let params = json!({
-            "operation": req.operation.as_str(),
-            "input": req.input,
-            "capability_token": req.capability_token,
-        });
+        let request_id = req.id.clone();
+        let params = serde_json::to_value(req).map_err(|error| FcpError::Internal {
+            message: format!("Failed to encode invocation: {error}"),
+        })?;
         let value = self.connector.handle_invoke(params).await?;
         Ok(InvokeResponse::ok(request_id, value))
     }
@@ -214,12 +204,7 @@ fn handshake_request(host_public_key: [u8; 32], capabilities: &[&str]) -> Handsh
             .collect(),
         host: None,
         transport_caps: None,
-        // dja9u typestate ratchet: connector verifier binds to this id; the
-        // capability token's target_instance must match it (see build_token).
-        requested_instance_id: Some(
-            InstanceId::try_from("inst_e2e_test_fixture".to_string())
-                .expect("valid test instance id"),
-        ),
+        requested_instance_id: Some(InstanceId::new()),
     }
 }
 
@@ -261,7 +246,7 @@ fn invoke_request(
     InvokeRequest {
         r#type: "invoke".to_string(),
         id: RequestId::from("anthropic-e2e"),
-        connector_id: ConnectorId::from_static("anthropic"),
+        connector_id: ConnectorId::from_static("fcp.anthropic"),
         operation: OperationId::from_static(operation),
         zone_id: ZoneId::work(),
         input,
@@ -377,38 +362,29 @@ fn streaming_sse_body() -> String {
 // Test 1: Default deny — compliance suite
 // ============================================================================
 
-/// Default deny: invoke without matching capability triggers error.
-/// Uses the E2E compliance harness with static (manifest) + dynamic checks.
+/// A correctly signed, current-instance token must carry the operation's
+/// capability even when that operation was negotiated during handshake.
 #[fcp_async_core::runtime::test]
 async fn anthropic_default_deny_compliance_suite_passes() {
+    let mock = MockApiServer::start().await;
     let mut connector = AnthropicConnectorAdapter::new();
     let signing_key = Ed25519SigningKey::generate();
     let handshake = handshake_request(
         signing_key.verifying_key().to_bytes(),
-        &["anthropic.get_usage"],
+        &["anthropic.chat", "anthropic.get_usage"],
     );
-    // Token grants "anthropic.get_usage" but invoke targets "anthropic.chat" → denial
-    let token = build_token(
-        &signing_key,
-        "anthropic.get_usage",
-        &["anthropic.get_usage"],
-        connector.instance_id(),
-    );
-    let invoke = invoke_request(
-        "anthropic.chat",
-        json!({ "message": "blocked request" }),
-        token,
-    );
-
     let dynamic = DynamicSuite {
-        config: json!({ "api_key": "test-anthropic-key" }),
-        handshake: handshake.clone(),
-        invoke: Some(invoke),
-        expect_invoke_error: true,
+        config: json!({
+            "api_key": "test-anthropic-key",
+            "base_url": mock.base_url(),
+        }),
+        handshake,
+        invoke: None,
+        expect_invoke_error: false,
         simulate: None,
         expect_simulate_would_succeed: None,
         require_simulate_denial_details: false,
-        require_capability_denial: true,
+        require_capability_denial: false,
         require_decision_receipt: false,
     };
     let suite = ComplianceSuite::new(
@@ -423,7 +399,27 @@ async fn anthropic_default_deny_compliance_suite_passes() {
         .await
         .expect("compliance suite run");
 
-    assert!(report.passed, "default deny compliance should pass");
+    assert!(report.passed, "default deny lifecycle should pass");
+    assert!(connector.health().await.is_ready());
+    // The runner configures and handshakes, rotating the instance. Sign after
+    // that lifecycle so neither a stale binding nor a missing operation grant
+    // can explain this wrong-capability denial.
+    let token = build_token(
+        &signing_key,
+        "anthropic.get_usage",
+        &["anthropic.chat"],
+        connector.instance_id(),
+    );
+    let denied = connector
+        .invoke(invoke_request(
+            "anthropic.chat",
+            json!({ "message": "blocked request" }),
+            token,
+        ))
+        .await
+        .expect_err("the wrong signed capability must be denied");
+    assert!(matches!(denied, FcpError::OperationNotGranted { .. }));
+    mock.assert_request_count(0).await;
 }
 
 // ============================================================================
@@ -454,17 +450,6 @@ async fn anthropic_allow_valid_token_connector_suite_passes() {
     let mut connector = AnthropicConnectorAdapter::new();
     let signing_key = Ed25519SigningKey::generate();
     let handshake = handshake_request(signing_key.verifying_key().to_bytes(), &["anthropic.chat"]);
-    let token = build_token(
-        &signing_key,
-        "anthropic.chat",
-        &["anthropic.chat"],
-        connector.instance_id(),
-    );
-    let invoke = invoke_request(
-        "anthropic.chat",
-        json!({ "message": "hello from e2e" }),
-        token,
-    );
     let suite = ConnectorSuite {
         test_name: "anthropic_allow_valid_token".to_string(),
         config: json!({
@@ -472,7 +457,7 @@ async fn anthropic_allow_valid_token_connector_suite_passes() {
             "base_url": mock.base_url(),
         }),
         handshake,
-        invoke: Some(invoke),
+        invoke: None,
         invoke_expectations: InvokeExpectations {
             expect_error: false,
             expect_decision_receipt: false,
@@ -489,18 +474,26 @@ async fn anthropic_allow_valid_token_connector_suite_passes() {
         .await
         .expect("connector suite run");
 
-    assert!(report.passed, "allow suite should pass");
-    let invoke_entry = report
-        .logs
-        .iter()
-        .find(|entry| entry.context.get("operation") == Some(&json!("invoke")))
-        .expect("invoke entry");
-    assert_eq!(invoke_entry.result, "pass");
-    assert_eq!(
-        invoke_entry.context.get("invoke_status"),
-        Some(&json!(format!("{:?}", InvokeStatus::Ok)))
+    assert!(report.passed, "allow lifecycle should pass");
+    assert!(connector.health().await.is_ready());
+    let token = build_token(
+        &signing_key,
+        "anthropic.chat",
+        &["anthropic.chat"],
+        connector.instance_id(),
     );
+    let response = connector
+        .invoke(invoke_request(
+            "anthropic.chat",
+            json!({ "message": "hello from e2e" }),
+            token,
+        ))
+        .await
+        .expect("authorized invocation");
+    assert_eq!(response.status, InvokeStatus::Ok);
+    assert_eq!(response.result.unwrap()["response"], "hello from mock");
     mock.assert_received("/v1/messages").await;
+    mock.assert_request_count(1).await;
 }
 
 // ============================================================================

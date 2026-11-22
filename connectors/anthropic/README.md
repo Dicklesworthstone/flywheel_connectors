@@ -46,8 +46,20 @@ Important runtime truths the contract preserves:
 - `claude-opus-4-7` accepts adaptive thinking only; the connector rejects manual `thinking: {"type":"enabled"}` for that model before provider I/O.
 - Thinking is rejected with non-default temperature and forced tool choice before provider I/O.
 - Thinking content is never returned verbatim in `content_blocks`; it is represented as `{"type":"thinking","redacted":true}`.
-- FCP subscribe is not implemented; streaming is exposed through `anthropic.message.stream`.
-- Runtime handshake returns a SHA-256 hash of the bundled `manifest.toml`.
+- `anthropic.message.stream` consumes provider SSE and returns one assembled invocation result with tool-use blocks, usage, and provenance. The native host does not advertise an FCP event stream or subscription support.
+- Runtime handshake returns a SHA-256 hash of the bundled `manifest.toml`, the actual instance identifier, and only supported capabilities requested by the host.
+- Configuration and handshake attempts revoke previous authority, including rejected attempts. A new handshake rotates the instance; reconfiguration is required before binding the account to a different zone.
+- Introspection exposes all seven operations directly from the manifest, including the local auth and model helpers.
+
+## Native Host Contract
+
+The executable uses the shared bounded JSONL transport and protocol `2.0` or `2.0.0` handshake. Invocation parameters are a complete FCP `InvokeRequest`: `type`, a nonempty `id`, `connector_id: "fcp.anthropic"`, `zone_id`, `operation`, object `input`, and `capability_token`. JSON-RPC transport IDs and invocation IDs are independent. Successful invocation results use the complete `InvokeResponse` envelope.
+
+Health follows `HealthSnapshot`. Configuration alone reports degraded readiness until handshake succeeds. Redacted account metadata, actual instance, configured/handshaken state, bound zone, and counters are in `details`. Shutdown terminates the native loop without waiting for stdin to close and prevents buffered requests from running afterward.
+
+Invocation and simulation validate the manifest input schema and local model, thinking, tool, and media rules. Model aliases are normalized before capability resource checks, so a canonical model deny rule also covers its aliases. Authorization checks the requested connector, negotiated zone and capabilities, signed operation scope, and actual instance.
+
+Admitted invocations enforce signed call and byte budgets through the shared session. The byte counter covers the compact complete FCP request and response; it does not meter provider HTTP traffic. Native JSONL requests and released invocation responses have 16 MiB limits. Simulation performs no provider request and consumes no call allowance; a successful preview does not reserve execution capacity. Provider retry and cancellation behavior remains owned by the existing client/runtime path.
 
 ## First-Slice Scope
 
@@ -96,7 +108,7 @@ The first Anthropic README slice documents the existing runtime surface:
 - Total operation timeout: `120_000 ms`.
 - Maximum response bytes are `10_485_760`.
 - Sandbox profile is `strict`, with `256 MB` memory, `50%` CPU, `120_000 ms` wall-clock timeout, read-only `/usr` and `/lib`, no exec, and no ptrace.
-- Event capability metadata declares streaming support, no replay, and a minimum buffer of 10 events.
+- Handshake event capabilities remain disabled: provider SSE is buffered into the invocation response, and the native transport does not emit incremental FCP events.
 
 ## Capability Families
 
@@ -153,9 +165,9 @@ These are excluded on purpose:
 - base URL policy for `api.anthropic.com` and loopback-compatible origins
 - credential-injection status for secretless mode
 - operation schemas, safety, risk, idempotency, and AI hints
-- simulate-time capability-token checks against bound resources
+- simulation checks for the same input schema, provider semantics, target, zone, negotiated capability, and normalized model resources used by invocation
 
-The deterministic integration evidence is anchored on WireMock and connector-local tests covering:
+Deterministic coverage includes the actual shipped executable connected to a loopback HTTP/SSE server, alongside WireMock and connector-local tests covering:
 
 - simple chat and multi-turn message invokes
 - system prompts
@@ -163,8 +175,9 @@ The deterministic integration evidence is anchored on WireMock and connector-loc
 - tool use and streamed tool-input JSON deltas
 - 401, 429, 529, 500, and context-length error mapping
 - usage and cost accounting
-- default-deny capability-token behavior
-- lifecycle behavior for configure, handshake, health, doctor, self-check, introspection, simulate, and shutdown
+- default-deny capability-token behavior, signed call/byte limits, and canonical-model alias scopes
+- native response and health schemas, bounded JSONL framing, malformed input recovery, and shutdown with buffered input
+- lifecycle revocation for successful and failed configure/handshake attempts, zone binding, health, doctor, self-check, introspection, simulate, and shutdown
 - live verification skip/pass behavior gated by `ANTHROPIC_API_KEY`
 
 ## Source Notes
@@ -176,7 +189,8 @@ The deterministic integration evidence is anchored on WireMock and connector-loc
 - `connectors/anthropic/tests/conformance_contract.rs` checks contract-level operation metadata.
 - `connectors/anthropic/tests/provider_contract.rs` checks provider/auth behavior.
 - `connectors/anthropic/tests/v3_lifecycle.rs` checks lifecycle expectations.
-- `connectors/anthropic/tests/integration.rs` covers deterministic loopback and error behavior.
+- `connectors/anthropic/tests/integration.rs` covers deterministic loopback, authority transitions, local admission, and error behavior.
+- `connectors/anthropic/tests/native_host.rs` drives the shipped executable through real pipes and loopback HTTP/SSE with signed budgeted tokens.
 - `connectors/anthropic/tests/live_verification.rs` emits live skip/pass results when `ANTHROPIC_API_KEY` is absent or present.
 - Claude Code authentication docs define the current CLI auth precedence and setup-token semantics; this connector keeps those credentials out of direct `api.anthropic.com` calls unless a host-managed or loopback boundary is explicitly configured.
 
@@ -213,7 +227,7 @@ The verification surface captures:
 
 **Common remediation**:
 
-- If `health` reports `not_configured`, configure with exactly one auth method and then run handshake.
+- If health details report `configured=false`, configure with exactly one auth method and then run handshake. If `configured=true` and `handshaken=false`, negotiate a new session and sign tokens for its returned `instance_id`.
 - If `self_check` reports `credential_injection_required`, run behind the host egress injection layer or switch to a direct live-test key.
 - If `claude_code_oauth_token`, `oauth_token`, or `setup_token` is rejected against the default API origin, use `api_key` or `credential_id` for direct Anthropic API calls, or route the Claude Code credential through a host-managed Claude CLI/provider boundary.
 - If `anthropic.auth.refresh_oauth` reports `refreshable=false`, rerun `claude setup-token` or rotate the host-managed credential outside the connector, then reconfigure with the new token.

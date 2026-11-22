@@ -5,7 +5,7 @@ min_mesh_version = "2.0.0"
 min_protocol = "fcp2-sym/2.0"
 protocol_features = []
 max_datagram_bytes = 65000
-interface_hash = "blake3-256:fcp.interface.v2:27d29e7c20874b43d6f211941ac4de5bbbf2341aff7ccf0967251c98792a08f6"
+interface_hash = "blake3-256:fcp.interface.v2:cea36fadc900b4c27430f2791f8a2ddd9725e3f07afe12a85e6dfbf9115d8297"
 
 [connector]
 id = "fcp.anthropic"
@@ -116,23 +116,13 @@ type = "string"
 
 [provides.operations."anthropic.chat".input_schema.properties.model]
 default = "claude-sonnet-4-6"
-description = "Anthropic model to use"
-enum = [
-    "claude-opus-4-7",
-    "claude-opus-4-6",
-    "claude-sonnet-4-6",
-    "claude-opus-4-5-20251101",
-    "claude-sonnet-4-5-20250929",
-    "claude-haiku-4-5-20251001",
-    "claude-sonnet-4-20250514",
-    "claude-3-5-haiku-20241022",
-    "claude-3-5-sonnet-20241022",
-]
+description = "Supported Anthropic model ID or alias; normalized to a canonical model before authorization and provider dispatch"
+minLength = 1
 type = "string"
 
 [provides.operations."anthropic.chat".input_schema.properties.system]
 description = "Optional system prompt, either a string or an Anthropic content-block array"
-type = "string"
+type = ["string", "array"]
 
 [provides.operations."anthropic.chat".output_schema]
 required = [
@@ -159,7 +149,7 @@ type = "integer"
 type = "integer"
 
 [provides.operations."anthropic.chat".output_schema.properties.usage.properties.service_tier]
-type = "string"
+type = ["string", "null"]
 
 [provides.operations."anthropic.chat".output_schema.properties.provenance]
 description = "Provenance and taint metadata for the AI-generated output"
@@ -471,7 +461,7 @@ type = "object"
 
 [provides.operations."anthropic.message".input_schema.properties.messages.items.properties.content]
 description = "Message content, either a string or an Anthropic content-block array with optional cache_control annotations"
-type = "string"
+type = ["string", "array"]
 
 [provides.operations."anthropic.message".input_schema.properties.messages.items.properties.role]
 enum = [
@@ -482,23 +472,13 @@ type = "string"
 
 [provides.operations."anthropic.message".input_schema.properties.model]
 default = "claude-sonnet-4-6"
-description = "Anthropic model to use"
-enum = [
-    "claude-opus-4-7",
-    "claude-opus-4-6",
-    "claude-sonnet-4-6",
-    "claude-opus-4-5-20251101",
-    "claude-sonnet-4-5-20250929",
-    "claude-haiku-4-5-20251001",
-    "claude-sonnet-4-20250514",
-    "claude-3-5-haiku-20241022",
-    "claude-3-5-sonnet-20241022",
-]
+description = "Supported Anthropic model ID or alias; normalized to a canonical model before authorization and provider dispatch"
+minLength = 1
 type = "string"
 
 [provides.operations."anthropic.message".input_schema.properties.system]
 description = "Optional system prompt, either a string or an Anthropic content-block array"
-type = "string"
+type = ["string", "array"]
 
 [provides.operations."anthropic.message".input_schema.properties.temperature]
 description = "Sampling temperature from 0.0 to 1.0"
@@ -574,7 +554,7 @@ type = "string"
 type = "string"
 
 [provides.operations."anthropic.message".output_schema.properties.stop_reason]
-type = "string"
+type = ["string", "null"]
 
 [provides.operations."anthropic.message".output_schema.properties.usage]
 type = "object"
@@ -586,7 +566,7 @@ type = "integer"
 type = "integer"
 
 [provides.operations."anthropic.message".output_schema.properties.usage.properties.service_tier]
-type = "string"
+type = ["string", "null"]
 
 [provides.operations."anthropic.message".output_schema.properties.provenance]
 description = "Provenance and taint metadata for the AI-generated output"
@@ -684,7 +664,7 @@ type = "object"
 
 [provides.operations."anthropic.message.stream".input_schema.properties.messages.items.properties.content]
 description = "Message content, either a string or an Anthropic content-block array with optional cache_control annotations"
-type = "string"
+type = ["string", "array"]
 
 [provides.operations."anthropic.message.stream".input_schema.properties.messages.items.properties.role]
 enum = [
@@ -695,23 +675,13 @@ type = "string"
 
 [provides.operations."anthropic.message.stream".input_schema.properties.model]
 default = "claude-sonnet-4-6"
-description = "Anthropic model to use"
-enum = [
-    "claude-opus-4-7",
-    "claude-opus-4-6",
-    "claude-sonnet-4-6",
-    "claude-opus-4-5-20251101",
-    "claude-sonnet-4-5-20250929",
-    "claude-haiku-4-5-20251001",
-    "claude-sonnet-4-20250514",
-    "claude-3-5-haiku-20241022",
-    "claude-3-5-sonnet-20241022",
-]
+description = "Supported Anthropic model ID or alias; normalized to a canonical model before authorization and provider dispatch"
+minLength = 1
 type = "string"
 
 [provides.operations."anthropic.message.stream".input_schema.properties.system]
 description = "Optional system prompt, either a string or an Anthropic content-block array"
-type = "string"
+type = ["string", "array"]
 
 [provides.operations."anthropic.message.stream".input_schema.properties.temperature]
 description = "Sampling temperature from 0.0 to 1.0"
@@ -788,7 +758,7 @@ type = "string"
 type = "string"
 
 [provides.operations."anthropic.message.stream".output_schema.properties.stop_reason]
-type = "string"
+type = ["string", "null"]
 
 [provides.operations."anthropic.message.stream".output_schema.properties.streamed]
 type = "boolean"
@@ -803,7 +773,7 @@ type = "integer"
 type = "integer"
 
 [provides.operations."anthropic.message.stream".output_schema.properties.usage.properties.service_tier]
-type = "string"
+type = ["string", "null"]
 
 [provides.operations."anthropic.message.stream".output_schema.properties.provenance]
 description = "Provenance and taint metadata for the AI-generated output"

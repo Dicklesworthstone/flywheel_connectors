@@ -1,31 +1,41 @@
 //! FCP Anthropic Connector implementation.
 
-use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
+use fcp_manifest::ConnectorManifest;
 use fcp_prelude::{
-    AgentHint, BaseConnector, CapabilityGrant, CapabilityId, CapabilityToken, CapabilityVerifier,
-    ConnectorId, CredentialId, EventCaps, FcpError, FcpResult, HandshakeRequest, HandshakeResponse,
-    IdempotencyClass, InstanceId, Introspection, OperationId, OperationInfo, RiskLevel, SafetyTier,
-    SelfCheckReport, SessionId, SimulateRequest, SimulateResponse,
+    ApprovalMode, BaseConnector, ConnectorId, CredentialId, FcpError, FcpResult, HandshakeRequest,
+    HealthSnapshot, InstanceId, Introspection, InvokeRequest, InvokeResponse, OperationId,
+    OperationInfo, SelfCheckReport, SessionId, SimulateRequest, SimulateResponse, ZoneId,
 };
+use fcp_sdk::prelude::{OperationContractSet, StandaloneSession};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sha2::{Digest, Sha256};
 use tracing::{info, instrument};
 
 use crate::{
     client::{AnthropicAuth, AnthropicClient, DEFAULT_API_VERSION, DEFAULT_BASE_URL},
     error::AnthropicError,
     types::{
-        BETA_INTERLEAVED_THINKING, CacheCreation, ContentBlock, DEFAULT_MODEL, ImageSource,
-        Message, MessageContent, MessageRequestOptions, Model, Role, SUPPORTED_MODEL_IDS,
-        ServiceTier, Tool, ToolChoice, Usage,
+        BETA_INTERLEAVED_THINKING, CacheCreation, ContentBlock, ImageSource, Message,
+        MessageContent, MessageRequestOptions, Model, Role, ServiceTier, Tool, ToolChoice, Usage,
     },
 };
 
 const MANIFEST_TOML: &str = include_str!("../manifest.toml");
+const MAX_INVOKE_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
+const OPERATION_IDS: [&str; 7] = [
+    "anthropic.chat",
+    "anthropic.message",
+    "anthropic.message.stream",
+    "anthropic.get_usage",
+    "anthropic.auth.list_methods",
+    "anthropic.auth.refresh_oauth",
+    "anthropic.models.normalize",
+];
 
 /// Parsed and validated Anthropic connector configuration.
 #[derive(Debug, Clone)]
@@ -261,36 +271,6 @@ fn parse_anthropic_base_url(base_url: &str) -> Result<Url, String> {
     }
 
     Ok(parsed)
-}
-
-fn required_capability(operation: &str) -> FcpResult<CapabilityId> {
-    let capability = match operation {
-        "anthropic.message" => "anthropic.message",
-        "anthropic.message.stream" => "anthropic.message.stream",
-        "anthropic.chat" => "anthropic.chat",
-        "anthropic.get_usage" => "anthropic.get_usage",
-        "anthropic.auth.list_methods" | "anthropic.auth.refresh_oauth" => "anthropic.auth",
-        "anthropic.models.normalize" => "anthropic.models",
-        _ => {
-            return Err(FcpError::OperationNotGranted {
-                operation: operation.into(),
-            });
-        }
-    };
-    Ok(CapabilityId::from_static(capability))
-}
-
-fn resource_uris_for_operation(operation: &str, input: &serde_json::Value) -> Vec<String> {
-    match operation {
-        "anthropic.message" | "anthropic.message.stream" | "anthropic.chat" => {
-            let model = input
-                .get("model")
-                .and_then(|v| v.as_str())
-                .unwrap_or(DEFAULT_MODEL.as_str());
-            vec![format!("anthropic:model:{model}")]
-        }
-        _ => Vec::new(),
-    }
 }
 
 fn parse_model_from_input(input: &serde_json::Value) -> FcpResult<(Model, String)> {
@@ -650,12 +630,14 @@ impl DoctorResult {
 
 /// FCP Anthropic Connector.
 pub struct AnthropicConnector {
-    base: Arc<BaseConnector>,
+    base: BaseConnector,
     config: Option<AnthropicConfig>,
     client: Option<AnthropicClient>,
     total_cost: AtomicU64, // Store as fixed-point (cost * 1_000_000_000)
-    verifier: Option<CapabilityVerifier>,
+    authority: Option<StandaloneSession>,
     session_id: Option<SessionId>,
+    bound_zone: Option<ZoneId>,
+    started_at: Instant,
 }
 
 impl AnthropicConnector {
@@ -663,12 +645,14 @@ impl AnthropicConnector {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            base: Arc::new(BaseConnector::new(ConnectorId::from_static("anthropic"))),
+            base: BaseConnector::new(ConnectorId::from_static("fcp.anthropic")),
             config: None,
             client: None,
             total_cost: AtomicU64::new(0),
-            verifier: None,
+            authority: None,
             session_id: None,
+            bound_zone: None,
+            started_at: Instant::now(),
         }
     }
 
@@ -684,10 +668,21 @@ impl AnthropicConnector {
         &self.base.instance_id
     }
 
-    fn manifest_hash() -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(MANIFEST_TOML.as_bytes());
-        format!("sha256:{}", hex::encode(hasher.finalize()))
+    fn invalidate_authority(&mut self) {
+        self.authority = None;
+        self.session_id = None;
+        self.base.set_handshaken(false);
+        self.base.instance_id = InstanceId::new();
+    }
+
+    fn clear_configuration(&mut self) {
+        self.invalidate_authority();
+        self.bound_zone = None;
+        self.base.set_configured(false);
+        self.config = None;
+        if let Some(client) = self.client.take() {
+            client.shutdown();
+        }
     }
 
     /// Get total errors.
@@ -720,6 +715,9 @@ impl AnthropicConnector {
         &mut self,
         params: serde_json::Value,
     ) -> FcpResult<serde_json::Value> {
+        // Every attempt revokes the previous account and its grants, including
+        // a replacement configuration that fails validation.
+        self.clear_configuration();
         let config = AnthropicConfig::from_params(&params)?;
 
         let client = AnthropicClient::new_with_auth_and_version(
@@ -751,94 +749,98 @@ impl AnthropicConnector {
         }))
     }
 
-    /// Handle handshake method.
+    /// Negotiate a fresh, manifest-scoped host session.
     ///
-    /// # Errors
-    ///
-    /// Returns an error if the handshake request is malformed or serialization fails.
+    /// A rejected handshake also revokes the previous session. Binding the
+    /// configured account to another zone requires an explicit reconfiguration.
     pub async fn handle_handshake(
         &mut self,
         params: serde_json::Value,
     ) -> FcpResult<serde_json::Value> {
-        let req: HandshakeRequest =
-            serde_json::from_value(params).map_err(|e| FcpError::InvalidRequest {
+        self.invalidate_authority();
+        if self.client.is_none() || self.config.is_none() {
+            return Err(FcpError::NotConfigured);
+        }
+        let request: HandshakeRequest =
+            serde_json::from_value(params).map_err(|_| FcpError::InvalidRequest {
                 code: 1003,
-                message: format!("Invalid handshake request: {e}"),
+                message: "Invalid handshake request".into(),
             })?;
-
-        // Set up verifier
-        self.verifier = Some(CapabilityVerifier::new(
-            req.host_public_key,
-            req.zone.clone(),
-            self.base.instance_id.clone(),
-        ));
-
-        let session_id = SessionId::new();
-        self.session_id = Some(session_id.clone());
+        if self
+            .bound_zone
+            .as_ref()
+            .is_some_and(|zone| zone != &request.zone)
+        {
+            return Err(FcpError::CapabilityDenied {
+                capability: "anthropic.handshake".into(),
+                reason: "Reconfigure before binding this account to another zone".into(),
+            });
+        }
+        let zone = request.zone.clone();
+        let mut authority = StandaloneSession::new(MANIFEST_TOML)?;
+        let response = authority.handshake(request)?;
+        let mut result = serde_json::to_value(&response).map_err(|error| FcpError::Internal {
+            message: format!("Failed to serialize handshake: {error}"),
+        })?;
+        result["instance_id"] = json!(authority.instance_id());
+        result["connector_id"] = json!("fcp.anthropic");
+        result["protocol_version"] = json!("2.0");
+        self.base.instance_id = authority.instance_id().clone();
+        self.session_id = Some(response.session_id);
+        self.bound_zone = Some(zone);
+        self.authority = Some(authority);
         self.base.set_handshaken(true);
-
-        // Convert capability IDs to grants
-        let capabilities_granted: Vec<CapabilityGrant> = req
-            .capabilities_requested
-            .into_iter()
-            .map(|cap| CapabilityGrant {
-                capability: cap,
-                operation: None,
-            })
-            .collect();
-
-        let response = HandshakeResponse {
-            status: "accepted".into(),
-            capabilities_granted,
-            session_id,
-            manifest_hash: Self::manifest_hash(),
-            nonce: req.nonce,
-            event_caps: Some(EventCaps {
-                streaming: true,
-                replay: false,
-                min_buffer_events: 10,
-                requires_ack: false,
-            }),
-            auth_caps: None,
-            op_catalog_hash: None,
-        };
-
-        serde_json::to_value(response).map_err(|e| FcpError::Internal {
-            message: format!("Failed to serialize response: {e}"),
-        })
+        Ok(result)
     }
 
-    /// Handle health check.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if health status serialization fails (should not happen).
+    /// Return the canonical host health snapshot and redacted account details.
     pub async fn handle_health(&self) -> FcpResult<serde_json::Value> {
-        let configured = self.config.is_some();
-        let auth = self
-            .config
-            .as_ref()
-            .map_or_else(|| "unconfigured".to_string(), |c| c.auth.redacted_label());
-        let base_url = self
-            .config
-            .as_ref()
-            .map_or_else(|| DEFAULT_BASE_URL.to_string(), |c| c.base_url.clone());
-        let api_version = self.client.as_ref().map_or_else(
-            || DEFAULT_API_VERSION.to_string(),
-            |client| client.api_version().to_string(),
-        );
-        Ok(json!({
-            "status": if configured { "healthy" } else { "not_configured" },
-            "auth": auth,
-            "auth_method": self.config.as_ref().map_or("unconfigured", |c| c.auth.method_name()),
-            "base_url": base_url,
-            "api_version": api_version,
+        let configured = self.config.is_some() && self.client.is_some();
+        let handshaken = configured
+            && self
+                .authority
+                .as_ref()
+                .is_some_and(StandaloneSession::is_established);
+        let mut health = if handshaken {
+            HealthSnapshot::ready()
+        } else if configured {
+            HealthSnapshot::degraded("handshake required")
+        } else {
+            HealthSnapshot::degraded("not configured")
+        };
+        health.uptime_ms = u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        health.details = Some(json!({
+            "connector_id": "fcp.anthropic",
+            "configured": configured,
+            "handshaken": handshaken,
+            "instance_id": self.base.instance_id,
+            "zone": self.bound_zone,
+            "session_id": self.session_id,
+            "auth": self.config.as_ref().map_or_else(
+                || "unconfigured".to_owned(),
+                |config| config.auth.redacted_label()
+            ),
+            "auth_method": self.config.as_ref().map_or(
+                "unconfigured",
+                |config| config.auth.method_name()
+            ),
+            "base_url": self.config.as_ref().map_or(
+                DEFAULT_BASE_URL,
+                |config| config.base_url.as_str()
+            ),
+            "api_version": self.client.as_ref().map_or(
+                DEFAULT_API_VERSION,
+                AnthropicClient::api_version
+            ),
             "metrics": {
                 "requests_total": self.total_requests(),
                 "requests_error": self.total_errors(),
                 "total_cost_usd": self.total_cost()
             }
-        }))
+        }));
+        serde_json::to_value(health).map_err(|error| FcpError::Internal {
+            message: format!("Failed to serialize health: {error}"),
+        })
     }
 
     /// Handle doctor checks.
@@ -999,334 +1001,128 @@ impl AnthropicConnector {
         })
     }
 
-    /// Handle introspect method.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if introspection serialization fails.
+    /// Advertise the complete operation catalog from the embedded manifest.
     pub async fn handle_introspect(&self) -> FcpResult<serde_json::Value> {
         let introspection = Introspection {
-            operations: vec![
-                OperationInfo {
-                    id: OperationId::from_static("anthropic.message"),
-                    summary: "Send a message to Claude".into(),
-                    input_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "model": {
-                                "type": "string",
-                                "enum": SUPPORTED_MODEL_IDS,
-                                "default": DEFAULT_MODEL.as_str()
-                            },
-                            "messages": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "role": { "type": "string", "enum": ["user", "assistant"] },
-                                        "content": { "oneOf": [{ "type": "string" }, { "type": "array", "items": { "type": "object" } }] }
-                                    },
-                                    "required": ["role", "content"]
-                                }
-                            },
-                            "system": { "oneOf": [{ "type": "string" }, { "type": "array", "items": { "type": "object" } }] },
-                            "max_tokens": { "type": "integer", "default": 4096 },
-                            "temperature": { "type": "number", "minimum": 0, "maximum": 1 },
-                            "tools": { "type": "array", "description": "Tool definitions; set eager_input_streaming=true per tool for GA fine-grained input streaming." },
-                            "tool_choice": { "type": "object" },
-                            "anthropic_betas": { "type": "array", "items": { "type": "string" } },
-                            "enable_1m_context": { "type": "boolean", "description": "Require a 1M-capable model. Opus 4.7, Opus 4.6, and Sonnet 4.6 are 1M-capable without a beta header." },
-                            "cache_control": { "type": "object", "description": "Top-level automatic prompt caching control." },
-                            "service_tier": { "type": "string", "enum": ["auto", "standard_only"] },
-                            "thinking": { "type": "object" },
-                            "output_config": { "type": "object", "description": "Output configuration such as adaptive-thinking effort." }
-                        },
-                        "required": ["messages"]
-                    }),
-                    output_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "id": { "type": "string" },
-                            "content": { "type": "string" },
-                            "model": { "type": "string" },
-                            "stop_reason": { "type": "string" },
-                            "usage": {
-                                "type": "object",
-                                "properties": {
-                                    "input_tokens": { "type": "integer" },
-                                    "output_tokens": { "type": "integer" }
-                                }
-                            },
-                            "cost_usd": { "type": "number" }
-                        }
-                    }),
-                    capability: CapabilityId::from_static("anthropic.message"),
-                    risk_level: RiskLevel::Medium,
-                    description: None,
-                    rate_limit: None,
-                    requires_approval: None,
-                    safety_tier: SafetyTier::Safe,
-                    idempotency: IdempotencyClass::None,
-                    ai_hints: AgentHint {
-                        when_to_use: "Send a message to Claude and get a response.".into(),
-                        common_mistakes: vec![
-                            "Not providing messages array".into(),
-                            "Exceeding context length".into(),
-                        ],
-                        examples: vec![
-                            r#"{"messages": [{"role": "user", "content": "Hello!"}]}"#.into(),
-                        ],
-                        related: vec![],
-                    },
-                },
-                OperationInfo {
-                    id: OperationId::from_static("anthropic.chat"),
-                    summary: "Simple chat with Claude (single message)".into(),
-                    input_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "model": {
-                                "type": "string",
-                                "enum": SUPPORTED_MODEL_IDS,
-                                "default": DEFAULT_MODEL.as_str()
-                            },
-                            "message": { "type": "string" },
-                            "system": { "oneOf": [{ "type": "string" }, { "type": "array", "items": { "type": "object" } }] },
-                            "max_tokens": { "type": "integer", "default": 4096 },
-                            "anthropic_betas": { "type": "array", "items": { "type": "string" } },
-                            "enable_1m_context": { "type": "boolean", "description": "Require a 1M-capable model. Opus 4.7, Opus 4.6, and Sonnet 4.6 are 1M-capable without a beta header." },
-                            "cache_control": { "type": "object", "description": "Top-level automatic prompt caching control." },
-                            "service_tier": { "type": "string", "enum": ["auto", "standard_only"] },
-                            "thinking": { "type": "object" },
-                            "output_config": { "type": "object", "description": "Output configuration such as adaptive-thinking effort." }
-                        },
-                        "required": ["message"]
-                    }),
-                    output_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "response": { "type": "string" },
-                            "usage": {
-                                "type": "object",
-                                "properties": {
-                                    "input_tokens": { "type": "integer" },
-                                    "output_tokens": { "type": "integer" }
-                                }
-                            },
-                            "cost_usd": { "type": "number" }
-                        }
-                    }),
-                    capability: CapabilityId::from_static("anthropic.chat"),
-                    risk_level: RiskLevel::Medium,
-                    description: None,
-                    rate_limit: None,
-                    requires_approval: None,
-                    safety_tier: SafetyTier::Safe,
-                    idempotency: IdempotencyClass::None,
-                    ai_hints: AgentHint {
-                        when_to_use: "Simple single-turn chat with Claude.".into(),
-                        common_mistakes: vec![],
-                        examples: vec![r#"{"message": "What is 2+2?"}"#.into()],
-                        related: vec![],
-                    },
-                },
-                OperationInfo {
-                    id: OperationId::from_static("anthropic.message.stream"),
-                    summary: "Stream a message response from Claude via SSE".into(),
-                    input_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "model": {
-                                "type": "string",
-                                "enum": SUPPORTED_MODEL_IDS,
-                                "default": DEFAULT_MODEL.as_str()
-                            },
-                            "messages": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "role": { "type": "string", "enum": ["user", "assistant"] },
-                                        "content": { "oneOf": [{ "type": "string" }, { "type": "array", "items": { "type": "object" } }] }
-                                    },
-                                    "required": ["role", "content"]
-                                }
-                            },
-                            "system": { "oneOf": [{ "type": "string" }, { "type": "array", "items": { "type": "object" } }] },
-                            "max_tokens": { "type": "integer", "default": 4096 },
-                            "temperature": { "type": "number", "minimum": 0, "maximum": 1 },
-                            "tools": { "type": "array", "description": "Tool definitions; set eager_input_streaming=true per tool for GA fine-grained input streaming." },
-                            "tool_choice": { "type": "object", "description": "Optional tool selection policy" },
-                            "anthropic_betas": { "type": "array", "items": { "type": "string" } },
-                            "enable_1m_context": { "type": "boolean", "description": "Require a 1M-capable model. Opus 4.7, Opus 4.6, and Sonnet 4.6 are 1M-capable without a beta header." },
-                            "cache_control": { "type": "object", "description": "Top-level automatic prompt caching control." },
-                            "service_tier": { "type": "string", "enum": ["auto", "standard_only"] },
-                            "thinking": { "type": "object" },
-                            "output_config": { "type": "object", "description": "Output configuration such as adaptive-thinking effort." }
-                        },
-                        "required": ["messages"]
-                    }),
-                    output_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "id": { "type": "string" },
-                            "content": { "type": "string" },
-                            "content_blocks": { "type": "array" },
-                            "model": { "type": "string" },
-                            "stop_reason": { "type": "string" },
-                            "streamed": { "type": "boolean" },
-                            "usage": {
-                                "type": "object",
-                                "properties": {
-                                    "input_tokens": { "type": "integer" },
-                                    "output_tokens": { "type": "integer" }
-                                }
-                            },
-                            "cost_usd": { "type": "number" }
-                        }
-                    }),
-                    capability: CapabilityId::from_static("anthropic.message.stream"),
-                    risk_level: RiskLevel::Medium,
-                    description: None,
-                    rate_limit: None,
-                    requires_approval: None,
-                    safety_tier: SafetyTier::Safe,
-                    idempotency: IdempotencyClass::None,
-                    ai_hints: AgentHint {
-                        when_to_use:
-                            "Stream Claude responses token-by-token via SSE for lower latency."
-                                .into(),
-                        common_mistakes: vec![
-                            "Not handling SSE events incrementally.".into(),
-                            "Not providing messages array.".into(),
-                        ],
-                        examples: vec![
-                            r#"{"messages": [{"role": "user", "content": "Write a poem"}]}"#.into(),
-                        ],
-                        related: vec![
-                            CapabilityId::from_static("anthropic.message"),
-                            CapabilityId::from_static("anthropic.chat"),
-                        ],
-                    },
-                },
-                OperationInfo {
-                    id: OperationId::from_static("anthropic.get_usage"),
-                    summary: "Get current usage and cost statistics".into(),
-                    input_schema: json!({
-                        "type": "object",
-                        "properties": {}
-                    }),
-                    output_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "total_input_tokens": { "type": "integer" },
-                            "total_output_tokens": { "type": "integer" },
-                            "total_cost_usd": { "type": "number" },
-                            "requests_total": { "type": "integer" },
-                            "requests_error": { "type": "integer" }
-                        }
-                    }),
-                    capability: CapabilityId::from_static("anthropic.get_usage"),
-                    risk_level: RiskLevel::Low,
-                    description: None,
-                    rate_limit: None,
-                    requires_approval: None,
-                    safety_tier: SafetyTier::Safe,
-                    idempotency: IdempotencyClass::Strict,
-                    ai_hints: AgentHint {
-                        when_to_use: "Check usage and costs for this session.".into(),
-                        common_mistakes: vec![],
-                        examples: vec![],
-                        related: vec![],
-                    },
-                },
-            ],
+            operations: operations_info()?.to_vec(),
             events: vec![],
             resource_types: vec![],
             auth_caps: None,
             event_caps: None,
         };
-
-        serde_json::to_value(introspection).map_err(|e| FcpError::Internal {
-            message: format!("Failed to serialize introspection: {e}"),
+        serde_json::to_value(introspection).map_err(|error| FcpError::Internal {
+            message: format!("Failed to serialize introspection: {error}"),
         })
     }
 
-    /// Handle simulate method.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the simulate request is malformed or serialization fails.
+    /// Check the same input, model scopes and authority as invocation without
+    /// contacting the provider or consuming the signed token's call budget.
     pub async fn handle_simulate(&self, params: serde_json::Value) -> FcpResult<serde_json::Value> {
-        let req: SimulateRequest =
-            serde_json::from_value(params).map_err(|e| FcpError::InvalidRequest {
+        let request: SimulateRequest =
+            serde_json::from_value(params).map_err(|_| FcpError::InvalidRequest {
                 code: 1003,
-                message: format!("Invalid simulate request: {e}"),
+                message: "Invalid simulate request".into(),
             })?;
-
-        let capability = match required_capability(req.operation.as_str()) {
-            Ok(capability) => capability,
+        if request.r#type != "simulate" || request.id.0.is_empty() || !request.input.is_object() {
+            return Err(FcpError::InvalidRequest {
+                code: 1003,
+                message: "Simulation requires a typed request, non-empty ID and object input"
+                    .into(),
+            });
+        }
+        let authorization = self
+            .validate_operation(&request.operation, &request.input)
+            .and_then(|resources| {
+                self.authority
+                    .as_ref()
+                    .ok_or(FcpError::NotHandshaken)?
+                    .authorize(
+                        &request.connector_id,
+                        &request.zone_id,
+                        &request.operation,
+                        request.capability_token,
+                        &resources,
+                    )
+                    .map(drop)
+            });
+        let response = match authorization {
+            Ok(()) => SimulateResponse::allowed(request.id),
             Err(error) => {
-                return serde_json::to_value(SimulateResponse::denied(
-                    req.id,
-                    error.to_string(),
-                    error.error_code(),
-                ))
-                .map_err(|e| FcpError::Internal {
-                    message: format!("Failed to serialize response: {e}"),
-                });
+                let mut response =
+                    SimulateResponse::denied(request.id, error.to_string(), error.error_code());
+                if matches!(
+                    error,
+                    FcpError::CapabilityDenied { .. } | FcpError::OperationNotGranted { .. }
+                ) && let Some(operation) = operations_info()?
+                    .iter()
+                    .find(|operation| operation.id == request.operation)
+                {
+                    response = response
+                        .with_missing_capabilities(vec![operation.capability.as_str().to_owned()]);
+                }
+                response
             }
         };
-        if self.client.is_none() {
-            return serde_json::to_value(SimulateResponse::denied(
-                req.id,
-                "Connector is not configured",
-                FcpError::NotConfigured.error_code(),
-            ))
-            .map_err(|e| FcpError::Internal {
-                message: format!("Failed to serialize response: {e}"),
-            });
-        }
-        let Some(verifier) = self.verifier.as_ref() else {
-            return serde_json::to_value(SimulateResponse::denied(
-                req.id,
-                "Connector handshake not completed",
-                FcpError::NotHandshaken.error_code(),
-            ))
-            .map_err(|e| FcpError::Internal {
-                message: format!("Failed to serialize response: {e}"),
-            });
-        };
-        let resource_uris = resource_uris_for_operation(req.operation.as_str(), &req.input);
-        if let Err(error) = verifier.verify_bound(
-            req.capability_token,
-            &capability,
-            &req.operation,
-            &resource_uris,
-        ) {
-            let mut response =
-                SimulateResponse::denied(req.id, error.to_string(), error.error_code());
-            if error.error_code() == "FCP-3001" {
-                response =
-                    response.with_missing_capabilities(vec![capability.as_str().to_string()]);
-            }
-            return serde_json::to_value(response).map_err(|e| FcpError::Internal {
-                message: format!("Failed to serialize response: {e}"),
-            });
-        }
-
-        let response = SimulateResponse::allowed(req.id);
-        serde_json::to_value(response).map_err(|e| FcpError::Internal {
-            message: format!("Failed to serialize response: {e}"),
+        serde_json::to_value(response).map_err(|error| FcpError::Internal {
+            message: format!("Failed to serialize simulation: {error}"),
         })
     }
 
-    /// Handle invoke method.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the operation is invalid, capability token verification
-    /// fails, required parameters are missing, or the API call fails.
+    /// Validate local provider semantics before either admission or simulation.
+    fn validate_operation(
+        &self,
+        operation: &OperationId,
+        input: &serde_json::Value,
+    ) -> FcpResult<Vec<String>> {
+        self.base.check_ready()?;
+        let config = self.config.as_ref().ok_or(FcpError::NotConfigured)?;
+        if self.client.is_none() {
+            return Err(FcpError::NotConfigured);
+        }
+        operations_info()?
+            .iter()
+            .find(|metadata| metadata.id == *operation)
+            .ok_or_else(|| FcpError::OperationNotGranted {
+                operation: operation.as_str().to_owned(),
+            })?;
+        operation_contracts()?.validate_input(operation, input)?;
+        match operation.as_str() {
+            "anthropic.chat" | "anthropic.message" | "anthropic.message.stream" => {
+                let (model, canonical) = parse_model_from_input(input)?;
+                parse_max_tokens(input)?;
+                let options = build_message_options(input, model, config)?;
+                if operation.as_str() != "anthropic.chat" {
+                    let mut messages: Vec<Message> =
+                        serde_json::from_value(input["messages"].clone()).map_err(|error| {
+                            FcpError::InvalidRequest {
+                                code: 1003,
+                                message: format!("Invalid messages format: {error}"),
+                            }
+                        })?;
+                    validate_message_media_policy(&messages)?;
+                    if config.auth.uses_claude_code_oauth() && options.thinking.is_some() {
+                        strip_trailing_assistant_prefill_when_thinking(&mut messages);
+                    }
+                    if messages.is_empty() {
+                        return Err(FcpError::InvalidRequest {
+                            code: 1003,
+                            message: "Messages array must contain a message after thinking-prefill normalization".into(),
+                        });
+                    }
+                }
+                // Capabilities bind the actual provider model, so an alias
+                // cannot bypass a canonical model deny rule.
+                Ok(vec![format!("anthropic:model:{canonical}")])
+            }
+            "anthropic.models.normalize" => {
+                parse_model_from_input(input)?;
+                Ok(Vec::new())
+            }
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    /// Admit one complete host invocation and settle its bounded response.
     pub async fn handle_invoke(&self, params: serde_json::Value) -> FcpResult<serde_json::Value> {
         let result = self.handle_invoke_internal(params).await;
         self.base.record_request(result.is_ok());
@@ -1337,50 +1133,28 @@ impl AnthropicConnector {
         &self,
         params: serde_json::Value,
     ) -> FcpResult<serde_json::Value> {
-        let operation =
-            params
-                .get("operation")
-                .and_then(|v| v.as_str())
-                .ok_or(FcpError::InvalidRequest {
-                    code: 1003,
-                    message: "Missing operation".into(),
-                })?;
-
-        let input = params.get("input").cloned().unwrap_or(json!({}));
-
         self.base.check_ready()?;
-
-        // Extract and verify capability token
-        let token_value = params
-            .get("capability_token")
-            .ok_or(FcpError::InvalidRequest {
+        let request: InvokeRequest =
+            serde_json::from_value(params).map_err(|_| FcpError::InvalidRequest {
                 code: 1003,
-                message: "Missing capability_token".into(),
+                message: "Invalid FCP invoke request".into(),
             })?;
-
-        let capability =
-            serde_json::from_value::<CapabilityToken>(token_value.clone()).map_err(|e| {
-                FcpError::InvalidRequest {
-                    code: 1003,
-                    message: format!("Invalid capability_token format: {e}"),
-                }
-            })?;
-
-        // Verify token
-        let op_id: OperationId = operation.parse().map_err(|_| FcpError::InvalidRequest {
-            code: 1003,
-            message: "Invalid operation ID format".into(),
-        })?;
-        let cap_id = required_capability(operation)?;
-        let resource_uris = resource_uris_for_operation(operation, &input);
-
-        if let Some(verifier) = &self.verifier {
-            verifier.verify_bound(capability, &cap_id, &op_id, &resource_uris)?;
-        } else {
-            return Err(FcpError::NotHandshaken);
+        if !request.input.is_object() || request.deadline_ms == Some(0) {
+            return Err(FcpError::InvalidRequest {
+                code: 1003,
+                message: "Invocation requires object input and a nonzero deadline when supplied"
+                    .into(),
+            });
         }
-
-        match operation {
+        let resources = self.validate_operation(&request.operation, &request.input)?;
+        let witness = self
+            .authority
+            .as_ref()
+            .ok_or(FcpError::NotHandshaken)?
+            .admit_bounded(&request, &resources, MAX_INVOKE_RESPONSE_BYTES)?;
+        let operation = request.operation.as_str();
+        let input = request.input;
+        let result = match operation {
             "anthropic.message" => self.invoke_message(input).await,
             "anthropic.message.stream" => self.invoke_message_stream(input).await,
             "anthropic.chat" => self.invoke_chat(input).await,
@@ -1391,7 +1165,14 @@ impl AnthropicConnector {
             _ => Err(FcpError::OperationNotGranted {
                 operation: operation.into(),
             }),
-        }
+        };
+        let response = match &result {
+            Ok(value) => InvokeResponse::ok(request.id.clone(), value.clone()),
+            Err(error) => InvokeResponse::error(request.id.clone(), error.clone()),
+        };
+        operation_contracts()?.validate_response(&request.operation, &request.id, &response)?;
+        witness.finish_response(&response)?;
+        result
     }
 
     async fn invoke_message(&self, input: serde_json::Value) -> FcpResult<serde_json::Value> {
@@ -1988,15 +1769,7 @@ impl AnthropicConnector {
         _params: serde_json::Value,
     ) -> FcpResult<serde_json::Value> {
         info!("Anthropic connector shutting down");
-        if let Some(client) = &self.client {
-            client.shutdown();
-        }
-        self.client = None;
-        self.config = None;
-        self.verifier = None;
-        self.session_id = None;
-        self.base.set_configured(false);
-        self.base.set_handshaken(false);
+        self.clear_configuration();
         Ok(json!({ "status": "shutdown" }))
     }
 }
@@ -2007,6 +1780,52 @@ impl Default for AnthropicConnector {
     }
 }
 
+fn operation_contracts() -> FcpResult<&'static OperationContractSet> {
+    static CONTRACTS: OnceLock<FcpResult<OperationContractSet>> = OnceLock::new();
+    CONTRACTS
+        .get_or_init(|| OperationContractSet::from_manifest_toml(MANIFEST_TOML))
+        .as_ref()
+        .map_err(Clone::clone)
+}
+
+fn operations_info() -> FcpResult<&'static [OperationInfo]> {
+    static OPERATIONS: OnceLock<Result<Vec<OperationInfo>, String>> = OnceLock::new();
+    let operations = OPERATIONS.get_or_init(|| {
+        let manifest =
+            ConnectorManifest::parse_str(MANIFEST_TOML).map_err(|error| error.to_string())?;
+        if manifest.provides.operations.len() != OPERATION_IDS.len() {
+            return Err("Anthropic manifest does not match the implemented operation set".into());
+        }
+        OPERATION_IDS
+            .into_iter()
+            .map(|id| {
+                let operation = manifest
+                    .provides
+                    .operations
+                    .get(id)
+                    .ok_or_else(|| format!("Anthropic manifest is missing {id}"))?;
+                Ok(OperationInfo {
+                    id: OperationId::from_static(id),
+                    summary: operation.description.clone(),
+                    description: Some(operation.description.clone()),
+                    input_schema: operation.input_schema.clone(),
+                    output_schema: operation.output_schema.clone(),
+                    capability: operation.capability.clone(),
+                    risk_level: operation.risk_level,
+                    safety_tier: operation.safety_tier,
+                    idempotency: operation.idempotency,
+                    ai_hints: operation.ai_hints.clone(),
+                    rate_limit: operation.rate_limit.as_ref().map(|limit| limit.0.clone()),
+                    requires_approval: Some(ApprovalMode::from(operation.requires_approval)),
+                })
+            })
+            .collect()
+    });
+    operations.as_deref().map_err(|error| FcpError::Internal {
+        message: format!("Embedded Anthropic manifest is invalid: {error}"),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2015,8 +1834,9 @@ mod tests {
     use fcp_crypto::cose::CapabilityTokenBuilder;
     use fcp_crypto::ed25519::Ed25519SigningKey;
     use fcp_manifest::ConnectorManifest;
-    use fcp_prelude::CapabilityConstraints;
+    use fcp_prelude::{CapabilityConstraints, CapabilityToken, HandshakeResponse};
     use parking_lot::Mutex;
+    use sha2::{Digest, Sha256};
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::path::PathBuf;
@@ -2266,19 +2086,35 @@ mod tests {
     #[fcp_async_core::runtime::test]
     async fn test_handshake() {
         let mut connector = AnthropicConnector::new();
+        connector
+            .handle_configure(json!({"api_key": "test-key"}))
+            .await
+            .unwrap();
+        let key = Ed25519SigningKey::generate();
+        let initial_instance = connector.instance_id().clone();
         let result = connector
             .handle_handshake(json!({
-                "protocol_version": "1.0.0",
+                "protocol_version": "2.0.0",
                 "zone": "z:work",
-                "host_public_key": vec![0u8; 32],
+                "host_public_key": key.verifying_key().to_bytes(),
                 "nonce": vec![0u8; 32],
-                "capabilities_requested": ["anthropic.message"]
+                "capabilities_requested": ["anthropic.message", "unknown.capability"]
             }))
             .await
             .unwrap();
-
-        // HandshakeResponse does not include connector_id in V2
-        assert_eq!(result["status"], "accepted");
+        let response: HandshakeResponse = serde_json::from_value(result.clone()).unwrap();
+        assert_eq!(response.status, "accepted");
+        assert_eq!(response.capabilities_granted.len(), 1);
+        assert_eq!(
+            response.capabilities_granted[0].capability.as_str(),
+            "anthropic.message"
+        );
+        assert_eq!(result["connector_id"], "fcp.anthropic");
+        assert_eq!(result["instance_id"], connector.instance_id().as_str());
+        assert_ne!(&initial_instance, connector.instance_id());
+        let health: HealthSnapshot =
+            serde_json::from_value(connector.handle_health().await.unwrap()).unwrap();
+        assert_eq!(health.details.unwrap()["handshaken"], true);
     }
 
     #[fcp_async_core::runtime::test]
@@ -2286,8 +2122,11 @@ mod tests {
         let connector = AnthropicConnector::new();
         let result = connector.handle_health().await.unwrap();
 
-        assert_eq!(result["status"], "not_configured");
-        assert_eq!(result["auth"], "unconfigured");
+        let health: HealthSnapshot = serde_json::from_value(result).unwrap();
+        let details = health.details.unwrap();
+        assert_eq!(details["configured"], false);
+        assert_eq!(details["handshaken"], false);
+        assert_eq!(details["auth"], "unconfigured");
     }
 
     #[fcp_async_core::runtime::test]
@@ -2301,10 +2140,13 @@ mod tests {
             .unwrap();
 
         let result = connector.handle_health().await.unwrap();
-        assert_eq!(result["status"], "healthy");
-        assert_eq!(result["auth"], "api_key:redacted");
-        assert_eq!(result["base_url"], DEFAULT_BASE_URL);
-        assert_eq!(result["api_version"], DEFAULT_API_VERSION);
+        let health: HealthSnapshot = serde_json::from_value(result).unwrap();
+        let details = health.details.unwrap();
+        assert_eq!(details["configured"], true);
+        assert_eq!(details["handshaken"], false);
+        assert_eq!(details["auth"], "api_key:redacted");
+        assert_eq!(details["base_url"], DEFAULT_BASE_URL);
+        assert_eq!(details["api_version"], DEFAULT_API_VERSION);
     }
 
     // --- Configure tests ---
@@ -3101,22 +2943,25 @@ mod tests {
         let signing_key = Ed25519SigningKey::generate();
         let verifying_key = signing_key.verifying_key();
 
-        // Handshake first to setup verifier
-        connector
+        let handshake = connector
             .handle_handshake(json!({
-                "protocol_version": "1.0.0",
+                "protocol_version": "2.0.0",
                 "zone": "z:work",
                 "host_public_key": verifying_key.to_bytes(),
                 "nonce": vec![0u8; 32],
                 "capabilities_requested": ["anthropic.chat"]
             }))
-            .await
-            .unwrap();
+            .await;
+        assert!(matches!(handshake, Err(FcpError::NotConfigured)));
 
         let capability = generate_valid_token(&signing_key, &connector, "anthropic.chat");
 
         let result = connector
             .handle_invoke(json!({
+                "type": "invoke",
+                "id": "unconfigured-chat",
+                "connector_id": "fcp.anthropic",
+                "zone_id": "z:work",
                 "operation": "anthropic.chat",
                 "input": {
                     "message": "Hello"
@@ -3151,7 +2996,7 @@ mod tests {
 
         connector
             .handle_handshake(json!({
-                "protocol_version": "1.0.0",
+                "protocol_version": "2.0.0",
                 "zone": "z:work",
                 "host_public_key": verifying_key.to_bytes(),
                 "nonce": vec![0u8; 32],
@@ -3164,6 +3009,10 @@ mod tests {
 
         let result = connector
             .handle_invoke(json!({
+                "type": "invoke",
+                "id": "missing-messages",
+                "connector_id": "fcp.anthropic",
+                "zone_id": "z:work",
                 "operation": "anthropic.message",
                 "input": {},
                 "capability_token": capability
@@ -3174,7 +3023,7 @@ mod tests {
         let err = result.unwrap_err();
         match err {
             FcpError::InvalidRequest { message, .. } => {
-                assert!(message.contains("messages"));
+                assert!(message.contains("schema"));
             }
             other => assert!(
                 matches!(other, FcpError::InvalidRequest { .. }),
@@ -3223,7 +3072,7 @@ mod tests {
         let verifying_key = signing_key.verifying_key();
         connector
             .handle_handshake(json!({
-                "protocol_version": "1.0.0",
+                "protocol_version": "2.0.0",
                 "zone": "z:work",
                 "host_public_key": verifying_key.to_bytes(),
                 "nonce": vec![0u8; 32],
@@ -3235,6 +3084,10 @@ mod tests {
         let capability = generate_valid_token(&signing_key, &connector, "anthropic.message");
         let result = connector
             .handle_invoke(json!({
+                "type": "invoke",
+                "id": "advanced-message",
+                "connector_id": "fcp.anthropic",
+                "zone_id": "z:work",
                 "operation": "anthropic.message",
                 "input": {
                     "model": "sonnet-4.6",
@@ -3306,14 +3159,17 @@ mod tests {
     #[fcp_async_core::runtime::test]
     async fn test_get_usage() {
         let mut connector = AnthropicConnector::new();
-        connector.base.set_configured(true);
+        connector
+            .handle_configure(json!({"api_key": "test-key"}))
+            .await
+            .unwrap();
 
         let signing_key = Ed25519SigningKey::generate();
         let verifying_key = signing_key.verifying_key();
 
         connector
             .handle_handshake(json!({
-                "protocol_version": "1.0.0",
+                "protocol_version": "2.0.0",
                 "zone": "z:work",
                 "host_public_key": verifying_key.to_bytes(),
                 "nonce": vec![0u8; 32],
@@ -3327,6 +3183,10 @@ mod tests {
 
         let result = connector
             .handle_invoke(json!({
+                "type": "invoke",
+                "id": "local-usage",
+                "connector_id": "fcp.anthropic",
+                "zone_id": "z:work",
                 "operation": "anthropic.get_usage",
                 "input": {},
                 "capability_token": capability
@@ -3488,16 +3348,28 @@ mod tests {
         assert_eq!(c.total_errors(), 0);
     }
 
-    #[test]
-    fn handshake_manifest_hash_tracks_bundled_manifest() {
+    #[fcp_async_core::runtime::test]
+    async fn handshake_manifest_hash_tracks_bundled_manifest() {
         let mut hasher = Sha256::new();
         hasher.update(MANIFEST_TOML.as_bytes());
         let expected = format!("sha256:{}", hex::encode(hasher.finalize()));
-
-        let actual = AnthropicConnector::manifest_hash();
-
-        assert_eq!(actual, expected);
-        assert_ne!(actual, "sha256:anthropic-connector-v1");
+        let mut connector = AnthropicConnector::new();
+        connector
+            .handle_configure(json!({"api_key": "test-key"}))
+            .await
+            .unwrap();
+        let key = Ed25519SigningKey::generate();
+        let response = connector
+            .handle_handshake(json!({
+                "protocol_version": "2.0.0",
+                "zone": "z:work",
+                "host_public_key": key.verifying_key().to_bytes(),
+                "nonce": vec![0u8; 32],
+                "capabilities_requested": []
+            }))
+            .await
+            .unwrap();
+        assert_eq!(response["manifest_hash"], expected);
     }
 
     // --- AnthropicConfig edge cases ---

@@ -72,7 +72,7 @@ async fn setup_handshake(connector: &mut AnthropicConnector, caps: &[&str]) -> T
 
     connector
         .handle_handshake(json!({
-            "protocol_version": "1.0.0",
+            "protocol_version": "2.0.0",
             "zone": "z:work",
             "host_public_key": verifying_key.to_bytes(),
             "nonce": vec![0u8; 32],
@@ -180,6 +180,10 @@ async fn chat_invoke_happy_path() {
 
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "test-invoke",
+            "connector_id": "fcp.anthropic",
+            "zone_id": "z:work",
             "operation": "anthropic.chat",
             "input": { "message": "Hi there" },
             "capability_token": token
@@ -215,6 +219,10 @@ async fn message_invoke_multi_turn() {
 
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "test-invoke",
+            "connector_id": "fcp.anthropic",
+            "zone_id": "z:work",
             "operation": "anthropic.message",
             "input": {
                 "messages": [
@@ -251,6 +259,10 @@ async fn message_invoke_with_system() {
 
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "test-invoke",
+            "connector_id": "fcp.anthropic",
+            "zone_id": "z:work",
             "operation": "anthropic.message",
             "input": {
                 "messages": [{"role": "user", "content": "What is 6*7?"}],
@@ -550,6 +562,10 @@ async fn tool_use_invoke_shape() {
 
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "test-invoke",
+            "connector_id": "fcp.anthropic",
+            "zone_id": "z:work",
             "operation": "anthropic.message",
             "input": {
                 "messages": [{"role": "user", "content": "What is the weather in SF?"}],
@@ -739,6 +755,10 @@ async fn error_401_maps_to_unauthorized() {
 
     let err = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "test-invoke",
+            "connector_id": "fcp.anthropic",
+            "zone_id": "z:work",
             "operation": "anthropic.chat",
             "input": { "message": "Hi" },
             "capability_token": token
@@ -895,6 +915,10 @@ async fn error_context_length_maps_to_invalid_request() {
 
     let err = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "test-invoke",
+            "connector_id": "fcp.anthropic",
+            "zone_id": "z:work",
             "operation": "anthropic.chat",
             "input": { "message": "Hi" },
             "capability_token": token
@@ -952,6 +976,10 @@ async fn usage_metrics_accumulate() {
     let token: TestCapability = generate_valid_token(&signing_key, "anthropic.chat");
     connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "test-invoke",
+            "connector_id": "fcp.anthropic",
+            "zone_id": "z:work",
             "operation": "anthropic.chat",
             "input": { "message": "First" },
             "capability_token": token
@@ -963,6 +991,10 @@ async fn usage_metrics_accumulate() {
     let usage_token: TestCapability = generate_valid_token(&signing_key, "anthropic.get_usage");
     let usage = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "test-invoke",
+            "connector_id": "fcp.anthropic",
+            "zone_id": "z:work",
             "operation": "anthropic.get_usage",
             "input": {},
             "capability_token": usage_token
@@ -1010,6 +1042,10 @@ async fn usage_cost_is_model_dependent() {
 
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "test-invoke",
+            "connector_id": "fcp.anthropic",
+            "zone_id": "z:work",
             "operation": "anthropic.message",
             "input": {
                 "messages": [{"role": "user", "content": "Hi"}],
@@ -1046,6 +1082,10 @@ async fn capability_missing_token_fails() {
 
     let err = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "test-invoke",
+            "connector_id": "fcp.anthropic",
+            "zone_id": "z:work",
             "operation": "anthropic.chat",
             "input": { "message": "Hi" }
         }))
@@ -1077,6 +1117,10 @@ async fn capability_no_handshake_fails() {
 
     let err = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "test-invoke",
+            "connector_id": "fcp.anthropic",
+            "zone_id": "z:work",
             "operation": "anthropic.chat",
             "input": { "message": "Hi" },
             "capability_token": token
@@ -1095,12 +1139,19 @@ async fn capability_no_handshake_fails() {
 async fn capability_no_configure_fails() {
     let _ctx = AsyncTestContext::for_scenario("anthropic.capability.no_configure");
 
-    let mut connector = AnthropicConnector::new();
-    let signing_key = setup_handshake(&mut connector, &["anthropic.chat"]).await;
+    let connector = AnthropicConnector::new();
+    let signing_key = TestAuth {
+        signing_key: Ed25519SigningKey::generate(),
+        instance_id: connector.instance_id().as_str().to_owned(),
+    };
     let token: TestCapability = generate_valid_token(&signing_key, "anthropic.chat");
 
     let err = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "test-invoke",
+            "connector_id": "fcp.anthropic",
+            "zone_id": "z:work",
             "operation": "anthropic.chat",
             "input": { "message": "Hi" },
             "capability_token": token
@@ -1130,6 +1181,10 @@ async fn capability_wrong_operation_fails() {
 
     let err = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "test-invoke",
+            "connector_id": "fcp.anthropic",
+            "zone_id": "z:work",
             "operation": "anthropic.chat",
             "input": { "message": "Hi" },
             "capability_token": wrong_token
@@ -1162,6 +1217,10 @@ async fn capability_unknown_operation_fails() {
 
     let err = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "test-invoke",
+            "connector_id": "fcp.anthropic",
+            "zone_id": "z:work",
             "operation": "anthropic.nonexistent",
             "input": {},
             "capability_token": token
@@ -1187,10 +1246,13 @@ async fn lifecycle_health_before_configure() {
         .handle_health()
         .await
         .expect("health should succeed");
-    assert_eq!(result["status"], "not_configured");
+    let health: fcp_core::HealthSnapshot = serde_json::from_value(result).unwrap();
+    let details = health.details.unwrap();
+    assert_eq!(details["configured"], false);
+    assert_eq!(details["handshaken"], false);
 }
 
-/// Health check after configure reports healthy.
+/// Health after configure remains degraded until a host handshake succeeds.
 #[fcp_async_core::test]
 async fn lifecycle_health_after_configure() {
     let mock = MockApiServer::start().await;
@@ -1201,19 +1263,23 @@ async fn lifecycle_health_after_configure() {
         .handle_health()
         .await
         .expect("health should succeed");
-    assert_eq!(result["status"], "healthy");
+    let health: fcp_core::HealthSnapshot = serde_json::from_value(result).unwrap();
+    let details = health.details.unwrap();
+    assert_eq!(details["configured"], true);
+    assert_eq!(details["handshaken"], false);
 }
 
 /// Handshake returns accepted with capabilities granted.
 #[fcp_async_core::test]
 async fn lifecycle_handshake_grants_capabilities() {
     let mut connector = AnthropicConnector::new();
+    setup_configure(&mut connector, "http://localhost:9999").await;
     let signing_key = Ed25519SigningKey::generate();
     let verifying_key = signing_key.verifying_key();
 
     let result = connector
         .handle_handshake(json!({
-            "protocol_version": "1.0.0",
+            "protocol_version": "2.0.0",
             "zone": "z:work",
             "host_public_key": verifying_key.to_bytes(),
             "nonce": vec![0u8; 32],
@@ -1223,7 +1289,9 @@ async fn lifecycle_handshake_grants_capabilities() {
         .expect("handshake should succeed");
 
     assert_eq!(result["status"], "accepted");
-    assert!(result["event_caps"]["streaming"].as_bool().unwrap());
+    // Provider SSE is assembled into an invocation result; no host event stream is advertised.
+    assert!(!result["event_caps"]["streaming"].as_bool().unwrap());
+    assert_eq!(result["instance_id"], connector.instance_id().as_str());
     let caps = result["capabilities_granted"].as_array().unwrap();
     assert_eq!(caps.len(), 3);
 }
@@ -1255,7 +1323,10 @@ async fn lifecycle_introspect_operations() {
     assert!(op_ids.contains(&"anthropic.message.stream"));
     assert!(op_ids.contains(&"anthropic.chat"));
     assert!(op_ids.contains(&"anthropic.get_usage"));
-    assert_eq!(op_ids.len(), 4);
+    assert!(op_ids.contains(&"anthropic.auth.list_methods"));
+    assert!(op_ids.contains(&"anthropic.auth.refresh_oauth"));
+    assert!(op_ids.contains(&"anthropic.models.normalize"));
+    assert_eq!(op_ids.len(), 7);
 
     // Verify schemas are present
     for op in ops {
@@ -1285,6 +1356,10 @@ async fn validation_empty_messages_fails() {
 
     let err = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "test-invoke",
+            "connector_id": "fcp.anthropic",
+            "zone_id": "z:work",
             "operation": "anthropic.message",
             "input": { "messages": [] },
             "capability_token": token
@@ -1295,9 +1370,8 @@ async fn validation_empty_messages_fails() {
     match &err {
         fcp_core::FcpError::InvalidRequest { message, .. } => {
             assert!(
-                message.to_lowercase().contains("empty")
-                    || message.to_lowercase().contains("messages"),
-                "error should mention messages: {message}"
+                message.contains("schema"),
+                "input should fail the declared schema: {message}"
             );
         }
         other => assert!(
@@ -1318,6 +1392,10 @@ async fn validation_unknown_model_fails() {
 
     let err = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "test-invoke",
+            "connector_id": "fcp.anthropic",
+            "zone_id": "z:work",
             "operation": "anthropic.message",
             "input": {
                 "messages": [{"role": "user", "content": "Hi"}],
@@ -1345,6 +1423,10 @@ async fn validation_chat_missing_message_fails() {
 
     let err = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "test-invoke",
+            "connector_id": "fcp.anthropic",
+            "zone_id": "z:work",
             "operation": "anthropic.chat",
             "input": {},
             "capability_token": token
@@ -1355,8 +1437,8 @@ async fn validation_chat_missing_message_fails() {
     match &err {
         fcp_core::FcpError::InvalidRequest { message, .. } => {
             assert!(
-                message.to_lowercase().contains("message"),
-                "error should mention message: {message}"
+                message.contains("schema"),
+                "missing input should fail the declared schema: {message}"
             );
         }
         other => assert!(
@@ -1386,6 +1468,10 @@ async fn metrics_error_counter_increments() {
 
     let _ = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "test-invoke",
+            "connector_id": "fcp.anthropic",
+            "zone_id": "z:work",
             "operation": "anthropic.chat",
             "input": { "message": "Hi" },
             "capability_token": token
@@ -1427,6 +1513,10 @@ async fn chat_invoke_provenance_metadata() {
 
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "test-invoke",
+            "connector_id": "fcp.anthropic",
+            "zone_id": "z:work",
             "operation": "anthropic.chat",
             "input": { "message": "test" },
             "capability_token": token
@@ -1471,6 +1561,10 @@ async fn message_invoke_provenance_metadata() {
 
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "test-invoke",
+            "connector_id": "fcp.anthropic",
+            "zone_id": "z:work",
             "operation": "anthropic.message",
             "input": {
                 "messages": [{"role": "user", "content": "Hello"}],
@@ -1563,6 +1657,10 @@ async fn message_stream_invoke_full_response() {
 
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "test-invoke",
+            "connector_id": "fcp.anthropic",
+            "zone_id": "z:work",
             "operation": "anthropic.message.stream",
             "input": {
                 "messages": [{"role": "user", "content": "Stream test"}],
@@ -1705,6 +1803,10 @@ async fn message_stream_invoke_honors_interleaved_block_indices() {
 
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "test-invoke",
+            "connector_id": "fcp.anthropic",
+            "zone_id": "z:work",
             "operation": "anthropic.message.stream",
             "input": {
                 "messages": [{"role": "user", "content": "Stream test"}],
@@ -1933,6 +2035,10 @@ async fn error_529_via_connector_invoke() {
 
     let err = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "test-invoke",
+            "connector_id": "fcp.anthropic",
+            "zone_id": "z:work",
             "operation": "anthropic.chat",
             "input": { "message": "Hi" },
             "capability_token": token
@@ -1973,6 +2079,10 @@ async fn validation_message_missing_messages_field() {
 
     let err = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "test-invoke",
+            "connector_id": "fcp.anthropic",
+            "zone_id": "z:work",
             "operation": "anthropic.message",
             "input": { "system": "You are helpful" },
             "capability_token": token
@@ -1983,9 +2093,8 @@ async fn validation_message_missing_messages_field() {
     match &err {
         fcp_core::FcpError::InvalidRequest { message, .. } => {
             assert!(
-                message.to_lowercase().contains("messages")
-                    || message.to_lowercase().contains("missing"),
-                "error should mention messages: {message}"
+                message.contains("schema"),
+                "missing input should fail the declared schema: {message}"
             );
         }
         other => assert!(
@@ -1995,43 +2104,28 @@ async fn validation_message_missing_messages_field() {
     }
 }
 
-/// Empty message string in chat invoke fails at API level.
+/// Empty chat input is rejected before provider I/O.
 #[fcp_async_core::test]
 async fn validation_chat_empty_message_string() {
-    let mock = MockApiServer::start().await;
-
-    mock.expect_error(
-        "/v1/messages",
-        400,
-        anthropic_error(
-            "invalid_request_error",
-            "messages.0.content: Input should be a non-empty string",
-        ),
-    )
-    .await;
-
+    let server = MockServer::start().await;
     let mut connector = AnthropicConnector::new();
-    setup_configure(&mut connector, &mock.base_url()).await;
-    let signing_key = setup_handshake(&mut connector, &["anthropic.chat"]).await;
-    let token: TestCapability = generate_valid_token(&signing_key, "anthropic.chat");
-
-    let err = connector
+    setup_configure(&mut connector, &server.uri()).await;
+    let auth = setup_handshake(&mut connector, &["anthropic.chat"]).await;
+    let token = generate_valid_token(&auth, "anthropic.chat");
+    let error = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "empty-chat",
+            "connector_id": "fcp.anthropic",
+            "zone_id": "z:work",
             "operation": "anthropic.chat",
-            "input": { "message": "" },
+            "input": {"message": ""},
             "capability_token": token
         }))
         .await
-        .expect_err("empty message string should fail");
-
-    // This exercises the full path: connector -> client -> API -> error mapping
-    assert!(
-        matches!(
-            err,
-            fcp_core::FcpError::External { .. } | fcp_core::FcpError::InvalidRequest { .. }
-        ),
-        "expected error, got: {err:?}"
-    );
+        .expect_err("empty chat should fail before provider dispatch");
+    assert!(matches!(error, FcpError::InvalidRequest { code: 1003, .. }));
+    assert!(server.received_requests().await.unwrap().is_empty());
 }
 
 /// Missing operation field in invoke request fails.
@@ -2045,6 +2139,10 @@ async fn validation_missing_operation_field() {
 
     let err = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "test-invoke",
+            "connector_id": "fcp.anthropic",
+            "zone_id": "z:work",
             "input": { "message": "Hi" },
             "capability_token": token
         }))
@@ -2054,8 +2152,8 @@ async fn validation_missing_operation_field() {
     match &err {
         fcp_core::FcpError::InvalidRequest { message, .. } => {
             assert!(
-                message.to_lowercase().contains("operation"),
-                "error should mention operation: {message}"
+                message.contains("invoke request"),
+                "missing operation should fail the complete envelope: {message}"
             );
         }
         other => assert!(
@@ -2076,6 +2174,10 @@ async fn validation_stream_empty_messages_fails() {
 
     let err = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "test-invoke",
+            "connector_id": "fcp.anthropic",
+            "zone_id": "z:work",
             "operation": "anthropic.message.stream",
             "input": { "messages": [] },
             "capability_token": token
@@ -2100,6 +2202,10 @@ async fn validation_stream_unknown_model_fails() {
 
     let err = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "test-invoke",
+            "connector_id": "fcp.anthropic",
+            "zone_id": "z:work",
             "operation": "anthropic.message.stream",
             "input": {
                 "messages": [{"role": "user", "content": "Hi"}],
@@ -2404,13 +2510,17 @@ async fn lifecycle_shutdown_then_invoke_fails_closed() {
     let shutdown_result = connector.handle_shutdown(json!({})).await.unwrap();
     assert_eq!(shutdown_result["status"], "shutdown");
     assert_eq!(
-        connector.handle_health().await.unwrap()["status"],
-        "not_configured"
+        connector.handle_health().await.unwrap()["details"]["configured"],
+        false
     );
 
     let token: TestCapability = generate_valid_token(&signing_key, "anthropic.chat");
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "test-invoke",
+            "connector_id": "fcp.anthropic",
+            "zone_id": "z:work",
             "operation": "anthropic.chat",
             "input": { "message": "Post-shutdown test" },
             "capability_token": token
@@ -2438,6 +2548,10 @@ async fn health_metrics_after_operations() {
     let token: TestCapability = generate_valid_token(&signing_key, "anthropic.chat");
     connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "test-invoke",
+            "connector_id": "fcp.anthropic",
+            "zone_id": "z:work",
             "operation": "anthropic.chat",
             "input": { "message": "Test" },
             "capability_token": token
@@ -2446,7 +2560,7 @@ async fn health_metrics_after_operations() {
         .unwrap();
 
     let health = connector.handle_health().await.unwrap();
-    let metrics = &health["metrics"];
+    let metrics = &health["details"]["metrics"];
     assert!(
         metrics["requests_total"].as_u64().unwrap() >= 1,
         "should have at least 1 request"
@@ -2487,6 +2601,10 @@ async fn chat_opus_model_higher_cost() {
 
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "test-invoke",
+            "connector_id": "fcp.anthropic",
+            "zone_id": "z:work",
             "operation": "anthropic.message",
             "input": {
                 "messages": [{"role": "user", "content": "Hi"}],
@@ -2528,6 +2646,10 @@ async fn chat_claude35_sonnet_model() {
 
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "test-invoke",
+            "connector_id": "fcp.anthropic",
+            "zone_id": "z:work",
             "operation": "anthropic.message",
             "input": {
                 "messages": [{"role": "user", "content": "Hi"}],
@@ -2560,6 +2682,10 @@ async fn message_with_zero_temperature() {
 
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "test-invoke",
+            "connector_id": "fcp.anthropic",
+            "zone_id": "z:work",
             "operation": "anthropic.message",
             "input": {
                 "messages": [{"role": "user", "content": "Test"}],
@@ -2603,6 +2729,10 @@ async fn message_empty_content_response() {
 
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "test-invoke",
+            "connector_id": "fcp.anthropic",
+            "zone_id": "z:work",
             "operation": "anthropic.message",
             "input": {
                 "messages": [{"role": "user", "content": "Hi"}],
@@ -2673,7 +2803,7 @@ async fn simulate_returns_allowed() {
         .handle_simulate(json!({
             "type": "simulate",
             "id": "sim_001",
-            "connector_id": "anthropic",
+            "connector_id": "fcp.anthropic",
             "operation": "anthropic.message",
             "zone_id": "z:work",
             "capability_token": token,
@@ -2693,14 +2823,18 @@ async fn simulate_returns_allowed() {
 async fn simulate_checks_bound_capability_grants() {
     let mut connector = AnthropicConnector::new();
     setup_configure(&mut connector, "http://localhost:9999").await;
-    let signing_key = setup_handshake(&mut connector, &["anthropic.get_usage"]).await;
+    let signing_key = setup_handshake(
+        &mut connector,
+        &["anthropic.get_usage", "anthropic.message"],
+    )
+    .await;
     let capability = generate_valid_token(&signing_key, "anthropic.get_usage");
 
     let result = connector
         .handle_simulate(json!({
             "type": "simulate",
             "id": "sim_denied",
-            "connector_id": "anthropic",
+            "connector_id": "fcp.anthropic",
             "operation": "anthropic.message",
             "zone_id": "z:work",
             "capability_token": capability,
@@ -2714,6 +2848,7 @@ async fn simulate_checks_bound_capability_grants() {
     assert_eq!(result["id"], "sim_denied");
     assert_eq!(result["would_succeed"], false);
     assert_eq!(result["denial_code"], "FCP-3003");
+    assert_eq!(result["missing_capabilities"], json!(["anthropic.message"]));
 }
 
 /// Introspect schema has required fields for all operations.
@@ -2769,6 +2904,10 @@ async fn get_usage_initial_state() {
 
     let usage = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "test-invoke",
+            "connector_id": "fcp.anthropic",
+            "zone_id": "z:work",
             "operation": "anthropic.get_usage",
             "input": {},
             "capability_token": token
@@ -2866,6 +3005,10 @@ async fn stream_tool_use_via_connector_invoke() {
 
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "test-invoke",
+            "connector_id": "fcp.anthropic",
+            "zone_id": "z:work",
             "operation": "anthropic.message.stream",
             "input": {
                 "messages": [{"role": "user", "content": "Search test"}],
@@ -2968,6 +3111,10 @@ async fn stream_tool_use_via_connector_invoke_rejects_malformed_input_json() {
 
     let err = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "test-invoke",
+            "connector_id": "fcp.anthropic",
+            "zone_id": "z:work",
             "operation": "anthropic.message.stream",
             "input": {
                 "messages": [{"role": "user", "content": "Search test"}],
@@ -3045,6 +3192,10 @@ async fn stream_error_via_connector_invoke() {
 
     let err = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "test-invoke",
+            "connector_id": "fcp.anthropic",
+            "zone_id": "z:work",
             "operation": "anthropic.message.stream",
             "input": {
                 "messages": [{"role": "user", "content": "Error test"}]
@@ -3089,6 +3240,10 @@ async fn stream_pre_stream_auth_error() {
 
     let err = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "test-invoke",
+            "connector_id": "fcp.anthropic",
+            "zone_id": "z:work",
             "operation": "anthropic.message.stream",
             "input": {
                 "messages": [{"role": "user", "content": "Hi"}]
@@ -3102,4 +3257,279 @@ async fn stream_pre_stream_auth_error() {
         matches!(err, fcp_core::FcpError::Unauthorized { .. }),
         "expected Unauthorized, got: {err:?}"
     );
+}
+
+// ============================================================================
+// Host authority and local admission regressions
+// ============================================================================
+
+fn chat_request(token: &TestCapability) -> serde_json::Value {
+    json!({
+        "type": "invoke",
+        "id": "authority-chat",
+        "connector_id": "fcp.anthropic",
+        "zone_id": "z:work",
+        "operation": "anthropic.chat",
+        "input": {"message": "Do not send this preview to the provider."},
+        "capability_token": token
+    })
+}
+
+#[fcp_async_core::test]
+async fn every_lifecycle_attempt_revokes_old_authority_and_instance_tokens() {
+    let server = MockServer::start().await;
+    for transition in [
+        "configure",
+        "failed_configure",
+        "handshake",
+        "failed_handshake",
+        "shutdown",
+    ] {
+        let mut connector = AnthropicConnector::new();
+        setup_configure(&mut connector, &server.uri()).await;
+        let auth = setup_handshake(&mut connector, &["anthropic.chat"]).await;
+        let old_instance = connector.instance_id().clone();
+        let token = generate_valid_token(&auth, "anthropic.chat");
+        let mut preview = chat_request(&token);
+        preview["type"] = json!("simulate");
+        assert_eq!(
+            connector.handle_simulate(preview.clone()).await.unwrap()["would_succeed"],
+            true,
+            "{transition}: initial authority should be usable"
+        );
+
+        match transition {
+            "configure" => setup_configure(&mut connector, &server.uri()).await,
+            "failed_configure" => {
+                assert!(
+                    connector
+                        .handle_configure(json!({"api_key": ""}))
+                        .await
+                        .is_err()
+                );
+            }
+            "handshake" => {
+                setup_handshake(&mut connector, &["anthropic.chat"]).await;
+            }
+            "failed_handshake" => {
+                assert!(
+                    connector
+                        .handle_handshake(json!({"zone": "z:work"}))
+                        .await
+                        .is_err()
+                );
+            }
+            "shutdown" => {
+                connector.handle_shutdown(json!({})).await.unwrap();
+            }
+            _ => unreachable!(),
+        }
+        assert_ne!(&old_instance, connector.instance_id(), "{transition}");
+        assert_eq!(
+            connector.handle_simulate(preview.clone()).await.unwrap()["would_succeed"],
+            false,
+            "{transition}: previous token remained usable"
+        );
+        assert!(connector.handle_invoke(chat_request(&token)).await.is_err());
+
+        // Recovery cannot resurrect a grant signed for an old instance.
+        setup_configure(&mut connector, &server.uri()).await;
+        setup_handshake(&mut connector, &["anthropic.chat"]).await;
+        assert_eq!(
+            connector.handle_simulate(preview).await.unwrap()["would_succeed"],
+            false,
+            "{transition}: recovery restored an old token"
+        );
+    }
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[fcp_async_core::test]
+async fn handshake_enforces_protocol_forbidden_zone_and_configuration_zone_binding() {
+    let server = MockServer::start().await;
+    let mut connector = AnthropicConnector::new();
+    setup_configure(&mut connector, &server.uri()).await;
+    let key = Ed25519SigningKey::generate();
+    let mut request = json!({
+        "protocol_version": "2.0.0",
+        "zone": "z:public",
+        "host_public_key": key.verifying_key().to_bytes(),
+        "nonce": vec![7_u8; 32],
+        "capabilities_requested": ["anthropic.chat"]
+    });
+    assert!(matches!(
+        connector.handle_handshake(request.clone()).await,
+        Err(FcpError::CapabilityDenied { .. })
+    ));
+    request["zone"] = json!("z:work");
+    connector.handle_handshake(request.clone()).await.unwrap();
+    let instance = connector.instance_id().clone();
+
+    request["zone"] = json!("z:private");
+    assert!(matches!(
+        connector.handle_handshake(request.clone()).await,
+        Err(FcpError::CapabilityDenied { .. })
+    ));
+    assert_ne!(&instance, connector.instance_id());
+    assert!(matches!(
+        connector.handle_handshake(request.clone()).await,
+        Err(FcpError::CapabilityDenied { .. })
+    ));
+    let health: fcp_core::HealthSnapshot =
+        serde_json::from_value(connector.handle_health().await.unwrap()).unwrap();
+    assert!(!health.is_ready());
+    assert_eq!(health.details.unwrap()["zone"], "z:work");
+
+    request["zone"] = json!("z:work");
+    request["protocol_version"] = json!("1.0.0");
+    assert!(matches!(
+        connector.handle_handshake(request.clone()).await,
+        Err(FcpError::InvalidRequest { code: 1003, .. })
+    ));
+    request["protocol_version"] = json!("2.0");
+    connector.handle_handshake(request.clone()).await.unwrap();
+
+    setup_configure(&mut connector, &server.uri()).await;
+    request["zone"] = json!("z:private");
+    connector.handle_handshake(request).await.unwrap();
+    let health: fcp_core::HealthSnapshot =
+        serde_json::from_value(connector.handle_health().await.unwrap()).unwrap();
+    assert!(health.is_ready());
+    assert_eq!(health.details.unwrap()["zone"], "z:private");
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[fcp_async_core::test]
+async fn simulate_and_invoke_share_schema_and_provider_semantic_validation() {
+    let server = MockServer::start().await;
+    let mut connector = AnthropicConnector::new();
+    setup_configure(&mut connector, &server.uri()).await;
+    let auth = setup_handshake(&mut connector, &["anthropic.message"]).await;
+    let token = generate_valid_token(&auth, "anthropic.message");
+    for input in [
+        json!({}),
+        json!({"messages": []}),
+        json!({"messages": [{"role": "user", "content": "Hello"}], "max_tokens": 0}),
+        json!({"messages": [{"role": "user", "content": "Hello"}], "model": "unknown-model"}),
+        json!({
+            "messages": [{"role": "user", "content": "Hello"}],
+            "model": "claude-opus-4-7",
+            "thinking": {"type": "enabled", "budget_tokens": 1024}
+        }),
+        json!({
+            "messages": [{"role": "user", "content": "Hello"}],
+            "thinking": {"type": "enabled", "budget_tokens": 1024},
+            "temperature": 0.5
+        }),
+        json!({"messages": [{"role": "user", "content": "Hello"}], "tools": [{}]}),
+        json!({
+            "messages": [{"role": "user", "content": [{
+                "type": "image",
+                "source": {"type": "url", "url": "file:///private/image.png"}
+            }]}]
+        }),
+    ] {
+        let mut request = json!({
+            "type": "simulate",
+            "id": "invalid-preview",
+            "connector_id": "fcp.anthropic",
+            "zone_id": "z:work",
+            "operation": "anthropic.message",
+            "input": input,
+            "capability_token": token
+        });
+        let preview: fcp_core::SimulateResponse =
+            serde_json::from_value(connector.handle_simulate(request.clone()).await.unwrap())
+                .unwrap();
+        assert!(
+            !preview.would_succeed,
+            "input was accepted: {}",
+            request["input"]
+        );
+        assert_eq!(preview.denial_code.as_deref(), Some("FCP-1003"));
+        request["type"] = json!("invoke");
+        assert!(matches!(
+            connector.handle_invoke(request).await,
+            Err(FcpError::InvalidRequest { code: 1003, .. })
+        ));
+    }
+    let malformed = json!({
+        "type": "simulate",
+        "id": "",
+        "connector_id": "fcp.anthropic",
+        "zone_id": "z:work",
+        "operation": "anthropic.message",
+        "input": {"messages": [{"role": "user", "content": "Hello"}]},
+        "capability_token": token
+    });
+    assert!(matches!(
+        connector.handle_simulate(malformed).await,
+        Err(FcpError::InvalidRequest { code: 1003, .. })
+    ));
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[fcp_async_core::test]
+async fn canonical_model_denials_cover_aliases_and_unnegotiated_capabilities() {
+    let server = MockServer::start().await;
+    let mut connector = AnthropicConnector::new();
+    setup_configure(&mut connector, &server.uri()).await;
+    let auth = setup_handshake(&mut connector, &["anthropic.chat"]).await;
+    let constraints = CapabilityConstraints {
+        resource_allow: vec!["*".into()],
+        resource_deny: vec!["anthropic:model:claude-sonnet-4-6".into()],
+        ..Default::default()
+    };
+    let mut cbor = Vec::new();
+    ciborium::into_writer(&constraints, &mut cbor).unwrap();
+    let now = Utc::now();
+    let token = TestCapability::from_raw(
+        CapabilityTokenBuilder::new()
+            .capability_id("anthropic.chat")
+            .operations(&["anthropic.chat"])
+            .zone_id("z:work")
+            .principal("user:test")
+            .issuer("node:test")
+            .target_instance(&auth.instance_id)
+            .validity(now, now + Duration::hours(1))
+            .try_constraints_cbor(&cbor)
+            .unwrap()
+            .sign(&auth.signing_key)
+            .unwrap(),
+    );
+    for model in ["sonnet-4.6", "claude-sonnet-4-6"] {
+        let mut request = chat_request(&token);
+        request["input"]["model"] = json!(model);
+        request["type"] = json!("simulate");
+        let preview = connector.handle_simulate(request.clone()).await.unwrap();
+        assert_eq!(preview["would_succeed"], false);
+        assert_eq!(preview["denial_code"], "FCP-3004");
+        request["type"] = json!("invoke");
+        assert!(matches!(
+            connector.handle_invoke(request).await,
+            Err(FcpError::ResourceNotAllowed { .. })
+        ));
+    }
+
+    // A host signature cannot add a capability omitted from negotiation.
+    let unnegotiated = generate_valid_token(&auth, "anthropic.message");
+    let preview = connector
+        .handle_simulate(json!({
+            "type": "simulate",
+            "id": "unnegotiated",
+            "connector_id": "fcp.anthropic",
+            "zone_id": "z:work",
+            "operation": "anthropic.message",
+            "input": {"messages": [{"role": "user", "content": "Hello"}]},
+            "capability_token": unnegotiated
+        }))
+        .await
+        .unwrap();
+    assert_eq!(preview["would_succeed"], false);
+    assert_eq!(preview["denial_code"], "FCP-3001");
+    assert_eq!(
+        preview["missing_capabilities"],
+        json!(["anthropic.message"])
+    );
+    assert!(server.received_requests().await.unwrap().is_empty());
 }

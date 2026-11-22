@@ -109,7 +109,7 @@ async fn setup_live_connector(connector: &mut AnthropicConnector, api_key: &str)
 
     connector
         .handle_handshake(json!({
-            "protocol_version": "1.0.0",
+            "protocol_version": "2.0.0",
             "zone": "z:work",
             "host_public_key": verifying_key.to_bytes(),
             "nonce": vec![0u8; 32],
@@ -138,6 +138,10 @@ async fn live_messages_create() {
 
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "live-chat",
+            "connector_id": "fcp.anthropic",
+            "zone_id": "z:work",
             "operation": "anthropic.chat",
             "input": {
                 "message": "Reply with exactly: hello world",
@@ -198,7 +202,7 @@ async fn live_error_mapping_invalid_key() {
 
     connector
         .handle_handshake(json!({
-            "protocol_version": "1.0.0",
+            "protocol_version": "2.0.0",
             "zone": "z:work",
             "host_public_key": verifying_key.to_bytes(),
             "nonce": vec![0u8; 32],
@@ -215,6 +219,10 @@ async fn live_error_mapping_invalid_key() {
 
     let err = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "live-invalid-key",
+            "connector_id": "fcp.anthropic",
+            "zone_id": "z:work",
             "operation": "anthropic.chat",
             "input": {
                 "message": "hello",
@@ -257,10 +265,9 @@ async fn live_health_check() {
         .await
         .expect("health check should succeed");
 
-    assert!(
-        health.get("status").is_some() || health.get("healthy").is_some(),
-        "health response should contain status or healthy field: {health}"
-    );
+    let snapshot: fcp_core::HealthSnapshot = serde_json::from_value(health.clone())
+        .expect("health must follow the native host contract");
+    assert_eq!(snapshot.details.unwrap()["handshaken"], true);
 
     eprintln!("PASS: live_health_check — {health}");
 }
