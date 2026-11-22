@@ -5,7 +5,7 @@ min_mesh_version = "2.0.0"
 min_protocol = "fcp2-sym/2.0"
 protocol_features = []
 max_datagram_bytes = 65000
-interface_hash = "blake3-256:fcp.interface.v2:b975b64993732f5ccadc694043b79f71e08bb7c08d5560d8f4289c274d1a9d07"
+interface_hash = "blake3-256:fcp.interface.v2:ad94fa16e986b112b6c7a34c6a7b35d0977a5e87a06bdb4286a89ed7facc5b3a"
 
 [connector]
 id = "fcp.openai"
@@ -76,7 +76,7 @@ forbidden = [
 # Operations
 # -----------------------------------------------------------------------------
 
-[provides.operations.chat]
+[provides.operations."openai.chat"]
 description = "Send a chat completion request to OpenAI models"
 capability = "openai.chat"
 risk_level = "medium"
@@ -85,15 +85,15 @@ requires_approval = "none"
 idempotency = "none"
 revocation_freshness = "safe"
 
-[provides.operations.chat.rate_limit]
+[provides.operations."openai.chat".rate_limit]
 max = 100
 per_ms = 60000
 
-[provides.operations.chat.input_schema]
+[provides.operations."openai.chat".input_schema]
 required = ["messages"]
 type = "object"
 
-[provides.operations.chat.input_schema.properties.model]
+[provides.operations."openai.chat".input_schema.properties.model]
 description = "OpenAI model to use"
 default = "gpt-4o"
 enum = [
@@ -105,81 +105,150 @@ enum = [
 ]
 type = "string"
 
-[provides.operations.chat.input_schema.properties.messages]
+[provides.operations."openai.chat".input_schema.properties.messages]
 description = "Array of chat messages"
 type = "array"
 minItems = 1
 
-[provides.operations.chat.input_schema.properties.messages.items]
+[provides.operations."openai.chat".input_schema.properties.messages.items]
 type = "object"
-required = ["role", "content"]
+required = ["role"]
+anyOf = [
+    { required = ["content"], properties = { content = { type = ["string", "array"] } } },
+    { required = ["tool_calls"], properties = { role = { const = "assistant" }, tool_calls = { type = "array", minItems = 1 } } },
+]
+allOf = [
+    { if = { properties = { role = { const = "tool" } } }, then = { required = ["tool_call_id"] } },
+]
 
-[provides.operations.chat.input_schema.properties.messages.items.properties.role]
+[provides.operations."openai.chat".input_schema.properties.messages.items.properties.role]
 type = "string"
 enum = ["system", "user", "assistant", "tool"]
 
-[provides.operations.chat.input_schema.properties.messages.items.properties.content]
+[provides.operations."openai.chat".input_schema.properties.messages.items.properties.content]
+description = "Text, multimodal content parts, or null for an assistant tool-call message"
+type = ["string", "array", "null"]
+
+[provides.operations."openai.chat".input_schema.properties.messages.items.properties.content.items]
+type = "object"
+
+[provides.operations."openai.chat".input_schema.properties.messages.items.properties.tool_calls]
+description = "Tool calls from an assistant message, preserved when continuing the conversation"
+type = "array"
+
+[provides.operations."openai.chat".input_schema.properties.messages.items.properties.tool_calls.items]
+type = "object"
+required = ["id", "type", "function"]
+
+[provides.operations."openai.chat".input_schema.properties.messages.items.properties.tool_calls.items.properties.id]
 type = "string"
 
-[provides.operations.chat.input_schema.properties.max_tokens]
+[provides.operations."openai.chat".input_schema.properties.messages.items.properties.tool_calls.items.properties.type]
+const = "function"
+
+[provides.operations."openai.chat".input_schema.properties.messages.items.properties.tool_calls.items.properties.function]
+type = "object"
+required = ["name", "arguments"]
+
+[provides.operations."openai.chat".input_schema.properties.messages.items.properties.tool_calls.items.properties.function.properties.name]
+type = "string"
+
+[provides.operations."openai.chat".input_schema.properties.messages.items.properties.tool_calls.items.properties.function.properties.arguments]
+type = "string"
+
+[provides.operations."openai.chat".input_schema.properties.messages.items.properties.tool_call_id]
+description = "Required non-empty tool call ID for a tool result message"
+type = "string"
+minLength = 1
+
+[provides.operations."openai.chat".input_schema.properties.max_tokens]
 description = "Maximum tokens to generate"
 type = "integer"
 default = 4096
 minimum = 1
 maximum = 128000
 
-[provides.operations.chat.input_schema.properties.temperature]
+[provides.operations."openai.chat".input_schema.properties.temperature]
 description = "Sampling temperature (0-2)"
 type = "number"
 minimum = 0
 maximum = 2
 
-[provides.operations.chat.input_schema.properties.tools]
+[provides.operations."openai.chat".input_schema.properties.tools]
 description = "Tool definitions for function calling"
 type = "array"
 
-[provides.operations.chat.input_schema.properties.tool_choice]
+[provides.operations."openai.chat".input_schema.properties.tool_choice]
 description = "Controls how the model uses tools"
+oneOf = [
+    { type = "string", enum = ["none", "auto", "required"] },
+    { type = "object", required = ["type", "function"], properties = { type = { const = "function" }, function = { type = "object", required = ["name"], properties = { name = { type = "string" } } } } },
+]
+
+[provides.operations."openai.chat".output_schema]
+required = ["id", "content", "tool_calls"]
 type = "object"
 
-[provides.operations.chat.output_schema]
-required = ["id", "content"]
-type = "object"
-
-[provides.operations.chat.output_schema.properties.id]
+[provides.operations."openai.chat".output_schema.properties.id]
 description = "Response ID from OpenAI"
 type = "string"
 
-[provides.operations.chat.output_schema.properties.content]
+[provides.operations."openai.chat".output_schema.properties.content]
 description = "Generated response content"
 type = "string"
 
-[provides.operations.chat.output_schema.properties.model]
+[provides.operations."openai.chat".output_schema.properties.model]
 description = "Model used for generation"
 type = "string"
 
-[provides.operations.chat.output_schema.properties.finish_reason]
-description = "Reason generation stopped"
-type = "string"
-enum = ["stop", "length", "tool_calls", "content_filter"]
+[provides.operations."openai.chat".output_schema.properties.finish_reason]
+description = "Reason generation stopped, if reported by the provider"
+oneOf = [
+    { type = "string", enum = ["stop", "length", "tool_calls", "content_filter"] },
+    { type = "null" },
+]
 
-[provides.operations.chat.output_schema.properties.usage]
+[provides.operations."openai.chat".output_schema.properties.tool_calls]
+description = "Function calls requested by the assistant; empty when no tool is requested"
+type = "array"
+
+[provides.operations."openai.chat".output_schema.properties.tool_calls.items]
+type = "object"
+required = ["id", "type", "function"]
+
+[provides.operations."openai.chat".output_schema.properties.tool_calls.items.properties.id]
+type = "string"
+
+[provides.operations."openai.chat".output_schema.properties.tool_calls.items.properties.type]
+const = "function"
+
+[provides.operations."openai.chat".output_schema.properties.tool_calls.items.properties.function]
+type = "object"
+required = ["name", "arguments"]
+
+[provides.operations."openai.chat".output_schema.properties.tool_calls.items.properties.function.properties.name]
+type = "string"
+
+[provides.operations."openai.chat".output_schema.properties.tool_calls.items.properties.function.properties.arguments]
+type = "string"
+
+[provides.operations."openai.chat".output_schema.properties.usage]
 type = "object"
 
-[provides.operations.chat.output_schema.properties.usage.properties.prompt_tokens]
+[provides.operations."openai.chat".output_schema.properties.usage.properties.prompt_tokens]
 type = "integer"
 
-[provides.operations.chat.output_schema.properties.usage.properties.completion_tokens]
+[provides.operations."openai.chat".output_schema.properties.usage.properties.completion_tokens]
 type = "integer"
 
-[provides.operations.chat.output_schema.properties.usage.properties.total_tokens]
+[provides.operations."openai.chat".output_schema.properties.usage.properties.total_tokens]
 type = "integer"
 
-[provides.operations.chat.output_schema.properties.cost_usd]
+[provides.operations."openai.chat".output_schema.properties.cost_usd]
 description = "Estimated cost in USD"
 type = "number"
 
-[provides.operations.chat.network_constraints]
+[provides.operations."openai.chat".network_constraints]
 host_allow = ["api.openai.com", "api.deepseek.com"]
 port_allow = [443]
 ip_allow = []
@@ -197,7 +266,7 @@ connect_timeout_ms = 10000
 total_timeout_ms = 120000
 max_response_bytes = 10485760
 
-[provides.operations.chat.ai_hints]
+[provides.operations."openai.chat".ai_hints]
 when_to_use = "Send a chat completion request to OpenAI models. Supports multi-turn conversations and function calling."
 common_mistakes = [
     "Not providing messages array.",
@@ -214,7 +283,7 @@ related = ["openai.simple_chat"]
 
 # -----------------------------------------------------------------------------
 
-[provides.operations.simple_chat]
+[provides.operations."openai.simple_chat"]
 description = "Simple single-turn chat with GPT models"
 capability = "openai.chat"
 risk_level = "medium"
@@ -223,15 +292,15 @@ requires_approval = "none"
 idempotency = "none"
 revocation_freshness = "safe"
 
-[provides.operations.simple_chat.rate_limit]
+[provides.operations."openai.simple_chat".rate_limit]
 max = 100
 per_ms = 60000
 
-[provides.operations.simple_chat.input_schema]
+[provides.operations."openai.simple_chat".input_schema]
 required = ["message"]
 type = "object"
 
-[provides.operations.simple_chat.input_schema.properties.model]
+[provides.operations."openai.simple_chat".input_schema.properties.model]
 description = "OpenAI model to use"
 default = "gpt-4o"
 enum = [
@@ -243,47 +312,47 @@ enum = [
 ]
 type = "string"
 
-[provides.operations.simple_chat.input_schema.properties.message]
+[provides.operations."openai.simple_chat".input_schema.properties.message]
 description = "User message to send"
 type = "string"
 minLength = 1
 
-[provides.operations.simple_chat.input_schema.properties.system]
+[provides.operations."openai.simple_chat".input_schema.properties.system]
 description = "Optional system prompt"
 type = "string"
 
-[provides.operations.simple_chat.input_schema.properties.max_tokens]
+[provides.operations."openai.simple_chat".input_schema.properties.max_tokens]
 description = "Maximum tokens to generate"
 type = "integer"
 default = 4096
 minimum = 1
 maximum = 128000
 
-[provides.operations.simple_chat.output_schema]
+[provides.operations."openai.simple_chat".output_schema]
 required = ["response"]
 type = "object"
 
-[provides.operations.simple_chat.output_schema.properties.response]
+[provides.operations."openai.simple_chat".output_schema.properties.response]
 description = "Generated response text"
 type = "string"
 
-[provides.operations.simple_chat.output_schema.properties.usage]
+[provides.operations."openai.simple_chat".output_schema.properties.usage]
 type = "object"
 
-[provides.operations.simple_chat.output_schema.properties.usage.properties.prompt_tokens]
+[provides.operations."openai.simple_chat".output_schema.properties.usage.properties.prompt_tokens]
 type = "integer"
 
-[provides.operations.simple_chat.output_schema.properties.usage.properties.completion_tokens]
+[provides.operations."openai.simple_chat".output_schema.properties.usage.properties.completion_tokens]
 type = "integer"
 
-[provides.operations.simple_chat.output_schema.properties.usage.properties.total_tokens]
+[provides.operations."openai.simple_chat".output_schema.properties.usage.properties.total_tokens]
 type = "integer"
 
-[provides.operations.simple_chat.output_schema.properties.cost_usd]
+[provides.operations."openai.simple_chat".output_schema.properties.cost_usd]
 description = "Estimated cost in USD"
 type = "number"
 
-[provides.operations.simple_chat.network_constraints]
+[provides.operations."openai.simple_chat".network_constraints]
 host_allow = ["api.openai.com", "api.deepseek.com"]
 port_allow = [443]
 ip_allow = []
@@ -301,7 +370,7 @@ connect_timeout_ms = 10000
 total_timeout_ms = 120000
 max_response_bytes = 10485760
 
-[provides.operations.simple_chat.ai_hints]
+[provides.operations."openai.simple_chat".ai_hints]
 when_to_use = "Quick single-turn chat when you just need a simple response. For multi-turn or complex conversations, use openai.chat instead."
 common_mistakes = [
     "Using for multi-turn conversations.",
@@ -314,7 +383,7 @@ related = ["openai.chat"]
 
 # -----------------------------------------------------------------------------
 
-[provides.operations.get_usage]
+[provides.operations."openai.get_usage"]
 description = "Get current usage and cost statistics for this session"
 capability = "openai.chat"
 risk_level = "low"
@@ -323,38 +392,38 @@ requires_approval = "none"
 idempotency = "strict"
 revocation_freshness = "safe"
 
-[provides.operations.get_usage.rate_limit]
+[provides.operations."openai.get_usage".rate_limit]
 max = 1000
 per_ms = 60000
 
-[provides.operations.get_usage.input_schema]
+[provides.operations."openai.get_usage".input_schema]
 type = "object"
 
-[provides.operations.get_usage.output_schema]
+[provides.operations."openai.get_usage".output_schema]
 required = ["total_prompt_tokens", "total_completion_tokens", "total_cost_usd"]
 type = "object"
 
-[provides.operations.get_usage.output_schema.properties.total_prompt_tokens]
+[provides.operations."openai.get_usage".output_schema.properties.total_prompt_tokens]
 description = "Total prompt tokens used in session"
 type = "integer"
 
-[provides.operations.get_usage.output_schema.properties.total_completion_tokens]
+[provides.operations."openai.get_usage".output_schema.properties.total_completion_tokens]
 description = "Total completion tokens generated in session"
 type = "integer"
 
-[provides.operations.get_usage.output_schema.properties.total_cost_usd]
+[provides.operations."openai.get_usage".output_schema.properties.total_cost_usd]
 description = "Total estimated cost in USD"
 type = "number"
 
-[provides.operations.get_usage.output_schema.properties.requests_total]
+[provides.operations."openai.get_usage".output_schema.properties.requests_total]
 description = "Total requests made"
 type = "integer"
 
-[provides.operations.get_usage.output_schema.properties.requests_error]
+[provides.operations."openai.get_usage".output_schema.properties.requests_error]
 description = "Total failed requests"
 type = "integer"
 
-[provides.operations.get_usage.network_constraints]
+[provides.operations."openai.get_usage".network_constraints]
 host_allow = ["none.invalid"]
 port_allow = [0]
 ip_allow = []
@@ -372,7 +441,7 @@ connect_timeout_ms = 10000
 total_timeout_ms = 30000
 max_response_bytes = 65536
 
-[provides.operations.get_usage.ai_hints]
+[provides.operations."openai.get_usage".ai_hints]
 when_to_use = "Check usage and costs for the current session. Useful for monitoring spend."
 common_mistakes = [
     "Calling repeatedly in a tight loop instead of batching usage checks at natural breakpoints.",
@@ -382,7 +451,7 @@ related = []
 
 # -----------------------------------------------------------------------------
 
-[provides.operations.embeddings]
+[provides.operations."openai.embeddings"]
 description = "Generate text embeddings using OpenAI embedding models"
 capability = "openai.embeddings"
 risk_level = "low"
@@ -391,15 +460,15 @@ requires_approval = "none"
 idempotency = "none"
 revocation_freshness = "safe"
 
-[provides.operations.embeddings.rate_limit]
+[provides.operations."openai.embeddings".rate_limit]
 max = 200
 per_ms = 60000
 
-[provides.operations.embeddings.input_schema]
+[provides.operations."openai.embeddings".input_schema]
 required = ["input"]
 type = "object"
 
-[provides.operations.embeddings.input_schema.properties.model]
+[provides.operations."openai.embeddings".input_schema.properties.model]
 description = "Embedding model to use"
 default = "text-embedding-3-small"
 enum = [
@@ -409,55 +478,61 @@ enum = [
 ]
 type = "string"
 
-[provides.operations.embeddings.input_schema.properties.input]
+[provides.operations."openai.embeddings".input_schema.properties.input]
 description = "Text to embed (string or array of strings, max 2048 items)"
+type = ["string", "array"]
+minLength = 1
+minItems = 1
+maxItems = 2048
+
+[provides.operations."openai.embeddings".input_schema.properties.input.items]
 type = "string"
 
-[provides.operations.embeddings.input_schema.properties.dimensions]
+[provides.operations."openai.embeddings".input_schema.properties.dimensions]
 description = "Output dimensions (text-embedding-3 models only)"
 type = "integer"
 minimum = 1
 maximum = 3072
 
-[provides.operations.embeddings.output_schema]
+[provides.operations."openai.embeddings".output_schema]
 required = ["data", "model"]
 type = "object"
 
-[provides.operations.embeddings.output_schema.properties.model]
+[provides.operations."openai.embeddings".output_schema.properties.model]
 description = "Embedding model used"
 type = "string"
 
-[provides.operations.embeddings.output_schema.properties.data]
+[provides.operations."openai.embeddings".output_schema.properties.data]
 description = "Array of embedding vectors"
 type = "array"
 
-[provides.operations.embeddings.output_schema.properties.data.items]
+[provides.operations."openai.embeddings".output_schema.properties.data.items]
 type = "object"
 required = ["index", "embedding"]
 
-[provides.operations.embeddings.output_schema.properties.data.items.properties.index]
+[provides.operations."openai.embeddings".output_schema.properties.data.items.properties.index]
 type = "integer"
 
-[provides.operations.embeddings.output_schema.properties.data.items.properties.embedding]
+[provides.operations."openai.embeddings".output_schema.properties.data.items.properties.embedding]
 type = "array"
 
-[provides.operations.embeddings.output_schema.properties.data.items.properties.embedding.items]
+[provides.operations."openai.embeddings".output_schema.properties.data.items.properties.embedding.items]
 type = "number"
 
-[provides.operations.embeddings.output_schema.properties.usage]
+[provides.operations."openai.embeddings".output_schema.properties.usage]
 type = "object"
 
-[provides.operations.embeddings.output_schema.properties.usage.properties.prompt_tokens]
+[provides.operations."openai.embeddings".output_schema.properties.usage.properties.prompt_tokens]
 type = "integer"
 
-[provides.operations.embeddings.output_schema.properties.usage.properties.total_tokens]
+[provides.operations."openai.embeddings".output_schema.properties.usage.properties.total_tokens]
 type = "integer"
 
-[provides.operations.embeddings.output_schema.properties.cost_usd]
+[provides.operations."openai.embeddings".output_schema.properties.cost_usd]
 description = "Estimated cost in USD"
 type = "number"
 
-[provides.operations.embeddings.network_constraints]
+[provides.operations."openai.embeddings".network_constraints]
 host_allow = ["api.openai.com", "api.deepseek.com"]
 port_allow = [443]
 ip_allow = []
@@ -475,7 +550,7 @@ connect_timeout_ms = 10000
 total_timeout_ms = 120000
 max_response_bytes = 10485760
 
-[provides.operations.embeddings.ai_hints]
+[provides.operations."openai.embeddings".ai_hints]
 when_to_use = "Generate vector embeddings from text for semantic search, clustering, or similarity comparisons."
 common_mistakes = [
     "Exceeding 8191 token input limit.",
@@ -490,7 +565,7 @@ related = []
 
 # -----------------------------------------------------------------------------
 
-[provides.operations.images_generate]
+[provides.operations."openai.images.generate"]
 description = "Generate images from text prompts using DALL-E models"
 capability = "openai.images"
 risk_level = "medium"
@@ -499,68 +574,68 @@ requires_approval = "none"
 idempotency = "none"
 revocation_freshness = "safe"
 
-[provides.operations.images_generate.rate_limit]
+[provides.operations."openai.images.generate".rate_limit]
 max = 50
 per_ms = 60000
 
-[provides.operations.images_generate.input_schema]
+[provides.operations."openai.images.generate".input_schema]
 required = ["prompt"]
 type = "object"
 
-[provides.operations.images_generate.input_schema.properties.prompt]
+[provides.operations."openai.images.generate".input_schema.properties.prompt]
 description = "Text description of the image to generate"
 type = "string"
 minLength = 1
 
-[provides.operations.images_generate.input_schema.properties.model]
+[provides.operations."openai.images.generate".input_schema.properties.model]
 description = "Image generation model"
 default = "dall-e-3"
 enum = ["dall-e-3", "dall-e-2"]
 type = "string"
 
-[provides.operations.images_generate.input_schema.properties.n]
+[provides.operations."openai.images.generate".input_schema.properties.n]
 description = "Number of images to generate (1-10 for DALL-E 2, always 1 for DALL-E 3)"
 type = "integer"
 default = 1
 minimum = 1
 maximum = 10
 
-[provides.operations.images_generate.input_schema.properties.size]
+[provides.operations."openai.images.generate".input_schema.properties.size]
 description = "Image size"
 default = "1024x1024"
 enum = ["256x256", "512x512", "1024x1024", "1792x1024", "1024x1792"]
 type = "string"
 
-[provides.operations.images_generate.input_schema.properties.quality]
+[provides.operations."openai.images.generate".input_schema.properties.quality]
 description = "Image quality (DALL-E 3 only)"
 default = "standard"
 enum = ["standard", "hd"]
 type = "string"
 
-[provides.operations.images_generate.output_schema]
+[provides.operations."openai.images.generate".output_schema]
 required = ["created", "data"]
 type = "object"
 
-[provides.operations.images_generate.output_schema.properties.created]
+[provides.operations."openai.images.generate".output_schema.properties.created]
 description = "Unix timestamp of creation"
 type = "integer"
 
-[provides.operations.images_generate.output_schema.properties.data]
+[provides.operations."openai.images.generate".output_schema.properties.data]
 description = "Array of generated image data"
 type = "array"
 
-[provides.operations.images_generate.output_schema.properties.data.items]
+[provides.operations."openai.images.generate".output_schema.properties.data.items]
 type = "object"
 
-[provides.operations.images_generate.output_schema.properties.data.items.properties.b64_json]
+[provides.operations."openai.images.generate".output_schema.properties.data.items.properties.b64_json]
 description = "Base64-encoded image data"
-type = "string"
+type = ["string", "null"]
 
-[provides.operations.images_generate.output_schema.properties.data.items.properties.revised_prompt]
+[provides.operations."openai.images.generate".output_schema.properties.data.items.properties.revised_prompt]
 description = "Revised prompt (DALL-E 3)"
-type = "string"
+type = ["string", "null"]
 
-[provides.operations.images_generate.network_constraints]
+[provides.operations."openai.images.generate".network_constraints]
 host_allow = ["api.openai.com", "api.deepseek.com"]
 port_allow = [443]
 ip_allow = []
@@ -578,7 +653,7 @@ connect_timeout_ms = 10000
 total_timeout_ms = 120000
 max_response_bytes = 52428800
 
-[provides.operations.images_generate.ai_hints]
+[provides.operations."openai.images.generate".ai_hints]
 when_to_use = "Generate images from text descriptions using DALL-E models."
 common_mistakes = [
     "Empty prompt string.",
@@ -592,7 +667,7 @@ related = []
 
 # -----------------------------------------------------------------------------
 
-[provides.operations.videos_generate]
+[provides.operations."openai.videos.generate"]
 description = "Generate a short video from a text prompt using OpenAI video models"
 capability = "openai.videos"
 risk_level = "medium"
@@ -601,87 +676,87 @@ requires_approval = "none"
 idempotency = "none"
 revocation_freshness = "safe"
 
-[provides.operations.videos_generate.rate_limit]
+[provides.operations."openai.videos.generate".rate_limit]
 max = 20
 per_ms = 60000
 
-[provides.operations.videos_generate.input_schema]
+[provides.operations."openai.videos.generate".input_schema]
 required = ["prompt"]
 type = "object"
 
-[provides.operations.videos_generate.input_schema.properties.prompt]
+[provides.operations."openai.videos.generate".input_schema.properties.prompt]
 description = "Text prompt for the video"
 type = "string"
 minLength = 1
 
-[provides.operations.videos_generate.input_schema.properties.model]
+[provides.operations."openai.videos.generate".input_schema.properties.model]
 description = "Video generation model"
 default = "sora-2"
 enum = ["sora-2", "sora-2-pro"]
 type = "string"
 
-[provides.operations.videos_generate.input_schema.properties.duration_seconds]
+[provides.operations."openai.videos.generate".input_schema.properties.duration_seconds]
 description = "Requested video duration"
 enum = [4, 8, 12]
 type = "integer"
 
-[provides.operations.videos_generate.input_schema.properties.size]
+[provides.operations."openai.videos.generate".input_schema.properties.size]
 description = "Video output size"
 enum = ["720x1280", "1280x720", "1024x1792", "1792x1024"]
 type = "string"
 
-[provides.operations.videos_generate.input_schema.properties.aspect_ratio]
+[provides.operations."openai.videos.generate".input_schema.properties.aspect_ratio]
 description = "Aspect ratio shorthand mapped to a supported size"
 enum = ["9:16", "16:9", "4:7", "7:4"]
 type = "string"
 
-[provides.operations.videos_generate.input_schema.properties.poll_interval_ms]
+[provides.operations."openai.videos.generate".input_schema.properties.poll_interval_ms]
 description = "Delay between video job status checks"
 type = "integer"
 default = 2500
 minimum = 1
 maximum = 60000
 
-[provides.operations.videos_generate.input_schema.properties.max_poll_attempts]
+[provides.operations."openai.videos.generate".input_schema.properties.max_poll_attempts]
 description = "Maximum video job status checks"
 type = "integer"
 default = 120
 minimum = 1
 maximum = 120
 
-[provides.operations.videos_generate.output_schema]
+[provides.operations."openai.videos.generate".output_schema]
 required = ["video_id", "model", "status", "mime_type", "video_b64"]
 type = "object"
 
-[provides.operations.videos_generate.output_schema.properties.video_id]
+[provides.operations."openai.videos.generate".output_schema.properties.video_id]
 description = "Provider video job ID"
 type = "string"
 
-[provides.operations.videos_generate.output_schema.properties.model]
+[provides.operations."openai.videos.generate".output_schema.properties.model]
 description = "Model used for generation"
 type = "string"
 
-[provides.operations.videos_generate.output_schema.properties.status]
+[provides.operations."openai.videos.generate".output_schema.properties.status]
 description = "Final provider job status"
 type = "string"
 
-[provides.operations.videos_generate.output_schema.properties.seconds]
+[provides.operations."openai.videos.generate".output_schema.properties.seconds]
 description = "Provider duration metadata"
-type = "string"
+type = ["string", "null"]
 
-[provides.operations.videos_generate.output_schema.properties.size]
+[provides.operations."openai.videos.generate".output_schema.properties.size]
 description = "Provider size metadata"
-type = "string"
+type = ["string", "null"]
 
-[provides.operations.videos_generate.output_schema.properties.mime_type]
+[provides.operations."openai.videos.generate".output_schema.properties.mime_type]
 description = "Downloaded video MIME type"
 type = "string"
 
-[provides.operations.videos_generate.output_schema.properties.video_b64]
+[provides.operations."openai.videos.generate".output_schema.properties.video_b64]
 description = "Base64-encoded video bytes"
 type = "string"
 
-[provides.operations.videos_generate.network_constraints]
+[provides.operations."openai.videos.generate".network_constraints]
 host_allow = ["api.openai.com"]
 port_allow = [443]
 ip_allow = []
@@ -699,7 +774,7 @@ connect_timeout_ms = 10000
 total_timeout_ms = 120000
 max_response_bytes = 104857600
 
-[provides.operations.videos_generate.ai_hints]
+[provides.operations."openai.videos.generate".ai_hints]
 when_to_use = "Generate a short OpenAI video and return downloaded video bytes."
 common_mistakes = [
     "Assuming the submit response contains the final video bytes.",
@@ -712,7 +787,7 @@ related = ["openai.images.generate"]
 
 # -----------------------------------------------------------------------------
 
-[provides.operations.audio_transcribe]
+[provides.operations."openai.audio.transcribe"]
 description = "Transcribe audio to text using OpenAI Whisper"
 capability = "openai.audio.transcribe"
 risk_level = "medium"
@@ -721,42 +796,42 @@ requires_approval = "none"
 idempotency = "none"
 revocation_freshness = "safe"
 
-[provides.operations.audio_transcribe.rate_limit]
+[provides.operations."openai.audio.transcribe".rate_limit]
 max = 50
 per_ms = 60000
 
-[provides.operations.audio_transcribe.input_schema]
+[provides.operations."openai.audio.transcribe".input_schema]
 required = ["audio_b64"]
 type = "object"
 
-[provides.operations.audio_transcribe.input_schema.properties.audio_b64]
+[provides.operations."openai.audio.transcribe".input_schema.properties.audio_b64]
 description = "Base64-encoded audio data"
 type = "string"
 
-[provides.operations.audio_transcribe.input_schema.properties.filename]
+[provides.operations."openai.audio.transcribe".input_schema.properties.filename]
 description = "Original filename with extension"
 default = "audio.mp3"
 type = "string"
 
-[provides.operations.audio_transcribe.input_schema.properties.model]
+[provides.operations."openai.audio.transcribe".input_schema.properties.model]
 description = "Whisper model to use"
 default = "whisper-1"
 enum = ["whisper-1"]
 type = "string"
 
-[provides.operations.audio_transcribe.input_schema.properties.language]
+[provides.operations."openai.audio.transcribe".input_schema.properties.language]
 description = "ISO-639-1 language code (optional)"
 type = "string"
 
-[provides.operations.audio_transcribe.output_schema]
+[provides.operations."openai.audio.transcribe".output_schema]
 required = ["text"]
 type = "object"
 
-[provides.operations.audio_transcribe.output_schema.properties.text]
+[provides.operations."openai.audio.transcribe".output_schema.properties.text]
 description = "Transcribed text"
 type = "string"
 
-[provides.operations.audio_transcribe.network_constraints]
+[provides.operations."openai.audio.transcribe".network_constraints]
 host_allow = ["api.openai.com", "api.deepseek.com"]
 port_allow = [443]
 ip_allow = []
@@ -774,7 +849,7 @@ connect_timeout_ms = 10000
 total_timeout_ms = 120000
 max_response_bytes = 10485760
 
-[provides.operations.audio_transcribe.ai_hints]
+[provides.operations."openai.audio.transcribe".ai_hints]
 when_to_use = "Transcribe audio files to text using OpenAI Whisper. Supports mp3, mp4, mpeg, mpga, m4a, wav, and webm."
 common_mistakes = [
     "Sending empty audio data.",
@@ -788,7 +863,7 @@ related = ["openai.audio.tts"]
 
 # -----------------------------------------------------------------------------
 
-[provides.operations.realtime_transcribe]
+[provides.operations."openai.realtime.transcribe"]
 description = "Transcribe streaming audio over an OpenAI Realtime WebSocket session"
 capability = "openai.realtime.transcribe"
 risk_level = "medium"
@@ -797,29 +872,29 @@ requires_approval = "none"
 idempotency = "none"
 revocation_freshness = "safe"
 
-[provides.operations.realtime_transcribe.rate_limit]
+[provides.operations."openai.realtime.transcribe".rate_limit]
 max = 50
 per_ms = 60000
 
-[provides.operations.realtime_transcribe.input_schema]
+[provides.operations."openai.realtime.transcribe".input_schema]
 type = "object"
 
-[provides.operations.realtime_transcribe.input_schema.properties.audio_b64]
+[provides.operations."openai.realtime.transcribe".input_schema.properties.audio_b64]
 description = "Base64-encoded audio chunk to append to the realtime input buffer"
 type = "string"
 
-[provides.operations.realtime_transcribe.input_schema.properties.audio_chunks_b64]
+[provides.operations."openai.realtime.transcribe".input_schema.properties.audio_chunks_b64]
 description = "Ordered base64-encoded audio chunks to stream before commit"
 type = "array"
 
-[provides.operations.realtime_transcribe.input_schema.properties.audio_chunks_b64.items]
+[provides.operations."openai.realtime.transcribe".input_schema.properties.audio_chunks_b64.items]
 type = "string"
 
-[provides.operations.realtime_transcribe.input_schema.properties.session_id]
+[provides.operations."openai.realtime.transcribe".input_schema.properties.session_id]
 description = "Optional caller session identifier for event correlation"
 type = "string"
 
-[provides.operations.realtime_transcribe.input_schema.properties.model]
+[provides.operations."openai.realtime.transcribe".input_schema.properties.model]
 description = "Realtime transcription model"
 default = "gpt-4o-transcribe"
 enum = [
@@ -830,138 +905,138 @@ enum = [
 ]
 type = "string"
 
-[provides.operations.realtime_transcribe.input_schema.properties.audio_format]
+[provides.operations."openai.realtime.transcribe".input_schema.properties.audio_format]
 description = "Input audio encoding for appended buffers"
 default = "pcm16"
 enum = ["pcm16", "g711_ulaw", "g711_alaw"]
 type = "string"
 
-[provides.operations.realtime_transcribe.input_schema.properties.language]
+[provides.operations."openai.realtime.transcribe".input_schema.properties.language]
 description = "Optional ISO-639-1 language code"
 type = "string"
 
-[provides.operations.realtime_transcribe.input_schema.properties.prompt]
+[provides.operations."openai.realtime.transcribe".input_schema.properties.prompt]
 description = "Optional transcription prompt or keyword list"
 type = "string"
 
-[provides.operations.realtime_transcribe.input_schema.properties.include_logprobs]
+[provides.operations."openai.realtime.transcribe".input_schema.properties.include_logprobs]
 description = "Include transcription logprobs in server events"
 default = false
 type = "boolean"
 
-[provides.operations.realtime_transcribe.input_schema.properties.server_vad]
+[provides.operations."openai.realtime.transcribe".input_schema.properties.server_vad]
 description = "Use OpenAI server VAD for speech turn detection"
 default = true
 type = "boolean"
 
-[provides.operations.realtime_transcribe.input_schema.properties.vad_threshold]
+[provides.operations."openai.realtime.transcribe".input_schema.properties.vad_threshold]
 description = "Server VAD threshold"
 default = 0.5
 minimum = 0
 maximum = 1
 type = "number"
 
-[provides.operations.realtime_transcribe.input_schema.properties.prefix_padding_ms]
+[provides.operations."openai.realtime.transcribe".input_schema.properties.prefix_padding_ms]
 description = "Server VAD prefix padding"
 default = 300
 minimum = 0
 maximum = 10000
 type = "integer"
 
-[provides.operations.realtime_transcribe.input_schema.properties.silence_duration_ms]
+[provides.operations."openai.realtime.transcribe".input_schema.properties.silence_duration_ms]
 description = "Server VAD silence duration"
 default = 500
 minimum = 0
 maximum = 30000
 type = "integer"
 
-[provides.operations.realtime_transcribe.input_schema.properties.noise_reduction]
+[provides.operations."openai.realtime.transcribe".input_schema.properties.noise_reduction]
 description = "Input audio noise reduction mode"
 default = "near_field"
 enum = ["near_field", "far_field", "none"]
 type = "string"
 
-[provides.operations.realtime_transcribe.input_schema.properties.commit_audio_buffer]
+[provides.operations."openai.realtime.transcribe".input_schema.properties.commit_audio_buffer]
 description = "Send input_audio_buffer.commit after appending chunks"
 default = true
 type = "boolean"
 
-[provides.operations.realtime_transcribe.input_schema.properties.connect_timeout_ms]
+[provides.operations."openai.realtime.transcribe".input_schema.properties.connect_timeout_ms]
 description = "WebSocket connect timeout"
 default = 10000
 minimum = 100
 maximum = 120000
 type = "integer"
 
-[provides.operations.realtime_transcribe.input_schema.properties.timeout_ms]
+[provides.operations."openai.realtime.transcribe".input_schema.properties.timeout_ms]
 description = "Overall session timeout"
 default = 30000
 minimum = 100
 maximum = 300000
 type = "integer"
 
-[provides.operations.realtime_transcribe.input_schema.properties.max_events]
+[provides.operations."openai.realtime.transcribe".input_schema.properties.max_events]
 description = "Maximum server events to process before failing closed"
 default = 64
 minimum = 1
 maximum = 1024
 type = "integer"
 
-[provides.operations.realtime_transcribe.input_schema.properties.max_reconnect_attempts]
+[provides.operations."openai.realtime.transcribe".input_schema.properties.max_reconnect_attempts]
 description = "Maximum supervised reconnect attempts before giving up"
 default = 0
 minimum = 0
 maximum = 5
 type = "integer"
 
-[provides.operations.realtime_transcribe.input_schema.properties.reconnect_delay_ms]
+[provides.operations."openai.realtime.transcribe".input_schema.properties.reconnect_delay_ms]
 description = "Delay between supervised reconnect attempts"
 default = 1000
 minimum = 100
 maximum = 30000
 type = "integer"
 
-[provides.operations.realtime_transcribe.output_schema]
+[provides.operations."openai.realtime.transcribe".output_schema]
 required = ["session_id", "model", "audio_format", "text"]
 type = "object"
 
-[provides.operations.realtime_transcribe.output_schema.properties.session_id]
+[provides.operations."openai.realtime.transcribe".output_schema.properties.session_id]
 description = "Caller-visible session identifier"
 type = "string"
 
-[provides.operations.realtime_transcribe.output_schema.properties.provider_session_id]
+[provides.operations."openai.realtime.transcribe".output_schema.properties.provider_session_id]
 description = "Provider session identifier, if observed"
-type = "string"
+type = ["string", "null"]
 
-[provides.operations.realtime_transcribe.output_schema.properties.model]
+[provides.operations."openai.realtime.transcribe".output_schema.properties.model]
 description = "Transcription model"
 type = "string"
 
-[provides.operations.realtime_transcribe.output_schema.properties.audio_format]
+[provides.operations."openai.realtime.transcribe".output_schema.properties.audio_format]
 description = "Input audio format"
 type = "string"
 
-[provides.operations.realtime_transcribe.output_schema.properties.text]
+[provides.operations."openai.realtime.transcribe".output_schema.properties.text]
 description = "Completed transcript text"
 type = "string"
 
-[provides.operations.realtime_transcribe.output_schema.properties.transcripts]
+[provides.operations."openai.realtime.transcribe".output_schema.properties.transcripts]
 description = "Completed transcript events"
 type = "array"
 
-[provides.operations.realtime_transcribe.output_schema.properties.partials]
+[provides.operations."openai.realtime.transcribe".output_schema.properties.partials]
 description = "Partial transcript delta events"
 type = "array"
 
-[provides.operations.realtime_transcribe.output_schema.properties.audio_commits]
+[provides.operations."openai.realtime.transcribe".output_schema.properties.audio_commits]
 description = "Input audio commit events observed from the server"
 type = "array"
 
-[provides.operations.realtime_transcribe.output_schema.properties.stats]
+[provides.operations."openai.realtime.transcribe".output_schema.properties.stats]
 description = "Session event and reconnect statistics"
 type = "object"
 
-[provides.operations.realtime_transcribe.network_constraints]
+[provides.operations."openai.realtime.transcribe".network_constraints]
 host_allow = ["api.openai.com"]
 port_allow = [443]
 ip_allow = []
@@ -979,7 +1054,7 @@ connect_timeout_ms = 10000
 total_timeout_ms = 300000
 max_response_bytes = 10485760
 
-[provides.operations.realtime_transcribe.ai_hints]
+[provides.operations."openai.realtime.transcribe".ai_hints]
 when_to_use = "Stream microphone or chunked audio through OpenAI Realtime transcription and collect completed transcript events."
 common_mistakes = [
     "Sending audio in a format different from audio_format.",
@@ -993,7 +1068,7 @@ related = ["openai.audio.transcribe"]
 
 # -----------------------------------------------------------------------------
 
-[provides.operations.realtime_voice]
+[provides.operations."openai.realtime.voice"]
 description = "Run a supervised OpenAI Realtime voice WebSocket session"
 capability = "openai.realtime.voice"
 risk_level = "medium"
@@ -1002,33 +1077,33 @@ requires_approval = "none"
 idempotency = "none"
 revocation_freshness = "safe"
 
-[provides.operations.realtime_voice.rate_limit]
+[provides.operations."openai.realtime.voice".rate_limit]
 max = 50
 per_ms = 60000
 
-[provides.operations.realtime_voice.input_schema]
+[provides.operations."openai.realtime.voice".input_schema]
 type = "object"
 
-[provides.operations.realtime_voice.input_schema.properties.audio_b64]
+[provides.operations."openai.realtime.voice".input_schema.properties.audio_b64]
 description = "Base64-encoded input audio chunk"
 type = "string"
 
-[provides.operations.realtime_voice.input_schema.properties.audio_chunks_b64]
+[provides.operations."openai.realtime.voice".input_schema.properties.audio_chunks_b64]
 description = "Ordered base64-encoded audio chunks to drain after session.updated"
 type = "array"
 
-[provides.operations.realtime_voice.input_schema.properties.audio_chunks_b64.items]
+[provides.operations."openai.realtime.voice".input_schema.properties.audio_chunks_b64.items]
 type = "string"
 
-[provides.operations.realtime_voice.input_schema.properties.message]
+[provides.operations."openai.realtime.voice".input_schema.properties.message]
 description = "Optional user text message to send before response.create"
 type = "string"
 
-[provides.operations.realtime_voice.input_schema.properties.session_id]
+[provides.operations."openai.realtime.voice".input_schema.properties.session_id]
 description = "Optional caller session identifier for event correlation"
 type = "string"
 
-[provides.operations.realtime_voice.input_schema.properties.model]
+[provides.operations."openai.realtime.voice".input_schema.properties.model]
 description = "Realtime voice model"
 default = "gpt-realtime"
 enum = [
@@ -1039,29 +1114,29 @@ enum = [
 ]
 type = "string"
 
-[provides.operations.realtime_voice.input_schema.properties.voice]
+[provides.operations."openai.realtime.voice".input_schema.properties.voice]
 description = "Realtime output voice"
 default = "alloy"
 enum = ["alloy", "ash", "ballad", "cedar", "coral", "echo", "marin", "sage", "shimmer", "verse"]
 type = "string"
 
-[provides.operations.realtime_voice.input_schema.properties.instructions]
+[provides.operations."openai.realtime.voice".input_schema.properties.instructions]
 description = "Session instructions"
 type = "string"
 
-[provides.operations.realtime_voice.input_schema.properties.audio_format]
+[provides.operations."openai.realtime.voice".input_schema.properties.audio_format]
 description = "Input audio encoding for appended buffers"
 default = "pcm16"
 enum = ["pcm16", "g711_ulaw", "g711_alaw"]
 type = "string"
 
-[provides.operations.realtime_voice.input_schema.properties.output_audio_format]
+[provides.operations."openai.realtime.voice".input_schema.properties.output_audio_format]
 description = "Output audio encoding to request from the model"
 default = "pcm16"
 enum = ["pcm16", "g711_ulaw", "g711_alaw"]
 type = "string"
 
-[provides.operations.realtime_voice.input_schema.properties.input_transcription_model]
+[provides.operations."openai.realtime.voice".input_schema.properties.input_transcription_model]
 description = "Model used for optional input-audio transcription events"
 default = "whisper-1"
 enum = [
@@ -1072,89 +1147,89 @@ enum = [
 ]
 type = "string"
 
-[provides.operations.realtime_voice.input_schema.properties.server_vad]
+[provides.operations."openai.realtime.voice".input_schema.properties.server_vad]
 description = "Use server VAD turn detection"
 default = false
 type = "boolean"
 
-[provides.operations.realtime_voice.input_schema.properties.auto_respond_to_audio]
+[provides.operations."openai.realtime.voice".input_schema.properties.auto_respond_to_audio]
 description = "Let server VAD automatically create responses"
 default = true
 type = "boolean"
 
-[provides.operations.realtime_voice.input_schema.properties.interrupt_response]
+[provides.operations."openai.realtime.voice".input_schema.properties.interrupt_response]
 description = "Let input speech interrupt an in-flight assistant response"
 default = true
 type = "boolean"
 
-[provides.operations.realtime_voice.input_schema.properties.commit_audio_buffer]
+[provides.operations."openai.realtime.voice".input_schema.properties.commit_audio_buffer]
 description = "Send input_audio_buffer.commit after appending chunks"
 default = true
 type = "boolean"
 
-[provides.operations.realtime_voice.input_schema.properties.create_response]
+[provides.operations."openai.realtime.voice".input_schema.properties.create_response]
 description = "Send response.create after queued input is drained"
 default = true
 type = "boolean"
 
-[provides.operations.realtime_voice.input_schema.properties.connect_timeout_ms]
+[provides.operations."openai.realtime.voice".input_schema.properties.connect_timeout_ms]
 description = "WebSocket connect timeout"
 default = 10000
 minimum = 100
 maximum = 120000
 type = "integer"
 
-[provides.operations.realtime_voice.input_schema.properties.timeout_ms]
+[provides.operations."openai.realtime.voice".input_schema.properties.timeout_ms]
 description = "Overall session timeout"
 default = 30000
 minimum = 100
 maximum = 300000
 type = "integer"
 
-[provides.operations.realtime_voice.input_schema.properties.max_events]
+[provides.operations."openai.realtime.voice".input_schema.properties.max_events]
 description = "Maximum server events to process before failing closed"
 default = 128
 minimum = 1
 maximum = 2048
 type = "integer"
 
-[provides.operations.realtime_voice.output_schema]
+[provides.operations."openai.realtime.voice".output_schema]
 required = ["session_id", "model", "voice", "audio_chunks_b64"]
 type = "object"
 
-[provides.operations.realtime_voice.output_schema.properties.session_id]
+[provides.operations."openai.realtime.voice".output_schema.properties.session_id]
 description = "Caller-visible session identifier"
 type = "string"
 
-[provides.operations.realtime_voice.output_schema.properties.provider_session_id]
+[provides.operations."openai.realtime.voice".output_schema.properties.provider_session_id]
 description = "Provider session identifier, if observed"
-type = "string"
+type = ["string", "null"]
 
-[provides.operations.realtime_voice.output_schema.properties.model]
+[provides.operations."openai.realtime.voice".output_schema.properties.model]
 description = "Realtime voice model"
 type = "string"
 
-[provides.operations.realtime_voice.output_schema.properties.voice]
+[provides.operations."openai.realtime.voice".output_schema.properties.voice]
 description = "Realtime voice used for the output"
 type = "string"
 
-[provides.operations.realtime_voice.output_schema.properties.audio_b64]
+[provides.operations."openai.realtime.voice".output_schema.properties.audio_b64]
 description = "Concatenated assistant audio deltas"
-type = "string"
+type = ["string", "null"]
 
-[provides.operations.realtime_voice.output_schema.properties.audio_chunks_b64]
+[provides.operations."openai.realtime.voice".output_schema.properties.audio_chunks_b64]
 description = "Assistant audio deltas in arrival order"
 type = "array"
 
-[provides.operations.realtime_voice.output_schema.properties.assistant_transcript]
+[provides.operations."openai.realtime.voice".output_schema.properties.assistant_transcript]
 description = "Final assistant transcript text"
 type = "string"
 
-[provides.operations.realtime_voice.output_schema.properties.stats]
+[provides.operations."openai.realtime.voice".output_schema.properties.stats]
 description = "Session event and reconnect statistics"
 type = "object"
 
-[provides.operations.realtime_voice.network_constraints]
+[provides.operations."openai.realtime.voice".network_constraints]
 host_allow = ["api.openai.com"]
 port_allow = [443]
 ip_allow = []
@@ -1172,7 +1247,7 @@ connect_timeout_ms = 10000
 total_timeout_ms = 300000
 max_response_bytes = 10485760
 
-[provides.operations.realtime_voice.ai_hints]
+[provides.operations."openai.realtime.voice".ai_hints]
 when_to_use = "Use for supervised Realtime voice sessions that stream queued audio after session readiness and return assistant audio/transcript events."
 common_mistakes = [
     "Starting audio before the session.updated readiness event.",
@@ -1186,7 +1261,7 @@ related = ["openai.realtime.transcribe"]
 
 # -----------------------------------------------------------------------------
 
-[provides.operations.realtime_browser_session]
+[provides.operations."openai.realtime.browser_session"]
 description = "Create an ephemeral OpenAI Realtime browser client secret"
 capability = "openai.realtime.browser_session"
 risk_level = "medium"
@@ -1195,14 +1270,14 @@ requires_approval = "none"
 idempotency = "none"
 revocation_freshness = "safe"
 
-[provides.operations.realtime_browser_session.rate_limit]
+[provides.operations."openai.realtime.browser_session".rate_limit]
 max = 50
 per_ms = 60000
 
-[provides.operations.realtime_browser_session.input_schema]
+[provides.operations."openai.realtime.browser_session".input_schema]
 type = "object"
 
-[provides.operations.realtime_browser_session.input_schema.properties.model]
+[provides.operations."openai.realtime.browser_session".input_schema.properties.model]
 description = "Realtime model"
 default = "gpt-realtime"
 enum = [
@@ -1213,77 +1288,77 @@ enum = [
 ]
 type = "string"
 
-[provides.operations.realtime_browser_session.input_schema.properties.voice]
+[provides.operations."openai.realtime.browser_session".input_schema.properties.voice]
 description = "Realtime output voice"
 default = "alloy"
 enum = ["alloy", "ash", "ballad", "cedar", "coral", "echo", "marin", "sage", "shimmer", "verse"]
 type = "string"
 
-[provides.operations.realtime_browser_session.input_schema.properties.instructions]
+[provides.operations."openai.realtime.browser_session".input_schema.properties.instructions]
 description = "Session instructions"
 type = "string"
 
-[provides.operations.realtime_browser_session.input_schema.properties.audio_format]
+[provides.operations."openai.realtime.browser_session".input_schema.properties.audio_format]
 description = "Browser input audio encoding"
 default = "pcm16"
 enum = ["pcm16", "g711_ulaw", "g711_alaw"]
 type = "string"
 
-[provides.operations.realtime_browser_session.input_schema.properties.output_audio_format]
+[provides.operations."openai.realtime.browser_session".input_schema.properties.output_audio_format]
 description = "Browser output audio encoding"
 default = "pcm16"
 enum = ["pcm16", "g711_ulaw", "g711_alaw"]
 type = "string"
 
-[provides.operations.realtime_browser_session.input_schema.properties.expires_after_seconds]
+[provides.operations."openai.realtime.browser_session".input_schema.properties.expires_after_seconds]
 description = "Requested ephemeral secret lifetime"
 default = 60
 minimum = 1
 maximum = 600
 type = "integer"
 
-[provides.operations.realtime_browser_session.input_schema.properties.audit_context]
+[provides.operations."openai.realtime.browser_session".input_schema.properties.audit_context]
 description = "Caller audit context for this client-secret mint"
 default = "fcp-openai-realtime-browser-session"
 type = "string"
 
-[provides.operations.realtime_browser_session.output_schema]
+[provides.operations."openai.realtime.browser_session".output_schema]
 required = ["provider", "transport", "client_secret", "offer_url", "model", "voice"]
 type = "object"
 
-[provides.operations.realtime_browser_session.output_schema.properties.provider]
+[provides.operations."openai.realtime.browser_session".output_schema.properties.provider]
 description = "Provider identifier"
 type = "string"
 
-[provides.operations.realtime_browser_session.output_schema.properties.transport]
+[provides.operations."openai.realtime.browser_session".output_schema.properties.transport]
 description = "Browser transport contract"
 type = "string"
 
-[provides.operations.realtime_browser_session.output_schema.properties.client_secret]
+[provides.operations."openai.realtime.browser_session".output_schema.properties.client_secret]
 description = "Ephemeral client secret for direct browser Realtime negotiation"
 type = "string"
 
-[provides.operations.realtime_browser_session.output_schema.properties.offer_url]
+[provides.operations."openai.realtime.browser_session".output_schema.properties.offer_url]
 description = "OpenAI WebRTC SDP offer endpoint"
 type = "string"
 
-[provides.operations.realtime_browser_session.output_schema.properties.model]
+[provides.operations."openai.realtime.browser_session".output_schema.properties.model]
 description = "Realtime model"
 type = "string"
 
-[provides.operations.realtime_browser_session.output_schema.properties.voice]
+[provides.operations."openai.realtime.browser_session".output_schema.properties.voice]
 description = "Realtime voice"
 type = "string"
 
-[provides.operations.realtime_browser_session.output_schema.properties.expires_at]
+[provides.operations."openai.realtime.browser_session".output_schema.properties.expires_at]
 description = "Provider expiration timestamp, if returned"
-type = "integer"
+type = ["integer", "null"]
 
-[provides.operations.realtime_browser_session.output_schema.properties.audit_context]
+[provides.operations."openai.realtime.browser_session".output_schema.properties.audit_context]
 description = "Caller audit context"
 type = "string"
 
-[provides.operations.realtime_browser_session.network_constraints]
+[provides.operations."openai.realtime.browser_session".network_constraints]
 host_allow = ["api.openai.com"]
 port_allow = [443]
 ip_allow = []
@@ -1301,7 +1376,7 @@ connect_timeout_ms = 10000
 total_timeout_ms = 120000
 max_response_bytes = 10485760
 
-[provides.operations.realtime_browser_session.ai_hints]
+[provides.operations."openai.realtime.browser_session".ai_hints]
 when_to_use = "Create a short-lived Realtime client secret for a browser WebRTC SDP offer flow."
 common_mistakes = [
     "Logging or persisting the returned ephemeral client secret.",
@@ -1314,7 +1389,7 @@ related = ["openai.realtime.voice"]
 
 # -----------------------------------------------------------------------------
 
-[provides.operations.audio_tts]
+[provides.operations."openai.audio.tts"]
 description = "Convert text to speech audio using OpenAI TTS"
 capability = "openai.audio.tts"
 risk_level = "medium"
@@ -1323,65 +1398,65 @@ requires_approval = "none"
 idempotency = "none"
 revocation_freshness = "safe"
 
-[provides.operations.audio_tts.rate_limit]
+[provides.operations."openai.audio.tts".rate_limit]
 max = 50
 per_ms = 60000
 
-[provides.operations.audio_tts.input_schema]
+[provides.operations."openai.audio.tts".input_schema]
 required = ["input"]
 type = "object"
 
-[provides.operations.audio_tts.input_schema.properties.input]
+[provides.operations."openai.audio.tts".input_schema.properties.input]
 description = "Text to convert to speech (max 4096 characters)"
 type = "string"
 minLength = 1
 maxLength = 4096
 
-[provides.operations.audio_tts.input_schema.properties.model]
+[provides.operations."openai.audio.tts".input_schema.properties.model]
 description = "TTS model to use"
 default = "tts-1"
 enum = ["tts-1", "tts-1-hd"]
 type = "string"
 
-[provides.operations.audio_tts.input_schema.properties.voice]
+[provides.operations."openai.audio.tts".input_schema.properties.voice]
 description = "Voice to use for speech"
 default = "alloy"
 enum = ["alloy", "echo", "fable", "onyx", "nova", "shimmer"]
 type = "string"
 
-[provides.operations.audio_tts.input_schema.properties.response_format]
+[provides.operations."openai.audio.tts".input_schema.properties.response_format]
 description = "Output audio format"
 default = "mp3"
 enum = ["mp3", "opus", "aac", "flac"]
 type = "string"
 
-[provides.operations.audio_tts.input_schema.properties.speed]
+[provides.operations."openai.audio.tts".input_schema.properties.speed]
 description = "Playback speed (0.25 to 4.0)"
 type = "number"
 minimum = 0.25
 maximum = 4.0
 
-[provides.operations.audio_tts.output_schema]
+[provides.operations."openai.audio.tts".output_schema]
 required = ["audio_b64", "format"]
 type = "object"
 
-[provides.operations.audio_tts.output_schema.properties.audio_b64]
+[provides.operations."openai.audio.tts".output_schema.properties.audio_b64]
 description = "Base64-encoded audio data"
 type = "string"
 
-[provides.operations.audio_tts.output_schema.properties.format]
+[provides.operations."openai.audio.tts".output_schema.properties.format]
 description = "Audio format"
 type = "string"
 
-[provides.operations.audio_tts.output_schema.properties.mime_type]
+[provides.operations."openai.audio.tts".output_schema.properties.mime_type]
 description = "MIME type of the audio"
 type = "string"
 
-[provides.operations.audio_tts.output_schema.properties.input_chars]
+[provides.operations."openai.audio.tts".output_schema.properties.input_chars]
 description = "Number of input characters"
 type = "integer"
 
-[provides.operations.audio_tts.network_constraints]
+[provides.operations."openai.audio.tts".network_constraints]
 host_allow = ["api.openai.com", "api.deepseek.com"]
 port_allow = [443]
 ip_allow = []
@@ -1399,7 +1474,7 @@ connect_timeout_ms = 10000
 total_timeout_ms = 120000
 max_response_bytes = 52428800
 
-[provides.operations.audio_tts.ai_hints]
+[provides.operations."openai.audio.tts".ai_hints]
 when_to_use = "Convert text to speech audio using OpenAI TTS models. Returns base64-encoded audio."
 common_mistakes = [
     "Exceeding 4096 character input limit.",
@@ -1413,7 +1488,7 @@ related = ["openai.audio.transcribe"]
 
 # -----------------------------------------------------------------------------
 
-[provides.operations.finetune_create]
+[provides.operations."openai.finetune.create"]
 description = "Create a fine-tuning job to train a custom model"
 capability = "openai.finetune.create"
 risk_level = "high"
@@ -1422,59 +1497,59 @@ requires_approval = "interactive"
 idempotency = "none"
 revocation_freshness = "critical"
 
-[provides.operations.finetune_create.rate_limit]
+[provides.operations."openai.finetune.create".rate_limit]
 max = 10
 per_ms = 60000
 
-[provides.operations.finetune_create.input_schema]
+[provides.operations."openai.finetune.create".input_schema]
 required = ["training_file"]
 type = "object"
 
-[provides.operations.finetune_create.input_schema.properties.training_file]
+[provides.operations."openai.finetune.create".input_schema.properties.training_file]
 description = "Training file ID (from OpenAI Files API)"
 type = "string"
 
-[provides.operations.finetune_create.input_schema.properties.model]
+[provides.operations."openai.finetune.create".input_schema.properties.model]
 description = "Base model to fine-tune"
 default = "gpt-4o-mini-2024-07-18"
 enum = ["gpt-4o-mini-2024-07-18", "gpt-3.5-turbo-0125"]
 type = "string"
 
-[provides.operations.finetune_create.input_schema.properties.validation_file]
+[provides.operations."openai.finetune.create".input_schema.properties.validation_file]
 description = "Optional validation file ID"
 type = "string"
 
-[provides.operations.finetune_create.input_schema.properties.suffix]
+[provides.operations."openai.finetune.create".input_schema.properties.suffix]
 description = "Suffix for the fine-tuned model name (max 18 chars)"
 type = "string"
 maxLength = 18
 
-[provides.operations.finetune_create.output_schema]
+[provides.operations."openai.finetune.create".output_schema]
 required = ["id", "status"]
 type = "object"
 
-[provides.operations.finetune_create.output_schema.properties.id]
+[provides.operations."openai.finetune.create".output_schema.properties.id]
 description = "Fine-tuning job ID"
 type = "string"
 
-[provides.operations.finetune_create.output_schema.properties.model]
+[provides.operations."openai.finetune.create".output_schema.properties.model]
 description = "Base model being fine-tuned"
 type = "string"
 
-[provides.operations.finetune_create.output_schema.properties.status]
+[provides.operations."openai.finetune.create".output_schema.properties.status]
 description = "Job status"
 type = "string"
 enum = ["validating_files", "queued", "running", "succeeded", "failed", "cancelled"]
 
-[provides.operations.finetune_create.output_schema.properties.training_file]
+[provides.operations."openai.finetune.create".output_schema.properties.training_file]
 description = "Training file ID"
 type = "string"
 
-[provides.operations.finetune_create.output_schema.properties.created_at]
+[provides.operations."openai.finetune.create".output_schema.properties.created_at]
 description = "Unix timestamp of creation"
 type = "integer"
 
-[provides.operations.finetune_create.network_constraints]
+[provides.operations."openai.finetune.create".network_constraints]
 host_allow = ["api.openai.com", "api.deepseek.com"]
 port_allow = [443]
 ip_allow = []
@@ -1492,7 +1567,7 @@ connect_timeout_ms = 10000
 total_timeout_ms = 120000
 max_response_bytes = 10485760
 
-[provides.operations.finetune_create.ai_hints]
+[provides.operations."openai.finetune.create".ai_hints]
 when_to_use = "Create a fine-tuning job to train a custom model on your training data. Requires a training file uploaded via the Files API."
 common_mistakes = [
     "Missing training_file ID.",
@@ -1506,7 +1581,7 @@ related = ["openai.finetune.list", "openai.finetune.get"]
 
 # -----------------------------------------------------------------------------
 
-[provides.operations.finetune_list]
+[provides.operations."openai.finetune.list"]
 description = "List fine-tuning jobs"
 capability = "openai.finetune.list"
 risk_level = "low"
@@ -1515,37 +1590,37 @@ requires_approval = "none"
 idempotency = "strict"
 revocation_freshness = "safe"
 
-[provides.operations.finetune_list.rate_limit]
+[provides.operations."openai.finetune.list".rate_limit]
 max = 100
 per_ms = 60000
 
-[provides.operations.finetune_list.input_schema]
+[provides.operations."openai.finetune.list".input_schema]
 type = "object"
 
-[provides.operations.finetune_list.input_schema.properties.limit]
+[provides.operations."openai.finetune.list".input_schema.properties.limit]
 description = "Max number of jobs to return"
 type = "integer"
 default = 20
 minimum = 1
 maximum = 100
 
-[provides.operations.finetune_list.input_schema.properties.after]
+[provides.operations."openai.finetune.list".input_schema.properties.after]
 description = "Cursor for pagination"
 type = "string"
 
-[provides.operations.finetune_list.output_schema]
+[provides.operations."openai.finetune.list".output_schema]
 required = ["data", "has_more"]
 type = "object"
 
-[provides.operations.finetune_list.output_schema.properties.data]
+[provides.operations."openai.finetune.list".output_schema.properties.data]
 description = "Array of fine-tuning jobs"
 type = "array"
 
-[provides.operations.finetune_list.output_schema.properties.has_more]
+[provides.operations."openai.finetune.list".output_schema.properties.has_more]
 description = "Whether there are more results"
 type = "boolean"
 
-[provides.operations.finetune_list.network_constraints]
+[provides.operations."openai.finetune.list".network_constraints]
 host_allow = ["api.openai.com", "api.deepseek.com"]
 port_allow = [443]
 ip_allow = []
@@ -1563,7 +1638,7 @@ connect_timeout_ms = 10000
 total_timeout_ms = 120000
 max_response_bytes = 10485760
 
-[provides.operations.finetune_list.ai_hints]
+[provides.operations."openai.finetune.list".ai_hints]
 when_to_use = "List fine-tuning jobs to check status of training runs."
 common_mistakes = [
     "Not using pagination (after cursor) when there are many fine-tuning jobs — results are capped by the limit parameter.",
@@ -1576,7 +1651,7 @@ related = ["openai.finetune.get", "openai.finetune.create"]
 
 # -----------------------------------------------------------------------------
 
-[provides.operations.finetune_get]
+[provides.operations."openai.finetune.get"]
 description = "Get details of a specific fine-tuning job"
 capability = "openai.finetune.get"
 risk_level = "low"
@@ -1585,51 +1660,51 @@ requires_approval = "none"
 idempotency = "strict"
 revocation_freshness = "safe"
 
-[provides.operations.finetune_get.rate_limit]
+[provides.operations."openai.finetune.get".rate_limit]
 max = 100
 per_ms = 60000
 
-[provides.operations.finetune_get.input_schema]
+[provides.operations."openai.finetune.get".input_schema]
 required = ["job_id"]
 type = "object"
 
-[provides.operations.finetune_get.input_schema.properties.job_id]
+[provides.operations."openai.finetune.get".input_schema.properties.job_id]
 description = "Fine-tuning job ID"
 type = "string"
 
-[provides.operations.finetune_get.output_schema]
+[provides.operations."openai.finetune.get".output_schema]
 required = ["id", "status"]
 type = "object"
 
-[provides.operations.finetune_get.output_schema.properties.id]
+[provides.operations."openai.finetune.get".output_schema.properties.id]
 description = "Fine-tuning job ID"
 type = "string"
 
-[provides.operations.finetune_get.output_schema.properties.model]
+[provides.operations."openai.finetune.get".output_schema.properties.model]
 description = "Base model"
 type = "string"
 
-[provides.operations.finetune_get.output_schema.properties.status]
+[provides.operations."openai.finetune.get".output_schema.properties.status]
 description = "Job status"
 type = "string"
 
-[provides.operations.finetune_get.output_schema.properties.fine_tuned_model]
+[provides.operations."openai.finetune.get".output_schema.properties.fine_tuned_model]
 description = "Fine-tuned model name (available after success)"
-type = "string"
+type = ["string", "null"]
 
-[provides.operations.finetune_get.output_schema.properties.created_at]
+[provides.operations."openai.finetune.get".output_schema.properties.created_at]
 description = "Unix timestamp of creation"
 type = "integer"
 
-[provides.operations.finetune_get.output_schema.properties.finished_at]
+[provides.operations."openai.finetune.get".output_schema.properties.finished_at]
 description = "Unix timestamp of completion"
-type = "integer"
+type = ["integer", "null"]
 
-[provides.operations.finetune_get.output_schema.properties.trained_tokens]
+[provides.operations."openai.finetune.get".output_schema.properties.trained_tokens]
 description = "Number of tokens trained"
-type = "integer"
+type = ["integer", "null"]
 
-[provides.operations.finetune_get.network_constraints]
+[provides.operations."openai.finetune.get".network_constraints]
 host_allow = ["api.openai.com", "api.deepseek.com"]
 port_allow = [443]
 ip_allow = []
@@ -1647,7 +1722,7 @@ connect_timeout_ms = 10000
 total_timeout_ms = 120000
 max_response_bytes = 10485760
 
-[provides.operations.finetune_get.ai_hints]
+[provides.operations."openai.finetune.get".ai_hints]
 when_to_use = "Get details and status of a specific fine-tuning job."
 common_mistakes = ["Missing job_id."]
 examples = [
@@ -1657,7 +1732,7 @@ related = ["openai.finetune.list", "openai.finetune.events"]
 
 # -----------------------------------------------------------------------------
 
-[provides.operations.finetune_cancel]
+[provides.operations."openai.finetune.cancel"]
 description = "Cancel a running or queued fine-tuning job"
 capability = "openai.finetune.cancel"
 risk_level = "high"
@@ -1666,31 +1741,31 @@ requires_approval = "interactive"
 idempotency = "none"
 revocation_freshness = "critical"
 
-[provides.operations.finetune_cancel.rate_limit]
+[provides.operations."openai.finetune.cancel".rate_limit]
 max = 10
 per_ms = 60000
 
-[provides.operations.finetune_cancel.input_schema]
+[provides.operations."openai.finetune.cancel".input_schema]
 required = ["job_id"]
 type = "object"
 
-[provides.operations.finetune_cancel.input_schema.properties.job_id]
+[provides.operations."openai.finetune.cancel".input_schema.properties.job_id]
 description = "Fine-tuning job ID to cancel"
 type = "string"
 
-[provides.operations.finetune_cancel.output_schema]
+[provides.operations."openai.finetune.cancel".output_schema]
 required = ["id", "status"]
 type = "object"
 
-[provides.operations.finetune_cancel.output_schema.properties.id]
+[provides.operations."openai.finetune.cancel".output_schema.properties.id]
 description = "Fine-tuning job ID"
 type = "string"
 
-[provides.operations.finetune_cancel.output_schema.properties.status]
+[provides.operations."openai.finetune.cancel".output_schema.properties.status]
 description = "Job status after cancellation"
 type = "string"
 
-[provides.operations.finetune_cancel.network_constraints]
+[provides.operations."openai.finetune.cancel".network_constraints]
 host_allow = ["api.openai.com", "api.deepseek.com"]
 port_allow = [443]
 ip_allow = []
@@ -1708,7 +1783,7 @@ connect_timeout_ms = 10000
 total_timeout_ms = 120000
 max_response_bytes = 10485760
 
-[provides.operations.finetune_cancel.ai_hints]
+[provides.operations."openai.finetune.cancel".ai_hints]
 when_to_use = "Cancel a running or queued fine-tuning job."
 common_mistakes = ["Missing job_id."]
 examples = [
@@ -1718,7 +1793,7 @@ related = ["openai.finetune.get"]
 
 # -----------------------------------------------------------------------------
 
-[provides.operations.finetune_events]
+[provides.operations."openai.finetune.events"]
 description = "List events for a fine-tuning job"
 capability = "openai.finetune.events"
 risk_level = "low"
@@ -1727,42 +1802,42 @@ requires_approval = "none"
 idempotency = "strict"
 revocation_freshness = "safe"
 
-[provides.operations.finetune_events.rate_limit]
+[provides.operations."openai.finetune.events".rate_limit]
 max = 100
 per_ms = 60000
 
-[provides.operations.finetune_events.input_schema]
+[provides.operations."openai.finetune.events".input_schema]
 required = ["job_id"]
 type = "object"
 
-[provides.operations.finetune_events.input_schema.properties.job_id]
+[provides.operations."openai.finetune.events".input_schema.properties.job_id]
 description = "Fine-tuning job ID"
 type = "string"
 
-[provides.operations.finetune_events.input_schema.properties.limit]
+[provides.operations."openai.finetune.events".input_schema.properties.limit]
 description = "Max events to return"
 type = "integer"
 default = 20
 minimum = 1
 maximum = 100
 
-[provides.operations.finetune_events.input_schema.properties.after]
+[provides.operations."openai.finetune.events".input_schema.properties.after]
 description = "Cursor for pagination"
 type = "string"
 
-[provides.operations.finetune_events.output_schema]
+[provides.operations."openai.finetune.events".output_schema]
 required = ["data", "has_more"]
 type = "object"
 
-[provides.operations.finetune_events.output_schema.properties.data]
+[provides.operations."openai.finetune.events".output_schema.properties.data]
 description = "Array of events"
 type = "array"
 
-[provides.operations.finetune_events.output_schema.properties.has_more]
+[provides.operations."openai.finetune.events".output_schema.properties.has_more]
 description = "Whether there are more results"
 type = "boolean"
 
-[provides.operations.finetune_events.network_constraints]
+[provides.operations."openai.finetune.events".network_constraints]
 host_allow = ["api.openai.com", "api.deepseek.com"]
 port_allow = [443]
 ip_allow = []
@@ -1780,7 +1855,7 @@ connect_timeout_ms = 10000
 total_timeout_ms = 120000
 max_response_bytes = 10485760
 
-[provides.operations.finetune_events.ai_hints]
+[provides.operations."openai.finetune.events".ai_hints]
 when_to_use = "View training progress events for a fine-tuning job."
 common_mistakes = ["Missing job_id."]
 examples = [
@@ -1792,7 +1867,7 @@ related = ["openai.finetune.get"]
 # Assistants
 # -----------------------------------------------------------------------------
 
-[provides.operations.assistants_create]
+[provides.operations."openai.assistants.create"]
 description = "Create an assistant with a model and instructions"
 capability = "openai.assistants.create"
 risk_level = "medium"
@@ -1801,55 +1876,55 @@ requires_approval = "none"
 idempotency = "none"
 revocation_freshness = "risky"
 
-[provides.operations.assistants_create.rate_limit]
+[provides.operations."openai.assistants.create".rate_limit]
 max = 50
 per_ms = 60000
 
-[provides.operations.assistants_create.input_schema]
+[provides.operations."openai.assistants.create".input_schema]
 required = ["model"]
 type = "object"
 
-[provides.operations.assistants_create.input_schema.properties.model]
+[provides.operations."openai.assistants.create".input_schema.properties.model]
 description = "Model for the assistant"
 type = "string"
 
-[provides.operations.assistants_create.input_schema.properties.name]
+[provides.operations."openai.assistants.create".input_schema.properties.name]
 description = "Name of the assistant"
 type = "string"
 
-[provides.operations.assistants_create.input_schema.properties.instructions]
+[provides.operations."openai.assistants.create".input_schema.properties.instructions]
 description = "System instructions for the assistant"
 type = "string"
 
-[provides.operations.assistants_create.input_schema.properties.tools]
+[provides.operations."openai.assistants.create".input_schema.properties.tools]
 description = "Tools available to the assistant"
 type = "array"
 
-[provides.operations.assistants_create.input_schema.properties.metadata]
+[provides.operations."openai.assistants.create".input_schema.properties.metadata]
 description = "Arbitrary metadata"
 type = "object"
 
-[provides.operations.assistants_create.output_schema]
+[provides.operations."openai.assistants.create".output_schema]
 required = ["id", "model"]
 type = "object"
 
-[provides.operations.assistants_create.output_schema.properties.id]
+[provides.operations."openai.assistants.create".output_schema.properties.id]
 description = "Assistant ID"
 type = "string"
 
-[provides.operations.assistants_create.output_schema.properties.model]
+[provides.operations."openai.assistants.create".output_schema.properties.model]
 description = "Model used"
 type = "string"
 
-[provides.operations.assistants_create.output_schema.properties.name]
+[provides.operations."openai.assistants.create".output_schema.properties.name]
 description = "Assistant name"
-type = "string"
+type = ["string", "null"]
 
-[provides.operations.assistants_create.output_schema.properties.created_at]
+[provides.operations."openai.assistants.create".output_schema.properties.created_at]
 description = "Unix timestamp of creation"
 type = "integer"
 
-[provides.operations.assistants_create.network_constraints]
+[provides.operations."openai.assistants.create".network_constraints]
 host_allow = ["api.openai.com", "api.deepseek.com"]
 port_allow = [443]
 ip_allow = []
@@ -1867,7 +1942,7 @@ connect_timeout_ms = 10000
 total_timeout_ms = 120000
 max_response_bytes = 10485760
 
-[provides.operations.assistants_create.ai_hints]
+[provides.operations."openai.assistants.create".ai_hints]
 when_to_use = "Create an OpenAI assistant with a model, name, and instructions."
 common_mistakes = ["Missing model field."]
 examples = [
@@ -1877,7 +1952,7 @@ related = ["openai.assistants.get", "openai.threads.create"]
 
 # -----------------------------------------------------------------------------
 
-[provides.operations.assistants_list]
+[provides.operations."openai.assistants.list"]
 description = "List assistants"
 capability = "openai.assistants.list"
 risk_level = "low"
@@ -1886,37 +1961,37 @@ requires_approval = "none"
 idempotency = "strict"
 revocation_freshness = "safe"
 
-[provides.operations.assistants_list.rate_limit]
+[provides.operations."openai.assistants.list".rate_limit]
 max = 100
 per_ms = 60000
 
-[provides.operations.assistants_list.input_schema]
+[provides.operations."openai.assistants.list".input_schema]
 type = "object"
 
-[provides.operations.assistants_list.input_schema.properties.limit]
+[provides.operations."openai.assistants.list".input_schema.properties.limit]
 description = "Max number of assistants to return"
 type = "integer"
 default = 20
 minimum = 1
 maximum = 100
 
-[provides.operations.assistants_list.input_schema.properties.after]
+[provides.operations."openai.assistants.list".input_schema.properties.after]
 description = "Cursor for pagination"
 type = "string"
 
-[provides.operations.assistants_list.output_schema]
+[provides.operations."openai.assistants.list".output_schema]
 required = ["data", "has_more"]
 type = "object"
 
-[provides.operations.assistants_list.output_schema.properties.data]
+[provides.operations."openai.assistants.list".output_schema.properties.data]
 description = "Array of assistants"
 type = "array"
 
-[provides.operations.assistants_list.output_schema.properties.has_more]
+[provides.operations."openai.assistants.list".output_schema.properties.has_more]
 description = "Whether there are more results"
 type = "boolean"
 
-[provides.operations.assistants_list.network_constraints]
+[provides.operations."openai.assistants.list".network_constraints]
 host_allow = ["api.openai.com", "api.deepseek.com"]
 port_allow = [443]
 ip_allow = []
@@ -1934,7 +2009,7 @@ connect_timeout_ms = 10000
 total_timeout_ms = 120000
 max_response_bytes = 10485760
 
-[provides.operations.assistants_list.ai_hints]
+[provides.operations."openai.assistants.list".ai_hints]
 when_to_use = "List available assistants."
 common_mistakes = [
     "Not paginating with the after cursor when you have more than 20 assistants.",
@@ -1944,7 +2019,7 @@ related = ["openai.assistants.get"]
 
 # -----------------------------------------------------------------------------
 
-[provides.operations.assistants_get]
+[provides.operations."openai.assistants.get"]
 description = "Get an assistant by ID"
 capability = "openai.assistants.get"
 risk_level = "low"
@@ -1953,39 +2028,39 @@ requires_approval = "none"
 idempotency = "strict"
 revocation_freshness = "safe"
 
-[provides.operations.assistants_get.rate_limit]
+[provides.operations."openai.assistants.get".rate_limit]
 max = 100
 per_ms = 60000
 
-[provides.operations.assistants_get.input_schema]
+[provides.operations."openai.assistants.get".input_schema]
 required = ["assistant_id"]
 type = "object"
 
-[provides.operations.assistants_get.input_schema.properties.assistant_id]
+[provides.operations."openai.assistants.get".input_schema.properties.assistant_id]
 description = "Assistant ID"
 type = "string"
 
-[provides.operations.assistants_get.output_schema]
+[provides.operations."openai.assistants.get".output_schema]
 required = ["id", "model"]
 type = "object"
 
-[provides.operations.assistants_get.output_schema.properties.id]
+[provides.operations."openai.assistants.get".output_schema.properties.id]
 description = "Assistant ID"
 type = "string"
 
-[provides.operations.assistants_get.output_schema.properties.model]
+[provides.operations."openai.assistants.get".output_schema.properties.model]
 description = "Model used"
 type = "string"
 
-[provides.operations.assistants_get.output_schema.properties.name]
+[provides.operations."openai.assistants.get".output_schema.properties.name]
 description = "Assistant name"
-type = "string"
+type = ["string", "null"]
 
-[provides.operations.assistants_get.output_schema.properties.created_at]
+[provides.operations."openai.assistants.get".output_schema.properties.created_at]
 description = "Unix timestamp of creation"
 type = "integer"
 
-[provides.operations.assistants_get.network_constraints]
+[provides.operations."openai.assistants.get".network_constraints]
 host_allow = ["api.openai.com", "api.deepseek.com"]
 port_allow = [443]
 ip_allow = []
@@ -2003,7 +2078,7 @@ connect_timeout_ms = 10000
 total_timeout_ms = 120000
 max_response_bytes = 10485760
 
-[provides.operations.assistants_get.ai_hints]
+[provides.operations."openai.assistants.get".ai_hints]
 when_to_use = "Get details of a specific assistant."
 common_mistakes = ["Missing assistant_id."]
 examples = ['{"assistant_id": "asst_abc123"}']
@@ -2011,7 +2086,7 @@ related = ["openai.assistants.list"]
 
 # -----------------------------------------------------------------------------
 
-[provides.operations.assistants_delete]
+[provides.operations."openai.assistants.delete"]
 description = "Delete an assistant"
 capability = "openai.assistants.delete"
 risk_level = "high"
@@ -2020,31 +2095,31 @@ requires_approval = "interactive"
 idempotency = "none"
 revocation_freshness = "critical"
 
-[provides.operations.assistants_delete.rate_limit]
+[provides.operations."openai.assistants.delete".rate_limit]
 max = 20
 per_ms = 60000
 
-[provides.operations.assistants_delete.input_schema]
+[provides.operations."openai.assistants.delete".input_schema]
 required = ["assistant_id"]
 type = "object"
 
-[provides.operations.assistants_delete.input_schema.properties.assistant_id]
+[provides.operations."openai.assistants.delete".input_schema.properties.assistant_id]
 description = "Assistant ID to delete"
 type = "string"
 
-[provides.operations.assistants_delete.output_schema]
+[provides.operations."openai.assistants.delete".output_schema]
 required = ["id", "deleted"]
 type = "object"
 
-[provides.operations.assistants_delete.output_schema.properties.id]
+[provides.operations."openai.assistants.delete".output_schema.properties.id]
 description = "Deleted assistant ID"
 type = "string"
 
-[provides.operations.assistants_delete.output_schema.properties.deleted]
+[provides.operations."openai.assistants.delete".output_schema.properties.deleted]
 description = "Whether deletion succeeded"
 type = "boolean"
 
-[provides.operations.assistants_delete.network_constraints]
+[provides.operations."openai.assistants.delete".network_constraints]
 host_allow = ["api.openai.com", "api.deepseek.com"]
 port_allow = [443]
 ip_allow = []
@@ -2062,7 +2137,7 @@ connect_timeout_ms = 10000
 total_timeout_ms = 120000
 max_response_bytes = 10485760
 
-[provides.operations.assistants_delete.ai_hints]
+[provides.operations."openai.assistants.delete".ai_hints]
 when_to_use = "Delete an assistant. This action is irreversible."
 common_mistakes = ["Missing assistant_id."]
 examples = ['{"assistant_id": "asst_abc123"}']
@@ -2072,7 +2147,7 @@ related = ["openai.assistants.get"]
 # Threads
 # -----------------------------------------------------------------------------
 
-[provides.operations.threads_create]
+[provides.operations."openai.threads.create"]
 description = "Create a thread for conversation"
 capability = "openai.threads.create"
 risk_level = "low"
@@ -2081,34 +2156,34 @@ requires_approval = "none"
 idempotency = "none"
 revocation_freshness = "safe"
 
-[provides.operations.threads_create.rate_limit]
+[provides.operations."openai.threads.create".rate_limit]
 max = 100
 per_ms = 60000
 
-[provides.operations.threads_create.input_schema]
+[provides.operations."openai.threads.create".input_schema]
 type = "object"
 
-[provides.operations.threads_create.input_schema.properties.messages]
+[provides.operations."openai.threads.create".input_schema.properties.messages]
 description = "Initial messages for the thread"
 type = "array"
 
-[provides.operations.threads_create.input_schema.properties.metadata]
+[provides.operations."openai.threads.create".input_schema.properties.metadata]
 description = "Arbitrary metadata"
 type = "object"
 
-[provides.operations.threads_create.output_schema]
+[provides.operations."openai.threads.create".output_schema]
 required = ["id"]
 type = "object"
 
-[provides.operations.threads_create.output_schema.properties.id]
+[provides.operations."openai.threads.create".output_schema.properties.id]
 description = "Thread ID"
 type = "string"
 
-[provides.operations.threads_create.output_schema.properties.created_at]
+[provides.operations."openai.threads.create".output_schema.properties.created_at]
 description = "Unix timestamp of creation"
 type = "integer"
 
-[provides.operations.threads_create.network_constraints]
+[provides.operations."openai.threads.create".network_constraints]
 host_allow = ["api.openai.com", "api.deepseek.com"]
 port_allow = [443]
 ip_allow = []
@@ -2126,7 +2201,7 @@ connect_timeout_ms = 10000
 total_timeout_ms = 120000
 max_response_bytes = 10485760
 
-[provides.operations.threads_create.ai_hints]
+[provides.operations."openai.threads.create".ai_hints]
 when_to_use = "Create a thread for use with the Assistants API."
 common_mistakes = [
     "Creating a new thread for every message instead of reusing an existing thread for multi-turn conversations.",
@@ -2136,7 +2211,7 @@ related = ["openai.threads.messages.create", "openai.threads.runs.create"]
 
 # -----------------------------------------------------------------------------
 
-[provides.operations.threads_get]
+[provides.operations."openai.threads.get"]
 description = "Get a thread by ID"
 capability = "openai.threads.get"
 risk_level = "low"
@@ -2145,31 +2220,31 @@ requires_approval = "none"
 idempotency = "strict"
 revocation_freshness = "safe"
 
-[provides.operations.threads_get.rate_limit]
+[provides.operations."openai.threads.get".rate_limit]
 max = 100
 per_ms = 60000
 
-[provides.operations.threads_get.input_schema]
+[provides.operations."openai.threads.get".input_schema]
 required = ["thread_id"]
 type = "object"
 
-[provides.operations.threads_get.input_schema.properties.thread_id]
+[provides.operations."openai.threads.get".input_schema.properties.thread_id]
 description = "Thread ID"
 type = "string"
 
-[provides.operations.threads_get.output_schema]
+[provides.operations."openai.threads.get".output_schema]
 required = ["id"]
 type = "object"
 
-[provides.operations.threads_get.output_schema.properties.id]
+[provides.operations."openai.threads.get".output_schema.properties.id]
 description = "Thread ID"
 type = "string"
 
-[provides.operations.threads_get.output_schema.properties.created_at]
+[provides.operations."openai.threads.get".output_schema.properties.created_at]
 description = "Unix timestamp of creation"
 type = "integer"
 
-[provides.operations.threads_get.network_constraints]
+[provides.operations."openai.threads.get".network_constraints]
 host_allow = ["api.openai.com", "api.deepseek.com"]
 port_allow = [443]
 ip_allow = []
@@ -2187,7 +2262,7 @@ connect_timeout_ms = 10000
 total_timeout_ms = 120000
 max_response_bytes = 10485760
 
-[provides.operations.threads_get.ai_hints]
+[provides.operations."openai.threads.get".ai_hints]
 when_to_use = "Get details of a specific thread."
 common_mistakes = ["Missing thread_id."]
 examples = ['{"thread_id": "thread_abc123"}']
@@ -2197,7 +2272,7 @@ related = ["openai.threads.messages.list"]
 # Thread Messages
 # -----------------------------------------------------------------------------
 
-[provides.operations.threads_messages_create]
+[provides.operations."openai.threads.messages.create"]
 description = "Create a message in a thread"
 capability = "openai.threads.messages.create"
 risk_level = "low"
@@ -2206,53 +2281,53 @@ requires_approval = "none"
 idempotency = "none"
 revocation_freshness = "safe"
 
-[provides.operations.threads_messages_create.rate_limit]
+[provides.operations."openai.threads.messages.create".rate_limit]
 max = 100
 per_ms = 60000
 
-[provides.operations.threads_messages_create.input_schema]
+[provides.operations."openai.threads.messages.create".input_schema]
 required = ["thread_id", "role", "content"]
 type = "object"
 
-[provides.operations.threads_messages_create.input_schema.properties.thread_id]
+[provides.operations."openai.threads.messages.create".input_schema.properties.thread_id]
 description = "Thread ID to add the message to"
 type = "string"
 
-[provides.operations.threads_messages_create.input_schema.properties.role]
+[provides.operations."openai.threads.messages.create".input_schema.properties.role]
 description = "Message role"
 type = "string"
 enum = ["user", "assistant"]
 
-[provides.operations.threads_messages_create.input_schema.properties.content]
+[provides.operations."openai.threads.messages.create".input_schema.properties.content]
 description = "Message content text"
 type = "string"
 minLength = 1
 
-[provides.operations.threads_messages_create.input_schema.properties.metadata]
+[provides.operations."openai.threads.messages.create".input_schema.properties.metadata]
 description = "Arbitrary metadata"
 type = "object"
 
-[provides.operations.threads_messages_create.output_schema]
+[provides.operations."openai.threads.messages.create".output_schema]
 required = ["id", "thread_id", "role"]
 type = "object"
 
-[provides.operations.threads_messages_create.output_schema.properties.id]
+[provides.operations."openai.threads.messages.create".output_schema.properties.id]
 description = "Message ID"
 type = "string"
 
-[provides.operations.threads_messages_create.output_schema.properties.thread_id]
+[provides.operations."openai.threads.messages.create".output_schema.properties.thread_id]
 description = "Thread ID"
 type = "string"
 
-[provides.operations.threads_messages_create.output_schema.properties.role]
+[provides.operations."openai.threads.messages.create".output_schema.properties.role]
 description = "Message role"
 type = "string"
 
-[provides.operations.threads_messages_create.output_schema.properties.created_at]
+[provides.operations."openai.threads.messages.create".output_schema.properties.created_at]
 description = "Unix timestamp of creation"
 type = "integer"
 
-[provides.operations.threads_messages_create.network_constraints]
+[provides.operations."openai.threads.messages.create".network_constraints]
 host_allow = ["api.openai.com", "api.deepseek.com"]
 port_allow = [443]
 ip_allow = []
@@ -2270,7 +2345,7 @@ connect_timeout_ms = 10000
 total_timeout_ms = 120000
 max_response_bytes = 10485760
 
-[provides.operations.threads_messages_create.ai_hints]
+[provides.operations."openai.threads.messages.create".ai_hints]
 when_to_use = "Add a message to a thread before creating a run."
 common_mistakes = ["Missing content field.", "Empty content string."]
 examples = [
@@ -2280,7 +2355,7 @@ related = ["openai.threads.messages.list", "openai.threads.runs.create"]
 
 # -----------------------------------------------------------------------------
 
-[provides.operations.threads_messages_list]
+[provides.operations."openai.threads.messages.list"]
 description = "List messages in a thread"
 capability = "openai.threads.messages.list"
 risk_level = "low"
@@ -2289,42 +2364,42 @@ requires_approval = "none"
 idempotency = "strict"
 revocation_freshness = "safe"
 
-[provides.operations.threads_messages_list.rate_limit]
+[provides.operations."openai.threads.messages.list".rate_limit]
 max = 100
 per_ms = 60000
 
-[provides.operations.threads_messages_list.input_schema]
+[provides.operations."openai.threads.messages.list".input_schema]
 required = ["thread_id"]
 type = "object"
 
-[provides.operations.threads_messages_list.input_schema.properties.thread_id]
+[provides.operations."openai.threads.messages.list".input_schema.properties.thread_id]
 description = "Thread ID"
 type = "string"
 
-[provides.operations.threads_messages_list.input_schema.properties.limit]
+[provides.operations."openai.threads.messages.list".input_schema.properties.limit]
 description = "Max messages to return"
 type = "integer"
 default = 20
 minimum = 1
 maximum = 100
 
-[provides.operations.threads_messages_list.input_schema.properties.after]
+[provides.operations."openai.threads.messages.list".input_schema.properties.after]
 description = "Cursor for pagination"
 type = "string"
 
-[provides.operations.threads_messages_list.output_schema]
+[provides.operations."openai.threads.messages.list".output_schema]
 required = ["data", "has_more"]
 type = "object"
 
-[provides.operations.threads_messages_list.output_schema.properties.data]
+[provides.operations."openai.threads.messages.list".output_schema.properties.data]
 description = "Array of messages"
 type = "array"
 
-[provides.operations.threads_messages_list.output_schema.properties.has_more]
+[provides.operations."openai.threads.messages.list".output_schema.properties.has_more]
 description = "Whether there are more results"
 type = "boolean"
 
-[provides.operations.threads_messages_list.network_constraints]
+[provides.operations."openai.threads.messages.list".network_constraints]
 host_allow = ["api.openai.com", "api.deepseek.com"]
 port_allow = [443]
 ip_allow = []
@@ -2342,7 +2417,7 @@ connect_timeout_ms = 10000
 total_timeout_ms = 120000
 max_response_bytes = 10485760
 
-[provides.operations.threads_messages_list.ai_hints]
+[provides.operations."openai.threads.messages.list".ai_hints]
 when_to_use = "List messages in a thread to see conversation history."
 common_mistakes = ["Missing thread_id."]
 examples = ['{"thread_id": "thread_abc123"}']
@@ -2352,7 +2427,7 @@ related = ["openai.threads.messages.create"]
 # Runs
 # -----------------------------------------------------------------------------
 
-[provides.operations.threads_runs_create]
+[provides.operations."openai.threads.runs.create"]
 description = "Create a run to execute an assistant on a thread"
 capability = "openai.threads.runs.create"
 risk_level = "medium"
@@ -2361,56 +2436,56 @@ requires_approval = "none"
 idempotency = "none"
 revocation_freshness = "safe"
 
-[provides.operations.threads_runs_create.rate_limit]
+[provides.operations."openai.threads.runs.create".rate_limit]
 max = 50
 per_ms = 60000
 
-[provides.operations.threads_runs_create.input_schema]
+[provides.operations."openai.threads.runs.create".input_schema]
 required = ["thread_id", "assistant_id"]
 type = "object"
 
-[provides.operations.threads_runs_create.input_schema.properties.thread_id]
+[provides.operations."openai.threads.runs.create".input_schema.properties.thread_id]
 description = "Thread ID to run the assistant on"
 type = "string"
 
-[provides.operations.threads_runs_create.input_schema.properties.assistant_id]
+[provides.operations."openai.threads.runs.create".input_schema.properties.assistant_id]
 description = "Assistant ID to run"
 type = "string"
 
-[provides.operations.threads_runs_create.input_schema.properties.instructions]
+[provides.operations."openai.threads.runs.create".input_schema.properties.instructions]
 description = "Override instructions for this run"
 type = "string"
 
-[provides.operations.threads_runs_create.input_schema.properties.metadata]
+[provides.operations."openai.threads.runs.create".input_schema.properties.metadata]
 description = "Arbitrary metadata"
 type = "object"
 
-[provides.operations.threads_runs_create.output_schema]
+[provides.operations."openai.threads.runs.create".output_schema]
 required = ["id", "status"]
 type = "object"
 
-[provides.operations.threads_runs_create.output_schema.properties.id]
+[provides.operations."openai.threads.runs.create".output_schema.properties.id]
 description = "Run ID"
 type = "string"
 
-[provides.operations.threads_runs_create.output_schema.properties.thread_id]
+[provides.operations."openai.threads.runs.create".output_schema.properties.thread_id]
 description = "Thread ID"
 type = "string"
 
-[provides.operations.threads_runs_create.output_schema.properties.assistant_id]
+[provides.operations."openai.threads.runs.create".output_schema.properties.assistant_id]
 description = "Assistant ID"
 type = "string"
 
-[provides.operations.threads_runs_create.output_schema.properties.status]
+[provides.operations."openai.threads.runs.create".output_schema.properties.status]
 description = "Run status"
 type = "string"
 enum = ["queued", "in_progress", "requires_action", "cancelling", "cancelled", "failed", "completed", "incomplete", "expired"]
 
-[provides.operations.threads_runs_create.output_schema.properties.created_at]
+[provides.operations."openai.threads.runs.create".output_schema.properties.created_at]
 description = "Unix timestamp of creation"
 type = "integer"
 
-[provides.operations.threads_runs_create.network_constraints]
+[provides.operations."openai.threads.runs.create".network_constraints]
 host_allow = ["api.openai.com", "api.deepseek.com"]
 port_allow = [443]
 ip_allow = []
@@ -2428,7 +2503,7 @@ connect_timeout_ms = 10000
 total_timeout_ms = 120000
 max_response_bytes = 10485760
 
-[provides.operations.threads_runs_create.ai_hints]
+[provides.operations."openai.threads.runs.create".ai_hints]
 when_to_use = "Create a run to execute an assistant on a thread with messages."
 common_mistakes = ["Missing thread_id or assistant_id."]
 examples = [
@@ -2438,7 +2513,7 @@ related = ["openai.threads.runs.get", "openai.threads.messages.list"]
 
 # -----------------------------------------------------------------------------
 
-[provides.operations.threads_runs_get]
+[provides.operations."openai.threads.runs.get"]
 description = "Get run status and details"
 capability = "openai.threads.runs.get"
 risk_level = "low"
@@ -2447,52 +2522,52 @@ requires_approval = "none"
 idempotency = "strict"
 revocation_freshness = "safe"
 
-[provides.operations.threads_runs_get.rate_limit]
+[provides.operations."openai.threads.runs.get".rate_limit]
 max = 100
 per_ms = 60000
 
-[provides.operations.threads_runs_get.input_schema]
+[provides.operations."openai.threads.runs.get".input_schema]
 required = ["thread_id", "run_id"]
 type = "object"
 
-[provides.operations.threads_runs_get.input_schema.properties.thread_id]
+[provides.operations."openai.threads.runs.get".input_schema.properties.thread_id]
 description = "Thread ID"
 type = "string"
 
-[provides.operations.threads_runs_get.input_schema.properties.run_id]
+[provides.operations."openai.threads.runs.get".input_schema.properties.run_id]
 description = "Run ID"
 type = "string"
 
-[provides.operations.threads_runs_get.output_schema]
+[provides.operations."openai.threads.runs.get".output_schema]
 required = ["id", "status"]
 type = "object"
 
-[provides.operations.threads_runs_get.output_schema.properties.id]
+[provides.operations."openai.threads.runs.get".output_schema.properties.id]
 description = "Run ID"
 type = "string"
 
-[provides.operations.threads_runs_get.output_schema.properties.status]
+[provides.operations."openai.threads.runs.get".output_schema.properties.status]
 description = "Run status"
 type = "string"
 
-[provides.operations.threads_runs_get.output_schema.properties.usage]
+[provides.operations."openai.threads.runs.get".output_schema.properties.usage]
 description = "Token usage"
-type = "object"
+type = ["object", "null"]
 
-[provides.operations.threads_runs_get.output_schema.properties.usage.properties.prompt_tokens]
+[provides.operations."openai.threads.runs.get".output_schema.properties.usage.properties.prompt_tokens]
 type = "integer"
 
-[provides.operations.threads_runs_get.output_schema.properties.usage.properties.completion_tokens]
+[provides.operations."openai.threads.runs.get".output_schema.properties.usage.properties.completion_tokens]
 type = "integer"
 
-[provides.operations.threads_runs_get.output_schema.properties.usage.properties.total_tokens]
+[provides.operations."openai.threads.runs.get".output_schema.properties.usage.properties.total_tokens]
 type = "integer"
 
-[provides.operations.threads_runs_get.output_schema.properties.created_at]
+[provides.operations."openai.threads.runs.get".output_schema.properties.created_at]
 description = "Unix timestamp of creation"
 type = "integer"
 
-[provides.operations.threads_runs_get.network_constraints]
+[provides.operations."openai.threads.runs.get".network_constraints]
 host_allow = ["api.openai.com", "api.deepseek.com"]
 port_allow = [443]
 ip_allow = []
@@ -2510,7 +2585,7 @@ connect_timeout_ms = 10000
 total_timeout_ms = 120000
 max_response_bytes = 10485760
 
-[provides.operations.threads_runs_get.ai_hints]
+[provides.operations."openai.threads.runs.get".ai_hints]
 when_to_use = "Poll for run status to check if it has completed."
 common_mistakes = ["Missing thread_id or run_id."]
 examples = ['{"thread_id": "thread_abc123", "run_id": "run_abc123"}']
@@ -2518,7 +2593,7 @@ related = ["openai.threads.runs.create", "openai.threads.runs.cancel"]
 
 # -----------------------------------------------------------------------------
 
-[provides.operations.threads_runs_cancel]
+[provides.operations."openai.threads.runs.cancel"]
 description = "Cancel a running or queued run"
 capability = "openai.threads.runs.cancel"
 risk_level = "medium"
@@ -2527,35 +2602,35 @@ requires_approval = "none"
 idempotency = "none"
 revocation_freshness = "risky"
 
-[provides.operations.threads_runs_cancel.rate_limit]
+[provides.operations."openai.threads.runs.cancel".rate_limit]
 max = 50
 per_ms = 60000
 
-[provides.operations.threads_runs_cancel.input_schema]
+[provides.operations."openai.threads.runs.cancel".input_schema]
 required = ["thread_id", "run_id"]
 type = "object"
 
-[provides.operations.threads_runs_cancel.input_schema.properties.thread_id]
+[provides.operations."openai.threads.runs.cancel".input_schema.properties.thread_id]
 description = "Thread ID"
 type = "string"
 
-[provides.operations.threads_runs_cancel.input_schema.properties.run_id]
+[provides.operations."openai.threads.runs.cancel".input_schema.properties.run_id]
 description = "Run ID to cancel"
 type = "string"
 
-[provides.operations.threads_runs_cancel.output_schema]
+[provides.operations."openai.threads.runs.cancel".output_schema]
 required = ["id", "status"]
 type = "object"
 
-[provides.operations.threads_runs_cancel.output_schema.properties.id]
+[provides.operations."openai.threads.runs.cancel".output_schema.properties.id]
 description = "Run ID"
 type = "string"
 
-[provides.operations.threads_runs_cancel.output_schema.properties.status]
+[provides.operations."openai.threads.runs.cancel".output_schema.properties.status]
 description = "Run status after cancellation"
 type = "string"
 
-[provides.operations.threads_runs_cancel.network_constraints]
+[provides.operations."openai.threads.runs.cancel".network_constraints]
 host_allow = ["api.openai.com", "api.deepseek.com"]
 port_allow = [443]
 ip_allow = []
@@ -2573,7 +2648,7 @@ connect_timeout_ms = 10000
 total_timeout_ms = 120000
 max_response_bytes = 10485760
 
-[provides.operations.threads_runs_cancel.ai_hints]
+[provides.operations."openai.threads.runs.cancel".ai_hints]
 when_to_use = "Cancel a running or queued run."
 common_mistakes = ["Missing thread_id or run_id."]
 examples = ['{"thread_id": "thread_abc123", "run_id": "run_abc123"}']

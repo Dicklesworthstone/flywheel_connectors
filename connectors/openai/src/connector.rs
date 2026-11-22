@@ -23,9 +23,9 @@ use crate::{
     client::{DEFAULT_BASE_URL, OpenAIAuth, OpenAIClient, VideoPollingOptions},
     error::OpenAIError,
     types::{
-        EmbeddingInput, EmbeddingModel, ImageModel, ImageQuality, ImageSize, Message, Model, Tool,
-        ToolChoice, TtsModel, TtsResponseFormat, TtsVoice, Usage, VideoDurationSeconds, VideoModel,
-        VideoSize, WhisperModel,
+        EmbeddingInput, EmbeddingModel, ImageModel, ImageQuality, ImageSize, Message,
+        MessageContent, Model, Role, Tool, ToolChoice, TtsModel, TtsResponseFormat, TtsVoice,
+        Usage, VideoDurationSeconds, VideoModel, VideoSize, WhisperModel,
     },
 };
 
@@ -2569,17 +2569,55 @@ impl OpenAIConnector {
                             },
                             "messages": {
                                 "type": "array",
+                                "minItems": 1,
                                 "items": {
                                     "type": "object",
                                     "properties": {
                                         "role": { "type": "string", "enum": ["system", "user", "assistant", "tool"] },
-                                        "content": { "type": "string" }
+                                        "content": { "type": ["string", "array", "null"] },
+                                        "tool_calls": { "type": "array" },
+                                        "tool_call_id": { "type": "string", "minLength": 1 }
                                     },
-                                    "required": ["role", "content"]
+                                    "required": ["role"],
+                                    "anyOf": [
+                                        {
+                                            "required": ["content"],
+                                            "properties": { "content": { "type": ["string", "array"] } }
+                                        },
+                                        {
+                                            "required": ["tool_calls"],
+                                            "properties": {
+                                                "role": { "const": "assistant" },
+                                                "tool_calls": { "type": "array", "minItems": 1 }
+                                            }
+                                        }
+                                    ],
+                                    "allOf": [{
+                                        "if": { "properties": { "role": { "const": "tool" } } },
+                                        "then": { "required": ["tool_call_id"] }
+                                    }]
                                 }
                             },
                             "max_tokens": { "type": "integer", "default": 4096 },
-                            "temperature": { "type": "number", "minimum": 0, "maximum": 2 }
+                            "temperature": { "type": "number", "minimum": 0, "maximum": 2 },
+                            "tools": { "type": "array" },
+                            "tool_choice": {
+                                "oneOf": [
+                                    { "type": "string", "enum": ["none", "auto", "required"] },
+                                    {
+                                        "type": "object",
+                                        "required": ["type", "function"],
+                                        "properties": {
+                                            "type": { "const": "function" },
+                                            "function": {
+                                                "type": "object",
+                                                "required": ["name"],
+                                                "properties": { "name": { "type": "string" } }
+                                            }
+                                        }
+                                    }
+                                ]
+                            }
                         },
                         "required": ["messages"]
                     }),
@@ -2589,7 +2627,8 @@ impl OpenAIConnector {
                             "id": { "type": "string" },
                             "content": { "type": "string" },
                             "model": { "type": "string" },
-                            "finish_reason": { "type": "string" },
+                            "finish_reason": { "type": ["string", "null"] },
+                            "tool_calls": { "type": "array" },
                             "usage": {
                                 "type": "object",
                                 "properties": {
@@ -4217,6 +4256,31 @@ impl OpenAIConnector {
                 message: "Messages array cannot be empty".into(),
             });
         }
+        for message in &messages {
+            if matches!(&message.content, MessageContent::Null)
+                && (message.role != Role::Assistant
+                    || !message
+                        .tool_calls
+                        .as_ref()
+                        .is_some_and(|calls| !calls.is_empty()))
+            {
+                return Err(FcpError::InvalidRequest {
+                    code: 1003,
+                    message: "Only assistant messages with tool calls may omit content".into(),
+                });
+            }
+            if message.role == Role::Tool
+                && !message
+                    .tool_call_id
+                    .as_ref()
+                    .is_some_and(|id| !id.trim().is_empty())
+            {
+                return Err(FcpError::InvalidRequest {
+                    code: 1003,
+                    message: "Tool messages require a non-empty tool_call_id".into(),
+                });
+            }
+        }
 
         let max_tokens = input.get("max_tokens").and_then(|v| v.as_u64()).map(|v| {
             if v > u64::from(u32::MAX) {
@@ -4255,25 +4319,22 @@ impl OpenAIConnector {
         let cost = usage.calculate_cost(model);
         self.track_cost(&usage, model);
 
-        // Extract content from first choice
-        let content = response
-            .choices
-            .first()
-            .and_then(|c| c.message.content.as_ref())
-            .cloned()
-            .unwrap_or_default();
-
-        let finish_reason = response
-            .choices
-            .first()
-            .and_then(|c| c.finish_reason)
-            .map(|r| format!("{r:?}").to_lowercase());
+        let choice = response.choices.first().ok_or_else(|| FcpError::External {
+            service: "openai".into(),
+            message: "Chat completion response contained no choices".into(),
+            status_code: None,
+            retryable: false,
+            retry_after: None,
+        })?;
+        let content = choice.message.content.as_deref().unwrap_or_default();
+        let tool_calls = choice.message.tool_calls.as_deref().unwrap_or_default();
 
         Ok(json!({
             "id": response.id,
             "content": content,
+            "tool_calls": tool_calls,
             "model": response.model,
-            "finish_reason": finish_reason,
+            "finish_reason": choice.finish_reason,
             "usage": {
                 "prompt_tokens": usage.prompt_tokens,
                 "completion_tokens": usage.completion_tokens,
@@ -5901,7 +5962,7 @@ impl OpenAIConnector {
             "object": run.object,
             "thread_id": run.thread_id,
             "assistant_id": run.assistant_id,
-            "status": format!("{:?}", run.status).to_lowercase(),
+            "status": run.status,
             "model": run.model,
             "created_at": run.created_at,
             "provenance": {
@@ -5947,7 +6008,7 @@ impl OpenAIConnector {
             "object": run.object,
             "thread_id": run.thread_id,
             "assistant_id": run.assistant_id,
-            "status": format!("{:?}", run.status).to_lowercase(),
+            "status": run.status,
             "model": run.model,
             "created_at": run.created_at,
             "started_at": run.started_at,
@@ -5996,7 +6057,7 @@ impl OpenAIConnector {
 
         Ok(json!({
             "id": run.id,
-            "status": format!("{:?}", run.status).to_lowercase(),
+            "status": run.status,
             "provenance": {
                 "source": "openai.threads.runs.cancel",
                 "derived": false,

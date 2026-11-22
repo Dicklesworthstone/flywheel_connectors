@@ -71,7 +71,8 @@ impl Default for Model {
 pub struct Message {
     /// Role of the message sender.
     pub role: Role,
-    /// Content of the message.
+    /// Content of the message. Assistant tool calls may omit text content.
+    #[serde(default)]
     pub content: MessageContent,
     /// Optional name for the participant.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -136,14 +137,17 @@ pub enum Role {
     Tool,
 }
 
-/// Content of a message (can be text or multimodal).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Content of a message (text, multimodal, or an assistant tool-call turn).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum MessageContent {
     /// Simple text content
     Text(String),
     /// Complex content with multiple parts (for vision)
     Parts(Vec<ContentPart>),
+    /// No text content; valid for an assistant message containing tool calls.
+    #[default]
+    Null,
 }
 
 impl From<&str> for MessageContent {
@@ -1524,7 +1528,7 @@ mod tests {
         assert_eq!(msg.role, Role::User);
         match &msg.content {
             MessageContent::Text(t) => assert_eq!(t, "Hello"),
-            MessageContent::Parts(_) => panic!("Expected Text content"),
+            MessageContent::Parts(_) | MessageContent::Null => panic!("Expected Text content"),
         }
         assert!(msg.name.is_none());
         assert!(msg.tool_calls.is_none());
@@ -1537,7 +1541,7 @@ mod tests {
         assert_eq!(msg.role, Role::Assistant);
         match &msg.content {
             MessageContent::Text(t) => assert_eq!(t, "Response"),
-            MessageContent::Parts(_) => panic!("Expected Text content"),
+            MessageContent::Parts(_) | MessageContent::Null => panic!("Expected Text content"),
         }
     }
 
@@ -1547,7 +1551,7 @@ mod tests {
         assert_eq!(msg.role, Role::System);
         match &msg.content {
             MessageContent::Text(t) => assert_eq!(t, "You are helpful"),
-            MessageContent::Parts(_) => panic!("Expected Text content"),
+            MessageContent::Parts(_) | MessageContent::Null => panic!("Expected Text content"),
         }
     }
 
@@ -1558,7 +1562,7 @@ mod tests {
         let content: MessageContent = "test".into();
         match content {
             MessageContent::Text(t) => assert_eq!(t, "test"),
-            MessageContent::Parts(_) => panic!("Expected Text"),
+            MessageContent::Parts(_) | MessageContent::Null => panic!("Expected Text"),
         }
     }
 
@@ -1567,7 +1571,7 @@ mod tests {
         let content: MessageContent = String::from("test").into();
         match content {
             MessageContent::Text(t) => assert_eq!(t, "test"),
-            MessageContent::Parts(_) => panic!("Expected Text"),
+            MessageContent::Parts(_) | MessageContent::Null => panic!("Expected Text"),
         }
     }
 
@@ -1597,6 +1601,41 @@ mod tests {
         assert_eq!(parts[0]["type"], "text");
         assert_eq!(parts[1]["type"], "image_url");
         assert_eq!(parts[1]["image_url"]["detail"], "high");
+    }
+
+    #[test]
+    fn assistant_tool_calls_accept_null_and_omitted_content() {
+        let tool_calls = json!([{
+            "id": "call_weather",
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "arguments": r#"{"city":"San Francisco"}"#
+            }
+        }]);
+        for explicit_null in [false, true] {
+            let mut value = json!({"role": "assistant", "tool_calls": tool_calls});
+            if explicit_null {
+                value["content"] = serde_json::Value::Null;
+            }
+            let message: Message =
+                serde_json::from_value(value).expect("assistant tool message must deserialize");
+            assert!(matches!(message.content, MessageContent::Null));
+            let serialized = serde_json::to_value(message).unwrap();
+            assert!(serialized["content"].is_null());
+            assert_eq!(serialized["tool_calls"], tool_calls);
+        }
+    }
+
+    #[test]
+    fn tool_result_preserves_call_binding() {
+        let value = json!({
+            "role": "tool",
+            "content": "18 C, sunny",
+            "tool_call_id": "call_weather"
+        });
+        let message: Message = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(message).unwrap(), value);
     }
 
     // ---- ContentPart ----

@@ -73,50 +73,50 @@ fn manifest_declares_strict_per_operation_network_constraints() {
             .expect("OpenAI interface hash should compute")
     );
 
-    for operation_id in ["chat", "simple_chat", "embeddings"] {
+    for operation_id in ["openai.chat", "openai.simple_chat", "openai.embeddings"] {
         let constraints = network_constraints(&manifest, operation_id);
         assert_openai_or_compatible_api_constraints(constraints, 10_485_760);
     }
     assert_openai_or_compatible_api_constraints(
-        network_constraints(&manifest, "images_generate"),
+        network_constraints(&manifest, "openai.images.generate"),
         52_428_800,
     );
 
     for operation_id in [
-        "audio_transcribe",
-        "audio_tts",
-        "finetune_create",
-        "finetune_list",
-        "finetune_get",
-        "finetune_cancel",
-        "finetune_events",
-        "assistants_create",
-        "assistants_list",
-        "assistants_get",
-        "assistants_delete",
-        "threads_create",
-        "threads_get",
-        "threads_messages_create",
-        "threads_messages_list",
-        "threads_runs_create",
-        "threads_runs_get",
-        "threads_runs_cancel",
+        "openai.audio.transcribe",
+        "openai.audio.tts",
+        "openai.finetune.create",
+        "openai.finetune.list",
+        "openai.finetune.get",
+        "openai.finetune.cancel",
+        "openai.finetune.events",
+        "openai.assistants.create",
+        "openai.assistants.list",
+        "openai.assistants.get",
+        "openai.assistants.delete",
+        "openai.threads.create",
+        "openai.threads.get",
+        "openai.threads.messages.create",
+        "openai.threads.messages.list",
+        "openai.threads.runs.create",
+        "openai.threads.runs.get",
+        "openai.threads.runs.cancel",
     ] {
         let constraints = network_constraints(&manifest, operation_id);
         assert_openai_or_compatible_api_constraints(constraints, constraints.max_response_bytes);
     }
 
     for operation_id in [
-        "videos_generate",
-        "realtime_transcribe",
-        "realtime_voice",
-        "realtime_browser_session",
+        "openai.videos.generate",
+        "openai.realtime.transcribe",
+        "openai.realtime.voice",
+        "openai.realtime.browser_session",
     ] {
         let constraints = network_constraints(&manifest, operation_id);
         assert_openai_api_only_constraints(operation_id, constraints);
     }
 
-    assert_no_egress_constraints(network_constraints(&manifest, "get_usage"));
+    assert_no_egress_constraints(network_constraints(&manifest, "openai.get_usage"));
     assert_eq!(
         manifest.provides.operations.len(),
         27,
@@ -156,17 +156,17 @@ fn assert_openai_api_only_constraints(operation_id: &str, constraints: &NetworkC
     assert_eq!(constraints.host_allow.as_slice(), ["api.openai.com"]);
     assert_common_provider_constraints(constraints);
     match operation_id {
-        "videos_generate" => {
+        "openai.videos.generate" => {
             assert_eq!(constraints.max_redirects, 5);
             assert_eq!(constraints.total_timeout_ms, 120_000);
             assert_eq!(constraints.max_response_bytes, 104_857_600);
         }
-        "realtime_transcribe" | "realtime_voice" => {
+        "openai.realtime.transcribe" | "openai.realtime.voice" => {
             assert_eq!(constraints.max_redirects, 0);
             assert_eq!(constraints.total_timeout_ms, 300_000);
             assert_eq!(constraints.max_response_bytes, 10_485_760);
         }
-        "realtime_browser_session" => {
+        "openai.realtime.browser_session" => {
             assert_eq!(constraints.max_redirects, 0);
             assert_eq!(constraints.total_timeout_ms, 120_000);
             assert_eq!(constraints.max_response_bytes, 10_485_760);
@@ -1138,14 +1138,219 @@ async fn tool_use_invoke_shape() {
         .await
         .expect("invoke should succeed");
 
-    // finish_reason is formatted via `format!("{r:?}").to_lowercase()` -> "toolcalls"
-    let fr = result["finish_reason"].as_str().unwrap();
-    assert!(
-        fr == "tool_calls" || fr == "toolcalls",
-        "expected tool_calls or toolcalls, got: {fr}"
+    assert_eq!(result["finish_reason"], "tool_calls");
+    assert_eq!(result["content"], "");
+    assert_eq!(
+        result["tool_calls"],
+        json!([{
+            "id": "call_abc123",
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "arguments": r#"{"city":"San Francisco","unit":"celsius"}"#
+            }
+        }])
     );
     assert_eq!(result["usage"]["prompt_tokens"], 20);
     assert_eq!(result["usage"]["completion_tokens"], 15);
+}
+
+/// A caller can return every requested tool result and continue the same conversation.
+#[fcp_async_core::runtime::test]
+async fn tool_calls_complete_round_trip_with_null_or_omitted_content() {
+    for omit_content in [false, true] {
+        let mock = MockServer::start().await;
+        let calls = json!([
+            {
+                "id": "call_weather",
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "arguments": r#"{"city":"San Francisco"}"#
+                }
+            },
+            {
+                "id": "call_clock",
+                "type": "function",
+                "function": {
+                    "name": "get_time",
+                    "arguments": r#"{"timezone":"America/Los_Angeles"}"#
+                }
+            }
+        ]);
+        let mut first_response =
+            openai_tool_use_response("chatcmpl-tools", "unused", "unused", "{}", 20, 15);
+        first_response["choices"][0]["message"]["tool_calls"] = calls.clone();
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_partial_json(json!({"tool_choice": "auto"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(first_response))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let expected_messages = json!([
+            {"role": "user", "content": "What is the weather and time in San Francisco?"},
+            {"role": "assistant", "content": null, "tool_calls": calls},
+            {"role": "tool", "content": "18 C, sunny", "tool_call_id": "call_weather"},
+            {"role": "tool", "content": "10:30 AM", "tool_call_id": "call_clock"}
+        ]);
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_partial_json(json!({"messages": expected_messages})))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(openai_success_response(
+                    "chatcmpl-final",
+                    "It is sunny, 18 C, and 10:30 AM.",
+                    40,
+                    12,
+                )),
+            )
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let mut connector = OpenAIConnector::new();
+        setup_configure(&mut connector, &mock.uri()).await;
+        let signing_key = setup_handshake(&mut connector, &["openai.chat"]).await;
+        let first = connector
+            .handle_invoke(json!({
+                "operation": "openai.chat",
+                "input": {
+                    "messages": [expected_messages[0].clone()],
+                    "tools": [
+                        {"type": "function", "function": {
+                            "name": "get_weather",
+                            "parameters": {"type": "object", "properties": {
+                                "city": {"type": "string"}
+                            }}
+                        }},
+                        {"type": "function", "function": {
+                            "name": "get_time",
+                            "parameters": {"type": "object", "properties": {
+                                "timezone": {"type": "string"}
+                            }}
+                        }}
+                    ],
+                    "tool_choice": "auto"
+                },
+                "capability_token": generate_valid_token(&signing_key, "openai.chat")
+            }))
+            .await
+            .expect("tool request must be returned to the caller");
+        assert_eq!(first["finish_reason"], "tool_calls");
+        assert_eq!(first["tool_calls"], calls);
+
+        let mut messages = expected_messages.clone();
+        messages[1]["tool_calls"] = first["tool_calls"].clone();
+        if omit_content {
+            messages[1].as_object_mut().unwrap().remove("content");
+        }
+        let second = connector
+            .handle_invoke(json!({
+                "operation": "openai.chat",
+                "input": {"messages": messages},
+                "capability_token": generate_valid_token(&signing_key, "openai.chat")
+            }))
+            .await
+            .expect("tool results must be accepted in a follow-up completion");
+        assert_eq!(second["content"], "It is sunny, 18 C, and 10:30 AM.");
+        assert_eq!(second["finish_reason"], "stop");
+        assert_eq!(second["tool_calls"], json!([]));
+        assert_eq!(mock.received_requests().await.unwrap().len(), 2);
+        mock.verify().await;
+    }
+}
+
+/// Invalid nullable content and unbound tool results fail before any provider request.
+#[fcp_async_core::runtime::test]
+async fn invalid_tool_conversation_is_rejected_before_provider_dispatch() {
+    let mock = MockServer::start().await;
+    let mut connector = OpenAIConnector::new();
+    setup_configure(&mut connector, &mock.uri()).await;
+    let signing_key = setup_handshake(&mut connector, &["openai.chat"]).await;
+
+    for message in [
+        json!({"role": "user", "content": null}),
+        json!({"role": "assistant", "content": null}),
+        json!({"role": "assistant", "tool_calls": []}),
+        json!({"role": "tool", "content": "unbound result"}),
+        json!({"role": "tool", "content": "unbound result", "tool_call_id": ""}),
+        json!({"role": "tool", "content": "unbound result", "tool_call_id": "  "}),
+    ] {
+        let result = connector
+            .handle_invoke(json!({
+                "operation": "openai.chat",
+                "input": {"messages": [message.clone()]},
+                "capability_token": generate_valid_token(&signing_key, "openai.chat")
+            }))
+            .await;
+        assert!(
+            matches!(result, Err(FcpError::InvalidRequest { .. })),
+            "invalid tool conversation must fail locally: {message}; got {result:?}"
+        );
+    }
+    assert!(mock.received_requests().await.unwrap().is_empty());
+}
+
+#[fcp_async_core::runtime::test]
+async fn chat_preserves_nullable_and_snake_case_finish_reasons() {
+    for finish_reason in [json!("content_filter"), serde_json::Value::Null] {
+        let mock = MockServer::start().await;
+        let mut response = openai_success_response("chatcmpl-filtered", "", 10, 0);
+        response["choices"][0]["finish_reason"] = finish_reason.clone();
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(response))
+            .expect(1)
+            .mount(&mock)
+            .await;
+        let mut connector = OpenAIConnector::new();
+        setup_configure(&mut connector, &mock.uri()).await;
+        let signing_key = setup_handshake(&mut connector, &["openai.chat"]).await;
+        let result = connector
+            .handle_invoke(json!({
+                "operation": "openai.chat",
+                "input": {"messages": [{"role": "user", "content": "Hello"}]},
+                "capability_token": generate_valid_token(&signing_key, "openai.chat")
+            }))
+            .await
+            .expect("a valid completion must retain the provider finish reason");
+        assert_eq!(result["finish_reason"], finish_reason);
+        assert_eq!(result["tool_calls"], json!([]));
+        mock.verify().await;
+    }
+}
+
+#[fcp_async_core::runtime::test]
+async fn chat_rejects_provider_response_without_choices() {
+    let mock = MockServer::start().await;
+    let mut response = openai_success_response("chatcmpl-empty", "", 10, 0);
+    response["choices"] = json!([]);
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(response))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    let mut connector = OpenAIConnector::new();
+    setup_configure(&mut connector, &mock.uri()).await;
+    let signing_key = setup_handshake(&mut connector, &["openai.chat"]).await;
+    let result = connector
+        .handle_invoke(json!({
+            "operation": "openai.chat",
+            "input": {"messages": [{"role": "user", "content": "Hello"}]},
+            "capability_token": generate_valid_token(&signing_key, "openai.chat")
+        }))
+        .await;
+    assert!(matches!(
+        result,
+        Err(FcpError::External {
+            retryable: false,
+            ..
+        })
+    ));
+    mock.verify().await;
 }
 
 /// Tool use streaming: streaming response with tool call deltas.
