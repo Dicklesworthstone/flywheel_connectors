@@ -73,14 +73,26 @@ fn generate_valid_token(
 async fn setup_handshake(connector: &mut NotionConnector, caps: &[&str]) -> Ed25519SigningKey {
     let signing_key = Ed25519SigningKey::generate();
     let verifying_key = signing_key.verifying_key();
+    let catalog: fcp_prelude::Introspection =
+        serde_json::from_value(connector.handle_introspect().await.unwrap()).unwrap();
+    let capabilities: Vec<&str> = caps
+        .iter()
+        .map(|requested| {
+            catalog
+                .operations
+                .iter()
+                .find(|operation| operation.id.as_str() == *requested)
+                .map_or(*requested, |operation| operation.capability.as_str())
+        })
+        .collect();
 
     connector
         .handle_handshake(json!({
-            "protocol_version": "1.0.0",
+            "protocol_version": "2.0.0",
             "zone": "z:work",
             "host_public_key": verifying_key.to_bytes(),
             "nonce": vec![0u8; 32],
-            "capabilities_requested": caps
+            "capabilities_requested": capabilities
         }))
         .await
         .expect("handshake should succeed");
@@ -563,6 +575,10 @@ async fn invoke_search_through_connector() {
 
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "search",
+            "connector_id": "fcp.notion",
+            "zone_id": "z:work",
             "operation": "notion.search",
             "input": { "query": "test" },
             "capability_token": token
@@ -592,6 +608,10 @@ async fn invoke_get_page_through_connector() {
 
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "get-page",
+            "connector_id": "fcp.notion",
+            "zone_id": "z:work",
             "operation": "notion.get_page",
             "input": { "page_id": "pg-42" },
             "capability_token": token
@@ -625,6 +645,10 @@ async fn invoke_query_database_through_connector() {
 
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "query-database",
+            "connector_id": "fcp.notion",
+            "zone_id": "z:work",
             "operation": "notion.query_database",
             "input": { "database_id": "db-1" },
             "capability_token": token
@@ -654,6 +678,10 @@ async fn invoke_create_page_through_connector() {
 
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "create-page",
+            "connector_id": "fcp.notion",
+            "zone_id": "z:work",
             "operation": "notion.create_page",
             "input": {
                 "parent": { "database_id": "db-1" },
@@ -685,6 +713,10 @@ async fn invoke_update_page_through_connector() {
 
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "update-page",
+            "connector_id": "fcp.notion",
+            "zone_id": "z:work",
             "operation": "notion.update_page",
             "input": {
                 "page_id": "pg-42",
@@ -720,6 +752,10 @@ async fn invoke_delete_page_through_connector() {
 
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "delete-page",
+            "connector_id": "fcp.notion",
+            "zone_id": "z:work",
             "operation": "notion.delete_page",
             "input": { "page_id": "pg-42" },
             "capability_token": token
@@ -753,6 +789,10 @@ async fn invoke_get_database_through_connector() {
 
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "get-database",
+            "connector_id": "fcp.notion",
+            "zone_id": "z:work",
             "operation": "notion.get_database",
             "input": { "database_id": "db-1" },
             "capability_token": token
@@ -787,6 +827,10 @@ async fn invoke_create_database_through_connector() {
 
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "create-database",
+            "connector_id": "fcp.notion",
+            "zone_id": "z:work",
             "operation": "notion.create_database",
             "input": {
                 "parent": { "page_id": "pg-1" },
@@ -824,6 +868,10 @@ async fn invoke_update_database_through_connector() {
 
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "update-database",
+            "connector_id": "fcp.notion",
+            "zone_id": "z:work",
             "operation": "notion.update_database",
             "input": {
                 "database_id": "db-1",
@@ -863,6 +911,10 @@ async fn invoke_get_block_through_connector() {
 
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "get-block",
+            "connector_id": "fcp.notion",
+            "zone_id": "z:work",
             "operation": "notion.get_block",
             "input": { "block_id": "blk-1" },
             "capability_token": token
@@ -899,6 +951,10 @@ async fn invoke_update_block_through_connector() {
 
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "update-block",
+            "connector_id": "fcp.notion",
+            "zone_id": "z:work",
             "operation": "notion.update_block",
             "input": {
                 "block_id": "blk-1",
@@ -935,6 +991,10 @@ async fn invoke_delete_block_through_connector() {
 
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "delete-block",
+            "connector_id": "fcp.notion",
+            "zone_id": "z:work",
             "operation": "notion.delete_block",
             "input": { "block_id": "blk-1" },
             "capability_token": token
@@ -970,6 +1030,10 @@ async fn invoke_get_block_children_through_connector() {
 
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "get-block-children",
+            "connector_id": "fcp.notion",
+            "zone_id": "z:work",
             "operation": "notion.get_block_children",
             "input": { "block_id": "blk-1" },
             "capability_token": token
@@ -1005,6 +1069,10 @@ async fn invoke_append_blocks_through_connector() {
 
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "append-blocks",
+            "connector_id": "fcp.notion",
+            "zone_id": "z:work",
             "operation": "notion.append_blocks",
             "input": {
                 "block_id": "blk-1",
@@ -1049,6 +1117,10 @@ async fn invoke_add_comment_through_connector() {
 
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "add-comment",
+            "connector_id": "fcp.notion",
+            "zone_id": "z:work",
             "operation": "notion.add_comment",
             "input": {
                 "parent": { "page_id": "pg-1" },
@@ -1087,6 +1159,10 @@ async fn invoke_list_comments_through_connector() {
 
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "list-comments",
+            "connector_id": "fcp.notion",
+            "zone_id": "z:work",
             "operation": "notion.list_comments",
             "input": { "block_id": "pg-1" },
             "capability_token": token
@@ -1110,6 +1186,10 @@ async fn wrong_capability_rejected() {
 
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "get-page-wrong-capability",
+            "connector_id": "fcp.notion",
+            "zone_id": "z:work",
             "operation": "notion.get_page",
             "input": { "page_id": "pg-1" },
             "capability_token": token
@@ -1131,6 +1211,10 @@ async fn missing_required_field_returns_invalid_request() {
 
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "get-page-missing-field",
+            "connector_id": "fcp.notion",
+            "zone_id": "z:work",
             "operation": "notion.get_page",
             "input": {},
             "capability_token": token
@@ -1156,6 +1240,10 @@ async fn unknown_operation_rejected() {
 
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "unknown-operation",
+            "connector_id": "fcp.notion",
+            "zone_id": "z:work",
             "operation": "notion.nonexistent",
             "input": {},
             "capability_token": token
@@ -1191,6 +1279,10 @@ async fn search_includes_sensitivity_metadata() {
 
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "sensitive-search",
+            "connector_id": "fcp.notion",
+            "zone_id": "z:work",
             "operation": "notion.search",
             "input": { "query": "sensitive" },
             "capability_token": token
@@ -1234,6 +1326,10 @@ async fn search_with_filter() {
 
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "filtered-search",
+            "connector_id": "fcp.notion",
+            "zone_id": "z:work",
             "operation": "notion.search",
             "input": {
                 "query": "meeting",
@@ -1270,6 +1366,10 @@ async fn search_empty_results() {
 
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "empty-search-results",
+            "connector_id": "fcp.notion",
+            "zone_id": "z:work",
             "operation": "notion.search",
             "input": { "query": "nonexistent" },
             "capability_token": token
@@ -1334,6 +1434,10 @@ async fn search_redacts_person_emails() {
 
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "search-redaction",
+            "connector_id": "fcp.notion",
+            "zone_id": "z:work",
             "operation": "notion.search",
             "input": {},
             "capability_token": token
@@ -1375,6 +1479,10 @@ async fn search_requires_search_capability() {
 
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "search-wrong-capability",
+            "connector_id": "fcp.notion",
+            "zone_id": "z:work",
             "operation": "notion.search",
             "input": { "query": "test" },
             "capability_token": token
@@ -1432,6 +1540,10 @@ async fn search_redacts_created_by_last_edited_by_property_types() {
 
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "search-property-redaction",
+            "connector_id": "fcp.notion",
+            "zone_id": "z:work",
             "operation": "notion.search",
             "input": { "query": "prop test" },
             "capability_token": token

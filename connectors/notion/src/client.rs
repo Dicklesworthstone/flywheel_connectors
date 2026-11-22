@@ -98,7 +98,7 @@ const FORBIDDEN_ID_CHARS: &[char] = &[
 /// Validate a Notion object ID. Rejects empty strings and strings containing
 /// URL-active characters (slashes, query markers, fragments, ampersands,
 /// percent signs) that could allow URL injection or path traversal.
-fn validate_notion_id(id: &str, label: &str) -> NotionResult<()> {
+pub(crate) fn validate_notion_id(id: &str, label: &str) -> NotionResult<()> {
     if id.is_empty() {
         return Err(NotionError::Validation {
             message: format!("{label} must not be empty"),
@@ -134,7 +134,7 @@ fn validate_pagination_cursor(cursor: &str, label: &str) -> NotionResult<()> {
 }
 
 /// Percent-encode a value for safe inclusion in a URL path segment.
-fn encode_path_segment(value: &str) -> String {
+pub(crate) fn encode_path_segment(value: &str) -> String {
     utf8_percent_encode(value, PATH_SEGMENT_ENCODE_SET).to_string()
 }
 

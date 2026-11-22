@@ -58,17 +58,24 @@ Important runtime truths the contract preserves:
 - Runtime request timeout is 30 seconds.
 - Runtime request-context timeout is 30 seconds.
 - The client uses the shared retry loop with `max_retries = 2`.
-- `health()` reports configured client state and counters. It does not perform a live Notion probe.
+- `health()` returns a canonical `HealthSnapshot` with the real instance ID, configured/handshaken state, zone, session, uptime, and counters. Readiness requires configuration and a successful handshake. It does not perform a live Notion probe.
 - `doctor()` performs local configuration and credential-injection checks only. It does not call Notion.
 - `self_check()` performs a live `POST /search` probe only in direct-token mode.
 - `credential_id` self-check reports degraded `credential_injection_required` and skips a live probe.
-- Runtime `invoke` uses the JSON field `operation`, not `operation_id`.
-- Runtime `invoke` requires a deserializable, bound `CapabilityToken`.
-- Runtime `invoke` verifies the bound capability token against the operation capability and operation ID.
-- Runtime `simulate` always returns allowed after deserializing a `SimulateRequest`.
-- Runtime `simulate` does not check configuration, handshake, operation name, input shape, approval policy, or capability token.
-- Runtime `shutdown()` logs client shutdown and returns `{ "status": "shutdown" }`.
-- Runtime `shutdown()` does not clear config, client, verifier, session, or base lifecycle state.
+- Runtime `invoke` requires a complete `InvokeRequest`: `type: "invoke"`, a nonempty string `id`, `connector_id: "fcp.notion"`, `zone_id`, `operation`, `input`, and a bound `capability_token`.
+- Runtime input and output schemas, operation metadata, and approval modes come from the bundled manifest. Input is checked before admission; successful output is checked before release.
+- Runtime `invoke` verifies the negotiated capability class, signed operation, connector, zone, actual instance, and input-derived resource scopes. Shared session admission enforces signed call and complete FCP-message byte budgets and idempotency-key scope.
+- Runtime `simulate` checks configuration, handshake, operation, input schema, signed token, resource scopes, and current call allowance without provider I/O or consuming a call. It is a local authorization preview; host approval, revocation, holder proof, lease enforcement, and provider availability remain separate responsibilities.
+- Every configure or handshake attempt revokes previous authority and rotates its instance binding, including rejected attempts. Reconfiguration clears previous credentials before validating replacements.
+- Runtime `shutdown()` clears configuration, client, session authority, and readiness, and returns `{ "status": "shutdown" }`.
+
+### Native host transport
+
+The binary accepts bounded JSONL RPC frames with `method` and `params`, using the shared 16 MiB request limit. It validates supplied JSON-RPC versions and transport IDs, recovers after malformed frames, and closes the stream after an oversized frame. Successful shutdown is flushed before exit, even if the host keeps stdin open; later buffered work is not dispatched.
+
+Handshake accepts protocol `2.0` or `2.0.0`, grants only deduplicated capability classes used by manifest operations, and returns the actual `instance_id`. Tokens must be signed after negotiation and bound to that returned instance. The manifest's forbidden `z:public` zone is rejected. A configured workspace remains bound to its first negotiated zone until reconfiguration; a rejected attempt to change zones also revokes the previous session.
+
+An invoke reply contains a canonical `InvokeResponse` inside the RPC `result`. Its `id` is the invocation ID from `params.id`; the outer RPC `id` is independently preserved. The complete FCP response has a 16 MiB local cap and must also fit a token's remaining signed byte allowance. An unknown or oversized outcome retains its admission charge and is not a retry permit.
 
 ## Runtime API Adapter
 
@@ -76,9 +83,9 @@ The runtime uses these request shapes:
 
 | Operation | Runtime request | Required input | Output handling |
 |-----------|-----------------|----------------|-----------------|
-| `notion.create_page` | `POST /pages` | `parent` | Returns `{ "page": ... }`. Runtime does not require `properties` even though the manifest schema does. |
+| `notion.create_page` | `POST /pages` | `parent`, `properties` | Returns `{ "page": ... }`. |
 | `notion.get_page` | `GET /pages/{page_id}` | `page_id` | Returns `{ "page": ... }`. |
-| `notion.update_page` | `PATCH /pages/{page_id}` with `{ "properties": ... }` | `page_id` | Missing `properties` becomes `{}` at runtime. |
+| `notion.update_page` | `PATCH /pages/{page_id}` with `{ "properties": ... }` | `page_id`, `properties` | Returns `{ "page": ... }`. |
 | `notion.delete_page` | `PATCH /pages/{page_id}` with `{ "archived": true }` | `page_id` | Soft archives the page and returns `{ "page": ... }`. |
 | `notion.get_database` | `GET /databases/{database_id}` | `database_id` | Returns `{ "database": ... }`. |
 | `notion.create_database` | `POST /databases` | `parent`, `title`, `properties` | Returns `{ "database": ... }`. |
@@ -90,7 +97,7 @@ The runtime uses these request shapes:
 | `notion.delete_block` | `PATCH /blocks/{block_id}` with `{ "archived": true }` | `block_id` | Soft archives the block and returns `{ "block": ... }`. |
 | `notion.get_block_children` | `GET /blocks/{block_id}/children` | `block_id` | Returns `results`, `has_more`, and `next_cursor`. Runtime does not accept `start_cursor` here. |
 | `notion.append_blocks` | `PATCH /blocks/{block_id}/children` | `block_id`, `children` | Sends `{ "children": ... }` and returns `results`. |
-| `notion.add_comment` | `POST /comments` | `parent` | Returns `{ "comment": ... }`. Runtime does not require `rich_text` even though the manifest schema does. |
+| `notion.add_comment` | `POST /comments` | `parent`, `rich_text` | Returns `{ "comment": ... }`. |
 | `notion.list_comments` | `GET /comments?block_id={block_id}` | `block_id` | Returns `results`, `has_more`, and `next_cursor`. Runtime does not accept `start_cursor` here. |
 
 Identifier and cursor handling is deliberately restrictive:
@@ -109,20 +116,11 @@ This README documents runtime truth and keeps current drift visible:
 - Current Notion docs introduce the data-source object and data-source query APIs after the database/data-source split. Runtime still exposes database-centric operations and calls `/databases/{database_id}/query`.
 - Current Notion docs describe cursor values as opaque. Runtime validates cursor byte length and control characters before forwarding them.
 - Current Notion docs describe append-block limits, including a maximum of 100 block children in one request. Runtime documents this in hints but does not enforce the 100-child limit before sending.
-- Manifest schemas require `properties` for `notion.create_page` and `notion.update_page`. Runtime only requires `parent` for create and defaults missing update properties to `{}`.
-- Manifest schema requires `rich_text` for `notion.add_comment`. Runtime only checks `parent`.
-- Manifest operation approval modes are policy or interactive for write/delete operations. Runtime introspection reports no approval metadata for all operations.
 - Manifest rate-limit pools exist for read, write, delete, and search at 3 requests per 1000 ms with burst 3. Runtime introspection reports no rate-limit metadata.
 - Manifest event capabilities advertise streaming support with no replay and a 50-event minimum buffer. Runtime does not expose subscribe or unsubscribe handlers in the stdio entrypoint.
-- Handshake grants every requested capability without filtering against the manifest optional capability list.
-- Handshake returns a SHA-256 hash of the bundled `manifest.toml`.
-- Configure does not reset an existing handshake, verifier, or session.
-- Health does not require a completed handshake.
-- `simulate` is not an authorization preview. It is a permissive deserialization check.
-- Shutdown does not clear runtime lifecycle state.
 - There is no dedicated tracked verification shell script for this connector.
 
-A follow-up parity bead should reconcile database/data-source endpoint naming, align runtime input validation with manifest schemas, expose manifest approval and rate-limit metadata through introspection, enforce append child count before the provider call, make simulate match invoke policy, filter granted capabilities during handshake, and decide whether shutdown should clear lifecycle state.
+Remaining provider parity work includes database/data-source endpoint naming, rate-limit pool reporting, append child-count enforcement, and event delivery. The native session continues to use the existing FCP 2 JSONL handshake; this change is not a transport-version migration.
 
 ## First-Slice Scope
 
@@ -190,7 +188,7 @@ The current Notion README slice documents the existing runtime surface:
 | `notion.create_database` | `POST /databases` | `notion.write` | `Risky` | `Medium` | `None` | Creates database schema. |
 | `notion.update_database` | `PATCH /databases/{database_id}` | `notion.write` | `Risky` | `Medium` | `Strict` | Mutates database metadata or schema fields. |
 | `notion.query_database` | `POST /databases/{database_id}/query` | `notion.read` | `Safe` | `Low` | `Strict` | Reads rows from a database-like source. |
-| `notion.search` | `POST /search` | `notion.search` | `Safe` | `Low` | `Strict` | Searches shared workspace objects and adds sensitivity metadata. |
+| `notion.search` | `POST /search` | `notion.search` | `Safe` | `Medium` | `Strict` | Searches shared workspace objects and adds sensitivity metadata. |
 | `notion.get_block` | `GET /blocks/{block_id}` | `notion.read` | `Safe` | `Low` | `Strict` | Reads block metadata/content. |
 | `notion.update_block` | `PATCH /blocks/{block_id}` | `notion.write` | `Risky` | `Medium` | `Strict` | Mutates a block. |
 | `notion.delete_block` | `PATCH /blocks/{block_id}` archive body | `notion.delete` | `Risky` | `High` | `Strict` | Archives a block. |
@@ -201,17 +199,17 @@ The current Notion README slice documents the existing runtime surface:
 
 ## Resource URIs
 
-Runtime capability-token verification currently checks capability and operation ID, but passes an empty resource binding list to the verifier. The effective authorization binding is capability plus operation, not a provider resource URI.
+Runtime derives resource bindings from the actual validated input for both simulation and invocation. Signed allow/deny constraints apply to these scopes:
 
-Follow-up work should add resource URI shapes such as:
-
-| Operation family | Candidate resource URI shape |
+| Operation family | Resource URI shape |
 |------------------|------------------------------|
 | Pages | `notion://page/{page_id}` |
-| Databases or data sources | `notion://database/{database_id}` or `notion://data-source/{data_source_id}` |
-| Blocks | `notion://block/{block_id}` |
-| Comments | `notion://block/{block_id}/comments` |
-| Workspace search | `notion://workspace/{workspace_id}/search` |
+| Databases and database queries | `notion://database/{database_id}` |
+| Blocks, block children, appends, and comment listing | `notion://block/{block_id}` |
+| Page/database creation and comment creation | The selected parent page, database, discussion (`notion://discussion/{discussion_id}`), or workspace (`notion://workspace`) |
+| Workspace search | `notion://workspace/search` |
+
+Each creation parent must identify exactly one resource. UUID IDs are normalized to lowercase, hyphenated form for authorization, so compact or uppercase aliases cannot evade a resource deny; path segments use the same validation and encoding rules as HTTP dispatch. Search covers the currently configured integration's workspace visibility. Configuration changes revoke all prior instance-bound tokens.
 
 ## Explicit Non-Goals
 
@@ -239,8 +237,8 @@ These are excluded on purpose:
 - local network-constraint target checks
 - credential-injection requirement for credential-id mode
 - direct-token self-check through a live `POST /search` probe
-- operation metadata generated by runtime code
-- permissive simulation behavior
+- operation metadata and input/output schemas derived from the embedded manifest
+- local simulation with the same input and authorization checks as invocation
 - typed provider/FCP error mapping
 - search redaction behavior for email-bearing person and user fields
 
@@ -254,6 +252,8 @@ The deterministic integration evidence is anchored on connector-local tests cove
 - missing required fields and unknown operation rejection
 - search sensitivity metadata and person/user email redaction
 - custom API URLs, credential-id mode, Notion version override, doctor, self-check, and manifest hash stability
+- lifecycle revocation on successful and failed configuration/handshake attempts, forbidden zones, and workspace zone binding
+- the shipped binary's real HTTP request, typed health and invoke envelopes, non-consuming simulation, signed call/byte budgets, malformed frames, oversized frames, and shutdown termination
 
 ## Source Notes
 

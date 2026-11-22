@@ -1,16 +1,17 @@
 //! FCP Notion Connector implementation.
 
-use std::sync::Arc;
+use std::sync::OnceLock;
+use std::time::Instant;
 
+use fcp_manifest::ConnectorManifest;
 use fcp_prelude::{
-    AgentHint, BaseConnector, CapabilityGrant, CapabilityId, CapabilityToken, CapabilityVerifier,
-    ConnectorId, CredentialId, EventCaps, FcpError, FcpResult, HandshakeRequest, HandshakeResponse,
-    IdempotencyClass, Introspection, OperationId, OperationInfo, RiskLevel, SafetyTier,
-    SelfCheckReport, SessionId, SimulateRequest, SimulateResponse,
+    ApprovalMode, BaseConnector, ConnectorId, CredentialId, FcpError, FcpResult, HandshakeRequest,
+    HealthSnapshot, InstanceId, Introspection, InvokeRequest, InvokeResponse, OperationId,
+    OperationInfo, SelfCheckReport, SessionId, SimulateRequest, SimulateResponse, ZoneId,
 };
+use fcp_sdk::prelude::{OperationContractSet, StandaloneSession};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sha2::{Digest, Sha256};
 use tracing::{info, instrument};
 
 use crate::{
@@ -18,11 +19,29 @@ use crate::{
         DEFAULT_API_URL, DEFAULT_NOTION_VERSION, NotionAuth, NotionClient, normalize_notion_version,
     },
     error::NotionError,
-    limits,
 };
 
 const MAX_NOTION_CURSOR_BYTES: usize = 512;
+const MAX_INVOKE_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
 const MANIFEST_TOML: &str = include_str!("../manifest.toml");
+const OPERATION_IDS: [&str; 16] = [
+    "notion.create_page",
+    "notion.get_page",
+    "notion.update_page",
+    "notion.delete_page",
+    "notion.get_database",
+    "notion.create_database",
+    "notion.update_database",
+    "notion.query_database",
+    "notion.search",
+    "notion.get_block",
+    "notion.update_block",
+    "notion.delete_block",
+    "notion.get_block_children",
+    "notion.append_blocks",
+    "notion.add_comment",
+    "notion.list_comments",
+];
 
 /// Validated configuration for the Notion connector.
 struct NotionConfig {
@@ -211,11 +230,13 @@ enum DoctorStatus {
 
 /// FCP Notion Connector.
 pub struct NotionConnector {
-    base: Arc<BaseConnector>,
+    base: BaseConnector,
     config: Option<NotionConfig>,
     client: Option<NotionClient>,
-    verifier: Option<CapabilityVerifier>,
+    authority: Option<StandaloneSession>,
     session_id: Option<SessionId>,
+    bound_zone: Option<ZoneId>,
+    started_at: Instant,
 }
 
 impl NotionConnector {
@@ -223,11 +244,13 @@ impl NotionConnector {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            base: Arc::new(BaseConnector::new(ConnectorId::from_static("notion"))),
+            base: BaseConnector::new(ConnectorId::from_static("fcp.notion")),
             config: None,
             client: None,
-            verifier: None,
+            authority: None,
             session_id: None,
+            bound_zone: None,
+            started_at: Instant::now(),
         }
     }
 
@@ -237,10 +260,21 @@ impl NotionConnector {
         &self.base.instance_id
     }
 
-    fn manifest_hash() -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(MANIFEST_TOML.as_bytes());
-        format!("sha256:{}", hex::encode(hasher.finalize()))
+    fn invalidate_authority(&mut self) {
+        self.authority = None;
+        self.session_id = None;
+        self.base.set_handshaken(false);
+        self.base.instance_id = InstanceId::new();
+    }
+
+    fn clear_configuration(&mut self) {
+        self.invalidate_authority();
+        self.bound_zone = None;
+        self.base.set_configured(false);
+        self.config = None;
+        if let Some(client) = self.client.take() {
+            client.shutdown();
+        }
     }
 
     /// Handle configure method.
@@ -249,6 +283,9 @@ impl NotionConnector {
         &mut self,
         params: serde_json::Value,
     ) -> FcpResult<serde_json::Value> {
+        // A rejected configuration must not leave the old account or grants
+        // usable. New authority requires a successful configure and handshake.
+        self.clear_configuration();
         let config = NotionConfig::from_params(&params)?;
 
         let client =
@@ -272,67 +309,76 @@ impl NotionConnector {
         &mut self,
         params: serde_json::Value,
     ) -> FcpResult<serde_json::Value> {
+        self.invalidate_authority();
+        if self.client.is_none() || self.config.is_none() {
+            return Err(FcpError::NotConfigured);
+        }
         let req: HandshakeRequest =
-            serde_json::from_value(params).map_err(|e| FcpError::InvalidRequest {
+            serde_json::from_value(params).map_err(|_| FcpError::InvalidRequest {
                 code: 1003,
-                message: format!("Invalid handshake request: {e}"),
+                message: "Invalid handshake request".into(),
             })?;
 
-        self.verifier = Some(CapabilityVerifier::new(
-            req.host_public_key,
-            req.zone.clone(),
-            self.base.instance_id.clone(),
-        ));
-
-        let session_id = SessionId::new();
-        self.session_id = Some(session_id.clone());
-        self.base.set_handshaken(true);
-
-        let capabilities_granted: Vec<CapabilityGrant> = req
-            .capabilities_requested
-            .into_iter()
-            .map(|cap| CapabilityGrant {
-                capability: cap,
-                operation: None,
-            })
-            .collect();
-
-        let response = HandshakeResponse {
-            status: "accepted".into(),
-            capabilities_granted,
-            session_id,
-            manifest_hash: Self::manifest_hash(),
-            nonce: req.nonce,
-            event_caps: Some(EventCaps {
-                streaming: true,
-                replay: false,
-                min_buffer_events: 50,
-                requires_ack: false,
-            }),
-            auth_caps: None,
-            op_catalog_hash: None,
-        };
-
-        serde_json::to_value(response).map_err(|e| FcpError::Internal {
+        if self
+            .bound_zone
+            .as_ref()
+            .is_some_and(|zone| zone != &req.zone)
+        {
+            return Err(FcpError::CapabilityDenied {
+                capability: "notion.handshake".into(),
+                reason: "Reconfigure before binding this workspace to another zone".into(),
+            });
+        }
+        let zone = req.zone.clone();
+        let mut authority = StandaloneSession::new(MANIFEST_TOML)?;
+        let response = authority.handshake(req)?;
+        let mut result = serde_json::to_value(&response).map_err(|e| FcpError::Internal {
             message: format!("Failed to serialize response: {e}"),
-        })
+        })?;
+        result["instance_id"] = json!(authority.instance_id());
+        result["connector_id"] = json!("fcp.notion");
+        result["protocol_version"] = json!("2.0");
+        self.base.instance_id = authority.instance_id().clone();
+        self.session_id = Some(response.session_id);
+        self.bound_zone = Some(zone);
+        self.authority = Some(authority);
+        self.base.set_handshaken(true);
+        Ok(result)
     }
 
     /// Handle health check.
     pub async fn handle_health(&self) -> FcpResult<serde_json::Value> {
-        let configured = self.client.is_some();
+        let configured = self.client.is_some() && self.config.is_some();
+        let handshaken = configured
+            && self
+                .authority
+                .as_ref()
+                .is_some_and(StandaloneSession::is_established);
         let metrics = self.base.metrics();
-        let mut health = json!({
-            "status": if configured { "healthy" } else { "not_configured" },
+        let mut health = if handshaken {
+            HealthSnapshot::ready()
+        } else if configured {
+            HealthSnapshot::degraded("handshake required")
+        } else {
+            HealthSnapshot::degraded("not configured")
+        };
+        health.uptime_ms = u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let mut details = json!({
+            "connector_id": "fcp.notion",
+            "configured": configured,
+            "handshaken": handshaken,
+            "instance_id": self.base.instance_id,
+            "zone": self.bound_zone,
+            "session_id": self.session_id,
             "metrics": {
                 "requests_total": metrics.requests_total,
                 "requests_error": metrics.requests_error,
             }
         });
         if let Some(config) = &self.config {
-            health["auth_mode"] = json!(config.auth.redacted_label());
-            health["api_url"] = json!(config.api_url);
-            health["notion_version"] = json!(
+            details["auth_mode"] = json!(config.auth.redacted_label());
+            details["api_url"] = json!(config.api_url);
+            details["notion_version"] = json!(
                 self.client.as_ref().map_or(
                     config
                         .notion_version
@@ -342,7 +388,10 @@ impl NotionConnector {
                 )
             );
         }
-        Ok(health)
+        health.details = Some(details);
+        serde_json::to_value(health).map_err(|error| FcpError::Internal {
+            message: format!("Failed to serialize health: {error}"),
+        })
     }
 
     /// Handle doctor readiness check.
@@ -522,464 +571,7 @@ impl NotionConnector {
     /// Handle introspect method.
     pub async fn handle_introspect(&self) -> FcpResult<serde_json::Value> {
         let introspection = Introspection {
-            operations: vec![
-                op_info(
-                    "notion.create_page",
-                    "Create a new page in a database or as a child page",
-                    json!({
-                        "type": "object",
-                        "required": ["parent", "properties"],
-                        "properties": {
-                            "parent": { "type": "object" },
-                            "properties": { "type": "object" }
-                        }
-                    }),
-                    json!({ "type": "object", "properties": { "page": { "type": "object" } } }),
-                    "notion.write",
-                    RiskLevel::Medium,
-                    SafetyTier::Risky,
-                    IdempotencyClass::None,
-                    AgentHint {
-                        when_to_use: "Create a new page or database entry in Notion.".into(),
-                        common_mistakes: vec!["Not specifying the parent database or page ID".into()],
-                        examples: vec![
-                            r#"{"parent": {"database_id": "abc123"}, "properties": {"Name": {"title": [{"text": {"content": "New page"}}]}}}"#.into(),
-                        ],
-                        related: vec![
-                            CapabilityId::from_static("notion.get_page"),
-                            CapabilityId::from_static("notion.query_database"),
-                        ],
-                    },
-                ),
-                op_info(
-                    "notion.get_page",
-                    "Retrieve a Notion page by ID",
-                    json!({
-                        "type": "object",
-                        "required": ["page_id"],
-                        "properties": {
-                            "page_id": { "type": "string" }
-                        }
-                    }),
-                    json!({ "type": "object", "properties": { "page": { "type": "object" } } }),
-                    "notion.read",
-                    RiskLevel::Low,
-                    SafetyTier::Safe,
-                    IdempotencyClass::Strict,
-                    AgentHint {
-                        when_to_use: "Retrieve details of a specific Notion page.".into(),
-                        common_mistakes: vec![],
-                        examples: vec![r#"{"page_id": "abc123-def456"}"#.into()],
-                        related: vec![
-                            CapabilityId::from_static("notion.create_page"),
-                            CapabilityId::from_static("notion.update_page"),
-                        ],
-                    },
-                ),
-                op_info(
-                    "notion.update_page",
-                    "Update properties of a Notion page",
-                    json!({
-                        "type": "object",
-                        "required": ["page_id", "properties"],
-                        "properties": {
-                            "page_id": { "type": "string" },
-                            "properties": { "type": "object" }
-                        }
-                    }),
-                    json!({ "type": "object", "properties": { "page": { "type": "object" } } }),
-                    "notion.write",
-                    RiskLevel::Medium,
-                    SafetyTier::Risky,
-                    IdempotencyClass::Strict,
-                    AgentHint {
-                        when_to_use: "Update properties on an existing Notion page.".into(),
-                        common_mistakes: vec![],
-                        examples: vec![
-                            r#"{"page_id": "abc123", "properties": {"Status": {"select": {"name": "Done"}}}}"#.into(),
-                        ],
-                        related: vec![CapabilityId::from_static("notion.get_page")],
-                    },
-                ),
-                op_info(
-                    "notion.delete_page",
-                    "Archive (soft-delete) a Notion page",
-                    json!({
-                        "type": "object",
-                        "required": ["page_id"],
-                        "properties": {
-                            "page_id": { "type": "string" }
-                        }
-                    }),
-                    json!({ "type": "object", "properties": { "page": { "type": "object" } } }),
-                    "notion.delete",
-                    RiskLevel::High,
-                    SafetyTier::Risky,
-                    IdempotencyClass::Strict,
-                    AgentHint {
-                        when_to_use: "Archive a Notion page (soft delete).".into(),
-                        common_mistakes: vec!["Expecting permanent deletion — Notion only archives".into()],
-                        examples: vec![r#"{"page_id": "abc123"}"#.into()],
-                        related: vec![CapabilityId::from_static("notion.get_page")],
-                    },
-                ),
-                op_info(
-                    "notion.get_database",
-                    "Retrieve a Notion database by ID",
-                    json!({
-                        "type": "object",
-                        "required": ["database_id"],
-                        "properties": {
-                            "database_id": { "type": "string" }
-                        }
-                    }),
-                    json!({ "type": "object", "properties": { "database": { "type": "object" } } }),
-                    "notion.read",
-                    RiskLevel::Low,
-                    SafetyTier::Safe,
-                    IdempotencyClass::Strict,
-                    AgentHint {
-                        when_to_use: "Retrieve a database schema and properties.".into(),
-                        common_mistakes: vec![],
-                        examples: vec![r#"{"database_id": "abc123-def456"}"#.into()],
-                        related: vec![
-                            CapabilityId::from_static("notion.query_database"),
-                            CapabilityId::from_static("notion.update_database"),
-                        ],
-                    },
-                ),
-                op_info(
-                    "notion.create_database",
-                    "Create a new database in a page",
-                    json!({
-                        "type": "object",
-                        "required": ["parent", "title", "properties"],
-                        "properties": {
-                            "parent": { "type": "object" },
-                            "title": { "type": "array" },
-                            "properties": { "type": "object" }
-                        }
-                    }),
-                    json!({ "type": "object", "properties": { "database": { "type": "object" } } }),
-                    "notion.write",
-                    RiskLevel::Medium,
-                    SafetyTier::Risky,
-                    IdempotencyClass::None,
-                    AgentHint {
-                        when_to_use: "Create a new inline database within a page.".into(),
-                        common_mistakes: vec!["Not specifying at least one property definition".into()],
-                        examples: vec![
-                            r#"{"parent": {"page_id": "abc123"}, "title": [{"text": {"content": "Tasks"}}], "properties": {"Name": {"title": {}}}}"#.into(),
-                        ],
-                        related: vec![
-                            CapabilityId::from_static("notion.get_database"),
-                            CapabilityId::from_static("notion.query_database"),
-                        ],
-                    },
-                ),
-                op_info(
-                    "notion.update_database",
-                    "Update a database's title, description, or properties",
-                    json!({
-                        "type": "object",
-                        "required": ["database_id"],
-                        "properties": {
-                            "database_id": { "type": "string" },
-                            "title": { "type": "array" },
-                            "properties": { "type": "object" },
-                            "description": { "type": "array" }
-                        }
-                    }),
-                    json!({ "type": "object", "properties": { "database": { "type": "object" } } }),
-                    "notion.write",
-                    RiskLevel::Medium,
-                    SafetyTier::Risky,
-                    IdempotencyClass::Strict,
-                    AgentHint {
-                        when_to_use: "Update a database schema, title, or description.".into(),
-                        common_mistakes: vec![],
-                        examples: vec![
-                            r#"{"database_id": "abc123", "title": [{"text": {"content": "Updated Tasks"}}]}"#.into(),
-                        ],
-                        related: vec![CapabilityId::from_static("notion.get_database")],
-                    },
-                ),
-                op_info(
-                    "notion.query_database",
-                    "Query a Notion database with filters and sorts",
-                    json!({
-                        "type": "object",
-                        "required": ["database_id"],
-                        "properties": {
-                            "database_id": { "type": "string" },
-                            "filter": { "type": "object" },
-                            "start_cursor": { "type": "string" }
-                        }
-                    }),
-                    json!({
-                        "type": "object",
-                        "properties": {
-                            "results": { "type": "array" },
-                            "has_more": { "type": "boolean" },
-                            "next_cursor": { "type": ["string", "null"], "description": "Cursor for the next page of results" }
-                        }
-                    }),
-                    "notion.read",
-                    RiskLevel::Low,
-                    SafetyTier::Safe,
-                    IdempotencyClass::Strict,
-                    AgentHint {
-                        when_to_use: "Query a database with optional filters.".into(),
-                        common_mistakes: vec!["Not handling pagination with start_cursor".into()],
-                        examples: vec![r#"{"database_id": "abc123"}"#.into()],
-                        related: vec![
-                            CapabilityId::from_static("notion.get_page"),
-                            CapabilityId::from_static("notion.search"),
-                        ],
-                    },
-                ),
-                op_info(
-                    "notion.search",
-                    "Search pages and databases across the workspace (sensitive — results are redacted)",
-                    json!({
-                        "type": "object",
-                        "properties": {
-                            "query": { "type": "string", "description": "Text query to search for" },
-                            "filter": {
-                                "type": "object",
-                                "description": "Optional filter (e.g. {\"value\": \"page\", \"property\": \"object\"} to restrict to pages)"
-                            }
-                        }
-                    }),
-                    json!({
-                        "type": "object",
-                        "required": ["results", "has_more", "sensitivity", "provenance", "taint"],
-                        "properties": {
-                            "results": { "type": "array", "description": "Redacted search results" },
-                            "has_more": { "type": "boolean" },
-                            "next_cursor": { "type": ["string", "null"], "description": "Cursor for the next page of results" },
-                            "result_count": { "type": "integer" },
-                            "sensitivity": { "type": "string" },
-                            "provenance": { "type": "object" },
-                            "taint": { "type": "array" }
-                        }
-                    }),
-                    "notion.search",
-                    RiskLevel::Medium,
-                    SafetyTier::Safe,
-                    IdempotencyClass::Strict,
-                    AgentHint {
-                        when_to_use: "Search across all pages and databases. Results include provenance metadata and PII is redacted.".into(),
-                        common_mistakes: vec![
-                            "Not checking the sensitivity field — search results may expose cross-workspace data".into(),
-                        ],
-                        examples: vec![
-                            r#"{"query": "meeting notes"}"#.into(),
-                            r#"{"query": "Q1 plan", "filter": {"value": "page", "property": "object"}}"#.into(),
-                        ],
-                        related: vec![
-                            CapabilityId::from_static("notion.query_database"),
-                            CapabilityId::from_static("notion.get_page"),
-                        ],
-                    },
-                ),
-                op_info(
-                    "notion.get_block",
-                    "Retrieve a single block by ID",
-                    json!({
-                        "type": "object",
-                        "required": ["block_id"],
-                        "properties": {
-                            "block_id": { "type": "string" }
-                        }
-                    }),
-                    json!({ "type": "object", "properties": { "block": { "type": "object" } } }),
-                    "notion.read",
-                    RiskLevel::Low,
-                    SafetyTier::Safe,
-                    IdempotencyClass::Strict,
-                    AgentHint {
-                        when_to_use: "Retrieve a specific block by its ID.".into(),
-                        common_mistakes: vec![],
-                        examples: vec![r#"{"block_id": "abc123"}"#.into()],
-                        related: vec![
-                            CapabilityId::from_static("notion.get_block_children"),
-                            CapabilityId::from_static("notion.update_block"),
-                        ],
-                    },
-                ),
-                op_info(
-                    "notion.update_block",
-                    "Update a block's content",
-                    json!({
-                        "type": "object",
-                        "required": ["block_id"],
-                        "properties": {
-                            "block_id": { "type": "string" },
-                            "paragraph": { "type": "object" },
-                            "heading_1": { "type": "object" },
-                            "heading_2": { "type": "object" },
-                            "heading_3": { "type": "object" },
-                            "to_do": { "type": "object" },
-                            "toggle": { "type": "object" }
-                        }
-                    }),
-                    json!({ "type": "object", "properties": { "block": { "type": "object" } } }),
-                    "notion.write",
-                    RiskLevel::Medium,
-                    SafetyTier::Risky,
-                    IdempotencyClass::Strict,
-                    AgentHint {
-                        when_to_use: "Update the content of a block.".into(),
-                        common_mistakes: vec!["Sending the wrong block type key for the block".into()],
-                        examples: vec![
-                            r#"{"block_id": "abc123", "paragraph": {"rich_text": [{"text": {"content": "Updated text"}}]}}"#.into(),
-                        ],
-                        related: vec![
-                            CapabilityId::from_static("notion.get_block"),
-                            CapabilityId::from_static("notion.delete_block"),
-                        ],
-                    },
-                ),
-                op_info(
-                    "notion.delete_block",
-                    "Archive (soft-delete) a block",
-                    json!({
-                        "type": "object",
-                        "required": ["block_id"],
-                        "properties": {
-                            "block_id": { "type": "string" }
-                        }
-                    }),
-                    json!({ "type": "object", "properties": { "block": { "type": "object" } } }),
-                    "notion.delete",
-                    RiskLevel::High,
-                    SafetyTier::Risky,
-                    IdempotencyClass::Strict,
-                    AgentHint {
-                        when_to_use: "Archive a block (soft delete).".into(),
-                        common_mistakes: vec!["Expecting permanent deletion — Notion only archives".into()],
-                        examples: vec![r#"{"block_id": "abc123"}"#.into()],
-                        related: vec![CapabilityId::from_static("notion.get_block")],
-                    },
-                ),
-                op_info(
-                    "notion.get_block_children",
-                    "Get child blocks of a block or page",
-                    json!({
-                        "type": "object",
-                        "required": ["block_id"],
-                        "properties": {
-                            "block_id": { "type": "string" }
-                        }
-                    }),
-                    json!({
-                        "type": "object",
-                        "properties": {
-                            "results": { "type": "array" },
-                            "has_more": { "type": "boolean" },
-                            "next_cursor": { "type": ["string", "null"], "description": "Cursor for the next page of results" }
-                        }
-                    }),
-                    "notion.read",
-                    RiskLevel::Low,
-                    SafetyTier::Safe,
-                    IdempotencyClass::Strict,
-                    AgentHint {
-                        when_to_use: "Read the content blocks of a page.".into(),
-                        common_mistakes: vec![],
-                        examples: vec![r#"{"block_id": "abc123"}"#.into()],
-                        related: vec![
-                            CapabilityId::from_static("notion.get_page"),
-                            CapabilityId::from_static("notion.append_blocks"),
-                        ],
-                    },
-                ),
-                op_info(
-                    "notion.append_blocks",
-                    "Append child blocks to a page or block",
-                    json!({
-                        "type": "object",
-                        "required": ["block_id", "children"],
-                        "properties": {
-                            "block_id": { "type": "string" },
-                            "children": { "type": "array" }
-                        }
-                    }),
-                    json!({
-                        "type": "object",
-                        "properties": {
-                            "results": { "type": "array" }
-                        }
-                    }),
-                    "notion.write",
-                    RiskLevel::Medium,
-                    SafetyTier::Risky,
-                    IdempotencyClass::None,
-                    AgentHint {
-                        when_to_use: "Add content blocks to a page.".into(),
-                        common_mistakes: vec![format!("Exceeding {} blocks per request", limits::BLOCKS_MAX_PER_REQUEST)],
-                        examples: vec![
-                            r#"{"block_id": "abc123", "children": [{"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"text": {"content": "Hello"}}]}}]}"#.into(),
-                        ],
-                        related: vec![CapabilityId::from_static("notion.get_block_children")],
-                    },
-                ),
-                op_info(
-                    "notion.add_comment",
-                    "Add a comment to a page or discussion",
-                    json!({
-                        "type": "object",
-                        "required": ["parent", "rich_text"],
-                        "properties": {
-                            "parent": { "type": "object" },
-                            "rich_text": { "type": "array" }
-                        }
-                    }),
-                    json!({ "type": "object", "properties": { "comment": { "type": "object" } } }),
-                    "notion.write",
-                    RiskLevel::Medium,
-                    SafetyTier::Risky,
-                    IdempotencyClass::None,
-                    AgentHint {
-                        when_to_use: "Add a comment to a Notion page.".into(),
-                        common_mistakes: vec![],
-                        examples: vec![
-                            r#"{"parent": {"page_id": "abc123"}, "rich_text": [{"text": {"content": "Looks good!"}}]}"#.into(),
-                        ],
-                        related: vec![CapabilityId::from_static("notion.list_comments")],
-                    },
-                ),
-                op_info(
-                    "notion.list_comments",
-                    "List comments on a page or block",
-                    json!({
-                        "type": "object",
-                        "required": ["block_id"],
-                        "properties": {
-                            "block_id": { "type": "string" }
-                        }
-                    }),
-                    json!({
-                        "type": "object",
-                        "properties": {
-                            "results": { "type": "array" },
-                            "has_more": { "type": "boolean" },
-                            "next_cursor": { "type": ["string", "null"], "description": "Cursor for the next page of results" }
-                        }
-                    }),
-                    "notion.read",
-                    RiskLevel::Low,
-                    SafetyTier::Safe,
-                    IdempotencyClass::Strict,
-                    AgentHint {
-                        when_to_use: "Read comments on a page.".into(),
-                        common_mistakes: vec![],
-                        examples: vec![r#"{"block_id": "abc123"}"#.into()],
-                        related: vec![CapabilityId::from_static("notion.add_comment")],
-                    },
-                ),
-            ],
+            operations: operations_info()?.to_vec(),
             events: vec![],
             resource_types: vec![],
             auth_caps: None,
@@ -994,15 +586,77 @@ impl NotionConnector {
     /// Handle simulate method.
     pub async fn handle_simulate(&self, params: serde_json::Value) -> FcpResult<serde_json::Value> {
         let req: SimulateRequest =
-            serde_json::from_value(params).map_err(|e| FcpError::InvalidRequest {
+            serde_json::from_value(params).map_err(|_| FcpError::InvalidRequest {
                 code: 1003,
-                message: format!("Invalid simulate request: {e}"),
+                message: "Invalid simulate request".into(),
             })?;
 
-        let response = SimulateResponse::allowed(req.id);
+        if req.r#type != "simulate" || req.id.0.is_empty() || !req.input.is_object() {
+            return Err(FcpError::InvalidRequest {
+                code: 1003,
+                message: "Simulation requires a typed request, non-empty ID and object input"
+                    .into(),
+            });
+        }
+        let authorization = self
+            .validate_operation(&req.operation, &req.input)
+            .and_then(|resources| {
+                self.authority
+                    .as_ref()
+                    .ok_or(FcpError::NotHandshaken)?
+                    .authorize(
+                        &req.connector_id,
+                        &req.zone_id,
+                        &req.operation,
+                        req.capability_token,
+                        &resources,
+                    )
+                    .map(drop)
+            });
+        let response = match authorization {
+            Ok(()) => SimulateResponse::allowed(req.id),
+            Err(error) => {
+                let mut response =
+                    SimulateResponse::denied(req.id, error.to_string(), error.error_code());
+                if matches!(
+                    error,
+                    FcpError::CapabilityDenied { .. } | FcpError::OperationNotGranted { .. }
+                ) && let Some(operation) = operations_info()?
+                    .iter()
+                    .find(|operation| operation.id == req.operation)
+                {
+                    response = response
+                        .with_missing_capabilities(vec![operation.capability.as_str().to_owned()]);
+                }
+                response
+            }
+        };
         serde_json::to_value(response).map_err(|e| FcpError::Internal {
             message: format!("Failed to serialize response: {e}"),
         })
+    }
+
+    /// Validate the advertised input and derive its actual resource scopes.
+    fn validate_operation(
+        &self,
+        operation: &OperationId,
+        input: &serde_json::Value,
+    ) -> FcpResult<Vec<String>> {
+        self.base.check_ready()?;
+        if self.client.is_none() || self.config.is_none() {
+            return Err(FcpError::NotConfigured);
+        }
+        operations_info()?
+            .iter()
+            .find(|metadata| metadata.id == *operation)
+            .ok_or_else(|| FcpError::OperationNotGranted {
+                operation: operation.as_str().to_owned(),
+            })?;
+        operation_contracts()?.validate_input(operation, input)?;
+        if operation.as_str() == "notion.query_database" {
+            optional_safe_cursor(input, "start_cursor")?;
+        }
+        resource_uris_for_operation(operation.as_str(), input)
     }
 
     /// Handle invoke method.
@@ -1016,60 +670,27 @@ impl NotionConnector {
         &self,
         params: serde_json::Value,
     ) -> FcpResult<serde_json::Value> {
-        let operation =
-            params
-                .get("operation")
-                .and_then(|v| v.as_str())
-                .ok_or(FcpError::InvalidRequest {
-                    code: 1003,
-                    message: "Missing operation".into(),
-                })?;
-
-        let input = params.get("input").cloned().unwrap_or(json!({}));
-
-        let token_value = params
-            .get("capability_token")
-            .ok_or(FcpError::InvalidRequest {
+        self.base.check_ready()?;
+        let request: InvokeRequest =
+            serde_json::from_value(params).map_err(|_| FcpError::InvalidRequest {
                 code: 1003,
-                message: "Missing capability_token".into(),
+                message: "Invalid FCP invoke request".into(),
             })?;
-
-        let token: CapabilityToken =
-            serde_json::from_value(token_value.clone()).map_err(|e| FcpError::InvalidRequest {
+        if !request.input.is_object() || request.deadline_ms == Some(0) {
+            return Err(FcpError::InvalidRequest {
                 code: 1003,
-                message: format!("Invalid capability_token format: {e}"),
-            })?;
-
-        let op_id: OperationId = operation.parse().map_err(|_| FcpError::InvalidRequest {
-            code: 1003,
-            message: "Invalid operation ID format".into(),
-        })?;
-        let intro = self.handle_introspect().await?;
-        let cap_str = intro
-            .get("operations")
-            .and_then(|ops| ops.as_array())
-            .and_then(|ops| {
-                ops.iter()
-                    .find(|o| o.get("id").and_then(|id| id.as_str()) == Some(operation))
-            })
-            .and_then(|op| op.get("capability"))
-            .and_then(|cap| cap.as_str())
-            .ok_or_else(|| FcpError::OperationNotGranted {
-                operation: operation.into(),
-            })?;
-
-        let cap_id: CapabilityId = cap_str.parse().map_err(|_| FcpError::InvalidRequest {
-            code: 1003,
-            message: "Invalid capability ID format".into(),
-        })?;
-
-        if let Some(verifier) = &self.verifier {
-            verifier.verify_bound(token, &cap_id, &op_id, &[])?;
-        } else {
-            return Err(FcpError::NotConfigured);
+                message: "Invocation requires object input and an unexpired deadline".into(),
+            });
         }
-
-        match operation {
+        let resources = self.validate_operation(&request.operation, &request.input)?;
+        let witness = self
+            .authority
+            .as_ref()
+            .ok_or(FcpError::NotHandshaken)?
+            .admit_bounded(&request, &resources, MAX_INVOKE_RESPONSE_BYTES)?;
+        let operation = request.operation.as_str();
+        let input = request.input;
+        let result = match operation {
             "notion.create_page" => self.invoke_create_page(input).await,
             "notion.get_page" => self.invoke_get_page(input).await,
             "notion.update_page" => self.invoke_update_page(input).await,
@@ -1089,7 +710,14 @@ impl NotionConnector {
             _ => Err(FcpError::OperationNotGranted {
                 operation: operation.into(),
             }),
-        }
+        };
+        let response = match &result {
+            Ok(value) => InvokeResponse::ok(request.id.clone(), value.clone()),
+            Err(error) => InvokeResponse::error(request.id.clone(), error.clone()),
+        };
+        operation_contracts()?.validate_response(&request.operation, &request.id, &response)?;
+        witness.finish_response(&response)?;
+        result
     }
 
     // ── Operation implementations ─────────────────────────────────
@@ -1392,12 +1020,10 @@ impl NotionConnector {
 
     /// Handle shutdown.
     pub async fn handle_shutdown(
-        &self,
+        &mut self,
         _params: serde_json::Value,
     ) -> FcpResult<serde_json::Value> {
-        if let Some(client) = &self.client {
-            client.shutdown();
-        }
+        self.clear_configuration();
         info!("Notion connector shutting down");
         Ok(json!({ "status": "shutdown" }))
     }
@@ -1410,6 +1036,84 @@ impl Default for NotionConnector {
 }
 
 // ── Helper functions ──────────────────────────────────────────────
+
+fn resource_uri(kind: &str, id: &str) -> FcpResult<String> {
+    crate::client::validate_notion_id(id, kind).map_err(|error| error.to_fcp_error())?;
+    // Notion accepts dashed and compact UUIDs for the same object. Use one
+    // scope spelling so an equivalent ID cannot evade an explicit resource deny.
+    let canonical_id = uuid::Uuid::parse_str(id)
+        .map_or_else(|_| id.to_owned(), |uuid| uuid.hyphenated().to_string());
+    Ok(format!(
+        "notion://{kind}/{}",
+        crate::client::encode_path_segment(&canonical_id)
+    ))
+}
+
+fn parent_resource_uri(input: &serde_json::Value) -> FcpResult<String> {
+    let parent = input.get("parent").ok_or(FcpError::InvalidRequest {
+        code: 1003,
+        message: "Missing required field: parent".into(),
+    })?;
+    let mut resource = None;
+    for (field, kind) in [
+        ("page_id", "page"),
+        ("database_id", "database"),
+        ("discussion_id", "discussion"),
+    ] {
+        if parent.get(field).is_some() {
+            if resource.is_some() {
+                return Err(FcpError::InvalidRequest {
+                    code: 1003,
+                    message: "parent must identify exactly one resource".into(),
+                });
+            }
+            resource = Some(resource_uri(kind, require_str(parent, field)?)?);
+        }
+    }
+    if parent.get("workspace").and_then(serde_json::Value::as_bool) == Some(true) {
+        if resource.is_some() {
+            return Err(FcpError::InvalidRequest {
+                code: 1003,
+                message: "parent must identify exactly one resource".into(),
+            });
+        }
+        return Ok("notion://workspace".into());
+    }
+    resource.ok_or(FcpError::InvalidRequest {
+        code: 1003,
+        message: "parent must identify a page, database, discussion, or workspace".into(),
+    })
+}
+
+fn resource_uris_for_operation(
+    operation: &str,
+    input: &serde_json::Value,
+) -> FcpResult<Vec<String>> {
+    let resource = match operation {
+        "notion.create_page" | "notion.create_database" | "notion.add_comment" => {
+            parent_resource_uri(input)?
+        }
+        "notion.get_page" | "notion.update_page" | "notion.delete_page" => {
+            resource_uri("page", require_str(input, "page_id")?)?
+        }
+        "notion.get_database" | "notion.update_database" | "notion.query_database" => {
+            resource_uri("database", require_str(input, "database_id")?)?
+        }
+        "notion.get_block"
+        | "notion.update_block"
+        | "notion.delete_block"
+        | "notion.get_block_children"
+        | "notion.append_blocks"
+        | "notion.list_comments" => resource_uri("block", require_str(input, "block_id")?)?,
+        "notion.search" => "notion://workspace/search".into(),
+        _ => {
+            return Err(FcpError::OperationNotGranted {
+                operation: operation.into(),
+            });
+        }
+    };
+    Ok(vec![resource])
+}
 
 /// Redact PII from a single search result object.
 ///
@@ -1482,33 +1186,50 @@ fn require_str<'a>(input: &'a serde_json::Value, field: &str) -> FcpResult<&'a s
         })
 }
 
-// Explicit metadata parameters keep each operation declaration complete at its call site.
-#[allow(clippy::fn_params_excessive_bools)]
-fn op_info(
-    id: &'static str,
-    summary: &str,
-    input_schema: serde_json::Value,
-    output_schema: serde_json::Value,
-    capability: &'static str,
-    risk_level: RiskLevel,
-    safety_tier: SafetyTier,
-    idempotency: IdempotencyClass,
-    ai_hints: AgentHint,
-) -> OperationInfo {
-    OperationInfo {
-        id: OperationId::from_static(id),
-        summary: summary.into(),
-        input_schema,
-        output_schema,
-        capability: CapabilityId::from_static(capability),
-        risk_level,
-        description: None,
-        rate_limit: None,
-        requires_approval: None,
-        safety_tier,
-        idempotency,
-        ai_hints,
-    }
+fn operation_contracts() -> FcpResult<&'static OperationContractSet> {
+    static CONTRACTS: OnceLock<FcpResult<OperationContractSet>> = OnceLock::new();
+    CONTRACTS
+        .get_or_init(|| OperationContractSet::from_manifest_toml(MANIFEST_TOML))
+        .as_ref()
+        .map_err(Clone::clone)
+}
+
+fn operations_info() -> FcpResult<&'static [OperationInfo]> {
+    static OPERATIONS: OnceLock<Result<Vec<OperationInfo>, String>> = OnceLock::new();
+    let operations = OPERATIONS.get_or_init(|| {
+        let manifest =
+            ConnectorManifest::parse_str(MANIFEST_TOML).map_err(|error| error.to_string())?;
+        if manifest.provides.operations.len() != OPERATION_IDS.len() {
+            return Err("Notion manifest does not match the implemented operation set".into());
+        }
+        OPERATION_IDS
+            .into_iter()
+            .map(|id| {
+                let operation = manifest
+                    .provides
+                    .operations
+                    .get(id)
+                    .ok_or_else(|| format!("Notion manifest is missing {id}"))?;
+                Ok(OperationInfo {
+                    id: OperationId::from_static(id),
+                    summary: operation.description.clone(),
+                    description: Some(operation.description.clone()),
+                    input_schema: operation.input_schema.clone(),
+                    output_schema: operation.output_schema.clone(),
+                    capability: operation.capability.clone(),
+                    risk_level: operation.risk_level,
+                    safety_tier: operation.safety_tier,
+                    idempotency: operation.idempotency,
+                    ai_hints: operation.ai_hints.clone(),
+                    rate_limit: operation.rate_limit.as_ref().map(|limit| limit.0.clone()),
+                    requires_approval: Some(ApprovalMode::from(operation.requires_approval)),
+                })
+            })
+            .collect()
+    });
+    operations.as_deref().map_err(|error| FcpError::Internal {
+        message: format!("Embedded Notion manifest is invalid: {error}"),
+    })
 }
 
 #[cfg(test)]
@@ -1518,6 +1239,8 @@ mod tests {
     use fcp_crypto::cose::CapabilityTokenBuilder;
     use fcp_crypto::ed25519::Ed25519SigningKey;
     use fcp_manifest::ConnectorManifest;
+    use fcp_prelude::{CapabilityToken, HandshakeResponse};
+    use sha2::{Digest, Sha256};
     use std::path::PathBuf;
 
     fn generate_valid_token(
@@ -1526,14 +1249,27 @@ mod tests {
         operations: &[&str],
         instance_id: &fcp_prelude::InstanceId,
     ) -> CapabilityToken {
-        use fcp_prelude::CapabilityConstraints;
+        generate_scoped_token(
+            signing_key,
+            cap,
+            operations,
+            instance_id,
+            &fcp_prelude::CapabilityConstraints {
+                resource_allow: vec!["*".into()],
+                ..Default::default()
+            },
+        )
+    }
 
-        let constraints = CapabilityConstraints {
-            resource_allow: vec!["*".into()],
-            ..Default::default()
-        };
+    fn generate_scoped_token(
+        signing_key: &Ed25519SigningKey,
+        cap: &str,
+        operations: &[&str],
+        instance_id: &InstanceId,
+        constraints: &fcp_prelude::CapabilityConstraints,
+    ) -> CapabilityToken {
         let mut constraints_cbor = Vec::new();
-        ciborium::into_writer(&constraints, &mut constraints_cbor).unwrap();
+        ciborium::into_writer(constraints, &mut constraints_cbor).unwrap();
 
         let now = Utc::now();
         let cose = CapabilityTokenBuilder::new()
@@ -1551,12 +1287,380 @@ mod tests {
         CapabilityToken::from_raw(cose)
     }
 
+    async fn negotiate(connector: &mut NotionConnector, key: &Ed25519SigningKey) {
+        connector
+            .handle_handshake(json!({
+                "protocol_version": "2.0.0",
+                "zone": "z:work",
+                "host_public_key": key.verifying_key().to_bytes(),
+                "nonce": vec![0_u8; 32],
+                "capabilities_requested": ["notion.read", "notion.write"]
+            }))
+            .await
+            .unwrap();
+    }
+
+    fn page_simulation(token: &CapabilityToken) -> serde_json::Value {
+        json!({
+            "type": "simulate",
+            "id": "simulate-page",
+            "connector_id": "fcp.notion",
+            "zone_id": "z:work",
+            "operation": "notion.get_page",
+            "input": {"page_id": "page-1"},
+            "capability_token": token
+        })
+    }
+
+    fn page_invocation(token: &CapabilityToken) -> serde_json::Value {
+        let mut request = page_simulation(token);
+        request["type"] = json!("invoke");
+        request["id"] = json!("invoke-page");
+        request
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn lifecycle_attempts_revoke_previous_authority_and_rotate_instance() {
+        for transition in [
+            "configure",
+            "failed_configure",
+            "handshake",
+            "failed_handshake",
+            "shutdown",
+        ] {
+            let mut connector = NotionConnector::new();
+            let config = json!({"credential_id": "550e8400-e29b-41d4-a716-446655440000"});
+            connector.handle_configure(config.clone()).await.unwrap();
+            let key = Ed25519SigningKey::generate();
+            negotiate(&mut connector, &key).await;
+            let old_instance = connector.instance_id().clone();
+            let old_token =
+                generate_valid_token(&key, "notion.read", &["notion.get_page"], &old_instance);
+            let admitted: SimulateResponse = serde_json::from_value(
+                connector
+                    .handle_simulate(page_simulation(&old_token))
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(admitted.would_succeed);
+
+            match transition {
+                "configure" => {
+                    connector.handle_configure(config.clone()).await.unwrap();
+                }
+                "failed_configure" => {
+                    assert!(
+                        connector
+                            .handle_configure(json!({"token": ""}))
+                            .await
+                            .is_err()
+                    );
+                }
+                "handshake" => negotiate(&mut connector, &key).await,
+                "failed_handshake" => {
+                    assert!(
+                        connector
+                            .handle_handshake(json!({"zone": "z:work"}))
+                            .await
+                            .is_err()
+                    );
+                }
+                "shutdown" => {
+                    connector.handle_shutdown(json!({})).await.unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert_ne!(connector.instance_id(), &old_instance, "{transition}");
+            let denied: SimulateResponse = serde_json::from_value(
+                connector
+                    .handle_simulate(page_simulation(&old_token))
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(!denied.would_succeed, "{transition}");
+            assert!(
+                connector
+                    .handle_invoke(page_invocation(&old_token))
+                    .await
+                    .is_err(),
+                "{transition}"
+            );
+
+            connector.handle_configure(config).await.unwrap();
+            negotiate(&mut connector, &key).await;
+            let fresh = generate_valid_token(
+                &key,
+                "notion.read",
+                &["notion.get_page"],
+                connector.instance_id(),
+            );
+            let admitted: SimulateResponse = serde_json::from_value(
+                connector
+                    .handle_simulate(page_simulation(&fresh))
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(admitted.would_succeed, "fresh session after {transition}");
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn negotiated_capabilities_cannot_be_expanded_by_a_valid_host_signature() {
+        let mut connector = NotionConnector::new();
+        connector
+            .handle_configure(json!({"credential_id": "550e8400-e29b-41d4-a716-446655440000"}))
+            .await
+            .unwrap();
+        let key = Ed25519SigningKey::generate();
+        let response = connector
+            .handle_handshake(json!({
+                "protocol_version": "2.0.0",
+                "zone": "z:work",
+                "host_public_key": key.verifying_key().to_bytes(),
+                "nonce": vec![0_u8; 32],
+                "capabilities_requested": ["notion.write", "notion.write", "notion.get_page", "unknown.cap"]
+            }))
+            .await
+            .unwrap();
+        let negotiated: HandshakeResponse = serde_json::from_value(response).unwrap();
+        assert_eq!(negotiated.capabilities_granted.len(), 1);
+        assert_eq!(
+            negotiated.capabilities_granted[0].capability.as_str(),
+            "notion.write"
+        );
+        let token = generate_valid_token(
+            &key,
+            "notion.read",
+            &["notion.get_page"],
+            connector.instance_id(),
+        );
+        let denied: SimulateResponse = serde_json::from_value(
+            connector
+                .handle_simulate(page_simulation(&token))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(!denied.would_succeed);
+        assert_eq!(denied.missing_capabilities, vec!["notion.read"]);
+        assert!(matches!(
+            connector.handle_invoke(page_invocation(&token)).await,
+            Err(FcpError::CapabilityDenied { .. })
+        ));
+
+        negotiate(&mut connector, &key).await;
+        let wrong_capability = generate_valid_token(
+            &key,
+            "notion.write",
+            &["notion.get_page"],
+            connector.instance_id(),
+        );
+        let denied: SimulateResponse = serde_json::from_value(
+            connector
+                .handle_simulate(page_simulation(&wrong_capability))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(!denied.would_succeed);
+        assert_eq!(denied.missing_capabilities, vec!["notion.read"]);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn simulate_and_invoke_share_schema_identity_signature_and_resource_gates() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut connector = NotionConnector::new();
+        connector
+            .handle_configure(json!({
+                "token": "ntn_no_io",
+                "api_url": format!("http://{}/v1", listener.local_addr().unwrap())
+            }))
+            .await
+            .unwrap();
+        let key = Ed25519SigningKey::generate();
+        negotiate(&mut connector, &key).await;
+        let token = generate_valid_token(
+            &key,
+            "notion.read",
+            &["notion.get_page"],
+            connector.instance_id(),
+        );
+        let allowed: SimulateResponse = serde_json::from_value(
+            connector
+                .handle_simulate(page_simulation(&token))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(allowed.would_succeed);
+        let impostor = Ed25519SigningKey::generate();
+        let forged = generate_valid_token(
+            &impostor,
+            "notion.read",
+            &["notion.get_page"],
+            connector.instance_id(),
+        );
+        let denied_resource = generate_scoped_token(
+            &key,
+            "notion.read",
+            &["notion.get_page"],
+            connector.instance_id(),
+            &fcp_prelude::CapabilityConstraints {
+                resource_allow: vec!["*".into()],
+                resource_deny: vec!["notion://page/page-1".into()],
+                ..Default::default()
+            },
+        );
+        let mut cases = Vec::new();
+        for (field, value) in [
+            ("connector_id", json!("fcp.other")),
+            ("zone_id", json!("z:private")),
+            ("operation", json!("notion.nonexistent")),
+            ("input", json!({"page_id": 7})),
+            ("input", json!({})),
+        ] {
+            let mut request = page_simulation(&token);
+            request[field] = value;
+            cases.push(request);
+        }
+        cases.push(page_simulation(&forged));
+        cases.push(page_simulation(&denied_resource));
+        for mut request in cases {
+            let denied: SimulateResponse =
+                serde_json::from_value(connector.handle_simulate(request.clone()).await.unwrap())
+                    .unwrap();
+            assert!(!denied.would_succeed);
+            request["type"] = json!("invoke");
+            assert!(connector.handle_invoke(request).await.is_err());
+        }
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn compact_uuid_cannot_evade_a_resource_deny() {
+        let mut connector = NotionConnector::new();
+        connector
+            .handle_configure(json!({"credential_id": "550e8400-e29b-41d4-a716-446655440000"}))
+            .await
+            .unwrap();
+        let key = Ed25519SigningKey::generate();
+        negotiate(&mut connector, &key).await;
+        let token = generate_scoped_token(
+            &key,
+            "notion.read",
+            &["notion.get_page"],
+            connector.instance_id(),
+            &fcp_prelude::CapabilityConstraints {
+                resource_allow: vec!["*".into()],
+                resource_deny: vec!["notion://page/550e8400-e29b-41d4-a716-446655440000".into()],
+                ..Default::default()
+            },
+        );
+        for id in [
+            "550e8400-e29b-41d4-a716-446655440000",
+            "550E8400E29B41D4A716446655440000",
+        ] {
+            let mut request = page_simulation(&token);
+            request["input"]["page_id"] = json!(id);
+            let denied: SimulateResponse =
+                serde_json::from_value(connector.handle_simulate(request.clone()).await.unwrap())
+                    .unwrap();
+            assert!(!denied.would_succeed, "{id}");
+            request["type"] = json!("invoke");
+            assert!(connector.handle_invoke(request).await.is_err(), "{id}");
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn forbidden_zones_and_cross_zone_rebinding_fail_closed() {
+        let mut connector = NotionConnector::new();
+        let config = json!({"credential_id": "550e8400-e29b-41d4-a716-446655440000"});
+        connector.handle_configure(config.clone()).await.unwrap();
+        let key = Ed25519SigningKey::generate();
+        let request = |zone| {
+            json!({
+                "protocol_version": "2.0.0",
+                "zone": zone,
+                "host_public_key": key.verifying_key().to_bytes(),
+                "nonce": vec![0_u8; 32],
+                "capabilities_requested": ["notion.read"]
+            })
+        };
+
+        assert!(matches!(
+            connector.handle_handshake(request("z:public")).await,
+            Err(FcpError::CapabilityDenied { .. })
+        ));
+        connector.handle_handshake(request("z:work")).await.unwrap();
+        let previous_instance = connector.instance_id().clone();
+        let previous_token = generate_valid_token(
+            &key,
+            "notion.read",
+            &["notion.get_page"],
+            &previous_instance,
+        );
+        assert!(matches!(
+            connector.handle_handshake(request("z:private")).await,
+            Err(FcpError::CapabilityDenied { .. })
+        ));
+        assert_ne!(connector.instance_id(), &previous_instance);
+        let denied: SimulateResponse = serde_json::from_value(
+            connector
+                .handle_simulate(page_simulation(&previous_token))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(!denied.would_succeed);
+        assert_eq!(connector.bound_zone, Some(ZoneId::work()));
+
+        connector.handle_handshake(request("z:work")).await.unwrap();
+        connector.handle_configure(config).await.unwrap();
+        connector
+            .handle_handshake(request("z:private"))
+            .await
+            .unwrap();
+        assert_eq!(connector.bound_zone, Some(ZoneId::private()));
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn runtime_catalog_preserves_every_manifest_schema_and_policy() {
+        let connector = NotionConnector::new();
+        let catalog: Introspection =
+            serde_json::from_value(connector.handle_introspect().await.unwrap()).unwrap();
+        let manifest = ConnectorManifest::parse_str(MANIFEST_TOML).unwrap();
+        assert_eq!(catalog.operations.len(), manifest.provides.operations.len());
+        for operation in catalog.operations {
+            let declared = &manifest.provides.operations[operation.id.as_str()];
+            assert_eq!(operation.input_schema, declared.input_schema);
+            assert_eq!(operation.output_schema, declared.output_schema);
+            assert_eq!(operation.capability, declared.capability);
+            assert_eq!(operation.risk_level, declared.risk_level);
+            assert_eq!(operation.safety_tier, declared.safety_tier);
+            assert_eq!(operation.idempotency, declared.idempotency);
+            assert_eq!(
+                operation.requires_approval,
+                Some(ApprovalMode::from(declared.requires_approval))
+            );
+        }
+    }
+
     #[fcp_async_core::runtime::test]
     async fn test_handshake() {
         let mut connector = NotionConnector::new();
+        connector
+            .handle_configure(json!({"credential_id": "550e8400-e29b-41d4-a716-446655440000"}))
+            .await
+            .unwrap();
         let result = connector
             .handle_handshake(json!({
-                "protocol_version": "1.0.0",
+                "protocol_version": "2.0.0",
                 "zone": "z:work",
                 "host_public_key": vec![0u8; 32],
                 "nonce": vec![0u8; 32],
@@ -1572,7 +1676,11 @@ mod tests {
     async fn test_health_not_configured() {
         let connector = NotionConnector::new();
         let result = connector.handle_health().await.unwrap();
-        assert_eq!(result["status"], "not_configured");
+        let health: HealthSnapshot = serde_json::from_value(result).unwrap();
+        let details = health.details.unwrap();
+        assert_eq!(details["configured"], false);
+        assert_eq!(details["handshaken"], false);
+        assert_eq!(details["instance_id"], connector.instance_id().as_str());
     }
 
     #[fcp_async_core::runtime::test]
@@ -1582,16 +1690,16 @@ mod tests {
         let signing_key = Ed25519SigningKey::generate();
         let verifying_key = signing_key.verifying_key();
 
-        connector
+        let handshake = connector
             .handle_handshake(json!({
-                "protocol_version": "1.0.0",
+                "protocol_version": "2.0.0",
                 "zone": "z:work",
                 "host_public_key": verifying_key.to_bytes(),
                 "nonce": vec![0u8; 32],
-                "capabilities_requested": ["notion.get_page"]
+                "capabilities_requested": ["notion.read"]
             }))
-            .await
-            .unwrap();
+            .await;
+        assert!(matches!(handshake, Err(FcpError::NotConfigured)));
 
         let token = generate_valid_token(
             &signing_key,
@@ -1602,6 +1710,10 @@ mod tests {
 
         let result = connector
             .handle_invoke(json!({
+                "type": "invoke",
+                "id": "get-page-unconfigured",
+                "connector_id": "fcp.notion",
+                "zone_id": "z:work",
                 "operation": "notion.get_page",
                 "input": { "page_id": "page-123" },
                 "capability_token": token
@@ -1628,11 +1740,11 @@ mod tests {
 
         connector
             .handle_handshake(json!({
-                "protocol_version": "1.0.0",
+                "protocol_version": "2.0.0",
                 "zone": "z:work",
                 "host_public_key": verifying_key.to_bytes(),
                 "nonce": vec![0u8; 32],
-                "capabilities_requested": ["notion.get_page"]
+                "capabilities_requested": ["notion.read"]
             }))
             .await
             .unwrap();
@@ -1646,6 +1758,10 @@ mod tests {
 
         let result = connector
             .handle_invoke(json!({
+                "type": "invoke",
+                "id": "get-page-missing-id",
+                "connector_id": "fcp.notion",
+                "zone_id": "z:work",
                 "operation": "notion.get_page",
                 "input": {},
                 "capability_token": token
@@ -1655,7 +1771,7 @@ mod tests {
         assert!(result.is_err());
         match result.unwrap_err() {
             FcpError::InvalidRequest { message, .. } => {
-                assert!(message.contains("page_id"));
+                assert!(message.contains("declared schema"));
             }
             e => panic!("Expected InvalidRequest, got: {e:?}"),
         }
@@ -1706,11 +1822,11 @@ mod tests {
 
         connector
             .handle_handshake(json!({
-                "protocol_version": "1.0.0",
+                "protocol_version": "2.0.0",
                 "zone": "z:work",
                 "host_public_key": verifying_key.to_bytes(),
                 "nonce": vec![0u8; 32],
-                "capabilities_requested": ["notion.get_database"]
+                "capabilities_requested": ["notion.read"]
             }))
             .await
             .unwrap();
@@ -1724,6 +1840,10 @@ mod tests {
 
         let result = connector
             .handle_invoke(json!({
+                "type": "invoke",
+                "id": "get-database-missing-id",
+                "connector_id": "fcp.notion",
+                "zone_id": "z:work",
                 "operation": "notion.get_database",
                 "input": {},
                 "capability_token": token
@@ -1733,7 +1853,7 @@ mod tests {
         assert!(result.is_err());
         match result.unwrap_err() {
             FcpError::InvalidRequest { message, .. } => {
-                assert!(message.contains("database_id"));
+                assert!(message.contains("declared schema"));
             }
             e => panic!("Expected InvalidRequest, got: {e:?}"),
         }
@@ -1755,11 +1875,11 @@ mod tests {
 
         connector
             .handle_handshake(json!({
-                "protocol_version": "1.0.0",
+                "protocol_version": "2.0.0",
                 "zone": "z:work",
                 "host_public_key": verifying_key.to_bytes(),
                 "nonce": vec![0u8; 32],
-                "capabilities_requested": ["notion.create_database"]
+                "capabilities_requested": ["notion.write"]
             }))
             .await
             .unwrap();
@@ -1774,6 +1894,10 @@ mod tests {
         // Missing parent
         let result = connector
             .handle_invoke(json!({
+                "type": "invoke",
+                "id": "create-database-missing-parent",
+                "connector_id": "fcp.notion",
+                "zone_id": "z:work",
                 "operation": "notion.create_database",
                 "input": {"title": [], "properties": {}},
                 "capability_token": token
@@ -1782,7 +1906,7 @@ mod tests {
         assert!(result.is_err());
         match result.unwrap_err() {
             FcpError::InvalidRequest { message, .. } => {
-                assert!(message.contains("parent"));
+                assert!(message.contains("declared schema"));
             }
             e => panic!("Expected InvalidRequest for parent, got: {e:?}"),
         }
@@ -1796,6 +1920,10 @@ mod tests {
         );
         let result2 = connector
             .handle_invoke(json!({
+                "type": "invoke",
+                "id": "create-database-missing-title",
+                "connector_id": "fcp.notion",
+                "zone_id": "z:work",
                 "operation": "notion.create_database",
                 "input": {"parent": {"page_id": "p1"}, "properties": {}},
                 "capability_token": token2
@@ -1804,7 +1932,7 @@ mod tests {
         assert!(result2.is_err());
         match result2.unwrap_err() {
             FcpError::InvalidRequest { message, .. } => {
-                assert!(message.contains("title"));
+                assert!(message.contains("declared schema"));
             }
             e => panic!("Expected InvalidRequest for title, got: {e:?}"),
         }
@@ -1818,6 +1946,10 @@ mod tests {
         );
         let result3 = connector
             .handle_invoke(json!({
+                "type": "invoke",
+                "id": "create-database-missing-properties",
+                "connector_id": "fcp.notion",
+                "zone_id": "z:work",
                 "operation": "notion.create_database",
                 "input": {"parent": {"page_id": "p1"}, "title": []},
                 "capability_token": token3
@@ -1826,7 +1958,7 @@ mod tests {
         assert!(result3.is_err());
         match result3.unwrap_err() {
             FcpError::InvalidRequest { message, .. } => {
-                assert!(message.contains("properties"));
+                assert!(message.contains("declared schema"));
             }
             e => panic!("Expected InvalidRequest for properties, got: {e:?}"),
         }
@@ -1848,11 +1980,11 @@ mod tests {
 
         connector
             .handle_handshake(json!({
-                "protocol_version": "1.0.0",
+                "protocol_version": "2.0.0",
                 "zone": "z:work",
                 "host_public_key": verifying_key.to_bytes(),
                 "nonce": vec![0u8; 32],
-                "capabilities_requested": ["notion.get_block"]
+                "capabilities_requested": ["notion.read"]
             }))
             .await
             .unwrap();
@@ -1866,6 +1998,10 @@ mod tests {
 
         let result = connector
             .handle_invoke(json!({
+                "type": "invoke",
+                "id": "get-block-missing-id",
+                "connector_id": "fcp.notion",
+                "zone_id": "z:work",
                 "operation": "notion.get_block",
                 "input": {},
                 "capability_token": token
@@ -1875,7 +2011,7 @@ mod tests {
         assert!(result.is_err());
         match result.unwrap_err() {
             FcpError::InvalidRequest { message, .. } => {
-                assert!(message.contains("block_id"));
+                assert!(message.contains("declared schema"));
             }
             e => panic!("Expected InvalidRequest, got: {e:?}"),
         }
@@ -1897,11 +2033,11 @@ mod tests {
 
         connector
             .handle_handshake(json!({
-                "protocol_version": "1.0.0",
+                "protocol_version": "2.0.0",
                 "zone": "z:work",
                 "host_public_key": verifying_key.to_bytes(),
                 "nonce": vec![0u8; 32],
-                "capabilities_requested": ["notion.delete_block"]
+                "capabilities_requested": ["notion.delete"]
             }))
             .await
             .unwrap();
@@ -1915,6 +2051,10 @@ mod tests {
 
         let result = connector
             .handle_invoke(json!({
+                "type": "invoke",
+                "id": "delete-block-missing-id",
+                "connector_id": "fcp.notion",
+                "zone_id": "z:work",
                 "operation": "notion.delete_block",
                 "input": {},
                 "capability_token": token
@@ -1924,7 +2064,7 @@ mod tests {
         assert!(result.is_err());
         match result.unwrap_err() {
             FcpError::InvalidRequest { message, .. } => {
-                assert!(message.contains("block_id"));
+                assert!(message.contains("declared schema"));
             }
             e => panic!("Expected InvalidRequest, got: {e:?}"),
         }
@@ -2189,10 +2329,13 @@ mod tests {
             .await
             .unwrap();
         let health = connector.handle_health().await.unwrap();
-        assert_eq!(health["status"], "healthy");
-        assert!(health["auth_mode"].as_str().unwrap().contains("token"));
-        assert!(health["api_url"].as_str().is_some());
-        assert_eq!(health["notion_version"], DEFAULT_NOTION_VERSION);
+        let snapshot: HealthSnapshot = serde_json::from_value(health).unwrap();
+        let details = snapshot.details.unwrap();
+        assert_eq!(details["configured"], true);
+        assert_eq!(details["handshaken"], false);
+        assert!(details["auth_mode"].as_str().unwrap().contains("token"));
+        assert!(details["api_url"].as_str().is_some());
+        assert_eq!(details["notion_version"], DEFAULT_NOTION_VERSION);
     }
 
     #[fcp_async_core::runtime::test]
@@ -2389,15 +2532,29 @@ mod tests {
         assert_eq!(computed, computed2);
     }
 
-    #[test]
-    fn handshake_manifest_hash_tracks_bundled_manifest() {
+    #[fcp_async_core::runtime::test]
+    async fn handshake_manifest_hash_tracks_bundled_manifest() {
         let mut hasher = Sha256::new();
         hasher.update(MANIFEST_TOML.as_bytes());
         let expected = format!("sha256:{}", hex::encode(hasher.finalize()));
 
-        let actual = NotionConnector::manifest_hash();
-
-        assert_eq!(actual, expected);
-        assert_ne!(actual, "sha256:notion-connector-v1");
+        let mut connector = NotionConnector::new();
+        connector
+            .handle_configure(json!({"credential_id": "550e8400-e29b-41d4-a716-446655440000"}))
+            .await
+            .unwrap();
+        let key = Ed25519SigningKey::generate();
+        let response = connector
+            .handle_handshake(json!({
+                "protocol_version": "2.0.0",
+                "zone": "z:work",
+                "host_public_key": key.verifying_key().to_bytes(),
+                "nonce": vec![0_u8; 32],
+                "capabilities_requested": []
+            }))
+            .await
+            .unwrap();
+        assert_eq!(response["manifest_hash"], expected);
+        assert_eq!(response["instance_id"], json!(connector.instance_id()));
     }
 }

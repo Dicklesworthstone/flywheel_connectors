@@ -9,14 +9,16 @@
 
 use std::{
     fmt::Write as FmtWrite,
-    io::{Read, Write as IoWrite},
+    io::{BufRead, BufReader, Read, Write as IoWrite},
     net::{TcpListener, TcpStream},
+    process::{Child, ChildStdin, Command, ExitStatus, Stdio},
     sync::mpsc::{self, Receiver},
     thread::{self, JoinHandle},
-    time::Duration as StdDuration,
+    time::{Duration as StdDuration, Instant},
 };
 
 use chrono::{Duration as ChronoDuration, Utc};
+use fcp_core::{HealthSnapshot, Introspection, InvokeResponse, InvokeStatus, SimulateResponse};
 use fcp_crypto::{cose::CapabilityTokenBuilder, ed25519::Ed25519SigningKey};
 use fcp_notion::{client::DEFAULT_NOTION_VERSION, connector::NotionConnector};
 use fcp_prelude::{CapabilityConstraints, CapabilityToken, FcpError, InstanceId};
@@ -48,6 +50,9 @@ impl LoopbackServer {
     fn start(response: HttpResponse) -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0))
             .expect("loopback listener should bind to an ephemeral port");
+        listener
+            .set_nonblocking(true)
+            .expect("loopback listener should be nonblocking");
         let base_url = format!(
             "http://{}",
             listener
@@ -57,9 +62,17 @@ impl LoopbackServer {
         let (request_tx, received) = mpsc::channel();
 
         let join = thread::spawn(move || {
-            let (mut stream, _) = listener
-                .accept()
-                .expect("loopback listener should accept expected request");
+            let deadline = Instant::now() + StdDuration::from_secs(10);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "loopback request timed out");
+                        thread::sleep(StdDuration::from_millis(5));
+                    }
+                    Err(error) => panic!("loopback accept failed: {error}"),
+                }
+            };
             stream
                 .set_read_timeout(Some(StdDuration::from_secs(5)))
                 .expect("loopback stream should set read timeout");
@@ -211,13 +224,28 @@ fn valid_capability_grant(
     capability: &str,
     operation: &str,
 ) -> CapabilityToken {
+    scoped_capability_grant(
+        signing_key,
+        instance_id,
+        capability,
+        operation,
+        &CapabilityConstraints {
+            resource_allow: vec!["*".into()],
+            ..Default::default()
+        },
+    )
+}
+
+fn scoped_capability_grant(
+    signing_key: &Ed25519SigningKey,
+    instance_id: &InstanceId,
+    capability: &str,
+    operation: &str,
+    constraints: &CapabilityConstraints,
+) -> CapabilityToken {
     let now = Utc::now();
-    let constraints = CapabilityConstraints {
-        resource_allow: vec!["*".into()],
-        ..Default::default()
-    };
     let mut cbor = Vec::new();
-    ciborium::into_writer(&constraints, &mut cbor).expect("serialize capability constraints");
+    ciborium::into_writer(constraints, &mut cbor).expect("serialize capability constraints");
     let cose = CapabilityTokenBuilder::new()
         .capability_id(capability)
         .zone_id("z:work")
@@ -225,6 +253,7 @@ fn valid_capability_grant(
         .operations(&[operation])
         .issuer("node:local-non-mock")
         .target_instance(instance_id.as_str())
+        .token_id(b"notion-local-non-mock-grant")
         .validity(now, now + ChronoDuration::hours(1))
         .try_constraints_cbor(&cbor)
         .expect("constraints CBOR should validate")
@@ -249,7 +278,7 @@ async fn setup_connector(
     let signing_key = Ed25519SigningKey::generate();
     connector
         .handle_handshake(json!({
-            "protocol_version": "1.0.0",
+            "protocol_version": "2.0.0",
             "zone": "z:work",
             "host_public_key": signing_key.verifying_key().to_bytes(),
             "nonce": vec![7_u8; 32],
@@ -259,6 +288,313 @@ async fn setup_connector(
         .expect("handshake connector");
 
     (connector, signing_key)
+}
+
+struct NativeProcess {
+    child: Child,
+    input: Option<ChildStdin>,
+    output: Receiver<Result<Value, String>>,
+    reader: Option<JoinHandle<()>>,
+}
+
+impl NativeProcess {
+    fn start() -> Self {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_fcp-notion"))
+            .env("RUST_LOG", "off")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("shipped Notion binary should start");
+        let input = child.stdin.take().expect("child stdin");
+        let stdout = child.stdout.take().expect("child stdout");
+        let (sender, output) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let response = line.map_err(|error| error.to_string()).and_then(|line| {
+                    serde_json::from_str(&line).map_err(|error| error.to_string())
+                });
+                if sender.send(response).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            child,
+            input: Some(input),
+            output,
+            reader: Some(reader),
+        }
+    }
+
+    fn send_bytes(&mut self, frame: &[u8]) -> std::io::Result<()> {
+        let input = self.input.as_mut().expect("live child stdin");
+        input.write_all(frame)?;
+        input.flush()
+    }
+
+    fn send(&mut self, frame: &Value) {
+        let mut bytes = serde_json::to_vec(frame).expect("serialize RPC");
+        bytes.push(b'\n');
+        self.send_bytes(&bytes).expect("write RPC");
+    }
+
+    fn receive(&self) -> Value {
+        self.output
+            .recv_timeout(StdDuration::from_secs(10))
+            .expect("native response should arrive within deadline")
+            .expect("stdout must contain only JSONL responses")
+    }
+
+    fn rpc(&mut self, id: &str, method: &str, params: Value) -> Value {
+        self.send(&json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params
+        }));
+        let response = self.receive();
+        assert_eq!(response["id"], id);
+        response
+    }
+
+    fn wait_for_exit(&mut self) -> ExitStatus {
+        // Keep stdin open while waiting: a successful shutdown must exit by
+        // itself, rather than depending on the host closing the pipe.
+        let deadline = Instant::now() + StdDuration::from_secs(5);
+        let status = loop {
+            if let Some(status) = self.child.try_wait().expect("poll native process") {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "native process did not terminate"
+            );
+            thread::sleep(StdDuration::from_millis(10));
+        };
+        self.input.take();
+        if let Some(reader) = self.reader.take() {
+            reader.join().expect("stdout reader should finish");
+        }
+        status
+    }
+}
+
+impl Drop for NativeProcess {
+    fn drop(&mut self) {
+        self.input.take();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+    }
+}
+
+fn capability_denied_code() -> String {
+    FcpError::CapabilityDenied {
+        capability: CAP_SEARCH.into(),
+        reason: "test".into(),
+    }
+    .error_code()
+}
+
+#[test]
+fn native_binary_host_contract_and_signed_budgets_reach_real_http() {
+    let server = LoopbackServer::start(HttpResponse::json(
+        "200 OK",
+        r#"{"object":"list","results":[],"has_more":false,"next_cursor":null}"#,
+    ));
+    let mut process = NativeProcess::start();
+    let initial: HealthSnapshot =
+        serde_json::from_value(process.rpc("boot", "health", json!({}))["result"].clone())
+            .expect("initial health must use the host health schema");
+    assert_eq!(initial.details.as_ref().unwrap()["configured"], false);
+
+    let configured = process.rpc(
+        "configure",
+        "configure",
+        json!({"token": LOOPBACK_BEARER_VALUE, "api_url": server.notion_api_url()}),
+    );
+    assert_eq!(configured["result"]["status"], "configured");
+    let key = Ed25519SigningKey::generate();
+    let handshake = process.rpc(
+        "handshake",
+        "handshake",
+        json!({
+            "protocol_version": "2.0.0",
+            "zone": "z:work",
+            "host_public_key": key.verifying_key().to_bytes(),
+            "nonce": vec![9_u8; 32],
+            "capabilities_requested": [CAP_SEARCH, CAP_SEARCH, "notion.admin"]
+        }),
+    );
+    assert_eq!(handshake["result"]["status"], "accepted");
+    assert_eq!(
+        handshake["result"]["capabilities_granted"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let health: HealthSnapshot =
+        serde_json::from_value(process.rpc("ready", "health", json!({}))["result"].clone())
+            .expect("negotiated health must use the host health schema");
+    let details = health.details.unwrap();
+    assert_eq!(details["configured"], true);
+    assert_eq!(details["handshaken"], true);
+    assert_eq!(details["instance_id"], handshake["result"]["instance_id"]);
+    let instance: InstanceId = serde_json::from_value(details["instance_id"].clone()).unwrap();
+    assert_ne!(
+        json!(instance),
+        initial.details.unwrap()["instance_id"],
+        "handshake must rotate the real instance"
+    );
+    let catalog: Introspection =
+        serde_json::from_value(process.rpc("catalog", "introspect", json!({}))["result"].clone())
+            .expect("binary must expose typed operation metadata");
+    assert_eq!(catalog.operations.len(), 16);
+
+    let token = scoped_capability_grant(
+        &key,
+        &instance,
+        CAP_SEARCH,
+        OP_SEARCH,
+        &CapabilityConstraints {
+            resource_allow: vec!["notion://workspace/search".into()],
+            max_calls: Some(1),
+            max_bytes: Some(1_000_000),
+            ..Default::default()
+        },
+    );
+    let mut request = json!({
+        "type": "simulate",
+        "id": "search-preview",
+        "connector_id": "fcp.notion",
+        "zone_id": "z:work",
+        "operation": OP_SEARCH,
+        "input": {"query": "FCP binary proof"},
+        "capability_token": token
+    });
+    for _ in 0..3 {
+        let preview: SimulateResponse = serde_json::from_value(
+            process.rpc("preview", "simulate", request.clone())["result"].clone(),
+        )
+        .unwrap();
+        assert!(preview.would_succeed);
+    }
+    assert!(matches!(
+        server.received.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
+
+    request["type"] = json!("invoke");
+    request["id"] = json!("provider-invocation");
+    let mut malformed = request.clone();
+    malformed.as_object_mut().unwrap().remove("connector_id");
+    assert_eq!(
+        process.rpc("missing-target", "invoke", malformed)["error"]["code"],
+        "FCP-1003"
+    );
+    let mut expired = request.clone();
+    expired["deadline_ms"] = json!(0);
+    assert_eq!(
+        process.rpc("expired", "invoke", expired)["error"]["code"],
+        "FCP-1003"
+    );
+    let tiny_grant = scoped_capability_grant(
+        &key,
+        &instance,
+        CAP_SEARCH,
+        OP_SEARCH,
+        &CapabilityConstraints {
+            resource_allow: vec!["*".into()],
+            max_bytes: Some(1),
+            ..Default::default()
+        },
+    );
+    let mut too_large = request.clone();
+    too_large["capability_token"] = json!(tiny_grant);
+    assert_eq!(
+        process.rpc("tiny-byte-budget", "invoke", too_large)["error"]["code"],
+        capability_denied_code()
+    );
+    assert!(matches!(
+        server.received.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
+
+    let outer = process.rpc("transport-invocation", "invoke", request.clone());
+    let response: InvokeResponse = serde_json::from_value(outer["result"].clone())
+        .expect("binary must return a complete InvokeResponse");
+    assert_eq!(response.r#type, "response");
+    assert_eq!(response.id.0, "provider-invocation");
+    assert_eq!(response.status, InvokeStatus::Ok);
+    let result = response.result.unwrap();
+    assert_eq!(result["result_count"], 0);
+    assert_eq!(result["sensitivity"], "workspace_wide");
+    let captured = server.take();
+    assert_request(&captured);
+    assert_eq!(captured.body, json!({"query": "FCP binary proof"}));
+
+    let replay = process.rpc("spent-grant", "invoke", request.clone());
+    assert_eq!(replay["error"]["code"], capability_denied_code());
+    request["type"] = json!("simulate");
+    let spent_preview: SimulateResponse =
+        serde_json::from_value(process.rpc("spent-preview", "simulate", request)["result"].clone())
+            .unwrap();
+    assert!(!spent_preview.would_succeed);
+    assert_eq!(
+        process.rpc("shutdown", "shutdown", json!({}))["result"]["status"],
+        "shutdown"
+    );
+    assert!(process.wait_for_exit().success());
+    assert!(process.output.try_recv().is_err());
+    server.join();
+}
+
+#[test]
+fn native_binary_recovers_from_bad_frames_and_shutdown_stops_buffered_work() {
+    let mut process = NativeProcess::start();
+    process.send_bytes(b"{broken json\n").unwrap();
+    assert!(process.receive().get("error").is_some());
+    process.send(&json!({"jsonrpc": "2.0", "id": null, "method": "health", "params": {}}));
+    let health = process.receive();
+    assert_eq!(health["id"], Value::Null);
+    serde_json::from_value::<HealthSnapshot>(health["result"].clone()).unwrap();
+
+    process.send(&json!({"jsonrpc": "2.0", "id": {}, "method": "health", "params": {}}));
+    assert_eq!(process.receive()["error"]["code"], "FCP-1001");
+    process.send(&json!({"jsonrpc": "1.0", "id": 7, "method": "health", "params": {}}));
+    assert_eq!(process.receive()["error"]["code"], "FCP-1001");
+
+    process
+        .send_bytes(
+            b"{\"jsonrpc\":\"2.0\",\"id\":\"quit\",\"method\":\"shutdown\",\"params\":{}}\n\
+              {\"jsonrpc\":\"2.0\",\"id\":\"must-not-run\",\"method\":\"health\",\"params\":{}}\n",
+        )
+        .unwrap();
+    let shutdown = process.receive();
+    assert_eq!(shutdown["id"], "quit");
+    assert_eq!(shutdown["result"]["status"], "shutdown");
+    assert!(process.wait_for_exit().success());
+    assert!(
+        process.output.try_recv().is_err(),
+        "buffered work ran after shutdown"
+    );
+}
+
+#[test]
+fn native_binary_closes_the_stream_after_an_oversized_frame() {
+    let mut process = NativeProcess::start();
+    let mut frame = vec![b'x'; fcp_sdk::prelude::JsonlConfig::default().max_request_bytes + 1];
+    frame.push(b'\n');
+    if let Err(error) = process.send_bytes(&frame) {
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+    assert_eq!(process.receive()["error"]["code"], "FCP-1004");
+    assert!(!process.wait_for_exit().success());
+    assert!(process.output.try_recv().is_err());
 }
 
 #[fcp_async_core::runtime::test]
@@ -299,12 +635,17 @@ async fn local_non_mock_search_posts_body_headers_and_redacts_output() {
             "next_cursor": null
         }"#,
     ));
-    let (connector, signing_key) = setup_connector(&server.notion_api_url(), &[CAP_SEARCH]).await;
+    let (mut connector, signing_key) =
+        setup_connector(&server.notion_api_url(), &[CAP_SEARCH]).await;
     let grant =
         valid_capability_grant(&signing_key, connector.instance_id(), CAP_SEARCH, OP_SEARCH);
 
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "loopback-search",
+            "connector_id": "fcp.notion",
+            "zone_id": "z:work",
             "operation": OP_SEARCH,
             "input": {
                 "query": "FCP local proof",
@@ -396,6 +737,10 @@ async fn local_non_mock_search_rejects_wrong_capability_token() {
 
     let err = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "loopback-wrong-capability",
+            "connector_id": "fcp.notion",
+            "zone_id": "z:work",
             "operation": OP_SEARCH,
             "input": {"query": "should not leave connector"},
             "capability_token": grant

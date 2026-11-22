@@ -45,7 +45,7 @@ impl NotionConnectorAdapter {
     fn new() -> Self {
         Self {
             connector: NotionConnector::new(),
-            id: ConnectorId::from_static("notion"),
+            id: ConnectorId::from_static("fcp.notion"),
         }
     }
 }
@@ -74,17 +74,9 @@ impl FcpConnector for NotionConnectorAdapter {
 
     async fn health(&self) -> HealthSnapshot {
         match self.connector.handle_health().await {
-            Ok(payload) => {
-                let status = payload
-                    .get("status")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("unknown");
-                match status {
-                    "healthy" => HealthSnapshot::ready(),
-                    "not_configured" => HealthSnapshot::degraded("not_configured"),
-                    other => HealthSnapshot::degraded(format!("notion_status:{other}")),
-                }
-            }
+            Ok(payload) => serde_json::from_value(payload).unwrap_or_else(|error| {
+                HealthSnapshot::error(format!("invalid Notion health: {error}"))
+            }),
             Err(err) => HealthSnapshot::error(err.to_string()),
         }
     }
@@ -139,12 +131,10 @@ impl FcpConnector for NotionConnectorAdapter {
     }
 
     async fn invoke(&self, req: InvokeRequest) -> fcp_core::FcpResult<InvokeResponse> {
-        let request_id = req.id;
-        let params = json!({
-            "operation": req.operation.as_str(),
-            "input": req.input,
-            "capability_token": req.capability_token,
-        });
+        let request_id = req.id.clone();
+        let params = serde_json::to_value(req).map_err(|error| FcpError::Internal {
+            message: format!("Failed to encode invocation: {error}"),
+        })?;
         let value = self.connector.handle_invoke(params).await?;
         Ok(InvokeResponse::ok(request_id, value))
     }
@@ -243,7 +233,7 @@ fn invoke_request(
     InvokeRequest {
         r#type: "invoke".to_string(),
         id: RequestId::from("notion-e2e"),
-        connector_id: ConnectorId::from_static("notion"),
+        connector_id: ConnectorId::from_static("fcp.notion"),
         operation: OperationId::from_static(operation),
         zone_id: ZoneId::work(),
         input,
@@ -371,6 +361,24 @@ async fn notion_default_deny_compliance_suite_passes() {
         .expect("compliance suite run");
 
     assert!(report.passed, "default deny compliance should pass");
+
+    // Prove that denial also holds for a token bound to the newly negotiated
+    // instance, so a stale pre-handshake binding cannot explain the result.
+    let bound_token = build_token(
+        &signing_key,
+        "notion.write",
+        &["notion.get_page"],
+        connector.connector.instance_id().as_str(),
+    );
+    let denied = connector
+        .invoke(invoke_request(
+            "notion.get_page",
+            json!({"page_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"}),
+            bound_token,
+        ))
+        .await
+        .expect_err("unnegotiated read capability must be denied");
+    assert!(matches!(denied, FcpError::CapabilityDenied { .. }));
 }
 
 // ============================================================================
@@ -395,16 +403,10 @@ async fn notion_allow_valid_token_connector_suite_passes() {
     // Introspection declares `notion.get_page` operation requires
     // capability `notion.read` (permission class, not op id).
     let handshake = handshake_request(signing_key.verifying_key().to_bytes(), &["notion.read"]);
-    let token = build_token(
-        &signing_key,
-        "notion.read",
-        &["notion.get_page"],
-        connector.connector.instance_id().as_str(),
-    );
-    let invoke = invoke_request(
+    let mut invoke = invoke_request(
         "notion.get_page",
         json!({ "page_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890" }),
-        token,
+        CapabilityToken::test_token(),
     );
     let suite = ConnectorSuite {
         test_name: "notion_allow_valid_token".to_string(),
@@ -413,7 +415,7 @@ async fn notion_allow_valid_token_connector_suite_passes() {
             "api_url": mock.base_url(),
         }),
         handshake,
-        invoke: Some(invoke),
+        invoke: None,
         invoke_expectations: InvokeExpectations {
             expect_error: false,
             expect_decision_receipt: false,
@@ -431,21 +433,30 @@ async fn notion_allow_valid_token_connector_suite_passes() {
         .expect("connector suite run");
 
     assert!(report.passed, "allow suite should pass");
-    let invoke_entry = report
-        .logs
-        .iter()
-        .find(|entry| entry.context.get("operation") == Some(&json!("invoke")))
-        .expect("invoke entry");
-    assert_eq!(invoke_entry.result, "pass");
+    assert!(connector.health().await.is_ready());
+    // The suite performs configuration and handshake. Sign only after it has
+    // returned the actual instance to which provider invocations are bound.
+    invoke.capability_token = build_token(
+        &signing_key,
+        "notion.read",
+        &["notion.get_page"],
+        connector.connector.instance_id().as_str(),
+    );
+    let response = connector
+        .invoke(invoke)
+        .await
+        .expect("authorized invocation");
+    assert_eq!(response.status, InvokeStatus::Ok);
     assert_eq!(
-        invoke_entry.context.get("invoke_status"),
-        Some(&json!(format!("{:?}", InvokeStatus::Ok)))
+        response.result.unwrap()["page"]["id"],
+        "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
     );
 
     // br-7e15h: independently verify the connector actually hit the
     // mock API, not just that the runner's report says passed.
     mock.assert_received("/pages/a1b2c3d4-e5f6-7890-abcd-ef1234567890")
         .await;
+    mock.assert_request_count(1).await;
 }
 
 // ============================================================================
