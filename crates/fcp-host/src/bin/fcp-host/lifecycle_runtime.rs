@@ -254,6 +254,7 @@ pub(super) async fn selected_entry(
     connector_id: &ConnectorId,
 ) -> HostResult<(RegistryEntry, u64)> {
     let state = registry.state.read().await;
+    registry.require_running()?;
     let entry = state
         .connectors
         .get(connector_id)

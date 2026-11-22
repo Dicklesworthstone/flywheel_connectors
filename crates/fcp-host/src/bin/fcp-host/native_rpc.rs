@@ -1296,6 +1296,7 @@ mod tests {
                 NativeInvocationTermination::new(invocation_deadline(Instant::now(), None));
             invocation.bind_inventory_fence(InventoryDispatchFence {
                 version: Arc::clone(&version),
+                shutting_down: Arc::new(AtomicBool::new(false)),
                 admitted_generation: 7,
             });
             let active = invocation.register_rpc_for_method(active_method);
@@ -1329,6 +1330,7 @@ mod tests {
             let fresh = NativeInvocationTermination::new(invocation_deadline(Instant::now(), None));
             fresh.bind_inventory_fence(InventoryDispatchFence {
                 version: Arc::clone(&version),
+                shutting_down: Arc::new(AtomicBool::new(false)),
                 admitted_generation: 8,
             });
             let next = fresh.register_rpc_for_method("invoke");
@@ -1346,6 +1348,7 @@ mod tests {
             NativeInvocationTermination::new(invocation_deadline(Instant::now(), None));
         invocation.bind_inventory_fence(InventoryDispatchFence {
             version: Arc::clone(&version),
+            shutting_down: Arc::new(AtomicBool::new(false)),
             admitted_generation: 1,
         });
         version.store(2, Ordering::SeqCst);

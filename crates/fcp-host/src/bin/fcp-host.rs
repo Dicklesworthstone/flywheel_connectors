@@ -2722,6 +2722,9 @@ struct SubprocessRegistry {
     version: Arc<AtomicU64>,
     capability_verifying_key: Option<[u8; PUBLIC_KEY_SIZE]>,
     rate_limiters: Arc<HostRateLimiterStore>,
+    // Sticky even when shutdown times out: retained HTTP/lifecycle callers
+    // must never reopen child-process admission after retirement starts.
+    shutting_down: Arc<AtomicBool>,
 }
 
 /// Runtime queues can outlive registry selection. Retain the generation that
@@ -2730,12 +2733,14 @@ struct SubprocessRegistry {
 #[derive(Clone, Debug)]
 struct InventoryDispatchFence {
     version: Arc<AtomicU64>,
+    shutting_down: Arc<AtomicBool>,
     admitted_generation: u64,
 }
 
 impl InventoryDispatchFence {
     fn is_current(&self) -> bool {
-        self.version.load(Ordering::SeqCst) == self.admitted_generation
+        !self.shutting_down.load(Ordering::SeqCst)
+            && self.version.load(Ordering::SeqCst) == self.admitted_generation
     }
 
     fn require_current(&self) -> HostResult<()> {
@@ -3638,6 +3643,126 @@ fn rate_limit_scope_label(scope: RateLimitScope) -> &'static str {
 }
 
 impl SubprocessRegistry {
+    fn require_running(&self) -> HostResult<()> {
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return Err(HostError::Unavailable(
+                "host connector registry is shutting down; new runtime work is refused".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Retire the exact registered runtimes under one absolute deadline. The
+    /// inventory gate excludes replacement/activation while this snapshot is
+    /// drained; the sticky flag also fences callers that outlive the gate.
+    async fn shutdown(&self, deadline: Instant) -> HostResult<()> {
+        self.shutting_down.store(true, Ordering::SeqCst);
+        if Instant::now() >= deadline {
+            return Err(HostError::Unavailable(
+                "host connector shutdown deadline expired before runtime retirement".to_owned(),
+            ));
+        }
+        let _transaction = fcp_async_core::time::timeout(
+            deadline.saturating_duration_since(Instant::now()),
+            self.inventory_transaction.lock(),
+        )
+        .await
+        .map_err(|_| {
+            HostError::Unavailable(
+                "host connector shutdown deadline expired waiting for an inventory transaction; runtime exit is unconfirmed"
+                    .to_owned(),
+            )
+        })?;
+        let mut connectors = fcp_async_core::time::timeout(
+            deadline.saturating_duration_since(Instant::now()),
+            async {
+                let state = self.state.read().await;
+                state
+                    .connectors
+                    .iter()
+                    .map(|(id, entry)| (id.clone(), entry.connector.clone()))
+                    .collect::<Vec<_>>()
+            },
+        )
+        .await
+        .map_err(|_| {
+            HostError::Unavailable(
+                "host connector shutdown deadline expired reading the runtime inventory; runtime exit is unconfirmed"
+                    .to_owned(),
+            )
+        })?;
+        connectors.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
+        if Instant::now() >= deadline {
+            return Err(HostError::Unavailable(
+                "host connector shutdown deadline expired before runtime retirement".to_owned(),
+            ));
+        }
+        let total = connectors.len();
+        // Poll every retirement concurrently. A busy or failed child must not
+        // prevent unrelated idle children from receiving their shutdown RPC.
+        let results = futures_util::future::join_all(connectors.into_iter().map(
+            |(connector_id, connector)| async move {
+                let result = fcp_async_core::time::timeout(
+                    deadline.saturating_duration_since(Instant::now()),
+                    async {
+                        match &connector {
+                            ConnectorRuntime::Native(native) => {
+                                native.retire_runtime(deadline).await
+                            }
+                            ConnectorRuntime::NativeWarmPool(pool) => {
+                                pool.retire_runtime(deadline).await
+                            }
+                            ConnectorRuntime::Wasi(wasi) => wasi.retire_runtime(deadline).await,
+                            ConnectorRuntime::Dormant(_)
+                            | ConnectorRuntime::UnavailableNativeProxyOnly(_) => Ok(()),
+                        }
+                    },
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    Err(HostError::Unavailable(
+                        "host connector shutdown deadline expired before confirmed runtime exit"
+                            .to_owned(),
+                    ))
+                });
+                match &result {
+                    Ok(()) => tracing::info!(
+                        event = "host_connector_retired",
+                        %connector_id,
+                        "registered connector runtime is stopped"
+                    ),
+                    Err(error) => tracing::error!(
+                        event = "host_connector_retirement_failed",
+                        %connector_id,
+                        %error,
+                        "registered connector runtime exit remains unconfirmed"
+                    ),
+                }
+                (connector_id, result)
+            },
+        ))
+        .await;
+        let failed = results
+            .into_iter()
+            .filter_map(|(id, result)| result.err().map(|_| id.to_string()))
+            .collect::<Vec<_>>();
+        tracing::info!(
+            event = "host_connector_shutdown_summary",
+            registered = total,
+            stopped = total - failed.len(),
+            unconfirmed = failed.len(),
+            "registered connector shutdown completed its bounded retirement sweep"
+        );
+        if !failed.is_empty() {
+            return Err(HostError::Unavailable(format!(
+                "host connector shutdown could not confirm retirement for {}/{total} runtimes: {}",
+                failed.len(),
+                failed.join(", ")
+            )));
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     async fn from_configs(
         configs: Vec<ConnectorConfig>,
@@ -3690,6 +3815,7 @@ impl SubprocessRegistry {
             version: Arc::new(AtomicU64::new(1)),
             capability_verifying_key,
             rate_limiters: Arc::new(HostRateLimiterStore::default()),
+            shutting_down: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -3842,12 +3968,14 @@ impl SubprocessRegistry {
     /// Check after asynchronous authority lookups and at each runtime handoff.
     /// A configuration publication never retargets already admitted authority.
     fn require_generation(&self, admitted_generation: u64) -> HostResult<()> {
+        self.require_running()?;
         self.inventory_fence(admitted_generation).require_current()
     }
 
     fn inventory_fence(&self, admitted_generation: u64) -> InventoryDispatchFence {
         InventoryDispatchFence {
             version: Arc::clone(&self.version),
+            shutting_down: Arc::clone(&self.shutting_down),
             admitted_generation,
         }
     }
@@ -3860,6 +3988,7 @@ impl SubprocessRegistry {
     }
 
     async fn plan_configs(&self, configs: Vec<ConnectorConfig>) -> HostResult<RegistryConfigPlan> {
+        self.require_running()?;
         let (
             current_configs,
             current_state_policies,
@@ -4037,6 +4166,7 @@ impl SubprocessRegistry {
                     current.connectors.get(connector_id),
                 )?;
             }
+            self.require_running()?;
             let (entry, fence) = lifecycle_runtime::prepare_entry(
                 plan.next_configs[connector_id].clone(),
                 admitted,
@@ -4186,6 +4316,7 @@ impl SubprocessRegistry {
         prepared: PreparedRegistryApply,
     ) -> HostResult<ConnectorInventoryApplyReport> {
         let mut state = self.state.write().await;
+        self.require_running()?;
         for fence in &prepared.launch_fences {
             fence.require_current()?;
         }
@@ -4271,6 +4402,7 @@ impl SubprocessRegistry {
         let connector_id = request.connector_id.clone();
         let connector = {
             let state = self.state.read().await;
+            self.require_running()?;
             state
                 .connectors
                 .get(&connector_id)
@@ -4722,6 +4854,7 @@ impl SubprocessRegistry {
         let connector_id = request.connector_id.clone();
         let connector = {
             let state = self.state.read().await;
+            self.require_running()?;
             state
                 .connectors
                 .get(&connector_id)
@@ -4751,7 +4884,7 @@ impl ConnectorRegistry for SubprocessRegistry {
         };
         let mut results = Vec::new();
         for (connector, zone_envelope_error) in connectors {
-            if let Some(error) = zone_envelope_error {
+            if let Some(error) = zone_envelope_error.or_else(|| self.require_running().err()) {
                 let mut summary = connector.static_summary();
                 summary.health = ConnectorHealth::unavailable(error.to_string());
                 summary.last_health_check = Some(chrono::Utc::now());
@@ -4773,7 +4906,7 @@ impl ConnectorRegistry for SubprocessRegistry {
                 )
             })
         }?;
-        if let Some(error) = zone_envelope_error {
+        if let Some(error) = zone_envelope_error.or_else(|| self.require_running().err()) {
             let mut summary = connector.static_summary();
             summary.health = ConnectorHealth::unavailable(error.to_string());
             summary.last_health_check = Some(chrono::Utc::now());
@@ -4786,6 +4919,7 @@ impl ConnectorRegistry for SubprocessRegistry {
     async fn get_introspection(&self, id: &ConnectorId) -> Option<Introspection> {
         let connector = {
             let state = self.state.read().await;
+            self.require_running().ok()?;
             let entry = state.connectors.get(id)?;
             if let Err(error) = require_allowed_zones_configured(id, &entry.config.allowed_zones) {
                 tracing::warn!(
@@ -4816,6 +4950,7 @@ impl ConnectorRegistry for SubprocessRegistry {
     async fn self_check(&self, id: &ConnectorId) -> Option<SelfCheckReport> {
         let connector = {
             let state = self.state.read().await;
+            self.require_running().ok()?;
             state
                 .connectors
                 .get(id)
@@ -6441,6 +6576,8 @@ enum ResponseIdDisposition {
 
 const CONNECTOR_RPC_QUEUE_CAPACITY: usize = 64;
 const CONNECTOR_RPC_IO_TIMEOUT: Duration = Duration::from_secs(10);
+/// Shared across all registered runtimes, including inventory-gate wait time.
+const HOST_CONNECTOR_SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 /// Message prefix stamped on `HostError::RegistryError` when a connector replies
 /// with a JSON-RPC error object (as opposed to a transport/dispatcher failure).
 /// Single-sourced so the warm-pool retention classifier and the constructor can
@@ -10712,8 +10849,23 @@ async fn async_main(telemetry_config: TelemetryConfig) -> HostResult<()> {
         .invoke_jobs
         .shutdown(invoke_jobs::SHUTDOWN_GRACE)
         .await;
+    // Cleanup is unconditional: a listener failure or an invocation-drain
+    // timeout must not skip cooperative child shutdown. Preserve the original
+    // serving/draining failure after reporting every retirement failure.
+    let retirement_result = state
+        .registry
+        .shutdown(Instant::now() + HOST_CONNECTOR_SHUTDOWN_GRACE)
+        .await;
+    if let Err(error) = &retirement_result {
+        tracing::error!(
+            event = "host_connector_shutdown_failed",
+            %error,
+            "host exit could not confirm all registered child runtimes stopped"
+        );
+    }
     serve_result?;
     drain_result?;
+    retirement_result?;
     tracing::info!(event = "host_shutdown_complete", "fcp-host exiting cleanly");
     Ok(())
 }
@@ -21025,6 +21177,7 @@ output_schema = {{ type = "object" }}
             version: Arc::new(AtomicU64::new(1)),
             capability_verifying_key: None,
             rate_limiters: Arc::new(HostRateLimiterStore::default()),
+            shutting_down: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -21054,6 +21207,7 @@ output_schema = {{ type = "object" }}
             version: Arc::new(AtomicU64::new(1)),
             capability_verifying_key: None,
             rate_limiters: Arc::new(HostRateLimiterStore::default()),
+            shutting_down: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -32554,6 +32708,7 @@ output_schema = { type = "object" }
             version: Arc::new(AtomicU64::new(1)),
             capability_verifying_key: None,
             rate_limiters: Arc::new(HostRateLimiterStore::default()),
+            shutting_down: Arc::new(AtomicBool::new(false)),
         });
         let budget = Arc::new(BudgetPolicyEngine::new());
         let discovery = Arc::new(DiscoveryEndpoint::new(
@@ -33145,6 +33300,7 @@ output_schema = { type = "object" }
             version: Arc::new(AtomicU64::new(1)),
             capability_verifying_key: None,
             rate_limiters: Arc::new(HostRateLimiterStore::default()),
+            shutting_down: Arc::new(AtomicBool::new(false)),
         });
         let budget = Arc::new(BudgetPolicyEngine::new());
         let discovery = Arc::new(DiscoveryEndpoint::new(
@@ -41760,7 +41916,282 @@ done"#;
             version: Arc::new(AtomicU64::new(version)),
             capability_verifying_key: None,
             rate_limiters: Arc::new(HostRateLimiterStore::default()),
+            shutting_down: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+
+    #[cfg(unix)]
+    async fn registry_shutdown_test_connector(
+        connector_id: &'static str,
+        script: &str,
+        environment: &BTreeMap<String, String>,
+    ) -> Arc<SubprocessConnector> {
+        let runner = ConnectorProcessRunner::spawn(
+            "/bin/sh",
+            &["-c".to_owned(), script.to_owned()],
+            environment,
+        )
+        .await
+        .expect("spawn registry shutdown fixture");
+        let retirement = runner.runtime_retirement.clone();
+        let events = runner.event_transport.clone();
+        let (sender, receiver) = mpsc::channel(4);
+        let actor = task::try_spawn(native_rpc::run_dispatcher(runner, receiver))
+            .expect("admit fixture dispatcher");
+        let mut connector = dispatcher_test_connector(connector_id, sender, actor);
+        let fixture = Arc::get_mut(&mut connector).expect("exclusive fixture");
+        fixture.runtime_retirement = retirement;
+        fixture.event_transport = Some(events);
+        connector
+    }
+
+    #[cfg(unix)]
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn registry_shutdown_retires_every_idle_native_child_and_fences_retained_callers() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut entries = Vec::new();
+        let mut retained = Vec::new();
+        for (index, id) in [
+            "fcp.test.shutdown-a:utility:1.0.0",
+            "fcp.test.shutdown-b:utility:1.0.0",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let calls = directory.path().join(format!("calls-{index}"));
+            let exited = directory.path().join(format!("exited-{index}"));
+            let environment = BTreeMap::from([
+                ("CALLS".to_owned(), calls.to_string_lossy().into_owned()),
+                ("EXITED".to_owned(), exited.to_string_lossy().into_owned()),
+            ]);
+            let connector = registry_shutdown_test_connector(
+                id,
+                r#"
+IFS= read -r request || exit 1
+printf '%s\n' "$request" > "$CALLS"
+printf '%s\n' '{"jsonrpc":"2.0","id":"0:0","result":{}}'
+while IFS= read -r request; do exit 2; done
+: > "$EXITED"
+"#,
+                &environment,
+            )
+            .await;
+            retained.push((Arc::clone(&connector), calls, exited));
+            entries.push((id, connector, dispatcher_test_config(id)));
+        }
+        let registry = dispatcher_registry_with_connectors(entries);
+        registry
+            .shutdown(Instant::now() + Duration::from_secs(5))
+            .await
+            .expect("every registered physical child must exit");
+        assert!(registry.require_running().is_err());
+        for (connector, calls, exited) in retained {
+            assert!(connector.runtime_retirement.is_exited());
+            assert!(connector.runner_tx.is_closed());
+            assert!(exited.exists(), "child must observe EOF and exit naturally");
+            let request: Value =
+                serde_json::from_str(&std::fs::read_to_string(calls).unwrap()).unwrap();
+            assert_eq!(request["method"], "shutdown");
+            assert_eq!(request["params"]["drain"], true);
+            assert!(
+                connector.rpc("health", json!({})).await.is_err(),
+                "retained references cannot revive a stopped actor"
+            );
+        }
+        registry
+            .shutdown(Instant::now() + Duration::from_secs(1))
+            .await
+            .expect("confirmed registry shutdown is idempotent");
+    }
+
+    #[cfg(unix)]
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn registry_shutdown_shares_one_budget_and_keeps_draining_after_busy_or_dead_children() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut entries = Vec::new();
+        let mut held = Vec::new();
+        for (index, id) in [
+            "fcp.test.shutdown-busy-a:utility:1.0.0",
+            "fcp.test.shutdown-busy-b:utility:1.0.0",
+            "fcp.test.shutdown-busy-c:utility:1.0.0",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let ready = directory.path().join(format!("ready-{index}"));
+            let release = directory.path().join(format!("release-{index}"));
+            let environment = BTreeMap::from([
+                ("READY".to_owned(), ready.to_string_lossy().into_owned()),
+                ("RELEASE".to_owned(), release.to_string_lossy().into_owned()),
+            ]);
+            let connector = registry_shutdown_test_connector(
+                id,
+                r#"
+IFS= read -r request || exit 1
+: > "$READY"
+while [ ! -f "$RELEASE" ]; do sleep 0.01; done
+printf '%s\n' '{"jsonrpc":"2.0","id":"0:0","result":{"completed":true}}'
+IFS= read -r request || exit 1
+printf '%s\n' '{"jsonrpc":"2.0","id":"0:1","result":{}}'
+while IFS= read -r request; do exit 2; done
+"#,
+                &environment,
+            )
+            .await;
+            let active_connector = Arc::clone(&connector);
+            let active = task::try_spawn(async move {
+                active_connector.rpc("hold", json!({})).await
+            })
+            .unwrap();
+            fcp_async_core::time::timeout(Duration::from_secs(5), async {
+                while !ready.exists() {
+                    fcp_async_core::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("fixture selected its active operation");
+            held.push((Arc::clone(&connector), release, active));
+            entries.push((id, connector, dispatcher_test_config(id)));
+        }
+        const DEAD: &str = "fcp.test.shutdown-dead:utility:1.0.0";
+        let dead = registry_shutdown_test_connector(DEAD, "exit 0", &BTreeMap::new()).await;
+        dead.runtime_retirement
+            .wait_for_exit(Instant::now() + Duration::from_secs(5))
+            .await
+            .expect("naturally dead runtime remains observable");
+        entries.push((DEAD, Arc::clone(&dead), dispatcher_test_config(DEAD)));
+
+        const IDLE: &str = "fcp.test.shutdown-idle:utility:1.0.0";
+        let exited = directory.path().join("idle-exited");
+        let environment = BTreeMap::from([(
+            "EXITED".to_owned(),
+            exited.to_string_lossy().into_owned(),
+        )]);
+        let idle = registry_shutdown_test_connector(
+            IDLE,
+            r#"
+IFS= read -r request || exit 1
+printf '%s\n' '{"jsonrpc":"2.0","id":"0:0","result":{}}'
+while IFS= read -r request; do exit 2; done
+: > "$EXITED"
+"#,
+            &environment,
+        )
+        .await;
+        entries.push((IDLE, Arc::clone(&idle), dispatcher_test_config(IDLE)));
+
+        let registry = dispatcher_registry_with_connectors(entries);
+        let started = Instant::now();
+        let result = registry
+            .shutdown(started + Duration::from_secs(1))
+            .await;
+        let elapsed = started.elapsed();
+        let idle_retired = idle.runtime_retirement.is_exited() && exited.exists();
+        let busy_retired = held
+            .iter()
+            .any(|(connector, _, _)| connector.runtime_retirement.is_exited());
+        // Release fixtures even if an assertion below fails: an unselected
+        // stop must not interrupt the child that still owns its active work.
+        for (_, release, _) in &held {
+            std::fs::write(release, b"").unwrap();
+        }
+        for (_, _, active) in held {
+            assert_eq!(active.await.unwrap().unwrap(), json!({"completed": true}));
+        }
+        registry
+            .shutdown(Instant::now() + Duration::from_secs(5))
+            .await
+            .expect("retry observes and retires the same retained children");
+
+        let error = result.expect_err("busy children cannot be reported stopped");
+        assert!(error.to_string().contains("3/5"), "{error}");
+        assert!(
+            elapsed < Duration::from_millis(2_500),
+            "three busy children must share the original one-second budget: {elapsed:?}"
+        );
+        assert!(idle_retired, "busy children must not starve an idle child's shutdown");
+        assert!(!busy_retired, "queued retirement must preserve active work ownership");
+        assert!(dead.runtime_retirement.is_exited());
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn registry_shutdown_fences_prepared_publication_and_direct_dispatch() {
+        let registry = empty_registry(7);
+        let prepared = registry.prepare_configs(Vec::new()).await.unwrap();
+        let fence = registry.inventory_fence(registry.version());
+        let invocation =
+            NativeInvocationTermination::new(Instant::now() + Duration::from_secs(10));
+        invocation.bind_inventory_fence(fence.clone());
+        let active = invocation.register_rpc_for_method("invoke");
+        assert!(active.try_begin());
+        let queued = invocation.register_rpc_for_method("invoke");
+        registry
+            .shutdown(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(registry.publish_configs(prepared).await.is_err());
+        assert!(registry.prepare_configs(Vec::new()).await.is_err());
+        assert_eq!(registry.version(), 7, "shutdown does not publish new inventory");
+        assert!(!fence.is_current(), "retained actor fences observe shutdown");
+        assert!(fence.require_current().is_err());
+        assert!(invocation.require_current_inventory().is_err());
+        assert!(!queued.try_begin(), "queued effects cannot activate after shutdown");
+        assert!(queued.is_settled());
+        assert!(!active.is_cancelled(), "shutdown must not relabel selected work");
+        assert!(active.try_settle_reply());
+        assert!(!active.transport_retired());
+        let later = invocation.register_rpc_for_method("invoke");
+        assert!(!later.try_begin(), "retained sessions cannot mint fresh authority");
+        let request = runtime_network_test_request(
+            "fcp.test.shutdown:utility:1.0.0",
+            "test.echo",
+        );
+        let connector_id = request.connector_id.clone();
+        let simulation = warm_pool_test_simulate_request(request.clone());
+        for error in [
+            registry.invoke(request).await.unwrap_err(),
+            registry.simulate(simulation).await.unwrap_err(),
+        ] {
+            assert!(error.to_string().contains("shutting down"), "{error}");
+        }
+        let error = lifecycle_runtime::selected_entry(&registry, &connector_id)
+            .await
+            .err()
+            .expect("retained lifecycle callers must be refused");
+        assert!(error.to_string().contains("shutting down"), "{error}");
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn registry_shutdown_inventory_wait_uses_deadline_and_remains_closed_after_timeout() {
+        let registry = empty_registry(9);
+        let fence = registry.inventory_fence(registry.version());
+        let invocation =
+            NativeInvocationTermination::new(Instant::now() + Duration::from_secs(10));
+        invocation.bind_inventory_fence(fence.clone());
+        let queued = invocation.register_rpc_for_method("invoke");
+        let transaction = registry.inventory_transaction.lock().await;
+        let started = Instant::now();
+        let error = registry
+            .shutdown(started + Duration::from_millis(30))
+            .await
+            .expect_err("inventory serialization must not wait without a deadline");
+        let elapsed = started.elapsed();
+        assert!(error.to_string().contains("inventory transaction"), "{error}");
+        assert!(elapsed < Duration::from_secs(1));
+        assert!(!fence.is_current(), "timed-out retirement still fences actor admission");
+        assert!(fence.require_current().is_err());
+        assert!(invocation.require_current_inventory().is_err());
+        assert!(!queued.try_begin(), "a gate timeout cannot revive queued effects");
+        assert!(queued.is_settled());
+        assert!(registry.require_running().is_err());
+        assert!(registry.prepare_configs(Vec::new()).await.is_err());
+        drop(transaction);
+        registry
+            .shutdown(Instant::now() + Duration::from_secs(1))
+            .await
+            .expect("a retry may confirm shutdown without reopening admission");
+        assert!(registry.require_running().is_err());
     }
 
     #[test]
