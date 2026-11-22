@@ -53,13 +53,22 @@ Important runtime truths the contract preserves:
 - The client retries connect/timeout errors and retryable API errors; 429 and secondary-rate-limit 403 responses map to `RateLimited`.
 - Owner and repository names are validated locally before URL construction.
 - File paths are percent-encoded by path segment before content lookup.
-- Runtime handshake installs a `CapabilityVerifier`.
+- Runtime handshake accepts FCP `2.0` / `2.0.0`, installs an instance-bound `CapabilityVerifier`, and grants only the requested capability classes that implemented operations actually use.
 - Runtime handshake returns a SHA-256 hash of the bundled `manifest.toml`.
-- `invoke` requires `operation`, `input`, and `capability_token`; it validates input, computes resource URIs, and verifies a bound capability token before provider execution.
+- Native `invoke` requires the complete `InvokeRequest`: `type = "invoke"`, a non-empty string `id`, `connector_id = "fcp.github"`, the negotiated `zone_id`, `operation`, `input`, and `capability_token`. The dispatcher validates the envelope and idempotency-key shape before provider execution; operation admission then validates input, derives resource URIs, and verifies the bound token and negotiated grant.
 - `simulate` validates operation inventory, input shape, configured state, handshaken state, resource URI construction, and bound capability token before returning an allowed result.
-- `github.process_webhook` never calls GitHub. It accepts only host-forwarded structured payloads with `signature_validated = true`, requires repository context, and deduplicates the latest 1024 delivery IDs in process memory.
-- `health()` is local state only; `self_check()` degrades for `credential_id` because real connectivity depends on the egress proxy.
-- `handle_shutdown()` shuts down the client runtime, records local shutdown state, and clears base configured/handshaken flags.
+- Every configure and handshake attempt revokes previous authority and rotates instance identity, including rejected attempts. A configured account remains bound to its negotiated zone until reconfiguration; `z:public` is rejected.
+- `github.process_webhook` never calls GitHub. It accepts only host-forwarded structured payloads with `signature_validated = true`, requires repository context, and deduplicates the latest 1024 delivery IDs in process memory. Simulation does not consume a delivery receipt, and receipts survive session rotation and reconfiguration.
+- `health()` returns a canonical `HealthSnapshot` from local state, including actual instance/session identity and monotonic uptime. It becomes ready after configuration and handshake; `self_check()` degrades for `credential_id` because real connectivity depends on the egress proxy.
+- `handle_shutdown()` shuts down the client runtime, clears configuration and authority, and reports stopping health. The native process flushes its shutdown acknowledgment and exits even if stdin remains open.
+
+### Native host contract
+
+The binary uses the SDK JSONL server with bounded input frames. Each request has a JSON-RPC 2.0 transport envelope; invocation results contain a canonical `InvokeResponse`. The outer transport ID and inner invocation ID are independent and both are preserved. Invalid JSON, protocol versions, IDs, or inner invocation envelopes are rejected before operation effects.
+
+After configure and handshake, read `health.details.instance_id` and bind the signed capability token to that instance. Tokens from a previous session remain invalid after recovery from a rejected configuration or handshake. Health uses the core tagged status shape, such as `status.state = "ready"`, with configuration, session, zone, and instance fields under `details`.
+
+Runtime introspection declares policy approval for `github.create_issue` and `github.create_pull_request`, and interactive approval for `github.merge_pull_request` and `github.trigger_workflow`, matching the manifest. The host remains responsible for applying approval and broader execution policy before dispatch.
 
 ## Drift Visible In This Checkout
 
@@ -69,13 +78,12 @@ This README documents the runtime truth and keeps current drift visible:
 - `rate_limits.operation_pools` maps search operations to `github.search`; manifest operation metadata and runtime introspection map them to `github.read`.
 - `rate_limits.operation_pools` maps `github.process_webhook` to `github.read`; manifest operation metadata and runtime verification use `github.process_webhook`.
 - Manifest `github.process_webhook` input schema requires only `payload`, while runtime and introspection also require `signature_validated`.
-- Manifest approval modes are `policy` or `interactive` for mutating operations, but runtime introspection currently sets `requires_approval = None` for all GitHub operations.
 - Source contains `invoke_begin_oauth` and `invoke_complete_oauth` helpers, but neither operation is advertised by introspection or reachable through `handle_invoke`.
 - Manifest description mentions releases, but there are no release operations in this runtime slice.
-- Manifest event caps say streaming is enabled, but the runtime exposes no event stream catalog; the only event-shaped output is returned by `github.process_webhook`.
+- Manifest event caps say streaming is enabled, while runtime handshake advertises no streaming support and introspection exposes no event stream catalog; the only event-shaped output is returned by `github.process_webhook`.
 - `connectors/github/tests/local_non_mock.rs` exercises the production connector invoke path against a deterministic loopback GitHub API fixture for read, write, and workflow-dispatch operations.
 
-A follow-up parity bead should reconcile search/rate-limit capability mapping, align webhook schemas, surface approval modes in introspection, either publish or remove the OAuth helper paths, and decide whether the loopback acceptance fixture should grow into GitHub fixture replay.
+A follow-up parity bead should reconcile search/rate-limit capability mapping, align webhook schemas and declared event support, either publish or remove the OAuth helper paths, and decide whether the loopback acceptance fixture should grow into GitHub fixture replay.
 
 ## First-Slice Scope
 
@@ -261,6 +269,7 @@ The deterministic integration evidence is anchored on connector-local tests cove
 - invoke rejection for unknown operation, missing token, wrong token, missing handshake, missing configuration, and invalid input
 - provider 401, 404, 409, 422, 429, 500 classes and FCP error mapping
 - webhook signature gate, repository context requirement, delivery-ID deduplication, and no-egress manifest constraints
+- actual binary framing and signed invocation, independent transport/request IDs, stale-session rejection, no-effect simulation, and shutdown while stdin remains open
 
 ## Source Notes
 
@@ -269,7 +278,7 @@ The deterministic integration evidence is anchored on connector-local tests cove
 - `connectors/github/src/types.rs` defines issue, pull request, repository, content, workflow, search, and webhook shapes.
 - `connectors/github/src/error.rs` defines connector error classes and FCP error conversion.
 - `connectors/github/manifest.toml` defines the operation catalog, network constraints, sandbox boundary, zone policy, event caps, and rate-limit pools.
-- `connectors/github/tests/integration.rs`, `connectors/github/tests/conformance_contract.rs`, and `connectors/github/tests/local_non_mock.rs` cover deterministic runtime behavior, contract assertions, and local loopback acceptance.
+- `connectors/github/tests/integration.rs`, `connectors/github/tests/conformance_contract.rs`, and `connectors/github/tests/local_non_mock.rs` cover deterministic runtime behavior, contract assertions, and local loopback acceptance. `connectors/github/tests/native_protocol.rs` exercises the shipped executable with signed capabilities and the actual JSONL transport.
 
 ## Verification Bundle
 

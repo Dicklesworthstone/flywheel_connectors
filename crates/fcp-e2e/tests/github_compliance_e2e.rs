@@ -45,7 +45,7 @@ impl GitHubConnectorAdapter {
     fn new() -> Self {
         Self {
             connector: GitHubConnector::new(),
-            id: ConnectorId::from_static("github"),
+            id: ConnectorId::from_static("fcp.github"),
         }
     }
 }
@@ -74,17 +74,8 @@ impl FcpConnector for GitHubConnectorAdapter {
 
     async fn health(&self) -> HealthSnapshot {
         match self.connector.handle_health().await {
-            Ok(payload) => {
-                let status = payload
-                    .get("status")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("unknown");
-                match status {
-                    "healthy" => HealthSnapshot::ready(),
-                    "not_configured" => HealthSnapshot::degraded("not_configured"),
-                    other => HealthSnapshot::degraded(format!("github_status:{other}")),
-                }
-            }
+            Ok(payload) => serde_json::from_value(payload)
+                .unwrap_or_else(|err| HealthSnapshot::error(err.to_string())),
             Err(err) => HealthSnapshot::error(err.to_string()),
         }
     }
@@ -139,12 +130,10 @@ impl FcpConnector for GitHubConnectorAdapter {
     }
 
     async fn invoke(&self, req: InvokeRequest) -> fcp_core::FcpResult<InvokeResponse> {
-        let request_id = req.id;
-        let params = json!({
-            "operation": req.operation.as_str(),
-            "input": req.input,
-            "capability_token": req.capability_token,
-        });
+        let request_id = req.id.clone();
+        let params = serde_json::to_value(req).map_err(|err| FcpError::Internal {
+            message: format!("failed to serialize invoke request: {err}"),
+        })?;
         let value = self.connector.handle_invoke(params).await?;
         Ok(InvokeResponse::ok(request_id, value))
     }
@@ -241,7 +230,7 @@ fn invoke_request(
     InvokeRequest {
         r#type: "invoke".to_string(),
         id: RequestId::from("github-e2e"),
-        connector_id: ConnectorId::from_static("github"),
+        connector_id: ConnectorId::from_static("fcp.github"),
         operation: OperationId::from_static(operation),
         zone_id: ZoneId::work(),
         input,
@@ -326,6 +315,7 @@ fn github_get_repo_success_response() -> serde_json::Value {
 /// (which requires "github.read").
 #[fcp_async_core::runtime::test]
 async fn github_default_deny_compliance_suite_passes() {
+    let mock = MockApiServer::start().await;
     let mut connector = GitHubConnectorAdapter::new();
     let signing_key = Ed25519SigningKey::generate();
     let handshake = handshake_request(signing_key.verifying_key().to_bytes(), &["github.write"]);
@@ -334,7 +324,7 @@ async fn github_default_deny_compliance_suite_passes() {
         &signing_key,
         connector.connector.instance_id().as_str(),
         "github.write",
-        &["github.write"],
+        &["github.get_repo"],
     );
     let invoke = invoke_request(
         "github.get_repo",
@@ -347,7 +337,7 @@ async fn github_default_deny_compliance_suite_passes() {
         // `token` config; use the sanctioned credential_id reference shape.
         config: json!({
             "credential_id": "550e8400-e29b-41d4-a716-446655440000",
-            "base_url": "http://localhost:9999"
+            "base_url": mock.base_url()
         }),
         handshake: handshake.clone(),
         invoke: Some(invoke),
@@ -371,6 +361,28 @@ async fn github_default_deny_compliance_suite_passes() {
         .expect("compliance suite run");
 
     assert!(report.passed, "default deny compliance should pass");
+
+    // Bind the denial token to the negotiated instance so stale authority cannot explain it.
+    let token = build_token(
+        &signing_key,
+        connector.connector.instance_id().as_str(),
+        "github.write",
+        &["github.get_repo"],
+    );
+    let err = connector
+        .invoke(invoke_request(
+            "github.get_repo",
+            json!({ "owner": "octocat", "repo": "hello-world" }),
+            token,
+        ))
+        .await
+        .expect_err("unnegotiated read capability should be denied");
+    assert!(matches!(
+        &err,
+        FcpError::CapabilityDenied { capability, .. } if capability == "github.read"
+    ));
+    assert_eq!(err.error_code(), "FCP-3001");
+    mock.assert_request_count(0).await;
 }
 
 // ============================================================================
@@ -392,17 +404,6 @@ async fn github_allow_valid_token_connector_suite_passes() {
     let mut connector = GitHubConnectorAdapter::new();
     let signing_key = Ed25519SigningKey::generate();
     let handshake = handshake_request(signing_key.verifying_key().to_bytes(), &["github.read"]);
-    let token = build_token(
-        &signing_key,
-        connector.connector.instance_id().as_str(),
-        "github.read",
-        &["github.get_repo"],
-    );
-    let invoke = invoke_request(
-        "github.get_repo",
-        json!({ "owner": "octocat", "repo": "hello-world" }),
-        token,
-    );
     let suite = ConnectorSuite {
         test_name: "github_allow_valid_token".to_string(),
         // Secretless ratchet (e99o6): credential_id reference shape.
@@ -411,7 +412,7 @@ async fn github_allow_valid_token_connector_suite_passes() {
             "base_url": mock.base_url(),
         }),
         handshake,
-        invoke: Some(invoke),
+        invoke: None,
         invoke_expectations: InvokeExpectations {
             expect_error: false,
             expect_decision_receipt: false,
@@ -429,15 +430,27 @@ async fn github_allow_valid_token_connector_suite_passes() {
         .expect("connector suite run");
 
     assert!(report.passed, "allow suite should pass");
-    let invoke_entry = report
-        .logs
-        .iter()
-        .find(|entry| entry.context.get("operation") == Some(&json!("invoke")))
-        .expect("invoke entry");
-    assert_eq!(invoke_entry.result, "pass");
+    assert!(connector.health().await.is_ready());
+
+    // Configure and handshake rotate the instance; mint only after the lifecycle suite.
+    let token = build_token(
+        &signing_key,
+        connector.connector.instance_id().as_str(),
+        "github.read",
+        &["github.get_repo"],
+    );
+    let response = connector
+        .invoke(invoke_request(
+            "github.get_repo",
+            json!({ "owner": "octocat", "repo": "hello-world" }),
+            token,
+        ))
+        .await
+        .expect("invoke with current-instance authority");
+    assert_eq!(response.status, InvokeStatus::Ok);
     assert_eq!(
-        invoke_entry.context.get("invoke_status"),
-        Some(&json!(format!("{:?}", InvokeStatus::Ok)))
+        response.result.expect("repository output")["repository"]["full_name"],
+        "octocat/Hello-World"
     );
     mock.assert_request_count(1).await;
     let received = mock.received_requests().await;

@@ -44,7 +44,7 @@ impl GitHubAdapter {
     fn new() -> Self {
         Self {
             connector: GitHubConnector::new(),
-            id: ConnectorId::from_static("github"),
+            id: ConnectorId::from_static("fcp.github"),
         }
     }
 }
@@ -73,17 +73,8 @@ impl FcpConnector for GitHubAdapter {
 
     async fn health(&self) -> HealthSnapshot {
         match self.connector.handle_health().await {
-            Ok(payload) => {
-                let status = payload
-                    .get("status")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("unknown");
-                match status {
-                    "healthy" => HealthSnapshot::ready(),
-                    "not_configured" => HealthSnapshot::degraded("not_configured"),
-                    other => HealthSnapshot::degraded(format!("github_status:{other}")),
-                }
-            }
+            Ok(payload) => serde_json::from_value(payload)
+                .unwrap_or_else(|err| HealthSnapshot::error(err.to_string())),
             Err(err) => HealthSnapshot::error(err.to_string()),
         }
     }
@@ -138,12 +129,10 @@ impl FcpConnector for GitHubAdapter {
     }
 
     async fn invoke(&self, req: InvokeRequest) -> fcp_core::FcpResult<InvokeResponse> {
-        let request_id = req.id;
-        let params = json!({
-            "operation": req.operation.as_str(),
-            "input": req.input,
-            "capability_token": req.capability_token,
-        });
+        let request_id = req.id.clone();
+        let params = serde_json::to_value(req).map_err(|err| FcpError::Internal {
+            message: format!("failed to serialize invoke request: {err}"),
+        })?;
         let value = self.connector.handle_invoke(params).await?;
         Ok(InvokeResponse::ok(request_id, value))
     }
@@ -227,7 +216,7 @@ fn invoke_request(
     InvokeRequest {
         r#type: "invoke".to_string(),
         id: RequestId::from("full-system-e2e"),
-        connector_id: ConnectorId::from_static("github"),
+        connector_id: ConnectorId::from_static("fcp.github"),
         operation: OperationId::from_static(operation),
         zone_id: ZoneId::work(),
         input,
@@ -447,17 +436,6 @@ async fn e2e_connector_invoke_with_mock() {
     let signing_key2 = Ed25519SigningKey::generate();
     let mut connector2 = GitHubAdapter::new();
     let handshake2 = handshake_request(signing_key2.verifying_key().to_bytes(), &["github.read"]);
-    let token2 = build_token(
-        &signing_key2,
-        connector2.connector.instance_id().as_str(),
-        "github.read",
-        &["github.get_repo"],
-    );
-    let invoke2 = invoke_request(
-        "github.get_repo",
-        json!({ "owner": "octocat", "repo": "hello-world" }),
-        token2,
-    );
 
     let suite = ConnectorSuite {
         test_name: "full_e2e_invoke_mock".to_string(),
@@ -466,7 +444,7 @@ async fn e2e_connector_invoke_with_mock() {
             "base_url": mock.base_url(),
         }),
         handshake: handshake2,
-        invoke: Some(invoke2),
+        invoke: None,
         invoke_expectations: InvokeExpectations {
             expect_error: false,
             expect_decision_receipt: false,
@@ -485,6 +463,29 @@ async fn e2e_connector_invoke_with_mock() {
 
     assert!(report.passed, "connector suite should pass");
     assert!(!report.logs.is_empty(), "report should contain log entries");
+    assert!(connector2.health().await.is_ready());
+
+    // Sign after the runner establishes the new session and its instance.
+    let token2 = build_token(
+        &signing_key2,
+        connector2.connector.instance_id().as_str(),
+        "github.read",
+        &["github.get_repo"],
+    );
+    let response2 = connector2
+        .invoke(invoke_request(
+            "github.get_repo",
+            json!({ "owner": "octocat", "repo": "hello-world" }),
+            token2,
+        ))
+        .await
+        .expect("invoke after lifecycle suite");
+    assert_eq!(response2.status, InvokeStatus::Ok);
+    assert_eq!(
+        response2.result.expect("repository output")["repository"]["full_name"],
+        "octocat/Hello-World"
+    );
+    mock.assert_request_count(2).await;
 }
 
 // ============================================================================
@@ -511,6 +512,27 @@ async fn e2e_capability_verification() {
     let handshake = handshake_request(signing_key.verifying_key().to_bytes(), &["github.write"]);
     connector.handshake(handshake).await.expect("handshake");
 
+    // The token is valid for the current instance; the missing read grant causes denial.
+    let token = build_token(
+        &signing_key,
+        connector.connector.instance_id().as_str(),
+        "github.write",
+        &["github.get_repo"],
+    );
+    let err = connector
+        .invoke(invoke_request(
+            "github.get_repo",
+            json!({ "owner": "octocat", "repo": "hello-world" }),
+            token,
+        ))
+        .await
+        .expect_err("unnegotiated read capability should be denied");
+    assert!(matches!(
+        &err,
+        FcpError::CapabilityDenied { capability, .. } if capability == "github.read"
+    ));
+    assert_eq!(err.error_code(), "FCP-3001");
+
     // Run through the E2E runner expecting an error
     let mut connector2 = GitHubAdapter::new();
     let signing_key2 = Ed25519SigningKey::generate();
@@ -519,7 +541,7 @@ async fn e2e_capability_verification() {
         &signing_key2,
         connector2.connector.instance_id().as_str(),
         "github.write",
-        &["github.write"],
+        &["github.get_repo"],
     );
     let invoke2 = invoke_request(
         "github.get_repo",
@@ -540,7 +562,7 @@ async fn e2e_capability_verification() {
             expect_decision_receipt: false,
             expect_audit_event: false,
             expect_receipt: false,
-            expected_reason_code: Some("FCP-3003".to_string()),
+            expected_reason_code: Some("FCP-3001".to_string()),
             rate_limit_pool: None,
         },
     };
@@ -563,8 +585,9 @@ async fn e2e_capability_verification() {
         .expect("execute log entry");
     assert_eq!(
         execute_entry.context.get("reason_code"),
-        Some(&json!("FCP-3003"))
+        Some(&json!("FCP-3001"))
     );
+    mock.assert_request_count(0).await;
 }
 
 // ============================================================================
@@ -640,6 +663,7 @@ async fn e2e_error_mapping_structured() {
         !display.is_empty(),
         "error Display should produce non-empty output"
     );
+    mock.assert_request_count(1).await;
 }
 
 // ============================================================================
