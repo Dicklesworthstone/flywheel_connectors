@@ -1,10 +1,11 @@
 //! FCP GitHub Connector implementation.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::sync::{
-    Arc, Mutex,
+    Mutex,
     atomic::{AtomicBool, Ordering},
 };
+use std::time::Instant;
 
 use fcp_oauth::{
     AuthorizationCallback, OAuth2Client, OAuthError, OAuthProvider,
@@ -12,10 +13,11 @@ use fcp_oauth::{
     normalize_registered_redirect_uri,
 };
 use fcp_prelude::{
-    AgentHint, BaseConnector, CapabilityGrant, CapabilityId, CapabilityToken, CapabilityVerifier,
-    ConnectorId, CredentialId, EventCaps, FcpError, FcpResult, HandshakeRequest, HandshakeResponse,
-    IdempotencyClass, InstanceId, Introspection, OperationId, OperationInfo, RiskLevel, SafetyTier,
-    SelfCheckReport, SessionId, SimulateRequest, SimulateResponse, reject_secret_config_material,
+    AgentHint, ApprovalMode, BaseConnector, CapabilityGrant, CapabilityId, CapabilityToken,
+    CapabilityVerifier, ConnectorId, CredentialId, EventCaps, FcpError, FcpResult,
+    HandshakeRequest, HandshakeResponse, HealthSnapshot, HealthState, IdempotencyClass, InstanceId,
+    Introspection, OperationId, OperationInfo, RiskLevel, SafetyTier, SelfCheckReport, SessionId,
+    SimulateRequest, SimulateResponse, ZoneId, reject_secret_config_material,
 };
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
@@ -180,11 +182,14 @@ enum DoctorStatus {
 
 /// FCP GitHub Connector.
 pub struct GitHubConnector {
-    base: Arc<BaseConnector>,
+    base: BaseConnector,
     client: Option<GitHubClient>,
     config: Option<GitHubConfig>,
     verifier: Option<CapabilityVerifier>,
     session_id: Option<SessionId>,
+    bound_zone: Option<ZoneId>,
+    granted_capabilities: BTreeSet<String>,
+    started_at: Instant,
     seen_webhook_deliveries: Mutex<HashSet<String>>,
     webhook_delivery_order: Mutex<VecDeque<String>>,
     shutdown: AtomicBool,
@@ -195,11 +200,14 @@ impl GitHubConnector {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            base: Arc::new(BaseConnector::new(ConnectorId::from_static("github"))),
+            base: BaseConnector::new(ConnectorId::from_static("fcp.github")),
             client: None,
             config: None,
             verifier: None,
             session_id: None,
+            bound_zone: None,
+            granted_capabilities: BTreeSet::new(),
+            started_at: Instant::now(),
             seen_webhook_deliveries: Mutex::new(HashSet::new()),
             webhook_delivery_order: Mutex::new(VecDeque::new()),
             shutdown: AtomicBool::new(false),
@@ -216,6 +224,26 @@ impl GitHubConnector {
         let mut hasher = Sha256::new();
         hasher.update(MANIFEST_TOML.as_bytes());
         format!("sha256:{}", hex::encode(hasher.finalize()))
+    }
+
+    fn invalidate_authority(&mut self) {
+        self.verifier = None;
+        self.session_id = None;
+        self.granted_capabilities.clear();
+        self.base.set_handshaken(false);
+        self.base.instance_id = InstanceId::new();
+    }
+
+    fn clear_configuration(&mut self) {
+        self.invalidate_authority();
+        self.base.set_configured(false);
+        self.config = None;
+        self.bound_zone = None;
+        if let Some(client) = self.client.take() {
+            client.shutdown();
+        }
+        // Replay receipts belong to the process, not to a negotiated session.
+        // Reconfiguration must not make an accepted delivery executable again.
     }
 
     fn claim_webhook_delivery(&self, delivery_id: &str) -> FcpResult<()> {
@@ -257,6 +285,7 @@ impl GitHubConnector {
         &mut self,
         params: serde_json::Value,
     ) -> FcpResult<serde_json::Value> {
+        self.clear_configuration();
         let cfg = GitHubConfig::from_params(&params)?;
 
         let client =
@@ -282,30 +311,68 @@ impl GitHubConnector {
         &mut self,
         params: serde_json::Value,
     ) -> FcpResult<serde_json::Value> {
+        // A failed negotiation revokes the previous session just as a
+        // successful replacement does. Old tokens must never regain authority.
+        self.invalidate_authority();
+        if self.client.is_none() || self.config.is_none() {
+            return Err(FcpError::NotConfigured);
+        }
         let req: HandshakeRequest =
-            serde_json::from_value(params).map_err(|e| FcpError::InvalidRequest {
+            serde_json::from_value(params).map_err(|_| FcpError::InvalidRequest {
                 code: 1003,
-                message: format!("Invalid handshake request: {e}"),
+                message: "Invalid handshake request".into(),
             })?;
+        if !matches!(req.protocol_version.as_str(), "2.0" | "2.0.0") {
+            return Err(FcpError::InvalidRequest {
+                code: 1003,
+                message: "GitHub requires FCP protocol 2.0".into(),
+            });
+        }
+
+        if req.zone.as_str() == "z:public" {
+            return Err(FcpError::CapabilityDenied {
+                capability: "github.handshake".into(),
+                reason: "GitHub manifest forbids the requested session zone".into(),
+            });
+        }
+        if self
+            .bound_zone
+            .as_ref()
+            .is_some_and(|zone| zone != &req.zone)
+        {
+            return Err(FcpError::CapabilityDenied {
+                capability: "github.handshake".into(),
+                reason: "Reconfigure before binding GitHub to another zone".into(),
+            });
+        }
+
+        let operations = Self::operations_info();
+        let capabilities_granted: Vec<CapabilityGrant> = req
+            .capabilities_requested
+            .into_iter()
+            .filter(|capability| {
+                operations
+                    .iter()
+                    .any(|operation| operation.capability == *capability)
+                    && self
+                        .granted_capabilities
+                        .insert(capability.as_str().to_owned())
+            })
+            .map(|capability| CapabilityGrant {
+                capability,
+                operation: None,
+            })
+            .collect();
 
         self.verifier = Some(CapabilityVerifier::new(
             req.host_public_key,
             req.zone.clone(),
             self.base.instance_id.clone(),
         ));
-
         let session_id = SessionId::new();
         self.session_id = Some(session_id.clone());
+        self.bound_zone = Some(req.zone);
         self.base.set_handshaken(true);
-
-        let capabilities_granted: Vec<CapabilityGrant> = req
-            .capabilities_requested
-            .into_iter()
-            .map(|cap| CapabilityGrant {
-                capability: cap,
-                operation: None,
-            })
-            .collect();
 
         let response = HandshakeResponse {
             status: "accepted".into(),
@@ -313,12 +380,9 @@ impl GitHubConnector {
             session_id,
             manifest_hash: Self::manifest_hash(),
             nonce: req.nonce,
-            event_caps: Some(EventCaps {
-                streaming: true,
-                replay: false,
-                min_buffer_events: 100,
-                requires_ack: false,
-            }),
+            // Webhooks are admitted through process_webhook. The native
+            // binary does not implement an unsolicited event stream.
+            event_caps: Some(EventCaps::default()),
             auth_caps: None,
             op_catalog_hash: None,
         };
@@ -334,31 +398,41 @@ impl GitHubConnector {
     /// Returns [`FcpError`] if the health status cannot be determined.
     pub async fn handle_health(&self) -> FcpResult<serde_json::Value> {
         let shutdown = self.shutdown.load(Ordering::Acquire);
-        let configured = self.client.is_some() && !shutdown;
+        let configured = self.client.is_some() && self.config.is_some() && !shutdown;
+        let handshaken = configured && self.verifier.is_some() && self.session_id.is_some();
         let metrics = self.base.metrics();
-        let auth_mode = self
-            .config
-            .as_ref()
-            .map_or("none", |c| c.auth.redacted_label());
-        let api_url = self
-            .config
-            .as_ref()
-            .map_or("not_configured", |c| c.base_url.as_str());
-        Ok(json!({
-            "status": if shutdown {
-                "shutdown"
-            } else if configured {
-                "healthy"
-            } else {
-                "not_configured"
-            },
-            "auth_mode": auth_mode,
-            "api_url": api_url,
+        let mut health = HealthSnapshot::ready();
+        health.status = if shutdown {
+            HealthState::Stopping
+        } else if handshaken {
+            HealthState::Ready
+        } else if configured {
+            HealthState::Degraded {
+                reason: "handshake required".into(),
+            }
+        } else {
+            HealthState::Degraded {
+                reason: "not configured".into(),
+            }
+        };
+        health.uptime_ms = u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        health.details = Some(json!({
+            "connector_id": self.base.id,
+            "configured": configured,
+            "handshaken": handshaken,
+            "instance_id": self.base.instance_id,
+            "zone": self.bound_zone,
+            "session_id": self.session_id,
+            "auth_mode": self.config.as_ref().map_or("none", |c| c.auth.redacted_label()),
+            "api_url": self.config.as_ref().map_or("not_configured", |c| c.base_url.as_str()),
             "metrics": {
                 "requests_total": metrics.requests_total,
                 "requests_error": metrics.requests_error,
             }
-        }))
+        }));
+        serde_json::to_value(health).map_err(|error| FcpError::Internal {
+            message: format!("Failed to serialize health: {error}"),
+        })
     }
 
     /// Handle doctor readiness diagnostics.
@@ -878,85 +952,92 @@ impl GitHubConnector {
     /// Returns [`FcpError`] if the request is invalid or serialization fails.
     pub async fn handle_simulate(&self, params: serde_json::Value) -> FcpResult<serde_json::Value> {
         let req: SimulateRequest =
-            serde_json::from_value(params).map_err(|e| FcpError::InvalidRequest {
+            serde_json::from_value(params).map_err(|_| FcpError::InvalidRequest {
                 code: 1003,
-                message: format!("Invalid simulate request: {e}"),
+                message: "Invalid simulate request".into(),
             })?;
-
-        let capability = match github_capability_for_operation(req.operation.as_str()) {
-            Ok(capability) => capability,
-            Err(error) => {
-                let response =
-                    SimulateResponse::denied(req.id, error.to_string(), error.error_code());
-                return serde_json::to_value(response).map_err(|e| FcpError::Internal {
-                    message: format!("Failed to serialize response: {e}"),
-                });
-            }
-        };
-
-        if let Err(error) = validate_github_input(req.operation.as_str(), &req.input) {
-            let response = SimulateResponse::denied(req.id, error.to_string(), error.error_code());
-            return serde_json::to_value(response).map_err(|e| FcpError::Internal {
-                message: format!("Failed to serialize response: {e}"),
+        if req.r#type != "simulate" || req.id.0.is_empty() {
+            return Err(FcpError::InvalidRequest {
+                code: 1003,
+                message: "Expected simulate request with a non-empty ID".into(),
             });
         }
 
-        if self.config.is_none() || self.client.is_none() {
-            let response = SimulateResponse::denied(
-                req.id,
-                "Connector is not configured",
-                FcpError::NotConfigured.error_code(),
-            );
-            return serde_json::to_value(response).map_err(|e| FcpError::Internal {
-                message: format!("Failed to serialize response: {e}"),
-            });
-        }
-
-        let Some(verifier) = &self.verifier else {
-            let response = SimulateResponse::denied(
-                req.id,
-                "Connector handshake not completed",
-                FcpError::NotHandshaken.error_code(),
-            );
-            return serde_json::to_value(response).map_err(|e| FcpError::Internal {
-                message: format!("Failed to serialize response: {e}"),
-            });
-        };
-
-        let resource_uris = match resource_uris_for_operation(req.operation.as_str(), &req.input) {
-            Ok(resource_uris) => resource_uris,
-            Err(error) => {
-                let response =
-                    SimulateResponse::denied(req.id, error.to_string(), error.error_code());
-                return serde_json::to_value(response).map_err(|e| FcpError::Internal {
-                    message: format!("Failed to serialize response: {e}"),
-                });
-            }
-        };
-
-        let response = match verifier.verify_bound(
-            req.capability_token,
-            &capability,
+        let authorization = self.authorize_operation(
             &req.operation,
-            &resource_uris,
-        ) {
-            Ok(_) => SimulateResponse::allowed(req.id),
+            &req.input,
+            req.capability_token,
+            Some(&req.connector_id),
+            Some(&req.zone_id),
+        );
+        let response = match authorization {
+            Ok(()) => SimulateResponse::allowed(req.id),
             Err(error) => {
-                let is_grant_mismatch = matches!(
+                let response =
+                    SimulateResponse::denied(req.id, error.to_string(), error.error_code());
+                if matches!(
                     error,
                     FcpError::CapabilityDenied { .. } | FcpError::OperationNotGranted { .. }
-                );
-                let mut response =
-                    SimulateResponse::denied(req.id, error.to_string(), error.error_code());
-                if is_grant_mismatch {
-                    response = response.with_missing_capabilities(vec![capability.as_str().into()]);
+                ) {
+                    match github_capability_for_operation(req.operation.as_str()) {
+                        Ok(capability) => {
+                            response.with_missing_capabilities(vec![capability.as_str().to_owned()])
+                        }
+                        Err(_) => response,
+                    }
+                } else {
+                    response
                 }
-                response
             }
         };
         serde_json::to_value(response).map_err(|e| FcpError::Internal {
             message: format!("Failed to serialize response: {e}"),
         })
+    }
+
+    /// Check the live session and input without provider I/O or replay admission.
+    fn authorize_operation(
+        &self,
+        operation: &OperationId,
+        input: &serde_json::Value,
+        token: CapabilityToken,
+        connector_id: Option<&ConnectorId>,
+        zone_id: Option<&ZoneId>,
+    ) -> FcpResult<()> {
+        self.base.check_ready()?;
+        if self.client.is_none() || self.config.is_none() {
+            return Err(FcpError::NotConfigured);
+        }
+        if connector_id.is_some_and(|id| id != &self.base.id)
+            || zone_id.is_some_and(|zone| self.bound_zone.as_ref() != Some(zone))
+        {
+            return Err(FcpError::InvalidRequest {
+                code: 1003,
+                message: "Request does not match the negotiated GitHub connector and zone".into(),
+            });
+        }
+        let metadata = Self::operations_info()
+            .into_iter()
+            .find(|metadata| metadata.id == *operation)
+            .ok_or_else(|| FcpError::OperationNotGranted {
+                operation: operation.as_str().to_owned(),
+            })?;
+        if !self
+            .granted_capabilities
+            .contains(metadata.capability.as_str())
+        {
+            return Err(FcpError::CapabilityDenied {
+                capability: metadata.capability.as_str().to_owned(),
+                reason: "Capability was not granted by the current handshake".into(),
+            });
+        }
+        let resources = resource_uris_for_operation(operation.as_str(), input)?;
+        self.verifier
+            .as_ref()
+            .ok_or(FcpError::NotHandshaken)?
+            .verify_bound(token, &metadata.capability, operation, &resources)?;
+        validate_github_input(operation.as_str(), input)?;
+        fcp_sdk::validate_input(&metadata.input_schema, input)
     }
 
     /// Handle invoke method.
@@ -1005,12 +1086,31 @@ impl GitHubConnector {
             message: "Invalid operation ID format".into(),
         })?;
 
-        let cap_id = github_capability_for_operation(operation)?;
-        let resource_uris = resource_uris_for_operation(operation, &input)?;
-        self.base.check_ready()?;
-
-        let verifier = self.verifier.as_ref().ok_or(FcpError::NotHandshaken)?;
-        verifier.verify_bound(token, &cap_id, &op_id, &resource_uris)?;
+        let connector_id: Option<ConnectorId> = params
+            .get("connector_id")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|_| FcpError::InvalidRequest {
+                code: 1003,
+                message: "Invalid connector_id".into(),
+            })?;
+        let zone_id: Option<ZoneId> = params
+            .get("zone_id")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|_| FcpError::InvalidRequest {
+                code: 1003,
+                message: "Invalid zone_id".into(),
+            })?;
+        self.authorize_operation(
+            &op_id,
+            &input,
+            token,
+            connector_id.as_ref(),
+            zone_id.as_ref(),
+        )?;
 
         match operation {
             "github.create_issue" => self.invoke_create_issue(input).await,
@@ -1467,16 +1567,12 @@ impl GitHubConnector {
     /// # Errors
     /// Returns [`FcpError`] if the shutdown process fails.
     pub async fn handle_shutdown(
-        &self,
+        &mut self,
         _params: serde_json::Value,
     ) -> FcpResult<serde_json::Value> {
         info!("GitHub connector shutting down");
-        if let Some(client) = &self.client {
-            client.shutdown();
-        }
+        self.clear_configuration();
         self.shutdown.store(true, Ordering::Release);
-        self.base.set_handshaken(false);
-        self.base.set_configured(false);
         Ok(json!({ "status": "shutdown" }))
     }
 }
@@ -1952,7 +2048,11 @@ fn op_info(
         risk_level,
         description: None,
         rate_limit: None,
-        requires_approval: None,
+        requires_approval: Some(match id {
+            "github.create_issue" | "github.create_pull_request" => ApprovalMode::Policy,
+            "github.merge_pull_request" | "github.trigger_workflow" => ApprovalMode::Interactive,
+            _ => ApprovalMode::None,
+        }),
         safety_tier,
         idempotency,
         ai_hints,
@@ -2019,7 +2119,7 @@ mod tests {
         capability: CapabilityToken,
     ) -> serde_json::Value {
         serde_json::to_value(SimulateRequest::new(
-            ConnectorId::from_static("github"),
+            ConnectorId::from_static("fcp.github"),
             OperationId::from_static(operation),
             fcp_core::ZoneId::work(),
             input,
@@ -2049,7 +2149,7 @@ mod tests {
         let verifying_key = signing_key.verifying_key();
         connector
             .handle_handshake(json!({
-                "protocol_version": "1.0.0",
+                "protocol_version": "2.0.0",
                 "zone": "z:work",
                 "host_public_key": verifying_key.to_bytes(),
                 "nonce": vec![0u8; 32],
@@ -2067,10 +2167,10 @@ mod tests {
 
     #[fcp_async_core::runtime::test]
     async fn test_handshake() {
-        let mut connector = GitHubConnector::new();
+        let mut connector = configured_connector().await;
         let result = connector
             .handle_handshake(json!({
-                "protocol_version": "1.0.0",
+                "protocol_version": "2.0.0",
                 "zone": "z:work",
                 "host_public_key": vec![0u8; 32],
                 "nonce": vec![0u8; 32],
@@ -2085,30 +2185,32 @@ mod tests {
     #[fcp_async_core::runtime::test]
     async fn test_health_not_configured() {
         let connector = GitHubConnector::new();
-        let result = connector.handle_health().await.unwrap();
-        assert_eq!(result["status"], "not_configured");
+        let health: HealthSnapshot =
+            serde_json::from_value(connector.handle_health().await.unwrap()).unwrap();
+        assert!(!health.is_ready());
+        let details = health.details.unwrap();
+        assert_eq!(details["configured"], false);
+        assert_eq!(details["handshaken"], false);
+        assert_eq!(details["instance_id"], connector.instance_id().as_str());
     }
 
     #[fcp_async_core::runtime::test]
     async fn test_invoke_without_config() {
         let mut connector = GitHubConnector::new();
-
         let signing_key = Ed25519SigningKey::generate();
-        let verifying_key = signing_key.verifying_key();
-
-        connector
+        let error = connector
             .handle_handshake(json!({
-                "protocol_version": "1.0.0",
+                "protocol_version": "2.0.0",
                 "zone": "z:work",
-                "host_public_key": verifying_key.to_bytes(),
+                "host_public_key": signing_key.verifying_key().to_bytes(),
                 "nonce": vec![0u8; 32],
-                "capabilities_requested": ["github.get_repo"]
+                "capabilities_requested": ["github.read"]
             }))
             .await
-            .unwrap();
+            .unwrap_err();
+        assert!(matches!(error, FcpError::NotConfigured));
 
         let token = generate_valid_token(&signing_key, &connector, "github.get_repo");
-
         let result = connector
             .handle_invoke(json!({
                 "operation": "github.get_repo",
@@ -2116,8 +2218,6 @@ mod tests {
                 "capability_token": token
             }))
             .await;
-
-        assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), FcpError::NotConfigured));
     }
 
@@ -2136,11 +2236,11 @@ mod tests {
 
         connector
             .handle_handshake(json!({
-                "protocol_version": "1.0.0",
+                "protocol_version": "2.0.0",
                 "zone": "z:work",
                 "host_public_key": verifying_key.to_bytes(),
                 "nonce": vec![0u8; 32],
-                "capabilities_requested": ["github.get_issue"]
+                "capabilities_requested": ["github.read"]
             }))
             .await
             .unwrap();
@@ -2815,16 +2915,18 @@ mod tests {
 
     #[fcp_async_core::runtime::test]
     async fn test_health_includes_auth_mode() {
-        let mut connector = GitHubConnector::new();
-        connector
-            .handle_configure(json!({ "credential_id": uuid::Uuid::new_v4().to_string() }))
-            .await
-            .unwrap();
-
-        let result = connector.handle_health().await.unwrap();
-        assert_eq!(result["status"], "healthy");
-        assert_eq!(result["auth_mode"], "credential_id");
-        assert_eq!(result["api_url"], DEFAULT_BASE_URL);
+        let connector = configured_connector().await;
+        let health: HealthSnapshot =
+            serde_json::from_value(connector.handle_health().await.unwrap()).unwrap();
+        assert!(
+            !health.is_ready(),
+            "configuration alone is not a live session"
+        );
+        let details = health.details.unwrap();
+        assert_eq!(details["configured"], true);
+        assert_eq!(details["handshaken"], false);
+        assert_eq!(details["auth_mode"], "credential_id");
+        assert_eq!(details["api_url"], DEFAULT_BASE_URL);
     }
 
     #[fcp_async_core::runtime::test]
@@ -3247,27 +3349,37 @@ mod tests {
 
     #[fcp_async_core::runtime::test]
     async fn test_handshake_grants_requested_capabilities() {
-        let mut connector = GitHubConnector::new();
-        let result = connector
-            .handle_handshake(json!({
-                "protocol_version": "1.0.0",
-                "zone": "z:work",
-                "host_public_key": vec![0u8; 32],
-                "nonce": vec![0u8; 32],
-                "capabilities_requested": ["github.read", "github.write"]
-            }))
-            .await
-            .unwrap();
-        let grants = result["capabilities_granted"].as_array().unwrap();
-        assert_eq!(grants.len(), 2);
+        let mut connector = configured_connector().await;
+        let result: HandshakeResponse = serde_json::from_value(
+            connector
+                .handle_handshake(json!({
+                    "protocol_version": "2.0.0",
+                    "zone": "z:work",
+                    "host_public_key": vec![0u8; 32],
+                    "nonce": vec![0u8; 32],
+                    "capabilities_requested": [
+                        "github.read", "github.write", "github.read",
+                        "github.search", "github.get_repo", "github.unknown"
+                    ]
+                }))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let grants: Vec<_> = result
+            .capabilities_granted
+            .iter()
+            .map(|grant| grant.capability.as_str())
+            .collect();
+        assert_eq!(grants, vec!["github.read", "github.write"]);
     }
 
     #[fcp_async_core::runtime::test]
     async fn test_handshake_has_session_id() {
-        let mut connector = GitHubConnector::new();
+        let mut connector = configured_connector().await;
         let result = connector
             .handle_handshake(json!({
-                "protocol_version": "1.0.0",
+                "protocol_version": "2.0",
                 "zone": "z:work",
                 "host_public_key": vec![0u8; 32],
                 "nonce": vec![0u8; 32],
@@ -3277,14 +3389,21 @@ mod tests {
             .unwrap();
         assert!(result["session_id"].is_string());
         assert!(connector.session_id.is_some());
+        let health: HealthSnapshot =
+            serde_json::from_value(connector.handle_health().await.unwrap()).unwrap();
+        assert!(health.is_ready());
+        assert_eq!(
+            health.details.unwrap()["instance_id"],
+            connector.instance_id().as_str()
+        );
     }
 
     #[fcp_async_core::runtime::test]
     async fn test_handshake_event_caps() {
-        let mut connector = GitHubConnector::new();
+        let mut connector = configured_connector().await;
         let result = connector
             .handle_handshake(json!({
-                "protocol_version": "1.0.0",
+                "protocol_version": "2.0.0",
                 "zone": "z:work",
                 "host_public_key": vec![0u8; 32],
                 "nonce": vec![0u8; 32],
@@ -3293,7 +3412,7 @@ mod tests {
             .await
             .unwrap();
         let event_caps = &result["event_caps"];
-        assert_eq!(event_caps["streaming"], true);
+        assert_eq!(event_caps["streaming"], false);
         assert_eq!(event_caps["replay"], false);
     }
 
@@ -3302,16 +3421,20 @@ mod tests {
     #[fcp_async_core::runtime::test]
     async fn test_health_not_configured_status() {
         let connector = GitHubConnector::new();
-        let result = connector.handle_health().await.unwrap();
-        assert_eq!(result["status"], "not_configured");
+        let health: HealthSnapshot =
+            serde_json::from_value(connector.handle_health().await.unwrap()).unwrap();
+        assert!(!health.is_ready());
+        assert_eq!(health.details.unwrap()["configured"], false);
     }
 
     #[fcp_async_core::runtime::test]
     async fn test_health_metrics_start_at_zero() {
         let connector = GitHubConnector::new();
-        let result = connector.handle_health().await.unwrap();
-        assert_eq!(result["metrics"]["requests_total"], 0);
-        assert_eq!(result["metrics"]["requests_error"], 0);
+        let health: HealthSnapshot =
+            serde_json::from_value(connector.handle_health().await.unwrap()).unwrap();
+        let details = health.details.unwrap();
+        assert_eq!(details["metrics"]["requests_total"], 0);
+        assert_eq!(details["metrics"]["requests_error"], 0);
     }
 
     // ── require_str sync tests ──────────────────────────────────────
@@ -3487,6 +3610,282 @@ mod tests {
     fn doctor_status_pass_serializes_as_snake_case() {
         let v = serde_json::to_value(DoctorStatus::Pass).unwrap();
         assert_eq!(v, "pass");
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn session_replacements_revoke_old_tokens_even_when_rejected() {
+        for transition in [
+            "invalid_configure",
+            "configure",
+            "malformed_handshake",
+            "unsupported_protocol",
+            "forbidden_zone",
+            "handshake",
+            "shutdown",
+        ] {
+            let (mut connector, key) = handshaken_connector().await;
+            let old_instance = connector.instance_id().clone();
+            let old_token = generate_valid_token(&key, &connector, "github.get_repo");
+            let input = json!({"owner": "octocat", "repo": "hello-world"});
+            let before = parse_simulate_response(
+                connector
+                    .handle_simulate(simulate_request(
+                        "github.get_repo",
+                        input.clone(),
+                        old_token.clone(),
+                    ))
+                    .await
+                    .unwrap(),
+            );
+            assert!(before.would_succeed);
+
+            let mut handshake = json!({
+                "protocol_version": "2.0.0",
+                "zone": "z:work",
+                "host_public_key": key.verifying_key().to_bytes(),
+                "nonce": vec![7u8; 32],
+                "capabilities_requested": ["github.read"]
+            });
+            match transition {
+                "invalid_configure" => {
+                    assert!(connector.handle_configure(json!({})).await.is_err());
+                }
+                "configure" => {
+                    connector
+                        .handle_configure(
+                            json!({"credential_id": uuid::Uuid::new_v4().to_string()}),
+                        )
+                        .await
+                        .unwrap();
+                }
+                "malformed_handshake" => {
+                    assert!(connector.handle_handshake(json!({})).await.is_err());
+                }
+                "unsupported_protocol" => {
+                    handshake["protocol_version"] = json!("1.0.0");
+                    assert!(connector.handle_handshake(handshake.clone()).await.is_err());
+                }
+                "forbidden_zone" => {
+                    handshake["zone"] = json!("z:public");
+                    assert!(connector.handle_handshake(handshake.clone()).await.is_err());
+                }
+                "handshake" => {
+                    connector.handle_handshake(handshake.clone()).await.unwrap();
+                }
+                "shutdown" => {
+                    connector.handle_shutdown(json!({})).await.unwrap();
+                }
+                _ => unreachable!(),
+            }
+
+            assert_ne!(connector.instance_id(), &old_instance, "{transition}");
+            let health: HealthSnapshot =
+                serde_json::from_value(connector.handle_health().await.unwrap()).unwrap();
+            assert_eq!(health.is_ready(), transition == "handshake", "{transition}");
+            let denied = parse_simulate_response(
+                connector
+                    .handle_simulate(simulate_request(
+                        "github.get_repo",
+                        input.clone(),
+                        old_token.clone(),
+                    ))
+                    .await
+                    .unwrap(),
+            );
+            assert!(!denied.would_succeed, "{transition}");
+            assert!(
+                connector
+                    .handle_invoke(json!({
+                        "operation": "github.get_repo",
+                        "input": input,
+                        "capability_token": old_token
+                    }))
+                    .await
+                    .is_err(),
+                "{transition} must fence provider dispatch"
+            );
+
+            connector
+                .handle_configure(json!({"credential_id": uuid::Uuid::new_v4().to_string()}))
+                .await
+                .unwrap();
+            handshake["protocol_version"] = json!("2.0.0");
+            handshake["zone"] = json!("z:work");
+            connector.handle_handshake(handshake).await.unwrap();
+            let old_grant = parse_simulate_response(
+                connector
+                    .handle_simulate(simulate_request(
+                        "github.get_repo",
+                        input.clone(),
+                        old_token,
+                    ))
+                    .await
+                    .unwrap(),
+            );
+            assert!(
+                !old_grant.would_succeed,
+                "recovery revived {transition} grant"
+            );
+            let current = generate_valid_token(&key, &connector, "github.get_repo");
+            let allowed = parse_simulate_response(
+                connector
+                    .handle_simulate(simulate_request("github.get_repo", input, current))
+                    .await
+                    .unwrap(),
+            );
+            assert!(allowed.would_succeed, "{transition} recovery");
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn live_invocation_and_simulation_reject_mismatched_envelopes() {
+        let (connector, key) = handshaken_connector().await;
+        for (field, value) in [("connector_id", "fcp.other"), ("zone_id", "z:private")] {
+            let token = generate_valid_token(&key, &connector, "github.get_repo");
+            let mut simulate = simulate_request(
+                "github.get_repo",
+                json!({"owner": "octocat", "repo": "hello-world"}),
+                token,
+            );
+            simulate[field] = json!(value);
+            let denied =
+                parse_simulate_response(connector.handle_simulate(simulate.clone()).await.unwrap());
+            assert!(!denied.would_succeed);
+            simulate["type"] = json!("invoke");
+            assert!(connector.handle_invoke(simulate).await.is_err());
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn signed_write_capability_cannot_expand_a_read_only_handshake() {
+        let mut connector = configured_connector().await;
+        let key = Ed25519SigningKey::generate();
+        connector
+            .handle_handshake(json!({
+                "protocol_version": "2.0.0",
+                "zone": "z:work",
+                "host_public_key": key.verifying_key().to_bytes(),
+                "nonce": vec![0u8; 32],
+                "capabilities_requested": ["github.read"]
+            }))
+            .await
+            .unwrap();
+        let token = generate_valid_token(&key, &connector, "github.create_issue");
+        let request = simulate_request(
+            "github.create_issue",
+            json!({"owner": "octocat", "repo": "hello-world", "title": "denied"}),
+            token,
+        );
+        let denied =
+            parse_simulate_response(connector.handle_simulate(request.clone()).await.unwrap());
+        assert!(!denied.would_succeed);
+        assert_eq!(
+            denied.missing_capabilities,
+            vec!["github.write".to_string()]
+        );
+        assert!(matches!(
+            connector.handle_invoke(request).await,
+            Err(FcpError::CapabilityDenied { .. })
+        ));
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn rejected_zone_changes_do_not_forget_the_configured_zone() {
+        let (mut connector, key) = handshaken_connector().await;
+        for zone in ["z:public", "z:private", "z:private"] {
+            assert!(
+                connector
+                    .handle_handshake(json!({
+                        "protocol_version": "2.0.0",
+                        "zone": zone,
+                        "host_public_key": key.verifying_key().to_bytes(),
+                        "nonce": vec![0u8; 32],
+                        "capabilities_requested": ["github.read"]
+                    }))
+                    .await
+                    .is_err()
+            );
+            assert_eq!(connector.bound_zone, Some(ZoneId::work()));
+            assert!(connector.base.check_ready().is_err());
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn preflight_and_session_rotation_preserve_webhook_replay_receipts() {
+        let (mut connector, key) = handshaken_connector().await;
+        let input = json!({
+            "signature_validated": true,
+            "payload": {
+                "event_type": "issues",
+                "delivery_id": "session-replay-1",
+                "repository": {
+                    "id": 1,
+                    "full_name": "octocat/hello-world",
+                    "html_url": "https://github.com/octocat/hello-world"
+                },
+                "data": {"action": "opened", "issue": {"number": 42}}
+            }
+        });
+        let token = generate_valid_token(&key, &connector, "github.process_webhook");
+        for _ in 0..2 {
+            let result = parse_simulate_response(
+                connector
+                    .handle_simulate(simulate_request(
+                        "github.process_webhook",
+                        input.clone(),
+                        token.clone(),
+                    ))
+                    .await
+                    .unwrap(),
+            );
+            assert!(result.would_succeed);
+        }
+        connector
+            .handle_invoke(json!({
+                "operation": "github.process_webhook",
+                "input": input,
+                "capability_token": token
+            }))
+            .await
+            .unwrap();
+        connector
+            .handle_configure(json!({"credential_id": uuid::Uuid::new_v4().to_string()}))
+            .await
+            .unwrap();
+        connector
+            .handle_handshake(json!({
+                "protocol_version": "2.0.0",
+                "zone": "z:work",
+                "host_public_key": key.verifying_key().to_bytes(),
+                "nonce": vec![0u8; 32],
+                "capabilities_requested": ["github.process_webhook"]
+            }))
+            .await
+            .unwrap();
+        let token = generate_valid_token(&key, &connector, "github.process_webhook");
+        let error = connector
+            .handle_invoke(json!({
+                "operation": "github.process_webhook",
+                "input": input,
+                "capability_token": token
+            }))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("duplicate webhook delivery_id"));
+    }
+
+    #[test]
+    fn runtime_approval_requirements_match_the_embedded_manifest() {
+        let manifest = ConnectorManifest::parse_str(MANIFEST_TOML).unwrap();
+        for operation in GitHubConnector::operations_info() {
+            let declared = &manifest.provides.operations[operation.id.as_str()];
+            assert_eq!(
+                operation.requires_approval,
+                Some(ApprovalMode::from(declared.requires_approval)),
+                "{}",
+                operation.id.as_str()
+            );
+        }
     }
 
     #[test]

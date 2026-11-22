@@ -17,7 +17,7 @@ use fcp_prelude::CapabilityConstraints;
 use serde_json::{Value, json};
 
 const ACCEPTANCE_SUITE_CLASS: &str = "local_non_mock";
-const CONNECTOR_ID: &str = "github";
+const CONNECTOR_ID: &str = "fcp.github";
 const FIXTURE_ID: &str = "github-loopback-local-acceptance";
 const TEST_CREDENTIAL_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
 const OWNER: &str = "octocat";
@@ -279,7 +279,7 @@ async fn setup_handshake(connector: &mut GitHubConnector, caps: &[&str]) -> Ed25
 
     connector
         .handle_handshake(json!({
-            "protocol_version": "1.0.0",
+            "protocol_version": "2.0.0",
             "zone": "z:work",
             "host_public_key": verifying_key.to_bytes(),
             "nonce": vec![0_u8; 32],

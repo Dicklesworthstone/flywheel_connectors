@@ -12,7 +12,7 @@
 use fcp_crypto::Ed25519SigningKey;
 use fcp_crypto::cose::CapabilityTokenBuilder;
 use fcp_github::connector::GitHubConnector;
-use fcp_prelude::{CapabilityConstraints, CapabilityToken};
+use fcp_prelude::{CapabilityConstraints, CapabilityToken, HealthSnapshot};
 
 use chrono::{Duration, Utc};
 use serde_json::json;
@@ -106,7 +106,7 @@ async fn setup_live_connector(connector: &mut GitHubConnector, token: &str) -> E
 
     connector
         .handle_handshake(json!({
-            "protocol_version": "1.0.0",
+            "protocol_version": "2.0.0",
             "zone": "z:work",
             "host_public_key": verifying_key.to_bytes(),
             "nonce": vec![0u8; 32],
@@ -238,7 +238,7 @@ async fn live_error_mapping_invalid_token() {
 
     connector
         .handle_handshake(json!({
-            "protocol_version": "1.0.0",
+            "protocol_version": "2.0.0",
             "zone": "z:work",
             "host_public_key": verifying_key.to_bytes(),
             "nonce": vec![0u8; 32],
@@ -295,10 +295,16 @@ async fn live_health_check() {
         .await
         .expect("health check should succeed");
 
+    let snapshot: HealthSnapshot =
+        serde_json::from_value(health.clone()).expect("canonical health snapshot");
     assert!(
-        health.get("status").is_some() || health.get("healthy").is_some(),
-        "health response should contain status or healthy field: {health}"
+        snapshot.is_ready(),
+        "handshaken connector must report readiness"
     );
+    let details = snapshot.details.expect("lifecycle details");
+    assert_eq!(details["configured"], true);
+    assert_eq!(details["handshaken"], true);
+    assert_eq!(details["instance_id"], connector.instance_id().as_str());
 
     eprintln!("PASS: live_health_check — {health}");
 }

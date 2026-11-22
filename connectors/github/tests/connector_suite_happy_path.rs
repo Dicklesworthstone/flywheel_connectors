@@ -5,9 +5,9 @@ use fcp_github::connector::GitHubConnector;
 use fcp_prelude::{
     AgentHint, CapabilityConstraints, CapabilityId, CapabilityToken, ConnectorId, ConnectorMetrics,
     FcpConnector, FcpError, HandshakeRequest, HandshakeResponse, HealthSnapshot, IdempotencyClass,
-    InstanceId, Introspection, InvokeRequest, InvokeResponse, OperationId, OperationInfo,
-    RequestId, RiskLevel, SafetyTier, ShutdownRequest, SimulateRequest, SimulateResponse,
-    SubscribeRequest, SubscribeResponse, UnsubscribeRequest, ZoneId,
+    Introspection, InvokeRequest, InvokeResponse, OperationId, OperationInfo, RequestId, RiskLevel,
+    SafetyTier, ShutdownRequest, SimulateRequest, SimulateResponse, SubscribeRequest,
+    SubscribeResponse, UnsubscribeRequest, ZoneId,
 };
 use serde_json::json;
 use wiremock::{
@@ -15,7 +15,7 @@ use wiremock::{
     matchers::{header, method, path},
 };
 
-const CONNECTOR_ID: &str = "github";
+const CONNECTOR_ID: &str = "fcp.github";
 const OP_GET_REPO: &str = "github.get_repo";
 const CAP_READ: &str = "github.read";
 const TEST_CREDENTIAL_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
@@ -25,6 +25,9 @@ const REPO: &str = "hello-world";
 struct GitHubAdapter {
     connector: GitHubConnector,
     id: ConnectorId,
+    // Only authorized provider fixtures opt into host issuance after lifecycle setup.
+    // Keeping this absent preserves intentionally invalid tokens in denial tests.
+    host_token_issuer: Option<Ed25519SigningKey>,
 }
 
 impl GitHubAdapter {
@@ -32,11 +35,15 @@ impl GitHubAdapter {
         Self {
             connector: GitHubConnector::new(),
             id: ConnectorId::from_static(CONNECTOR_ID),
+            host_token_issuer: None,
         }
     }
 
-    fn instance_id(&self) -> &InstanceId {
-        self.connector.instance_id()
+    fn with_host_token_issuer(signing_key: Ed25519SigningKey) -> Self {
+        Self {
+            host_token_issuer: Some(signing_key),
+            ..Self::new()
+        }
     }
 }
 
@@ -64,11 +71,11 @@ impl FcpConnector for GitHubAdapter {
 
     async fn health(&self) -> HealthSnapshot {
         match self.connector.handle_health().await {
-            Ok(payload) => match payload.get("status").and_then(serde_json::Value::as_str) {
-                Some("healthy") => HealthSnapshot::ready(),
-                Some(other) => HealthSnapshot::degraded(format!("github_status:{other}")),
-                None => HealthSnapshot::error("github_status:missing".to_string()),
-            },
+            Ok(payload) => {
+                serde_json::from_value::<HealthSnapshot>(payload).unwrap_or_else(|err| {
+                    HealthSnapshot::error(format!("invalid GitHub health snapshot: {err}"))
+                })
+            }
             Err(err) => HealthSnapshot::error(err.to_string()),
         }
     }
@@ -121,16 +128,35 @@ impl FcpConnector for GitHubAdapter {
         }
     }
 
-    async fn invoke(&self, req: InvokeRequest) -> fcp_core::FcpResult<InvokeResponse> {
-        let request_id = req.id;
-        let value = self
-            .connector
-            .handle_invoke(json!({
-                "operation": req.operation.as_str(),
-                "input": req.input,
-                "capability_token": req.capability_token,
-            }))
-            .await?;
+    async fn invoke(&self, mut req: InvokeRequest) -> fcp_core::FcpResult<InvokeResponse> {
+        if let Some(signing_key) = &self.host_token_issuer {
+            // The runner constructs requests before configure/handshake. Model the real host:
+            // learn the current instance from canonical health, then issue a scoped token.
+            let health: HealthSnapshot =
+                serde_json::from_value(self.connector.handle_health().await?).map_err(|err| {
+                    FcpError::Internal {
+                        message: format!("invalid GitHub health snapshot: {err}"),
+                    }
+                })?;
+            if !health.is_ready() {
+                return Err(FcpError::NotHandshaken);
+            }
+            let details = health.details.ok_or_else(|| FcpError::Internal {
+                message: "GitHub health omitted instance details".to_string(),
+            })?;
+            let instance_id = details
+                .get("instance_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| FcpError::Internal {
+                    message: "GitHub health omitted instance_id".to_string(),
+                })?;
+            req.capability_token = build_token(signing_key, instance_id);
+        }
+        let request_id = req.id.clone();
+        let request = serde_json::to_value(req).map_err(|err| FcpError::Internal {
+            message: format!("failed to serialize invoke request: {err}"),
+        })?;
+        let value = self.connector.handle_invoke(request).await?;
         Ok(InvokeResponse::ok(request_id, value))
     }
 
@@ -163,11 +189,11 @@ fn handshake_request(host_public_key: [u8; 32]) -> HandshakeRequest {
         capabilities_requested: vec![CapabilityId::from_static(CAP_READ)],
         host: None,
         transport_caps: None,
-        requested_instance_id: Some(InstanceId::new()),
+        requested_instance_id: None,
     }
 }
 
-fn build_token(signing_key: &Ed25519SigningKey, instance_id: &InstanceId) -> CapabilityToken {
+fn build_token(signing_key: &Ed25519SigningKey, instance_id: &str) -> CapabilityToken {
     let now = Utc::now();
     let constraints = CapabilityConstraints {
         resource_allow: vec![format!("github://{OWNER}/{REPO}")],
@@ -184,7 +210,7 @@ fn build_token(signing_key: &Ed25519SigningKey, instance_id: &InstanceId) -> Cap
         .issuer("node:test")
         .token_id(b"github-connector-suite")
         .validity(now, now + Duration::hours(1))
-        .target_instance(instance_id.as_str())
+        .target_instance(instance_id)
         .try_constraints_cbor(&cbor)
         .expect("valid constraints cbor")
         .sign(signing_key)
@@ -192,11 +218,7 @@ fn build_token(signing_key: &Ed25519SigningKey, instance_id: &InstanceId) -> Cap
     CapabilityToken::from_raw(raw)
 }
 
-fn get_repo_invoke(
-    signing_key: &Ed25519SigningKey,
-    id: &'static str,
-    instance_id: &InstanceId,
-) -> InvokeRequest {
+fn get_repo_invoke(id: &'static str) -> InvokeRequest {
     InvokeRequest {
         r#type: "invoke".to_string(),
         id: RequestId::new(id),
@@ -207,7 +229,8 @@ fn get_repo_invoke(
             "owner": OWNER,
             "repo": REPO
         }),
-        capability_token: build_token(signing_key, instance_id),
+        // The opted-in test host issues this token after observing the handshaken instance.
+        capability_token: CapabilityToken::from_raw(Vec::new()),
         holder_proof: None,
         context: None,
         idempotency_key: None,
@@ -217,6 +240,35 @@ fn get_repo_invoke(
         provenance: None,
         approval_tokens: Vec::new(),
     }
+}
+
+#[fcp_async_core::runtime::test]
+async fn adapter_without_host_issuer_preserves_invalid_tokens() {
+    let server = MockServer::start().await;
+    let signing_key = Ed25519SigningKey::generate();
+    let mut connector = GitHubAdapter::new();
+    connector
+        .configure(json!({
+            "credential_id": TEST_CREDENTIAL_ID,
+            "base_url": server.uri(),
+        }))
+        .await
+        .expect("configure connector");
+    connector
+        .handshake(handshake_request(signing_key.verifying_key().to_bytes()))
+        .await
+        .expect("handshake connector");
+
+    let mut invoke = get_repo_invoke("github-invalid-token");
+    invoke.capability_token = CapabilityToken::from_raw(vec![0xff]);
+    connector
+        .invoke(invoke)
+        .await
+        .expect_err("the adapter must not replace an intentionally invalid token");
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "an invalid token must not reach the provider"
+    );
 }
 
 #[fcp_async_core::runtime::test]
@@ -253,12 +305,9 @@ async fn connector_suite_happy_path_gets_repo() {
         .await;
 
     let signing_key = Ed25519SigningKey::generate();
-    let mut connector = GitHubAdapter::new();
-    let invoke = get_repo_invoke(
-        &signing_key,
-        "github-connector-suite",
-        connector.instance_id(),
-    );
+    let handshake = handshake_request(signing_key.verifying_key().to_bytes());
+    let mut connector = GitHubAdapter::with_host_token_issuer(signing_key);
+    let invoke = get_repo_invoke("github-connector-suite");
 
     let suite = ConnectorSuite {
         test_name: "github_get_repo_happy_path".to_string(),
@@ -266,7 +315,7 @@ async fn connector_suite_happy_path_gets_repo() {
             "credential_id": TEST_CREDENTIAL_ID,
             "base_url": server.uri(),
         }),
-        handshake: handshake_request(signing_key.verifying_key().to_bytes()),
+        handshake,
         invoke: Some(invoke),
         invoke_expectations: InvokeExpectations::default(),
     };
@@ -304,12 +353,9 @@ async fn connector_suite_error_path_reports_not_found_repo() {
         .await;
 
     let signing_key = Ed25519SigningKey::generate();
-    let mut connector = GitHubAdapter::new();
-    let invoke = get_repo_invoke(
-        &signing_key,
-        "github-connector-suite-not-found",
-        connector.instance_id(),
-    );
+    let handshake = handshake_request(signing_key.verifying_key().to_bytes());
+    let mut connector = GitHubAdapter::with_host_token_issuer(signing_key);
+    let invoke = get_repo_invoke("github-connector-suite-not-found");
 
     let suite = ConnectorSuite {
         test_name: "github_get_repo_not_found".to_string(),
@@ -317,7 +363,7 @@ async fn connector_suite_error_path_reports_not_found_repo() {
             "credential_id": TEST_CREDENTIAL_ID,
             "base_url": server.uri(),
         }),
-        handshake: handshake_request(signing_key.verifying_key().to_bytes()),
+        handshake,
         invoke: Some(invoke),
         invoke_expectations: InvokeExpectations {
             expect_error: true,

@@ -71,14 +71,31 @@ fn generate_valid_bound_token(
 async fn setup_handshake(connector: &mut GitHubConnector, caps: &[&str]) -> Ed25519SigningKey {
     let signing_key = Ed25519SigningKey::generate();
     let verifying_key = signing_key.verifying_key();
+    // Operation names are fixture shorthand only; the wire protocol negotiates capabilities.
+    let capabilities: Vec<&str> = caps
+        .iter()
+        .map(|cap| match *cap {
+            "github.create_issue" | "github.create_pull_request" => "github.write",
+            "github.merge_pull_request" | "github.trigger_workflow" => "github.admin",
+            "github.get_issue"
+            | "github.search_issues"
+            | "github.get_pull_request"
+            | "github.get_repo"
+            | "github.search_repos"
+            | "github.list_workflows"
+            | "github.get_file_content"
+            | "github.search_code" => "github.read",
+            other => other,
+        })
+        .collect();
 
     connector
         .handle_handshake(json!({
-            "protocol_version": "1.0.0",
+            "protocol_version": "2.0.0",
             "zone": "z:work",
             "host_public_key": verifying_key.to_bytes(),
             "nonce": vec![0u8; 32],
-            "capabilities_requested": caps
+            "capabilities_requested": capabilities
         }))
         .await
         .expect("handshake should succeed");
@@ -859,7 +876,7 @@ async fn invalid_pagination_fails_before_network_or_simulation() {
             let token = generate_valid_bound_token(&key, &connector, operation);
             let simulation = connector
                 .handle_simulate(json!({
-                    "type": "simulate", "id": "invalid-page", "connector_id": "github",
+                    "type": "simulate", "id": "invalid-page", "connector_id": "fcp.github",
                     "operation": operation, "zone_id": "z:work", "input": input,
                     "capability_token": token, "estimate_cost": false, "check_availability": false
                 }))
@@ -1349,8 +1366,8 @@ async fn capability_no_handshake_fails() {
 async fn capability_no_configure_fails() {
     let _ctx = AsyncTestContext::for_scenario("github.capability.no_configure");
 
-    let mut connector = GitHubConnector::new();
-    let signing_key = setup_handshake(&mut connector, &["github.get_repo"]).await;
+    let connector = GitHubConnector::new();
+    let signing_key = Ed25519SigningKey::generate();
     let token = generate_valid_bound_token(&signing_key, &connector, "github.get_repo");
 
     let err = connector
@@ -1431,7 +1448,7 @@ async fn capability_unknown_operation_fails() {
 // Lifecycle Tests
 // ============================================================================
 
-/// Health check before configure reports `not_configured`.
+/// Health is canonical and not ready before configuration.
 #[fcp_async_core::test]
 async fn lifecycle_health_before_configure() {
     let connector = GitHubConnector::new();
@@ -1439,10 +1456,16 @@ async fn lifecycle_health_before_configure() {
         .handle_health()
         .await
         .expect("health should succeed");
-    assert_eq!(result["status"], "not_configured");
+    let health: fcp_core::HealthSnapshot =
+        serde_json::from_value(result).expect("canonical health snapshot");
+    assert!(!health.is_ready());
+    let details = health.details.expect("lifecycle details");
+    assert_eq!(details["configured"], false);
+    assert_eq!(details["handshaken"], false);
+    assert_eq!(details["instance_id"], connector.instance_id().as_str());
 }
 
-/// Health check after configure reports healthy.
+/// Health requires both configuration and a successful handshake before readiness.
 #[fcp_async_core::test]
 async fn lifecycle_health_after_configure() {
     let mock_server = MockServer::start().await;
@@ -1453,36 +1476,92 @@ async fn lifecycle_health_after_configure() {
         .handle_health()
         .await
         .expect("health should succeed");
-    assert_eq!(result["status"], "healthy");
+    let health: fcp_core::HealthSnapshot =
+        serde_json::from_value(result).expect("canonical health snapshot");
+    assert!(!health.is_ready());
+    let details = health.details.expect("lifecycle details");
+    assert_eq!(details["configured"], true);
+    assert_eq!(details["handshaken"], false);
+    assert_eq!(details["api_url"], mock_server.uri());
+
+    setup_handshake(&mut connector, &["github.read"]).await;
+    let health: fcp_core::HealthSnapshot = serde_json::from_value(
+        connector
+            .handle_health()
+            .await
+            .expect("health after handshake"),
+    )
+    .expect("canonical health snapshot");
+    assert!(health.is_ready());
+    let details = health.details.expect("lifecycle details");
+    assert_eq!(details["configured"], true);
+    assert_eq!(details["handshaken"], true);
+    assert_eq!(details["instance_id"], connector.instance_id().as_str());
+    assert!(
+        mock_server.received_requests().await.unwrap().is_empty(),
+        "lifecycle health must not call the provider"
+    );
 }
 
 /// Handshake returns accepted with capabilities granted.
 #[fcp_async_core::test]
 async fn lifecycle_handshake_grants_capabilities() {
+    let mock_server = MockServer::start().await;
     let mut connector = GitHubConnector::new();
+    setup_configure(&mut connector, &mock_server.uri()).await;
     let signing_key = Ed25519SigningKey::generate();
     let verifying_key = signing_key.verifying_key();
 
     let result = connector
         .handle_handshake(json!({
-            "protocol_version": "1.0.0",
+            "protocol_version": "2.0.0",
             "zone": "z:work",
             "host_public_key": verifying_key.to_bytes(),
             "nonce": vec![0u8; 32],
-            "capabilities_requested": ["github.read", "github.write", "github.admin"]
+            "capabilities_requested": [
+                "github.read", "github.write", "github.admin", "github.process_webhook",
+                "github.read", "github.get_repo", "github.unknown"
+            ]
         }))
         .await
         .expect("handshake should succeed");
 
-    assert_eq!(result["status"], "accepted");
-    let caps = result["capabilities_granted"].as_array().unwrap();
-    assert_eq!(caps.len(), 3);
+    let response: fcp_core::HandshakeResponse =
+        serde_json::from_value(result).expect("canonical handshake response");
+    assert_eq!(response.status, "accepted");
+    let caps: Vec<&str> = response
+        .capabilities_granted
+        .iter()
+        .map(|grant| grant.capability.as_str())
+        .collect();
+    assert_eq!(
+        caps.len(),
+        4,
+        "unsupported or duplicate grants must be removed"
+    );
+    for expected in [
+        "github.read",
+        "github.write",
+        "github.admin",
+        "github.process_webhook",
+    ] {
+        assert!(
+            caps.contains(&expected),
+            "missing supported grant: {expected}"
+        );
+    }
+    assert!(
+        response
+            .capabilities_granted
+            .iter()
+            .all(|grant| grant.operation.is_none())
+    );
 }
 
 /// Shutdown returns clean status.
 #[fcp_async_core::test]
 async fn lifecycle_shutdown_clean() {
-    let connector = GitHubConnector::new();
+    let mut connector = GitHubConnector::new();
     let result = connector
         .handle_shutdown(json!({}))
         .await
@@ -2214,7 +2293,7 @@ async fn simulate_returns_allowed() {
         .handle_simulate(json!({
             "type": "simulate",
             "id": "req-001",
-            "connector_id": "github",
+            "connector_id": "fcp.github",
             "operation": "github.get_repo",
             "zone_id": "z:work",
             "input": { "owner": "octocat", "repo": "hello-world" },
@@ -2248,13 +2327,19 @@ async fn health_includes_metrics() {
         .await
         .expect("health should succeed");
 
-    assert!(result["metrics"].is_object(), "metrics should be an object");
+    let health: fcp_core::HealthSnapshot =
+        serde_json::from_value(result).expect("canonical health snapshot");
+    let details = health.details.expect("health details");
     assert!(
-        result["metrics"]["requests_total"].is_number(),
+        details["metrics"].is_object(),
+        "metrics should be an object"
+    );
+    assert!(
+        details["metrics"]["requests_total"].is_number(),
         "requests_total should be present"
     );
     assert!(
-        result["metrics"]["requests_error"].is_number(),
+        details["metrics"]["requests_error"].is_number(),
         "requests_error should be present"
     );
 }
@@ -2272,7 +2357,12 @@ async fn health_auth_mode_field() {
         .await
         .expect("health should succeed");
 
-    assert_eq!(result["auth_mode"], "credential_id");
+    let health: fcp_core::HealthSnapshot =
+        serde_json::from_value(result).expect("canonical health snapshot");
+    assert_eq!(
+        health.details.expect("health details")["auth_mode"],
+        "credential_id"
+    );
 
     // Also check credential_id mode
     let mut connector2 = GitHubConnector::new();
@@ -2288,7 +2378,12 @@ async fn health_auth_mode_field() {
         .await
         .expect("health should succeed");
 
-    assert_eq!(result2["auth_mode"], "credential_id");
+    let health: fcp_core::HealthSnapshot =
+        serde_json::from_value(result2).expect("canonical health snapshot");
+    assert_eq!(
+        health.details.expect("health details")["auth_mode"],
+        "credential_id"
+    );
 }
 
 /// Shutdown transitions the connector out of the invokable lifecycle state.
@@ -2335,7 +2430,13 @@ async fn shutdown_then_reinvoke() {
         .handle_health()
         .await
         .expect("health after shutdown should still work");
-    assert_eq!(health_result["status"], "shutdown");
+    let health: fcp_core::HealthSnapshot =
+        serde_json::from_value(health_result).expect("canonical health snapshot");
+    assert!(!health.is_ready());
+    assert!(matches!(health.status, fcp_core::HealthState::Stopping));
+    let details = health.details.expect("lifecycle details");
+    assert_eq!(details["configured"], false);
+    assert_eq!(details["handshaken"], false);
 
     // Invoke fails at the connector lifecycle gate instead of leaking a cancelled HTTP request.
     let token = generate_valid_bound_token(&signing_key, &connector, "github.get_repo");
