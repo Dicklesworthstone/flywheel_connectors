@@ -31,6 +31,10 @@ use crate::{
     HostBackpressureSignal, StreamError, StreamResult,
 };
 
+mod framing;
+
+use framing::InboundFraming;
+
 /// Hard ceiling for inbound WebSocket payloads, regardless of caller config.
 pub const MAX_WEBSOCKET_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 
@@ -40,6 +44,7 @@ fn websocket_cx() -> fcp_async_core::Cx {
 
 fn websocket_config(config: &WsConfig) -> WebSocketConfig {
     let mut websocket_config = WebSocketConfig::new()
+        .max_frame_size(config.max_message_size.min(MAX_WEBSOCKET_MESSAGE_SIZE))
         .max_message_size(config.max_message_size.min(MAX_WEBSOCKET_MESSAGE_SIZE))
         .ping_interval(config.ping_interval)
         .connect_timeout(Some(config.connect_timeout));
@@ -213,12 +218,64 @@ fn websocket_error(err: WsError) -> StreamError {
     }
 }
 
-fn build_handshake(url: &str, headers: &HashMap<String, String>) -> StreamResult<ClientHandshake> {
+fn valid_subprotocol(protocol: &str) -> bool {
+    !protocol.is_empty()
+        && protocol.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
+fn build_handshake(url: &str, config: &WsConfig) -> StreamResult<ClientHandshake> {
     let cx = websocket_cx();
     let mut handshake = ClientHandshake::new(url, cx.entropy())
         .map_err(|err| connection_failed(err.to_string()))?;
-    for (name, value) in headers {
+    let mut protocol_header = None;
+    for (name, value) in &config.headers {
+        if name.eq_ignore_ascii_case("sec-websocket-protocol") {
+            if protocol_header.replace(value.as_str()).is_some() {
+                return Err(connection_failed("Duplicate WebSocket subprotocol headers"));
+            }
+            continue;
+        }
         handshake = handshake.header(name.clone(), value.clone());
+    }
+    if let Some(required) = config.required_subprotocol.as_deref() {
+        if !valid_subprotocol(required)
+            || protocol_header.is_some_and(|header| header.trim() != required)
+        {
+            return Err(connection_failed(
+                "Invalid or conflicting required WebSocket subprotocol",
+            ));
+        }
+        handshake = handshake.protocol(required);
+    } else if let Some(header) = protocol_header {
+        let mut protocols = Vec::new();
+        for protocol in header.split(',').map(str::trim) {
+            if !valid_subprotocol(protocol) || protocols.contains(&protocol) {
+                return Err(connection_failed("Invalid WebSocket subprotocol header"));
+            }
+            protocols.push(protocol);
+            // A raw header alone does not register an offer for the dependency's
+            // response validator. Keep both sides of negotiation consistent.
+            handshake = handshake.protocol(protocol);
+        }
     }
     Ok(handshake)
 }
@@ -282,11 +339,11 @@ async fn perform_handshake<IO>(
     mut io: IO,
     url: &str,
     config: &WsConfig,
-) -> StreamResult<WebSocket<IO>>
+) -> StreamResult<WebSocket<InboundFrameGuard<IO>>>
 where
     IO: AsyncRead + AsyncWrite + Unpin,
 {
-    let handshake = build_handshake(url, &config.headers)?;
+    let handshake = build_handshake(url, config)?;
     let request = handshake.request_bytes();
     write_all(&mut io, &request)
         .await
@@ -302,15 +359,26 @@ where
     handshake
         .validate_response(&response)
         .map_err(|err| connection_failed(err.to_string()))?;
+    if let Some(required) = config.required_subprotocol.as_deref()
+        && response.header("sec-websocket-protocol") != Some(required)
+    {
+        return Err(connection_failed(
+            "Server did not select the required WebSocket subprotocol",
+        ));
+    }
 
-    Ok(WebSocket::from_upgraded(io, websocket_config(config)))
+    Ok(WebSocket::from_upgraded(
+        InboundFrameGuard::new(io),
+        websocket_config(config),
+    ))
 }
 
 fn build_tls_connector() -> StreamResult<TlsConnector> {
     TlsConnectorBuilder::new()
         .with_native_roots()
         .map_err(|err| connection_failed(err.to_string()))?
-        .alpn_http()
+        // This client performs an HTTP/1.1 Upgrade, not HTTP/2 CONNECT.
+        .alpn_protocols(vec![b"http/1.1".to_vec()])
         .build()
         .map_err(|err| connection_failed(err.to_string()))
 }
@@ -361,9 +429,83 @@ impl Drop for WsTcpStream {
     }
 }
 
+/// Observe plaintext frame boundaries after the HTTP upgrade, including for
+/// TLS transports. Keep payloads in the caller's buffer and let the dependency
+/// codec continue to enforce protocol validity and configured payload limits.
+struct InboundFrameGuard<IO> {
+    inner: IO,
+    framing: InboundFraming,
+}
+
+impl<IO> InboundFrameGuard<IO> {
+    const fn new(inner: IO) -> Self {
+        Self {
+            inner,
+            framing: InboundFraming::new(),
+        }
+    }
+}
+
+impl<IO: AsyncRead + Unpin> AsyncRead for InboundFrameGuard<IO> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        let Self { inner, framing } = self.get_mut();
+        let limit = match framing.read_limit() {
+            Ok(limit) => limit.min(buf.remaining()),
+            Err(error) => return Poll::Ready(Err(error)),
+        };
+        let count = {
+            // Do not advance the caller's filled cursor until these bytes pass
+            // the guard. No payload copy or second payload buffer is needed.
+            let mut limited = ReadBuf::new(&mut buf.unfilled()[..limit]);
+            match Pin::new(inner).poll_read(cx, &mut limited) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => return Poll::Pending,
+            }
+            let count = limited.filled().len();
+            let result = if count == 0 {
+                framing.end_of_stream()
+            } else {
+                framing.observe(limited.filled())
+            };
+            if let Err(error) = result {
+                return Poll::Ready(Err(error));
+            }
+            count
+        };
+        buf.advance(count);
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl<IO: AsyncWrite + Unpin> AsyncWrite for InboundFrameGuard<IO> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
 enum WsTransport {
-    Plain(Box<WebSocket<WsTcpStream>>),
-    Tls(Box<WebSocket<TlsStream<WsTcpStream>>>),
+    Plain(Box<WebSocket<InboundFrameGuard<WsTcpStream>>>),
+    Tls(Box<WebSocket<InboundFrameGuard<TlsStream<WsTcpStream>>>>),
 }
 
 impl WsTransport {
@@ -610,6 +752,8 @@ pub struct WsConfig {
     pub max_message_size: usize,
     /// Additional headers.
     pub headers: HashMap<String, String>,
+    /// Exact subprotocol the server must select. No selection is a failure.
+    pub required_subprotocol: Option<String>,
     /// Auto-reconnect on disconnect.
     pub auto_reconnect: bool,
     /// Maximum reconnection attempts.
@@ -632,6 +776,7 @@ impl std::fmt::Debug for WsConfig {
             .field("pong_timeout", &self.pong_timeout)
             .field("max_message_size", &self.max_message_size)
             .field("headers", &redacted_headers)
+            .field("required_subprotocol", &self.required_subprotocol)
             .field("auto_reconnect", &self.auto_reconnect)
             .field("max_reconnect_attempts", &self.max_reconnect_attempts)
             .field("reconnect_delay", &self.reconnect_delay)
@@ -647,6 +792,7 @@ impl Default for WsConfig {
             pong_timeout: Duration::from_secs(10),
             max_message_size: MAX_WEBSOCKET_MESSAGE_SIZE,
             headers: HashMap::new(),
+            required_subprotocol: None,
             auto_reconnect: true,
             max_reconnect_attempts: Some(10),
             reconnect_delay: Duration::from_secs(1),
@@ -690,6 +836,16 @@ impl WsConfig {
     #[must_use]
     pub fn with_header(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.headers.insert(key.into(), value.into());
+        self
+    }
+
+    /// Offer one subprotocol and require the server to select it exactly.
+    ///
+    /// Invalid token syntax or a conflicting custom protocol header fails the
+    /// handshake before any request bytes are sent. The default remains optional.
+    #[must_use]
+    pub fn with_required_subprotocol(mut self, protocol: impl Into<String>) -> Self {
+        self.required_subprotocol = Some(protocol.into());
         self
     }
 
@@ -1193,6 +1349,140 @@ mod tests {
             .write_all(response.as_bytes())
             .expect("write websocket handshake response");
         stream.flush().expect("flush websocket handshake response");
+    }
+
+    fn spawn_wire_websocket_server(wire: Vec<u8>) -> (String, thread::JoinHandle<()>) {
+        let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            socket.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+            complete_server_handshake(&mut socket);
+            // One write deliberately coalesces earlier complete messages with
+            // the later malformed/truncated frame.
+            socket.write_all(&wire).unwrap();
+            socket.shutdown(Shutdown::Write).unwrap();
+            // Leave the read half alive for automatic Pong/Close responses.
+            let mut received = [0; 256];
+            loop {
+                match socket.read(&mut received) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(error) if error.kind() == io::ErrorKind::ConnectionReset => break,
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(error) => panic!("WebSocket client did not finish: {error}"),
+                }
+            }
+        });
+        (format!("ws://{address}/frames"), peer)
+    }
+
+    #[test]
+    fn websocket_guard_preserves_prior_message_then_rejects_incomplete_wire() {
+        for (tail, expected) in [
+            (
+                vec![0x02, 1, b'x', 0x89, 0, 0x8a, 0, 0x88, 2, 0x03, 0xe8],
+                "fragmented message",
+            ),
+            (vec![0x01, 0, 0x88, 0], "fragmented message"),
+            (vec![0x82], "incomplete frame"),
+            (vec![0x82, 126, 0], "incomplete frame"),
+            (vec![0x82, 127, 0, 0, 0], "incomplete frame"),
+            (vec![0x82, 3, b'x'], "incomplete frame"),
+            (vec![0x02, 1, b'x'], "incomplete fragmented message"),
+        ] {
+            let mut wire = vec![0x81, 6];
+            wire.extend_from_slice(b"status");
+            wire.extend(tail);
+            let (url, peer) = spawn_wire_websocket_server(wire);
+            block_on(async {
+                let mut config = WsConfig::new().with_connect_timeout(Duration::from_secs(3));
+                config.ping_interval = None;
+                config.pong_timeout = Duration::from_secs(3);
+                config.auto_reconnect = false;
+                let mut connection = WsClient::with_config(url, config)
+                    .connect()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    connection.recv().await.unwrap(),
+                    Some(WsMessage::text("status")),
+                    "a later frame cannot hide an earlier complete message"
+                );
+                let error = connection.recv().await.unwrap_err();
+                assert!(
+                    matches!(&error, StreamError::WebSocketError(message)
+                        if message.contains(expected)),
+                    "{error:?}"
+                );
+                assert!(connection.is_closed());
+                assert!(connection.recv().await.unwrap().is_none());
+            });
+            peer.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn websocket_guard_accepts_complete_fragments_controls_and_clean_close() {
+        for opcode in [1, 2] {
+            // The euro sign spans three fragments; control frames can appear
+            // between fragments without ending or corrupting the message.
+            let wire = vec![
+                opcode, 1, 0xe2, 0x89, 1, b'p', 0x00, 1, 0x82, 0x8a, 0,
+                0x80, 1, 0xac, 0x88, 2, 0x03, 0xe8,
+            ];
+            let (url, peer) = spawn_wire_websocket_server(wire);
+            block_on(async {
+                let mut config = WsConfig::new().with_connect_timeout(Duration::from_secs(3));
+                config.ping_interval = None;
+                config.pong_timeout = Duration::from_secs(3);
+                config.auto_reconnect = false;
+                let mut connection = WsClient::with_config(url, config)
+                    .connect()
+                    .await
+                    .unwrap();
+                let expected = if opcode == 1 {
+                    WsMessage::text("€")
+                } else {
+                    WsMessage::binary(vec![0xe2, 0x82, 0xac])
+                };
+                assert_eq!(connection.recv().await.unwrap(), Some(expected));
+                assert!(matches!(
+                    connection.recv().await.unwrap(),
+                    Some(WsMessage::Close(Some(frame))) if frame.code == 1000
+                ));
+                assert!(connection.is_closed());
+                assert!(connection.recv().await.unwrap().is_none());
+            });
+            peer.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn websocket_guard_empty_read_does_not_poll_transport_or_report_eof() {
+        struct Unread;
+        impl AsyncRead for Unread {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                panic!("zero-capacity read must not touch the transport");
+            }
+        }
+
+        let mut guarded = InboundFrameGuard::new(Unread);
+        guarded.framing.observe(&[0x02, 0]).unwrap();
+        block_on(async {
+            let mut empty = [];
+            let mut read_buf = ReadBuf::new(&mut empty);
+            poll_fn(|cx| Pin::new(&mut guarded).poll_read(cx, &mut read_buf))
+                .await
+                .unwrap();
+        });
+        assert_eq!(guarded.framing.read_limit().unwrap(), 2);
+        assert!(guarded.framing.end_of_stream().is_err());
     }
 
     fn spawn_blackhole_websocket_server(stall: Duration) -> (String, thread::JoinHandle<()>) {

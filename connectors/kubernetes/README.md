@@ -86,7 +86,7 @@ Important runtime truths the contract preserves:
 - `kubernetes.get_secret` redacts data by default unless `unmask=true`, while `kubernetes.secret.get` returns the full secret object including `data`.
 - The tracked verifier script is deliberately fail-closed: missing `rch` workers or remote prerequisites are reported as infra-blocked, not as a green connector proof.
 
-True watch/log event delivery and Kubernetes exec channel transport remain separate work. Native protocol coverage does not establish live-cluster behavior or provider credentials.
+True watch/log event delivery remains separate work. Pod exec uses the Kubernetes remotecommand WebSocket transport described below. Native protocol coverage does not establish live-cluster behavior or provider credentials.
 
 ## First-Slice Scope
 
@@ -177,7 +177,7 @@ The current Kubernetes README slice documents the existing runtime surface:
 | `kubernetes.update_configmap` | `PUT /api/v1/namespaces/{namespace}/configmaps/{name}` | `kubernetes.write` | `Risky` | `Medium` | `BestEffort` | Legacy ConfigMap update operation; approval metadata is `Policy`. |
 | `kubernetes.get_secret` | `GET /api/v1/namespaces/{namespace}/secrets/{name}` | `kubernetes.secrets` | `Dangerous` | `High` | `Strict` | Legacy Secret read; redacts `data` unless `unmask=true`. |
 | `kubernetes.watch_events` | `GET /api/v1/namespaces/{namespace}/events` | `kubernetes.read` | `Safe` | `Low` | `Strict` | One-shot event list, not a durable watch stream. |
-| `kubernetes.exec` | `GET /api/v1/namespaces/{namespace}/pods/{name}/exec` | `kubernetes.admin` | `Dangerous` | `High` | `None` | Runs a command in a container after exec guard validation. |
+| `kubernetes.exec` | WebSocket `GET /api/v1/namespaces/{namespace}/pods/{name}/exec` | `kubernetes.admin` | `Dangerous` | `High` | `None` | Runs a noninteractive command after exec guard validation; returns stdout, stderr and the actual exit code. |
 | `kubernetes.configmap.list` | `GET /api/v1/namespaces/{namespace}/configmaps` | `kubernetes.read` | `Safe` | `Low` | `Strict` | Lists ConfigMaps. |
 | `kubernetes.configmap.get` | `GET /api/v1/namespaces/{namespace}/configmaps/{name}` | `kubernetes.read` | `Safe` | `Low` | `Strict` | Reads one ConfigMap. |
 | `kubernetes.configmap.create` | `POST /api/v1/namespaces/{namespace}/configmaps` | `kubernetes.admin` | `Dangerous` | `High` | `None` | Creates a ConfigMap. |
@@ -218,7 +218,23 @@ Every invocation binds its signed resource scope to the configured cluster endpo
 | Events | `/events` |
 | Exec | `/pods/{name}/exec` |
 
-Native executable acceptance coverage is in `tests/native_host.rs`: real loopback reads and writes, scoped grants, non-consuming simulation, exhausted quotas, stale instances, failed lifecycle transitions, invalid routes/results, deadline interruption and shutdown. These tests require a successful build; formatting and source review alone are not execution evidence.
+Native executable acceptance coverage is in `tests/native_host.rs`: real loopback reads and writes, scoped grants, non-consuming simulation, exhausted quotas, stale instances, failed lifecycle transitions, invalid routes/results, deadline interruption and shutdown. Exec coverage uses real WebSocket upgrades and binary channel frames. These tests require a successful build; formatting and source review alone are not execution evidence.
+
+### Running a command in a pod
+
+`kubernetes.exec` takes a namespace, pod name, command argument array and optional container. For example:
+
+```json
+{"namespace":"workloads","name":"worker-0","command":["/usr/bin/printenv","APP_MODE"],"container":"worker"}
+```
+
+The operation requires `allow_pod_exec=true`, an allowed namespace, an admitted `kubernetes.admin` grant for the pod's `/exec` resource, and a target that passes the existing pod security and label checks. Shell trampolines remain disabled unless `allow_shell_exec` is explicitly enabled. An empty executable or NUL-containing argument is rejected before provider access.
+
+The client performs an authenticated HTTP/1.1 WebSocket upgrade using exactly `v5.channel.k8s.io`. HTTPS API endpoints use WSS with certificate validation; loopback HTTP fixtures use WS. The selected API server must support that protocol. There is no SPDY or older-subprotocol fallback, stdin, terminal allocation, or interactive attach mode.
+
+Binary stdout, stderr and status channels are collected until a clean close or explicit closure of all requested streams. A valid Kubernetes terminal status is required before returning an `exec_result` containing `{"stdout":"...","stderr":"...","exit_code":0}`. Nonzero command exits are returned with their actual exit code. Split UTF-8 sequences and split status messages are reconstructed before decoding. Retained channel data is limited to 2 MiB in aggregate, with a separate 64 KiB status limit; successful output must be valid UTF-8.
+
+The connector never reconnects or retries an exec. A missing status, raw transport EOF, truncated stream, abnormal close, output overflow, deadline or connector shutdown produces a nonretryable unknown outcome and retains the admitted allowance. The command may already have run remotely; this result does not authorize replay or establish remote cancellation. Error messages contain fixed diagnostics and byte counts, without partial output, command arguments or credential values.
 
 ## Runtime Guardrails
 

@@ -5289,6 +5289,7 @@ dependencies = [
  "fcp-crypto",
  "fcp-prelude",
  "fcp-sdk",
+ "fcp-streaming",
  "percent-encoding",
  "reqwest 0.13.2",
  "serde",

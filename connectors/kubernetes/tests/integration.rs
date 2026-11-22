@@ -16,6 +16,7 @@ use wiremock::matchers::{header, method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 mod common;
+mod exec_support;
 use common::TestConnector as KubernetesConnector;
 
 async fn setup_connector(mock_url: &str) -> KubernetesConnector {
@@ -1414,34 +1415,10 @@ async fn counters_error_increment() {
 
 #[fcp_async_core::runtime::test]
 async fn exec_command() {
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/api/v1/namespaces/default/pods/debug-pod"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "kind": "Pod",
-            "metadata": {
-                "name": "debug-pod",
-                "labels": {"fcp.flywheel.ai/exec-approved": "true"}
-            },
-            "spec": {
-                "containers": [{"name": "debug", "image": "busybox"}]
-            }
-        })))
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path_regex(
-            r"/api/v1/namespaces/default/pods/debug-pod/exec.*",
-        ))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "stdout": "total 4\ndrwxr-xr-x 2 root root 4096 Jan 1 00:00 app\n",
-            "stderr": "",
-            "exit_code": 0
-        })))
-        .mount(&server)
-        .await;
-
-    let c = setup_connector(&server.uri()).await;
+    let server = exec_support::ExecServer::start(exec_support::ExecScript::success(
+        "total 4\ndrwxr-xr-x 2 root root 4096 Jan 1 00:00 app\n", "",
+    ));
+    let c = setup_connector(&server.url).await;
     let result = c
         .handle_invoke(json!({
             "operation_id": "kubernetes.exec",
@@ -1460,41 +1437,20 @@ async fn exec_command() {
             .contains("app")
     );
     assert_eq!(result["exec_result"]["exit_code"], 0);
+    assert_eq!(server.observed().method, "GET");
+    let upgrade = server.observed();
+    assert_eq!(upgrade.method, "GET");
+    assert_eq!(upgrade.headers["sec-websocket-protocol"], exec_support::PROTOCOL);
+    server.no_request();
+    server.finish();
 }
 
 #[fcp_async_core::runtime::test]
 async fn exec_with_container() {
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/api/v1/namespaces/default/pods/multi-pod"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "kind": "Pod",
-            "metadata": {
-                "name": "multi-pod",
-                "labels": {"fcp.flywheel.ai/exec-approved": "true"}
-            },
-            "spec": {
-                "containers": [
-                    {"name": "app", "image": "nginx"},
-                    {"name": "sidecar", "image": "busybox"}
-                ]
-            }
-        })))
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path_regex(
-            r"/api/v1/namespaces/default/pods/multi-pod/exec.*",
-        ))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "stdout": "hello\n",
-            "stderr": "",
-            "exit_code": 0
-        })))
-        .mount(&server)
-        .await;
-
-    let c = setup_connector(&server.uri()).await;
+    let mut script = exec_support::ExecScript::success("hello\n", "");
+    script.containers = vec!["app", "sidecar"];
+    let server = exec_support::ExecServer::start(script);
+    let c = setup_connector(&server.url).await;
     let result = c
         .handle_invoke(json!({
             "operation_id": "kubernetes.exec",
@@ -1513,6 +1469,11 @@ async fn exec_with_container() {
             .unwrap()
             .contains("hello")
     );
+    server.observed();
+    let upgrade = server.observed();
+    assert!(upgrade.target.contains("container=sidecar"));
+    server.no_request();
+    server.finish();
 }
 
 #[fcp_async_core::runtime::test]

@@ -46,6 +46,18 @@ pub enum KubernetesError {
     /// Connector policy denied the requested action.
     #[error("Policy denied: {0}")]
     PolicyDenied(String),
+
+    /// Exec may have started, but no complete, trustworthy result is available.
+    /// Only fixed diagnostic text and byte counts are retained, never command
+    /// arguments, bearer headers, provider status messages or partial output.
+    #[error(
+        "Kubernetes exec outcome unknown: {reason}; captured {stdout_bytes} stdout bytes and {stderr_bytes} stderr bytes; command may have run; do not replay automatically"
+    )]
+    ExecOutcomeUnknown {
+        reason: &'static str,
+        stdout_bytes: usize,
+        stderr_bytes: usize,
+    },
 }
 
 impl KubernetesError {
@@ -123,6 +135,13 @@ impl KubernetesError {
                 capability: "kubernetes.policy".into(),
                 reason: reason.clone(),
             },
+            Self::ExecOutcomeUnknown { .. } => FcpError::External {
+                service: "kubernetes".into(),
+                message: self.to_string(),
+                status_code: None,
+                retryable: false,
+                retry_after: None,
+            },
         }
     }
 }
@@ -162,6 +181,26 @@ impl fcp_sdk::ConnectorErrorMapping for KubernetesError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exec_unknown_outcome_is_terminal_and_preserves_only_safe_counts() {
+        let error = KubernetesError::ExecOutcomeUnknown {
+            reason: "exec stream was interrupted before terminal status",
+            stdout_bytes: 17,
+            stderr_bytes: 9,
+        };
+        assert!(!error.is_retryable());
+        assert!(error.retry_after().is_none());
+        let FcpError::External { service, message, status_code, retryable, retry_after } = error.to_fcp_error() else {
+            panic!("exec uncertainty must remain an external provider failure");
+        };
+        assert_eq!(service, "kubernetes");
+        assert!(message.contains("17 stdout bytes and 9 stderr bytes"));
+        assert!(message.contains("do not replay automatically"));
+        assert!(!retryable);
+        assert!(status_code.is_none());
+        assert!(retry_after.is_none());
+    }
 
     #[test]
     fn rate_limited_is_retryable() {

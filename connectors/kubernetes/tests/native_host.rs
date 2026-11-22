@@ -3,6 +3,7 @@
 #![allow(clippy::missing_panics_doc, clippy::too_many_lines)]
 
 mod common;
+mod exec_support;
 
 use std::{
     io::{BufRead, BufReader, Read, Write},
@@ -561,4 +562,287 @@ fn native_rejects_invalid_provider_results_and_keeps_the_grant_spent() {
     denied(&process.rpc("invoke", req));
     provider.no_request();
     process.shutdown();
+}
+
+fn exec_process(server: &exec_support::ExecServer) -> (Process, Ed25519SigningKey, InstanceId) {
+    let mut process = Process::new();
+    let configured = process.rpc(
+        "configure",
+        json!({
+            "bearer_token": "kubernetes-native-fixture", "base_url": server.url,
+            "allowed_namespaces": ["default"], "allow_write_operations": true,
+            "allow_pod_exec": true,
+        }),
+    );
+    assert_eq!(configured["result"]["status"], "configured", "{configured}");
+    let key = Ed25519SigningKey::generate();
+    let instance = process.handshake(&key, &["kubernetes.admin"]);
+    (process, key, instance)
+}
+
+fn exec_request(
+    server: &exec_support::ExecServer,
+    key: &Ed25519SigningKey,
+    instance: &InstanceId,
+    token_id: &[u8],
+) -> Value {
+    request(
+        "kubernetes.exec",
+        json!({"namespace": "default", "name": "debugpod", "command": ["id"]}),
+        token(
+            key,
+            instance,
+            "kubernetes.exec",
+            token_id,
+            &CapabilityConstraints {
+                resource_allow: vec![format!(
+                    "kubernetes://cluster/{}/namespaces/default/pods/debugpod/exec",
+                    utf8_percent_encode(&server.url, NON_ALPHANUMERIC)
+                )],
+                // A second call is allowed, but an uncertain first call must
+                // retain the entire finite byte reservation.
+                max_calls: Some(2),
+                max_bytes: Some(4096),
+                ..Default::default()
+            },
+        ),
+    )
+}
+
+fn observed_exec(server: &exec_support::ExecServer) -> exec_support::Observation {
+    let pod = server.observed();
+    assert_eq!(pod.method, "GET");
+    assert_eq!(pod.target, "/api/v1/namespaces/default/pods/debugpod");
+    let upgrade = server.observed();
+    assert_eq!(upgrade.method, "GET");
+    assert!(upgrade.target.starts_with("/api/v1/namespaces/default/pods/debugpod/exec?"));
+    assert_eq!(upgrade.headers["sec-websocket-protocol"], exec_support::PROTOCOL);
+    assert_eq!(upgrade.headers["authorization"], "Bearer kubernetes-native-fixture");
+    upgrade
+}
+
+#[test]
+fn native_exec_decodes_fragmented_utf8_and_status_then_drains_output() {
+    use exec_support::{ExecScript, frame};
+
+    let mut script = ExecScript::open();
+    script.containers = vec!["app", "sidecar"];
+    script.message(1, b"price: \xE2");
+    // A UTF-8 character spans remotecommand messages; the second message is
+    // itself split into WebSocket fragments with a control frame between them.
+    let mut fragment = frame(2, &[1, 0x82]);
+    fragment[0] &= 0x7f;
+    script.wire.extend(fragment);
+    script.wire.extend(frame(9, b"fixture-ping"));
+    script.wire.extend(frame(0, &[0xAC]));
+    script.message(3, b"{\"status\":");
+    script.message(3, b"\"Success\"}");
+    // Status is a logical stream, and completion cannot discard later output.
+    script.message(2, b"warning\n");
+    script.message(1, b" 12\n");
+    script.close();
+    let server = exec_support::ExecServer::start(script);
+    let (mut process, key, instance) = exec_process(&server);
+    let mut req = exec_request(&server, &key, &instance, b"exec-fragments");
+    req["input"]["container"] = json!("sidecar");
+    req["input"]["command"] = json!(["printf", "%s", "a&b +/\"", "", "  "]);
+    let output = success(process.rpc("invoke", req)).result.unwrap();
+    assert_eq!(output["exec_result"], json!({
+        "stdout": "price: € 12\n", "stderr": "warning\n", "exit_code": 0,
+    }));
+    let upgrade = observed_exec(&server);
+    let url = reqwest::Url::parse(&format!("{}{}", server.url, upgrade.target)).unwrap();
+    let pairs: Vec<_> = url.query_pairs().map(|(key, value)| (key.into_owned(), value.into_owned())).collect();
+    let commands: Vec<_> = pairs.iter().filter(|(key, _)| key == "command").map(|(_, value)| value.as_str()).collect();
+    assert_eq!(commands, ["printf", "%s", "a&b +/\"", "", "  "]);
+    for (key, value) in [("stdin", "false"), ("tty", "false"), ("stdout", "true"), ("stderr", "true"), ("container", "sidecar")] {
+        assert!(pairs.iter().any(|pair| pair == &(key.into(), value.into())));
+    }
+    server.wait_for_disconnect();
+    server.no_request();
+    process.shutdown();
+    server.finish();
+}
+
+#[test]
+fn native_exec_returns_nonzero_exit_only_from_terminal_status() {
+    let mut script = exec_support::ExecScript::open();
+    script.message(2, b"command failed\n");
+    script.status(json!({
+        "status": "Failure", "reason": "NonZeroExitCode",
+        "details": {"causes": [{"reason": "ExitCode", "message": "7"}]},
+    }));
+    script.close_stream(3);
+    script.close_stream(1);
+    script.close_stream(2);
+    // All three requested streams explicitly close; a transport Close is not
+    // necessary, and the client must retire the socket instead of waiting.
+    let server = exec_support::ExecServer::start(script);
+    let (mut process, key, instance) = exec_process(&server);
+    let req = exec_request(&server, &key, &instance, b"exec-exit-seven");
+    let output = success(process.rpc("invoke", req)).result.unwrap();
+    assert_eq!(output["exec_result"], json!({
+        "stdout": "", "stderr": "command failed\n", "exit_code": 7,
+    }));
+    observed_exec(&server);
+    server.wait_for_disconnect();
+    server.no_request();
+    process.shutdown();
+    server.finish();
+}
+
+#[test]
+fn native_exec_rejects_uncertain_protocol_output_without_replay_or_budget_refund() {
+    use exec_support::{ExecScript, frame, frame_header};
+    use fcp_kubernetes::client::MAX_EXEC_OUTPUT_BYTES;
+
+    let mut cases = Vec::new();
+    let mut wrong_protocol = ExecScript::success("", "");
+    wrong_protocol.protocol = Some("v4.channel.k8s.io");
+    cases.push(("wrong-protocol", wrong_protocol));
+    let mut missing_protocol = ExecScript::success("", "");
+    missing_protocol.protocol = None;
+    cases.push(("missing-protocol", missing_protocol));
+    for (label, status) in [("http-403", 403), ("http-429", 429), ("http-503", 503)] {
+        let mut script = ExecScript::open();
+        script.http_rejection = Some(status);
+        cases.push((label, script));
+    }
+    let mut missing_status = ExecScript::open();
+    missing_status.message(1, b"private partial output");
+    missing_status.close();
+    cases.push(("missing-status", missing_status));
+    let mut empty_close = ExecScript::open();
+    empty_close.status(json!({"status": "Success"}));
+    empty_close.wire.extend(frame(8, &[]));
+    cases.push(("empty-close-code", empty_close));
+    let mut malformed_status = ExecScript::open();
+    malformed_status.message(3, b"{\"status\":\"Success\"");
+    malformed_status.close();
+    cases.push(("truncated-status", malformed_status));
+    let mut invalid_exit = ExecScript::open();
+    invalid_exit.status(json!({"status": "Failure", "reason": "NonZeroExitCode", "details": {"causes": [{"reason": "ExitCode", "message": "0"}]}}));
+    invalid_exit.close();
+    cases.push(("invalid-exit-zero", invalid_exit));
+    let mut truncated_frame = ExecScript::open();
+    truncated_frame.status(json!({"status": "Success"}));
+    truncated_frame.wire.extend(frame_header(2, 20));
+    truncated_frame.wire.extend([1, b'x']);
+    truncated_frame.disconnect = true;
+    cases.push(("status-then-partial-frame-eof", truncated_frame));
+    let mut interrupted_message = ExecScript::open();
+    interrupted_message.status(json!({"status": "Success"}));
+    let mut fragment = frame(2, &[1, b'x']);
+    fragment[0] &= 0x7f;
+    interrupted_message.wire.extend(fragment);
+    interrupted_message.close();
+    cases.push(("status-then-fragmented-message-close", interrupted_message));
+    let mut invalid_utf8 = ExecScript::open();
+    invalid_utf8.message(1, &[0xff]);
+    invalid_utf8.status(json!({"status": "Success"}));
+    invalid_utf8.close();
+    cases.push(("invalid-utf8", invalid_utf8));
+    let mut oversized_frame = ExecScript::open();
+    // Header alone must fail without allocating/reading the advertised payload.
+    oversized_frame.wire.extend(frame_header(2, MAX_EXEC_OUTPUT_BYTES + 2));
+    cases.push(("oversized-frame", oversized_frame));
+    let mut oversized_output = ExecScript::open();
+    oversized_output.message(1, &vec![b'a'; MAX_EXEC_OUTPUT_BYTES / 2]);
+    oversized_output.message(2, &vec![b'b'; MAX_EXEC_OUTPUT_BYTES / 2 + 1]);
+    cases.push(("cumulative-output", oversized_output));
+    let mut oversized_status = ExecScript::open();
+    oversized_status.message(3, &vec![b'a'; 65_537]);
+    cases.push(("oversized-status", oversized_status));
+
+    for (label, script) in cases {
+        let waits_for_disconnect = !script.disconnect && script.http_rejection.is_none();
+        let server = exec_support::ExecServer::start(script);
+        let (mut process, key, instance) = exec_process(&server);
+        let req = exec_request(&server, &key, &instance, label.as_bytes());
+        let response = process.rpc("invoke", req.clone());
+        let error = denied(&response);
+        assert!(error.message.contains("outcome unknown"), "{label}: {response}");
+        assert!(response["result"].is_null(), "{label}: {response}");
+        let serialized = response.to_string();
+        for secret in ["private partial output", "kubernetes-native-fixture", &server.url] {
+            assert!(!serialized.contains(secret), "{label}: leaked {secret}");
+        }
+        observed_exec(&server);
+        if waits_for_disconnect {
+            server.wait_for_disconnect();
+        }
+        // max_calls=2 leaves one call, but no bytes may be reclaimed after an
+        // exec whose result is uncertain. A repeat must not even GET the pod.
+        denied(&process.rpc("invoke", req));
+        server.no_request();
+        process.shutdown();
+        server.finish();
+    }
+}
+
+#[test]
+fn native_exec_deadline_drops_the_live_socket_and_retains_admission() {
+    let mut script = exec_support::ExecScript::open();
+    script.message(1, b"started");
+    let server = exec_support::ExecServer::start(script);
+    let (mut process, key, instance) = exec_process(&server);
+    let mut req = exec_request(&server, &key, &instance, b"exec-deadline");
+    req["deadline_ms"] = json!(250);
+    let start = Instant::now();
+    let error = denied(&process.rpc("invoke", req.clone()));
+    assert!(error.message.contains("unknown"));
+    assert!(start.elapsed() < Duration::from_secs(3));
+    observed_exec(&server);
+    server.wait_for_disconnect();
+    denied(&process.rpc("invoke", req));
+    server.no_request();
+    process.shutdown();
+    server.finish();
+}
+
+#[test]
+fn native_exec_preflight_rejects_invalid_commands_and_scopes_before_pod_lookup() {
+    let server = exec_support::ExecServer::start(exec_support::ExecScript::success("ok\n", ""));
+    let (mut process, key, instance) = exec_process(&server);
+    let req = exec_request(&server, &key, &instance, b"exec-preflight");
+    for command in [json!([]), json!([" "]), json!(["id", "x\u{0000}y"]), json!(["id", 17])] {
+        let mut invalid = req.clone();
+        invalid["input"]["command"] = command;
+        denied(&process.rpc("invoke", invalid));
+    }
+    let mut wrong_pod = req.clone();
+    wrong_pod["input"]["name"] = json!("otherpod");
+    denied(&process.rpc("invoke", wrong_pod));
+    let mut unsigned = req.clone();
+    unsigned.as_object_mut().unwrap().remove("capability_token");
+    denied(&process.rpc("invoke", unsigned));
+    server.no_request();
+    let output = success(process.rpc("invoke", req)).result.unwrap();
+    assert_eq!(output["exec_result"]["stdout"], "ok\n");
+    observed_exec(&server);
+    server.wait_for_disconnect();
+    server.no_request();
+    process.shutdown();
+    server.finish();
+}
+
+#[test]
+fn native_exec_keeps_pod_label_and_container_policy_before_upgrade() {
+    for multiple_containers in [false, true] {
+        let mut script = exec_support::ExecScript::success("should never run", "");
+        if multiple_containers {
+            script.containers = vec!["app", "sidecar"];
+        } else {
+            script.approved = false;
+        }
+        let server = exec_support::ExecServer::start(script);
+        let (mut process, key, instance) = exec_process(&server);
+        let req = exec_request(&server, &key, &instance, b"exec-pod-policy");
+        let error = denied(&process.rpc("invoke", req));
+        assert!(error.message.contains(if multiple_containers { "explicit container" } else { "label" }));
+        assert_eq!(server.observed().target, "/api/v1/namespaces/default/pods/debugpod");
+        server.no_request();
+        process.shutdown();
+        server.finish();
+    }
 }

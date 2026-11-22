@@ -8,6 +8,7 @@ use std::time::Duration;
 use fcp_prelude::CredentialId;
 use fcp_sdk::migration::HttpRetryConfig;
 use fcp_sdk::{ConnectorRuntime, ConnectorRuntimeConfig};
+use fcp_streaming::{StreamError, WsClient, WsConfig, WsMessage};
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::{Client, Response, StatusCode};
 use tracing::{debug, instrument};
@@ -19,6 +20,11 @@ use crate::{
 
 /// Default Kubernetes API base URL (in-cluster).
 pub const DEFAULT_BASE_URL: &str = "https://kubernetes.default.svc";
+
+/// Maximum combined stdout, stderr and terminal-status bytes retained by exec.
+pub const MAX_EXEC_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
+const MAX_EXEC_STATUS_BYTES: usize = 64 * 1024;
+const EXEC_SUBPROTOCOL: &str = "v5.channel.k8s.io";
 
 /// Validate that a value is safe to embed as a URL path segment.
 ///
@@ -689,10 +695,9 @@ impl KubernetesClient {
             .await
     }
 
-    /// Execute a command in a pod container.
-    ///
-    /// NOTE: Real Kubernetes exec uses WebSocket upgrade; here we model it as
-    /// a POST for FCP connector purposes and return `stdout`/`stderr`/`exit_code`.
+    /// Execute a command over Kubernetes remotecommand v5 without stdin or
+    /// TTY. An exec is never retried or reconnected: interruption can leave a
+    /// command running remotely even after its local stream has disappeared.
     pub async fn exec_in_pod(
         &self,
         namespace: &str,
@@ -702,6 +707,19 @@ impl KubernetesClient {
     ) -> KubernetesResult<serde_json::Value> {
         let namespace = sanitize_path_segment(namespace, "namespace")?;
         let name = sanitize_path_segment(name, "name")?;
+        if namespace == "."
+            || name == "."
+            || command.first().is_none_or(|value| value.trim().is_empty())
+            || command.iter().any(|part| part.contains('\0'))
+            || container.is_some_and(|value| value.trim().is_empty())
+        {
+            return Err(KubernetesError::InvalidInput(
+                "exec requires valid target IDs, a non-empty command and valid container selection"
+                    .into(),
+            ));
+        }
+        let namespace = utf8_percent_encode(namespace, NON_ALPHANUMERIC);
+        let name = utf8_percent_encode(name, NON_ALPHANUMERIC);
         let mut path = format!("/api/v1/namespaces/{namespace}/pods/{name}/exec");
         let mut params = Vec::new();
         for cmd in command {
@@ -709,6 +727,8 @@ impl KubernetesClient {
         }
         params.push("stdout=true".to_string());
         params.push("stderr=true".to_string());
+        params.push("stdin=false".to_string());
+        params.push("tty=false".to_string());
         if let Some(c) = container {
             params.push(format!("container={}", encode_query_param(c)));
         }
@@ -716,7 +736,95 @@ impl KubernetesClient {
             path.push('?');
             path.push_str(&params.join("&"));
         }
-        self.post(&path, &serde_json::json!({})).await
+        let mut url = reqwest::Url::parse(&format!("{}{path}", self.base_url))
+            .map_err(|_| KubernetesError::InvalidInput("invalid exec endpoint".into()))?;
+        let scheme = match url.scheme() {
+            "https" => "wss",
+            "http" => "ws",
+            _ => {
+                return Err(KubernetesError::InvalidInput(
+                    "exec requires an HTTP or HTTPS API endpoint".into(),
+                ));
+            }
+        };
+        url.set_scheme(scheme)
+            .map_err(|()| KubernetesError::InvalidInput("invalid exec endpoint scheme".into()))?;
+        let mut config = WsConfig::new()
+            .with_required_subprotocol(EXEC_SUBPROTOCOL)
+            .with_max_message_size(MAX_EXEC_OUTPUT_BYTES + 1)
+            .with_auto_reconnect(false)
+            .with_ping_interval(None)
+            .with_connect_timeout(Duration::from_secs(30))
+            .with_header("User-Agent", "fcp-kubernetes/0.1.0 (FCP connector)");
+        let (header, value) = match &self.auth {
+            KubernetesAuth::BearerToken(token) => ("Authorization", format!("Bearer {token}")),
+            KubernetesAuth::CredentialId(id) => ("X-FCP-Credential-Id", id.to_string()),
+        };
+        // Unlike the HTTP builder, the shared upgrade client accepts strings.
+        // Validate the credential header without reflecting its value on error.
+        reqwest::header::HeaderValue::from_str(&value)
+            .map_err(|_| KubernetesError::InvalidInput("invalid exec credential header".into()))?;
+        config = config.with_header(header, value);
+
+        let context = self.runtime.request_context();
+        let mut output = ExecOutput::default();
+        let result = context
+            .run(async {
+                let mut connection = WsClient::with_config(url.as_str(), config)
+                    .connect()
+                    .await
+                    .map_err(|_| {
+                        output
+                            .unknown("WebSocket upgrade or required subprotocol negotiation failed")
+                    })?;
+                loop {
+                    match connection.recv().await {
+                        Ok(Some(WsMessage::Binary(message))) => {
+                            if output.accept(&message)? {
+                                return output.exit_code();
+                            }
+                        }
+                        Ok(Some(WsMessage::Ping(_) | WsMessage::Pong(_))) => {}
+                        Ok(Some(WsMessage::Text(_))) => {
+                            return Err(
+                                output.unknown("unexpected text message in remotecommand stream")
+                            );
+                        }
+                        Ok(Some(WsMessage::Close(Some(frame)))) if frame.code == 1000 => {
+                            return output.exit_code();
+                        }
+                        Ok(Some(WsMessage::Close(_))) => {
+                            return Err(output.unknown(
+                                "exec WebSocket closed abnormally before complete output",
+                            ));
+                        }
+                        Ok(None) => {
+                            return Err(output.unknown(
+                                "exec transport ended without a clean close or complete stream-closure markers",
+                            ));
+                        }
+                        Err(StreamError::BufferOverflow { .. }) => {
+                            return Err(output.unknown(
+                                "exec WebSocket frame or message exceeded the configured bound",
+                            ));
+                        }
+                        Err(_) => {
+                            return Err(output
+                                .unknown("exec stream was interrupted before terminal status"));
+                        }
+                    }
+                }
+            })
+            .await;
+        let exit_code = match result {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(
+                    output.unknown("exec deadline or connector shutdown interrupted the stream")
+                );
+            }
+        };
+        output.finish(exit_code)
     }
 
     /// List events in a namespace.
@@ -811,6 +919,145 @@ fn retry_after_ms_from_headers(headers: &reqwest::header::HeaderMap) -> Option<u
         .map(|seconds| seconds.saturating_mul(1000))
 }
 
+// Protocol contract: client-go v0.34.1 tools/remotecommand/v4.go and v5.go,
+// apimachinery/pkg/util/remotecommand/constants.go. v5 adds per-stream close
+// markers; terminal Status uses JSON reason="ExitCode" for the command exit.
+#[derive(Default)]
+struct ExecOutput {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    status: Vec<u8>,
+    closed: [bool; 3],
+}
+
+#[derive(serde::Deserialize)]
+struct ExecStatus {
+    status: String,
+    #[serde(default)]
+    reason: String,
+    #[serde(default)]
+    details: Option<ExecStatusDetails>,
+}
+
+#[derive(serde::Deserialize)]
+struct ExecStatusDetails {
+    #[serde(default)]
+    causes: Vec<ExecStatusCause>,
+}
+
+#[derive(serde::Deserialize)]
+struct ExecStatusCause {
+    #[serde(default)]
+    reason: String,
+    #[serde(default)]
+    message: String,
+}
+
+impl ExecOutput {
+    fn unknown(&self, reason: &'static str) -> KubernetesError {
+        KubernetesError::ExecOutcomeUnknown {
+            reason,
+            stdout_bytes: self.stdout.len(),
+            stderr_bytes: self.stderr.len(),
+        }
+    }
+
+    /// Returns true only when all three requested streams were explicitly
+    /// closed. A parseable status prefix alone does not prove output is drained.
+    fn accept(&mut self, message: &[u8]) -> KubernetesResult<bool> {
+        let (&channel, payload) = message
+            .split_first()
+            .ok_or_else(|| self.unknown("empty remotecommand message"))?;
+        if channel == 255 {
+            let [stream @ 1..=3] = payload else {
+                return Err(self.unknown("invalid remotecommand stream-close message"));
+            };
+            let index = usize::from(*stream - 1);
+            if self.closed[index] {
+                return Err(self.unknown("duplicate remotecommand stream-close message"));
+            }
+            self.closed[index] = true;
+            return Ok(self.closed.iter().all(|closed| *closed));
+        }
+        if !matches!(channel, 1..=3) || self.closed[usize::from(channel - 1)] {
+            return Err(self.unknown("unexpected or already-closed remotecommand channel"));
+        }
+        let retained = self.stdout.len() + self.stderr.len() + self.status.len();
+        if retained
+            .checked_add(payload.len())
+            .is_none_or(|size| size > MAX_EXEC_OUTPUT_BYTES)
+        {
+            return Err(self.unknown("exec output exceeded the 2097152-byte aggregate bound"));
+        }
+        if channel == 3 && self.status.len().saturating_add(payload.len()) > MAX_EXEC_STATUS_BYTES {
+            return Err(self.unknown("exec terminal status exceeded the 65536-byte bound"));
+        }
+        match channel {
+            1 => self.stdout.extend_from_slice(payload),
+            2 => self.stderr.extend_from_slice(payload),
+            3 => self.status.extend_from_slice(payload),
+            _ => unreachable!("channel validated above"),
+        }
+        Ok(false)
+    }
+
+    fn exit_code(&self) -> KubernetesResult<u8> {
+        let status: ExecStatus = serde_json::from_slice(&self.status).map_err(|_| {
+            self.unknown("exec stream ended without a complete valid terminal status")
+        })?;
+        match status.status.as_str() {
+            "Success"
+                if status.reason.is_empty()
+                    && status
+                        .details
+                        .as_ref()
+                        .is_none_or(|details| details.causes.is_empty()) =>
+            {
+                Ok(0)
+            }
+            "Failure" if status.reason == "NonZeroExitCode" => {
+                let causes = status
+                    .details
+                    .ok_or_else(|| self.unknown("terminal failure omitted its exit-code details"))?
+                    .causes;
+                let mut exit_codes = causes.iter().filter(|cause| cause.reason == "ExitCode");
+                let cause = exit_codes
+                    .next()
+                    .ok_or_else(|| self.unknown("terminal failure omitted its exit code"))?;
+                if exit_codes.next().is_some()
+                    || cause.message.is_empty()
+                    || !cause.message.bytes().all(|byte| byte.is_ascii_digit())
+                {
+                    return Err(self.unknown("terminal failure carried an invalid exit code"));
+                }
+                cause
+                    .message
+                    .parse::<u8>()
+                    .ok()
+                    .filter(|code| *code != 0)
+                    .ok_or_else(|| self.unknown("terminal failure carried an invalid exit code"))
+            }
+            _ => Err(self.unknown("server reported a failure without a valid command exit status")),
+        }
+    }
+
+    fn finish(self, exit_code: u8) -> KubernetesResult<serde_json::Value> {
+        let stdout_bytes = self.stdout.len();
+        let stderr_bytes = self.stderr.len();
+        let invalid_utf8 = |_| KubernetesError::ExecOutcomeUnknown {
+            reason: "completed exec output was not valid UTF-8",
+            stdout_bytes,
+            stderr_bytes,
+        };
+        // Decode once after completion: a UTF-8 code point may straddle messages.
+        let stdout = String::from_utf8(self.stdout).map_err(invalid_utf8)?;
+        let stderr = String::from_utf8(self.stderr).map_err(invalid_utf8)?;
+        Ok(serde_json::json!({
+            "stdout": stdout, "stderr": stderr, "exit_code": exit_code,
+        }))
+    }
+}
+
 fn decode_success_body(status: StatusCode, body: &str) -> KubernetesResult<serde_json::Value> {
     if status == StatusCode::NO_CONTENT {
         return Ok(serde_json::json!({}));
@@ -828,6 +1075,102 @@ fn decode_success_body(status: StatusCode, body: &str) -> KubernetesResult<serde
 mod tests {
     use super::*;
     use reqwest::header::{HeaderMap, HeaderValue};
+
+    #[test]
+    fn exec_status_is_a_bounded_stream_and_does_not_finish_output_early() {
+        let mut output = ExecOutput::default();
+        assert!(!output.accept(b"\x03{\"status\":").unwrap());
+        assert!(!output.accept(b"\x03\"Success\"}").unwrap());
+        assert!(!output.accept(&[1, 0xe2]).unwrap());
+        assert!(!output.accept(&[1, 0x82, 0xac]).unwrap());
+        assert!(!output.accept(&[255, 3]).unwrap());
+        assert!(!output.accept(&[255, 2]).unwrap());
+        assert!(output.accept(&[255, 1]).unwrap());
+        let code = output.exit_code().unwrap();
+        assert_eq!(output.finish(code).unwrap(), serde_json::json!({
+            "stdout": "€", "stderr": "", "exit_code": 0,
+        }));
+    }
+
+    #[test]
+    fn exec_status_requires_unambiguous_valid_exit_information() {
+        for status in [
+            serde_json::json!({"status": "Success", "reason": "NonZeroExitCode"}),
+            serde_json::json!({"status": "Failure"}),
+            serde_json::json!({"status": "Failure", "reason": "NonZeroExitCode"}),
+            serde_json::json!({"status": "Failure", "reason": "NonZeroExitCode", "details": {"causes": [
+                {"reason": "ExitCode", "message": "7"}, {"reason": "ExitCode", "message": "8"}
+            ]}}),
+        ] {
+            let mut output = ExecOutput::default();
+            let mut message = vec![3];
+            message.extend(serde_json::to_vec(&status).unwrap());
+            output.accept(&message).unwrap();
+            assert!(matches!(output.exit_code(), Err(KubernetesError::ExecOutcomeUnknown { .. })));
+        }
+        for code in ["", "0", "-1", "256", "7 ", "7.0"] {
+            let mut output = ExecOutput::default();
+            let mut message = vec![3];
+            message.extend(serde_json::to_vec(&serde_json::json!({
+                "status": "Failure", "reason": "NonZeroExitCode",
+                "details": {"causes": [{"reason": "ExitCode", "message": code}]},
+            })).unwrap());
+            output.accept(&message).unwrap();
+            assert!(output.exit_code().is_err(), "accepted invalid exit code {code:?}");
+        }
+        let mut output = ExecOutput::default();
+        output.accept(b"\x03{\"status\":\"Success\"}garbage").unwrap();
+        assert!(output.exit_code().is_err());
+    }
+
+    #[test]
+    fn exec_limits_are_inclusive_and_reject_before_retaining_extra_bytes() {
+        let mut output = ExecOutput::default();
+        let status = b"{\"status\":\"Success\"}";
+        let mut stdout = vec![1];
+        stdout.resize(1 + MAX_EXEC_OUTPUT_BYTES - status.len(), b'x');
+        output.accept(&stdout).unwrap();
+        let mut terminal = vec![3];
+        terminal.extend_from_slice(status);
+        output.accept(&terminal).unwrap();
+        assert_eq!(output.exit_code().unwrap(), 0);
+        let stdout_size = output.stdout.len();
+        assert!(output.accept(&[2, b'y']).is_err());
+        assert_eq!(output.stdout.len(), stdout_size);
+        assert!(output.stderr.is_empty());
+        assert_eq!(output.status.len(), status.len());
+
+        let mut output = ExecOutput::default();
+        let mut terminal = vec![3];
+        terminal.resize(1 + MAX_EXEC_STATUS_BYTES, b' ');
+        output.accept(&terminal).unwrap();
+        assert!(output.accept(&[3, b' ']).is_err());
+        assert_eq!(output.status.len(), MAX_EXEC_STATUS_BYTES);
+    }
+
+    #[test]
+    fn exec_closed_channels_cannot_receive_more_data_or_duplicate_close() {
+        let mut output = ExecOutput::default();
+        assert!(!output.accept(&[255, 1]).unwrap());
+        assert!(output.accept(&[1, b'x']).is_err());
+        assert!(output.accept(&[255, 1]).is_err());
+        assert!(output.accept(&[255, 0]).is_err());
+        assert!(output.accept(&[0, b'x']).is_err());
+        assert!(output.accept(&[]).is_err());
+        assert!(output.exit_code().is_err());
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn exec_rejects_invalid_command_before_connecting() {
+        let client = KubernetesClient::new(
+            KubernetesAuth::BearerToken("fixture-token".into()),
+            Some("http://127.0.0.1:9"),
+        ).unwrap();
+        for command in [vec![], vec![" ".into()], vec!["id".into(), "x\0y".into()]] {
+            assert!(matches!(client.exec_in_pod("default", "debugpod", None, &command).await,
+                Err(KubernetesError::InvalidInput(_))));
+        }
+    }
 
     #[test]
     fn auth_debug_redacts_token() {

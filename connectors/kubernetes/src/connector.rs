@@ -1512,6 +1512,12 @@ impl KubernetesConnector {
                         message: "command must name an executable".into(),
                     });
                 }
+                if command.iter().any(|argument| argument.contains('\0')) {
+                    return Err(FcpError::InvalidRequest {
+                        code: 1003,
+                        message: "command arguments must not contain NUL".into(),
+                    });
+                }
                 if (is_system_namespace(namespace)
                     && !config.policy.allow_exec_into_system_namespaces)
                     || (command_uses_shell(&command) && !config.policy.allow_shell_exec)
