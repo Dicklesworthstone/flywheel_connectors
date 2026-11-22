@@ -25,9 +25,10 @@ use crate::{
     error::OpenAIError,
     types::{
         EmbeddingInput, EmbeddingModel, ImageModel, ImageQuality, ImageSize, Message,
-        MessageContent, Model, ResponsesInput, ResponsesRequest, Role, Tool, ToolChoice, TtsModel,
+        MessageContent, Model, ResponseResourceRequest, ResponsesInput, ResponsesRequest,
+        ResponsesResponse, RetrieveResponseRequest, Role, Tool, ToolChoice, TtsModel,
         TtsResponseFormat, TtsVoice, Usage, VideoDurationSeconds, VideoModel, VideoSize,
-        WhisperModel,
+        WhisperModel, validate_response_id,
     },
 };
 
@@ -1965,9 +1966,12 @@ fn normalize_base_url(base_url: &str) -> FcpResult<String> {
     Ok(parsed.to_string().trim_end_matches('/').to_string())
 }
 
-const OPERATION_IDS: [&str; 28] = [
+const OPERATION_IDS: [&str; 31] = [
     "openai.chat",
     "openai.responses.create",
+    "openai.responses.get",
+    "openai.responses.cancel",
+    "openai.responses.delete",
     "openai.simple_chat",
     "openai.get_usage",
     "openai.embeddings",
@@ -2096,7 +2100,10 @@ fn response_byte_limit(operation: &OperationId) -> FcpResult<u64> {
             .checked_add(2)
             .map(|bytes| bytes / 3)
             .and_then(|groups| groups.checked_mul(4))
-    } else if operation.as_str() == "openai.responses.create" {
+    } else if matches!(
+        operation.as_str(),
+        "openai.responses.create" | "openai.responses.get" | "openai.responses.cancel"
+    ) {
         // output_text duplicates at most the text already in response.output.
         upstream_limit.checked_mul(2)
     } else {
@@ -2163,6 +2170,31 @@ fn parse_responses_request(input: serde_json::Value) -> FcpResult<ResponsesReque
         })?;
     request.validate().map_err(|error| error.to_fcp_error())?;
     Ok(request)
+}
+
+fn parse_response_resource(input: serde_json::Value) -> FcpResult<ResponseResourceRequest> {
+    let request: ResponseResourceRequest =
+        serde_json::from_value(input).map_err(|_| FcpError::InvalidRequest {
+            code: 1003,
+            message: "Invalid response resource request".into(),
+        })?;
+    validate_response_id(&request.response_id).map_err(|error| error.to_fcp_error())?;
+    Ok(request)
+}
+
+fn parse_response_retrieval(input: serde_json::Value) -> FcpResult<RetrieveResponseRequest> {
+    let request: RetrieveResponseRequest =
+        serde_json::from_value(input).map_err(|_| FcpError::InvalidRequest {
+            code: 1003,
+            message: "Invalid response retrieval request".into(),
+        })?;
+    request.validate().map_err(|error| error.to_fcp_error())?;
+    Ok(request)
+}
+
+fn responses_result(response: ResponsesResponse) -> serde_json::Value {
+    let output_text = response.output_text();
+    json!({ "response": response, "output_text": output_text, "cost_usd": null })
 }
 
 fn ensure_responses_base_url(base_url: &str) -> FcpResult<()> {
@@ -2930,11 +2962,19 @@ impl OpenAIConnector {
         if operation.as_str() == "openai.chat" {
             parse_chat_messages(input)?;
         }
-        if operation.as_str() == "openai.responses.create" {
+        if operation.as_str().starts_with("openai.responses.") {
             let config = self.config.as_ref().ok_or(FcpError::NotConfigured)?;
             ensure_responses_base_url(&config.base_url)?;
-            let request = parse_responses_request(input.clone())?;
-            return responses_resource_uris(&request);
+            if operation.as_str() == "openai.responses.create" {
+                let request = parse_responses_request(input.clone())?;
+                return responses_resource_uris(&request);
+            }
+            let response_id = if operation.as_str() == "openai.responses.get" {
+                parse_response_retrieval(input.clone())?.response_id
+            } else {
+                parse_response_resource(input.clone())?.response_id
+            };
+            return Ok(vec![format!("openai:response:{response_id}")]);
         }
         Ok(self.resource_uris_for_operation(operation.as_str(), input))
     }
@@ -3015,6 +3055,9 @@ impl OpenAIConnector {
         match operation {
             "openai.chat" => self.invoke_chat(input).await,
             "openai.responses.create" => self.invoke_responses_create(input).await,
+            "openai.responses.get" => self.invoke_responses_get(input).await,
+            "openai.responses.cancel" => self.invoke_responses_cancel(input).await,
+            "openai.responses.delete" => self.invoke_responses_delete(input).await,
             "openai.simple_chat" => self.invoke_simple_chat(input).await,
             "openai.get_usage" => self.invoke_get_usage().await,
             "openai.embeddings" => self.invoke_embeddings(input).await,
@@ -3061,15 +3104,52 @@ impl OpenAIConnector {
             .map_err(|error| error.to_fcp_error())?;
         self.unpriced_response_requests
             .fetch_add(1, Ordering::Relaxed);
-        let output_text = response.output_text();
         // Keep the provider object intact, including future fields and failed
         // or incomplete generation details. Legacy chat prices do not cover
         // arbitrary Responses models, cache discounts or provider services.
-        Ok(json!({
-            "response": response,
-            "output_text": output_text,
-            "cost_usd": null
-        }))
+        Ok(responses_result(response))
+    }
+
+    async fn invoke_responses_get(&self, input: serde_json::Value) -> FcpResult<serde_json::Value> {
+        let request = parse_response_retrieval(input)?;
+        let response = self
+            .client
+            .as_ref()
+            .ok_or(FcpError::NotConfigured)?
+            .get_response(&request)
+            .await
+            .map_err(|error| error.to_fcp_error())?;
+        Ok(responses_result(response))
+    }
+
+    async fn invoke_responses_cancel(
+        &self,
+        input: serde_json::Value,
+    ) -> FcpResult<serde_json::Value> {
+        let request = parse_response_resource(input)?;
+        let response = self
+            .client
+            .as_ref()
+            .ok_or(FcpError::NotConfigured)?
+            .cancel_response(&request.response_id)
+            .await
+            .map_err(|error| error.to_fcp_error())?;
+        Ok(responses_result(response))
+    }
+
+    async fn invoke_responses_delete(
+        &self,
+        input: serde_json::Value,
+    ) -> FcpResult<serde_json::Value> {
+        let request = parse_response_resource(input)?;
+        let response = self
+            .client
+            .as_ref()
+            .ok_or(FcpError::NotConfigured)?
+            .delete_response(&request.response_id)
+            .await
+            .map_err(|error| error.to_fcp_error())?;
+        Ok(json!(response))
     }
 
     async fn invoke_chat(&self, input: serde_json::Value) -> FcpResult<serde_json::Value> {
@@ -6080,11 +6160,11 @@ mod tests {
     // ═══════════════════════════════════════════════════════════════════
 
     #[fcp_async_core::runtime::test]
-    async fn introspection_has_27_operations() {
+    async fn introspection_has_31_operations() {
         let connector = OpenAIConnector::new();
         let value = connector.handle_introspect().await.unwrap();
         let ops = value["operations"].as_array().unwrap();
-        assert_eq!(ops.len(), 28, "Expected 28 operations");
+        assert_eq!(ops.len(), 31, "Expected 31 operations");
     }
 
     #[fcp_async_core::runtime::test]

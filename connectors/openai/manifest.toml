@@ -5,7 +5,7 @@ min_mesh_version = "2.0.0"
 min_protocol = "fcp2-sym/2.0"
 protocol_features = []
 max_datagram_bytes = 65000
-interface_hash = "blake3-256:fcp.interface.v2:2f1e415c85427047342f03a95bc864845284ee56f9de427824726b83cf050392"
+interface_hash = "blake3-256:fcp.interface.v2:31ff9ed04a573abf175eff734a0b32171c28af361f51c743cec0a881406fa6b8"
 
 [connector]
 id = "fcp.openai"
@@ -42,6 +42,9 @@ required = [
 optional = [
     "openai.chat",
     "openai.responses.create",
+    "openai.responses.get",
+    "openai.responses.cancel",
+    "openai.responses.delete",
     "openai.embeddings",
     "openai.images",
     "openai.videos",
@@ -78,7 +81,7 @@ forbidden = [
 # -----------------------------------------------------------------------------
 
 [provides.operations."openai.responses.create"]
-description = "Create a structured OpenAI response with function calls and conversation continuation"
+description = "Create a synchronous response or background job with function calls and conversation continuation"
 capability = "openai.responses.create"
 risk_level = "medium"
 safety_tier = "safe"
@@ -237,8 +240,8 @@ description = "Only synchronous, non-streaming responses are supported"
 oneOf = [{ const = false }, { type = "null" }]
 
 [provides.operations."openai.responses.create".input_schema.properties.background]
-description = "Background jobs require lifecycle support and are not supported by this operation"
-oneOf = [{ const = false }, { type = "null" }]
+description = "Return an accepted background job; retain response.id and retrieve or cancel it through the lifecycle operations"
+type = ["boolean", "null"]
 
 [provides.operations."openai.responses.create".output_schema]
 type = "object"
@@ -319,14 +322,199 @@ common_mistakes = [
     "Dropping function call IDs, raw argument strings or reasoning items between turns.",
     "Omitting resource grants for previous responses, provider item IDs, files or referenced input URLs; resource suffixes escape percent, question-mark and star literals as %25, %3F and %2A.",
     "Treating cost_usd=null as a zero price; actual token usage is in response.usage.",
-    "Enabling streaming, background execution or hosted/MCP tools; these modes are not implemented by this operation.",
+    "Enabling streaming or hosted/MCP tools; these modes are not implemented by this operation.",
+    "Repeating a background create request to poll; use openai.responses.get with the returned response.id instead.",
     "Reading only output_text when response.status is failed or incomplete; inspect the complete response.",
 ]
 examples = [
     '{"model":"gpt-6.2-astra","input":"Hello","max_output_tokens":256}',
     '{"model":"gpt-6.2-astra","previous_response_id":"resp_previous","input":[{"type":"function_call_output","call_id":"call_weather","output":"18 C"}]}',
 ]
-related = ["openai.chat", "openai.get_usage"]
+related = ["openai.responses.get", "openai.responses.cancel", "openai.responses.delete", "openai.chat", "openai.get_usage"]
+
+[provides.operations."openai.responses.get"]
+description = "Retrieve a stored response or poll an accepted background job without repeating generation"
+capability = "openai.responses.get"
+risk_level = "low"
+safety_tier = "safe"
+requires_approval = "none"
+idempotency = "strict"
+revocation_freshness = "safe"
+
+[provides.operations."openai.responses.get".rate_limit]
+max = 100
+per_ms = 60000
+
+[provides.operations."openai.responses.get".input_schema]
+type = "object"
+required = ["response_id"]
+additionalProperties = false
+
+[provides.operations."openai.responses.get".input_schema.properties.response_id]
+type = "string"
+minLength = 1
+maxLength = 512
+pattern = "^[A-Za-z0-9_-]+$"
+
+[provides.operations."openai.responses.get".input_schema.properties.include]
+type = ["array", "null"]
+maxItems = 16
+items = { type = "string", minLength = 1, maxLength = 128 }
+
+[provides.operations."openai.responses.get".output_schema]
+type = "object"
+required = ["response", "output_text", "cost_usd"]
+
+[provides.operations."openai.responses.get".output_schema.properties.response]
+type = "object"
+required = ["id", "object", "status", "model", "output", "usage"]
+properties = { id = { type = "string", minLength = 1 }, object = { const = "response" }, status = { type = "string", minLength = 1 }, model = { type = "string", minLength = 1 }, output = { type = "array", items = { type = "object" } }, usage = { type = ["object", "null"] } }
+
+[provides.operations."openai.responses.get".output_schema.properties.output_text]
+type = "string"
+
+[provides.operations."openai.responses.get".output_schema.properties.cost_usd]
+type = "null"
+
+[provides.operations."openai.responses.get".network_constraints]
+host_allow = ["api.openai.com"]
+port_allow = [443]
+ip_allow = []
+cidr_deny = []
+deny_localhost = true
+deny_private_ranges = true
+deny_tailnet_ranges = true
+require_sni = true
+spki_pins = []
+deny_ip_literals = true
+require_host_canonicalization = true
+dns_max_ips = 16
+max_redirects = 0
+connect_timeout_ms = 10000
+total_timeout_ms = 120000
+max_response_bytes = 10485760
+
+[provides.operations."openai.responses.get".ai_hints]
+when_to_use = "Poll response.status while queued or in_progress; stop polling at a terminal status. Requires the exact openai:response:<response_id> resource."
+common_mistakes = ["Repeating create to poll an accepted job.", "Treating a failed or incomplete provider status as completed text.", "Adding retrieved usage repeatedly to generation totals."]
+examples = ['{"response_id":"resp_job"}', '{"response_id":"resp_job","include":["reasoning.encrypted_content"]}']
+related = ["openai.responses.create", "openai.responses.cancel", "openai.responses.delete"]
+
+[provides.operations."openai.responses.cancel"]
+description = "Cancel an accepted background response and return its provider state"
+capability = "openai.responses.cancel"
+risk_level = "high"
+safety_tier = "risky"
+requires_approval = "interactive"
+idempotency = "strict"
+revocation_freshness = "critical"
+
+[provides.operations."openai.responses.cancel".rate_limit]
+max = 20
+per_ms = 60000
+
+[provides.operations."openai.responses.cancel".input_schema]
+type = "object"
+required = ["response_id"]
+additionalProperties = false
+
+[provides.operations."openai.responses.cancel".input_schema.properties.response_id]
+type = "string"
+minLength = 1
+maxLength = 512
+pattern = "^[A-Za-z0-9_-]+$"
+
+[provides.operations."openai.responses.cancel".output_schema]
+type = "object"
+required = ["response", "output_text", "cost_usd"]
+
+[provides.operations."openai.responses.cancel".output_schema.properties.response]
+type = "object"
+required = ["id", "object", "status", "model", "output", "usage"]
+properties = { id = { type = "string", minLength = 1 }, object = { const = "response" }, status = { type = "string", minLength = 1 }, model = { type = "string", minLength = 1 }, output = { type = "array", items = { type = "object" } }, usage = { type = ["object", "null"] } }
+
+[provides.operations."openai.responses.cancel".output_schema.properties.output_text]
+type = "string"
+
+[provides.operations."openai.responses.cancel".output_schema.properties.cost_usd]
+type = "null"
+
+[provides.operations."openai.responses.cancel".network_constraints]
+host_allow = ["api.openai.com"]
+port_allow = [443]
+ip_allow = []
+cidr_deny = []
+deny_localhost = true
+deny_private_ranges = true
+deny_tailnet_ranges = true
+require_sni = true
+spki_pins = []
+deny_ip_literals = true
+require_host_canonicalization = true
+dns_max_ips = 16
+max_redirects = 0
+connect_timeout_ms = 10000
+total_timeout_ms = 120000
+max_response_bytes = 10485760
+
+[provides.operations."openai.responses.cancel".ai_hints]
+when_to_use = "Cancel a response created with background=true, with host approval and exact response resource authority. Inspect the returned status because the job may already have finished."
+common_mistakes = ["Trying to cancel a synchronous response.", "Assuming a cancellation transport timeout proves the job stopped.", "Using create authority to cancel a different response."]
+examples = ['{"response_id":"resp_job"}']
+related = ["openai.responses.get", "openai.responses.create"]
+
+[provides.operations."openai.responses.delete"]
+description = "Delete a retained model response after explicit approval"
+capability = "openai.responses.delete"
+risk_level = "high"
+safety_tier = "risky"
+requires_approval = "interactive"
+idempotency = "strict"
+revocation_freshness = "critical"
+
+[provides.operations."openai.responses.delete".rate_limit]
+max = 20
+per_ms = 60000
+
+[provides.operations."openai.responses.delete".input_schema]
+type = "object"
+required = ["response_id"]
+additionalProperties = false
+
+[provides.operations."openai.responses.delete".input_schema.properties.response_id]
+type = "string"
+minLength = 1
+maxLength = 512
+pattern = "^[A-Za-z0-9_-]+$"
+
+[provides.operations."openai.responses.delete".output_schema]
+type = "object"
+required = ["id", "object", "deleted"]
+properties = { id = { type = "string", minLength = 1 }, object = { const = "response.deleted" }, deleted = { const = true } }
+
+[provides.operations."openai.responses.delete".network_constraints]
+host_allow = ["api.openai.com"]
+port_allow = [443]
+ip_allow = []
+cidr_deny = []
+deny_localhost = true
+deny_private_ranges = true
+deny_tailnet_ranges = true
+require_sni = true
+spki_pins = []
+deny_ip_literals = true
+require_host_canonicalization = true
+dns_max_ips = 16
+max_redirects = 0
+connect_timeout_ms = 10000
+total_timeout_ms = 120000
+max_response_bytes = 10485760
+
+[provides.operations."openai.responses.delete".ai_hints]
+when_to_use = "Remove a retained response with host approval and exact openai:response:<response_id> authority."
+common_mistakes = ["Deleting conversation context still needed by later previous_response_id requests.", "Assuming deletion is a substitute for cancelling a running background job.", "Repeating generation after an uncertain deletion outcome."]
+examples = ['{"response_id":"resp_job"}']
+related = ["openai.responses.get", "openai.responses.cancel"]
 
 # -----------------------------------------------------------------------------
 
@@ -3013,6 +3201,9 @@ scope = "instance"
 
 [rate_limits.operation_pools]
 "openai.responses.create" = ["openai.responses"]
+"openai.responses.get" = ["openai.responses"]
+"openai.responses.cancel" = ["openai.responses"]
+"openai.responses.delete" = ["openai.responses"]
 "openai.embeddings" = ["openai.embeddings"]
 "openai.images.generate" = ["openai.images"]
 "openai.videos.generate" = ["openai.videos"]

@@ -15,15 +15,16 @@ use crate::{
     error::{OpenAIError, OpenAIResult},
     types::{
         ApiError, Assistant, AssistantListResponse, ChatCompletionChunk, ChatCompletionRequest,
-        ChatCompletionResponse, CreateAssistantRequest, CreateFineTuneRequest, EmbeddingInput,
-        EmbeddingModel, EmbeddingRequest, EmbeddingResponse, FineTuneEventListResponse,
-        FineTuneHyperparameters, FineTuneJob, FineTuneListResponse, GeneratedVideoAsset,
-        ImageGenerationRequest, ImageGenerationResponse, ImageModel, ImageQuality, ImageSize,
-        Message, Model, ResponsesRequest, ResponsesResponse, Run, RunListResponse, Thread,
-        ThreadMessage, ThreadMessageListResponse, Tool, ToolChoice, TranscriptionResponse,
-        TtsModel, TtsRequest, TtsResponseFormat, TtsVoice, Usage, VideoDurationSeconds,
-        VideoGenerationRequest, VideoGenerationResponse, VideoModel, VideoSize, VideoStatus,
-        WhisperModel,
+        ChatCompletionResponse, CreateAssistantRequest, CreateFineTuneRequest, DeletedResponse,
+        EmbeddingInput, EmbeddingModel, EmbeddingRequest, EmbeddingResponse,
+        FineTuneEventListResponse, FineTuneHyperparameters, FineTuneJob, FineTuneListResponse,
+        GeneratedVideoAsset, ImageGenerationRequest, ImageGenerationResponse, ImageModel,
+        ImageQuality, ImageSize, Message, Model, ResponsesRequest, ResponsesResponse,
+        RetrieveResponseRequest, Run, RunListResponse, Thread, ThreadMessage,
+        ThreadMessageListResponse, Tool, ToolChoice, TranscriptionResponse, TtsModel, TtsRequest,
+        TtsResponseFormat, TtsVoice, Usage, VideoDurationSeconds, VideoGenerationRequest,
+        VideoGenerationResponse, VideoModel, VideoSize, VideoStatus, WhisperModel,
+        validate_response_id,
     },
 };
 
@@ -265,6 +266,7 @@ impl OpenAIClient {
     ) -> OpenAIResult<ResponsesResponse> {
         request.validate()?;
         let response: ResponsesResponse = self.post("/v1/responses", request).await?;
+        validate_response_identity(&response, None)?;
         if let Some(usage) = &response.usage {
             self.total_prompt_tokens
                 .fetch_add(usage.input_tokens, Ordering::Relaxed);
@@ -272,6 +274,121 @@ impl OpenAIClient {
                 .fetch_add(usage.output_tokens, Ordering::Relaxed);
         }
         Ok(response)
+    }
+
+    /// Retrieve a response without replaying its original generation.
+    ///
+    /// Repeated reads do not add the same generation's usage to token counters.
+    /// Background usage remains available in the returned provider object.
+    ///
+    /// # Errors
+    /// Rejects unsafe identifiers, invalid selectors, mismatched provider IDs,
+    /// and provider, decoding, deadline or cancellation failures.
+    #[instrument(skip(self, request))]
+    pub async fn get_response(
+        &self,
+        request: &RetrieveResponseRequest,
+    ) -> OpenAIResult<ResponsesResponse> {
+        request.validate()?;
+        let (_, bytes) = self
+            .response_resource_request(
+                reqwest::Method::GET,
+                &request.response_id,
+                "",
+                request.include.as_deref().unwrap_or_default(),
+            )
+            .await?;
+        let response = serde_json::from_slice(&bytes)?;
+        validate_response_identity(&response, Some(&request.response_id))?;
+        Ok(response)
+    }
+
+    /// Cancel an accepted background response and return its current state.
+    ///
+    /// The provider rejects cancellation of synchronous responses. A terminal
+    /// response returned here need not have status cancelled if it already ended.
+    ///
+    /// # Errors
+    /// Rejects unsafe or mismatched IDs and propagates provider/I/O failures.
+    #[instrument(skip(self))]
+    pub async fn cancel_response(&self, response_id: &str) -> OpenAIResult<ResponsesResponse> {
+        let (_, bytes) = self
+            .response_resource_request(reqwest::Method::POST, response_id, "/cancel", &[])
+            .await?;
+        let response = serde_json::from_slice(&bytes)?;
+        validate_response_identity(&response, Some(response_id))?;
+        Ok(response)
+    }
+
+    /// Delete a retained response after explicit resource-scoped authorization.
+    ///
+    /// # Errors
+    /// Rejects unsafe IDs, inconsistent deletion acknowledgements, and failures.
+    #[instrument(skip(self))]
+    pub async fn delete_response(&self, response_id: &str) -> OpenAIResult<DeletedResponse> {
+        let (status, bytes) = self
+            .response_resource_request(reqwest::Method::DELETE, response_id, "", &[])
+            .await?;
+        let response: DeletedResponse = if status == StatusCode::NO_CONTENT && bytes.is_empty() {
+            DeletedResponse {
+                id: response_id.to_owned(),
+                object: "response.deleted".into(),
+                deleted: true,
+            }
+        } else {
+            serde_json::from_slice(&bytes)?
+        };
+        if response.id != response_id || response.object != "response.deleted" || !response.deleted
+        {
+            return Err(OpenAIError::Api {
+                error_type: "response_identity_mismatch".into(),
+                message: "Provider did not confirm deletion of the requested response; outcome may be unknown".into(),
+                status_code: None,
+            });
+        }
+        Ok(response)
+    }
+
+    /// One bounded, cancellable lifecycle request. Reading, cancelling or
+    /// deleting a response never issues another POST /responses generation.
+    async fn response_resource_request(
+        &self,
+        method: reqwest::Method,
+        response_id: &str,
+        suffix: &str,
+        include: &[String],
+    ) -> OpenAIResult<(StatusCode, Vec<u8>)> {
+        validate_response_id(response_id)?;
+        let url = format!("{}/v1/responses/{response_id}{suffix}", self.base_url);
+        let ctx = self.runtime.request_context();
+        let policy = self.retry_config.to_retry_policy();
+        RetryLoop::execute(&ctx, &policy, |_| async {
+            let result = async {
+                let selectors: Vec<_> = include.iter().map(|value| ("include[]", value)).collect();
+                let mut request = self
+                    .client
+                    .request(method.clone(), &url)
+                    .header("Content-Type", "application/json");
+                if !selectors.is_empty() {
+                    request = request.query(&selectors);
+                }
+                let response = self.apply_auth(request).send().await?;
+                let status = response.status();
+                let headers = response.headers().clone();
+                let bytes = read_bounded_response(response, MAX_JSON_RESPONSE_BYTES).await?;
+                if status.is_success() {
+                    Ok((status, bytes))
+                } else {
+                    Err(parse_error_response(status, &headers, &bytes))
+                }
+            }
+            .await;
+            match result {
+                Ok(value) => AttemptOutcome::Success(value),
+                Err(error) => AttemptOutcome::Terminal(error),
+            }
+        })
+        .await
     }
 
     /// Send a chat completion request.
@@ -1273,6 +1390,25 @@ impl OpenAIClient {
             Err(parse_error_response(status, &headers, &bytes))
         }
     }
+}
+
+fn validate_response_identity(
+    response: &ResponsesResponse,
+    expected_id: Option<&str>,
+) -> OpenAIResult<()> {
+    if validate_response_id(&response.id).is_err()
+        || expected_id.is_some_and(|id| response.id != id)
+        || response.object != "response"
+        || response.model.trim().is_empty()
+        || response.status.trim().is_empty()
+    {
+        return Err(OpenAIError::Api {
+            error_type: "response_identity_mismatch".into(),
+            message: "Provider returned an invalid or different response identity; outcome may be unknown".into(),
+            status_code: None,
+        });
+    }
+    Ok(())
 }
 
 /// Bound provider bytes before retaining or parsing them, even without a

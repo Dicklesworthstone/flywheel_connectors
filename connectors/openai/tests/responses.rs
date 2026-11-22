@@ -13,13 +13,13 @@ use std::sync::{
 use fcp_openai::{
     client::{OpenAIAuth, OpenAIClient},
     error::OpenAIError,
-    types::{ResponsesRequest, ResponsesResponse},
+    types::{ResponsesRequest, ResponsesResponse, RetrieveResponseRequest},
 };
 use fcp_prelude::CredentialId;
 use serde_json::{Value, json};
 use wiremock::{
     Mock, MockServer, Request, ResponseTemplate,
-    matchers::{body_json, header, method, path},
+    matchers::{body_json, header, method, path, query_param},
 };
 
 const MODEL: &str = "model-from-provider-catalog";
@@ -260,7 +260,6 @@ async fn unsupported_modes_and_invalid_continuations_fail_before_http() {
         json!({"model": " ", "input": "Hello"}),
         json!({"model": " padded-model ", "input": "Hello"}),
         json!({"model": MODEL, "input": "Hello", "stream": true}),
-        json!({"model": MODEL, "input": "Hello", "background": true}),
         json!({"model": MODEL, "input": "Hello", "max_output_tokens": 15}),
         json!({"model": MODEL, "input": "Hello", "previous_response_id": ""}),
         json!({"model": MODEL, "input": "Hello", "previous_response_id": " resp-previous "}),
@@ -421,4 +420,237 @@ async fn provider_failed_and_incomplete_results_keep_status_and_error_details() 
     }
     assert_eq!(client.total_prompt_tokens(), 0);
     assert_eq!(client.total_completion_tokens(), 0);
+}
+
+#[fcp_async_core::runtime::test]
+async fn background_response_lifecycle_preserves_job_identity_without_regeneration() {
+    let server = MockServer::start().await;
+    let input =
+        json!({"model": MODEL, "input": "Long reasoning task", "background": true, "store": true});
+    let mut queued = provider_response("resp-job", json!([]), Value::Null);
+    queued["status"] = json!("queued");
+    queued["background"] = json!(true);
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .and(body_json(input.clone()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(queued))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let complete = provider_response(
+        "resp-job",
+        json!([
+            {"type":"reasoning", "id":"reasoning-job", "summary":[], "encrypted_content":"opaque"},
+            {"type":"message", "role":"assistant", "content":[{"type":"output_text", "text":"Done"}]}
+        ]),
+        reported_usage(12, 8),
+    );
+    Mock::given(method("GET"))
+        .and(path("/v1/responses/resp-job"))
+        .and(query_param("include[]", "reasoning.encrypted_content"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(complete.clone()))
+        .expect(2)
+        .mount(&server)
+        .await;
+    // Cancellation can return an already completed response without changing it.
+    Mock::given(method("POST"))
+        .and(path("/v1/responses/resp-job/cancel"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(complete.clone()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/v1/responses/resp-job"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id":"resp-job", "object":"response.deleted", "deleted":true
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = OpenAIClient::new("test-key")
+        .unwrap()
+        .with_base_url(server.uri());
+    let accepted = client.create_response(&request(input)).await.unwrap();
+    assert_eq!(accepted.id, "resp-job");
+    assert_eq!(accepted.status, "queued");
+    let retrieval = RetrieveResponseRequest {
+        response_id: accepted.id.clone(),
+        include: Some(vec!["reasoning.encrypted_content".into()]),
+    };
+    for _ in 0..2 {
+        let received = client.get_response(&retrieval).await.unwrap();
+        assert_eq!(received.output_text(), "Done");
+        assert_eq!(serde_json::to_value(received).unwrap(), complete);
+    }
+    let cancelled = client.cancel_response(&accepted.id).await.unwrap();
+    assert_eq!(cancelled.status, "completed");
+    assert_eq!(
+        client.delete_response(&accepted.id).await.unwrap().id,
+        accepted.id
+    );
+    assert_eq!(
+        client.total_prompt_tokens(),
+        0,
+        "polling must not repeatedly bill usage"
+    );
+    assert_eq!(client.total_completion_tokens(), 0);
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 5);
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.headers.get("authorization").is_some())
+    );
+}
+
+#[fcp_async_core::runtime::test]
+async fn lifecycle_rejects_unsafe_ids_and_invalid_selectors_before_http() {
+    let server = MockServer::start().await;
+    let client = OpenAIClient::new("test-key")
+        .unwrap()
+        .with_base_url(server.uri());
+    for id in [
+        "",
+        " resp-job",
+        "resp-job ",
+        "../responses",
+        "resp/x",
+        "resp?x=1",
+        "resp#x",
+        "resp%2Fx",
+        "resp*",
+        "réponse",
+    ] {
+        let request = RetrieveResponseRequest {
+            response_id: id.into(),
+            include: None,
+        };
+        assert!(matches!(
+            client.get_response(&request).await,
+            Err(OpenAIError::InvalidInput { .. })
+        ));
+        assert!(matches!(
+            client.cancel_response(id).await,
+            Err(OpenAIError::InvalidInput { .. })
+        ));
+        assert!(matches!(
+            client.delete_response(id).await,
+            Err(OpenAIError::InvalidInput { .. })
+        ));
+    }
+    for include in [
+        vec![String::new()],
+        vec![" padded ".into()],
+        vec!["x".repeat(129)],
+        vec!["x".into(); 17],
+    ] {
+        let request = RetrieveResponseRequest {
+            response_id: "resp-job".into(),
+            include: Some(include),
+        };
+        assert!(matches!(
+            client.get_response(&request).await,
+            Err(OpenAIError::InvalidInput { .. })
+        ));
+    }
+    let request = RetrieveResponseRequest {
+        response_id: "x".repeat(513),
+        include: None,
+    };
+    assert!(client.get_response(&request).await.is_err());
+    assert!(
+        serde_json::from_value::<RetrieveResponseRequest>(
+            json!({"response_id":"resp-job", "stream":true})
+        )
+        .is_err()
+    );
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[fcp_async_core::runtime::test]
+async fn lifecycle_refuses_mismatched_provider_identity_and_false_deletion_acknowledgements() {
+    let server = MockServer::start().await;
+    let wrong = provider_response("resp-someone-else", json!([]), Value::Null);
+    Mock::given(method("GET"))
+        .and(path("/v1/responses/resp-requested"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(wrong.clone()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses/resp-requested/cancel"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(wrong))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/v1/responses/resp-requested"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({"id":"resp-requested", "object":"response.deleted", "deleted":false}),
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = OpenAIClient::new("test-key")
+        .unwrap()
+        .with_base_url(server.uri())
+        .with_retry_config(3, 1, 1);
+    let retrieval = RetrieveResponseRequest {
+        response_id: "resp-requested".into(),
+        include: None,
+    };
+    let errors = [
+        client.get_response(&retrieval).await.unwrap_err(),
+        client.cancel_response("resp-requested").await.unwrap_err(),
+        client.delete_response("resp-requested").await.unwrap_err(),
+    ];
+    for error in errors {
+        assert!(
+            matches!(&error, OpenAIError::Api { error_type, .. } if error_type == "response_identity_mismatch")
+        );
+        assert!(!error.is_retryable());
+    }
+    assert_eq!(server.received_requests().await.unwrap().len(), 3);
+}
+
+#[fcp_async_core::runtime::test]
+async fn response_delete_accepts_empty_204_and_propagates_missing_job_without_replay() {
+    let server = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .and(path("/v1/responses/resp-job"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/responses/resp-missing"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(
+            json!({"error":{"type":"invalid_request_error", "message":"Not found"}}),
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = OpenAIClient::new("test-key")
+        .unwrap()
+        .with_base_url(server.uri())
+        .with_retry_config(3, 1, 1);
+    let deleted = client.delete_response("resp-job").await.unwrap();
+    assert!(deleted.deleted);
+    assert_eq!(deleted.object, "response.deleted");
+    assert_eq!(deleted.id, "resp-job");
+    let error = client
+        .get_response(&RetrieveResponseRequest {
+            response_id: "resp-missing".into(),
+            include: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        OpenAIError::Api {
+            status_code: Some(404),
+            ..
+        }
+    ));
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
 }

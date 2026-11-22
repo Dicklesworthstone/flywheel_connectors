@@ -260,7 +260,7 @@ pub struct ResponsesRequest {
     /// Only false is supported by this synchronous operation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
-    /// Only false is supported until background-job lifecycle operations exist.
+    /// Return an accepted background job for later retrieval or cancellation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub background: Option<bool>,
 }
@@ -274,7 +274,7 @@ impl ResponsesRequest {
     ///
     /// # Errors
     ///
-    /// Rejects malformed fields, unsupported tools, and streaming/background modes.
+    /// Rejects malformed fields, unsupported tools, and streaming mode.
     pub fn validate(&self) -> crate::error::OpenAIResult<()> {
         let invalid = |message: &str| crate::error::OpenAIError::InvalidInput {
             message: message.to_owned(),
@@ -287,11 +287,6 @@ impl ResponsesRequest {
         if self.stream == Some(true) {
             return Err(invalid(
                 "Responses streaming is not supported by this operation",
-            ));
-        }
-        if self.background == Some(true) {
-            return Err(invalid(
-                "Responses background execution is not supported by this operation",
             ));
         }
         if self
@@ -556,6 +551,80 @@ pub struct ResponsesUsage {
     /// Additional provider usage fields.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// A response identifier for cancellation or deletion.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResponseResourceRequest {
+    /// Exact provider response to access.
+    pub response_id: String,
+}
+
+/// Non-streaming retrieval of an existing response, including a background job.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetrieveResponseRequest {
+    /// Exact provider response to retrieve.
+    pub response_id: String,
+    /// Optional additional fields, such as reasoning.encrypted_content.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include: Option<Vec<String>>,
+}
+
+impl RetrieveResponseRequest {
+    /// Validate path and query values before authorization or provider I/O.
+    ///
+    /// # Errors
+    /// Rejects unsafe identifiers and excessive or empty include selectors.
+    pub fn validate(&self) -> crate::error::OpenAIResult<()> {
+        validate_response_id(&self.response_id)?;
+        if self.include.as_ref().is_some_and(|selectors| {
+            selectors.len() > 16
+                || selectors.iter().any(|selector| {
+                    selector.is_empty()
+                        || selector.len() > 128
+                        || selector.trim() != selector
+                        || selector.chars().any(char::is_control)
+                })
+        }) {
+            return Err(crate::error::OpenAIError::InvalidInput {
+                message:
+                    "Responses include requires at most 16 nonempty selectors of at most 128 bytes"
+                        .into(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Keep opaque response identifiers in exactly one URL path segment and one
+/// capability resource. Reject rather than normalize attacker-supplied aliases.
+pub(crate) fn validate_response_id(id: &str) -> crate::error::OpenAIResult<()> {
+    if id.is_empty()
+        || id.len() > 512
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return Err(crate::error::OpenAIError::InvalidInput {
+            message:
+                "response_id must contain 1 to 512 ASCII letters, digits, underscores or hyphens"
+                    .into(),
+        });
+    }
+    Ok(())
+}
+
+/// Confirmed deletion of the requested response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeletedResponse {
+    /// Exact deleted response identifier.
+    pub id: String,
+    /// Provider discriminator, response.deleted.
+    pub object: String,
+    /// True only after a successful deletion acknowledgement.
+    pub deleted: bool,
 }
 
 /// Complete structured Responses API result.

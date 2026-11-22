@@ -120,11 +120,15 @@ fn read_request(stream: &mut TcpStream) -> CapturedRequest {
                     name.eq_ignore_ascii_case("content-length")
                         .then(|| value.trim().parse().unwrap())
                 })
-                .expect("request content-length");
+                .unwrap_or(0);
             if bytes.len() >= end + 4 + length {
                 return CapturedRequest {
                     headers,
-                    body: serde_json::from_slice(&bytes[end + 4..end + 4 + length]).unwrap(),
+                    body: if length == 0 {
+                        Value::Null
+                    } else {
+                        serde_json::from_slice(&bytes[end + 4..end + 4 + length]).unwrap()
+                    },
                 };
             }
         }
@@ -342,7 +346,7 @@ fn native_chat_completes_tool_conversation_and_enforces_signed_budgets() {
     let catalog: Introspection =
         serde_json::from_value(process.rpc("catalog", "introspect", json!({}))["result"].clone())
             .unwrap();
-    assert_eq!(catalog.operations.len(), 28);
+    assert_eq!(catalog.operations.len(), 31);
     assert!(
         catalog
             .operations
@@ -889,6 +893,195 @@ fn native_responses_preserve_function_continuation_and_enforce_all_reference_sco
     assert!(server.requests.try_recv().is_err());
     assert_eq!(
         process.rpc("responses-shutdown", "shutdown", json!({}))["result"]["status"],
+        "shutdown"
+    );
+    assert!(process.wait_for_exit().success());
+    server.finish();
+}
+
+#[test]
+fn native_background_lifecycle_scopes_poll_cancel_and_delete_without_recreating_work() {
+    const RESPONSE_ID: &str = "resp-native-job";
+    const RESPONSE_MODEL: &str = "model-from-provider-catalog";
+    let response = |status: &str| {
+        json!({
+            "id": RESPONSE_ID, "object":"response", "status":status,
+            "model":RESPONSE_MODEL, "output":[], "usage":null, "background":true
+        })
+    };
+    let server = LoopbackServer::start(vec![
+        response("queued"),
+        response("in_progress"),
+        response("cancelled"),
+        response("cancelled"),
+        json!({"id":RESPONSE_ID, "object":"response.deleted", "deleted":true}),
+    ]);
+    let mut process = NativeProcess::start();
+    assert!(
+        process
+            .rpc(
+                "job-config",
+                "configure",
+                json!({
+                    "api_key": API_KEY, "base_url":server.url
+                })
+            )
+            .get("error")
+            .is_none()
+    );
+    let key = Ed25519SigningKey::from_bytes(&[81_u8; 32]).unwrap();
+    let handshake = process.rpc("job-session", "handshake", json!({
+        "protocol_version":"2.0", "zone":"z:work",
+        "host_public_key":key.verifying_key().to_bytes(), "nonce":vec![1_u8;32],
+        "capabilities_requested":["openai.responses.create", "openai.responses.get", "openai.responses.cancel", "openai.responses.delete", "openai.chat"]
+    }));
+    let instance: InstanceId =
+        serde_json::from_value(handshake["result"]["instance_id"].clone()).unwrap();
+    let token_for = |operation: &str, resource: &str, calls: u32| {
+        grant(
+            &key,
+            &instance,
+            operation,
+            format!("job-{operation}").as_bytes(),
+            &CapabilityConstraints {
+                resource_allow: vec![resource.into()],
+                max_calls: Some(calls),
+                max_bytes: Some(1_000_000),
+                ..Default::default()
+            },
+        )
+    };
+    let create_token = token_for(
+        "openai.responses.create",
+        &format!("openai:model:{RESPONSE_MODEL}"),
+        1,
+    );
+    let get_token = token_for(
+        "openai.responses.get",
+        &format!("openai:response:{RESPONSE_ID}"),
+        2,
+    );
+    let cancel_token = token_for(
+        "openai.responses.cancel",
+        &format!("openai:response:{RESPONSE_ID}"),
+        1,
+    );
+    let delete_token = token_for(
+        "openai.responses.delete",
+        &format!("openai:response:{RESPONSE_ID}"),
+        1,
+    );
+    let mut request = json!({
+        "type":"invoke", "id":"job-create", "connector_id":"fcp.openai", "zone_id":"z:work",
+        "operation":"openai.responses.create", "capability_token":create_token,
+        "input":{"model":RESPONSE_MODEL, "input":"Long reasoning task", "background":true, "store":true}
+    });
+    let accepted: InvokeResponse = serde_json::from_value(
+        process.rpc("job-create", "invoke", request.clone())["result"].clone(),
+    )
+    .unwrap();
+    assert_eq!(accepted.status, InvokeStatus::Ok);
+    assert_eq!(accepted.result.unwrap()["response"]["status"], "queued");
+    let submitted = server.receive();
+    assert_eq!(
+        submitted.headers.lines().next(),
+        Some("POST /v1/responses HTTP/1.1")
+    );
+    assert_eq!(submitted.body["background"], true);
+
+    request["operation"] = json!("openai.responses.get");
+    request["capability_token"] = json!(get_token);
+    request["input"] = json!({"response_id":RESPONSE_ID});
+    request["type"] = json!("simulate");
+    for _ in 0..2 {
+        let simulation: SimulateResponse = serde_json::from_value(
+            process.rpc("job-preview", "simulate", request.clone())["result"].clone(),
+        )
+        .unwrap();
+        assert!(simulation.would_succeed);
+    }
+    request["type"] = json!("invoke");
+    for forbidden_id in [
+        "resp-not-granted",
+        "resp-native-job?other=1",
+        "../resp-native-job",
+        " resp-native-job",
+    ] {
+        request["id"] = json!("job-refused");
+        request["input"] = json!({"response_id":forbidden_id});
+        let denied = process.rpc("job-refused", "invoke", request.clone());
+        assert!(denied.get("error").is_some());
+    }
+    request["input"] = json!({"response_id":RESPONSE_ID});
+    request["operation"] = json!("openai.responses.cancel");
+    let denied = process.rpc("job-wrong-capability", "invoke", request.clone());
+    assert!(
+        denied.get("error").is_some(),
+        "read authority must not cancel work"
+    );
+    server.assert_no_requests();
+
+    for (id, operation, token, expected_line, expected_status) in [
+        (
+            "job-poll",
+            "openai.responses.get",
+            get_token.clone(),
+            "GET /v1/responses/resp-native-job HTTP/1.1",
+            "in_progress",
+        ),
+        (
+            "job-cancel",
+            "openai.responses.cancel",
+            cancel_token,
+            "POST /v1/responses/resp-native-job/cancel HTTP/1.1",
+            "cancelled",
+        ),
+        (
+            "job-confirm",
+            "openai.responses.get",
+            get_token,
+            "GET /v1/responses/resp-native-job HTTP/1.1",
+            "cancelled",
+        ),
+        (
+            "job-delete",
+            "openai.responses.delete",
+            delete_token,
+            "DELETE /v1/responses/resp-native-job HTTP/1.1",
+            "deleted",
+        ),
+    ] {
+        request["id"] = json!(id);
+        request["operation"] = json!(operation);
+        request["capability_token"] = json!(token);
+        let outcome: InvokeResponse =
+            serde_json::from_value(process.rpc(id, "invoke", request.clone())["result"].clone())
+                .unwrap();
+        assert_eq!(outcome.status, InvokeStatus::Ok);
+        let result = outcome.result.unwrap();
+        if expected_status == "deleted" {
+            assert_eq!(result["deleted"], true);
+        } else {
+            assert_eq!(result["response"]["status"], expected_status);
+        }
+        let observed = server.receive();
+        assert_eq!(observed.headers.lines().next(), Some(expected_line));
+        assert!(has_header(
+            &observed.headers,
+            "authorization",
+            &format!("Bearer {API_KEY}")
+        ));
+        assert!(observed.body.is_null());
+    }
+    request["id"] = json!("job-delete-exhausted");
+    let exhausted = process.rpc("job-delete-exhausted", "invoke", request);
+    assert!(
+        exhausted.get("error").is_some(),
+        "lifecycle calls must consume their signed allowance"
+    );
+    assert!(server.requests.try_recv().is_err());
+    assert_eq!(
+        process.rpc("job-stop", "shutdown", json!({}))["result"]["status"],
         "shutdown"
     );
     assert!(process.wait_for_exit().success());

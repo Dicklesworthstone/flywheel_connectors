@@ -18,6 +18,9 @@ The current runtime invoke IDs are:
 
 - `openai.chat`
 - `openai.responses.create`
+- `openai.responses.get`
+- `openai.responses.cancel`
+- `openai.responses.delete`
 - `openai.simple_chat`
 - `openai.get_usage`
 - `openai.embeddings`
@@ -149,9 +152,21 @@ Signed resource grants cover the model and every referenced provider object or e
 
 Content-part references are checked in both message content and function outputs. Inline `data:image` content is caller-supplied data. URL scopes use `url::Url` canonicalization. All scope suffixes then escape `%`, `?` and `*`, in that order, as `%25`, `%3F` and `%2A`. This keeps literal URL characters from becoming capability-policy glob operators. For example, `https://example.com/a?b=1` requires `openai:input_url:https://example.com/a%3Fb=1`.
 
-This operation supports client-executed function tools. Hosted/MCP tools, active hosted-tool continuation items, streaming and background jobs are rejected during local validation. Simulation applies the same request and reference checks without provider traffic or budget debit.
+This operation supports client-executed function tools and optional background execution. Hosted/MCP tools, active hosted-tool continuation items and streaming are rejected during local validation. Simulation applies the same request and reference checks without provider traffic or budget debit.
 
-Actual input/output token counts are retained in `response.usage` and added to the connector's token counters. `cost_usd` is explicitly null because the legacy chat price table cannot price arbitrary Responses models or provider services. `openai.get_usage.unpriced_response_requests` counts these requests; its `total_cost_usd` excludes them. Response budgeting includes the additional `output_text` projection.
+Actual input/output token counts supplied in a creation response are retained in `response.usage` and added to the connector's session counters. `cost_usd` is explicitly null because the legacy chat price table cannot price arbitrary Responses models or provider services. `openai.get_usage.unpriced_response_requests` counts accepted creation responses; its `total_cost_usd` excludes them. Response budgeting includes the additional `output_text` projection.
+
+### Background jobs and retained response lifecycle
+
+Pass `"background": true` to `openai.responses.create` and retain the returned `response.id`. Creation may return `queued` or `in_progress` with no usage yet. Use `openai.responses.get` with `{"response_id":"resp_job"}` to poll that exact job. Retrieval also accepts an `include` array, for example `{"response_id":"resp_job","include":["reasoning.encrypted_content"]}`. Stop polling at a terminal status and inspect the complete provider object, including failure or incomplete details. Polling never repeats the creation request.
+
+Use `openai.responses.cancel` with the same response ID to cancel a background job. The provider may return an already completed result; a successful call does not necessarily mean the final status is `cancelled`. Use `openai.responses.delete` to remove a retained response. Cancellation and deletion have separate capabilities and require interactive host approval. Deletion is not a substitute for cancelling running work. A lost or timed-out reply leaves the outcome uncertain.
+
+Every lifecycle operation requires its own capability and the exact `openai:response:<response_id>` resource. Model-generation authority alone does not grant access to an existing response. IDs must contain 1–512 ASCII letters, digits, underscores or hyphens; URL delimiters and whitespace aliases are rejected before admission. Provider replies must identify the requested response before they are released. Deletion accepts a matching affirmative JSON acknowledgement or HTTP 204 with an empty body.
+
+Retrieval and cancellation preserve `response.usage` but do not increment generation counters. This prevents repeated polls from counting the same generation repeatedly. Consequently, session token totals exclude background usage that was unavailable in the creation reply; the terminal response's usage is the authoritative per-job record. As with synchronous Responses, no dollar price is inferred. The connector does not run an autonomous polling worker, and stopping the connector does not cancel accepted provider jobs.
+
+Provider references: [background mode](https://developers.openai.com/api/docs/guides/background), [retrieve](https://developers.openai.com/api/reference/resources/responses/methods/retrieve), [cancel](https://developers.openai.com/api/reference/resources/responses/methods/cancel), and [delete](https://developers.openai.com/api/reference/resources/responses/methods/delete).
 
 OpenAI [retired the Assistants API on August 26, 2026](https://developers.openai.com/api/docs/assistants/migration). Existing Assistants/Threads bindings remain in the catalog, and the Responses operation provides the current generation and function-continuation path. API details: [create response](https://developers.openai.com/api/reference/resources/responses/methods/create) and [function calling](https://developers.openai.com/api/docs/guides/function-calling).
 
@@ -164,7 +179,8 @@ OpenAI [retired the Assistants API on August 26, 2026](https://developers.openai
 - Forbidden source zone: `z:public`.
 - Capability surface:
   - `openai.chat` gates chat, simple chat, and local usage accounting.
-  - `openai.responses.create` gates the synchronous Responses operation and its separately scoped context references.
+  - `openai.responses.create` gates synchronous or background generation and its separately scoped context references.
+  - `openai.responses.get`, `openai.responses.cancel`, and `openai.responses.delete` independently gate access to a named response; cancellation and deletion require host approval.
   - `openai.embeddings` gates embedding creation.
   - `openai.images` gates image generation.
   - `openai.videos` gates video generation.
@@ -192,6 +208,7 @@ OpenAI [retired the Assistants API on August 26, 2026](https://developers.openai
 - Realtime audio chunks must be non-empty base64 and each decoded chunk must be at most `15 MiB`.
 - Browser realtime client secrets default to `60 s` TTL and are capped at `600 s`.
 - Maximum response bytes are `10_485_760` for standard responses, `52_428_800` for image/TTS audio, and `104_857_600` for downloaded video bytes.
+- These limits are enforced while receiving provider bodies, including chunked replies; error bodies have a separate 64 KiB ceiling. HTTP redirects and automatic transport retries are disabled. A response timeout or interrupted body is terminal because the provider may already have accepted generation or a mutation.
 - Sandbox profile is `strict`, with `256 MB` memory, `50%` CPU, `120_000 ms` wall-clock timeout, read-only `/usr` and `/lib`, no exec, and no ptrace.
 - Event capability metadata declares streaming support, no replay, and a minimum buffer of 10 events.
 

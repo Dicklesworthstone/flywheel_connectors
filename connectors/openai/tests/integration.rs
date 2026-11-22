@@ -150,6 +150,9 @@ fn manifest_declares_strict_per_operation_network_constraints() {
 
     for operation_id in [
         "openai.responses.create",
+        "openai.responses.get",
+        "openai.responses.cancel",
+        "openai.responses.delete",
         "openai.videos.generate",
         "openai.realtime.transcribe",
         "openai.realtime.voice",
@@ -162,7 +165,7 @@ fn manifest_declares_strict_per_operation_network_constraints() {
     assert_no_egress_constraints(network_constraints(&manifest, "openai.get_usage"));
     assert_eq!(
         manifest.provides.operations.len(),
-        28,
+        31,
         "update network constraint assertions when OpenAI operations change"
     );
 }
@@ -209,7 +212,11 @@ fn assert_openai_api_only_constraints(operation_id: &str, constraints: &NetworkC
             assert_eq!(constraints.total_timeout_ms, 300_000);
             assert_eq!(constraints.max_response_bytes, 10_485_760);
         }
-        "openai.responses.create" | "openai.realtime.browser_session" => {
+        "openai.responses.create"
+        | "openai.responses.get"
+        | "openai.responses.cancel"
+        | "openai.responses.delete"
+        | "openai.realtime.browser_session" => {
             assert_eq!(constraints.max_redirects, 0);
             assert_eq!(constraints.total_timeout_ms, 120_000);
             assert_eq!(constraints.max_response_bytes, 10_485_760);
