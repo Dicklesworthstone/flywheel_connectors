@@ -1,16 +1,16 @@
 //! FCP Linear Connector implementation.
 
 use std::collections::{BTreeSet, VecDeque};
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration as StdDuration, Instant};
 
 use chrono::Utc;
+use fcp_manifest::ConnectorManifest;
 use fcp_prelude::{
-    AgentHint, BaseConnector, CapabilityGrant, CapabilityId, CapabilityToken, CapabilityVerifier,
-    ConnectorId, CredentialId, EventCaps, EventInfo, FcpError, FcpResult, HandshakeRequest,
-    HandshakeResponse, IdempotencyClass, InstanceId, Introspection, OperationId, OperationInfo,
-    RiskLevel, SafetyTier, SelfCheckReport, SessionId, SimulateRequest, SimulateResponse,
+    ApprovalMode, BaseConnector, CapabilityGrant, CapabilityToken, CapabilityVerifier, ConnectorId,
+    CredentialId, EventCaps, EventInfo, FcpError, FcpResult, HandshakeRequest, HandshakeResponse,
+    HealthSnapshot, InstanceId, Introspection, OperationId, OperationInfo, SelfCheckReport,
+    SessionId, SimulateRequest, SimulateResponse, ZoneId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -31,6 +31,18 @@ const MAX_LINEAR_WEBHOOK_REPLAY_RECEIPTS: usize = 10_000;
 const LINEAR_WEBHOOK_REPLAY_RETENTION: StdDuration =
     StdDuration::from_millis(2 * MAX_LINEAR_WEBHOOK_SKEW_MS + 1);
 const MANIFEST_TOML: &str = include_str!("../manifest.toml");
+const OPERATION_IDS: [&str; 10] = [
+    "linear.create_issue",
+    "linear.get_issue",
+    "linear.update_issue",
+    "linear.search_issues",
+    "linear.list_teams",
+    "linear.list_cycles",
+    "linear.add_comment",
+    "linear.list_projects",
+    "linear.plan_sync",
+    "linear.process_webhook",
+];
 
 /// Parsed and validated Linear connector configuration.
 #[derive(Debug, Clone)]
@@ -105,7 +117,7 @@ fn validate_api_url_for_auth(raw_url: &str, auth: &LinearAuth) -> FcpResult<Stri
     // would otherwise pass validation and leak `?leak=x` on every
     // request with the POST body's GraphQL endpoint appended after
     // the `?` boundary. Userinfo would bake into every URL and
-    // silently override the bearer the connector sets in the header.
+    // silently override the API key the connector sets in the header.
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err(FcpError::InvalidRequest {
             code: 1003,
@@ -311,11 +323,14 @@ fn webhook_payload_fingerprint(payload: &serde_json::Value) -> FcpResult<[u8; 32
 
 /// FCP Linear Connector.
 pub struct LinearConnector {
-    base: Arc<BaseConnector>,
+    base: BaseConnector,
     config: Option<LinearConfig>,
     client: Option<LinearClient>,
     verifier: Option<CapabilityVerifier>,
     session_id: Option<SessionId>,
+    session_zone: Option<ZoneId>,
+    granted_capabilities: BTreeSet<String>,
+    started_at: Instant,
     webhook_replay_receipts: Mutex<WebhookReplayReceipts>,
 }
 
@@ -324,16 +339,19 @@ impl LinearConnector {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            base: Arc::new(BaseConnector::new(ConnectorId::from_static("linear"))),
+            base: BaseConnector::new(ConnectorId::from_static("fcp.linear")),
             config: None,
             client: None,
             verifier: None,
             session_id: None,
+            session_zone: None,
+            granted_capabilities: BTreeSet::new(),
+            started_at: Instant::now(),
             webhook_replay_receipts: Mutex::new(WebhookReplayReceipts::default()),
         }
     }
 
-    /// Stable connector instance identity used for bound capability-token verification.
+    /// Current negotiated instance identity used for bound capability verification.
     #[must_use]
     pub fn instance_id(&self) -> &InstanceId {
         &self.base.instance_id
@@ -343,6 +361,24 @@ impl LinearConnector {
         let mut hasher = Sha256::new();
         hasher.update(MANIFEST_TOML.as_bytes());
         format!("sha256:{}", hex::encode(hasher.finalize()))
+    }
+
+    fn invalidate_authority(&mut self) {
+        self.verifier = None;
+        self.session_id = None;
+        self.session_zone = None;
+        self.granted_capabilities.clear();
+        self.base.set_handshaken(false);
+        self.base.instance_id = InstanceId::new();
+    }
+
+    fn clear_configuration(&mut self) {
+        self.invalidate_authority();
+        self.base.set_configured(false);
+        self.config = None;
+        if let Some(client) = self.client.take() {
+            client.shutdown();
+        }
     }
 
     fn record_webhook_delivery(
@@ -377,6 +413,7 @@ impl LinearConnector {
         &mut self,
         params: serde_json::Value,
     ) -> FcpResult<serde_json::Value> {
+        self.clear_configuration();
         let config = LinearConfig::from_params(&params)?;
 
         let client =
@@ -541,11 +578,41 @@ impl LinearConnector {
         &mut self,
         params: serde_json::Value,
     ) -> FcpResult<serde_json::Value> {
+        // Even a rejected negotiation ends the previous authority. A caller
+        // cannot keep using an old grant after replacing or failing a session.
+        self.invalidate_authority();
+        if self.client.is_none() || self.config.is_none() {
+            return Err(FcpError::NotConfigured);
+        }
         let req: HandshakeRequest =
-            serde_json::from_value(params).map_err(|e| FcpError::InvalidRequest {
+            serde_json::from_value(params).map_err(|_| FcpError::InvalidRequest {
                 code: 1003,
-                message: format!("Invalid handshake request: {e}"),
+                message: "Invalid handshake request".into(),
             })?;
+        if !matches!(req.protocol_version.as_str(), "2.0" | "2.0.0") {
+            return Err(FcpError::InvalidRequest {
+                code: 1003,
+                message: "Linear requires FCP protocol 2.0".into(),
+            });
+        }
+
+        let operations = operations_info()?;
+        let capabilities_granted: Vec<CapabilityGrant> = req
+            .capabilities_requested
+            .into_iter()
+            .filter(|capability| {
+                operations
+                    .iter()
+                    .any(|operation| operation.capability == *capability)
+                    && self
+                        .granted_capabilities
+                        .insert(capability.as_str().to_owned())
+            })
+            .map(|capability| CapabilityGrant {
+                capability,
+                operation: None,
+            })
+            .collect();
 
         self.verifier = Some(CapabilityVerifier::new(
             req.host_public_key,
@@ -555,16 +622,8 @@ impl LinearConnector {
 
         let session_id = SessionId::new();
         self.session_id = Some(session_id.clone());
+        self.session_zone = Some(req.zone);
         self.base.set_handshaken(true);
-
-        let capabilities_granted: Vec<CapabilityGrant> = req
-            .capabilities_requested
-            .into_iter()
-            .map(|cap| CapabilityGrant {
-                capability: cap,
-                operation: None,
-            })
-            .collect();
 
         let response = HandshakeResponse {
             status: "accepted".into(),
@@ -589,341 +648,35 @@ impl LinearConnector {
 
     /// Handle health check.
     pub async fn handle_health(&self) -> FcpResult<serde_json::Value> {
-        let configured = self.client.is_some();
+        let configured = self.client.is_some() && self.config.is_some();
+        let handshaken = configured && self.verifier.is_some() && self.session_id.is_some();
         let metrics = self.base.metrics();
-        Ok(json!({
-            "status": if configured { "healthy" } else { "not_configured" },
+        let mut health = if handshaken {
+            HealthSnapshot::ready()
+        } else if configured {
+            HealthSnapshot::degraded("handshake required")
+        } else {
+            HealthSnapshot::degraded("not configured")
+        };
+        health.uptime_ms = u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        health.details = Some(json!({
+            "configured": configured,
+            "handshaken": handshaken,
+            "instance_id": self.base.instance_id,
             "metrics": {
                 "requests_total": metrics.requests_total,
                 "requests_error": metrics.requests_error,
             }
-        }))
+        }));
+        serde_json::to_value(health).map_err(|error| FcpError::Internal {
+            message: format!("Failed to serialize health: {error}"),
+        })
     }
 
     /// Handle introspect method.
     pub async fn handle_introspect(&self) -> FcpResult<serde_json::Value> {
         let introspection = Introspection {
-            operations: vec![
-                op_info(
-                    "linear.create_issue",
-                    "Create an issue in Linear",
-                    json!({
-                        "type": "object",
-                        "required": ["title", "team_id"],
-                        "properties": {
-                            "title": { "type": "string" },
-                            "team_id": { "type": "string" },
-                            "description": { "type": "string" }
-                        }
-                    }),
-                    json!({ "type": "object", "properties": { "issue": { "type": "object" } } }),
-                    "linear.write",
-                    RiskLevel::Medium,
-                    SafetyTier::Risky,
-                    IdempotencyClass::None,
-                    AgentHint {
-                        when_to_use: "Create a new issue in Linear.".into(),
-                        common_mistakes: vec!["Not specifying the team ID".into()],
-                        examples: vec![
-                            r#"{"title": "Fix login bug", "team_id": "TEAM-123"}"#.into(),
-                        ],
-                        related: vec![
-                            CapabilityId::from_static("linear.get_issue"),
-                            CapabilityId::from_static("linear.search_issues"),
-                        ],
-                    },
-                ),
-                op_info(
-                    "linear.get_issue",
-                    "Get a Linear issue by ID",
-                    json!({
-                        "type": "object",
-                        "required": ["issue_id"],
-                        "properties": {
-                            "issue_id": { "type": "string" }
-                        }
-                    }),
-                    json!({ "type": "object", "properties": { "issue": { "type": "object" } } }),
-                    "linear.read",
-                    RiskLevel::Low,
-                    SafetyTier::Safe,
-                    IdempotencyClass::Strict,
-                    AgentHint {
-                        when_to_use: "Look up a specific issue by ID.".into(),
-                        common_mistakes: vec![],
-                        examples: vec![r#"{"issue_id": "LIN-123"}"#.into()],
-                        related: vec![
-                            CapabilityId::from_static("linear.create_issue"),
-                            CapabilityId::from_static("linear.update_issue"),
-                        ],
-                    },
-                ),
-                op_info(
-                    "linear.update_issue",
-                    "Update an issue's properties",
-                    json!({
-                        "type": "object",
-                        "required": ["issue_id"],
-                        "properties": {
-                            "issue_id": { "type": "string" },
-                            "title": { "type": "string" },
-                            "state_id": { "type": "string" },
-                            "description": { "type": "string" }
-                        }
-                    }),
-                    json!({ "type": "object", "properties": { "issue": { "type": "object" } } }),
-                    "linear.write",
-                    RiskLevel::Medium,
-                    SafetyTier::Risky,
-                    IdempotencyClass::Strict,
-                    AgentHint {
-                        when_to_use: "Update issue title, status, assignee, or other fields."
-                            .into(),
-                        common_mistakes: vec![],
-                        examples: vec![
-                            r#"{"issue_id": "LIN-123", "state_id": "done-state-id"}"#.into(),
-                        ],
-                        related: vec![CapabilityId::from_static("linear.get_issue")],
-                    },
-                ),
-                op_info(
-                    "linear.search_issues",
-                    "Search issues with text query",
-                    json!({
-                        "type": "object",
-                        "required": ["query"],
-                        "properties": {
-                            "query": { "type": "string" }
-                        }
-                    }),
-                    json!({
-                        "type": "object",
-                        "properties": {
-                            "issues": { "type": "array" }
-                        }
-                    }),
-                    "linear.read",
-                    RiskLevel::Low,
-                    SafetyTier::Safe,
-                    IdempotencyClass::Strict,
-                    AgentHint {
-                        when_to_use: "Search for issues matching a text query.".into(),
-                        common_mistakes: vec![],
-                        examples: vec![r#"{"query": "login bug"}"#.into()],
-                        related: vec![CapabilityId::from_static("linear.get_issue")],
-                    },
-                ),
-                op_info(
-                    "linear.list_teams",
-                    "List all teams in the workspace",
-                    json!({
-                        "type": "object",
-                        "properties": {}
-                    }),
-                    json!({
-                        "type": "object",
-                        "properties": {
-                            "teams": { "type": "array" }
-                        }
-                    }),
-                    "linear.read",
-                    RiskLevel::Low,
-                    SafetyTier::Safe,
-                    IdempotencyClass::Strict,
-                    AgentHint {
-                        when_to_use: "List available teams in the workspace.".into(),
-                        common_mistakes: vec![],
-                        examples: vec![r"{}".into()],
-                        related: vec![CapabilityId::from_static("linear.create_issue")],
-                    },
-                ),
-                op_info(
-                    "linear.list_cycles",
-                    "List cycles for a team",
-                    json!({
-                        "type": "object",
-                        "required": ["team_id"],
-                        "properties": {
-                            "team_id": { "type": "string" }
-                        }
-                    }),
-                    json!({
-                        "type": "object",
-                        "properties": {
-                            "cycles": { "type": "array" }
-                        }
-                    }),
-                    "linear.read",
-                    RiskLevel::Low,
-                    SafetyTier::Safe,
-                    IdempotencyClass::Strict,
-                    AgentHint {
-                        when_to_use: "List sprints/cycles for a team.".into(),
-                        common_mistakes: vec![],
-                        examples: vec![r#"{"team_id": "TEAM-123"}"#.into()],
-                        related: vec![CapabilityId::from_static("linear.list_teams")],
-                    },
-                ),
-                op_info(
-                    "linear.add_comment",
-                    "Add a comment to an issue",
-                    json!({
-                        "type": "object",
-                        "required": ["issue_id", "body"],
-                        "properties": {
-                            "issue_id": { "type": "string" },
-                            "body": { "type": "string" }
-                        }
-                    }),
-                    json!({ "type": "object", "properties": { "comment": { "type": "object" } } }),
-                    "linear.write",
-                    RiskLevel::Medium,
-                    SafetyTier::Risky,
-                    IdempotencyClass::None,
-                    AgentHint {
-                        when_to_use: "Comment on an issue.".into(),
-                        common_mistakes: vec![],
-                        examples: vec![
-                            r#"{"issue_id": "LIN-123", "body": "Working on this now."}"#.into(),
-                        ],
-                        related: vec![CapabilityId::from_static("linear.get_issue")],
-                    },
-                ),
-                op_info(
-                    "linear.list_projects",
-                    "List projects in the workspace",
-                    json!({
-                        "type": "object",
-                        "properties": {}
-                    }),
-                    json!({
-                        "type": "object",
-                        "properties": {
-                            "projects": { "type": "array" }
-                        }
-                    }),
-                    "linear.read",
-                    RiskLevel::Low,
-                    SafetyTier::Safe,
-                    IdempotencyClass::Strict,
-                    AgentHint {
-                        when_to_use: "List projects.".into(),
-                        common_mistakes: vec![],
-                        examples: vec![r"{}".into()],
-                        related: vec![CapabilityId::from_static("linear.list_teams")],
-                    },
-                ),
-                op_info(
-                    "linear.plan_sync",
-                    "Plan a deterministic Beads ↔ Linear sync action without side effects",
-                    json!({
-                        "type": "object",
-                        "required": ["planned_at"],
-                        "properties": {
-                            "bead": {
-                                "type": "object",
-                                "description": "Optional Beads-side snapshot to compare"
-                            },
-                            "linear": {
-                                "type": "object",
-                                "description": "Optional Linear-side snapshot to compare"
-                            },
-                            "policy": {
-                                "type": "string",
-                                "enum": ["prefer_freshest", "prefer_bead", "prefer_linear", "manual"]
-                            },
-                            "planned_at": {
-                                "type": "string",
-                                "description": "RFC3339 timestamp recorded in the sync intent"
-                            }
-                        }
-                    }),
-                    json!({
-                        "type": "object",
-                        "properties": {
-                            "intent": { "type": "object" }
-                        }
-                    }),
-                    "linear.read",
-                    RiskLevel::Low,
-                    SafetyTier::Safe,
-                    IdempotencyClass::Strict,
-                    AgentHint {
-                        when_to_use: "Preview the exact Beads ↔ Linear sync action before any write."
-                            .into(),
-                        common_mistakes: vec![
-                            "planned_at is required so the audit artifact stays explicit".into(),
-                            "Provide at least one of bead or linear; both missing is not a meaningful sync plan"
-                                .into(),
-                        ],
-                        examples: vec![
-                            r#"{"planned_at":"2026-03-15T00:00:00Z","policy":"prefer_freshest","bead":{"bead_id":"br-123","title":"New title","description":"Body","status":"open","priority":1,"updated_at":"2026-03-15T00:00:00Z"},"linear":{"issue_id":"lin-1","identifier":"LIN-123","title":"Old title","description":"Body","status":"open","priority":1,"updated_at":"2026-03-14T23:00:00Z"}}"#.into(),
-                        ],
-                        related: vec![
-                            CapabilityId::from_static("linear.get_issue"),
-                            CapabilityId::from_static("linear.process_webhook"),
-                        ],
-                    },
-                ),
-                op_info(
-                    "linear.process_webhook",
-                    "Process an inbound Linear webhook payload forwarded by fcp-host",
-                    json!({
-                        "type": "object",
-                        "required": ["payload", "delivery_id", "signature_validated"],
-                        "properties": {
-                            "delivery_id": {
-                                "type": "string",
-                                "description": "Linear-Delivery header UUID forwarded by fcp-host"
-                            },
-                            "signature_validated": {
-                                "type": "boolean",
-                                "description": "True only when fcp-host has already verified Linear-Signature against the raw body"
-                            },
-                            "payload": {
-                                "type": "object",
-                                "description": "Raw Linear webhook payload"
-                            }
-                        }
-                    }),
-                    json!({
-                        "type": "object",
-                        "properties": {
-                            "event": {
-                                "type": "object",
-                                "properties": {
-                                    "topic": { "type": "string" },
-                                    "resource_type": { "type": "string" },
-                                    "action": { "type": "string" },
-                                    "resource_uri": { "type": "string" },
-                                    "data": { "type": "object" },
-                                    "delivery_id": { "type": "string" },
-                                    "idempotency_key": { "type": "string" },
-                                    "webhook_timestamp": { "type": "integer" }
-                                }
-                            }
-                        }
-                    }),
-                    "linear.process_webhook",
-                    RiskLevel::Low,
-                    SafetyTier::Safe,
-                    IdempotencyClass::Strict,
-                    AgentHint {
-                        when_to_use: "Process a webhook event forwarded by fcp-host.".into(),
-                        common_mistakes: vec![
-                            "Sending the payload without the wrapper object".into(),
-                            "Forwarding parsed webhook JSON before fcp-host verifies the Linear-Signature header".into(),
-                            "Dropping the Linear-Delivery header; without it downstream idempotency receipts cannot be stable".into(),
-                        ],
-                        examples: vec![
-                            r#"{"delivery_id":"234d1a4e-b617-4388-90fe-adc3633d6b72","signature_validated":true,"payload":{"action":"create","type":"Issue","createdAt":"2026-03-07T00:00:00Z","webhookTimestamp":1762459200000,"data":{"id":"i1"}}}"#.into(),
-                        ],
-                        related: vec![
-                            CapabilityId::from_static("linear.get_issue"),
-                        ],
-                    },
-                ),
-            ],
+            operations: operations_info()?.to_vec(),
             events: vec![
                 EventInfo {
                     topic: "linear.issue.create".into(),
@@ -1107,15 +860,82 @@ impl LinearConnector {
     /// Handle simulate method.
     pub async fn handle_simulate(&self, params: serde_json::Value) -> FcpResult<serde_json::Value> {
         let req: SimulateRequest =
-            serde_json::from_value(params).map_err(|e| FcpError::InvalidRequest {
+            serde_json::from_value(params).map_err(|_| FcpError::InvalidRequest {
                 code: 1003,
-                message: format!("Invalid simulate request: {e}"),
+                message: "Invalid simulate request".into(),
             })?;
-
-        let response = SimulateResponse::allowed(req.id);
+        if req.r#type != "simulate" {
+            return Err(FcpError::InvalidRequest {
+                code: 1003,
+                message: "Expected simulate request type".into(),
+            });
+        }
+        let authorization = self.authorize_operation(
+            &req.operation,
+            &req.input,
+            req.capability_token,
+            Some(&req.connector_id),
+            Some(&req.zone_id),
+        );
+        let response = match authorization {
+            Ok(()) => SimulateResponse::allowed(req.id),
+            Err(error) => {
+                let response =
+                    SimulateResponse::denied(req.id, error.to_string(), error.error_code());
+                if let FcpError::CapabilityDenied { capability, .. } = error {
+                    response.with_missing_capabilities(vec![capability])
+                } else {
+                    response
+                }
+            }
+        };
         serde_json::to_value(response).map_err(|e| FcpError::Internal {
             message: format!("Failed to serialize response: {e}"),
         })
+    }
+
+    /// Shared, side-effect-free gate for both preflight and provider dispatch.
+    fn authorize_operation(
+        &self,
+        operation: &OperationId,
+        input: &serde_json::Value,
+        token: CapabilityToken,
+        connector_id: Option<&ConnectorId>,
+        zone_id: Option<&ZoneId>,
+    ) -> FcpResult<()> {
+        self.base.check_ready()?;
+        if self.client.is_none() || self.config.is_none() {
+            return Err(FcpError::NotConfigured);
+        }
+        if connector_id.is_some_and(|id| id != &self.base.id)
+            || zone_id.is_some_and(|zone| self.session_zone.as_ref() != Some(zone))
+        {
+            return Err(FcpError::InvalidRequest {
+                code: 1003,
+                message: "Request does not match the negotiated Linear connector and zone".into(),
+            });
+        }
+        let metadata = operations_info()?
+            .iter()
+            .find(|metadata| metadata.id == *operation)
+            .ok_or_else(|| FcpError::OperationNotGranted {
+                operation: operation.as_str().to_owned(),
+            })?;
+        if !self
+            .granted_capabilities
+            .contains(metadata.capability.as_str())
+        {
+            return Err(FcpError::CapabilityDenied {
+                capability: metadata.capability.as_str().to_owned(),
+                reason: "Capability was not granted by the current handshake".into(),
+            });
+        }
+        let resources = resource_uris_for_operation(operation.as_str(), input)?;
+        self.verifier
+            .as_ref()
+            .ok_or(FcpError::NotHandshaken)?
+            .verify_bound(token, &metadata.capability, operation, &resources)?;
+        fcp_sdk::validate_input(&metadata.input_schema, input)
     }
 
     /// Handle invoke method.
@@ -1148,42 +968,40 @@ impl LinearConnector {
             })?;
 
         let token: CapabilityToken =
-            serde_json::from_value(token_value.clone()).map_err(|e| FcpError::InvalidRequest {
+            serde_json::from_value(token_value.clone()).map_err(|_| FcpError::InvalidRequest {
                 code: 1003,
-                message: format!("Invalid capability_token format: {e}"),
+                message: "Invalid capability_token format".into(),
             })?;
 
         let op_id: OperationId = operation.parse().map_err(|_| FcpError::InvalidRequest {
             code: 1003,
             message: "Invalid operation ID format".into(),
         })?;
-        let intro = self.handle_introspect().await?;
-        let cap_str = intro
-            .get("operations")
-            .and_then(|ops| ops.as_array())
-            .and_then(|ops| {
-                ops.iter()
-                    .find(|o| o.get("id").and_then(|id| id.as_str()) == Some(operation))
-            })
-            .and_then(|op| op.get("capability"))
-            .and_then(|cap| cap.as_str())
-            .ok_or_else(|| FcpError::OperationNotGranted {
-                operation: operation.into(),
+        let connector_id: Option<ConnectorId> = params
+            .get("connector_id")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|_| FcpError::InvalidRequest {
+                code: 1003,
+                message: "Invalid connector_id".into(),
             })?;
-
-        let cap_id: CapabilityId = cap_str.parse().map_err(|_| FcpError::InvalidRequest {
-            code: 1003,
-            message: "Invalid capability ID format".into(),
-        })?;
-
-        let resource_uris = resource_uris_for_operation(operation, &input)?;
-
-        if let Some(verifier) = &self.verifier {
-            // dja9u.1.b: typestate handoff via verify_bound.
-            let _bound = verifier.verify_bound(token, &cap_id, &op_id, &resource_uris)?;
-        } else {
-            return Err(FcpError::NotConfigured);
-        }
+        let zone_id: Option<ZoneId> = params
+            .get("zone_id")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|_| FcpError::InvalidRequest {
+                code: 1003,
+                message: "Invalid zone_id".into(),
+            })?;
+        self.authorize_operation(
+            &op_id,
+            &input,
+            token,
+            connector_id.as_ref(),
+            zone_id.as_ref(),
+        )?;
 
         match operation {
             "linear.create_issue" => self.invoke_create_issue(input).await,
@@ -1446,12 +1264,10 @@ impl LinearConnector {
 
     /// Handle shutdown.
     pub async fn handle_shutdown(
-        &self,
+        &mut self,
         _params: serde_json::Value,
     ) -> FcpResult<serde_json::Value> {
-        if let Some(client) = &self.client {
-            client.shutdown();
-        }
+        self.clear_configuration();
         info!("Linear connector shutting down");
         Ok(json!({ "status": "shutdown" }))
     }
@@ -1535,32 +1351,42 @@ fn resource_uri_for_webhook_payload(payload: &crate::types::WebhookPayload) -> S
     }
 }
 
-#[allow(clippy::fn_params_excessive_bools)]
-fn op_info(
-    id: &'static str,
-    summary: &str,
-    input_schema: serde_json::Value,
-    output_schema: serde_json::Value,
-    capability: &'static str,
-    risk_level: RiskLevel,
-    safety_tier: SafetyTier,
-    idempotency: IdempotencyClass,
-    ai_hints: AgentHint,
-) -> OperationInfo {
-    OperationInfo {
-        id: OperationId::from_static(id),
-        summary: summary.into(),
-        input_schema,
-        output_schema,
-        capability: CapabilityId::from_static(capability),
-        risk_level,
-        description: None,
-        rate_limit: None,
-        requires_approval: None,
-        safety_tier,
-        idempotency,
-        ai_hints,
-    }
+fn operations_info() -> FcpResult<&'static [OperationInfo]> {
+    static OPERATIONS: OnceLock<Result<Vec<OperationInfo>, String>> = OnceLock::new();
+    let operations = OPERATIONS.get_or_init(|| {
+        let manifest =
+            ConnectorManifest::parse_str(MANIFEST_TOML).map_err(|error| error.to_string())?;
+        if manifest.provides.operations.len() != OPERATION_IDS.len() {
+            return Err("Linear manifest does not match the implemented operation set".into());
+        }
+        OPERATION_IDS
+            .into_iter()
+            .map(|id| {
+                let operation = manifest
+                    .provides
+                    .operations
+                    .get(id)
+                    .ok_or_else(|| format!("Linear manifest is missing {id}"))?;
+                Ok(OperationInfo {
+                    id: OperationId::from_static(id),
+                    summary: operation.description.clone(),
+                    description: Some(operation.description.clone()),
+                    input_schema: operation.input_schema.clone(),
+                    output_schema: operation.output_schema.clone(),
+                    capability: operation.capability.clone(),
+                    risk_level: operation.risk_level,
+                    safety_tier: operation.safety_tier,
+                    idempotency: operation.idempotency,
+                    ai_hints: operation.ai_hints.clone(),
+                    rate_limit: operation.rate_limit.as_ref().map(|limit| limit.0.clone()),
+                    requires_approval: Some(ApprovalMode::from(operation.requires_approval)),
+                })
+            })
+            .collect()
+    });
+    operations.as_deref().map_err(|error| FcpError::Internal {
+        message: format!("Embedded Linear manifest is invalid: {error}"),
+    })
 }
 
 #[cfg(test)]
@@ -1572,6 +1398,7 @@ mod tests {
     use fcp_manifest::{ConnectorManifest, OperationSection};
     use fcp_prelude::CapabilityConstraints;
     use std::path::PathBuf;
+    use std::sync::Arc;
 
     #[test]
     fn validate_api_url_for_auth_accepts_api_linear_app_with_api_key() {
@@ -1678,12 +1505,252 @@ mod tests {
         )
     }
 
+    async fn configured_connector() -> LinearConnector {
+        let mut connector = LinearConnector::new();
+        connector
+            .handle_configure(json!({
+                "api_key": "lin_api_test",
+                "api_url": "http://127.0.0.1:1/graphql"
+            }))
+            .await
+            .unwrap();
+        connector
+    }
+
+    fn handshake_params(signing_key: &Ed25519SigningKey) -> serde_json::Value {
+        json!({
+            "protocol_version": "2.0",
+            "zone": "z:work",
+            "host_public_key": signing_key.verifying_key().to_bytes(),
+            "nonce": vec![0u8; 32],
+            "capabilities_requested": ["linear.read"]
+        })
+    }
+
+    fn local_plan_request(kind: &str, token: CapabilityToken) -> serde_json::Value {
+        json!({
+            "type": kind,
+            "id": "local-plan",
+            "connector_id": "fcp.linear",
+            "zone_id": "z:work",
+            "operation": "linear.plan_sync",
+            "input": {
+                "planned_at": "2026-03-15T00:00:00Z",
+                "bead": {
+                    "bead_id": "br-local",
+                    "title": "Local plan",
+                    "updated_at": "2026-03-15T00:00:00Z"
+                }
+            },
+            "capability_token": token
+        })
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn failed_lifecycle_transitions_revoke_authority_and_rotate_identity() {
+        for transition in ["configure", "handshake", "shutdown"] {
+            let mut connector = configured_connector().await;
+            let signing_key = Ed25519SigningKey::generate();
+            connector
+                .handle_handshake(handshake_params(&signing_key))
+                .await
+                .unwrap();
+            let old_instance = connector.instance_id().clone();
+            let old_token = generate_valid_token(&signing_key, "linear.plan_sync", &old_instance);
+            connector
+                .handle_invoke(local_plan_request("invoke", old_token.clone()))
+                .await
+                .unwrap();
+
+            match transition {
+                "configure" => {
+                    assert!(connector.handle_configure(json!({})).await.is_err());
+                }
+                "handshake" => {
+                    let mut request = handshake_params(&signing_key);
+                    request["protocol_version"] = json!("1.0.0");
+                    assert!(connector.handle_handshake(request).await.is_err());
+                }
+                "shutdown" => {
+                    connector.handle_shutdown(json!({})).await.unwrap();
+                }
+                _ => unreachable!(),
+            }
+
+            let health: HealthSnapshot =
+                serde_json::from_value(connector.handle_health().await.unwrap()).unwrap();
+            assert!(!health.is_ready(), "{transition} must revoke readiness");
+            assert_eq!(health.details.unwrap()["handshaken"], false);
+            assert!(
+                connector
+                    .handle_invoke(local_plan_request("invoke", old_token.clone()))
+                    .await
+                    .is_err(),
+                "{transition} must revoke invoke authority"
+            );
+            let simulation: SimulateResponse = serde_json::from_value(
+                connector
+                    .handle_simulate(local_plan_request("simulate", old_token.clone()))
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(
+                !simulation.would_succeed,
+                "{transition} must revoke preflight authority"
+            );
+
+            connector
+                .handle_configure(json!({
+                    "api_key": "lin_api_test",
+                    "api_url": "http://127.0.0.1:1/graphql"
+                }))
+                .await
+                .unwrap();
+            connector
+                .handle_handshake(handshake_params(&signing_key))
+                .await
+                .unwrap();
+            assert_ne!(connector.instance_id(), &old_instance);
+            assert!(
+                connector
+                    .handle_invoke(local_plan_request("invoke", old_token.clone()))
+                    .await
+                    .is_err(),
+                "{transition} must not revive an old token after a new handshake"
+            );
+            let simulation: SimulateResponse = serde_json::from_value(
+                connector
+                    .handle_simulate(local_plan_request("simulate", old_token))
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(
+                !simulation.would_succeed,
+                "{transition} must keep old preflight grants revoked"
+            );
+            let new_token =
+                generate_valid_token(&signing_key, "linear.plan_sync", connector.instance_id());
+            let simulation: SimulateResponse = serde_json::from_value(
+                connector
+                    .handle_simulate(local_plan_request("simulate", new_token.clone()))
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(simulation.would_succeed);
+            connector
+                .handle_invoke(local_plan_request("invoke", new_token))
+                .await
+                .unwrap();
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn handshake_limits_capabilities_and_successful_rehandshake_revokes_old_grants() {
+        let mut connector = configured_connector().await;
+        let signing_key = Ed25519SigningKey::generate();
+        let mut params = handshake_params(&signing_key);
+        params["capabilities_requested"] = json!(["linear.read", "linear.read", "linear.unknown"]);
+        let handshake: HandshakeResponse =
+            serde_json::from_value(connector.handle_handshake(params).await.unwrap()).unwrap();
+        assert_eq!(handshake.capabilities_granted.len(), 1);
+        assert_eq!(
+            handshake.capabilities_granted[0].capability.as_str(),
+            "linear.read"
+        );
+        let old_token =
+            generate_valid_token(&signing_key, "linear.plan_sync", connector.instance_id());
+        connector
+            .handle_handshake(handshake_params(&signing_key))
+            .await
+            .unwrap();
+        assert!(
+            connector
+                .handle_invoke(local_plan_request("invoke", old_token))
+                .await
+                .is_err()
+        );
+
+        let token =
+            generate_valid_token(&signing_key, "linear.create_issue", connector.instance_id());
+        let request = json!({
+            "type": "simulate",
+            "id": "unnegotiated-write",
+            "connector_id": "fcp.linear",
+            "zone_id": "z:work",
+            "operation": "linear.create_issue",
+            "input": { "title": "Unnegotiated write", "team_id": "team-1" },
+            "capability_token": token,
+        });
+        let simulation: SimulateResponse =
+            serde_json::from_value(connector.handle_simulate(request.clone()).await.unwrap())
+                .unwrap();
+        assert!(!simulation.would_succeed);
+        assert_eq!(simulation.missing_capabilities, ["linear.write"]);
+        assert!(matches!(
+            connector.handle_invoke(request).await,
+            Err(FcpError::CapabilityDenied { .. })
+        ));
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn simulation_does_not_consume_webhook_replay_admission() {
+        let mut connector = configured_connector().await;
+        let signing_key = Ed25519SigningKey::generate();
+        let mut handshake = handshake_params(&signing_key);
+        handshake["capabilities_requested"] = json!(["linear.process_webhook"]);
+        connector.handle_handshake(handshake).await.unwrap();
+        let token = generate_valid_token(
+            &signing_key,
+            "linear.process_webhook",
+            connector.instance_id(),
+        );
+        let request = json!({
+            "type": "simulate",
+            "id": "webhook-preflight",
+            "connector_id": "fcp.linear",
+            "zone_id": "z:work",
+            "operation": "linear.process_webhook",
+            "input": {
+                "delivery_id": Uuid::new_v4().to_string(),
+                "signature_validated": true,
+                "payload": {
+                    "action": "create",
+                    "type": "Issue",
+                    "createdAt": "2026-03-15T00:00:00Z",
+                    "webhookTimestamp": Utc::now().timestamp_millis(),
+                    "data": { "id": "issue-preflight" }
+                }
+            },
+            "capability_token": token,
+        });
+        let simulation: SimulateResponse =
+            serde_json::from_value(connector.handle_simulate(request.clone()).await.unwrap())
+                .unwrap();
+        assert!(simulation.would_succeed);
+        assert!(
+            connector
+                .webhook_replay_receipts
+                .lock()
+                .unwrap()
+                .accepted
+                .is_empty()
+        );
+        connector.handle_invoke(request.clone()).await.unwrap();
+        assert!(
+            connector.handle_invoke(request).await.is_err(),
+            "the real invocation must still record replay protection"
+        );
+    }
+
     #[fcp_async_core::runtime::test]
     async fn test_handshake() {
-        let mut connector = LinearConnector::new();
+        let mut connector = configured_connector().await;
         let result = connector
             .handle_handshake(json!({
-                "protocol_version": "1.0.0",
+                "protocol_version": "2.0.0",
                 "zone": "z:work",
                 "host_public_key": vec![0u8; 32],
                 "nonce": vec![0u8; 32],
@@ -1699,7 +1766,11 @@ mod tests {
     async fn test_health_not_configured() {
         let connector = LinearConnector::new();
         let result = connector.handle_health().await.unwrap();
-        assert_eq!(result["status"], "not_configured");
+        let health: HealthSnapshot = serde_json::from_value(result).unwrap();
+        assert!(!health.is_ready());
+        let details = health.details.unwrap();
+        assert_eq!(details["configured"], false);
+        assert_eq!(details["handshaken"], false);
     }
 
     #[fcp_async_core::runtime::test]
@@ -1709,16 +1780,17 @@ mod tests {
         let signing_key = Ed25519SigningKey::generate();
         let verifying_key = signing_key.verifying_key();
 
-        connector
+        let handshake_error = connector
             .handle_handshake(json!({
-                "protocol_version": "1.0.0",
+                "protocol_version": "2.0.0",
                 "zone": "z:work",
                 "host_public_key": verifying_key.to_bytes(),
                 "nonce": vec![0u8; 32],
-                "capabilities_requested": ["linear.get_issue"]
+                "capabilities_requested": ["linear.read"]
             }))
             .await
-            .unwrap();
+            .unwrap_err();
+        assert!(matches!(handshake_error, FcpError::NotConfigured));
 
         let token = generate_valid_token(&signing_key, "linear.get_issue", connector.instance_id());
 
@@ -1736,23 +1808,18 @@ mod tests {
 
     #[fcp_async_core::runtime::test]
     async fn test_invoke_missing_field() {
-        let mut connector = LinearConnector::new();
-        connector.client = Some(
-            LinearClient::new("fake_key")
-                .unwrap()
-                .with_api_url("http://localhost:9999/graphql"),
-        );
+        let mut connector = configured_connector().await;
 
         let signing_key = Ed25519SigningKey::generate();
         let verifying_key = signing_key.verifying_key();
 
         connector
             .handle_handshake(json!({
-                "protocol_version": "1.0.0",
+                "protocol_version": "2.0.0",
                 "zone": "z:work",
                 "host_public_key": verifying_key.to_bytes(),
                 "nonce": vec![0u8; 32],
-                "capabilities_requested": ["linear.create_issue"]
+                "capabilities_requested": ["linear.write"]
             }))
             .await
             .unwrap();
@@ -1815,17 +1882,17 @@ mod tests {
 
     #[fcp_async_core::runtime::test]
     async fn test_get_issue_rejects_disallowed_resource_scope() {
-        let mut connector = LinearConnector::new();
+        let mut connector = configured_connector().await;
         let signing_key = Ed25519SigningKey::generate();
         let verifying_key = signing_key.verifying_key();
 
         connector
             .handle_handshake(json!({
-                "protocol_version": "1.0.0",
+                "protocol_version": "2.0.0",
                 "zone": "z:work",
                 "host_public_key": verifying_key.to_bytes(),
                 "nonce": vec![0u8; 32],
-                "capabilities_requested": ["linear.get_issue"]
+                "capabilities_requested": ["linear.read"]
             }))
             .await
             .unwrap();
@@ -1859,17 +1926,17 @@ mod tests {
 
     #[fcp_async_core::runtime::test]
     async fn test_plan_sync_requires_at_least_one_snapshot() {
-        let mut connector = LinearConnector::new();
+        let mut connector = configured_connector().await;
         let signing_key = Ed25519SigningKey::generate();
         let verifying_key = signing_key.verifying_key();
 
         connector
             .handle_handshake(json!({
-                "protocol_version": "1.0.0",
+                "protocol_version": "2.0.0",
                 "zone": "z:work",
                 "host_public_key": verifying_key.to_bytes(),
                 "nonce": vec![0u8; 32],
-                "capabilities_requested": ["linear.plan_sync"]
+                "capabilities_requested": ["linear.read"]
             }))
             .await
             .unwrap();
@@ -2459,13 +2526,13 @@ mod tests {
 
     #[fcp_async_core::runtime::test]
     async fn test_process_webhook_requires_verified_signature() {
-        let mut connector = LinearConnector::new();
+        let mut connector = configured_connector().await;
         let signing_key = Ed25519SigningKey::generate();
         let verifying_key = signing_key.verifying_key();
 
         connector
             .handle_handshake(json!({
-                "protocol_version": "1.0.0",
+                "protocol_version": "2.0.0",
                 "zone": "z:work",
                 "host_public_key": verifying_key.to_bytes(),
                 "nonce": vec![0u8; 32],
@@ -2508,13 +2575,13 @@ mod tests {
 
     #[fcp_async_core::runtime::test]
     async fn test_process_webhook_rejects_stale_timestamp() {
-        let mut connector = LinearConnector::new();
+        let mut connector = configured_connector().await;
         let signing_key = Ed25519SigningKey::generate();
         let verifying_key = signing_key.verifying_key();
 
         connector
             .handle_handshake(json!({
-                "protocol_version": "1.0.0",
+                "protocol_version": "2.0.0",
                 "zone": "z:work",
                 "host_public_key": verifying_key.to_bytes(),
                 "nonce": vec![0u8; 32],
@@ -2557,13 +2624,13 @@ mod tests {
 
     #[fcp_async_core::runtime::test]
     async fn test_process_webhook_rejects_duplicate_delivery_id() {
-        let mut connector = LinearConnector::new();
+        let mut connector = configured_connector().await;
         let signing_key = Ed25519SigningKey::generate();
         let verifying_key = signing_key.verifying_key();
 
         connector
             .handle_handshake(json!({
-                "protocol_version": "1.0.0",
+                "protocol_version": "2.0.0",
                 "zone": "z:work",
                 "host_public_key": verifying_key.to_bytes(),
                 "nonce": vec![0u8; 32],
@@ -2619,11 +2686,11 @@ mod tests {
 
     #[fcp_async_core::runtime::test]
     async fn test_process_webhook_rejects_payload_alias_and_timestamp_reordering() {
-        let mut connector = LinearConnector::new();
+        let mut connector = configured_connector().await;
         let signing_key = Ed25519SigningKey::generate();
         connector
             .handle_handshake(json!({
-                "protocol_version": "1.0.0",
+                "protocol_version": "2.0.0",
                 "zone": "z:work",
                 "host_public_key": signing_key.verifying_key().to_bytes(),
                 "nonce": vec![0u8; 32],
@@ -2717,13 +2784,13 @@ mod tests {
 
     #[fcp_async_core::runtime::test]
     async fn test_process_webhook_rejects_disallowed_resource_scope() {
-        let mut connector = LinearConnector::new();
+        let mut connector = configured_connector().await;
         let signing_key = Ed25519SigningKey::generate();
         let verifying_key = signing_key.verifying_key();
 
         connector
             .handle_handshake(json!({
-                "protocol_version": "1.0.0",
+                "protocol_version": "2.0.0",
                 "zone": "z:work",
                 "host_public_key": verifying_key.to_bytes(),
                 "nonce": vec![0u8; 32],

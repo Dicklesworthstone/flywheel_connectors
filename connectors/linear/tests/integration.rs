@@ -62,14 +62,22 @@ fn generate_valid_token(
 async fn setup_handshake(connector: &mut LinearConnector, caps: &[&str]) -> Ed25519SigningKey {
     let signing_key = Ed25519SigningKey::generate();
     let verifying_key = signing_key.verifying_key();
+    let capabilities: std::collections::BTreeSet<_> = caps
+        .iter()
+        .map(|operation| match *operation {
+            "linear.create_issue" | "linear.update_issue" | "linear.add_comment" => "linear.write",
+            "linear.process_webhook" => "linear.process_webhook",
+            _ => "linear.read",
+        })
+        .collect();
 
     connector
         .handle_handshake(json!({
-            "protocol_version": "1.0.0",
+            "protocol_version": "2.0.0",
             "zone": "z:work",
             "host_public_key": verifying_key.to_bytes(),
             "nonce": vec![0u8; 32],
-            "capabilities_requested": caps
+            "capabilities_requested": capabilities
         }))
         .await
         .expect("handshake should succeed");
@@ -369,14 +377,14 @@ async fn redaction_api_key_not_in_error_message() {
     );
 }
 
-/// API key is sent as Bearer auth header.
+/// Personal API keys use Linear's raw Authorization header contract.
 #[fcp_async_core::runtime::test]
-async fn api_key_sent_as_bearer_auth() {
+async fn api_key_sent_as_raw_authorization() {
     let mock_server = MockServer::start().await;
 
     Mock::given(method("POST"))
         .and(path("/graphql"))
-        .and(header("authorization", "Bearer test-api-key"))
+        .and(header("authorization", "test-api-key"))
         .respond_with(graphql_success(&json!({
             "teams": { "nodes": [] }
         })))
@@ -720,6 +728,10 @@ async fn invoke_create_issue_through_connector() {
 #[fcp_async_core::runtime::test]
 async fn invoke_plan_sync_through_connector() {
     let mut connector = LinearConnector::new();
+    connector
+        .handle_configure(json!({ "api_key": "test-api-key" }))
+        .await
+        .unwrap();
     let signing_key = setup_handshake(&mut connector, &["linear.plan_sync"]).await;
     let token = generate_valid_token(&signing_key, "linear.plan_sync", connector.instance_id());
 
@@ -771,6 +783,10 @@ async fn invoke_plan_sync_through_connector() {
 #[fcp_async_core::runtime::test]
 async fn invoke_plan_sync_surfaces_linkage_conflict() {
     let mut connector = LinearConnector::new();
+    connector
+        .handle_configure(json!({ "api_key": "test-api-key" }))
+        .await
+        .unwrap();
     let signing_key = setup_handshake(&mut connector, &["linear.plan_sync"]).await;
     let token = generate_valid_token(&signing_key, "linear.plan_sync", connector.instance_id());
 
@@ -821,6 +837,10 @@ async fn invoke_plan_sync_surfaces_linkage_conflict() {
 #[fcp_async_core::runtime::test]
 async fn invoke_plan_sync_conflicts_on_single_sided_claimed_linkage() {
     let mut connector = LinearConnector::new();
+    connector
+        .handle_configure(json!({ "api_key": "test-api-key" }))
+        .await
+        .unwrap();
     let signing_key = setup_handshake(&mut connector, &["linear.plan_sync"]).await;
     let token = generate_valid_token(&signing_key, "linear.plan_sync", connector.instance_id());
 

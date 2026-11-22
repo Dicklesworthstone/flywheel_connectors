@@ -139,9 +139,9 @@ impl LinearClient {
     /// Apply authentication headers to a request builder.
     fn apply_auth(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         match &self.auth {
-            LinearAuth::ApiKey(key) => {
-                builder.header(header::AUTHORIZATION, format!("Bearer {key}"))
-            }
+            // Personal API keys use a raw Authorization value. Bearer is
+            // reserved for OAuth access tokens by the Linear GraphQL API.
+            LinearAuth::ApiKey(key) => builder.header(header::AUTHORIZATION, key),
             LinearAuth::CredentialId(_) => {
                 // Secretless: egress proxy injects credentials. Send without auth header.
                 builder

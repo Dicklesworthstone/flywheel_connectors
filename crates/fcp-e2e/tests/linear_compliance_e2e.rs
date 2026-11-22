@@ -17,11 +17,10 @@ use fcp_crypto::{cose::CapabilityTokenBuilder, ed25519::Ed25519SigningKey};
 use fcp_e2e::{ComplianceSuite, ConnectorSuite, E2eRunner, InvokeExpectations};
 use fcp_manifest::ConnectorManifest;
 use fcp_prelude::{
-    AgentHint, CapabilityId, CapabilityToken, ConnectorId, ConnectorMetrics, FcpConnector,
-    FcpError, HandshakeRequest, HandshakeResponse, HealthSnapshot, IdempotencyClass, InstanceId,
-    Introspection, InvokeRequest, InvokeResponse, InvokeStatus, OperationId, OperationInfo,
-    RequestId, RiskLevel, SafetyTier, ShutdownRequest, SimulateRequest, SimulateResponse,
-    SubscribeRequest, SubscribeResponse, UnsubscribeRequest, ZoneId,
+    CapabilityId, CapabilityToken, ConnectorId, ConnectorMetrics, FcpConnector, FcpError,
+    HandshakeRequest, HandshakeResponse, HealthSnapshot, InstanceId, Introspection, InvokeRequest,
+    InvokeResponse, InvokeStatus, OperationId, RequestId, ShutdownRequest, SimulateRequest,
+    SimulateResponse, SubscribeRequest, SubscribeResponse, UnsubscribeRequest, ZoneId,
 };
 use fcp_testkit::MockApiServer;
 use serde_json::json;
@@ -39,13 +38,17 @@ use fcp_linear::connector::LinearConnector;
 struct LinearConnectorAdapter {
     connector: LinearConnector,
     id: ConnectorId,
+    catalog: Introspection,
 }
 
 impl LinearConnectorAdapter {
-    fn new() -> Self {
+    async fn new() -> Self {
+        let connector = LinearConnector::new();
+        let catalog = serde_json::from_value(connector.handle_introspect().await.unwrap()).unwrap();
         Self {
-            connector: LinearConnector::new(),
-            id: ConnectorId::from_static("linear"),
+            connector,
+            id: ConnectorId::from_static("fcp.linear"),
+            catalog,
         }
     }
 }
@@ -74,17 +77,8 @@ impl FcpConnector for LinearConnectorAdapter {
 
     async fn health(&self) -> HealthSnapshot {
         match self.connector.handle_health().await {
-            Ok(payload) => {
-                let status = payload
-                    .get("status")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("unknown");
-                match status {
-                    "healthy" => HealthSnapshot::ready(),
-                    "not_configured" => HealthSnapshot::degraded("not_configured"),
-                    other => HealthSnapshot::degraded(format!("linear_status:{other}")),
-                }
-            }
+            Ok(payload) => serde_json::from_value(payload)
+                .expect("Linear health must use the canonical host schema"),
             Err(err) => HealthSnapshot::error(err.to_string()),
         }
     }
@@ -98,51 +92,12 @@ impl FcpConnector for LinearConnectorAdapter {
     }
 
     fn introspect(&self) -> Introspection {
-        Introspection {
-            operations: vec![OperationInfo {
-                id: OperationId::from_static("linear.get_issue"),
-                summary: "Get a Linear issue by ID".to_string(),
-                description: None,
-                input_schema: json!({
-                    "type": "object",
-                    "required": ["issue_id"],
-                    "properties": {
-                        "issue_id": { "type": "string" }
-                    }
-                }),
-                output_schema: json!({
-                    "type": "object",
-                    "properties": {
-                        "issue": { "type": "object" }
-                    }
-                }),
-                capability: CapabilityId::from_static("linear.read"),
-                risk_level: RiskLevel::Low,
-                safety_tier: SafetyTier::Safe,
-                idempotency: IdempotencyClass::Strict,
-                ai_hints: AgentHint {
-                    when_to_use: "Look up a specific issue by ID.".to_string(),
-                    common_mistakes: Vec::new(),
-                    examples: vec![r#"{"issue_id": "LIN-123"}"#.to_string()],
-                    related: Vec::new(),
-                },
-                rate_limit: None,
-                requires_approval: None,
-            }],
-            events: Vec::new(),
-            resource_types: Vec::new(),
-            auth_caps: None,
-            event_caps: None,
-        }
+        self.catalog.clone()
     }
 
     async fn invoke(&self, req: InvokeRequest) -> fcp_core::FcpResult<InvokeResponse> {
-        let request_id = req.id;
-        let params = json!({
-            "operation": req.operation.as_str(),
-            "input": req.input,
-            "capability_token": req.capability_token,
-        });
+        let request_id = req.id.clone();
+        let params = serde_json::to_value(req).expect("invoke request should serialize");
         let value = self.connector.handle_invoke(params).await?;
         Ok(InvokeResponse::ok(request_id, value))
     }
@@ -170,16 +125,10 @@ impl FcpConnector for LinearConnectorAdapter {
 // Helpers
 // ============================================================================
 
-fn reference_manifest_with_hash() -> String {
-    let raw = include_str!("../../../tests/vectors/manifest/manifest_valid.toml");
-    let unchecked = ConnectorManifest::parse_str_unchecked(raw).expect("unchecked manifest parse");
-    let computed = unchecked
-        .compute_interface_hash()
-        .expect("compute interface hash");
-    raw.replace(
-        &unchecked.manifest.interface_hash.to_string(),
-        &computed.to_string(),
-    )
+fn linear_manifest_with_hash() -> String {
+    let raw = include_str!("../../../connectors/linear/manifest.toml");
+    ConnectorManifest::parse_str(raw).expect("bundled Linear manifest should validate");
+    raw.to_owned()
 }
 
 fn handshake_request(host_public_key: [u8; 32], capabilities: &[&str]) -> HandshakeRequest {
@@ -242,7 +191,7 @@ fn invoke_request(
     InvokeRequest {
         r#type: "invoke".to_string(),
         id: RequestId::from("linear-e2e"),
-        connector_id: ConnectorId::from_static("linear"),
+        connector_id: ConnectorId::from_static("fcp.linear"),
         operation: OperationId::from_static(operation),
         zone_id: ZoneId::work(),
         input,
@@ -339,7 +288,7 @@ fn linear_get_issue_graphql_response() -> serde_json::Value {
 /// (which requires "linear.read").
 #[fcp_async_core::runtime::test]
 async fn linear_default_deny_compliance_suite_passes() {
-    let mut connector = LinearConnectorAdapter::new();
+    let mut connector = LinearConnectorAdapter::new().await;
     let signing_key = Ed25519SigningKey::generate();
     let handshake = handshake_request(signing_key.verifying_key().to_bytes(), &["linear.write"]);
     // Token grants "linear.write" but invoke targets "linear.get_issue" -> denial
@@ -365,11 +314,7 @@ async fn linear_default_deny_compliance_suite_passes() {
         require_capability_denial: true,
         require_decision_receipt: false,
     };
-    let suite = ComplianceSuite::new(
-        "linear_default_deny",
-        reference_manifest_with_hash(),
-        dynamic,
-    );
+    let suite = ComplianceSuite::new("linear_default_deny", linear_manifest_with_hash(), dynamic);
 
     let mut runner = E2eRunner::new("fcp-e2e-linear");
     let report = runner
@@ -396,18 +341,11 @@ async fn linear_allow_valid_token_connector_suite_passes() {
         .mount(mock.inner())
         .await;
 
-    let mut connector = LinearConnectorAdapter::new();
+    let mut connector = LinearConnectorAdapter::new().await;
     let signing_key = Ed25519SigningKey::generate();
     // Introspection declares `linear.get_issue` requires capability
     // `linear.read` (permission class), not the op id itself.
     let handshake = handshake_request(signing_key.verifying_key().to_bytes(), &["linear.read"]);
-    let token = build_token(
-        &signing_key,
-        connector.connector.instance_id().as_str(),
-        "linear.read",
-        &["linear.get_issue"],
-    );
-    let invoke = invoke_request("linear.get_issue", json!({ "issue_id": "LIN-42" }), token);
     let suite = ConnectorSuite {
         test_name: "linear_allow_valid_token".to_string(),
         config: json!({
@@ -415,7 +353,8 @@ async fn linear_allow_valid_token_connector_suite_passes() {
             "api_url": format!("{}/graphql", mock.base_url()),
         }),
         handshake,
-        invoke: Some(invoke),
+        // The real instance is available only after this setup handshake.
+        invoke: None,
         invoke_expectations: InvokeExpectations {
             expect_error: false,
             expect_decision_receipt: false,
@@ -433,16 +372,23 @@ async fn linear_allow_valid_token_connector_suite_passes() {
         .expect("connector suite run");
 
     assert!(report.passed, "allow suite should pass");
-    let invoke_entry = report
-        .logs
-        .iter()
-        .find(|entry| entry.context.get("operation") == Some(&json!("invoke")))
-        .expect("invoke entry");
-    assert_eq!(invoke_entry.result, "pass");
-    assert_eq!(
-        invoke_entry.context.get("invoke_status"),
-        Some(&json!(format!("{:?}", InvokeStatus::Ok)))
+    let health = connector.health().await;
+    assert!(health.is_ready());
+    let instance: InstanceId =
+        serde_json::from_value(health.details.unwrap()["instance_id"].clone()).unwrap();
+    let token = build_token(
+        &signing_key,
+        instance.as_str(),
+        "linear.read",
+        &["linear.get_issue"],
     );
+    let request = invoke_request("linear.get_issue", json!({ "issue_id": "LIN-42" }), token);
+    let response = connector
+        .invoke(request)
+        .await
+        .expect("negotiated grant should authorize the real operation");
+    assert_eq!(response.status, InvokeStatus::Ok);
+    assert_eq!(response.result.unwrap()["issue"]["identifier"], "LIN-42");
 
     // br-7e15h: independently verify the GraphQL endpoint was hit.
     mock.assert_received("/graphql").await;

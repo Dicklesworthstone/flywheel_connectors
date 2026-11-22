@@ -1,6 +1,6 @@
 # Linear Connector V3 Contract
 
-> **Status**: runtime contract documented with API-key header and manifest-policy drift
+> **Status**: native host protocol, personal API-key authentication, and manifest operation policy aligned
 > **Bead**: `flywheel_connectors-4kw5f.12`
 > **Parent**: `flywheel_connectors-4kw5f`
 > **Verification script**: none tracked; use the commands below
@@ -32,14 +32,13 @@ The current crate exposes these operations:
 Important runtime truths the contract preserves:
 
 - Package and binary name are `fcp-linear`.
-- Runtime `BaseConnector` ID is `linear`.
-- Manifest connector ID is `fcp.linear`.
+- Runtime and manifest connector ID is `fcp.linear`.
 - Manifest version is `0.1.0`.
 - Configuration requires exactly one auth source:
   - `api_key`
   - `credential_id`
 - `credential_id` must be a valid UUID.
-- Direct `api_key` mode sends `Authorization: Bearer <key>`.
+- Direct `api_key` mode sends `Authorization: <API_KEY>`, following Linear's personal API-key contract.
 - `credential_id` mode sends no auth header; it assumes host or egress-proxy credential injection.
 - Default GraphQL URL is `https://api.linear.app/graphql`.
 - Direct `api_key` mode accepts only `https://api.linear.app` or local loopback test URLs.
@@ -49,32 +48,25 @@ Important runtime truths the contract preserves:
 - Runtime retry config sets `max_retries = 2` and routes GraphQL execution through the shared retry loop.
 - `health_check` performs `query { viewer { id } }`.
 - `self_check` performs the live viewer query only for direct-auth mode; credential-id mode reports `credential_injection_required`.
-- `health` reports only local client configuration and request metrics, not live provider reachability.
+- `health` returns a canonical `HealthSnapshot` with configuration, handshake, actual instance identity, and request metrics. It becomes ready only after configuration and handshake; live provider reachability is checked separately by `self_check`.
 - `doctor` checks configuration, client initialization, API URL, auth mode, a string-based host policy, and credential-injection status.
-- `handshake` constructs a `CapabilityVerifier`, records a new session, grants requested capabilities back, and returns a SHA-256 hash of the bundled `manifest.toml`.
-- `invoke` expects `operation`, `input`, and `capability_token`.
-- `invoke` verifies a bound FCP capability token against the operation capability and operation-specific resource URIs before dispatching.
-- `simulate` deserializes `SimulateRequest` and returns allowed without checking operation ID, configured state, handshake state, capability tokens, or approval policy.
-- `handle_shutdown` calls the client runtime shutdown hook but does not clear client/config/verifier/session state or reset configured/handshaken flags.
+- `handshake` requires configuration and FCP protocol `2.0` or `2.0.0`, constructs a `CapabilityVerifier`, records a new session, grants only supported requested operation capabilities, and returns a SHA-256 hash of the bundled `manifest.toml`.
+- The native executable accepts a canonical `InvokeRequest` and returns a canonical `InvokeResponse`; the inner invocation ID and outer JSON-RPC ID remain separate. It uses the SDK's bounded JSONL transport.
+- `invoke` and `simulate` share local readiness, connector, zone, negotiated-capability, signed-instance, operation, resource-scope, and input-schema validation. Simulation performs no GraphQL request or webhook replay admission.
+- Introspection derives all ten operation schemas and policy fields, including write approvals, from the validated embedded manifest. Approval admission remains a host responsibility.
+- Each configuration or handshake attempt invalidates prior session authority and rotates the actual instance identity. Failed attempts leave prior grants unusable. Shutdown clears configuration and authority, closes the client runtime, and terminates the native JSONL loop after its acknowledgment.
 
-## Drift Visible In This Checkout
+## Remaining Runtime Limits
 
-This README documents runtime truth and keeps current drift visible:
+The implemented host contract preserves these limits:
 
-- Linear's current GraphQL docs distinguish OAuth bearer tokens from personal API keys. OAuth tokens are passed as `Authorization: Bearer <ACCESS_TOKEN>`, while personal API keys are documented as `Authorization: <API_KEY>`. Runtime direct `api_key` mode always sends a bearer header.
-- Linear OAuth apps were migrated to refresh-token behavior on April 1, 2026, and access tokens are short-lived. Runtime does not implement OAuth, token refresh, revocation, migration, client credentials, PKCE, or actor authorization.
-- Runtime `BaseConnector` ID is `linear`, while the manifest connector ID is `fcp.linear`.
-- Runtime `simulate` is permissive and does not mirror invoke's capability-token verification.
-- Runtime operation metadata sets `requires_approval = None` in introspection, while the manifest marks create, update, and comment creation as policy-gated.
-- Manifest rate-limit operation pools map `linear.process_webhook` to `linear.read`, while runtime introspection and token verification use `linear.process_webhook`.
-- Manifest gives `linear.plan_sync` network constraints for `api.linear.app`, but runtime `plan_sync` is local-only and does not call Linear.
+- Direct `api_key` configuration is for personal API keys. OAuth bearer-token issuance, refresh, revocation, PKCE, and actor authorization are not implemented.
+- Simulation validates local authorization and schema prerequisites; it does not promise provider availability or reserve a webhook delivery receipt.
+- The `linear.process_webhook` rate-limit mapping shares the `linear.read` pool; its authorization capability remains `linear.process_webhook`.
+- `linear.plan_sync` and `linear.process_webhook` are local operations with no-egress manifest constraints.
 - Runtime event caps say streaming is available, but the connector has no inbound listener and only processes webhook payloads forwarded by fcp-host.
 - Runtime direct `api_key` URL policy is pinned to `api.linear.app`, while credential-id mode can configure arbitrary parsed absolute URLs.
 - Runtime doctor host policy uses substring matching for `api.linear.app`, so self-check or configure-time validation is the stronger endpoint-policy source.
-- Runtime `health` can report healthy for a configured client before handshake and without a live provider check.
-- Runtime shutdown does not reset lifecycle state.
-
-A follow-up parity bead should decide whether direct auth is an OAuth token or a personal API key, align the header accordingly, implement or explicitly exclude OAuth refresh behavior, make simulation deny by the same policy family as invoke, align approval metadata, map `linear.process_webhook` to its own rate-limit pool, and tighten credential-id endpoint policy.
 
 ## First-Slice Scope
 
@@ -85,8 +77,8 @@ The current Linear README slice documents the existing runtime surface:
 - deterministic Beads/Linear sync planning
 - forwarded webhook processing with signature-validation flag, timestamp skew checks, and delivery replay protection
 - retry, timeout, provider error, readiness, doctor, health, self-check, simulate, introspect, invoke, and shutdown behavior
-- runtime/manifest drift around auth headers, approval metadata, endpoint policy, event streaming, rate-limit pools, and simulation
-- mock-only GraphQL and connector integration tests
+- canonical native request/response framing, manifest policy parity, and fail-closed session lifecycle
+- deterministic GraphQL fixtures and real executable/loopback integration tests
 
 ### Webhook Replay Protection
 
@@ -119,7 +111,7 @@ restarts.
 - Allowed source zones: `z:owner`, `z:private`, and `z:work`.
 - Allowed target zone: `z:work`.
 - Forbidden zone: `z:public`.
-- Runtime handshake grants whatever capabilities are requested by the host after constructing its verifier.
+- Runtime handshake grants only supported requested operation capabilities. Tokens must be signed by that handshake's host key and target the actual instance reported by health; caller-selected instance IDs cannot substitute for it.
 - The connector does not persist issues, comments, projects, teams, cycles, OAuth tokens, API keys, credential IDs beyond configuration metadata, provider payloads, provider error bodies, webhook payloads, webhook delivery IDs beyond the in-memory replay cache, or Beads sync plans.
 - Linear issue data can include private project names, incident details, customer references, code snippets, and internal planning. Treat live reads and writes as work-zone data.
 
@@ -198,6 +190,8 @@ The deterministic integration evidence is anchored on connector-local tests cove
 - plan-sync update and conflict planning
 - webhook signature-validation flag, timestamp replay window, duplicate delivery rejection, and scoped resource URI checks
 - configuration validation for auth exclusivity, credential IDs, unsafe URL components, direct host policy, local test URLs, and manifest operation inventory
+- a compiled native executable talking to a loopback GraphQL server: canonical health, all ten manifest operation contracts, separate request IDs, read/write results, raw API-key headers, and rejected grants with zero provider requests
+- failed configuration/handshake and shutdown revocation, fresh instance negotiation, and simulation that leaves webhook replay protection untouched
 
 ## Source Notes
 
@@ -207,6 +201,7 @@ The deterministic integration evidence is anchored on connector-local tests cove
 - `connectors/linear/src/error.rs` defines connector error classes and FCP error conversion.
 - `connectors/linear/manifest.toml` defines the operation catalog, network constraints, sandbox boundary, zone policy, event caps, rate-limit pools, and AI hints.
 - `connectors/linear/tests/integration.rs` covers deterministic HTTP behavior and connector-level behavior.
+- `connectors/linear/tests/local_non_mock.rs` exercises real HTTP transport and the shipped JSONL executable without live Linear credentials.
 
 ## Verification Bundle
 
@@ -230,7 +225,7 @@ The verification surface captures:
 
 - Use WireMock fixtures for routine verification.
 - Use a disposable Linear workspace for live mutation proof.
-- Prefer OAuth access-token semantics for live direct-auth checks until the direct `api_key` header behavior is reconciled with current Linear docs.
+- Supply a personal API key in `api_key`; host credential injection is required for a separate OAuth bearer-token flow.
 
 **Dedicated environment**:
 
@@ -247,13 +242,13 @@ The verification surface captures:
 **Common remediation**:
 
 - If configuration fails, provide exactly one of `api_key` or `credential_id`.
-- If direct auth fails against live Linear, check whether the provided value is an OAuth access token or a personal API key and reconcile the header behavior.
+- If direct auth fails against live Linear, verify that `api_key` contains a valid personal API key with access to the target workspace.
 - If self-check reports `credential_injection_required`, use direct auth or wire host-side injection.
 - If issue creation fails, use the team UUID returned by `linear.list_teams`, not only the team key.
 - If issue update fails, use a workflow state UUID, not a state display name.
 - If `linear.plan_sync` rejects input, include `planned_at` and at least one `bead` or `linear` snapshot.
 - If webhook processing rejects a payload, confirm `signature_validated = true`, a UUID `delivery_id`, a fresh `payload.webhookTimestamp`, and an allowed capability-token resource scope.
-- If `simulate` allows an operation but policy should deny it, remember that current simulation is permissive and invoke is the enforcing path.
+- If invocation or simulation denies a token after reconfiguration or handshake, obtain the new instance ID from ready health and issue a fresh bound grant. Host approval checks and provider availability still apply independently of connector-local preflight.
 
 **Rerun commands**:
 
