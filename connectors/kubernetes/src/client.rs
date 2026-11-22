@@ -106,6 +106,8 @@ impl KubernetesClient {
     pub fn new(auth: KubernetesAuth, base_url: Option<&str>) -> KubernetesResult<Self> {
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::Policy::never())
             .user_agent("fcp-kubernetes/0.1.0 (FCP connector)")
             .build()?;
 
@@ -129,6 +131,14 @@ impl KubernetesClient {
     /// Trigger graceful shutdown of request contexts.
     pub fn shutdown(&self) {
         self.runtime.shutdown();
+    }
+
+    /// Run a complete admitted operation under the client shutdown tree.
+    pub(crate) fn invocation_context(
+        &self,
+        remaining: Duration,
+    ) -> fcp_async_core::ExecutionContext {
+        self.runtime.request_context_with_timeout(remaining)
     }
 
     fn add_auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {

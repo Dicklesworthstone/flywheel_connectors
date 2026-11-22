@@ -15,7 +15,8 @@ use serde_json::json;
 use wiremock::matchers::{header, method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use fcp_kubernetes::connector::KubernetesConnector;
+mod common;
+use common::TestConnector as KubernetesConnector;
 
 async fn setup_connector(mock_url: &str) -> KubernetesConnector {
     setup_connector_with_config(mock_url, json!({})).await
@@ -51,14 +52,15 @@ async fn setup_connector_with_config(
 async fn lifecycle_health_unconfigured() {
     let c = KubernetesConnector::new();
     let h = c.handle_health().await.unwrap();
-    assert_eq!(h["status"], "unconfigured");
+    assert_eq!(h["status"]["state"], "degraded");
+    assert_eq!(h["details"]["configured"], false);
 }
 
 #[fcp_async_core::runtime::test]
 async fn lifecycle_full() {
     let server = MockServer::start().await;
     let c = setup_connector(&server.uri()).await;
-    assert_eq!(c.handle_health().await.unwrap()["status"], "healthy");
+    assert_eq!(c.handle_health().await.unwrap()["status"]["state"], "ready");
 }
 
 #[fcp_async_core::runtime::test]
@@ -72,7 +74,10 @@ async fn lifecycle_shutdown() {
     let server = MockServer::start().await;
     let mut c = setup_connector(&server.uri()).await;
     c.handle_shutdown(json!({})).await.unwrap();
-    assert_eq!(c.handle_health().await.unwrap()["status"], "unconfigured");
+    assert_eq!(
+        c.handle_health().await.unwrap()["details"]["configured"],
+        false
+    );
 }
 
 #[fcp_async_core::runtime::test]
@@ -1131,7 +1136,7 @@ async fn simulate_create_pod() {
     assert!(
         c.handle_simulate(json!({"operation_id": "kubernetes.create_pod"}))
             .await
-            .unwrap()["allowed"]
+            .unwrap()["would_succeed"]
             .as_bool()
             .unwrap()
     );
@@ -1144,7 +1149,7 @@ async fn simulate_apply_deployment() {
     assert!(
         c.handle_simulate(json!({"operation_id": "kubernetes.apply_deployment"}))
             .await
-            .unwrap()["allowed"]
+            .unwrap()["would_succeed"]
             .as_bool()
             .unwrap()
     );
@@ -1157,7 +1162,7 @@ async fn simulate_delete_deployment() {
     assert!(
         c.handle_simulate(json!({"operation_id": "kubernetes.delete_deployment"}))
             .await
-            .unwrap()["allowed"]
+            .unwrap()["would_succeed"]
             .as_bool()
             .unwrap()
     );
@@ -1170,7 +1175,7 @@ async fn simulate_list_services() {
     assert!(
         c.handle_simulate(json!({"operation_id": "kubernetes.list_services"}))
             .await
-            .unwrap()["allowed"]
+            .unwrap()["would_succeed"]
             .as_bool()
             .unwrap()
     );
@@ -1303,7 +1308,7 @@ async fn simulate_known() {
     assert!(
         c.handle_simulate(json!({"operation_id": "kubernetes.list_pods"}))
             .await
-            .unwrap()["allowed"]
+            .unwrap()["would_succeed"]
             .as_bool()
             .unwrap()
     );
@@ -1316,7 +1321,7 @@ async fn simulate_unknown() {
     assert!(
         !c.handle_simulate(json!({"operation_id": "kubernetes.nope"}))
             .await
-            .unwrap()["allowed"]
+            .unwrap()["would_succeed"]
             .as_bool()
             .unwrap()
     );
@@ -1329,7 +1334,7 @@ async fn simulate_delete_pod() {
     assert!(
         c.handle_simulate(json!({"operation_id": "kubernetes.delete_pod"}))
             .await
-            .unwrap()["allowed"]
+            .unwrap()["would_succeed"]
             .as_bool()
             .unwrap()
     );
@@ -1342,7 +1347,7 @@ async fn simulate_get_secret() {
     assert!(
         c.handle_simulate(json!({"operation_id": "kubernetes.get_secret"}))
             .await
-            .unwrap()["allowed"]
+            .unwrap()["would_succeed"]
             .as_bool()
             .unwrap()
     );
@@ -1355,7 +1360,7 @@ async fn simulate_watch_events() {
     assert!(
         c.handle_simulate(json!({"operation_id": "kubernetes.watch_events"}))
             .await
-            .unwrap()["allowed"]
+            .unwrap()["would_succeed"]
             .as_bool()
             .unwrap()
     );
@@ -1381,8 +1386,8 @@ async fn counters_increment() {
     .await
     .unwrap();
     let h = c.handle_health().await.unwrap();
-    assert_eq!(h["requests"], 1);
-    assert_eq!(h["errors"], 0);
+    assert_eq!(h["details"]["requests"], 1);
+    assert_eq!(h["details"]["errors"], 0);
 }
 
 #[fcp_async_core::runtime::test]
@@ -1401,8 +1406,8 @@ async fn counters_error_increment() {
         )
         .await;
     let h = c.handle_health().await.unwrap();
-    assert_eq!(h["requests"], 1);
-    assert_eq!(h["errors"], 1);
+    assert_eq!(h["details"]["requests"], 1);
+    assert_eq!(h["details"]["errors"], 1);
 }
 
 // ── Feature 2: Exec ──────────────────────────────────────────────
@@ -1573,7 +1578,7 @@ async fn simulate_exec() {
     assert!(
         c.handle_simulate(json!({"operation_id": "kubernetes.exec"}))
             .await
-            .unwrap()["allowed"]
+            .unwrap()["would_succeed"]
             .as_bool()
             .unwrap()
     );
@@ -2268,7 +2273,7 @@ async fn simulate_configmap_list() {
     assert!(
         c.handle_simulate(json!({"operation_id": "kubernetes.configmap.list"}))
             .await
-            .unwrap()["allowed"]
+            .unwrap()["would_succeed"]
             .as_bool()
             .unwrap()
     );
@@ -2281,7 +2286,7 @@ async fn simulate_configmap_get() {
     assert!(
         c.handle_simulate(json!({"operation_id": "kubernetes.configmap.get"}))
             .await
-            .unwrap()["allowed"]
+            .unwrap()["would_succeed"]
             .as_bool()
             .unwrap()
     );
@@ -2294,7 +2299,7 @@ async fn simulate_configmap_create() {
     assert!(
         c.handle_simulate(json!({"operation_id": "kubernetes.configmap.create"}))
             .await
-            .unwrap()["allowed"]
+            .unwrap()["would_succeed"]
             .as_bool()
             .unwrap()
     );
@@ -2307,7 +2312,7 @@ async fn simulate_configmap_update() {
     assert!(
         c.handle_simulate(json!({"operation_id": "kubernetes.configmap.update"}))
             .await
-            .unwrap()["allowed"]
+            .unwrap()["would_succeed"]
             .as_bool()
             .unwrap()
     );
@@ -2320,7 +2325,7 @@ async fn simulate_configmap_delete() {
     assert!(
         c.handle_simulate(json!({"operation_id": "kubernetes.configmap.delete"}))
             .await
-            .unwrap()["allowed"]
+            .unwrap()["would_succeed"]
             .as_bool()
             .unwrap()
     );
@@ -2333,7 +2338,7 @@ async fn simulate_secret_list() {
     assert!(
         c.handle_simulate(json!({"operation_id": "kubernetes.secret.list"}))
             .await
-            .unwrap()["allowed"]
+            .unwrap()["would_succeed"]
             .as_bool()
             .unwrap()
     );
@@ -2346,7 +2351,7 @@ async fn simulate_secret_get() {
     assert!(
         c.handle_simulate(json!({"operation_id": "kubernetes.secret.get"}))
             .await
-            .unwrap()["allowed"]
+            .unwrap()["would_succeed"]
             .as_bool()
             .unwrap()
     );
@@ -2359,7 +2364,7 @@ async fn simulate_secret_create() {
     assert!(
         c.handle_simulate(json!({"operation_id": "kubernetes.secret.create"}))
             .await
-            .unwrap()["allowed"]
+            .unwrap()["would_succeed"]
             .as_bool()
             .unwrap()
     );
@@ -2372,7 +2377,7 @@ async fn simulate_secret_delete() {
     assert!(
         c.handle_simulate(json!({"operation_id": "kubernetes.secret.delete"}))
             .await
-            .unwrap()["allowed"]
+            .unwrap()["would_succeed"]
             .as_bool()
             .unwrap()
     );

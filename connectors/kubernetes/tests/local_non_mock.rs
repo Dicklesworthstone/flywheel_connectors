@@ -17,7 +17,8 @@ use std::{
     time::Duration,
 };
 
-use fcp_kubernetes::connector::KubernetesConnector;
+mod common;
+use common::TestConnector as KubernetesConnector;
 use serde_json::json;
 
 const EXPECTED_PATH: &str = "/api/v1/namespaces/default/pods";

@@ -1,14 +1,18 @@
 //! FCP Kubernetes Connector implementation.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use fcp_prelude::{
     AgentHint, ApprovalMode, BaseConnector, CapabilityId, ConnectorId, CredentialId, FcpError,
-    FcpResult, IdempotencyClass, OperationId, OperationInfo, RiskLevel, SafetyTier,
-    SelfCheckReport,
+    FcpResult, HandshakeRequest, HealthSnapshot, IdempotencyClass, InvokeRequest, InvokeResponse,
+    OperationId, OperationInfo, RiskLevel, SafetyTier, SelfCheckReport, SimulateRequest,
+    SimulateResponse, ZoneId,
 };
+use fcp_sdk::prelude::{OperationContractSet, StandaloneSession};
+use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -19,6 +23,36 @@ use crate::{
     error::KubernetesError,
     zone::OperationCategory,
 };
+
+const MANIFEST_TOML: &str = include_str!("../manifest.toml");
+const MAX_NATIVE_RESPONSE_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_INVOCATION_TIMEOUT_MS: u64 = 60_000;
+
+fn operation_contracts() -> FcpResult<&'static OperationContractSet> {
+    static CONTRACTS: OnceLock<FcpResult<OperationContractSet>> = OnceLock::new();
+    CONTRACTS
+        .get_or_init(|| OperationContractSet::from_manifest_toml(MANIFEST_TOML))
+        .as_ref()
+        .map_err(Clone::clone)
+}
+
+fn encode<T: Serialize>(value: &T) -> FcpResult<serde_json::Value> {
+    serde_json::to_value(value).map_err(|_| FcpError::Internal {
+        message: "Unable to encode Kubernetes protocol response".into(),
+    })
+}
+
+fn interrupted_invocation() -> FcpError {
+    FcpError::External {
+        service: "kubernetes".into(),
+        message:
+            "Invocation deadline exhausted or execution cancelled; provider outcome may be unknown"
+                .into(),
+        status_code: None,
+        retryable: false,
+        retry_after: None,
+    }
+}
 
 /// Parsed and validated Kubernetes connector configuration.
 #[derive(Debug, Clone)]
@@ -256,10 +290,12 @@ impl DoctorResult {
 
 /// FCP Kubernetes Connector.
 pub struct KubernetesConnector {
-    base: Arc<BaseConnector>,
+    base: BaseConnector,
     config: Option<KubernetesConfig>,
     client: Option<Arc<KubernetesClient>>,
-    session_id: Option<String>,
+    authority: Option<StandaloneSession>,
+    configured_zone: Option<ZoneId>,
+    started_at: Instant,
     request_count: AtomicU64,
     error_count: AtomicU64,
 }
@@ -268,10 +304,12 @@ impl KubernetesConnector {
     /// Create a new Kubernetes connector.
     pub fn new() -> Self {
         Self {
-            base: Arc::new(BaseConnector::new(ConnectorId::from_static("kubernetes"))),
+            base: BaseConnector::new(ConnectorId::from_static("fcp.kubernetes")),
             config: None,
             client: None,
-            session_id: None,
+            authority: None,
+            configured_zone: None,
+            started_at: Instant::now(),
             request_count: AtomicU64::new(0),
             error_count: AtomicU64::new(0),
         }
@@ -285,74 +323,127 @@ impl Default for KubernetesConnector {
 }
 
 impl KubernetesConnector {
+    fn session_established(&self) -> bool {
+        self.base.handshaken.load(Ordering::Acquire)
+            && self
+                .authority
+                .as_ref()
+                .is_some_and(StandaloneSession::is_established)
+    }
+
+    fn invalidate_session(&mut self) {
+        self.base.set_handshaken(false);
+        if let Some(authority) = self.authority.as_mut() {
+            authority.invalidate();
+            self.base.instance_id = authority.instance_id().clone();
+        } else {
+            self.base.instance_id = fcp_prelude::InstanceId::new();
+        }
+    }
+
+    fn clear_configuration(&mut self) {
+        self.invalidate_session();
+        self.base.set_configured(false);
+        if let Some(client) = self.client.take() {
+            client.shutdown();
+        }
+        self.config = None;
+        self.authority = None;
+        self.configured_zone = None;
+    }
+
     pub async fn handle_configure(
         &mut self,
         params: serde_json::Value,
     ) -> FcpResult<serde_json::Value> {
+        // Failed replacement attempts also revoke the previous credentials and
+        // instance. No old grant survives a partial lifecycle transition.
+        self.clear_configuration();
         let config = KubernetesConfig::from_params(&params)?;
         let provisioning = config.provisioning_readiness();
-        let status = if provisioning.network_ok {
-            "configured"
-        } else {
-            "configured_with_warnings"
-        };
-        info!(auth = %config.auth.redacted_label(), base_url = %config.base_url, %status, "Configuring Kubernetes connector");
+        if !provisioning.network_ok {
+            return Err(FcpError::InvalidRequest {
+                code: 1003,
+                message: provisioning.network_message,
+            });
+        }
+        operation_contracts()?;
+        let authority = StandaloneSession::new(MANIFEST_TOML)?;
+        info!(auth = %config.auth.redacted_label(), "Configuring Kubernetes connector");
 
         let client = KubernetesClient::new(config.auth.clone(), Some(&config.base_url))
             .map_err(|e| e.to_fcp_error())?;
 
+        self.base.instance_id = authority.instance_id().clone();
+        self.authority = Some(authority);
         self.client = Some(Arc::new(client));
         self.config = Some(config);
         self.base.set_configured(true);
-        Ok(json!({ "status": status }))
+        Ok(json!({ "status": "configured" }))
     }
 
     pub async fn handle_handshake(
         &mut self,
         params: serde_json::Value,
     ) -> FcpResult<serde_json::Value> {
-        if self.config.is_none() {
-            return Err(FcpError::InvalidRequest {
-                code: 1004,
-                message: "Connector not configured".into(),
+        self.invalidate_session();
+        if self.config.is_none() || self.client.is_none() {
+            return Err(FcpError::NotConfigured);
+        }
+        let mut request: HandshakeRequest =
+            serde_json::from_value(params).map_err(|_| FcpError::InvalidRequest {
+                code: 1003,
+                message: "Invalid FCP handshake request".into(),
+            })?;
+        if !matches!(request.zone.as_str(), "z:infra" | "z:work")
+            || self
+                .configured_zone
+                .as_ref()
+                .is_some_and(|zone| zone != &request.zone)
+        {
+            return Err(FcpError::CapabilityDenied {
+                capability: "kubernetes.handshake".into(),
+                reason: "Kubernetes requires an allowed target zone matching the configured session; reconfigure before changing zones".into(),
             });
         }
-
-        let session_id = params
-            .get("session_id")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string);
-
-        self.session_id = session_id;
+        let available = self.handshake_capabilities();
+        request
+            .capabilities_requested
+            .retain(|capability| available.contains(&capability.as_str()));
+        let zone = request.zone.clone();
+        let authority = self.authority.as_mut().ok_or(FcpError::NotConfigured)?;
+        let result = authority.handshake(request);
+        self.base.instance_id = authority.instance_id().clone();
+        let mut response = encode(&result?)?;
+        self.configured_zone = Some(zone);
         self.base.set_handshaken(true);
-
-        Ok(json!({
-            "protocol_version": "2.0",
-            "connector_id": "fcp.kubernetes",
-            "connector_version": "0.1.0",
-            "capabilities": self.handshake_capabilities(),
-        }))
+        response["protocol_version"] = json!("2.0");
+        response["connector_id"] = json!(self.base.id);
+        response["instance_id"] = json!(self.base.instance_id);
+        Ok(response)
     }
 
     pub async fn handle_health(&self) -> FcpResult<serde_json::Value> {
         let configured = self.config.is_some();
-        let handshaken = self.session_id.is_some();
-
-        let status = if configured && handshaken {
-            "healthy"
+        let handshaken = self.session_established();
+        let mut snapshot = if configured && handshaken && self.client.is_some() {
+            HealthSnapshot::ready()
         } else if configured {
-            "degraded"
+            HealthSnapshot::degraded("not handshaken")
         } else {
-            "unconfigured"
+            HealthSnapshot::degraded("not configured")
         };
-
-        Ok(json!({
-            "status": status,
+        snapshot.uptime_ms =
+            u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        snapshot.details = Some(json!({
             "configured": configured,
             "handshaken": handshaken,
+            "instance_id": self.base.instance_id,
+            "readiness_scope": "configured local client and negotiated authority; not a live Kubernetes health proof",
             "requests": self.request_count.load(Ordering::Relaxed),
             "errors": self.error_count.load(Ordering::Relaxed),
-        }))
+        }));
+        encode(&snapshot)
     }
 
     pub async fn handle_doctor(&self) -> FcpResult<serde_json::Value> {
@@ -380,7 +471,7 @@ impl KubernetesConnector {
             critical: true,
         });
 
-        let handshaken = self.session_id.is_some();
+        let handshaken = self.session_established();
         checks.push(DoctorCheck {
             name: "handshake".into(),
             passed: handshaken,
@@ -463,31 +554,89 @@ impl KubernetesConnector {
             "connector_id": "fcp.kubernetes",
             "version": "0.1.0",
             "operations": serde_json::to_value(operations_info()).unwrap_or_default(),
+            "events": [],
+            "resource_types": [],
+            "event_caps": fcp_prelude::EventCaps::default(),
         }))
     }
 
     #[instrument(skip(self, params))]
     pub async fn handle_invoke(&self, params: serde_json::Value) -> FcpResult<serde_json::Value> {
-        self.base.check_ready()?;
-
-        let operation = params
-            .get("operation_id")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| FcpError::InvalidRequest {
-                code: 1003,
-                message: "Missing operation_id".into(),
-            })?;
-
-        let input = params.get("input").cloned().unwrap_or_else(|| json!({}));
-        self.authorize_operation(operation, &input)
-            .map_err(|e| e.to_fcp_error())?;
-
+        let started_at = Instant::now();
+        let result = self.invoke_inner(params, started_at).await;
         self.request_count.fetch_add(1, Ordering::Relaxed);
+        if result.is_err() {
+            self.error_count.fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
 
-        let client = self.client.as_ref().ok_or_else(|| FcpError::Internal {
-            message: "Client not initialized".into(),
-        })?;
+    async fn invoke_inner(
+        &self,
+        params: serde_json::Value,
+        started_at: Instant,
+    ) -> FcpResult<serde_json::Value> {
+        self.base.check_ready()?;
+        let request: InvokeRequest =
+            serde_json::from_value(params).map_err(|_| FcpError::InvalidRequest {
+                code: 1003,
+                message: "Invalid FCP invoke request".into(),
+            })?;
+        if request.r#type != "invoke"
+            || request.id.0.is_empty()
+            || !request.input.is_object()
+            || request.deadline_ms == Some(0)
+        {
+            return Err(FcpError::InvalidRequest {
+                code: 1003,
+                message: "Invocation requires a typed request, non-empty ID, object input and nonzero deadline".into(),
+            });
+        }
+        let budget = Duration::from_millis(
+            request
+                .deadline_ms
+                .unwrap_or(MAX_INVOCATION_TIMEOUT_MS)
+                .min(MAX_INVOCATION_TIMEOUT_MS),
+        );
+        let resources = self.prepare_operation(&request.operation, &request.input)?;
+        let witness = self
+            .authority
+            .as_ref()
+            .ok_or(FcpError::NotHandshaken)?
+            .admit_bounded(&request, &resources, MAX_NATIVE_RESPONSE_BYTES)?;
+        let client = self.client.as_ref().ok_or(FcpError::NotConfigured)?;
+        let remaining = budget.saturating_sub(started_at.elapsed());
+        if remaining.is_zero() {
+            return Err(interrupted_invocation());
+        }
+        let context = client.invocation_context(remaining);
+        let result = context
+            .run(self.dispatch_operation(client, request.operation.as_str(), &request.input))
+            .await
+            .map_err(|_| interrupted_invocation())?;
+        let response = match result {
+            Ok(output) => InvokeResponse::ok(request.id.clone(), output),
+            Err(error) => InvokeResponse::error(request.id.clone(), error),
+        };
+        operation_contracts()?.validate_response(&request.operation, &request.id, &response)?;
+        if started_at.elapsed() >= budget || context.is_cancelled() {
+            return Err(interrupted_invocation());
+        }
+        witness.finish_response(&response)?;
+        match response {
+            InvokeResponse {
+                error: Some(error), ..
+            } => Err(error),
+            response => encode(&response),
+        }
+    }
 
+    async fn dispatch_operation(
+        &self,
+        client: &KubernetesClient,
+        operation: &str,
+        input: &serde_json::Value,
+    ) -> FcpResult<serde_json::Value> {
         let result = match operation {
             "kubernetes.list_pods" => self.op_list_pods(client, &input).await,
             "kubernetes.get_pod" => self.op_get_pod(client, &input).await,
@@ -528,51 +677,63 @@ impl KubernetesConnector {
             }
         };
 
-        result.map_err(|e| {
-            self.error_count.fetch_add(1, Ordering::Relaxed);
-            e.to_fcp_error()
-        })
+        result.map_err(|error| error.to_fcp_error())
     }
 
     pub async fn handle_simulate(&self, params: serde_json::Value) -> FcpResult<serde_json::Value> {
-        let operation = params
-            .get("operation_id")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("");
-        let input = params.get("input").cloned().unwrap_or_else(|| json!({}));
-
-        let allowed = operations_info().iter().any(|o| o.id.as_ref() == operation);
-        let denial = if allowed {
-            self.authorize_operation(operation, &input).err()
-        } else {
-            None
-        };
-
-        Ok(json!({
-            "allowed": allowed && denial.is_none(),
-            "reason": if !allowed {
-                "Unknown operation".to_string()
-            } else if let Some(err) = denial {
-                err.to_string()
-            } else {
-                "Operation supported".to_string()
-            },
-        }))
+        let request: SimulateRequest =
+            serde_json::from_value(params).map_err(|_| FcpError::InvalidRequest {
+                code: 1003,
+                message: "Invalid FCP simulate request".into(),
+            })?;
+        if request.r#type != "simulate" || request.id.0.is_empty() || !request.input.is_object() {
+            return Err(FcpError::InvalidRequest {
+                code: 1003,
+                message: "Simulation requires a typed request, non-empty ID and object input"
+                    .into(),
+            });
+        }
+        let authorization = self
+            .prepare_operation(&request.operation, &request.input)
+            .and_then(|resources| {
+                self.authority
+                    .as_ref()
+                    .ok_or(FcpError::NotHandshaken)?
+                    .authorize(
+                        &request.connector_id,
+                        &request.zone_id,
+                        &request.operation,
+                        request.capability_token,
+                        &resources,
+                    )
+                    .map(drop)
+            });
+        encode(&match authorization {
+            Ok(()) => SimulateResponse::allowed(request.id),
+            Err(error) => {
+                SimulateResponse::denied(request.id, error.to_string(), error.error_code())
+            }
+        })
     }
 
     pub async fn handle_shutdown(
         &mut self,
-        _params: serde_json::Value,
+        params: serde_json::Value,
     ) -> FcpResult<serde_json::Value> {
-        if let Some(client) = &self.client {
-            client.shutdown();
+        self.clear_configuration();
+        let request: fcp_prelude::ShutdownRequest =
+            serde_json::from_value(params).map_err(|_| FcpError::InvalidRequest {
+                code: 1003,
+                message: "Invalid FCP shutdown request".into(),
+            })?;
+        if request.r#type != "shutdown" {
+            return Err(FcpError::InvalidRequest {
+                code: 1003,
+                message: "Shutdown requires type shutdown".into(),
+            });
         }
         info!("Kubernetes connector shutting down");
-        self.client = None;
-        self.config = None;
-        self.base.set_configured(false);
-        self.base.set_handshaken(false);
-        Ok(json!({}))
+        Ok(json!({ "status": "shutdown" }))
     }
 
     async fn op_list_pods(
@@ -1243,6 +1404,129 @@ impl KubernetesConnector {
         Ok(json!({ "deployment": result }))
     }
 
+    fn prepare_operation(
+        &self,
+        operation: &OperationId,
+        input: &serde_json::Value,
+    ) -> FcpResult<Vec<String>> {
+        self.base.check_ready()?;
+        let config = self.config.as_ref().ok_or(FcpError::NotConfigured)?;
+        operation_contracts()?.validate_input(operation, input)?;
+        self.authorize_operation(operation.as_str(), input)
+            .map_err(|error| error.to_fcp_error())?;
+        let namespace = require_str(input, "namespace").map_err(|error| error.to_fcp_error())?;
+        validate_resource_name(namespace, "namespace", false)?;
+        let (collection, named, subresource) = match operation.as_str() {
+            "kubernetes.list_pods" => ("pods", false, ""),
+            "kubernetes.get_pod" | "kubernetes.create_pod" | "kubernetes.delete_pod" => {
+                ("pods", true, "")
+            }
+            "kubernetes.get_pod_logs" | "kubernetes.stream_pod_logs" => ("pods", true, "/log"),
+            "kubernetes.exec" => ("pods", true, "/exec"),
+            "kubernetes.list_deployments" => ("deployments", false, ""),
+            "kubernetes.scale_deployment" => ("deployments", true, "/scale"),
+            "kubernetes.get_deployment"
+            | "kubernetes.apply_deployment"
+            | "kubernetes.delete_deployment"
+            | "kubernetes.rollout_restart"
+            | "kubernetes.rollout.status"
+            | "kubernetes.rollout.history"
+            | "kubernetes.rollout.rollback" => ("deployments", true, ""),
+            "kubernetes.list_services" => ("services", false, ""),
+            "kubernetes.get_service" => ("services", true, ""),
+            "kubernetes.configmap.list" => ("configmaps", false, ""),
+            "kubernetes.get_configmap"
+            | "kubernetes.update_configmap"
+            | "kubernetes.configmap.get"
+            | "kubernetes.configmap.create"
+            | "kubernetes.configmap.update"
+            | "kubernetes.configmap.delete" => ("configmaps", true, ""),
+            "kubernetes.secret.list" => ("secrets", false, ""),
+            "kubernetes.get_secret"
+            | "kubernetes.secret.get"
+            | "kubernetes.secret.create"
+            | "kubernetes.secret.delete" => ("secrets", true, ""),
+            "kubernetes.watch_events" => ("events", false, ""),
+            _ => {
+                return Err(FcpError::OperationNotGranted {
+                    operation: operation.as_str().into(),
+                });
+            }
+        };
+        let cluster = utf8_percent_encode(config.base_url.trim_end_matches('/'), NON_ALPHANUMERIC);
+        let mut resource =
+            format!("kubernetes://cluster/{cluster}/namespaces/{namespace}/{collection}");
+        if named {
+            let name = require_str(input, "name").map_err(|error| error.to_fcp_error())?;
+            validate_resource_name(name, "name", true)?;
+            resource.push('/');
+            resource.push_str(name);
+            resource.push_str(subresource);
+        }
+        if let Some(container) = input.get("container") {
+            let container = container.as_str().ok_or_else(|| FcpError::InvalidRequest {
+                code: 1003,
+                message: "container must be a DNS label".into(),
+            })?;
+            validate_resource_name(container, "container", false)?;
+        }
+        for field in [
+            "replicas",
+            "grace_period_seconds",
+            "tail_lines",
+            "since_seconds",
+        ] {
+            if let Some(value) = input.get(field) {
+                let number = value.as_u64().ok_or_else(|| FcpError::InvalidRequest {
+                    code: 1003,
+                    message: format!("{field} must be a nonnegative integer"),
+                })?;
+                if field == "replicas" && number > u64::from(u32::MAX) {
+                    return Err(FcpError::InvalidRequest {
+                        code: 1003,
+                        message: "replicas exceeds the supported range".into(),
+                    });
+                }
+            }
+        }
+        let invalid = |error: KubernetesError| error.to_fcp_error();
+        match operation.as_str() {
+            "kubernetes.create_pod" => {
+                validate_pod_spec(&input["spec"], "pod spec").map_err(invalid)?
+            }
+            "kubernetes.apply_deployment" => {
+                validate_deployment_spec(&input["spec"]).map_err(invalid)?
+            }
+            "kubernetes.rollout.rollback" => {
+                validate_template_spec(&input["template"], "rollout template").map_err(invalid)?
+            }
+            "kubernetes.exec" => {
+                let command: Vec<String> = serde_json::from_value(input["command"].clone())
+                    .map_err(|_| FcpError::InvalidRequest {
+                        code: 1003,
+                        message: "command must be a nonempty array of strings".into(),
+                    })?;
+                if command.is_empty() || command[0].trim().is_empty() {
+                    return Err(FcpError::InvalidRequest {
+                        code: 1003,
+                        message: "command must name an executable".into(),
+                    });
+                }
+                if (is_system_namespace(namespace)
+                    && !config.policy.allow_exec_into_system_namespaces)
+                    || (command_uses_shell(&command) && !config.policy.allow_shell_exec)
+                {
+                    return Err(KubernetesError::PolicyDenied(
+                        "Exec target or command is not permitted by the configured policy".into(),
+                    )
+                    .to_fcp_error());
+                }
+            }
+            _ => {}
+        }
+        Ok(vec![resource])
+    }
+
     fn handshake_capabilities(&self) -> Vec<&'static str> {
         let Some(config) = &self.config else {
             return vec!["kubernetes.read", "kubernetes.secrets"];
@@ -1329,6 +1613,39 @@ impl KubernetesConnector {
         }
 
         Ok(())
+    }
+}
+
+/// A route and its authorization resource must name the same Kubernetes object.
+/// Reject normalization, query syntax, escapes and whitespace before admission.
+fn validate_resource_name(value: &str, field: &str, subdomain: bool) -> FcpResult<()> {
+    let valid_label = |label: &str| {
+        !label.is_empty()
+            && label.len() <= 63
+            && label
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphanumeric)
+            && label
+                .as_bytes()
+                .last()
+                .is_some_and(u8::is_ascii_alphanumeric)
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    };
+    let valid = if subdomain {
+        value.len() <= 253 && value.split('.').all(valid_label)
+    } else {
+        valid_label(value)
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(FcpError::InvalidRequest {
+            code: 1003,
+            message: format!("{field} must be a valid Kubernetes resource name"),
+        })
     }
 }
 
@@ -3387,7 +3704,8 @@ mod tests {
         let c = KubernetesConnector::default();
         assert!(c.config.is_none());
         assert!(c.client.is_none());
-        assert!(c.session_id.is_none());
+        assert!(c.authority.is_none());
+        assert!(!c.session_established());
     }
 
     #[test]

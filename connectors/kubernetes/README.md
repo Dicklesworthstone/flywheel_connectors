@@ -52,48 +52,41 @@ Important runtime truths the contract preserves:
 
 - Package and binary name are `fcp-kubernetes`.
 - Manifest connector ID is `fcp.kubernetes`.
-- Runtime `BaseConnector` ID is `kubernetes`; introspection and handshake report `fcp.kubernetes`.
-- Manifest interface hash is `blake3-256:fcp.interface.v2:e90faeeadc7a5377ce77653b8e437e77916f71689d67e66186acddafcbff7a5c`.
+- Runtime, manifest, introspection and handshake use connector ID `fcp.kubernetes`.
+- Configure validates the bundled manifest's interface hash before installing the client or session authority.
 - Configuration requires exactly one auth source: direct `bearer_token` or `credential_id`.
 - Direct auth sends `Authorization: Bearer <token>`.
 - `credential_id` mode sends `X-FCP-Credential-Id` and expects host egress policy to inject real secret material.
 - Default base URL is `https://kubernetes.default.svc`.
 - URL policy rejects malformed URLs, userinfo, query strings, fragments, non-HTTP(S) schemes, and non-loopback HTTP.
 - URL policy accepts the default in-cluster service host, `.svc`, `.svc.cluster.local`, loopback hosts, and custom HTTPS hosts.
-- URL policy is reported as configure status and readiness detail; the client is still created for `configured_with_warnings` cases.
+- Invalid URL policy rejects configuration before client creation.
 - Runtime request timeout is 30 seconds.
-- The client uses the shared retry loop with `max_retries = 3`.
-- Runtime `invoke` uses `operation_id`, not `operation`.
-- Runtime `simulate` uses `operation_id`, validates operation inventory and policy gates, and does not require configured/handshaken/client state.
-- Runtime does not install a `CapabilityVerifier` and does not verify `capability_token`.
-- Runtime does not verify approval tokens even when introspection reports approval modes.
+- Provider dispatch does not follow redirects or automatically replay transport requests.
+- The native executable accepts the complete FCP `InvokeRequest` (`type`, `id`, `connector_id`, `zone_id`, `operation`, `input`, and `capability_token`) and returns a correlated `InvokeResponse`.
+- Configure validates the embedded manifest and operation schemas. Handshake negotiates only requested, declared capabilities enabled by the configured access policy, binds the nonce, and rotates the actual instance identifier.
+- Invoke verifies the signature, negotiated capability, operation, exact connector/zone/instance, input-derived resource, scoped idempotency key, and cumulative call/byte limits before provider dispatch.
+- Simulation uses the complete `SimulateRequest`, performs local validation and authorization, and neither contacts Kubernetes nor consumes the grant.
+- Host approval, revocation, holder-proof and provenance enforcement remain required; the connector's session checks do not replace them.
 - Writes and deletes are disabled by default.
 - Pod exec is disabled by default.
 - Enabling write operations or pod exec requires `allowed_namespaces`.
 - Default exec target label requirement is `fcp.flywheel.ai/exec-approved=true`.
 - `health()` is local state only; `self_check()` does not call Kubernetes for direct bearer-token auth.
-- `handle_shutdown()` shuts down the client runtime and clears config/client/base flags, but leaves `session_id` in memory.
+- A caller may narrow the complete invocation deadline, up to a trusted 60-second ceiling. The budget includes parsing, admission, provider work and response validation. Interrupted outcomes are nonretryable and keep their admission charge.
+- Failed configure/handshake attempts revoke previous session authority. Reconfiguration and shutdown also clear the old client credentials and cancel its request contexts.
+- The shared JSONL transport bounds request frames to 32 MiB, preserves complete FCP errors, and exits after a successful shutdown reply even while stdin remains open.
 
-## Drift Visible In This Checkout
+## Remaining Runtime Limits
 
-This README documents the runtime truth and keeps current drift visible:
-
-- Runtime `BaseConnector` ID is `kubernetes`, while manifest and reported connector ID are `fcp.kubernetes`.
-- Handshake is simplified and does not parse a full `HandshakeRequest`; it only reads optional `session_id`.
-- Handshake does not return manifest hash, nonce binding, requested capability grants, or a capability verifier.
-- `invoke` and `simulate` do not verify capability tokens.
-- Introspection exposes approval metadata for high-risk operations, but runtime does not validate approval tokens.
-- Manifest event caps say streaming is enabled with durable watch cursor state, but runtime exposes no event catalog and no durable cursor persistence.
+- The native session enforces connector authority; approval tokens and live policy revocation are verified by the host.
+- Manifest and native introspection advertise no event subscriptions, replay, or durable watch state. The connector is stateless.
 - `kubernetes.watch_events` performs a one-shot event list and returns an array.
 - `kubernetes.stream_pod_logs` performs a log request with `follow=true` and returns a string payload, not a connector event stream.
-- `handle_health` reports `handshaken` from `session_id.is_some()`, while base readiness can be set by a handshake without a `session_id`.
-- `handle_shutdown` leaves a stale `session_id`.
-- `base_url_policy` can produce `configured_with_warnings` but does not hard-stop client creation.
 - `kubernetes.get_secret` redacts data by default unless `unmask=true`, while `kubernetes.secret.get` returns the full secret object including `data`.
-- The manifest state hint mentions watch cursors and checkpoints, but the current runtime does not persist watch cursors.
 - The tracked verifier script is deliberately fail-closed: missing `rch` workers or remote prerequisites are reported as infra-blocked, not as a green connector proof.
 
-A follow-up parity bead should align connector IDs, implement full handshake and token verification, reconcile approval metadata with runtime approval-token checks, split one-shot reads from true streams, persist watch cursors if event caps remain advertised, and add a tracked verification bundle.
+True watch/log event delivery and Kubernetes exec channel transport remain separate work. Native protocol coverage does not establish live-cluster behavior or provider credentials.
 
 ## First-Slice Scope
 
@@ -119,7 +112,7 @@ The current Kubernetes README slice documents the existing runtime surface:
   - `kubernetes.write` gates scaling, rollout restart, ConfigMap updates, and rollout rollback.
   - `kubernetes.admin` gates pod create/delete, deployment apply/delete, exec, and ConfigMap create/delete.
   - `kubernetes.secrets` gates full secret read/create/delete operations.
-- Runtime policy flags, not capability tokens, currently enforce write and exec availability.
+- Runtime policy flags, negotiated grants, and signed capability tokens jointly enforce write and exec availability.
 - The connector does not persist bearer tokens, credential secret material, raw provider responses, secret values, pod logs, exec output, event lists, or rollout data outside process memory.
 - Kubernetes payloads can include infrastructure topology, pod specs, image names, logs, events, ConfigMaps, Secrets, and exec output. Treat live output as infra-zone operational data.
 
@@ -208,23 +201,24 @@ Runtime introspection returns approval metadata:
 | `Policy` | `kubernetes.update_configmap` |
 | `None` | `kubernetes.list_services`, `kubernetes.get_configmap`, `kubernetes.get_deployment`, `kubernetes.get_pod`, `kubernetes.get_pod_logs`, `kubernetes.get_service`, `kubernetes.list_deployments`, `kubernetes.list_pods`, `kubernetes.stream_pod_logs`, `kubernetes.watch_events`, `kubernetes.configmap.list`, `kubernetes.configmap.get`, `kubernetes.secret.list`, `kubernetes.rollout.status`, `kubernetes.rollout.history` |
 
-This metadata is advisory in the current runtime. `invoke` enforces configuration policy gates and input validation, but does not validate an approval token.
+The host must enforce this approval metadata before dispatch. The native connector additionally enforces the negotiated capability, configured operation policy, input schema, namespace and resource scope.
 
 ## Resource URIs
 
-Runtime capability-token verification is absent for Kubernetes in this checkout, so there are no effective resource URI bindings. The practical authorization binding is configuration plus policy flags plus namespace guards.
+Every invocation binds its signed resource scope to the configured cluster endpoint and the route derived from its actual input. The prefix is `kubernetes://cluster/{encoded_base_url}/namespaces/{namespace}`. `encoded_base_url` is the configured URL without a trailing slash, percent-encoded with `percent_encoding::NON_ALPHANUMERIC`; it is not a caller-selected cluster alias. Namespace, object and container names are validated before admission.
 
-Follow-up work should add resource URI shapes such as:
-
-| Operation family | Candidate resource URI shape |
+| Operation family | Resource suffix after the namespace prefix |
 |------------------|------------------------------|
-| Pods and logs | `kubernetes://{cluster}/namespaces/{namespace}/pods/{name}` |
-| Deployments and rollouts | `kubernetes://{cluster}/namespaces/{namespace}/deployments/{name}` |
-| Services | `kubernetes://{cluster}/namespaces/{namespace}/services/{name}` |
-| ConfigMaps | `kubernetes://{cluster}/namespaces/{namespace}/configmaps/{name}` |
-| Secrets | `kubernetes://{cluster}/namespaces/{namespace}/secrets/{name}` |
-| Events | `kubernetes://{cluster}/namespaces/{namespace}/events` |
-| Exec | `kubernetes://{cluster}/namespaces/{namespace}/pods/{name}/exec` |
+| Pods | `/pods` for lists; `/pods/{name}` for named operations |
+| Pod logs | `/pods/{name}/log` |
+| Deployments and rollouts | `/deployments` for lists; `/deployments/{name}` for named operations; `/deployments/{name}/scale` for scaling |
+| Services | `/services` or `/services/{name}` |
+| ConfigMaps | `/configmaps` or `/configmaps/{name}` |
+| Secrets | `/secrets` or `/secrets/{name}` |
+| Events | `/events` |
+| Exec | `/pods/{name}/exec` |
+
+Native executable acceptance coverage is in `tests/native_host.rs`: real loopback reads and writes, scoped grants, non-consuming simulation, exhausted quotas, stale instances, failed lifecycle transitions, invalid routes/results, deadline interruption and shutdown. These tests require a successful build; formatting and source review alone are not execution evidence.
 
 ## Runtime Guardrails
 

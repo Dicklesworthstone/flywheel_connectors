@@ -5,24 +5,20 @@ min_mesh_version = "2.0.0"
 min_protocol = "fcp2-sym/2.0"
 protocol_features = []
 max_datagram_bytes = 65000
-interface_hash = "blake3-256:fcp.interface.v2:e90faeeadc7a5377ce77653b8e437e77916f71689d67e66186acddafcbff7a5c"
+interface_hash = "blake3-256:fcp.interface.v2:cd3467e4cf96a43bf4df88ee258fda4669cf717960bad65dafa0662452b58ebd"
 
 [connector]
 id = "fcp.kubernetes"
 name = "Kubernetes Connector"
 version = "0.1.0"
 description = "FCP connector for Kubernetes cluster management (pods, deployments, services, configmaps, secrets, events, logs)"
-archetypes = [
-    "operational",
-    "streaming",
-]
-format = "wasi"
+archetypes = ["operational"]
+format = "native"
 status = "proven"
 
 [connector.state]
-model = "singleton_writer"
+model = "stateless"
 state_schema_version = "1"
-migration_hint = "Stores watch resourceVersion cursors and event stream checkpoints per namespace."
 
 [zones]
 home = "z:infra"
@@ -46,7 +42,6 @@ required = [
     "network.dns",
     "network.egress",
     "network.tls.sni",
-    "storage.state",
 ]
 optional = [
     "network.tls.mtls",
@@ -2006,9 +2001,9 @@ related = [
 ]
 
 [event_caps]
-streaming = true
+streaming = false
 replay = false
-min_buffer_events = 200
+min_buffer_events = 0
 
 [sandbox]
 profile = "strict"
