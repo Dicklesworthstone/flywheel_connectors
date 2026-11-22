@@ -53,6 +53,7 @@ struct ProviderResponse {
     status: u16,
     headers: Vec<(&'static str, &'static str)>,
     body: Value,
+    raw_wire: Option<Vec<u8>>,
 }
 
 impl ProviderResponse {
@@ -61,6 +62,16 @@ impl ProviderResponse {
             status,
             headers: Vec::new(),
             body,
+            raw_wire: None,
+        }
+    }
+
+    fn raw(wire: Vec<u8>) -> Self {
+        Self {
+            status: 200,
+            headers: Vec::new(),
+            body: Value::Null,
+            raw_wire: Some(wire),
         }
     }
 
@@ -100,19 +111,25 @@ impl LoopbackServer {
                         sender.send(read_request(&mut stream)).unwrap();
                         let response = &responses[count.min(responses.len() - 1)];
                         count += 1;
-                        let body = response.body.to_string();
-                        let mut wire = format!(
-                            "HTTP/1.1 {} Fixture\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n",
-                            response.status,
-                            body.len()
-                        );
-                        for (name, value) in &response.headers {
-                            wire.push_str(&format!("{name}: {value}\r\n"));
-                        }
-                        wire.push_str("\r\n");
-                        wire.push_str(&body);
+                        let wire = match &response.raw_wire {
+                            Some(wire) => std::borrow::Cow::Borrowed(wire.as_slice()),
+                            None => {
+                                let body = response.body.to_string();
+                                let mut wire = format!(
+                                    "HTTP/1.1 {} Fixture\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n",
+                                    response.status,
+                                    body.len()
+                                );
+                                for (name, value) in &response.headers {
+                                    wire.push_str(&format!("{name}: {value}\r\n"));
+                                }
+                                wire.push_str("\r\n");
+                                wire.push_str(&body);
+                                std::borrow::Cow::Owned(wire.into_bytes())
+                            }
+                        };
                         if let Err(error) = stream
-                            .write_all(wire.as_bytes())
+                            .write_all(wire.as_ref())
                             .and_then(|()| stream.flush())
                         {
                             assert!(
@@ -810,4 +827,317 @@ fn native_oversized_frame_closes_transport() {
     assert_eq!(error.code, "FCP-1004");
     assert!(!error.retryable);
     assert!(!process.wait_for_exit().success());
+}
+
+const PROVIDER_BODY_LIMIT: usize = 2 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug)]
+enum ProviderReadPath {
+    Json,
+    AwsEvent,
+    MantleSse,
+}
+
+impl ProviderReadPath {
+    fn operation(self) -> &'static str {
+        match self {
+            Self::Json => OP_CONVERSE,
+            Self::AwsEvent => "aws_bedrock.converse_stream",
+            Self::MantleSse => "aws_bedrock.invoke_model_stream",
+        }
+    }
+
+    fn content_type(self) -> &'static str {
+        match self {
+            Self::Json => "application/json",
+            Self::AwsEvent => "application/vnd.amazon.eventstream",
+            Self::MantleSse => "text/event-stream",
+        }
+    }
+
+    fn resource(self) -> &'static str {
+        match self {
+            Self::Json | Self::AwsEvent => MODEL_URI,
+            Self::MantleSse => MANTLE_MODEL_URI,
+        }
+    }
+
+    fn input(self) -> Value {
+        match self {
+            Self::Json | Self::AwsEvent => converse_input(),
+            Self::MantleSse => json!({
+                "model_id": MANTLE_MODEL,
+                "model_family": "mantle_anthropic_messages",
+                "messages": [{"role": "user", "content": [{"type": "text", "text": "Hello"}]}],
+                "max_tokens": 64
+            }),
+        }
+    }
+
+    fn config(self, server: &LoopbackServer) -> Value {
+        match self {
+            Self::Json | Self::AwsEvent => native_config(Some(server)),
+            Self::MantleSse => json!({
+                "region": "us-east-1",
+                "mantle_bearer_token": MANTLE_TOKEN,
+                "mantle_base_url": server.url,
+                "request_timeout_ms": 5_000,
+                "retry": {
+                    "max_retries": 0,
+                    "initial_delay_ms": 1,
+                    "max_delay_ms": 1,
+                    "jitter_enabled": false
+                }
+            }),
+        }
+    }
+
+    fn successful_body(self) -> Vec<u8> {
+        match self {
+            Self::Json => serde_json::to_vec(&converse_output()).unwrap(),
+            Self::AwsEvent => {
+                let headers = std::collections::BTreeMap::from([
+                    (":message-type".to_owned(), "event".to_owned()),
+                    (":event-type".to_owned(), "contentBlockDelta".to_owned()),
+                ]);
+                let payload = serde_json::to_vec(&json!({
+                    "delta": {"text": "bounded event 雪"}
+                }))
+                .unwrap();
+                fcp_aws_bedrock::event_stream::encode_event_stream_message(&headers, &payload)
+            }
+            Self::MantleSse => concat!(
+                "event: content_block_delta\n",
+                "data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"bounded SSE 雪\"}}\n\n",
+                "data: [DONE]\n\n",
+            )
+            .as_bytes()
+            .to_vec(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ProviderBodyFailure {
+    DeclaredOverflow,
+    ChunkedOverflow,
+    Truncated,
+}
+
+impl ProviderBodyFailure {
+    fn expected_message(self) -> &'static str {
+        match self {
+            Self::DeclaredOverflow | Self::ChunkedOverflow => {
+                "provider response body exceeded 2097152 bytes"
+            }
+            Self::Truncated => "provider response body could not be read completely",
+        }
+    }
+}
+
+fn fixed_length_wire(
+    status: u16,
+    content_type: &str,
+    declared_bytes: usize,
+    body: &[u8],
+) -> Vec<u8> {
+    let mut wire = format!(
+        "HTTP/1.1 {status} Fixture\r\ncontent-type: {content_type}\r\ncontent-length: {declared_bytes}\r\nconnection: close\r\n"
+    )
+    .into_bytes();
+    if matches!(status, 429 | 503) {
+        wire.extend_from_slice(b"retry-after: 60\r\n");
+    }
+    wire.extend_from_slice(b"\r\n");
+    wire.extend_from_slice(body);
+    wire
+}
+
+fn chunked_wire(status: u16, content_type: &str, body: &[u8], chunk_size: usize) -> Vec<u8> {
+    let mut wire = format!(
+        "HTTP/1.1 {status} Fixture\r\ncontent-type: {content_type}\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n"
+    )
+    .into_bytes();
+    for chunk in body.chunks(chunk_size) {
+        write!(wire, "{:x}\r\n", chunk.len()).unwrap();
+        wire.extend_from_slice(chunk);
+        wire.extend_from_slice(b"\r\n");
+    }
+    wire.extend_from_slice(b"0\r\n\r\n");
+    wire
+}
+
+fn body_failure_response(
+    path: ProviderReadPath,
+    status: u16,
+    failure: ProviderBodyFailure,
+) -> ProviderResponse {
+    let wire = match failure {
+        ProviderBodyFailure::DeclaredOverflow => {
+            // No body bytes are sent. The size failure must come from checking
+            // the declaration, not from reading or retaining a large body.
+            fixed_length_wire(status, path.content_type(), PROVIDER_BODY_LIMIT + 1, &[])
+        }
+        ProviderBodyFailure::ChunkedOverflow => chunked_wire(
+            status,
+            path.content_type(),
+            &vec![b'x'; PROVIDER_BODY_LIMIT + 1],
+            64 * 1024,
+        ),
+        ProviderBodyFailure::Truncated => {
+            let body = path.successful_body();
+            // Even a syntactically complete provider payload must be withheld
+            // when the HTTP body terminates before its declared byte count.
+            fixed_length_wire(status, path.content_type(), body.len() + 1, &body)
+        }
+    };
+    ProviderResponse::raw(wire)
+}
+
+#[test]
+fn native_provider_body_limits_are_terminal_and_keep_reserved_bytes_for_every_reader() {
+    let failures = [
+        (200, ProviderBodyFailure::DeclaredOverflow),
+        (200, ProviderBodyFailure::ChunkedOverflow),
+        (200, ProviderBodyFailure::Truncated),
+        (429, ProviderBodyFailure::Truncated),
+        (503, ProviderBodyFailure::DeclaredOverflow),
+        (503, ProviderBodyFailure::Truncated),
+    ];
+    for path in [
+        ProviderReadPath::Json,
+        ProviderReadPath::AwsEvent,
+        ProviderReadPath::MantleSse,
+    ] {
+        let server = LoopbackServer::start(
+            failures
+                .iter()
+                .map(|&(status, failure)| body_failure_response(path, status, failure))
+                .collect(),
+        );
+        let mut process = NativeProcess::start();
+        let mut config = path.config(&server);
+        config["retry"]["max_retries"] = json!(2);
+        config["retry"]["max_delay_ms"] = json!(60_000);
+        configure(&mut process, config);
+        let key = Ed25519SigningKey::generate();
+        let instance = handshake(&mut process, &key, &["aws_bedrock.chat"]);
+        for (index, &(status, failure)) in failures.iter().enumerate() {
+            let token_id = format!("provider-body-{index}");
+            let constraints = CapabilityConstraints {
+                resource_allow: vec![path.resource().into()],
+                max_calls: Some(2),
+                max_bytes: Some(1_000_000),
+                ..Default::default()
+            };
+            let invocation = request(
+                path.operation(),
+                path.input(),
+                grant(
+                    &key,
+                    &instance,
+                    path.operation(),
+                    token_id.as_bytes(),
+                    &constraints,
+                ),
+            );
+            let started = Instant::now();
+            let response = process.rpc("provider-body-failure", "invoke", invocation.clone());
+            let error: FcpErrorResponse = serde_json::from_value(response["error"].clone())
+                .expect("incomplete provider bodies require a complete FCP error response");
+            assert!(
+                started.elapsed() < StdDuration::from_secs(3),
+                "{path:?} {status} {failure:?}: body rejection waited for retry backoff"
+            );
+            assert!(!error.retryable, "{path:?} {status} {failure:?}: {response}");
+            assert_eq!(error.retry_after_ms, None);
+            assert!(
+                error.message.contains(failure.expected_message()),
+                "{path:?} {status} {failure:?}: {response}"
+            );
+            assert!(
+                error.message.contains("provider outcome may be unknown"),
+                "{path:?} {status} {failure:?}: {response}"
+            );
+            server.receive();
+            server.assert_no_requests();
+
+            // Two call slots were signed. Only one was used, so this denial
+            // demonstrates that the uncertain response reservation stayed charged.
+            let mut replay = invocation;
+            replay["id"] = json!("must-not-replay-incomplete-body");
+            assert_eq!(
+                process.rpc("spent-body-reservation", "invoke", replay)["error"]["code"],
+                "FCP-3001",
+                "{path:?} {status} {failure:?}"
+            );
+            server.assert_no_requests();
+        }
+        process.shutdown();
+        server.finish();
+    }
+}
+
+#[test]
+fn native_bounded_readers_preserve_valid_chunked_json_binary_events_and_unicode_sse() {
+    for path in [
+        ProviderReadPath::Json,
+        ProviderReadPath::AwsEvent,
+        ProviderReadPath::MantleSse,
+    ] {
+        let server = LoopbackServer::start(vec![ProviderResponse::raw(chunked_wire(
+            200,
+            path.content_type(),
+            &path.successful_body(),
+            7,
+        ))]);
+        let mut process = NativeProcess::start();
+        configure(&mut process, path.config(&server));
+        let key = Ed25519SigningKey::generate();
+        let instance = handshake(&mut process, &key, &["aws_bedrock.chat"]);
+        let token = grant(
+            &key,
+            &instance,
+            path.operation(),
+            b"valid-bounded-provider-body",
+            &CapabilityConstraints {
+                resource_allow: vec![path.resource().into()],
+                max_calls: Some(1),
+                max_bytes: Some(1_000_000),
+                ..Default::default()
+            },
+        );
+        let response = decode_success(&process.rpc(
+            "valid-bounded-body",
+            "invoke",
+            request(path.operation(), path.input(), token),
+        ));
+        let result = response.result.unwrap();
+        match path {
+            ProviderReadPath::Json => assert_eq!(result, converse_output()),
+            ProviderReadPath::AwsEvent => {
+                assert_eq!(result["chunk_count"], 1);
+                assert_eq!(result["events"][0]["event_type"], "contentBlockDelta");
+                assert_eq!(result["events"][0]["payload_json"]["delta"]["text"], "bounded event 雪");
+            }
+            ProviderReadPath::MantleSse => {
+                assert_eq!(result["chunk_count"], 1);
+                assert_eq!(result["events"][0]["event_type"], "content_block_delta");
+                assert_eq!(result["events"][0]["payload_json"]["delta"]["text"], "bounded SSE 雪");
+            }
+        }
+        let captured = server.receive();
+        let authorization = header(&captured.headers, "authorization").unwrap();
+        if matches!(path, ProviderReadPath::MantleSse) {
+            assert_eq!(authorization, "Bearer bedrock-native-mantle-token");
+            assert_eq!(captured.target, "/anthropic/v1/messages");
+            assert!(header(&captured.headers, "x-amz-date").is_none());
+        } else {
+            assert!(authorization.starts_with("AWS4-HMAC-SHA256 "));
+            assert!(header(&captured.headers, "x-amz-date").is_some());
+        }
+        server.assert_no_requests();
+        process.shutdown();
+        server.finish();
+    }
 }

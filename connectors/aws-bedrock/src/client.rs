@@ -18,6 +18,10 @@ use crate::types::{
     FoundationModelsResponse, HealthStatus, InvokeModelInput, ListModelsInput, ModelListSource,
 };
 
+// The 192 MiB sandbox needs room for parsed JSON/event values and settlement
+// copies, so raw bodies are capped below the released-response ceiling.
+const MAX_PROVIDER_RESPONSE_BYTES: u64 = 2 * 1024 * 1024;
+
 pub struct BedrockClient {
     client: Client,
     auth: BedrockAuth,
@@ -739,6 +743,45 @@ fn with_bearer_auth(req: RequestBuilder, auth_value: &str) -> RequestBuilder {
     with_static_request_header(req, "Authorization", &format!("Bearer {auth_value}"))
 }
 
+fn response_body_too_large() -> BedrockError {
+    BedrockError::ResponseBody {
+        message: format!(
+            "provider response body exceeded {MAX_PROVIDER_RESPONSE_BYTES} bytes"
+        ),
+    }
+}
+
+/// Bound actual decoded bytes before parsing JSON, AWS frames or Mantle SSE.
+async fn read_bounded_body(mut response: reqwest::Response) -> BedrockResult<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|bytes| bytes > MAX_PROVIDER_RESPONSE_BYTES)
+    {
+        return Err(response_body_too_large());
+    }
+
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|error| BedrockError::ResponseBody {
+        message: if error.is_timeout() {
+            "provider response body could not be read completely (timeout)"
+        } else {
+            "provider response body could not be read completely"
+        }
+        .into(),
+    })? {
+        let retained = u64::try_from(body.len()).map_err(|_| response_body_too_large())?;
+        let additional = u64::try_from(chunk.len()).map_err(|_| response_body_too_large())?;
+        if retained
+            .checked_add(additional)
+            .is_none_or(|total| total > MAX_PROVIDER_RESPONSE_BYTES)
+        {
+            return Err(response_body_too_large());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 async fn handle_json_response<T: serde::de::DeserializeOwned>(
     req: RequestBuilder,
 ) -> AttemptOutcome<T, BedrockError> {
@@ -753,10 +796,11 @@ async fn handle_json_response<T: serde::de::DeserializeOwned>(
     };
     let status = resp.status().as_u16();
     let retry_after = retry_after(&resp);
-    let text = match resp.text().await {
+    let bytes = match read_bounded_body(resp).await {
         Ok(body) => body,
-        Err(error) => return AttemptOutcome::Terminal(BedrockError::Http(error)),
+        Err(error) => return AttemptOutcome::Terminal(error),
     };
+    let text = String::from_utf8_lossy(&bytes);
     if !(200..300).contains(&status) {
         return classify_error(status, retry_after, &text);
     }
@@ -780,9 +824,9 @@ async fn handle_event_stream_response(
     };
     let status = resp.status().as_u16();
     let retry_after = retry_after(&resp);
-    let bytes = match resp.bytes().await {
+    let bytes = match read_bounded_body(resp).await {
         Ok(body) => body,
-        Err(error) => return AttemptOutcome::Terminal(BedrockError::Http(error)),
+        Err(error) => return AttemptOutcome::Terminal(error),
     };
     if !(200..300).contains(&status) {
         let body = String::from_utf8_lossy(&bytes);
@@ -808,10 +852,11 @@ async fn handle_sse_response(
     };
     let status = resp.status().as_u16();
     let retry_after = retry_after(&resp);
-    let text = match resp.text().await {
+    let bytes = match read_bounded_body(resp).await {
         Ok(body) => body,
-        Err(error) => return AttemptOutcome::Terminal(BedrockError::Http(error)),
+        Err(error) => return AttemptOutcome::Terminal(error),
     };
+    let text = String::from_utf8_lossy(&bytes);
     if !(200..300).contains(&status) {
         return classify_error(status, retry_after, &text);
     }
@@ -934,6 +979,83 @@ fn decode_sse_stream(text: &str) -> BedrockStreamResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[fcp_async_core::runtime::test]
+    async fn bounded_body_accepts_exact_limit_with_declared_or_chunked_length() {
+        use std::io::{BufRead, Write};
+        use std::net::TcpListener;
+        use std::thread;
+        use std::time::Instant;
+
+        for chunked in [false, true] {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let worker = thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "bounded-body test request timed out");
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("bounded-body test listener failed: {error}"),
+                    }
+                };
+                stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut reader = std::io::BufReader::new(stream);
+                loop {
+                    let mut line = String::new();
+                    assert!(reader.read_line(&mut line).unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                let mut stream = reader.into_inner();
+                if chunked {
+                    stream.write_all(
+                        b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n"
+                    ).unwrap();
+                } else {
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\ncontent-length: {MAX_PROVIDER_RESPONSE_BYTES}\r\nconnection: close\r\n\r\n"
+                    ).unwrap();
+                }
+                let chunk = vec![b'x'; 64 * 1024];
+                for _ in 0..32 {
+                    if chunked {
+                        write!(stream, "{:X}\r\n", chunk.len()).unwrap();
+                    }
+                    stream.write_all(&chunk).unwrap();
+                    if chunked {
+                        stream.write_all(b"\r\n").unwrap();
+                    }
+                }
+                if chunked {
+                    stream.write_all(b"0\r\n\r\n").unwrap();
+                }
+                stream.flush().unwrap();
+            });
+            let received: BedrockResult<Vec<u8>> = async {
+                let response = Client::builder()
+                    .timeout(Duration::from_secs(5))
+                    .build()
+                    .unwrap()
+                    .get(url)
+                    .send()
+                    .await?;
+                read_bounded_body(response).await
+            }
+            .await;
+            worker.join().unwrap();
+            let body = received.expect("the inclusive decoded-body limit should be accepted");
+            assert_eq!(u64::try_from(body.len()).unwrap(), MAX_PROVIDER_RESPONSE_BYTES);
+            assert!(body.iter().all(|byte| *byte == b'x'));
+        }
+    }
 
     #[test]
     fn model_id_rejects_path_traversal() {

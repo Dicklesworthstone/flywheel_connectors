@@ -19,6 +19,11 @@ pub enum BedrockError {
     #[error("AWS event-stream error: {0}")]
     EventStream(#[from] EventStreamError),
 
+    /// A dispatched request returned an oversized or incomplete body. Retrying
+    /// could repeat a completed generation, so this is always terminal.
+    #[error("{message}; provider outcome may be unknown")]
+    ResponseBody { message: String },
+
     #[error("Bedrock API error {status}: {kind}: {message}")]
     Api {
         status: u16,
@@ -64,6 +69,7 @@ impl BedrockError {
             }
             Self::Json(_)
             | Self::EventStream(_)
+            | Self::ResponseBody { .. }
             | Self::Unauthorized(_)
             | Self::NotFound(_)
             | Self::Async(_)
@@ -94,6 +100,13 @@ impl BedrockError {
             Self::EventStream(error) => FcpError::External {
                 service: "aws-bedrock".into(),
                 message: format!("AWS event-stream decode error: {error}"),
+                status_code: None,
+                retryable: false,
+                retry_after: None,
+            },
+            Self::ResponseBody { .. } => FcpError::External {
+                service: "aws-bedrock".into(),
+                message: self.to_string(),
                 status_code: None,
                 retryable: false,
                 retry_after: None,
@@ -210,5 +223,41 @@ pub fn bedrock_error_from_status(status: u16, body: &str) -> BedrockError {
             kind,
             message,
         },
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejected_provider_bodies_never_advertise_retry_or_upstream_status() {
+        for message in [
+            "provider response body exceeded 2097152 bytes",
+            "provider response body could not be read completely",
+            "provider response body could not be read completely (timeout)",
+        ] {
+            let error = BedrockError::ResponseBody {
+                message: message.into(),
+            };
+            assert!(!ConnectorErrorMapping::is_retryable(&error));
+            assert!(ConnectorErrorMapping::retry_after(&error).is_none());
+            let mapped = ConnectorErrorMapping::to_fcp_error(&error);
+            assert!(matches!(
+                &mapped,
+                FcpError::External {
+                    status_code: None,
+                    retryable: false,
+                    retry_after: None,
+                    ..
+                }
+            ));
+            let wire = mapped.to_response();
+            assert!(!wire.retryable);
+            assert!(wire.retry_after_ms.is_none());
+            assert!(wire.message.contains(message));
+            assert!(wire.message.contains("provider outcome may be unknown"));
+        }
     }
 }
