@@ -27,6 +27,10 @@ use crate::{
 
 const MANIFEST_TOML: &str = include_str!("../manifest.toml");
 const MAX_INVOKE_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_STREAM_CONTENT_BLOCKS: usize = 1024;
+// Parsed tool values and settlement copies cost substantially more than raw JSON.
+const MAX_STREAM_TOOL_JSON_BYTES: u64 = MAX_INVOKE_RESPONSE_BYTES / 16;
+const MAX_STREAM_TOOL_JSON_BYTES_PER_BLOCK: u64 = MAX_INVOKE_RESPONSE_BYTES / 64;
 const OPERATION_IDS: [&str; 7] = [
     "anthropic.chat",
     "anthropic.message",
@@ -36,6 +40,71 @@ const OPERATION_IDS: [&str; 7] = [
     "anthropic.auth.refresh_oauth",
     "anthropic.models.normalize",
 ];
+
+/// Conservative accounting for retained stream content and its final representation.
+/// The shared session still verifies the exact serialized response size.
+#[derive(Default)]
+struct StreamAssemblyBudget {
+    assembly_bytes: u64,
+    tool_json_bytes: u64,
+}
+
+impl StreamAssemblyBudget {
+    fn reserve(&mut self, bytes: u64) -> FcpResult<()> {
+        self.assembly_bytes = self
+            .assembly_bytes
+            .checked_add(bytes)
+            .filter(|total| *total <= MAX_INVOKE_RESPONSE_BYTES)
+            .ok_or_else(|| stream_limit_error("assembly byte limit"))?;
+        Ok(())
+    }
+
+    fn reserve_json_string(&mut self, value: &str, copies: u64) -> FcpResult<()> {
+        let encoded_bytes = value.bytes().try_fold(2_u64, |total, byte| {
+            let width = match byte {
+                b'"' | b'\\' | b'\n' | b'\r' | b'\t' | 8 | 12 => 2,
+                0..=31 => 6,
+                _ => 1,
+            };
+            total.checked_add(width)
+        });
+        let bytes = encoded_bytes
+            .and_then(|bytes| bytes.checked_mul(copies))
+            .ok_or_else(|| stream_limit_error("assembly byte limit"))?;
+        self.reserve(bytes)
+    }
+
+    fn reserve_tool_json(&mut self, current_len: usize, fragment: &str) -> FcpResult<()> {
+        let current_len = u64::try_from(current_len)
+            .map_err(|_| stream_limit_error("per-block tool JSON byte limit"))?;
+        let fragment_len = u64::try_from(fragment.len())
+            .map_err(|_| stream_limit_error("per-block tool JSON byte limit"))?;
+        if current_len
+            .checked_add(fragment_len)
+            .is_none_or(|total| total > MAX_STREAM_TOOL_JSON_BYTES_PER_BLOCK)
+        {
+            return Err(stream_limit_error("per-block tool JSON byte limit"));
+        }
+        let total_tool_json = self
+            .tool_json_bytes
+            .checked_add(fragment_len)
+            .filter(|total| *total <= MAX_STREAM_TOOL_JSON_BYTES)
+            .ok_or_else(|| stream_limit_error("aggregate tool JSON byte limit"))?;
+        self.reserve(fragment_len)?;
+        self.tool_json_bytes = total_tool_json;
+        Ok(())
+    }
+}
+
+fn stream_limit_error(limit: &str) -> FcpError {
+    FcpError::External {
+        service: "anthropic".into(),
+        message: format!("Anthropic stream exceeded {limit}; provider outcome may be unknown"),
+        status_code: None,
+        retryable: false,
+        retry_after: None,
+    }
+}
 
 /// Parsed and validated Anthropic connector configuration.
 #[derive(Debug, Clone)]
@@ -1418,9 +1487,21 @@ impl AnthropicConnector {
         }
 
         let mut blocks: Vec<Option<BlockAccumulator>> = Vec::new();
+        let mut assembly_budget = StreamAssemblyBudget::default();
+        // Reserve fixed envelope/usage fields before accumulating provider data.
+        assembly_budget.reserve(4096)?;
 
         while let Some(event_result) = stream.next().await {
-            let event = event_result.map_err(|_: AnthropicError| {
+            let event = event_result.map_err(|error: AnthropicError| {
+                if matches!(
+                    &error,
+                    AnthropicError::Api { error_type, .. }
+                        if matches!(error_type.as_str(), "sse_event_too_large" | "sse_buffer_overflow")
+                ) {
+                    return invalid_stream_error(format!(
+                        "Anthropic stream limit exceeded: {error}; provider outcome may be unknown"
+                    ));
+                }
                 invalid_stream_error(
                     "Anthropic stream failed before message_stop; provider outcome may be unknown",
                 )
@@ -1445,6 +1526,8 @@ impl AnthropicConnector {
                             "Anthropic stream repeated message_start",
                         ));
                     }
+                    assembly_budget.reserve_json_string(&msg.id, 1)?;
+                    assembly_budget.reserve_json_string(&msg.model, 1)?;
                     message_started = true;
                     message_id = msg.id;
                     response_model = msg.model;
@@ -1455,24 +1538,36 @@ impl AnthropicConnector {
                     content_block,
                 } => {
                     let block_index = block_slot(index)?;
-                    if blocks.len() <= block_index {
-                        blocks.resize_with(block_index + 1, || None);
-                    }
-                    if blocks[block_index].is_some() {
+                    if block_index < blocks.len() {
                         return Err(invalid_stream_error(format!(
                             "Anthropic stream reopened content block at index {index}"
                         )));
                     }
+                    if block_index != blocks.len() {
+                        return Err(invalid_stream_error(format!(
+                            "Anthropic stream used non-contiguous content block index {index}; expected {}",
+                            blocks.len()
+                        )));
+                    }
+                    if blocks.len() >= MAX_STREAM_CONTENT_BLOCKS {
+                        return Err(stream_limit_error("content block count limit"));
+                    }
+                    // Bound auxiliary block records as well as provider strings.
+                    assembly_budget.reserve(512)?;
                     let block = match content_block {
-                        crate::types::ContentBlockStartData::Text { text } => BlockAccumulator {
-                            block_type: "text".into(),
-                            text,
-                            thinking_seen: false,
-                            tool_id: String::new(),
-                            tool_name: String::new(),
-                            tool_input_json: String::new(),
-                            closed: false,
-                        },
+                        crate::types::ContentBlockStartData::Text { text } => {
+                            // Text appears in both content and content_blocks.
+                            assembly_budget.reserve_json_string(&text, 2)?;
+                            BlockAccumulator {
+                                block_type: "text".into(),
+                                text,
+                                thinking_seen: false,
+                                tool_id: String::new(),
+                                tool_name: String::new(),
+                                tool_input_json: String::new(),
+                                closed: false,
+                            }
+                        }
                         crate::types::ContentBlockStartData::Thinking { .. } => BlockAccumulator {
                             block_type: "thinking".into(),
                             text: String::new(),
@@ -1483,6 +1578,8 @@ impl AnthropicConnector {
                             closed: false,
                         },
                         crate::types::ContentBlockStartData::ToolUse { id, name, .. } => {
+                            assembly_budget.reserve_json_string(&id, 1)?;
+                            assembly_budget.reserve_json_string(&name, 1)?;
                             BlockAccumulator {
                                 block_type: "tool_use".into(),
                                 text: String::new(),
@@ -1494,7 +1591,7 @@ impl AnthropicConnector {
                             }
                         }
                     };
-                    blocks[block_index] = Some(block);
+                    blocks.push(Some(block));
                 }
                 crate::types::StreamEvent::ContentBlockDelta { index, delta } => {
                     let block_index = block_slot(index)?;
@@ -1518,6 +1615,7 @@ impl AnthropicConnector {
                                     "Anthropic stream sent text delta for non-text block at index {index}"
                                 )));
                             }
+                            assembly_budget.reserve_json_string(&text, 2)?;
                             block.text.push_str(&text);
                         }
                         crate::types::ContentDelta::ThinkingDelta { .. } => {
@@ -1534,6 +1632,8 @@ impl AnthropicConnector {
                                     "Anthropic stream sent tool JSON delta for non-tool block at index {index}"
                                 )));
                             }
+                            assembly_budget
+                                .reserve_tool_json(block.tool_input_json.len(), &partial_json)?;
                             block.tool_input_json.push_str(&partial_json);
                         }
                     }

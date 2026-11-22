@@ -108,8 +108,23 @@ impl LoopbackServer {
                             .set_read_timeout(Some(StdDuration::from_secs(5)))
                             .unwrap();
                         sender.send(read_request(&mut stream)).unwrap();
-                        stream.write_all(response.as_bytes()).unwrap();
-                        stream.flush().unwrap();
+                        stream
+                            .set_write_timeout(Some(StdDuration::from_secs(5)))
+                            .unwrap();
+                        if let Err(error) = stream
+                            .write_all(response.as_bytes())
+                            .and_then(|()| stream.flush())
+                        {
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                            ) {
+                                // Bounded readers intentionally stop an oversized
+                                // provider body before the server finishes sending.
+                                continue;
+                            }
+                            panic!("scripted provider write failed: {error}");
+                        }
                         if hold_open {
                             // No EOF is supplied until the test has observed the
                             // invocation result. This exercises body/terminal-event
@@ -861,6 +876,359 @@ fn native_sse_terminal_event_finishes_without_waiting_for_http_eof() {
             assert_eq!(result["content_blocks"], json!([]));
         }
         server.receive();
+        server.finish();
+    }
+}
+
+
+fn append_provider_event(body: &mut String, event: Value) {
+    body.push_str("event: ");
+    body.push_str(event["type"].as_str().unwrap());
+    body.push_str("\ndata: ");
+    body.push_str(&event.to_string());
+    body.push_str("\n\n");
+}
+
+fn provider_stream_start() -> String {
+    STREAM_RESPONSE
+        .split_once("event: content_block_start")
+        .unwrap()
+        .0
+        .to_string()
+}
+
+fn finish_provider_stream(body: &mut String) {
+    append_provider_event(
+        body,
+        json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn"},
+            "usage": {"output_tokens": 8}
+        }),
+    );
+    append_provider_event(body, json!({"type": "message_stop"}));
+}
+
+fn full_stream_response(body: &str) -> String {
+    format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+fn assert_provider_limit(
+    server: &LoopbackServer,
+    operation: &str,
+    expected_message: &str,
+) {
+    let (mut process, key, instance) = prepared_deadline_process(server, operation);
+    let mut request = bounded_provider_request(&key, &instance, operation);
+    request["deadline_ms"] = json!(5_000);
+    let response = process.rpc("bounded-provider-output", "invoke", request.clone());
+    assert_eq!(response["error"]["retryable"], false, "{response}");
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(expected_message),
+        "{response}"
+    );
+    server.receive();
+    assert_uncertain_budget_is_retained(&mut process, server, request, &key, &instance);
+}
+
+#[test]
+fn native_sse_rejects_sparse_reopened_and_excessive_blocks() {
+    for (scenario, expected_message) in [
+        ("huge", "non-contiguous content block index"),
+        ("gap", "non-contiguous content block index"),
+        ("reopen", "reopened content block"),
+        ("count", "content block count limit"),
+    ] {
+        let mut body = provider_stream_start();
+        let indices = match scenario {
+            "huge" => vec![u32::MAX],
+            "gap" => vec![1],
+            "reopen" => vec![0, 0],
+            "count" => (0..1025).collect(),
+            _ => unreachable!(),
+        };
+        for index in indices {
+            append_provider_event(
+                &mut body,
+                json!({
+                    "type": "content_block_start",
+                    "index": index,
+                    "content_block": {"type": "text", "text": ""}
+                }),
+            );
+            append_provider_event(
+                &mut body,
+                json!({"type": "content_block_stop", "index": index}),
+            );
+        }
+        finish_provider_stream(&mut body);
+        let server = LoopbackServer::scripted(full_stream_response(&body), false);
+        assert_provider_limit(&server, "anthropic.message.stream", expected_message);
+        server.finish();
+    }
+}
+
+#[test]
+fn native_sse_bounds_aggregate_text_and_tool_json_before_growth() {
+    for (scenario, expected_message) in [
+        ("text", "assembly byte limit"),
+        ("single_event", "stream limit exceeded"),
+        ("escaped_text", "assembly byte limit"),
+        ("initial_text", "assembly byte limit"),
+        ("per_tool", "per-block tool JSON byte limit"),
+        ("aggregate_tool", "aggregate tool JSON byte limit"),
+    ] {
+        let mut body = provider_stream_start();
+        match scenario {
+            "single_event" => {
+                append_provider_event(
+                    &mut body,
+                    json!({
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": {"type": "text", "text": "x".repeat(1024 * 1024)}
+                    }),
+                );
+                append_provider_event(
+                    &mut body,
+                    json!({"type": "content_block_stop", "index": 0}),
+                );
+            }
+            "text" | "escaped_text" => {
+                append_provider_event(
+                    &mut body,
+                    json!({
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": {"type": "text", "text": ""}
+                    }),
+                );
+                let (fragment, count) = if scenario == "text" {
+                    ("x".repeat(256 * 1024), 36)
+                } else {
+                    // Raw text is small, but JSON escaping and duplicate output
+                    // representations must both count against assembly capacity.
+                    ("\u{0001}".repeat(64 * 1024), 24)
+                };
+                for _ in 0..count {
+                    append_provider_event(
+                        &mut body,
+                        json!({
+                            "type": "content_block_delta",
+                            "index": 0,
+                            "delta": {"type": "text_delta", "text": fragment}
+                        }),
+                    );
+                }
+                append_provider_event(
+                    &mut body,
+                    json!({"type": "content_block_stop", "index": 0}),
+                );
+            }
+            "initial_text" => {
+                for index in 0..34 {
+                    append_provider_event(
+                        &mut body,
+                        json!({
+                            "type": "content_block_start",
+                            "index": index,
+                            "content_block": {"type": "text", "text": "x".repeat(256 * 1024)}
+                        }),
+                    );
+                    append_provider_event(
+                        &mut body,
+                        json!({"type": "content_block_stop", "index": index}),
+                    );
+                }
+            }
+            "per_tool" | "aggregate_tool" => {
+                let (payload_bytes, blocks) = if scenario == "per_tool" {
+                    (256 * 1024, 1)
+                } else {
+                    (128 * 1024, 9)
+                };
+                let input = json!({"payload": "x".repeat(payload_bytes)}).to_string();
+                for index in 0..blocks {
+                    append_provider_event(
+                        &mut body,
+                        json!({
+                            "type": "content_block_start",
+                            "index": index,
+                            "content_block": {
+                                "type": "tool_use",
+                                "id": format!("tool-{index}"),
+                                "name": "lookup",
+                                "input": {}
+                            }
+                        }),
+                    );
+                    for partial in input.as_bytes().chunks(128 * 1024) {
+                        append_provider_event(
+                            &mut body,
+                            json!({
+                                "type": "content_block_delta",
+                                "index": index,
+                                "delta": {
+                                    "type": "input_json_delta",
+                                    "partial_json": std::str::from_utf8(partial).unwrap()
+                                }
+                            }),
+                        );
+                    }
+                    append_provider_event(
+                        &mut body,
+                        json!({"type": "content_block_stop", "index": index}),
+                    );
+                }
+            }
+            _ => unreachable!(),
+        }
+        finish_provider_stream(&mut body);
+        let server = LoopbackServer::scripted(full_stream_response(&body), false);
+        assert_provider_limit(&server, "anthropic.message.stream", expected_message);
+        server.finish();
+    }
+}
+
+#[test]
+fn native_sse_preserves_normal_multiple_text_and_tool_blocks() {
+    let mut body = provider_stream_start();
+    append_provider_event(
+        &mut body,
+        json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text", "text": "Hello"}
+        }),
+    );
+    append_provider_event(&mut body, json!({"type": "content_block_stop", "index": 0}));
+    for index in 1..=3 {
+        append_provider_event(
+            &mut body,
+            json!({
+                "type": "content_block_start",
+                "index": index,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": format!("tool-{index}"),
+                    "name": "weather",
+                    "input": {}
+                }
+            }),
+        );
+        append_provider_event(
+            &mut body,
+            json!({
+                "type": "content_block_delta",
+                "index": index,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": json!({"city": "Paris", "day": index}).to_string()
+                }
+            }),
+        );
+        append_provider_event(
+            &mut body,
+            json!({"type": "content_block_stop", "index": index}),
+        );
+    }
+    append_provider_event(
+        &mut body,
+        json!({
+            "type": "content_block_start",
+            "index": 4,
+            "content_block": {"type": "text", "text": " done"}
+        }),
+    );
+    append_provider_event(&mut body, json!({"type": "content_block_stop", "index": 4}));
+    finish_provider_stream(&mut body);
+    let server = LoopbackServer::scripted(full_stream_response(&body), false);
+    let (mut process, key, instance) =
+        prepared_deadline_process(&server, "anthropic.message.stream");
+    let request = bounded_provider_request(&key, &instance, "anthropic.message.stream");
+    let response: InvokeResponse = serde_json::from_value(
+        process.rpc("bounded-multiple-blocks", "invoke", request)["result"].clone(),
+    )
+    .unwrap();
+    assert_eq!(response.status, InvokeStatus::Ok);
+    let result = response.result.unwrap();
+    assert_eq!(result["content"], "Hello done");
+    assert_eq!(result["content_blocks"].as_array().unwrap().len(), 5);
+    for index in 1..=3 {
+        assert_eq!(
+            result["content_blocks"][index]["input"],
+            json!({"city": "Paris", "day": index})
+        );
+    }
+    server.receive();
+    server.finish();
+}
+
+fn oversized_chunked_json_response(status: &str) -> String {
+    let mut response = format!(
+        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n"
+    );
+    // Individually small chunks cumulatively exceed the 2 MiB decoded-body cap.
+    let chunk = "x".repeat(64 * 1024);
+    for _ in 0..33 {
+        response.push_str(&format!("{:X}\r\n{chunk}\r\n", chunk.len()));
+    }
+    response.push_str("0\r\n\r\n");
+    response
+}
+
+#[test]
+fn native_provider_body_limits_are_terminal_for_success_and_retryable_statuses() {
+    let raw_limit = 2 * 1024 * 1024;
+    for (operation, response, hold_open, expected) in [
+        (
+            "anthropic.message",
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                raw_limit + 1
+            ),
+            true,
+            "response exceeded",
+        ),
+        (
+            "anthropic.message.stream",
+            format!(
+                "HTTP/1.1 529 Overloaded\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                raw_limit + 1
+            ),
+            true,
+            "response exceeded",
+        ),
+        (
+            "anthropic.message",
+            oversized_chunked_json_response("429 Too Many Requests"),
+            false,
+            "response exceeded",
+        ),
+        (
+            "anthropic.message.stream",
+            oversized_chunked_json_response("503 Service Unavailable"),
+            false,
+            "response exceeded",
+        ),
+        (
+            "anthropic.message",
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{MESSAGE_RESPONSE}",
+                MESSAGE_RESPONSE.len() + 50
+            ),
+            false,
+            "could not be read completely",
+        ),
+    ] {
+        let server = LoopbackServer::scripted(response, hold_open);
+        assert_provider_limit(&server, operation, expected);
         server.finish();
     }
 }

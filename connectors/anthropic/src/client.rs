@@ -34,6 +34,10 @@ pub(crate) const DEFAULT_API_VERSION: &str = "2023-06-01";
 /// Hard ceiling for one invocation, including provider retries and stream assembly.
 const MAX_INVOCATION_TIMEOUT_MS: u64 = 300_000;
 
+/// Raw JSON bodies stay below the released-response ceiling to leave headroom
+/// for parsed tool values and response-settlement copies.
+const MAX_PROVIDER_RESPONSE_BYTES: u64 = 2 * 1024 * 1024;
+
 /// Resolve the API version to use: config override > env var > compiled default.
 fn resolve_api_version(config_override: Option<&str>) -> String {
     if let Some(v) = config_override.map(str::trim).filter(|s| !s.is_empty()) {
@@ -300,7 +304,7 @@ impl AnthropicClient {
         let response = request.send().await?;
         let status = response.status();
         let retry_after = extract_retry_after(&response);
-        let bytes = response.bytes().await?;
+        let bytes = read_bounded_body(response).await?;
         if status.is_success() {
             Ok(())
         } else {
@@ -601,7 +605,7 @@ impl AnthropicClient {
         let status = response.status();
         if !status.is_success() {
             let retry_after = extract_retry_after(&response);
-            let bytes = response.bytes().await?;
+            let bytes = read_bounded_body(response).await?;
             return Err(parse_error_response(status, &bytes, retry_after));
         }
 
@@ -615,7 +619,7 @@ impl AnthropicClient {
     {
         let status = response.status();
         let retry_after = extract_retry_after(&response);
-        let bytes = response.bytes().await?;
+        let bytes = read_bounded_body(response).await?;
 
         if status.is_success() {
             serde_json::from_slice(&bytes).map_err(AnthropicError::from)
@@ -623,6 +627,49 @@ impl AnthropicClient {
             Err(parse_error_response(status, &bytes, retry_after))
         }
     }
+}
+
+fn response_body_limit_error() -> AnthropicError {
+    AnthropicError::Api {
+        error_type: "response_too_large".into(),
+        message: format!(
+            "Anthropic response exceeded {MAX_PROVIDER_RESPONSE_BYTES} bytes; provider outcome may be unknown"
+        ),
+        status_code: None,
+    }
+}
+
+/// Limit both declared and actual provider bytes before retaining or parsing them.
+async fn read_bounded_body(response: Response) -> AnthropicResult<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|bytes| bytes > MAX_PROVIDER_RESPONSE_BYTES)
+    {
+        return Err(response_body_limit_error());
+    }
+    let mut body = Vec::new();
+    let mut stream = Box::pin(response.bytes_stream());
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| AnthropicError::Api {
+            error_type: "response_body_incomplete".into(),
+            message:
+                "Anthropic response body could not be read completely; provider outcome may be unknown"
+                    .into(),
+            // A response-body failure follows dispatch and must not trigger an
+            // automatic retry of a possibly completed provider generation.
+            status_code: None,
+        })?;
+        let retained = u64::try_from(body.len()).map_err(|_| response_body_limit_error())?;
+        let additional = u64::try_from(chunk.len()).map_err(|_| response_body_limit_error())?;
+        if retained
+            .checked_add(additional)
+            .is_none_or(|total| total > MAX_PROVIDER_RESPONSE_BYTES)
+        {
+            return Err(response_body_limit_error());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 fn apply_beta_headers(
@@ -661,7 +708,7 @@ pub(crate) fn parse_retry_after_header_value(value: &str) -> Option<u64> {
 /// Parse an error response.
 pub(crate) fn parse_error_response(
     status: StatusCode,
-    bytes: &Bytes,
+    bytes: &[u8],
     retry_after_ms: Option<u64>,
 ) -> AnthropicError {
     // Try to parse as API error
@@ -711,10 +758,9 @@ pub(crate) fn parse_error_response(
     }
 }
 
-/// Parse SSE stream into events.
-/// Maximum SSE buffer size (16 MiB). Prevents memory exhaustion from
-/// malformed streams that never produce an event delimiter.
-pub(crate) const MAX_SSE_BUFFER_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum raw SSE event size (1 MiB), before JSON expansion. Complete
+/// multi-event chunks may exceed this; each individual event must fit.
+pub(crate) const MAX_SSE_BUFFER_BYTES: usize = 1024 * 1024;
 
 fn parse_sse_stream(response: Response) -> impl Stream<Item = AnthropicResult<StreamEvent>> {
     parse_sse_chunks(response.bytes_stream())
@@ -737,24 +783,36 @@ where
                 }
             };
 
-            buffer.extend_from_slice(&chunk);
-
-            // Process complete SSE events
-            while let Some(event_bytes) = take_next_sse_event(&mut buffer) {
-                if let Some(event) = parse_sse_event_bytes(&event_bytes) {
-                    yield event;
+            let mut remaining = chunk.as_ref();
+            while !remaining.is_empty() {
+                // At most one bounded event and a split CRLF delimiter are
+                // retained, even if a network chunk batches many events.
+                let available = (MAX_SSE_BUFFER_BYTES + 4).saturating_sub(buffer.len());
+                if available == 0 {
+                    yield Err(sse_buffer_limit_error());
+                    return;
                 }
-            }
+                let take = available.min(remaining.len());
+                buffer.extend_from_slice(&remaining[..take]);
+                remaining = &remaining[take..];
 
-            if buffer.len() > MAX_SSE_BUFFER_BYTES {
-                yield Err(AnthropicError::Api {
-                    error_type: "sse_buffer_overflow".into(),
-                    message: format!(
-                        "SSE buffer exceeded {MAX_SSE_BUFFER_BYTES} bytes without a complete event"
-                    ),
-                    status_code: None,
-                });
-                return;
+                while let Some(event_bytes) = take_next_sse_event(&mut buffer) {
+                    let event_bytes = match event_bytes {
+                        Ok(event_bytes) => event_bytes,
+                        Err(error) => {
+                            yield Err(error);
+                            return;
+                        }
+                    };
+                    if let Some(event) = parse_sse_event_bytes(&event_bytes) {
+                        yield event;
+                    }
+                }
+
+                if buffer.len() == MAX_SSE_BUFFER_BYTES + 4 {
+                    yield Err(sse_buffer_limit_error());
+                    return;
+                }
             }
         }
 
@@ -767,11 +825,28 @@ where
     }
 }
 
-fn take_next_sse_event(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
+fn sse_buffer_limit_error() -> AnthropicError {
+    AnthropicError::Api {
+        error_type: "sse_buffer_overflow".into(),
+        message: format!(
+            "SSE buffer exceeded {MAX_SSE_BUFFER_BYTES} bytes without a complete bounded event"
+        ),
+        status_code: None,
+    }
+}
+
+fn take_next_sse_event(buffer: &mut Vec<u8>) -> Option<AnthropicResult<Vec<u8>>> {
     let (event_end, delimiter_len) = next_sse_event_boundary(buffer)?;
+    if event_end > MAX_SSE_BUFFER_BYTES {
+        return Some(Err(AnthropicError::Api {
+            error_type: "sse_event_too_large".into(),
+            message: format!("Anthropic SSE event exceeded {MAX_SSE_BUFFER_BYTES} bytes"),
+            status_code: None,
+        }));
+    }
     let event = buffer[..event_end].to_vec();
     buffer.drain(..event_end + delimiter_len);
-    Some(event)
+    Some(Ok(event))
 }
 
 fn next_sse_event_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
@@ -1388,13 +1463,17 @@ mod tests {
         .as_bytes()
         .to_vec();
 
-        let first = take_next_sse_event(&mut buffer).expect("expected first event");
+        let first = take_next_sse_event(&mut buffer)
+            .expect("expected first event")
+            .expect("first event should be bounded");
         let first = parse_sse_event_bytes(&first)
             .expect("expected first parsed event")
             .expect("expected first ok event");
         assert!(matches!(first, StreamEvent::Ping));
 
-        let second = take_next_sse_event(&mut buffer).expect("expected second event");
+        let second = take_next_sse_event(&mut buffer)
+            .expect("expected second event")
+            .expect("second event should be bounded");
         let second = parse_sse_event_bytes(&second)
             .expect("expected second parsed event")
             .expect("expected second ok event");
@@ -1419,7 +1498,9 @@ mod tests {
         buffer.push(0xA9);
         buffer.extend_from_slice(b"\"}}\n\n");
 
-        let event = take_next_sse_event(&mut buffer).expect("expected complete event");
+        let event = take_next_sse_event(&mut buffer)
+            .expect("expected complete event")
+            .expect("event should be bounded");
         let event = parse_sse_event_bytes(&event)
             .expect("expected parsed event")
             .expect("expected ok event");
@@ -1467,6 +1548,88 @@ mod tests {
         assert_eq!(events.len(), 1, "expected only the delimited ping event");
         let event = events.into_iter().next().unwrap().unwrap();
         assert!(matches!(event, StreamEvent::Ping));
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn bounded_sse_parser_preserves_large_batches_of_small_events() {
+        let event = format!(":{}\nevent: ping\ndata: {{\"type\":\"ping\"}}\n\n", "x".repeat(4096));
+        let count = MAX_SSE_BUFFER_BYTES / event.len() + 2;
+        let chunk = event.repeat(count).into_bytes();
+        assert!(chunk.len() > MAX_SSE_BUFFER_BYTES);
+        let received = parse_sse_chunks(stream::iter(vec![Ok(Bytes::from(chunk))]))
+            .fold(0_usize, |count, event| async move {
+                assert!(matches!(event.unwrap(), StreamEvent::Ping));
+                count + 1
+            })
+            .await;
+        assert_eq!(received, count);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn bounded_sse_parser_allows_exact_limit_with_split_crlf_delimiter() {
+        let suffix = "\r\nevent: ping\r\ndata: {\"type\":\"ping\"}";
+        let mut payload = format!(":{}{suffix}", "x".repeat(MAX_SSE_BUFFER_BYTES - suffix.len() - 1))
+            .into_bytes();
+        assert_eq!(payload.len(), MAX_SSE_BUFFER_BYTES);
+        payload.extend_from_slice(b"\r\n\r\n");
+        for delimiter_bytes in 1..=3 {
+            let split = MAX_SSE_BUFFER_BYTES + delimiter_bytes;
+            let events: Vec<_> = parse_sse_chunks(stream::iter(vec![
+                Ok(Bytes::copy_from_slice(&payload[..split])),
+                Ok(Bytes::copy_from_slice(&payload[split..])),
+            ]))
+            .collect()
+            .await;
+            assert_eq!(events.len(), 1);
+            assert!(matches!(events.into_iter().next().unwrap().unwrap(), StreamEvent::Ping));
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn bounded_sse_parser_rejects_oversized_event_with_or_without_delimiter() {
+        let suffix = "\nevent: ping\ndata: {\"type\":\"ping\"}";
+        for delimiter in ["", "\n\n"] {
+            let payload = format!(
+                ":{}{suffix}{delimiter}",
+                "x".repeat(MAX_SSE_BUFFER_BYTES - suffix.len())
+            );
+            let events: Vec<_> = parse_sse_chunks(stream::iter(vec![
+                Ok(Bytes::from(payload)),
+            ]))
+            .collect()
+            .await;
+            assert_eq!(events.len(), 1);
+            let error = events.into_iter().next().unwrap().unwrap_err();
+            assert!(
+                matches!(
+                    &error,
+                    AnthropicError::Api { error_type, status_code: None, .. }
+                        if error_type == "sse_event_too_large"
+                ),
+                "{error:?}"
+            );
+            assert!(!error.is_retryable());
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn bounded_sse_parser_preserves_utf8_split_between_network_chunks() {
+        let mut first =
+            b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"caf"
+                .to_vec();
+        first.push(0xC3);
+        let second = vec![0xA9, b'"', b'}', b'}', b'\n', b'\n'];
+        let events: Vec<_> = parse_sse_chunks(stream::iter(vec![
+            Ok(Bytes::from(first)),
+            Ok(Bytes::from(second)),
+        ]))
+        .collect()
+        .await;
+        assert_eq!(events.len(), 1);
+        match events.into_iter().next().unwrap().unwrap() {
+            StreamEvent::Error { error } => assert_eq!(error.message, "café"),
+            event => panic!("unexpected SSE event: {event:?}"),
+        }
     }
 
     #[fcp_async_core::runtime::test]
