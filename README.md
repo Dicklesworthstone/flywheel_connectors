@@ -3723,6 +3723,34 @@ A capability token is `ConstraintsEnforced` only when the verifier has evaluated
 
 **Default-deny default.** An empty `CapabilityConstraints` (all fields empty/`None`) is interpreted as **deny all** rather than "no restrictions." This is the C3.4 default-deny rule: a token that forgot to declare any resource pattern grants access to nothing. `CapabilityConstraints::is_empty()` exists precisely so callers can detect this case explicitly.
 
+### Cumulative Host Usage Enforcement
+
+Local invocation admission and native stream **open, poll, and acknowledgement**
+controls share one signed-token usage account. The account is identified by the
+verified signing key and token ID; changing a request ID, operation, connector,
+or control method does not replenish the grant. The executing host reserves one
+call and the deterministic-CBOR input size before admitting work. A mesh origin
+that forwards a control does not charge its independent local account as well.
+
+Stream input accounting includes the host-pinned topic and resource plus the
+complete control payload: stream identity, window or poll limit, and all
+acknowledgement sequences and cursors. Known ownership and structural conflicts
+are rejected before reservation. Live authority is checked again after quota
+admission and before custody changes or dispatch. An authenticated **close**
+remains available after quota exhaustion so a consumer can stop its producer.
+
+Usage reservations are conservative and never refunded after cancellation,
+failed delivery, or an uncertain result. Quota and event custody use separate
+durable stores, so a reservation can be spent without a later stream effect.
+Configure `FCP_HOST_LIFECYCLE_STATE_FILE` to retain usage across host restarts;
+an explicitly in-memory lifecycle store retains usage only for its lifetime.
+Unlimited controls only read the ledger and do not rewrite the admin snapshot.
+
+These counters are **executor-local**, not a mesh-wide spending limit. The byte
+debit covers admitted invocation and stream-control input; it does not account
+for response bodies, delivered event payloads, or provider traffic. Separate
+bounded custody and transport limits still apply to those surfaces.
+
 ---
 
 ## Connector Lifecycle and Health
@@ -4744,8 +4772,8 @@ The TTL is bounded by two competing pressures: too short, and a legitimate retry
 Capability tokens carry a `token_id` (CWT `cti`) for one-shot revocation tracking and a CWT `exp` for time-bound expiry. The replay-protection model differs from webhooks: tokens are long-enough lived that a per-token cache would bloat, so replay protection is bounded by the `exp` window plus the revocation freshness SLA.
 
 - An expired token is refused before any further check (cheap, no cache lookup).
-- A non-expired one-shot token (`max_calls = 1` in `CapabilityConstraints`) is checked against the per-token revocation registry; the first invoke records the token as used; the second is refused.
-- A non-expired N-shot token (`max_calls = N`) carries its used-count in a per-token mesh object that all peers can read; concurrent invokes coordinate via the HRW lease holder.
+- A non-expired one-shot token (`max_calls = 1` in `CapabilityConstraints`) spends its allowance at executor admission; another invocation or charged native stream control on that executor is refused.
+- A non-expired N-shot token (`max_calls = N`) uses the same executor-local durable ledger. Concurrent invocations and stream controls reserve atomically against one account. The ledger does not provide a mesh-wide quota; see [Cumulative Host Usage Enforcement](#cumulative-host-usage-enforcement) for persistence and byte-accounting boundaries.
 
 The replay window for a one-shot token is bounded by `exp - iat`, which for FCP's defaults is single-digit minutes for high-risk operations and hours for low-risk ones. Token revocation freshness must keep up; `RevocationFreshnessClass::Critical` operations refuse to proceed if the revocation view is older than `revocation_freshness_sla_secs` (default 300 seconds).
 

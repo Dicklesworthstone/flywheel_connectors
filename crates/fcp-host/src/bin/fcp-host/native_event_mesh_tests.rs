@@ -159,7 +159,7 @@ fn pinned_holder(token: &fcp_core::CapabilityToken, holder: &Ed25519SigningKey) 
     json!({"auth":holder_auth(token, holder),"executor_node":EXECUTOR,"stream_id":STREAM})
 }
 
-async fn install_native_source(fixture: &mut Fixture) {
+pub(super) async fn install_native_source(fixture: &mut Fixture) {
     // Fixed JSON replies keep the fixture independent of a system Python or
     // JSON executable. All requests still traverse the production dispatcher,
     // continuous stdout reader and native ACK writer.
@@ -237,6 +237,95 @@ done
         ..(*fixture.host).clone()
     });
     fixture.journal = journal;
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn selected_stream_executor_alone_spends_the_shared_control_budget() {
+    let fixture = fixture().await;
+    let mut grant = issuance("agent:alice");
+    grant.max_calls = Some(2);
+    let (token, _) = issue(&fixture, grant).await;
+    let authority: StreamAuthority = serde_json::from_value(auth(&token)).unwrap();
+    let admitted = fixture
+        .host
+        .native_events
+        .authorize(
+            &fixture.host,
+            &authority,
+            true,
+            None,
+            json!({"method":"poll","stream_id":STREAM,"limit":1}),
+        )
+        .await
+        .unwrap();
+    let mesh = mesh_fixture(&fixture).await;
+    let app = relay_app(&mesh);
+    let (status, body) = send(app.clone(), "/rpc/streams/poll", pinned(&token)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut ack = pinned(&token);
+    ack["ack"] = json!(acknowledgement());
+    let (status, body) = send(app.clone(), "/rpc/streams/ack", ack).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = send(app.clone(), "/rpc/streams/poll", pinned(&token)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let key = fixture.key.verifying_key();
+    assert!(
+        mesh.executor
+            .lifecycle
+            .check_capability_usage(&admitted.metered_request, &key, "agent:alice")
+            .await
+            .is_err(),
+        "the selected executor spent both controls",
+    );
+    mesh.origin
+        .lifecycle
+        .check_capability_usage(&admitted.metered_request, &key, "agent:alice")
+        .await
+        .expect("a forwarding origin must not debit another independent account");
+    let (status, body) = send(app, "/rpc/streams/close", pinned(&token)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(fixture.journal.describe(STREAM).unwrap().closed);
+    mesh.stop().await;
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn lost_stream_ack_response_does_not_refund_the_signed_call() {
+    let fixture = fixture().await;
+    fixture
+        .journal
+        .poll(STREAM, &owner_binding(), &instance(), 1)
+        .unwrap();
+    let mut grant = issuance("agent:alice");
+    grant.max_calls = Some(1);
+    let (token, _) = issue(&fixture, grant).await;
+    let mesh = mesh_fixture(&fixture).await;
+    mesh.faults.store(DROP_ACK_REPLY, Ordering::SeqCst);
+    let app = relay_app(&mesh);
+    let mut request = pinned(&token);
+    request["ack"] = json!(acknowledgement());
+    let (status, body) = send(app.clone(), "/rpc/streams/ack", request.clone()).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert_eq!(mesh.injected_faults.load(Ordering::SeqCst), DROP_ACK_REPLY);
+    let committed = fixture.journal.describe(STREAM).unwrap();
+    assert_eq!(committed.pending_events, 0);
+    assert_eq!(committed.acknowledged_events, 1);
+    let (status, body) = send(app.clone(), "/rpc/streams/ack", request).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a lost reply must not restore credit: {body}"
+    );
+    assert_eq!(
+        fixture
+            .journal
+            .describe(STREAM)
+            .unwrap()
+            .acknowledged_events,
+        1
+    );
+    let (status, body) = send(app, "/rpc/streams/close", pinned(&token)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    mesh.stop().await;
 }
 
 #[fcp_async_core::runtime::test(flavor = "multi_thread")]

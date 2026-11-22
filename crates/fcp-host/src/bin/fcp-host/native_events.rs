@@ -93,6 +93,9 @@ struct Admission {
     enforce_operation_network_constraints: bool,
     generation: u64,
     authority: live_authority::LiveAuthorityDispatchGuard,
+    /// The exact control input used by policy and executor-local quota admission.
+    /// Never persist or log this request: it retains the original bearer token.
+    metered_request: InvokeRequest,
 }
 
 struct Attachment {
@@ -125,6 +128,36 @@ fn denied(message: &str) -> HostError {
 
 fn unavailable(message: &str) -> HostError {
     HostError::Unavailable(message.to_owned())
+}
+
+fn validate_ack_control(auth: &StreamAuthority, ack: &EventAck) -> HostResult<()> {
+    if ack.r#type != "ack"
+        || ack.seqs.is_empty()
+        || ack.seqs.len() > fcp_host::NATIVE_EVENT_MAX_WINDOW as usize
+        || ack.seqs.len() != ack.cursors.len()
+    {
+        return Err(invalid(
+            "acknowledgement requires 1 to 64 exact sequence/cursor pairs",
+        ));
+    }
+    if ack.topic != auth.topic {
+        return Err(denied(
+            "acknowledgement topic differs from the authorized topic",
+        ));
+    }
+    let mut cursors = HashSet::new();
+    for cursor in &ack.cursors {
+        // Keep the journal's identifier bound at this pre-debit boundary too.
+        if cursor.is_empty()
+            || cursor.len() > 1024
+            || cursor.chars().any(char::is_control)
+            || cursor.trim() != cursor
+            || !cursors.insert(cursor)
+        {
+            return Err(invalid("invalid or duplicate acknowledgement cursor"));
+        }
+    }
+    Ok(())
 }
 
 /// Open custody before any connector starts, so a second writer cannot race it.
@@ -200,6 +233,7 @@ impl EventService {
         auth: &StreamAuthority,
         execution: bool,
         admitted_execution_fence: Option<fcp_host::ConnectorExecutionFence>,
+        control: Value,
     ) -> HostResult<Admission> {
         self.journal()?;
         if auth.request_id.is_empty()
@@ -330,7 +364,11 @@ impl EventService {
             connector_id: auth.connector_id.clone(),
             operation: operation.clone(),
             zone_id: auth.zone_id.clone(),
-            input: json!({"topic": auth.topic, "resource_uri": resource_uri}),
+            input: json!({
+                "topic": auth.topic,
+                "resource_uri": resource_uri,
+                "control": control,
+            }),
             capability_token: auth.capability_token.clone(),
             holder_proof: auth.holder_proof.clone(),
             context: None,
@@ -366,7 +404,20 @@ impl EventService {
                 "event capability rejected by persisted host authority",
             ));
         }
-        enforce_live_capability_constraints(&request, claims, &principal, Some(&resource_uri))?;
+        if execution {
+            enforce_live_capability_constraints(&request, claims, &principal, Some(&resource_uri))?;
+        } else {
+            // Cleanup starts no subscription, delivery, or provider credit.
+            // Exhausted grants may still stop their own retained stream.
+            enforce_live_capability_constraints_with_usage(
+                &request,
+                claims,
+                &principal,
+                Some(&resource_uri),
+                0,
+                0,
+            )?;
+        }
         let policy = simulate_policy_decision(&PolicySimulationInput {
             zone_policy: host.lookup_zone_policy(&auth.zone_id).await?,
             invoke_request: request.clone(),
@@ -416,7 +467,37 @@ impl EventService {
             enforce_operation_network_constraints: config.enforce_operation_network_constraints,
             generation,
             authority,
+            metered_request: request,
         })
+    }
+
+    fn require_current_admission(&self, host: &AppState, admission: &Admission) -> HostResult<()> {
+        if admission.generation != host.registry.version.load(Ordering::Acquire) {
+            return Err(denied("connector changed during event admission; retry"));
+        }
+        admission.authority.refresh()?.require_current()
+    }
+
+    /// One executor-local call and canonical control-input byte debit precedes
+    /// custody or upstream work. This shares the token's invocation account;
+    /// relay origins never reach this method. Failed or uncertain work cannot
+    /// refund authority. Event payload and provider bytes are not metered here.
+    async fn reserve_usage(&self, host: &AppState, admission: &Admission) -> HostResult<()> {
+        self.require_current_admission(host, admission)?;
+        let key = host
+            .capability_verifying_key
+            .as_ref()
+            .ok_or_else(|| denied("host event verification key is unavailable"))?;
+        host.lifecycle
+            .reserve_capability_usage(
+                &admission.metered_request,
+                key,
+                &admission.binding.principal,
+            )
+            .await?;
+        // The durable store may wait behind another writer. Never let that
+        // wait turn earlier lifecycle, inventory, or token authority stale.
+        self.require_current_admission(host, admission)
     }
 
     fn verify_instance(
@@ -450,7 +531,7 @@ impl EventService {
         admission: &Admission,
         stream_id: &str,
     ) -> HostResult<InstanceId> {
-        admission.authority.refresh()?.require_current()?;
+        self.require_current_admission(host, admission)?;
         let retained = self.journal()?.describe(stream_id)?;
         if retained.binding != admission.binding {
             return Err(denied("event stream belongs to another consumer or scope"));
@@ -465,8 +546,21 @@ impl EventService {
         request: OpenRequest,
         execution_fence: Option<fcp_host::ConnectorExecutionFence>,
     ) -> HostResult<Value> {
+        if !(1..=fcp_host::NATIVE_EVENT_MAX_WINDOW).contains(&request.window_size) {
+            return Err(invalid("event window must be between 1 and 64"));
+        }
         let admission = self
-            .authorize(host, &request.auth, true, execution_fence)
+            .authorize(
+                host,
+                &request.auth,
+                true,
+                execution_fence,
+                json!({
+                    "method": "open",
+                    "stream_id": request.stream_id,
+                    "window_size": request.window_size,
+                }),
+            )
             .await?;
         let termination = NativeInvocationTermination::new(Instant::now() + REQUEST_TIMEOUT);
         termination.bind_inventory_fence(host.registry.inventory_fence(admission.generation));
@@ -478,25 +572,8 @@ impl EventService {
         }
         // A native subscription starts provider traffic. Apply the same
         // runtime egress gate used by invoke before dispatching it.
-        let network_request = InvokeRequest {
-            r#type: "invoke".into(),
-            id: RequestId::new(request.auth.request_id.clone()),
-            connector_id: request.auth.connector_id.clone(),
-            operation: admission.operation.clone(),
-            zone_id: request.auth.zone_id.clone(),
-            input: json!({"resource_uri": admission.resource_uri}),
-            capability_token: request.auth.capability_token.clone(),
-            holder_proof: request.auth.holder_proof.clone(),
-            context: None,
-            idempotency_key: None,
-            lease_seq: None,
-            deadline_ms: None,
-            correlation_id: None,
-            provenance: None,
-            approval_tokens: Vec::new(),
-        };
         host.registry
-            .enforce_runtime_network_policy(&network_request)
+            .enforce_runtime_network_policy(&admission.metered_request)
             .await?;
         let stream_id = match request.stream_id {
             Some(stream_id) => stream_id,
@@ -567,7 +644,19 @@ impl EventService {
         // Health preparation and attachment ownership can both wait. Refresh
         // before durable custody changes; the physical RPC has its own guard
         // at actor selection after any subsequent zone-lock or queue wait.
-        admission.authority.refresh()?.require_current()?;
+        self.require_current_admission(host, &admission)?;
+        journal.check_registration(
+            &stream_id,
+            &admission.binding,
+            request.window_size,
+            &instance_id,
+        )?;
+        self.reserve_usage(host, &admission).await?;
+        // Quota persistence is an authorization wait, not permission to reuse
+        // stale identity or custody. Recheck before the first journal write;
+        // registration and the native writer repeat their own final fences.
+        self.verify_instance(host, &request.auth, &admission, &instance_id)?;
+        self.require_current_admission(host, &admission)?;
         // Persist ownership before retiring any previous process. A token for
         // a different principal must not disrupt its retained consumer.
         let stream = journal.register(
@@ -747,9 +836,20 @@ impl EventService {
         request: PollRequest,
         execution_fence: Option<fcp_host::ConnectorExecutionFence>,
     ) -> HostResult<Value> {
+        if request.limit == 0 || request.limit > fcp_host::NATIVE_EVENT_MAX_WINDOW as usize {
+            return Err(invalid("event poll limit must be between 1 and 64"));
+        }
         let admitted = self
-            .authorize(host, &request.auth, true, execution_fence)
+            .authorize(
+                host,
+                &request.auth,
+                true,
+                execution_fence,
+                json!({"method": "poll", "stream_id": request.stream_id, "limit": request.limit}),
+            )
             .await?;
+        self.authorize_retained(host, &request.auth, &admitted, &request.stream_id)?;
+        self.reserve_usage(host, &admitted).await?;
         let instance =
             self.authorize_retained(host, &request.auth, &admitted, &request.stream_id)?;
         let batch = self.journal()?.poll(
@@ -767,9 +867,18 @@ impl EventService {
         request: AckRequest,
         execution_fence: Option<fcp_host::ConnectorExecutionFence>,
     ) -> HostResult<Value> {
+        validate_ack_control(&request.auth, &request.ack)?;
         let admitted = self
-            .authorize(host, &request.auth, true, execution_fence)
+            .authorize(
+                host,
+                &request.auth,
+                true,
+                execution_fence,
+                json!({"method": "ack", "stream_id": request.stream_id, "ack": request.ack}),
+            )
             .await?;
+        self.authorize_retained(host, &request.auth, &admitted, &request.stream_id)?;
+        self.reserve_usage(host, &admitted).await?;
         let instance =
             self.authorize_retained(host, &request.auth, &admitted, &request.stream_id)?;
         // This synchronization is the custody handoff. No connector ACK may
@@ -832,7 +941,15 @@ impl EventService {
     }
 
     async fn close(&self, host: &AppState, request: CloseRequest) -> HostResult<Value> {
-        let admitted = self.authorize(host, &request.auth, false, None).await?;
+        let admitted = self
+            .authorize(
+                host,
+                &request.auth,
+                false,
+                None,
+                json!({"method": "close", "stream_id": request.stream_id}),
+            )
+            .await?;
         let instance =
             self.authorize_retained(host, &request.auth, &admitted, &request.stream_id)?;
         let stream = self

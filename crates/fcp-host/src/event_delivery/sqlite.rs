@@ -325,6 +325,17 @@ impl SqliteJournal {
         }
     }
 
+    pub(super) fn check_registration(
+        &mut self,
+        stream_id: &str,
+        binding: &NativeEventBinding,
+        window_size: u32,
+    ) -> SqlResult<()> {
+        self.transaction(|transaction| {
+            registration_candidate(transaction, stream_id, binding, window_size).map(|_| ())
+        })
+    }
+
     pub(super) fn register(
         &mut self,
         stream_id: &str,
@@ -333,32 +344,13 @@ impl SqliteJournal {
         instance_id: InstanceId,
     ) -> SqlResult<NativeEventStream> {
         self.transaction(|transaction| {
-            if let Some(mut stream) = find_stream(transaction, stream_id)? {
-                authorize(&stream, &binding, None)?;
-                if stream.window_size != window_size {
-                    return Err(invalid("retained stream window cannot change").into());
-                }
-                if stream.closed {
-                    return Err(unavailable("closed event streams cannot be reopened").into());
-                }
+            if let Some(mut stream) = registration_candidate(transaction, stream_id, &binding, window_size)? {
                 // Native mappings carry their physical instance, so no scan or
                 // rewrite of historical cursor receipts is needed on reattach.
                 transaction.execute("UPDATE streams SET attachment_epoch = attachment_epoch + (instance_id != ?2), instance_id = ?2 WHERE stream_id = ?1",
                     params![stream_id, instance_id.as_str()])?;
                 stream.instance_id = instance_id;
                 return Ok(stream);
-            }
-            let active: i64 = transaction.query_row(
-                "SELECT count(*) FROM streams INDEXED BY active_stream WHERE closed = 0 OR pending_count > 0",
-                [], |row| row.get(0))?;
-            if active >= NATIVE_EVENT_MAX_STREAMS as i64 {
-                return Err(unavailable("event journal active stream limit reached").into());
-            }
-            let overlap: bool = transaction.query_row(
-                "SELECT EXISTS(SELECT 1 FROM streams INDEXED BY active_source WHERE connector_id = ?1 AND zone_id = ?2 AND (closed = 0 OR pending_count > 0))",
-                params![binding.connector_id.as_str(), binding.zone_id.as_str()], |row| row.get(0))?;
-            if overlap {
-                return Err(unavailable("connector already has a retained event consumer").into());
             }
             let record = StreamRecord { binding, instance_id, window_size, closed: false,
                 pending: VecDeque::new(), acknowledged: BTreeMap::new() };
@@ -586,6 +578,41 @@ fn insert_event(
         "INSERT INTO events(stream_id, cursor, delivery_seq, native_seq, native_instance, digest, event_json, payload_bytes, delivered, native_epoch) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![stream_id, cursor, delivery.as_slice(), native.as_ref().map(<[u8; 8]>::as_slice), native_seq.map(|_| instance.as_str()), digest, payload, payload.map_or(0, |bytes| bytes.len() as i64), delivered, native_seq.map(|_| epoch)])?;
     Ok(())
+}
+
+fn registration_candidate(
+    connection: &Connection,
+    stream_id: &str,
+    binding: &NativeEventBinding,
+    window_size: u32,
+) -> SqlResult<Option<NativeEventStream>> {
+    if let Some(stream) = find_stream(connection, stream_id)? {
+        authorize(&stream, binding, None)?;
+        if stream.window_size != window_size {
+            return Err(invalid("retained stream window cannot change").into());
+        }
+        if stream.closed {
+            return Err(unavailable("closed event streams cannot be reopened").into());
+        }
+        return Ok(Some(stream));
+    }
+    let active: i64 = connection.query_row(
+        "SELECT count(*) FROM streams INDEXED BY active_stream WHERE closed = 0 OR pending_count > 0",
+        [],
+        |row| row.get(0),
+    )?;
+    if active >= NATIVE_EVENT_MAX_STREAMS as i64 {
+        return Err(unavailable("event journal active stream limit reached").into());
+    }
+    let overlap: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM streams INDEXED BY active_source WHERE connector_id = ?1 AND zone_id = ?2 AND (closed = 0 OR pending_count > 0))",
+        params![binding.connector_id.as_str(), binding.zone_id.as_str()],
+        |row| row.get(0),
+    )?;
+    if overlap {
+        return Err(unavailable("connector already has a retained event consumer").into());
+    }
+    Ok(None)
 }
 
 fn find_stream(connection: &Connection, stream_id: &str) -> SqlResult<Option<NativeEventStream>> {

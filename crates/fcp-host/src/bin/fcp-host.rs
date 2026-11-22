@@ -1291,9 +1291,7 @@ impl NativeWarmPoolConnector {
         connector: &Arc<SubprocessConnector>,
     ) -> HostResult<()> {
         let mut instances = self.prepared_instances.lock().map_err(|_| {
-            HostError::Unavailable(
-                "native warm-pool identity registry is unavailable".to_owned(),
-            )
+            HostError::Unavailable("native warm-pool identity registry is unavailable".to_owned())
         })?;
         instances.retain(|_, owner| owner.strong_count() > 0);
         if let Some(owner) = instances.get(instance).and_then(std::sync::Weak::upgrade)
@@ -1337,9 +1335,11 @@ impl NativeWarmPoolConnector {
         }
         if (self.config.allowed_operations.is_empty() && self.config.enforce_empty_allow_lists)
             || (!self.config.allowed_operations.is_empty()
-                && !self.config.allowed_operations.iter().any(|operation| {
-                    operation == request.operation.as_str()
-                }))
+                && !self
+                    .config
+                    .allowed_operations
+                    .iter()
+                    .any(|operation| operation == request.operation.as_str()))
         {
             return Err(HostError::PreflightFailed(
                 "native warm-pool operation is not allowed by inventory".to_owned(),
@@ -1354,9 +1354,7 @@ impl NativeWarmPoolConnector {
                 )
             })?;
         let key = self.capability_verifying_key.ok_or_else(|| {
-            HostError::PreflightFailed(
-                "host capability verification is not configured".to_owned(),
-            )
+            HostError::PreflightFailed("host capability verification is not configured".to_owned())
         })?;
         let resources = live_constraint_resource_uri(request.input)
             .into_iter()
@@ -1381,7 +1379,9 @@ impl NativeWarmPoolConnector {
             .and_then(ciborium::Value::as_text)
             .ok_or_else(denied)?;
         let instance = InstanceId::try_from(instance.to_owned()).map_err(|_| denied())?;
-        verified.promote_with_instance(&instance).map_err(|_| denied())?;
+        verified
+            .promote_with_instance(&instance)
+            .map_err(|_| denied())?;
         Ok(instance)
     }
 
@@ -1402,15 +1402,25 @@ impl NativeWarmPoolConnector {
         let mut entry = checkout.entry;
         let prepared = {
             let mut handshaken_zone = entry.connector.handshaken_zone.lock().await;
-            entry.connector.handshake_if_needed(zone, &mut handshaken_zone, None).await?;
+            entry
+                .connector
+                .handshake_if_needed(zone, &mut handshaken_zone, None)
+                .await?;
             let health = entry.connector.rpc("health", json!({})).await?;
-            session::prepared_from_health(self.connector_id.clone(), zone.clone(), health)
-                .map_err(|_| HostError::Unavailable(
-                    "native warm-pool executor did not report a ready authenticated instance"
-                        .to_owned(),
-                ))?
+            session::prepared_from_health(self.connector_id.clone(), zone.clone(), health).map_err(
+                |_| {
+                    HostError::Unavailable(
+                        "native warm-pool executor did not report a ready authenticated instance"
+                            .to_owned(),
+                    )
+                },
+            )?
         };
-        if entry.instance_id.as_ref().is_some_and(|previous| previous != &prepared.instance_id) {
+        if entry
+            .instance_id
+            .as_ref()
+            .is_some_and(|previous| previous != &prepared.instance_id)
+        {
             return Err(HostError::Unavailable(
                 "prepared native warm-pool instance changed; prepare a new executor".to_owned(),
             ));
@@ -1432,7 +1442,10 @@ impl NativeWarmPoolConnector {
         }
         entries.push(entry);
         self.apply_retention_locked(&mut entries);
-        if !entries.iter().any(|entry| Arc::ptr_eq(&entry.connector, &selected)) {
+        if !entries
+            .iter()
+            .any(|entry| Arc::ptr_eq(&entry.connector, &selected))
+        {
             return Err(HostError::Unavailable(
                 "prepared native warm-pool executor could not be retained under current pool limits"
                     .to_owned(),
@@ -1478,13 +1491,25 @@ impl NativeWarmPoolConnector {
         handshaken_zone: &mut Option<ZoneId>,
         termination: Option<&NativeInvocationTermination>,
     ) -> HostResult<()> {
-        entry.connector.handshake_if_needed(request.zone_id, handshaken_zone, termination).await?;
-        let health = entry.connector.rpc_with_termination("health", json!({}), termination).await?;
+        entry
+            .connector
+            .handshake_if_needed(request.zone_id, handshaken_zone, termination)
+            .await?;
+        let health = entry
+            .connector
+            .rpc_with_termination("health", json!({}), termination)
+            .await?;
         let prepared = session::prepared_from_health(
-            self.connector_id.clone(), request.zone_id.clone(), health,
-        ).map_err(|_| HostError::Unavailable(
-            "prepared native warm-pool executor is no longer ready; prepare a new executor".to_owned(),
-        ))?;
+            self.connector_id.clone(),
+            request.zone_id.clone(),
+            health,
+        )
+        .map_err(|_| {
+            HostError::Unavailable(
+                "prepared native warm-pool executor is no longer ready; prepare a new executor"
+                    .to_owned(),
+            )
+        })?;
         if entry.instance_id.as_ref() != Some(&prepared.instance_id) {
             return Err(HostError::Unavailable(
                 "prepared native warm-pool instance changed before dispatch".to_owned(),
@@ -1500,7 +1525,10 @@ impl NativeWarmPoolConnector {
             entry_age: entry.created_at.elapsed(),
             previous_exit: None,
         };
-        if !matches!(self.config.prewarm.decide_checkout(&observation), PrewarmCheckoutDecision::AdmitWarm { .. }) {
+        if !matches!(
+            self.config.prewarm.decide_checkout(&observation),
+            PrewarmCheckoutDecision::AdmitWarm { .. }
+        ) {
             return Err(HostError::Unavailable(
                 "prepared native warm-pool executor no longer satisfies checkout policy".to_owned(),
             ));
@@ -7655,12 +7683,30 @@ fn enforce_live_capability_constraints(
     principal: &str,
     resource_uri: Option<&str>,
 ) -> HostResult<()> {
-    let constraints = capability_constraints_from_claims(claims)?;
     let input_cbor = to_deterministic_cbor(&request.input).map_err(|error| {
         HostError::PreflightFailed(format!(
             "failed to canonicalize request input for capability constraints: {error}"
         ))
     })?;
+    enforce_live_capability_constraints_with_usage(
+        request,
+        claims,
+        principal,
+        resource_uri,
+        1,
+        input_cbor.len().try_into().unwrap_or(u64::MAX),
+    )
+}
+
+fn enforce_live_capability_constraints_with_usage(
+    request: &InvokeRequest,
+    claims: &fcp_crypto::cose::CwtClaims,
+    principal: &str,
+    resource_uri: Option<&str>,
+    observed_calls: u32,
+    observed_bytes: u64,
+) -> HostResult<()> {
+    let constraints = capability_constraints_from_claims(claims)?;
     let requested_at_unix_ms = u64::try_from(Utc::now().timestamp_millis()).map_err(|_| {
         HostError::PreflightFailed(
             "system clock produced a negative timestamp for capability constraint enforcement"
@@ -7680,8 +7726,8 @@ fn enforce_live_capability_constraints(
         host: String::new(),
         resource_uri: resource_uri.unwrap_or_default().to_string(),
         requested_at_unix_ms,
-        observed_calls: 1,
-        observed_bytes: input_cbor.len().try_into().unwrap_or(u64::MAX),
+        observed_calls,
+        observed_bytes,
     };
 
     match DefaultConstraintEnforcer::new().evaluate(&constraints, &descriptor) {
@@ -18484,7 +18530,9 @@ fn mesh_forward_error_message(error: &fcp_mesh::invoke_route::MeshForwardError) 
         MeshForwardError::HopLimitExceeded { .. } => "mesh forward hop limit was exceeded",
         MeshForwardError::Stale { .. } => "mesh forward envelope is not fresh",
         MeshForwardError::Replayed { .. } => "mesh forward nonce was already accepted",
-        MeshForwardError::ReplayCacheSaturated { .. } => "mesh forward replay admission is at capacity",
+        MeshForwardError::ReplayCacheSaturated { .. } => {
+            "mesh forward replay admission is at capacity"
+        }
         MeshForwardError::ReplyBindingMismatch(_) => "mesh forward reply binding is invalid",
         MeshForwardError::BodyTooLarge { .. } => "mesh forward body exceeds its method limit",
     }
@@ -18789,11 +18837,8 @@ async fn mesh_forward_handler(
     state: State<Arc<AppState>>,
     Json(envelope): Json<fcp_mesh::invoke_route::MeshForwardEnvelope>,
 ) -> Result<Json<fcp_mesh::invoke_route::MeshForwardReply>, (StatusCode, String)> {
-    mesh_forward_admitted_handler(
-        state,
-        mesh_forward_intake::AdmittedJson::for_test(envelope),
-    )
-    .await
+    mesh_forward_admitted_handler(state, mesh_forward_intake::AdmittedJson::for_test(envelope))
+        .await
 }
 
 /// The connectors this host executes, as mesh advertisement entries.
@@ -23298,7 +23343,9 @@ output_schema = {{ type = "object" }}
         let response = app.clone().oneshot(request(schema_body)).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(
-            axum::body::to_bytes(response.into_body(), 128).await.unwrap(),
+            axum::body::to_bytes(response.into_body(), 128)
+                .await
+                .unwrap(),
             "mesh forward schema is unsupported"
         );
         let mut unknown_origin = envelope.clone();
@@ -23311,7 +23358,9 @@ output_schema = {{ type = "object" }}
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(
-            axum::body::to_bytes(response.into_body(), 128).await.unwrap(),
+            axum::body::to_bytes(response.into_body(), 128)
+                .await
+                .unwrap(),
             "mesh forward origin is not trusted"
         );
         let mut forged = envelope.clone();
@@ -23323,7 +23372,9 @@ output_schema = {{ type = "object" }}
             let response = app.clone().oneshot(request(forged.clone())).await.unwrap();
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
             assert_eq!(
-                axum::body::to_bytes(response.into_body(), 128).await.unwrap(),
+                axum::body::to_bytes(response.into_body(), 128)
+                    .await
+                    .unwrap(),
                 "mesh forward signature is invalid"
             );
         }
@@ -23334,14 +23385,18 @@ output_schema = {{ type = "object" }}
             .unwrap();
         assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
         assert_eq!(
-            axum::body::to_bytes(malformed.into_body(), 256).await.unwrap(),
+            axum::body::to_bytes(malformed.into_body(), 256)
+                .await
+                .unwrap(),
             "mesh forward envelope is invalid"
         );
         let body = serde_json::to_vec(&envelope).unwrap();
         let response = app.clone().oneshot(request(body.clone())).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let reply: MeshForwardReply = serde_json::from_slice(
-            &axum::body::to_bytes(response.into_body(), 4096).await.unwrap(),
+            &axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap(),
         )
         .expect("authenticated mesh reply");
         assert_eq!(reply.status, StatusCode::NOT_FOUND.as_u16());
@@ -23349,7 +23404,9 @@ output_schema = {{ type = "object" }}
             let response = app.clone().oneshot(request(body.clone())).await.unwrap();
             assert_eq!(response.status(), StatusCode::CONFLICT);
             assert_eq!(
-                axum::body::to_bytes(response.into_body(), 128).await.unwrap(),
+                axum::body::to_bytes(response.into_body(), 128)
+                    .await
+                    .unwrap(),
                 "mesh forward nonce was already accepted"
             );
         }
@@ -36190,7 +36247,10 @@ done"#;
         manifest.capabilities.required = vec![echo.capability.clone()];
         manifest.capabilities.optional.clear();
         manifest.provides.operations.clear();
-        manifest.provides.operations.insert("test.echo".to_owned(), echo);
+        manifest
+            .provides
+            .operations
+            .insert("test.echo".to_owned(), echo);
         manifest.manifest.interface_hash = manifest
             .compute_interface_hash()
             .expect("fixture interface hash");
@@ -36490,7 +36550,10 @@ done"#;
         let error = pool
             .register_prepared_instance(&original.instance_id, &other_worker)
             .unwrap_err();
-        assert!(error.to_string().contains("ambiguous instance identity"), "{error}");
+        assert!(
+            error.to_string().contains("ambiguous instance identity"),
+            "{error}"
+        );
         pool.register_prepared_instance(&original.instance_id, &original_worker)
             .expect("the same live owner can be prepared again");
         {
@@ -36552,8 +36615,18 @@ done"#;
         requests.push(("forged signature", forged));
         for (label, capability, operation, zone) in [
             ("wrong capability", "cap.test.other", "test.echo", "z:work"),
-            ("wrong operation grant", "cap.test.echo", "test.other", "z:work"),
-            ("wrong signed zone", "cap.test.echo", "test.echo", "z:private"),
+            (
+                "wrong operation grant",
+                "cap.test.echo",
+                "test.other",
+                "z:work",
+            ),
+            (
+                "wrong signed zone",
+                "cap.test.echo",
+                "test.echo",
+                "z:private",
+            ),
         ] {
             let mut request = valid.clone();
             request.capability_token = test_capability_token_for_instance(
@@ -36613,7 +36686,9 @@ done"#;
             assert_eq!(entries.len(), workers.len(), "{label}");
             for worker in &workers {
                 assert!(
-                    entries.iter().any(|entry| Arc::ptr_eq(&entry.connector, worker)),
+                    entries
+                        .iter()
+                        .any(|entry| Arc::ptr_eq(&entry.connector, worker)),
                     "invalid authority must not consume or replace a worker: {label}",
                 );
             }
@@ -36674,7 +36749,11 @@ done"#;
         let error = pool.invoke(request).await.unwrap_err();
         assert!(error.to_string().contains("unavailable or busy"), "{error}");
         let entries = pool.entries.lock().await;
-        assert_eq!(entries.len(), 1, "stale target must not trigger replacement");
+        assert_eq!(
+            entries.len(),
+            1,
+            "stale target must not trigger replacement"
+        );
         assert!(Arc::ptr_eq(&entries[0].connector, &other_worker));
         drop(entries);
         assert_eq!(warm_pool_authorized_invocations(&target_worker).await, 0);

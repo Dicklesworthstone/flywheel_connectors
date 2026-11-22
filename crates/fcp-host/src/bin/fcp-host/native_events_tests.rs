@@ -408,6 +408,392 @@ async fn signed_consumer_polls_and_commits_ack_without_connector_rpc() {
 }
 
 #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn stream_open_poll_and_ack_share_one_signed_call_budget_and_close_remains_available() {
+    let mut fixture = fixture().await;
+    mesh_tests::install_native_source(&mut fixture).await;
+    let mut grant = issuance("agent:alice");
+    grant.max_calls = Some(3);
+    let (token, _) = issue(&fixture, grant).await;
+    let app = app(&fixture);
+    let (status, body) = send(
+        app.clone(),
+        "/rpc/streams/open",
+        json!({"auth":auth(&token),"stream_id":STREAM,"window_size":1}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while fixture.journal.describe(STREAM).unwrap().pending_events == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "native event never reached durable custody"
+        );
+        fcp_async_core::time::sleep(Duration::from_millis(10)).await;
+    }
+    let (status, body) = send(
+        app.clone(),
+        "/rpc/streams/poll",
+        json!({"auth":auth(&token),"stream_id":STREAM,"limit":1}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = send(
+        app.clone(),
+        "/rpc/streams/ack",
+        json!({"auth":auth(&token),"stream_id":STREAM,"ack":acknowledgement()}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let committed: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(committed["upstream_notified"], true);
+    assert_eq!(committed["stream"]["acknowledged_events"], 1);
+    // Reusing a request ID is not a free replay of a control operation.
+    for route in ["open", "poll", "ack"] {
+        let mut request = json!({"auth":auth(&token),"stream_id":STREAM});
+        if route == "ack" {
+            request["ack"] = json!(acknowledgement());
+        }
+        let (status, body) = send(app.clone(), &format!("/rpc/streams/{route}"), request).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{route}: {body}");
+        assert!(body.contains("call budget"), "{body}");
+    }
+    let (status, body) = send(
+        app,
+        "/rpc/streams/close",
+        json!({"auth":auth(&token),"stream_id":STREAM}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let retained = fixture.journal.describe(STREAM).unwrap();
+    assert!(retained.closed);
+    assert_eq!(retained.pending_events, 0);
+    assert_eq!(retained.acknowledged_events, 1);
+}
+
+fn metered_control_bytes(control: Value) -> u64 {
+    to_deterministic_cbor(&json!({
+        "topic": TOPIC,
+        "resource_uri": RESOURCE,
+        "control": control,
+    }))
+    .unwrap()
+    .len()
+    .try_into()
+    .unwrap()
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn retained_stream_owner_window_and_instance_refusals_do_not_spend_authority() {
+    let mut fixture = fixture().await;
+    mesh_tests::install_native_source(&mut fixture).await;
+    let (owner, _) = issue(&fixture, issuance("agent:alice")).await;
+    let app = app(&fixture);
+    let (status, body) = send(
+        app.clone(),
+        "/rpc/streams/open",
+        json!({"auth":auth(&owner),"stream_id":STREAM,"window_size":1}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    for (principal, target, window, expected) in [
+        ("agent:bob", instance(), 1, StatusCode::FORBIDDEN),
+        ("agent:alice", instance(), 2, StatusCode::BAD_REQUEST),
+        ("agent:alice", InstanceId::new(), 1, StatusCode::FORBIDDEN),
+    ] {
+        let mut grant = issuance(principal);
+        grant.instance_id = Some(target);
+        grant.max_calls = Some(1);
+        let (token, _) = issue(&fixture, grant).await;
+        let authority: StreamAuthority = serde_json::from_value(auth(&token)).unwrap();
+        let admitted = fixture
+            .host
+            .native_events
+            .authorize(
+                &fixture.host,
+                &authority,
+                true,
+                None,
+                json!({"method":"open","stream_id":STREAM,"window_size":window}),
+            )
+            .await
+            .unwrap();
+        let (status, body) = send(
+            app.clone(),
+            "/rpc/streams/open",
+            json!({"auth":auth(&token),"stream_id":STREAM,"window_size":window}),
+        )
+        .await;
+        assert_eq!(status, expected, "{body}");
+        fixture
+            .host
+            .lifecycle
+            .check_capability_usage(
+                &admitted.metered_request,
+                &fixture.key.verifying_key(),
+                principal,
+            )
+            .await
+            .expect("retained ownership/instance/window refusal must precede the debit");
+        let retained = fixture.journal.describe(STREAM).unwrap();
+        assert_eq!(retained.binding, owner_binding());
+        assert_eq!(retained.instance_id, instance());
+        assert_eq!(retained.window_size, 1);
+    }
+    let (status, body) = send(
+        app,
+        "/rpc/streams/close",
+        json!({"auth":auth(&owner),"stream_id":STREAM}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn stream_control_byte_budget_is_cumulative_and_ack_denial_preserves_custody() {
+    let fixture = fixture().await;
+    let poll_bytes = metered_control_bytes(json!({"method":"poll","stream_id":STREAM,"limit":1}));
+    let ack_bytes =
+        metered_control_bytes(json!({"method":"ack","stream_id":STREAM,"ack":acknowledgement()}));
+    let mut grant = issuance("agent:alice");
+    grant.max_bytes = Some(poll_bytes + ack_bytes - 1);
+    let (token, _) = issue(&fixture, grant).await;
+    let app = app(&fixture);
+    let (status, body) = send(
+        app.clone(),
+        "/rpc/streams/poll",
+        json!({"auth":auth(&token),"stream_id":STREAM,"limit":1}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = send(
+        app.clone(),
+        "/rpc/streams/ack",
+        json!({"auth":auth(&token),"stream_id":STREAM,"ack":acknowledgement()}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(body.contains("byte budget"), "{body}");
+    let retained = fixture.journal.describe(STREAM).unwrap();
+    assert_eq!(
+        retained.pending_events, 1,
+        "quota refusal cannot release custody"
+    );
+    assert_eq!(retained.acknowledged_events, 0);
+    let (status, body) = send(
+        app,
+        "/rpc/streams/close",
+        json!({"auth":auth(&token),"stream_id":STREAM}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(fixture.journal.describe(STREAM).unwrap().pending_events, 1);
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn stream_byte_constraints_include_poll_controls_and_ack_cursor_payloads() {
+    let fixture = fixture().await;
+    let mut grant = issuance("agent:alice");
+    grant.max_bytes = Some(metered_control_bytes(
+        json!({"method":"poll","stream_id":STREAM,"limit":1}),
+    ));
+    let (token, _) = issue(&fixture, grant).await;
+    let app = app(&fixture);
+    for request in [
+        json!({"auth":auth(&token),"stream_id":STREAM,"limit":64}),
+        json!({"auth":auth(&token),"stream_id":"x".repeat(128),"limit":1}),
+    ] {
+        let (status, body) = send(app.clone(), "/rpc/streams/poll", request).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(body.contains("max_bytes"), "{body}");
+    }
+    let (status, body) = send(
+        app.clone(),
+        "/rpc/streams/poll",
+        json!({"auth":auth(&token),"stream_id":STREAM,"limit":1}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "rejected payloads must not debit: {body}"
+    );
+
+    let mut grant = issuance("agent:alice");
+    grant.max_bytes = Some(metered_control_bytes(
+        json!({"method":"ack","stream_id":STREAM,"ack":acknowledgement()}),
+    ));
+    let (token, _) = issue(&fixture, grant).await;
+    let long_ack = EventAck::new(TOPIC, vec![7]).with_cursors(vec!["c".repeat(1024)]);
+    let (status, body) = send(
+        app.clone(),
+        "/rpc/streams/ack",
+        json!({"auth":auth(&token),"stream_id":STREAM,"ack":long_ack}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(body.contains("max_bytes"), "{body}");
+    let (status, body) = send(
+        app,
+        "/rpc/streams/ack",
+        json!({"auth":auth(&token),"stream_id":STREAM,"ack":acknowledgement()}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "rejected cursor payload must not debit: {body}"
+    );
+    assert_eq!(
+        fixture
+            .journal
+            .describe(STREAM)
+            .unwrap()
+            .acknowledged_events,
+        1
+    );
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn malformed_stream_controls_do_not_consume_the_last_signed_call() {
+    let fixture = fixture().await;
+    let mut grant = issuance("agent:alice");
+    grant.max_calls = Some(1);
+    let (token, _) = issue(&fixture, grant).await;
+    let app = app(&fixture);
+    for (route, request) in [
+        (
+            "poll",
+            json!({"auth":auth(&token),"stream_id":STREAM,"limit":0}),
+        ),
+        (
+            "poll",
+            json!({"auth":auth(&token),"stream_id":STREAM,"limit":65}),
+        ),
+        (
+            "poll",
+            json!({"auth":auth(&token),"stream_id":"missing-stream","limit":1}),
+        ),
+        (
+            "open",
+            json!({"auth":auth(&token),"stream_id":STREAM,"window_size":0}),
+        ),
+        (
+            "open",
+            json!({"auth":auth(&token),"stream_id":STREAM,"window_size":65}),
+        ),
+        (
+            "ack",
+            json!({"auth":auth(&token),"stream_id":STREAM,"ack":EventAck::new(TOPIC, Vec::new())}),
+        ),
+        (
+            "ack",
+            json!({"auth":auth(&token),"stream_id":STREAM,"ack":EventAck::new(TOPIC, vec![7])}),
+        ),
+        (
+            "ack",
+            json!({"auth":auth(&token),"stream_id":STREAM,"ack":EventAck::new(TOPIC, vec![7,8]).with_cursors(vec!["same".to_owned(),"same".to_owned()])}),
+        ),
+        (
+            "ack",
+            json!({"auth":auth(&token),"stream_id":STREAM,"ack":EventAck::new(TOPIC, vec![7]).with_cursors(vec!["x".repeat(1025)])}),
+        ),
+        (
+            "ack",
+            json!({"auth":auth(&token),"stream_id":STREAM,"ack":EventAck::new("other.topic", vec![7]).with_cursors(vec!["provider-cursor-7".to_owned()])}),
+        ),
+    ] {
+        let (status, body) = send(app.clone(), &format!("/rpc/streams/{route}"), request).await;
+        assert!(status.is_client_error(), "{route}: {body}");
+    }
+    let mut wrong_zone = auth(&token);
+    wrong_zone["zone_id"] = json!(ZoneId::private());
+    let (status, body) = send(
+        app.clone(),
+        "/rpc/streams/poll",
+        json!({"auth":wrong_zone,"stream_id":STREAM,"limit":1}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let request = json!({"auth":auth(&token),"stream_id":STREAM,"limit":1});
+    let (status, body) = send(app.clone(), "/rpc/streams/poll", request.clone()).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "invalid controls spent authority: {body}"
+    );
+    let (status, body) = send(app, "/rpc/streams/poll", request).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn concurrent_stream_polls_cannot_share_the_last_signed_call() {
+    let fixture = fixture().await;
+    let mut grant = issuance("agent:alice");
+    grant.max_calls = Some(1);
+    let (token, _) = issue(&fixture, grant).await;
+    let app = app(&fixture);
+    let results = futures_util::future::join_all((0..8).map(|_| {
+        send(
+            app.clone(),
+            "/rpc/streams/poll",
+            json!({"auth":auth(&token),"stream_id":STREAM,"limit":1}),
+        )
+    }))
+    .await;
+    assert_eq!(
+        results
+            .iter()
+            .filter(|(status, _)| *status == StatusCode::OK)
+            .count(),
+        1
+    );
+    assert_eq!(
+        results
+            .iter()
+            .filter(|(status, _)| *status == StatusCode::FORBIDDEN)
+            .count(),
+        7
+    );
+    let retained = fixture.journal.describe(STREAM).unwrap();
+    assert_eq!(retained.pending_events, 1);
+    assert_eq!(retained.acknowledged_events, 0);
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn zero_usage_grant_can_close_only_its_own_retained_stream() {
+    let fixture = fixture().await;
+    let app = app(&fixture);
+    for principal in ["agent:bob", "agent:alice"] {
+        let mut grant = issuance(principal);
+        grant.max_calls = Some(0);
+        grant.max_bytes = Some(0);
+        let (token, _) = issue(&fixture, grant).await;
+        let (status, body) = send(
+            app.clone(),
+            "/rpc/streams/close",
+            json!({"auth":auth(&token),"stream_id":STREAM}),
+        )
+        .await;
+        let expected = if principal == "agent:alice" {
+            StatusCode::OK
+        } else {
+            StatusCode::FORBIDDEN
+        };
+        assert_eq!(status, expected, "{body}");
+        assert_eq!(
+            fixture.journal.describe(STREAM).unwrap().closed,
+            principal == "agent:alice"
+        );
+    }
+    assert_eq!(fixture.journal.describe(STREAM).unwrap().pending_events, 1);
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
 async fn lifecycle_disable_blocks_stream_work_preserves_custody_and_allows_authorized_close() {
     for desired in [
         fcp_host::DesiredRuntimeState::Disabled,
@@ -420,7 +806,13 @@ async fn lifecycle_disable_blocks_stream_work_preserves_custody_and_allows_autho
         let admitted = fixture
             .host
             .native_events
-            .authorize(&fixture.host, &authority, true, None)
+            .authorize(
+                &fixture.host,
+                &authority,
+                true,
+                None,
+                json!({"method":"poll","stream_id":STREAM,"limit":1}),
+            )
             .await
             .unwrap();
         fixture
@@ -611,7 +1003,13 @@ async fn owner_membership_withdrawal_blocks_holder_reads_and_custody_changes() {
     let admission = fixture
         .host
         .native_events
-        .authorize(&fixture.host, &authority, true, None)
+        .authorize(
+            &fixture.host,
+            &authority,
+            true,
+            None,
+            json!({"method":"poll","stream_id":STREAM,"limit":1}),
+        )
         .await
         .unwrap();
     fixture

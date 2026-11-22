@@ -234,6 +234,32 @@ impl NativeEventJournal {
         })
     }
 
+    /// Check whether a logical stream can be registered without changing custody.
+    ///
+    /// This allows a host to reject existing ownership, window, or capacity
+    /// conflicts before reserving a signed usage allowance. It does not attach
+    /// a process, clear native sequence mappings, or reserve space. Registration
+    /// repeats every check under mutation ownership after any intervening wait.
+    ///
+    /// # Errors
+    /// Rejects invalid identities, conflicting scope, closed streams, exhausted
+    /// stream capacity, and unavailable or fenced persistence.
+    pub fn check_registration(
+        &self,
+        stream_id: &str,
+        binding: &NativeEventBinding,
+        window_size: u32,
+        instance_id: &InstanceId,
+    ) -> HostResult<()> {
+        validate_registration(stream_id, binding, window_size, instance_id)?;
+        if self.path.is_some() {
+            return self
+                .with_sqlite(|sqlite| sqlite.check_registration(stream_id, binding, window_size));
+        }
+        let state = self.lock()?;
+        check_registration_snapshot(&state.snapshot, stream_id, binding, window_size)
+    }
+
     /// Register a logical stream, or reattach an identical retained binding.
     ///
     /// A connector/zone has one active consumer. Existing payloads and exact
@@ -250,26 +276,15 @@ impl NativeEventJournal {
         window_size: u32,
         instance_id: InstanceId,
     ) -> HostResult<NativeEventStream> {
-        validate_stream_id(stream_id)?;
-        validate_binding(&binding)?;
-        validate_identifier(instance_id.as_str(), "connector instance identifier")?;
-        if !(1..=NATIVE_EVENT_MAX_WINDOW).contains(&window_size) {
-            return Err(invalid("event window must be between 1 and 64"));
-        }
+        validate_registration(stream_id, &binding, window_size, &instance_id)?;
         if self.path.is_some() {
             return self.with_sqlite(|sqlite| {
                 sqlite.register(stream_id, binding, window_size, instance_id)
             });
         }
         self.mutate(|snapshot| {
+            check_registration_snapshot(snapshot, stream_id, &binding, window_size)?;
             if let Some(record) = snapshot.streams.get_mut(stream_id) {
-                check_binding(record, &binding)?;
-                if record.window_size != window_size {
-                    return Err(invalid("retained stream window cannot change"));
-                }
-                if record.closed {
-                    return Err(unavailable("closed event streams cannot be reopened"));
-                }
                 // The host must verify the capability against the newly
                 // observed instance before replacing this admission. Retained
                 // payloads keep their original provenance and delivery IDs.
@@ -287,18 +302,6 @@ impl NativeEventJournal {
                     record.instance_id = instance_id;
                 }
                 return Ok(stream_view(stream_id, record, self.path.is_some()));
-            }
-            if snapshot.streams.len() >= NATIVE_EVENT_MAX_STREAMS {
-                return Err(unavailable("event journal stream limit reached"));
-            }
-            if snapshot.streams.values().any(|record| {
-                record.binding.connector_id == binding.connector_id
-                    && record.binding.zone_id == binding.zone_id
-                    && (!record.closed || !record.pending.is_empty())
-            }) {
-                return Err(unavailable(
-                    "connector already has a retained event consumer",
-                ));
             }
             let record = StreamRecord {
                 binding,
@@ -648,6 +651,52 @@ fn check_binding(record: &StreamRecord, binding: &NativeEventBinding) -> HostRes
     if record.binding != *binding {
         return Err(denied(
             "event stream belongs to a different consumer or scope",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_registration(
+    stream_id: &str,
+    binding: &NativeEventBinding,
+    window_size: u32,
+    instance_id: &InstanceId,
+) -> HostResult<()> {
+    validate_stream_id(stream_id)?;
+    validate_binding(binding)?;
+    validate_identifier(instance_id.as_str(), "connector instance identifier")?;
+    if !(1..=NATIVE_EVENT_MAX_WINDOW).contains(&window_size) {
+        return Err(invalid("event window must be between 1 and 64"));
+    }
+    Ok(())
+}
+
+fn check_registration_snapshot(
+    snapshot: &JournalSnapshot,
+    stream_id: &str,
+    binding: &NativeEventBinding,
+    window_size: u32,
+) -> HostResult<()> {
+    if let Some(record) = snapshot.streams.get(stream_id) {
+        check_binding(record, binding)?;
+        if record.window_size != window_size {
+            return Err(invalid("retained stream window cannot change"));
+        }
+        if record.closed {
+            return Err(unavailable("closed event streams cannot be reopened"));
+        }
+        return Ok(());
+    }
+    if snapshot.streams.len() >= NATIVE_EVENT_MAX_STREAMS {
+        return Err(unavailable("event journal stream limit reached"));
+    }
+    if snapshot.streams.values().any(|record| {
+        record.binding.connector_id == binding.connector_id
+            && record.binding.zone_id == binding.zone_id
+            && (!record.closed || !record.pending.is_empty())
+    }) {
+        return Err(unavailable(
+            "connector already has a retained event consumer",
         ));
     }
     Ok(())
@@ -1050,6 +1099,143 @@ mod tests {
     pub(super) fn ack(sequence: u64) -> EventAck {
         EventAck::new(binding().topic, vec![sequence])
             .with_cursors(vec![format!("update:{sequence}")])
+    }
+
+    fn assert_registration_preview_preserves_custody(journal: &NativeEventJournal) {
+        for invalid_window in [0, NATIVE_EVENT_MAX_WINDOW + 1] {
+            assert!(
+                journal
+                    .check_registration("stream-1", &binding(), invalid_window, &instance_id())
+                    .is_err()
+            );
+        }
+        assert!(
+            journal
+                .check_registration("invalid stream", &binding(), 1, &instance_id())
+                .is_err()
+        );
+        for _ in 0..2 {
+            journal
+                .check_registration("stream-1", &binding(), 1, &instance_id())
+                .unwrap();
+        }
+        assert!(
+            journal.describe("stream-1").is_err(),
+            "preview must not create custody"
+        );
+        register(journal, 1);
+        ingest(journal, event(1)).unwrap();
+        journal
+            .poll("stream-1", &binding(), &instance_id(), 1)
+            .unwrap();
+
+        let replacement: InstanceId = "inst_native_delivery_replacement".parse().unwrap();
+        journal
+            .check_registration("stream-1", &binding(), 1, &replacement)
+            .unwrap();
+        let retained = journal.describe("stream-1").unwrap();
+        assert_eq!(retained.instance_id, instance_id());
+        assert_eq!(retained.pending_events, 1);
+        let mut other_owner = binding();
+        other_owner.principal = "agent:other".to_owned();
+        assert!(
+            journal
+                .check_registration("stream-1", &other_owner, 1, &replacement)
+                .is_err()
+        );
+        assert!(
+            journal
+                .check_registration("stream-1", &binding(), 2, &replacement)
+                .is_err()
+        );
+        assert!(
+            journal
+                .check_registration("stream-other", &binding(), 1, &replacement)
+                .is_err()
+        );
+        let confirmed = journal
+            .acknowledge("stream-1", &binding(), &instance_id(), &ack(1))
+            .unwrap();
+        assert_eq!(
+            confirmed.seqs,
+            vec![1],
+            "preview must not clear native sequence mappings"
+        );
+        journal
+            .close("stream-1", &binding(), &instance_id())
+            .unwrap();
+        assert!(
+            journal
+                .check_registration("stream-1", &binding(), 1, &replacement)
+                .is_err()
+        );
+
+        journal
+            .check_registration("stream-preview", &binding(), 1, &replacement)
+            .unwrap();
+        journal
+            .register("stream-competing", binding(), 1, replacement.clone())
+            .unwrap();
+        assert!(
+            journal
+                .register("stream-preview", binding(), 1, replacement)
+                .is_err(),
+            "registration must recheck conflicts introduced after a preview"
+        );
+    }
+
+    #[test]
+    fn memory_registration_preview_never_changes_custody() {
+        assert_registration_preview_preserves_custody(&NativeEventJournal::memory());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_registration_preview_never_changes_custody() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal = NativeEventJournal::open(directory.path().join("registration.json")).unwrap();
+        assert_registration_preview_preserves_custody(&journal);
+    }
+
+    fn assert_registration_preview_checks_capacity(journal: &NativeEventJournal) {
+        for index in 0..NATIVE_EVENT_MAX_STREAMS {
+            let mut binding = binding();
+            binding.connector_id = format!("fcp.fixture{index}:utility:1.0.0").parse().unwrap();
+            journal
+                .register(&format!("stream-{index}"), binding, 1, instance_id())
+                .unwrap();
+        }
+        assert!(
+            journal
+                .check_registration("stream-extra", &binding(), 1, &instance_id())
+                .unwrap_err()
+                .to_string()
+                .contains("stream limit")
+        );
+        let mut existing = binding();
+        existing.connector_id = ConnectorId::from_static("fcp.fixture0:utility:1.0.0");
+        journal
+            .check_registration("stream-0", &existing, 1, &instance_id())
+            .unwrap();
+        journal.state.lock().unwrap().persistence_failed = true;
+        assert!(
+            journal
+                .check_registration("stream-0", &existing, 1, &instance_id())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn memory_registration_preview_checks_capacity_and_persistence_fences() {
+        assert_registration_preview_checks_capacity(&NativeEventJournal::memory());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_registration_preview_checks_capacity_and_persistence_fences() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal = NativeEventJournal::open(directory.path().join("capacity.json")).unwrap();
+        assert_registration_preview_checks_capacity(&journal);
     }
 
     #[test]

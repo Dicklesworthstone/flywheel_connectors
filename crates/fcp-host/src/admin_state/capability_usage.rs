@@ -1,10 +1,12 @@
 //! Executor-local, durable accounting for signed capability usage ceilings.
 //!
-//! Admission spends a call and the deterministic-CBOR input size in the same
-//! snapshot transaction as its invocation ticket. Nothing refunds this debit:
-//! cancellation, a missing reply, or a crash may follow an external effect.
-//! Byte charges are an input-only lower bound, not complete request/response,
-//! provider-egress, or stream accounting. Accounts are not mesh-wide quotas.
+//! Invocation admission spends a call and the deterministic-CBOR input size in
+//! the same snapshot transaction as its invocation ticket. Stream controls debit
+//! the same account before changing custody or dispatching provider work.
+//! Nothing refunds these debits: cancellation, a missing reply, or a crash may
+//! follow an external effect. Byte charges cover admitted input, not response
+//! bodies, provider traffic, or delivered event payloads. Accounts are not
+//! mesh-wide quotas.
 //! Persistence follows the containing store: explicit in-memory stores retain
 //! counters only for that store's lifetime. A persisted admission-time high-water
 //! allows expired accounts to be reclaimed without allowing a backward clock
@@ -294,6 +296,10 @@ impl HostAdminStateStore {
         principal: &str,
     ) -> HostResult<()> {
         let scope = CapabilityUsageScope::from_request(request, verifying_key, principal)?;
+        self.check_capability_usage_scope(&scope).await
+    }
+
+    async fn check_capability_usage_scope(&self, scope: &CapabilityUsageScope) -> HostResult<()> {
         let state = self.state.read().await;
         if self.persistence_failed.load(Ordering::Acquire) {
             return Err(HostError::Unavailable(
@@ -303,7 +309,50 @@ impl HostAdminStateStore {
         }
         state
             .capability_usage
-            .check(&scope, Utc::now())
+            .check(scope, Utc::now())
+            .map_err(|error| match error {
+                LifecycleError::InvalidPolicy { reason } => denied(&reason),
+                other => HostError::Unavailable(other.to_string()),
+            })
+    }
+
+    /// Reserve one authorized stream control's signed call and input allowance.
+    ///
+    /// This uses exactly the same executor-local account as invocation
+    /// admission. The request input must contain the complete normalized control
+    /// payload, without bearer tokens or transport metadata. The caller must
+    /// independently authorize its operation, instance and retained ownership
+    /// before reserving, then recheck live authority after this await and before
+    /// changing custody or dispatching work. A forwarding origin must not debit
+    /// its own account on behalf of the executor.
+    ///
+    /// A successful limited reservation is persisted before returning. It is
+    /// never refunded, including when later validation, custody persistence,
+    /// cancellation or delivery fails. The quota and event journals are separate
+    /// stores: a lost reply can consume allowance without proving any effect.
+    /// No invocation-history ticket is invented for a stream control. Ordinary
+    /// invokes must use [`Self::admit_capability_invocation`] instead, which
+    /// commits their ticket and debit together.
+    ///
+    /// Grants without a call or input-byte ceiling only read the ledger. An
+    /// unlimited poll must not rewrite the entire admin snapshot, while prior
+    /// persistence failures and conflicting retained token IDs still deny it.
+    ///
+    /// # Errors
+    /// Rejects invalid signed scope, exhausted allowances, conflicting signed
+    /// token IDs, full accounting capacity, or unavailable persistence.
+    pub async fn reserve_capability_usage(
+        &self,
+        request: &InvokeRequest,
+        verifying_key: &Ed25519VerifyingKey,
+        principal: &str,
+    ) -> HostResult<()> {
+        let scope = CapabilityUsageScope::from_request(request, verifying_key, principal)?;
+        if scope.max_calls.is_none() && scope.max_input_bytes.is_none() {
+            return self.check_capability_usage_scope(&scope).await;
+        }
+        self.apply_mutation(|snapshot| snapshot.capability_usage.reserve(&scope, Utc::now()))
+            .await
             .map_err(|error| match error {
                 LifecycleError::InvalidPolicy { reason } => denied(&reason),
                 other => HostError::Unavailable(other.to_string()),
@@ -512,6 +561,251 @@ mod tests {
         let results = futures_util::future::join_all(attempts).await;
         assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 3);
         assert_eq!(store.state.read().await.invocations.len(), 3);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn stream_controls_and_invocations_share_one_signed_allowance() {
+        let store = HostAdminStateStore::new();
+        let key = signing_key().verifying_key();
+        let mut request = request(Some(3), None);
+        store
+            .reserve_capability_usage(&request, &key, "user:test")
+            .await
+            .unwrap();
+        request.id = RequestId::new("usage-invoke-after-stream");
+        store
+            .admit_capability_invocation(admission(&request), &request, &key)
+            .await
+            .unwrap();
+        request.id = RequestId::new("usage-stream-other-operation");
+        request.operation = OperationId::from_static("fixture.list");
+        request.connector_id = ConnectorId::from_static("fcp.test.other:utility:1.0.0");
+        store
+            .reserve_capability_usage(&request, &key, "user:test")
+            .await
+            .unwrap();
+        assert!(
+            store
+                .reserve_capability_usage(&request, &key, "user:test")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("call budget exhausted")
+        );
+        let state = store.state.read().await;
+        assert_eq!(state.invocations.len(), 1, "controls are not invocations");
+        assert_eq!(state.capability_usage.accounts.len(), 1);
+        assert_eq!(
+            state
+                .capability_usage
+                .accounts
+                .values()
+                .next()
+                .unwrap()
+                .calls,
+            3
+        );
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn concurrent_stream_and_invoke_admission_cannot_split_the_last_allowance() {
+        let store = HostAdminStateStore::new();
+        let key = signing_key().verifying_key();
+        let request = request(Some(3), None);
+        let attempts = (0..32).map(|index| {
+            let store = &store;
+            let key = &key;
+            let mut request = request.clone();
+            request.id = RequestId::new(format!("usage-mixed-{index}"));
+            async move {
+                if index % 2 == 0 {
+                    store
+                        .reserve_capability_usage(&request, key, "user:test")
+                        .await
+                } else {
+                    store
+                        .admit_capability_invocation(admission(&request), &request, key)
+                        .await
+                        .map(|_| ())
+                }
+            }
+        });
+        let results = futures_util::future::join_all(attempts).await;
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 3);
+        for error in results.into_iter().filter_map(Result::err) {
+            assert!(error.to_string().contains("call budget exhausted"));
+        }
+        let state = store.state.read().await;
+        assert_eq!(
+            state
+                .capability_usage
+                .accounts
+                .values()
+                .next()
+                .unwrap()
+                .calls,
+            3
+        );
+        assert!(state.invocations.len() <= 3);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn stream_control_bytes_accumulate_with_invocation_input() {
+        let store = HostAdminStateStore::new();
+        let key = signing_key().verifying_key();
+        let poll = serde_json::json!({
+            "topic": "fixture.events", "resource_uri": "fixture://events",
+            "control": {"method": "poll", "stream_id": "stream-fixture", "limit": 1}
+        });
+        let ack = serde_json::json!({
+            "topic": "fixture.events", "resource_uri": "fixture://events",
+            "control": {"method": "ack", "stream_id": "stream-fixture",
+                "ack": {"topic": "fixture.events", "seqs": [1, 2, 3],
+                    "cursors": ["first", "second", "large-cursor".repeat(32)]}}
+        });
+        let total = u64::try_from(
+            to_deterministic_cbor(&poll).unwrap().len()
+                + to_deterministic_cbor(&ack).unwrap().len(),
+        )
+        .unwrap();
+        let mut request = request(None, Some(total));
+        request.input = poll;
+        store
+            .reserve_capability_usage(&request, &key, "user:test")
+            .await
+            .unwrap();
+        request.id = RequestId::new("usage-after-control-bytes");
+        request.input = ack;
+        store
+            .admit_capability_invocation(admission(&request), &request, &key)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .reserve_capability_usage(&request, &key, "user:test")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("input byte budget exhausted")
+        );
+        let state = store.state.read().await;
+        let account = state.capability_usage.accounts.values().next().unwrap();
+        assert_eq!(account.input_bytes, total);
+        assert_eq!(account.calls, 2);
+        assert!(
+            !serde_json::to_string(&*state)
+                .unwrap()
+                .contains("large-cursor")
+        );
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn stream_debit_survives_restart_without_an_invocation_record() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("stream-usage-state.json");
+        let key = signing_key().verifying_key();
+        let request = request(Some(1), None);
+        let store = HostAdminStateStore::with_state_path(path.clone()).unwrap();
+        store
+            .reserve_capability_usage(&request, &key, "user:test")
+            .await
+            .unwrap();
+        assert!(store.state.read().await.invocations.is_empty());
+        drop(store);
+        let recovered = HostAdminStateStore::with_state_path(path).unwrap();
+        assert!(recovered.state.read().await.invocations.is_empty());
+        for result in [
+            recovered
+                .reserve_capability_usage(&request, &key, "user:test")
+                .await,
+            recovered
+                .admit_capability_invocation(admission(&request), &request, &key)
+                .await
+                .map(|_| ()),
+        ] {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("call budget exhausted")
+            );
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn unlimited_controls_do_not_rewrite_admin_state_or_bypass_a_failed_store() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("unlimited-control.json");
+        let key = signing_key().verifying_key();
+        let unlimited = request(None, None);
+        let store = HostAdminStateStore::with_state_path(path.clone()).unwrap();
+        for _ in 0..3 {
+            store
+                .reserve_capability_usage(&unlimited, &key, "user:test")
+                .await
+                .unwrap();
+        }
+        assert!(
+            !path.exists(),
+            "unlimited polls need no quota snapshot write"
+        );
+        assert!(store.state.read().await.capability_usage.is_empty());
+        store.persistence_failed.store(true, Ordering::Release);
+        assert!(matches!(
+            store
+                .reserve_capability_usage(&unlimited, &key, "user:test")
+                .await,
+            Err(HostError::Unavailable(_))
+        ));
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn stream_usage_signature_scope_and_persistence_fail_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let blocked_parent = directory.path().join("ordinary-file");
+        std::fs::write(&blocked_parent, b"not a directory").unwrap();
+        let store =
+            HostAdminStateStore::with_state_path(blocked_parent.join("state.json")).unwrap();
+        let key = signing_key().verifying_key();
+        let wrong_key = Ed25519SigningKey::from_bytes(&[62; 32])
+            .unwrap()
+            .verifying_key();
+        let request = request(Some(1), None);
+        assert!(
+            store
+                .reserve_capability_usage(&request, &wrong_key, "user:test")
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .reserve_capability_usage(&request, &key, "user:other")
+                .await
+                .is_err()
+        );
+        let mut wrong_zone = request.clone();
+        wrong_zone.zone_id = ZoneId::private();
+        assert!(
+            store
+                .reserve_capability_usage(&wrong_zone, &key, "user:test")
+                .await
+                .is_err()
+        );
+        assert!(!store.persistence_failed.load(Ordering::Acquire));
+        assert!(
+            store
+                .reserve_capability_usage(&request, &key, "user:test")
+                .await
+                .is_err()
+        );
+        assert!(store.persistence_failed.load(Ordering::Acquire));
+        assert!(
+            store
+                .reserve_capability_usage(&request, &key, "user:test")
+                .await
+                .is_err()
+        );
+        assert!(store.state.read().await.capability_usage.is_empty());
     }
 
     #[fcp_async_core::runtime::test]
