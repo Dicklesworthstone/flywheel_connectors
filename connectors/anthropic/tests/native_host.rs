@@ -48,6 +48,7 @@ struct LoopbackServer {
     url: String,
     requests: Receiver<CapturedRequest>,
     thread: Option<JoinHandle<()>>,
+    stop: Option<mpsc::Sender<()>>,
 }
 
 impl LoopbackServer {
@@ -83,6 +84,52 @@ impl LoopbackServer {
             url,
             requests,
             thread: Some(thread),
+            stop: None,
+        }
+    }
+
+    /// Keep serving until explicitly released so unexpected retries are observable.
+    fn scripted(response: String, hold_open: bool) -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (sender, requests) = mpsc::channel();
+        let (stop, stopped) = mpsc::channel();
+        let thread = thread::spawn(move || {
+            let deadline = Instant::now() + StdDuration::from_secs(15);
+            loop {
+                if stopped.try_recv().is_ok() {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "scripted provider was not released");
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream
+                            .set_read_timeout(Some(StdDuration::from_secs(5)))
+                            .unwrap();
+                        sender.send(read_request(&mut stream)).unwrap();
+                        stream.write_all(response.as_bytes()).unwrap();
+                        stream.flush().unwrap();
+                        if hold_open {
+                            // No EOF is supplied until the test has observed the
+                            // invocation result. This exercises body/terminal-event
+                            // handling rather than only HTTP response headers.
+                            let _ = stopped.recv_timeout(StdDuration::from_secs(5));
+                            break;
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(StdDuration::from_millis(5));
+                    }
+                    Err(error) => panic!("scripted provider accept failed: {error}"),
+                }
+            }
+        });
+        Self {
+            url,
+            requests,
+            thread: Some(thread),
+            stop: Some(stop),
         }
     }
 
@@ -100,12 +147,18 @@ impl LoopbackServer {
     }
 
     fn finish(mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
         self.thread.take().unwrap().join().unwrap();
     }
 }
 
 impl Drop for LoopbackServer {
     fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -526,4 +579,288 @@ fn native_oversized_frame_closes_transport() {
     assert_eq!(process.receive()["error"]["code"], "FCP-1004");
     assert!(!process.wait_for_exit().success());
     assert!(process.output.try_recv().is_err());
+}
+
+
+fn prepared_deadline_process(
+    server: &LoopbackServer,
+    operation: &str,
+) -> (NativeProcess, Ed25519SigningKey, InstanceId) {
+    let mut process = NativeProcess::start();
+    assert_eq!(
+        process.rpc(
+            "configure",
+            "configure",
+            json!({"api_key": API_KEY, "base_url": server.url}),
+        )["result"]["status"],
+        "configured"
+    );
+    let key = Ed25519SigningKey::generate();
+    let handshake = process.rpc(
+        "handshake",
+        "handshake",
+        json!({
+            "protocol_version": "2.0",
+            "zone": "z:work",
+            "host_public_key": key.verifying_key().to_bytes(),
+            "nonce": vec![9_u8; 32],
+            "capabilities_requested": [operation, "anthropic.get_usage"]
+        }),
+    );
+    let instance = serde_json::from_value(handshake["result"]["instance_id"].clone()).unwrap();
+    (process, key, instance)
+}
+
+fn bounded_provider_request(
+    key: &Ed25519SigningKey,
+    instance: &InstanceId,
+    operation: &str,
+) -> Value {
+    json!({
+        "type": "invoke",
+        "id": "bounded-provider",
+        "connector_id": "fcp.anthropic",
+        "zone_id": "z:work",
+        "operation": operation,
+        "deadline_ms": 500,
+        "input": {
+            "model": MODEL,
+            "messages": [{"role": "user", "content": "Hello"}],
+            "max_tokens": 64
+        },
+        "capability_token": grant(
+            key,
+            instance,
+            operation,
+            b"bounded-provider-budget",
+            &CapabilityConstraints {
+                resource_allow: vec![format!("anthropic:model:{MODEL}")],
+                // A second call still has a call slot, but an uncertain first
+                // invocation must retain its entire signed byte reservation.
+                max_calls: Some(2),
+                max_bytes: Some(1_000_000),
+                ..Default::default()
+            },
+        )
+    })
+}
+
+fn assert_uncertain_budget_is_retained(
+    process: &mut NativeProcess,
+    server: &LoopbackServer,
+    mut request: Value,
+    key: &Ed25519SigningKey,
+    instance: &InstanceId,
+) {
+    request["id"] = json!("would-repeat-provider");
+    request["deadline_ms"] = json!(5_000);
+    assert_eq!(
+        process.rpc("spent-byte-budget", "invoke", request)["error"]["code"],
+        "FCP-3001"
+    );
+    server.assert_no_requests();
+
+    // Timing out one invocation must not cancel the client runtime or prevent
+    // independent work under a fresh grant in the same negotiated session.
+    let recovery: InvokeResponse = serde_json::from_value(
+        process.rpc(
+            "after-interruption",
+            "invoke",
+            json!({
+                "type": "invoke",
+                "id": "independent-local-operation",
+                "connector_id": "fcp.anthropic",
+                "zone_id": "z:work",
+                "operation": "anthropic.get_usage",
+                "input": {},
+                "capability_token": grant(
+                    key,
+                    instance,
+                    "anthropic.get_usage",
+                    b"fresh-local-budget",
+                    &CapabilityConstraints {
+                        resource_allow: vec!["*".into()],
+                        ..Default::default()
+                    },
+                )
+            }),
+        )["result"]
+            .clone(),
+    )
+    .unwrap();
+    assert_eq!(recovery.status, InvokeStatus::Ok);
+}
+
+#[test]
+fn native_deadline_bounds_retry_wait_and_http_and_sse_body_reads() {
+    let partial_stream = STREAM_RESPONSE
+        .split_once("event: message_stop")
+        .unwrap()
+        .0;
+    let rate_limit_body =
+        r#"{"type":"error","error":{"type":"rate_limit_error","message":"try later"}}"#;
+    let scenarios = [
+        (
+            "anthropic.message",
+            format!(
+                "HTTP/1.1 429 Too Many Requests\r\nretry-after: 60\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{rate_limit_body}",
+                rate_limit_body.len()
+            ),
+            false,
+        ),
+        (
+            "anthropic.message",
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{\"id\":"
+                .to_string(),
+            true,
+        ),
+        (
+            "anthropic.message.stream",
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n{partial_stream}"
+            ),
+            true,
+        ),
+    ];
+    for (operation, response, hold_open) in scenarios {
+        let server = LoopbackServer::scripted(response, hold_open);
+        let (mut process, key, instance) = prepared_deadline_process(&server, operation);
+        let request = bounded_provider_request(&key, &instance, operation);
+        let started = Instant::now();
+        let response = process.rpc("deadline", "invoke", request.clone());
+        assert!(
+            started.elapsed() < StdDuration::from_secs(3),
+            "host deadline did not bound the complete provider operation"
+        );
+        assert_eq!(response["error"]["retryable"], false);
+        let message = response["error"]["message"].as_str().unwrap();
+        assert!(message.contains("deadline"), "{response}");
+        assert!(message.contains("outcome may be unknown"), "{response}");
+        let captured = server.receive();
+        assert_eq!(
+            captured.body["stream"].as_bool().unwrap_or(false),
+            operation.ends_with(".stream")
+        );
+        assert_uncertain_budget_is_retained(
+            &mut process,
+            &server,
+            request,
+            &key,
+            &instance,
+        );
+        server.finish();
+    }
+}
+
+#[test]
+fn native_sse_requires_terminal_message_and_closed_content() {
+    let without_stop = STREAM_RESPONSE
+        .split_once("event: message_stop")
+        .unwrap()
+        .0;
+    let before_first_block_stop = STREAM_RESPONSE
+        .split_once("event: content_block_stop")
+        .unwrap()
+        .0;
+    let terminal = concat!(
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":8}}\n\n",
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+    );
+    let without_final_delta = STREAM_RESPONSE
+        .split_once("event: message_delta")
+        .unwrap()
+        .0;
+    for (body, expected_error, missing_bytes) in [
+        (without_stop.to_string(), "ended before message_stop", 0),
+        (without_stop.to_string(), "failed before message_stop", 50),
+        (
+            format!("{before_first_block_stop}{terminal}"),
+            "before final message_delta or content_block_stop",
+            0,
+        ),
+        (
+            format!(
+                "{without_final_delta}event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
+            ),
+            "before final message_delta or content_block_stop",
+            0,
+        ),
+        (
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string(),
+            "before message_start",
+            0,
+        ),
+    ] {
+        let server = LoopbackServer::scripted(
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len() + missing_bytes
+            ),
+            false,
+        );
+        let (mut process, key, instance) =
+            prepared_deadline_process(&server, "anthropic.message.stream");
+        let request = bounded_provider_request(&key, &instance, "anthropic.message.stream");
+        let response = process.rpc("incomplete-stream", "invoke", request.clone());
+        assert_eq!(response["error"]["retryable"], false);
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(expected_error),
+            "{response}"
+        );
+        server.receive();
+        assert_uncertain_budget_is_retained(
+            &mut process,
+            &server,
+            request,
+            &key,
+            &instance,
+        );
+        server.finish();
+    }
+}
+
+#[test]
+fn native_sse_terminal_event_finishes_without_waiting_for_http_eof() {
+    let start = STREAM_RESPONSE.split_once("event: content_block_start").unwrap().0;
+    let empty_message = format!(
+        "{start}{}",
+        concat!(
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":0}}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":null},\"usage\":{\"output_tokens\":8}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        )
+    );
+    for (body, reason, has_tool) in [
+        (STREAM_RESPONSE, "tool_use", true),
+        (empty_message.as_str(), "end_turn", false),
+    ] {
+        let server = LoopbackServer::scripted(
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n{body}"
+            ),
+            true,
+        );
+        let (mut process, key, instance) =
+            prepared_deadline_process(&server, "anthropic.message.stream");
+        let request = bounded_provider_request(&key, &instance, "anthropic.message.stream");
+        let response: InvokeResponse = serde_json::from_value(
+            process.rpc("complete-open-stream", "invoke", request)["result"].clone(),
+        )
+        .expect("message_stop must complete without waiting for transport EOF");
+        assert_eq!(response.status, InvokeStatus::Ok);
+        let result = response.result.unwrap();
+        assert_eq!(result["stop_reason"], reason);
+        assert_eq!(result["usage"]["output_tokens"], 8);
+        if has_tool {
+            assert_eq!(result["content_blocks"][1]["input"], json!({"city": "Paris"}));
+        } else {
+            assert_eq!(result["content"], "");
+            assert_eq!(result["content_blocks"], json!([]));
+        }
+        server.receive();
+        server.finish();
+    }
 }

@@ -31,6 +31,9 @@ pub const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 /// the `FCP_ANTHROPIC_API_VERSION` environment variable.
 pub(crate) const DEFAULT_API_VERSION: &str = "2023-06-01";
 
+/// Hard ceiling for one invocation, including provider retries and stream assembly.
+const MAX_INVOCATION_TIMEOUT_MS: u64 = 300_000;
+
 /// Resolve the API version to use: config override > env var > compiled default.
 fn resolve_api_version(config_override: Option<&str>) -> String {
     if let Some(v) = config_override.map(str::trim).filter(|s| !s.is_empty()) {
@@ -196,6 +199,15 @@ impl AnthropicClient {
     /// Shut down the connector runtime.
     pub fn shutdown(&self) {
         self.runtime.shutdown();
+    }
+
+    /// Bind an invocation to client shutdown and a caller-narrowed total budget.
+    pub(crate) fn invocation_context(&self, deadline_ms: Option<u64>) -> ExecutionContext {
+        let timeout_ms = deadline_ms
+            .unwrap_or(MAX_INVOCATION_TIMEOUT_MS)
+            .min(MAX_INVOCATION_TIMEOUT_MS);
+        self.runtime
+            .request_context_with_timeout(Duration::from_millis(timeout_ms))
     }
 
     /// Set the base URL (for testing).
@@ -513,10 +525,9 @@ impl AnthropicClient {
         R: serde::de::DeserializeOwned + Send,
     {
         let url = format!("{}{endpoint}", self.base_url);
-        // Budget must be generous enough for max_retries × max retry_after.
-        // Anthropic 529 responses suggest 60s retry_after, so with 3 retries
-        // we need at least 180s plus request time. Use 300s.
-        let ctx = ExecutionContext::request_scoped(Duration::from_secs(300));
+        // Keep retry/backoff cancellation attached to the client runtime. The
+        // enclosing invocation can impose an earlier deadline across all attempts.
+        let ctx = self.invocation_context(None);
         let policy = self.retry_config.to_retry_policy();
 
         RetryLoop::execute(&ctx, &policy, |attempt| {
@@ -1038,6 +1049,61 @@ mod tests {
         )
         .unwrap();
         stream.flush().unwrap();
+    }
+
+    #[test]
+    fn invocation_context_clamps_caller_deadline_and_inherits_shutdown() {
+        let client = AnthropicClient::new("test-key").unwrap();
+        for deadline in [None, Some(u64::MAX)] {
+            let budget = client
+                .invocation_context(deadline)
+                .remaining_budget()
+                .unwrap();
+            assert!(budget <= Duration::from_millis(MAX_INVOCATION_TIMEOUT_MS));
+            assert!(!budget.is_zero());
+        }
+        let narrowed = client.invocation_context(Some(5_000));
+        assert!(narrowed.remaining_budget().unwrap() <= Duration::from_secs(5));
+        assert_eq!(
+            client.invocation_context(Some(0)).remaining_budget(),
+            Some(Duration::ZERO)
+        );
+        assert!(!narrowed.is_cancelled());
+        client.shutdown();
+        assert!(narrowed.is_cancelled());
+        assert!(client.invocation_context(None).is_cancelled());
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn shutdown_stops_provider_retry_loop_before_http_dispatch() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let client = AnthropicClient::new("test-key")
+            .unwrap()
+            .with_base_url(format!("http://{}", listener.local_addr().unwrap()));
+        client.shutdown();
+
+        let result = fcp_async_core::time::timeout(
+            Duration::from_secs(1),
+            client.chat(Model::default(), "hello", None, 16),
+        )
+        .await
+        .expect("a stopped runtime must not start or wait for provider traffic");
+        assert!(
+            matches!(
+                &result,
+                Err(AnthropicError::Api { error_type, .. })
+                    if error_type == "request_cancelled"
+            ),
+            "{result:?}"
+        );
+        assert!(
+            matches!(
+                listener.accept(),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+            ),
+            "shutdown must prevent opening a provider connection"
+        );
     }
 
     #[fcp_async_core::runtime::test]

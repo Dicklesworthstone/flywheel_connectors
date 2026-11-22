@@ -1146,6 +1146,13 @@ impl AnthropicConnector {
                     .into(),
             });
         }
+        // Start the caller budget before local validation and admission, and
+        // keep it attached to client shutdown through the complete provider result.
+        let context = self
+            .client
+            .as_ref()
+            .ok_or(FcpError::NotConfigured)?
+            .invocation_context(request.deadline_ms);
         let resources = self.validate_operation(&request.operation, &request.input)?;
         let witness = self
             .authority
@@ -1154,18 +1161,32 @@ impl AnthropicConnector {
             .admit_bounded(&request, &resources, MAX_INVOKE_RESPONSE_BYTES)?;
         let operation = request.operation.as_str();
         let input = request.input;
-        let result = match operation {
-            "anthropic.message" => self.invoke_message(input).await,
-            "anthropic.message.stream" => self.invoke_message_stream(input).await,
-            "anthropic.chat" => self.invoke_chat(input).await,
-            "anthropic.get_usage" => self.invoke_get_usage().await,
-            "anthropic.auth.list_methods" => self.invoke_auth_list_methods().await,
-            "anthropic.auth.refresh_oauth" => self.invoke_auth_refresh_oauth().await,
-            "anthropic.models.normalize" => self.invoke_models_normalize(input).await,
-            _ => Err(FcpError::OperationNotGranted {
-                operation: operation.into(),
-            }),
-        };
+        let result = context
+            .run(async {
+                match operation {
+                    "anthropic.message" => self.invoke_message(input).await,
+                    "anthropic.message.stream" => self.invoke_message_stream(input).await,
+                    "anthropic.chat" => self.invoke_chat(input).await,
+                    "anthropic.get_usage" => self.invoke_get_usage().await,
+                    "anthropic.auth.list_methods" => self.invoke_auth_list_methods().await,
+                    "anthropic.auth.refresh_oauth" => self.invoke_auth_refresh_oauth().await,
+                    "anthropic.models.normalize" => self.invoke_models_normalize(input).await,
+                    _ => Err(FcpError::OperationNotGranted {
+                        operation: operation.into(),
+                    }),
+                }
+            })
+            .await
+            .map_err(|_| FcpError::External {
+                service: "anthropic".into(),
+                message: "Invocation deadline exhausted or execution cancelled; provider outcome may be unknown"
+                    .into(),
+                status_code: None,
+                retryable: false,
+                retry_after: None,
+            })?;
+        // Dropping the witness on interruption retains its signed reservation:
+        // an interrupted provider call must not regain spend capacity.
         let response = match &result {
             Ok(value) => InvokeResponse::ok(request.id.clone(), value.clone()),
             Err(error) => InvokeResponse::error(request.id.clone(), error.clone()),
@@ -1325,6 +1346,8 @@ impl AnthropicConnector {
             .map_err(|e: AnthropicError| e.to_fcp_error())?;
         let mut stream = pin!(stream);
 
+        let mut message_started = false;
+        let mut message_stopped = false;
         let mut message_id = String::new();
         let mut response_model = String::new();
         let mut stop_reason: Option<String> = None;
@@ -1397,10 +1420,32 @@ impl AnthropicConnector {
         let mut blocks: Vec<Option<BlockAccumulator>> = Vec::new();
 
         while let Some(event_result) = stream.next().await {
-            let event = event_result.map_err(|e: AnthropicError| e.to_fcp_error())?;
+            let event = event_result.map_err(|_: AnthropicError| {
+                invalid_stream_error(
+                    "Anthropic stream failed before message_stop; provider outcome may be unknown",
+                )
+            })?;
+            if !message_started
+                && !matches!(
+                    &event,
+                    crate::types::StreamEvent::MessageStart { .. }
+                        | crate::types::StreamEvent::Ping
+                        | crate::types::StreamEvent::Error { .. }
+                )
+            {
+                return Err(invalid_stream_error(
+                    "Anthropic stream emitted message data before message_start",
+                ));
+            }
 
             match event {
                 crate::types::StreamEvent::MessageStart { message: msg } => {
+                    if message_started {
+                        return Err(invalid_stream_error(
+                            "Anthropic stream repeated message_start",
+                        ));
+                    }
+                    message_started = true;
                     message_id = msg.id;
                     response_model = msg.model;
                     usage = msg.usage;
@@ -1522,7 +1567,23 @@ impl AnthropicConnector {
                     }
                     block.closed = true;
                 }
-                crate::types::StreamEvent::MessageStop | crate::types::StreamEvent::Ping => {}
+                crate::types::StreamEvent::MessageStop => {
+                    if stop_reason.is_none()
+                        || blocks
+                            .iter()
+                            .filter_map(Option::as_ref)
+                            .any(|block| !block.closed)
+                    {
+                        return Err(invalid_stream_error(
+                            "Anthropic stream stopped before final message_delta or content_block_stop",
+                        ));
+                    }
+                    message_stopped = true;
+                    // message_stop completes the provider result; a gateway may
+                    // keep the HTTP connection open after this terminal event.
+                    break;
+                }
+                crate::types::StreamEvent::Ping => {}
                 crate::types::StreamEvent::Error { error } => {
                     return Err(FcpError::External {
                         service: "anthropic".into(),
@@ -1533,6 +1594,12 @@ impl AnthropicConnector {
                     });
                 }
             }
+        }
+
+        if !message_stopped {
+            return Err(invalid_stream_error(
+                "Anthropic stream ended before message_stop; provider outcome may be unknown",
+            ));
         }
 
         let cost = usage.calculate_cost(model);
