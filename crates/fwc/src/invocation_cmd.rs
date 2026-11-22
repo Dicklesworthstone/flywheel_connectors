@@ -1251,6 +1251,8 @@ mod tests {
     fn record(terminal: Option<InvocationOutcome>, finalized: bool) -> InvocationRecord {
         let now = Utc::now();
         InvocationRecord {
+            budget_requests_reserved: false,
+            budget_usage_digest: None,
             ticket: InvocationTicket {
                 operation_id: "req-inspect".to_owned(),
                 attempt_id: 7,

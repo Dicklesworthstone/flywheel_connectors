@@ -556,6 +556,8 @@ mod tests {
         let admitted_at: DateTime<Utc> = "2026-11-21T12:00:00Z".parse().unwrap();
         InvocationQueryResponse {
             invocation: Some(InvocationRecord {
+                budget_requests_reserved: false,
+                budget_usage_digest: None,
                 ticket: InvocationTicket {
                     operation_id: pending.binding.request_id.clone(),
                     attempt_id,

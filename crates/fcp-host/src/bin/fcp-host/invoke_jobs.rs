@@ -922,9 +922,18 @@ async fn run_owned(
     })?;
     let ticket = match before_deadline(
         deadline,
-        state
-            .lifecycle
-            .admit_capability_invocation(admission, &request, capability_key),
+        async {
+            let zone_budget = state.budget.policy_for_zone(&request.zone_id).await;
+            state
+                .lifecycle
+                .admit_budgeted_capability_invocation(
+                    admission,
+                    &request,
+                    capability_key,
+                    zone_budget.as_ref(),
+                )
+                .await
+        },
         "durable invocation admission",
     )
     .await
@@ -974,6 +983,7 @@ async fn run_owned(
         finalize_by,
         super::record_invoke_budget_usage(
             state.budget.as_ref(),
+            &ticket,
             Some(&request.zone_id),
             &request.connector_id,
             request.operation.as_str(),
@@ -981,7 +991,8 @@ async fn run_owned(
         ),
         "source budget accounting",
     )
-    .await;
+    .await
+    .and_then(std::convert::identity);
     // A zone without a configured policy still completes budget finalization.
     // Preserve that completed decision separately from a timed-out accounting
     // attempt, without claiming that any budget usage was actually recorded.
@@ -1702,7 +1713,10 @@ mod tests {
         assert!(!finalization.receipt_recorded);
         assert!(finalization.audit_event_id.is_some());
         assert_eq!(finalization.response_http_status, Some(200));
-        assert_eq!(finalization.response_status, Some(fcp_kernel::InvokeStatus::Ok));
+        assert_eq!(
+            finalization.response_status,
+            Some(fcp_kernel::InvokeStatus::Ok)
+        );
     }
 
     #[fcp_async_core::runtime::test(flavor = "multi_thread")]

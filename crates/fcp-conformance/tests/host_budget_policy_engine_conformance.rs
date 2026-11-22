@@ -7,7 +7,7 @@
 //!
 //! - per-zone policy lifecycle (`upsert_policy` / `remove_policy`),
 //! - opt-in evaluation: `record_usage` and `snapshot` return
-//!   `Option<...>` so a zone WITHOUT a configured policy is silently
+//!   `HostResult<Option<...>>` so a zone WITHOUT a configured policy is silently
 //!   a no-op (admins must explicitly enable enforcement),
 //! - sorted multi-zone reporting (`report` orders snapshots by
 //!   `zone_id` so CLI output is deterministic), and
@@ -43,7 +43,10 @@ async fn record_usage_on_unconfigured_zone_returns_none() {
     let engine = BudgetPolicyEngine::new();
     let zone = ZoneId::work();
 
-    let eval = engine.record_usage(&zone, &[UsageMetric::tokens(50)]).await;
+    let eval = engine
+        .record_usage(&zone, &[UsageMetric::tokens(50)])
+        .await
+        .unwrap();
     assert!(
         eval.is_none(),
         "un-configured zone MUST return None — no policy means no enforcement, NOT implicit zero-cap"
@@ -55,7 +58,7 @@ async fn snapshot_on_unconfigured_zone_returns_none() {
     let engine = BudgetPolicyEngine::new();
     let zone = ZoneId::work();
 
-    let snap = engine.snapshot(&zone).await;
+    let snap = engine.snapshot(&zone).await.unwrap();
     assert!(
         snap.is_none(),
         "un-configured zone MUST snapshot as None — no policy means nothing to snapshot"
@@ -72,6 +75,7 @@ async fn record_usage_on_configured_zone_evaluates_and_returns_some() {
     let eval = engine
         .record_usage(&zone, &[UsageMetric::tokens(50)])
         .await
+        .expect("usage storage succeeds")
         .expect("configured zone must produce a BudgetEvaluation");
     assert_eq!(eval.action, BudgetAction::Allow);
     let entry = eval
@@ -94,6 +98,7 @@ async fn upsert_policy_replaces_prior_policy() {
     let eval_strict = engine
         .record_usage(&zone, &[UsageMetric::tokens(50)])
         .await
+        .expect("usage storage succeeds")
         .expect("evaluation");
     assert_eq!(
         eval_strict.action,
@@ -111,6 +116,7 @@ async fn upsert_policy_replaces_prior_policy() {
     let eval_relaxed = engine
         .record_usage(&zone, &[UsageMetric::tokens(50)])
         .await
+        .expect("usage storage succeeds")
         .expect("evaluation");
     let entry = eval_relaxed
         .snapshot
@@ -138,7 +144,10 @@ async fn remove_policy_returns_prior_and_makes_zone_unconfigured() {
     assert_eq!(removed.budgets[0].limit, 100);
 
     // After removal the zone is un-configured again.
-    let eval = engine.record_usage(&zone, &[UsageMetric::tokens(1)]).await;
+    let eval = engine
+        .record_usage(&zone, &[UsageMetric::tokens(1)])
+        .await
+        .unwrap();
     assert!(
         eval.is_none(),
         "after remove_policy, record_usage MUST return None — the policy is gone"
@@ -169,12 +178,14 @@ async fn with_policies_constructor_seeds_initial_state() {
     let work_eval = engine
         .record_usage(&ZoneId::work(), &[UsageMetric::tokens(60)])
         .await
+        .expect("usage storage succeeds")
         .expect("work configured");
     assert_eq!(work_eval.action, BudgetAction::Allow);
 
     let private_eval = engine
         .record_usage(&ZoneId::private(), &[UsageMetric::tokens(60)])
         .await
+        .expect("usage storage succeeds")
         .expect("private configured");
     assert_eq!(
         private_eval.action,
@@ -184,7 +195,8 @@ async fn with_policies_constructor_seeds_initial_state() {
 
     let unknown = engine
         .record_usage(&ZoneId::owner(), &[UsageMetric::tokens(1)])
-        .await;
+        .await
+        .unwrap();
     assert!(
         unknown.is_none(),
         "owner has no policy — record_usage returns None"
@@ -207,7 +219,7 @@ async fn report_returns_snapshots_sorted_by_zone_id() {
         .upsert_policy(ZoneId::private(), token_policy(300))
         .await;
 
-    let report = engine.report(None).await;
+    let report = engine.report(None).await.unwrap();
     assert_eq!(report.zones.len(), 3);
     let ids: Vec<&str> = report.zones.iter().map(|z| z.zone_id.as_str()).collect();
     let mut sorted = ids.clone();
@@ -229,7 +241,7 @@ async fn report_with_zone_filter_narrows_to_single_zone() {
         .await;
 
     let work = ZoneId::work();
-    let report = engine.report(Some(&work)).await;
+    let report = engine.report(Some(&work)).await.unwrap();
     assert_eq!(
         report.zones.len(),
         1,
@@ -246,7 +258,7 @@ async fn report_with_unknown_zone_filter_returns_empty() {
         .await;
 
     let owner = ZoneId::owner();
-    let report = engine.report(Some(&owner)).await;
+    let report = engine.report(Some(&owner)).await.unwrap();
     assert!(
         report.zones.is_empty(),
         "report filtered to a zone with no policy MUST return zero entries"

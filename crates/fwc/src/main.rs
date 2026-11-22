@@ -57011,6 +57011,8 @@ input = { query = "{{steps.first-read.output.title}}" }
                 "2026-11-22T00:00:00Z".parse().unwrap();
             let evidence = fcp_host::InvocationQueryResponse {
                 invocation: Some(fcp_host::InvocationRecord {
+                    budget_requests_reserved: false,
+                    budget_usage_digest: None,
                     ticket: fcp_host::InvocationTicket {
                         operation_id: target.binding.request_id.clone(),
                         attempt_id: 1,

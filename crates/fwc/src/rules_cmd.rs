@@ -6224,6 +6224,8 @@ mod tests {
         let principal = scope.principal.clone().unwrap();
         InvocationQueryResponse {
             invocation: Some(InvocationRecord {
+                budget_requests_reserved: false,
+                budget_usage_digest: None,
                 ticket: InvocationTicket {
                     operation_id: request_id.to_owned(),
                     attempt_id: 7,
