@@ -1,16 +1,17 @@
-//! Idempotent undo — reverse previous operations using declared inverse mappings.
+//! Explicit compensations for a small set of completed connector operations.
 //!
-//! This module looks up an operation's declared inverse and constructs the
-//! inverse input from the original input/output using JSON-path-style
-//! field mappings.
+//! Built-in mappings name existing create/delete or create/archive operations
+//! and use the resource identities returned by the original invocation. A
+//! compensation cannot retract notifications, readers, or later changes.
 //!
 //! # Design principles
 //!
-//! - Every undoable operation declares its inverse and a field mapping.
-//! - A rich built-in table covers the most common connector pairs.
-//! - Custom mappings can be registered at runtime (e.g. loaded from TOML).
+//! - History contains hashes, so callers supply the original input and response.
+//! - Matching hashes establish local continuity, not authenticated provenance.
+//! - Executable history plans use only reviewed built-in mappings.
+//! - Custom mappings remain available for offline planning.
 //! - Non-reversible operations are flagged with human-readable guidance.
-//! - Planning is separate from execution — `plan_undo` never calls connectors.
+//! - Planning grants no authority; execution still needs live host checks.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -30,6 +31,20 @@ pub enum UndoError {
     OperationNotFound,
     /// A path expression in the input mapping could not be evaluated.
     InputMappingFailed(String),
+    /// The source does not record a definite successful invocation.
+    SourceNotSuccessful,
+    /// The recorded connector, zone, or history identity is unusable.
+    InvalidSourceScope,
+    /// The supplied input does not match the local history record.
+    InputMismatch,
+    /// The supplied response does not match the local history record.
+    ResponseMismatch,
+    /// The source response is not a complete successful invocation envelope.
+    InvalidSourceResponse,
+    /// A created resource identifier is missing or cannot be safely reused.
+    InvalidResourceIdentity,
+    /// A Discord delivery was suppressed or disagrees with its source channel.
+    DeliveryMismatch,
 }
 
 impl fmt::Display for UndoError {
@@ -43,11 +58,57 @@ impl fmt::Display for UndoError {
             Self::InputMappingFailed(msg) => {
                 write!(f, "input mapping failed: {msg}")
             }
+            Self::SourceNotSuccessful => {
+                write!(f, "undo requires a successful source history entry")
+            }
+            Self::InvalidSourceScope => {
+                write!(f, "undo requires the recorded connector family and zone")
+            }
+            Self::InputMismatch => {
+                write!(f, "original input does not match the local history hash")
+            }
+            Self::ResponseMismatch => {
+                write!(f, "original response does not match the local history hash")
+            }
+            Self::InvalidSourceResponse => {
+                write!(f, "undo requires a complete successful invocation response")
+            }
+            Self::InvalidResourceIdentity => {
+                write!(
+                    f,
+                    "original response has no usable created resource identity"
+                )
+            }
+            Self::DeliveryMismatch => {
+                write!(
+                    f,
+                    "Discord delivery does not prove a message in the original channel"
+                )
+            }
         }
     }
 }
 
 impl std::error::Error for UndoError {}
+
+impl UndoError {
+    /// Stable, payload-free refusal code for CLI diagnostics.
+    #[must_use]
+    pub const fn error_type(&self) -> &'static str {
+        match self {
+            Self::NoInverse | Self::OperationNotFound => "undo-not-supported",
+            Self::MissingOutputField(_)
+            | Self::InputMappingFailed(_)
+            | Self::InvalidResourceIdentity => "undo-resource-identity-required",
+            Self::SourceNotSuccessful => "undo-source-not-successful",
+            Self::InvalidSourceScope => "undo-source-scope-invalid",
+            Self::InputMismatch => "undo-input-mismatch",
+            Self::ResponseMismatch => "undo-response-mismatch",
+            Self::InvalidSourceResponse => "undo-source-response-invalid",
+            Self::DeliveryMismatch => "undo-delivery-mismatch",
+        }
+    }
+}
 
 // ── Core types ──────────────────────────────────────────────────────────────
 
@@ -55,7 +116,7 @@ impl std::error::Error for UndoError {}
 /// operation's input.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InverseMapping {
-    /// Fully-qualified name of the inverse operation (e.g. `"github.close_issue"`).
+    /// Fully-qualified name of the inverse operation (e.g. `"notion.delete_page"`).
     pub inverse_operation: String,
     /// Maps target field names to JSON-path source expressions.
     ///
@@ -74,7 +135,7 @@ pub struct UndoPlan {
     pub inverse_operation: String,
     /// Fully-constructed input for the inverse operation.
     pub inverse_input: serde_json::Value,
-    /// Risk level of the inverse operation (e.g. `"low"`, `"medium"`, `"high"`).
+    /// Planning risk estimate; live metadata remains authoritative at execution.
     pub risk_level: String,
     /// Whether a human/agent must confirm before execution.
     pub requires_confirmation: bool,
@@ -99,8 +160,8 @@ pub struct ReversibilityCheck {
 
 /// Registry of inverse-operation mappings.
 ///
-/// Ships with a built-in table of common connector pairs and allows
-/// additional mappings to be registered at runtime.
+/// Ships with reviewed connector pairs and allows custom offline mappings.
+/// Custom registration does not extend the executable history-plan allowlist.
 #[derive(Clone, Debug)]
 pub struct UndoRegistry {
     mappings: BTreeMap<String, InverseMapping>,
@@ -151,7 +212,6 @@ impl UndoRegistry {
 
     // ── Built-in table ──────────────────────────────────────────────────
 
-    #[allow(clippy::too_many_lines)]
     fn load_builtins(&mut self) {
         // Helper to insert a simple mapping with common id-based patterns.
         let mut add = |op: &str, inv: &str, fields: &[(&str, &str)]| {
@@ -168,153 +228,41 @@ impl UndoRegistry {
             );
         };
 
-        // GitHub
-        add(
-            "github.create_issue",
-            "github.close_issue",
-            &[
-                ("owner", "$.input.owner"),
-                ("repo", "$.input.repo"),
-                ("issue_number", "$.output.issue.number"),
-            ],
-        );
-        add(
-            "github.create_pull_request",
-            "github.close_pull_request",
-            &[
-                ("owner", "$.input.owner"),
-                ("repo", "$.input.repo"),
-                ("pull_number", "$.output.pull_request.number"),
-            ],
-        );
-        add(
-            "github.create_repo",
-            "github.delete_repo",
-            &[("owner", "$.output.owner.login"), ("repo", "$.output.name")],
-        );
-        add(
-            "github.add_label",
-            "github.remove_label",
-            &[
-                ("owner", "$.input.owner"),
-                ("repo", "$.input.repo"),
-                ("issue_number", "$.input.issue_number"),
-                ("label", "$.input.label"),
-            ],
-        );
-
-        // Slack
-        add(
-            "slack.send_message",
-            "slack.delete_message",
-            &[("channel", "$.input.channel"), ("ts", "$.output.ts")],
-        );
-
-        // Discord
+        // These pairs are implemented by both manifest and connector runtime,
+        // and the inverse runtimes declare strict idempotency.
+        // Every resource key comes from the original successful result rather
+        // than a caller-chosen deletion target.
         add(
             "discord.send_message",
             "discord.delete_message",
             &[
-                ("channel_id", "$.input.channel_id"),
+                ("channel_id", "$.output.channel_id"),
                 ("message_id", "$.output.id"),
             ],
         );
-
-        // Todoist
         add(
-            "todoist.create_task",
-            "todoist.close_task",
+            "todoist.tasks.create",
+            "todoist.tasks.delete",
             &[("task_id", "$.output.id")],
         );
-
-        // Linear
-        add(
-            "linear.create_issue",
-            "linear.close_issue",
-            &[("issue_id", "$.output.id")],
-        );
-
-        // Notion
         add(
             "notion.create_page",
-            "notion.archive_page",
-            &[("page_id", "$.output.id")],
+            "notion.delete_page",
+            &[("page_id", "$.output.page.id")],
         );
-
-        // Jira
-        add(
-            "jira.create_issue",
-            "jira.close_issue",
-            &[
-                ("issue_key", "$.output.key"),
-                ("project", "$.input.project"),
-            ],
-        );
-
-        // Trello
-        add(
-            "trello.create_card",
-            "trello.archive_card",
-            &[("card_id", "$.output.id")],
-        );
-
-        // Asana
-        add(
-            "asana.create_task",
-            "asana.close_task",
-            &[("task_gid", "$.output.gid")],
-        );
-
-        // Kubernetes
-        add(
-            "kubernetes.create_pod",
-            "kubernetes.delete_pod",
-            &[("namespace", "$.input.namespace"), ("name", "$.input.name")],
-        );
-
-        // Terraform
-        add(
-            "terraform.apply",
-            "terraform.destroy",
-            &[
-                ("workspace", "$.input.workspace"),
-                ("config_dir", "$.input.config_dir"),
-            ],
-        );
-
-        // S3
-        add(
-            "s3.upload_object",
-            "s3.delete_object",
-            &[("bucket", "$.input.bucket"), ("key", "$.input.key")],
-        );
-
-        // Stripe
-        add(
-            "stripe.create_subscription",
-            "stripe.cancel_subscription",
-            &[("subscription_id", "$.output.id")],
-        );
-
-        // Spotify
-        add(
-            "spotify.follow_playlist",
-            "spotify.unfollow_playlist",
-            &[("playlist_id", "$.input.playlist_id")],
-        );
-
-        // Generic create/delete, enable/disable, add/remove
-        add("generic.create", "generic.delete", &[("id", "$.output.id")]);
-        add("generic.enable", "generic.disable", &[("id", "$.input.id")]);
-        add("generic.add", "generic.remove", &[("id", "$.input.id")]);
-        add("generic.start", "generic.stop", &[("id", "$.input.id")]);
-        add(
-            "generic.subscribe",
-            "generic.unsubscribe",
-            &[("subscription_id", "$.output.id")],
-        );
-
         // Non-reversible operations — guidance only.
+        self.guidance.insert(
+            "trello.cards.create".to_owned(),
+            "Automatic compensation is unavailable: the current trello.cards.delete runtime does not declare strict idempotency. Inspect current card state and retained host evidence before a separate authorized deletion.".to_owned(),
+        );
+        self.guidance.insert(
+            "terraform.apply".to_owned(),
+            "Destroying a workspace is not an undo of apply; inspect the prior state and plan a targeted repair.".to_owned(),
+        );
+        self.guidance.insert(
+            "s3.upload_object".to_owned(),
+            "Deleting an object cannot restore overwritten contents; inspect version history before a repair.".to_owned(),
+        );
         self.guidance.insert(
             "gmail.send_email".to_owned(),
             "Emails cannot be unsent. Consider sending a follow-up correction.".to_owned(),
@@ -423,8 +371,183 @@ fn resolve_segments(
 
 // ── Plan construction ───────────────────────────────────────────────────────
 
+/// Build a compensation from a recorded successful invocation and caller-held
+/// source data. Neither source data nor credentials are persisted here.
+///
+/// `full_response` is the complete original `InvokeResponse` (the CLI's
+/// `response` member), because history hashes that envelope rather than its
+/// nested connector result. Matching hashes is a local continuity check, not
+/// cryptographic authentication of the history or provider result. The caller
+/// must still verify the exact live connector, operation, and recorded zone,
+/// and use current capability, approval, and preflight checks before dispatch.
+///
+/// # Errors
+/// Refuses unsuccessful history, changed source data, missing or contradictory
+/// response evidence, mismatched scope, and unusable created resource IDs.
+pub fn plan_history_undo(
+    entry: &crate::history::HistoryEntry,
+    original_input: &serde_json::Value,
+    full_response: &serde_json::Value,
+) -> Result<UndoPlan, UndoError> {
+    let family = match entry.operation_id.as_str() {
+        "discord.send_message" => "discord",
+        "notion.create_page" => "notion",
+        "todoist.tasks.create" => "todoist",
+        _ => return Err(UndoError::NoInverse),
+    };
+    if entry.status != crate::history::OpStatus::Success || entry.error_code.is_some() {
+        return Err(UndoError::SourceNotSuccessful);
+    }
+    let connector_family = entry
+        .connector_id
+        .strip_prefix("fcp.")
+        .unwrap_or(&entry.connector_id)
+        .split(':')
+        .next();
+    if !valid_identity(&entry.entry_id, 128)
+        || !valid_scope_label(&entry.connector_id)
+        || connector_family != Some(family)
+        || !entry
+            .zone
+            .as_deref()
+            .is_some_and(|zone| valid_scope_label(zone) && zone.starts_with("z:") && zone.len() > 2)
+    {
+        return Err(UndoError::InvalidSourceScope);
+    }
+    if crate::history::content_hash(original_input) != entry.input_hash {
+        return Err(UndoError::InputMismatch);
+    }
+    let response_hash = crate::history::content_hash(full_response);
+    if entry.output_hash.as_deref() != Some(response_hash.as_str()) {
+        return Err(UndoError::ResponseMismatch);
+    }
+    if !original_input.is_object()
+        || full_response
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            != Some("response")
+        || !full_response
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|id| valid_identity(id, 128))
+        || full_response
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            != Some("ok")
+        || full_response
+            .get("error")
+            .is_some_and(|error| !error.is_null())
+        || full_response
+            .get("decision_receipt_id")
+            .is_some_and(|receipt| !receipt.is_null())
+    {
+        return Err(UndoError::InvalidSourceResponse);
+    }
+    let result = full_response
+        .get("result")
+        .filter(|result| result.is_object())
+        .ok_or(UndoError::InvalidSourceResponse)?;
+    let mut plan = plan_undo(
+        &UndoRegistry::new(),
+        &entry.operation_id,
+        original_input,
+        result,
+    )
+    .map_err(|_| UndoError::InvalidResourceIdentity)?;
+    if !plan.inverse_input.as_object().is_some_and(|fields| {
+        fields
+            .values()
+            .all(|value| value.as_str().is_some_and(valid_resource_identity))
+    }) {
+        return Err(UndoError::InvalidResourceIdentity);
+    }
+    if family == "discord" {
+        validate_discord_delivery(original_input, result)?;
+    }
+    plan.original_entry_id.clone_from(&entry.entry_id);
+    plan.warnings.push(
+        "Source input and response match local history hashes; this is not authenticated provider provenance. Live authorization and preflight remain required."
+            .to_owned(),
+    );
+    plan.warnings.push(if family == "notion" {
+        "This archives the created page, including any later edits. It does not restore prior state or retract notifications and access already observed by others."
+            .to_owned()
+    } else {
+        "This deletes the created resource, including any later edits. It does not restore prior state or retract notifications and access already observed by others."
+            .to_owned()
+    });
+    Ok(plan)
+}
+
+fn valid_identity(value: &str, maximum: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= maximum
+        && !value
+            .chars()
+            .any(|ch| ch.is_whitespace() || ch.is_control())
+}
+
+// These identifiers become URL path segments in connector clients. None of
+// the reviewed providers needs delimiters, escapes, Unicode, or whitespace.
+fn valid_resource_identity(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 512
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn valid_scope_label(value: &str) -> bool {
+    value.len() <= 128
+        && value
+            .bytes()
+            .next()
+            .is_some_and(|first| first.is_ascii_lowercase() || first.is_ascii_digit())
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || matches!(byte, b'.' | b'_' | b':' | b'-')
+        })
+}
+
+fn validate_discord_delivery(
+    input: &serde_json::Value,
+    result: &serde_json::Value,
+) -> Result<(), UndoError> {
+    let channel = result.get("channel_id").and_then(serde_json::Value::as_str);
+    let message = result.get("id").and_then(serde_json::Value::as_str);
+    if channel != input.get("channel_id").and_then(serde_json::Value::as_str)
+        || !channel.is_some_and(|value| value.bytes().all(|byte| byte.is_ascii_digit()))
+        || !message.is_some_and(|value| value.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return Err(UndoError::DeliveryMismatch);
+    }
+    // Older successful responses have no delivery metadata. When present, the
+    // metadata must agree with the provider-visible resource being removed.
+    if let Some(delivery) = result.get("delivery")
+        && (!delivery.is_object()
+            || delivery.get("status").and_then(serde_json::Value::as_str) != Some("delivered")
+            || delivery
+                .get("visible")
+                .is_some_and(|visible| visible != true)
+            || delivery
+                .get("visibility")
+                .is_some_and(|visibility| visibility != "visible")
+            || delivery
+                .get("message_id")
+                .is_some_and(|id| id.as_str() != message)
+            || delivery
+                .get("channel_id")
+                .is_some_and(|id| id.as_str() != channel))
+    {
+        return Err(UndoError::DeliveryMismatch);
+    }
+    Ok(())
+}
+
 /// Construct an undo plan from the registry, original operation, and its
-/// input/output.
+/// input/output. This general mapping helper does not establish history
+/// continuity or execution authority; use `plan_history_undo` for live undo.
 ///
 /// # Errors
 ///
@@ -467,7 +590,6 @@ pub fn plan_undo(
 
     // Determine risk level based on the inverse operation name.
     let risk_level = classify_risk(&mapping.inverse_operation);
-    let requires_confirmation = risk_level == "high";
 
     Ok(UndoPlan {
         original_entry_id: String::new(), // Filled by caller.
@@ -475,7 +597,7 @@ pub fn plan_undo(
         inverse_operation: mapping.inverse_operation.clone(),
         inverse_input: serde_json::Value::Object(inverse_input),
         risk_level,
-        requires_confirmation,
+        requires_confirmation: true,
         warnings,
     })
 }
@@ -520,7 +642,10 @@ pub fn check_reversibility(registry: &UndoRegistry, operation_id: &str) -> Rever
             operation_id: operation_id.to_owned(),
             reversible: true,
             inverse_operation: Some(mapping.inverse_operation.clone()),
-            guidance: format!("Can be reversed via '{}'.", mapping.inverse_operation),
+            guidance: format!(
+                "A compensating operation is available via '{}'. Confirm its current scope and risk; it cannot restore all prior effects or retract notifications.",
+                mapping.inverse_operation
+            ),
         },
     )
 }
@@ -535,38 +660,34 @@ mod tests {
     // ── UndoRegistry: built-in lookups ──────────────────────────────────
 
     #[test]
-    fn registry_has_builtin_github_create_issue() {
+    fn registry_refuses_nonexistent_github_close_issue() {
         let reg = UndoRegistry::new();
-        let m = reg.lookup("github.create_issue").unwrap();
-        assert_eq!(m.inverse_operation, "github.close_issue");
+        assert!(reg.lookup("github.create_issue").is_none());
     }
 
     #[test]
-    fn registry_has_builtin_github_create_pull_request() {
+    fn registry_refuses_nonexistent_github_close_pull_request() {
         let reg = UndoRegistry::new();
-        let m = reg.lookup("github.create_pull_request").unwrap();
-        assert_eq!(m.inverse_operation, "github.close_pull_request");
+        assert!(reg.lookup("github.create_pull_request").is_none());
     }
 
     #[test]
-    fn registry_has_builtin_github_create_repo() {
+    fn registry_refuses_unverified_github_create_repo_pair() {
         let reg = UndoRegistry::new();
-        let m = reg.lookup("github.create_repo").unwrap();
-        assert_eq!(m.inverse_operation, "github.delete_repo");
+        assert!(reg.lookup("github.create_repo").is_none());
     }
 
     #[test]
-    fn registry_has_builtin_github_add_label() {
+    fn registry_refuses_label_removal_without_prior_state() {
         let reg = UndoRegistry::new();
-        let m = reg.lookup("github.add_label").unwrap();
-        assert_eq!(m.inverse_operation, "github.remove_label");
+        assert!(reg.lookup("github.add_label").is_none());
     }
 
     #[test]
-    fn registry_has_builtin_slack_send_message() {
+    fn registry_refuses_nonexistent_slack_delete_message() {
         let reg = UndoRegistry::new();
-        let m = reg.lookup("slack.send_message").unwrap();
-        assert_eq!(m.inverse_operation, "slack.delete_message");
+        assert!(reg.lookup("slack.send_message").is_none());
+        assert!(reg.lookup("slack.post_message").is_none());
     }
 
     #[test]
@@ -577,115 +698,94 @@ mod tests {
     }
 
     #[test]
-    fn registry_has_builtin_todoist_create_task() {
+    fn registry_has_builtin_todoist_tasks_create() {
         let reg = UndoRegistry::new();
-        let m = reg.lookup("todoist.create_task").unwrap();
-        assert_eq!(m.inverse_operation, "todoist.close_task");
+        let m = reg.lookup("todoist.tasks.create").unwrap();
+        assert_eq!(m.inverse_operation, "todoist.tasks.delete");
+        assert!(reg.lookup("todoist.create_task").is_none());
     }
 
     #[test]
-    fn registry_has_builtin_linear_create_issue() {
+    fn registry_refuses_nonexistent_linear_close_issue() {
         let reg = UndoRegistry::new();
-        let m = reg.lookup("linear.create_issue").unwrap();
-        assert_eq!(m.inverse_operation, "linear.close_issue");
+        assert!(reg.lookup("linear.create_issue").is_none());
     }
 
     #[test]
     fn registry_has_builtin_notion_create_page() {
         let reg = UndoRegistry::new();
         let m = reg.lookup("notion.create_page").unwrap();
-        assert_eq!(m.inverse_operation, "notion.archive_page");
+        assert_eq!(m.inverse_operation, "notion.delete_page");
     }
 
     #[test]
-    fn registry_has_builtin_jira_create_issue() {
+    fn registry_refuses_unverified_jira_close_issue() {
         let reg = UndoRegistry::new();
-        let m = reg.lookup("jira.create_issue").unwrap();
-        assert_eq!(m.inverse_operation, "jira.close_issue");
+        assert!(reg.lookup("jira.create_issue").is_none());
     }
 
     #[test]
-    fn registry_has_builtin_trello_create_card() {
+    fn registry_refuses_non_strict_trello_delete() {
         let reg = UndoRegistry::new();
-        let m = reg.lookup("trello.create_card").unwrap();
-        assert_eq!(m.inverse_operation, "trello.archive_card");
+        assert!(reg.lookup("trello.cards.create").is_none());
+        assert!(reg.lookup("trello.create_card").is_none());
     }
 
     #[test]
-    fn registry_has_builtin_asana_create_task() {
+    fn registry_refuses_unverified_asana_create_task() {
         let reg = UndoRegistry::new();
-        let m = reg.lookup("asana.create_task").unwrap();
-        assert_eq!(m.inverse_operation, "asana.close_task");
+        assert!(reg.lookup("asana.create_task").is_none());
+        assert!(reg.lookup("asana.tasks.create").is_none());
     }
 
     #[test]
-    fn registry_has_builtin_kubernetes_create_pod() {
+    fn registry_refuses_name_reuse_as_pod_identity() {
         let reg = UndoRegistry::new();
-        let m = reg.lookup("kubernetes.create_pod").unwrap();
-        assert_eq!(m.inverse_operation, "kubernetes.delete_pod");
+        assert!(reg.lookup("kubernetes.create_pod").is_none());
     }
 
     #[test]
-    fn registry_has_builtin_terraform_apply() {
+    fn registry_refuses_workspace_destruction_as_compensation() {
         let reg = UndoRegistry::new();
-        let m = reg.lookup("terraform.apply").unwrap();
-        assert_eq!(m.inverse_operation, "terraform.destroy");
+        assert!(reg.lookup("terraform.apply").is_none());
     }
 
     #[test]
-    fn registry_has_builtin_s3_upload_object() {
+    fn registry_refuses_object_delete_as_overwrite_restoration() {
         let reg = UndoRegistry::new();
-        let m = reg.lookup("s3.upload_object").unwrap();
-        assert_eq!(m.inverse_operation, "s3.delete_object");
+        assert!(reg.lookup("s3.upload_object").is_none());
     }
 
     #[test]
-    fn registry_has_builtin_stripe_create_subscription() {
+    fn registry_refuses_unverified_stripe_create_subscription() {
         let reg = UndoRegistry::new();
-        let m = reg.lookup("stripe.create_subscription").unwrap();
-        assert_eq!(m.inverse_operation, "stripe.cancel_subscription");
+        assert!(reg.lookup("stripe.create_subscription").is_none());
     }
 
     #[test]
-    fn registry_has_builtin_spotify_follow_playlist() {
+    fn registry_refuses_unfollow_without_prior_follow_state() {
         let reg = UndoRegistry::new();
-        let m = reg.lookup("spotify.follow_playlist").unwrap();
-        assert_eq!(m.inverse_operation, "spotify.unfollow_playlist");
+        assert!(reg.lookup("spotify.follow_playlist").is_none());
     }
 
     #[test]
-    fn registry_has_builtin_generic_pairs() {
+    fn registry_does_not_guess_generic_pairs() {
         let reg = UndoRegistry::new();
-        assert_eq!(
-            reg.lookup("generic.create").unwrap().inverse_operation,
-            "generic.delete"
-        );
-        assert_eq!(
-            reg.lookup("generic.enable").unwrap().inverse_operation,
-            "generic.disable"
-        );
-        assert_eq!(
-            reg.lookup("generic.add").unwrap().inverse_operation,
-            "generic.remove"
-        );
-        assert_eq!(
-            reg.lookup("generic.start").unwrap().inverse_operation,
-            "generic.stop"
-        );
-        assert_eq!(
-            reg.lookup("generic.subscribe").unwrap().inverse_operation,
-            "generic.unsubscribe"
-        );
+        for operation in [
+            "generic.create",
+            "generic.enable",
+            "generic.add",
+            "generic.start",
+            "generic.subscribe",
+        ] {
+            assert!(reg.lookup(operation).is_none(), "{operation}");
+        }
     }
 
     #[test]
-    fn registry_has_at_least_20_builtins() {
+    fn registry_contains_only_reviewed_builtins() {
         let reg = UndoRegistry::new();
-        assert!(
-            reg.len() >= 20,
-            "expected >= 20 builtins, got {}",
-            reg.len()
-        );
+        assert_eq!(reg.len(), 3);
     }
 
     #[test]
@@ -716,16 +816,18 @@ mod tests {
     #[test]
     fn registry_custom_overwrites_builtin() {
         let mut reg = UndoRegistry::new();
+        let before = reg.len();
         reg.register(
-            "github.create_issue",
+            "notion.create_page",
             InverseMapping {
-                inverse_operation: "github.delete_issue".to_owned(),
+                inverse_operation: "custom.archive_page".to_owned(),
                 input_mapping: BTreeMap::new(),
             },
         );
+        assert_eq!(reg.len(), before);
         assert_eq!(
-            reg.lookup("github.create_issue").unwrap().inverse_operation,
-            "github.delete_issue"
+            reg.lookup("notion.create_page").unwrap().inverse_operation,
+            "custom.archive_page"
         );
     }
 
@@ -869,32 +971,28 @@ mod tests {
     #[test]
     fn plan_simple_inverse() {
         let reg = UndoRegistry::new();
-        let input = json!({"owner": "acme", "repo": "widgets"});
-        let output = json!({"issue": {"number": 7}});
-        let plan = plan_undo(&reg, "github.create_issue", &input, &output).unwrap();
-        assert_eq!(plan.inverse_operation, "github.close_issue");
-        assert_eq!(plan.inverse_input["owner"], json!("acme"));
-        assert_eq!(plan.inverse_input["repo"], json!("widgets"));
-        assert_eq!(plan.inverse_input["issue_number"], json!(7));
+        let input = json!({"content": "Review proposal"});
+        let output = json!({"id": "task-7"});
+        let plan = plan_undo(&reg, "todoist.tasks.create", &input, &output).unwrap();
+        assert_eq!(plan.inverse_operation, "todoist.tasks.delete");
+        assert_eq!(plan.inverse_input, json!({"task_id": "task-7"}));
     }
 
     #[test]
-    fn plan_slack_inverse() {
+    fn plan_refuses_unimplemented_slack_inverse() {
         let reg = UndoRegistry::new();
         let input = json!({"channel": "C123"});
         let output = json!({"ts": "1234567890.123456"});
-        let plan = plan_undo(&reg, "slack.send_message", &input, &output).unwrap();
-        assert_eq!(plan.inverse_operation, "slack.delete_message");
-        assert_eq!(plan.inverse_input["channel"], json!("C123"));
-        assert_eq!(plan.inverse_input["ts"], json!("1234567890.123456"));
+        let error = plan_undo(&reg, "slack.post_message", &input, &output).unwrap_err();
+        assert_eq!(error, UndoError::NoInverse);
     }
 
     #[test]
     fn plan_missing_output_field_error() {
         let reg = UndoRegistry::new();
-        let input = json!({"owner": "acme", "repo": "w"});
-        let output = json!({}); // Missing issue.number
-        let err = plan_undo(&reg, "github.create_issue", &input, &output).unwrap_err();
+        let input = json!({});
+        let output = json!({"page": {}}); // Missing page.id
+        let err = plan_undo(&reg, "notion.create_page", &input, &output).unwrap_err();
         assert_eq!(
             std::mem::discriminant(&err),
             std::mem::discriminant(&UndoError::MissingOutputField(String::new()))
@@ -903,10 +1001,17 @@ mod tests {
 
     #[test]
     fn plan_missing_input_field_error() {
-        let reg = UndoRegistry::new();
-        let input = json!({}); // Missing owner
-        let output = json!({"issue": {"number": 1}});
-        let err = plan_undo(&reg, "github.create_issue", &input, &output).unwrap_err();
+        let mut reg = UndoRegistry::new();
+        reg.register(
+            "custom.open",
+            InverseMapping {
+                inverse_operation: "custom.close".to_owned(),
+                input_mapping: BTreeMap::from([("scope".to_owned(), "$.input.scope".to_owned())]),
+            },
+        );
+        let input = json!({}); // Missing scope in a custom offline mapping.
+        let output = json!({"id": "created-1"});
+        let err = plan_undo(&reg, "custom.open", &input, &output).unwrap_err();
         assert_eq!(
             std::mem::discriminant(&err),
             std::mem::discriminant(&UndoError::InputMappingFailed(String::new()))
@@ -923,21 +1028,26 @@ mod tests {
     #[test]
     fn plan_risk_level_high_for_delete() {
         let reg = UndoRegistry::new();
-        let input = json!({"owner": "a", "repo": "b"});
-        let output = json!({"owner": {"login": "a"}, "name": "b"});
-        let plan = plan_undo(&reg, "github.create_repo", &input, &output).unwrap();
+        let input = json!({});
+        let output = json!({"id": "task-1"});
+        let plan = plan_undo(&reg, "todoist.tasks.create", &input, &output).unwrap();
         assert_eq!(plan.risk_level, "high");
         assert!(plan.requires_confirmation);
     }
 
     #[test]
     fn plan_risk_level_medium_for_close() {
-        let reg = UndoRegistry::new();
-        let input = json!({"owner": "a", "repo": "b"});
-        let output = json!({"issue": {"number": 1}});
-        let plan = plan_undo(&reg, "github.create_issue", &input, &output).unwrap();
+        let mut reg = UndoRegistry::new();
+        reg.register(
+            "custom.open",
+            InverseMapping {
+                inverse_operation: "custom.close".to_owned(),
+                input_mapping: BTreeMap::new(),
+            },
+        );
+        let plan = plan_undo(&reg, "custom.open", &json!({}), &json!({})).unwrap();
         assert_eq!(plan.risk_level, "medium");
-        assert!(!plan.requires_confirmation);
+        assert!(plan.requires_confirmation);
     }
 
     #[test]
@@ -952,7 +1062,7 @@ mod tests {
         );
         let plan = plan_undo(&reg, "custom.foo", &json!({}), &json!({})).unwrap();
         assert_eq!(plan.risk_level, "low");
-        assert!(!plan.requires_confirmation);
+        assert!(plan.requires_confirmation);
     }
 
     #[test]
@@ -1024,13 +1134,13 @@ mod tests {
     #[test]
     fn reversibility_check_reversible() {
         let reg = UndoRegistry::new();
-        let check = check_reversibility(&reg, "github.create_issue");
+        let check = check_reversibility(&reg, "notion.create_page");
         assert!(check.reversible);
         assert_eq!(
             check.inverse_operation,
-            Some("github.close_issue".to_owned())
+            Some("notion.delete_page".to_owned())
         );
-        assert!(check.guidance.contains("close_issue"));
+        assert!(check.guidance.contains("delete_page"));
     }
 
     #[test]
@@ -1101,6 +1211,13 @@ mod tests {
             UndoError::MissingOutputField("ts".to_owned()),
             UndoError::OperationNotFound,
             UndoError::InputMappingFailed("bad path".to_owned()),
+            UndoError::SourceNotSuccessful,
+            UndoError::InvalidSourceScope,
+            UndoError::InputMismatch,
+            UndoError::ResponseMismatch,
+            UndoError::InvalidSourceResponse,
+            UndoError::InvalidResourceIdentity,
+            UndoError::DeliveryMismatch,
         ];
         for err in &errors {
             let json_str = serde_json::to_string(err).unwrap();
@@ -1171,10 +1288,10 @@ mod tests {
     #[test]
     fn plan_preserves_original_operation() {
         let reg = UndoRegistry::new();
-        let input = json!({"channel": "C1"});
-        let output = json!({"ts": "123"});
-        let plan = plan_undo(&reg, "slack.send_message", &input, &output).unwrap();
-        assert_eq!(plan.original_operation, "slack.send_message");
+        let input = json!({"content": "Test task"});
+        let output = json!({"id": "task-123"});
+        let plan = plan_undo(&reg, "todoist.tasks.create", &input, &output).unwrap();
+        assert_eq!(plan.original_operation, "todoist.tasks.create");
     }
 
     #[test]
@@ -1299,7 +1416,7 @@ mod tests {
         let cloned = reg.clone();
         assert_eq!(reg.len(), cloned.len());
         // Verify a lookup works on clone
-        assert!(cloned.lookup("github.create_issue").is_some());
+        assert!(cloned.lookup("notion.create_page").is_some());
     }
 
     // ── Debug impls ──────────────────────────────────────────────────────
@@ -1497,12 +1614,12 @@ mod tests {
     #[test]
     fn plan_discord_inverse() {
         let reg = UndoRegistry::new();
-        let input = json!({"channel_id": "ch-1"});
-        let output = json!({"id": "msg-42"});
+        let input = json!({"channel_id": "123"});
+        let output = json!({"id": "456", "channel_id": "123"});
         let plan = plan_undo(&reg, "discord.send_message", &input, &output).unwrap();
         assert_eq!(plan.inverse_operation, "discord.delete_message");
-        assert_eq!(plan.inverse_input["channel_id"], json!("ch-1"));
-        assert_eq!(plan.inverse_input["message_id"], json!("msg-42"));
+        assert_eq!(plan.inverse_input["channel_id"], json!("123"));
+        assert_eq!(plan.inverse_input["message_id"], json!("456"));
         assert_eq!(plan.risk_level, "high");
     }
 
@@ -1511,124 +1628,113 @@ mod tests {
         let reg = UndoRegistry::new();
         let input = json!({});
         let output = json!({"id": "task-99"});
-        let plan = plan_undo(&reg, "todoist.create_task", &input, &output).unwrap();
-        assert_eq!(plan.inverse_operation, "todoist.close_task");
+        let plan = plan_undo(&reg, "todoist.tasks.create", &input, &output).unwrap();
+        assert_eq!(plan.inverse_operation, "todoist.tasks.delete");
         assert_eq!(plan.inverse_input["task_id"], json!("task-99"));
     }
 
     #[test]
-    fn plan_linear_inverse() {
+    fn plan_refuses_unimplemented_linear_close() {
         let reg = UndoRegistry::new();
         let input = json!({});
         let output = json!({"id": "LIN-42"});
-        let plan = plan_undo(&reg, "linear.create_issue", &input, &output).unwrap();
-        assert_eq!(plan.inverse_operation, "linear.close_issue");
-        assert_eq!(plan.inverse_input["issue_id"], json!("LIN-42"));
+        let error = plan_undo(&reg, "linear.create_issue", &input, &output).unwrap_err();
+        assert_eq!(error, UndoError::NoInverse);
     }
 
     #[test]
     fn plan_notion_inverse() {
         let reg = UndoRegistry::new();
         let input = json!({});
-        let output = json!({"id": "page-abc"});
+        let output = json!({"page": {"id": "page-abc"}});
         let plan = plan_undo(&reg, "notion.create_page", &input, &output).unwrap();
-        assert_eq!(plan.inverse_operation, "notion.archive_page");
+        assert_eq!(plan.inverse_operation, "notion.delete_page");
         assert_eq!(plan.inverse_input["page_id"], json!("page-abc"));
-        assert_eq!(plan.risk_level, "medium");
+        assert_eq!(plan.risk_level, "high");
     }
 
     #[test]
-    fn plan_jira_inverse() {
+    fn plan_refuses_unverified_jira_close() {
         let reg = UndoRegistry::new();
         let input = json!({"project": "PROJ"});
         let output = json!({"key": "PROJ-123"});
-        let plan = plan_undo(&reg, "jira.create_issue", &input, &output).unwrap();
-        assert_eq!(plan.inverse_operation, "jira.close_issue");
-        assert_eq!(plan.inverse_input["issue_key"], json!("PROJ-123"));
-        assert_eq!(plan.inverse_input["project"], json!("PROJ"));
+        let error = plan_undo(&reg, "jira.create_issue", &input, &output).unwrap_err();
+        assert_eq!(error, UndoError::NoInverse);
     }
 
     #[test]
-    fn plan_trello_inverse() {
+    fn plan_refuses_trello_delete_without_strict_runtime_metadata() {
         let reg = UndoRegistry::new();
         let input = json!({});
         let output = json!({"id": "card-7"});
-        let plan = plan_undo(&reg, "trello.create_card", &input, &output).unwrap();
-        assert_eq!(plan.inverse_operation, "trello.archive_card");
-        assert_eq!(plan.inverse_input["card_id"], json!("card-7"));
+        let error = plan_undo(&reg, "trello.cards.create", &input, &output).unwrap_err();
+        assert_eq!(error, UndoError::NoInverse);
     }
 
     #[test]
-    fn plan_asana_inverse() {
+    fn plan_refuses_unverified_asana_close() {
         let reg = UndoRegistry::new();
         let input = json!({});
         let output = json!({"gid": "12345"});
-        let plan = plan_undo(&reg, "asana.create_task", &input, &output).unwrap();
-        assert_eq!(plan.inverse_operation, "asana.close_task");
-        assert_eq!(plan.inverse_input["task_gid"], json!("12345"));
+        let error = plan_undo(&reg, "asana.create_task", &input, &output).unwrap_err();
+        assert_eq!(error, UndoError::NoInverse);
     }
 
     #[test]
-    fn plan_kubernetes_inverse() {
+    fn plan_refuses_pod_name_reuse_as_identity() {
         let reg = UndoRegistry::new();
         let input = json!({"namespace": "default", "name": "my-pod"});
         let output = json!({});
-        let plan = plan_undo(&reg, "kubernetes.create_pod", &input, &output).unwrap();
-        assert_eq!(plan.inverse_operation, "kubernetes.delete_pod");
-        assert_eq!(plan.inverse_input["namespace"], json!("default"));
-        assert_eq!(plan.inverse_input["name"], json!("my-pod"));
-        assert_eq!(plan.risk_level, "high");
-        assert!(plan.requires_confirmation);
+        let error = plan_undo(&reg, "kubernetes.create_pod", &input, &output).unwrap_err();
+        assert_eq!(error, UndoError::NoInverse);
     }
 
     #[test]
-    fn plan_terraform_inverse() {
+    fn plan_refuses_workspace_destroy_as_apply_undo() {
         let reg = UndoRegistry::new();
         let input = json!({"workspace": "prod", "config_dir": "/infra"});
         let output = json!({});
-        let plan = plan_undo(&reg, "terraform.apply", &input, &output).unwrap();
-        assert_eq!(plan.inverse_operation, "terraform.destroy");
-        assert_eq!(plan.inverse_input["workspace"], json!("prod"));
-        assert_eq!(plan.inverse_input["config_dir"], json!("/infra"));
-        assert_eq!(plan.risk_level, "high");
-        assert!(plan.requires_confirmation);
+        let error = plan_undo(&reg, "terraform.apply", &input, &output).unwrap_err();
+        assert_eq!(error, UndoError::NoInverse);
     }
 
     #[test]
-    fn plan_s3_inverse() {
+    fn plan_refuses_object_delete_as_overwrite_undo() {
         let reg = UndoRegistry::new();
         let input = json!({"bucket": "my-bucket", "key": "path/to/file.txt"});
         let output = json!({});
-        let plan = plan_undo(&reg, "s3.upload_object", &input, &output).unwrap();
-        assert_eq!(plan.inverse_operation, "s3.delete_object");
-        assert_eq!(plan.inverse_input["bucket"], json!("my-bucket"));
-        assert_eq!(plan.inverse_input["key"], json!("path/to/file.txt"));
+        let error = plan_undo(&reg, "s3.upload_object", &input, &output).unwrap_err();
+        assert_eq!(error, UndoError::NoInverse);
     }
 
     #[test]
-    fn plan_stripe_inverse() {
+    fn plan_refuses_unverified_subscription_cancel() {
         let reg = UndoRegistry::new();
         let input = json!({});
         let output = json!({"id": "sub_abc123"});
-        let plan = plan_undo(&reg, "stripe.create_subscription", &input, &output).unwrap();
-        assert_eq!(plan.inverse_operation, "stripe.cancel_subscription");
-        assert_eq!(plan.inverse_input["subscription_id"], json!("sub_abc123"));
-        assert_eq!(plan.risk_level, "medium");
+        let error = plan_undo(&reg, "stripe.create_subscription", &input, &output).unwrap_err();
+        assert_eq!(error, UndoError::NoInverse);
     }
 
     #[test]
-    fn plan_spotify_inverse() {
+    fn plan_refuses_unfollow_without_previous_state() {
         let reg = UndoRegistry::new();
         let input = json!({"playlist_id": "pl-42"});
         let output = json!({});
-        let plan = plan_undo(&reg, "spotify.follow_playlist", &input, &output).unwrap();
-        assert_eq!(plan.inverse_operation, "spotify.unfollow_playlist");
-        assert_eq!(plan.inverse_input["playlist_id"], json!("pl-42"));
+        let error = plan_undo(&reg, "spotify.follow_playlist", &input, &output).unwrap_err();
+        assert_eq!(error, UndoError::NoInverse);
     }
 
     #[test]
     fn plan_generic_create_inverse() {
-        let reg = UndoRegistry::new();
+        let mut reg = UndoRegistry::new();
+        reg.register(
+            "generic.create",
+            InverseMapping {
+                inverse_operation: "generic.delete".to_owned(),
+                input_mapping: BTreeMap::from([("id".to_owned(), "$.output.id".to_owned())]),
+            },
+        );
         let input = json!({});
         let output = json!({"id": "gen-1"});
         let plan = plan_undo(&reg, "generic.create", &input, &output).unwrap();
@@ -1639,7 +1745,14 @@ mod tests {
 
     #[test]
     fn plan_generic_enable_inverse() {
-        let reg = UndoRegistry::new();
+        let mut reg = UndoRegistry::new();
+        reg.register(
+            "generic.enable",
+            InverseMapping {
+                inverse_operation: "generic.disable".to_owned(),
+                input_mapping: BTreeMap::from([("id".to_owned(), "$.input.id".to_owned())]),
+            },
+        );
         let input = json!({"id": "feat-1"});
         let output = json!({});
         let plan = plan_undo(&reg, "generic.enable", &input, &output).unwrap();
@@ -1650,7 +1763,14 @@ mod tests {
 
     #[test]
     fn plan_generic_add_inverse() {
-        let reg = UndoRegistry::new();
+        let mut reg = UndoRegistry::new();
+        reg.register(
+            "generic.add",
+            InverseMapping {
+                inverse_operation: "generic.remove".to_owned(),
+                input_mapping: BTreeMap::from([("id".to_owned(), "$.input.id".to_owned())]),
+            },
+        );
         let input = json!({"id": "item-1"});
         let output = json!({});
         let plan = plan_undo(&reg, "generic.add", &input, &output).unwrap();
@@ -1661,7 +1781,14 @@ mod tests {
 
     #[test]
     fn plan_generic_start_inverse() {
-        let reg = UndoRegistry::new();
+        let mut reg = UndoRegistry::new();
+        reg.register(
+            "generic.start",
+            InverseMapping {
+                inverse_operation: "generic.stop".to_owned(),
+                input_mapping: BTreeMap::from([("id".to_owned(), "$.input.id".to_owned())]),
+            },
+        );
         let input = json!({"id": "proc-1"});
         let output = json!({});
         let plan = plan_undo(&reg, "generic.start", &input, &output).unwrap();
@@ -1672,7 +1799,17 @@ mod tests {
 
     #[test]
     fn plan_generic_subscribe_inverse() {
-        let reg = UndoRegistry::new();
+        let mut reg = UndoRegistry::new();
+        reg.register(
+            "generic.subscribe",
+            InverseMapping {
+                inverse_operation: "generic.unsubscribe".to_owned(),
+                input_mapping: BTreeMap::from([(
+                    "subscription_id".to_owned(),
+                    "$.output.id".to_owned(),
+                )]),
+            },
+        );
         let input = json!({});
         let output = json!({"id": "sub-1"});
         let plan = plan_undo(&reg, "generic.subscribe", &input, &output).unwrap();
@@ -1681,36 +1818,30 @@ mod tests {
     }
 
     #[test]
-    fn plan_github_add_label_inverse() {
+    fn plan_refuses_removing_existing_github_label() {
         let reg = UndoRegistry::new();
         let input = json!({"owner": "acme", "repo": "w", "issue_number": 5, "label": "bug"});
         let output = json!({});
-        let plan = plan_undo(&reg, "github.add_label", &input, &output).unwrap();
-        assert_eq!(plan.inverse_operation, "github.remove_label");
-        assert_eq!(plan.inverse_input["label"], json!("bug"));
-        assert_eq!(plan.inverse_input["issue_number"], json!(5));
-        assert_eq!(plan.risk_level, "medium");
+        let error = plan_undo(&reg, "github.add_label", &input, &output).unwrap_err();
+        assert_eq!(error, UndoError::NoInverse);
     }
 
     #[test]
-    fn plan_github_pr_inverse() {
+    fn plan_refuses_nonexistent_github_pr_close() {
         let reg = UndoRegistry::new();
         let input = json!({"owner": "acme", "repo": "widgets"});
         let output = json!({"pull_request": {"number": 101}});
-        let plan = plan_undo(&reg, "github.create_pull_request", &input, &output).unwrap();
-        assert_eq!(plan.inverse_operation, "github.close_pull_request");
-        assert_eq!(plan.inverse_input["pull_number"], json!(101));
+        let error = plan_undo(&reg, "github.create_pull_request", &input, &output).unwrap_err();
+        assert_eq!(error, UndoError::NoInverse);
     }
 
     #[test]
-    fn plan_github_create_repo_inverse() {
+    fn plan_refuses_unverified_github_repo_delete() {
         let reg = UndoRegistry::new();
         let input = json!({});
         let output = json!({"owner": {"login": "acme"}, "name": "new-repo"});
-        let plan = plan_undo(&reg, "github.create_repo", &input, &output).unwrap();
-        assert_eq!(plan.inverse_operation, "github.delete_repo");
-        assert_eq!(plan.inverse_input["owner"], json!("acme"));
-        assert_eq!(plan.inverse_input["repo"], json!("new-repo"));
+        let error = plan_undo(&reg, "github.create_repo", &input, &output).unwrap_err();
+        assert_eq!(error, UndoError::NoInverse);
     }
 
     // ── Multiple warnings ────────────────────────────────────────────────
@@ -1742,9 +1873,9 @@ mod tests {
     #[test]
     fn plan_no_warnings_when_all_fields_present() {
         let reg = UndoRegistry::new();
-        let input = json!({"channel": "C1"});
-        let output = json!({"ts": "123"});
-        let plan = plan_undo(&reg, "slack.send_message", &input, &output).unwrap();
+        let input = json!({});
+        let output = json!({"id": "task-123"});
+        let plan = plan_undo(&reg, "todoist.tasks.create", &input, &output).unwrap();
         assert!(plan.warnings.is_empty());
     }
 
@@ -1826,22 +1957,16 @@ mod tests {
     fn reversibility_slack_send_message() {
         let reg = UndoRegistry::new();
         let check = check_reversibility(&reg, "slack.send_message");
-        assert!(check.reversible);
-        assert_eq!(
-            check.inverse_operation.as_deref(),
-            Some("slack.delete_message")
-        );
+        assert!(!check.reversible);
+        assert!(check.inverse_operation.is_none());
     }
 
     #[test]
     fn reversibility_kubernetes_create_pod() {
         let reg = UndoRegistry::new();
         let check = check_reversibility(&reg, "kubernetes.create_pod");
-        assert!(check.reversible);
-        assert_eq!(
-            check.inverse_operation.as_deref(),
-            Some("kubernetes.delete_pod")
-        );
+        assert!(!check.reversible);
+        assert!(check.inverse_operation.is_none());
     }
 
     #[test]
@@ -1864,11 +1989,9 @@ mod tests {
     fn reversibility_terraform_apply() {
         let reg = UndoRegistry::new();
         let check = check_reversibility(&reg, "terraform.apply");
-        assert!(check.reversible);
-        assert_eq!(
-            check.inverse_operation.as_deref(),
-            Some("terraform.destroy")
-        );
+        assert!(!check.reversible);
+        assert!(check.inverse_operation.is_none());
+        assert!(check.guidance.contains("prior state"));
     }
 
     #[test]
@@ -1881,8 +2004,9 @@ mod tests {
     #[test]
     fn reversibility_check_guidance_format_for_reversible() {
         let reg = UndoRegistry::new();
-        let check = check_reversibility(&reg, "s3.upload_object");
-        assert!(check.guidance.starts_with("Can be reversed via"));
+        let check = check_reversibility(&reg, "notion.create_page");
+        assert!(check.guidance.contains("compensating operation"));
+        assert!(check.guidance.contains("cannot restore all prior effects"));
     }
 
     // ── Serde edge cases ─────────────────────────────────────────────────
@@ -1978,38 +2102,59 @@ mod tests {
     // ── Builtin mapping field counts ─────────────────────────────────────
 
     #[test]
-    fn github_create_issue_mapping_has_three_fields() {
+    fn notion_mapping_uses_nested_created_page_id() {
         let reg = UndoRegistry::new();
-        let m = reg.lookup("github.create_issue").unwrap();
-        assert_eq!(m.input_mapping.len(), 3);
+        let m = reg.lookup("notion.create_page").unwrap();
+        assert_eq!(
+            m.input_mapping,
+            BTreeMap::from([("page_id".to_owned(), "$.output.page.id".to_owned()),])
+        );
     }
 
     #[test]
-    fn slack_mapping_has_two_fields() {
+    fn discord_mapping_uses_response_channel_and_message_ids() {
         let reg = UndoRegistry::new();
-        let m = reg.lookup("slack.send_message").unwrap();
-        assert_eq!(m.input_mapping.len(), 2);
+        let m = reg.lookup("discord.send_message").unwrap();
+        assert_eq!(
+            m.input_mapping,
+            BTreeMap::from([
+                ("channel_id".to_owned(), "$.output.channel_id".to_owned()),
+                ("message_id".to_owned(), "$.output.id".to_owned()),
+            ])
+        );
     }
 
     #[test]
     fn todoist_mapping_has_one_field() {
         let reg = UndoRegistry::new();
-        let m = reg.lookup("todoist.create_task").unwrap();
-        assert_eq!(m.input_mapping.len(), 1);
+        let m = reg.lookup("todoist.tasks.create").unwrap();
+        assert_eq!(
+            m.input_mapping,
+            BTreeMap::from([("task_id".to_owned(), "$.output.id".to_owned()),])
+        );
     }
 
     #[test]
-    fn github_add_label_mapping_has_four_fields() {
+    fn trello_guidance_explains_runtime_idempotency_gap() {
         let reg = UndoRegistry::new();
-        let m = reg.lookup("github.add_label").unwrap();
-        assert_eq!(m.input_mapping.len(), 4);
+        let check = check_reversibility(&reg, "trello.cards.create");
+        assert!(!check.reversible);
+        assert!(check.inverse_operation.is_none());
+        assert!(
+            check
+                .guidance
+                .contains("does not declare strict idempotency")
+        );
+        assert!(check.guidance.contains("retained host evidence"));
     }
 
     #[test]
-    fn terraform_mapping_has_two_fields() {
+    fn overwrite_guidance_does_not_offer_a_delete_mapping() {
         let reg = UndoRegistry::new();
-        let m = reg.lookup("terraform.apply").unwrap();
-        assert_eq!(m.input_mapping.len(), 2);
+        let check = check_reversibility(&reg, "s3.upload_object");
+        assert!(!check.reversible);
+        assert!(check.inverse_operation.is_none());
+        assert!(check.guidance.contains("overwritten contents"));
     }
 
     // ── plan_undo original_entry_id is empty ─────────────────────────────
@@ -2017,10 +2162,381 @@ mod tests {
     #[test]
     fn plan_original_entry_id_is_empty() {
         let reg = UndoRegistry::new();
-        let input = json!({"channel": "C1"});
-        let output = json!({"ts": "t1"});
-        let plan = plan_undo(&reg, "slack.send_message", &input, &output).unwrap();
+        let input = json!({});
+        let output = json!({"id": "task-1"});
+        let plan = plan_undo(&reg, "todoist.tasks.create", &input, &output).unwrap();
         assert!(plan.original_entry_id.is_empty());
+    }
+
+    // History plans are the only plans suitable for the live CLI path. These
+    // fixtures model the complete response envelope that history hashes.
+    fn recorded_source(
+        operation: &str,
+        input: serde_json::Value,
+        result: serde_json::Value,
+    ) -> (
+        crate::history::HistoryEntry,
+        serde_json::Value,
+        serde_json::Value,
+    ) {
+        let family = operation.split('.').next().unwrap();
+        let response = json!({
+            "type": "response",
+            "id": "request-1",
+            "status": "ok",
+            "result": result,
+            "resource_uris": [],
+        });
+        let entry = crate::history::HistoryEntry {
+            entry_id: "history-entry-1".to_owned(),
+            timestamp: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            connector_id: format!("fcp.{family}"),
+            operation_id: operation.to_owned(),
+            zone: Some("z:work".to_owned()),
+            input_hash: crate::history::content_hash(&input),
+            input_summary: "source input".to_owned(),
+            output_hash: Some(crate::history::content_hash(&response)),
+            output_summary: Some("source response".to_owned()),
+            status: crate::history::OpStatus::Success,
+            latency_ms: 1,
+            error_code: None,
+            idempotency_key: None,
+            agent_session: None,
+        };
+        (entry, input, response)
+    }
+
+    #[test]
+    fn history_plans_use_real_contracts_and_require_confirmation() {
+        for (operation, input, result, inverse, expected) in [
+            (
+                "discord.send_message",
+                json!({"channel_id": "123", "content": "private-body"}),
+                json!({"id": "456", "channel_id": "123", "content": "private-body"}),
+                "discord.delete_message",
+                json!({"channel_id": "123", "message_id": "456"}),
+            ),
+            (
+                "notion.create_page",
+                json!({"private": "private-body"}),
+                json!({"page": {"id": "page-123", "private": "private-body"}}),
+                "notion.delete_page",
+                json!({"page_id": "page-123"}),
+            ),
+            (
+                "todoist.tasks.create",
+                json!({"content": "private-body"}),
+                json!({"id": "task_123", "content": "private-body"}),
+                "todoist.tasks.delete",
+                json!({"task_id": "task_123"}),
+            ),
+        ] {
+            let (entry, input, response) = recorded_source(operation, input, result);
+            let plan = plan_history_undo(&entry, &input, &response).unwrap();
+            assert_eq!(plan.original_entry_id, entry.entry_id);
+            assert_eq!(plan.original_operation, operation);
+            assert_eq!(plan.inverse_operation, inverse);
+            assert_eq!(plan.inverse_input, expected);
+            assert!(plan.requires_confirmation);
+            assert!(
+                plan.warnings
+                    .iter()
+                    .any(|warning| warning.contains("not authenticated"))
+            );
+            assert!(
+                !serde_json::to_string(&plan)
+                    .unwrap()
+                    .contains("private-body")
+            );
+        }
+    }
+
+    #[test]
+    fn history_plan_requires_successful_definite_source() {
+        let (mut entry, input, response) =
+            recorded_source("todoist.tasks.create", json!({}), json!({"id": "task-1"}));
+        for status in [
+            crate::history::OpStatus::Error,
+            crate::history::OpStatus::Timeout,
+            crate::history::OpStatus::RateLimited,
+            crate::history::OpStatus::Denied,
+            crate::history::OpStatus::Simulated,
+        ] {
+            entry.status = status;
+            assert_eq!(
+                plan_history_undo(&entry, &input, &response),
+                Err(UndoError::SourceNotSuccessful)
+            );
+        }
+        entry.status = crate::history::OpStatus::Success;
+        entry.error_code = Some("unexpected-error".to_owned());
+        assert_eq!(
+            plan_history_undo(&entry, &input, &response),
+            Err(UndoError::SourceNotSuccessful)
+        );
+    }
+
+    #[test]
+    fn history_plan_checks_both_hashes_and_complete_response() {
+        let (mut entry, input, response) = recorded_source(
+            "todoist.tasks.create",
+            json!({"content": "original"}),
+            json!({"id": "task-1"}),
+        );
+        assert_eq!(
+            plan_history_undo(&entry, &json!({"content": "changed"}), &response),
+            Err(UndoError::InputMismatch)
+        );
+        let mut changed = response.clone();
+        changed["id"] = json!("different-request");
+        assert_eq!(
+            plan_history_undo(&entry, &input, &changed),
+            Err(UndoError::ResponseMismatch)
+        );
+        assert_eq!(
+            plan_history_undo(&entry, &input, &response["result"]),
+            Err(UndoError::ResponseMismatch)
+        );
+        entry.output_hash = None;
+        assert_eq!(
+            plan_history_undo(&entry, &input, &response),
+            Err(UndoError::ResponseMismatch)
+        );
+    }
+
+    #[test]
+    fn history_plan_rejects_malformed_or_contradictory_envelopes() {
+        let (entry, input, valid) =
+            recorded_source("todoist.tasks.create", json!({}), json!({"id": "task-1"}));
+        for (field, value) in [
+            ("type", json!("other")),
+            ("id", json!(null)),
+            ("id", json!("")),
+            ("status", json!("error")),
+            ("error", json!({"code": "secret-provider-error"})),
+            ("decision_receipt_id", json!("denied-decision")),
+            ("result", json!(null)),
+            ("result", json!([])),
+        ] {
+            let mut response = valid.clone();
+            response[field] = value;
+            let mut recorded = entry.clone();
+            recorded.output_hash = Some(crate::history::content_hash(&response));
+            assert_eq!(
+                plan_history_undo(&recorded, &input, &response),
+                Err(UndoError::InvalidSourceResponse),
+                "field: {field}"
+            );
+        }
+        for field in ["type", "id", "status", "result"] {
+            let mut response = valid.clone();
+            response.as_object_mut().unwrap().remove(field);
+            let mut recorded = entry.clone();
+            recorded.output_hash = Some(crate::history::content_hash(&response));
+            assert_eq!(
+                plan_history_undo(&recorded, &input, &response),
+                Err(UndoError::InvalidSourceResponse),
+                "missing: {field}"
+            );
+        }
+        let (entry, input, response) =
+            recorded_source("todoist.tasks.create", json!([]), json!({"id": "task-1"}));
+        assert_eq!(
+            plan_history_undo(&entry, &input, &response),
+            Err(UndoError::InvalidSourceResponse)
+        );
+    }
+
+    #[test]
+    fn history_plan_requires_recorded_family_zone_and_bounded_entry_id() {
+        let (entry, input, response) =
+            recorded_source("todoist.tasks.create", json!({}), json!({"id": "task-1"}));
+        for connector in [
+            "fcp.notion",
+            "todoist-other",
+            "FCP.todoist",
+            "todoist/other",
+            "",
+        ] {
+            let mut recorded = entry.clone();
+            recorded.connector_id = connector.to_owned();
+            assert_eq!(
+                plan_history_undo(&recorded, &input, &response),
+                Err(UndoError::InvalidSourceScope)
+            );
+        }
+        for zone in [None, Some(""), Some("z:"), Some("work"), Some("z:work\n")] {
+            let mut recorded = entry.clone();
+            recorded.zone = zone.map(str::to_owned);
+            assert_eq!(
+                plan_history_undo(&recorded, &input, &response),
+                Err(UndoError::InvalidSourceScope)
+            );
+        }
+        for id in [String::new(), "entry\ncontrol".to_owned(), "a".repeat(129)] {
+            let mut recorded = entry.clone();
+            recorded.entry_id = id;
+            assert_eq!(
+                plan_history_undo(&recorded, &input, &response),
+                Err(UndoError::InvalidSourceScope)
+            );
+        }
+        for connector in ["fcp.todoist", "fcp.todoist:utility:1.0.0", "todoist:fcp:v1"] {
+            let mut recorded = entry.clone();
+            recorded.connector_id = connector.to_owned();
+            assert!(plan_history_undo(&recorded, &input, &response).is_ok());
+        }
+    }
+
+    #[test]
+    fn history_plan_rejects_unusable_or_url_active_resource_identifiers() {
+        for id in [
+            json!(null),
+            json!(17),
+            json!(false),
+            json!(""),
+            json!(" "),
+            json!("a b"),
+            json!("a\n"),
+            json!("../other"),
+            json!("a/b"),
+            json!("a\\b"),
+            json!("a?other"),
+            json!("a#other"),
+            json!("%2fother"),
+            json!("%252fother"),
+            json!("ページ"),
+            json!("a".repeat(513)),
+        ] {
+            for operation in ["notion.create_page", "todoist.tasks.create"] {
+                let result = if operation == "notion.create_page" {
+                    json!({"page": {"id": id.clone()}})
+                } else {
+                    json!({"id": id.clone()})
+                };
+                let (entry, input, response) = recorded_source(operation, json!({}), result);
+                let error = plan_history_undo(&entry, &input, &response).unwrap_err();
+                assert_eq!(
+                    error,
+                    UndoError::InvalidResourceIdentity,
+                    "{operation}: {id}"
+                );
+                assert_eq!(error.error_type(), "undo-resource-identity-required");
+            }
+        }
+    }
+
+    #[test]
+    fn history_plan_rejects_missing_nested_identity_without_guessing() {
+        for result in [
+            json!({}),
+            json!({"id": "top-level-id"}),
+            json!({"page": {}}),
+        ] {
+            let (entry, input, response) = recorded_source("notion.create_page", json!({}), result);
+            assert_eq!(
+                plan_history_undo(&entry, &input, &response),
+                Err(UndoError::InvalidResourceIdentity)
+            );
+        }
+    }
+
+    #[test]
+    fn history_plan_checks_discord_channel_and_delivery_evidence() {
+        for result in [
+            json!({"id": "456", "channel_id": "999"}),
+            json!({"id": "not-a-snowflake", "channel_id": "123"}),
+            json!({"id": "456", "channel_id": "123", "delivery": {"status": "suppressed"}}),
+            json!({"id": "456", "channel_id": "123", "delivery": {"status": "delivered", "visible": false}}),
+            json!({"id": "456", "channel_id": "123", "delivery": {"status": "delivered", "visibility": "hidden"}}),
+            json!({"id": "456", "channel_id": "123", "delivery": {"status": "delivered", "message_id": "789"}}),
+            json!({"id": "456", "channel_id": "123", "delivery": {"status": "delivered", "channel_id": "999"}}),
+            json!({"id": "456", "channel_id": "123", "delivery": null}),
+        ] {
+            let (entry, input, response) =
+                recorded_source("discord.send_message", json!({"channel_id": "123"}), result);
+            assert_eq!(
+                plan_history_undo(&entry, &input, &response),
+                Err(UndoError::DeliveryMismatch)
+            );
+        }
+        let (entry, input, response) = recorded_source(
+            "discord.send_message",
+            json!({"channel_id": "123"}),
+            json!({
+                "id": null, "channel_id": "123", "delivery": {"status": "suppressed"},
+            }),
+        );
+        assert_eq!(
+            plan_history_undo(&entry, &input, &response),
+            Err(UndoError::InvalidResourceIdentity)
+        );
+        let (entry, input, response) = recorded_source(
+            "discord.send_message",
+            json!({"channel_id": "123"}),
+            json!({
+                "id": "456", "channel_id": "123", "delivery": {
+                    "status": "delivered", "visibility": "visible", "visible": true, "message_id": "456",
+                },
+            }),
+        );
+        assert!(plan_history_undo(&entry, &input, &response).is_ok());
+    }
+
+    #[test]
+    fn history_plan_allowlist_is_independent_of_custom_offline_mappings() {
+        let mut registry = UndoRegistry::new();
+        registry.register(
+            "notion.create_page",
+            InverseMapping {
+                inverse_operation: "custom.destroy_workspace".to_owned(),
+                input_mapping: BTreeMap::new(),
+            },
+        );
+        let (entry, input, response) = recorded_source(
+            "notion.create_page",
+            json!({}),
+            json!({"page": {"id": "page-1"}}),
+        );
+        assert_eq!(
+            plan_undo(&registry, &entry.operation_id, &input, &response["result"])
+                .unwrap()
+                .inverse_operation,
+            "custom.destroy_workspace"
+        );
+        assert_eq!(
+            plan_history_undo(&entry, &input, &response)
+                .unwrap()
+                .inverse_operation,
+            "notion.delete_page"
+        );
+        for operation in [
+            "terraform.apply",
+            "s3.upload_object",
+            "github.create_issue",
+            "generic.create",
+            "trello.cards.create",
+        ] {
+            let (entry, input, response) =
+                recorded_source(operation, json!({}), json!({"id": "created-1"}));
+            assert_eq!(
+                plan_history_undo(&entry, &input, &response),
+                Err(UndoError::NoInverse)
+            );
+        }
+    }
+
+    #[test]
+    fn history_plan_errors_do_not_echo_source_payloads() {
+        let (entry, input, response) = recorded_source(
+            "todoist.tasks.create",
+            json!({"secret": "sensitive-source"}),
+            json!({"id": "sensitive-source?target"}),
+        );
+        let error = plan_history_undo(&entry, &input, &response).unwrap_err();
+        assert_eq!(error, UndoError::InvalidResourceIdentity);
+        assert!(!error.to_string().contains("sensitive-source"));
+        assert!(!error.error_type().contains("sensitive-source"));
     }
 
     // ── path evaluation with special characters ──────────────────────────
