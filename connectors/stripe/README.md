@@ -43,8 +43,7 @@ The current crate exposes these operations:
 Important runtime truths the contract preserves:
 
 - Package and binary name are `fcp-stripe`.
-- Runtime `BaseConnector` ID is `stripe`.
-- Manifest connector ID is `fcp.stripe`.
+- Runtime and manifest connector ID are `fcp.stripe`; the shipped native executable uses the shared bounded JSONL transport.
 - Configuration requires exactly one auth source:
   - `secret_key`
   - `credential_id`
@@ -58,33 +57,36 @@ Important runtime truths the contract preserves:
 - Runtime reqwest timeout is `30 seconds`.
 - Runtime request context timeout is `30 seconds`.
 - Runtime retry policy uses `max_retries = 2`.
-- Runtime `invoke` uses `operation`, not `operation_id`.
-- Runtime verifies a bound capability token before provider dispatch.
+- Runtime `invoke` requires the complete typed FCP envelope, including `type`, `id`, `connector_id`, `zone_id`, `operation`, `input`, and `capability_token`, and returns a correlated `InvokeResponse`.
+- A configured connector negotiates FCP 2.0 authority in `z:private` or `z:owner`. Each handshake rotates the actual instance ID and grants only requested capabilities declared by the manifest. Changing zones requires reconfiguration.
+- Runtime verifies the negotiated capability, connector, zone, current instance, operation and resource scope before provider dispatch. Signed call and byte allowances and exact idempotency-key restrictions are enforced by shared session admission.
 - Runtime resource bindings use `stripe:account:self` or object-shaped URIs such as `stripe:customer:{id}`, `stripe:payment_intent:{id}`, `stripe:subscription:{id}`, and `stripe:invoice:{id}`.
 - Side-effect operations include an `audit` object with `operation`, `side_effect`, `idempotency_key`, and `resource_id`.
-- Side-effect operations accept explicit `idempotency_key`, or derive one from top-level `operation_id` or `request_id`.
+- Side-effect operations accept an explicit `idempotency_key` in the envelope or operation input. If both are supplied they must match exactly; native keys contain at most 128 printable non-space ASCII bytes. Otherwise a stable provider key is derived from the canonical request `id`. Reuse that ID or explicit key when reconciling a retry of the same logical effect.
+- The caller's `deadline_ms` bounds preflight, provider work and retry backoff, up to the existing 30 second runtime cap. A timed-out invocation reports an uncertain outcome without refunding its admitted allowance. Successful responses settle their actual serialized FCP bytes; uncertain or failed outcomes retain their response reservation.
 - `stripe.ingest_webhook_event` requires the original raw payload string, `stripe_signature`, configured `webhook_signing_secret`, and optional `received_at`/`delivery_id`.
 - Webhook replay protection is process-local and keyed by Stripe `event.id`, not the optional host `delivery_id`.
 - Runtime handshake returns a SHA-256 hash of the bundled `manifest.toml`.
-- `health()` is local state and metrics only.
+- `health()` returns the canonical ready/degraded snapshot and actual instance ID. Ready means configuration and a negotiated session are present; it does not assert live Stripe reachability or prove host credential injection.
 - `self_check()` calls `GET /balance` only in direct-secret mode and degrades in `credential_id` mode.
-- `handle_shutdown()` shuts down the client runtime but does not clear connector configuration.
+- Failed configuration or handshake attempts revoke previous authority. Shutdown clears configuration and credentials, cancels client request contexts, acknowledges the request, and exits the native loop. EOF and transport failures also retire the client.
 
 ## Remaining Drift Visible In This Checkout
 
 This README documents runtime truth and keeps current drift visible:
 
-- Runtime handshake advertises streaming/replay event caps, while introspection exposes no events and no event caps.
-- Manifest marks mutating payment/customer operations as `policy` or `interactive`, and runtime introspection now reports those manifest approval modes. The invoke path still checks no approval token.
-- Official Stripe examples use form-style request parameters for API calls; this runtime currently sends JSON bodies for create/update/confirm/capture/cancel/refund/subscription operations.
+- Webhook ingestion is a signed invocation. Manifest and handshake advertise no streaming or replay subscription transport; introspection exposes no events.
+- Manifest marks mutating payment/customer operations as `policy` or `interactive`, and runtime introspection reports those approval modes. The private host control channel remains responsible for approval, lease, holder-proof, provenance and mesh revocation enforcement in addition to the connector's admission checks.
+- Mutation bodies use `application/x-www-form-urlencoded`, including Stripe bracket notation for nested parameters. Explicit provider keys are preserved exactly; client retries reuse the same key and body.
 - Official Stripe idempotency guidance says all `POST` requests accept idempotency keys and `GET`/`DELETE` idempotency keys have no effect. Runtime derives or forwards idempotency keys for some delete operations as well.
 - `stripe.ingest_webhook_event` validates Stripe signatures inside the connector, but the connector does not open an HTTP listener, register Stripe webhook endpoints, or persist delivery state.
 - Webhook replay protection stores only in-memory event IDs and evicts by tolerance window and cache size.
 - List operations expose only narrow filters and `limit`; they do not expose full Stripe pagination cursors, search endpoints, expand parameters, or API version selection.
-- Manifest says connector format is `wasi`; the current Rust crate is a normal package/bin using reqwest and the FCP runtime helpers.
+- Manifest declares the shipped executable as `native`.
 - `connectors/stripe/tests/local_non_mock.rs` exercises the production connector invoke path against a deterministic loopback Stripe fixture for read, write, and payment/refund operations.
+- `connectors/stripe/tests/native_host.rs` exercises the shipped binary over JSONL and real loopback HTTP, including health/session negotiation, signed admission, form mutations, deadline cancellation, lifecycle revocation and webhook verification.
 
-A follow-up enforcement bead should add approval-token checks, decide whether JSON request bodies are an intentional Stripe facade or live API drift, reconcile idempotency behavior for DELETE paths, add pagination/search/expand support if needed, and decide whether the loopback acceptance fixture should grow into Stripe CLI replay.
+Full pagination/search/expand support and durable webhook delivery remain outside this bounded connector surface.
 
 ## First-Slice Scope
 
@@ -191,6 +193,8 @@ Runtime capability-token verification binds operations to these resource URI sha
 | Invoice operations | `stripe:invoice:{invoice_id}` or `stripe:customer:{customer}` |
 | Webhook ingest | signed object URI when known, such as `stripe:invoice:{id}`, otherwise `stripe:event:{event_id}` |
 
+Resource IDs retain ordinary letters, digits, underscores and hyphens. Other characters are percent-encoded so delimiters, wildcard characters and literal percent escapes identify distinct resources. Webhook signatures are verified against the original payload before deriving the resource scope; simulation neither registers delivery IDs nor spends invocation allowance.
+
 ## Explicit Non-Goals
 
 The current implementation does not include:
@@ -231,7 +235,7 @@ The deterministic integration evidence is anchored on connector-local tests cove
 ## Source Notes
 
 - `connectors/stripe/src/connector.rs` defines configuration parsing, endpoint policy, lifecycle handlers, diagnostics, introspection, simulation, bound capability verification, resource URI binding, idempotency derivation, webhook signature verification, replay cache, and invoke dispatch.
-- `connectors/stripe/src/client.rs` defines Stripe REST request construction, auth behavior, retry dispatch, timeout configuration, path/query encoding, JSON request bodies, and provider error mapping.
+- `connectors/stripe/src/client.rs` defines Stripe REST request construction, auth behavior, retry dispatch, timeout configuration, path/query and form encoding, and provider error mapping.
 - `connectors/stripe/src/types.rs` defines Stripe customer, payment intent, refund, subscription, invoice, balance, deleted-object, list, and webhook event shapes.
 - `connectors/stripe/src/error.rs` defines connector error classes and FCP error conversion.
 - `connectors/stripe/src/limits.rs` defines webhook payload and replay-cache bounds.

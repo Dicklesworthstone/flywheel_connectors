@@ -5,7 +5,7 @@ min_mesh_version = "2.0.0"
 min_protocol = "fcp2-sym/2.0"
 protocol_features = []
 max_datagram_bytes = 65000
-interface_hash = "blake3-256:fcp.interface.v2:a9fc858e7558691b35ade5a4cf440778b9b77bb31c7200f29c4de50ce6f1a9d7"
+interface_hash = "blake3-256:fcp.interface.v2:04e53b1687ee072c35e4ea9f21859202ca255fd9d174a6745b45e5b856995040"
 
 [connector]
 id = "fcp.stripe"
@@ -14,9 +14,8 @@ version = "0.1.0"
 description = "FCP connector for Stripe (payments, customers, subscriptions, invoices, refunds)"
 archetypes = [
     "operational",
-    "streaming",
 ]
-format = "wasi"
+format = "native"
 status = "proven"
 
 [connector.state]
@@ -1159,9 +1158,9 @@ related = [
 ]
 
 [event_caps]
-streaming = true
-replay = true
-min_buffer_events = 100
+streaming = false
+replay = false
+min_buffer_events = 0
 
 [sandbox]
 profile = "strict"

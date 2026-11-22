@@ -7,6 +7,10 @@
 //! All operations are READ-ONLY (`stripe.list_customers`, `stripe.get_balance`) and
 //! do not create or mutate any resources.
 
+#[macro_use]
+#[path = "support/mod.rs"]
+mod test_support;
+
 use fcp_crypto::Ed25519SigningKey;
 use fcp_crypto::cose::CapabilityTokenBuilder;
 use fcp_prelude::{CapabilityConstraints, CapabilityToken};
@@ -90,7 +94,7 @@ fn generate_read_token(
     ciborium::into_writer(&constraints, &mut cbor).expect("serialize constraints");
     let cose = CapabilityTokenBuilder::new()
         .capability_id(cap)
-        .zone_id("z:work")
+        .zone_id("z:private")
         .principal("user:live-test")
         .operations(&[op])
         .issuer("node:live-test")
@@ -121,8 +125,8 @@ async fn setup_live_connector(
 
     connector
         .handle_handshake(json!({
-            "protocol_version": "1.0.0",
-            "zone": "z:work",
+            "protocol_version": "2.0",
+            "zone": "z:private",
             "host_public_key": verifying_key.to_bytes(),
             "nonce": vec![0u8; 32],
             "capabilities_requested": ["stripe.read"]
@@ -150,7 +154,7 @@ async fn live_customers_list() {
     );
 
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "stripe.list_customers",
             "input": {
                 "limit": 3
@@ -201,8 +205,8 @@ async fn live_error_mapping_invalid_key() {
 
     connector
         .handle_handshake(json!({
-            "protocol_version": "1.0.0",
-            "zone": "z:work",
+            "protocol_version": "2.0",
+            "zone": "z:private",
             "host_public_key": verifying_key.to_bytes(),
             "nonce": vec![0u8; 32],
             "capabilities_requested": ["stripe.read"]
@@ -217,7 +221,7 @@ async fn live_error_mapping_invalid_key() {
     );
 
     let err = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "stripe.list_customers",
             "input": { "limit": 1 },
             "capability_token": capability

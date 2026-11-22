@@ -31,6 +31,11 @@
     clippy::unused_async
 )]
 
+#[cfg(test)]
+#[macro_use]
+#[path = "../tests/support/mod.rs"]
+mod test_support;
+
 pub mod client;
 pub mod connector;
 pub mod error;

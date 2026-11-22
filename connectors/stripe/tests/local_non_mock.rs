@@ -2,6 +2,10 @@
 
 #![allow(clippy::too_many_lines)]
 
+#[macro_use]
+#[path = "support/mod.rs"]
+mod test_support;
+
 use std::{
     collections::HashMap,
     io::{Read, Write},
@@ -17,7 +21,7 @@ use fcp_stripe::connector::StripeConnector;
 use serde_json::{Value, json};
 
 const ACCEPTANCE_SUITE_CLASS: &str = "local_non_mock";
-const CONNECTOR_ID: &str = "stripe";
+const CONNECTOR_ID: &str = "fcp.stripe";
 const FIXTURE_ID: &str = "stripe-loopback-local-acceptance";
 const CUSTOMER_ID: &str = "cus_local_acceptance";
 const PAYMENT_INTENT_ID: &str = "pi_local_acceptance";
@@ -260,7 +264,7 @@ fn generate_valid_token(
     ciborium::into_writer(&constraints, &mut constraints_cbor).expect("serialize constraints");
     let cose = CapabilityTokenBuilder::new()
         .capability_id(capability)
-        .zone_id("z:work")
+        .zone_id("z:private")
         .principal("user:local-non-mock")
         .operations(&[op])
         .issuer("node:local-non-mock")
@@ -279,11 +283,11 @@ async fn setup_handshake(connector: &mut StripeConnector, caps: &[&str]) -> Ed25
 
     connector
         .handle_handshake(json!({
-            "protocol_version": "1.0.0",
-            "zone": "z:work",
+            "protocol_version": "2.0",
+            "zone": "z:private",
             "host_public_key": verifying_key.to_bytes(),
             "nonce": vec![0_u8; 32],
-            "capabilities_requested": caps
+            "capabilities_requested": test_support::capabilities(caps)
         }))
         .await
         .expect("handshake should succeed");
@@ -314,7 +318,7 @@ async fn loopback_acceptance_exercises_read_write_and_payment_paths() {
     .await;
 
     let balance = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "stripe.get_balance",
             "input": {},
             "capability_token": generate_valid_token(&signing_key, connector.instance_id(), "stripe.get_balance")
@@ -322,7 +326,7 @@ async fn loopback_acceptance_exercises_read_write_and_payment_paths() {
         .await
         .expect("read balance through loopback fixture");
     let customer = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "stripe.create_customer",
             "operation_id": "op-local-customer",
             "input": {
@@ -334,7 +338,7 @@ async fn loopback_acceptance_exercises_read_write_and_payment_paths() {
         .await
         .expect("create customer through loopback fixture");
     let refund = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "stripe.create_refund",
             "operation_id": "op-local-refund",
             "input": {

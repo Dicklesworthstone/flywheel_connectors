@@ -11,6 +11,10 @@
 
 #![allow(clippy::too_many_lines)]
 
+#[macro_use]
+#[path = "support/mod.rs"]
+mod test_support;
+
 use chrono::{Duration, Utc};
 use fcp_crypto::{cose::CapabilityTokenBuilder, ed25519::Ed25519SigningKey};
 use fcp_prelude::{CapabilityConstraints, CapabilityToken, FcpError};
@@ -63,7 +67,7 @@ fn generate_valid_token(
     ciborium::into_writer(&constraints, &mut cbor).expect("serialize constraints");
     let cose = CapabilityTokenBuilder::new()
         .capability_id(cap)
-        .zone_id("z:work")
+        .zone_id("z:private")
         .principal("user:test")
         .operations(&[op])
         .issuer("node:test")
@@ -82,11 +86,11 @@ async fn setup_handshake(connector: &mut StripeConnector, caps: &[&str]) -> Ed25
 
     connector
         .handle_handshake(json!({
-            "protocol_version": "1.0.0",
-            "zone": "z:work",
+            "protocol_version": "2.0",
+            "zone": "z:private",
             "host_public_key": verifying_key.to_bytes(),
             "nonce": vec![0u8; 32],
-            "capabilities_requested": caps
+            "capabilities_requested": test_support::capabilities(caps)
         }))
         .await
         .expect("handshake should succeed");
@@ -975,7 +979,7 @@ async fn invoke_get_balance_through_connector() {
         generate_valid_token(&signing_key, connector.instance_id(), "stripe.get_balance");
 
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "stripe.get_balance",
             "input": {},
             "capability_token": capability
@@ -1011,7 +1015,7 @@ async fn invoke_create_customer_through_connector() {
     );
 
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "stripe.create_customer",
             "input": { "email": "new@example.com" },
             "capability_token": capability
@@ -1049,7 +1053,7 @@ async fn invoke_create_customer_derives_idempotency_key_from_operation_id() {
     );
 
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "stripe.create_customer",
             "operation_id": "op-cc-1",
             "input": { "email": "new@example.com" },
@@ -1087,7 +1091,7 @@ async fn invoke_update_customer_through_connector() {
     );
 
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "stripe.update_customer",
             "operation_id": "op-update-1",
             "input": { "customer_id": "cus_42", "email": "updated@example.com" },
@@ -1130,7 +1134,7 @@ async fn invoke_delete_customer_through_connector() {
     );
 
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "stripe.delete_customer",
             "operation_id": "op-delete-1",
             "input": { "customer_id": "cus_42" },
@@ -1169,7 +1173,7 @@ async fn invoke_get_subscription_through_connector() {
     );
 
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "stripe.get_subscription",
             "input": { "subscription_id": "sub_123" },
             "capability_token": capability
@@ -1207,7 +1211,7 @@ async fn invoke_list_subscriptions_through_connector() {
     );
 
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "stripe.list_subscriptions",
             "input": { "customer": "cus_42", "status": "active", "limit": 10 },
             "capability_token": capability
@@ -1243,7 +1247,7 @@ async fn invoke_get_invoice_through_connector() {
         generate_valid_token(&signing_key, connector.instance_id(), "stripe.get_invoice");
 
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "stripe.get_invoice",
             "input": { "invoice_id": "in_123" },
             "capability_token": capability
@@ -1282,7 +1286,7 @@ async fn invoke_create_refund_through_connector() {
     );
 
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "stripe.create_refund",
             "input": { "payment_intent": "pi_789", "amount": 500 },
             "capability_token": capability
@@ -1322,7 +1326,7 @@ async fn invoke_create_subscription_derives_idempotency_key_from_operation_id() 
     );
 
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "stripe.create_subscription",
             "operation_id": "op-sub-create-1",
             "input": { "customer": "cus_42", "price": "price_abc123" },
@@ -1363,7 +1367,7 @@ async fn invoke_cancel_subscription_derives_idempotency_key_from_operation_id() 
     );
 
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "stripe.cancel_subscription",
             "operation_id": "op-sub-cancel-1",
             "input": { "subscription_id": "sub_derived" },
@@ -1406,7 +1410,7 @@ async fn invoke_create_refund_derives_idempotency_key_from_operation_id() {
     );
 
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "stripe.create_refund",
             "operation_id": "op-789",
             "input": { "payment_intent": "pi_derived", "amount": 250 },
@@ -1431,7 +1435,7 @@ async fn wrong_capability_rejected() {
         generate_valid_token(&signing_key, connector.instance_id(), "stripe.get_balance");
 
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "stripe.get_customer",
             "input": { "customer_id": "cus_123" },
             "capability_token": capability
@@ -1456,7 +1460,7 @@ async fn missing_required_field_returns_invalid_request() {
     );
 
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "stripe.create_payment_intent",
             "input": { "amount": 2000 },
             "capability_token": capability
@@ -1482,7 +1486,7 @@ async fn unknown_operation_rejected() {
         generate_valid_token(&signing_key, connector.instance_id(), "stripe.nonexistent");
 
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "stripe.nonexistent",
             "input": {},
             "capability_token": capability
@@ -1517,7 +1521,7 @@ async fn invoke_ingest_webhook_event_success() {
     let signature = build_webhook_signature("whsec_integration", payload, signature_timestamp);
 
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "stripe.ingest_webhook_event",
             "input": {
                 "payload": payload,
@@ -1557,7 +1561,7 @@ async fn invoke_ingest_webhook_event_replay_rejected() {
     let signature_timestamp = Utc::now().timestamp();
     let payload = r#"{"id":"evt_replay_test","object":"event","type":"invoice.paid","created":1700000000,"data":{"object":{"id":"in_123","object":"invoice"}}}"#;
     let signature = build_webhook_signature("whsec_replay", payload, signature_timestamp);
-    let invoke = json!({
+    let invoke = invoke_request!({
         "operation": "stripe.ingest_webhook_event",
         "input": {
             "payload": payload,
@@ -1598,7 +1602,7 @@ async fn invoke_ingest_webhook_event_invalid_signature_is_redacted() {
 
     let payload = r#"{"id":"evt_invalid_sig","object":"event","type":"invoice.paid","created":1700000000,"data":{"object":{"id":"in_123","object":"invoice"}}}"#;
     let err = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "stripe.ingest_webhook_event",
             "input": {
                 "payload": payload,
