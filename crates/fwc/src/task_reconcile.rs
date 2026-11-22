@@ -15,7 +15,19 @@ use fcp_host::{
 use fcp_kernel::InvokeStatus;
 use serde::{Deserialize, Serialize};
 
-use crate::workflow::TaskInvocationBinding;
+/// Payload-free identity synced after preflight and before an actual invoke.
+/// The transport binding commits to the exact token, idempotency key and
+/// effect-affecting request without treating a token subject hint as authority.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TaskInvocationBinding {
+    pub request_id: String,
+    pub host: String,
+    pub connector_id: String,
+    pub operation: String,
+    pub zone_id: String,
+    pub principal: Option<String>,
+    pub transport_idempotency: fcp_host::InvocationIdempotency,
+}
 
 const MAX_METADATA_BYTES: usize = 512;
 const MAX_MESH_TARGETS: usize = 256;
@@ -497,7 +509,9 @@ fn verify_local_completion(
         .terminal
         .as_ref()
         .ok_or(ReconcileFailure::IncompleteEvidence)?;
-    let finished_at = record.finished_at.ok_or(ReconcileFailure::IncompleteEvidence)?;
+    let finished_at = record
+        .finished_at
+        .ok_or(ReconcileFailure::IncompleteEvidence)?;
     if terminal.outcome != InvocationOutcome::Succeeded
         || !(200..300).contains(&terminal.http_status)
     {
@@ -547,7 +561,9 @@ fn verify_mesh_completion(
         .terminal
         .as_ref()
         .ok_or(ReconcileFailure::IncompleteEvidence)?;
-    let finished_at = record.finished_at.ok_or(ReconcileFailure::IncompleteEvidence)?;
+    let finished_at = record
+        .finished_at
+        .ok_or(ReconcileFailure::IncompleteEvidence)?;
     if terminal.outcome != MeshInvocationOutcome::Succeeded {
         return Err(ReconcileFailure::UnsuccessfulOutcome);
     }
@@ -674,8 +690,7 @@ mod tests {
                     } else {
                         principal_binding()
                     }),
-                    transport_idempotency: (!relay)
-                        .then(|| binding.transport_idempotency.clone()),
+                    transport_idempotency: (!relay).then(|| binding.transport_idempotency.clone()),
                 },
                 admitted_at,
                 attempts: vec![
@@ -724,7 +739,13 @@ mod tests {
         assert_eq!(proof.receipt_id.as_deref(), Some("receipt-final"));
         assert_eq!(proof.audit_event_id.as_deref(), Some("audit-final"));
         let encoded = serde_json::to_value(&proof).unwrap();
-        for absent in ["result", "input", "capability_token", "idempotency_key", "retry"] {
+        for absent in [
+            "result",
+            "input",
+            "capability_token",
+            "idempotency_key",
+            "retry",
+        ] {
             assert!(
                 encoded.get(absent).is_none(),
                 "{absent} must not be reconstructed"

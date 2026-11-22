@@ -19,5 +19,6 @@ pub mod readiness;
 pub mod recovery;
 pub mod schema_nav;
 pub mod search;
+pub mod task_reconcile;
 pub mod test_observability;
 pub mod truth;

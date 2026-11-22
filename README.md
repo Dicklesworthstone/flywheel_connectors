@@ -4048,12 +4048,47 @@ must still match. Resume retains the original run's idempotency namespace; an
 explicit `--idempotency-key` must match it. Downtime and resumed setup consume
 the original workflow deadline rather than starting a new timeout.
 
-A pending invocation, failed or denied step, blocked or unknown outcome, expired
-deadline, or completed run refuses resume. In particular, interruption after
-dispatch but before a terminal result is durably recorded cannot establish
-whether an external effect happened. Inspect that retained evidence before
-attempting further work. Checkpoints retain operation results, use private Unix
-file permissions, and allow only one writer at a time.
+An unresolved pending invocation, failed or denied step, blocked or unknown
+outcome, expired deadline, or completed run refuses resume. Checkpoints retain
+operation results, use private Unix file permissions, and allow only one writer
+at a time.
+
+If the process stopped after dispatch, or the connector's terminal reply was
+lost, reconcile the checkpoint against protected host invocation history before
+attempting to resume:
+
+```bash
+fwc --host https://fcp-host.example pipeline reconcile .fwc/runs/workflow.json \
+    --admin-token-file /path/to/host-admin-token
+fwc --host https://fcp-host.example recipe reconcile .fwc/runs/pr-review.json \
+    --admin-token-file /path/to/host-admin-token
+```
+
+Select the original host explicitly or through the same host configuration.
+Reconciliation reads history using the host inspection credential; it never
+invokes, retries, or cancels a connector operation. The saved request,
+capability-bound effect identity, connector, operation, zone, principal, and
+observed host attempt must match. An active job, non-durable receipt, incomplete
+finalization, or conflicting observation leaves the outcome unresolved. Older
+checkpoints without the original invocation binding cannot establish this proof
+and remain refused.
+
+A confirmed step is recorded as `reconciled` with `output_available: false`.
+Completion evidence does not contain the connector's original result, so
+reconciliation never invents one. The original uncertain record and untouched
+blocked suffix are retained separately. A subsequent explicit `--resume` can
+continue with static inputs and direct parameter lookups, using current
+authorization and preflight. If any reconciled output is missing, general jq
+filters and conditions that could read step results refuse further dispatch,
+including indirect or undeclared output dependencies. Existing successful
+results remain available, but recovery deliberately restricts expressions until
+every required result is known.
+
+Reconciliation can record evidence after a deadline has expired; it does not
+extend that deadline or make an expired run executable. If every step is
+confirmed, the checkpoint is completed without sending further work. Repeating
+reconciliation of an already confirmed checkpoint reports the retained proof
+without requiring another history request.
 
 ### Recipes
 

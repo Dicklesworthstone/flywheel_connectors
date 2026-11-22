@@ -294,6 +294,7 @@ mod undo;
 mod validate;
 mod webhook_events;
 mod workflow;
+mod workflow_reconcile_cmd;
 #[allow(dead_code)]
 mod zone_scope;
 
@@ -3389,6 +3390,9 @@ enum RecipeCommand {
     /// Summarize recipe cost, risk, approvals, and declared rate-limit impact.
     Estimate(RecipeRunArgs),
 
+    /// Reconcile an interrupted run from protected host history without sending work.
+    Reconcile(workflow_reconcile_cmd::WorkflowReconcileArgs),
+
     /// Export one built-in recipe as raw TOML for local customization.
     Export(RecipeRefArgs),
 }
@@ -3470,6 +3474,9 @@ enum PipelineCommand {
 
     /// Summarize pipeline cost, risk, approvals, and declared rate-limit impact.
     Estimate(PipelineRunArgs),
+
+    /// Reconcile an interrupted run from protected host history without sending work.
+    Reconcile(workflow_reconcile_cmd::WorkflowReconcileArgs),
 }
 
 #[derive(Args, Debug, Default, Serialize)]
@@ -6130,8 +6137,8 @@ impl HostAdminClient {
         protected_inspection: bool,
     ) -> Result<Self> {
         let endpoint = normalize_host_endpoint(endpoint)?;
-        let unix_socket = cfg!(unix)
-            && (endpoint.starts_with("unix://") || endpoint.starts_with('/'));
+        let unix_socket =
+            cfg!(unix) && (endpoint.starts_with("unix://") || endpoint.starts_with('/'));
         if protected_inspection && !unix_socket {
             let url = Url::parse(&endpoint)?;
             let literal_loopback = match url.host() {
@@ -26811,12 +26818,7 @@ impl TaskInvocationContext<'_, '_> {
         format!("fwc-task:{}:{}", self.ticket.attempt_id(), self.ordinal)
     }
 
-    fn reserve(
-        &self,
-        host: &str,
-        request: &InvokeRequest,
-        principal: Option<&str>,
-    ) -> Result<()> {
+    fn reserve(&self, host: &str, request: &InvokeRequest, principal: Option<&str>) -> Result<()> {
         // HTTP invoke carries no asserted-principal header. Bind the exact
         // capability/effects alias retained by both local and forwarding jobs;
         // unverified token claims are only an additional expected-principal check.
@@ -26827,8 +26829,10 @@ impl TaskInvocationContext<'_, '_> {
             operation: request.operation.to_string(),
             zone_id: request.zone_id.to_string(),
             principal: principal.map(str::to_owned),
-            transport_idempotency: fcp_host::InvocationIdempotency::from_relay_request(request, None)?
-                .context("saved task invocation requires an idempotency binding")?,
+            transport_idempotency: fcp_host::InvocationIdempotency::from_relay_request(
+                request, None,
+            )?
+            .context("saved task invocation requires an idempotency binding")?,
         };
         self.lease
             .record_invocation_binding(self.ticket, self.ordinal, binding)
@@ -31812,6 +31816,9 @@ fn pipeline_dispatch(args: &PipelineArgs, explicit_host: Option<&str>) -> Result
         PipelineCommand::Estimate(args) => {
             pipeline_run_dispatch(&roots, args, PipelinePlanMode::Estimate, explicit_host)
         }
+        PipelineCommand::Reconcile(args) => {
+            workflow_reconcile_cmd::dispatch("pipeline", args, explicit_host)
+        }
     }
 }
 
@@ -31871,7 +31878,7 @@ fn workflow_checkpoint_binding(
     pipe::checkpoint::RunBinding::new(
         command,
         &json!({"plan": plan, "resolved_contracts": resolved_contracts}),
-        &host.endpoint,
+        &normalize_host_endpoint(&host.endpoint)?,
         zone,
         &plan.execution_order,
     )
@@ -32403,6 +32410,58 @@ fn pipeline_value_uses_dynamic_outputs(value: &Value) -> bool {
         Value::Object(fields) => fields.values().any(pipeline_value_uses_dynamic_outputs),
         _ => false,
     }
+}
+
+/// Recovery cannot evaluate arbitrary jq against an incomplete steps object:
+/// missing keys, bracket syntax and default operators can turn unknown results
+/// into plausible inputs. Only provable parameter lookups and literal data are
+/// independent of all missing results. Parameter values remain data.
+fn pipeline_recovery_template_is_parameter_only(template: &str, context: &Value) -> bool {
+    let mut cursor = 0;
+    while let Some(start) = template[cursor..].find("{{") {
+        let expression_start = cursor + start + 2;
+        let Some(end) = template[expression_start..].find("}}") else {
+            return false;
+        };
+        let expression_end = expression_start + end;
+        if pipeline_parameter_filter(&template[expression_start..expression_end], context).is_none()
+        {
+            return false;
+        }
+        cursor = expression_end + 2;
+    }
+    true
+}
+
+fn pipeline_recovery_input_is_parameter_only(value: &Value, context: &Value) -> bool {
+    match value {
+        Value::String(template) => pipeline_recovery_template_is_parameter_only(template, context),
+        Value::Array(values) => values
+            .iter()
+            .all(|value| pipeline_recovery_input_is_parameter_only(value, context)),
+        Value::Object(fields) => fields
+            .values()
+            .all(|value| pipeline_recovery_input_is_parameter_only(value, context)),
+        _ => true,
+    }
+}
+
+fn pipeline_recovery_condition_is_parameter_only(condition: &str, context: &Value) -> bool {
+    let condition = condition.trim();
+    if matches!(condition, "true" | "false") {
+        return true;
+    }
+    if let Some(expression) = pipeline_exact_placeholder_expr(condition) {
+        return pipeline_parameter_filter(expression, context).is_some();
+    }
+    // Bare conditions are executed as jq, while parameter placeholders are
+    // rewritten to getpath. Punctuation in a parameter key must not disguise
+    // a jq operator that reads the incomplete steps object.
+    condition.starts_with(".params.")
+        && condition
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'[' | b']'))
+        && pipeline_parameter_filter(condition, context).is_some()
 }
 
 fn pipeline_step_uses_dynamic_outputs(step: &pipe::PlannedPipelineStep) -> bool {
@@ -32954,12 +33013,12 @@ fn execute_live_pipeline_plan(
                 step_outputs = restored.snapshot().outputs.clone();
                 resumed_steps = step_results.len();
                 for (id, record) in plan.execution_order.iter().zip(&step_results) {
-                    // RunCheckpoint::resume accepts only terminal successes or
-                    // definite skips and verifies their ordered output prefix.
-                    let status = if record["status"] == "ok" {
-                        "ok"
-                    } else {
-                        "skipped"
+                    // Reconciled success proves completion without reconstructing
+                    // an output. Dynamic consumers still fail the missing-output
+                    // check below, while independent steps may continue.
+                    let status = match record["status"].as_str() {
+                        Some("ok" | "reconciled") => "ok",
+                        _ => "skipped",
                     };
                     step_statuses.insert(id.clone(), status);
                 }
@@ -33117,6 +33176,47 @@ fn execute_live_pipeline_plan(
             continue;
         }
 
+        let context = pipeline_execution_context(&plan.params, &step_outputs, &step_errors);
+        let unavailable_reconciled_outputs = step_results
+            .iter()
+            .filter(|record| record["status"] == "reconciled")
+            .filter_map(|record| record["id"].as_str())
+            .filter(|id| !step_outputs.contains_key(*id))
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if !unavailable_reconciled_outputs.is_empty()
+            && (!pipeline_recovery_input_is_parameter_only(&step.input_template, &context)
+                || step.condition_template.as_deref().is_some_and(|condition| {
+                    !pipeline_recovery_condition_is_parameter_only(condition, &context)
+                }))
+        {
+            blocked_steps += 1;
+            step_statuses.insert(step.id.clone(), "blocked");
+            step_results.push(json!({
+                "id": &step.id,
+                "operation": &step.operation,
+                "status": "blocked",
+                "reason": "missing-dependency-output",
+                "depends_on": &step.depends_on,
+                "missing_outputs": unavailable_reconciled_outputs,
+                "invoke_attempted": false,
+                "notes": [
+                    "A reconciled step has no recovered output. Only static inputs, simple parameter lookups and parameter-only conditions may continue; general expressions require complete result data."
+                ],
+            }));
+            failure.get_or_insert_with(|| {
+                pipeline_execution_failure(
+                    command,
+                    &step.id,
+                    "input-authoring",
+                    "pipeline-reconciled-output-unavailable",
+                    "A prior step completed according to retained host evidence, but its result body is unavailable. This step cannot prove its inputs and condition are independent of that result and was not invoked.",
+                    CliExitCode::Validation,
+                )
+            });
+            continue;
+        }
+
         let missing_outputs = step
             .depends_on
             .iter()
@@ -33145,7 +33245,6 @@ fn execute_live_pipeline_plan(
             continue;
         }
 
-        let context = pipeline_execution_context(&plan.params, &step_outputs, &step_errors);
         let condition_evaluation = match step
             .condition_template
             .as_ref()
@@ -33567,13 +33666,27 @@ fn execute_live_pipeline_plan(
                 let fenced = (|| -> Result<()> {
                     let attempt = u32::try_from(attempt_number)
                         .context("workflow checkpoint attempt counter overflow")?;
-                    checkpoint.mark_pending(
+                    let binding = task_reconcile::TaskInvocationBinding {
+                        request_id: invoke_request.id.to_string(),
+                        host: normalize_host_endpoint(&host.endpoint)?,
+                        connector_id: invoke_request.connector_id.to_string(),
+                        operation: invoke_request.operation.to_string(),
+                        zone_id: invoke_request.zone_id.to_string(),
+                        principal: auth.principal_hint.clone(),
+                        transport_idempotency: fcp_host::InvocationIdempotency::from_relay_request(
+                            &invoke_request,
+                            None,
+                        )?
+                        .context("workflow checkpoint requires an exact idempotency binding")?,
+                    };
+                    checkpoint.mark_pending_bound(
                         pipe::checkpoint::PendingInvocation {
                             step_id: step.id.clone(),
                             request_id: request_id.to_string(),
                             idempotency_key: idempotency_key.clone(),
                             attempt,
                         },
+                        binding,
                         workflow_checkpoint_remaining_ms(run_budget),
                     )
                 })();
@@ -33934,6 +34047,9 @@ fn recipe_dispatch(args: &RecipeArgs, explicit_host: Option<&str>) -> Result<Dis
         }
         RecipeCommand::Estimate(args) => {
             recipe_run_dispatch(args, PipelinePlanMode::Estimate, explicit_host)
+        }
+        RecipeCommand::Reconcile(args) => {
+            workflow_reconcile_cmd::dispatch("recipe", args, explicit_host)
         }
         RecipeCommand::Export(args) => Ok(recipe_export_dispatch(args)),
     }
@@ -37130,7 +37246,13 @@ fn dispatch_compiled_primitive(
     if let (Some(task), Commands::Invoke(args)) = (task, &parsed.command) {
         if let Some(host) = resolve_host_config(parsed.host.as_deref())? {
             return invoke_dispatch_host_controlled(
-                "invoke", args, &host, None, None, None, Some(task),
+                "invoke",
+                args,
+                &host,
+                None,
+                None,
+                None,
+                Some(task),
             );
         }
         return invoke_dispatch_without_host("invoke", args);
@@ -42678,10 +42800,8 @@ deny_ptrace = true
         assert!(!serialized.contains("PRIVATE-RECONCILE-CREDENTIAL"));
         assert!(!serialized.contains("admin_token_file"));
 
-        let minimal = prepare_cli(
-            &["fwc", "task", "reconcile", "w:12345678"].map(str::to_owned),
-        )
-        .expect("task reconcile should allow the configured credential source");
+        let minimal = prepare_cli(&["fwc", "task", "reconcile", "w:12345678"].map(str::to_owned))
+            .expect("task reconcile should allow the configured credential source");
         assert!(matches!(
             minimal.cli.command,
             Commands::Task(super::TaskArgs {
@@ -42689,10 +42809,9 @@ deny_ptrace = true
             })
         ));
 
-        let intent = prepare_cli(
-            &["fwc", "task", "search GitHub issues for auth"].map(str::to_owned),
-        )
-        .expect("natural-language task intent should retain implicit creation");
+        let intent =
+            prepare_cli(&["fwc", "task", "search GitHub issues for auth"].map(str::to_owned))
+                .expect("natural-language task intent should retain implicit creation");
         let Commands::Task(super::TaskArgs {
             command: super::TaskCommand::Create(args),
         }) = intent.cli.command
@@ -46217,9 +46336,7 @@ deny_ptrace = true
         }
     }
 
-    fn task_journal_fixture(
-        store: &super::workflow::TaskStore,
-    ) -> super::workflow::WorkflowTask {
+    fn task_journal_fixture(store: &super::workflow::TaskStore) -> super::workflow::WorkflowTask {
         let task = store
             .create(super::workflow::WorkflowRequest {
                 intent: "search GitHub issues for auth".to_owned(),
@@ -46403,7 +46520,10 @@ deny_ptrace = true
                     let request: fcp_kernel::InvokeRequest = serde_json::from_str(body).unwrap();
                     let persisted = fs::read_to_string(&observed_path).unwrap();
                     for secret in &observed_secrets {
-                        assert!(!persisted.contains(secret), "runtime authority was persisted");
+                        assert!(
+                            !persisted.contains(secret),
+                            "runtime authority was persisted"
+                        );
                     }
                     assert!(!persisted.contains("\"capability_token\""));
                     assert!(!persisted.contains("\"approval_tokens\""));
@@ -46511,7 +46631,8 @@ deny_ptrace = true
                 assert_eq!(binding.host, host);
                 assert!(scope_digests.insert(binding.transport_idempotency.scope_digest.clone()));
             }
-            let persisted = fs::read_to_string(task_journal_fixture_path(&store, &task.id)).unwrap();
+            let persisted =
+                fs::read_to_string(task_journal_fixture_path(&store, &task.id)).unwrap();
             for secret in &secrets {
                 assert!(!persisted.contains(secret));
                 assert!(!execution.payload.to_string().contains(secret));
@@ -46914,7 +47035,8 @@ deny_ptrace = true
                 &failed_argv,
                 &["fwc", "guide", "list"],
             ]);
-            let outcome = super::materialize_compiled_steps(&compiled, true, None, None, None, None);
+            let outcome =
+                super::materialize_compiled_steps(&compiled, true, None, None, None, None);
             assert_eq!(outcome.exit_code, expected_exit);
             assert_eq!(outcome.payload["executed_count"], 2);
             assert_eq!(outcome.payload["executed_steps"][0]["status"], "executed");
@@ -56645,12 +56767,24 @@ input = { query = "{{steps.first-read.output.title}}" }
         )
         .unwrap();
         checkpoint
-            .mark_pending(
+            .mark_pending_bound(
                 super::pipe::checkpoint::PendingInvocation {
                     step_id: first.id.clone(),
                     request_id: request_id.to_string(),
                     idempotency_key,
                     attempt: 1,
+                },
+                super::task_reconcile::TaskInvocationBinding {
+                    request_id: request_id.to_string(),
+                    host: super::normalize_host_endpoint(endpoint).unwrap(),
+                    connector_id: resolved.connector.summary.id.to_string(),
+                    operation: resolved.operation.name.clone(),
+                    zone_id: "z:work".to_owned(),
+                    principal: Some("test-principal".to_owned()),
+                    transport_idempotency: fcp_host::InvocationIdempotency {
+                        scope_digest: "a".repeat(64),
+                        effect_digest: "b".repeat(64),
+                    },
                 },
                 Some(120_000),
             )
@@ -56821,6 +56955,168 @@ input = { query = "{{steps.first-read.output.title}}" }
     }
 
     #[test]
+    fn execute_pipeline_resume_after_reconciliation_never_replays_or_invents_outputs() {
+        for mode in ["static", "explicit-dependency", "implicit-dependency"] {
+            let needs_output = mode != "static";
+            let tempdir = TempDir::new().unwrap();
+            let _history = super::install_test_history_path(tempdir.path().join("history.jsonl"));
+            let (path, _) = workflow_checkpoint_fixture(tempdir.path());
+            if !needs_output {
+                let source = fs::read_to_string(&path).unwrap();
+                fs::write(
+                    &path,
+                    source.replace("{{steps.first-read.output.title}}", "independent follow-up"),
+                )
+                .unwrap();
+            }
+            if mode == "implicit-dependency" {
+                let source = fs::read_to_string(&path).unwrap();
+                let source = source.replace("depends_on = [\"first-read\"]\n", "");
+                let source = source.replace(
+                    r#"input = { query = "{{steps.first-read.output.title}}" }"#,
+                    r#"input = { query = '{{ .steps["first-read"].output.title // "guessed" }}' }"#,
+                );
+                fs::write(&path, source).unwrap();
+            }
+            let definition =
+                super::pipe::parse_pipeline_definition(&fs::read_to_string(&path).unwrap())
+                    .unwrap();
+            let params = super::pipe::bind_pipeline_params(&definition, &[]).unwrap();
+            let plan = super::pipe::build_pipeline_plan(&definition, &params).unwrap();
+            let checkpoint_path = tempdir.path().join("run.checkpoint.json");
+            let token = test_capability_token_arg();
+            let mut catalog = pipe_mock_catalog(false);
+            catalog.truncate(2);
+            let mut routes = catalog.clone();
+            routes.extend(catalog);
+            if !needs_output {
+                routes.extend([
+                    (
+                        "POST /rpc/preflight".to_owned(),
+                        mock_preflight_response_json(true),
+                    ),
+                    (
+                        "POST /rpc/invoke".to_owned(),
+                        mock_invoke_response_json(json!({"continued": true})),
+                    ),
+                ]);
+            }
+            let (host, server, log) = spawn_mock_host_sequence_with_body_log(routes);
+            seed_workflow_checkpoint(&checkpoint_path, &host, &plan, true);
+            let mut checkpoint =
+                super::pipe::checkpoint::RunCheckpoint::open_for_reconciliation(&checkpoint_path)
+                    .unwrap();
+            let target = checkpoint.reconciliation_target().unwrap().unwrap();
+            let admitted_at: chrono::DateTime<chrono::Utc> =
+                "2026-11-22T00:00:00Z".parse().unwrap();
+            let evidence = fcp_host::InvocationQueryResponse {
+                invocation: Some(fcp_host::InvocationRecord {
+                    ticket: fcp_host::InvocationTicket {
+                        operation_id: target.binding.request_id.clone(),
+                        attempt_id: 1,
+                    },
+                    admission: fcp_host::InvocationAdmission {
+                        operation_id: target.binding.request_id.clone(),
+                        connector_id: target.binding.connector_id.clone(),
+                        operation: target.binding.operation.clone(),
+                        zone_id: target.binding.zone_id.clone(),
+                        principal: "test-principal".to_owned(),
+                        correlation_id: None,
+                        deadline_at: admitted_at + chrono::Duration::seconds(30),
+                        idempotency: Some(fcp_host::InvocationIdempotency {
+                            scope_digest: "c".repeat(64),
+                            effect_digest: "d".repeat(64),
+                        }),
+                        transport_idempotency: Some(target.binding.transport_idempotency.clone()),
+                    },
+                    admitted_at,
+                    terminal: Some(fcp_host::InvocationTerminal {
+                        outcome: fcp_host::InvocationOutcome::Succeeded,
+                        receipt_id: None,
+                        duration_ms: 1000,
+                        http_status: 200,
+                    }),
+                    finished_at: Some(admitted_at + chrono::Duration::seconds(1)),
+                    finalization: Some(fcp_host::InvocationFinalization {
+                        budget_recorded: false,
+                        budget_finalized: true,
+                        receipt_recorded: false,
+                        audit_event_id: Some("workflow-completion-audit".to_owned()),
+                        sampling_operation_id: None,
+                        sampling_completed: None,
+                        response_http_status: Some(200),
+                        response_status: Some(InvokeStatus::Ok),
+                    }),
+                    durable: true,
+                }),
+                mesh_invocation: None,
+                host_job_active: false,
+            };
+            assert!(matches!(
+                checkpoint
+                    .reconcile_observation(
+                        &super::normalize_host_endpoint(&host).unwrap(),
+                        &evidence
+                    )
+                    .unwrap(),
+                super::pipe::checkpoint::CheckpointReconciliationOutcome::Confirmed { .. }
+            ));
+            assert!(checkpoint.snapshot().outputs.is_empty());
+            drop(checkpoint);
+
+            let (exit, payload) = execute_json(&[
+                "fwc",
+                "--json",
+                "--host",
+                &host,
+                "pipeline",
+                "run",
+                &path.display().to_string(),
+                "--resume",
+                &checkpoint_path.display().to_string(),
+                "--zone",
+                "z:work",
+                "--capability-token",
+                &token,
+            ]);
+            server.join().unwrap();
+            assert_eq!(
+                exit,
+                if needs_output {
+                    CliExitCode::Validation
+                } else {
+                    CliExitCode::Success
+                }
+                .into(),
+                "{payload}"
+            );
+            let execution = &payload["execution"];
+            assert_eq!(execution["resumed_steps"], 1);
+            assert_eq!(execution["steps"][0]["status"], "reconciled");
+            assert_eq!(execution["steps"][0]["output_available"], false);
+            assert!(execution["outputs"].get("first-read").is_none());
+            let requests = log.lock().unwrap();
+            let invocations = requests
+                .iter()
+                .filter(|(route, _)| route == "POST /rpc/invoke")
+                .collect::<Vec<_>>();
+            assert_eq!(invocations.len(), usize::from(!needs_output));
+            if needs_output {
+                assert_eq!(
+                    payload["error"]["type"],
+                    "pipeline-reconciled-output-unavailable"
+                );
+                assert_eq!(execution["steps"][1]["reason"], "missing-dependency-output");
+            } else {
+                let sent: Value = serde_json::from_str(&invocations[0].1).unwrap();
+                assert_ne!(sent["id"], target.binding.request_id);
+                assert_eq!(sent["input"]["query"], "independent follow-up");
+                assert_eq!(execution["outputs"]["second-read"]["continued"], true);
+            }
+        }
+    }
+
+    #[test]
     fn execute_pipeline_checkpoint_records_completed_run_without_credentials() {
         let tempdir = TempDir::new().unwrap();
         let _history = super::install_test_history_path(tempdir.path().join("history.jsonl"));
@@ -56880,6 +57176,103 @@ input = { query = "{{steps.first-read.output.title}}" }
             saved["state"]["snapshot"]["step_results"],
             payload["execution"]["steps"]
         );
+    }
+
+    #[test]
+    fn workflow_recovery_refuses_general_filters_when_any_result_is_missing() {
+        let context = json!({
+            "params": {
+                "enabled": true,
+                "query": "{{steps.missing.output}} remains literal",
+                "rows": ["first"],
+                "with-punctuation": "safe",
+                "x//": {"steps": {"missing": {"output==null": true}}},
+            },
+            "steps": {"known": {"output": "available"}},
+        });
+        let disguised_condition = ".params.x//.steps.missing.output==null";
+        assert!(super::pipeline_parameter_filter(disguised_condition, &context).is_some());
+        assert!(!super::pipeline_recovery_condition_is_parameter_only(
+            disguised_condition,
+            &context
+        ));
+        for template in [
+            "{{steps.missing.output}}",
+            "{{ steps.missing.output }}",
+            "{{.steps.missing.output}}",
+            "{{ .steps[\"missing\"].output // \"guess\" }}",
+            "{{ .[\"steps\"][\"missing\"].output }}",
+            "{{ . | .steps | values }}",
+            "{{ params.query | .steps.missing }}",
+            "{{.steps.known.output}}",
+            "prefix {{steps.missing.output}} suffix",
+            "{{params.enabled",
+        ] {
+            assert!(
+                !super::pipeline_recovery_input_is_parameter_only(
+                    &json!({"nested": [template]}),
+                    &context,
+                ),
+                "{template}"
+            );
+        }
+        for input in [
+            json!({"query": "static .steps.missing.output"}),
+            json!({"query": "{{params.query}}"}),
+            json!({"query": "prefix {{ .params.query }} suffix"}),
+            json!({"query": "{{params.with-punctuation}}"}),
+            json!({"query": "{{params.rows[0]}}", "count": 1}),
+        ] {
+            assert!(
+                super::pipeline_recovery_input_is_parameter_only(&input, &context),
+                "{input}"
+            );
+        }
+        for condition in [
+            ".steps.missing.output // true",
+            ". | .[\"steps\"] | length == 0",
+            "{{ .steps[\"missing\"].output }} == null",
+            "{{params.enabled}} and (.steps.missing == null)",
+        ] {
+            assert!(
+                !super::pipeline_recovery_condition_is_parameter_only(condition, &context),
+                "{condition}"
+            );
+        }
+        for condition in ["true", "false", ".params.enabled", "{{ .params.enabled }}"] {
+            assert!(
+                super::pipeline_recovery_condition_is_parameter_only(condition, &context),
+                "{condition}"
+            );
+        }
+    }
+
+    #[test]
+    fn workflow_reconcile_accepts_checkpoint_and_inspection_credentials_only() {
+        for command in ["pipeline", "recipe"] {
+            let parsed = Cli::try_parse_from([
+                "fwc",
+                "--host",
+                "http://127.0.0.1:8787",
+                command,
+                "reconcile",
+                "run.json",
+                "--admin-token-file",
+                "owner-token",
+            ]);
+            assert!(parsed.is_ok(), "{parsed:?}");
+            assert!(
+                Cli::try_parse_from([
+                    "fwc",
+                    command,
+                    "reconcile",
+                    "run.json",
+                    "--capability-token",
+                    "must-never-be-used-to-replay",
+                ])
+                .is_err()
+            );
+        }
     }
 
     #[test]

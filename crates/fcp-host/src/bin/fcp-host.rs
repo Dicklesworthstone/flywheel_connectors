@@ -11925,9 +11925,11 @@ fn oauth_challenge_from_value(
         .ok_or_else(|| invalid_oauth_provider_response("oauth_device", "missing `expires_in`"))?;
     let expires_delta = chrono::TimeDelta::from_std(expires_in)
         .map_err(|_| invalid_oauth_provider_response("oauth_device", "invalid expiry duration"))?;
-    let expires_at = Utc::now().checked_add_signed(expires_delta).ok_or_else(|| {
-        invalid_oauth_provider_response("oauth_device", "expiry timestamp is out of range")
-    })?;
+    let expires_at = Utc::now()
+        .checked_add_signed(expires_delta)
+        .ok_or_else(|| {
+            invalid_oauth_provider_response("oauth_device", "expiry timestamp is out of range")
+        })?;
     OAuthDeviceCodeChallenge::new(
         oauth_required_string(value, "device_code", "oauth_device")?,
         oauth_required_string(value, "user_code", "oauth_device")?,
@@ -11969,21 +11971,16 @@ impl BlockingOAuthTransport {
     ) -> Result<Value, AuthError> {
         use std::io::Read as _;
 
-        let response = self
-            .client
-            .post(url)
-            .form(form)
-            .send()
-            .map_err(|error| {
-                let reason = if error.is_timeout() {
-                    "OAuth provider request timed out"
-                } else if error.is_connect() {
-                    "could not connect to OAuth provider endpoint"
-                } else {
-                    "OAuth provider request failed"
-                };
-                invalid_oauth_provider_response(method, reason)
-            })?;
+        let response = self.client.post(url).form(form).send().map_err(|error| {
+            let reason = if error.is_timeout() {
+                "OAuth provider request timed out"
+            } else if error.is_connect() {
+                "could not connect to OAuth provider endpoint"
+            } else {
+                "OAuth provider request failed"
+            };
+            invalid_oauth_provider_response(method, reason)
+        })?;
         let status = response.status();
         if status.is_redirection() {
             return Err(invalid_oauth_provider_response(
@@ -41920,7 +41917,6 @@ done"#;
         }
     }
 
-
     #[cfg(unix)]
     async fn registry_shutdown_test_connector(
         connector_id: &'static str,
@@ -42040,10 +42036,9 @@ while IFS= read -r request; do exit 2; done
             )
             .await;
             let active_connector = Arc::clone(&connector);
-            let active = task::try_spawn(async move {
-                active_connector.rpc("hold", json!({})).await
-            })
-            .unwrap();
+            let active =
+                task::try_spawn(async move { active_connector.rpc("hold", json!({})).await })
+                    .unwrap();
             fcp_async_core::time::timeout(Duration::from_secs(5), async {
                 while !ready.exists() {
                     fcp_async_core::time::sleep(Duration::from_millis(5)).await;
@@ -42064,10 +42059,8 @@ while IFS= read -r request; do exit 2; done
 
         const IDLE: &str = "fcp.test.shutdown-idle:utility:1.0.0";
         let exited = directory.path().join("idle-exited");
-        let environment = BTreeMap::from([(
-            "EXITED".to_owned(),
-            exited.to_string_lossy().into_owned(),
-        )]);
+        let environment =
+            BTreeMap::from([("EXITED".to_owned(), exited.to_string_lossy().into_owned())]);
         let idle = registry_shutdown_test_connector(
             IDLE,
             r#"
@@ -42083,9 +42076,7 @@ while IFS= read -r request; do exit 2; done
 
         let registry = dispatcher_registry_with_connectors(entries);
         let started = Instant::now();
-        let result = registry
-            .shutdown(started + Duration::from_secs(1))
-            .await;
+        let result = registry.shutdown(started + Duration::from_secs(1)).await;
         let elapsed = started.elapsed();
         let idle_retired = idle.runtime_retirement.is_exited() && exited.exists();
         let busy_retired = held
@@ -42110,8 +42101,14 @@ while IFS= read -r request; do exit 2; done
             elapsed < Duration::from_millis(2_500),
             "three busy children must share the original one-second budget: {elapsed:?}"
         );
-        assert!(idle_retired, "busy children must not starve an idle child's shutdown");
-        assert!(!busy_retired, "queued retirement must preserve active work ownership");
+        assert!(
+            idle_retired,
+            "busy children must not starve an idle child's shutdown"
+        );
+        assert!(
+            !busy_retired,
+            "queued retirement must preserve active work ownership"
+        );
         assert!(dead.runtime_retirement.is_exited());
     }
 
@@ -42120,8 +42117,7 @@ while IFS= read -r request; do exit 2; done
         let registry = empty_registry(7);
         let prepared = registry.prepare_configs(Vec::new()).await.unwrap();
         let fence = registry.inventory_fence(registry.version());
-        let invocation =
-            NativeInvocationTermination::new(Instant::now() + Duration::from_secs(10));
+        let invocation = NativeInvocationTermination::new(Instant::now() + Duration::from_secs(10));
         invocation.bind_inventory_fence(fence.clone());
         let active = invocation.register_rpc_for_method("invoke");
         assert!(active.try_begin());
@@ -42132,21 +42128,34 @@ while IFS= read -r request; do exit 2; done
             .unwrap();
         assert!(registry.publish_configs(prepared).await.is_err());
         assert!(registry.prepare_configs(Vec::new()).await.is_err());
-        assert_eq!(registry.version(), 7, "shutdown does not publish new inventory");
-        assert!(!fence.is_current(), "retained actor fences observe shutdown");
+        assert_eq!(
+            registry.version(),
+            7,
+            "shutdown does not publish new inventory"
+        );
+        assert!(
+            !fence.is_current(),
+            "retained actor fences observe shutdown"
+        );
         assert!(fence.require_current().is_err());
         assert!(invocation.require_current_inventory().is_err());
-        assert!(!queued.try_begin(), "queued effects cannot activate after shutdown");
+        assert!(
+            !queued.try_begin(),
+            "queued effects cannot activate after shutdown"
+        );
         assert!(queued.is_settled());
-        assert!(!active.is_cancelled(), "shutdown must not relabel selected work");
+        assert!(
+            !active.is_cancelled(),
+            "shutdown must not relabel selected work"
+        );
         assert!(active.try_settle_reply());
         assert!(!active.transport_retired());
         let later = invocation.register_rpc_for_method("invoke");
-        assert!(!later.try_begin(), "retained sessions cannot mint fresh authority");
-        let request = runtime_network_test_request(
-            "fcp.test.shutdown:utility:1.0.0",
-            "test.echo",
+        assert!(
+            !later.try_begin(),
+            "retained sessions cannot mint fresh authority"
         );
+        let request = runtime_network_test_request("fcp.test.shutdown:utility:1.0.0", "test.echo");
         let connector_id = request.connector_id.clone();
         let simulation = warm_pool_test_simulate_request(request.clone());
         for error in [
@@ -42166,8 +42175,7 @@ while IFS= read -r request; do exit 2; done
     async fn registry_shutdown_inventory_wait_uses_deadline_and_remains_closed_after_timeout() {
         let registry = empty_registry(9);
         let fence = registry.inventory_fence(registry.version());
-        let invocation =
-            NativeInvocationTermination::new(Instant::now() + Duration::from_secs(10));
+        let invocation = NativeInvocationTermination::new(Instant::now() + Duration::from_secs(10));
         invocation.bind_inventory_fence(fence.clone());
         let queued = invocation.register_rpc_for_method("invoke");
         let transaction = registry.inventory_transaction.lock().await;
@@ -42177,12 +42185,21 @@ while IFS= read -r request; do exit 2; done
             .await
             .expect_err("inventory serialization must not wait without a deadline");
         let elapsed = started.elapsed();
-        assert!(error.to_string().contains("inventory transaction"), "{error}");
+        assert!(
+            error.to_string().contains("inventory transaction"),
+            "{error}"
+        );
         assert!(elapsed < Duration::from_secs(1));
-        assert!(!fence.is_current(), "timed-out retirement still fences actor admission");
+        assert!(
+            !fence.is_current(),
+            "timed-out retirement still fences actor admission"
+        );
         assert!(fence.require_current().is_err());
         assert!(invocation.require_current_inventory().is_err());
-        assert!(!queued.try_begin(), "a gate timeout cannot revive queued effects");
+        assert!(
+            !queued.try_begin(),
+            "a gate timeout cannot revive queued effects"
+        );
         assert!(queued.is_settled());
         assert!(registry.require_running().is_err());
         assert!(registry.prepare_configs(Vec::new()).await.is_err());
@@ -43383,7 +43400,6 @@ while IFS= read -r request; do exit 2; done
         Some((method, path, body))
     }
 
-
     // Exercise the actual host OAuth transport against raw HTTP, so redirect
     // behavior, chunked bodies and absent Content-Length cannot be hidden by a
     // JSON-only provider fixture.
@@ -43396,7 +43412,9 @@ while IFS= read -r request; do exit 2; done
     impl HostOAuthTransportTestServer {
         fn start(response: impl FnOnce(&str) -> Vec<u8>) -> Self {
             let listener = StdTcpListener::bind("127.0.0.1:0").expect("OAuth test listener");
-            listener.set_nonblocking(true).expect("nonblocking listener");
+            listener
+                .set_nonblocking(true)
+                .expect("nonblocking listener");
             let base_url = format!("http://{}", listener.local_addr().unwrap());
             let response = response(&base_url);
             let stop = Arc::new(AtomicBool::new(false));
@@ -43559,14 +43577,9 @@ while IFS= read -r request; do exit 2; done
                     Some("repo"),
                 )?;
                 let grant = OAuthRefreshTokenGrant::new("host-refresh-secret")?;
-                fcp_provider_auth::OAuthRefreshTokenFlow::refresh(
-                    &cx,
-                    &config,
-                    &grant,
-                    &transport,
-                )
-                .await
-                .map(|_| ())
+                fcp_provider_auth::OAuthRefreshTokenFlow::refresh(&cx, &config, &grant, &transport)
+                    .await
+                    .map(|_| ())
             }
             _ => panic!("unknown OAuth fixture flow"),
         }
@@ -43577,9 +43590,8 @@ while IFS= read -r request; do exit 2; done
         for status in [301, 302, 303, 307, 308] {
             for cross_origin in [false, true] {
                 for flow in ["device-start", "device-poll", "auth-code", "refresh"] {
-                    let target = HostOAuthTransportTestServer::start(|_| {
-                        host_oauth_success_http_response()
-                    });
+                    let target =
+                        HostOAuthTransportTestServer::start(|_| host_oauth_success_http_response());
                     let source = HostOAuthTransportTestServer::start(|source_url| {
                         let destination = if cross_origin {
                             target.base_url.as_str()
@@ -43615,21 +43627,40 @@ while IFS= read -r request; do exit 2; done
                     let source_requests = source.finish();
                     let target_requests = target.finish();
                     assert_eq!(source_requests.len(), 1, "{flow}, {status}, {cross_origin}");
-                    assert!(target_requests.is_empty(), "{flow}, {status}, {cross_origin}");
+                    assert!(
+                        target_requests.is_empty(),
+                        "{flow}, {status}, {cross_origin}"
+                    );
                     assert_eq!(source_requests[0].0, "POST");
                     assert!(source_requests[0].2.contains("client_id=host-client"));
                     match flow {
                         "device-poll" => {
-                            assert!(source_requests[0].2.contains("device_code=host-device-secret"));
+                            assert!(
+                                source_requests[0]
+                                    .2
+                                    .contains("device_code=host-device-secret")
+                            );
                         }
                         "auth-code" => {
                             assert!(source_requests[0].2.contains("code=host-code-secret"));
                             assert!(source_requests[0].2.contains("code_verifier="));
-                            assert!(source_requests[0].2.contains("client_secret=host-client-secret"));
+                            assert!(
+                                source_requests[0]
+                                    .2
+                                    .contains("client_secret=host-client-secret")
+                            );
                         }
                         "refresh" => {
-                            assert!(source_requests[0].2.contains("refresh_token=host-refresh-secret"));
-                            assert!(source_requests[0].2.contains("client_secret=host-client-secret"));
+                            assert!(
+                                source_requests[0]
+                                    .2
+                                    .contains("refresh_token=host-refresh-secret")
+                            );
+                            assert!(
+                                source_requests[0]
+                                    .2
+                                    .contains("client_secret=host-client-secret")
+                            );
                         }
                         _ => {}
                     }
@@ -43680,12 +43711,12 @@ while IFS= read -r request; do exit 2; done
         for (status, body, expected) in [
             (200, "host-body-secret", "not valid JSON"),
             (200, "[\"host-body-secret\"]", "JSON object"),
+            (503, "{\"access_token\":\"host-body-secret\"}", "HTTP 503"),
             (
-                503,
+                307,
                 "{\"access_token\":\"host-body-secret\"}",
-                "HTTP 503",
+                "redirects are not permitted",
             ),
-            (307, "{\"access_token\":\"host-body-secret\"}", "redirects are not permitted"),
         ] {
             let provider = HostOAuthTransportTestServer::start(|_| {
                 host_oauth_http_response(status, "", body.as_bytes(), false)
@@ -43716,11 +43747,19 @@ while IFS= read -r request; do exit 2; done
             let (actual, reason) = oauth_provider_error_parts(&body, None);
             assert_eq!(
                 actual,
-                if code == "host-error-secret" { "provider_error" } else { code }
+                if code == "host-error-secret" {
+                    "provider_error"
+                } else {
+                    code
+                }
             );
             assert!(reason.contains("withheld"));
             let error = oauth_provider_rejection("oauth_refresh", &body, None).to_string();
-            for secret in ["host-error-secret", "host-description-secret", "host-uri-secret"] {
+            for secret in [
+                "host-error-secret",
+                "host-description-secret",
+                "host-uri-secret",
+            ] {
                 assert!(!error.contains(secret));
             }
         }

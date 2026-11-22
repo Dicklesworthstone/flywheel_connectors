@@ -21,7 +21,16 @@ use crate::{
 const TASK_SCHEMA_VERSION: u32 = 1;
 const PAYLOAD_PLACEHOLDER: &str = "./intent-payload.json";
 const TASK_SUBCOMMANDS: &[&str] = &[
-    "create", "show", "list", "resolve", "ask", "advance", "bind", "approve", "run", "reconcile",
+    "create",
+    "show",
+    "list",
+    "resolve",
+    "ask",
+    "advance",
+    "bind",
+    "approve",
+    "run",
+    "reconcile",
 ];
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -138,19 +147,7 @@ impl TaskStepExecution {
     }
 }
 
-/// Payload-free identity synced after preflight and before an actual invoke.
-/// The transport binding commits to the exact token, idempotency key and
-/// effect-affecting request without treating a token subject hint as authority.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct TaskInvocationBinding {
-    pub request_id: String,
-    pub host: String,
-    pub connector_id: String,
-    pub operation: String,
-    pub zone_id: String,
-    pub principal: Option<String>,
-    pub transport_idempotency: fcp_host::InvocationIdempotency,
-}
+pub use crate::task_reconcile::TaskInvocationBinding;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -982,11 +979,7 @@ impl TaskLease<'_> {
 
     /// Sync the next primitive's identity before even a non-invoke primitive
     /// can run. An interrupted unsupported effect remains visible and fenced.
-    pub fn record_step_started(
-        &self,
-        ticket: &TaskExecutionTicket,
-        ordinal: usize,
-    ) -> Result<()> {
+    pub fn record_step_started(&self, ticket: &TaskExecutionTicket, ordinal: usize) -> Result<()> {
         let mut task = self.pending_execution(ticket)?;
         let journal = pending_journal_mut(&mut task)?;
         let index = journal
@@ -1154,10 +1147,7 @@ impl TaskLease<'_> {
     /// Finish from retained evidence only. This also recovers a lost aggregate
     /// receipt when every primitive outcome was already saved successfully.
     /// Unstarted, unsupported, or uncertain steps remain fenced for review.
-    pub fn finish_reconciliation(
-        &self,
-        expected_task_attempt_id: &str,
-    ) -> Result<WorkflowTask> {
+    pub fn finish_reconciliation(&self, expected_task_attempt_id: &str) -> Result<WorkflowTask> {
         let task = self.reconciliation_task(expected_task_attempt_id)?;
         if task.execution_fence.as_ref().expect("fence checked").state
             == TaskExecutionState::Completed
@@ -1193,7 +1183,11 @@ impl TaskLease<'_> {
     ) -> Result<WorkflowTask> {
         let fence = task.execution_fence.as_ref().expect("fence checked");
         let journal = fence.journal.as_ref().expect("journal checked");
-        let completed_count = journal.steps.iter().filter(|step| step.is_complete()).count();
+        let completed_count = journal
+            .steps
+            .iter()
+            .filter(|step| step.is_complete())
+            .count();
         let unresolved_count = journal.steps.len() - completed_count;
         let completed = unresolved_count == 0;
         let state = if completed {
@@ -1361,10 +1355,16 @@ fn receipt_contradicts_completion(receipt: Option<&Value>) -> bool {
     };
     let result = &receipt["result"];
     let unknown = result["error"]["type"] == "invoke-outcome-unknown"
-        || matches!(result["outcome"].as_str(), Some("unknown" | "outcome_unknown"));
+        || matches!(
+            result["outcome"].as_str(),
+            Some("unknown" | "outcome_unknown")
+        );
     receipt["primitive_dispatched"] == false
         || result["invoke_attempted"] == false
-        || matches!(result["phase"].as_str(), Some("preflight" | "input-authoring"))
+        || matches!(
+            result["phase"].as_str(),
+            Some("preflight" | "input-authoring")
+        )
         || result["response"]["status"] == "error"
         || result["response"]
             .get("error")
@@ -1390,14 +1390,15 @@ fn validate_step_completion(
         "workflow completion contradicts a retained definitive primitive outcome"
     );
     ensure!(
-        [completion.receipt_id.as_deref(), completion.audit_event_id.as_deref()]
-            .into_iter()
-            .flatten()
-            .all(|value| {
-                !value.trim().is_empty()
-                    && value.len() <= 512
-                    && !value.chars().any(char::is_control)
-            }),
+        [
+            completion.receipt_id.as_deref(),
+            completion.audit_event_id.as_deref()
+        ]
+        .into_iter()
+        .flatten()
+        .all(|value| {
+            !value.trim().is_empty() && value.len() <= 512 && !value.chars().any(char::is_control)
+        }),
         "workflow completion contains invalid evidence references"
     );
     Ok(())
@@ -2671,12 +2672,20 @@ mod tests {
         }
         assert!(
             lease
-                .record_invocation_completion(ticket.attempt_id(), step.ordinal, completion_proof(8))
+                .record_invocation_completion(
+                    ticket.attempt_id(),
+                    step.ordinal,
+                    completion_proof(8)
+                )
                 .is_err()
         );
         let unresolved = lease.finish_reconciliation(ticket.attempt_id()).unwrap();
         assert_eq!(unresolved.capsule_status, "execution-needs-review");
-        assert!(lease.finish_reconciliation("different-task-attempt").is_err());
+        assert!(
+            lease
+                .finish_reconciliation("different-task-attempt")
+                .is_err()
+        );
     }
 
     #[test]
@@ -2842,7 +2851,11 @@ mod tests {
             lease.record_step_started(&ticket, step.ordinal).unwrap();
             if step.ordinal == invoke.ordinal {
                 lease
-                    .record_invocation_binding(&ticket, step.ordinal, invocation_binding("req-crash"))
+                    .record_invocation_binding(
+                        &ticket,
+                        step.ordinal,
+                        invocation_binding("req-crash"),
+                    )
                     .unwrap();
                 break;
             }
@@ -2953,7 +2966,11 @@ mod tests {
                 saved.execution_blocker(),
                 Some(super::TaskExecutionState::NeedsReview)
             );
-            assert!(saved.execution_fence.unwrap().journal.unwrap().steps[0].receipt.is_none());
+            assert!(
+                saved.execution_fence.unwrap().journal.unwrap().steps[0]
+                    .receipt
+                    .is_none()
+            );
         }
     }
 
@@ -2974,9 +2991,16 @@ mod tests {
             saved.execution_blocker(),
             Some(super::TaskExecutionState::NeedsReview)
         );
-        assert!(saved.execution_fence.unwrap().journal.unwrap().steps.iter().all(|step| {
-            step.started_at.is_none() && step.receipt.is_none()
-        }));
+        assert!(
+            saved
+                .execution_fence
+                .unwrap()
+                .journal
+                .unwrap()
+                .steps
+                .iter()
+                .all(|step| { step.started_at.is_none() && step.receipt.is_none() })
+        );
     }
 
     #[test]
@@ -3003,7 +3027,11 @@ mod tests {
                     continue;
                 }
                 lease
-                    .record_invocation_binding(&ticket, step.ordinal, invocation_binding("req-bound"))
+                    .record_invocation_binding(
+                        &ticket,
+                        step.ordinal,
+                        invocation_binding("req-bound"),
+                    )
                     .unwrap();
                 let mut receipt = successful_step_receipt(step);
                 assert!(
@@ -6064,7 +6092,16 @@ mod tests {
     fn task_subcommands_contains_all_expected() {
         let subs = super::task_subcommands();
         for expected in &[
-            "create", "show", "list", "resolve", "ask", "advance", "bind", "approve", "run", "reconcile",
+            "create",
+            "show",
+            "list",
+            "resolve",
+            "ask",
+            "advance",
+            "bind",
+            "approve",
+            "run",
+            "reconcile",
         ] {
             assert!(subs.contains(expected), "missing subcommand '{}'", expected);
         }

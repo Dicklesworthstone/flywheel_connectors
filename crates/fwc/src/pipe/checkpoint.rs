@@ -2,9 +2,10 @@
 //!
 //! The checkpoint is an execution fence, not an approval or retry authority.
 //! A synced pending marker precedes every effect. Only a complete successful
-//! response can make its output reusable on resume; an interrupted invocation
-//! remains pending even when the provider may have completed it. New attempts
-//! still require current credentials, metadata, and host preflight.
+//! response can make its output reusable on resume. An interrupted invocation
+//! stays fenced until a protected host observation proves its completion; that
+//! observation never reconstructs output. New attempts still require current
+//! credentials, metadata, and host preflight.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
@@ -15,6 +16,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use fcp_host::InvocationQueryResponse;
+
+use crate::task_reconcile::{
+    self, ReconcileFailure, TaskInvocationAttempt, TaskInvocationBinding, TaskInvocationCompletion,
+    TaskInvocationCompletionSource,
+};
 
 const CHECKPOINT_VERSION: u32 = 1;
 const MAX_CHECKPOINT_BYTES: usize = 64 * 1024 * 1024;
@@ -118,6 +126,39 @@ impl PendingInvocation {
     }
 }
 
+/// The exact invocation selected for an observational recovery.
+#[derive(Clone, Debug)]
+pub struct CheckpointReconciliationTarget {
+    pub step_id: String,
+    pub binding: TaskInvocationBinding,
+    pub observed_attempt: Option<TaskInvocationAttempt>,
+}
+
+/// Reconciliation never invokes a connector or reconstructs its result body.
+#[derive(Clone, Debug)]
+pub enum CheckpointReconciliationOutcome {
+    Confirmed {
+        step_id: String,
+        completion: TaskInvocationCompletion,
+        run_completed: bool,
+    },
+    Unresolved {
+        step_id: String,
+        reason: ReconcileFailure,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InvocationJournalEntry {
+    pending: PendingInvocation,
+    binding: TaskInvocationBinding,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    observed_attempt: Option<TaskInvocationAttempt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    completion: Option<TaskInvocationCompletion>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CheckpointState {
@@ -131,6 +172,14 @@ struct CheckpointState {
     snapshot: RunSnapshot,
     pending: Option<PendingInvocation>,
     completed: bool,
+    /// Optional fields preserve the checksum representation of older checkpoints.
+    /// Unbound legacy invocations remain ineligible for reconciliation.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    invocation_journal: BTreeMap<String, InvocationJournalEntry>,
+    /// Original uncertain and unattempted suffix records remain evidence even
+    /// after a separate host observation establishes completion.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    retained_step_results: Vec<Value>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -198,6 +247,8 @@ impl RunCheckpoint {
             snapshot: RunSnapshot::default(),
             pending: None,
             completed: false,
+            invocation_journal: BTreeMap::new(),
+            retained_step_results: Vec::new(),
         };
         let mut checkpoint = Self {
             path,
@@ -256,6 +307,201 @@ impl RunCheckpoint {
         &self.state.snapshot
     }
 
+    /// Open existing evidence under its exclusive execution lock. Observation
+    /// remains possible after an execution deadline; it never renews that deadline.
+    ///
+    /// # Errors
+    /// Refuses corrupt, oversized, non-private, or concurrently owned artifacts.
+    pub fn open_for_reconciliation(path: &Path) -> Result<Self> {
+        let path = absolute_path(path)?;
+        let lock = acquire_lock(&path)?;
+        let state = read_checkpoint(&path)?;
+        Ok(Self {
+            path,
+            _lock: lock,
+            state,
+            poisoned: false,
+        })
+    }
+
+    #[must_use]
+    pub fn command(&self) -> &str {
+        &self.state.binding.command
+    }
+
+    /// Whether every step is confirmed complete or definitely skipped.
+    #[must_use]
+    pub fn completed(&self) -> bool {
+        self.state.completed
+            && self.state.pending.is_none()
+            && self.state.snapshot.step_results.len() == self.state.binding.execution_order.len()
+            && self
+                .state
+                .snapshot
+                .step_results
+                .iter()
+                .all(confirmed_record)
+    }
+
+    /// Original uncertain outcomes and the unattempted suffix removed from the
+    /// resumable prefix. Their bytes remain part of the checksummed checkpoint.
+    #[must_use]
+    pub fn retained_step_results(&self) -> &[Value] {
+        &self.state.retained_step_results
+    }
+
+    /// Return the one uncertain invocation eligible for a protected host lookup.
+    /// A definite failure, legacy unbound invocation, or downstream effect refuses
+    /// recovery rather than treating missing evidence as permission to replay.
+    ///
+    /// # Errors
+    /// Refuses an unsafe prefix, missing identity, or a failed checkpoint write.
+    pub fn reconciliation_target(&self) -> Result<Option<CheckpointReconciliationTarget>> {
+        ensure!(
+            !self.poisoned,
+            "workflow checkpoint requires recovery after a write failure"
+        );
+        let Some(index) = reconciliation_index(&self.state)? else {
+            return Ok(None);
+        };
+        let id = &self.state.binding.execution_order[index];
+        let entry = self
+            .state
+            .invocation_journal
+            .get(id)
+            .context("legacy workflow invocation has no exact identity to reconcile")?;
+        ensure!(
+            entry.completion.is_none(),
+            "workflow invocation already has retained completion evidence"
+        );
+        Ok(Some(CheckpointReconciliationTarget {
+            step_id: id.clone(),
+            binding: entry.binding.clone(),
+            observed_attempt: entry.observed_attempt.clone(),
+        }))
+    }
+
+    /// Pin a matching host journal and attempt before examining completion.
+    /// Successful evidence records completion only: no output is reconstructed,
+    /// no request is dispatched, and any original uncertain record is retained.
+    ///
+    /// # Errors
+    /// Refuses invalid local state, clock rollback, exhausted evidence capacity,
+    /// or a persistence failure. Unproven host outcomes remain unresolved.
+    pub fn reconcile_observation(
+        &mut self,
+        selected_host: &str,
+        response: &InvocationQueryResponse,
+    ) -> Result<CheckpointReconciliationOutcome> {
+        self.reconcile_observation_at(selected_host, response, now_ms()?)
+    }
+
+    fn reconcile_observation_at(
+        &mut self,
+        selected_host: &str,
+        response: &InvocationQueryResponse,
+        now: u64,
+    ) -> Result<CheckpointReconciliationOutcome> {
+        let target = self
+            .reconciliation_target()?
+            .context("workflow checkpoint has no uncertain invocation to reconcile")?;
+        let unresolved = |reason| CheckpointReconciliationOutcome::Unresolved {
+            step_id: target.step_id.clone(),
+            reason,
+        };
+        let attempt = match task_reconcile::bind_observation(
+            &target.binding,
+            selected_host,
+            target.observed_attempt.as_ref(),
+            response,
+        ) {
+            Ok(attempt) => attempt,
+            Err(reason) => return Ok(unresolved(reason)),
+        };
+        if target.observed_attempt.is_none() {
+            let mut next = self.next_state(self.state.remaining_ms, now, false)?;
+            next.invocation_journal
+                .get_mut(&target.step_id)
+                .context("workflow invocation journal disappeared")?
+                .observed_attempt = Some(attempt.clone());
+            self.persist(next, false)?;
+        }
+        let completion = match task_reconcile::verify_completion(
+            &target.binding,
+            selected_host,
+            &attempt,
+            response,
+        ) {
+            Ok(completion) => completion,
+            Err(reason) => return Ok(unresolved(reason)),
+        };
+        let index = reconciliation_index(&self.state)?
+            .context("workflow uncertain invocation disappeared")?;
+        let mut next = self.next_state(self.state.remaining_ms, now, false)?;
+        let archived = next.snapshot.step_results.split_off(index);
+        ensure!(
+            next.retained_step_results
+                .len()
+                .saturating_add(archived.len())
+                <= MAX_CHECKPOINT_STEPS * 2,
+            "workflow checkpoint reconciliation evidence capacity exhausted"
+        );
+        next.retained_step_results.extend(archived);
+        let entry = next
+            .invocation_journal
+            .get_mut(&target.step_id)
+            .context("workflow invocation journal disappeared")?;
+        entry.completion = Some(completion.clone());
+        next.snapshot.step_results.push(serde_json::json!({
+            "id": target.step_id,
+            "operation": target.binding.operation,
+            "status": "reconciled",
+            "mode": "observe",
+            "request_id": target.binding.request_id,
+            "idempotency_key": entry.pending.idempotency_key,
+            "output_available": false,
+            "invoked_during_reconciliation": false,
+            "reconciliation": completion,
+        }));
+        next.pending = None;
+        next.completed = next.snapshot.step_results.len() == next.binding.execution_order.len();
+        let run_completed = next.completed;
+        self.persist(next, false)?;
+        Ok(CheckpointReconciliationOutcome::Confirmed {
+            step_id: target.step_id,
+            completion,
+            run_completed,
+        })
+    }
+
+    /// Finalize a fully confirmed prefix after a lost aggregate checkpoint.
+    /// Partial or uncertain work is left untouched; this never resumes execution.
+    ///
+    /// # Errors
+    /// Refuses unsafe evidence, clock rollback, or a failed durable write.
+    pub fn finish_reconciliation(&mut self) -> Result<bool> {
+        self.finish_reconciliation_at(now_ms()?)
+    }
+
+    fn finish_reconciliation_at(&mut self, now: u64) -> Result<bool> {
+        ensure!(
+            !self.poisoned,
+            "workflow checkpoint requires recovery after a write failure"
+        );
+        if self.completed() {
+            return Ok(true);
+        }
+        if self.reconciliation_target()?.is_some()
+            || self.state.snapshot.step_results.len() != self.state.binding.execution_order.len()
+        {
+            return Ok(false);
+        }
+        let mut next = self.next_state(self.state.remaining_ms, now, false)?;
+        next.completed = true;
+        self.persist(next, false)?;
+        Ok(true)
+    }
+
     /// Remaining execution time after charging downtime and saved elapsed time.
     ///
     /// # Errors
@@ -308,6 +554,10 @@ impl RunCheckpoint {
             "workflow checkpoint cannot rewrite completed step evidence"
         );
         for record in &snapshot.step_results[self.state.snapshot.step_results.len()..] {
+            ensure!(
+                record["status"] != "reconciled",
+                "workflow completion must be verified through reconciliation"
+            );
             if record["status"] == "ok" {
                 ensure!(
                     self.state.pending.as_ref().is_some_and(|pending| {
@@ -361,14 +611,56 @@ impl RunCheckpoint {
         self.mark_pending_at(pending, remaining_ms, now_ms()?)
     }
 
+    /// Capture the exact host, zone, token/effect digests and optional expected
+    /// principal in the same durable transaction as the pre-dispatch fence.
+    /// Only a bound invocation can later be reconciled from host evidence.
+    ///
+    /// # Errors
+    /// Refuses scope drift, changed retry authority/effects, or persistence failure.
+    pub fn mark_pending_bound(
+        &mut self,
+        pending: PendingInvocation,
+        binding: TaskInvocationBinding,
+        remaining_ms: Option<u64>,
+    ) -> Result<()> {
+        self.mark_pending_with_binding_at(pending, Some(binding), remaining_ms, now_ms()?)
+    }
+
     fn mark_pending_at(
         &mut self,
         pending: PendingInvocation,
         remaining_ms: Option<u64>,
         now: u64,
     ) -> Result<()> {
+        self.mark_pending_with_binding_at(pending, None, remaining_ms, now)
+    }
+
+    fn mark_pending_with_binding_at(
+        &mut self,
+        pending: PendingInvocation,
+        binding: Option<TaskInvocationBinding>,
+        remaining_ms: Option<u64>,
+        now: u64,
+    ) -> Result<()> {
         self.require_writable()?;
         pending.validate()?;
+        if let Some(binding) = &binding {
+            validate_invocation_binding(&self.state.binding, &pending, binding)?;
+            ensure!(
+                self.state.snapshot.step_results.iter().all(|record| {
+                    record["request_id"].as_str() != Some(pending.request_id.as_str())
+                }),
+                "workflow invocation identity is already bound to an earlier step"
+            );
+        }
+        if let Some(previous) = self.state.invocation_journal.get(&pending.step_id) {
+            ensure!(
+                binding.as_ref() == Some(&previous.binding)
+                    && previous.observed_attempt.is_none()
+                    && previous.completion.is_none(),
+                "workflow checkpoint retry changed its saved invocation binding"
+            );
+        }
         ensure!(
             self.state
                 .binding
@@ -392,6 +684,17 @@ impl RunCheckpoint {
             );
         }
         let mut next = self.next_state(remaining_ms, now, true)?;
+        if let Some(binding) = binding {
+            next.invocation_journal.insert(
+                pending.step_id.clone(),
+                InvocationJournalEntry {
+                    pending: pending.clone(),
+                    binding,
+                    observed_attempt: None,
+                    completion: None,
+                },
+            );
+        }
         next.pending = Some(pending);
         self.persist(next, false)
     }
@@ -455,6 +758,7 @@ impl RunCheckpoint {
         create: bool,
         write: impl FnOnce(&Path, &[u8], bool) -> Result<()>,
     ) -> Result<()> {
+        validate_reconciliation_state(&next)?;
         let digest = serialized_digest(&next)?;
         let bytes = bounded_bytes(&CheckpointEnvelope {
             state: next.clone(),
@@ -468,6 +772,210 @@ impl RunCheckpoint {
         self.poisoned = false;
         Ok(())
     }
+}
+
+fn confirmed_record(record: &Value) -> bool {
+    matches!(
+        record["status"].as_str(),
+        Some("ok" | "skipped" | "reconciled")
+    )
+}
+
+fn unattempted_stopped_record(record: &Value) -> bool {
+    record["status"] == "blocked"
+        && record["reason"] == "execution-stopped"
+        && record["attempted"] == false
+        && record["invoke_attempted"] != true
+        && record["request_id"].is_null()
+        && record["idempotency_key"].is_null()
+        && record["response"].is_null()
+        && record["attempts"].is_null()
+}
+
+fn uncertain_record(record: &Value) -> bool {
+    record["status"] == "outcome_unknown"
+        && record["invoke_attempted"] == true
+        && record["response"].is_null()
+}
+
+fn reconciliation_index(state: &CheckpointState) -> Result<Option<usize>> {
+    for (index, record) in state.snapshot.step_results.iter().enumerate() {
+        if confirmed_record(record) {
+            continue;
+        }
+        ensure!(
+            uncertain_record(record),
+            "workflow checkpoint contains a definitive failure or unsupported recovery state"
+        );
+        ensure!(
+            state.pending.is_none()
+                && state.snapshot.step_results[index + 1..]
+                    .iter()
+                    .all(|later| {
+                        unattempted_stopped_record(later)
+                            && later["id"]
+                                .as_str()
+                                .is_some_and(|id| !state.invocation_journal.contains_key(id))
+                    }),
+            "workflow checkpoint has downstream effects or unresolved execution evidence"
+        );
+        return Ok(Some(index));
+    }
+    Ok(state
+        .pending
+        .as_ref()
+        .map(|_| state.snapshot.step_results.len()))
+}
+
+fn valid_invocation_endpoint(endpoint: &str) -> bool {
+    #[cfg(unix)]
+    if endpoint.starts_with("unix://") || endpoint.starts_with('/') {
+        let socket_path = Path::new(endpoint.strip_prefix("unix://").unwrap_or(endpoint));
+        return socket_path.is_absolute() && socket_path.file_name().is_some();
+    }
+    url::Url::parse(endpoint).is_ok_and(|url| {
+        matches!(url.scheme(), "http" | "https")
+            && url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none()
+    })
+}
+
+fn validate_invocation_binding(
+    run: &RunBinding,
+    pending: &PendingInvocation,
+    binding: &TaskInvocationBinding,
+) -> Result<()> {
+    let metadata = |value: &str| valid_label(value) && value.len() <= 512;
+    ensure!(
+        valid_label(&binding.host)
+            && valid_invocation_endpoint(&binding.host)
+            && binding.request_id == pending.request_id
+            && binding.zone_id == run.zone
+            && blake3::hash(binding.host.as_bytes()).to_hex().as_str() == run.endpoint_digest
+            && [
+                binding.request_id.as_str(),
+                binding.connector_id.as_str(),
+                binding.operation.as_str(),
+                binding.zone_id.as_str(),
+            ]
+            .into_iter()
+            .all(metadata)
+            && binding.principal.as_deref().is_none_or(metadata)
+            && valid_digest(&binding.transport_idempotency.scope_digest)
+            && valid_digest(&binding.transport_idempotency.effect_digest),
+        "workflow invocation binding does not match its checkpoint scope"
+    );
+    Ok(())
+}
+
+fn validate_completion(completion: &TaskInvocationCompletion) -> Result<()> {
+    ensure!(
+        completion.attempt_id > 0
+            && completion.finished_at >= completion.admitted_at
+            && [
+                completion.receipt_id.as_deref(),
+                completion.audit_event_id.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .all(|value| valid_label(value) && value.len() <= 512)
+            && match completion.source {
+                TaskInvocationCompletionSource::LocalFinalized => {
+                    completion.audit_event_id.is_some()
+                }
+                TaskInvocationCompletionSource::MeshOriginObserved => {
+                    completion.audit_event_id.is_none()
+                }
+            },
+        "workflow checkpoint has invalid completion evidence"
+    );
+    Ok(())
+}
+
+fn validate_reconciliation_state(state: &CheckpointState) -> Result<()> {
+    ensure!(
+        state.invocation_journal.len() <= state.binding.execution_order.len()
+            && state.retained_step_results.len() <= MAX_CHECKPOINT_STEPS * 2,
+        "workflow checkpoint reconciliation evidence exceeds its limit"
+    );
+    let mut request_ids = BTreeSet::new();
+    for (id, entry) in &state.invocation_journal {
+        ensure!(
+            request_ids.insert(entry.pending.request_id.as_str()),
+            "workflow invocation identity is bound to multiple steps"
+        );
+        entry.pending.validate()?;
+        validate_invocation_binding(&state.binding, &entry.pending, &entry.binding)?;
+        let index = state
+            .binding
+            .execution_order
+            .iter()
+            .position(|step| step == id)
+            .context("workflow invocation journal contains an unknown step")?;
+        ensure!(
+            entry.pending.step_id == *id
+                && entry
+                    .observed_attempt
+                    .as_ref()
+                    .is_none_or(|pin| pin.attempt_id > 0),
+            "workflow invocation journal has an invalid pending identity or attempt"
+        );
+        if let Some(record) = state.snapshot.step_results.get(index) {
+            ensure!(
+                record["request_id"].as_str() == Some(entry.pending.request_id.as_str())
+                    && record["idempotency_key"].as_str()
+                        == entry.pending.idempotency_key.as_deref(),
+                "workflow invocation journal disagrees with its saved step"
+            );
+        } else {
+            ensure!(
+                index == state.snapshot.step_results.len()
+                    && state.pending.as_ref() == Some(&entry.pending),
+                "workflow invocation journal has no matching dispatch fence"
+            );
+        }
+        if let Some(completion) = &entry.completion {
+            validate_completion(completion)?;
+            let record = state
+                .snapshot
+                .step_results
+                .get(index)
+                .context("workflow completion has no corresponding step record")?;
+            ensure!(
+                entry.observed_attempt.as_ref() == Some(&completion.attempt())
+                    && record["status"] == "reconciled"
+                    && record["operation"].as_str() == Some(entry.binding.operation.as_str())
+                    && record["reconciliation"] == serde_json::to_value(completion)?,
+                "workflow completion is not bound to its selected host attempt"
+            );
+        }
+    }
+    for record in &state.snapshot.step_results {
+        if record["status"] == "reconciled" {
+            ensure!(
+                record["id"].as_str().is_some_and(|id| {
+                    state
+                        .invocation_journal
+                        .get(id)
+                        .is_some_and(|entry| entry.completion.is_some())
+                }),
+                "workflow reconciled step has no retained invocation evidence"
+            );
+        }
+    }
+    for record in &state.retained_step_results {
+        ensure!(
+            record["id"]
+                .as_str()
+                .is_some_and(|id| { state.binding.execution_order.iter().any(|step| step == id) })
+                && (uncertain_record(record) || unattempted_stopped_record(record)),
+            "workflow retained reconciliation evidence is invalid"
+        );
+    }
+    Ok(())
 }
 
 fn validate_snapshot(binding: &RunBinding, snapshot: &RunSnapshot, resume: bool) -> Result<()> {
@@ -499,6 +1007,23 @@ fn validate_snapshot(binding: &RunBinding, snapshot: &RunSnapshot, resume: bool)
                     "workflow checkpoint success lacks matching terminal response evidence"
                 );
                 successful.insert(id.clone(), record["response"]["result"].clone());
+            }
+            Some("reconciled") => {
+                ensure!(
+                    record["mode"] == "observe"
+                        && record["output_available"] == false
+                        && record["invoked_during_reconciliation"] == false
+                        && record["response"].is_null()
+                        && record["request_id"].as_str().is_some_and(|request| {
+                            valid_label(request) && request.len() <= MAX_REQUEST_ID_BYTES
+                        })
+                        && record["idempotency_key"].as_str().is_some_and(valid_label)
+                        && serde_json::from_value::<TaskInvocationCompletion>(
+                            record["reconciliation"].clone()
+                        )
+                        .is_ok(),
+                    "workflow checkpoint reconciliation lacks completion evidence"
+                );
             }
             Some("skipped") => {
                 ensure!(
@@ -595,6 +1120,7 @@ fn read_checkpoint(path: &Path) -> Result<CheckpointState> {
             "workflow checkpoint pending step is out of order"
         );
     }
+    validate_reconciliation_state(&state)?;
     Ok(state)
 }
 
@@ -1391,6 +1917,707 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    fn invocation_binding(step: &str) -> TaskInvocationBinding {
+        TaskInvocationBinding {
+            request_id: format!("request-{step}"),
+            host: "http://127.0.0.1:8787".to_owned(),
+            connector_id: "fcp.github:enterprise:v1".to_owned(),
+            operation: "github.create_issue".to_owned(),
+            zone_id: "z:work".to_owned(),
+            principal: Some("user:owner".to_owned()),
+            transport_idempotency: fcp_host::InvocationIdempotency {
+                scope_digest: "a".repeat(64),
+                effect_digest: "b".repeat(64),
+            },
+        }
+    }
+
+    fn bind_pending(checkpoint: &mut RunCheckpoint, step: &str) -> TaskInvocationBinding {
+        let invocation = invocation_binding(step);
+        checkpoint
+            .mark_pending_with_binding_at(
+                pending(step, 1),
+                Some(invocation.clone()),
+                Some(700),
+                START + 300,
+            )
+            .unwrap();
+        invocation
+    }
+
+    fn local_observation(binding: &TaskInvocationBinding) -> InvocationQueryResponse {
+        let admitted_at = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
+            i64::try_from(START + 300).unwrap(),
+        )
+        .unwrap();
+        InvocationQueryResponse {
+            invocation: Some(fcp_host::InvocationRecord {
+                ticket: fcp_host::InvocationTicket {
+                    operation_id: binding.request_id.clone(),
+                    attempt_id: 7,
+                },
+                admission: fcp_host::InvocationAdmission {
+                    operation_id: binding.request_id.clone(),
+                    connector_id: binding.connector_id.clone(),
+                    operation: binding.operation.clone(),
+                    zone_id: binding.zone_id.clone(),
+                    principal: "user:owner".to_owned(),
+                    correlation_id: None,
+                    deadline_at: admitted_at + chrono::Duration::seconds(30),
+                    idempotency: Some(fcp_host::InvocationIdempotency {
+                        scope_digest: "c".repeat(64),
+                        effect_digest: "d".repeat(64),
+                    }),
+                    transport_idempotency: Some(binding.transport_idempotency.clone()),
+                },
+                admitted_at,
+                terminal: Some(fcp_host::InvocationTerminal {
+                    outcome: fcp_host::InvocationOutcome::Succeeded,
+                    receipt_id: Some("receipt-final".to_owned()),
+                    duration_ms: 100,
+                    http_status: 200,
+                }),
+                finished_at: Some(admitted_at + chrono::Duration::milliseconds(100)),
+                finalization: Some(fcp_host::InvocationFinalization {
+                    budget_recorded: true,
+                    budget_finalized: true,
+                    receipt_recorded: true,
+                    audit_event_id: Some("audit-final".to_owned()),
+                    sampling_operation_id: None,
+                    sampling_completed: None,
+                    response_http_status: Some(200),
+                    response_status: Some(fcp_kernel::InvokeStatus::Ok),
+                }),
+                durable: true,
+            }),
+            mesh_invocation: None,
+            host_job_active: false,
+        }
+    }
+
+    fn mesh_observation(binding: &TaskInvocationBinding) -> InvocationQueryResponse {
+        let admitted_at = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
+            i64::try_from(START + 300).unwrap(),
+        )
+        .unwrap();
+        InvocationQueryResponse {
+            invocation: None,
+            mesh_invocation: Some(fcp_host::MeshInvocationRecord {
+                ticket: fcp_host::InvocationTicket {
+                    operation_id: binding.request_id.clone(),
+                    attempt_id: 7,
+                },
+                intent: fcp_host::MeshInvocationIntent {
+                    operation_id: binding.request_id.clone(),
+                    connector_id: binding.connector_id.clone(),
+                    operation: binding.operation.clone(),
+                    zone_id: binding.zone_id.clone(),
+                    origin_node: "node-origin".to_owned(),
+                    target_node: "node-first".to_owned(),
+                    identity: fcp_host::MeshInvocationIdentity::VerifiedPrincipal {
+                        principal: "user:owner".to_owned(),
+                    },
+                    correlation_id: None,
+                    deadline_at: admitted_at + chrono::Duration::seconds(30),
+                    idempotency: Some(fcp_host::InvocationIdempotency {
+                        scope_digest: "c".repeat(64),
+                        effect_digest: "d".repeat(64),
+                    }),
+                    transport_idempotency: Some(binding.transport_idempotency.clone()),
+                },
+                admitted_at,
+                attempts: vec![fcp_host::MeshInvocationAttempt {
+                    target_node: "node-first".to_owned(),
+                    selected_at: admitted_at,
+                    observation: Some(fcp_host::MeshInvocationObservation::ResponseObserved {
+                        http_status: 200,
+                    }),
+                }],
+                terminal: Some(fcp_host::MeshInvocationTerminal {
+                    outcome: fcp_host::MeshInvocationOutcome::Succeeded,
+                    http_status: 200,
+                    duration_ms: 100,
+                    receipt_id: Some("receipt-remote".to_owned()),
+                }),
+                finished_at: Some(admitted_at + chrono::Duration::milliseconds(100)),
+                durable: true,
+            }),
+            host_job_active: false,
+        }
+    }
+
+    fn unknown(step: &str) -> Value {
+        json!({
+            "id": step,
+            "operation": "github.create_issue",
+            "status": "outcome_unknown",
+            "reason": "invoke-outcome-unknown",
+            "request_id": format!("request-{step}"),
+            "idempotency_key": format!("key-{step}"),
+            "invoke_attempted": true,
+            "automatic_retry_allowed": false,
+            "attempts": [{"attempt":1, "status":"outcome_unknown"}],
+        })
+    }
+
+    fn stopped(step: &str) -> Value {
+        json!({
+            "id": step,
+            "operation": "github.create_issue",
+            "status": "blocked",
+            "reason": "execution-stopped",
+            "blocked_by": ["fetch"],
+            "attempted": false,
+        })
+    }
+
+    #[test]
+    fn reconciliation_recovers_pending_completion_without_reconstructing_output() {
+        let directory = TempDir::new().unwrap();
+        let mut checkpoint = create(&directory);
+        let invocation = bind_pending(&mut checkpoint, "fetch");
+        let path = checkpoint.path.clone();
+        drop(checkpoint);
+
+        let mut checkpoint = RunCheckpoint::open_for_reconciliation(&path).unwrap();
+        assert_eq!(checkpoint.command(), "pipeline");
+        assert!(RunCheckpoint::open_for_reconciliation(&path).is_err());
+        let outcome = checkpoint
+            .reconcile_observation_at(
+                &invocation.host,
+                &local_observation(&invocation),
+                START + 500,
+            )
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            CheckpointReconciliationOutcome::Confirmed {
+                run_completed: false,
+                ..
+            }
+        ));
+        assert!(checkpoint.snapshot().outputs.is_empty());
+        assert_eq!(
+            checkpoint.snapshot().step_results[0]["status"],
+            "reconciled"
+        );
+        assert_eq!(
+            checkpoint.snapshot().step_results[0]["output_available"],
+            false
+        );
+        assert!(
+            checkpoint.snapshot().step_results[0]
+                .get("response")
+                .is_none()
+        );
+        assert_eq!(checkpoint.retained_step_results(), &[] as &[Value]);
+        assert!(checkpoint.reconciliation_target().unwrap().is_none());
+        assert!(!checkpoint.finish_reconciliation_at(START + 500).unwrap());
+        drop(checkpoint);
+
+        let mut resumed = RunCheckpoint::resume_at(&path, &binding(), START + 600).unwrap();
+        assert_eq!(resumed.snapshot().step_results.len(), 1);
+        assert!(resumed.snapshot().outputs.is_empty());
+        resumed
+            .mark_pending_with_binding_at(
+                pending("notify", 1),
+                Some(invocation_binding("notify")),
+                Some(400),
+                START + 600,
+            )
+            .unwrap();
+        assert_eq!(resumed.state.pending.as_ref().unwrap().step_id, "notify");
+    }
+
+    #[test]
+    fn reconciliation_retains_original_unknown_and_unattempted_suffix() {
+        let directory = TempDir::new().unwrap();
+        let mut checkpoint = create(&directory);
+        let invocation = bind_pending(&mut checkpoint, "fetch");
+        let original = vec![unknown("fetch"), stopped("notify")];
+        checkpoint
+            .save_snapshot_at(&original, &BTreeMap::new(), Some(600), true, START + 400)
+            .unwrap();
+        assert!(!checkpoint.completed());
+        let path = checkpoint.path.clone();
+        drop(checkpoint);
+
+        let mut checkpoint = RunCheckpoint::open_for_reconciliation(&path).unwrap();
+        checkpoint
+            .reconcile_observation_at(
+                &invocation.host,
+                &local_observation(&invocation),
+                START + 500,
+            )
+            .unwrap();
+        assert_eq!(checkpoint.retained_step_results(), original.as_slice());
+        assert_eq!(checkpoint.snapshot().step_results.len(), 1);
+        assert!(checkpoint.snapshot().outputs.is_empty());
+        assert!(!checkpoint.completed());
+        let state = read_checkpoint(&path).unwrap();
+        assert_eq!(state.retained_step_results, original);
+        assert_eq!(
+            state.invocation_journal["fetch"].pending,
+            pending("fetch", 1)
+        );
+        drop(checkpoint);
+        assert!(RunCheckpoint::resume_at(&path, &binding(), START + 600).is_ok());
+    }
+
+    #[test]
+    fn reconciliation_can_finish_after_deadline_without_reopening_execution() {
+        let directory = TempDir::new().unwrap();
+        let mut checkpoint = create(&directory);
+        let (_, original_outputs) = finish_first(&mut checkpoint);
+        let invocation = bind_pending(&mut checkpoint, "notify");
+        let expires = checkpoint.state.expires_at_ms;
+        let outcome = checkpoint
+            .reconcile_observation_at(
+                &invocation.host,
+                &mesh_observation(&invocation),
+                START + 2_000,
+            )
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            CheckpointReconciliationOutcome::Confirmed {
+                completion: TaskInvocationCompletion {
+                    source: TaskInvocationCompletionSource::MeshOriginObserved,
+                    ..
+                },
+                run_completed: true,
+                ..
+            }
+        ));
+        assert!(checkpoint.completed());
+        assert_eq!(checkpoint.snapshot().outputs, original_outputs);
+        assert!(!checkpoint.snapshot().outputs.contains_key("notify"));
+        assert_eq!(checkpoint.state.expires_at_ms, expires);
+        assert_eq!(checkpoint.state.remaining_ms, Some(0));
+        assert!(checkpoint.reconciliation_target().unwrap().is_none());
+        assert!(checkpoint.finish_reconciliation_at(START + 2_001).unwrap());
+        let path = checkpoint.path.clone();
+        drop(checkpoint);
+        assert!(
+            RunCheckpoint::open_for_reconciliation(&path)
+                .unwrap()
+                .completed()
+        );
+        assert!(RunCheckpoint::resume_at(&path, &binding(), START + 2_001).is_err());
+    }
+
+    #[test]
+    fn unresolved_observation_pins_attempt_before_later_success() {
+        let directory = TempDir::new().unwrap();
+        let mut checkpoint = create(&directory);
+        let invocation = bind_pending(&mut checkpoint, "fetch");
+        let mut response = local_observation(&invocation);
+        response.host_job_active = true;
+        assert!(matches!(
+            checkpoint
+                .reconcile_observation_at(&invocation.host, &response, START + 400)
+                .unwrap(),
+            CheckpointReconciliationOutcome::Unresolved {
+                reason: ReconcileFailure::ActiveHostJob,
+                ..
+            }
+        ));
+        let path = checkpoint.path.clone();
+        drop(checkpoint);
+        let mut checkpoint = RunCheckpoint::open_for_reconciliation(&path).unwrap();
+        assert_eq!(
+            checkpoint
+                .reconciliation_target()
+                .unwrap()
+                .unwrap()
+                .observed_attempt
+                .unwrap()
+                .attempt_id,
+            7
+        );
+        response.host_job_active = false;
+        response.invocation.as_mut().unwrap().ticket.attempt_id = 8;
+        assert!(matches!(
+            checkpoint
+                .reconcile_observation_at(&invocation.host, &response, START + 500)
+                .unwrap(),
+            CheckpointReconciliationOutcome::Unresolved {
+                reason: ReconcileFailure::AttemptChanged,
+                ..
+            }
+        ));
+        assert!(checkpoint.snapshot().step_results.is_empty());
+        response.invocation.as_mut().unwrap().ticket.attempt_id = 7;
+        assert!(matches!(
+            checkpoint
+                .reconcile_observation_at(&invocation.host, &response, START + 600)
+                .unwrap(),
+            CheckpointReconciliationOutcome::Confirmed { .. }
+        ));
+    }
+
+    #[test]
+    fn reconciliation_rejects_wrong_scope_before_pinning_host_history() {
+        let directory = TempDir::new().unwrap();
+        let mut checkpoint = create(&directory);
+        let invocation = bind_pending(&mut checkpoint, "fetch");
+        let response = local_observation(&invocation);
+        let before = fs::read(&checkpoint.path).unwrap();
+        assert!(matches!(
+            checkpoint
+                .reconcile_observation_at("http://other.example", &response, START + 400)
+                .unwrap(),
+            CheckpointReconciliationOutcome::Unresolved {
+                reason: ReconcileFailure::WrongHost,
+                ..
+            }
+        ));
+        for case in 0..6 {
+            let mut response = local_observation(&invocation);
+            let record = response.invocation.as_mut().unwrap();
+            match case {
+                0 => record.admission.zone_id = "z:other".to_owned(),
+                1 => record.admission.connector_id = "other".to_owned(),
+                2 => record.admission.operation = "other".to_owned(),
+                3 => record.admission.principal = "other".to_owned(),
+                4 => {
+                    record
+                        .admission
+                        .transport_idempotency
+                        .as_mut()
+                        .unwrap()
+                        .scope_digest = "f".repeat(64);
+                }
+                _ => {
+                    record
+                        .admission
+                        .transport_idempotency
+                        .as_mut()
+                        .unwrap()
+                        .effect_digest = "f".repeat(64);
+                }
+            }
+            assert!(matches!(
+                checkpoint
+                    .reconcile_observation_at(&invocation.host, &response, START + 400)
+                    .unwrap(),
+                CheckpointReconciliationOutcome::Unresolved { .. }
+            ));
+            assert_eq!(fs::read(&checkpoint.path).unwrap(), before);
+        }
+        assert!(
+            checkpoint
+                .reconciliation_target()
+                .unwrap()
+                .unwrap()
+                .observed_attempt
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn incomplete_or_unsuccessful_host_evidence_never_clears_uncertainty() {
+        for case in 0..5 {
+            let directory = TempDir::new().unwrap();
+            let mut checkpoint = create(&directory);
+            let invocation = bind_pending(&mut checkpoint, "fetch");
+            let mut response = local_observation(&invocation);
+            let record = response.invocation.as_mut().unwrap();
+            match case {
+                0 => record.durable = false,
+                1 => record.finalization.as_mut().unwrap().budget_finalized = false,
+                2 => record.finalization.as_mut().unwrap().audit_event_id = None,
+                3 => {
+                    record.terminal.as_mut().unwrap().outcome =
+                        fcp_host::InvocationOutcome::ConnectorError;
+                }
+                _ => record.finalization = None,
+            }
+            assert!(matches!(
+                checkpoint
+                    .reconcile_observation_at(&invocation.host, &response, START + 400)
+                    .unwrap(),
+                CheckpointReconciliationOutcome::Unresolved { .. }
+            ));
+            assert!(checkpoint.state.pending.is_some());
+            assert!(checkpoint.snapshot().step_results.is_empty());
+            assert!(
+                checkpoint
+                    .reconciliation_target()
+                    .unwrap()
+                    .unwrap()
+                    .observed_attempt
+                    .is_some()
+            );
+            let path = checkpoint.path.clone();
+            drop(checkpoint);
+            assert!(RunCheckpoint::resume_at(&path, &binding(), START + 500).is_err());
+        }
+    }
+
+    #[test]
+    fn recovery_refuses_definite_failures_and_any_downstream_dispatch() {
+        for status in ["error", "denied"] {
+            let directory = TempDir::new().unwrap();
+            let mut checkpoint = create(&directory);
+            bind_pending(&mut checkpoint, "fetch");
+            let mut record = unknown("fetch");
+            record["status"] = json!(status);
+            checkpoint
+                .save_snapshot_at(
+                    &[record, stopped("notify")],
+                    &BTreeMap::new(),
+                    Some(600),
+                    true,
+                    START + 400,
+                )
+                .unwrap();
+            let before = fs::read(&checkpoint.path).unwrap();
+            assert!(checkpoint.reconciliation_target().is_err());
+            assert_eq!(fs::read(&checkpoint.path).unwrap(), before);
+        }
+        for mutation in ["request_id", "invoke_attempted", "reason", "attempts"] {
+            let directory = TempDir::new().unwrap();
+            let mut checkpoint = create(&directory);
+            bind_pending(&mut checkpoint, "fetch");
+            let mut later = stopped("notify");
+            later[mutation] = match mutation {
+                "invoke_attempted" => json!(true),
+                "attempts" => json!([{"attempt":1}]),
+                _ => json!("ambiguous"),
+            };
+            checkpoint
+                .save_snapshot_at(
+                    &[unknown("fetch"), later],
+                    &BTreeMap::new(),
+                    Some(600),
+                    true,
+                    START + 400,
+                )
+                .unwrap();
+            assert!(checkpoint.reconciliation_target().is_err(), "{mutation}");
+        }
+    }
+
+    #[test]
+    fn bound_retries_preserve_authority_and_allow_only_next_attempt() {
+        let directory = TempDir::new().unwrap();
+        let mut checkpoint = create(&directory);
+        let invocation = bind_pending(&mut checkpoint, "fetch");
+        let before = fs::read(&checkpoint.path).unwrap();
+        for case in 0..7 {
+            let mut changed = invocation.clone();
+            match case {
+                0 => changed.host = "http://other.example".to_owned(),
+                1 => changed.zone_id = "z:other".to_owned(),
+                2 => changed.connector_id = "other".to_owned(),
+                3 => changed.operation = "other".to_owned(),
+                4 => changed.principal = None,
+                5 => changed.transport_idempotency.scope_digest = "f".repeat(64),
+                _ => changed.transport_idempotency.effect_digest = "f".repeat(64),
+            }
+            assert!(
+                checkpoint
+                    .mark_pending_with_binding_at(
+                        pending("fetch", 2),
+                        Some(changed),
+                        Some(600),
+                        START + 400,
+                    )
+                    .is_err()
+            );
+            assert_eq!(fs::read(&checkpoint.path).unwrap(), before);
+        }
+        assert!(
+            checkpoint
+                .mark_pending_at(pending("fetch", 2), Some(600), START + 400)
+                .is_err()
+        );
+        checkpoint
+            .mark_pending_with_binding_at(
+                pending("fetch", 2),
+                Some(invocation.clone()),
+                Some(600),
+                START + 400,
+            )
+            .unwrap();
+        assert_eq!(
+            checkpoint.state.invocation_journal["fetch"].pending.attempt,
+            2
+        );
+        assert_eq!(checkpoint.state.expires_at_ms, Some(START + 1_000));
+        let mut response = local_observation(&invocation);
+        response.host_job_active = true;
+        checkpoint
+            .reconcile_observation_at(&invocation.host, &response, START + 500)
+            .unwrap();
+        assert!(
+            checkpoint
+                .mark_pending_with_binding_at(
+                    pending("fetch", 3),
+                    Some(invocation),
+                    Some(500),
+                    START + 500,
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn legacy_fences_remain_unrecoverable_and_keep_original_serialization() {
+        let directory = TempDir::new().unwrap();
+        let mut checkpoint = create(&directory);
+        checkpoint
+            .mark_pending_at(pending("fetch", 1), Some(900), START + 100)
+            .unwrap();
+        let encoded = serde_json::to_value(&checkpoint.state).unwrap();
+        assert!(encoded.get("invocation_journal").is_none());
+        assert!(encoded.get("retained_step_results").is_none());
+        let path = checkpoint.path.clone();
+        let before = fs::read(&path).unwrap();
+        drop(checkpoint);
+        let checkpoint = RunCheckpoint::open_for_reconciliation(&path).unwrap();
+        assert!(checkpoint.reconciliation_target().is_err());
+        assert_eq!(fs::read(path).unwrap(), before);
+    }
+
+    #[test]
+    fn reconciliation_requires_journal_proof_and_cannot_be_forged_by_snapshot_save() {
+        let directory = TempDir::new().unwrap();
+        let mut checkpoint = create(&directory);
+        let invocation = bind_pending(&mut checkpoint, "fetch");
+        checkpoint
+            .reconcile_observation_at(
+                &invocation.host,
+                &local_observation(&invocation),
+                START + 400,
+            )
+            .unwrap();
+        let reconciled = checkpoint.snapshot().step_results[0].clone();
+        let mut corrupt = checkpoint.state.clone();
+        corrupt.invocation_journal.clear();
+        assert!(validate_reconciliation_state(&corrupt).is_err());
+        let mut corrupt = checkpoint.state.clone();
+        corrupt
+            .invocation_journal
+            .get_mut("fetch")
+            .unwrap()
+            .observed_attempt = Some(TaskInvocationAttempt {
+            source: task_reconcile::TaskInvocationSource::Mesh,
+            attempt_id: 7,
+        });
+        assert!(validate_reconciliation_state(&corrupt).is_err());
+        let mut corrupt = checkpoint.state.clone();
+        corrupt
+            .snapshot
+            .outputs
+            .insert("fetch".to_owned(), Value::Null);
+        assert!(validate_snapshot(&corrupt.binding, &corrupt.snapshot, true).is_err());
+        let other = TempDir::new().unwrap();
+        let mut unfenced = create(&other);
+        assert!(
+            unfenced
+                .save_snapshot_at(
+                    &[reconciled],
+                    &BTreeMap::new(),
+                    Some(900),
+                    false,
+                    START + 100,
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn checkpoint_finishes_confirmed_aggregate_without_lookup_or_new_effect() {
+        let directory = TempDir::new().unwrap();
+        let mut checkpoint = create(&directory);
+        let (mut records, mut outputs) = finish_first(&mut checkpoint);
+        checkpoint
+            .mark_pending_at(pending("notify", 1), Some(700), START + 300)
+            .unwrap();
+        records.push(success("notify", json!({"accepted":true})));
+        outputs.insert("notify".to_owned(), json!({"accepted":true}));
+        checkpoint
+            .save_snapshot_at(&records, &outputs, Some(600), false, START + 400)
+            .unwrap();
+        assert!(!checkpoint.completed());
+        let path = checkpoint.path.clone();
+        drop(checkpoint);
+        let mut checkpoint = RunCheckpoint::open_for_reconciliation(&path).unwrap();
+        assert!(checkpoint.reconciliation_target().unwrap().is_none());
+        assert!(checkpoint.finish_reconciliation_at(START + 2_000).unwrap());
+        assert!(checkpoint.completed());
+        assert_eq!(checkpoint.snapshot().step_results, records);
+        assert_eq!(checkpoint.snapshot().outputs, outputs);
+        let persisted = fs::read(&path).unwrap();
+        assert!(checkpoint.finish_reconciliation_at(START + 2_001).unwrap());
+        assert_eq!(fs::read(&path).unwrap(), persisted);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn absolute_unix_hosts_capture_and_reconcile_the_exact_original_scope() {
+        for host in [
+            "/tmp/fcp-checkpoint-test.sock",
+            "unix:///tmp/fcp-checkpoint-test.sock",
+        ] {
+            let directory = TempDir::new().unwrap();
+            let scope = RunBinding::new(
+                "pipeline",
+                &json!({"name":"socket-workflow"}),
+                host,
+                "z:work",
+                &["fetch".to_owned()],
+            )
+            .unwrap();
+            let path = directory.path().join("run.json");
+            let mut checkpoint =
+                RunCheckpoint::create_at(&path, scope, "socket-run".to_owned(), None, START)
+                    .unwrap();
+            let mut invocation = invocation_binding("fetch");
+            invocation.host = host.to_owned();
+            checkpoint
+                .mark_pending_with_binding_at(
+                    pending("fetch", 1),
+                    Some(invocation.clone()),
+                    None,
+                    START + 100,
+                )
+                .unwrap();
+            drop(checkpoint);
+            let mut checkpoint = RunCheckpoint::open_for_reconciliation(&path).unwrap();
+            assert_eq!(
+                checkpoint
+                    .reconciliation_target()
+                    .unwrap()
+                    .unwrap()
+                    .binding
+                    .host,
+                host
+            );
+            assert!(matches!(
+                checkpoint
+                    .reconcile_observation_at(host, &local_observation(&invocation), START + 500)
+                    .unwrap(),
+                CheckpointReconciliationOutcome::Confirmed {
+                    run_completed: true,
+                    ..
+                }
+            ));
+            assert!(checkpoint.completed());
+            assert!(checkpoint.snapshot().outputs.is_empty());
+        }
+        for invalid in [
+            "unix://",
+            "unix://relative.sock",
+            "unix://host/tmp/fcp.sock",
+            "/",
+        ] {
+            assert!(!valid_invocation_endpoint(invalid), "{invalid}");
+        }
     }
 
     #[cfg(unix)]
