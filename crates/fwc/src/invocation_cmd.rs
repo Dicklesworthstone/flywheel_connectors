@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use clap::Args;
 use fcp_host::{
-    InvocationOutcome, InvocationQueryRequest, InvocationQueryResponse, MeshInvocationIdentity,
+    InvocationOutcome, InvocationQueryRequest, InvocationQueryResponse,
+    InvocationResultQueryRequest, InvocationResultQueryResponse, MeshInvocationIdentity,
     MeshInvocationObservation, MeshInvocationOutcome, MeshInvocationRecord,
 };
 use serde_json::{Value, json};
@@ -24,6 +25,7 @@ const MAX_INVOCATION_RESPONSE_BYTES: u64 = 512 * 1024;
 const MAX_OPERATION_ID_BYTES: usize = 512;
 const MAX_MESH_INVOCATION_ATTEMPTS: usize = 256;
 const INVOCATION_QUERY_PATH: &str = "/rpc/admin/invocations";
+const INVOCATION_RESULT_PATH: &str = "/rpc/admin/invocations/result";
 const HISTORY_SCOPE: &str = "selected-host-invocation-history";
 const MISSING_HISTORY_CAVEAT: &str = "A missing retained record does not prove that the operation had no effects. Origin forwarding and executor-local histories are distinct, and completed history is bounded.";
 const MESH_HISTORY_CAVEAT: &str = "Origin forwarding evidence covers this host's retained attempt. It does not establish remote cancellation, provide a replayable result, or guarantee mesh-wide exactly-once execution.";
@@ -57,7 +59,9 @@ pub(crate) enum LookupFailure {
     Timeout,
     Http(u16),
     InvalidResponse,
+    InvalidResult,
     ResponseTooLarge,
+    ResultTooLarge,
 }
 
 impl LookupFailure {
@@ -113,9 +117,19 @@ impl LookupFailure {
                 "The host returned an invalid invocation record or a record for a different request or attempt.",
                 CliExitCode::Transport,
             ),
+            Self::InvalidResult => (
+                "invalid-invocation-result-response",
+                "The private result's exact attempt, effect binding, response digest or retention period could not be verified.",
+                CliExitCode::Transport,
+            ),
             Self::ResponseTooLarge => (
                 "invocation-query-response-too-large",
                 "The host invocation metadata response exceeded the 512 KiB read limit.",
+                CliExitCode::Transport,
+            ),
+            Self::ResultTooLarge => (
+                "invocation-result-response-too-large",
+                "The private invocation result response exceeded its 2 MiB read limit.",
                 CliExitCode::Transport,
             ),
         }
@@ -272,7 +286,11 @@ pub(crate) fn watch(
                     polls,
                     selected,
                     last,
-                    if timed_out { "invocation-watch-timeout" } else { kind },
+                    if timed_out {
+                        "invocation-watch-timeout"
+                    } else {
+                        kind
+                    },
                     message,
                     timed_out,
                 );
@@ -422,8 +440,8 @@ fn watch_stopped(
     message: &str,
     timed_out: bool,
 ) -> DispatchOutcome {
-    let mut outcome = last
-        .unwrap_or_else(|| lookup_failure(lookup, Some(endpoint), LookupFailure::Transport));
+    let mut outcome =
+        last.unwrap_or_else(|| lookup_failure(lookup, Some(endpoint), LookupFailure::Transport));
     annotate_watch(&mut outcome, args, started, polls, selected, timed_out);
     outcome.exit_code = CliExitCode::Transport;
     outcome.payload["status"] = json!("error");
@@ -475,51 +493,14 @@ pub(crate) fn query_invocation(
     request: &InvocationQueryRequest,
     token: &str,
 ) -> std::result::Result<InvocationQueryResponse, LookupFailure> {
-    // The dedicated client refuses redirects, including same-origin redirects.
-    // Never attach these credentials to discovery, invoke, or a mesh peer.
-    let response = client
-        .client
-        .post(format!("{}{}", client.base_url, INVOCATION_QUERY_PATH))
-        .bearer_auth(token)
-        .header("x-fcp-zone", "z:owner")
-        .timeout(client.read_timeout)
-        .json(request)
-        .send()
-        .map_err(classify_query_transport)?;
-    let status = response.status();
-    if !status.is_success() {
-        // Error bodies may contain secrets echoed by a proxy or upstream host.
-        return Err(LookupFailure::Http(status.as_u16()));
-    }
-    if response
-        .content_length()
-        .is_some_and(|length| length > MAX_INVOCATION_RESPONSE_BYTES)
-    {
-        return Err(LookupFailure::ResponseTooLarge);
-    }
-    let mut body = Vec::new();
-    response
-        .take(MAX_INVOCATION_RESPONSE_BYTES + 1)
-        .read_to_end(&mut body)
-        .map_err(|error| {
-            // Blocking Response::read wraps reqwest errors in io::Error.
-            // Inspect the wrapped error directly so the timeout kind survives.
-            if error.kind() == std::io::ErrorKind::TimedOut
-                || error
-                    .get_ref()
-                    .and_then(|cause| cause.downcast_ref::<reqwest::Error>())
-                    .is_some_and(reqwest::Error::is_timeout)
-            {
-                LookupFailure::Timeout
-            } else {
-                LookupFailure::Transport
-            }
-        })?;
-    if body.len() as u64 > MAX_INVOCATION_RESPONSE_BYTES {
-        return Err(LookupFailure::ResponseTooLarge);
-    }
-    let response: InvocationQueryResponse =
-        serde_json::from_slice(&body).map_err(|_| LookupFailure::InvalidResponse)?;
+    let response: InvocationQueryResponse = query_admin(
+        client,
+        request,
+        token,
+        INVOCATION_QUERY_PATH,
+        MAX_INVOCATION_RESPONSE_BYTES,
+        LookupFailure::ResponseTooLarge,
+    )?;
     if response.invocation.is_some() && response.mesh_invocation.is_some() {
         return Err(LookupFailure::InvalidResponse);
     }
@@ -538,6 +519,89 @@ pub(crate) fn query_invocation(
         return Err(LookupFailure::InvalidResponse);
     }
     Ok(response)
+}
+
+/// Fetch actual private output only after the caller verified the original
+/// completed invocation. This never contacts another host or invokes a provider.
+pub(crate) fn query_invocation_result(
+    client: &HostAdminClient,
+    request: &InvocationResultQueryRequest,
+    token: &str,
+) -> std::result::Result<InvocationResultQueryResponse, LookupFailure> {
+    request
+        .binding
+        .validate()
+        .map_err(|_| LookupFailure::InvalidRequest)?;
+    // The persisted file has a larger wrapper than this API response, so the
+    // same complete-record ceiling also bounds the wire representation.
+    let response: InvocationResultQueryResponse = query_admin(
+        client,
+        request,
+        token,
+        INVOCATION_RESULT_PATH,
+        fcp_host::INVOCATION_RESULT_MAX_BYTES as u64,
+        LookupFailure::ResultTooLarge,
+    )?;
+    if let Some(result) = &response.result {
+        result
+            .validate(&request.binding, chrono::Utc::now())
+            .map_err(|_| LookupFailure::InvalidResult)?;
+    }
+    Ok(response)
+}
+
+fn query_admin<T: serde::Serialize, R: serde::de::DeserializeOwned>(
+    client: &HostAdminClient,
+    request: &T,
+    token: &str,
+    path: &str,
+    max_bytes: u64,
+    oversized: LookupFailure,
+) -> std::result::Result<R, LookupFailure> {
+    // The dedicated client refuses redirects, including same-origin redirects.
+    // Never attach these credentials to discovery, invoke, or a mesh peer.
+    let response = client
+        .client
+        .post(format!("{}{path}", client.base_url))
+        .bearer_auth(token)
+        .header("x-fcp-zone", "z:owner")
+        .timeout(client.read_timeout)
+        .json(request)
+        .send()
+        .map_err(classify_query_transport)?;
+    let status = response.status();
+    if !status.is_success() {
+        // Error bodies may contain secrets echoed by a proxy or upstream host.
+        return Err(LookupFailure::Http(status.as_u16()));
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_bytes)
+    {
+        return Err(oversized);
+    }
+    let mut body = Vec::new();
+    response
+        .take(max_bytes + 1)
+        .read_to_end(&mut body)
+        .map_err(|error| {
+            // Blocking Response::read wraps reqwest errors in io::Error.
+            // Inspect the wrapped error directly so the timeout kind survives.
+            if error.kind() == std::io::ErrorKind::TimedOut
+                || error
+                    .get_ref()
+                    .and_then(|cause| cause.downcast_ref::<reqwest::Error>())
+                    .is_some_and(reqwest::Error::is_timeout)
+            {
+                LookupFailure::Timeout
+            } else {
+                LookupFailure::Transport
+            }
+        })?;
+    if body.len() as u64 > max_bytes {
+        return Err(oversized);
+    }
+    serde_json::from_slice(&body).map_err(|_| LookupFailure::InvalidResponse)
 }
 
 fn mesh_record_matches_query(
@@ -1418,13 +1482,48 @@ mod tests {
     #[test]
     fn watch_reports_recorded_failures_unknowns_and_incomplete_finalization() {
         for (terminal, finalized, active, expected_exit) in [
-            (Some(InvocationOutcome::ConnectorError), true, false, CliExitCode::Connector),
-            (Some(InvocationOutcome::Cancelled), true, false, CliExitCode::Connector),
-            (Some(InvocationOutcome::DeadlineExceeded), true, false, CliExitCode::Transport),
-            (Some(InvocationOutcome::HostError), true, false, CliExitCode::Transport),
-            (Some(InvocationOutcome::OutcomeUnknown), false, true, CliExitCode::Transport),
-            (Some(InvocationOutcome::Succeeded), false, false, CliExitCode::Transport),
-            (Some(InvocationOutcome::Succeeded), true, false, CliExitCode::Transport),
+            (
+                Some(InvocationOutcome::ConnectorError),
+                true,
+                false,
+                CliExitCode::Connector,
+            ),
+            (
+                Some(InvocationOutcome::Cancelled),
+                true,
+                false,
+                CliExitCode::Connector,
+            ),
+            (
+                Some(InvocationOutcome::DeadlineExceeded),
+                true,
+                false,
+                CliExitCode::Transport,
+            ),
+            (
+                Some(InvocationOutcome::HostError),
+                true,
+                false,
+                CliExitCode::Transport,
+            ),
+            (
+                Some(InvocationOutcome::OutcomeUnknown),
+                false,
+                true,
+                CliExitCode::Transport,
+            ),
+            (
+                Some(InvocationOutcome::Succeeded),
+                false,
+                false,
+                CliExitCode::Transport,
+            ),
+            (
+                Some(InvocationOutcome::Succeeded),
+                true,
+                false,
+                CliExitCode::Transport,
+            ),
             (None, false, false, CliExitCode::Transport),
         ] {
             let host = TestHost::start(Reply::Json(
@@ -1447,9 +1546,15 @@ mod tests {
     fn watch_preserves_mesh_evidence_without_claiming_executor_finalization() {
         for (terminal, expected_exit) in [
             (MeshInvocationOutcome::Succeeded, CliExitCode::Success),
-            (MeshInvocationOutcome::ConnectorError, CliExitCode::Connector),
+            (
+                MeshInvocationOutcome::ConnectorError,
+                CliExitCode::Connector,
+            ),
             (MeshInvocationOutcome::NotDelivered, CliExitCode::Transport),
-            (MeshInvocationOutcome::OutcomeUnknown, CliExitCode::Transport),
+            (
+                MeshInvocationOutcome::OutcomeUnknown,
+                CliExitCode::Transport,
+            ),
         ] {
             let host = TestHost::start(Reply::Json(
                 200,
@@ -1548,10 +1653,7 @@ mod tests {
                 json!({"invocation": null, "mesh_invocation": forwarded_record(None, true), "host_job_active": true}),
                 8,
             ),
-            (
-                json!({"invocation": null, "host_job_active": true}),
-                7,
-            ),
+            (json!({"invocation": null, "host_job_active": true}), 7),
         ] {
             let host = TestHost::start(Reply::Json(200, body));
             let outcome = execute_watch_for_attempt(&host.endpoint, 1, 0, Some(attempt));

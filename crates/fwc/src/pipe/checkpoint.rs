@@ -4,8 +4,10 @@
 //! A synced pending marker precedes every effect. Only a complete successful
 //! response can make its output reusable on resume. An interrupted invocation
 //! stays fenced until a protected host observation proves its completion; that
-//! observation never reconstructs output. New attempts still require current
-//! credentials, metadata, and host preflight.
+//! observation alone never reconstructs output. Explicit recovery can transfer
+//! the exact final response from private host custody after re-verifying that
+//! same completion. New attempts still require current credentials, metadata,
+//! and host preflight.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
@@ -17,7 +19,7 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use fcp_host::InvocationQueryResponse;
+use fcp_host::{InvocationQueryResponse, InvocationResultBinding, RetainedInvocationResult};
 
 use crate::task_reconcile::{
     self, ReconcileFailure, TaskInvocationAttempt, TaskInvocationBinding, TaskInvocationCompletion,
@@ -157,6 +159,66 @@ struct InvocationJournalEntry {
     observed_attempt: Option<TaskInvocationAttempt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     completion: Option<TaskInvocationCompletion>,
+    /// Metadata for an explicitly retrieved response. The actual response lives
+    /// in its step record; this evidence cannot synthesize a missing result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    output_recovery: Option<CheckpointOutputRecovery>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckpointOutputRecovery {
+    version: u32,
+    binding: InvocationResultBinding,
+    retained_at: chrono::DateTime<chrono::Utc>,
+    expires_at: chrono::DateTime<chrono::Utc>,
+    response_digest: String,
+    recovered_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl CheckpointOutputRecovery {
+    fn validate(
+        &self,
+        invocation: &TaskInvocationBinding,
+        completion: &TaskInvocationCompletion,
+        record: &Value,
+        saved_at_ms: u64,
+    ) -> Result<()> {
+        ensure!(
+            completion.source == TaskInvocationCompletionSource::LocalFinalized
+                && self.binding.ticket.operation_id == invocation.request_id
+                && self.binding.ticket.attempt_id == completion.attempt_id
+                && self.binding.admitted_at == completion.admitted_at
+                && self.binding.finished_at == completion.finished_at
+                && Some(&self.binding.audit_event_id) == completion.audit_event_id.as_ref()
+                && self.binding.connector_id == invocation.connector_id
+                && self.binding.operation == invocation.operation
+                && self.binding.zone_id == invocation.zone_id
+                && invocation
+                    .principal
+                    .as_ref()
+                    .is_none_or(|principal| principal == &self.binding.principal)
+                && self.binding.transport_idempotency == invocation.transport_idempotency
+                && u64::try_from(self.recovered_at.timestamp_millis())
+                    .is_ok_and(|at| at <= saved_at_ms)
+                && record["output_available"] == true
+                && record["output_recovery"] == serde_json::to_value(self)?,
+            "workflow recovered output does not match its confirmed invocation"
+        );
+        let result = RetainedInvocationResult {
+            version: self.version,
+            binding: self.binding.clone(),
+            retained_at: self.retained_at,
+            expires_at: self.expires_at,
+            response_digest: self.response_digest.clone(),
+            response: serde_json::from_value(record["response"].clone())
+                .context("workflow recovered output has no actual response")?,
+        };
+        // Host retention governs transfer into the checkpoint. Once recovered,
+        // private workflow data has the same lifetime as any received output.
+        result.validate(&self.binding, self.recovered_at)?;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -379,6 +441,192 @@ impl RunCheckpoint {
             binding: entry.binding.clone(),
             observed_attempt: entry.observed_attempt.clone(),
         }))
+    }
+
+    /// Completed local steps whose actual output has not yet been transferred.
+    /// These targets authorize a read only; even missing custody never permits
+    /// repeating the original operation.
+    ///
+    /// # Errors
+    /// Refuses a poisoned checkpoint or inconsistent retained evidence.
+    pub fn output_recovery_targets(&self) -> Result<Vec<CheckpointReconciliationTarget>> {
+        ensure!(
+            !self.poisoned,
+            "workflow checkpoint requires recovery after a write failure"
+        );
+        validate_reconciliation_state(&self.state)?;
+        Ok(self
+            .state
+            .binding
+            .execution_order
+            .iter()
+            .filter_map(|id| {
+                let entry = self.state.invocation_journal.get(id)?;
+                let completion = entry.completion.as_ref()?;
+                (completion.source == TaskInvocationCompletionSource::LocalFinalized
+                    && entry.output_recovery.is_none())
+                .then(|| CheckpointReconciliationTarget {
+                    step_id: id.clone(),
+                    binding: entry.binding.clone(),
+                    observed_attempt: entry.observed_attempt.clone(),
+                })
+            })
+            .collect())
+    }
+
+    /// Verify fresh history before any private-output lookup is sent.
+    ///
+    /// # Errors
+    /// Refuses an unconfirmed step, changed completion, or another host/attempt.
+    pub fn output_recovery_binding(
+        &self,
+        step_id: &str,
+        selected_host: &str,
+        observation: &InvocationQueryResponse,
+    ) -> Result<InvocationResultBinding> {
+        ensure!(
+            !self.poisoned,
+            "workflow checkpoint requires recovery after a write failure"
+        );
+        let entry = self
+            .state
+            .invocation_journal
+            .get(step_id)
+            .context("workflow output recovery has no retained invocation")?;
+        let completion = entry
+            .completion
+            .as_ref()
+            .context("workflow output recovery requires confirmed completion")?;
+        ensure!(
+            completion.source == TaskInvocationCompletionSource::LocalFinalized,
+            "workflow output recovery requires executor-local history"
+        );
+        let actual = task_reconcile::verify_completion(
+            &entry.binding,
+            selected_host,
+            &completion.attempt(),
+            observation,
+        )?;
+        ensure!(
+            &actual == completion,
+            "workflow completion changed before output recovery"
+        );
+        InvocationResultBinding::from_record(
+            observation
+                .invocation
+                .as_ref()
+                .context("workflow result has no local invocation record")?,
+        )
+        .map_err(Into::into)
+    }
+
+    /// Transfer the actual successful response into the private checkpoint.
+    /// Both history and output must match the original pinned attempt/effects;
+    /// this method cannot dispatch, invent output, or change completion evidence.
+    ///
+    /// # Errors
+    /// Refuses another host/attempt/effect, incomplete history, expired/corrupt
+    /// custody, conflicting output, clock rollback, or a failed durable write.
+    pub fn recover_output(
+        &mut self,
+        step_id: &str,
+        selected_host: &str,
+        observation: &InvocationQueryResponse,
+        result: &RetainedInvocationResult,
+    ) -> Result<bool> {
+        let recovered_at = chrono::Utc::now();
+        let now = u64::try_from(recovered_at.timestamp_millis())
+            .context("workflow recovery timestamp is out of range")?;
+        self.recover_output_with_time(
+            step_id,
+            selected_host,
+            observation,
+            result,
+            now,
+            recovered_at,
+        )
+    }
+
+    #[cfg(test)]
+    fn recover_output_at(
+        &mut self,
+        step_id: &str,
+        selected_host: &str,
+        observation: &InvocationQueryResponse,
+        result: &RetainedInvocationResult,
+        now: u64,
+    ) -> Result<bool> {
+        self.recover_output_with_time(
+            step_id,
+            selected_host,
+            observation,
+            result,
+            now,
+            timestamp(now)?,
+        )
+    }
+
+    fn recover_output_with_time(
+        &mut self,
+        step_id: &str,
+        selected_host: &str,
+        observation: &InvocationQueryResponse,
+        result: &RetainedInvocationResult,
+        now: u64,
+        recovered_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool> {
+        ensure!(
+            now >= self.state.saved_at_ms,
+            "workflow checkpoint clock moved backward"
+        );
+        let binding = self.output_recovery_binding(step_id, selected_host, observation)?;
+        let entry = self
+            .state
+            .invocation_journal
+            .get(step_id)
+            .context("workflow output recovery has no retained invocation")?;
+        result.validate(&binding, recovered_at)?;
+        if let Some(previous) = &entry.output_recovery {
+            ensure!(
+                previous.binding == binding && previous.response_digest == result.response_digest,
+                "workflow output recovery cannot replace a previous result"
+            );
+            return Ok(false);
+        }
+        let output = result
+            .response
+            .result
+            .clone()
+            .context("workflow result recovery lacks an actual output")?;
+        let recovery = CheckpointOutputRecovery {
+            version: result.version,
+            binding,
+            retained_at: result.retained_at,
+            expires_at: result.expires_at,
+            response_digest: result.response_digest.clone(),
+            recovered_at,
+        };
+        let mut next = self.next_state(self.state.remaining_ms, now, false)?;
+        let step = next
+            .snapshot
+            .step_results
+            .iter_mut()
+            .find(|record| record["id"].as_str() == Some(step_id))
+            .context("workflow result has no completed step record")?;
+        ensure!(
+            step["status"] == "reconciled" && step["output_available"] == false,
+            "workflow output recovery requires an unrecovered reconciled step"
+        );
+        step["response"] = serde_json::to_value(&result.response)?;
+        step["output_available"] = Value::Bool(true);
+        step["output_recovery"] = serde_json::to_value(&recovery)?;
+        next.snapshot.outputs.insert(step_id.to_owned(), output);
+        next.invocation_journal
+            .get_mut(step_id)
+            .context("workflow invocation journal disappeared")?
+            .output_recovery = Some(recovery);
+        self.persist(next, false)?;
+        Ok(true)
     }
 
     /// Pin a matching host journal and attempt before examining completion.
@@ -692,6 +940,7 @@ impl RunCheckpoint {
                     binding,
                     observed_attempt: None,
                     completion: None,
+                    output_recovery: None,
                 },
             );
         }
@@ -951,6 +1200,21 @@ fn validate_reconciliation_state(state: &CheckpointState) -> Result<()> {
                     && record["reconciliation"] == serde_json::to_value(completion)?,
                 "workflow completion is not bound to its selected host attempt"
             );
+            if let Some(recovery) = &entry.output_recovery {
+                recovery.validate(&entry.binding, completion, record, state.saved_at_ms)?;
+            } else {
+                ensure!(
+                    record["output_available"] == false
+                        && record["response"].is_null()
+                        && record["output_recovery"].is_null(),
+                    "workflow output has no verified custody evidence"
+                );
+            }
+        } else {
+            ensure!(
+                entry.output_recovery.is_none(),
+                "workflow output recovery has no confirmed completion"
+            );
         }
     }
     for record in &state.snapshot.step_results {
@@ -1011,9 +1275,7 @@ fn validate_snapshot(binding: &RunBinding, snapshot: &RunSnapshot, resume: bool)
             Some("reconciled") => {
                 ensure!(
                     record["mode"] == "observe"
-                        && record["output_available"] == false
                         && record["invoked_during_reconciliation"] == false
-                        && record["response"].is_null()
                         && record["request_id"].as_str().is_some_and(|request| {
                             valid_label(request) && request.len() <= MAX_REQUEST_ID_BYTES
                         })
@@ -1024,6 +1286,33 @@ fn validate_snapshot(binding: &RunBinding, snapshot: &RunSnapshot, resume: bool)
                         .is_ok(),
                     "workflow checkpoint reconciliation lacks completion evidence"
                 );
+                if record["output_available"] == true {
+                    let response: fcp_kernel::InvokeResponse =
+                        serde_json::from_value(record["response"].clone())
+                            .context("workflow recovered output lacks its final response")?;
+                    fcp_manifest::OperationContractSet::validate_response_envelope(
+                        &fcp_kernel::RequestId(
+                            record["request_id"]
+                                .as_str()
+                                .context("missing request id")?
+                                .to_owned(),
+                        ),
+                        &response,
+                    )?;
+                    ensure!(
+                        response.status == fcp_kernel::InvokeStatus::Ok,
+                        "workflow recovered output is not a successful response"
+                    );
+                    successful.insert(
+                        id.clone(),
+                        response.result.context("missing recovered output")?,
+                    );
+                } else {
+                    ensure!(
+                        record["output_available"] == false && record["response"].is_null(),
+                        "workflow metadata-only reconciliation cannot invent output"
+                    );
+                }
             }
             Some("skipped") => {
                 ensure!(
@@ -1122,6 +1411,14 @@ fn read_checkpoint(path: &Path) -> Result<CheckpointState> {
     }
     validate_reconciliation_state(&state)?;
     Ok(state)
+}
+
+#[cfg(test)]
+fn timestamp(milliseconds: u64) -> Result<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::from_timestamp_millis(
+        i64::try_from(milliseconds).context("workflow recovery timestamp is out of range")?,
+    )
+    .context("workflow recovery timestamp is out of range")
 }
 
 fn now_ms() -> Result<u64> {
@@ -2071,6 +2368,219 @@ mod tests {
             "blocked_by": ["fetch"],
             "attempted": false,
         })
+    }
+
+    fn retained_output(
+        observation: &InvocationQueryResponse,
+        output: Value,
+    ) -> RetainedInvocationResult {
+        let binding =
+            InvocationResultBinding::from_record(observation.invocation.as_ref().unwrap()).unwrap();
+        let response = fcp_kernel::InvokeResponse::ok(
+            fcp_kernel::RequestId(binding.ticket.operation_id.clone()),
+            output,
+        );
+        let mut digest = blake3::Hasher::new_derive_key("fcp.host.invocation-result.response.v1");
+        digest.update(&serde_json::to_vec(&response).unwrap());
+        RetainedInvocationResult {
+            version: 1,
+            retained_at: timestamp(START + 450).unwrap(),
+            expires_at: binding.finished_at
+                + chrono::Duration::seconds(fcp_host::INVOCATION_RESULT_TTL_SECONDS),
+            binding,
+            response_digest: digest.finalize().to_hex().to_string(),
+            response,
+        }
+    }
+
+    #[test]
+    fn recovered_actual_output_survives_resume_without_replacing_original_evidence() {
+        for output in [
+            json!({"id": "created-resource", "title": "actual provider result"}),
+            Value::Null,
+        ] {
+            let directory = TempDir::new().unwrap();
+            let mut checkpoint = create(&directory);
+            let invocation = bind_pending(&mut checkpoint, "fetch");
+            checkpoint
+                .save_snapshot_at(
+                    &[unknown("fetch"), stopped("notify")],
+                    &BTreeMap::new(),
+                    Some(600),
+                    true,
+                    START + 400,
+                )
+                .unwrap();
+            let observation = local_observation(&invocation);
+            checkpoint
+                .reconcile_observation_at(&invocation.host, &observation, START + 500)
+                .unwrap();
+            let original = checkpoint.retained_step_results().to_vec();
+            let actual = retained_output(&observation, output.clone());
+            assert_eq!(checkpoint.output_recovery_targets().unwrap().len(), 1);
+            assert!(
+                checkpoint
+                    .recover_output_at(
+                        "fetch",
+                        &invocation.host,
+                        &observation,
+                        &actual,
+                        START + 600
+                    )
+                    .unwrap()
+            );
+            assert_eq!(checkpoint.snapshot().outputs.get("fetch"), Some(&output));
+            assert!(checkpoint.output_recovery_targets().unwrap().is_empty());
+            assert_eq!(
+                checkpoint.snapshot().step_results[0]["status"],
+                "reconciled"
+            );
+            assert_eq!(
+                checkpoint.snapshot().step_results[0]["output_available"],
+                true
+            );
+            assert_eq!(checkpoint.retained_step_results(), original);
+            assert!(
+                !checkpoint
+                    .recover_output_at(
+                        "fetch",
+                        &invocation.host,
+                        &observation,
+                        &actual,
+                        START + 650
+                    )
+                    .unwrap()
+            );
+            let path = checkpoint.path.clone();
+            drop(checkpoint);
+            let mut resumed = RunCheckpoint::resume_at(&path, &binding(), START + 700).unwrap();
+            assert_eq!(resumed.snapshot().outputs.get("fetch"), Some(&output));
+            assert_eq!(resumed.retained_step_results(), original);
+            assert_eq!(
+                remaining_at(&resumed.state, START + 700).unwrap(),
+                Some(300)
+            );
+            resumed
+                .mark_pending_with_binding_at(
+                    pending("notify", 1),
+                    Some(invocation_binding("notify")),
+                    Some(300),
+                    START + 700,
+                )
+                .unwrap();
+            assert_eq!(resumed.state.pending.as_ref().unwrap().step_id, "notify");
+        }
+    }
+
+    #[test]
+    fn output_recovery_refuses_expired_corrupt_mismatched_or_unconfirmed_custody() {
+        let directory = TempDir::new().unwrap();
+        let mut checkpoint = create(&directory);
+        let invocation = bind_pending(&mut checkpoint, "fetch");
+        let observation = local_observation(&invocation);
+        let actual = retained_output(&observation, json!({"id": "actual-created-resource"}));
+        assert!(
+            checkpoint
+                .recover_output_at(
+                    "fetch",
+                    &invocation.host,
+                    &observation,
+                    &actual,
+                    START + 450
+                )
+                .is_err()
+        );
+        checkpoint
+            .reconcile_observation_at(&invocation.host, &observation, START + 500)
+            .unwrap();
+        let before = fs::read(&checkpoint.path).unwrap();
+        let changes: [fn(&mut RetainedInvocationResult); 6] = [
+            |r| r.binding.ticket.attempt_id += 1,
+            |r| r.binding.zone_id = "z:private".into(),
+            |r| r.binding.transport_idempotency.effect_digest = "e".repeat(64),
+            |r| r.response.result = Some(json!({"id": "fabricated"})),
+            |r| r.response_digest = "0".repeat(64),
+            |r| r.expires_at = r.retained_at,
+        ];
+        for change in changes {
+            let mut wrong = actual.clone();
+            change(&mut wrong);
+            assert!(
+                checkpoint
+                    .recover_output_at("fetch", &invocation.host, &observation, &wrong, START + 600)
+                    .is_err()
+            );
+            assert_eq!(fs::read(&checkpoint.path).unwrap(), before);
+        }
+        assert!(
+            checkpoint
+                .recover_output_at(
+                    "fetch",
+                    "http://another-host",
+                    &observation,
+                    &actual,
+                    START + 600
+                )
+                .is_err()
+        );
+        let mut running = observation.clone();
+        running.host_job_active = true;
+        assert!(
+            checkpoint
+                .recover_output_at("fetch", &invocation.host, &running, &actual, START + 600)
+                .is_err()
+        );
+        assert!(
+            checkpoint
+                .recover_output_at(
+                    "fetch",
+                    &invocation.host,
+                    &observation,
+                    &actual,
+                    u64::try_from(actual.expires_at.timestamp_millis()).unwrap()
+                )
+                .is_err()
+        );
+        assert_eq!(fs::read(&checkpoint.path).unwrap(), before);
+        assert!(checkpoint.snapshot().outputs.is_empty());
+    }
+
+    #[test]
+    fn checkpoint_recovery_digest_still_binds_actual_response_after_reload() {
+        let directory = TempDir::new().unwrap();
+        let mut checkpoint = create(&directory);
+        let invocation = bind_pending(&mut checkpoint, "fetch");
+        let observation = local_observation(&invocation);
+        checkpoint
+            .reconcile_observation_at(&invocation.host, &observation, START + 500)
+            .unwrap();
+        let actual = retained_output(&observation, json!({"id": "real"}));
+        checkpoint
+            .recover_output_at(
+                "fetch",
+                &invocation.host,
+                &observation,
+                &actual,
+                START + 600,
+            )
+            .unwrap();
+        let mut changed = checkpoint.state.clone();
+        changed.snapshot.step_results[0]["response"]["result"] = json!({"id": "invented"});
+        changed
+            .snapshot
+            .outputs
+            .insert("fetch".into(), json!({"id": "invented"}));
+        let envelope = CheckpointEnvelope {
+            digest: serialized_digest(&changed).unwrap(),
+            state: changed,
+        };
+        let path = checkpoint.path.clone();
+        drop(checkpoint);
+        fs::write(&path, bounded_bytes(&envelope).unwrap()).unwrap();
+        assert!(
+            RunCheckpoint::open_for_reconciliation(&path).is_err(),
+            "a recomputed file checksum is not response custody evidence"
+        );
     }
 
     #[test]

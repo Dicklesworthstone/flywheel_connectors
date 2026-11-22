@@ -1,14 +1,16 @@
 //! Reconcile durable pipeline and recipe checkpoints without replaying effects.
 //!
 //! Completion comes from the original host's protected invocation history.
-//! A confirmed completion has no recovered output: explicit resume still needs
-//! current authority and cannot fabricate inputs for dependent steps.
+//! Metadata-only completion has no recovered output. Explicit output recovery
+//! transfers an exact, bounded response from private host custody; resume still
+//! needs current authority and cannot fabricate inputs for dependent steps.
 
 use std::path::PathBuf;
+use std::time::Instant;
 
 use anyhow::Result;
 use clap::Args;
-use fcp_host::InvocationQueryRequest;
+use fcp_host::{InvocationQueryRequest, InvocationResultQueryRequest};
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -31,6 +33,11 @@ pub(crate) struct WorkflowReconcileArgs {
     #[arg(long, value_name = "PATH")]
     #[serde(skip)]
     admin_token_file: Option<PathBuf>,
+
+    /// Recover actual output from opt-in private host custody for completed local
+    /// attempts. Writes sensitive result data into this private checkpoint.
+    #[arg(long)]
+    recover_output: bool,
 }
 
 pub(crate) fn dispatch(
@@ -62,10 +69,30 @@ pub(crate) fn dispatch(
             CliExitCode::Validation,
         ));
     }
-    let target = match checkpoint.reconciliation_target() {
-        Ok(Some(target)) => target,
-        Ok(None) => {
-            return Ok(match checkpoint.finish_reconciliation() {
+    let uncertain = match checkpoint.reconciliation_target() {
+        Ok(target) => target,
+        Err(_) => {
+            return Ok(refusal(
+                command,
+                Some(&checkpoint),
+                "workflow-reconciliation-unavailable",
+                "The checkpoint does not contain an eligible, consistently bound uncertain invocation. Its original evidence remains retained.",
+                CliExitCode::Validation,
+            ));
+        }
+    };
+    let recoverable = if args.recover_output {
+        match checkpoint.output_recovery_targets() {
+            Ok(targets) => targets,
+            Err(_) => return Ok(persistence_refusal(command, &checkpoint)),
+        }
+    } else {
+        Vec::new()
+    };
+    let target = match uncertain.as_ref().or(recoverable.first()) {
+        Some(target) => target.clone(),
+        None => {
+            let outcome = match checkpoint.finish_reconciliation() {
                 Ok(true) => report(
                     command,
                     Some(&checkpoint),
@@ -88,16 +115,20 @@ pub(crate) fn dispatch(
                     CliExitCode::Validation,
                 ),
                 Err(_) => persistence_refusal(command, &checkpoint),
-            });
-        }
-        Err(_) => {
-            return Ok(refusal(
-                command,
-                Some(&checkpoint),
-                "workflow-reconciliation-unavailable",
-                "The checkpoint does not contain an eligible, consistently bound uncertain invocation. Its original evidence remains retained.",
-                CliExitCode::Validation,
-            ));
+            };
+            if args.recover_output
+                && outcome.exit_code == CliExitCode::Success
+                && has_missing_reconciled_output(&checkpoint)
+            {
+                return Ok(refusal(
+                    command,
+                    Some(&checkpoint),
+                    "workflow-result-not-local",
+                    "The remaining reconciled output has no executor-local custody on this selected host. Its metadata completion remains saved, and the operation was not repeated.",
+                    CliExitCode::Validation,
+                ));
+            }
+            return Ok(outcome);
         }
     };
 
@@ -138,7 +169,7 @@ pub(crate) fn dispatch(
             CliExitCode::Validation,
         ));
     }
-    let client = match HostAdminClient::for_invocation_inspection(&selected_host) {
+    let mut client = match HostAdminClient::for_invocation_inspection(&selected_host) {
         Ok(client) => client,
         Err(_) => {
             return Ok(lookup_refusal(
@@ -152,6 +183,9 @@ pub(crate) fn dispatch(
         Ok(token) => token,
         Err(error) => return Ok(lookup_refusal(command, &checkpoint, error)),
     };
+    let Some(deadline) = Instant::now().checked_add(client.read_timeout) else {
+        return Ok(lookup_refusal(command, &checkpoint, LookupFailure::Timeout));
+    };
     let request = InvocationQueryRequest {
         operation_id: target.binding.request_id.clone(),
         attempt_id: target
@@ -159,47 +193,237 @@ pub(crate) fn dispatch(
             .as_ref()
             .map(|attempt| attempt.attempt_id),
     };
-    // This is one bounded metadata lookup using the existing no-redirect,
-    // admin-authenticated transport. It never invokes, cancels or retrieves a
-    // result body, and never retries an uncertain operation.
+    // Completion always comes from metadata first. The separate private-output
+    // read below is opt-in and must match this exact verified attempt.
     let response = match invocation_cmd::query_invocation(&client, &request, &token) {
         Ok(response) => response,
         Err(error) => return Ok(lookup_refusal(command, &checkpoint, error)),
     };
-    match checkpoint.reconcile_observation(&selected_host, &response) {
-        Ok(CheckpointReconciliationOutcome::Confirmed {
-            step_id,
-            completion,
-            run_completed,
-        }) => Ok(report(
-            command,
-            Some(&checkpoint),
-            vec![json!({
+    let mut observations = Vec::new();
+    let mut lookups = 1;
+    if uncertain.is_some() {
+        match checkpoint.reconcile_observation(&selected_host, &response) {
+            Ok(CheckpointReconciliationOutcome::Confirmed {
+                step_id,
+                completion,
+                run_completed,
+            }) => observations.push(json!({
                 "step_id": step_id,
                 "status": "confirmed",
                 "source": "host-admin-api",
                 "completion": completion,
                 "run_completed": run_completed,
                 "output_available": false,
-            })],
-            1,
-            CliExitCode::Success,
-        )),
-        Ok(CheckpointReconciliationOutcome::Unresolved { step_id, reason }) => Ok(report(
-            command,
-            Some(&checkpoint),
-            vec![json!({
-                "step_id": step_id,
-                "status": "unresolved",
-                "source": "host-admin-api",
-                "reason": reason.code(),
-                "message": reason.message(),
-            })],
-            1,
-            CliExitCode::Validation,
-        )),
-        Err(_) => Ok(persistence_refusal(command, &checkpoint)),
+            })),
+            Ok(CheckpointReconciliationOutcome::Unresolved { step_id, reason }) => {
+                return Ok(report(
+                    command,
+                    Some(&checkpoint),
+                    vec![json!({
+                        "step_id": step_id,
+                        "status": "unresolved",
+                        "source": "host-admin-api",
+                        "reason": reason.code(),
+                        "message": reason.message(),
+                    })],
+                    1,
+                    CliExitCode::Validation,
+                ));
+            }
+            Err(_) => return Ok(persistence_refusal(command, &checkpoint)),
+        }
     }
+    let mut exit_code = CliExitCode::Success;
+    if args.recover_output {
+        let targets = match checkpoint.output_recovery_targets() {
+            Ok(targets) => targets,
+            Err(_) => return Ok(persistence_refusal(command, &checkpoint)),
+        };
+        for output_target in targets {
+            if output_target.binding.host != selected_host {
+                return Ok(refusal(
+                    command,
+                    Some(&checkpoint),
+                    ReconcileFailure::WrongHost.code(),
+                    ReconcileFailure::WrongHost.message(),
+                    CliExitCode::Validation,
+                ));
+            }
+            let history = if output_target.step_id == target.step_id {
+                response.clone()
+            } else {
+                if let Err(error) = narrow_lookup_deadline(&mut client, deadline) {
+                    return Ok(output_lookup_refusal(
+                        command,
+                        &checkpoint,
+                        observations,
+                        lookups,
+                        error,
+                    ));
+                }
+                lookups += 1;
+                match invocation_cmd::query_invocation(
+                    &client,
+                    &InvocationQueryRequest {
+                        operation_id: output_target.binding.request_id.clone(),
+                        attempt_id: output_target
+                            .observed_attempt
+                            .as_ref()
+                            .map(|attempt| attempt.attempt_id),
+                    },
+                    &token,
+                ) {
+                    Ok(history) => history,
+                    Err(error) => {
+                        return Ok(output_lookup_refusal(
+                            command,
+                            &checkpoint,
+                            observations,
+                            lookups,
+                            error,
+                        ));
+                    }
+                }
+            };
+            let binding = match checkpoint.output_recovery_binding(
+                &output_target.step_id,
+                &selected_host,
+                &history,
+            ) {
+                Ok(binding) => binding,
+                Err(_) => {
+                    return Ok(output_lookup_refusal(
+                        command,
+                        &checkpoint,
+                        observations,
+                        lookups,
+                        LookupFailure::InvalidResponse,
+                    ));
+                }
+            };
+            if let Err(error) = narrow_lookup_deadline(&mut client, deadline) {
+                return Ok(output_lookup_refusal(
+                    command,
+                    &checkpoint,
+                    observations,
+                    lookups,
+                    error,
+                ));
+            }
+            lookups += 1;
+            let retained = match invocation_cmd::query_invocation_result(
+                &client,
+                &InvocationResultQueryRequest { binding },
+                &token,
+            ) {
+                Ok(response) => response.result,
+                Err(error) => {
+                    return Ok(output_lookup_refusal(
+                        command,
+                        &checkpoint,
+                        observations,
+                        lookups,
+                        error,
+                    ));
+                }
+            };
+            let Some(retained) = retained else {
+                exit_code = CliExitCode::Validation;
+                observations.push(json!({
+                    "step_id": output_target.step_id,
+                    "status": "output-unavailable",
+                    "output_available": false,
+                    "reason": "host-result-not-retained",
+                    "message": "The host has no retained result for this exact completion. Custody may be disabled, expired or outside its retention limits; the original effect was not repeated.",
+                }));
+                continue;
+            };
+            if checkpoint
+                .recover_output(&output_target.step_id, &selected_host, &history, &retained)
+                .is_err()
+            {
+                let mut outcome = report(
+                    command,
+                    Some(&checkpoint),
+                    observations,
+                    lookups,
+                    CliExitCode::Internal,
+                );
+                outcome.payload["error"] = json!({
+                    "type": "workflow-recovered-output-not-persisted",
+                    "message": "The verified result could not be saved consistently in the private checkpoint. Reopen and inspect it before continuing; no invocation was sent.",
+                    "recoverable": false,
+                });
+                return Ok(outcome);
+            }
+            observations.push(json!({
+                "step_id": output_target.step_id,
+                "status": "output-recovered",
+                "source": "host-private-result-api",
+                "output_available": true,
+                "response_digest": retained.response_digest,
+                "attempt_id": retained.binding.ticket.attempt_id,
+                "invoked_during_reconciliation": false,
+            }));
+        }
+        if has_missing_reconciled_output(&checkpoint) {
+            exit_code = CliExitCode::Validation;
+            for record in &checkpoint.snapshot().step_results {
+                if record["status"] == "reconciled"
+                    && record["output_available"] == false
+                    && record["reconciliation"]["source"] == "mesh_origin_observed"
+                {
+                    observations.push(json!({
+                        "step_id": record["id"],
+                        "status": "output-unavailable",
+                        "output_available": false,
+                        "reason": "workflow-result-not-local",
+                        "message": "The entry host's mesh completion observation does not contain an executor-local response for recovery.",
+                    }));
+                }
+            }
+        }
+    }
+    Ok(report(
+        command,
+        Some(&checkpoint),
+        observations,
+        lookups,
+        exit_code,
+    ))
+}
+
+fn has_missing_reconciled_output(checkpoint: &RunCheckpoint) -> bool {
+    checkpoint
+        .snapshot()
+        .step_results
+        .iter()
+        .any(|record| record["status"] == "reconciled" && record["output_available"] == false)
+}
+
+fn narrow_lookup_deadline(
+    client: &mut HostAdminClient,
+    deadline: Instant,
+) -> std::result::Result<(), LookupFailure> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(LookupFailure::Timeout);
+    }
+    client.read_timeout = remaining;
+    Ok(())
+}
+
+fn output_lookup_refusal(
+    command: &str,
+    checkpoint: &RunCheckpoint,
+    observations: Vec<Value>,
+    lookups: usize,
+    error: LookupFailure,
+) -> DispatchOutcome {
+    let (kind, message, exit_code) = error.description();
+    let mut outcome = report(command, Some(checkpoint), observations, lookups, exit_code);
+    outcome.payload["error"] = json!({"type": kind, "message": message, "recoverable": false});
+    outcome
 }
 
 fn lookup_refusal(
@@ -255,7 +479,7 @@ fn report(
                 json!({
                     "id": record["id"],
                     "status": record["status"],
-                    "output_available": record["status"] == "ok",
+                    "output_available": record["status"] == "ok" || record["output_available"] == true,
                 })
             })
             .collect::<Vec<_>>()
@@ -280,7 +504,8 @@ fn report(
         },
         "invoke_attempted": false,
         "automatic_retry_allowed": false,
-        "result_recovered": false,
+        "result_recovered": checkpoint.is_some_and(|checkpoint| checkpoint.snapshot().step_results.iter()
+            .any(|record| record["status"] == "reconciled" && record["output_available"] == true)),
         "reconciliation": {
             "complete": completed,
             "host_lookups": lookups,
@@ -289,7 +514,7 @@ fn report(
             "retained_original_records": checkpoint.map(|checkpoint| checkpoint.retained_step_results().len()),
         },
         "caveats": [
-            "Completion evidence does not recover a missing result body. Steps that need that output remain blocked.",
+            "Completion metadata alone does not recover output. Only an explicitly retrieved, exact-bound local response makes missing result data available; mesh-origin observations do not include executor output.",
             "Missing, failed, active, non-durable or differently bound history never authorizes replay.",
             "Explicit resume keeps the original run identity and deadline and requires current operation contracts, credentials and host preflight.",
         ],
@@ -377,13 +602,14 @@ mod tests {
             WorkflowReconcileArgs {
                 checkpoint: path,
                 admin_token_file: Some(token_path),
+                recover_output: false,
             },
             binding,
         )
     }
 
     fn local_success(binding: &TaskInvocationBinding) -> InvocationQueryResponse {
-        let admitted_at: DateTime<Utc> = "2026-11-22T00:00:00Z".parse().unwrap();
+        let admitted_at: DateTime<Utc> = Utc::now() - chrono::Duration::seconds(2);
         InvocationQueryResponse {
             invocation: Some(InvocationRecord {
                 ticket: InvocationTicket {
@@ -503,6 +729,228 @@ mod tests {
             stream.write_all(&bytes).unwrap();
             request
         })
+    }
+
+    fn serve_recovery_reads(
+        listener: TcpListener,
+        history: InvocationQueryResponse,
+        result: fcp_host::InvocationResultQueryResponse,
+    ) -> thread::JoinHandle<Vec<Value>> {
+        thread::spawn(move || {
+            let mut requests = Vec::new();
+            for (path, body) in [
+                (
+                    "/rpc/admin/invocations",
+                    serde_json::to_vec(&history).unwrap(),
+                ),
+                (
+                    "/rpc/admin/invocations/result",
+                    serde_json::to_vec(&result).unwrap(),
+                ),
+            ] {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let (mut stream, _) = loop {
+                    match listener.accept() {
+                        Ok(connection) => break connection,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "recovery lookup never arrived");
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("recovery accept failed: {error}"),
+                    }
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                reader.read_line(&mut request_line).unwrap();
+                assert_eq!(
+                    request_line.trim_end(),
+                    format!("POST {path} HTTP/1.1"),
+                    "recovery cannot invoke or change hosts"
+                );
+                let mut content_length = None;
+                let mut authorized = false;
+                let mut owner_zone = false;
+                for _ in 0..64 {
+                    let mut header = String::new();
+                    assert!(reader.read_line(&mut header).unwrap() > 0);
+                    assert!(header.len() < 8192);
+                    if header == "\r\n" {
+                        break;
+                    }
+                    let (name, value) = header.split_once(':').unwrap();
+                    match name.to_ascii_lowercase().as_str() {
+                        "content-length" => {
+                            content_length = Some(value.trim().parse::<usize>().unwrap())
+                        }
+                        "authorization" => {
+                            assert_eq!(value.trim(), format!("Bearer {OWNER_TOKEN}"));
+                            authorized = true;
+                        }
+                        "x-fcp-zone" => {
+                            assert_eq!(value.trim(), "z:owner");
+                            owner_zone = true;
+                        }
+                        _ => {}
+                    }
+                }
+                assert!(
+                    authorized && owner_zone,
+                    "both private reads require owner authorization"
+                );
+                let length = content_length.unwrap();
+                assert!(length < 16 * 1024);
+                let mut request = vec![0; length];
+                reader.read_exact(&mut request).unwrap();
+                requests.push(serde_json::from_slice(&request).unwrap());
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+                stream.write_all(&body).unwrap();
+            }
+            requests
+        })
+    }
+
+    #[cfg(unix)]
+    fn retained_result(
+        directory: &TempDir,
+        history: &InvocationQueryResponse,
+    ) -> fcp_host::RetainedInvocationResult {
+        let store = fcp_host::InvocationResultStore::open(directory.path().join("private-custody"))
+            .unwrap();
+        let record = history.invocation.as_ref().unwrap();
+        let response = fcp_kernel::InvokeResponse::ok(
+            fcp_kernel::RequestId(record.ticket.operation_id.clone()),
+            json!({"created_id": "created-exactly-once", "private": "recovery-output-secret"}),
+        );
+        assert!(store.retain(record, &response, Utc::now()).unwrap());
+        let binding = fcp_host::InvocationResultBinding::from_record(record).unwrap();
+        store.get(&binding, Utc::now()).unwrap().unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_output_recovery_transfers_real_custody_without_replaying_or_printing_secrets() {
+        for previously_confirmed in [false, true] {
+            let directory = TempDir::new().unwrap();
+            let (host, listener) = listener();
+            let (mut args, binding) = pending_checkpoint(&directory, &host, true);
+            args.recover_output = true;
+            let history = local_success(&binding);
+            let retained = retained_result(&directory, &history);
+            if previously_confirmed {
+                let mut checkpoint =
+                    RunCheckpoint::open_for_reconciliation(&args.checkpoint).unwrap();
+                checkpoint.reconcile_observation(&host, &history).unwrap();
+            }
+            let server = serve_recovery_reads(
+                listener,
+                history,
+                fcp_host::InvocationResultQueryResponse {
+                    result: Some(retained.clone()),
+                },
+            );
+            let outcome = dispatch("pipeline", &args, Some(&host)).unwrap();
+            let requests = server.join().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[0]["operation_id"], binding.request_id);
+            assert_eq!(
+                requests[0]["attempt_id"],
+                if previously_confirmed {
+                    json!(7)
+                } else {
+                    Value::Null
+                }
+            );
+            assert_eq!(
+                requests[1]["binding"],
+                serde_json::to_value(&retained.binding).unwrap()
+            );
+            assert_eq!(
+                outcome.exit_code,
+                CliExitCode::Success,
+                "{}",
+                outcome.payload
+            );
+            assert_eq!(outcome.payload["invoke_attempted"], false);
+            assert_eq!(outcome.payload["result_recovered"], true);
+            assert_eq!(outcome.payload["reconciliation"]["host_lookups"], 2);
+            assert!(
+                !outcome
+                    .payload
+                    .to_string()
+                    .contains("recovery-output-secret")
+            );
+            assert!(!outcome.payload.to_string().contains(OWNER_TOKEN));
+            let checkpoint = RunCheckpoint::open_for_reconciliation(&args.checkpoint).unwrap();
+            assert_eq!(
+                checkpoint.snapshot().outputs["send"],
+                retained.response.result.clone().unwrap()
+            );
+            assert_eq!(
+                checkpoint.snapshot().step_results[0]["status"],
+                "reconciled"
+            );
+            assert_eq!(
+                checkpoint.snapshot().step_results[0]["output_available"],
+                true
+            );
+            assert!(!checkpoint.completed());
+            drop(checkpoint);
+            args.admin_token_file = Some(directory.path().join("missing-token"));
+            let repeated = dispatch("pipeline", &args, None).unwrap();
+            assert_eq!(repeated.exit_code, CliExitCode::Success);
+            assert_eq!(repeated.payload["reconciliation"]["host_lookups"], 0);
+            assert_eq!(repeated.payload["result_recovered"], true);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unavailable_or_invalid_output_preserves_confirmed_metadata_without_fabricating_results() {
+        for mode in ["missing", "wrong-zone", "corrupt-response", "expired"] {
+            let directory = TempDir::new().unwrap();
+            let (host, listener) = listener();
+            let (mut args, binding) = pending_checkpoint(&directory, &host, true);
+            args.recover_output = true;
+            let history = local_success(&binding);
+            let mut retained = retained_result(&directory, &history);
+            match mode {
+                "wrong-zone" => retained.binding.zone_id = "z:private".into(),
+                "corrupt-response" => {
+                    retained.response.result = Some(json!({"created_id": "guessed"}))
+                }
+                "expired" => retained.expires_at = Utc::now() - chrono::Duration::seconds(1),
+                _ => {}
+            }
+            let server = serve_recovery_reads(
+                listener,
+                history,
+                fcp_host::InvocationResultQueryResponse {
+                    result: (mode != "missing").then_some(retained),
+                },
+            );
+            let outcome = dispatch("pipeline", &args, Some(&host)).unwrap();
+            assert_eq!(server.join().unwrap().len(), 2);
+            assert_ne!(outcome.exit_code, CliExitCode::Success, "{mode}");
+            assert_eq!(outcome.payload["result_recovered"], false);
+            assert_eq!(outcome.payload["invoke_attempted"], false);
+            let checkpoint = RunCheckpoint::open_for_reconciliation(&args.checkpoint).unwrap();
+            assert_eq!(
+                checkpoint.snapshot().step_results[0]["status"],
+                "reconciled"
+            );
+            assert_eq!(
+                checkpoint.snapshot().step_results[0]["output_available"],
+                false
+            );
+            assert!(checkpoint.snapshot().outputs.is_empty());
+        }
     }
 
     #[test]

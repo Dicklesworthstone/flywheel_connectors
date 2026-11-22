@@ -56956,8 +56956,21 @@ input = { query = "{{steps.first-read.output.title}}" }
 
     #[test]
     fn execute_pipeline_resume_after_reconciliation_never_replays_or_invents_outputs() {
-        for mode in ["static", "explicit-dependency", "implicit-dependency"] {
+        for mode in [
+            "static",
+            "explicit-dependency",
+            "implicit-dependency",
+            "recovered-explicit",
+            "recovered-implicit",
+            "recovered-denied",
+        ] {
             let needs_output = mode != "static";
+            let recover_output = mode.starts_with("recovered-");
+            if recover_output && !cfg!(unix) {
+                continue;
+            }
+            let can_continue = !needs_output || recover_output;
+            let allowed = mode != "recovered-denied";
             let tempdir = TempDir::new().unwrap();
             let _history = super::install_test_history_path(tempdir.path().join("history.jsonl"));
             let (path, _) = workflow_checkpoint_fixture(tempdir.path());
@@ -56969,7 +56982,7 @@ input = { query = "{{steps.first-read.output.title}}" }
                 )
                 .unwrap();
             }
-            if mode == "implicit-dependency" {
+            if mode == "implicit-dependency" || mode == "recovered-implicit" {
                 let source = fs::read_to_string(&path).unwrap();
                 let source = source.replace("depends_on = [\"first-read\"]\n", "");
                 let source = source.replace(
@@ -56989,17 +57002,17 @@ input = { query = "{{steps.first-read.output.title}}" }
             catalog.truncate(2);
             let mut routes = catalog.clone();
             routes.extend(catalog);
-            if !needs_output {
-                routes.extend([
-                    (
-                        "POST /rpc/preflight".to_owned(),
-                        mock_preflight_response_json(true),
-                    ),
-                    (
+            if can_continue {
+                routes.push((
+                    "POST /rpc/preflight".to_owned(),
+                    mock_preflight_response_json(allowed),
+                ));
+                if allowed {
+                    routes.push((
                         "POST /rpc/invoke".to_owned(),
                         mock_invoke_response_json(json!({"continued": true})),
-                    ),
-                ]);
+                    ));
+                }
             }
             let (host, server, log) = spawn_mock_host_sequence_with_body_log(routes);
             seed_workflow_checkpoint(&checkpoint_path, &host, &plan, true);
@@ -57007,8 +57020,7 @@ input = { query = "{{steps.first-read.output.title}}" }
                 super::pipe::checkpoint::RunCheckpoint::open_for_reconciliation(&checkpoint_path)
                     .unwrap();
             let target = checkpoint.reconciliation_target().unwrap().unwrap();
-            let admitted_at: chrono::DateTime<chrono::Utc> =
-                "2026-11-22T00:00:00Z".parse().unwrap();
+            let admitted_at = chrono::Utc::now() - chrono::Duration::seconds(2);
             let evidence = fcp_host::InvocationQueryResponse {
                 invocation: Some(fcp_host::InvocationRecord {
                     ticket: fcp_host::InvocationTicket {
@@ -57062,6 +57074,39 @@ input = { query = "{{steps.first-read.output.title}}" }
                 super::pipe::checkpoint::CheckpointReconciliationOutcome::Confirmed { .. }
             ));
             assert!(checkpoint.snapshot().outputs.is_empty());
+            if recover_output {
+                let custody =
+                    fcp_host::InvocationResultStore::open(tempdir.path().join("private-results"))
+                        .unwrap();
+                let response = fcp_kernel::InvokeResponse::ok(
+                    fcp_kernel::RequestId(target.binding.request_id.clone()),
+                    json!({"title": "recovered actual title"}),
+                );
+                let record = evidence.invocation.as_ref().unwrap();
+                assert!(
+                    custody
+                        .retain(record, &response, chrono::Utc::now())
+                        .unwrap()
+                );
+                let result_binding =
+                    fcp_host::InvocationResultBinding::from_record(record).unwrap();
+                let result = custody
+                    .get(&result_binding, chrono::Utc::now())
+                    .unwrap()
+                    .unwrap();
+                checkpoint
+                    .recover_output(
+                        &target.step_id,
+                        &super::normalize_host_endpoint(&host).unwrap(),
+                        &evidence,
+                        &result,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    checkpoint.snapshot().outputs["first-read"]["title"],
+                    "recovered actual title"
+                );
+            }
             drop(checkpoint);
 
             let (exit, payload) = execute_json(&[
@@ -57082,8 +57127,10 @@ input = { query = "{{steps.first-read.output.title}}" }
             server.join().unwrap();
             assert_eq!(
                 exit,
-                if needs_output {
+                if !can_continue {
                     CliExitCode::Validation
+                } else if !allowed {
+                    CliExitCode::PolicyDenied
                 } else {
                     CliExitCode::Success
                 }
@@ -57093,25 +57140,42 @@ input = { query = "{{steps.first-read.output.title}}" }
             let execution = &payload["execution"];
             assert_eq!(execution["resumed_steps"], 1);
             assert_eq!(execution["steps"][0]["status"], "reconciled");
-            assert_eq!(execution["steps"][0]["output_available"], false);
-            assert!(execution["outputs"].get("first-read").is_none());
+            assert_eq!(execution["steps"][0]["output_available"], recover_output);
+            if recover_output {
+                assert_eq!(
+                    execution["outputs"]["first-read"]["title"],
+                    "recovered actual title"
+                );
+            } else {
+                assert!(execution["outputs"].get("first-read").is_none());
+            }
             let requests = log.lock().unwrap();
             let invocations = requests
                 .iter()
                 .filter(|(route, _)| route == "POST /rpc/invoke")
                 .collect::<Vec<_>>();
-            assert_eq!(invocations.len(), usize::from(!needs_output));
-            if needs_output {
+            assert_eq!(invocations.len(), usize::from(can_continue && allowed));
+            if !can_continue {
                 assert_eq!(
                     payload["error"]["type"],
                     "pipeline-reconciled-output-unavailable"
                 );
                 assert_eq!(execution["steps"][1]["reason"], "missing-dependency-output");
-            } else {
+            } else if allowed {
                 let sent: Value = serde_json::from_str(&invocations[0].1).unwrap();
                 assert_ne!(sent["id"], target.binding.request_id);
-                assert_eq!(sent["input"]["query"], "independent follow-up");
+                assert_eq!(
+                    sent["input"]["query"],
+                    if recover_output {
+                        "recovered actual title"
+                    } else {
+                        "independent follow-up"
+                    }
+                );
                 assert_eq!(execution["outputs"]["second-read"]["continued"], true);
+            } else {
+                assert_eq!(execution["steps"][1]["status"], "denied");
+                assert!(execution["outputs"].get("second-read").is_none());
             }
         }
     }
