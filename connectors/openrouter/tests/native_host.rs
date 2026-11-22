@@ -543,16 +543,44 @@ fn malformed_chat_responses_never_become_success_or_regain_their_signed_call() {
         HttpResponse::json(
             json!({"id": "", "model": "openai/gpt-4.1-mini", "choices": [{"message": {"content": "text"}}]}),
         ),
+        HttpResponse::json(json!({
+            "id": "chat-top-level-error", "model": "openai/gpt-4.1-mini",
+            "error": {"code": 502, "message": "provider disconnected"},
+            "choices": [{"message": {"role": "assistant", "content": "partial text"}, "finish_reason": "stop"}]
+        })),
+        HttpResponse::json(json!({
+            "id": "chat-choice-error", "model": "openai/gpt-4.1-mini",
+            "choices": [{
+                "message": {"role": "assistant", "content": "partial text"},
+                "error": {"code": 502, "message": "provider disconnected"},
+                "finish_reason": "error"
+            }]
+        })),
+        HttpResponse::json(json!({
+            "id": "chat-error-finish", "model": "openai/gpt-4.1-mini",
+            "choices": [{"message": {"role": "assistant", "content": null}, "finish_reason": "error"}]
+        })),
         HttpResponse::json(
             json!({"id": "chat-tools", "model": "openai/gpt-4.1-mini", "choices": [{
                 "message": {"role": "assistant", "content": null, "tool_calls": [tool_call.clone()]}, "finish_reason": "tool_calls"
             }]}),
         ),
+        HttpResponse::json(json!({
+            "id": "chat-refusal", "model": "openai/gpt-4.1-mini", "error": null,
+            "choices": [{
+                "message": {"role": "assistant", "refusal": "I cannot help with that."},
+                "finish_reason": "stop", "error": null
+            }]
+        })),
+        HttpResponse::json(json!({
+            "id": "chat-filtered", "model": "openai/gpt-4.1-mini",
+            "choices": [{"message": {"role": "assistant", "content": null}, "finish_reason": "content_filter"}]
+        })),
     ]);
     let key = Ed25519SigningKey::generate();
     let mut process = NativeProcess::start();
     let instance = process.configure(&server, &key);
-    for index in 0..4 {
+    for index in 0..7 {
         let invocation = request(
             &key,
             &instance,
@@ -603,6 +631,31 @@ fn malformed_chat_responses_never_become_success_or_regain_their_signed_call() {
             .headers
             .starts_with("POST /chat/completions ")
     );
+    for (id, finish_reason, refusal) in [
+        ("valid-refusal", "stop", Some("I cannot help with that.")),
+        ("valid-filtered", "content_filter", None),
+    ] {
+        let invocation = request(
+            &key,
+            &instance,
+            "openrouter.chat.completions",
+            id.as_bytes(),
+            one_call(&["openrouter:model:openai/gpt-4.1-mini"]),
+            json!({"messages": [{"role": "user", "content": "Hello"}]}),
+        );
+        let result = output(process.rpc(id, "invoke", invocation));
+        assert!(result["content"].is_null());
+        assert_eq!(result["finish_reason"], finish_reason);
+        if let Some(refusal) = refusal {
+            assert_eq!(result["raw"]["choices"][0]["message"]["refusal"], refusal);
+        }
+        assert!(
+            server
+                .receive()
+                .headers
+                .starts_with("POST /chat/completions ")
+        );
+    }
     process.rpc("shutdown", "shutdown", json!({}));
     assert!(process.wait_for_exit().success());
     server.finish();

@@ -1084,13 +1084,15 @@ fn invalid_input(message: &str) -> FcpError {
 }
 
 fn validate_chat_response(response: &Value) -> FcpResult<()> {
-    let invalid = || FcpError::External {
+    let invalid = || {
+        FcpError::External {
         service: "openrouter".into(),
-        message: "Provider returned an incomplete chat completion; provider outcome may be unknown"
+        message: "Provider returned a failed or incomplete chat completion; provider outcome may be unknown"
             .into(),
         status_code: Some(200),
         retryable: false,
         retry_after: None,
+    }
     };
     for field in ["id", "model"] {
         if response
@@ -1101,8 +1103,17 @@ fn validate_chat_response(response: &Value) -> FcpResult<()> {
             return Err(invalid());
         }
     }
-    let message = response
-        .pointer("/choices/0/message")
+    let choice = response.pointer("/choices/0").ok_or_else(invalid)?;
+    // OpenRouter can report a generation failure alongside partial content in
+    // an HTTP 200 response. Partial text must not become a successful receipt.
+    if response.get("error").is_some_and(|error| !error.is_null())
+        || choice.get("error").is_some_and(|error| !error.is_null())
+        || choice.get("finish_reason").and_then(Value::as_str) == Some("error")
+    {
+        return Err(invalid());
+    }
+    let message = choice
+        .get("message")
         .and_then(Value::as_object)
         .ok_or_else(invalid)?;
     let has_tools = message
