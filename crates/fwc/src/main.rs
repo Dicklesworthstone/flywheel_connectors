@@ -57023,6 +57023,8 @@ input = { query = "{{steps.first-read.output.title}}" }
             let admitted_at = chrono::Utc::now() - chrono::Duration::seconds(2);
             let evidence = fcp_host::InvocationQueryResponse {
                 invocation: Some(fcp_host::InvocationRecord {
+                    budget_requests_reserved: false,
+                    budget_usage_digest: None,
                     ticket: fcp_host::InvocationTicket {
                         operation_id: target.binding.request_id.clone(),
                         attempt_id: 1,

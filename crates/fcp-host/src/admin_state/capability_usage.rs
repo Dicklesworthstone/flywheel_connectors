@@ -22,7 +22,7 @@ use fcp_crypto::{
     cose::{cwt_claims, fcp2_claims},
     ed25519::Ed25519VerifyingKey,
 };
-use fcp_kernel::{InvokeRequest, LifecycleError};
+use fcp_kernel::{InvokeRequest, LifecycleError, UsageBudgetPolicy};
 use fcp_prelude::CapabilityConstraints;
 use serde::{Deserialize, Serialize};
 
@@ -379,6 +379,27 @@ impl HostAdminStateStore {
         request: &InvokeRequest,
         verifying_key: &Ed25519VerifyingKey,
     ) -> HostResult<InvocationTicket> {
+        self.admit_budgeted_capability_invocation(admission, request, verifying_key, None)
+            .await
+    }
+
+    /// Atomically reserve configured zone requests, signed usage, and the ticket.
+    ///
+    /// The policy must come from trusted host zone configuration, never the
+    /// request or connector. All checks share one snapshot transaction, so a
+    /// refusal spends neither allowance. A committed request is never refunded.
+    /// Other zone metrics remain once-only post-outcome observations.
+    ///
+    /// # Errors
+    /// Returns invocation/capability admission failures, invalid zone policy,
+    /// an exhausted projected request budget, or unavailable persistence.
+    pub async fn admit_budgeted_capability_invocation(
+        &self,
+        admission: InvocationAdmission,
+        request: &InvokeRequest,
+        verifying_key: &Ed25519VerifyingKey,
+        zone_budget: Option<&UsageBudgetPolicy>,
+    ) -> HostResult<InvocationTicket> {
         if admission.operation_id != request.id.0.as_str()
             || admission.connector_id != request.connector_id.as_str()
             || admission.operation != request.operation.as_str()
@@ -390,7 +411,7 @@ impl HostAdminStateStore {
         }
         let scope =
             CapabilityUsageScope::from_request(request, verifying_key, &admission.principal)?;
-        self.admit_invocation_with_usage(admission, Some(scope))
+        self.admit_invocation_with_usage(admission, Some(scope), zone_budget)
             .await
     }
 }
@@ -561,6 +582,105 @@ mod tests {
         let results = futures_util::future::join_all(attempts).await;
         assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 3);
         assert_eq!(store.state.read().await.invocations.len(), 3);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn concurrent_zone_admission_commits_one_request_and_one_signed_debit() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("zone-and-token-usage.json");
+        let store = HostAdminStateStore::with_state_path(path.clone()).unwrap();
+        let key = signing_key().verifying_key();
+        let request = request(Some(2), None);
+        let policy = UsageBudgetPolicy {
+            enforcement: fcp_kernel::BudgetEnforcement::Deny,
+            budgets: vec![fcp_kernel::UsageBudgetLimit {
+                metric: fcp_kernel::UsageMetricKind::Requests,
+                limit: 1,
+                window_seconds: 3_600,
+            }],
+        };
+        let attempts = (0..2).map(|index| {
+            let store = &store;
+            let key = &key;
+            let policy = &policy;
+            let mut request = request.clone();
+            request.id = RequestId::new(format!("zone-concurrent-{index}"));
+            async move {
+                store
+                    .admit_budgeted_capability_invocation(
+                        admission(&request),
+                        &request,
+                        key,
+                        Some(policy),
+                    )
+                    .await
+            }
+        });
+        let results = futures_util::future::join_all(attempts).await;
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert!(
+            results
+                .iter()
+                .filter_map(|result| result.as_ref().err())
+                .all(|error| { error.to_string().contains("zone usage budget exhausted") })
+        );
+        let snapshot = store.export_snapshot_json().await.unwrap();
+        assert_eq!(snapshot["invocations"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            snapshot["capability_usage"]["accounts"]
+                .as_object()
+                .unwrap()
+                .values()
+                .next()
+                .unwrap()["calls"],
+            1,
+            "the rejected zone reservation must not consume the second signed call"
+        );
+        let ticket = results.into_iter().find_map(Result::ok).unwrap();
+        drop(store);
+        let reopened = HostAdminStateStore::with_state_path(path).unwrap();
+        let retained = reopened
+            .invocation_record(&ticket.operation_id, None)
+            .await
+            .unwrap();
+        assert!(retained.budget_requests_reserved);
+        assert_eq!(
+            retained.terminal.unwrap().outcome,
+            InvocationOutcome::OutcomeUnknown
+        );
+        let mut next = request.clone();
+        next.id = RequestId::new("zone-after-restart");
+        assert!(
+            reopened
+                .admit_budgeted_capability_invocation(admission(&next), &next, &key, Some(&policy),)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("zone usage budget exhausted")
+        );
+        // Changing the trusted zone limit exposes the one remaining signed
+        // call; neither the failed concurrent attempt nor restart spent it.
+        let mut expanded = policy;
+        expanded.budgets[0].limit = 2;
+        reopened
+            .admit_budgeted_capability_invocation(admission(&next), &next, &key, Some(&expanded))
+            .await
+            .unwrap();
+        assert!(
+            reopened
+                .check_capability_usage(&next, &key, "user:test")
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            reopened
+                .snapshot_zone_budget(&ZoneId::work(), &expanded)
+                .await
+                .unwrap()
+                .budgets[0]
+                .used,
+            2
+        );
     }
 
     #[fcp_async_core::runtime::test]

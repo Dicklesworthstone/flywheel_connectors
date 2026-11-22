@@ -181,7 +181,8 @@ async fn budget_engine_preflight_denies_when_exceeded() {
     // Exceed budget
     engine
         .record_usage(&zone, &[UsageMetric::tokens(200)])
-        .await;
+        .await
+        .unwrap();
 
     let mut registry = TestRegistry::new();
     registry.add(
@@ -236,7 +237,10 @@ async fn budget_engine_preflight_allows_within_budget() {
         .await;
 
     // Use some budget but stay within limits
-    engine.record_usage(&zone, &[UsageMetric::tokens(50)]).await;
+    engine
+        .record_usage(&zone, &[UsageMetric::tokens(50)])
+        .await
+        .unwrap();
 
     let registry = TestRegistry::new();
     let endpoint = DiscoveryEndpoint::new(Arc::new(registry), Arc::new(engine));
@@ -273,7 +277,8 @@ async fn budget_engine_warn_mode_allows_preflight_even_exceeded() {
 
     engine
         .record_usage(&zone, &[UsageMetric::tokens(500)])
-        .await;
+        .await
+        .unwrap();
 
     let registry = TestRegistry::new();
     let endpoint = DiscoveryEndpoint::new(Arc::new(registry), Arc::new(engine));
@@ -799,7 +804,7 @@ async fn budget_engine_policy_lifecycle() {
     let zone = ZoneId::work();
 
     // No policy → no snapshot
-    assert!(engine.snapshot(&zone).await.is_none());
+    assert!(engine.snapshot(&zone).await.unwrap().is_none());
 
     // Add policy
     engine
@@ -817,7 +822,7 @@ async fn budget_engine_policy_lifecycle() {
         .await;
 
     // Snapshot now works
-    let snap = engine.snapshot(&zone).await.unwrap();
+    let snap = engine.snapshot(&zone).await.unwrap().unwrap();
     assert_eq!(snap.budgets[0].used, 0);
     assert_eq!(snap.budgets[0].limit, 100);
 
@@ -825,11 +830,12 @@ async fn budget_engine_policy_lifecycle() {
     let eval = engine
         .record_usage(&zone, &[UsageMetric::tokens(50)])
         .await
+        .unwrap()
         .unwrap();
     assert_eq!(eval.action, BudgetAction::Allow);
 
     // Snapshot reflects usage
-    let snap = engine.snapshot(&zone).await.unwrap();
+    let snap = engine.snapshot(&zone).await.unwrap().unwrap();
     assert_eq!(snap.budgets[0].used, 50);
 
     // Remove policy
@@ -837,7 +843,7 @@ async fn budget_engine_policy_lifecycle() {
     assert!(removed.is_some());
 
     // No more snapshot
-    assert!(engine.snapshot(&zone).await.is_none());
+    assert!(engine.snapshot(&zone).await.unwrap().is_none());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1275,7 +1281,8 @@ async fn budget_engine_with_policies_preflight_integration() {
     // Exceed zone_a tokens
     engine
         .record_usage(&zone_a, &[UsageMetric::tokens(60)])
-        .await;
+        .await
+        .unwrap();
 
     // zone_a preflight should deny
     let req_a = PreflightRequest {
@@ -1291,7 +1298,8 @@ async fn budget_engine_with_policies_preflight_integration() {
     // Exceed zone_b requests — warn mode, should still allow
     engine
         .record_usage(&zone_b, &[UsageMetric::requests(20)])
-        .await;
+        .await
+        .unwrap();
 
     let req_b = PreflightRequest {
         connector_id: ConnectorId::from_static("fcp.test:utility:1.0.0"),
@@ -1332,7 +1340,8 @@ async fn full_pipeline_discover_introspect_preflight_denied() {
     // Pre-record usage to exceed
     engine
         .record_usage(&zone, &[UsageMetric::tokens(100)])
-        .await;
+        .await
+        .unwrap();
 
     let mut registry = TestRegistry::new();
     registry.add(
@@ -1545,6 +1554,7 @@ async fn budget_zero_limit_denies_any_usage_via_engine() {
     let eval = engine
         .record_usage(&zone, &[UsageMetric::tokens(1)])
         .await
+        .unwrap()
         .unwrap();
     assert_eq!(eval.action, BudgetAction::Deny);
 
@@ -1705,7 +1715,8 @@ async fn budget_engine_multi_zone_multi_metric_preflight() {
     // Use tokens in work zone — within limits
     engine
         .record_usage(&zone_work, &[UsageMetric::tokens(100)])
-        .await;
+        .await
+        .unwrap();
 
     // work zone preflight should allow
     let req = PreflightRequest {
@@ -1721,7 +1732,8 @@ async fn budget_engine_multi_zone_multi_metric_preflight() {
     // Exhaust work zone tokens
     engine
         .record_usage(&zone_work, &[UsageMetric::tokens(150)])
-        .await;
+        .await
+        .unwrap();
 
     let resp = engine.evaluate_preflight(&req).await;
     assert!(!resp.allowed, "work zone should be denied after exceeding");
@@ -1729,7 +1741,8 @@ async fn budget_engine_multi_zone_multi_metric_preflight() {
     // Private zone should be independent and still allow
     engine
         .record_usage(&zone_private, &[UsageMetric::requests(100)])
-        .await;
+        .await
+        .unwrap();
 
     let req_private = PreflightRequest {
         connector_id: ConnectorId::from_static("fcp.test:utility:1.0.0"),
@@ -2006,8 +2019,11 @@ async fn budget_engine_remove_readd_lifecycle() {
         .await;
 
     // Record some usage
-    engine.record_usage(&zone, &[UsageMetric::tokens(60)]).await;
-    let snap = engine.snapshot(&zone).await.unwrap();
+    engine
+        .record_usage(&zone, &[UsageMetric::tokens(60)])
+        .await
+        .unwrap();
+    let snap = engine.snapshot(&zone).await.unwrap().unwrap();
     assert_eq!(snap.budgets[0].used, 60);
 
     // Remove policy
@@ -2015,13 +2031,14 @@ async fn budget_engine_remove_readd_lifecycle() {
     assert!(removed.is_some());
 
     // No snapshot available
-    assert!(engine.snapshot(&zone).await.is_none());
+    assert!(engine.snapshot(&zone).await.unwrap().is_none());
 
     // record_usage returns None when no policy
     assert!(
         engine
             .record_usage(&zone, &[UsageMetric::tokens(10)])
             .await
+            .unwrap()
             .is_none()
     );
 
@@ -2040,7 +2057,7 @@ async fn budget_engine_remove_readd_lifecycle() {
         )
         .await;
 
-    let snap = engine.snapshot(&zone).await.unwrap();
+    let snap = engine.snapshot(&zone).await.unwrap().unwrap();
     assert_eq!(
         snap.budgets[0].used, 60,
         "tracker retains usage across policy changes"
@@ -2505,7 +2522,8 @@ async fn budget_engine_zones_fully_independent() {
     // Exhaust zone_a
     engine
         .record_usage(&zone_a, &[UsageMetric::tokens(200)])
-        .await;
+        .await
+        .unwrap();
 
     // zone_a should be denied
     let req_a = PreflightRequest {
@@ -2530,7 +2548,7 @@ async fn budget_engine_zones_fully_independent() {
     assert!(resp_b.allowed);
 
     // Verify zone_b snapshot is untouched
-    let snap = engine.snapshot(&zone_b).await.unwrap();
+    let snap = engine.snapshot(&zone_b).await.unwrap().unwrap();
     assert_eq!(snap.budgets[0].used, 0);
 }
 

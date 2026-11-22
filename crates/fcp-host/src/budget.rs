@@ -4,17 +4,23 @@
 //! snapshots suitable for CLI/operator reporting.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use fcp_async_core::sync::{Mutex, RwLock};
+use fcp_async_core::sync::RwLock;
 use fcp_kernel::{
-    BudgetEnforcement, BudgetStatus, FcpError, UsageBudgetPolicy, UsageBudgetSnapshot,
-    UsageBudgetUsage, UsageMetric, UsageMetricKind,
+    BudgetEnforcement, BudgetStatus, FcpError, LifecycleError, UsageBudgetPolicy,
+    UsageBudgetSnapshot, UsageBudgetUsage, UsageMetric, UsageMetricKind,
 };
 use fcp_policy::ZoneId;
 use serde::{Deserialize, Serialize};
 
-use crate::{PolicyEngine, PreflightRequest, PreflightResponse};
+use crate::{
+    HostAdminStateStore, HostError, HostResult, InvocationTicket, PolicyEngine, PreflightRequest,
+    PreflightResponse,
+};
+
+const MAX_TRACKED_BUDGET_ZONES: usize = 4096;
 
 /// Header carrying host backpressure reason for connector clients.
 pub const FCP_BACKPRESSURE_REASON_HEADER: &str = "X-FCP-Backpressure-Reason";
@@ -140,17 +146,22 @@ impl BudgetEvaluation {
 }
 
 /// Tracks usage per zone and enforces budget policies.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BudgetTracker {
     zones: HashMap<ZoneId, ZoneBudgetState>,
+    #[serde(default)]
+    observed_at_unix_secs: u64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ZoneBudgetState {
     metrics: HashMap<UsageMetricKind, MetricWindow>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct MetricWindow {
     window_seconds: u64,
     window_started_at: u64,
@@ -172,7 +183,18 @@ impl BudgetTracker {
         policy: &UsageBudgetPolicy,
         metrics: &[UsageMetric],
     ) -> BudgetEvaluation {
-        let now = now_secs();
+        self.record_usage_at(zone_id, policy, metrics, now_secs())
+    }
+
+    pub(crate) fn record_usage_at(
+        &mut self,
+        zone_id: &ZoneId,
+        policy: &UsageBudgetPolicy,
+        metrics: &[UsageMetric],
+        now: u64,
+    ) -> BudgetEvaluation {
+        let now = now.max(self.observed_at_unix_secs);
+        self.observed_at_unix_secs = now;
         let usage_by_kind = aggregate_metrics(metrics);
         let state = self.zones.entry(zone_id.clone()).or_default();
 
@@ -278,7 +300,17 @@ impl BudgetTracker {
         zone_id: &ZoneId,
         policy: &UsageBudgetPolicy,
     ) -> UsageBudgetSnapshot {
-        let now = now_secs();
+        self.snapshot_at(zone_id, policy, now_secs())
+    }
+
+    pub(crate) fn snapshot_at(
+        &mut self,
+        zone_id: &ZoneId,
+        policy: &UsageBudgetPolicy,
+        now: u64,
+    ) -> UsageBudgetSnapshot {
+        let now = now.max(self.observed_at_unix_secs);
+        self.observed_at_unix_secs = now;
         let state = self.zones.entry(zone_id.clone()).or_default();
 
         let mut entries = Vec::new();
@@ -316,69 +348,234 @@ impl BudgetTracker {
             updated_at: now,
         }
     }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.zones.is_empty() && self.observed_at_unix_secs == 0
+    }
+
+    pub(crate) fn validate_persisted(&self) -> HostResult<()> {
+        if self.zones.len() > MAX_TRACKED_BUDGET_ZONES
+            || self.observed_at_unix_secs > i64::MAX as u64
+            || self.zones.values().any(|zone| {
+                zone.metrics.values().any(|window| {
+                    window.window_seconds == 0
+                        || window.window_started_at > self.observed_at_unix_secs
+                })
+            })
+        {
+            return Err(HostError::Internal(
+                "persisted zone budget windows are inconsistent".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn check_capacity(&self, zone_id: &ZoneId) -> Result<(), LifecycleError> {
+        if !self.zones.contains_key(zone_id) && self.zones.len() >= MAX_TRACKED_BUDGET_ZONES {
+            return Err(invalid_budget("zone budget ledger capacity exhausted"));
+        }
+        Ok(())
+    }
+
+    /// Spend the next host invocation before dispatch, under the store's transaction.
+    /// Other metrics remain observed post-outcome usage rather than estimates.
+    pub(crate) fn reserve_request(
+        &mut self,
+        zone_id: &ZoneId,
+        policy: &UsageBudgetPolicy,
+        now: u64,
+    ) -> Result<bool, LifecycleError> {
+        validate_usage_budget_policy(policy)?;
+        self.check_capacity(zone_id)?;
+        let snapshot = self.snapshot_at(zone_id, policy, now);
+        if policy.enforcement == BudgetEnforcement::Deny
+            && snapshot.budgets.iter().any(|entry| {
+                entry.status == BudgetStatus::Exceeded
+                    || (entry.metric == UsageMetricKind::Requests && entry.used >= entry.limit)
+            })
+        {
+            return Err(invalid_budget(
+                "zone usage budget exhausted before invocation admission",
+            ));
+        }
+        let reserved = policy
+            .budgets
+            .iter()
+            .any(|entry| entry.metric == UsageMetricKind::Requests);
+        if reserved {
+            self.record_usage_at(zone_id, policy, &[UsageMetric::requests(1)], now);
+        }
+        Ok(reserved)
+    }
 }
 
-/// Policy engine that surfaces budget snapshots and enforces deny-on-exceeded.
-#[derive(Debug)]
+pub(crate) fn validate_usage_budget_policy(
+    policy: &UsageBudgetPolicy,
+) -> Result<(), LifecycleError> {
+    let mut metrics = std::collections::HashSet::new();
+    if policy
+        .budgets
+        .iter()
+        .any(|budget| budget.window_seconds == 0 || !metrics.insert(budget.metric))
+    {
+        return Err(invalid_budget(
+            "zone budgets require positive windows and unique metrics",
+        ));
+    }
+    Ok(())
+}
+
+fn invalid_budget(reason: &str) -> LifecycleError {
+    LifecycleError::InvalidPolicy {
+        reason: reason.to_owned(),
+    }
+}
+
+/// Policy engine backed by the host's transactional usage ledger.
+///
+/// Live hosts share their lifecycle store with this engine so admission,
+/// reports, and outcome accounting observe the same persisted windows.
 pub struct BudgetPolicyEngine {
-    tracker: Mutex<BudgetTracker>,
+    store: Arc<HostAdminStateStore>,
     policies: RwLock<HashMap<ZoneId, UsageBudgetPolicy>>,
 }
 
+impl std::fmt::Debug for BudgetPolicyEngine {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BudgetPolicyEngine")
+            .finish_non_exhaustive()
+    }
+}
+
 impl BudgetPolicyEngine {
-    /// Create a new budget policy engine with no policies configured.
+    /// Validate an operator-supplied policy before publishing host configuration.
+    ///
+    /// # Errors
+    /// Rejects zero-length windows and repeated metric limits.
+    pub fn validate_policy(policy: &UsageBudgetPolicy) -> HostResult<()> {
+        validate_usage_budget_policy(policy)
+            .map_err(|error| HostError::InvalidFilter(error.to_string()))
+    }
+
+    /// Create an ephemeral budget engine with no policies configured.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Create a budget policy engine with predefined policies.
+    /// Create an ephemeral budget engine with predefined policies.
     #[must_use]
     pub fn with_policies(policies: HashMap<ZoneId, UsageBudgetPolicy>) -> Self {
+        Self::with_state_store(policies, Arc::new(HostAdminStateStore::new()))
+    }
+
+    /// Use the same store that commits invocation admission and finalization.
+    ///
+    /// Filesystem-backed stores retain usage across host restarts. An explicit
+    /// memory store retains it only for that store's lifetime.
+    #[must_use]
+    pub fn with_state_store(
+        policies: HashMap<ZoneId, UsageBudgetPolicy>,
+        store: Arc<HostAdminStateStore>,
+    ) -> Self {
         Self {
-            tracker: Mutex::new(BudgetTracker::new()),
+            store,
             policies: RwLock::new(policies),
         }
     }
 
+    /// The shared ledger and invocation store used by this engine.
+    #[must_use]
+    pub fn state_store(&self) -> &Arc<HostAdminStateStore> {
+        &self.store
+    }
+
     /// Insert or update the budget policy for a zone.
+    ///
+    /// Invalid policies are refused when evaluated or charged; no budget
+    /// window is reset merely by changing its limit or enforcement mode.
     pub async fn upsert_policy(&self, zone_id: ZoneId, policy: UsageBudgetPolicy) {
         let mut write = self.policies.write().await;
         write.insert(zone_id, policy);
     }
 
-    /// Remove the budget policy for a zone.
+    /// Remove the budget policy for a zone without forgetting retained usage.
     pub async fn remove_policy(&self, zone_id: &ZoneId) -> Option<UsageBudgetPolicy> {
         let mut write = self.policies.write().await;
         write.remove(zone_id)
     }
 
-    /// Record usage metrics and evaluate budgets for a zone.
+    /// Clone the current trusted policy for atomic invocation admission.
+    pub async fn policy_for_zone(&self, zone_id: &ZoneId) -> Option<UsageBudgetPolicy> {
+        self.policies.read().await.get(zone_id).cloned()
+    }
+
+    /// Record observed usage outside an invocation's once-only settlement.
+    ///
+    /// # Errors
+    ///
+    /// Refuses invalid policies, full ledgers, or unavailable persistence.
     pub async fn record_usage(
         &self,
         zone_id: &ZoneId,
         metrics: &[UsageMetric],
-    ) -> Option<BudgetEvaluation> {
-        let policy = {
-            let read = self.policies.read().await;
-            read.get(zone_id).cloned()
-        }?;
-        let mut tracker = self.tracker.lock().await;
-        Some(tracker.record_usage(zone_id, &policy, metrics))
+    ) -> HostResult<Option<BudgetEvaluation>> {
+        let Some(policy) = self.policy_for_zone(zone_id).await else {
+            return Ok(None);
+        };
+        self.store
+            .record_zone_budget_usage(zone_id, &policy, metrics)
+            .await
+            .map(Some)
     }
 
-    /// Fetch the latest budget snapshot for a zone (if configured).
-    pub async fn snapshot(&self, zone_id: &ZoneId) -> Option<UsageBudgetSnapshot> {
-        let policy = {
-            let read = self.policies.read().await;
-            read.get(zone_id).cloned()
-        }?;
-        let mut tracker = self.tracker.lock().await;
-        Some(tracker.snapshot(zone_id, &policy))
+    /// Settle one retained invocation's observed metrics exactly once.
+    ///
+    /// An admission-reserved request is not billed again. Missing provider
+    /// metrics stay missing; this method does not estimate tokens or price.
+    ///
+    /// # Errors
+    ///
+    /// Refuses unknown tickets, mismatched zones, conflicting settlements,
+    /// invalid policies, or unavailable persistence.
+    pub async fn record_invocation_usage(
+        &self,
+        ticket: &InvocationTicket,
+        zone_id: &ZoneId,
+        metrics: &[UsageMetric],
+    ) -> HostResult<Option<BudgetEvaluation>> {
+        let Some(policy) = self.policy_for_zone(zone_id).await else {
+            return Ok(None);
+        };
+        self.store
+            .settle_invocation_budget(ticket, zone_id, &policy, metrics)
+            .await
+            .map(Some)
     }
 
-    /// Report current budget snapshots for all configured zones or a single zone.
-    pub async fn report(&self, zone_filter: Option<&ZoneId>) -> BudgetReportResponse {
+    /// Fetch current usage without consuming a request or changing storage.
+    ///
+    /// # Errors
+    ///
+    /// Refuses invalid policies or unavailable persistence.
+    pub async fn snapshot(&self, zone_id: &ZoneId) -> HostResult<Option<UsageBudgetSnapshot>> {
+        let Some(policy) = self.policy_for_zone(zone_id).await else {
+            return Ok(None);
+        };
+        self.store
+            .snapshot_zone_budget(zone_id, &policy)
+            .await
+            .map(Some)
+    }
+
+    /// Report current snapshots for all configured zones or a single zone.
+    ///
+    /// # Errors
+    ///
+    /// Refuses invalid policies or unavailable persistence rather than
+    /// presenting an empty or reset report.
+    pub async fn report(&self, zone_filter: Option<&ZoneId>) -> HostResult<BudgetReportResponse> {
         let policies = {
             let read = self.policies.read().await;
             let mut entries = read
@@ -389,27 +586,18 @@ impl BudgetPolicyEngine {
             entries.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
             entries
         };
-
-        let mut tracker = self.tracker.lock().await;
-        let zones = policies
-            .into_iter()
-            .map(|(zone_id, policy)| tracker.snapshot(&zone_id, &policy))
-            .collect();
-
-        BudgetReportResponse {
+        let zones = self.store.report_zone_budgets(&policies).await?;
+        Ok(BudgetReportResponse {
             schema_version: BudgetReportResponse::SCHEMA_VERSION.to_string(),
             generated_at: Utc::now(),
             zones,
-        }
+        })
     }
 }
 
 impl Default for BudgetPolicyEngine {
     fn default() -> Self {
-        Self {
-            tracker: Mutex::new(BudgetTracker::new()),
-            policies: RwLock::new(HashMap::new()),
-        }
+        Self::with_policies(HashMap::new())
     }
 }
 
@@ -420,26 +608,25 @@ impl PolicyEngine for BudgetPolicyEngine {
         let Some(zone_id) = request.zone_id.as_ref() else {
             return response;
         };
-        let policy = {
-            let read = self.policies.read().await;
-            read.get(zone_id).cloned()
+        let snapshot = match self.snapshot(zone_id).await {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => return response,
+            Err(_) => {
+                response.allowed = false;
+                response.reason = Some("usage budget accounting unavailable".to_owned());
+                return response;
+            }
         };
-        let Some(policy) = policy else {
-            return response;
-        };
-
-        let snapshot = self.tracker.lock().await.snapshot(zone_id, &policy);
-        let exceeded = snapshot
-            .budgets
-            .iter()
-            .any(|entry| entry.status == BudgetStatus::Exceeded);
-
+        let blocks_next = snapshot.enforcement == BudgetEnforcement::Deny
+            && snapshot.budgets.iter().any(|entry| {
+                entry.status == BudgetStatus::Exceeded
+                    || (entry.metric == UsageMetricKind::Requests && entry.remaining == 0)
+            });
         response.budget_status = Some(snapshot);
-        if exceeded && policy.enforcement == BudgetEnforcement::Deny {
+        if blocks_next {
             response.allowed = false;
             response.reason = Some("usage budget exceeded".to_string());
         }
-
         response
     }
 }
@@ -554,6 +741,7 @@ mod tests {
         let eval = engine
             .record_usage(&zone, &[UsageMetric::tokens(150)])
             .await
+            .expect("budget storage")
             .expect("budget policy");
         assert_eq!(eval.action, BudgetAction::Deny);
 
@@ -1088,7 +1276,7 @@ mod tests {
     async fn budget_policy_engine_snapshot_without_policy_returns_none() {
         let engine = BudgetPolicyEngine::new();
         let zone = ZoneId::work();
-        assert!(engine.snapshot(&zone).await.is_none());
+        assert!(engine.snapshot(&zone).await.unwrap().is_none());
     }
 
     #[fcp_async_core::runtime::test]
@@ -1099,6 +1287,7 @@ mod tests {
             engine
                 .record_usage(&zone, &[UsageMetric::tokens(10)])
                 .await
+                .unwrap()
                 .is_none()
         );
     }
@@ -1117,11 +1306,11 @@ mod tests {
         };
 
         engine.upsert_policy(zone.clone(), policy).await;
-        assert!(engine.snapshot(&zone).await.is_some());
+        assert!(engine.snapshot(&zone).await.unwrap().is_some());
 
         let removed = engine.remove_policy(&zone).await;
         assert!(removed.is_some());
-        assert!(engine.snapshot(&zone).await.is_none());
+        assert!(engine.snapshot(&zone).await.unwrap().is_none());
     }
 
     #[fcp_async_core::runtime::test]
@@ -1139,7 +1328,7 @@ mod tests {
         };
         engine.upsert_policy(zone.clone(), policy1).await;
 
-        let snap1 = engine.snapshot(&zone).await.unwrap();
+        let snap1 = engine.snapshot(&zone).await.unwrap().unwrap();
         assert_eq!(snap1.enforcement, BudgetEnforcement::Warn);
 
         let policy2 = UsageBudgetPolicy {
@@ -1152,7 +1341,7 @@ mod tests {
         };
         engine.upsert_policy(zone.clone(), policy2).await;
 
-        let snap2 = engine.snapshot(&zone).await.unwrap();
+        let snap2 = engine.snapshot(&zone).await.unwrap().unwrap();
         assert_eq!(snap2.enforcement, BudgetEnforcement::Deny);
         assert_eq!(snap2.budgets[0].limit, 200);
     }
@@ -1179,6 +1368,7 @@ mod tests {
         let eval = engine
             .record_usage(&zone, &[UsageMetric::tokens(50)])
             .await
+            .unwrap()
             .unwrap();
         assert_eq!(eval.action, BudgetAction::Allow);
 
@@ -1232,7 +1422,8 @@ mod tests {
         // Exceed the budget
         engine
             .record_usage(&zone, &[UsageMetric::tokens(200)])
-            .await;
+            .await
+            .unwrap();
 
         let request = PreflightRequest {
             connector_id: ConnectorId::new("budget", "test", "v1").expect("connector id"),
@@ -1528,7 +1719,7 @@ mod tests {
         );
 
         let engine = BudgetPolicyEngine::with_policies(policies);
-        let snap = engine.snapshot(&zone).await.unwrap();
+        let snap = engine.snapshot(&zone).await.unwrap().unwrap();
         assert_eq!(snap.budgets[0].limit, 500);
         assert_eq!(snap.budgets[0].used, 0);
         assert_eq!(snap.enforcement, BudgetEnforcement::Deny);
@@ -1580,7 +1771,7 @@ mod tests {
             )
             .await;
 
-        let eval = engine.record_usage(&zone, &[]).await.unwrap();
+        let eval = engine.record_usage(&zone, &[]).await.unwrap().unwrap();
         assert_eq!(eval.action, BudgetAction::Allow);
         assert_eq!(eval.snapshot.budgets[0].used, 0);
     }
@@ -2142,7 +2333,7 @@ mod tests {
             )
             .await;
 
-        let report = engine.report(None).await;
+        let report = engine.report(None).await.unwrap();
         assert_eq!(report.schema_version, BudgetReportResponse::SCHEMA_VERSION);
         assert_eq!(report.zones.len(), 2);
         assert_eq!(report.zones[0].zone_id, ZoneId::private());
@@ -2171,7 +2362,7 @@ mod tests {
             .await
             .expect("usage should be recorded");
 
-        let report = engine.report(Some(&zone)).await;
+        let report = engine.report(Some(&zone)).await.unwrap();
         assert_eq!(report.zones.len(), 1);
         assert_eq!(report.zones[0].zone_id, zone);
         assert_eq!(report.zones[0].budgets[0].used, 250);
@@ -2728,7 +2919,7 @@ mod tests {
     #[fcp_async_core::runtime::test]
     async fn budget_policy_engine_report_empty_has_no_zones() {
         let engine = BudgetPolicyEngine::new();
-        let report = engine.report(None).await;
+        let report = engine.report(None).await.unwrap();
         assert!(report.zones.is_empty());
         assert_eq!(report.schema_version, BudgetReportResponse::SCHEMA_VERSION);
     }
@@ -2753,7 +2944,7 @@ mod tests {
             )
             .await;
         let nonexistent = ZoneId::owner();
-        let report = engine.report(Some(&nonexistent)).await;
+        let report = engine.report(Some(&nonexistent)).await.unwrap();
         assert!(report.zones.is_empty());
     }
 
@@ -2803,9 +2994,9 @@ mod tests {
             },
         );
         let engine = BudgetPolicyEngine::with_policies(policies);
-        let snap_work = engine.snapshot(&ZoneId::work()).await.unwrap();
+        let snap_work = engine.snapshot(&ZoneId::work()).await.unwrap().unwrap();
         assert_eq!(snap_work.enforcement, BudgetEnforcement::Deny);
-        let snap_priv = engine.snapshot(&ZoneId::private()).await.unwrap();
+        let snap_priv = engine.snapshot(&ZoneId::private()).await.unwrap().unwrap();
         assert_eq!(snap_priv.enforcement, BudgetEnforcement::Warn);
     }
 
@@ -2832,7 +3023,7 @@ mod tests {
             .record_usage(&zone, &[UsageMetric::tokens(250)])
             .await
             .unwrap();
-        let snap = engine.snapshot(&zone).await.unwrap();
+        let snap = engine.snapshot(&zone).await.unwrap().unwrap();
         assert_eq!(snap.budgets[0].used, 250);
         assert_eq!(snap.budgets[0].remaining, 750);
     }
@@ -2860,7 +3051,7 @@ mod tests {
             .record_usage(&zone, &[UsageMetric::tokens(123)])
             .await
             .unwrap();
-        let report = engine.report(None).await;
+        let report = engine.report(None).await.unwrap();
         assert_eq!(report.zones.len(), 1);
         assert_eq!(report.zones[0].budgets[0].used, 123);
     }
@@ -2895,7 +3086,7 @@ mod tests {
             }],
         };
         engine.upsert_policy(zone.clone(), new_policy).await;
-        let snap = engine.snapshot(&zone).await.unwrap();
+        let snap = engine.snapshot(&zone).await.unwrap().unwrap();
         // Usage is still tracked in the BudgetTracker
         assert_eq!(snap.budgets[0].used, 75);
         assert_eq!(snap.budgets[0].limit, 200);
@@ -3026,7 +3217,7 @@ mod tests {
     async fn budget_policy_engine_report_generated_at_is_recent() {
         let engine = BudgetPolicyEngine::new();
         let before = Utc::now();
-        let report = engine.report(None).await;
+        let report = engine.report(None).await.unwrap();
         let after = Utc::now();
         assert!(report.generated_at >= before);
         assert!(report.generated_at <= after);
@@ -3123,6 +3314,7 @@ mod tests {
             engine
                 .record_usage(&zone, &[UsageMetric::tokens(10)])
                 .await
+                .unwrap()
                 .is_none()
         );
     }
@@ -3145,12 +3337,104 @@ mod tests {
         engine.upsert_policy(ZoneId::owner(), policy.clone()).await;
         engine.upsert_policy(ZoneId::private(), policy).await;
 
-        let report = engine.report(None).await;
+        let report = engine.report(None).await.unwrap();
         assert_eq!(report.zones.len(), 3);
         // Zones should be sorted alphabetically
         let zone_ids: Vec<&str> = report.zones.iter().map(|z| z.zone_id.as_str()).collect();
         let mut sorted = zone_ids.clone();
         sorted.sort_unstable();
         assert_eq!(zone_ids, sorted);
+    }
+
+    #[test]
+    fn request_reservations_use_persisted_high_water_across_rollover_and_clock_rollback() {
+        let zone = ZoneId::work();
+        let policy = UsageBudgetPolicy {
+            enforcement: BudgetEnforcement::Deny,
+            budgets: vec![UsageBudgetLimit {
+                metric: UsageMetricKind::Requests,
+                limit: 1,
+                window_seconds: 60,
+            }],
+        };
+        let mut tracker = BudgetTracker::new();
+        assert!(tracker.reserve_request(&zone, &policy, 1_000).unwrap());
+        assert!(tracker.reserve_request(&zone, &policy, 1_059).is_err());
+        assert!(tracker.reserve_request(&zone, &policy, 1_060).unwrap());
+        let encoded = serde_json::to_vec(&tracker).unwrap();
+        let mut restarted: BudgetTracker = serde_json::from_slice(&encoded).unwrap();
+        restarted.validate_persisted().unwrap();
+        assert!(restarted.reserve_request(&zone, &policy, 1_000).is_err());
+        let current = restarted.snapshot_at(&zone, &policy, 1_001);
+        assert_eq!(current.updated_at, 1_060);
+        assert_eq!(current.budgets[0].window_started_at, 1_060);
+        assert_eq!(current.budgets[0].used, 1);
+        assert!(restarted.reserve_request(&zone, &policy, 1_120).unwrap());
+        assert!(restarted.reserve_request(&zone, &policy, 1_119).is_err());
+    }
+
+    #[test]
+    fn request_capacity_is_projected_without_reserving_unknown_provider_cost() {
+        let zone = ZoneId::work();
+        let policy = UsageBudgetPolicy {
+            enforcement: BudgetEnforcement::Deny,
+            budgets: vec![
+                UsageBudgetLimit {
+                    metric: UsageMetricKind::Requests,
+                    limit: 1,
+                    window_seconds: 60,
+                },
+                UsageBudgetLimit {
+                    metric: UsageMetricKind::Tokens,
+                    limit: 10,
+                    window_seconds: 60,
+                },
+            ],
+        };
+        let mut tracker = BudgetTracker::new();
+        tracker.record_usage_at(&zone, &policy, &[UsageMetric::tokens(10)], 100);
+        tracker.reserve_request(&zone, &policy, 100).unwrap();
+        let snapshot = tracker.snapshot_at(&zone, &policy, 100);
+        assert_eq!(snapshot.budgets[0].used, 1);
+        assert_eq!(snapshot.budgets[1].used, 10);
+        assert!(tracker.reserve_request(&zone, &policy, 100).is_err());
+        let mut zero = policy.clone();
+        zero.budgets[0].limit = 0;
+        assert!(
+            BudgetTracker::new()
+                .reserve_request(&zone, &zero, 100)
+                .is_err()
+        );
+        let mut over = BudgetTracker::new();
+        over.record_usage_at(&zone, &policy, &[UsageMetric::tokens(11)], 100);
+        assert!(over.reserve_request(&zone, &policy, 100).is_err());
+    }
+
+    #[test]
+    fn zone_capacity_never_evicts_spent_request_allowance() {
+        let policy = UsageBudgetPolicy {
+            enforcement: BudgetEnforcement::Deny,
+            budgets: vec![UsageBudgetLimit {
+                metric: UsageMetricKind::Requests,
+                limit: 1,
+                window_seconds: 60,
+            }],
+        };
+        let mut tracker = BudgetTracker::new();
+        for index in 0..MAX_TRACKED_BUDGET_ZONES {
+            let zone: ZoneId = format!("z:budget-{index}").parse().unwrap();
+            tracker.reserve_request(&zone, &policy, 100).unwrap();
+        }
+        assert!(
+            tracker
+                .reserve_request(&ZoneId::work(), &policy, 100)
+                .unwrap_err()
+                .to_string()
+                .contains("capacity exhausted")
+        );
+        let existing: ZoneId = "z:budget-0".parse().unwrap();
+        assert!(tracker.reserve_request(&existing, &policy, 100).is_err());
+        tracker.reserve_request(&existing, &policy, 160).unwrap();
+        assert_eq!(tracker.zones.len(), MAX_TRACKED_BUDGET_ZONES);
     }
 }

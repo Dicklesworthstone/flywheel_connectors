@@ -10051,6 +10051,9 @@ fn parse_zone_policies_json(raw: &str) -> HostResult<HashMap<ZoneId, ZonePolicyO
                 policy.zone_id.as_str()
             )));
         }
+        if let Some(budget) = &policy.usage_budget {
+            BudgetPolicyEngine::validate_policy(budget)?;
+        }
         policies.insert(zone_id, policy);
     }
     Ok(policies)
@@ -10477,7 +10480,19 @@ async fn async_main(telemetry_config: TelemetryConfig) -> HostResult<()> {
         Some(timeout) => DoctorService::with_timeout(Arc::clone(&registry), timeout),
         None => DoctorService::new(Arc::clone(&registry)),
     };
-    let budget = Arc::new(BudgetPolicyEngine::new());
+    let budget_policies = zone_policies
+        .iter()
+        .filter_map(|(zone, policy)| {
+            policy
+                .usage_budget
+                .clone()
+                .map(|budget| (zone.clone(), budget))
+        })
+        .collect();
+    let budget = Arc::new(BudgetPolicyEngine::with_state_store(
+        budget_policies,
+        Arc::clone(&lifecycle),
+    ));
     let discovery = Arc::new(DiscoveryEndpoint::new(
         Arc::clone(&registry),
         Arc::clone(&budget),
@@ -13010,7 +13025,11 @@ async fn budget_report_handler(
         })
         .transpose()?;
 
-    let report = state.budget.report(zone_filter.as_ref()).await;
+    let report = state
+        .budget
+        .report(zone_filter.as_ref())
+        .await
+        .map_err(map_host_error)?;
     tracing::debug!(
         event = "budget_report_response",
         zone_count = report.zones.len(),
@@ -18370,20 +18389,6 @@ async fn run_mesh_forward_job(
                     Err(error) => {
                         // Even a signed HTTP error may follow external effects.
                         // An undecodable or mismatched reply proves no outcome.
-                        if registered_locally {
-                            let _ = before_invoke_route_deadline(
-                                invoke_jobs::finalization_deadline(deadline),
-                                record_invoke_budget_usage(
-                                    state.budget.as_ref(),
-                                    Some(&request.zone_id),
-                                    &request.connector_id,
-                                    request.operation.as_str(),
-                                    None,
-                                ),
-                                "mesh invalid-response budget accounting",
-                            )
-                            .await;
-                        }
                         state
                             .lifecycle
                             .finish_mesh_invocation(
@@ -18396,19 +18401,25 @@ async fn run_mesh_forward_job(
                             )
                             .await
                             .map_err(mesh_invocation_evidence_error)?;
+                        if registered_locally {
+                            before_invoke_route_deadline(
+                                invoke_jobs::finalization_deadline(deadline),
+                                record_forwarded_budget_usage(
+                                    state.budget.as_ref(),
+                                    Some(&request.zone_id),
+                                    &request.connector_id,
+                                    request.operation.as_str(),
+                                    None,
+                                ),
+                                "mesh invalid-response budget accounting",
+                            )
+                            .await
+                            .and_then(std::convert::identity)
+                            .map_err(map_host_error)?;
+                        }
                         return Err(error);
                     }
                 };
-                if registered_locally {
-                    record_invoke_budget_usage(
-                        state.budget.as_ref(),
-                        Some(&request.zone_id),
-                        &request.connector_id,
-                        request.operation.as_str(),
-                        Some(&response),
-                    )
-                    .await;
-                }
                 state
                     .lifecycle
                     .finish_mesh_invocation(
@@ -18426,6 +18437,17 @@ async fn run_mesh_forward_job(
                     )
                     .await
                     .map_err(mesh_invocation_evidence_error)?;
+                if registered_locally {
+                    record_forwarded_budget_usage(
+                        state.budget.as_ref(),
+                        Some(&request.zone_id),
+                        &request.connector_id,
+                        request.operation.as_str(),
+                        Some(&response),
+                    )
+                    .await
+                    .map_err(map_host_error)?;
+                }
                 return Ok(response);
             }
             Err(failure) if failure.safe_to_retry() => {
@@ -19312,25 +19334,23 @@ async fn record_invoke_receipt_summary(
 
 async fn record_invoke_budget_usage(
     budget: &BudgetPolicyEngine,
+    ticket: &fcp_host::InvocationTicket,
     zone_id: Option<&ZoneId>,
     connector_id: &ConnectorId,
     operation: &str,
     response: Option<&InvokeResponse>,
-) -> bool {
+) -> HostResult<bool> {
     let Some(zone_id) = zone_id else {
-        return false;
+        return Ok(false);
     };
-    let mut metrics = response
+    let metrics = response
         .and_then(|response| response.usage_metrics.clone())
         .unwrap_or_default();
-    if !metrics
-        .iter()
-        .any(|metric| metric.kind == UsageMetricKind::Requests)
-    {
-        metrics.push(UsageMetric::requests(1));
-    }
-    let Some(evaluation) = budget.record_usage(zone_id, metrics.as_slice()).await else {
-        return false;
+    let Some(evaluation) = budget
+        .record_invocation_usage(ticket, zone_id, metrics.as_slice())
+        .await?
+    else {
+        return Ok(false);
     };
     match evaluation.action {
         BudgetAction::Allow => {}
@@ -19345,7 +19365,45 @@ async fn record_invoke_budget_usage(
             );
         }
     }
-    true
+    Ok(true)
+}
+
+// An entry node observes a forwarded response; the executor separately reserves
+// its own request allowance before dispatch. This is origin-side observation,
+// not an atomic or shared mesh quota.
+async fn record_forwarded_budget_usage(
+    budget: &BudgetPolicyEngine,
+    zone_id: Option<&ZoneId>,
+    connector_id: &ConnectorId,
+    operation: &str,
+    response: Option<&InvokeResponse>,
+) -> HostResult<bool> {
+    let Some(zone_id) = zone_id else {
+        return Ok(false);
+    };
+    let mut metrics = response
+        .and_then(|response| response.usage_metrics.clone())
+        .unwrap_or_default();
+    if !metrics
+        .iter()
+        .any(|metric| metric.kind == UsageMetricKind::Requests)
+    {
+        metrics.push(UsageMetric::requests(1));
+    }
+    let Some(evaluation) = budget.record_usage(zone_id, &metrics).await? else {
+        return Ok(false);
+    };
+    if evaluation.action != BudgetAction::Allow {
+        tracing::warn!(
+            event = "forwarded_budget_usage_recorded",
+            connector_id = %connector_id,
+            operation,
+            zone_id = %zone_id,
+            action = ?evaluation.action,
+            "forwarded invocation usage exceeded configured origin budget"
+        );
+    }
+    Ok(true)
 }
 
 fn elapsed_millis(started_at: Instant) -> u64 {
@@ -21429,7 +21487,19 @@ output_schema = {{ type = "object" }}
         capability_verifying_key: Option<Ed25519VerifyingKey>,
         zone_policies: HashMap<ZoneId, ZonePolicyObject>,
     ) -> Arc<AppState> {
-        let budget = Arc::new(BudgetPolicyEngine::new());
+        let budget_policies = zone_policies
+            .iter()
+            .filter_map(|(zone, policy)| {
+                policy
+                    .usage_budget
+                    .clone()
+                    .map(|budget| (zone.clone(), budget))
+            })
+            .collect();
+        let budget = Arc::new(BudgetPolicyEngine::with_state_store(
+            budget_policies,
+            Arc::clone(&lifecycle),
+        ));
         let discovery = Arc::new(DiscoveryEndpoint::new(
             Arc::clone(&registry),
             Arc::clone(&budget),
@@ -22062,11 +22132,24 @@ output_schema = {{ type = "object" }}
             dispatcher_test_connector("owned-test", runner_tx, runner_task),
             dispatcher_test_config("owned-test"),
         );
+        let mut configured_policy = host_runtime_policy(ZoneId::work());
+        configured_policy.usage_budget = Some(UsageBudgetPolicy {
+            enforcement: BudgetEnforcement::Deny,
+            budgets: vec![UsageBudgetLimit {
+                metric: UsageMetricKind::Requests,
+                limit: 100,
+                window_seconds: 60,
+            }],
+        });
+        let configured_policies = parse_zone_policies_json(
+            &serde_json::to_string(&HashMap::from([("z:work", configured_policy)])).unwrap(),
+        )
+        .expect("configured zone budget");
         let mut state = dispatcher_app_state(
             registry,
             Arc::clone(&lifecycle),
             Some(signing_key.verifying_key()),
-            HashMap::from([(ZoneId::work(), host_runtime_policy(ZoneId::work()))]),
+            configured_policies,
         );
         let unshared = Arc::get_mut(&mut state).expect("unshared app state");
         unshared.invoke_audit = Arc::new(invoke_audit);
@@ -22080,20 +22163,6 @@ output_schema = {{ type = "object" }}
             ));
             unshared.admin_bearer_token = Some(Arc::<str>::from("result-owner-test-secret"));
         }
-        state
-            .budget
-            .upsert_policy(
-                ZoneId::work(),
-                fcp_kernel::UsageBudgetPolicy {
-                    enforcement: fcp_kernel::BudgetEnforcement::Deny,
-                    budgets: vec![fcp_kernel::UsageBudgetLimit {
-                        metric: UsageMetricKind::Requests,
-                        limit: 100,
-                        window_seconds: 60,
-                    }],
-                },
-            )
-            .await;
         let request = InvokeRequest {
             r#type: "invoke".to_string(),
             id: RequestId::new("owned-disconnect"),
@@ -22221,10 +22290,12 @@ output_schema = {{ type = "object" }}
                 .budget
                 .snapshot(&ZoneId::work())
                 .await
+                .expect("budget storage")
                 .expect("budget")
                 .budgets[0]
                 .used,
-            3
+            1,
+            "provider request assertions cannot replace the host admission count"
         );
         let receipts = lifecycle
             .query_receipts(&ReceiptQueryRequest {
@@ -22708,10 +22779,11 @@ output_schema = {{ type = "object" }}
                 .budget
                 .snapshot(&ZoneId::work())
                 .await
+                .expect("budget storage")
                 .expect("budget")
                 .budgets[0]
                 .used,
-            5,
+            2,
             "source usage and child usage are each counted once"
         );
 
@@ -22752,10 +22824,11 @@ output_schema = {{ type = "object" }}
                 .budget
                 .snapshot(&ZoneId::work())
                 .await
+                .expect("budget storage")
                 .expect("budget")
                 .budgets[0]
                 .used,
-            7
+            3
         );
         let rpc_count_before_failed_link = llm_rpc_count.load(Ordering::SeqCst);
         maybe_orchestrate_mcp_sampling(
@@ -23403,7 +23476,10 @@ output_schema = {{ type = "object" }}
                 .expect("registry should load"),
         );
         let doctor = DoctorService::new(Arc::clone(&registry));
-        let budget = Arc::new(BudgetPolicyEngine::new());
+        let budget = Arc::new(BudgetPolicyEngine::with_state_store(
+            HashMap::new(),
+            Arc::clone(&lifecycle),
+        ));
         let discovery = Arc::new(DiscoveryEndpoint::new(
             Arc::clone(&registry),
             Arc::clone(&budget),
@@ -25466,8 +25542,9 @@ output_schema = {{ type = "object" }}
                 },
             )
             .await;
-        // Existing budget semantics deny once observed usage exceeds the limit.
-        for used in 1_u64..=2 {
+        // The final remaining request may execute; later previews and invokes
+        // must refuse forwarding once that allowance is exhausted.
+        for used in 1_u64..=1 {
             request.id = RequestId::random();
             invoke_handler(
                 State(Arc::clone(&state)),
@@ -25475,11 +25552,12 @@ output_schema = {{ type = "object" }}
                 Json(request.clone()),
             )
             .await
-            .expect("forward admitted before budget is exceeded");
+            .expect("forward admitted while one request remains");
             let snapshot = state
                 .budget
                 .snapshot(&zone_id)
                 .await
+                .expect("budget storage")
                 .expect("entry budget snapshot");
             assert_eq!(
                 snapshot.budgets[0].used, used,
@@ -25519,7 +25597,7 @@ output_schema = {{ type = "object" }}
                 .expect("retain budget evidence")
                 .budgets[0]
                 .used,
-            2
+            1
         );
         let denied_simulation = simulate_handler(
             State(Arc::clone(&state)),
@@ -25560,7 +25638,7 @@ output_schema = {{ type = "object" }}
         );
         assert_eq!(
             forwards.load(Ordering::SeqCst),
-            8,
+            7,
             "denials must stay on entry node"
         );
         assert_eq!(local_invokes.load(Ordering::SeqCst), 0);
@@ -25569,10 +25647,11 @@ output_schema = {{ type = "object" }}
                 .budget
                 .snapshot(&zone_id)
                 .await
+                .expect("budget storage")
                 .expect("entry budget")
                 .budgets[0]
                 .used,
-            2,
+            1,
             "denied requests and read-only checks must not charge another invocation"
         );
         shutdown_tx.send(true).expect("stop holder");
@@ -35515,10 +35594,11 @@ output_schema = { type = "object" }
                 .budget
                 .snapshot(&ZoneId::work())
                 .await
+                .expect("budget storage")
                 .expect("budget")
                 .budgets[0]
                 .used,
-            if streaming { 11 } else { 9 },
+            if streaming { 6 } else { 5 },
             "each source request is accounted once, including disconnected members"
         );
         let receipts = lifecycle
@@ -35795,7 +35875,7 @@ output_schema = { type = "object" }
     }
 
     #[fcp_async_core::runtime::test]
-    async fn record_invoke_budget_usage_updates_zone_budget_from_response_metrics() {
+    async fn record_forwarded_budget_usage_updates_zone_budget_from_response_metrics() {
         let budget = BudgetPolicyEngine::new();
         let zone = ZoneId::work();
         let connector_id = ConnectorId::from_static("fcp.test.budget-recording:utility:1.0.0");
@@ -35813,25 +35893,27 @@ output_schema = { type = "object" }
             )
             .await;
 
-        record_invoke_budget_usage(
+        record_forwarded_budget_usage(
             &budget,
             Some(&zone),
             &connector_id,
             "test.echo",
             Some(&invoke_response_with_metrics(vec![UsageMetric::tokens(60)])),
         )
-        .await;
+        .await
+        .expect("budget storage");
 
         let snapshot = budget
             .snapshot(&zone)
             .await
+            .expect("budget storage")
             .expect("budget policy should produce a snapshot");
         assert_eq!(snapshot.budgets[0].used, 60);
         assert_eq!(snapshot.budgets[0].remaining, 40);
     }
 
     #[fcp_async_core::runtime::test]
-    async fn record_invoke_budget_usage_ignores_missing_zone_or_metrics() {
+    async fn record_forwarded_budget_usage_ignores_missing_zone_or_metrics() {
         let budget = BudgetPolicyEngine::new();
         let zone = ZoneId::work();
         let connector_id = ConnectorId::from_static("fcp.test.budget-noop:utility:1.0.0");
@@ -35849,15 +35931,16 @@ output_schema = { type = "object" }
             )
             .await;
 
-        record_invoke_budget_usage(
+        record_forwarded_budget_usage(
             &budget,
             None,
             &connector_id,
             "test.echo",
             Some(&invoke_response_with_metrics(vec![UsageMetric::tokens(60)])),
         )
-        .await;
-        record_invoke_budget_usage(
+        .await
+        .expect("budget storage");
+        record_forwarded_budget_usage(
             &budget,
             Some(&zone),
             &connector_id,
@@ -35867,18 +35950,20 @@ output_schema = { type = "object" }
                 json!({"ok": true}),
             )),
         )
-        .await;
+        .await
+        .expect("budget storage");
 
         let snapshot = budget
             .snapshot(&zone)
             .await
+            .expect("budget storage")
             .expect("budget policy should produce a snapshot");
         assert_eq!(snapshot.budgets[0].used, 0);
         assert_eq!(snapshot.budgets[0].remaining, 100);
     }
 
     #[fcp_async_core::runtime::test]
-    async fn record_invoke_budget_usage_counts_request_without_connector_metric() {
+    async fn record_forwarded_budget_usage_counts_request_without_connector_metric() {
         let budget = BudgetPolicyEngine::new();
         let zone = ZoneId::work();
         let connector_id = ConnectorId::from_static("fcp.test.budget-requests:utility:1.0.0");
@@ -35896,7 +35981,7 @@ output_schema = { type = "object" }
             )
             .await;
 
-        record_invoke_budget_usage(
+        record_forwarded_budget_usage(
             &budget,
             Some(&zone),
             &connector_id,
@@ -35906,18 +35991,20 @@ output_schema = { type = "object" }
                 json!({"ok": true}),
             )),
         )
-        .await;
+        .await
+        .expect("budget storage");
 
         let snapshot = budget
             .snapshot(&zone)
             .await
+            .expect("budget storage")
             .expect("budget policy should produce a snapshot");
         assert_eq!(snapshot.budgets[0].used, 1);
         assert_eq!(snapshot.budgets[0].remaining, 9);
     }
 
     #[fcp_async_core::runtime::test]
-    async fn record_invoke_budget_usage_counts_failed_invoke_attempt() {
+    async fn record_forwarded_budget_usage_counts_failed_invoke_attempt() {
         let budget = BudgetPolicyEngine::new();
         let zone = ZoneId::work();
         let connector_id = ConnectorId::from_static("fcp.test.budget-failed-request:utility:1.0.0");
@@ -35935,11 +36022,14 @@ output_schema = { type = "object" }
             )
             .await;
 
-        record_invoke_budget_usage(&budget, Some(&zone), &connector_id, "test.echo", None).await;
+        record_forwarded_budget_usage(&budget, Some(&zone), &connector_id, "test.echo", None)
+            .await
+            .expect("budget storage");
 
         let snapshot = budget
             .snapshot(&zone)
             .await
+            .expect("budget storage")
             .expect("budget policy should produce a snapshot");
         assert_eq!(snapshot.budgets[0].used, 1);
         assert_eq!(snapshot.budgets[0].remaining, 9);
@@ -38755,6 +38845,31 @@ done"#;
 
         assert!(matches!(err, HostError::InvalidFilter(_)));
         assert!(err.to_string().contains("does not match policy zone_id"));
+    }
+
+    #[test]
+    fn parse_zone_policies_json_rejects_invalid_budget_windows_and_duplicate_metrics() {
+        for duplicate in [false, true] {
+            let mut policy = host_runtime_policy(ZoneId::work());
+            let limit = UsageBudgetLimit {
+                metric: UsageMetricKind::Requests,
+                limit: 1,
+                window_seconds: if duplicate { 60 } else { 0 },
+            };
+            policy.usage_budget = Some(UsageBudgetPolicy {
+                enforcement: BudgetEnforcement::Deny,
+                budgets: if duplicate {
+                    vec![limit.clone(), limit]
+                } else {
+                    vec![limit]
+                },
+            });
+            let raw = serde_json::to_string(&HashMap::from([("z:work", policy)])).unwrap();
+            assert!(matches!(
+                parse_zone_policies_json(&raw),
+                Err(HostError::InvalidFilter(_))
+            ));
+        }
     }
 
     #[test]

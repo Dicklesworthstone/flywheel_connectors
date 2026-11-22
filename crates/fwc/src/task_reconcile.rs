@@ -617,6 +617,8 @@ mod tests {
         let admitted_at = admitted_at();
         InvocationQueryResponse {
             invocation: Some(InvocationRecord {
+                budget_requests_reserved: false,
+                budget_usage_digest: None,
                 ticket: InvocationTicket {
                     operation_id: binding.request_id.clone(),
                     attempt_id: 7,

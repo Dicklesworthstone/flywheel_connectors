@@ -34,6 +34,7 @@ use crate::{
 
 mod capability_usage;
 mod mesh_invocations;
+mod usage_budget;
 use capability_usage::{CapabilityUsageLedger, CapabilityUsageScope};
 pub use mesh_invocations::*;
 
@@ -1010,6 +1011,14 @@ pub struct InvocationRecord {
     /// Independently tracked budget, receipt and audit finalization.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finalization: Option<InvocationFinalization>,
+    /// One zone request allowance was spent atomically with this ticket.
+    /// It remains spent after cancellation, failure, or an unknown outcome.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub budget_requests_reserved: bool,
+    /// Digest of once-only observed metric settlement, excluding request counts.
+    /// This retains no provider payload or metric labels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_usage_digest: Option<String>,
     /// Whether admission used a filesystem path with file and directory sync.
     ///
     /// Explicit memory-only hosts and platforms without directory sync report
@@ -3224,6 +3233,11 @@ pub struct HostAdminStateSnapshot {
     #[serde(default, skip_serializing_if = "CapabilityUsageLedger::is_empty")]
     capability_usage: CapabilityUsageLedger,
     #[serde(
+        default,
+        skip_serializing_if = "crate::budget::BudgetTracker::is_empty"
+    )]
+    zone_budget_usage: crate::budget::BudgetTracker,
+    #[serde(
         default = "initial_invocation_attempt_id",
         skip_serializing_if = "is_initial_invocation_attempt_id"
     )]
@@ -3260,6 +3274,7 @@ impl Default for HostAdminStateSnapshot {
             invocations: Vec::new(),
             mesh_invocations: Vec::new(),
             capability_usage: CapabilityUsageLedger::default(),
+            zone_budget_usage: crate::budget::BudgetTracker::default(),
             next_invocation_attempt_id: initial_invocation_attempt_id(),
         }
     }
@@ -3283,6 +3298,17 @@ impl HostAdminStateSnapshot {
         let mut unresolved_operations = HashSet::new();
         let mut changed = false;
         for record in &mut self.invocations {
+            if record.budget_usage_digest.as_ref().is_some_and(|digest| {
+                record.terminal.is_none()
+                    || digest.len() != 64
+                    || !digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            }) {
+                return Err(HostError::Internal(
+                    "persisted invocation budget settlement is inconsistent".to_owned(),
+                ));
+            }
             if record.ticket.operation_id != record.admission.operation_id
                 || record.ticket.attempt_id == 0
                 || record.ticket.attempt_id >= self.next_invocation_attempt_id
@@ -3751,6 +3777,7 @@ impl HostAdminStateStore {
             None => HostAdminStateSnapshot::default(),
         };
         state.capability_usage.validate()?;
+        state.zone_budget_usage.validate_persisted()?;
         // No executor job survives constructing a fresh store. Never silently
         // replay an admission that has no committed terminal observation.
         if state.recover_invocations_after_restart(Utc::now())? {
@@ -5747,13 +5774,15 @@ impl HostAdminStateStore {
         &self,
         admission: InvocationAdmission,
     ) -> HostResult<InvocationTicket> {
-        self.admit_invocation_with_usage(admission, None).await
+        self.admit_invocation_with_usage(admission, None, None)
+            .await
     }
 
     async fn admit_invocation_with_usage(
         &self,
         admission: InvocationAdmission,
         usage: Option<CapabilityUsageScope>,
+        zone_budget: Option<&fcp_kernel::UsageBudgetPolicy>,
     ) -> HostResult<InvocationTicket> {
         for (name, value) in [
             ("operation_id", admission.operation_id.as_str()),
@@ -5778,6 +5807,18 @@ impl HostAdminStateStore {
                 ));
             }
         }
+        let budget_zone = zone_budget
+            .map(|policy| {
+                crate::budget::validate_usage_budget_policy(policy)
+                    .map_err(|error| HostError::PreflightFailed(error.to_string()))?;
+                admission
+                    .zone_id
+                    .parse::<fcp_policy::ZoneId>()
+                    .map_err(|_| {
+                        HostError::InvalidFilter("invalid invocation budget zone".to_owned())
+                    })
+            })
+            .transpose()?;
         let durable = self.state_path.is_some() && cfg!(unix);
         self.apply_mutation(|snapshot| {
             let now = Utc::now();
@@ -5805,6 +5846,14 @@ impl HostAdminStateStore {
             if let Some(scope) = &usage {
                 snapshot.capability_usage.reserve(scope, now)?;
             }
+            let budget_requests_reserved = match (budget_zone.as_ref(), zone_budget) {
+                (Some(zone), Some(policy)) => snapshot.zone_budget_usage.reserve_request(
+                    zone,
+                    policy,
+                    u64::try_from(now.timestamp()).unwrap_or(0),
+                )?,
+                _ => false,
+            };
             // Local and forwarded work share one bound. Unknown effects and
             // incomplete finalization are never reclaimed to admit more work.
             snapshot.reserve_invocation_history_slot()?;
@@ -5823,6 +5872,8 @@ impl HostAdminStateStore {
                 terminal: None,
                 finished_at: None,
                 finalization: None,
+                budget_requests_reserved,
+                budget_usage_digest: None,
                 durable,
             });
             snapshot.next_invocation_attempt_id = next_attempt_id;
@@ -6885,11 +6936,9 @@ mod tests {
             .finish_invocation(&ticket, successful_invocation())
             .await
             .unwrap();
-        for (http_status, sampling_completed) in [
-            (None, None),
-            (Some(502), None),
-            (Some(200), Some(false)),
-        ] {
+        for (http_status, sampling_completed) in
+            [(None, None), (Some(502), None), (Some(200), Some(false))]
+        {
             assert!(
                 store
                     .record_invocation_finalization(
@@ -8299,6 +8348,8 @@ mod tests {
             terminal: None,
             finished_at: None,
             finalization: None,
+            budget_requests_reserved: false,
+            budget_usage_digest: None,
             durable: true,
         });
         assert!(

@@ -714,6 +714,8 @@ mod tests {
 
     fn record(id: &str) -> InvocationRecord {
         InvocationRecord {
+            budget_requests_reserved: false,
+            budget_usage_digest: None,
             ticket: InvocationTicket {
                 operation_id: id.into(),
                 attempt_id: 7,

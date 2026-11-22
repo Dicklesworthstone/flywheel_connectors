@@ -3751,6 +3751,34 @@ debit covers admitted invocation and stream-control input; it does not account
 for response bodies, delivered event payloads, or provider traffic. Separate
 bounded custody and transport limits still apply to those surfaces.
 
+### Configured Zone Invocation Budgets
+
+At startup, `fcp-host` loads each zone's `usage_budget` from the JSON policy map
+named by `FCP_HOST_ZONE_POLICIES_FILE`. A `requests` limit with
+`enforcement: "deny"` reserves one request before local invocation dispatch, atomically with
+the signed-token debit and invocation ticket. Concurrent admissions cannot spend
+the same remaining request. Reservations are never refunded after cancellation,
+failure, timeout, or an unknown outcome. The `warn` mode records usage without
+blocking admission. Each metric must have one limit and a positive
+`window_seconds`; invalid policies refuse startup.
+
+The zone ledger shares `FCP_HOST_LIFECYCLE_STATE_FILE` with invocation history, so
+restarting a persistent host retains spent allowance. A persisted timestamp that
+only advances prevents a backward wall-clock adjustment from reopening an earlier window.
+An in-memory lifecycle store retains counters only for its lifetime. Persistence
+failures refuse further admission and reporting. `/rpc/budget/report` and budget
+checks during preflight or simulation do not consume requests or rewrite usage.
+
+After a terminal observation, reported token, byte, credit, and duration metrics
+settle once against that exact invocation ticket; repeating the same settlement
+cannot charge again. Provider-reported request counts do not replace or add to
+the host's local admission count. These are executor-local invocation budgets,
+not limits on native stream controls or a shared mesh quota. An origin node's
+forwarded-response accounting remains observational. Non-request metrics are
+recorded after execution and can exceed a limit; they do not reserve estimated
+provider spend or supply missing pricing. Changing a window's configured
+duration starts a new window; changing only its limit retains tracked usage.
+
 ---
 
 ## Connector Lifecycle and Health
