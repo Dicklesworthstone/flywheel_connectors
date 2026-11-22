@@ -239,8 +239,12 @@ fn grant(
     let mut cbor = Vec::new();
     ciborium::into_writer(constraints, &mut cbor).unwrap();
     let now = Utc::now();
+    let capability = match operation {
+        "openai.simple_chat" | "openai.get_usage" => "openai.chat",
+        _ => operation,
+    };
     let signed = CapabilityTokenBuilder::new()
-        .capability_id(operation)
+        .capability_id(capability)
         .operations(&[operation])
         .zone_id("z:work")
         .principal("user:native-test")
@@ -338,7 +342,7 @@ fn native_chat_completes_tool_conversation_and_enforces_signed_budgets() {
     let catalog: Introspection =
         serde_json::from_value(process.rpc("catalog", "introspect", json!({}))["result"].clone())
             .unwrap();
-    assert_eq!(catalog.operations.len(), 27);
+    assert_eq!(catalog.operations.len(), 28);
     assert!(
         catalog
             .operations
@@ -350,6 +354,12 @@ fn native_chat_completes_tool_conversation_and_enforces_signed_budgets() {
             .operations
             .iter()
             .any(|op| op.id.as_str() == "openai.realtime.voice")
+    );
+    assert!(
+        catalog
+            .operations
+            .iter()
+            .any(|op| op.id.as_str() == "openai.responses.create")
     );
 
     let token = grant(
@@ -506,6 +516,382 @@ fn native_chat_completes_tool_conversation_and_enforces_signed_budgets() {
     );
     assert!(process.wait_for_exit().success());
     assert!(process.output.try_recv().is_err());
+    server.finish();
+}
+
+#[test]
+fn native_responses_preserve_function_continuation_and_enforce_all_reference_scopes() {
+    const RESPONSES_MODEL: &str = "model-from-provider-catalog";
+    const INPUT_URL: &str = "HTTPS://EXAMPLE.INVALID/a?b=1";
+    let first_payload = json!({
+        "id": "resp-native-first",
+        "object": "response",
+        "created_at": 1_800_000_000,
+        "status": "completed",
+        "model": RESPONSES_MODEL,
+        "output": [
+            {
+                "id": "reasoning-first",
+                "type": "reasoning",
+                "summary": [],
+                "encrypted_content": "opaque-first"
+            },
+            {
+                "id": "function-item-first",
+                "type": "function_call",
+                "call_id": "call-weather",
+                "name": "weather",
+                "arguments": "{ \"city\" : \"Paris\" }"
+            }
+        ],
+        "usage": {
+            "input_tokens": 31,
+            "output_tokens": 7,
+            "total_tokens": 38,
+            "input_tokens_details": {"cached_tokens": 3},
+            "output_tokens_details": {"reasoning_tokens": 2},
+            "future_usage_field": "retained"
+        },
+        "error": null,
+        "incomplete_details": null,
+        "future_response_field": {"retained": ["provider", "metadata"]}
+    });
+    let second_payload = json!({
+        "id": "resp-native-second",
+        "object": "response",
+        "created_at": 1_800_000_001,
+        "status": "completed",
+        "model": RESPONSES_MODEL,
+        "output": [
+            {
+                "id": "message-final",
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {"type": "output_text", "text": "It is ", "annotations": []},
+                    {"type": "output_text", "text": "18 C in Paris.", "annotations": []}
+                ]
+            },
+            {"type": "future_provider_item", "payload": {"preserved": true}}
+        ],
+        "usage": {
+            "input_tokens": 19,
+            "output_tokens": 5,
+            "total_tokens": 24,
+            "input_tokens_details": {"cached_tokens": 9},
+            "output_tokens_details": {"reasoning_tokens": 1}
+        },
+        "error": null,
+        "incomplete_details": null,
+        "future_response_field": "retained again"
+    });
+    let server = LoopbackServer::start(vec![first_payload.clone(), second_payload.clone()]);
+    let mut process = NativeProcess::start();
+    assert_eq!(
+        process.rpc(
+            "responses-config",
+            "configure",
+            json!({"api_key": API_KEY, "base_url": server.url}),
+        )["result"]["status"],
+        "configured"
+    );
+    let key = Ed25519SigningKey::generate();
+    let handshake = process.rpc(
+        "responses-handshake",
+        "handshake",
+        json!({
+            "protocol_version": "2.0.0",
+            "zone": "z:work",
+            "host_public_key": key.verifying_key().to_bytes(),
+            "nonce": vec![7_u8; 32],
+            "capabilities_requested": ["openai.responses.create", "openai.chat"]
+        }),
+    );
+    let instance: InstanceId =
+        serde_json::from_value(handshake["result"]["instance_id"].clone()).unwrap();
+    assert!(
+        handshake["result"]["capabilities_granted"]
+            .as_array()
+            .unwrap()
+            .contains(&json!({"capability": "openai.responses.create"}))
+    );
+    let token = grant(
+        &key,
+        &instance,
+        "openai.responses.create",
+        b"responses-two-turns",
+        &CapabilityConstraints {
+            resource_allow: vec![
+                format!("openai:model:{RESPONSES_MODEL}"),
+                "openai:response:resp-native-first".into(),
+                "openai:response_item:reasoning-context".into(),
+                "openai:response_item:item-context".into(),
+                "openai:file:file-weather".into(),
+                "openai:file:file-tool-result".into(),
+                // The literal query delimiter must not become a policy wildcard.
+                "openai:input_url:https://example.invalid/a%3Fb=1".into(),
+            ],
+            max_calls: Some(2),
+            max_bytes: Some(1_000_000),
+            ..Default::default()
+        },
+    );
+    let first_input = json!({
+        "model": RESPONSES_MODEL,
+        "input": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "Weather in Paris? Read the reference."},
+                    {"type": "input_file", "file_id": "file-weather"},
+                    {"type": "input_image", "image_url": INPUT_URL},
+                    {"type": "input_image", "image_url": "data:image/png;base64,AA=="}
+                ]
+            },
+            {
+                "id": "reasoning-context",
+                "type": "reasoning",
+                "summary": [],
+                "encrypted_content": "opaque-request-context"
+            },
+            {"type": "item_reference", "id": "item-context"}
+        ],
+        "tools": [{
+            "type": "function",
+            "name": "weather",
+            "description": "Read the weather for a city.",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+                "additionalProperties": false
+            },
+            "strict": true
+        }],
+        "tool_choice": "auto",
+        "max_output_tokens": 128,
+        "store": true,
+        "include": ["reasoning.encrypted_content"]
+    });
+    let mut request = json!({
+        "type": "simulate",
+        "id": "responses-preview",
+        "connector_id": "fcp.openai",
+        "zone_id": "z:work",
+        "operation": "openai.responses.create",
+        "input": first_input,
+        "capability_token": token
+    });
+    for _ in 0..3 {
+        let preview: SimulateResponse = serde_json::from_value(
+            process.rpc("responses-preview", "simulate", request.clone())["result"].clone(),
+        )
+        .unwrap();
+        assert!(preview.would_succeed);
+    }
+    server.assert_no_requests();
+    request["type"] = json!("invoke");
+    request["id"] = json!("responses-first");
+
+    for (id, input) in [
+        ("responses-wrong-model", {
+            let mut input = first_input.clone();
+            input["model"] = json!("another-provider-model");
+            input
+        }),
+        ("responses-wrong-previous", {
+            let mut input = first_input.clone();
+            input["previous_response_id"] = json!("resp-not-granted");
+            input
+        }),
+        ("responses-wrong-reasoning", {
+            let mut input = first_input.clone();
+            input["input"][1]["id"] = json!("reasoning-not-granted");
+            input
+        }),
+        ("responses-wrong-item", {
+            let mut input = first_input.clone();
+            input["input"][2]["id"] = json!("item-not-granted");
+            input
+        }),
+        ("responses-wrong-file", {
+            let mut input = first_input.clone();
+            input["input"][0]["content"][1]["file_id"] = json!("file-not-granted");
+            input
+        }),
+        ("responses-query-is-not-path", {
+            let mut input = first_input.clone();
+            input["input"][0]["content"][2]["image_url"] = json!("https://example.invalid/axb=1");
+            input
+        }),
+        ("responses-escaped-query-is-not-path", {
+            let mut input = first_input.clone();
+            input["input"][0]["content"][2]["image_url"] = json!("https://example.invalid/a%3Fb=1");
+            input
+        }),
+    ] {
+        let mut denied = request.clone();
+        denied["id"] = json!(id);
+        denied["input"] = input;
+        assert_eq!(
+            process.rpc(id, "invoke", denied.clone())["error"]["code"],
+            "FCP-3004",
+            "reference denial must precede provider work for {id}"
+        );
+        denied["type"] = json!("simulate");
+        let preview: SimulateResponse =
+            serde_json::from_value(process.rpc(id, "simulate", denied)["result"].clone()).unwrap();
+        assert!(!preview.would_succeed, "preview must deny {id}");
+    }
+    let mut hosted_tool = request.clone();
+    hosted_tool["input"]["tools"] = json!([{
+        "type": "mcp",
+        "server_label": "remote",
+        "server_url": "https://example.invalid/mcp"
+    }]);
+    assert_eq!(
+        process.rpc("responses-hosted-tool", "invoke", hosted_tool.clone())["error"]["code"],
+        "FCP-1003"
+    );
+    hosted_tool["type"] = json!("simulate");
+    let denied: SimulateResponse = serde_json::from_value(
+        process.rpc("responses-hosted-preview", "simulate", hosted_tool)["result"].clone(),
+    )
+    .unwrap();
+    assert!(!denied.would_succeed);
+    server.assert_no_requests();
+
+    let first: InvokeResponse = serde_json::from_value(
+        process.rpc("responses-outer-first", "invoke", request.clone())["result"].clone(),
+    )
+    .unwrap();
+    assert_eq!(first.id.0, "responses-first");
+    assert_eq!(first.status, InvokeStatus::Ok);
+    let first_result = first.result.unwrap();
+    assert_eq!(first_result["response"], first_payload);
+    assert_eq!(first_result["output_text"], "");
+    assert!(first_result["cost_usd"].is_null());
+    let captured = server.receive();
+    assert_eq!(
+        captured.headers.lines().next(),
+        Some("POST /v1/responses HTTP/1.1")
+    );
+    assert!(has_header(
+        &captured.headers,
+        "authorization",
+        &format!("Bearer {API_KEY}")
+    ));
+    assert_eq!(captured.body, first_input);
+    assert_eq!(
+        captured.body["input"][0]["content"][2]["image_url"], INPUT_URL,
+        "resource canonicalization must preserve the caller's provider payload"
+    );
+
+    let second_input = json!({
+        "model": RESPONSES_MODEL,
+        "previous_response_id": first_result["response"]["id"],
+        "input": [{
+            "type": "function_call_output",
+            "call_id": first_result["response"]["output"][1]["call_id"],
+            "output": [
+                {"type": "input_text", "text": "18 C"},
+                {"type": "input_file", "file_id": "file-tool-result"},
+                {"type": "input_image", "image_url": INPUT_URL}
+            ]
+        }],
+        "max_output_tokens": 128
+    });
+    request["id"] = json!("responses-second");
+    request["input"] = second_input.clone();
+    for (id, input) in [
+        ("responses-tool-output-file", {
+            let mut input = second_input.clone();
+            input["input"][0]["output"][1]["file_id"] = json!("file-not-granted");
+            input
+        }),
+        ("responses-tool-output-url", {
+            let mut input = second_input.clone();
+            input["input"][0]["output"][2]["image_url"] = json!("https://example.invalid/axb=1");
+            input
+        }),
+    ] {
+        let mut denied = request.clone();
+        denied["input"] = input;
+        assert_eq!(
+            process.rpc(id, "invoke", denied)["error"]["code"],
+            "FCP-3004"
+        );
+    }
+    server.assert_no_requests();
+    let second: InvokeResponse = serde_json::from_value(
+        process.rpc("responses-outer-second", "invoke", request.clone())["result"].clone(),
+    )
+    .unwrap();
+    assert_eq!(second.id.0, "responses-second");
+    assert_eq!(second.status, InvokeStatus::Ok);
+    let second_result = second.result.unwrap();
+    assert_eq!(second_result["response"], second_payload);
+    assert_eq!(second_result["output_text"], "It is 18 C in Paris.");
+    assert!(second_result["cost_usd"].is_null());
+    let follow_up = server.receive();
+    assert_eq!(
+        follow_up.headers.lines().next(),
+        Some("POST /v1/responses HTTP/1.1")
+    );
+    assert_eq!(follow_up.body, second_input);
+    assert_eq!(follow_up.body["previous_response_id"], "resp-native-first");
+    assert_eq!(follow_up.body["input"][0]["call_id"], "call-weather");
+
+    assert_eq!(
+        process.rpc("responses-spent", "invoke", request.clone())["error"]["code"],
+        "FCP-3001"
+    );
+    request["type"] = json!("simulate");
+    let spent: SimulateResponse = serde_json::from_value(
+        process.rpc("responses-spent-preview", "simulate", request)["result"].clone(),
+    )
+    .unwrap();
+    assert!(!spent.would_succeed);
+
+    let usage_token = grant(
+        &key,
+        &instance,
+        "openai.get_usage",
+        b"responses-usage",
+        &CapabilityConstraints {
+            resource_allow: vec!["*".into()],
+            max_calls: Some(1),
+            ..Default::default()
+        },
+    );
+    let usage: InvokeResponse = serde_json::from_value(
+        process.rpc(
+            "responses-usage",
+            "invoke",
+            json!({
+                "type": "invoke",
+                "id": "responses-usage",
+                "connector_id": "fcp.openai",
+                "zone_id": "z:work",
+                "operation": "openai.get_usage",
+                "input": {},
+                "capability_token": usage_token
+            }),
+        )["result"]
+            .clone(),
+    )
+    .unwrap();
+    assert_eq!(usage.status, InvokeStatus::Ok);
+    let usage = usage.result.unwrap();
+    assert_eq!(usage["total_prompt_tokens"], 50);
+    assert_eq!(usage["total_completion_tokens"], 12);
+    assert_eq!(usage["unpriced_response_requests"], 2);
+    assert!(server.requests.try_recv().is_err());
+    assert_eq!(
+        process.rpc("responses-shutdown", "shutdown", json!({}))["result"]["status"],
+        "shutdown"
+    );
+    assert!(process.wait_for_exit().success());
     server.finish();
 }
 

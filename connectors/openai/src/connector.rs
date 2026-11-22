@@ -25,8 +25,9 @@ use crate::{
     error::OpenAIError,
     types::{
         EmbeddingInput, EmbeddingModel, ImageModel, ImageQuality, ImageSize, Message,
-        MessageContent, Model, Role, Tool, ToolChoice, TtsModel, TtsResponseFormat, TtsVoice,
-        Usage, VideoDurationSeconds, VideoModel, VideoSize, WhisperModel,
+        MessageContent, Model, ResponsesInput, ResponsesRequest, Role, Tool, ToolChoice, TtsModel,
+        TtsResponseFormat, TtsVoice, Usage, VideoDurationSeconds, VideoModel, VideoSize,
+        WhisperModel,
     },
 };
 
@@ -1964,8 +1965,9 @@ fn normalize_base_url(base_url: &str) -> FcpResult<String> {
     Ok(parsed.to_string().trim_end_matches('/').to_string())
 }
 
-const OPERATION_IDS: [&str; 27] = [
+const OPERATION_IDS: [&str; 28] = [
     "openai.chat",
+    "openai.responses.create",
     "openai.simple_chat",
     "openai.get_usage",
     "openai.embeddings",
@@ -2074,7 +2076,7 @@ fn capability_for_operation(operation: &str) -> FcpResult<CapabilityId> {
         })
 }
 
-/// Reserve the complete JSON result, including base64 expansion for binary APIs.
+/// Reserve the complete JSON result, including binary expansion and derived text.
 /// The manifest's network limit describes upstream bytes, not the JSON envelope.
 fn response_byte_limit(operation: &OperationId) -> FcpResult<u64> {
     let upstream_limit = manifest()?
@@ -2094,6 +2096,9 @@ fn response_byte_limit(operation: &OperationId) -> FcpResult<u64> {
             .checked_add(2)
             .map(|bytes| bytes / 3)
             .and_then(|groups| groups.checked_mul(4))
+    } else if operation.as_str() == "openai.responses.create" {
+        // output_text duplicates at most the text already in response.output.
+        upstream_limit.checked_mul(2)
     } else {
         Some(upstream_limit)
     };
@@ -2148,6 +2153,107 @@ fn parse_chat_messages(input: &serde_json::Value) -> FcpResult<Vec<Message>> {
         }
     }
     Ok(messages)
+}
+
+fn parse_responses_request(input: serde_json::Value) -> FcpResult<ResponsesRequest> {
+    let request: ResponsesRequest =
+        serde_json::from_value(input).map_err(|_| FcpError::InvalidRequest {
+            code: 1003,
+            message: "Invalid Responses request".into(),
+        })?;
+    request.validate().map_err(|error| error.to_fcp_error())?;
+    Ok(request)
+}
+
+fn ensure_responses_base_url(base_url: &str) -> FcpResult<()> {
+    let parsed = url::Url::parse(base_url).map_err(|_| FcpError::InvalidRequest {
+        code: 1003,
+        message: "Invalid Responses base URL".into(),
+    })?;
+    let allowed = match parsed.host() {
+        Some(url::Host::Domain(host)) => {
+            matches!(host.trim_end_matches('.'), "api.openai.com" | "localhost")
+        }
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    };
+    if !allowed {
+        return Err(FcpError::InvalidRequest {
+            code: 1003,
+            message: "Responses requires api.openai.com or a loopback test endpoint".into(),
+        });
+    }
+    Ok(())
+}
+
+/// Scope every provider reference separately from permission to use the model.
+/// Inline content and raw function arguments are caller-supplied data.
+fn responses_resource_uris(request: &ResponsesRequest) -> FcpResult<Vec<String>> {
+    let mut resources = vec![format!(
+        "openai:model:{}",
+        response_resource_component(&request.model)
+    )];
+    if let Some(previous) = &request.previous_response_id {
+        resources.push(format!(
+            "openai:response:{}",
+            response_resource_component(previous)
+        ));
+    }
+    if let ResponsesInput::Items(items) = &request.input {
+        for item in items {
+            if let Some(id) = item.get("id").and_then(serde_json::Value::as_str) {
+                resources.push(format!(
+                    "openai:response_item:{}",
+                    response_resource_component(id)
+                ));
+            }
+            let content_field = if item.get("type").and_then(serde_json::Value::as_str)
+                == Some("function_call_output")
+            {
+                "output"
+            } else {
+                "content"
+            };
+            if let Some(parts) = item
+                .get(content_field)
+                .and_then(serde_json::Value::as_array)
+            {
+                for part in parts {
+                    if let Some(id) = part.get("file_id").and_then(serde_json::Value::as_str) {
+                        resources.push(format!("openai:file:{}", response_resource_component(id)));
+                    }
+                    for field in ["file_url", "image_url"] {
+                        if let Some(raw) = part.get(field).and_then(serde_json::Value::as_str) {
+                            let parsed =
+                                url::Url::parse(raw).map_err(|_| FcpError::InvalidRequest {
+                                    code: 1003,
+                                    message: "Invalid Responses content URL".into(),
+                                })?;
+                            if matches!(parsed.scheme(), "http" | "https") {
+                                resources.push(format!(
+                                    "openai:input_url:{}",
+                                    response_resource_component(parsed.as_str())
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    resources.sort_unstable();
+    resources.dedup();
+    Ok(resources)
+}
+
+/// Resource policies use '?' and '*' as glob operators. Escape literals
+/// injectively so an exact URL grant cannot authorize a different path.
+fn response_resource_component(value: &str) -> String {
+    value
+        .replace('%', "%25")
+        .replace('?', "%3F")
+        .replace('*', "%2A")
 }
 
 fn parse_video_duration(input: &serde_json::Value) -> FcpResult<Option<VideoDurationSeconds>> {
@@ -2305,6 +2411,7 @@ pub struct OpenAIConnector {
     config: Option<OpenAIConfig>,
     client: Option<OpenAIClient>,
     total_cost: AtomicU64, // Store as fixed-point (cost * 1_000_000_000)
+    unpriced_response_requests: AtomicU64,
     authority: Option<StandaloneSession>,
     session_id: Option<SessionId>,
     bound_zone: Option<ZoneId>,
@@ -2321,6 +2428,7 @@ impl OpenAIConnector {
             config: None,
             client: None,
             total_cost: AtomicU64::new(0),
+            unpriced_response_requests: AtomicU64::new(0),
             authority: None,
             session_id: None,
             bound_zone: None,
@@ -2822,6 +2930,12 @@ impl OpenAIConnector {
         if operation.as_str() == "openai.chat" {
             parse_chat_messages(input)?;
         }
+        if operation.as_str() == "openai.responses.create" {
+            let config = self.config.as_ref().ok_or(FcpError::NotConfigured)?;
+            ensure_responses_base_url(&config.base_url)?;
+            let request = parse_responses_request(input.clone())?;
+            return responses_resource_uris(&request);
+        }
         Ok(self.resource_uris_for_operation(operation.as_str(), input))
     }
 
@@ -2900,6 +3014,7 @@ impl OpenAIConnector {
     ) -> FcpResult<serde_json::Value> {
         match operation {
             "openai.chat" => self.invoke_chat(input).await,
+            "openai.responses.create" => self.invoke_responses_create(input).await,
             "openai.simple_chat" => self.invoke_simple_chat(input).await,
             "openai.get_usage" => self.invoke_get_usage().await,
             "openai.embeddings" => self.invoke_embeddings(input).await,
@@ -2932,6 +3047,29 @@ impl OpenAIConnector {
                 operation: operation.into(),
             }),
         }
+    }
+
+    async fn invoke_responses_create(
+        &self,
+        input: serde_json::Value,
+    ) -> FcpResult<serde_json::Value> {
+        let client = self.client.as_ref().ok_or(FcpError::NotConfigured)?;
+        let request = parse_responses_request(input)?;
+        let response = client
+            .create_response(&request)
+            .await
+            .map_err(|error| error.to_fcp_error())?;
+        self.unpriced_response_requests
+            .fetch_add(1, Ordering::Relaxed);
+        let output_text = response.output_text();
+        // Keep the provider object intact, including future fields and failed
+        // or incomplete generation details. Legacy chat prices do not cover
+        // arbitrary Responses models, cache discounts or provider services.
+        Ok(json!({
+            "response": response,
+            "output_text": output_text,
+            "cost_usd": null
+        }))
     }
 
     async fn invoke_chat(&self, input: serde_json::Value) -> FcpResult<serde_json::Value> {
@@ -3122,6 +3260,7 @@ impl OpenAIConnector {
             "total_prompt_tokens": prompt_tokens,
             "total_completion_tokens": completion_tokens,
             "total_cost_usd": self.total_cost(),
+            "unpriced_response_requests": self.unpriced_response_requests.load(Ordering::Relaxed),
             "requests_total": requests_total,
             "requests_error": self.total_errors()
         }))
@@ -5945,7 +6084,7 @@ mod tests {
         let connector = OpenAIConnector::new();
         let value = connector.handle_introspect().await.unwrap();
         let ops = value["operations"].as_array().unwrap();
-        assert_eq!(ops.len(), 27, "Expected 27 operations");
+        assert_eq!(ops.len(), 28, "Expected 28 operations");
     }
 
     #[fcp_async_core::runtime::test]

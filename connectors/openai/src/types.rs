@@ -194,6 +194,419 @@ pub enum ImageDetail {
     High,
 }
 
+/// Input accepted by the Responses API without forcing it through chat messages.
+///
+/// Item objects are retained verbatim so callers can return function outputs,
+/// replay reasoning items, or include multimodal content.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ResponsesInput {
+    /// A text prompt.
+    Text(String),
+    /// Ordered input items, including messages and function-call outputs.
+    Items(Vec<serde_json::Value>),
+}
+
+/// Non-streaming request to `POST /v1/responses`.
+///
+/// Model identifiers are intentionally not restricted to the legacy chat model
+/// enum. Unknown top-level fields are rejected instead of silently discarded.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResponsesRequest {
+    /// Provider model identifier.
+    pub model: String,
+    /// Text or ordered input items.
+    pub input: ResponsesInput,
+    /// Instructions for this response; not inherited from a previous response.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+    /// Response whose context should precede this request's input.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_response_id: Option<String>,
+    /// Flat function declarations. Hosted tools require separate authority.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<serde_json::Value>>,
+    /// none, auto, required, or a flat function selection object.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<serde_json::Value>,
+    /// Upper bound including both visible output and reasoning tokens.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
+    /// Provider reasoning configuration, retained without narrowing its fields.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<serde_json::Value>,
+    /// Text configuration, including structured output in `text.format`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<serde_json::Value>,
+    /// Whether the provider should retain the response for later retrieval.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub store: Option<bool>,
+    /// Additional provider output fields to include.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include: Option<Vec<String>>,
+    /// Provider metadata attached to the response.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<std::collections::BTreeMap<String, String>>,
+    /// Whether the model may emit multiple tool calls in parallel.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
+    /// Sampling temperature, when supported by the selected model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    /// Nucleus sampling probability, when supported by the selected model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f64>,
+    /// Only false is supported by this synchronous operation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream: Option<bool>,
+    /// Only false is supported until background-job lifecycle operations exist.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub background: Option<bool>,
+}
+
+impl ResponsesRequest {
+    /// Validate the supported request shape before authorization or provider I/O.
+    ///
+    /// Only client-executed function declarations and passive conversation items
+    /// are accepted. Hosted tools and approvals require separate authority.
+    /// Function arguments and outputs are never parsed, executed, or rewritten.
+    ///
+    /// # Errors
+    ///
+    /// Rejects malformed fields, unsupported tools, and streaming/background modes.
+    pub fn validate(&self) -> crate::error::OpenAIResult<()> {
+        let invalid = |message: &str| crate::error::OpenAIError::InvalidInput {
+            message: message.to_owned(),
+        };
+        if self.model.trim().is_empty() || self.model.trim() != self.model.as_str() {
+            return Err(invalid(
+                "Responses model must be nonempty without surrounding whitespace",
+            ));
+        }
+        if self.stream == Some(true) {
+            return Err(invalid(
+                "Responses streaming is not supported by this operation",
+            ));
+        }
+        if self.background == Some(true) {
+            return Err(invalid(
+                "Responses background execution is not supported by this operation",
+            ));
+        }
+        if self
+            .previous_response_id
+            .as_ref()
+            .is_some_and(|id| id.trim().is_empty() || id.trim() != id.as_str())
+        {
+            return Err(invalid(
+                "previous_response_id must be nonempty without surrounding whitespace",
+            ));
+        }
+        if self.max_output_tokens.is_some_and(|limit| limit < 16) {
+            return Err(invalid("max_output_tokens must be at least 16"));
+        }
+        if self
+            .temperature
+            .is_some_and(|value| !value.is_finite() || !(0.0..=2.0).contains(&value))
+        {
+            return Err(invalid("temperature must be between 0 and 2"));
+        }
+        if self
+            .top_p
+            .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+        {
+            return Err(invalid("top_p must be between 0 and 1"));
+        }
+        if self
+            .reasoning
+            .as_ref()
+            .is_some_and(|value| !value.is_object())
+        {
+            return Err(invalid("reasoning must be an object"));
+        }
+        if let Some(text) = &self.text {
+            if !text.is_object() {
+                return Err(invalid("text must be an object"));
+            }
+            if text.get("format").is_some_and(|format| !format.is_object()) {
+                return Err(invalid("text.format must be an object"));
+            }
+        }
+        if let ResponsesInput::Items(items) = &self.input {
+            for item in items {
+                if !item.is_object() {
+                    return Err(invalid("Responses input items must be objects"));
+                }
+                if item.get("id").is_some_and(|id| {
+                    id.as_str()
+                        .is_none_or(|id| id.trim().is_empty() || id.trim() != id)
+                }) {
+                    return Err(invalid(
+                        "Responses input item ids must be nonempty without surrounding whitespace",
+                    ));
+                }
+                let kind = match item.get("type") {
+                    None => None,
+                    Some(serde_json::Value::String(kind)) if !kind.trim().is_empty() => {
+                        Some(kind.as_str())
+                    }
+                    _ => {
+                        return Err(invalid(
+                            "Responses input item type must be a nonempty string",
+                        ));
+                    }
+                };
+                match kind {
+                    None | Some("message") => {
+                        if !matches!(
+                            item.get("role").and_then(serde_json::Value::as_str),
+                            Some("user" | "assistant" | "system" | "developer")
+                        ) {
+                            return Err(invalid("Responses message items require a valid role"));
+                        }
+                        let content = item
+                            .get("content")
+                            .ok_or_else(|| invalid("Responses messages require content"))?;
+                        Self::validate_content(content)?;
+                    }
+                    Some("function_call_output") => {
+                        if item
+                            .get("call_id")
+                            .and_then(serde_json::Value::as_str)
+                            .is_none_or(|id| id.trim().is_empty() || id.trim() != id)
+                        {
+                            return Err(invalid(
+                                "function_call_output requires a nonempty call_id without surrounding whitespace",
+                            ));
+                        }
+                        let output = item
+                            .get("output")
+                            .ok_or_else(|| invalid("function_call_output requires output"))?;
+                        Self::validate_content(output)?;
+                    }
+                    Some("function_call") => {
+                        if ["call_id", "name"].into_iter().any(|field| {
+                            item.get(field)
+                                .and_then(serde_json::Value::as_str)
+                                .is_none_or(|value| {
+                                    value.trim().is_empty() || value.trim() != value
+                                })
+                        }) || !item
+                            .get("arguments")
+                            .is_some_and(serde_json::Value::is_string)
+                        {
+                            return Err(invalid(
+                                "function_call requires unpadded call_id, name and string arguments",
+                            ));
+                        }
+                    }
+                    Some("item_reference") => {
+                        if item
+                            .get("id")
+                            .and_then(serde_json::Value::as_str)
+                            .is_none_or(|id| id.trim().is_empty() || id.trim() != id)
+                        {
+                            return Err(invalid(
+                                "item_reference requires a nonempty id without surrounding whitespace",
+                            ));
+                        }
+                    }
+                    Some("reasoning") => {}
+                    _ => {
+                        return Err(invalid(
+                            "Only message, function_call, function_call_output, reasoning and item_reference inputs are supported",
+                        ));
+                    }
+                }
+            }
+        }
+        if let Some(tools) = &self.tools {
+            for tool in tools {
+                if tool.get("type").and_then(serde_json::Value::as_str) != Some("function") {
+                    return Err(invalid("Only flat Responses function tools are supported"));
+                }
+                if tool
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .is_none_or(|name| name.trim().is_empty() || name.trim() != name)
+                {
+                    return Err(invalid(
+                        "Responses function tools require a nonempty top-level name without surrounding whitespace",
+                    ));
+                }
+                if tool
+                    .get("parameters")
+                    .is_some_and(|value| !value.is_null() && !value.is_object())
+                {
+                    return Err(invalid("Function parameters must be a JSON Schema object"));
+                }
+            }
+        }
+        if let Some(choice) = &self.tool_choice {
+            match choice {
+                serde_json::Value::String(value)
+                    if matches!(value.as_str(), "none" | "auto" | "required") => {}
+                serde_json::Value::Object(object) => {
+                    if object.get("type").and_then(serde_json::Value::as_str) != Some("function")
+                        || object
+                            .keys()
+                            .any(|key| !matches!(key.as_str(), "type" | "name"))
+                    {
+                        return Err(invalid(
+                            "Responses tool_choice objects must contain only type=function and name",
+                        ));
+                    }
+                    if object
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .is_none_or(|name| name.trim().is_empty() || name.trim() != name)
+                    {
+                        return Err(invalid(
+                            "Responses function tool_choice requires a nonempty top-level name without surrounding whitespace",
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(invalid(
+                        "tool_choice must be none, auto, required, or a function selection",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_content(content: &serde_json::Value) -> crate::error::OpenAIResult<()> {
+        let invalid = |message: &str| crate::error::OpenAIError::InvalidInput {
+            message: message.to_owned(),
+        };
+        if content.is_string() {
+            return Ok(());
+        }
+        let parts = content
+            .as_array()
+            .ok_or_else(|| invalid("Responses content must be a string or an array of objects"))?;
+        for part in parts {
+            let object = part
+                .as_object()
+                .ok_or_else(|| invalid("Responses content parts must be objects"))?;
+            if let Some(id) = object.get("file_id") {
+                if id
+                    .as_str()
+                    .is_none_or(|id| id.trim().is_empty() || id.trim() != id)
+                {
+                    return Err(invalid(
+                        "Content file_id must be nonempty without surrounding whitespace",
+                    ));
+                }
+            }
+            for field in ["file_url", "image_url"] {
+                if let Some(value) = object.get(field) {
+                    let value = value
+                        .as_str()
+                        .ok_or_else(|| invalid("Content URLs must be strings"))?;
+                    if value.trim().is_empty()
+                        || value.trim() != value
+                        || value.chars().any(char::is_control)
+                    {
+                        return Err(invalid(
+                            "Content URLs must be nonempty without whitespace padding or control characters",
+                        ));
+                    }
+                    let parsed = url::Url::parse(value)
+                        .map_err(|_| invalid("Content URLs must be valid absolute URLs"))?;
+                    if field == "image_url"
+                        && parsed.scheme() == "data"
+                        && value.starts_with("data:image/")
+                        && value
+                            .split_once(',')
+                            .is_some_and(|(_, data)| !data.is_empty())
+                    {
+                        continue;
+                    }
+                    if !matches!(parsed.scheme(), "http" | "https")
+                        || parsed.host_str().is_none()
+                        || !parsed.username().is_empty()
+                        || parsed.password().is_some()
+                    {
+                        return Err(invalid(
+                            "Content URLs must use HTTP(S) without credentials; image_url also accepts inline data:image URLs",
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Actual token usage reported by the Responses API.
+///
+/// Detailed cached/reasoning token information and future provider fields are
+/// retained in `extra`. There is no inferred cost or default token estimate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponsesUsage {
+    /// Actual input token count.
+    pub input_tokens: u64,
+    /// Actual output token count, including any reasoning tokens.
+    pub output_tokens: u64,
+    /// Provider-reported combined token count.
+    pub total_tokens: u64,
+    /// Additional provider usage fields.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Complete structured Responses API result.
+///
+/// Output items stay in provider order and preserve call IDs, raw argument
+/// strings, reasoning continuity fields, annotations, and unknown item types.
+/// Top-level status/error/incomplete details are retained rather than collapsed
+/// into a text-only completion.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponsesResponse {
+    /// Response identifier used by `previous_response_id`.
+    pub id: String,
+    /// Provider object discriminator.
+    pub object: String,
+    /// Provider status, such as completed, incomplete, or failed.
+    pub status: String,
+    /// Actual provider model identifier.
+    pub model: String,
+    /// Ordered, unmodified provider output items.
+    pub output: Vec<serde_json::Value>,
+    /// Actual usage, or none when the provider has not supplied it.
+    pub usage: Option<ResponsesUsage>,
+    /// All other provider response fields, including errors and continuation data.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+impl ResponsesResponse {
+    /// Concatenate assistant text output without discarding structured items.
+    #[must_use]
+    pub fn output_text(&self) -> String {
+        self.output
+            .iter()
+            .filter(|item| item.get("type").and_then(serde_json::Value::as_str) == Some("message"))
+            .filter_map(|item| item.get("content").and_then(serde_json::Value::as_array))
+            .flatten()
+            .filter(|part| {
+                part.get("type").and_then(serde_json::Value::as_str) == Some("output_text")
+            })
+            .filter_map(|part| part.get("text").and_then(serde_json::Value::as_str))
+            .collect()
+    }
+
+    /// Inspect complete function-call items without parsing or executing arguments.
+    pub fn function_calls(&self) -> impl Iterator<Item = &serde_json::Value> {
+        self.output.iter().filter(|item| {
+            item.get("type").and_then(serde_json::Value::as_str) == Some("function_call")
+        })
+    }
+}
+
 /// Request to the Chat Completions API.
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatCompletionRequest {

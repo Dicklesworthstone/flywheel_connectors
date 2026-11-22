@@ -20,10 +20,11 @@ use crate::{
         EmbeddingModel, EmbeddingRequest, EmbeddingResponse, FineTuneEventListResponse,
         FineTuneHyperparameters, FineTuneJob, FineTuneListResponse, GeneratedVideoAsset,
         ImageGenerationRequest, ImageGenerationResponse, ImageModel, ImageQuality, ImageSize,
-        Message, Model, Run, RunListResponse, Thread, ThreadMessage, ThreadMessageListResponse,
-        Tool, ToolChoice, TranscriptionResponse, TtsModel, TtsRequest, TtsResponseFormat, TtsVoice,
-        Usage, VideoDurationSeconds, VideoGenerationRequest, VideoGenerationResponse, VideoModel,
-        VideoSize, VideoStatus, WhisperModel,
+        Message, Model, ResponsesRequest, ResponsesResponse, Run, RunListResponse, Thread,
+        ThreadMessage, ThreadMessageListResponse, Tool, ToolChoice, TranscriptionResponse,
+        TtsModel, TtsRequest, TtsResponseFormat, TtsVoice, Usage, VideoDurationSeconds,
+        VideoGenerationRequest, VideoGenerationResponse, VideoModel, VideoSize, VideoStatus,
+        WhisperModel,
     },
 };
 
@@ -237,6 +238,32 @@ impl OpenAIClient {
             .fetch_add(u64::from(usage.prompt_tokens), Ordering::Relaxed);
         self.total_completion_tokens
             .fetch_add(u64::from(usage.completion_tokens), Ordering::Relaxed);
+    }
+
+    /// Create a structured response using the modern Responses API.
+    ///
+    /// Uses the same authentication, retry policy and runtime request context as
+    /// other JSON requests. Only actual provider usage is added to token totals;
+    /// this method does not estimate a price for an arbitrary model identifier.
+    ///
+    /// # Errors
+    ///
+    /// Rejects unsupported request modes before HTTP, and propagates provider,
+    /// transport, cancellation and response decoding failures.
+    #[instrument(skip(self, request))]
+    pub async fn create_response(
+        &self,
+        request: &ResponsesRequest,
+    ) -> OpenAIResult<ResponsesResponse> {
+        request.validate()?;
+        let response: ResponsesResponse = self.post("/v1/responses", request).await?;
+        if let Some(usage) = &response.usage {
+            self.total_prompt_tokens
+                .fetch_add(usage.input_tokens, Ordering::Relaxed);
+            self.total_completion_tokens
+                .fetch_add(usage.output_tokens, Ordering::Relaxed);
+        }
+        Ok(response)
     }
 
     /// Send a chat completion request.

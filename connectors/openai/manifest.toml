@@ -5,13 +5,13 @@ min_mesh_version = "2.0.0"
 min_protocol = "fcp2-sym/2.0"
 protocol_features = []
 max_datagram_bytes = 65000
-interface_hash = "blake3-256:fcp.interface.v2:ad94fa16e986b112b6c7a34c6a7b35d0977a5e87a06bdb4286a89ed7facc5b3a"
+interface_hash = "blake3-256:fcp.interface.v2:2f1e415c85427047342f03a95bc864845284ee56f9de427824726b83cf050392"
 
 [connector]
 id = "fcp.openai"
 name = "OpenAI Connector"
 version = "0.1.0"
-description = "FCP connector for OpenAI chat completion API with streaming support"
+description = "FCP connector for OpenAI Responses, chat, embeddings, media and realtime APIs"
 archetypes = [
     "operational",
     "streaming",
@@ -41,6 +41,7 @@ required = [
 ]
 optional = [
     "openai.chat",
+    "openai.responses.create",
     "openai.embeddings",
     "openai.images",
     "openai.videos",
@@ -74,6 +75,259 @@ forbidden = [
 
 # -----------------------------------------------------------------------------
 # Operations
+# -----------------------------------------------------------------------------
+
+[provides.operations."openai.responses.create"]
+description = "Create a structured OpenAI response with function calls and conversation continuation"
+capability = "openai.responses.create"
+risk_level = "medium"
+safety_tier = "safe"
+requires_approval = "none"
+idempotency = "none"
+revocation_freshness = "safe"
+
+[provides.operations."openai.responses.create".rate_limit]
+max = 100
+per_ms = 60000
+
+[provides.operations."openai.responses.create".input_schema]
+type = "object"
+required = ["model", "input"]
+additionalProperties = false
+
+[provides.operations."openai.responses.create".input_schema.properties.model]
+description = "Model ID available to the configured OpenAI account; not restricted to legacy chat models"
+type = "string"
+minLength = 1
+
+[provides.operations."openai.responses.create".input_schema.properties.input]
+description = "Text or ordered message, function, reasoning and item-reference inputs"
+type = ["string", "array"]
+
+[provides.operations."openai.responses.create".input_schema.properties.input.items]
+type = "object"
+allOf = [
+    { if = { properties = { type = { const = "message" } } }, then = { required = ["role", "content"] } },
+    { if = { required = ["type"], properties = { type = { const = "function_call" } } }, then = { required = ["call_id", "name", "arguments"] } },
+    { if = { required = ["type"], properties = { type = { const = "function_call_output" } } }, then = { required = ["call_id", "output"] } },
+    { if = { required = ["type"], properties = { type = { const = "item_reference" } } }, then = { required = ["id"] } },
+]
+
+[provides.operations."openai.responses.create".input_schema.properties.input.items.properties.type]
+type = "string"
+enum = ["message", "function_call", "function_call_output", "reasoning", "item_reference"]
+
+[provides.operations."openai.responses.create".input_schema.properties.input.items.properties.id]
+description = "Provider item ID; requires an openai:response_item:<id> resource grant"
+type = "string"
+minLength = 1
+
+[provides.operations."openai.responses.create".input_schema.properties.input.items.properties.role]
+type = "string"
+enum = ["system", "developer", "user", "assistant"]
+
+[provides.operations."openai.responses.create".input_schema.properties.input.items.properties.content]
+type = ["string", "array"]
+
+[provides.operations."openai.responses.create".input_schema.properties.input.items.properties.content.items]
+type = "object"
+
+[provides.operations."openai.responses.create".input_schema.properties.input.items.properties.call_id]
+type = "string"
+minLength = 1
+
+[provides.operations."openai.responses.create".input_schema.properties.input.items.properties.name]
+type = "string"
+minLength = 1
+
+[provides.operations."openai.responses.create".input_schema.properties.input.items.properties.arguments]
+type = "string"
+
+[provides.operations."openai.responses.create".input_schema.properties.input.items.properties.output]
+type = ["string", "array"]
+
+[provides.operations."openai.responses.create".input_schema.properties.input.items.properties.output.items]
+type = "object"
+
+[provides.operations."openai.responses.create".input_schema.properties.instructions]
+type = ["string", "null"]
+
+[provides.operations."openai.responses.create".input_schema.properties.previous_response_id]
+description = "Stored context to continue; requires an openai:response:<id> resource grant"
+type = ["string", "null"]
+minLength = 1
+
+[provides.operations."openai.responses.create".input_schema.properties.tools]
+description = "Client-executed function definitions in flat Responses format; hosted tools are not supported"
+type = ["array", "null"]
+
+[provides.operations."openai.responses.create".input_schema.properties.tools.items]
+type = "object"
+required = ["type", "name"]
+
+[provides.operations."openai.responses.create".input_schema.properties.tools.items.properties.type]
+const = "function"
+
+[provides.operations."openai.responses.create".input_schema.properties.tools.items.properties.name]
+type = "string"
+minLength = 1
+
+[provides.operations."openai.responses.create".input_schema.properties.tools.items.properties.description]
+type = ["string", "null"]
+
+[provides.operations."openai.responses.create".input_schema.properties.tools.items.properties.parameters]
+type = ["object", "null"]
+
+[provides.operations."openai.responses.create".input_schema.properties.tools.items.properties.strict]
+type = ["boolean", "null"]
+
+[provides.operations."openai.responses.create".input_schema.properties.tool_choice]
+oneOf = [
+    { type = "string", enum = ["none", "auto", "required"] },
+    { type = "object", required = ["type", "name"], properties = { type = { const = "function" }, name = { type = "string", minLength = 1 } } },
+    { type = "null" },
+]
+
+[provides.operations."openai.responses.create".input_schema.properties.max_output_tokens]
+type = ["integer", "null"]
+minimum = 16
+maximum = 4294967295
+
+[provides.operations."openai.responses.create".input_schema.properties.reasoning]
+type = ["object", "null"]
+
+[provides.operations."openai.responses.create".input_schema.properties.text]
+description = "Text configuration, including structured output under text.format"
+type = ["object", "null"]
+
+[provides.operations."openai.responses.create".input_schema.properties.text.properties.format]
+type = "object"
+
+[provides.operations."openai.responses.create".input_schema.properties.store]
+description = "Provider retention setting; follow the provider default when omitted"
+type = ["boolean", "null"]
+
+[provides.operations."openai.responses.create".input_schema.properties.include]
+type = ["array", "null"]
+
+[provides.operations."openai.responses.create".input_schema.properties.include.items]
+type = "string"
+
+[provides.operations."openai.responses.create".input_schema.properties.metadata]
+type = ["object", "null"]
+
+[provides.operations."openai.responses.create".input_schema.properties.metadata.additionalProperties]
+type = "string"
+
+[provides.operations."openai.responses.create".input_schema.properties.parallel_tool_calls]
+type = ["boolean", "null"]
+
+[provides.operations."openai.responses.create".input_schema.properties.temperature]
+type = ["number", "null"]
+minimum = 0
+maximum = 2
+
+[provides.operations."openai.responses.create".input_schema.properties.top_p]
+type = ["number", "null"]
+minimum = 0
+maximum = 1
+
+[provides.operations."openai.responses.create".input_schema.properties.stream]
+description = "Only synchronous, non-streaming responses are supported"
+oneOf = [{ const = false }, { type = "null" }]
+
+[provides.operations."openai.responses.create".input_schema.properties.background]
+description = "Background jobs require lifecycle support and are not supported by this operation"
+oneOf = [{ const = false }, { type = "null" }]
+
+[provides.operations."openai.responses.create".output_schema]
+type = "object"
+required = ["response", "output_text", "cost_usd"]
+
+[provides.operations."openai.responses.create".output_schema.properties.response]
+description = "Complete provider object, including function calls, status, errors, usage and future fields"
+type = "object"
+required = ["id", "object", "status", "model", "output", "usage"]
+
+[provides.operations."openai.responses.create".output_schema.properties.response.properties.id]
+type = "string"
+minLength = 1
+
+[provides.operations."openai.responses.create".output_schema.properties.response.properties.object]
+const = "response"
+
+[provides.operations."openai.responses.create".output_schema.properties.response.properties.status]
+type = "string"
+minLength = 1
+
+[provides.operations."openai.responses.create".output_schema.properties.response.properties.model]
+type = "string"
+minLength = 1
+
+[provides.operations."openai.responses.create".output_schema.properties.response.properties.output]
+type = "array"
+
+[provides.operations."openai.responses.create".output_schema.properties.response.properties.output.items]
+type = "object"
+
+[provides.operations."openai.responses.create".output_schema.properties.response.properties.usage]
+type = ["object", "null"]
+required = ["input_tokens", "output_tokens", "total_tokens"]
+
+[provides.operations."openai.responses.create".output_schema.properties.response.properties.usage.properties.input_tokens]
+type = "integer"
+minimum = 0
+
+[provides.operations."openai.responses.create".output_schema.properties.response.properties.usage.properties.output_tokens]
+type = "integer"
+minimum = 0
+
+[provides.operations."openai.responses.create".output_schema.properties.response.properties.usage.properties.total_tokens]
+type = "integer"
+minimum = 0
+
+[provides.operations."openai.responses.create".output_schema.properties.output_text]
+description = "Concatenated output_text blocks; structured provider output remains in response.output"
+type = "string"
+
+[provides.operations."openai.responses.create".output_schema.properties.cost_usd]
+description = "No cost estimate is inferred for arbitrary Responses models or provider services"
+type = "null"
+
+[provides.operations."openai.responses.create".network_constraints]
+host_allow = ["api.openai.com"]
+port_allow = [443]
+ip_allow = []
+cidr_deny = []
+deny_localhost = true
+deny_private_ranges = true
+deny_tailnet_ranges = true
+require_sni = true
+spki_pins = []
+deny_ip_literals = true
+require_host_canonicalization = true
+dns_max_ips = 16
+max_redirects = 0
+connect_timeout_ms = 10000
+total_timeout_ms = 120000
+max_response_bytes = 10485760
+
+[provides.operations."openai.responses.create".ai_hints]
+when_to_use = "Generate structured responses with current OpenAI models and client-executed functions; continue using previous_response_id or explicit history."
+common_mistakes = [
+    "Using Chat Completions' nested function schema instead of flat Responses function definitions.",
+    "Dropping function call IDs, raw argument strings or reasoning items between turns.",
+    "Omitting resource grants for previous responses, provider item IDs, files or referenced input URLs; resource suffixes escape percent, question-mark and star literals as %25, %3F and %2A.",
+    "Treating cost_usd=null as a zero price; actual token usage is in response.usage.",
+    "Enabling streaming, background execution or hosted/MCP tools; these modes are not implemented by this operation.",
+    "Reading only output_text when response.status is failed or incomplete; inspect the complete response.",
+]
+examples = [
+    '{"model":"gpt-6.2-astra","input":"Hello","max_output_tokens":256}',
+    '{"model":"gpt-6.2-astra","previous_response_id":"resp_previous","input":[{"type":"function_call_output","call_id":"call_weather","output":"18 C"}]}',
+]
+related = ["openai.chat", "openai.get_usage"]
+
 # -----------------------------------------------------------------------------
 
 [provides.operations."openai.chat"]
@@ -412,8 +666,13 @@ description = "Total completion tokens generated in session"
 type = "integer"
 
 [provides.operations."openai.get_usage".output_schema.properties.total_cost_usd]
-description = "Total estimated cost in USD"
+description = "Tracked legacy cost estimate in USD; excludes unpriced Responses requests"
 type = "number"
+
+[provides.operations."openai.get_usage".output_schema.properties.unpriced_response_requests]
+description = "Responses requests whose provider cost is not included in total_cost_usd"
+type = "integer"
+minimum = 0
 
 [provides.operations."openai.get_usage".output_schema.properties.requests_total]
 description = "Total requests made"
@@ -2683,6 +2942,13 @@ burst = 20
 scope = "instance"
 
 [[rate_limits.pools]]
+id = "openai.responses"
+requests = 100
+window_ms = 60000
+burst = 20
+scope = "instance"
+
+[[rate_limits.pools]]
 id = "openai.usage"
 requests = 1000
 window_ms = 60000
@@ -2746,6 +3012,7 @@ burst = 10
 scope = "instance"
 
 [rate_limits.operation_pools]
+"openai.responses.create" = ["openai.responses"]
 "openai.embeddings" = ["openai.embeddings"]
 "openai.images.generate" = ["openai.images"]
 "openai.videos.generate" = ["openai.videos"]

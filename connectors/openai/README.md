@@ -8,7 +8,7 @@
 
 ## Purpose
 
-This document fixes the operator-facing contract for `fcp.openai`. The connector exposes OpenAI chat, embeddings, image generation, video generation, audio transcription, realtime transcription, realtime voice, browser realtime client-secret minting, text-to-speech, fine-tuning jobs, Assistants, Threads, messages, and runs.
+This document fixes the operator-facing contract for `fcp.openai`. The connector exposes OpenAI Responses, chat, embeddings, image generation, video generation, audio transcription, realtime transcription, realtime voice, browser realtime client-secret minting, text-to-speech, fine-tuning jobs, Assistants, Threads, messages, and runs.
 
 The connector is broad, but it is not a credential store. OpenAI Codex OAuth/device-code transport is explicitly host-mediated and rejected inside connector-local configuration.
 
@@ -17,6 +17,7 @@ The connector is broad, but it is not a credential store. OpenAI Codex OAuth/dev
 The current runtime invoke IDs are:
 
 - `openai.chat`
+- `openai.responses.create`
 - `openai.simple_chat`
 - `openai.get_usage`
 - `openai.embeddings`
@@ -76,6 +77,7 @@ Authority and budget counters are process-local. The trusted host remains respon
 
 The first OpenAI README slice documents the existing runtime surface:
 
+- structured Responses generation, function calls and retained-context continuation
 - chat and simple chat through Chat Completions
 - SSE chat streaming at the client layer
 - embeddings with `text-embedding-3-small`, `text-embedding-3-large`, and `text-embedding-ada-002`
@@ -91,6 +93,68 @@ The first OpenAI README slice documents the existing runtime surface:
 - local token and cost accounting
 - bound capability-token verification before dispatch
 
+## Responses API And Function Continuation
+
+Use `openai.responses.create` for the current OpenAI Responses API. It accepts a model ID from the configured account without the legacy Chat Completions enum, text or ordered input items, reasoning configuration, structured text output, and flat function definitions. The operation requires the OpenAI API origin; loopback endpoints remain available for deterministic tests.
+
+The `input` portion of a typed FCP invocation can be:
+
+```json
+{
+  "model": "gpt-6.2-astra",
+  "input": "What is the weather in Paris?",
+  "tools": [{
+    "type": "function",
+    "name": "weather",
+    "parameters": {
+      "type": "object",
+      "properties": {"city": {"type": "string"}},
+      "required": ["city"],
+      "additionalProperties": false
+    },
+    "strict": true
+  }],
+  "tool_choice": "auto",
+  "max_output_tokens": 1024
+}
+```
+
+The operation result is `{ response, output_text, cost_usd }`. The complete provider object is retained under `response`, including ordered output items, function call IDs and raw argument strings, reasoning continuity, annotations, provider status/error details, and future fields. `output_text` is a convenience projection. Always inspect `response.status`; a provider result marked failed or incomplete retains its diagnostic fields.
+
+Execute requested functions in the caller, then continue with the returned response ID and the matching function `call_id`:
+
+```json
+{
+  "model": "gpt-6.2-astra",
+  "previous_response_id": "resp_previous",
+  "input": [{
+    "type": "function_call_output",
+    "call_id": "call_weather",
+    "output": "18 C, sunny"
+  }]
+}
+```
+
+Explicit history may also contain messages, function calls, function outputs, reasoning items and item references. The connector preserves supplied data and never executes function arguments. The provider controls model availability and storage; the optional `store` field is forwarded, and retained-context continuation depends on provider retention. Instructions are sent per request.
+
+Signed resource grants cover the model and every referenced provider object or external content URL:
+
+| Request field | Resource scope |
+|---|---|
+| `model` | `openai:model:<model>` |
+| `previous_response_id` | `openai:response:<id>` |
+| Any top-level input item's `id` | `openai:response_item:<id>` |
+| Content-part `file_id` | `openai:file:<id>` |
+| HTTP(S) `file_url` or `image_url` | `openai:input_url:<canonical-url>` |
+
+Content-part references are checked in both message content and function outputs. Inline `data:image` content is caller-supplied data. URL scopes use `url::Url` canonicalization. All scope suffixes then escape `%`, `?` and `*`, in that order, as `%25`, `%3F` and `%2A`. This keeps literal URL characters from becoming capability-policy glob operators. For example, `https://example.com/a?b=1` requires `openai:input_url:https://example.com/a%3Fb=1`.
+
+This operation supports client-executed function tools. Hosted/MCP tools, active hosted-tool continuation items, streaming and background jobs are rejected during local validation. Simulation applies the same request and reference checks without provider traffic or budget debit.
+
+Actual input/output token counts are retained in `response.usage` and added to the connector's token counters. `cost_usd` is explicitly null because the legacy chat price table cannot price arbitrary Responses models or provider services. `openai.get_usage.unpriced_response_requests` counts these requests; its `total_cost_usd` excludes them. Response budgeting includes the additional `output_text` projection.
+
+OpenAI [retired the Assistants API on August 26, 2026](https://developers.openai.com/api/docs/assistants/migration). Existing Assistants/Threads bindings remain in the catalog, and the Responses operation provides the current generation and function-continuation path. API details: [create response](https://developers.openai.com/api/reference/resources/responses/methods/create) and [function calling](https://developers.openai.com/api/docs/guides/function-calling).
+
 ## Auth And Scope Boundary
 
 - Authentication mechanisms: OpenAI API key or host-injected credential ID.
@@ -100,6 +164,7 @@ The first OpenAI README slice documents the existing runtime surface:
 - Forbidden source zone: `z:public`.
 - Capability surface:
   - `openai.chat` gates chat, simple chat, and local usage accounting.
+  - `openai.responses.create` gates the synchronous Responses operation and its separately scoped context references.
   - `openai.embeddings` gates embedding creation.
   - `openai.images` gates image generation.
   - `openai.videos` gates video generation.
@@ -212,7 +277,8 @@ The deterministic integration evidence is anchored on WireMock and connector-loc
 - `connectors/openai/src/types.rs` defines model IDs, pricing, message and tool shapes, embeddings, images, video, audio, TTS, fine-tune, Assistants, Threads, runs, and response types.
 - `connectors/openai/manifest.toml` defines the broad operation catalog, network constraints, sandbox boundary, event capability metadata, and no-listener/no-storage/no-exec posture.
 - `connectors/openai/tests/integration.rs` covers deterministic loopback, error behavior, capability boundaries, lifecycle, realtime WebSocket fixtures, and validation.
-- `connectors/openai/tests/native_host.rs` exercises the shipped executable with real loopback HTTP, a complete tool-call conversation, signed budgets, malformed frames and terminal shutdown.
+- `connectors/openai/tests/native_host.rs` exercises the shipped executable with real loopback HTTP, chat and Responses tool-call conversations, signed resource/budget constraints, malformed frames and terminal shutdown.
+- `connectors/openai/tests/responses.rs` covers provider request shapes, retained/stateless continuation, reference validation, retries, actual usage accounting and lossless failed/incomplete outputs.
 - `connectors/openai/tests/live_verification.rs` emits live skip/pass results when `OPENAI_API_KEY` is absent or present.
 
 ## Verification Bundle
