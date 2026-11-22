@@ -530,6 +530,85 @@ fn chunked_video_body_is_bounded_and_failed_work_cannot_regain_a_call() {
 }
 
 #[test]
+fn malformed_chat_responses_never_become_success_or_regain_their_signed_call() {
+    let tool_call = json!({"id": "call-1", "type": "function", "function": {"name": "weather", "arguments": "{}"}});
+    let server = Server::start(vec![
+        HttpResponse::json(json!({"error": {"message": "generation failed"}})),
+        HttpResponse::json(
+            json!({"id": "chat-empty", "model": "openai/gpt-4.1-mini", "choices": []}),
+        ),
+        HttpResponse::json(
+            json!({"id": "chat-no-model", "choices": [{"message": {"content": "text"}}]}),
+        ),
+        HttpResponse::json(
+            json!({"id": "", "model": "openai/gpt-4.1-mini", "choices": [{"message": {"content": "text"}}]}),
+        ),
+        HttpResponse::json(
+            json!({"id": "chat-tools", "model": "openai/gpt-4.1-mini", "choices": [{
+                "message": {"role": "assistant", "content": null, "tool_calls": [tool_call.clone()]}, "finish_reason": "tool_calls"
+            }]}),
+        ),
+    ]);
+    let key = Ed25519SigningKey::generate();
+    let mut process = NativeProcess::start();
+    let instance = process.configure(&server, &key);
+    for index in 0..4 {
+        let invocation = request(
+            &key,
+            &instance,
+            "openrouter.chat.completions",
+            format!("malformed-{index}").as_bytes(),
+            one_call(&["openrouter:model:openai/gpt-4.1-mini"]),
+            json!({"messages": [{"role": "user", "content": "Hello"}]}),
+        );
+        let failed = process.rpc("malformed-chat", "invoke", invocation.clone());
+        assert!(failed.get("result").is_none());
+        assert!(
+            failed["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("incomplete chat completion")
+        );
+        assert_eq!(failed["error"]["retryable"], false);
+        assert_eq!(
+            process.rpc("no-chat-replay", "invoke", invocation)["error"]["code"],
+            "FCP-3001"
+        );
+        assert!(
+            server
+                .receive()
+                .headers
+                .starts_with("POST /chat/completions ")
+        );
+        server.assert_no_requests();
+    }
+    let invocation = request(
+        &key,
+        &instance,
+        "openrouter.chat.completions",
+        b"valid-tool-call",
+        one_call(&["openrouter:model:openai/gpt-4.1-mini"]),
+        json!({"messages": [{"role": "user", "content": "Weather?"}]}),
+    );
+    let result = output(process.rpc("valid-tools", "invoke", invocation));
+    assert!(result["content"].is_null());
+    assert_eq!(result["finish_reason"], "tool_calls");
+    assert_eq!(
+        result["raw"]["choices"][0]["message"]["tool_calls"][0],
+        tool_call
+    );
+    assert!(
+        server
+            .receive()
+            .headers
+            .starts_with("POST /chat/completions ")
+    );
+    process.rpc("shutdown", "shutdown", json!({}));
+    assert!(process.wait_for_exit().success());
+    server.finish();
+}
+
+#[test]
 fn oversized_native_frame_is_rejected_before_any_dispatch() {
     let mut process = NativeProcess::start();
     let mut frame = vec![b' '; 16 * 1024 * 1024 + 1];

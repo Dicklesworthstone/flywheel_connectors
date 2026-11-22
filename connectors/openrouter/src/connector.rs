@@ -695,6 +695,7 @@ impl OpenRouterConnector {
         copy_if_present(&mut body, input, "tool_choice");
 
         let response = client.post_json("/chat/completions", body).await?;
+        validate_chat_response(&response)?;
         Ok(json!({
             "id": response.get("id").cloned().unwrap_or(Value::Null),
             "model": response.get("model").cloned().unwrap_or(Value::Null),
@@ -1079,6 +1080,43 @@ fn invalid_input(message: &str) -> FcpError {
     FcpError::InvalidRequest {
         code: 1003,
         message: message.into(),
+    }
+}
+
+fn validate_chat_response(response: &Value) -> FcpResult<()> {
+    let invalid = || FcpError::External {
+        service: "openrouter".into(),
+        message: "Provider returned an incomplete chat completion; provider outcome may be unknown"
+            .into(),
+        status_code: Some(200),
+        retryable: false,
+        retry_after: None,
+    };
+    for field in ["id", "model"] {
+        if response
+            .get(field)
+            .and_then(Value::as_str)
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            return Err(invalid());
+        }
+    }
+    let message = response
+        .pointer("/choices/0/message")
+        .and_then(Value::as_object)
+        .ok_or_else(invalid)?;
+    let has_tools = message
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .is_some_and(|calls| !calls.is_empty());
+    let has_refusal = message
+        .get("refusal")
+        .and_then(Value::as_str)
+        .is_some_and(|refusal| !refusal.trim().is_empty());
+    match message.get("content") {
+        Some(Value::String(_) | Value::Array(_) | Value::Null) => Ok(()),
+        None if has_tools || has_refusal => Ok(()),
+        _ => Err(invalid()),
     }
 }
 
