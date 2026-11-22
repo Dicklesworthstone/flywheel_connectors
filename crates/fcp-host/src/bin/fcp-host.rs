@@ -28,7 +28,7 @@ use axum::{
         header::{CACHE_CONTROL, ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, VARY},
     },
     middleware::{Next, from_fn_with_state},
-    response::Response,
+    response::{IntoResponse, Response},
     routing::{delete, get, post},
 };
 use base64::Engine;
@@ -7152,6 +7152,7 @@ Startup configuration is supplied via environment variables:
   FCP_HOST_BIND
   FCP_HOST_CONNECTORS or FCP_HOST_CONNECTORS_FILE
   FCP_HOST_LIFECYCLE_STATE_FILE
+  FCP_HOST_INVOCATION_RESULTS_DIR (opt-in private response recovery; 24-hour retention)
   FCP_HOST_ADMIN_BEARER_TOKEN
   FCP_HOST_CAPABILITY_PUBLIC_KEY or FCP_HOST_CAPABILITY_PUBLIC_KEY_FILE
   FCP_HOST_APPROVAL_PUBLIC_KEY or FCP_HOST_APPROVAL_PUBLIC_KEY_FILE
@@ -10375,6 +10376,18 @@ fn open_host_invocation_stores(
     Ok((lifecycle, audit))
 }
 
+/// Potentially sensitive response output is never persisted unless explicitly
+/// enabled. The directory must be absolute and private; fixed byte/count/age
+/// limits are independent of the payload-free lifecycle history.
+fn open_host_invocation_results() -> HostResult<Option<Arc<fcp_host::InvocationResultStore>>> {
+    let Some(directory) = std::env::var_os("FCP_HOST_INVOCATION_RESULTS_DIR") else {
+        return Ok(None);
+    };
+    fcp_host::InvocationResultStore::open(PathBuf::from(directory))
+        .map(Arc::new)
+        .map(Some)
+}
+
 fn invoke_audit_unavailable(phase: &'static str, error: fcp_audit::AuditError) -> HostError {
     tracing::error!(
         event = "invoke_audit_append_error",
@@ -10444,6 +10457,7 @@ async fn async_main(telemetry_config: TelemetryConfig) -> HostResult<()> {
 
     // Acquire journal ownership before spawning runtimes or recovering pending
     // lifecycle admissions. A second host must fail before touching live work.
+    let result_store = open_host_invocation_results()?;
     let (lifecycle, invoke_audit) =
         open_host_invocation_stores(HostAdminStateStore::persistence_path_from_env()?)?;
     let event_journal = native_events::open_journal()?;
@@ -10494,6 +10508,8 @@ async fn async_main(telemetry_config: TelemetryConfig) -> HostResult<()> {
             "mesh-backed invoke routing enabled"
         );
     }
+    let mut invoke_jobs = invoke_jobs::InvocationJobs::new();
+    invoke_jobs.result_store = result_store;
     let state = Arc::new(AppState {
         registry,
         doctor,
@@ -10515,7 +10531,7 @@ async fn async_main(telemetry_config: TelemetryConfig) -> HostResult<()> {
         zone_policies: Arc::new(RwLock::new(zone_policies)),
         telemetry_config,
         invoke_audit,
-        invoke_jobs: Arc::new(invoke_jobs::InvocationJobs::new()),
+        invoke_jobs: Arc::new(invoke_jobs),
         started_at: Instant::now(),
         mesh: mesh_router,
         connector_state_replication,
@@ -10625,6 +10641,11 @@ async fn async_main(telemetry_config: TelemetryConfig) -> HostResult<()> {
         )
         .route("/rpc/admin/journal", post(journal_query_handler))
         .route("/rpc/admin/invocations", post(invocation_query_handler))
+        .route(
+            "/rpc/admin/invocations/result",
+            post(invocation_result_handler)
+                .layer(axum::extract::DefaultBodyLimit::max(16 * 1024)),
+        )
         .route(
             "/rpc/admin/journal/{connector_id}",
             get(journal_connector_handler),
@@ -20055,6 +20076,50 @@ async fn invocation_query_handler(
     Ok(Json(observation))
 }
 
+/// Release a private response only to the protected owner-admin API, bound to
+/// the exact retained local success. Metadata queries never include output,
+/// and an ID/attempt alone cannot select data from another zone or effect.
+async fn invocation_result_handler(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<fcp_host::InvocationResultQueryRequest>,
+) -> Result<Response, (StatusCode, String)> {
+    request.binding.validate().map_err(map_host_error)?;
+    let record = state
+        .lifecycle
+        .invocation_record(
+            &request.binding.ticket.operation_id,
+            Some(request.binding.ticket.attempt_id),
+        )
+        .await;
+    let binding = record
+        .as_ref()
+        .and_then(|record| fcp_host::InvocationResultBinding::from_record(record).ok());
+    if binding.as_ref() != Some(&request.binding)
+        || state
+            .invoke_jobs
+            .is_active(&request.binding.ticket.operation_id)
+    {
+        return Err(map_host_error(HostError::PreflightFailed(
+            "invocation result requires the exact completed local attempt and effect binding"
+                .to_owned(),
+        )));
+    }
+    let result = state
+        .invoke_jobs
+        .result_store
+        .as_ref()
+        .map(|store| store.get(&request.binding, Utc::now()))
+        .transpose()
+        .map_err(map_host_error)?
+        .flatten();
+    let mut response = Json(fcp_host::InvocationResultQueryResponse { result }).into_response();
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    Ok(response)
+}
+
 async fn journal_query_handler(
     State(state): State<Arc<AppState>>,
     Json(request): Json<JournalQueryRequest>,
@@ -22003,9 +22068,18 @@ output_schema = {{ type = "object" }}
             Some(signing_key.verifying_key()),
             HashMap::from([(ZoneId::work(), host_runtime_policy(ZoneId::work()))]),
         );
-        Arc::get_mut(&mut state)
-            .expect("unshared app state")
-            .invoke_audit = Arc::new(invoke_audit);
+        let unshared = Arc::get_mut(&mut state).expect("unshared app state");
+        unshared.invoke_audit = Arc::new(invoke_audit);
+        #[cfg(unix)]
+        {
+            Arc::get_mut(&mut unshared.invoke_jobs)
+                .expect("unshared jobs")
+                .result_store = Some(Arc::new(
+                fcp_host::InvocationResultStore::open(directory.path().join("private-results"))
+                    .expect("private result custody"),
+            ));
+            unshared.admin_bearer_token = Some(Arc::<str>::from("result-owner-test-secret"));
+        }
         state
             .budget
             .upsert_policy(
@@ -22168,6 +22242,88 @@ output_schema = {{ type = "object" }}
         assert!(!metadata.contains("owned-disconnect-key"));
         assert!(record.admission.idempotency.is_some());
 
+        #[cfg(unix)]
+        {
+            let binding = fcp_host::InvocationResultBinding::from_record(&record)
+                .expect("completed exact attempt");
+            let admin_app = Router::new()
+                .route(
+                    "/rpc/admin/invocations/result",
+                    post(invocation_result_handler),
+                )
+                .route_layer(from_fn_with_state(
+                    Arc::clone(&state),
+                    admin_auth_middleware,
+                ))
+                .with_state(Arc::clone(&state));
+            let request = json!({"binding": binding});
+            for headers in [
+                Vec::new(),
+                vec![
+                    ("Authorization", "Bearer wrong"),
+                    (ADMIN_ZONE_HEADER, "z:owner"),
+                ],
+                vec![
+                    ("Authorization", "Bearer result-owner-test-secret"),
+                    (ADMIN_ZONE_HEADER, "z:work"),
+                ],
+            ] {
+                let denied = send_json_request(
+                    admin_app.clone(),
+                    axum::http::Method::POST,
+                    "/rpc/admin/invocations/result",
+                    request.clone(),
+                    &headers,
+                )
+                .await
+                .expect("admin result request");
+                assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+            }
+            let auth = [
+                ("Authorization", "Bearer result-owner-test-secret"),
+                (ADMIN_ZONE_HEADER, "z:owner"),
+            ];
+            let response = send_json_request(
+                admin_app.clone(),
+                axum::http::Method::POST,
+                "/rpc/admin/invocations/result",
+                request.clone(),
+                &auth,
+            )
+            .await
+            .expect("authorized result request");
+            assert_eq!(response.headers()[CACHE_CONTROL], "no-store");
+            let body = response_body_json_ok(response, "exact recovered output")
+                .await
+                .expect("result response");
+            let recovered: fcp_host::InvocationResultQueryResponse =
+                serde_json::from_value(body).expect("typed retained response");
+            let recovered = recovered
+                .result
+                .expect("actual final response retained after disconnect");
+            recovered
+                .validate(&binding, Utc::now())
+                .expect("complete custody");
+            assert_eq!(
+                recovered.response.result,
+                Some(json!({"private_result": "not persisted in ownership record"}))
+            );
+            for field in ["zone_id", "principal", "operation"] {
+                let mut wrong = request.clone();
+                wrong["binding"][field] = json!("different-scope");
+                let denied = send_json_request(
+                    admin_app.clone(),
+                    axum::http::Method::POST,
+                    "/rpc/admin/invocations/result",
+                    wrong,
+                    &auth,
+                )
+                .await
+                .expect("mismatched result request");
+                assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+            }
+        }
+
         let durability = state.invoke_audit.durability_status();
         assert_eq!(durability.storage, "local_journal");
         assert_eq!(durability.durable, cfg!(unix));
@@ -22193,6 +22349,22 @@ output_schema = {{ type = "object" }}
             .expect("durable record survived reopen");
         assert_eq!(recovered.terminal, record.terminal);
         assert_eq!(recovered.finalization, record.finalization);
+        #[cfg(unix)]
+        {
+            let results =
+                fcp_host::InvocationResultStore::open(directory.path().join("private-results"))
+                    .expect("reopen private result custody");
+            let binding = fcp_host::InvocationResultBinding::from_record(&recovered)
+                .expect("same durable completed attempt");
+            let result = results
+                .get(&binding, Utc::now())
+                .expect("read exact result")
+                .expect("result survived restart");
+            assert_eq!(
+                result.response.result,
+                Some(json!({"private_result": "not persisted in ownership record"}))
+            );
+        }
     }
 
     #[fcp_async_core::runtime::test(flavor = "multi_thread")]

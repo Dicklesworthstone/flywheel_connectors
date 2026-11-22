@@ -114,6 +114,8 @@ struct JobsState {
 pub(super) struct InvocationJobs {
     state: Mutex<JobsState>,
     capacity: usize,
+    /// Explicit opt-in response custody; ordinary history remains payload-free.
+    pub(super) result_store: Option<Arc<fcp_host::InvocationResultStore>>,
 }
 
 impl InvocationJobs {
@@ -130,6 +132,7 @@ impl InvocationJobs {
                 draining: HashMap::new(),
             }),
             capacity,
+            result_store: None,
         }
     }
 
@@ -1063,6 +1066,39 @@ async fn run_owned(
     // parent fenced, even though the source observation itself is definite.
     // A completed response marker may make confirmed history reclaimable.
     persist_finalization(state, &ticket, finalization, finalize_by).await;
+    // Keep actual output separately only after the complete successful history
+    // has persisted. Losing this optional custody never changes the observed
+    // effect or grants permission to retry it. The owned job remains active
+    // through publication, even when the original HTTP client disconnected.
+    if let (Some(store), Ok(response)) = (&state.invoke_jobs.result_store, &result)
+        && response.status == fcp_kernel::InvokeStatus::Ok
+        && Instant::now() < finalize_by
+        && let Ok(Some(record)) = before_deadline(
+            finalize_by,
+            state
+                .lifecycle
+                .invocation_record(&ticket.operation_id, Some(ticket.attempt_id)),
+            "invocation result binding lookup",
+        )
+        .await
+        && fcp_host::InvocationResultBinding::from_record(&record).is_ok()
+    {
+        match store.retain(&record, response, chrono::Utc::now()) {
+            Ok(true) => {}
+            Ok(false) => tracing::debug!(
+                event = "invoke_result_not_retained",
+                operation_id = %ticket.operation_id,
+                attempt_id = ticket.attempt_id,
+                "optional invocation result exceeds available retention limits",
+            ),
+            Err(_) => tracing::warn!(
+                event = "invoke_result_retention_unavailable",
+                operation_id = %ticket.operation_id,
+                attempt_id = ticket.attempt_id,
+                "optional invocation result custody could not be persisted",
+            ),
+        }
+    }
     match &result {
         Ok(response) => tracing::info!(
             event = "invoke_response",
