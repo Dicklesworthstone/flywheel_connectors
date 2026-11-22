@@ -300,6 +300,8 @@ async fn loopback_acceptance_exercises_write_list_and_topic_paths() {
 
     let posted = connector
         .handle_invoke(json!({
+            "type": "invoke", "id": "loopback-post-message",
+            "connector_id": "fcp.slack", "zone_id": "z:work",
             "operation": "slack.post_message",
             "input": {
                 "channel": CHANNEL_ID,
@@ -316,6 +318,8 @@ async fn loopback_acceptance_exercises_write_list_and_topic_paths() {
         .expect("post message through loopback fixture");
     let channels = connector
         .handle_invoke(json!({
+            "type": "invoke", "id": "loopback-list-channels",
+            "connector_id": "fcp.slack", "zone_id": "z:work",
             "operation": "slack.list_channels",
             "input": {
                 "types": "public_channel"
@@ -331,6 +335,8 @@ async fn loopback_acceptance_exercises_write_list_and_topic_paths() {
         .expect("list channels through loopback fixture");
     let topic = connector
         .handle_invoke(json!({
+            "type": "invoke", "id": "loopback-set-topic",
+            "connector_id": "fcp.slack", "zone_id": "z:work",
             "operation": "slack.set_channel_topic",
             "input": {
                 "channel": CHANNEL_ID,

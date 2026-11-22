@@ -70,6 +70,20 @@ const TEST_SLACK_SIGNING_SECRET: &str = "slack_signing_secret_2026";
 // Helpers
 // ============================================================================
 
+// Every invoke fixture carries the normative native envelope. Tokens are still
+// explicitly minted for the connector's current instance by setup_handshake.
+macro_rules! invoke_request {
+    ($($json:tt)+) => {{
+        let mut request = json!($($json)+);
+        let fields = request.as_object_mut().expect("invoke fixture object");
+        fields.entry("type").or_insert_with(|| json!("invoke"));
+        fields.entry("id").or_insert_with(|| json!(fcp_core::RequestId::random()));
+        fields.entry("connector_id").or_insert_with(|| json!("fcp.slack"));
+        fields.entry("zone_id").or_insert_with(|| json!("z:work"));
+        request
+    }};
+}
+
 fn bundled_slack_manifest() -> &'static fcp_manifest::ConnectorManifest {
     static MANIFEST: OnceLock<fcp_manifest::ConnectorManifest> = OnceLock::new();
     MANIFEST.get_or_init(|| {
@@ -919,7 +933,7 @@ async fn post_message_happy_path() {
 
     let cap = generate_valid_token(&key, "slack.post_message");
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "slack.post_message",
             "input": { "channel": "C01234567", "text": "Hello from FCP!" },
             "capability_token": cap
@@ -976,7 +990,7 @@ async fn post_message_threaded_denies_duplicate_owner_before_http_send() {
         "agent:a",
     );
     let first_result = first
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "slack.post_message",
             "input": {
                 "channel": "C01234567",
@@ -997,7 +1011,7 @@ async fn post_message_threaded_denies_duplicate_owner_before_http_send() {
         "agent:b",
     );
     let second_error = second
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "slack.post_message",
             "input": {
                 "channel": "C01234567",
@@ -1034,7 +1048,7 @@ async fn post_message_rejects_invalid_thread_ts_before_coordination_or_http() {
     let cap =
         generate_valid_token_for_principal(&key, "slack.write", "slack.post_message", "agent:a");
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "slack.post_message",
             "input": {
                 "channel": "C01234567",
@@ -1075,7 +1089,7 @@ async fn post_message_threaded_slack_api_failure_returns_no_coordination_success
     let cap =
         generate_valid_token_for_principal(&key, "slack.write", "slack.post_message", "agent:a");
     let error = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "slack.post_message",
             "input": {
                 "channel": "C01234567",
@@ -1119,7 +1133,7 @@ async fn reply_thread_happy_path() {
 
     let cap = generate_valid_token(&key, "slack.reply_thread");
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "slack.reply_thread",
             "input": {
                 "channel": "C01234567",
@@ -1178,7 +1192,7 @@ async fn reply_thread_denies_duplicate_owner_before_http_send() {
         "agent:a",
     );
     let first_result = first
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "slack.reply_thread",
             "input": {
                 "channel": "C01234567",
@@ -1199,7 +1213,7 @@ async fn reply_thread_denies_duplicate_owner_before_http_send() {
         "agent:b",
     );
     let second_error = second
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "slack.reply_thread",
             "input": {
                 "channel": "C01234567",
@@ -1236,7 +1250,7 @@ async fn reply_thread_rejects_invalid_thread_ts_before_coordination_or_http() {
     let cap =
         generate_valid_token_for_principal(&key, "slack.write", "slack.reply_thread", "agent:a");
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "slack.reply_thread",
             "input": {
                 "channel": "C01234567",
@@ -1277,7 +1291,7 @@ async fn reply_thread_slack_api_failure_returns_no_coordination_success() {
     let cap =
         generate_valid_token_for_principal(&key, "slack.write", "slack.reply_thread", "agent:a");
     let error = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "slack.reply_thread",
             "input": {
                 "channel": "C01234567",
@@ -1326,7 +1340,7 @@ async fn reply_thread_fail_open_sends_with_degraded_coordination_audit() {
     let cap =
         generate_valid_token_for_principal(&key, "slack.write", "slack.reply_thread", "agent:a");
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "slack.reply_thread",
             "input": {
                 "channel": "C01234567",
@@ -1411,7 +1425,7 @@ async fn progress_draft_text_sends_then_edits() {
         generate_valid_token_for_operation(&key, "slack.write", "slack.update_progress_draft");
 
     let first = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "slack.update_progress_draft",
             "input": {
                 "draft_id": "turn-1",
@@ -1427,7 +1441,7 @@ async fn progress_draft_text_sends_then_edits() {
     assert_eq!(first["draft"]["message_ts"], "1234567890.200000");
 
     let second = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "slack.update_progress_draft",
             "input": {
                 "draft_id": "turn-1",
@@ -1524,7 +1538,7 @@ async fn progress_draft_rich_blocks_and_duplicate_suppression() {
     });
 
     let first = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "slack.update_progress_draft",
             "input": base_input,
             "capability_token": cap.clone()
@@ -1548,7 +1562,7 @@ async fn progress_draft_rich_blocks_and_duplicate_suppression() {
         "flush": true
     });
     let second = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "slack.update_progress_draft",
             "input": changed_blocks.clone(),
             "capability_token": cap.clone()
@@ -1558,7 +1572,7 @@ async fn progress_draft_rich_blocks_and_duplicate_suppression() {
     assert_eq!(second["status"], "edited");
 
     let duplicate = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "slack.update_progress_draft",
             "input": changed_blocks,
             "capability_token": cap
@@ -1609,7 +1623,7 @@ async fn progress_draft_clear_deletes_visible_message() {
         generate_valid_token_for_operation(&key, "slack.write", "slack.update_progress_draft");
 
     connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "slack.update_progress_draft",
             "input": {
                 "draft_id": "turn-clear",
@@ -1622,7 +1636,7 @@ async fn progress_draft_clear_deletes_visible_message() {
         .expect("progress draft should send before clear");
 
     let cleared = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "slack.update_progress_draft",
             "input": {
                 "draft_id": "turn-clear",
@@ -1654,7 +1668,7 @@ async fn progress_draft_rejects_oversized_text_before_outbound_call() {
         generate_valid_token_for_operation(&key, "slack.write", "slack.update_progress_draft");
 
     let err = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "slack.update_progress_draft",
             "input": {
                 "draft_id": "turn-oversized",
@@ -1696,7 +1710,7 @@ async fn get_channel_history_happy_path() {
 
     let cap = generate_valid_token(&key, "slack.get_channel_history");
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "slack.get_channel_history",
             "input": { "channel": "C01234567", "limit": 10 },
             "capability_token": cap
@@ -1733,7 +1747,7 @@ async fn search_messages_happy_path() {
 
     let cap = generate_valid_token(&key, "slack.search_messages");
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "slack.search_messages",
             "input": { "query": "deployment in:#general" },
             "capability_token": cap
@@ -1794,7 +1808,7 @@ async fn list_channels_happy_path() {
 
     let cap = generate_valid_token(&key, "slack.list_channels");
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "slack.list_channels",
             "input": { "types": "public_channel" },
             "capability_token": cap
@@ -1839,7 +1853,7 @@ async fn get_user_info_happy_path() {
 
     let cap = generate_valid_token(&key, "slack.get_user_info");
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "slack.get_user_info",
             "input": { "user": "U01234567" },
             "capability_token": cap
@@ -1875,7 +1889,7 @@ async fn upload_file_happy_path() {
 
     let cap = generate_valid_token_for_operation(&key, "slack.files.write", "slack.upload_file");
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "slack.upload_file",
             "input": {
                 "channels": "C01234567",
@@ -1966,7 +1980,7 @@ async fn upload_file_threaded_denies_duplicate_owner_before_http_send() {
         "agent:a",
     );
     let first_result = first
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "slack.upload_file",
             "input": {
                 "channels": "C01234567",
@@ -1989,7 +2003,7 @@ async fn upload_file_threaded_denies_duplicate_owner_before_http_send() {
         "agent:b",
     );
     let second_error = second
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "slack.upload_file",
             "input": {
                 "channels": "C01234567",
@@ -2031,7 +2045,7 @@ async fn upload_file_rejects_invalid_thread_ts_before_coordination_or_http() {
         "agent:a",
     );
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "slack.upload_file",
             "input": {
                 "channels": "C01234567",
@@ -2087,7 +2101,7 @@ async fn upload_file_slack_api_failure_returns_no_coordination_success() {
         "agent:a",
     );
     let error = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "slack.upload_file",
             "input": {
                 "channels": "C01234567",
@@ -2376,7 +2390,7 @@ async fn download_file_happy_path() {
 
     let cap = generate_valid_token_for_operation(&key, "slack.files.read", "slack.download_file");
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "slack.download_file",
             "input": { "file_id": "F01234567" },
             "capability_token": cap
@@ -2542,7 +2556,7 @@ async fn binary_download_upload_roundtrip_preserves_bytes_and_scopes_credentials
     let mut connector = SlackConnector::new();
     setup_configure(&mut connector, server.url()).await;
     let key = setup_handshake(&mut connector, &["slack.files.read", "slack.files.write"]).await;
-    let download = connector.handle_invoke(json!({
+    let download = connector.handle_invoke(invoke_request!({
         "operation": "slack.download_file",
         "input": { "file_id": "FBINARY1" },
         "capability_token": generate_valid_token_for_operation(&key, "slack.files.read", "slack.download_file"),
@@ -2553,7 +2567,7 @@ async fn binary_download_upload_roundtrip_preserves_bytes_and_scopes_credentials
         download["content_sha256"],
         hex::encode(Sha256::digest(content))
     );
-    let upload = connector.handle_invoke(json!({
+    let upload = connector.handle_invoke(invoke_request!({
         "operation": "slack.upload_file",
         "input": {
             "channels": "C01234567",
@@ -2891,7 +2905,7 @@ async fn binary_upload_rejects_invalid_content_before_network() {
         let mut input = content;
         input["channels"] = json!("C01234567");
         input["thread_ts"] = json!("123.456");
-        let error = connector.handle_invoke(json!({
+        let error = connector.handle_invoke(invoke_request!({
             "operation": "slack.upload_file",
             "input": input,
             "capability_token": generate_valid_token_for_operation(&key, "slack.files.write", "slack.upload_file"),
@@ -2902,7 +2916,7 @@ async fn binary_upload_rejects_invalid_content_before_network() {
         );
     }
     let oversized = BASE64_STANDARD.encode(vec![0; 16 * 1024 * 1024 + 1]);
-    let error = connector.handle_invoke(json!({
+    let error = connector.handle_invoke(invoke_request!({
         "operation": "slack.upload_file",
         "input": {"channels": "C01234567", "content_base64": oversized},
         "capability_token": generate_valid_token_for_operation(&key, "slack.files.write", "slack.upload_file"),
@@ -2930,7 +2944,7 @@ async fn add_reaction_happy_path() {
 
     let cap = generate_valid_token(&key, "slack.add_reaction");
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "slack.add_reaction",
             "input": {
                 "channel": "C01234567",
@@ -2965,7 +2979,7 @@ async fn set_channel_topic_happy_path() {
 
     let cap = generate_valid_token(&key, "slack.set_channel_topic");
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "slack.set_channel_topic",
             "input": {
                 "channel": "C01234567",
@@ -3005,7 +3019,7 @@ async fn post_message_emits_receipt() {
 
     let cap = generate_valid_token(&key, "slack.post_message");
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "slack.post_message",
             "input": { "channel": "C01234567", "text": "Hello!" },
             "capability_token": cap
@@ -3048,7 +3062,7 @@ async fn reply_thread_emits_receipt() {
 
     let cap = generate_valid_token(&key, "slack.reply_thread");
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "slack.reply_thread",
             "input": {
                 "channel": "C01234567",
@@ -3090,7 +3104,7 @@ async fn upload_file_emits_receipt() {
 
     let cap = generate_valid_token_for_operation(&key, "slack.files.write", "slack.upload_file");
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "slack.upload_file",
             "input": {
                 "channels": "C01234567",
@@ -3125,7 +3139,7 @@ async fn add_reaction_emits_receipt() {
 
     let cap = generate_valid_token(&key, "slack.add_reaction");
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "slack.add_reaction",
             "input": {
                 "channel": "C01234567",
@@ -3163,7 +3177,7 @@ async fn set_channel_topic_emits_receipt() {
 
     let cap = generate_valid_token(&key, "slack.set_channel_topic");
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "slack.set_channel_topic",
             "input": { "channel": "C01234567", "topic": "New topic" },
             "capability_token": cap
@@ -3201,7 +3215,7 @@ async fn read_operations_have_no_receipt() {
 
     let cap = generate_valid_token(&key, "slack.list_channels");
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "slack.list_channels",
             "input": {},
             "capability_token": cap
@@ -3224,10 +3238,11 @@ async fn events_api_url_verification_uses_verified_webhook_payload() {
     assert_eq!(verified.event_type, "url_verification");
 
     let mut connector = SlackConnector::new();
+    setup_configure(&mut connector, "http://localhost:9999").await;
     let key = setup_handshake(&mut connector, &["slack.read"]).await;
     let cap = generate_valid_token_for_operation(&key, "slack.read", "slack.handle_events_api");
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "slack.handle_events_api",
             "input": {
                 "payload": verified.payload,
@@ -3277,7 +3292,7 @@ async fn events_api_event_callback_emits_after_monitor_policy() {
         .await
         .expect("subscribe to authorized native Events API delivery");
     let cap = generate_valid_token_for_operation(&key, "slack.read", "slack.handle_events_api");
-    let mut invocation = Box::pin(connector.handle_invoke(json!({
+    let mut invocation = Box::pin(connector.handle_invoke(invoke_request!({
         "operation": "slack.handle_events_api",
         "input": {
             "payload": verified.payload,
@@ -3349,7 +3364,7 @@ async fn events_api_event_callback_denied_by_monitor_policy_before_emit() {
     let mut event_rx = connector.subscribe_events();
     let cap = generate_valid_token_for_operation(&key, "slack.read", "slack.handle_events_api");
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "slack.handle_events_api",
             "input": {
                 "payload": verified.payload,
@@ -3378,7 +3393,7 @@ async fn events_api_event_callback_denied_by_monitor_policy_before_emit() {
 }
 
 fn events_api_native_fixture(key: &Ed25519SigningKey, event_id: &str) -> serde_json::Value {
-    json!({
+    invoke_request!({
         "operation": "slack.handle_events_api",
         "input": {
             "signature_result": "verified",
@@ -3998,7 +4013,7 @@ async fn invoke_401_not_authed() {
 
     let cap = generate_valid_token(&key, "slack.post_message");
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "slack.post_message",
             "input": { "channel": "C01234567", "text": "test" },
             "capability_token": cap
@@ -4032,7 +4047,7 @@ async fn invoke_401_invalid_auth() {
 
     let cap = generate_valid_token(&key, "slack.get_channel_history");
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "slack.get_channel_history",
             "input": { "channel": "C01234567" },
             "capability_token": cap
@@ -4066,7 +4081,7 @@ async fn invoke_403_missing_scope() {
 
     let cap = generate_valid_token(&key, "slack.post_message");
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "slack.post_message",
             "input": { "channel": "C01234567", "text": "test" },
             "capability_token": cap
@@ -4103,7 +4118,7 @@ async fn invoke_403_not_in_channel() {
 
     let cap = generate_valid_token(&key, "slack.post_message");
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "slack.post_message",
             "input": { "channel": "C01234567", "text": "test" },
             "capability_token": cap
@@ -4140,7 +4155,7 @@ async fn invoke_403_restricted_action() {
 
     let cap = generate_valid_token(&key, "slack.set_channel_topic");
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "slack.set_channel_topic",
             "input": { "channel": "C01234567", "topic": "new topic" },
             "capability_token": cap
@@ -4177,7 +4192,7 @@ async fn invoke_429_rate_limited_api() {
 
     let cap = generate_valid_token(&key, "slack.post_message");
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "slack.post_message",
             "input": { "channel": "C01234567", "text": "test" },
             "capability_token": cap
@@ -4211,7 +4226,7 @@ async fn invoke_resource_not_found() {
 
     let cap = generate_valid_token(&key, "slack.get_channel_history");
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "slack.get_channel_history",
             "input": { "channel": "C_INVALID" },
             "capability_token": cap
@@ -4413,7 +4428,7 @@ async fn grouped_capabilities_preserve_operation_and_resource_boundaries_before_
             "{case}"
         );
         let error = connector
-            .handle_invoke(json!({
+            .handle_invoke(invoke_request!({
                 "operation": "slack.post_message", "input": input,
                 "capability_token": token,
             }))
@@ -4436,7 +4451,7 @@ async fn fcp2_invoke_requires_handshake() {
 
     // No handshake → NotConfigured (no verifier set)
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "slack.list_channels",
             "input": {},
             "capability_token": { "raw": vec![0u8; 32] }
@@ -4454,7 +4469,7 @@ async fn fcp2_invoke_requires_capability_token() {
     let _key = setup_handshake(&mut connector, &["slack.write"]).await;
 
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "slack.post_message",
             "input": { "channel": "C01234567", "text": "test" }
         }))
@@ -4474,7 +4489,7 @@ async fn fcp2_wrong_capability_denied() {
     // Token is for slack.read, but we invoke slack.post_message
     let cap = generate_valid_token_for_operation(&key, "slack.read", "slack.read");
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "slack.post_message",
             "input": { "channel": "C01234567", "text": "test" },
             "capability_token": cap
@@ -4493,7 +4508,7 @@ async fn fcp2_unknown_operation_rejected() {
 
     let cap = generate_valid_token_for_operation(&key, "slack.nonexistent", "slack.nonexistent");
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "slack.nonexistent",
             "input": {},
             "capability_token": cap
@@ -4518,7 +4533,7 @@ async fn fcp2_missing_operation_field() {
     let _key = setup_handshake(&mut connector, &["slack.read"]).await;
 
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "input": {},
             "capability_token": { "raw": vec![0u8; 32] }
         }))
@@ -4553,6 +4568,7 @@ async fn lifecycle_health_after_configure() {
 async fn lifecycle_handshake_returns_accepted() {
     let _ctx = AsyncTestContext::for_scenario("slack.lifecycle.handshake");
     let mut connector = SlackConnector::new();
+    setup_configure(&mut connector, "http://localhost:9999").await;
 
     let result = connector
         .handle_handshake(json!({
@@ -5496,7 +5512,7 @@ async fn validate_post_message_missing_channel() {
 
     let cap = generate_valid_token(&key, "slack.post_message");
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "slack.post_message",
             "input": { "text": "hello" },
             "capability_token": cap
@@ -5515,7 +5531,7 @@ async fn validate_post_message_missing_text() {
 
     let cap = generate_valid_token(&key, "slack.post_message");
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "slack.post_message",
             "input": { "channel": "C01234567" },
             "capability_token": cap
@@ -5534,7 +5550,7 @@ async fn validate_reply_thread_missing_thread_ts() {
 
     let cap = generate_valid_token(&key, "slack.reply_thread");
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "slack.reply_thread",
             "input": { "channel": "C01234567", "text": "reply" },
             "capability_token": cap
@@ -5553,7 +5569,7 @@ async fn validate_add_reaction_missing_name() {
 
     let cap = generate_valid_token(&key, "slack.add_reaction");
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "slack.add_reaction",
             "input": { "channel": "C01234567", "timestamp": "1234567890.123456" },
             "capability_token": cap
@@ -5580,7 +5596,7 @@ async fn validate_upload_file_missing_channels() {
 
     let cap = generate_valid_token_for_operation(&key, "slack.files.write", "slack.upload_file");
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "slack.upload_file",
             "input": {
                 "resolved_content": "data"

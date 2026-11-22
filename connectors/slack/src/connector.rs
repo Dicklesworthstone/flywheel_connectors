@@ -12,11 +12,14 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use fcp_async_core::channel::{broadcast, watch};
 use fcp_async_core::sync::RwLock;
-use fcp_core::{HealthSnapshot, HealthState, SubscribeRequest, SubscribeResponse, SubscribeResult};
+use fcp_core::{
+    HealthSnapshot, HealthState, InstanceId, InvokeRequest, InvokeResponse, SubscribeRequest,
+    SubscribeResponse, SubscribeResult,
+};
 use fcp_prelude::{
-    AgentHint, BaseConnector, CapabilityGrant, CapabilityId, CapabilityToken, CapabilityVerifier,
+    AgentHint, BaseConnector, CapabilityId, CapabilityToken, CapabilityVerifier,
     ConnectorId, CredentialId, EventCaps, EventData, EventEnvelope, EventInfo, FcpError, FcpResult,
-    HandshakeRequest, HandshakeResponse, IdempotencyClass, Introspection, OperationId,
+    HandshakeRequest, IdempotencyClass, Introspection, OperationId,
     OperationInfo, Principal, RiskLevel, SafetyTier, SelfCheckReport, SessionId, SimulateRequest,
     SimulateResponse, ThreadInfo, TrustLevel, ZoneId, reject_secret_config_material,
 };
@@ -24,7 +27,7 @@ use fcp_sdk::{
     AgentId, ChannelId, ChatCoordinationAuditRecord, ChatCoordinationBackend,
     ChatCoordinationConfig, ChatCoordinationSendDecision, ChatCoordinationSendRequest, DmMode,
     InMemoryThreadOwnershipChecker, ThreadId, ThreadOwnershipChecker, normalize_slack_channel_id,
-    prelude::JsonlEventStream,
+    prelude::{JsonlEventStream, StandaloneSession},
 };
 use fcp_streaming::{WsClient, WsConnection, WsMessage};
 use serde::Deserialize;
@@ -59,6 +62,8 @@ const SLACK_EVENTS_API_VERIFIED_SIGNATURE_RESULT: &str = "verified";
 const NATIVE_EVENT_ACK_TIMEOUT: Duration = Duration::from_secs(60);
 const NATIVE_EVENT_TOPIC: &str = "slack.events";
 const MAX_FILE_CONTENT_BASE64_BYTES: usize = crate::client::MAX_UPLOAD_BYTES.div_ceil(3) * 4;
+// Includes the base64 representation of a bounded 16 MiB download and metadata.
+const MAX_INVOKE_RESPONSE_BYTES: u64 = 32 * 1024 * 1024;
 const MANIFEST_TOML: &str = include_str!("../manifest.toml");
 
 fn is_local_test_host(host: &str) -> bool {
@@ -388,6 +393,7 @@ pub struct SlackConnector {
     base: Arc<BaseConnector>,
     client: Option<SlackClient>,
     socket_mode_bearer: Option<SlackAuth>,
+    authority: Option<StandaloneSession>,
     verifier: Option<CapabilityVerifier>,
     session_id: Option<SessionId>,
     configured_zone: Option<ZoneId>,
@@ -417,6 +423,7 @@ impl SlackConnector {
             base: Arc::new(BaseConnector::new(ConnectorId::from_static("fcp.slack"))),
             client: None,
             socket_mode_bearer: None,
+            authority: None,
             verifier: None,
             session_id: None,
             configured_zone: None,
@@ -461,7 +468,13 @@ impl SlackConnector {
     /// Return this connector instance identifier for capability binding.
     #[must_use]
     pub fn instance_id(&self) -> &str {
-        self.base.instance_id.as_str()
+        self.active_instance_id().as_str()
+    }
+
+    fn active_instance_id(&self) -> &InstanceId {
+        self.authority
+            .as_ref()
+            .map_or(&self.base.instance_id, StandaloneSession::instance_id)
     }
 
     /// Attach the native JSONL transport once, before any handshake.
@@ -484,12 +497,14 @@ impl SlackConnector {
             stream.close();
         }
         self.event_subscription = None;
+        self.authority = None;
         self.verifier = None;
         self.session_id = None;
         self.granted_capabilities.clear();
         self.base.set_handshaken(false);
     }
 
+    #[cfg(test)]
     #[must_use]
     fn manifest_hash() -> String {
         let mut hasher = Sha256::new();
@@ -507,14 +522,14 @@ impl SlackConnector {
         params: serde_json::Value,
     ) -> FcpResult<serde_json::Value> {
         self.revoke_session();
-        self.stop_socket_mode().await?;
+        self.base.set_configured(false);
         if let Some(client) = self.client.take() {
             client.shutdown();
         }
         self.socket_mode_bearer = None;
         self.configured_zone = None;
+        self.stop_socket_mode().await?;
         self.progress_drafts.write().await.clear();
-        self.base.set_configured(false);
         reject_secret_config_material(&params)?;
 
         let receive_mode = match params.get("receive_mode").and_then(Value::as_str) {
@@ -582,12 +597,14 @@ impl SlackConnector {
             client = client.with_base_url(url);
         }
 
-        self.client = Some(client);
-        self.socket_mode_bearer = Some(socket_mode_auth);
-        self.receive_mode = receive_mode;
         *self.subscribed_topics.write().await = Vec::new();
         *self.monitor_policy.write().await = monitor_policy.clone();
         self.progress_drafts.write().await.clear();
+        // Publish the new credential/client only after every suspension point.
+        // A cancelled configure must never leave a handshake-eligible client.
+        self.client = Some(client);
+        self.socket_mode_bearer = Some(socket_mode_auth);
+        self.receive_mode = receive_mode;
         self.chat_coordination_config = chat_coordination_config;
         self.base.set_configured(true);
         info!("Slack connector configured");
@@ -618,6 +635,9 @@ impl SlackConnector {
                 message: format!("Invalid handshake request: {e}"),
             })?;
 
+        if self.client.is_none() {
+            return Err(FcpError::NotConfigured);
+        }
         if !matches!(req.protocol_version.as_str(), "2.0" | "2.0.0") {
             return Err(FcpError::InvalidRequest {
                 code: 1003,
@@ -640,46 +660,36 @@ impl SlackConnector {
                 message: "Slack zone changes require reconfiguration".into(),
             });
         }
+        let mut authority = StandaloneSession::new(MANIFEST_TOML)?;
+        let mut response = authority.handshake(req.clone())?;
+        response.event_caps = Some(EventCaps {
+            streaming: true,
+            replay: false,
+            min_buffer_events: 1,
+            requires_ack: true,
+        });
+        let mut value = serde_json::to_value(&response).map_err(|_| FcpError::Internal {
+            message: "Failed to serialize Slack handshake response".into(),
+        })?;
+        value["instance_id"] = json!(authority.instance_id());
+        value["connector_id"] = json!(self.base.id);
+        value["protocol_version"] = json!("2.0");
+
         self.configured_zone = Some(req.zone.clone());
-        self.granted_capabilities = req.capabilities_requested.iter().cloned().collect();
+        self.granted_capabilities = response
+            .capabilities_granted
+            .iter()
+            .map(|grant| grant.capability.clone())
+            .collect();
         self.verifier = Some(CapabilityVerifier::new(
             req.host_public_key,
             req.zone.clone(),
-            self.base.instance_id.clone(),
+            authority.instance_id().clone(),
         ));
-
-        let session_id = SessionId::new();
-        self.session_id = Some(session_id.clone());
+        self.session_id = Some(response.session_id);
+        self.authority = Some(authority);
         self.base.set_handshaken(true);
-
-        let capabilities_granted: Vec<CapabilityGrant> = req
-            .capabilities_requested
-            .into_iter()
-            .map(|cap| CapabilityGrant {
-                capability: cap,
-                operation: None,
-            })
-            .collect();
-
-        let response = HandshakeResponse {
-            status: "accepted".into(),
-            capabilities_granted,
-            session_id,
-            manifest_hash: Self::manifest_hash(),
-            nonce: req.nonce,
-            event_caps: Some(EventCaps {
-                streaming: true,
-                replay: false,
-                min_buffer_events: 1,
-                requires_ack: true,
-            }),
-            auth_caps: None,
-            op_catalog_hash: None,
-        };
-
-        serde_json::to_value(response).map_err(|e| FcpError::Internal {
-            message: format!("Failed to serialize response: {e}"),
-        })
+        Ok(value)
     }
 
     /// Handle health check.
@@ -729,7 +739,7 @@ impl SlackConnector {
             details: Some(json!({
                 "configured": self.client.is_some(),
                 "handshaken": self.session_id.is_some(),
-                "instance_id": self.base.instance_id,
+                "instance_id": self.active_instance_id(),
                 "zone_id": self.verifier.as_ref().map(|verifier| &verifier.zone_id),
                 "receive_mode": if self.receive_mode == SlackReceiveMode::SocketMode { "socket_mode" } else { "events_api" },
                 "socket_mode_running": *self.socket_mode_running.read().await,
@@ -1194,6 +1204,12 @@ impl SlackConnector {
                 code: 1003,
                 message: format!("Invalid simulate request: {e}"),
             })?;
+        if req.r#type != "simulate" || req.id.0.is_empty() || !req.input.is_object() {
+            return Err(FcpError::InvalidRequest {
+                code: 1003,
+                message: "Simulation requires a simulate request with a non-empty ID and object input".into(),
+            });
+        }
 
         let operation = req.operation.as_str();
         let Some(capability) = required_capability_for_operation(operation) else {
@@ -1236,7 +1252,7 @@ impl SlackConnector {
             ));
         }
 
-        let Some(verifier) = &self.verifier else {
+        let Some(authority) = &self.authority else {
             let error = FcpError::NotHandshaken;
             return Self::serialize_simulate_response(SimulateResponse::denied(
                 req.id,
@@ -1245,10 +1261,11 @@ impl SlackConnector {
             ));
         };
 
-        let response = match verifier.verify_bound(
-            req.capability_token,
-            &cap_id,
+        let response = match authority.authorize(
+            &req.connector_id,
+            &req.zone_id,
             &req.operation,
+            req.capability_token,
             &resource_uris,
         ) {
             Ok(_) => SimulateResponse::allowed(req.id),
@@ -1429,7 +1446,7 @@ impl SlackConnector {
 
         let event_tx = self.event_tx.clone();
         let connector_id = self.base.id.clone();
-        let instance_id = self.base.instance_id.clone();
+        let instance_id = self.active_instance_id().clone();
         let base = self.base.clone();
         let socket_mode_running = self.socket_mode_running.clone();
         let next_event_seq = self.next_event_seq.clone();
@@ -1679,58 +1696,45 @@ impl SlackConnector {
         &self,
         params: serde_json::Value,
     ) -> FcpResult<serde_json::Value> {
-        let operation =
-            params
-                .get("operation")
-                .and_then(|v| v.as_str())
-                .ok_or(FcpError::InvalidRequest {
-                    code: 1003,
-                    message: "Missing operation".into(),
-                })?;
-
-        let input = params.get("input").cloned().unwrap_or(json!({}));
-
-        let token_value = params
-            .get("capability_token")
-            .ok_or(FcpError::InvalidRequest {
+        let started = Instant::now();
+        self.base.check_ready()?;
+        let request: InvokeRequest =
+            serde_json::from_value(params).map_err(|_| FcpError::InvalidRequest {
                 code: 1003,
-                message: "Missing capability_token".into(),
+                message: "Invalid FCP invoke request: expected type, id, connector_id, operation, zone_id, input and capability_token".into(),
             })?;
-
-        let cap = serde_json::from_value::<CapabilityToken>(token_value.clone()).map_err(|e| {
-            FcpError::InvalidRequest {
+        if !request.input.is_object() || request.deadline_ms == Some(0) {
+            return Err(FcpError::InvalidRequest {
                 code: 1003,
-                message: format!("Invalid capability_token format: {e}"),
-            }
-        })?;
-
-        let op_id: OperationId = operation.parse().map_err(|_| FcpError::InvalidRequest {
-            code: 1003,
-            message: "Invalid operation ID format".into(),
-        })?;
-        let capability = required_capability_for_operation(operation).ok_or_else(|| {
+                message: "Invocation requires object input and an unexpired deadline".into(),
+            });
+        }
+        let operation = request.operation.as_str();
+        required_capability_for_operation(operation).ok_or_else(|| {
             FcpError::OperationNotGranted {
                 operation: operation.into(),
             }
         })?;
-        let cap_id = CapabilityId::from_static(capability);
-
-        let resource_uris = resource_uris_for_operation(operation, &input)?;
-
-        let (zone_id, claimant_agent_id) = if let Some(verifier) = &self.verifier {
-            let bound = verifier.verify_bound(cap, &cap_id, &op_id, &resource_uris)?;
-            let claimant_agent_id = bound
+        validate_simulate_input(operation, &request.input)?;
+        let resource_uris = resource_uris_for_operation(operation, &request.input)?;
+        let witness = self
+            .authority
+            .as_ref()
+            .ok_or(FcpError::NotHandshaken)?
+            .admit_bounded(&request, &resource_uris, MAX_INVOKE_RESPONSE_BYTES)?;
+        let claimant_agent_id = AgentId::new(
+            witness
+                .token()
                 .claims()
                 .get_principal_id()
-                .or_else(|| bound.claims().get_subject())
-                .unwrap_or_else(|| self.base.instance_id.as_str())
-                .to_owned();
-            (verifier.zone_id.clone(), AgentId::new(claimant_agent_id))
-        } else {
-            return Err(FcpError::NotConfigured);
-        };
-
-        match operation {
+                .or_else(|| witness.token().claims().get_subject())
+                .unwrap_or_else(|| self.instance_id())
+                .to_owned(),
+        );
+        let zone_id = request.zone_id.clone();
+        let input = request.input;
+        let dispatch = async {
+            match operation {
             SLACK_EVENTS_API_OPERATION => self.invoke_handle_events_api(input).await,
             "slack.post_message" => {
                 self.invoke_post_message(input, zone_id, claimant_agent_id)
@@ -1755,7 +1759,36 @@ impl SlackConnector {
             _ => Err(FcpError::OperationNotGranted {
                 operation: operation.into(),
             }),
-        }
+            }
+        };
+        let deadline_error = || FcpError::External {
+            service: "slack".into(),
+            message: "Invocation deadline exceeded; outcome unknown, do not retry automatically".into(),
+            status_code: Some(504),
+            retryable: false,
+            retry_after: None,
+        };
+        let result = if let Some(deadline_ms) = request.deadline_ms {
+            let remaining = Duration::from_millis(deadline_ms).saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                // Admission stays charged, but an exhausted deadline must not
+                // poll even an immediately-ready provider/side-effect future.
+                Err(deadline_error())
+            } else {
+                match fcp_async_core::time::timeout(remaining, dispatch).await {
+                    Ok(result) => result,
+                    Err(_) => Err(deadline_error()),
+                }
+            }
+        } else {
+            dispatch.await
+        };
+        let response = match &result {
+            Ok(value) => InvokeResponse::ok(request.id.clone(), value.clone()),
+            Err(error) => InvokeResponse::error(request.id.clone(), error.clone()),
+        };
+        witness.finish_response(&response)?;
+        result
     }
 
     // ── Operation implementations ─────────────────────────────────
@@ -1849,7 +1882,7 @@ impl SlackConnector {
             payload.get("event_id").and_then(Value::as_str),
             payload,
             &self.base.id,
-            &self.base.instance_id,
+            self.active_instance_id(),
             seq,
         );
         event.data.zone_id = subscription.verifier.zone_id.clone();
@@ -2603,14 +2636,14 @@ impl SlackConnector {
         _params: serde_json::Value,
     ) -> FcpResult<serde_json::Value> {
         self.revoke_session();
-        self.stop_socket_mode().await?;
-        self.progress_drafts.write().await.clear();
+        self.base.set_configured(false);
         if let Some(client) = self.client.take() {
             client.shutdown();
         }
         self.socket_mode_bearer = None;
         self.configured_zone = None;
-        self.base.set_configured(false);
+        self.stop_socket_mode().await?;
+        self.progress_drafts.write().await.clear();
         info!("Slack connector shutting down");
         Ok(json!({ "status": "shutdown" }))
     }
@@ -4253,6 +4286,370 @@ mod tests {
         })).unwrap();
     }
 
+    fn native_budget_token(
+        key: &Ed25519SigningKey,
+        instance: &str,
+        operation: &str,
+        max_calls: u32,
+        max_bytes: u64,
+    ) -> CapabilityToken {
+        let constraints = CapabilityConstraints {
+            resource_allow: vec!["*".into()],
+            max_calls: Some(max_calls),
+            max_bytes: Some(max_bytes),
+            idempotency_key: Some("native-budget-key".into()),
+            ..Default::default()
+        };
+        let mut cbor = Vec::new();
+        ciborium::into_writer(&constraints, &mut cbor).unwrap();
+        let now = Utc::now();
+        CapabilityToken::from_raw(
+            CapabilityTokenBuilder::new()
+                .capability_id("slack.read")
+                .zone_id("z:work")
+                .principal("user:test")
+                .operations(&[operation])
+                .issuer("node:test")
+                .target_instance(instance)
+                .token_id(b"slack-native-budget")
+                .validity(now - Duration::seconds(60), now + Duration::hours(1))
+                .try_constraints_cbor(&cbor)
+                .unwrap()
+                .sign(key)
+                .unwrap(),
+        )
+    }
+
+    fn native_invocation(token: CapabilityToken, payload: Value) -> Value {
+        json!({
+            "type": "invoke",
+            "id": fcp_core::RequestId::random(),
+            "connector_id": "fcp.slack",
+            "zone_id": "z:work",
+            "operation": SLACK_EVENTS_API_OPERATION,
+            "input": { "signature_result": "verified", "payload": payload },
+            "idempotency_key": "native-budget-key",
+            "capability_token": token,
+        })
+    }
+
+    fn native_simulation(invocation: &Value) -> Value {
+        let mut request = invocation.clone();
+        request["type"] = json!("simulate");
+        request
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn native_handshake_requires_configuration_and_filters_grants() {
+        let key = Ed25519SigningKey::generate();
+        let mut connector = SlackConnector::new();
+        let request = json!({
+            "protocol_version": "2.0.0", "zone": "z:work",
+            "host_public_key": key.verifying_key().to_bytes(),
+            "nonce": vec![0u8; 32],
+            "capabilities_requested": ["slack.read", "system.exec", "slack.unknown"],
+        });
+        assert!(matches!(
+            connector.handle_handshake(request.clone()).await,
+            Err(FcpError::NotConfigured)
+        ));
+        connector
+            .handle_configure(json!({
+                "credential_id": CredentialId::new().to_string(),
+                "receive_mode": "events_api",
+            }))
+            .await
+            .unwrap();
+        let response = connector.handle_handshake(request.clone()).await.unwrap();
+        assert_eq!(response["instance_id"], connector.instance_id());
+        assert_eq!(response["manifest_hash"], SlackConnector::manifest_hash());
+        assert_eq!(response["capabilities_granted"].as_array().unwrap().len(), 1);
+        assert_eq!(response["capabilities_granted"][0]["capability"], "slack.read");
+        assert_eq!(response["event_caps"]["requires_ack"], true);
+
+        let mut empty = request;
+        empty["capabilities_requested"] = json!([]);
+        connector.handle_handshake(empty).await.unwrap();
+        let token = native_token(
+            &key, connector.instance_id(), SLACK_EVENTS_API_OPERATION, "*", 3600,
+        );
+        let invocation = native_invocation(
+            token, json!({"type": "url_verification", "challenge": "empty-grants"}),
+        );
+        assert!(matches!(
+            connector.handle_invoke(invocation.clone()).await,
+            Err(FcpError::CapabilityDenied { .. })
+        ));
+        let simulation: SimulateResponse = serde_json::from_value(
+            connector.handle_simulate(native_simulation(&invocation)).await.unwrap(),
+        ).unwrap();
+        assert!(!simulation.would_succeed);
+        assert!(matches!(
+            connector.handle_subscribe(native_subscribe_request(&connector, &key)).await,
+            Err(FcpError::CapabilityDenied { .. })
+        ));
+        assert_eq!(connector.client.as_ref().unwrap().total_requests(), 0);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn native_admission_checks_scope_and_envelope_before_spending_calls() {
+        let (connector, key, _) = native_test_connector().await;
+        let token = native_budget_token(
+            &key, connector.instance_id(), SLACK_EVENTS_API_OPERATION, 2, 16 * 1024,
+        );
+        let invocation = native_invocation(
+            token, json!({"type": "url_verification", "challenge": "admitted"}),
+        );
+        for change in [
+            json!({"connector_id": "fcp.github"}),
+            json!({"zone_id": "z:private"}),
+            json!({"type": "simulate"}),
+            json!({"id": ""}),
+            json!({"deadline_ms": 0}),
+            json!({"input": null}),
+            json!({"idempotency_key": "different-key"}),
+        ] {
+            let mut request = invocation.clone();
+            request.as_object_mut().unwrap().extend(change.as_object().unwrap().clone());
+            assert!(connector.handle_invoke(request).await.is_err(), "{change}");
+        }
+        for field in ["type", "id", "connector_id", "zone_id"] {
+            let mut request = invocation.clone();
+            request.as_object_mut().unwrap().remove(field);
+            assert!(connector.handle_invoke(request).await.is_err(), "{field}");
+        }
+        for change in [
+            json!({"connector_id": "fcp.github"}),
+            json!({"zone_id": "z:private"}),
+        ] {
+            let mut request = native_simulation(&invocation);
+            request.as_object_mut().unwrap().extend(change.as_object().unwrap().clone());
+            let response: SimulateResponse = serde_json::from_value(
+                connector.handle_simulate(request).await.unwrap(),
+            ).unwrap();
+            assert!(!response.would_succeed, "{change}");
+        }
+        for _ in 0..3 {
+            let response: SimulateResponse = serde_json::from_value(
+                connector.handle_simulate(native_simulation(&invocation)).await.unwrap(),
+            ).unwrap();
+            assert!(response.would_succeed);
+        }
+        for _ in 0..2 {
+            let result = connector.handle_invoke(invocation.clone()).await.unwrap();
+            assert_eq!(result["challenge"], "admitted");
+        }
+        assert!(matches!(
+            connector.handle_invoke(invocation.clone()).await,
+            Err(FcpError::CapabilityDenied { .. })
+        ));
+        let response: SimulateResponse = serde_json::from_value(
+            connector.handle_simulate(native_simulation(&invocation)).await.unwrap(),
+        ).unwrap();
+        assert!(!response.would_succeed);
+        assert_eq!(connector.client.as_ref().unwrap().total_requests(), 0);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn native_response_budget_withholds_output_and_never_refunds_failure() {
+        let (connector, key, _) = native_test_connector().await;
+        let token = native_budget_token(
+            &key, connector.instance_id(), SLACK_EVENTS_API_OPERATION, 2, 16 * 1024,
+        );
+        let invocation = native_invocation(
+            token, json!({"type": "url_verification", "challenge": "x".repeat(9000)}),
+        );
+        // The complete request fits, but the response cannot fit in the signed
+        // remainder. The SDK must withhold it after execution and keep the charge.
+        let request: InvokeRequest = serde_json::from_value(invocation.clone()).unwrap();
+        assert!(serde_json::to_vec(&request).unwrap().len() < 16 * 1024);
+        let error = connector.handle_invoke(invocation.clone()).await.unwrap_err();
+        assert!(!error.is_retryable());
+        assert!(error.to_string().contains("outcome is unknown"));
+        assert!(!error.to_string().contains(&"x".repeat(100)));
+        assert!(matches!(
+            connector.handle_invoke(invocation).await,
+            Err(FcpError::CapabilityDenied { .. })
+        ));
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn native_rehandshake_revokes_old_invocations_and_event_authority() {
+        let (mut connector, key, capture) = native_test_connector().await;
+        let old_instance = connector.instance_id().to_owned();
+        let old_subscribe = native_subscribe_request(&connector, &key);
+        connector.handle_subscribe(old_subscribe.clone()).await.unwrap();
+        capture.auto_ack.store(false, Ordering::SeqCst);
+        let old_subscription = connector.event_subscription.clone().unwrap();
+        let event = socket_frame_to_event(
+            "events_api", Some("old-envelope"), &native_callback_payload(),
+            &connector.base.id, connector.active_instance_id(),
+            slack_event_sequence(&connector.next_event_seq).unwrap(),
+        );
+        let mut pending = Box::pin(old_subscription.deliver(event));
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(pending.as_mut().poll(cx)))
+                .await.is_pending()
+        );
+        let old_invocation = native_invocation(
+            native_token(&key, &old_instance, SLACK_EVENTS_API_OPERATION, "*", 3600),
+            json!({"type": "url_verification", "challenge": "old-instance"}),
+        );
+        let response = connector.handle_handshake(json!({
+            "protocol_version": "2.0.0", "zone": "z:work",
+            "host_public_key": key.verifying_key().to_bytes(),
+            "nonce": vec![0u8; 32], "capabilities_requested": ["slack.read"],
+            "requested_instance_id": old_instance,
+        })).await.unwrap();
+        assert_ne!(connector.instance_id(), old_instance.as_str());
+        assert_eq!(response["instance_id"], connector.instance_id());
+        assert!(pending.await.is_err());
+        assert!(!capture.stream.is_open());
+        assert!(connector.handle_invoke(old_invocation.clone()).await.is_err());
+        let simulation: SimulateResponse = serde_json::from_value(
+            connector.handle_simulate(native_simulation(&old_invocation)).await.unwrap(),
+        ).unwrap();
+        assert!(!simulation.would_succeed);
+        assert!(connector.handle_subscribe(old_subscribe).await.is_err());
+        assert!(!capture.stream.is_open());
+
+        let request = native_subscribe_request(&connector, &key);
+        connector.handle_subscribe(request).await.unwrap();
+        let mut current = Box::pin(connector.handle_invoke(native_invocation(
+            native_token(&key, connector.instance_id(), SLACK_EVENTS_API_OPERATION, "*", 3600),
+            native_callback_payload(),
+        )));
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(current.as_mut().poll(cx)))
+                .await.is_pending()
+        );
+        let old_frame = capture.frames.lock().unwrap()[0].clone();
+        let old_event = &old_frame["params"]["event"];
+        assert!(capture.stream.acknowledge(json!({
+            "stream_id": old_frame["params"]["stream_id"],
+            "ack": {
+                "type": "ack", "topic": old_event["topic"],
+                "seqs": [old_event["seq"]], "cursors": [old_event["cursor"]],
+            },
+        })).is_err());
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(current.as_mut().poll(cx)))
+                .await.is_pending()
+        );
+        acknowledge_capture(&capture, 1);
+        let result = current.await.unwrap();
+        assert_eq!(result["acknowledged"], true);
+        let frames = capture.frames.lock().unwrap();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[1]["params"]["event"]["data"]["instance_id"], connector.instance_id());
+        assert_ne!(frames[0]["params"]["event"]["seq"], frames[1]["params"]["event"]["seq"]);
+        assert_eq!(connector.base.metrics().events_emitted, 1);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn native_cancelled_lifecycle_cannot_reactivate_old_configuration() {
+        for shutdown in [false, true] {
+            let (mut connector, key, capture) = native_test_connector().await;
+            let running = connector.socket_mode_running.clone();
+            let guard = running.write().await;
+            // Stop waits for this lock after authority and credentials are
+            // invalidated. Cancelling that wait must not retain the old client.
+            let mut lifecycle = Box::pin(async {
+                if shutdown {
+                    connector.handle_shutdown(json!({})).await
+                } else {
+                    connector.handle_configure(json!({})).await
+                }
+            });
+            assert!(
+                lifecycle.as_mut().poll(&mut std::task::Context::from_waker(
+                    std::task::Waker::noop()
+                )).is_pending()
+            );
+            drop(lifecycle);
+            drop(guard);
+            assert!(connector.client.is_none());
+            assert!(connector.socket_mode_bearer.is_none());
+            assert!(connector.configured_zone.is_none());
+            assert!(connector.authority.is_none());
+            assert!(connector.verifier.is_none());
+            assert!(!capture.stream.is_open());
+            assert!(matches!(connector.base.check_ready(), Err(FcpError::NotConfigured)));
+            assert!(matches!(
+                connector.handle_handshake(json!({
+                    "protocol_version": "2.0.0", "zone": "z:work",
+                    "host_public_key": key.verifying_key().to_bytes(),
+                    "nonce": vec![0u8; 32], "capabilities_requested": ["slack.read"],
+                })).await,
+                Err(FcpError::NotConfigured)
+            ));
+        }
+
+        let (mut connector, key, capture) = native_test_connector().await;
+        let policy = connector.monitor_policy.clone();
+        {
+            let guard = policy.write().await;
+            let mut configure = Box::pin(connector.handle_configure(json!({
+                "credential_id": CredentialId::new().to_string(),
+                "receive_mode": "events_api",
+            })));
+            // This reaches the later policy reset after construction of the
+            // replacement client. The local client must not be published yet.
+            assert!(
+                configure.as_mut().poll(&mut std::task::Context::from_waker(
+                    std::task::Waker::noop()
+                )).is_pending()
+            );
+            drop(configure);
+            drop(guard);
+        }
+        assert!(connector.client.is_none());
+        assert!(connector.socket_mode_bearer.is_none());
+        assert!(connector.configured_zone.is_none());
+        assert!(connector.authority.is_none());
+        assert!(connector.verifier.is_none());
+        assert!(!capture.stream.is_open());
+        assert!(matches!(connector.base.check_ready(), Err(FcpError::NotConfigured)));
+        assert!(matches!(
+            connector.handle_handshake(json!({
+                "protocol_version": "2.0.0", "zone": "z:work",
+                "host_public_key": key.verifying_key().to_bytes(),
+                "nonce": vec![0u8; 32], "capabilities_requested": ["slack.read"],
+            })).await,
+            Err(FcpError::NotConfigured)
+        ));
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn native_invoke_deadline_does_not_acknowledge_or_refund_pending_delivery() {
+        let (mut connector, key, capture) = native_test_connector().await;
+        connector.handle_subscribe(native_subscribe_request(&connector, &key)).await.unwrap();
+        capture.auto_ack.store(false, Ordering::SeqCst);
+        let mut invocation = native_invocation(
+            native_budget_token(
+                &key, connector.instance_id(), SLACK_EVENTS_API_OPERATION, 2, 16 * 1024,
+            ),
+            native_callback_payload(),
+        );
+        invocation["deadline_ms"] = json!(250);
+        let mut dispatch = Box::pin(connector.handle_invoke(invocation.clone()));
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(dispatch.as_mut().poll(cx)))
+                .await.is_pending()
+        );
+        assert_eq!(capture.frames.lock().unwrap().len(), 1);
+        let error = dispatch.await.unwrap_err();
+        assert!(!error.is_retryable());
+        assert!(error.to_string().contains("outcome unknown"));
+        assert_eq!(capture.frames.lock().unwrap().len(), 1);
+        assert_eq!(connector.base.metrics().events_emitted, 0);
+        assert!(matches!(
+            connector.handle_invoke(invocation).await,
+            Err(FcpError::CapabilityDenied { .. })
+        ));
+        assert_eq!(capture.frames.lock().unwrap().len(), 1);
+    }
+
     #[fcp_async_core::runtime::test]
     async fn native_subscription_enforces_exact_authority_and_request_shape() {
         let (mut connector, key, capture) = native_test_connector().await;
@@ -4402,7 +4799,7 @@ mod tests {
                 Some("envelope"),
                 &native_callback_payload(),
                 &connector.base.id,
-                &connector.base.instance_id,
+                connector.active_instance_id(),
                 1,
             );
             let mut pending = Box::pin(subscription.deliver(event));
@@ -4436,7 +4833,7 @@ mod tests {
             Some("envelope"),
             &native_callback_payload(),
             &connector.base.id,
-            &connector.base.instance_id,
+            connector.active_instance_id(),
             1,
         );
         let mut pending = Box::pin(subscription.deliver(event.clone()));
@@ -5026,6 +5423,13 @@ mod tests {
     #[fcp_async_core::runtime::test]
     async fn test_handshake() {
         let mut connector = SlackConnector::new();
+        connector
+            .handle_configure(json!({
+                "credential_id": CredentialId::new().to_string(),
+                "receive_mode": "events_api",
+            }))
+            .await
+            .unwrap();
         let result = connector
             .handle_handshake(json!({
                 "protocol_version": "2.0.0",
@@ -5189,6 +5593,8 @@ mod tests {
             .expect("test token must otherwise be valid and instance-bound");
         let invoke_error = connector
             .handle_invoke(json!({
+                "type": "invoke", "id": "unknown-operation",
+                "connector_id": "fcp.slack", "zone_id": "z:work",
                 "operation": "slack.noop",
                 "input": {},
                 "capability_token": token.clone(),
@@ -5312,21 +5718,8 @@ mod tests {
 
     #[fcp_async_core::runtime::test]
     async fn test_invoke_without_config() {
-        let mut connector = SlackConnector::new();
-
+        let connector = SlackConnector::new();
         let signing_key = Ed25519SigningKey::generate();
-        let verifying_key = signing_key.verifying_key();
-
-        connector
-            .handle_handshake(json!({
-                "protocol_version": "2.0.0",
-                "zone": "z:work",
-                "host_public_key": verifying_key.to_bytes(),
-                "nonce": vec![0u8; 32],
-                "capabilities_requested": ["slack.read"]
-            }))
-            .await
-            .unwrap();
 
         let cap = generate_valid_token(
             &signing_key,
@@ -5337,6 +5730,8 @@ mod tests {
 
         let result = connector
             .handle_invoke(json!({
+                "type": "invoke", "id": "not-configured",
+                "connector_id": "fcp.slack", "zone_id": "z:work",
                 "operation": "slack.list_channels",
                 "input": {},
                 "capability_token": cap
@@ -5355,6 +5750,7 @@ mod tests {
                 .unwrap()
                 .with_base_url("http://localhost:9999"),
         );
+        connector.base.set_configured(true);
 
         let signing_key = Ed25519SigningKey::generate();
         let verifying_key = signing_key.verifying_key();
@@ -5379,6 +5775,8 @@ mod tests {
 
         let result = connector
             .handle_invoke(json!({
+                "type": "invoke", "id": "missing-text",
+                "connector_id": "fcp.slack", "zone_id": "z:work",
                 "operation": "slack.post_message",
                 "input": { "channel": "C01234567" },
                 "capability_token": cap
@@ -5400,6 +5798,13 @@ mod tests {
     #[fcp_async_core::runtime::test]
     async fn test_invoke_rejects_channel_outside_resource_allow() {
         let mut connector = SlackConnector::new();
+        connector
+            .handle_configure(json!({
+                "credential_id": CredentialId::new().to_string(),
+                "receive_mode": "events_api",
+            }))
+            .await
+            .unwrap();
 
         let signing_key = Ed25519SigningKey::generate();
         let verifying_key = signing_key.verifying_key();
@@ -5425,6 +5830,8 @@ mod tests {
 
         let err = connector
             .handle_invoke(json!({
+                "type": "invoke", "id": "wrong-resource",
+                "connector_id": "fcp.slack", "zone_id": "z:work",
                 "operation": "slack.post_message",
                 "input": {
                     "channel": "C-denied",

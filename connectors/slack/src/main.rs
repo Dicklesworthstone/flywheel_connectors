@@ -459,7 +459,9 @@ mod tests {
             &json!({
                 "jsonrpc": "2.0", "id": "callback-rpc", "method": "invoke",
                 "params": {
-                    "id": "callback-native", "operation": "slack.handle_events_api",
+                    "type": "invoke", "id": "callback-native",
+                    "connector_id": "fcp.slack", "zone_id": "z:work",
+                    "operation": "slack.handle_events_api",
                     "input": {"payload": payload, "signature_result": "verified"},
                     "capability_token": bound_read_token(&key, instance_id, "slack.handle_events_api", &["slack:channel:C_WIRE", "slack:user:U_WIRE", "slack:team:T_WIRE"]),
                 },
@@ -575,11 +577,8 @@ mod tests {
         let response = handle_message(&mut connector, &request.to_string()).await;
         assert_eq!(response["id"], 7);
         assert!(response.get("result").is_none());
-        assert_eq!(response["error"]["code"], "FCP-1003");
-        assert_eq!(
-            response["error"]["message"],
-            "Invalid request: Missing operation"
-        );
+        assert_eq!(response["error"]["code"], "FCP-5002");
+        assert_eq!(response["error"]["message"], "Connector not configured");
     }
 
     #[fcp_async_core::runtime::test]

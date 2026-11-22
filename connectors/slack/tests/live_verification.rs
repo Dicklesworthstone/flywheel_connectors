@@ -320,6 +320,8 @@ async fn live_conversations_list() {
 
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke", "id": "live-list-channels",
+            "connector_id": "fcp.slack", "zone_id": "z:work",
             "operation": "slack.list_channels",
             "input": {},
             "capability_token": cap
@@ -386,6 +388,8 @@ async fn live_error_mapping_invalid_token() {
 
     let err = connector
         .handle_invoke(json!({
+            "type": "invoke", "id": "live-invalid-token",
+            "connector_id": "fcp.slack", "zone_id": "z:work",
             "operation": "slack.list_channels",
             "input": {},
             "capability_token": cap
