@@ -76429,4 +76429,23 @@ require_attestation_types = ["in-toto"]"#,
     fn invariant_json_output_always_has_status_field() {
         // Every JSON response from execute_json must contain a "status" field
         // at the top level, regardless of success or failure.
-        let
+        let scenarios: Vec<Vec<&str>> = vec![
+            vec!["fwc", "--json", "guide"],
+            vec!["fwc", "--json", "list", "--offline"],
+            vec!["fwc", "--json", "show", "github", "--offline"],
+            vec!["fwc", "--json", "zzqxwplm"],
+            vec!["fwc", "--json", "delete", "github"],
+        ];
+
+        for scenario in &scenarios {
+            let (_exit_code, payload) = execute_json(scenario);
+            assert!(
+                payload.get("status").is_some(),
+                "JSON output for {scenario:?} must have a 'status' field, got keys: {:?}",
+                payload
+                    .as_object()
+                    .map(|obj| obj.keys().collect::<Vec<_>>())
+            );
+        }
+    }
+}
