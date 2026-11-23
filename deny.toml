@@ -23,7 +23,6 @@ ignore = [
     # the only im-rc container in the consumer tree is wasm-compose's
     # HashMap of Copy ID types (no panicking element Drop), and workspace
     # code never touches sized-chunks/im-rc directly.
-    "RUSTSEC-2026-0255",
     "RUSTSEC-2025-0111",
     "RUSTSEC-2026-0292",
     "RUSTSEC-2026-0318",
