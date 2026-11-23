@@ -9,8 +9,8 @@ use fcp_mesh::invoke_route::MeshPeerDirectory;
 use super::{
     CheckpointReadError, Duration, Ed25519VerifyingKey, HostResult, Instant, MembershipValidity,
     MeshForwardError, MeshPeerDirectoryCheckpoint, PathBuf, PeerContinuity, PeerSnapshot,
-    SignedMeshPeerDirectory, invalid, read_checkpoint, read_peer_file, storage_error,
-    unix_now_ms, write_checkpoint,
+    SignedMeshPeerDirectory, invalid, read_checkpoint, read_peer_file, storage_error, unix_now_ms,
+    write_checkpoint,
 };
 
 const RELOAD_INTERVAL: Duration = Duration::from_secs(1);
@@ -96,6 +96,31 @@ impl LiveMembership {
         // Preserved peer authority never bypasses expiry or a storage/source fence.
         current.check()?;
         current.continuity.check(snapshot)
+    }
+
+    /// A pending transport may pause during a publication, but must not make
+    /// progress under that uncertainty. Completed unrelated publications keep
+    /// its peer epoch; actual revocation, expiry, and storage/source failures
+    /// terminate the original request. Never block an async transport poll on
+    /// the publisher's lock or mistake contention for a new trusted directory.
+    pub(super) fn peer_transport_ready(
+        &self,
+        snapshot: &PeerSnapshot,
+    ) -> Result<bool, MeshForwardError> {
+        let current = match self.publication.try_read() {
+            Ok(current) => current,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(unavailable("state_poisoned"));
+            }
+        };
+        current.validity.check_at(unix_now_ms(), Instant::now())?;
+        current.continuity.check(snapshot)?;
+        match current.failure {
+            None => Ok(true),
+            Some("checkpoint_commit_in_progress") => Ok(false),
+            Some(reason) => Err(unavailable(reason)),
+        }
     }
 
     /// Runtime selection cannot wait on this publication while holding command
@@ -1194,13 +1219,14 @@ mod tests {
                 "{}".to_owned(),
             );
             let body = serde_json::to_vec(&reply).unwrap();
-            write!(
+            // The origin may now abort its transport as soon as this
+            // publication revokes the peer, before these bytes are written.
+            let _ = write!(
                 socket,
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
-            )
-            .unwrap();
-            socket.write_all(&body).unwrap();
+            );
+            let _ = socket.write_all(&body);
             fixture
         });
         let result = fcp_async_core::runtime::block_on_sync(router.forward(
@@ -1556,6 +1582,179 @@ mod tests {
             assert!(router.ensure_current_peer(&snapshot).is_err());
         }
 
+        #[test]
+        fn transport_pauses_publication_without_blocking_or_reviving_withdrawn_peers() {
+            let mut fixture = Fixture::new();
+            let router = fixture.router();
+            let node = TailscaleNodeId::new("peer");
+            let snapshot = router.trusted_peer(&node).unwrap();
+            let publication = fixture.membership.publication.write().unwrap();
+            assert!(!router.peer_transport_ready(&snapshot).unwrap());
+            drop(publication);
+            fixture.membership.refuse("checkpoint_commit_in_progress");
+            assert!(!router.peer_transport_ready(&snapshot).unwrap());
+            assert!(
+                router.ensure_current_peer(&snapshot).is_err(),
+                "new admission remains fenced"
+            );
+            fixture.payload.expires_at_ms += 60_000;
+            publish(&mut fixture);
+            assert!(router.peer_transport_ready(&snapshot).unwrap());
+            add_other_peer(&mut fixture);
+            publish(&mut fixture);
+            assert!(router.peer_transport_ready(&snapshot).unwrap());
+            fixture.membership.refuse("signed_source_rejected");
+            assert!(router.peer_transport_ready(&snapshot).is_err());
+            fixture.refresh().unwrap();
+            let original = fixture.payload.peers.clone();
+            fixture.payload.peers.retain(|peer| peer.node_id != "peer");
+            publish(&mut fixture);
+            fixture.payload.peers = original;
+            publish(&mut fixture);
+            assert!(router.peer_transport_ready(&snapshot).is_err());
+            let fresh = router.trusted_peer(&node).unwrap();
+            fixture
+                .membership
+                .publication
+                .read()
+                .unwrap()
+                .validity
+                .expired
+                .store(true, Ordering::Release);
+            assert!(router.peer_transport_ready(&fresh).is_err());
+        }
+
+        #[test]
+        fn stalled_forward_stops_on_revocation_before_the_transport_timeout() {
+            for (change, partial_response) in [
+                ("remove", false),
+                ("key", true),
+                ("endpoint", false),
+                ("expire", true),
+                ("storage", false),
+            ] {
+                let mut fixture = Fixture::new();
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                listener.set_nonblocking(true).unwrap();
+                fixture.payload.peers[1].endpoint =
+                    format!("http://{}", listener.local_addr().unwrap());
+                publish(&mut fixture);
+                let router = fixture.router();
+                let (finished, completion) = std::sync::mpsc::channel();
+                let server = std::thread::spawn(move || {
+                    let started = Instant::now();
+                    let mut socket = loop {
+                        match listener.accept() {
+                            Ok((socket, _)) => break socket,
+                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                                assert!(started.elapsed() < Duration::from_secs(5));
+                                std::thread::sleep(Duration::from_millis(1));
+                            }
+                            Err(error) => panic!("accept: {error}"),
+                        }
+                    };
+                    socket
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    socket
+                        .set_write_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let envelope = {
+                        let mut reader = BufReader::new(&mut socket);
+                        let mut line = String::new();
+                        reader.read_line(&mut line).unwrap();
+                        assert_eq!(line, "POST /rpc/mesh/forward HTTP/1.1\r\n");
+                        let mut length = None;
+                        let mut header_bytes = line.len();
+                        loop {
+                            line.clear();
+                            reader.read_line(&mut line).unwrap();
+                            header_bytes += line.len();
+                            assert!(!line.is_empty() && header_bytes <= 8192);
+                            if line == "\r\n" {
+                                break;
+                            }
+                            if let Some((name, value)) = line.split_once(':')
+                                && name.eq_ignore_ascii_case("content-length")
+                            {
+                                length = Some(value.trim().parse::<usize>().unwrap());
+                            }
+                        }
+                        let length = length.unwrap();
+                        assert!(length <= 8192);
+                        let mut body = vec![0; length];
+                        reader.read_exact(&mut body).unwrap();
+                        serde_json::from_slice::<MeshForwardEnvelope>(&body).unwrap()
+                    };
+                    assert!(matches!(envelope.body, MeshForwardBody::Invoke { .. }));
+                    if partial_response {
+                        socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1024\r\nConnection: close\r\n\r\n{").unwrap();
+                        socket.flush().unwrap();
+                    }
+                    match change {
+                        "remove" => {
+                            fixture.payload.peers.retain(|peer| peer.node_id != "peer");
+                            publish(&mut fixture);
+                        }
+                        "key" => {
+                            let key = Ed25519SigningKey::from_bytes(&[34; 32]).unwrap();
+                            fixture.payload.peers[1].public_key_hex =
+                                hex::encode(key.verifying_key().to_bytes());
+                            publish(&mut fixture);
+                        }
+                        "endpoint" => {
+                            fixture.payload.peers[1].endpoint = "http://127.0.0.1:19004".to_owned();
+                            publish(&mut fixture);
+                        }
+                        "expire" => fixture
+                            .membership
+                            .publication
+                            .read()
+                            .unwrap()
+                            .validity
+                            .expired
+                            .store(true, Ordering::Release),
+                        _ => fixture
+                            .membership
+                            .refuse("checkpoint_failure_requires_restart"),
+                    }
+                    // Deliberately keep both the connection and its incomplete
+                    // response alive. The watchdog must finish without an EOF,
+                    // another body chunk, or the request's normal five-second timeout.
+                    completion
+                        .recv_timeout(Duration::from_secs(3))
+                        .expect("forward must stop before this peer closes");
+                    drop(socket);
+                    fixture
+                });
+                let result = fcp_async_core::runtime::block_on_sync(fcp_async_core::time::timeout(
+                    Duration::from_secs(2),
+                    router.forward(
+                        &TailscaleNodeId::new("peer"),
+                        MeshForwardBody::Invoke {
+                            request_json: "{\"operation\":\"non_idempotent_write\"}".to_owned(),
+                            asserted_principal: None,
+                            origin_attempt_id: None,
+                        },
+                    ),
+                ));
+                let _ = finished.send(());
+                let fixture = server.join().unwrap();
+                let error = result
+                    .unwrap()
+                    .expect("authority watchdog must beat outer deadline")
+                    .unwrap_err();
+                assert!(
+                    matches!(&error, MeshForwardFailure::OutcomeUnknown { detail, .. } if detail.contains("authority")),
+                    "{change}: {error:?}"
+                );
+                assert!(!error.safe_to_retry());
+                assert_eq!(router.forward_usage().unwrap(), MeshForwardUsage::default());
+                drop(router);
+                drop(fixture);
+            }
+        }
+
         // Receive a complete signed invoke before publishing changes, then
         // return a reply signed by the original executor. Every I/O is bounded.
         // This tests the actual forwarding path, not just an epoch comparison.
@@ -1629,13 +1828,14 @@ mod tests {
                     "{\"committed\":true}".to_owned(),
                 );
                 let body = serde_json::to_vec(&reply).unwrap();
-                write!(
+                // Revocation can close the client before the old executor
+                // finishes writing. Success cases still require a verified reply.
+                let _ = write!(
                     socket,
                     "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
-                )
-                .unwrap();
-                socket.write_all(&body).unwrap();
+                );
+                let _ = socket.write_all(&body);
                 fixture
             });
             let result = fcp_async_core::runtime::block_on_sync(router.forward(

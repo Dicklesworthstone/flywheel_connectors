@@ -33,6 +33,11 @@
 //! including remove/re-add and rotate/restore sequences. Once delivery may have
 //! occurred, an authority failure is never retry-safe. Expiration and checkpoint
 //! publication/storage fences still apply to every request.
+//! Pending outbound requests recheck authority on every transport poll and at
+//! least every 100 ms while stalled. A membership publication pauses transport
+//! progress within the original deadline; unrelated completed renewals resume
+//! the same request. Revocation drops the owned transport and its reservations,
+//! without implying that already delivered provider effects were rolled back.
 //!
 //! Configuration (all three are required together; a partial configuration
 //! is a startup error rather than a silent single-host fallback):
@@ -53,8 +58,11 @@
 //!   `FCP_HOST_MESH_DIRECTORY_STATE` select owner-signed membership together.
 //!   The peer source then contains a signed directory rather than a raw array.
 
+use std::future::{Future, poll_fn};
 use std::path::{Path, PathBuf};
+use std::pin::pin;
 use std::sync::{Arc, Mutex};
+use std::task::Poll;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fcp_core::{HolderProof, InvokeRequest, TailscaleNodeId};
@@ -121,6 +129,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const ADVERTISEMENT_FETCH_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_REPLY_BYTES: usize = 16 * 1024 * 1024;
 const CANCELLATION_FORWARD_TIMEOUT: Duration = Duration::from_secs(5);
+const FORWARD_AUTHORITY_RECHECK_INTERVAL: Duration = Duration::from_millis(100);
 const CANCELLATION_FORWARD_LIMITS: MeshForwardLimits = MeshForwardLimits {
     max_in_flight: 4,
     max_per_peer: 2,
@@ -480,6 +489,7 @@ pub struct MeshRouter {
     stream_polls: ForwardControl,
     stream_settlements: ForwardControl,
     client: reqwest::Client,
+    forward_timeout: Duration,
     membership: Option<DirectoryGuard>,
 }
 
@@ -497,7 +507,10 @@ impl std::fmt::Debug for MeshRouter {
             .field("forward_limits", &self.forwards.limits())
             .field("cancellation_limits", &self.cancellations.limits())
             .field("stream_poll_limits", &self.stream_polls.limits())
-            .field("stream_settlement_limits", &self.stream_settlements.limits())
+            .field(
+                "stream_settlement_limits",
+                &self.stream_settlements.limits(),
+            )
             .field("durable_replay", &self.durable_replay.is_some())
             .field("owner_signed_membership", &self.membership.is_some())
             .finish_non_exhaustive()
@@ -567,6 +580,7 @@ impl MeshRouter {
             stream_polls,
             stream_settlements,
             client,
+            forward_timeout: settings.forward_timeout,
             membership: None,
         })
     }
@@ -759,6 +773,13 @@ impl MeshRouter {
         self.membership.as_ref().map_or_else(
             || self.ensure_current_directory(snapshot.directory()),
             |membership| membership.check_peer_snapshot(snapshot),
+        )
+    }
+
+    fn peer_transport_ready(&self, snapshot: &PeerSnapshot) -> Result<bool, MeshForwardError> {
+        self.membership.as_ref().map_or_else(
+            || self.ensure_current_peer(snapshot).map(|()| true),
+            |membership| membership.peer_transport_ready(snapshot),
         )
     }
 
@@ -1213,13 +1234,31 @@ impl MeshRouter {
         snapshot: &PeerSnapshot,
     ) -> Result<MeshForwardReply, MeshForwardFailure> {
         let peer_label = peer.node_id.as_str().to_owned();
-        // Recheck after signing, serialization, and resource admission, before
-        // constructing network work. No expired or revoked peer may initiate a send.
-        self.ensure_current_peer(snapshot)
-            .map_err(|error| MeshForwardFailure::NotDelivered {
-                peer: peer_label.clone(),
-                detail: error.to_string(),
-            })?;
+        let started = Instant::now();
+        let budget = if matches!(&envelope.body, MeshForwardBody::Cancel { .. }) {
+            CANCELLATION_FORWARD_TIMEOUT
+        } else {
+            self.forward_timeout
+        };
+        forward_while_authorized(
+            &peer_label,
+            budget,
+            || started.elapsed(),
+            self.forward_request(peer, payload, envelope, snapshot),
+            || self.peer_transport_ready(snapshot),
+            fcp_async_core::time::sleep,
+        )
+        .await
+    }
+
+    async fn forward_request(
+        &self,
+        peer: &MeshPeer,
+        payload: Vec<u8>,
+        envelope: &MeshForwardEnvelope,
+        snapshot: &PeerSnapshot,
+    ) -> Result<MeshForwardReply, MeshForwardFailure> {
+        let peer_label = peer.node_id.as_str().to_owned();
         let url = format!("{}{MESH_FORWARD_ROUTE}", peer.endpoint);
         let request = self
             .client
@@ -1266,14 +1305,8 @@ impl MeshRouter {
                 peer: peer_label.clone(),
                 error,
             })?;
-        // A request may already have executed when this peer's authority changes.
-        // Renewals and edits to other peers do not discard its authenticated result.
-        // An actual revocation still never makes a delivered request safe to replay.
-        self.ensure_current_peer(snapshot)
-            .map_err(|error| MeshForwardFailure::OutcomeUnknown {
-                peer: peer_label,
-                detail: error.to_string(),
-            })?;
+        // The outer poll guard checks current authority after this verification,
+        // including for a ready response that never yielded to its watchdog.
         Ok(reply)
     }
 
@@ -1330,6 +1363,440 @@ impl MeshRouter {
         // node and directory before accepting it, including signed freshness.
         serde_json::from_slice(&bytes)
             .map_err(|error| format!("advertisement is not valid JSON: {error}"))
+    }
+}
+
+/// Own exactly one transport through authority pauses and watchdog ticks.
+/// `Ok(false)` means publication is in progress, not that its old peer is
+/// revoked. Do not poll the transport or release even a ready result until the
+/// publication completes. Neither a pause nor a tick renews the original budget.
+/// A failure after the first transport poll is always ambiguous, even if the
+/// transport happened to be connecting or just returned an ordinary error.
+async fn forward_while_authorized<F, T, A, N, W, Tick>(
+    peer: &str,
+    budget: Duration,
+    elapsed: N,
+    transport: F,
+    authorize: A,
+    mut next_tick: W,
+) -> Result<T, MeshForwardFailure>
+where
+    F: Future<Output = Result<T, MeshForwardFailure>>,
+    A: Fn() -> Result<bool, MeshForwardError>,
+    N: Fn() -> Duration,
+    W: FnMut(Duration) -> Tick,
+    Tick: Future<Output = ()>,
+{
+    let mut transport = pin!(transport);
+    let mut polled = false;
+    let mut completed = None;
+    let guarded = poll_fn(|cx| {
+        let stopped = |polled: bool, detail: &str| {
+            if polled {
+                MeshForwardFailure::OutcomeUnknown {
+                    peer: peer.to_owned(),
+                    detail: detail.to_owned(),
+                }
+            } else {
+                MeshForwardFailure::NotDelivered {
+                    peer: peer.to_owned(),
+                    detail: detail.to_owned(),
+                }
+            }
+        };
+        if elapsed() >= budget {
+            return Poll::Ready(Err(stopped(polled, "mesh forwarding deadline elapsed")));
+        }
+        match authorize() {
+            Ok(true) => {}
+            Ok(false) => return Poll::Pending,
+            Err(_) => {
+                return Poll::Ready(Err(stopped(
+                    polled,
+                    "mesh peer authority is no longer available for this request",
+                )));
+            }
+        }
+        if completed.is_none() {
+            polled = true;
+            if let Poll::Ready(result) = transport.as_mut().poll(cx) {
+                completed = Some(result);
+            }
+        }
+        // Ready or never-waking futures can change authority or consume their
+        // whole budget inside one poll. Check both before accepting any outcome.
+        if elapsed() >= budget {
+            return Poll::Ready(Err(stopped(polled, "mesh forwarding deadline elapsed")));
+        }
+        match authorize() {
+            Ok(true) => completed.take().map_or(Poll::Pending, Poll::Ready),
+            Ok(false) => Poll::Pending,
+            Err(_) => Poll::Ready(Err(stopped(
+                polled,
+                "mesh peer authority is no longer available for this request",
+            ))),
+        }
+    });
+    let mut guarded = pin!(guarded);
+    loop {
+        let delay = FORWARD_AUTHORITY_RECHECK_INTERVAL.min(budget.saturating_sub(elapsed()));
+        let tick = pin!(next_tick(delay));
+        // Poll the guarded request first so an already exhausted deadline or
+        // newly withdrawn authority cannot be starved by an immediately ready tick.
+        match futures_util::future::select(guarded.as_mut(), tick).await {
+            futures_util::future::Either::Left((result, _)) => return result,
+            futures_util::future::Either::Right(_) => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod authority_watch_tests {
+    use std::cell::Cell;
+    use std::future::{pending, ready};
+    use std::task::{Context, Waker};
+
+    use super::*;
+
+    struct MarkDropped<'a>(&'a Cell<bool>);
+
+    impl Drop for MarkDropped<'_> {
+        fn drop(&mut self) {
+            self.0.set(true);
+        }
+    }
+
+    fn revoked() -> MeshForwardError {
+        MeshForwardError::Malformed {
+            field: "peer_directory",
+            detail: "fixture authority withdrawn".to_owned(),
+        }
+    }
+
+    #[test]
+    fn withdrawn_authority_never_polls_an_undispatched_transport() {
+        let polls = Cell::new(0);
+        let dropped = Cell::new(false);
+        let custody = MarkDropped(&dropped);
+        let transport = async {
+            let _custody = custody;
+            polls.set(polls.get() + 1);
+            Ok::<_, MeshForwardFailure>(42)
+        };
+        let mut guarded = Box::pin(forward_while_authorized(
+            "peer",
+            Duration::from_secs(1),
+            || Duration::ZERO,
+            transport,
+            || Err(revoked()),
+            |_| pending(),
+        ));
+        let Poll::Ready(Err(error)) = guarded
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+        else {
+            panic!("revocation must finish without transport progress");
+        };
+        assert!(error.safe_to_retry());
+        assert_eq!(polls.get(), 0);
+        drop(guarded);
+        assert!(dropped.get());
+    }
+
+    #[test]
+    fn authority_changed_inside_ready_or_pending_poll_is_ambiguous() {
+        for ready_result in [false, true] {
+            let current = Cell::new(true);
+            let polls = Cell::new(0);
+            let transport = poll_fn(|_| {
+                polls.set(polls.get() + 1);
+                current.set(false);
+                if ready_result {
+                    Poll::Ready(Ok(42))
+                } else {
+                    Poll::Pending
+                }
+            });
+            let mut guarded = Box::pin(forward_while_authorized(
+                "peer",
+                Duration::from_secs(1),
+                || Duration::ZERO,
+                transport,
+                || {
+                    if current.get() {
+                        Ok(true)
+                    } else {
+                        Err(revoked())
+                    }
+                },
+                |_| pending(),
+            ));
+            let Poll::Ready(Err(error)) = guarded
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+            else {
+                panic!("post-poll revocation must not depend on a timer wake");
+            };
+            assert!(matches!(error, MeshForwardFailure::OutcomeUnknown { .. }));
+            assert!(!error.safe_to_retry());
+            assert_eq!(polls.get(), 1);
+        }
+    }
+
+    #[test]
+    fn revocation_on_a_network_wake_prevents_another_transport_poll() {
+        let current = Cell::new(true);
+        let polls = Cell::new(0);
+        let dropped = Cell::new(false);
+        let custody = MarkDropped(&dropped);
+        let transport = async {
+            let _custody = custody;
+            poll_fn(|_| {
+                polls.set(polls.get() + 1);
+                Poll::<Result<u8, MeshForwardFailure>>::Pending
+            })
+            .await
+        };
+        let mut guarded = Box::pin(forward_while_authorized(
+            "peer",
+            Duration::from_secs(1),
+            || Duration::ZERO,
+            transport,
+            || {
+                if current.get() {
+                    Ok(true)
+                } else {
+                    Err(revoked())
+                }
+            },
+            |_| pending(),
+        ));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(guarded.as_mut().poll(&mut cx).is_pending());
+        current.set(false);
+        let Poll::Ready(Err(error)) = guarded.as_mut().poll(&mut cx) else {
+            panic!("a transport wake must observe withdrawn authority first");
+        };
+        assert!(matches!(error, MeshForwardFailure::OutcomeUnknown { .. }));
+        assert_eq!(polls.get(), 1);
+        drop(guarded);
+        assert!(dropped.get());
+    }
+
+    #[test]
+    fn watchdog_abandons_a_never_waking_transport_without_restarting_it() {
+        let current = Cell::new(true);
+        let polls = Cell::new(0);
+        let ticks = Cell::new(0);
+        let transport = poll_fn(|_| {
+            polls.set(polls.get() + 1);
+            Poll::<Result<u8, MeshForwardFailure>>::Pending
+        });
+        let mut guarded = Box::pin(forward_while_authorized(
+            "peer",
+            Duration::from_secs(1),
+            || Duration::ZERO,
+            transport,
+            || {
+                if current.get() {
+                    Ok(true)
+                } else {
+                    Err(revoked())
+                }
+            },
+            |delay| {
+                assert!(delay <= FORWARD_AUTHORITY_RECHECK_INTERVAL);
+                poll_fn(|_| {
+                    ticks.set(ticks.get() + 1);
+                    current.set(false);
+                    Poll::Ready(())
+                })
+            },
+        ));
+        let Poll::Ready(Err(error)) = guarded
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+        else {
+            panic!("watchdog must recheck a transport that never wakes");
+        };
+        assert!(matches!(error, MeshForwardFailure::OutcomeUnknown { .. }));
+        assert_eq!(polls.get(), 1);
+        assert_eq!(ticks.get(), 1);
+    }
+
+    #[test]
+    fn publication_pauses_pre_send_work_and_ready_results_without_repolling() {
+        for initially_ready in [false, true] {
+            let current = Cell::new(initially_ready);
+            let polls = Cell::new(0);
+            let ticks = Cell::new(0);
+            let transport = poll_fn(|_| {
+                polls.set(polls.get() + 1);
+                assert_eq!(
+                    polls.get(),
+                    1,
+                    "completed transports must never be polled twice"
+                );
+                current.set(false);
+                Poll::Ready(Ok(42))
+            });
+            let mut guarded = Box::pin(forward_while_authorized(
+                "peer",
+                Duration::from_secs(1),
+                || Duration::ZERO,
+                transport,
+                || Ok(current.get()),
+                |_| {
+                    poll_fn(|_| {
+                        ticks.set(ticks.get() + 1);
+                        if ticks.get() == 1 && !initially_ready {
+                            assert_eq!(polls.get(), 0, "publication must hold pre-send admission");
+                        } else {
+                            assert_eq!(polls.get(), 1, "ready result waits for publication");
+                        }
+                        current.set(true);
+                        Poll::Ready(())
+                    })
+                },
+            ));
+            assert_eq!(
+                guarded
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop())),
+                Poll::Ready(Ok(42)),
+            );
+            assert_eq!(polls.get(), 1);
+            assert_eq!(ticks.get(), if initially_ready { 1 } else { 2 });
+        }
+    }
+
+    #[test]
+    fn publication_that_revokes_a_completed_result_never_releases_it() {
+        let phase = Cell::new(0);
+        let polls = Cell::new(0);
+        let mut guarded = Box::pin(forward_while_authorized(
+            "peer",
+            Duration::from_secs(1),
+            || Duration::ZERO,
+            poll_fn(|_| {
+                polls.set(polls.get() + 1);
+                phase.set(1);
+                Poll::Ready(Ok(42))
+            }),
+            || match phase.get() {
+                0 => Ok(true),
+                1 => Ok(false),
+                _ => Err(revoked()),
+            },
+            |_| {
+                poll_fn(|_| {
+                    phase.set(2);
+                    Poll::Ready(())
+                })
+            },
+        ));
+        let Poll::Ready(Err(error)) = guarded
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+        else {
+            panic!("revoked completed response must be withheld");
+        };
+        assert!(matches!(error, MeshForwardFailure::OutcomeUnknown { .. }));
+        assert_eq!(polls.get(), 1);
+    }
+
+    #[test]
+    fn publication_wait_and_ready_work_share_the_original_deadline() {
+        for starts_transport in [false, true] {
+            let elapsed_ms = Cell::new(0);
+            let polls = Cell::new(0);
+            let transport = poll_fn(|_| {
+                polls.set(polls.get() + 1);
+                elapsed_ms.set(10);
+                Poll::Ready(Ok(42))
+            });
+            let mut guarded = Box::pin(forward_while_authorized(
+                "peer",
+                Duration::from_millis(10),
+                || Duration::from_millis(elapsed_ms.get()),
+                transport,
+                || Ok(starts_transport),
+                |delay| {
+                    assert!(delay <= Duration::from_millis(10));
+                    poll_fn(|_| {
+                        elapsed_ms.set(elapsed_ms.get() + 5);
+                        Poll::Ready(())
+                    })
+                },
+            ));
+            let Poll::Ready(Err(error)) = guarded
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+            else {
+                panic!("publication cannot renew an exhausted deadline");
+            };
+            assert_eq!(error.safe_to_retry(), !starts_transport);
+            assert_eq!(polls.get(), usize::from(starts_transport));
+            assert_eq!(elapsed_ms.get(), 10);
+        }
+        let polls = Cell::new(0);
+        let mut guarded = Box::pin(forward_while_authorized(
+            "peer",
+            Duration::ZERO,
+            || Duration::ZERO,
+            async {
+                polls.set(1);
+                Ok(42)
+            },
+            || Ok(true),
+            |_| ready(()),
+        ));
+        let Poll::Ready(Err(error)) = guarded
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+        else {
+            panic!("a ready timer must not starve an already expired request");
+        };
+        assert!(error.safe_to_retry());
+        assert_eq!(polls.get(), 0);
+    }
+
+    #[test]
+    fn current_authority_preserves_transport_outcomes_and_watcher_is_send() {
+        for error in [
+            MeshForwardFailure::NotDelivered {
+                peer: "peer".to_owned(),
+                detail: "connection refused".to_owned(),
+            },
+            MeshForwardFailure::OutcomeUnknown {
+                peer: "peer".to_owned(),
+                detail: "response lost".to_owned(),
+            },
+        ] {
+            let mut guarded = Box::pin(forward_while_authorized(
+                "peer",
+                Duration::from_secs(1),
+                || Duration::ZERO,
+                ready(Err::<u8, _>(error.clone())),
+                || Ok(true),
+                |_| pending(),
+            ));
+            assert_eq!(
+                guarded
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop())),
+                Poll::Ready(Err(error)),
+            );
+        }
+        fn assert_send(_: impl Future + Send) {}
+        assert_send(forward_while_authorized(
+            "peer",
+            Duration::from_secs(1),
+            || Duration::ZERO,
+            ready(Ok(42)),
+            || Ok(true),
+            |_| pending(),
+        ));
     }
 }
 
@@ -1509,20 +1976,36 @@ mod tests {
             TailscaleNodeId::new("node-b"),
             TailscaleNodeId::new("node-a"),
             unix_now_ms(),
-            MeshForwardBody::Cancel { request_json: "{}".to_owned(), origin_attempt_id: 7 },
-        ).unwrap();
+            MeshForwardBody::Cancel {
+                request_json: "{}".to_owned(),
+                origin_attempt_id: 7,
+            },
+        )
+        .unwrap();
         router.accept_inbound(&envelope).unwrap();
         let guard = router.cancellation_origin(&envelope).unwrap();
         router.check_cancellation_origin(&guard, &envelope).unwrap();
-        assert!(other_router.check_cancellation_origin(&guard, &envelope).is_err());
+        assert!(
+            other_router
+                .check_cancellation_origin(&guard, &envelope)
+                .is_err()
+        );
         let different_request = MeshForwardEnvelope::sign(
             &peer_key,
             TailscaleNodeId::new("node-b"),
             TailscaleNodeId::new("node-a"),
             unix_now_ms(),
-            MeshForwardBody::Cancel { request_json: "{}".to_owned(), origin_attempt_id: 8 },
-        ).unwrap();
-        assert!(router.check_cancellation_origin(&guard, &different_request).is_err());
+            MeshForwardBody::Cancel {
+                request_json: "{}".to_owned(),
+                origin_attempt_id: 8,
+            },
+        )
+        .unwrap();
+        assert!(
+            router
+                .check_cancellation_origin(&guard, &different_request)
+                .is_err()
+        );
         let mut forged = envelope.clone();
         forged.signature = "00".repeat(64);
         assert!(router.check_cancellation_origin(&guard, &forged).is_err());
@@ -1532,8 +2015,11 @@ mod tests {
             TailscaleNodeId::new("node-b"),
             TailscaleNodeId::new("node-a"),
             unix_now_ms(),
-            MeshForwardBody::Introspect { connector_id: "test".to_owned() },
-        ).unwrap();
+            MeshForwardBody::Introspect {
+                connector_id: "test".to_owned(),
+            },
+        )
+        .unwrap();
         assert!(router.cancellation_origin(&other_method).is_err());
     }
 
@@ -1551,7 +2037,8 @@ mod tests {
         let receiver_directory = MeshPeerDirectory::from_json(
             TailscaleNodeId::new("node-b"),
             &peers_json(&[("node-a", &local_key)]),
-        ).unwrap();
+        )
+        .unwrap();
         let router = MeshRouter::with_forward_limits(
             MeshRoutingSettings {
                 node_id: TailscaleNodeId::new("node-a"),
@@ -1560,7 +2047,8 @@ mod tests {
                     "node_id": "node-b",
                     "endpoint": endpoint,
                     "public_key_hex": hex::encode(peer_key.verifying_key().to_bytes()),
-                }]).to_string(),
+                }])
+                .to_string(),
                 forward_timeout: Duration::from_secs(5),
             },
             MeshForwardLimits {
@@ -1569,21 +2057,29 @@ mod tests {
                 max_request_bytes: 1024,
                 max_response_bytes: MAX_REPLY_BYTES,
             },
-        ).unwrap();
+        )
+        .unwrap();
         let server = std::thread::spawn(move || {
             let accept_deadline = Instant::now() + Duration::from_secs(5);
             let mut socket = loop {
                 match listener.accept() {
                     Ok((socket, _)) => break socket,
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        assert!(Instant::now() < accept_deadline, "cancel never reached peer");
+                        assert!(
+                            Instant::now() < accept_deadline,
+                            "cancel never reached peer"
+                        );
                         std::thread::sleep(Duration::from_millis(5));
                     }
                     Err(error) => panic!("peer accept failed: {error}"),
                 }
             };
-            socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-            socket.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
             let mut reader = BufReader::new(socket.try_clone().unwrap());
             let mut line = String::new();
             reader.read_line(&mut line).unwrap();
@@ -1609,13 +2105,26 @@ mod tests {
             let mut payload = vec![0; len];
             reader.read_exact(&mut payload).unwrap();
             let envelope: MeshForwardEnvelope = serde_json::from_slice(&payload).unwrap();
-            envelope.verify(
-                &receiver_directory, unix_now_ms(), DEFAULT_MESH_FORWARD_MAX_SKEW_MS,
-            ).unwrap();
-            assert!(matches!(&envelope.body, MeshForwardBody::Cancel { origin_attempt_id: 7, .. }));
+            envelope
+                .verify(
+                    &receiver_directory,
+                    unix_now_ms(),
+                    DEFAULT_MESH_FORWARD_MAX_SKEW_MS,
+                )
+                .unwrap();
+            assert!(matches!(
+                &envelope.body,
+                MeshForwardBody::Cancel {
+                    origin_attempt_id: 7,
+                    ..
+                }
+            ));
             let reply = MeshForwardReply::sign(
-                &peer_key, TailscaleNodeId::new("node-b"), &envelope,
-                200, "{\"accepted\":true}".to_owned(),
+                &peer_key,
+                TailscaleNodeId::new("node-b"),
+                &envelope,
+                200,
+                "{\"accepted\":true}".to_owned(),
             );
             let body = serde_json::to_vec(&reply).unwrap();
             write!(
@@ -1639,35 +2148,50 @@ mod tests {
         assert!(fourth.as_mut().poll(&mut cx).is_pending());
         assert_eq!(router.cancellation_usage().unwrap().in_flight, 4);
         let cancel = || MeshForwardBody::Cancel {
-            request_json: "{}".to_owned(), origin_attempt_id: 7,
+            request_json: "{}".to_owned(),
+            origin_attempt_id: 7,
         };
         let target = TailscaleNodeId::new("node-b");
-        let saturated = fcp_async_core::runtime::block_on_sync(
-            router.forward(&target, cancel()),
-        ).unwrap().unwrap_err();
-        assert!(matches!(saturated, MeshForwardFailure::NotDelivered { detail, .. }
-            if detail.contains("router_in_flight_limit")));
+        let saturated = fcp_async_core::runtime::block_on_sync(router.forward(&target, cancel()))
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            matches!(saturated, MeshForwardFailure::NotDelivered { detail, .. }
+            if detail.contains("router_in_flight_limit"))
+        );
         drop(third);
         drop(fourth);
-        let peer_saturated = fcp_async_core::runtime::block_on_sync(
-            router.forward(&target, cancel()),
-        ).unwrap().unwrap_err();
-        assert!(matches!(peer_saturated, MeshForwardFailure::NotDelivered { detail, .. }
-            if detail.contains("peer_in_flight_limit")));
+        let peer_saturated =
+            fcp_async_core::runtime::block_on_sync(router.forward(&target, cancel()))
+                .unwrap()
+                .unwrap_err();
+        assert!(
+            matches!(peer_saturated, MeshForwardFailure::NotDelivered { detail, .. }
+            if detail.contains("peer_in_flight_limit"))
+        );
         drop(first);
         drop(second);
 
-        let reply = fcp_async_core::runtime::block_on_sync(
-            router.forward(&target, cancel()),
-        ).unwrap().unwrap();
+        let reply = fcp_async_core::runtime::block_on_sync(router.forward(&target, cancel()))
+            .unwrap()
+            .unwrap();
         assert_eq!(reply.body_json, "{\"accepted\":true}");
         assert_eq!(router.forward_usage().unwrap().in_flight, 1);
-        assert_eq!(router.cancellation_usage().unwrap(), MeshForwardUsage::default());
-        let oversized = fcp_async_core::runtime::block_on_sync(
-            router.cancellations.execute("node-b", 128 * 1024 + 1, pending),
-        ).unwrap().unwrap_err();
-        assert!(matches!(oversized, MeshForwardFailure::NotDelivered { detail, .. }
-            if detail.contains("request_byte_limit")));
+        assert_eq!(
+            router.cancellation_usage().unwrap(),
+            MeshForwardUsage::default()
+        );
+        let oversized = fcp_async_core::runtime::block_on_sync(router.cancellations.execute(
+            "node-b",
+            128 * 1024 + 1,
+            pending,
+        ))
+        .unwrap()
+        .unwrap_err();
+        assert!(
+            matches!(oversized, MeshForwardFailure::NotDelivered { detail, .. }
+            if detail.contains("request_byte_limit"))
+        );
         drop(bulk);
         assert_eq!(router.forward_usage().unwrap(), MeshForwardUsage::default());
         server.join().unwrap();
@@ -2401,7 +2925,11 @@ mod tests {
             .stderr(std::process::Stdio::piped());
         let mut child = child.spawn().expect("proxy-isolated mesh test process");
         let child_deadline = Instant::now() + Duration::from_secs(20);
-        while child.try_wait().expect("inspect child test status").is_none() {
+        while child
+            .try_wait()
+            .expect("inspect child test status")
+            .is_none()
+        {
             if Instant::now() >= child_deadline {
                 let _ = child.kill();
                 let _ = child.wait();

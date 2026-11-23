@@ -129,6 +129,13 @@ impl DirectoryGuard {
         self.state.check_peer_snapshot(snapshot)
     }
 
+    pub(super) fn peer_transport_ready(
+        &self,
+        snapshot: &PeerSnapshot,
+    ) -> Result<bool, MeshForwardError> {
+        self.state.peer_transport_ready(snapshot)
+    }
+
     pub(super) fn check_peer_snapshot_for_dispatch(
         &self,
         snapshot: &PeerSnapshot,
