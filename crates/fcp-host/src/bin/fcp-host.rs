@@ -17056,10 +17056,7 @@ async fn perform_host_http_egress(
         )))
         .timeout(Duration::from_millis(u64::from(
             constraints.total_timeout_ms,
-        )))
-        // The host owns redirects so every target receives fresh capability,
-        // credential and network-policy admission before dispatch.
-        .redirect(reqwest::redirect::Policy::none());
+        )));
     if is_https {
         builder = builder.tls_backend_preconfigured(host_egress_rustls_client_config(
             "HTTP",
@@ -17069,7 +17066,7 @@ async fn perform_host_http_egress(
         )?);
     }
     builder = builder.resolve_to_addrs(&decision.canonical_host, socket_addrs);
-    let client = builder.build().map_err(|err| {
+    let client = build_host_egress_http_transport(builder).map_err(|err| {
         HostError::PreflightFailed(format!(
             "host-egress HTTP client for `{}` could not be built: {err}",
             decision.canonical_host
@@ -17113,6 +17110,21 @@ async fn perform_host_http_egress(
     outbound.send().await.map_err(|err| {
         map_reqwest_host_egress_error(err, &request_error_label, &decision.canonical_host)
     })
+}
+
+/// Finalize the transport only after TLS and admitted-address configuration.
+/// Ambient proxies would replace the checked socket destination, while hidden
+/// retries or redirects would send another request without fresh host admission.
+/// Keep these restrictions at the build boundary so later builder settings
+/// cannot silently restore transport-owned authority.
+fn build_host_egress_http_transport(
+    builder: reqwest::ClientBuilder,
+) -> Result<reqwest::Client, reqwest::Error> {
+    builder
+        .no_proxy()
+        .retry(reqwest::retry::never())
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
 }
 
 fn redact_host_http_redirect_authorization(error: HostError, redirects: usize) -> HostError {
@@ -28046,6 +28058,191 @@ output_schema = {{ type = "object" }}
                 .expect("flush 4kw5f.9.6.1 HTTP response");
         });
         (addr, task)
+    }
+
+    async fn host_egress_transport_fixture_server(
+        listener: TcpListener,
+        request_count: usize,
+        response: Vec<u8>,
+    ) -> (TcpListener, Vec<String>) {
+        let mut observed = Vec::new();
+        for _ in 0..request_count {
+            let request = fcp_async_core::time::timeout(Duration::from_secs(3), async {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = d9us6_read_complete_http_request(&mut stream).await;
+                stream.write_all(&response).await.unwrap();
+                stream.flush().await.unwrap();
+                request
+            })
+            .await
+            .expect("bounded transport fixture must receive its request");
+            observed.push(request);
+        }
+        (listener, observed)
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn host_egress_transport_clears_proxy_and_preserves_admitted_dns_target() {
+        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin.local_addr().unwrap();
+        let origin_task = task::spawn(host_egress_transport_fixture_server(
+            origin,
+            1,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\norigin".to_vec(),
+        ));
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let proxy_task = task::spawn(host_egress_transport_fixture_server(
+            proxy,
+            1,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nproxy".to_vec(),
+        ));
+        let url = format!(
+            "http://admitted-egress.invalid:{}/resource",
+            origin_addr.port()
+        );
+        let builder = || {
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(2))
+                .resolve_to_addrs("admitted-egress.invalid", &[origin_addr])
+                .proxy(reqwest::Proxy::all(format!("http://{proxy_addr}")).unwrap())
+        };
+
+        // Control: a DNS override does not prevent a configured proxy from
+        // receiving the request. This also keeps the test independent of the
+        // process environment and Cargo's system-proxy feature unification.
+        let control = builder().build().unwrap();
+        let response = control.get(&url).send().await.unwrap();
+        assert_eq!(response.text().await.unwrap(), "proxy");
+        let (proxy, proxied_requests) = proxy_task.await.unwrap();
+        assert_eq!(proxied_requests.len(), 1);
+        assert!(proxied_requests[0].starts_with(&format!("GET {url} HTTP/1.1\r\n")));
+        assert!(!proxied_requests[0].contains("egress-only-secret"));
+
+        // Use the exact final builder used by production egress. Even an
+        // explicitly supplied proxy must not see the admitted credential.
+        let client = build_host_egress_http_transport(builder()).unwrap();
+        let response = client
+            .post(&url)
+            .header(reqwest::header::AUTHORIZATION, "Bearer egress-only-secret")
+            .body("private operation input")
+            .send()
+            .await
+            .expect("admitted DNS target must remain directly reachable");
+        assert_eq!(response.text().await.unwrap(), "origin");
+        let (_origin, requests) = origin_task.await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("POST /resource HTTP/1.1\r\n"));
+        assert!(requests[0].contains("Bearer egress-only-secret"));
+        assert!(requests[0].ends_with("private operation input"));
+        assert!(
+            fcp_async_core::time::timeout(Duration::from_millis(25), proxy.accept())
+                .await
+                .is_err(),
+            "transport policy must not send the credential-bearing request to the proxy"
+        );
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn host_egress_transport_disables_underlying_post_retries() {
+        const RESPONSE: &[u8] =
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbusy";
+        const INPUT: &str = "single admitted mutation";
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}/mutate");
+        let builder = || {
+            let retry = reqwest::retry::for_host("127.0.0.1")
+                .no_budget()
+                .max_retries_per_request(2)
+                .classify_fn(|response| {
+                    if response.status() == Some(reqwest::StatusCode::SERVICE_UNAVAILABLE) {
+                        response.retryable()
+                    } else {
+                        response.success()
+                    }
+                });
+            reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(2))
+                .retry(retry)
+        };
+
+        // Control proves that this replayable POST and classifier really send
+        // three requests without the production transport restriction.
+        let provider = task::spawn(host_egress_transport_fixture_server(
+            listener,
+            3,
+            RESPONSE.to_vec(),
+        ));
+        let control = builder().build().unwrap();
+        let response = control.post(&url).body(INPUT).send().await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.text().await.unwrap(), "busy");
+        let (listener, repeated) = provider.await.unwrap();
+        assert_eq!(repeated.len(), 3);
+        assert!(repeated.iter().all(|request| request.ends_with(INPUT)));
+
+        let provider = task::spawn(host_egress_transport_fixture_server(
+            listener,
+            1,
+            RESPONSE.to_vec(),
+        ));
+        let client = build_host_egress_http_transport(builder()).unwrap();
+        let response = client.post(&url).body(INPUT).send().await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.text().await.unwrap(), "busy");
+        let (listener, observed) = provider.await.unwrap();
+        assert_eq!(observed.len(), 1);
+        assert!(observed[0].starts_with("POST /mutate HTTP/1.1\r\n"));
+        assert!(observed[0].ends_with(INPUT));
+        assert!(
+            fcp_async_core::time::timeout(Duration::from_millis(25), listener.accept())
+                .await
+                .is_err(),
+            "one admitted mutation must not acquire hidden transport attempts"
+        );
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn host_egress_transport_leaves_redirects_for_host_readmission() {
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let response = format!(
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{target_addr}/unadmitted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin.local_addr().unwrap();
+        let provider = task::spawn(host_egress_transport_fixture_server(
+            origin,
+            1,
+            response.into_bytes(),
+        ));
+        let client = build_host_egress_http_transport(
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(2))
+                .redirect(reqwest::redirect::Policy::limited(5)),
+        )
+        .unwrap();
+        let response = client
+            .post(format!("http://{origin_addr}/original"))
+            .header(reqwest::header::AUTHORIZATION, "Bearer redirect-secret")
+            .body("private operation input")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+        let (_origin, observed) = provider.await.unwrap();
+        assert_eq!(observed.len(), 1);
+        assert!(observed[0].starts_with("POST /original HTTP/1.1\r\n"));
+        assert!(observed[0].contains("Bearer redirect-secret"));
+        assert!(observed[0].ends_with("private operation input"));
+        assert!(
+            fcp_async_core::time::timeout(Duration::from_millis(25), target.accept())
+                .await
+                .is_err(),
+            "the host must re-admit redirect targets before credentials or body leave the origin"
+        );
     }
 
     #[derive(Clone)]
