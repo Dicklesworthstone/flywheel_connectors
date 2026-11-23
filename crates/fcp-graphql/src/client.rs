@@ -2,13 +2,13 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use fcp_async_core::http::{HttpClient, HttpClientBuilder, Method};
-use fcp_async_core::{AsyncError, sync::Mutex, task, time};
+use fcp_async_core::{AsyncError, time};
 use futures_util::future::{BoxFuture, FutureExt, Shared};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -96,22 +96,22 @@ pub struct GraphqlClientMetricsSnapshot {
 /// collision-free: key equality is byte-for-byte request equality.
 /// The memory cost is one additional `Vec<u8>` per in-flight entry,
 /// bounded by concurrency and released by [`DedupGuard::drop`].
-/// Composite dedup key: (request body bytes, idempotent flag).
-///
-/// br-brq7n: keying on body alone collapses two concurrent callers
-/// with byte-identical bodies but DIFFERENT `idempotent` classifications
-/// onto the same in-flight `send_with_retry(payload, idempotent)`
-/// future. The future captures the FIRST caller's `idempotent` value;
-/// a non-idempotent second caller would then inherit retry semantics
-/// that replay their (unsafe) request. Including the idempotent flag
-/// in the key gives each retry-class its own future — same body +
-/// same retry classification still dedups; same body + different
-/// classification does not.
-type DedupKey = (Vec<u8>, bool);
+/// Only explicitly idempotent operations enter this registry. Identical
+/// non-idempotent mutations are independent effects, never shared requests.
+type DedupKey = Vec<u8>;
 
-#[derive(Debug, Clone)]
+struct DedupRequest {
+    future: SharedRequestFuture,
+}
+
+struct DedupEntry {
+    request: Arc<DedupRequest>,
+    waiters: usize,
+}
+
+#[derive(Clone)]
 struct DedupState {
-    inner: Arc<Mutex<HashMap<DedupKey, SharedRequestFuture>>>,
+    inner: Arc<Mutex<HashMap<DedupKey, DedupEntry>>>,
 }
 
 impl DedupState {
@@ -120,41 +120,98 @@ impl DedupState {
             inner: Arc::new(Mutex::new(HashMap::new())),
         }
     }
+
+    fn acquire(
+        &self,
+        key: DedupKey,
+        build: impl FnOnce() -> SharedRequestFuture,
+    ) -> Result<DedupGuard, GraphqlClientError> {
+        // This lock protects metadata only. It never spans a poll or await;
+        // synchronous release therefore also works during runtime shutdown.
+        let mut inner = self.inner.lock().map_err(|_| GraphqlClientError::Protocol {
+            message: "GraphQL in-flight request registry is poisoned".to_owned(),
+        })?;
+        let mut retired = None;
+        let request = match inner
+            .get_mut(&key)
+            .filter(|entry| entry.request.future.peek().is_none())
+        {
+            Some(entry) => {
+                entry.waiters = entry.waiters.checked_add(1).ok_or_else(|| {
+                    GraphqlClientError::Protocol {
+                        message: "GraphQL in-flight request has too many waiters".to_owned(),
+                    }
+                })?;
+                Arc::clone(&entry.request)
+            }
+            None => {
+                let request = Arc::new(DedupRequest { future: build() });
+                retired = inner.insert(
+                    key.clone(),
+                    DedupEntry {
+                        request: Arc::clone(&request),
+                        waiters: 1,
+                    },
+                );
+                request
+            }
+        };
+        drop(inner);
+        // Drop transport futures outside the registry lock.
+        drop(retired);
+        Ok(DedupGuard {
+            state: self.clone(),
+            key,
+            request,
+        })
+    }
 }
 
-/// RAII guard that removes a dedup entry from the map when the owning
-/// caller exits — whether via normal return, cancellation (the outer
-/// future being dropped mid-`await`), or panic. Without this, a cancelled
-/// owner leaves the map entry resident forever, so every subsequent
-/// same-body caller hits the cached (stale) result and the map grows
-/// monotonically with unique cancelled-request bodies.
+/// Every waiter owns a registration, including callers joining an existing
+/// request. Cancellation releases only that waiter; the last departure drops
+/// the retained transport future. Completion retires the entry immediately,
+/// and request identity prevents old waiters from removing a newer request
+/// with the same body. No cleanup task is spawned or left to a dying runtime.
 struct DedupGuard {
     state: DedupState,
     key: DedupKey,
+    request: Arc<DedupRequest>,
+}
+
+impl DedupGuard {
+    fn finish(&self) {
+        self.release(true);
+    }
+
+    fn release(&self, completed: bool) {
+        let retired = {
+            // Admission fails closed on poison, but outstanding registrations
+            // must still release their own resources synchronously.
+            let mut inner = self
+                .state
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(entry) = inner.get_mut(&self.key) else {
+                return;
+            };
+            if !Arc::ptr_eq(&entry.request, &self.request) {
+                return;
+            }
+            if completed || entry.waiters == 1 {
+                inner.remove(&self.key)
+            } else {
+                entry.waiters -= 1;
+                None
+            }
+        };
+        drop(retired);
+    }
 }
 
 impl Drop for DedupGuard {
     fn drop(&mut self) {
-        // Common case: the lock is uncontended because the owner has
-        // already finished its `shared.await` and no other caller is
-        // mutating the map at this instant — remove synchronously.
-        if let Ok(mut inner) = self.state.inner.try_lock() {
-            inner.remove(&self.key);
-            return;
-        }
-
-        // Contended case: defer to a short spawned task so Drop stays
-        // synchronous. The task captures `state` + `key` by move; it
-        // cannot outlive the Arc because DedupState holds an Arc to the
-        // map. `mem::take` is fine here: we're in Drop and the key slot
-        // will never be read again.
-        let state = self.state.clone();
-        // The body Vec<u8> is the expensive part to clone — `mem::take`
-        // it out without disturbing the bool tag.
-        let key = (std::mem::take(&mut self.key.0), self.key.1);
-        task::spawn_detached(async move {
-            state.inner.lock().await.remove(&key);
-        });
+        self.release(false);
     }
 }
 
@@ -333,7 +390,8 @@ pub struct GraphqlClientConfig {
     pub query_limits: GraphqlQueryLimits,
     /// Maximum number of GraphQL operations allowed in one batch request.
     pub max_batch_items: usize,
-    /// Deduplicate in-flight requests.
+    /// Deduplicate in-flight requests explicitly classified as idempotent.
+    /// Non-idempotent mutations always retain their independent effects.
     pub dedup_in_flight: bool,
 }
 
@@ -480,7 +538,10 @@ impl GraphqlClientBuilder {
         self
     }
 
-    /// Enable in-flight deduplication.
+    /// Enable in-flight deduplication for explicitly idempotent operations.
+    ///
+    /// Non-idempotent operations are never coalesced, even with identical
+    /// bodies. Cancelling one waiter does not cancel another waiter's request.
     #[must_use]
     pub const fn with_dedup_in_flight(mut self, enabled: bool) -> Self {
         self.config.dedup_in_flight = enabled;
@@ -872,49 +933,16 @@ impl GraphqlClient {
         let body_bytes = serde_json::to_vec(&body)?;
         self.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
 
-        if let Some(state) = &self.dedup_state {
-            // br-brq7n: dedup key is (body_bytes, idempotent). Keying on
-            // body alone would let a non-idempotent caller hitchhike a
-            // prior idempotent caller's retried `send_with_retry`,
-            // replaying a request the spec says must not be replayed —
-            // and conversely, an idempotent caller's retries would be
-            // suppressed if a non-idempotent caller arrived first.
-            // Splitting by retry classification keeps each class on its
-            // own future without losing dedup for matched-class pairs.
-            let dedup_key: DedupKey = (body_bytes.clone(), idempotent);
-            // asupersync's MutexGuard is deliberately !Send. End its
-            // scope before awaiting the shared request so this future
-            // stays spawnable.
-            let (shared, inserted) = {
-                let mut guard = state.inner.lock().await;
-                if let Some(shared) = guard.get(&dedup_key).cloned() {
-                    (shared, false)
-                } else {
-                    let client = self.clone();
-                    let payload = body_bytes;
-                    let future = async move { client.send_with_retry(payload, idempotent).await }
-                        .boxed()
-                        .shared();
-                    guard.insert(dedup_key.clone(), future.clone());
-                    (future, true)
-                }
-            };
-
-            if inserted {
-                // The cleanup guard removes our entry from the dedup map no
-                // matter how we exit this scope: return, cancellation, or
-                // panic. Previously the explicit `remove` after `future.await`
-                // only fired on normal completion, so a cancelled owner
-                // leaked the entry and future duplicates saw a stale cached
-                // Shared<> indefinitely. Only the inserter owns that cleanup;
-                // a hitchhiking caller must not drop the in-flight entry.
-                let _cleanup = DedupGuard {
-                    state: state.clone(),
-                    key: dedup_key,
-                };
-                return shared.await;
-            }
-            return shared.await;
+        if idempotent && let Some(state) = &self.dedup_state {
+            let waiter = state.acquire(body_bytes.clone(), || {
+                let client = self.clone();
+                async move { client.send_with_retry(body_bytes, true).await }
+                    .boxed()
+                    .shared()
+            })?;
+            let result = waiter.request.future.clone().await;
+            waiter.finish();
+            return result;
         }
 
         self.send_with_retry(body_bytes, idempotent).await
@@ -1147,6 +1175,205 @@ mod tests {
             count
         });
         (endpoint, peer)
+    }
+
+    /// Real sockets remain unanswered until every intended caller is waiting.
+    /// Each response identifies its accepted HTTP request, so both accidental
+    /// extra dispatch and accidental mutation coalescing are observable.
+    struct DedupPeer {
+        endpoint: String,
+        received: Arc<AtomicU64>,
+        release: Arc<std::sync::atomic::AtomicBool>,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        worker: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl DedupPeer {
+        fn start() -> Self {
+            use std::io::{BufRead, Read, Write};
+            use std::sync::atomic::AtomicBool;
+
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let endpoint = format!("http://{}/graphql", listener.local_addr().unwrap());
+            let received = Arc::new(AtomicU64::new(0));
+            let release = Arc::new(AtomicBool::new(false));
+            let stop = Arc::new(AtomicBool::new(false));
+            let received_worker = Arc::clone(&received);
+            let release_worker = Arc::clone(&release);
+            let stop_worker = Arc::clone(&stop);
+            let worker = std::thread::spawn(move || {
+                let mut handlers = Vec::new();
+                while !stop_worker.load(Ordering::SeqCst) && handlers.len() < 8 {
+                    let socket = match listener.accept() {
+                        Ok((socket, _)) => socket,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(1));
+                            continue;
+                        }
+                        Err(error) => panic!("accept GraphQL request: {error}"),
+                    };
+                    let received = Arc::clone(&received_worker);
+                    let release = Arc::clone(&release_worker);
+                    handlers.push(std::thread::spawn(move || {
+                        socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                        socket.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
+                        let mut reader = std::io::BufReader::new(socket);
+                        let mut content_length = 0;
+                        let mut header_bytes = 0;
+                        loop {
+                            let mut line = String::new();
+                            let read = reader.read_line(&mut line).unwrap();
+                            if read == 0 {
+                                return;
+                            }
+                            header_bytes += read;
+                            assert!(header_bytes <= 8192);
+                            if line == "\r\n" {
+                                break;
+                            }
+                            if let Some((name, value)) = line.split_once(':') {
+                                if name.eq_ignore_ascii_case("content-length") {
+                                    content_length = value.trim().parse::<usize>().unwrap();
+                                }
+                            }
+                        }
+                        assert!(content_length <= 4096);
+                        reader.read_exact(&mut vec![0; content_length]).unwrap();
+                        let request = received.fetch_add(1, Ordering::SeqCst) + 1;
+                        let started = Instant::now();
+                        while !release.load(Ordering::SeqCst) {
+                            if started.elapsed() >= Duration::from_secs(2) {
+                                return;
+                            }
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        let body = format!("{{\"data\":{{\"request\":{request}}}}}");
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len(),
+                        );
+                        // A cancelled last waiter may already have closed it.
+                        let _ = reader.get_mut().write_all(response.as_bytes());
+                    }));
+                }
+                for handler in handlers {
+                    handler.join().unwrap();
+                }
+            });
+            Self { endpoint, received, release, stop, worker: Some(worker) }
+        }
+
+        fn client(&self) -> GraphqlClient {
+            GraphqlClientBuilder::new(&self.endpoint)
+                .with_dedup_in_flight(true)
+                .with_timeout(Duration::from_secs(2))
+                .with_retry_policy(RetryPolicy {
+                    max_attempts: 1,
+                    ..RetryPolicy::default()
+                })
+                .build()
+                .unwrap()
+        }
+    }
+
+    impl Drop for DedupPeer {
+        fn drop(&mut self) {
+            self.release.store(true, Ordering::SeqCst);
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(worker) = self.worker.take() {
+                worker.join().unwrap();
+            }
+        }
+    }
+
+    async fn drive_dedup_waiters(
+        peer: &DedupPeer,
+        count: u64,
+        waiters: &mut [BoxFuture<'_, Result<Vec<u8>, GraphqlClientError>>],
+    ) {
+        let started = Instant::now();
+        loop {
+            for waiter in &mut *waiters {
+                assert!(futures_util::poll!(waiter.as_mut()).is_pending());
+            }
+            if peer.received.load(Ordering::SeqCst) >= count {
+                return;
+            }
+            assert!(started.elapsed() < Duration::from_secs(2), "HTTP requests did not arrive");
+            time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn dedup_owner_cancellation_preserves_other_waiters_and_new_joiners() {
+        let peer = DedupPeer::start();
+        let client = peer.client();
+        let body = serde_json::json!({"query": "{ viewer { id } }"});
+        let mut waiters = vec![
+            client.execute_bytes(body.clone(), true).boxed(),
+            client.execute_bytes(body.clone(), true).boxed(),
+        ];
+        drive_dedup_waiters(&peer, 1, &mut waiters).await;
+        drop(waiters.remove(0));
+        waiters.push(client.execute_bytes(body.clone(), true).boxed());
+        drive_dedup_waiters(&peer, 1, &mut waiters).await;
+        peer.release.store(true, Ordering::SeqCst);
+
+        let responses = time::timeout(
+            Duration::from_secs(2),
+            futures_util::future::join_all(waiters),
+        ).await.unwrap();
+        assert_eq!(responses[0].as_ref().unwrap(), responses[1].as_ref().unwrap());
+        assert_eq!(peer.received.load(Ordering::SeqCst), 1);
+        assert!(client.dedup_state.as_ref().unwrap().inner.lock().unwrap().is_empty());
+
+        let later = client.execute_bytes(body, true).await.unwrap();
+        let later: Value = serde_json::from_slice(&later).unwrap();
+        assert_eq!(later["data"]["request"], 2);
+        assert_eq!(peer.received.load(Ordering::SeqCst), 2);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn dedup_last_waiter_cancellation_allows_a_fresh_request() {
+        let peer = DedupPeer::start();
+        let client = peer.client();
+        let body = serde_json::json!({"query": "{ viewer { id } }"});
+        let mut cancelled = vec![
+            client.execute_bytes(body.clone(), true).boxed(),
+            client.execute_bytes(body.clone(), true).boxed(),
+        ];
+        drive_dedup_waiters(&peer, 1, &mut cancelled).await;
+        drop(cancelled);
+        assert!(client.dedup_state.as_ref().unwrap().inner.lock().unwrap().is_empty());
+
+        let mut fresh = vec![client.execute_bytes(body, true).boxed()];
+        drive_dedup_waiters(&peer, 2, &mut fresh).await;
+        peer.release.store(true, Ordering::SeqCst);
+        let response = fresh.remove(0).await.unwrap();
+        let response: Value = serde_json::from_slice(&response).unwrap();
+        assert_eq!(response["data"]["request"], 2);
+        assert!(client.dedup_state.as_ref().unwrap().inner.lock().unwrap().is_empty());
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn dedup_never_coalesces_identical_non_idempotent_mutations() {
+        let peer = DedupPeer::start();
+        let client = peer.client();
+        let body = serde_json::json!({"query": "mutation { createPost { id } }"});
+        let mut waiters = vec![
+            client.execute_bytes(body.clone(), false).boxed(),
+            client.execute_bytes(body, false).boxed(),
+        ];
+        drive_dedup_waiters(&peer, 2, &mut waiters).await;
+        assert!(client.dedup_state.as_ref().unwrap().inner.lock().unwrap().is_empty());
+        peer.release.store(true, Ordering::SeqCst);
+        let responses = time::timeout(
+            Duration::from_secs(2),
+            futures_util::future::join_all(waiters),
+        ).await.unwrap();
+        assert_ne!(responses[0].as_ref().unwrap(), responses[1].as_ref().unwrap());
+        assert_eq!(peer.received.load(Ordering::SeqCst), 2);
     }
 
     #[fcp_async_core::runtime::test]
@@ -2578,99 +2805,118 @@ mod tests {
 
     // ---- DedupGuard ----
 
-    #[fcp_async_core::runtime::test]
-    async fn dedup_guard_removes_entry_on_drop() {
-        let state = DedupState::new();
-
-        // Pre-seed the map with a Shared future that's already resolved —
-        // the guard's job is only to remove the key, not to drive the
-        // future.
-        let fut = async { Ok(Vec::<u8>::new()) }.boxed().shared();
-        let key: DedupKey = (b"{\"query\":\"{ seeded }\"}".to_vec(), true);
-        state.inner.lock().await.insert(key.clone(), fut);
-        assert_eq!(state.inner.lock().await.len(), 1);
-
-        {
-            let _guard = DedupGuard {
-                state: state.clone(),
-                key: key.clone(),
-            };
-            // Drop happens at end of scope.
-        }
-
-        // Give the spawn fallback a chance to run if try_lock contended.
-        // In this test there's no concurrent lock holder, so try_lock
-        // succeeds and removal is synchronous.
-        assert!(
-            state.inner.lock().await.is_empty(),
-            "DedupGuard::drop must remove the map entry"
-        );
+    fn pending_dedup_request() -> SharedRequestFuture {
+        futures_util::future::pending().boxed().shared()
     }
 
-    #[fcp_async_core::runtime::test]
-    async fn dedup_guard_tolerates_missing_key() {
-        // Guard for a key that was already removed should be a no-op,
-        // not a panic.
+    #[test]
+    fn dedup_guard_retains_request_until_the_last_waiter_leaves() {
         let state = DedupState::new();
-        {
-            let _guard = DedupGuard {
-                state: state.clone(),
-                key: (b"never-inserted".to_vec(), true),
-            };
-        }
-        assert!(state.inner.lock().await.is_empty());
+        let key = b"same body".to_vec();
+        let first = state.acquire(key.clone(), pending_dedup_request).unwrap();
+        let second = state
+            .acquire(key.clone(), || panic!("join must reuse the pending request"))
+            .unwrap();
+        assert!(Arc::ptr_eq(&first.request, &second.request));
+        assert_eq!(state.inner.lock().unwrap()[&key].waiters, 2);
+
+        drop(first);
+        assert_eq!(state.inner.lock().unwrap()[&key].waiters, 1);
+        let third = state.acquire(key.clone(), pending_dedup_request).unwrap();
+        assert!(Arc::ptr_eq(&second.request, &third.request));
+        drop(second);
+        assert_eq!(state.inner.lock().unwrap()[&key].waiters, 1);
+        drop(third);
+        assert!(state.inner.lock().unwrap().is_empty());
     }
 
-    #[fcp_async_core::runtime::test]
-    async fn dedup_guard_keys_separate_idempotent_classifications() {
-        // br-brq7n regression: two callers with the same body but
-        // different idempotent classifications must NOT collide on the
-        // same dedup entry. The composite (Vec<u8>, bool) key keeps
-        // them separate so the non-idempotent caller cannot inherit
-        // the idempotent caller's retry behavior (or vice versa).
-        let state = DedupState::new();
-        let body = b"{\"query\":\"{ shared }\"}".to_vec();
-
-        let fut_idem = async { Ok(Vec::<u8>::new()) }.boxed().shared();
-        let fut_nonidem = async { Ok(b"different-result".to_vec()) }.boxed().shared();
-
-        state
-            .inner
-            .lock()
-            .await
-            .insert((body.clone(), true), fut_idem);
-        state
-            .inner
-            .lock()
-            .await
-            .insert((body.clone(), false), fut_nonidem);
-
-        // Both entries coexist — two distinct futures, one map.
-        assert_eq!(state.inner.lock().await.len(), 2);
-
-        // Lookups by class return distinct futures.
-        let guard = state.inner.lock().await;
-        assert!(guard.contains_key(&(body.clone(), true)));
-        assert!(guard.contains_key(&(body.clone(), false)));
-        drop(guard);
-
-        // Drop one guard; only that classification's entry is removed.
-        {
-            let _g = DedupGuard {
-                state: state.clone(),
-                key: (body.clone(), true),
-            };
+    #[test]
+    fn dedup_guard_drops_cancelled_transport_without_a_runtime() {
+        struct DropSignal(Arc<AtomicU64>);
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
         }
-        let guard = state.inner.lock().await;
-        assert_eq!(guard.len(), 1);
-        assert!(
-            !guard.contains_key(&(body.clone(), true)),
-            "idempotent entry must be removed"
+
+        let drops = Arc::new(AtomicU64::new(0));
+        let signal = DropSignal(Arc::clone(&drops));
+        let state = DedupState::new();
+        let first = state
+            .acquire(b"cancelled".to_vec(), || {
+                async move {
+                    let _signal = signal;
+                    futures_util::future::pending().await
+                }
+                .boxed()
+                .shared()
+            })
+            .unwrap();
+        let second = state.acquire(b"cancelled".to_vec(), pending_dedup_request).unwrap();
+        drop(first);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        drop(second);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert!(state.inner.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn dedup_guard_old_completion_cannot_remove_a_replacement() {
+        let state = DedupState::new();
+        let key = b"same body".to_vec();
+        let first = state
+            .acquire(key.clone(), || async { Ok(vec![1]) }.boxed().shared())
+            .unwrap();
+        let second = state.acquire(key.clone(), pending_dedup_request).unwrap();
+        assert_eq!(
+            first.request.future.clone().now_or_never().unwrap().unwrap(),
+            vec![1],
         );
-        assert!(
-            guard.contains_key(&(body.clone(), false)),
-            "non-idempotent entry must remain — separate dedup class"
-        );
+
+        // Completion can be observed before either original caller finishes.
+        // A new caller must start a fresh request instead of caching the result.
+        let replacement = state.acquire(key.clone(), pending_dedup_request).unwrap();
+        assert!(!Arc::ptr_eq(&first.request, &replacement.request));
+        first.finish();
+        drop(first);
+        drop(second);
+        assert!(Arc::ptr_eq(
+            &state.inner.lock().unwrap()[&key].request,
+            &replacement.request,
+        ));
+        drop(replacement);
+        assert!(state.inner.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn dedup_guard_concurrent_last_departures_remove_the_entry() {
+        let state = DedupState::new();
+        let key = b"cancel together".to_vec();
+        let first = state.acquire(key.clone(), pending_dedup_request).unwrap();
+        let second = state.acquire(key, pending_dedup_request).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let other_barrier = Arc::clone(&barrier);
+        let other = std::thread::spawn(move || {
+            other_barrier.wait();
+            drop(first);
+        });
+        barrier.wait();
+        drop(second);
+        other.join().unwrap();
+        assert!(state.inner.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn dedup_guard_completion_retires_request_with_waiters_outstanding() {
+        let state = DedupState::new();
+        let key = b"complete".to_vec();
+        let first = state.acquire(key.clone(), pending_dedup_request).unwrap();
+        let second = state.acquire(key, pending_dedup_request).unwrap();
+        first.finish();
+        assert!(state.inner.lock().unwrap().is_empty());
+        drop(second);
+        drop(first);
+        assert!(state.inner.lock().unwrap().is_empty());
     }
 
     // ---- br-flywheel_connectors-jdhaw: shared HttpClient pool ----
@@ -2778,40 +3024,16 @@ mod tests {
             .expect("body_a has 'a'");
         body_b[idx] = b'b';
 
-        let fut_a = async { Ok(b"RESPONSE-A".to_vec()) }.boxed().shared();
-        let fut_b = async { Ok(b"RESPONSE-B".to_vec()) }.boxed().shared();
-        let key_a: DedupKey = (body_a.clone(), true);
-        let key_b: DedupKey = (body_b.clone(), true);
+        let first = state
+            .acquire(body_a, || async { Ok(b"RESPONSE-A".to_vec()) }.boxed().shared())
+            .unwrap();
+        let second = state
+            .acquire(body_b, || async { Ok(b"RESPONSE-B".to_vec()) }.boxed().shared())
+            .unwrap();
+        assert_eq!(state.inner.lock().unwrap().len(), 2);
 
-        {
-            let mut inner = state.inner.lock().await;
-            inner.insert(key_a.clone(), fut_a);
-            inner.insert(key_b.clone(), fut_b);
-            assert_eq!(
-                inner.len(),
-                2,
-                "distinct bodies must occupy distinct map entries"
-            );
-        }
-
-        let got_a = state
-            .inner
-            .lock()
-            .await
-            .get(&key_a)
-            .cloned()
-            .expect("a present")
-            .await
-            .expect("a resolved");
-        let got_b = state
-            .inner
-            .lock()
-            .await
-            .get(&key_b)
-            .cloned()
-            .expect("b present")
-            .await
-            .expect("b resolved");
+        let got_a = first.request.future.clone().await.expect("a resolved");
+        let got_b = second.request.future.clone().await.expect("b resolved");
 
         assert_eq!(got_a, b"RESPONSE-A");
         assert_eq!(got_b, b"RESPONSE-B");
