@@ -5,12 +5,12 @@ use std::time::Instant;
 
 use anyhow::Result;
 use clap::Args;
-use fcp_host::InvocationQueryRequest;
+use fcp_host::{InvocationQueryRequest, InvocationResultQueryRequest};
 use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::invocation_cmd::{self, LookupFailure};
-use crate::task_reconcile::{self, ReconcileFailure};
+use crate::task_reconcile::{self, ReconcileFailure, TaskInvocationCompletionSource};
 use crate::workflow::{TaskExecutionState, TaskLease, TaskStore, WorkflowTask};
 use crate::{
     CliExitCode, CommandAvailability, CommandEnvelope, DispatchOutcome, HostAdminClient,
@@ -29,6 +29,11 @@ pub(crate) struct TaskReconcileArgs {
     #[arg(long, value_name = "PATH")]
     #[serde(skip)]
     admin_token_file: Option<PathBuf>,
+
+    /// Recover lost output for reconciled local completions from opt-in host custody.
+    /// Writes sensitive result data into the private capsule, never normal output.
+    #[arg(long)]
+    recover_output: bool,
 }
 
 pub(crate) fn dispatch(
@@ -59,7 +64,7 @@ fn reconcile(
             CliExitCode::Validation,
         ));
     };
-    if fence.state == TaskExecutionState::Completed {
+    if fence.state == TaskExecutionState::Completed && !args.recover_output {
         return Ok(report(&task, Vec::new(), 0, CliExitCode::Success));
     }
     let Some(journal) = fence.journal else {
@@ -73,14 +78,26 @@ fn reconcile(
 
     // A crash after saving the last primitive receipt needs no credential or
     // network access. The same applies when every required proof was already saved.
-    if journal.steps.iter().all(|step| step.is_complete()) {
-        return Ok(finish(&lease, &fence.attempt_id, &task, Vec::new(), 0, None));
+    let missing_output = |step: &crate::workflow::TaskStepExecution| {
+        args.recover_output && step.reconciliation.is_some() && step.output_recovery.is_none()
+    };
+    if journal.steps.iter().all(|step| step.is_complete())
+        && !journal.steps.iter().any(missing_output)
+    {
+        return Ok(finish(
+            &lease,
+            &fence.attempt_id,
+            &task,
+            Vec::new(),
+            0,
+            None,
+        ));
     }
     let mut observations = Vec::new();
     let candidates = journal
         .steps
         .iter()
-        .filter(|step| !step.is_complete() && step.invocation.is_some())
+        .filter(|step| step.invocation.is_some() && (!step.is_complete() || missing_output(step)))
         .filter(|step| {
             if step.completion_conflicts_with_receipt() {
                 observations.push(json!({
@@ -109,6 +126,14 @@ fn reconcile(
             observations,
             0,
             None,
+        ));
+    }
+    if args.recover_output && lease.prepare_output_recovery().is_err() {
+        return Ok(refusal(
+            &task,
+            "task-output-storage-not-private",
+            "Output recovery requires a private capsule and lock in a protected task directory. Secure the existing files before requesting sensitive host results.",
+            CliExitCode::Validation,
         ));
     }
 
@@ -153,6 +178,7 @@ fn reconcile(
         let binding = step.invocation.as_ref().expect("candidate has a binding");
         if binding.host != selected_host {
             observations.push(evidence_refusal(step.ordinal, ReconcileFailure::WrongHost));
+            lookup_exit = Some(CliExitCode::Validation);
             continue;
         }
         if lookups >= MAX_LOOKUPS {
@@ -207,6 +233,7 @@ fn reconcile(
             Ok(pin) => pin,
             Err(error) => {
                 observations.push(evidence_refusal(step.ordinal, error));
+                lookup_exit = Some(CliExitCode::Validation);
                 continue;
             }
         };
@@ -218,20 +245,17 @@ fn reconcile(
         }
         // Pin even active, non-durable or unknown observations before testing
         // success. A later read must never follow a newer local or mesh attempt.
-        let completion = match task_reconcile::verify_completion(
-            binding,
-            &selected_host,
-            &pin,
-            &response,
-        ) {
-            Ok(completion) => completion,
-            Err(error) => {
-                let mut observation = evidence_refusal(step.ordinal, error);
-                observation["observed_attempt"] = json!(pin);
-                observations.push(observation);
-                continue;
-            }
-        };
+        let completion =
+            match task_reconcile::verify_completion(binding, &selected_host, &pin, &response) {
+                Ok(completion) => completion,
+                Err(error) => {
+                    let mut observation = evidence_refusal(step.ordinal, error);
+                    observation["observed_attempt"] = json!(pin);
+                    observations.push(observation);
+                    lookup_exit = Some(CliExitCode::Validation);
+                    continue;
+                }
+            };
         match lease.record_invocation_completion(
             &fence.attempt_id,
             step.ordinal,
@@ -247,6 +271,100 @@ fn reconcile(
             "lookup_succeeded": true,
             "observed_attempt": pin,
             "completion": completion,
+        }));
+        if !args.recover_output || step.output_recovery.is_some() {
+            continue;
+        }
+        if completion.source != TaskInvocationCompletionSource::LocalFinalized {
+            observations.push(json!({
+                "ordinal": step.ordinal,
+                "status": "output-unavailable",
+                "reason": "task-result-not-local",
+                "message": "The entry host's mesh completion observation does not contain an executor-local response for recovery.",
+                "output_available": false,
+            }));
+            lookup_exit = Some(CliExitCode::Validation);
+            continue;
+        }
+        let result_binding = match lease.output_recovery_binding(
+            &fence.attempt_id,
+            step.ordinal,
+            &selected_host,
+            &response,
+        ) {
+            Ok(binding) => binding,
+            Err(_) => {
+                observations.push(evidence_refusal(
+                    step.ordinal,
+                    ReconcileFailure::InvalidHistory,
+                ));
+                lookup_exit = Some(CliExitCode::Validation);
+                continue;
+            }
+        };
+        if lookups >= MAX_LOOKUPS {
+            observations.push(json!({
+                "ordinal": step.ordinal,
+                "status": "output-unavailable",
+                "reason": "task-reconciliation-lookup-limit",
+                "message": "The bounded lookup count was reached before output recovery. Completion evidence remains saved.",
+            }));
+            lookup_exit = Some(CliExitCode::Validation);
+            break;
+        }
+        let remaining = budget.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            let (kind, message, exit) = LookupFailure::Timeout.description();
+            observations.push(json!({ "ordinal": step.ordinal, "status": "output-unavailable", "reason": kind, "message": message }));
+            lookup_exit = Some(exit);
+            break;
+        }
+        client.read_timeout = remaining;
+        lookups += 1;
+        let retained = match invocation_cmd::query_invocation_result(
+            &client,
+            &InvocationResultQueryRequest {
+                binding: result_binding,
+            },
+            &token,
+        ) {
+            Ok(response) => response.result,
+            Err(error) => {
+                let (kind, message, exit) = error.description();
+                observations.push(json!({ "ordinal": step.ordinal, "status": "output-unavailable", "reason": kind, "message": message }));
+                lookup_exit = Some(exit);
+                continue;
+            }
+        };
+        let Some(retained) = retained else {
+            observations.push(json!({
+                "ordinal": step.ordinal,
+                "status": "output-unavailable",
+                "reason": "host-result-not-retained",
+                "message": "No exact response remains in host custody. Retention may be disabled, expired or full; completion remains saved and the effect was not repeated.",
+                "output_available": false,
+            }));
+            lookup_exit = Some(CliExitCode::Validation);
+            continue;
+        };
+        match lease.record_invocation_output(
+            &fence.attempt_id,
+            step.ordinal,
+            &selected_host,
+            &response,
+            &retained,
+        ) {
+            Ok(saved) => task = saved,
+            Err(_) => return Ok(persistence_refusal(&lease, &task, observations, lookups)),
+        }
+        observations.push(json!({
+            "ordinal": step.ordinal,
+            "status": "output-recovered",
+            "source": "host-private-result-api",
+            "output_available": true,
+            "response_digest": retained.response_digest,
+            "attempt_id": retained.binding.ticket.attempt_id,
+            "invoked_during_reconciliation": false,
         }));
     }
     Ok(finish(
@@ -270,11 +388,11 @@ fn finish(
     match lease.finish_reconciliation(attempt_id) {
         Ok(saved) => {
             let completed = saved.execution_blocker() == Some(TaskExecutionState::Completed);
-            let exit = if completed {
+            let exit = lookup_exit.unwrap_or(if completed {
                 CliExitCode::Success
             } else {
-                lookup_exit.unwrap_or(CliExitCode::Validation)
-            };
+                CliExitCode::Validation
+            });
             report(&saved, observations, lookups, exit)
         }
         Err(_) => persistence_refusal(lease, task, observations, lookups),
@@ -348,9 +466,22 @@ fn report(
     let fenced = state.is_some();
     let total = journal.map(|journal| journal.steps.len());
     let covered = journal.map(|journal| {
-        journal.steps.iter().filter(|step| step.is_complete()).count()
+        journal
+            .steps
+            .iter()
+            .filter(|step| step.is_complete())
+            .count()
     });
-    let unresolved = total.zip(covered).map(|(total, covered)| total.saturating_sub(covered));
+    let unresolved = total
+        .zip(covered)
+        .map(|(total, covered)| total.saturating_sub(covered));
+    let recovered = journal.map_or(0, |journal| {
+        journal
+            .steps
+            .iter()
+            .filter(|step| step.output_recovery.is_some())
+            .count()
+    });
     let status = if completed {
         "completed"
     } else if covered.is_some_and(|count| count > 0) {
@@ -359,6 +490,10 @@ fn report(
         "unresolved"
     };
     let message = match (completed, journal.is_some(), fenced) {
+        (true, true, _) if recovered > 0 => {
+            "Every planned step has retained success evidence. Explicitly recovered responses \
+             are saved in the private capsule. The capsule remains consumed; no work was resent."
+        }
         (true, true, _) => {
             "Every planned step has retained success evidence. The capsule remains consumed. \
              Reconciliation did not resend work or reconstruct missing result bodies."
@@ -410,7 +545,7 @@ fn report(
         "message": message,
         "invoke_attempted": false,
         "automatic_retry_allowed": false,
-        "result_recovered": false,
+        "result_recovered": recovered > 0,
         "reconciliation": {
             "complete": completed,
             "journal_available": journal.is_some(),
@@ -418,13 +553,15 @@ fn report(
             "covered_steps": covered,
             "total_steps": total,
             "unresolved_steps": unresolved,
+            "recovered_outputs": recovered,
             "host_lookups": lookups,
             "observations": observations,
         },
         "task": task_payload_view(task),
         "caveats": [
             "Missing retained history does not prove that an operation had no effects.",
-            "Local finalization and mesh origin observations are distinct evidence scopes. Neither provides a replayable result or an external exactly-once guarantee.",
+            "Completion metadata alone does not contain a result. Only explicit exact-bound local response recovery transfers output; mesh-origin observations do not include executor output.",
+            "Recovered output does not grant permission to replay the task or establish an external exactly-once guarantee. Normal task views omit the recovered body.",
         ],
         "next_actions": next_actions,
     });
@@ -451,6 +588,8 @@ mod tests {
         InvocationAdmission, InvocationFinalization, InvocationIdempotency, InvocationOutcome,
         InvocationQueryResponse, InvocationRecord, InvocationTerminal, InvocationTicket,
     };
+    #[cfg(unix)]
+    use fcp_host::{InvocationResultBinding, RetainedInvocationResult};
     use fcp_kernel::InvokeStatus;
     use tempfile::TempDir;
 
@@ -510,7 +649,11 @@ mod tests {
                     .unwrap();
                 continue;
             }
-            assert_eq!(index + 1, step_count, "fixture invocation must be the last step");
+            assert_eq!(
+                index + 1,
+                step_count,
+                "fixture invocation must be the last step"
+            );
             let binding = TaskInvocationBinding {
                 request_id: format!("reconcile:{}:{}", ticket.attempt_id(), step.ordinal),
                 host: normalize_host_endpoint(host).unwrap(),
@@ -542,6 +685,7 @@ mod tests {
         TaskReconcileArgs {
             task_id: pending.task_id.clone(),
             admin_token_file: Some(path),
+            recover_output: false,
         }
     }
 
@@ -549,6 +693,7 @@ mod tests {
         TaskReconcileArgs {
             task_id: pending.task_id.clone(),
             admin_token_file: Some(temp.path().join("absent-admin-token")),
+            recover_output: false,
         }
     }
 
@@ -629,7 +774,10 @@ mod tests {
     fn bind_history_listener() -> (String, TcpListener) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
-        (format!("http://{}", listener.local_addr().unwrap()), listener)
+        (
+            format!("http://{}", listener.local_addr().unwrap()),
+            listener,
+        )
     }
 
     struct HistoryServer {
@@ -663,7 +811,10 @@ mod tests {
             let deadline = Instant::now() + Duration::from_secs(30);
             let mut served = 0;
             loop {
-                assert!(Instant::now() < deadline, "history test server exceeded its deadline");
+                assert!(
+                    Instant::now() < deadline,
+                    "history test server exceeded its deadline"
+                );
                 if !matches!(stopped.try_recv(), Err(mpsc::TryRecvError::Empty)) {
                     break;
                 }
@@ -676,8 +827,12 @@ mod tests {
                     Err(error) => panic!("history accept failed: {error}"),
                 };
                 stream.set_nonblocking(false).unwrap();
-                stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-                stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
                 let mut reader = BufReader::new(stream.try_clone().unwrap());
                 let mut request_line = String::new();
                 reader.read_line(&mut request_line).unwrap();
@@ -690,7 +845,10 @@ mod tests {
                 );
                 let mut headers = Vec::new();
                 loop {
-                    assert!(Instant::now() < deadline, "history headers exceeded deadline");
+                    assert!(
+                        Instant::now() < deadline,
+                        "history headers exceeded deadline"
+                    );
                     assert!(headers.len() < 64, "too many history request headers");
                     let mut line = String::new();
                     assert!(reader.read_line(&mut line).unwrap() > 0);
@@ -735,9 +893,17 @@ mod tests {
                 stream.flush().unwrap();
                 served += 1;
             }
-            assert_eq!(served, responses.len(), "expected protected history queries");
+            assert_eq!(
+                served,
+                responses.len(),
+                "expected protected history queries"
+            );
         });
-        HistoryServer { stop, handle, requests }
+        HistoryServer {
+            stop,
+            handle,
+            requests,
+        }
     }
 
     #[test]
@@ -772,7 +938,12 @@ mod tests {
         // spelling that differs from the value retained before invocation.
         let selected = format!("{}/", host.strip_prefix("http://").unwrap());
         let outcome = reconcile(&store, &args, Some(&selected)).unwrap();
-        assert_eq!(outcome.exit_code, CliExitCode::Success, "{}", outcome.payload);
+        assert_eq!(
+            outcome.exit_code,
+            CliExitCode::Success,
+            "{}",
+            outcome.payload
+        );
         assert_eq!(outcome.payload["reconciliation"]["complete"], true);
         assert_eq!(outcome.payload["reconciliation"]["host_lookups"], 1);
         assert_eq!(outcome.payload["invoke_attempted"], false);
@@ -782,13 +953,19 @@ mod tests {
         let step = saved_step(&store, &pending);
         assert_eq!(step.receipt.as_ref(), Some(&unknown));
         let completion = step.reconciliation.as_ref().unwrap();
-        assert_eq!(completion.source, TaskInvocationCompletionSource::LocalFinalized);
+        assert_eq!(
+            completion.source,
+            TaskInvocationCompletionSource::LocalFinalized
+        );
         assert_eq!(completion.attempt_id, 7);
         assert_eq!(completion.audit_event_id.as_deref(), Some("audit-finished"));
         assert!(completion.receipt_id.is_none());
         let saved = store.load(&pending.task_id).unwrap().unwrap();
         let history_len = saved.execution_history.len();
-        assert_eq!(saved.execution_blocker(), Some(TaskExecutionState::Completed));
+        assert_eq!(
+            saved.execution_blocker(),
+            Some(TaskExecutionState::Completed)
+        );
 
         let repeated = reconcile(
             &store,
@@ -799,7 +976,12 @@ mod tests {
         assert_eq!(repeated.exit_code, CliExitCode::Success);
         assert_eq!(repeated.payload["reconciliation"]["host_lookups"], 0);
         assert_eq!(
-            store.load(&pending.task_id).unwrap().unwrap().execution_history.len(),
+            store
+                .load(&pending.task_id)
+                .unwrap()
+                .unwrap()
+                .execution_history
+                .len(),
             history_len
         );
         let requests = server.finish();
@@ -823,7 +1005,11 @@ mod tests {
         let server = serve_history(
             listener,
             pending.binding.request_id.clone(),
-            vec![active, local_success(&pending, 8), local_success(&pending, 7)],
+            vec![
+                active,
+                local_success(&pending, 8),
+                local_success(&pending, 7),
+            ],
             |_| {},
         );
         let args = command_args(&temp, &pending);
@@ -851,12 +1037,18 @@ mod tests {
         assert_eq!(completed.exit_code, CliExitCode::Success);
         assert_eq!(completed.payload["reconciliation"]["complete"], true);
         assert_eq!(
-            saved_step(&store, &pending).reconciliation.unwrap().attempt(),
+            saved_step(&store, &pending)
+                .reconciliation
+                .unwrap()
+                .attempt(),
             pinned
         );
         let requests = server.finish();
         assert_eq!(
-            requests.iter().map(|request| request.attempt_id).collect::<Vec<_>>(),
+            requests
+                .iter()
+                .map(|request| request.attempt_id)
+                .collect::<Vec<_>>(),
             vec![None, Some(7), Some(7)],
             "follow-up queries must select the original host generation"
         );
@@ -883,12 +1075,7 @@ mod tests {
                 vec![response],
                 |_| {},
             );
-            let outcome = reconcile(
-                &store,
-                &command_args(&temp, &pending),
-                Some(&host),
-            )
-            .unwrap();
+            let outcome = reconcile(&store, &command_args(&temp, &pending), Some(&host)).unwrap();
             assert_ne!(outcome.exit_code, CliExitCode::Success);
             assert_eq!(outcome.payload["reconciliation"]["complete"], false);
             assert_eq!(
@@ -900,7 +1087,11 @@ mod tests {
             assert!(step.reconciliation.is_none());
             assert!(step.receipt.is_none());
             assert_eq!(
-                store.load(&pending.task_id).unwrap().unwrap().execution_blocker(),
+                store
+                    .load(&pending.task_id)
+                    .unwrap()
+                    .unwrap()
+                    .execution_blocker(),
                 Some(TaskExecutionState::NeedsReview)
             );
             assert_eq!(server.finish().len(), 1);
@@ -927,9 +1118,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(outcome.exit_code, CliExitCode::Validation);
-        assert_eq!(outcome.payload["error"]["type"], ReconcileFailure::WrongHost.code());
+        assert_eq!(
+            outcome.payload["error"]["type"],
+            ReconcileFailure::WrongHost.code()
+        );
         assert_eq!(outcome.payload["reconciliation"]["host_lookups"], 0);
         assert!(saved_step(&store, &pending).observed_attempt.is_none());
+        #[cfg(unix)]
+        {
+            let mut recovery_args = missing_token_args(&temp, &pending);
+            recovery_args.recover_output = true;
+            let recovery = reconcile(&store, &recovery_args, Some(&selected)).unwrap();
+            assert_eq!(recovery.exit_code, CliExitCode::Validation);
+            assert_eq!(
+                recovery.payload["error"]["type"],
+                ReconcileFailure::WrongHost.code()
+            );
+            assert_eq!(recovery.payload["reconciliation"]["host_lookups"], 0);
+        }
         assert!(server.finish().is_empty());
         assert_replay_blocked(&store, &pending);
     }
@@ -962,11 +1168,19 @@ mod tests {
             Some("invalid://unused-for-saved-receipts"),
         )
         .unwrap();
-        assert_eq!(outcome.exit_code, CliExitCode::Success, "{}", outcome.payload);
+        assert_eq!(
+            outcome.exit_code,
+            CliExitCode::Success,
+            "{}",
+            outcome.payload
+        );
         assert_eq!(outcome.payload["reconciliation"]["complete"], true);
         assert_eq!(outcome.payload["reconciliation"]["host_lookups"], 0);
         let saved = store.load(&pending.task_id).unwrap().unwrap();
-        assert_eq!(saved.execution_blocker(), Some(TaskExecutionState::Completed));
+        assert_eq!(
+            saved.execution_blocker(),
+            Some(TaskExecutionState::Completed)
+        );
         assert_eq!(
             saved.last_execution().unwrap().execution["reconciled_steps"],
             json!([])
@@ -1009,12 +1223,7 @@ mod tests {
             Vec::new(),
             |_| {},
         );
-        let outcome = reconcile(
-            &store,
-            &missing_token_args(&temp, &pending),
-            Some(&host),
-        )
-        .unwrap();
+        let outcome = reconcile(&store, &missing_token_args(&temp, &pending), Some(&host)).unwrap();
         assert_eq!(outcome.exit_code, CliExitCode::Validation);
         assert_eq!(outcome.payload["reconciliation"]["host_lookups"], 0);
         assert_eq!(outcome.payload["reconciliation"]["complete"], false);
@@ -1047,12 +1256,7 @@ mod tests {
             vec![local_success(&pending, 7)],
             move |_| fs::rename(&observed_tasks, &observed_archive).unwrap(),
         );
-        let outcome = reconcile(
-            &store,
-            &command_args(&temp, &pending),
-            Some(&host),
-        )
-        .unwrap();
+        let outcome = reconcile(&store, &command_args(&temp, &pending), Some(&host)).unwrap();
         assert_eq!(outcome.exit_code, CliExitCode::Internal);
         assert_eq!(
             outcome.payload["error"]["type"],
@@ -1089,16 +1293,26 @@ mod tests {
         let args = TaskReconcileArgs {
             task_id: task.id.clone(),
             admin_token_file: Some(temp.path().join("absent-admin-token")),
+            recover_output: false,
         };
         let outcome = reconcile(&store, &args, Some(&host)).unwrap();
         assert_eq!(outcome.exit_code, CliExitCode::Validation);
-        assert_eq!(outcome.payload["error"]["type"], "task-reconciliation-unavailable");
+        assert_eq!(
+            outcome.payload["error"]["type"],
+            "task-reconciliation-unavailable"
+        );
         assert_eq!(outcome.payload["reconciliation"]["complete"], false);
         assert_eq!(outcome.payload["reconciliation"]["execution_fenced"], false);
-        assert_eq!(outcome.payload["reconciliation"]["journal_available"], false);
+        assert_eq!(
+            outcome.payload["reconciliation"]["journal_available"],
+            false
+        );
         assert_eq!(outcome.payload["reconciliation"]["host_lookups"], 0);
         for field in ["covered_steps", "total_steps", "unresolved_steps"] {
-            assert_eq!(outcome.payload["reconciliation"].get(field), Some(&Value::Null));
+            assert_eq!(
+                outcome.payload["reconciliation"].get(field),
+                Some(&Value::Null)
+            );
         }
         assert!(
             outcome.payload["message"]
@@ -1106,7 +1320,14 @@ mod tests {
                 .unwrap()
                 .contains("no retained execution attempt")
         );
-        assert!(store.load(&task.id).unwrap().unwrap().execution_blocker().is_none());
+        assert!(
+            store
+                .load(&task.id)
+                .unwrap()
+                .unwrap()
+                .execution_blocker()
+                .is_none()
+        );
         assert!(server.finish().is_empty());
     }
 
@@ -1125,8 +1346,13 @@ mod tests {
         lease
             .record_step_finished(&pending.ticket, pending.step.ordinal, receipt)
             .unwrap();
-        let completed = lease.finish_reconciliation(pending.ticket.attempt_id()).unwrap();
-        assert_eq!(completed.execution_blocker(), Some(TaskExecutionState::Completed));
+        let completed = lease
+            .finish_reconciliation(pending.ticket.attempt_id())
+            .unwrap();
+        assert_eq!(
+            completed.execution_blocker(),
+            Some(TaskExecutionState::Completed)
+        );
         drop(lease);
 
         // Preserve the completed fence and aggregate receipt while loading the
@@ -1136,7 +1362,10 @@ mod tests {
             .join("tasks")
             .join(format!("{}.json", pending.task_id.replace(':', "_")));
         let mut legacy: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        legacy["execution_fence"].as_object_mut().unwrap().remove("journal");
+        legacy["execution_fence"]
+            .as_object_mut()
+            .unwrap()
+            .remove("journal");
         let mut file = fs::File::create(path).unwrap();
         serde_json::to_writer(&mut file, &legacy).unwrap();
         file.sync_all().unwrap();
@@ -1157,10 +1386,16 @@ mod tests {
         assert_eq!(outcome.exit_code, CliExitCode::Success);
         assert_eq!(outcome.payload["reconciliation"]["complete"], true);
         assert_eq!(outcome.payload["reconciliation"]["execution_fenced"], true);
-        assert_eq!(outcome.payload["reconciliation"]["journal_available"], false);
+        assert_eq!(
+            outcome.payload["reconciliation"]["journal_available"],
+            false
+        );
         assert_eq!(outcome.payload["reconciliation"]["host_lookups"], 0);
         for field in ["covered_steps", "total_steps", "unresolved_steps"] {
-            assert_eq!(outcome.payload["reconciliation"].get(field), Some(&Value::Null));
+            assert_eq!(
+                outcome.payload["reconciliation"].get(field),
+                Some(&Value::Null)
+            );
         }
         assert!(
             outcome.payload["message"]
@@ -1169,10 +1404,603 @@ mod tests {
                 .contains("legacy record has no per-step journal")
         );
         assert_eq!(
-            store.load(&pending.task_id).unwrap().unwrap().execution_history.len(),
+            store
+                .load(&pending.task_id)
+                .unwrap()
+                .unwrap()
+                .execution_history
+                .len(),
             completed.execution_history.len()
         );
         assert!(server.finish().is_empty());
+        assert_replay_blocked(&store, &pending);
+    }
+
+    #[cfg(unix)]
+    fn current_local_success(pending: &PendingInvocation) -> InvocationQueryResponse {
+        let mut history = local_success(pending, 7);
+        let record = history.invocation.as_mut().unwrap();
+        record.admitted_at = Utc::now() - chrono::Duration::seconds(4);
+        record.finished_at = Some(record.admitted_at + chrono::Duration::seconds(1));
+        record.admission.deadline_at = record.admitted_at + chrono::Duration::seconds(30);
+        history
+    }
+
+    #[cfg(unix)]
+    fn retained_result(
+        history: &InvocationQueryResponse,
+        output: Value,
+    ) -> RetainedInvocationResult {
+        let binding =
+            InvocationResultBinding::from_record(history.invocation.as_ref().unwrap()).unwrap();
+        let response = fcp_kernel::InvokeResponse::ok(
+            fcp_kernel::RequestId(binding.ticket.operation_id.clone()),
+            output,
+        );
+        let mut digest = blake3::Hasher::new_derive_key("fcp.host.invocation-result.response.v1");
+        digest.update(&serde_json::to_vec(&response).unwrap());
+        RetainedInvocationResult {
+            version: 1,
+            retained_at: binding.finished_at,
+            expires_at: binding.finished_at
+                + chrono::Duration::seconds(fcp_host::INVOCATION_RESULT_TTL_SECONDS),
+            binding,
+            response_digest: digest.finalize().to_hex().to_string(),
+            response,
+        }
+    }
+
+    #[cfg(unix)]
+    fn save_completion(
+        store: &TaskStore,
+        pending: &PendingInvocation,
+        history: &InvocationQueryResponse,
+    ) {
+        let lease = store.lock_task(&pending.task_id).unwrap();
+        let pin = task_reconcile::bind_observation(
+            &pending.binding,
+            &pending.binding.host,
+            None,
+            history,
+        )
+        .unwrap();
+        lease
+            .record_invocation_observation(
+                pending.ticket.attempt_id(),
+                pending.step.ordinal,
+                pin.clone(),
+            )
+            .unwrap();
+        let completion = task_reconcile::verify_completion(
+            &pending.binding,
+            &pending.binding.host,
+            &pin,
+            history,
+        )
+        .unwrap();
+        lease
+            .record_invocation_completion(
+                pending.ticket.attempt_id(),
+                pending.step.ordinal,
+                completion,
+            )
+            .unwrap();
+    }
+
+    /// Only these two authenticated read endpoints may be reached. The result
+    /// request must name the exact fresh history, never an invocation or peer.
+    #[cfg(unix)]
+    fn serve_result_reads(
+        listener: TcpListener,
+        history: InvocationQueryResponse,
+        result: Option<RetainedInvocationResult>,
+        expected_attempt: Option<u64>,
+    ) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            let expected_binding =
+                InvocationResultBinding::from_record(history.invocation.as_ref().unwrap()).unwrap();
+            for (path, body) in [
+                (
+                    "/rpc/admin/invocations",
+                    serde_json::to_vec(&history).unwrap(),
+                ),
+                (
+                    "/rpc/admin/invocations/result",
+                    serde_json::to_vec(&fcp_host::InvocationResultQueryResponse { result })
+                        .unwrap(),
+                ),
+            ] {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(
+                                Instant::now() < deadline,
+                                "expected task recovery read never arrived"
+                            );
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("task recovery accept failed: {error}"),
+                    }
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                reader.read_line(&mut request_line).unwrap();
+                assert_eq!(
+                    request_line.split_whitespace().take(2).collect::<Vec<_>>(),
+                    vec!["POST", path]
+                );
+                let mut headers = std::collections::BTreeMap::new();
+                loop {
+                    let mut line = String::new();
+                    assert!(reader.read_line(&mut line).unwrap() > 0);
+                    assert!(headers.len() < 64 && line.len() <= 8192);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    let (name, value) = line.split_once(':').unwrap();
+                    assert!(
+                        headers
+                            .insert(name.to_ascii_lowercase(), value.trim().to_owned())
+                            .is_none()
+                    );
+                }
+                assert_eq!(headers["authorization"], format!("Bearer {OWNER_TOKEN}"));
+                assert_eq!(headers["x-fcp-zone"], "z:owner");
+                let length: usize = headers["content-length"].parse().unwrap();
+                assert!(length > 0 && length <= 8192);
+                let mut request = vec![0; length];
+                reader.read_exact(&mut request).unwrap();
+                if path == "/rpc/admin/invocations" {
+                    let request: InvocationQueryRequest = serde_json::from_slice(&request).unwrap();
+                    assert_eq!(request.operation_id, expected_binding.ticket.operation_id);
+                    assert_eq!(request.attempt_id, expected_attempt);
+                } else {
+                    let request: InvocationResultQueryRequest =
+                        serde_json::from_slice(&request).unwrap();
+                    assert_eq!(request.binding, expected_binding);
+                }
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+                stream.write_all(&body).unwrap();
+                stream.flush().unwrap();
+            }
+        })
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn task_output_recovery_saves_exact_private_response_and_never_replays() {
+        for output in [
+            json!({"id":"already-created", "private":"task-output-secret"}),
+            Value::Null,
+        ] {
+            let temp = TempDir::new().unwrap();
+            let store = TaskStore::at_path(temp.path().join("state"));
+            let (host, listener) = bind_history_listener();
+            let pending = pending_invocation(&store, &host);
+            let history = current_local_success(&pending);
+            let retained = retained_result(&history, output.clone());
+            let server = serve_result_reads(listener, history, Some(retained.clone()), None);
+            let mut args = command_args(&temp, &pending);
+            args.recover_output = true;
+            let outcome = reconcile(&store, &args, Some(&host)).unwrap();
+            server.join().unwrap();
+            assert_eq!(
+                outcome.exit_code,
+                CliExitCode::Success,
+                "{}",
+                outcome.payload
+            );
+            assert_eq!(outcome.payload["result_recovered"], true);
+            assert_eq!(outcome.payload["invoke_attempted"], false);
+            assert_eq!(outcome.payload["reconciliation"]["host_lookups"], 2);
+            assert_eq!(outcome.payload["reconciliation"]["recovered_outputs"], 1);
+            assert!(!outcome.payload.to_string().contains("task-output-secret"));
+            let reopened = TaskStore::at_path(store.root_dir().to_path_buf());
+            let saved = reopened.load(&pending.task_id).unwrap().unwrap();
+            let step = saved_step(&reopened, &pending);
+            assert_eq!(
+                step.output_recovery
+                    .as_ref()
+                    .unwrap()
+                    .result
+                    .response
+                    .result,
+                Some(output)
+            );
+            assert_eq!(
+                step.output_recovery
+                    .as_ref()
+                    .unwrap()
+                    .result
+                    .response_digest,
+                retained.response_digest
+            );
+            assert!(!format!("{saved:?}").contains("task-output-secret"));
+            assert!(
+                !task_payload_view(&saved)
+                    .to_string()
+                    .contains("task-output-secret")
+            );
+            assert!(
+                !serde_json::to_string(&saved.execution_history)
+                    .unwrap()
+                    .contains("task-output-secret")
+            );
+            let mut repeated = missing_token_args(&temp, &pending);
+            repeated.recover_output = true;
+            let repeat =
+                reconcile(&reopened, &repeated, Some("invalid://no-network-required")).unwrap();
+            assert_eq!(repeat.exit_code, CliExitCode::Success);
+            assert_eq!(repeat.payload["result_recovered"], true);
+            assert_eq!(repeat.payload["reconciliation"]["host_lookups"], 0);
+            assert_eq!(
+                reopened
+                    .load(&pending.task_id)
+                    .unwrap()
+                    .unwrap()
+                    .execution_history
+                    .len(),
+                saved.execution_history.len()
+            );
+            assert_replay_blocked(&reopened, &pending);
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn task_output_recovery_can_follow_completed_metadata_without_changing_its_proof() {
+        let temp = TempDir::new().unwrap();
+        let store = TaskStore::at_path(temp.path().join("state"));
+        let (host, listener) = bind_history_listener();
+        let pending = pending_invocation(&store, &host);
+        let history = current_local_success(&pending);
+        save_completion(&store, &pending, &history);
+        let before = saved_step(&store, &pending);
+        let result = retained_result(&history, json!({"id":"previously-finished"}));
+        let server = serve_result_reads(listener, history, Some(result), Some(7));
+        let mut args = command_args(&temp, &pending);
+        args.recover_output = true;
+        let outcome = reconcile(&store, &args, Some(&host)).unwrap();
+        server.join().unwrap();
+        assert_eq!(
+            outcome.exit_code,
+            CliExitCode::Success,
+            "{}",
+            outcome.payload
+        );
+        let after = saved_step(&store, &pending);
+        assert_eq!(after.observed_attempt, before.observed_attempt);
+        assert_eq!(after.reconciliation, before.reconciliation);
+        assert_eq!(after.receipt, before.receipt);
+        assert!(after.output_recovery.is_some());
+        assert_replay_blocked(&store, &pending);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn task_output_recovery_refuses_missing_corrupt_expired_or_mismatched_custody() {
+        for mode in ["missing", "corrupt", "attempt", "expired", "zone", "failed"] {
+            let temp = TempDir::new().unwrap();
+            let store = TaskStore::at_path(temp.path().join("state"));
+            let (host, listener) = bind_history_listener();
+            let pending = pending_invocation(&store, &host);
+            let mut history = current_local_success(&pending);
+            if mode == "expired" {
+                let record = history.invocation.as_mut().unwrap();
+                record.admitted_at -= chrono::Duration::days(2);
+                record.finished_at = record.finished_at.map(|at| at - chrono::Duration::days(2));
+                record.admission.deadline_at -= chrono::Duration::days(2);
+            }
+            let mut result =
+                retained_result(&history, json!({"private":"untrusted-output-secret"}));
+            match mode {
+                "corrupt" => {
+                    result.response.result = Some(json!({"private":"changed-output-secret"}))
+                }
+                "attempt" => result.binding.ticket.attempt_id += 1,
+                "zone" => result.binding.zone_id = "z:private".into(),
+                "failed" => result.response.status = InvokeStatus::Error,
+                _ => {}
+            }
+            let server = serve_result_reads(
+                listener,
+                history,
+                (mode != "missing").then_some(result),
+                None,
+            );
+            let mut args = command_args(&temp, &pending);
+            args.recover_output = true;
+            let outcome = reconcile(&store, &args, Some(&host)).unwrap();
+            server.join().unwrap();
+            assert_ne!(
+                outcome.exit_code,
+                CliExitCode::Success,
+                "{mode}: {}",
+                outcome.payload
+            );
+            assert_eq!(outcome.payload["reconciliation"]["complete"], true);
+            assert_eq!(outcome.payload["result_recovered"], false);
+            assert!(!outcome.payload.to_string().contains("output-secret"));
+            let step = saved_step(&store, &pending);
+            assert!(step.reconciliation.is_some());
+            assert!(step.output_recovery.is_none());
+            assert_replay_blocked(&store, &pending);
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn task_output_recovery_refuses_public_storage_before_credentials_or_network() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let store = TaskStore::at_path(temp.path().join("state"));
+        let (host, listener) = bind_history_listener();
+        let pending = pending_invocation(&store, &host);
+        let path = store
+            .root_dir()
+            .join("tasks")
+            .join(format!("{}.json", pending.task_id.replace(':', "_")));
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let server = serve_history(
+            listener,
+            pending.binding.request_id.clone(),
+            Vec::new(),
+            |_| {},
+        );
+        let mut args = missing_token_args(&temp, &pending);
+        args.recover_output = true;
+        let outcome = reconcile(&store, &args, Some(&host)).unwrap();
+        assert_eq!(outcome.exit_code, CliExitCode::Validation);
+        assert_eq!(
+            outcome.payload["error"]["type"],
+            "task-output-storage-not-private"
+        );
+        assert_eq!(outcome.payload["reconciliation"]["host_lookups"], 0);
+        assert!(server.finish().is_empty());
+        assert_replay_blocked(&store, &pending);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn task_output_recovery_keeps_mesh_completion_separate_from_executor_custody() {
+        use fcp_host::{
+            MeshInvocationAttempt, MeshInvocationIdentity, MeshInvocationIntent,
+            MeshInvocationObservation, MeshInvocationOutcome, MeshInvocationRecord,
+            MeshInvocationTerminal,
+        };
+
+        let temp = TempDir::new().unwrap();
+        let store = TaskStore::at_path(temp.path().join("state"));
+        let (host, listener) = bind_history_listener();
+        let pending = pending_invocation(&store, &host);
+        let local = current_local_success(&pending).invocation.unwrap();
+        let response = InvocationQueryResponse {
+            invocation: None,
+            mesh_invocation: Some(MeshInvocationRecord {
+                ticket: local.ticket,
+                intent: MeshInvocationIntent {
+                    operation_id: pending.binding.request_id.clone(),
+                    connector_id: pending.binding.connector_id.clone(),
+                    operation: pending.binding.operation.clone(),
+                    zone_id: pending.binding.zone_id.clone(),
+                    origin_node: "node-origin".into(),
+                    target_node: "remote-executor".into(),
+                    identity: MeshInvocationIdentity::VerifiedPrincipal {
+                        principal: "user:owner".into(),
+                    },
+                    correlation_id: None,
+                    deadline_at: local.admission.deadline_at,
+                    idempotency: local.admission.idempotency,
+                    transport_idempotency: local.admission.transport_idempotency,
+                },
+                admitted_at: local.admitted_at,
+                attempts: vec![MeshInvocationAttempt {
+                    target_node: "remote-executor".into(),
+                    selected_at: local.admitted_at,
+                    observation: Some(MeshInvocationObservation::ResponseObserved {
+                        http_status: 200,
+                    }),
+                }],
+                terminal: Some(MeshInvocationTerminal {
+                    outcome: MeshInvocationOutcome::Succeeded,
+                    http_status: 200,
+                    duration_ms: 1000,
+                    receipt_id: None,
+                }),
+                finished_at: local.finished_at,
+                durable: true,
+            }),
+            host_job_active: false,
+        };
+        let server = serve_history(
+            listener,
+            pending.binding.request_id.clone(),
+            vec![response],
+            |_| {},
+        );
+        let mut args = command_args(&temp, &pending);
+        args.recover_output = true;
+        let outcome = reconcile(&store, &args, Some(&host)).unwrap();
+        assert_eq!(outcome.exit_code, CliExitCode::Validation);
+        assert_eq!(outcome.payload["reconciliation"]["complete"], true);
+        assert_eq!(outcome.payload["result_recovered"], false);
+        assert!(
+            outcome.payload["reconciliation"]["observations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|observation| observation["reason"] == "task-result-not-local")
+        );
+        let step = saved_step(&store, &pending);
+        assert_eq!(
+            step.reconciliation.unwrap().source,
+            TaskInvocationCompletionSource::MeshOriginObserved
+        );
+        assert!(step.output_recovery.is_none());
+        assert_eq!(
+            server.finish().len(),
+            1,
+            "no private result or remote executor request is permitted"
+        );
+        assert_replay_blocked(&store, &pending);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn task_output_recovery_reopens_transferred_custody_after_host_expiry_but_rejects_tampering() {
+        let temp = TempDir::new().unwrap();
+        let store = TaskStore::at_path(temp.path().join("state"));
+        let pending = pending_invocation(&store, "https://original-host.example");
+        let mut history = current_local_success(&pending);
+        let record = history.invocation.as_mut().unwrap();
+        record.admitted_at -= chrono::Duration::days(2);
+        record.finished_at = record.finished_at.map(|at| at - chrono::Duration::days(2));
+        record.admission.deadline_at -= chrono::Duration::days(2);
+        save_completion(&store, &pending, &history);
+        let result = retained_result(
+            &history,
+            json!({"id":"durably-transferred", "private":"historic-output-secret"}),
+        );
+        let recovered_at = result.retained_at + chrono::Duration::seconds(1);
+        assert!(result.expires_at < Utc::now());
+        assert!(result.validate(&result.binding, recovered_at).is_ok());
+        assert!(result.validate(&result.binding, Utc::now()).is_err());
+
+        // Model a capsule saved when custody was live. Loading it today must
+        // validate the original transfer time rather than renew host retention.
+        let path = store
+            .root_dir()
+            .join("tasks")
+            .join(format!("{}.json", pending.task_id.replace(':', "_")));
+        let mut capsule =
+            serde_json::to_value(store.load(&pending.task_id).unwrap().unwrap()).unwrap();
+        let steps = capsule["execution_fence"]["journal"]["steps"]
+            .as_array_mut()
+            .unwrap();
+        let index = steps
+            .iter()
+            .position(|step| step["ordinal"].as_u64() == Some(pending.step.ordinal as u64))
+            .unwrap();
+        steps[index]["output_recovery"] = json!({"recovered_at":recovered_at, "result":result});
+        fs::write(&path, serde_json::to_vec(&capsule).unwrap()).unwrap();
+        let reopened = TaskStore::at_path(store.root_dir().to_path_buf());
+        let saved = reopened.load(&pending.task_id).unwrap().unwrap();
+        assert!(
+            !task_payload_view(&saved)
+                .to_string()
+                .contains("historic-output-secret")
+        );
+        assert_eq!(
+            saved_step(&reopened, &pending)
+                .output_recovery
+                .unwrap()
+                .result
+                .response
+                .result,
+            Some(json!({"id":"durably-transferred", "private":"historic-output-secret"}))
+        );
+        assert_replay_blocked(&reopened, &pending);
+
+        capsule["execution_fence"]["journal"]["steps"][index]["output_recovery"]["result"]["response"]
+            ["result"] = json!({"id":"changed-after-transfer"});
+        fs::write(&path, serde_json::to_vec(&capsule).unwrap()).unwrap();
+        assert!(
+            reopened.load(&pending.task_id).is_err(),
+            "changed bytes must fail their original response digest"
+        );
+        assert_replay_blocked(&reopened, &pending);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn task_output_recovery_persistence_refuses_another_task_attempt_host_or_replacement() {
+        let temp = TempDir::new().unwrap();
+        let store = TaskStore::at_path(temp.path().join("state"));
+        let pending = pending_invocation(&store, "https://original-host.example");
+        let history = current_local_success(&pending);
+        save_completion(&store, &pending, &history);
+        let result = retained_result(&history, json!({"id":"exact-original-result"}));
+        let lease = store.lock_task(&pending.task_id).unwrap();
+        assert!(
+            lease
+                .record_invocation_output(
+                    "another-task-attempt",
+                    pending.step.ordinal,
+                    &pending.binding.host,
+                    &history,
+                    &result
+                )
+                .is_err()
+        );
+        assert!(
+            lease
+                .record_invocation_output(
+                    pending.ticket.attempt_id(),
+                    pending.step.ordinal,
+                    "https://different-host.example",
+                    &history,
+                    &result
+                )
+                .is_err()
+        );
+        let saved = lease
+            .record_invocation_output(
+                pending.ticket.attempt_id(),
+                pending.step.ordinal,
+                &pending.binding.host,
+                &history,
+                &result,
+            )
+            .unwrap();
+        let repeated = lease
+            .record_invocation_output(
+                pending.ticket.attempt_id(),
+                pending.step.ordinal,
+                &pending.binding.host,
+                &history,
+                &result,
+            )
+            .unwrap();
+        assert_eq!(
+            saved.execution_history.len(),
+            repeated.execution_history.len()
+        );
+        let replacement =
+            retained_result(&history, json!({"id":"different-self-consistent-result"}));
+        assert!(
+            lease
+                .record_invocation_output(
+                    pending.ticket.attempt_id(),
+                    pending.step.ordinal,
+                    &pending.binding.host,
+                    &history,
+                    &replacement
+                )
+                .is_err()
+        );
+        assert_eq!(
+            lease.load().unwrap().unwrap().execution_history.len(),
+            saved.execution_history.len()
+        );
+        assert_eq!(
+            saved_step(&store, &pending)
+                .output_recovery
+                .unwrap()
+                .result
+                .response_digest,
+            result.response_digest
+        );
+        drop(lease);
         assert_replay_blocked(&store, &pending);
     }
 }

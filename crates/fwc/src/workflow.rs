@@ -7,7 +7,8 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use chrono::{SecondsFormat, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
+use fcp_host::{InvocationQueryResponse, InvocationResultBinding, RetainedInvocationResult};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -15,7 +16,9 @@ use uuid::Uuid;
 use crate::{
     intent::{self, CompiledIntent, IntentMode, WorkflowTruth},
     readiness::CommandAvailability,
-    task_reconcile::{TaskInvocationAttempt, TaskInvocationCompletion},
+    task_reconcile::{
+        self, TaskInvocationAttempt, TaskInvocationCompletion, TaskInvocationCompletionSource,
+    },
 };
 
 const TASK_SCHEMA_VERSION: u32 = 1;
@@ -96,6 +99,28 @@ pub struct TaskExecutionFence {
     pub journal: Option<TaskExecutionJournal>,
 }
 
+impl TaskExecutionFence {
+    /// Public task views retain proof metadata without disclosing explicitly
+    /// recovered provider bodies from the private capsule.
+    #[must_use]
+    pub fn redacted_view(&self) -> Value {
+        let mut value = json!({
+            "attempt_id": self.attempt_id,
+            "started_at": self.started_at,
+            "trigger": self.trigger,
+            "mode": self.mode,
+            "revision": self.revision,
+            "state": self.state,
+        });
+        if let Some(journal) = &self.journal {
+            value["journal"] = json!({
+                "steps": journal.steps.iter().map(TaskStepExecution::redacted_view).collect::<Vec<_>>()
+            });
+        }
+        value
+    }
+}
+
 /// Ordered, durable progress for one exact capsule attempt. The plan snapshot
 /// remains stable if a later CLI version compiles the same intent differently.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -120,6 +145,10 @@ pub struct TaskStepExecution {
     /// a lost result body or supplies input for undispatched downstream work.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reconciliation: Option<TaskInvocationCompletion>,
+    /// Exact response transferred from private host custody only on explicit
+    /// output recovery. This never changes the original receipt or permits replay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_recovery: Option<TaskRecoveredOutput>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<String>,
     /// The executor supplies its redacted primitive receipt, never argv with
@@ -129,6 +158,36 @@ pub struct TaskStepExecution {
 }
 
 impl TaskStepExecution {
+    fn redacted_view(&self) -> Value {
+        let mut value = json!({
+            "ordinal": self.ordinal,
+            "command": self.command,
+            "side_effecting": self.side_effecting,
+        });
+        if let Some(started_at) = &self.started_at {
+            value["started_at"] = json!(started_at);
+        }
+        if let Some(invocation) = &self.invocation {
+            value["invocation"] = json!(invocation);
+        }
+        if let Some(observed_attempt) = &self.observed_attempt {
+            value["observed_attempt"] = json!(observed_attempt);
+        }
+        if let Some(reconciliation) = &self.reconciliation {
+            value["reconciliation"] = json!(reconciliation);
+        }
+        if let Some(output_recovery) = &self.output_recovery {
+            value["output_recovery"] = output_recovery.summary();
+        }
+        if let Some(finished_at) = &self.finished_at {
+            value["finished_at"] = json!(finished_at);
+        }
+        if let Some(receipt) = &self.receipt {
+            value["receipt"] = receipt.clone();
+        }
+        value
+    }
+
     /// A retained refusal or definitive connector failure cannot be replaced
     /// with a later successful host observation.
     #[must_use]
@@ -144,6 +203,40 @@ impl TaskStepExecution {
                     && self.observed_attempt.as_ref() == Some(&completion.attempt())
                     && !receipt_contradicts_completion(self.receipt.as_ref())
             })
+    }
+}
+
+/// Private custody of an exact completed response. Host retention expiry limits
+/// the transfer, not the lifetime of data already saved by the operator.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskRecoveredOutput {
+    pub recovered_at: DateTime<Utc>,
+    pub result: RetainedInvocationResult,
+}
+
+impl TaskRecoveredOutput {
+    #[must_use]
+    pub fn summary(&self) -> Value {
+        json!({
+            "version": self.result.version,
+            "request_id": self.result.binding.ticket.operation_id,
+            "attempt_id": self.result.binding.ticket.attempt_id,
+            "response_digest": self.result.response_digest,
+            "retained_at": self.result.retained_at,
+            "expires_at": self.result.expires_at,
+            "recovered_at": self.recovered_at,
+            "output_available": true,
+        })
+    }
+}
+
+impl std::fmt::Debug for TaskRecoveredOutput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TaskRecoveredOutput")
+            .field("metadata", &self.summary())
+            .finish_non_exhaustive()
     }
 }
 
@@ -472,6 +565,13 @@ impl TaskStore {
             );
             if let Some(journal) = &fence.journal {
                 validate_execution_journal(journal)?;
+                if journal
+                    .steps
+                    .iter()
+                    .any(|step| step.output_recovery.is_some())
+                {
+                    self.require_private_output_storage(task_id)?;
+                }
             }
         }
         recompute_task(&mut task, false);
@@ -810,6 +910,19 @@ impl TaskStore {
     fn save(&self, task: &WorkflowTask) -> Result<()> {
         validate_task_id(&task.id)?;
         self.ensure_tasks_dir()?;
+        if task
+            .execution_fence
+            .as_ref()
+            .and_then(|fence| fence.journal.as_ref())
+            .is_some_and(|journal| {
+                journal
+                    .steps
+                    .iter()
+                    .any(|step| step.output_recovery.is_some())
+            })
+        {
+            self.require_private_output_storage(&task.id)?;
+        }
         let final_path = self.task_path(&task.id);
         ensure_regular_task_file(&final_path)?;
         let temp_path = final_path.with_extension(format!("tmp.{}", Uuid::new_v4().simple()));
@@ -857,6 +970,39 @@ impl TaskStore {
                 self.tasks_dir().display()
             )
         })
+    }
+
+    /// Output custody requires private regular files and a directory which
+    /// another local user cannot replace. Existing public capsules must be
+    /// secured explicitly before an authenticated result is requested.
+    fn require_private_output_storage(&self, task_id: &str) -> Result<()> {
+        validate_task_id(task_id)?;
+        ensure!(
+            cfg!(unix),
+            "task output recovery requires private Unix storage"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+            let directory = fs::symlink_metadata(self.tasks_dir())?;
+            ensure!(
+                directory.is_dir() && directory.permissions().mode() & 0o022 == 0,
+                "task output recovery requires a protected task directory"
+            );
+            let task_path = self.task_path(task_id);
+            for path in [&task_path, &task_path.with_extension("lock")] {
+                let metadata = fs::symlink_metadata(path)?;
+                ensure!(
+                    metadata.is_file()
+                        && !metadata.file_type().is_symlink()
+                        && metadata.permissions().mode() & 0o077 == 0
+                        && metadata.nlink() == 1,
+                    "task output recovery requires private capsule and lock files without additional hard links"
+                );
+            }
+        }
+        Ok(())
     }
 
     fn task_path(&self, task_id: &str) -> PathBuf {
@@ -966,6 +1112,7 @@ impl TaskLease<'_> {
                         invocation: None,
                         observed_attempt: None,
                         reconciliation: None,
+                        output_recovery: None,
                         finished_at: None,
                         receipt: None,
                     })
@@ -1144,6 +1291,95 @@ impl TaskLease<'_> {
         self.save_reconciliation(task, true)
     }
 
+    /// Check output storage before reading or transmitting any admin authority.
+    pub fn prepare_output_recovery(&self) -> Result<()> {
+        self.store.require_private_output_storage(&self.task_id)
+    }
+
+    /// Bind a private result lookup to fresh, unchanged local completion. This
+    /// is a read permission only; it cannot authorize another invocation.
+    pub fn output_recovery_binding(
+        &self,
+        expected_task_attempt_id: &str,
+        ordinal: usize,
+        selected_host: &str,
+        observation: &InvocationQueryResponse,
+    ) -> Result<InvocationResultBinding> {
+        let mut task = self.reconciliation_task(expected_task_attempt_id)?;
+        let step = reconciliation_step_mut(&mut task, ordinal)?;
+        let completion = step
+            .reconciliation
+            .as_ref()
+            .context("task output recovery requires confirmed completion")?;
+        ensure!(
+            completion.source == TaskInvocationCompletionSource::LocalFinalized,
+            "task output recovery requires executor-local history"
+        );
+        let actual = task_reconcile::verify_completion(
+            step.invocation.as_ref().expect("invocation checked"),
+            selected_host,
+            &completion.attempt(),
+            observation,
+        )?;
+        ensure!(
+            &actual == completion,
+            "task completion changed before output recovery"
+        );
+        InvocationResultBinding::from_record(
+            observation
+                .invocation
+                .as_ref()
+                .context("task result has no local invocation record")?,
+        )
+        .map_err(Into::into)
+    }
+
+    /// Transfer a verified response into the capsule without replacing original
+    /// receipts, widening authority, or clearing the execution fence.
+    pub fn record_invocation_output(
+        &self,
+        expected_task_attempt_id: &str,
+        ordinal: usize,
+        selected_host: &str,
+        observation: &InvocationQueryResponse,
+        result: &RetainedInvocationResult,
+    ) -> Result<WorkflowTask> {
+        self.prepare_output_recovery()?;
+        let binding = self.output_recovery_binding(
+            expected_task_attempt_id,
+            ordinal,
+            selected_host,
+            observation,
+        )?;
+        let recovered_at = Utc::now();
+        result.validate(&binding, recovered_at)?;
+        let mut task = self.reconciliation_task(expected_task_attempt_id)?;
+        let saved_at: DateTime<Utc> = task
+            .updated_at
+            .parse()
+            .context("task output recovery requires a valid save timestamp")?;
+        ensure!(
+            recovered_at >= saved_at,
+            "task output recovery clock moved backward"
+        );
+        let step = reconciliation_step_mut(&mut task, ordinal)?;
+        if let Some(previous) = &step.output_recovery {
+            ensure!(
+                previous.result.binding == binding
+                    && previous.result.response_digest == result.response_digest,
+                "task output recovery cannot replace a previous result"
+            );
+            return Ok(task);
+        }
+        step.output_recovery = Some(TaskRecoveredOutput {
+            recovered_at,
+            result: result.clone(),
+        });
+        validate_step_output(step)?;
+        validate_recovered_output_size(pending_journal_mut(&mut task)?)?;
+        self.save_reconciliation(task, true)
+    }
+
     /// Finish from retained evidence only. This also recovers a lost aggregate
     /// receipt when every primitive outcome was already saved successfully.
     /// Unstarted, unsupported, or uncertain steps remain fenced for review.
@@ -1189,6 +1425,11 @@ impl TaskLease<'_> {
             .filter(|step| step.is_complete())
             .count();
         let unresolved_count = journal.steps.len() - completed_count;
+        let recovered_count = journal
+            .steps
+            .iter()
+            .filter(|step| step.output_recovery.is_some())
+            .count();
         let completed = unresolved_count == 0;
         let state = if completed {
             TaskExecutionState::Completed
@@ -1211,6 +1452,7 @@ impl TaskLease<'_> {
                         "request_id": step.invocation.as_ref().map(|binding| &binding.request_id),
                         "host": step.invocation.as_ref().map(|binding| &binding.host),
                         "completion": completion,
+                        "output_recovery": step.output_recovery.as_ref().map(TaskRecoveredOutput::summary),
                     })
                 })
             })
@@ -1242,8 +1484,9 @@ impl TaskLease<'_> {
             "reconciled_steps": reconciled_steps,
             "unresolved_steps": unresolved_steps,
             "automatic_retry_allowed": false,
-            "completion_only": true,
+            "completion_only": recovered_count == 0,
             "outputs_reconstructed": false,
+            "recovered_output_count": recovered_count,
         });
         let unchanged = fence.state == state
             && task.last_execution().is_some_and(|receipt| {
@@ -1404,6 +1647,68 @@ fn validate_step_completion(
     Ok(())
 }
 
+fn validate_step_output(step: &TaskStepExecution) -> Result<()> {
+    let recovery = step
+        .output_recovery
+        .as_ref()
+        .context("task output recovery is missing its retained response")?;
+    let invocation = step
+        .invocation
+        .as_ref()
+        .context("task output recovery has no original invocation binding")?;
+    let completion = step
+        .reconciliation
+        .as_ref()
+        .context("task output recovery has no confirmed completion")?;
+    validate_step_completion(step, completion)?;
+    let binding = &recovery.result.binding;
+    ensure!(
+        completion.source == TaskInvocationCompletionSource::LocalFinalized
+            && binding.ticket.operation_id == invocation.request_id
+            && binding.ticket.attempt_id == completion.attempt_id
+            && binding.admitted_at == completion.admitted_at
+            && binding.finished_at == completion.finished_at
+            && Some(&binding.audit_event_id) == completion.audit_event_id.as_ref()
+            && binding.connector_id == invocation.connector_id
+            && binding.operation == invocation.operation
+            && binding.zone_id == invocation.zone_id
+            && invocation
+                .principal
+                .as_ref()
+                .is_none_or(|principal| principal == &binding.principal)
+            && binding.transport_idempotency == invocation.transport_idempotency
+            && recovery
+                .result
+                .response
+                .receipt_id
+                .as_ref()
+                .map(ToString::to_string)
+                == completion.receipt_id,
+        "task recovered output does not match its confirmed invocation"
+    );
+    recovery.result.validate(binding, recovery.recovered_at)?;
+    Ok(())
+}
+
+fn validate_recovered_output_size(journal: &TaskExecutionJournal) -> Result<()> {
+    let mut bytes = 0_u64;
+    for output in journal
+        .steps
+        .iter()
+        .filter_map(|step| step.output_recovery.as_ref())
+    {
+        let encoded = serde_json::to_vec(output)?;
+        bytes = bytes
+            .checked_add(u64::try_from(encoded.len())?)
+            .context("task recovered output size overflow")?;
+        ensure!(
+            bytes <= fcp_host::INVOCATION_RESULT_MAX_TOTAL_BYTES,
+            "task recovered output exceeds the aggregate custody limit"
+        );
+    }
+    Ok(())
+}
+
 fn validate_invocation_binding(binding: &TaskInvocationBinding) -> Result<()> {
     let valid_metadata = |value: &str| {
         !value.trim().is_empty() && value.len() <= 512 && !value.chars().any(char::is_control)
@@ -1514,10 +1819,14 @@ fn validate_execution_journal(journal: &TaskExecutionJournal) -> Result<()> {
         if let Some(completion) = &step.reconciliation {
             validate_step_completion(step, completion)?;
         }
+        if step.output_recovery.is_some() {
+            validate_step_output(step)?;
+        }
         if let Some(receipt) = &step.receipt {
             validate_step_receipt(step, receipt)?;
         }
     }
+    validate_recovered_output_size(journal)?;
     Ok(())
 }
 

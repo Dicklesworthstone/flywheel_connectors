@@ -36766,7 +36766,7 @@ fn task_payload_view(task: &workflow::WorkflowTask) -> Value {
         },
         "execution_history_count": task.execution_history.len(),
         "last_execution": task.last_execution().map(execution_receipt_summary),
-        "execution_fence": task.execution_fence,
+        "execution_fence": task.execution_fence.as_ref().map(workflow::TaskExecutionFence::redacted_view),
     })
 }
 

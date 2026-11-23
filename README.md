@@ -1831,6 +1831,10 @@ fwc --json task show w:7f3k9a1b
 fwc --json --host http://127.0.0.1:8787 task reconcile w:7f3k9a1b \
     --admin-token-file host-admin.token
 
+# Explicitly transfer an exact completed local response into the private capsule.
+fwc --json --host http://127.0.0.1:8787 task reconcile w:7f3k9a1b \
+    --admin-token-file host-admin.token --recover-output
+
 # After reconciling prior host/provider effects, create a separate capsule
 # only when another execution is intended. Bind and approve its returned ID.
 fwc task create 'create a GitHub issue titled "Additional follow-up"' \
@@ -1860,10 +1864,30 @@ Older hosts without the new final-envelope and budget-completion markers cannot
 provide automatic proof of local completion.
 
 Reconciliation preserves the original receipts, including lost-response errors,
-and adds completion references. It reports `result_recovered: false`: missing
-result bodies are not reconstructed. It does not resume downstream work or send
-another invocation. A completed capsule remains consumed; repeated reconciliation
-is idempotent and does not authorize another run.
+and adds completion references. By default it reads metadata only and reports
+`result_recovered: false`. With `--recover-output`, it rechecks a reconciled local
+completion whose response was lost and requests its bounded response from the host's opt-in private
+result store (`FCP_HOST_INVOCATION_RESULTS_DIR`). The original host, attempt,
+admission times, connector, operation, zone, principal, effect bindings and
+response digest must all agree. This also works after a prior metadata-only
+reconciliation already completed the capsule. Ordinary successful primitive
+receipts already retain their returned result and need no recovery lookup.
+
+Recovered responses are saved under each step's `output_recovery.result.response`
+in the private task capsule. The capsule and lock must be private regular files
+in a protected task directory; this custody path currently requires Unix.
+Normal `task show`, reconciliation output and debugging retain metadata without
+printing recovered bodies. A task retains at most 64 MiB of recovered records,
+and each response remains subject to the host's 2 MiB record ceiling. Host
+retention expiry bounds the initial transfer; an already recovered response has
+the same lifetime as the capsule. Missing, expired, invalid or foreign custody
+returns a non-success exit while preserving any verified completion metadata.
+Mesh-origin completion cannot recover another executor's output through the
+entry host, and credentials are never forwarded to that executor automatically.
+
+Neither form resumes downstream work or sends another invocation. A completed
+capsule remains consumed; repeated reconciliation is idempotent, can reuse
+already saved output without a host read, and does not authorize another run.
 
 Successful simulations and definite failures before an effect can still be
 corrected and executed. Binding changes advance the capsule revision without
