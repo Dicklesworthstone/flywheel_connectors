@@ -3738,6 +3738,77 @@ deny_ptrace = true
     }
 
     #[test]
+    fn cancelling_one_request_preserves_sibling_and_future_requests() {
+        let runtime = ConnectorRuntime::new(ConnectorRuntimeConfig::default());
+        let cancelled = runtime.request_context();
+        let sibling = runtime.request_context();
+        let same_request = cancelled.clone();
+        same_request.cancel();
+
+        assert!(cancelled.is_cancelled());
+        assert!(!sibling.is_cancelled());
+        assert!(!runtime.is_shutting_down());
+        let later = runtime.request_context_with_timeout(Duration::from_secs(1));
+        assert!(!later.is_cancelled());
+        assert!(!runtime.background_context().is_cancelled());
+
+        runtime.shutdown();
+        assert!(sibling.is_cancelled());
+        assert!(later.is_cancelled());
+    }
+
+    #[test]
+    fn cancelling_background_work_does_not_shut_down_the_runtime() {
+        let runtime = ConnectorRuntime::new(ConnectorRuntimeConfig::default());
+        let cancelled = runtime.background_context();
+        let sibling = runtime.background_context();
+        let request = runtime.request_context();
+        cancelled.cancel();
+
+        assert!(!runtime.is_shutting_down());
+        assert!(!sibling.is_cancelled());
+        assert!(!request.is_cancelled());
+        assert!(!runtime.background_context().is_cancelled());
+        runtime.shutdown();
+        assert!(runtime.is_shutting_down());
+        assert!(sibling.is_cancelled());
+        assert!(request.is_cancelled());
+    }
+
+    #[test]
+    fn cancelling_request_child_preserves_request_and_other_request_children() {
+        let runtime = ConnectorRuntime::new(ConnectorRuntimeConfig::default());
+        let request = runtime.request_context();
+        let child = request.child();
+        let sibling = request.child();
+        let descendant = child.child();
+        child.cancel();
+
+        assert!(descendant.is_cancelled());
+        assert!(!request.is_cancelled());
+        assert!(!sibling.is_cancelled());
+        assert!(!runtime.request_context().is_cancelled());
+        runtime.shutdown();
+        assert!(request.is_cancelled());
+        assert!(sibling.is_cancelled());
+    }
+
+    #[test]
+    fn shutdown_reaches_work_after_intermediate_context_handles_are_dropped() {
+        let runtime = ConnectorRuntime::new(ConnectorRuntimeConfig::default());
+        let descendant = runtime.request_context().child();
+        let background = runtime.background_context().child();
+        assert!(!descendant.is_cancelled());
+        assert!(!background.is_cancelled());
+
+        runtime.shutdown();
+        assert!(descendant.is_cancelled());
+        assert!(background.is_cancelled());
+        assert!(runtime.request_context().is_cancelled());
+        assert!(runtime.background_context().is_cancelled());
+    }
+
+    #[test]
     fn runtime_request_context_is_cancelled_by_shutdown() {
         let runtime = ConnectorRuntime::new(ConnectorRuntimeConfig::default());
         let ctx_before = runtime.request_context();

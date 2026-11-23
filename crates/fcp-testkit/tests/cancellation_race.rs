@@ -196,19 +196,34 @@ async fn child_context_inherits_parent_cancellation() {
 }
 
 #[fcp_async_core::runtime::test]
-async fn child_and_parent_share_cancellation_token() {
-    // fcp-async-core uses shared cancellation: child.cancel() cancels parent too.
-    // This is by design (Go-style shared context cancellation).
+async fn child_cancel_preserves_parent_siblings_and_future_work() {
     let parent = ExecutionContext::request_scoped(Duration::from_secs(10));
     let child = parent.child();
+    let sibling = parent.child();
+    let descendant = child.child();
 
     child.cancel();
 
     assert!(child.is_cancelled());
-    assert!(
-        parent.is_cancelled(),
-        "shared cancellation: child cancel propagates to parent"
+    assert!(descendant.is_cancelled());
+    assert!(!parent.is_cancelled());
+    assert!(!sibling.is_cancelled());
+    assert!(!parent.child().is_cancelled());
+    assert_eq!(parent.run(async { 7 }).await.expect("parent work"), 7);
+    assert_eq!(sibling.run(async { 11 }).await.expect("sibling work"), 11);
+    assert_eq!(
+        descendant
+            .run(std::future::pending::<()>())
+            .await
+            .expect_err("cancelled descendant"),
+        AsyncError::Cancelled
     );
+
+    // Clones remain handles to the same work, including its descendants.
+    let same_parent = parent.clone();
+    same_parent.cancel();
+    assert!(parent.is_cancelled());
+    assert!(sibling.is_cancelled());
 }
 
 #[fcp_async_core::runtime::test]

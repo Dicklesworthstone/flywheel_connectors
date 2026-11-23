@@ -787,12 +787,16 @@ impl ExecutionContext {
         }
     }
 
-    /// Create a child context inheriting cancellation and deadline.
+    /// Create an independently cancellable child with the inherited deadline.
+    ///
+    /// Cancelling this context cancels every descendant. Cancelling a child
+    /// does not cancel its parent or siblings. Use `Clone::clone` to share
+    /// cancellation authority over the same work instead of deriving a child.
     #[must_use]
     pub fn child(&self) -> Self {
         Self {
             scope: self.scope,
-            cancellation: self.cancellation.clone(),
+            cancellation: self.cancellation.child_token(),
             deadline: self.deadline,
         }
     }
@@ -2828,47 +2832,697 @@ pub mod signal {
     pub use asupersync::signal::ctrl_c;
 }
 
-#[derive(Debug)]
-struct CancellationState {
-    sender: channel::watch::Sender<bool>,
-    _keepalive: std::sync::Mutex<channel::watch::Receiver<bool>>,
+// Cancellation state is independent of the executor: it needs neither a watcher
+// task per child nor a recursively owned chain of parent handles. Keeping this
+// state machine together also permits runtime-free race tests.
+mod cancellation {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex, MutexGuard};
+    use std::task::{Context, Poll, Waker};
+
+    type NodeId = u64;
+
+    fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+        // No user code runs under these locks. Recover the remaining state if
+        // another thread panicked so shutdown does not panic a second time.
+        mutex
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum Status {
+        Active,
+        Cancelled,
+        Closed,
+    }
+
+    struct SignalState {
+        status: Status,
+        next_waiter: u64,
+        waiters: BTreeMap<u64, Waker>,
+    }
+
+    pub(super) struct Signal {
+        state: Mutex<SignalState>,
+    }
+
+    impl std::fmt::Debug for Signal {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            let (status, waiters) = {
+                let state = lock(&self.state);
+                (state.status, state.waiters.len())
+            };
+            formatter
+                .debug_struct("CancellationSignal")
+                .field("status", &status)
+                .field("waiters", &waiters)
+                .finish()
+        }
+    }
+
+    impl Signal {
+        fn new(cancelled: bool) -> Self {
+            Self {
+                state: Mutex::new(SignalState {
+                    status: if cancelled {
+                        Status::Cancelled
+                    } else {
+                        Status::Active
+                    },
+                    next_waiter: 0,
+                    waiters: BTreeMap::new(),
+                }),
+            }
+        }
+
+        pub(super) fn is_cancelled(&self) -> bool {
+            lock(&self.state).status == Status::Cancelled
+        }
+
+        // Return wakers to the caller: a waker can run arbitrary executor code
+        // and must never be invoked or dropped while either lock is held.
+        fn finish(&self, status: Status) -> Vec<Waker> {
+            let mut state = lock(&self.state);
+            if state.status != Status::Active {
+                return Vec::new();
+            }
+            state.status = status;
+            std::mem::take(&mut state.waiters).into_values().collect()
+        }
+
+        pub(super) fn wait(self: &Arc<Self>) -> Wait {
+            Wait {
+                signal: Arc::clone(self),
+                waiter_id: None,
+            }
+        }
+    }
+
+    /// One pending wait, whose registration is removed when a race drops it.
+    pub(super) struct Wait {
+        signal: Arc<Signal>,
+        waiter_id: Option<u64>,
+    }
+
+    impl Future for Wait {
+        // True is explicit cancellation; false means the last scope was dropped.
+        type Output = bool;
+
+        fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<bool> {
+            let this = self.get_mut();
+            let waker = context.waker().clone();
+            let mut state = lock(&this.signal.state);
+            match state.status {
+                Status::Cancelled => {
+                    drop(state);
+                    Poll::Ready(true)
+                }
+                Status::Closed => {
+                    drop(state);
+                    Poll::Ready(false)
+                }
+                Status::Active => {
+                    let waiter_id = *this.waiter_id.get_or_insert_with(|| loop {
+                        let candidate = state.next_waiter;
+                        state.next_waiter = state.next_waiter.wrapping_add(1);
+                        if !state.waiters.contains_key(&candidate) {
+                            break candidate;
+                        }
+                    });
+                    let previous = state.waiters.insert(waiter_id, waker);
+                    drop(state);
+                    drop(previous);
+                    Poll::Pending
+                }
+            }
+        }
+    }
+
+    impl Drop for Wait {
+        fn drop(&mut self) {
+            if let Some(waiter_id) = self.waiter_id {
+                let previous = lock(&self.signal.state).waiters.remove(&waiter_id);
+                drop(previous);
+            }
+        }
+    }
+
+    struct Node {
+        parent: Option<NodeId>,
+        children: BTreeSet<NodeId>,
+        owned: bool,
+        signal: Arc<Signal>,
+    }
+
+    #[derive(Default)]
+    struct TreeState {
+        nodes: BTreeMap<NodeId, Node>,
+        next_node: NodeId,
+    }
+
+    #[derive(Default)]
+    struct Tree {
+        state: Mutex<TreeState>,
+    }
+
+    /// Clones of the outer Arc own one scope; descendants own their own scopes.
+    /// Tree entries retain ancestry, but never own a scope or another tree.
+    pub(super) struct Scope {
+        tree: Arc<Tree>,
+        node_id: NodeId,
+        pub(super) signal: Arc<Signal>,
+    }
+
+    impl std::fmt::Debug for Scope {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("CancellationScope")
+                .field("node_id", &self.node_id)
+                .field("signal", &self.signal)
+                .finish()
+        }
+    }
+
+    impl Scope {
+        pub(super) fn new() -> Arc<Self> {
+            let tree = Arc::new(Tree::default());
+            let signal = Arc::new(Signal::new(false));
+            lock(&tree.state).nodes.insert(
+                0,
+                Node {
+                    parent: None,
+                    children: BTreeSet::new(),
+                    owned: true,
+                    signal: Arc::clone(&signal),
+                },
+            );
+            Arc::new(Self {
+                tree,
+                node_id: 0,
+                signal,
+            })
+        }
+
+        pub(super) fn child(&self) -> Arc<Self> {
+            let mut tree = lock(&self.tree.state);
+            let node_id = loop {
+                let candidate = tree.next_node;
+                tree.next_node = tree.next_node.wrapping_add(1);
+                if !tree.nodes.contains_key(&candidate) {
+                    break candidate;
+                }
+            };
+            let signal = Arc::new(Signal::new(self.signal.is_cancelled()));
+            tree.nodes.insert(
+                node_id,
+                Node {
+                    parent: Some(self.node_id),
+                    children: BTreeSet::new(),
+                    owned: true,
+                    signal: Arc::clone(&signal),
+                },
+            );
+            tree.nodes
+                .get_mut(&self.node_id)
+                .expect("a live cancellation scope retains its tree entry")
+                .children
+                .insert(node_id);
+            Arc::new(Self {
+                tree: Arc::clone(&self.tree),
+                node_id,
+                signal,
+            })
+        }
+
+        pub(super) fn cancel(&self) {
+            let mut wake = Vec::new();
+            {
+                // Serialize child creation, removal, and cancellation. Every
+                // descendant is marked before releasing the tree, so another
+                // cancel cannot return early while propagation is incomplete.
+                let tree = lock(&self.tree.state);
+                let mut pending = vec![self.node_id];
+                while let Some(node_id) = pending.pop() {
+                    let node = tree
+                        .nodes
+                        .get(&node_id)
+                        .expect("a cancellation tree links only retained nodes");
+                    if node.signal.is_cancelled() {
+                        continue;
+                    }
+                    wake.extend(node.signal.finish(Status::Cancelled));
+                    pending.extend(node.children.iter().copied());
+                }
+            }
+            for waker in wake {
+                waker.wake();
+            }
+        }
+    }
+
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            let mut wake = Vec::new();
+            {
+                let mut tree = lock(&self.tree.state);
+                tree.nodes
+                    .get_mut(&self.node_id)
+                    .expect("a dropped cancellation scope retains its tree entry")
+                    .owned = false;
+                let mut current = Some(self.node_id);
+                while let Some(node_id) = current {
+                    let node = tree
+                        .nodes
+                        .get(&node_id)
+                        .expect("a cancellation tree links only retained nodes");
+                    if node.owned || !node.children.is_empty() {
+                        break;
+                    }
+                    let node = tree.nodes.remove(&node_id).expect("node was present");
+                    wake.extend(node.signal.finish(Status::Closed));
+                    if let Some(parent_id) = node.parent {
+                        tree.nodes
+                            .get_mut(&parent_id)
+                            .expect("a retained cancellation node retains its parent")
+                            .children
+                            .remove(&node_id);
+                    }
+                    current = node.parent;
+                }
+            }
+            for waker in wake {
+                waker.wake();
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{Scope, Signal, Wait, lock};
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier};
+        use std::task::{Context, Poll, Wake, Waker};
+
+        #[derive(Default)]
+        struct WakeCounter(AtomicUsize);
+
+        impl Wake for WakeCounter {
+            fn wake(self: Arc<Self>) {
+                self.wake_by_ref();
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        fn counting_waker() -> (Arc<WakeCounter>, Waker) {
+            let counter = Arc::new(WakeCounter::default());
+            let waker = Waker::from(Arc::clone(&counter));
+            (counter, waker)
+        }
+
+        fn poll(wait: &mut Wait, waker: &Waker) -> Poll<bool> {
+            Pin::new(wait).poll(&mut Context::from_waker(waker))
+        }
+
+        #[test]
+        fn child_cancellation_is_confined_to_its_subtree() {
+            let root = Scope::new();
+            let child = root.child();
+            let sibling = root.child();
+            let grandchild = child.child();
+            let shared = Arc::clone(&child);
+
+            shared.cancel();
+            assert!(child.signal.is_cancelled());
+            assert!(grandchild.signal.is_cancelled());
+            assert!(!root.signal.is_cancelled());
+            assert!(!sibling.signal.is_cancelled());
+            assert!(!root.child().signal.is_cancelled());
+            assert!(child.child().signal.is_cancelled());
+
+            root.cancel();
+            assert!(sibling.signal.is_cancelled());
+            assert!(root.child().signal.is_cancelled());
+        }
+
+        #[test]
+        fn pending_descendant_waiters_wake_without_waking_siblings() {
+            let root = Scope::new();
+            let child = root.child();
+            let leaf = child.child();
+            let sibling = root.child();
+            let (leaf_counter, leaf_waker) = counting_waker();
+            let (sibling_counter, sibling_waker) = counting_waker();
+            let mut leaf_wait = leaf.signal.wait();
+            let mut sibling_wait = sibling.signal.wait();
+            assert!(poll(&mut leaf_wait, &leaf_waker).is_pending());
+            assert!(poll(&mut sibling_wait, &sibling_waker).is_pending());
+
+            child.cancel();
+            assert_eq!(leaf_counter.0.load(Ordering::SeqCst), 1);
+            assert_eq!(sibling_counter.0.load(Ordering::SeqCst), 0);
+            assert_eq!(poll(&mut leaf_wait, &leaf_waker), Poll::Ready(true));
+            assert!(poll(&mut sibling_wait, &sibling_waker).is_pending());
+            root.cancel();
+            assert_eq!(sibling_counter.0.load(Ordering::SeqCst), 1);
+            assert_eq!(poll(&mut sibling_wait, &sibling_waker), Poll::Ready(true));
+        }
+
+        #[test]
+        fn dropped_intermediate_scope_preserves_cancellation_path() {
+            let root = Scope::new();
+            let middle = root.child();
+            let leaf = middle.child();
+            let weak_middle = Arc::downgrade(&middle);
+            drop(middle);
+            assert!(weak_middle.upgrade().is_none());
+            assert_eq!(lock(&root.tree.state).nodes.len(), 3);
+
+            root.cancel();
+            assert!(leaf.signal.is_cancelled());
+            drop(leaf);
+            assert_eq!(lock(&root.tree.state).nodes.len(), 1);
+        }
+
+        #[test]
+        fn completed_children_do_not_accumulate_in_a_long_lived_tree() {
+            let root = Scope::new();
+            for _ in 0..10_000 {
+                let child = root.child();
+                let leaf = child.child();
+                drop(child);
+                drop(leaf);
+                assert_eq!(lock(&root.tree.state).nodes.len(), 1);
+            }
+            assert!(lock(&root.tree.state).nodes[&root.node_id].children.is_empty());
+        }
+
+        #[test]
+        fn dropping_one_clone_keeps_the_scope_and_listener_live() {
+            let root = Scope::new();
+            let shared = Arc::clone(&root);
+            let (counter, waker) = counting_waker();
+            let mut wait = root.signal.wait();
+            assert!(poll(&mut wait, &waker).is_pending());
+            drop(root);
+            assert_eq!(counter.0.load(Ordering::SeqCst), 0);
+            assert!(poll(&mut wait, &waker).is_pending());
+
+            shared.cancel();
+            assert_eq!(poll(&mut wait, &waker), Poll::Ready(true));
+        }
+
+        #[test]
+        fn dropping_last_scope_wakes_waiter_as_closed_without_false_cancellation() {
+            let root = Scope::new();
+            let signal = Arc::clone(&root.signal);
+            let (counter, waker) = counting_waker();
+            let mut wait = signal.wait();
+            assert!(poll(&mut wait, &waker).is_pending());
+            drop(root);
+            assert_eq!(counter.0.load(Ordering::SeqCst), 1);
+            assert_eq!(poll(&mut wait, &waker), Poll::Ready(false));
+            assert!(!signal.is_cancelled());
+        }
+
+        #[test]
+        fn dropping_cancelled_scope_preserves_explicit_cancellation() {
+            let root = Scope::new();
+            let signal = Arc::clone(&root.signal);
+            root.cancel();
+            drop(root);
+            let (_, waker) = counting_waker();
+            assert_eq!(poll(&mut signal.wait(), &waker), Poll::Ready(true));
+        }
+
+        #[test]
+        fn dropping_losing_waits_unregisters_wakers_immediately() {
+            let root = Scope::new();
+            let (counter, waker) = counting_waker();
+            for _ in 0..10_000 {
+                let mut wait = root.signal.wait();
+                assert!(poll(&mut wait, &waker).is_pending());
+                assert_eq!(lock(&root.signal.state).waiters.len(), 1);
+                drop(wait);
+                assert!(lock(&root.signal.state).waiters.is_empty());
+            }
+            root.cancel();
+            assert_eq!(counter.0.load(Ordering::SeqCst), 0);
+        }
+
+        #[test]
+        fn repoll_registers_only_the_current_waker() {
+            let root = Scope::new();
+            let (old_counter, old_waker) = counting_waker();
+            let (new_counter, new_waker) = counting_waker();
+            let mut wait = root.signal.wait();
+            assert!(poll(&mut wait, &old_waker).is_pending());
+            assert!(poll(&mut wait, &new_waker).is_pending());
+            assert_eq!(lock(&root.signal.state).waiters.len(), 1);
+            root.cancel();
+            root.cancel();
+            assert_eq!(old_counter.0.load(Ordering::SeqCst), 0);
+            assert_eq!(new_counter.0.load(Ordering::SeqCst), 1);
+        }
+
+        #[test]
+        fn node_and_waiter_identifier_wrap_never_aliases_live_entries() {
+            let root = Scope::new();
+            lock(&root.tree.state).next_node = u64::MAX;
+            let first = root.child();
+            lock(&root.tree.state).next_node = u64::MAX;
+            let second = root.child();
+            assert_ne!(root.node_id, first.node_id);
+            assert_ne!(root.node_id, second.node_id);
+            assert_ne!(first.node_id, second.node_id);
+            first.cancel();
+            assert!(!second.signal.is_cancelled());
+
+            let (counter, waker) = counting_waker();
+            lock(&root.signal.state).next_waiter = u64::MAX;
+            let mut first_wait = root.signal.wait();
+            assert!(poll(&mut first_wait, &waker).is_pending());
+            lock(&root.signal.state).next_waiter = u64::MAX;
+            let mut second_wait = root.signal.wait();
+            assert!(poll(&mut second_wait, &waker).is_pending());
+            assert_ne!(first_wait.waiter_id, second_wait.waiter_id);
+            root.cancel();
+            assert_eq!(counter.0.load(Ordering::SeqCst), 2);
+        }
+
+        #[test]
+        fn child_creation_and_intermediate_drop_racing_cancel_never_miss_signal() {
+            for _ in 0..128 {
+                let root = Scope::new();
+                let creator_root = Arc::clone(&root);
+                let start = Arc::new(Barrier::new(2));
+                let creator_start = Arc::clone(&start);
+                let creator = std::thread::spawn(move || {
+                    creator_start.wait();
+                    let middle = creator_root.child();
+                    let leaf = middle.child();
+                    drop(middle);
+                    leaf
+                });
+                start.wait();
+                root.cancel();
+                let leaf = creator.join().expect("child creator");
+                assert!(leaf.signal.is_cancelled());
+                assert!(root.child().signal.is_cancelled());
+                drop(leaf);
+                assert_eq!(lock(&root.tree.state).nodes.len(), 1);
+            }
+        }
+
+        #[test]
+        fn waiter_registration_racing_cancel_is_ready_or_woken() {
+            for _ in 0..128 {
+                let root = Scope::new();
+                let cancel_root = Arc::clone(&root);
+                let start = Arc::new(Barrier::new(2));
+                let cancel_start = Arc::clone(&start);
+                let canceller = std::thread::spawn(move || {
+                    cancel_start.wait();
+                    cancel_root.cancel();
+                });
+                let (counter, waker) = counting_waker();
+                let mut wait = root.signal.wait();
+                start.wait();
+                let result = poll(&mut wait, &waker);
+                canceller.join().expect("canceller");
+                if result.is_pending() {
+                    assert_eq!(counter.0.load(Ordering::SeqCst), 1);
+                }
+                assert_eq!(poll(&mut wait, &waker), Poll::Ready(true));
+            }
+        }
+
+        #[test]
+        fn concurrent_cancellers_mark_all_descendants_before_returning() {
+            for _ in 0..32 {
+                let root = Scope::new();
+                let children: Vec<_> = (0..64).map(|_| root.child()).collect();
+                let other_root = Arc::clone(&root);
+                let other_children = children.clone();
+                let start = Arc::new(Barrier::new(2));
+                let other_start = Arc::clone(&start);
+                let other = std::thread::spawn(move || {
+                    other_start.wait();
+                    other_root.cancel();
+                    assert!(
+                        other_children
+                            .iter()
+                            .all(|child| child.signal.is_cancelled())
+                    );
+                });
+                start.wait();
+                root.cancel();
+                assert!(children.iter().all(|child| child.signal.is_cancelled()));
+                other.join().expect("concurrent canceller");
+            }
+        }
+
+        #[test]
+        fn deep_trees_cancel_and_drop_on_a_small_stack() {
+            std::thread::Builder::new()
+                .stack_size(128 * 1024)
+                .spawn(|| {
+                    for cancel_before_drop in [false, true] {
+                        let root = Scope::new();
+                        let mut leaf = Arc::clone(&root);
+                        for _ in 0..20_000 {
+                            leaf = leaf.child();
+                        }
+                        assert_eq!(lock(&root.tree.state).nodes.len(), 20_001);
+                        if cancel_before_drop {
+                            root.cancel();
+                            assert!(leaf.signal.is_cancelled());
+                        }
+                        drop(leaf);
+                        assert_eq!(lock(&root.tree.state).nodes.len(), 1);
+                    }
+                })
+                .expect("small-stack thread")
+                .join()
+                .expect("deep cancellation tree");
+        }
+
+        struct ReentrantWake {
+            root: Arc<Scope>,
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl Wake for ReentrantWake {
+            fn wake(self: Arc<Self>) {
+                let child = self.root.child();
+                assert!(child.signal.is_cancelled());
+                self.root.cancel();
+                self.calls.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        #[test]
+        fn waking_can_reenter_the_tree_without_a_lock_cycle() {
+            let root = Scope::new();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let waker = Waker::from(Arc::new(ReentrantWake {
+                root: Arc::clone(&root),
+                calls: Arc::clone(&calls),
+            }));
+            let mut wait = root.signal.wait();
+            assert!(poll(&mut wait, &waker).is_pending());
+            root.cancel();
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
+
+        struct ReentrantDrop {
+            signal: Arc<Signal>,
+            drops: Arc<AtomicUsize>,
+        }
+
+        impl Wake for ReentrantDrop {
+            fn wake(self: Arc<Self>) {}
+        }
+
+        impl Drop for ReentrantDrop {
+            fn drop(&mut self) {
+                let _ = self.signal.is_cancelled();
+                self.drops.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        #[test]
+        fn replaced_and_removed_wakers_drop_outside_the_signal_lock() {
+            let root = Scope::new();
+            let drops = Arc::new(AtomicUsize::new(0));
+            let mut wait = root.signal.wait();
+            for _ in 0..2 {
+                let waker = Waker::from(Arc::new(ReentrantDrop {
+                    signal: Arc::clone(&root.signal),
+                    drops: Arc::clone(&drops),
+                }));
+                assert!(poll(&mut wait, &waker).is_pending());
+                drop(waker);
+            }
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            drop(wait);
+            assert_eq!(drops.load(Ordering::SeqCst), 2);
+        }
+    }
 }
 
-/// Cooperative cancellation token.
+/// Cooperative cancellation token with directional child scopes.
+///
+/// Cloning a token shares cancellation authority over the same scope. Deriving
+/// a [`Self::child_token`] narrows that authority to a new subtree.
 #[derive(Clone, Debug)]
 pub struct CancellationToken {
-    inner: Arc<CancellationState>,
+    inner: Arc<cancellation::Scope>,
 }
 
 impl CancellationToken {
     /// Create token.
     #[must_use]
     pub fn new() -> Self {
-        let (sender, receiver) = channel::watch::channel(false);
         Self {
-            inner: Arc::new(CancellationState {
-                sender,
-                _keepalive: std::sync::Mutex::new(receiver),
-            }),
+            inner: cancellation::Scope::new(),
         }
     }
 
-    /// Trigger cancellation.
+    /// Derive a child cancelled by this token, but with no authority to cancel it.
+    ///
+    /// A child created after cancellation starts cancelled. Dropping a child
+    /// unlinks it when its last clone and descendant have been dropped.
+    #[must_use]
+    pub fn child_token(&self) -> Self {
+        Self {
+            inner: self.inner.child(),
+        }
+    }
+
+    /// Trigger cancellation of this scope and all its descendants.
     pub fn cancel(&self) {
-        let _ = self.inner.sender.send(true);
+        self.inner.cancel();
     }
 
     /// Current cancellation state.
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
-        *self.inner.sender.borrow()
+        self.inner.signal.is_cancelled()
     }
 
     /// Subscribe cancellation updates.
     #[must_use]
     pub fn subscribe(&self) -> CancellationListener {
         CancellationListener {
-            receiver: self.inner.sender.subscribe(),
+            signal: Arc::clone(&self.inner.signal),
         }
     }
 }
@@ -2882,34 +3536,28 @@ impl Default for CancellationToken {
 /// Cancellation listener for a [`CancellationToken`].
 #[derive(Debug)]
 pub struct CancellationListener {
-    receiver: channel::watch::Receiver<bool>,
+    signal: Arc<cancellation::Signal>,
 }
 
 impl CancellationListener {
     /// Current cancellation state.
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
-        *self.receiver.borrow()
+        self.signal.is_cancelled()
     }
 
     /// Await cancellation.
     ///
     /// # Errors
     ///
-    /// Returns [`AsyncError::Cancelled`] if sender side drops.
+    /// Returns [`AsyncError::Cancelled`] if the scope and its descendants drop
+    /// without explicit cancellation. Dropping a pending wait unregisters its
+    /// waker, even if this listener will be used again.
     pub async fn cancelled(&mut self) -> Result<(), AsyncError> {
-        if *self.receiver.borrow() {
-            return Ok(());
-        }
-
-        loop {
-            self.receiver
-                .changed()
-                .await
-                .map_err(|_| AsyncError::Cancelled)?;
-            if *self.receiver.borrow() {
-                return Ok(());
-            }
+        if self.signal.wait().await {
+            Ok(())
+        } else {
+            Err(AsyncError::Cancelled)
         }
     }
 }
@@ -3373,6 +4021,28 @@ mod tests {
 
         parent.cancel();
         assert!(child.is_cancelled());
+    }
+
+    #[test]
+    fn context_child_cancel_does_not_revoke_parent_siblings_or_future_work() {
+        let parent = ExecutionContext::request_scoped(Duration::from_secs(10));
+        let child = parent.child();
+        let sibling = parent.child();
+        let descendant = child.child();
+        let same_work = child.clone();
+
+        same_work.cancel();
+        assert!(child.is_cancelled());
+        assert!(descendant.is_cancelled());
+        assert!(!parent.is_cancelled());
+        assert!(!sibling.is_cancelled());
+        assert!(!parent.child().is_cancelled());
+        assert!(child.child().is_cancelled());
+        assert_eq!(child.deadline(), parent.deadline());
+
+        parent.cancel();
+        assert!(sibling.is_cancelled());
+        assert!(parent.child().is_cancelled());
     }
 
     #[runtime::test]
@@ -7351,14 +8021,21 @@ mod tests {
         });
     }
 
-    // ─── CancellationState Debug: via CancellationToken ─────────────────
+    // ─── Cancellation scope Debug: via CancellationToken ────────────────
 
     #[test]
-    fn cancellation_state_debug_via_token() {
+    fn cancellation_scope_debug_reports_current_signal_state() {
         let token = CancellationToken::new();
         let dbg = format!("{token:?}");
         assert!(dbg.contains("CancellationToken"));
-        assert!(dbg.contains("CancellationState"));
+        assert!(dbg.contains("CancellationScope"));
+        assert!(dbg.contains("CancellationSignal"));
+        assert!(dbg.contains("Active"));
+
+        token.cancel();
+        let cancelled = format!("{token:?}");
+        assert!(cancelled.contains("Cancelled"));
+        assert!(!cancelled.contains("Active"));
     }
 
     // ─── Channel factory: sync-visible creation tests ───────────────────

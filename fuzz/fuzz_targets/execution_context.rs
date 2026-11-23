@@ -1,12 +1,11 @@
 #![no_main]
 
 //! State-machine fuzz target for `fcp_async_core::ExecutionContext`
-//! cancellation + scope propagation (lib.rs:523-609).
+//! cancellation + scope propagation.
 //!
 //! `ExecutionContext` is the cancellation + deadline + scope primitive
-//! propagated through async work. cancel() triggers via a shared
-//! CancellationToken which propagates to children created via child().
-//! NOT covered by existing fuzz.
+//! propagated through async work. Clones share one cancellation scope; child()
+//! derives a new scope whose cancellation cannot affect parents or siblings.
 //!
 //! A regression that broke cancellation propagation would let a
 //! cancelled request continue spawning work in its descendants — a
@@ -121,6 +120,20 @@ fuzz_target!(|data: &[u8]| {
                 "chain[{i}] not cancelled after parent cancel — propagation broken"
             );
         }
+    } else if depth > 0 {
+        let cancelled_index = (input.timeout_ms as usize % depth) + 1;
+        chain[cancelled_index].cancel();
+        for (index, context) in chain.iter().enumerate() {
+            assert_eq!(
+                context.is_cancelled(),
+                index >= cancelled_index,
+                "cancellation must affect exactly the selected subtree"
+            );
+        }
+        assert!(
+            !parent.child().is_cancelled(),
+            "a cancelled descendant must not poison future work"
+        );
     }
 });
 
@@ -137,29 +150,27 @@ fn assert_execution_context_anchored() {
     assert!(parent.is_cancelled(), "ANCHOR: parent.cancel() didn't take");
     assert!(
         child.is_cancelled(),
-        "ANCHOR REGRESSION: child not cancelled after parent.cancel() — \
-         CancellationToken at lib.rs:594-597 not shared with child(); \
-         compute-exhaustion bug class re-opened"
+        "ANCHOR REGRESSION: child not cancelled after parent.cancel()"
     );
 
-    // Property 4: cancellation flows down only.
+    // Property 4: cancellation flows down only; clones still share a scope.
     let parent2 = ExecutionContext::background();
     let child2 = parent2.child();
-    child2.cancel();
-    assert!(child2.is_cancelled(), "ANCHOR: child.cancel() didn't take");
-    // Documented behavior: cancel propagates to descendants. Cancelling
-    // a child shares the same token (since child clones the token), so
-    // the parent ALSO becomes cancelled. This anchors the actual
-    // behavior — they share state via Arc/cloned token.
-    //
-    // Update: looking at the impl (lib.rs:561-567), `child()` uses
-    // `cancellation: self.cancellation.clone()` which does share the
-    // underlying state in tokio_util::sync::CancellationToken. So
-    // cancel-via-child cancels parent. This is the documented "shared
-    // cancellation" behavior, not strict downward propagation.
+    let sibling = parent2.child();
+    let shared_child = child2.clone();
+    shared_child.cancel();
+    assert!(child2.is_cancelled(), "ANCHOR: clone cancellation didn't take");
     assert!(
-        parent2.is_cancelled(),
-        "ANCHOR: child.cancel() should propagate to parent via shared token"
+        !parent2.is_cancelled(),
+        "ANCHOR: child cancellation must not revoke its parent"
+    );
+    assert!(
+        !sibling.is_cancelled(),
+        "ANCHOR: child cancellation must not revoke its sibling"
+    );
+    assert!(
+        !parent2.child().is_cancelled(),
+        "ANCHOR: child cancellation must not poison future work"
     );
 
     // Property 7: request_scoped has deadline.
