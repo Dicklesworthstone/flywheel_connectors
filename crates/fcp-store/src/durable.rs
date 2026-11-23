@@ -2589,7 +2589,7 @@ mod tests {
             object_id: test_object_id(seed),
             zone_id: test_zone(),
             oti: ObjectTransmissionInfo {
-                transfer_length: 2048,
+                transfer_length: 512,
                 symbol_size: 128,
                 source_blocks: 1,
                 sub_blocks: 1,
@@ -4934,6 +4934,125 @@ mod tests {
             store.list_zone(&test_zone()).await.is_empty(),
             "rejected metadata must not create durable symbol objects"
         );
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn durable_symbol_metadata_rejection_preserves_wal_and_honest_coverage() {
+        let directory = TempDir::new().unwrap();
+        for mac_key in [None, Some(TEST_MAC_KEY)] {
+            let mut config =
+                DurableSymbolStoreConfig::new(directory.path().join(mac_key.is_some().to_string()));
+            config.mac_key = mac_key;
+            config.checkpoint_after_ops = 0;
+            let store = DurableSymbolStore::open(config.clone()).unwrap();
+            store.put_object_meta(test_symbol_meta(1)).await.unwrap();
+            store.put_symbol(test_symbol(1, 0, 7)).await.unwrap();
+            let before = stored_file_bytes(&config.root_dir);
+            let used = store.storage_used().await;
+            let last_seq = store.last_seq.load(Ordering::SeqCst);
+
+            let corruptions: [fn(&mut ObjectSymbolMeta); 7] = [
+                |meta| meta.source_symbols = 1,
+                |meta| meta.oti.symbol_size = 0,
+                |meta| meta.oti.transfer_length = 0,
+                |meta| meta.oti.transfer_length = u64::MAX,
+                |meta| meta.oti.source_blocks = 2,
+                |meta| meta.oti.sub_blocks = 2,
+                |meta| meta.oti.alignment = 4,
+            ];
+            for corrupt in corruptions {
+                let mut invalid = test_symbol_meta(2);
+                corrupt(&mut invalid);
+                assert!(matches!(
+                    store.put_object_meta(invalid).await,
+                    Err(SymbolStoreError::InvalidSymbol { .. })
+                ));
+                assert_eq!(stored_file_bytes(&config.root_dir), before);
+                assert_eq!(store.storage_used().await, used);
+                assert_eq!(store.last_seq.load(Ordering::SeqCst), last_seq);
+                assert!(store.state.lock().await.write_fence.is_none());
+                assert!(matches!(
+                    store.get_object_meta(&test_object_id(2)).await,
+                    Err(SymbolStoreError::ObjectNotFound(_))
+                ));
+                assert!(!store.can_reconstruct(&test_object_id(2)).await);
+            }
+
+            // Bad announcements must neither fence legitimate writes nor
+            // make one retained symbol satisfy the actual four-symbol block.
+            assert!(!store.can_reconstruct(&test_object_id(1)).await);
+            for esi in 1..4 {
+                store.put_symbol(test_symbol(1, esi, 7)).await.unwrap();
+            }
+            assert!(store.can_reconstruct(&test_object_id(1)).await);
+            store.checkpoint().await.unwrap();
+            drop(store);
+            let recovered = DurableSymbolStore::open(config).unwrap();
+            assert!(recovered.can_reconstruct(&test_object_id(1)).await);
+            assert!(!recovered.can_reconstruct(&test_object_id(2)).await);
+        }
+    }
+
+    #[test]
+    fn durable_symbol_recovery_rejects_authenticated_inconsistent_metadata_without_changes() {
+        let directory = TempDir::new().unwrap();
+        for mac_key in [None, Some(TEST_MAC_KEY)] {
+            for checkpointed in [false, true] {
+                let corruptions: [fn(&mut ObjectSymbolMeta); 7] = [
+                    |meta| meta.source_symbols = 1,
+                    |meta| meta.oti.symbol_size = 0,
+                    |meta| meta.oti.transfer_length = 0,
+                    |meta| meta.oti.transfer_length = u64::MAX,
+                    |meta| meta.oti.source_blocks = 2,
+                    |meta| meta.oti.sub_blocks = 2,
+                    |meta| meta.oti.alignment = 4,
+                ];
+                for (index, corrupt) in corruptions.into_iter().enumerate() {
+                    let mut config = DurableSymbolStoreConfig::new(directory.path().join(format!(
+                        "{}-{checkpointed}-{index}",
+                        mac_key.is_some()
+                    )));
+                    config.mac_key = mac_key;
+                    config.checkpoint_after_ops = 0;
+                    // Create the normal writer lock before capturing unchanged
+                    // files, so both observation and writable recovery are tested.
+                    drop(DurableSymbolStore::open(config.clone()).unwrap());
+                    let mut invalid = test_symbol_meta(1);
+                    corrupt(&mut invalid);
+                    if checkpointed {
+                        let snapshot = SymbolSnapshot {
+                            objects: vec![SymbolSnapshotEntry {
+                                meta: invalid,
+                                symbols: Vec::new(),
+                            }],
+                        };
+                        fs::write(
+                            config.root_dir.join("symbols.snapshot.json"),
+                            snapshot_fixture_bytes(1, &snapshot, mac_key.as_ref()),
+                        )
+                        .unwrap();
+                    } else {
+                        let mut wal = wal_fixture_bytes(
+                            1,
+                            &SymbolWalOp::PutObjectMeta(invalid),
+                            mac_key.as_ref(),
+                        );
+                        // A malformed but correctly authenticated record must
+                        // not be repaired away along with an incomplete tail.
+                        wal.extend_from_slice(b"{");
+                        fs::write(config.root_dir.join("symbols.wal.jsonl"), wal).unwrap();
+                    }
+                    let before = stored_file_bytes(&config.root_dir);
+                    for access in [DurableAccess::ReadOnly, DurableAccess::ReadWrite] {
+                        assert!(matches!(
+                            DurableSymbolStore::open_with_access(config.clone(), access),
+                            Err(SymbolStoreError::InvalidSymbol { .. })
+                        ));
+                        assert_eq!(stored_file_bytes(&config.root_dir), before);
+                    }
+                }
+            }
+        }
     }
 
     #[fcp_async_core::runtime::test]

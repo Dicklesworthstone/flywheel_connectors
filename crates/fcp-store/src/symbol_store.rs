@@ -55,18 +55,50 @@ pub(crate) fn checked_symbol_storage_used(
         .ok_or(SymbolStoreError::QuotaExceeded { used, max })
 }
 
-/// Validate that object metadata declares a source-symbol count supported by
-/// the paired `RaptorQ` codec.
+/// Validate that stored metadata describes the source block the decoder uses.
+///
+/// Coverage and repair decisions use `source_symbols`, while the decoder derives
+/// K from the transmission length and symbol size. These must agree before any
+/// metadata is admitted or recovered; otherwise a forged low K can make an
+/// incomplete object appear reconstructable and stop repair. Empty encodings
+/// contain no symbols and do not belong in the symbol store.
 ///
 /// # Errors
-/// Returns [`SymbolStoreError::InvalidSymbol`] when the source-symbol count is
-/// zero or exceeds the RFC 6330 `K_MAX` bound.
+/// Returns [`SymbolStoreError::InvalidSymbol`] for a zero or unsupported source
+/// count, unsupported FCP transmission parameters, or a count inconsistent with
+/// the transmission length and symbol size.
 pub fn validate_source_symbols(meta: &ObjectSymbolMeta) -> Result<(), SymbolStoreError> {
     if meta.source_symbols == 0 || meta.source_symbols > MAX_SOURCE_SYMBOLS {
         return Err(SymbolStoreError::InvalidSymbol {
             reason: format!(
                 "source_symbols={} out of range (1..={}) for object {}",
                 meta.source_symbols, MAX_SOURCE_SYMBOLS, meta.object_id
+            ),
+        });
+    }
+
+    let oti = &meta.oti;
+    if oti.symbol_size == 0 {
+        return Err(SymbolStoreError::InvalidSymbol {
+            reason: "symbol_size must be non-zero".to_owned(),
+        });
+    }
+    // Keep admission aligned with RaptorQDecoder's FCP transmission contract.
+    if oti.source_blocks != 1 || oti.sub_blocks != 1 || oti.alignment != 8 {
+        return Err(SymbolStoreError::InvalidSymbol {
+            reason: format!(
+                "unsupported FCP transmission parameters: source_blocks={}, sub_blocks={}, alignment={}",
+                oti.source_blocks, oti.sub_blocks, oti.alignment
+            ),
+        });
+    }
+
+    let expected = oti.transfer_length.div_ceil(u64::from(oti.symbol_size));
+    if expected != u64::from(meta.source_symbols) {
+        return Err(SymbolStoreError::InvalidSymbol {
+            reason: format!(
+                "source_symbols={} differs from transmission-derived count {expected} for object {}",
+                meta.source_symbols, meta.object_id
             ),
         });
     }
@@ -1422,6 +1454,7 @@ mod tests {
 
             let mut meta = test_object_meta();
             meta.source_symbols = 10;
+            meta.oti.transfer_length = 10 * u64::from(meta.oti.symbol_size);
             store.put_object_meta(meta).await.unwrap();
 
             for esi in 0..5 {
@@ -1472,6 +1505,7 @@ mod tests {
 
                 let mut meta = test_object_meta();
                 meta.source_symbols = 4;
+                meta.oti.transfer_length = 4 * u64::from(meta.oti.symbol_size);
                 store.put_object_meta(meta).await.unwrap();
 
                 for esi in 0..4 {
@@ -1552,6 +1586,7 @@ mod tests {
 
                 let mut meta = test_object_meta();
                 meta.source_symbols = 4;
+                meta.oti.transfer_length = 4 * u64::from(meta.oti.symbol_size);
                 store.put_object_meta(meta).await.unwrap();
 
                 for (esi, source_node) in [(0, 1), (1, 1), (2, 1), (3, 2)] {
@@ -1873,6 +1908,7 @@ mod tests {
     async fn metadata_quota_covers_empty_objects_duplicates_and_deletion() {
         let mut meta = test_object_meta();
         meta.source_symbols = MAX_SOURCE_SYMBOLS;
+        meta.oti.transfer_length = u64::from(MAX_SOURCE_SYMBOLS) * u64::from(meta.oti.symbol_size);
         let charge = object_metadata_size(&meta);
         for max_bytes in [0, charge - 1] {
             let store = MemorySymbolStore::new(MemorySymbolStoreConfig {
@@ -1943,6 +1979,8 @@ mod tests {
                 let mut meta = sample.clone();
                 meta.object_id = ObjectId::from_bytes([index; 32]);
                 meta.source_symbols = MAX_SOURCE_SYMBOLS;
+                meta.oti.transfer_length =
+                    u64::from(MAX_SOURCE_SYMBOLS) * u64::from(meta.oti.symbol_size);
                 std::thread::spawn(move || {
                     start.wait();
                     fcp_async_core::runtime::block_on_sync(store.put_object_meta(meta))
@@ -2340,6 +2378,8 @@ mod tests {
                 let store = MemorySymbolStore::new(MemorySymbolStoreConfig::default());
                 let mut meta = test_object_meta();
                 meta.source_symbols = MAX_SOURCE_SYMBOLS;
+                meta.oti.transfer_length =
+                    u64::from(MAX_SOURCE_SYMBOLS) * u64::from(meta.oti.symbol_size);
 
                 store.put_object_meta(meta.clone()).await.unwrap();
 
@@ -2367,6 +2407,64 @@ mod tests {
                 }
             },
         );
+    }
+
+    #[test]
+    fn symbol_metadata_accepts_exact_and_partial_final_symbols() {
+        let mut meta = test_object_meta();
+        for (transfer_length, expected) in [
+            (1, 1),
+            (63, 1),
+            (64, 1),
+            (65, 2),
+            (1024, 16),
+            (u64::from(MAX_SOURCE_SYMBOLS) * 64, MAX_SOURCE_SYMBOLS),
+        ] {
+            meta.oti.transfer_length = transfer_length;
+            meta.source_symbols = expected;
+            validate_source_symbols(&meta).expect("valid FCP source block");
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn malformed_symbol_metadata_cannot_suppress_repair() {
+        let store = MemorySymbolStore::new(MemorySymbolStoreConfig::default());
+        let corruptions: [fn(&mut ObjectSymbolMeta); 10] = [
+            |meta| meta.source_symbols = 1,
+            |meta| meta.source_symbols = 17,
+            |meta| meta.oti.symbol_size = 0,
+            |meta| meta.oti.transfer_length = 0,
+            |meta| meta.oti.transfer_length = u64::MAX,
+            |meta| meta.oti.source_blocks = 0,
+            |meta| meta.oti.source_blocks = 2,
+            |meta| meta.oti.sub_blocks = 0,
+            |meta| meta.oti.sub_blocks = 2,
+            |meta| meta.oti.alignment = 4,
+        ];
+        for corrupt in corruptions {
+            let mut meta = test_object_meta();
+            corrupt(&mut meta);
+            assert!(matches!(
+                store.put_object_meta(meta).await,
+                Err(SymbolStoreError::InvalidSymbol { .. })
+            ));
+            assert!(matches!(
+                store.get_object_meta(&test_object_id()).await,
+                Err(SymbolStoreError::ObjectNotFound(_))
+            ));
+            assert_eq!(store.storage_used().await, 0);
+            assert!(!store.can_reconstruct(&test_object_id()).await);
+            assert!(store.get_distribution(&test_object_id()).await.is_none());
+        }
+
+        // The rejected low-K announcement must not poison later honest intake.
+        store.put_object_meta(test_object_meta()).await.unwrap();
+        store.put_symbol(test_symbol(0)).await.unwrap();
+        assert!(!store.can_reconstruct(&test_object_id()).await);
+        for esi in 1..16 {
+            store.put_symbol(test_symbol(esi)).await.unwrap();
+        }
+        assert!(store.can_reconstruct(&test_object_id()).await);
     }
 
     /// Regression for br-ywpup: a forged `source_symbols` above RFC 6330
@@ -2438,14 +2536,16 @@ mod tests {
                 let meta = test_object_meta();
                 store.put_object_meta(meta).await.unwrap();
 
-                // Different meta with same object_id
+                // Different valid meta with the same object_id.
                 let mut different = test_object_meta();
                 different.source_symbols = 999;
+                different.oti.transfer_length = 999 * u64::from(different.oti.symbol_size);
 
                 let result = store.put_object_meta(different).await;
                 assert!(matches!(
                     result,
-                    Err(SymbolStoreError::InvalidSymbol { .. })
+                    Err(SymbolStoreError::InvalidSymbol { reason })
+                        if reason.contains("Metadata mismatch")
                 ));
 
                 StoreLogData {
@@ -3060,6 +3160,7 @@ mod tests {
 
                 let mut meta = test_object_meta();
                 meta.source_symbols = 3;
+                meta.oti.transfer_length = 3 * u64::from(meta.oti.symbol_size);
                 store.put_object_meta(meta).await.unwrap();
 
                 // 2 symbols: not enough (need 3)
@@ -3235,6 +3336,7 @@ mod tests {
 
                 let mut meta = test_object_meta();
                 meta.source_symbols = 2;
+                meta.oti.transfer_length = 2 * u64::from(meta.oti.symbol_size);
                 store.put_object_meta(meta).await.unwrap();
 
                 // All from same node, but min_source_diversity=0

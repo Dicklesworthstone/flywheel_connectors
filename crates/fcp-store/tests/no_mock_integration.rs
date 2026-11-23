@@ -99,7 +99,7 @@ fn test_object_meta(n: u8) -> ObjectSymbolMeta {
         object_id: test_object_id(n),
         zone_id: test_zone(),
         oti: ObjectTransmissionInfo {
-            transfer_length: 1024,
+            transfer_length: 1280,
             symbol_size: 128,
             source_blocks: 1,
             sub_blocks: 1,
@@ -515,6 +515,7 @@ async fn source_diversity_plan_requires_new_source_when_single_node_dominates() 
 
     let mut meta = test_object_meta(object_n);
     meta.source_symbols = 4;
+    meta.oti.transfer_length = 4 * u64::from(meta.oti.symbol_size);
     store.put_object_meta(meta).await.expect("put meta");
 
     for esi in 0..4 {
@@ -604,6 +605,7 @@ async fn source_diversity_plan_recovers_after_source_churn() {
 
     let mut meta = test_object_meta(object_n);
     meta.source_symbols = 4;
+    meta.oti.transfer_length = 4 * u64::from(meta.oti.symbol_size);
     store.put_object_meta(meta).await.expect("put meta");
 
     for (esi, source_node) in [(0, 20), (1, 20), (2, 21), (3, 22), (4, 20)] {
@@ -689,6 +691,7 @@ async fn source_diversity_duplicate_esi_cannot_spoof_new_source() {
 
     let mut meta = test_object_meta(object_n);
     meta.source_symbols = 2;
+    meta.oti.transfer_length = 2 * u64::from(meta.oti.symbol_size);
     store.put_object_meta(meta).await.expect("put meta");
 
     store
@@ -753,6 +756,7 @@ async fn source_diversity_plan_requires_rebalancing_when_concentration_too_high(
 
     let mut meta = test_object_meta(object_n);
     meta.source_symbols = 4;
+    meta.oti.transfer_length = 4 * u64::from(meta.oti.symbol_size);
     store.put_object_meta(meta).await.expect("put meta");
 
     for (esi, source_node) in [(0, 40), (1, 40), (2, 40), (3, 41)] {

@@ -611,7 +611,7 @@ mod meshnode {
         let mut node = MeshNode::new(config, object_store, symbol_store.clone(), quarantine_store);
         authenticate_default_peer(&mut node, &zone_id);
 
-        let oti = ObjectTransmissionInformation::new(1024, 256, 1, 1, 1);
+        let oti = ObjectTransmissionInformation::new(1024, 256, 1, 1, 8);
         let meta = ObjectSymbolMeta {
             object_id,
             zone_id: zone_id.clone(),
@@ -703,7 +703,7 @@ mod meshnode {
         let mut node = MeshNode::new(config, object_store, symbol_store.clone(), quarantine_store);
         authenticate_default_peer(&mut node, &zone_id);
 
-        let oti = ObjectTransmissionInformation::new(1024, 256, 1, 1, 1);
+        let oti = ObjectTransmissionInformation::new(1024, 256, 1, 1, 8);
         let meta = ObjectSymbolMeta {
             object_id,
             zone_id: zone_id.clone(),
@@ -746,7 +746,7 @@ mod meshnode {
         let mut node = MeshNode::new(config, object_store, symbol_store.clone(), quarantine_store);
         authenticate_default_peer(&mut node, &zone_id);
 
-        let oti = ObjectTransmissionInformation::new(1024, 256, 1, 1, 1);
+        let oti = ObjectTransmissionInformation::new(1024, 256, 1, 1, 8);
         let symbol_size = oti.symbol_size() as usize;
         let meta = ObjectSymbolMeta {
             object_id,
@@ -817,7 +817,7 @@ mod meshnode {
         let mut node = MeshNode::new(config, object_store, symbol_store.clone(), quarantine_store);
         authenticate_default_peer(&mut node, &zone_id);
 
-        let oti = ObjectTransmissionInformation::new(1024, 256, 1, 1, 1);
+        let oti = ObjectTransmissionInformation::new(1024, 256, 1, 1, 8);
         let symbol_size = oti.symbol_size() as usize;
         let meta = ObjectSymbolMeta {
             object_id,
@@ -877,7 +877,7 @@ mod meshnode {
         let mut node = MeshNode::new(config, object_store, symbol_store.clone(), quarantine_store);
         authenticate_default_peer(&mut node, &zone_id);
 
-        let oti = ObjectTransmissionInformation::new(1024, 256, 1, 1, 1);
+        let oti = ObjectTransmissionInformation::new(1024, 256, 1, 1, 8);
         let symbol_size = oti.symbol_size() as usize;
         let meta = ObjectSymbolMeta {
             object_id,
@@ -939,7 +939,7 @@ mod meshnode {
         let mut node = MeshNode::new(config, object_store, symbol_store.clone(), quarantine_store);
         authenticate_default_peer(&mut node, &zone_id);
 
-        let oti = ObjectTransmissionInformation::new(1024, 256, 1, 1, 1);
+        let oti = ObjectTransmissionInformation::new(1024, 256, 1, 1, 8);
         let symbol_size = oti.symbol_size() as usize;
         let meta = ObjectSymbolMeta {
             object_id,
@@ -1000,7 +1000,7 @@ mod meshnode {
         let mut node = MeshNode::new(config, object_store, symbol_store.clone(), quarantine_store);
         authenticate_default_peer(&mut node, &zone_id);
 
-        let oti = ObjectTransmissionInformation::new(1024, 256, 1, 1, 1);
+        let oti = ObjectTransmissionInformation::new(1024, 256, 1, 1, 8);
         let symbol_size = oti.symbol_size() as usize;
         let meta = ObjectSymbolMeta {
             object_id,
@@ -1060,7 +1060,7 @@ mod meshnode {
         let mut node = MeshNode::new(config, object_store, symbol_store.clone(), quarantine_store);
         authenticate_default_peer(&mut node, &zone_id);
 
-        let oti = ObjectTransmissionInformation::new(1024, 256, 1, 1, 1);
+        let oti = ObjectTransmissionInformation::new(1024, 256, 1, 1, 8);
         let symbol_size = oti.symbol_size() as usize;
         let meta = ObjectSymbolMeta {
             object_id,
@@ -1121,7 +1121,7 @@ mod meshnode {
         let mut node = MeshNode::new(config, object_store, symbol_store.clone(), quarantine_store);
         authenticate_default_peer(&mut node, &zone_id);
 
-        let oti = ObjectTransmissionInformation::new(1024, 256, 1, 1, 1);
+        let oti = ObjectTransmissionInformation::new(1024, 256, 1, 1, 8);
         let symbol_size = oti.symbol_size() as usize;
         let meta = ObjectSymbolMeta {
             object_id,
@@ -1262,7 +1262,7 @@ mod meshnode {
         );
         authenticate_default_peer(&mut node, &zone_id);
 
-        let oti = ObjectTransmissionInformation::new(512, 128, 1, 1, 1);
+        let oti = ObjectTransmissionInformation::new(512, 128, 1, 1, 8);
         let symbol_size = oti.symbol_size() as usize;
         let meta = ObjectSymbolMeta {
             object_id,
@@ -1352,7 +1352,7 @@ mod meshnode {
         );
         authenticate_default_peer(&mut node, &zone_id);
 
-        let oti = ObjectTransmissionInformation::new(512, 128, 1, 1, 1);
+        let oti = ObjectTransmissionInformation::new(512, 128, 1, 1, 8);
         let symbol_size = oti.symbol_size() as usize;
         let meta = ObjectSymbolMeta {
             object_id,
@@ -1439,7 +1439,7 @@ mod meshnode {
         );
         authorize_default_peer(&mut node, &zone_id);
 
-        let oti = ObjectTransmissionInformation::new(512, 128, 1, 1, 1);
+        let oti = ObjectTransmissionInformation::new(512, 128, 1, 1, 8);
         let meta = ObjectSymbolMeta {
             object_id,
             zone_id: zone_id.clone(),
@@ -1612,7 +1612,7 @@ mod meshnode {
         let node_b = build_mesh_node("node-b", 22, 2);
         authenticate_peer_for_zone(&mut node_a, &NodeId::new("node-b"), &zone_id, 0);
 
-        let oti = ObjectTransmissionInformation::new(512, 128, 1, 1, 1);
+        let oti = ObjectTransmissionInformation::new(512, 128, 1, 1, 8);
         let meta = ObjectSymbolMeta {
             object_id,
             zone_id: zone_id.clone(),
@@ -1778,7 +1778,7 @@ mod meshnode {
         let symbol_store = node.symbol_store().clone();
         authorize_default_peer(&mut node, &zone_id);
 
-        let oti = ObjectTransmissionInformation::new(512, 128, 1, 1, 1);
+        let oti = ObjectTransmissionInformation::new(512, 128, 1, 1, 8);
         let meta = ObjectSymbolMeta {
             object_id,
             zone_id: zone_id.clone(),
@@ -1883,7 +1883,7 @@ mod meshnode {
         let _selected =
             node.select_transport_paths(&ZoneTransportPolicy::default(), &routes, &object_id, 0, 1);
 
-        let oti = ObjectTransmissionInformation::new(512, 128, 1, 1, 1);
+        let oti = ObjectTransmissionInformation::new(512, 128, 1, 1, 8);
         let meta = ObjectSymbolMeta {
             object_id,
             zone_id: zone_id.clone(),
@@ -2058,7 +2058,7 @@ mod meshnode {
         let node_b = build_mesh_node("node-b", 95, 32);
         authorize_peer_for_zone(&mut node_a, &peer, &zone_id);
 
-        let oti = ObjectTransmissionInformation::new(512, 128, 1, 1, 1);
+        let oti = ObjectTransmissionInformation::new(512, 128, 1, 1, 8);
         let meta = ObjectSymbolMeta {
             object_id,
             zone_id: zone_id.clone(),
@@ -5709,7 +5709,7 @@ mod real_component_integration {
         let symbol_store = node.symbol_store().clone();
         authorize_peer_for_zone(&mut node, &peer, &zone_id);
 
-        let oti = ObjectTransmissionInformation::new(512, 128, 1, 1, 1);
+        let oti = ObjectTransmissionInformation::new(512, 128, 1, 1, 8);
         let meta = ObjectSymbolMeta {
             object_id,
             zone_id: zone_id.clone(),
@@ -5839,7 +5839,7 @@ mod real_component_integration {
         let symbol_store = node.symbol_store().clone();
         authenticate_peer_for_zone(&mut node, &peer, &zone_id, 1000);
 
-        let oti = ObjectTransmissionInformation::new(512, 128, 1, 1, 1);
+        let oti = ObjectTransmissionInformation::new(1024, 128, 1, 1, 8);
         let meta = ObjectSymbolMeta {
             object_id,
             zone_id: zone_id.clone(),
@@ -5954,7 +5954,7 @@ mod real_component_integration {
         let symbol_store = node.symbol_store().clone();
         authenticate_peer_for_zone(&mut node, &peer, &zone_id, 1000);
 
-        let oti = ObjectTransmissionInformation::new(512, 128, 1, 1, 1);
+        let oti = ObjectTransmissionInformation::new(1024, 128, 1, 1, 8);
         let meta = ObjectSymbolMeta {
             object_id,
             zone_id: zone_id.clone(),
@@ -6163,7 +6163,7 @@ mod real_component_integration {
         let symbol_store_a = node_a.symbol_store().clone();
         let receiver_store = node_b.symbol_store().clone();
 
-        let oti = ObjectTransmissionInformation::new(512, 128, 1, 1, 1);
+        let oti = ObjectTransmissionInformation::new(512, 128, 1, 1, 8);
         let meta = ObjectSymbolMeta {
             object_id,
             zone_id: zone_id.clone(),
@@ -6361,7 +6361,7 @@ mod real_component_integration {
         let symbol_store = node.symbol_store().clone();
         authenticate_peer_for_zone(&mut node, &peer, &zone_id, 1000);
 
-        let oti = ObjectTransmissionInformation::new(512, 128, 1, 1, 1);
+        let oti = ObjectTransmissionInformation::new(1024, 128, 1, 1, 8);
         let meta = ObjectSymbolMeta {
             object_id,
             zone_id: zone_id.clone(),
@@ -6478,7 +6478,7 @@ mod real_component_integration {
         let symbol_store = node.symbol_store().clone();
         authenticate_peer_for_zone(&mut node, &peer, &zone_id, 1000);
 
-        let oti = ObjectTransmissionInformation::new(512, 128, 1, 1, 1);
+        let oti = ObjectTransmissionInformation::new(512, 128, 1, 1, 8);
         let meta = ObjectSymbolMeta {
             object_id,
             zone_id: zone_id.clone(),
@@ -6730,7 +6730,7 @@ mod real_component_integration {
         let symbol_store = node.symbol_store().clone();
         authorize_peer_for_zone(&mut node, &peer, &zone_id);
 
-        let oti = ObjectTransmissionInformation::new(512, 128, 1, 1, 1);
+        let oti = ObjectTransmissionInformation::new(512, 128, 1, 1, 8);
         let meta = ObjectSymbolMeta {
             object_id,
             zone_id: zone_id.clone(),
@@ -6874,7 +6874,7 @@ mod real_component_integration {
         let symbol_store = node.symbol_store().clone();
         authenticate_peer_for_zone(&mut node, &peer, &zone_id, 1000);
 
-        let oti = ObjectTransmissionInformation::new(512, 128, 1, 1, 1);
+        let oti = ObjectTransmissionInformation::new(512, 128, 1, 1, 8);
         let meta = ObjectSymbolMeta {
             object_id,
             zone_id: zone_id.clone(),

@@ -373,11 +373,11 @@ fuzz_target!(|data: &[u8]| {
                 object_id: ids[index],
                 zone_id: zone.clone(),
                 oti: ObjectTransmissionInfo {
-                    transfer_length: u64::from(symbol_size),
+                    transfer_length: u64::from(source_symbols) * u64::from(symbol_size),
                     symbol_size,
                     source_blocks: 1,
                     sub_blocks: 1,
-                    alignment: 1,
+                    alignment: 8,
                     payload_hash: None,
                 },
                 source_symbols,

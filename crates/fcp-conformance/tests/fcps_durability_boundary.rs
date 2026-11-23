@@ -205,7 +205,7 @@ async fn seed_recovery_symbols(
             object_id: payload_id,
             zone_id: zone.clone(),
             oti: ObjectTransmissionInfo::from_oti(ObjectTransmissionInformation::new(
-                1024, 256, 1, 1, 1,
+                768, 256, 1, 1, 8,
             )),
             source_symbols: 3,
             first_symbol_at: 1_000,

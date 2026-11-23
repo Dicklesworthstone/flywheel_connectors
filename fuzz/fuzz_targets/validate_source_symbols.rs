@@ -28,7 +28,7 @@ fn meta(input: &ValidateSourceSymbolsInput) -> ObjectSymbolMeta {
         object_id: ObjectId::from_bytes([input.object_id_byte; 32]),
         zone_id: ZoneId::work(),
         oti: ObjectTransmissionInfo {
-            transfer_length: 1024,
+            transfer_length: u64::from(input.source_symbols) * 128,
             symbol_size: 128,
             source_blocks: 1,
             sub_blocks: 1,

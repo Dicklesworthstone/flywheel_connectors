@@ -58,24 +58,34 @@ fn assert_validation(input: &Input, source_symbols: u32) {
     let second_text = outcome_text(second);
     assert_eq!(first_text, second_text, "validation must be deterministic");
 
-    if (1..=MAX_SOURCE_SYMBOLS).contains(&source_symbols) {
-        assert_eq!(
-            first_text, "ok",
-            "source_symbols={source_symbols} should be accepted"
-        );
+    let count_in_range = (1..=MAX_SOURCE_SYMBOLS).contains(&source_symbols);
+    let supported_oti = input.symbol_size != 0
+        && input.source_blocks == 1
+        && input.sub_blocks == 1
+        && input.alignment == 8;
+    // An independent interval oracle also covers a partial final symbol:
+    // (K - 1) * T < F <= K * T. Both products fit u64 for u32/u16 inputs.
+    let lower = u64::from(source_symbols.saturating_sub(1)) * u64::from(input.symbol_size);
+    let upper = u64::from(source_symbols) * u64::from(input.symbol_size);
+    let consistent_length = input.transfer_length > lower && input.transfer_length <= upper;
+
+    if count_in_range && supported_oti && consistent_length {
+        assert_eq!(first_text, "ok", "valid source block should be accepted");
     } else {
         assert!(
             first_text.starts_with("invalid:"),
-            "source_symbols={source_symbols} should be InvalidSymbol, got {first_text}"
+            "malformed source block should be InvalidSymbol, got {first_text}"
         );
-        assert!(
-            first_text.contains(&format!("source_symbols={source_symbols}")),
-            "InvalidSymbol reason must carry rejected source_symbols count: {first_text}"
-        );
-        assert!(
-            first_text.contains(&MAX_SOURCE_SYMBOLS.to_string()),
-            "InvalidSymbol reason must carry max source_symbols bound: {first_text}"
-        );
+        if !count_in_range {
+            assert!(
+                first_text.contains(&format!("source_symbols={source_symbols}")),
+                "InvalidSymbol reason must carry rejected source_symbols count: {first_text}"
+            );
+            assert!(
+                first_text.contains(&MAX_SOURCE_SYMBOLS.to_string()),
+                "InvalidSymbol reason must carry max source_symbols bound: {first_text}"
+            );
+        }
     }
 }
 
@@ -91,14 +101,14 @@ fuzz_target!(|data: &[u8]| {
 });
 
 fn assert_boundary_anchors() {
-    let input = Input {
+    let mut input = Input {
         object_id: [0xA5; 32],
         source_symbols: 1,
         transfer_length: 1024,
         symbol_size: 64,
         source_blocks: 1,
         sub_blocks: 1,
-        alignment: 1,
+        alignment: 8,
         payload_hash: Some([0x5A; 32]),
         first_symbol_at: 42,
     };
@@ -111,6 +121,13 @@ fn assert_boundary_anchors() {
         MAX_SOURCE_SYMBOLS + 1,
         u32::MAX,
     ] {
+        input.transfer_length = u64::from(source_symbols) * u64::from(input.symbol_size);
         assert_validation(&input, source_symbols);
     }
+
+    input.transfer_length = 65;
+    assert_validation(&input, 2);
+    assert_validation(&input, 1);
+    input.symbol_size = 0;
+    assert_validation(&input, 2);
 }

@@ -1407,11 +1407,11 @@ async fn offline_repair_artifact_bundle_captures_lifecycle_and_gc_evidence() {
             object_id: payload_id,
             zone_id: zone.clone(),
             oti: ObjectTransmissionInfo {
-                transfer_length: 1024,
+                transfer_length: 768,
                 symbol_size: 256,
                 source_blocks: 1,
                 sub_blocks: 1,
-                alignment: 1,
+                alignment: 8,
                 payload_hash: None,
             },
             source_symbols: 3,

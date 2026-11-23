@@ -4043,7 +4043,7 @@ mod tests {
     }
 
     fn test_object_symbol_meta(object_id: ObjectId, zone_id: &ZoneId) -> ObjectSymbolMeta {
-        let oti = ObjectTransmissionInformation::new(256, 64, 1, 1, 1);
+        let oti = ObjectTransmissionInformation::new(128, 64, 1, 1, 8);
         ObjectSymbolMeta {
             object_id,
             zone_id: zone_id.clone(),
@@ -4223,7 +4223,7 @@ mod tests {
         // is intended to be in the authenticated tier for this test.
         node.admission_mut().set_authenticated(&peer, true, 0);
 
-        let oti = ObjectTransmissionInformation::new(256, 64, 1, 1, 1);
+        let oti = ObjectTransmissionInformation::new(128, 64, 1, 1, 8);
         let meta = ObjectSymbolMeta {
             object_id,
             zone_id: zone_id.clone(),
@@ -4354,7 +4354,7 @@ mod tests {
         );
         node.update_peer_zones(&peer, zone_set(zone_id.clone()));
 
-        let oti = ObjectTransmissionInformation::new(256, 64, 1, 1, 1);
+        let oti = ObjectTransmissionInformation::new(128, 64, 1, 1, 8);
         let meta = ObjectSymbolMeta {
             object_id,
             zone_id: zone_id.clone(),
@@ -4415,7 +4415,7 @@ mod tests {
         let object_id = test_object_id("meshnode-signed-unauth");
         let peer_id = NodeId::new("peer-1");
 
-        let oti = ObjectTransmissionInformation::new(256, 64, 1, 1, 1);
+        let oti = ObjectTransmissionInformation::new(128, 64, 1, 1, 8);
         let meta = ObjectSymbolMeta {
             object_id,
             zone_id: zone_id.clone(),
@@ -4478,7 +4478,7 @@ mod tests {
         let object_id = test_object_id("meshnode-bad-signature");
         let peer_id = NodeId::new("peer-1");
 
-        let oti = ObjectTransmissionInformation::new(256, 64, 1, 1, 1);
+        let oti = ObjectTransmissionInformation::new(128, 64, 1, 1, 8);
         let meta = ObjectSymbolMeta {
             object_id,
             zone_id: zone_id.clone(),
@@ -4543,7 +4543,7 @@ mod tests {
         let object_id = test_object_id("meshnode-empty-zone-state");
         let peer_id = NodeId::new("peer-empty-zone");
 
-        let oti = ObjectTransmissionInformation::new(256, 64, 1, 1, 1);
+        let oti = ObjectTransmissionInformation::new(128, 64, 1, 1, 8);
         let meta = ObjectSymbolMeta {
             object_id,
             zone_id: zone_id.clone(),
@@ -9019,7 +9019,7 @@ mod tests {
         node.admission_mut().set_authenticated(&peer_b, true, 0);
 
         fcp_async_core::runtime::block_on_sync(async {
-            let oti = ObjectTransmissionInformation::new(256, 64, 1, 1, 1);
+            let oti = ObjectTransmissionInformation::new(256, 64, 1, 1, 8);
             node.symbol_store
                 .put_object_meta(ObjectSymbolMeta {
                     object_id,

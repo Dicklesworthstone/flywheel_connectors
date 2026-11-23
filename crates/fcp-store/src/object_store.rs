@@ -2137,7 +2137,7 @@ mod tests {
                             symbol_size: 64,
                             source_blocks: 1,
                             sub_blocks: 1,
-                            alignment: 1,
+                            alignment: 8,
                             payload_hash: None,
                         },
                         source_symbols: 2,

@@ -1995,7 +1995,7 @@ mod tests {
                     object_id: first_id,
                     zone_id: test_zone(),
                     oti: ObjectTransmissionInfo {
-                        transfer_length: 256,
+                        transfer_length: 64,
                         symbol_size: 64,
                         source_blocks: 1,
                         sub_blocks: 1,
@@ -2074,7 +2074,7 @@ mod tests {
                     object_id,
                     zone_id: test_zone(),
                     oti: ObjectTransmissionInfo {
-                        transfer_length: 256,
+                        transfer_length: 64,
                         symbol_size: 64,
                         source_blocks: 1,
                         sub_blocks: 1,
@@ -2165,7 +2165,7 @@ mod tests {
                     object_id,
                     zone_id: test_zone(),
                     oti: ObjectTransmissionInfo {
-                        transfer_length: 256,
+                        transfer_length: 64,
                         symbol_size: 64,
                         source_blocks: 1,
                         sub_blocks: 1,
@@ -3176,7 +3176,7 @@ mod tests {
                     object_id: id1,
                     zone_id: test_zone(),
                     oti: ObjectTransmissionInfo {
-                        transfer_length: 128,
+                        transfer_length: 64,
                         symbol_size: 64,
                         source_blocks: 1,
                         sub_blocks: 1,

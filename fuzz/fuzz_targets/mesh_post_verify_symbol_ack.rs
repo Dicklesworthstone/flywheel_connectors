@@ -78,7 +78,7 @@ fn test_request(object_id: ObjectId) -> SymbolRequest {
 
 fn install_symbol_data(node: &MeshNode, object_id: ObjectId) -> bool {
     let zone_id = test_zone_id();
-    let oti = ObjectTransmissionInformation::new(256, 64, 1, 1, 1);
+    let oti = ObjectTransmissionInformation::new(128, 64, 1, 1, 8);
     let meta = ObjectSymbolMeta {
         object_id,
         zone_id: zone_id.clone(),

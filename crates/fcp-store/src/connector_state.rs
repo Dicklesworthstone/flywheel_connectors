@@ -3803,7 +3803,7 @@ mod tests {
                 symbol_size: 4,
                 source_blocks: 1,
                 sub_blocks: 1,
-                alignment: 4,
+                alignment: 8,
                 payload_hash: None,
             },
             source_symbols: 2,

@@ -36,7 +36,7 @@ fn test_object_meta_with_symbol_size(
         object_id,
         zone_id: test_zone(),
         oti: ObjectTransmissionInfo {
-            transfer_length: 65536,
+            transfer_length: u64::from(source_symbols) * u64::try_from(symbol_size).unwrap(),
             symbol_size: u16::try_from(symbol_size).unwrap(),
             source_blocks: 1,
             sub_blocks: 1,
