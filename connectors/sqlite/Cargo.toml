@@ -34,9 +34,12 @@ thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
-rusqlite = { version = "0.39.0", features = ["bundled", "column_decltype", "hooks"] }
+rusqlite = { version = "0.39.0", features = ["bundled", "column_decltype", "hooks", "limits"] }
 
 [dev-dependencies]
+fcp-crypto = { path = "../../crates/fcp-crypto" }
 fcp-testkit.workspace = true
+chrono.workspace = true
+ciborium.workspace = true
 tempfile = "3.15"
 toml.workspace = true

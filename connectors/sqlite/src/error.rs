@@ -55,6 +55,19 @@ pub enum SqliteError {
     /// SQLite pragma error.
     #[error("SQLite pragma error: {0}")]
     Pragma(String),
+
+    /// The shared invocation deadline expired during SQLite execution.
+    #[error("SQLite execution deadline exceeded; inspect transaction state before retrying")]
+    DeadlineExceeded,
+
+    /// The complete result cannot be returned within the bounded native surface.
+    #[error("SQLite result exceeds the {limit} {resource} limit; narrow the query")]
+    ResultLimit {
+        /// Bounded resource, without query text or database contents.
+        resource: &'static str,
+        /// Effective limit for this invocation.
+        limit: u64,
+    },
 }
 
 impl SqliteError {
@@ -101,6 +114,15 @@ impl SqliteError {
                     retry_after: None,
                 }
             }
+            Self::DeadlineExceeded | Self::ResultLimit { .. } => FcpError::External {
+                service: "sqlite".into(),
+                message: self.to_string(),
+                status_code: None,
+                // Neither an interrupted write nor an unavailable result is
+                // evidence that it is safe to repeat the original operation.
+                retryable: false,
+                retry_after: None,
+            },
             Self::Rusqlite(rusqlite::Error::MultipleStatement) => FcpError::InvalidRequest {
                 code: 1003,
                 message: "only a single SQL statement is allowed".into(),
@@ -133,6 +155,7 @@ impl SqliteError {
                     retryable: true,
                     retry_after: None,
                 },
+                Some(ErrorCode::OperationInterrupted) => Self::DeadlineExceeded.to_fcp_error(),
                 Some(ErrorCode::PermissionDenied | ErrorCode::ReadOnly) => FcpError::External {
                     service: "sqlite".into(),
                     message: error.to_string(),
@@ -162,9 +185,7 @@ impl SqliteError {
 impl ConnectorErrorMapping for SqliteError {
     fn from_async_error(error: AsyncError) -> Self {
         match error {
-            AsyncError::Timeout { timeout_ms } => {
-                Self::Query(format!("deadline exceeded after {timeout_ms}ms"))
-            }
+            AsyncError::Timeout { .. } => Self::DeadlineExceeded,
             AsyncError::Cancelled => Self::Query("request cancelled".into()),
             other => Self::Query(other.to_string()),
         }
