@@ -67,6 +67,10 @@ const CONNECTOR_STATE_CHANGE_BUFFER_CAPACITY: usize = 1_024;
 const DEFAULT_SNAPSHOT_EVERY_SECS: u64 = 24 * 60 * 60;
 const MAX_CONNECTOR_STATE_CBOR_BYTES: usize = 1024 * 1024;
 const MAX_REPLICA_PAYLOAD_REFERENCE_DEPTH: usize = 64;
+const DEFAULT_CRDT_RECOVERY_LIMITS: ConnectorStateReplicaLimits = ConnectorStateReplicaLimits {
+    max_objects: 65_536,
+    max_bytes: 64 * 1024 * 1024,
+};
 
 /// Errors returned by [`FcpStoreConnectorStateStore`].
 #[derive(Debug, Error)]
@@ -193,7 +197,7 @@ pub enum ConnectorStateStoreError {
         lease_seq: u64,
     },
 
-    /// Committed singleton roots have incomparable authenticated heads.
+    /// Committed roots have incomparable authenticated heads without a signed merge.
     #[error(
         "connector state fork detected: roots {root_a} and {root_b} have incompatible heads {head_a} and {head_b}"
     )]
@@ -254,6 +258,13 @@ pub enum ConnectorStateStoreError {
         /// Content-addressed object whose stored bytes differ.
         object_id: ObjectId,
     },
+
+    /// A CRDT payload or merge would discard authenticated concurrent state.
+    #[error("invalid connector CRDT state: {reason}")]
+    InvalidCrdtState {
+        /// Structural or convergence violation; never includes state values.
+        reason: String,
+    },
 }
 
 type Result<T> = std::result::Result<T, ConnectorStateStoreError>;
@@ -271,6 +282,61 @@ pub struct ConnectorStateReplicaLimits {
     pub max_objects: usize,
     /// Maximum sum of canonical object lengths in bytes.
     pub max_bytes: usize,
+}
+
+/// A complete authenticated join of the locally committed CRDT branches.
+///
+/// This is a proposal, not a signed state object or proof of mesh-wide freshness.
+/// A writer creates a state with `prev = parent`, `seq = parent_seq + 1`, includes
+/// `required_refs` in its signed header, and uses `state_cbor` as the starting
+/// point for its next CRDT update. It then signs and submits the object through
+/// [`ConnectorStateStore::append_object`], which rechecks every branch under the
+/// append gate. A concurrent change can therefore refuse this proposal without
+/// losing any committed branch. No private writer key is entrusted to storage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectorStateCrdtMerge {
+    /// CRDT algebra shared by all authenticated source roots.
+    pub crdt_type: fcp_core::CrdtType,
+    /// Schema version shared by the source roots.
+    pub state_schema_version: u32,
+    /// Deterministic highest-sequence parent for the signed merge object.
+    pub parent: ObjectId,
+    /// Sequence of `parent`; the writer must check addition for overflow.
+    pub parent_seq: u64,
+    /// Concurrent heads not already reachable from `parent`.
+    pub required_refs: Vec<ObjectId>,
+    /// Canonical merged CRDT payload, including observed-remove tombstones.
+    pub state_cbor: Vec<u8>,
+}
+
+struct CrdtRecovery {
+    states: HashMap<ObjectId, ConnectorStateObject>,
+    heads: Vec<ObjectId>,
+    merge: Option<ConnectorStateCrdtMerge>,
+}
+
+impl CrdtRecovery {
+    fn reachable_from(&self, head: ObjectId) -> HashSet<ObjectId> {
+        let mut visited = HashSet::new();
+        let mut pending = vec![head];
+        while let Some(object_id) = pending.pop() {
+            if !visited.insert(object_id) {
+                continue;
+            }
+            if let Some(state) = self.states.get(&object_id) {
+                pending.extend(state.prev);
+                pending.extend(
+                    state
+                        .header
+                        .refs
+                        .iter()
+                        .copied()
+                        .filter(|id| *id != state.lease_object_id && self.states.contains_key(id)),
+                );
+            }
+        }
+        visited
+    }
 }
 
 /// One immutable singleton root, its signed ancestry, and referenced payloads.
@@ -601,6 +667,7 @@ pub struct FcpStoreConnectorStateStore {
     snapshot_every_secs: u64,
     state_object_write_retry_policy: BackoffPolicy,
     root_write_retry_policy: BackoffPolicy,
+    crdt_recovery_limits: ConnectorStateReplicaLimits,
     change_bus: Arc<ConnectorStateChangeBus>,
     root_cache: Arc<RwLock<Option<CachedConnectorStateRoot>>>,
     trusted_writer_keys: Option<Arc<HashSet<[u8; 32]>>>,
@@ -634,6 +701,7 @@ impl FcpStoreConnectorStateStore {
                 1.0,
             ),
             root_write_retry_policy: BackoffPolicy::new(0, Duration::ZERO, Duration::ZERO, 1.0),
+            crdt_recovery_limits: DEFAULT_CRDT_RECOVERY_LIMITS,
             change_bus,
             root_cache: Arc::new(RwLock::new(None)),
             trusted_writer_keys: None,
@@ -722,6 +790,21 @@ impl FcpStoreConnectorStateStore {
     #[must_use]
     pub const fn with_state_model(mut self, state_model: ConnectorStateModel) -> Self {
         self.state_model = state_model;
+        self
+    }
+
+    /// Bound the unique objects authenticated during CRDT recovery.
+    ///
+    /// The defaults are 65,536 objects and 64 MiB of canonical envelope bytes.
+    /// Reads and append admission fail instead of returning a partial join when
+    /// either limit is exceeded. Direct references are authenticated before their
+    /// schema is classified, so an absent historical root cannot hide a merge
+    /// source. Opaque application payloads count toward the budget but are not
+    /// merged or traversed.
+    #[must_use]
+    pub fn with_crdt_recovery_limits(mut self, limits: ConnectorStateReplicaLimits) -> Self {
+        self.crdt_recovery_limits = limits;
+        self.root_cache = Arc::new(RwLock::new(None));
         self
     }
 
@@ -1523,6 +1606,349 @@ impl FcpStoreConnectorStateStore {
         self.read_root_with_repair(None).await
     }
 
+    /// Authenticate and join every locally committed CRDT branch.
+    ///
+    /// This works even when ordinary canonical reads refuse an unresolved fork.
+    /// Every source state must have a valid signature, identity, keyed content
+    /// ID, complete ancestry, and monotone payload under the declared CRDT type.
+    /// The proposal never writes or caches a synthetic root. Use its payload and
+    /// references in a newly signed object submitted through the ordinary append
+    /// authorization boundary. Admission rechecks the join after concurrent work.
+    ///
+    /// # Errors
+    /// Returns an error for a non-CRDT adapter, malformed or incomplete history,
+    /// conflicting equal-clock values, or the configured recovery limits.
+    pub async fn read_crdt_merge(&self) -> Result<Option<ConnectorStateCrdtMerge>> {
+        let started = Instant::now();
+        let _append_guard = self.change_bus.append_guard.lock().await;
+        let result = async {
+            let roots = self.load_crdt_roots().await?;
+            Ok(self.recover_crdt_roots(&roots).await?.merge)
+        }
+        .await;
+        self.record_operation_telemetry(
+            CONNECTOR_STATE_READ_EVENT,
+            "read_crdt_merge",
+            if result.is_ok() { "ok" } else { "error" },
+            started,
+        );
+        result
+    }
+
+    async fn load_crdt_roots(&self) -> Result<Vec<(ObjectId, ConnectorStateRoot)>> {
+        if !self.state_model.is_crdt() {
+            return Err(ConnectorStateStoreError::InvalidCrdtState {
+                reason: "CRDT recovery requires a CRDT state model".to_string(),
+            });
+        }
+        let mut roots = Vec::new();
+        let mut root_budget = ReplicaBudget::new(self.crdt_recovery_limits);
+        for object_id in self.object_store.list_zone(&self.zone_id).await {
+            if self.object_store.get_header(&object_id).await?.schema != Self::root_schema_id() {
+                continue;
+            }
+            let stored = self.object_store.get(&object_id).await?;
+            let root: ConnectorStateRoot =
+                self.decode_stored(&stored, &Self::root_schema_id(), "connector state root")?;
+            if !self.root_belongs_to_store(&root) {
+                continue;
+            }
+            root_budget.charge(&stored)?;
+            self.validate_stored_root(object_id, &stored, &root)?;
+            if root.model != self.state_model {
+                return Err(ConnectorStateStoreError::IdentityMismatch {
+                    field: "model",
+                    expected: self.state_model.to_string(),
+                    got: root.model.to_string(),
+                });
+            }
+            if roots.len() >= self.crdt_recovery_limits.max_objects {
+                return Err(ConnectorStateStoreError::ReplicaObjectLimitExceeded {
+                    limit: self.crdt_recovery_limits.max_objects,
+                });
+            }
+            roots.push((object_id, root));
+        }
+        roots.sort_by_key(|(object_id, _)| *object_id);
+        Ok(roots)
+    }
+
+    fn merge_crdt_payloads(
+        crdt_type: fcp_core::CrdtType,
+        left: &[u8],
+        right: &[u8],
+    ) -> Result<Vec<u8>> {
+        let invalid = || ConnectorStateStoreError::InvalidCrdtState {
+            reason: format!("payload does not satisfy the {crdt_type} state schema"),
+        };
+        let merged = fcp_core::merge_crdt_states(crdt_type, left, right).map_err(|_| invalid())?;
+        let reversed =
+            fcp_core::merge_crdt_states(crdt_type, right, left).map_err(|_| invalid())?;
+        if merged != reversed {
+            // In particular, an LWW actor must not sign two different values at
+            // the same clock. Choosing the first encountered value would make
+            // replicas diverge according to object enumeration order.
+            return Err(ConnectorStateStoreError::InvalidCrdtState {
+                reason: "CRDT merge is ambiguous for conflicting actor clocks".to_string(),
+            });
+        }
+        Self::validate_state_cbor(&merged)?;
+        Ok(merged)
+    }
+
+    fn validate_crdt_payload(crdt_type: fcp_core::CrdtType, state: &[u8]) -> Result<()> {
+        if Self::merge_crdt_payloads(crdt_type, state, state)? != state {
+            return Err(ConnectorStateStoreError::InvalidCrdtState {
+                reason: "CRDT payload is not a canonical state of the declared type".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_crdt_extension(
+        crdt_type: fcp_core::CrdtType,
+        previous: &[u8],
+        next: &[u8],
+    ) -> Result<()> {
+        if Self::merge_crdt_payloads(crdt_type, previous, next)? != next {
+            return Err(ConnectorStateStoreError::InvalidCrdtState {
+                reason: "CRDT update would discard authenticated state".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    async fn recover_crdt_roots(
+        &self,
+        roots: &[(ObjectId, ConnectorStateRoot)],
+    ) -> Result<CrdtRecovery> {
+        self.recover_crdt_roots_with_candidate(roots, None).await
+    }
+
+    async fn recover_crdt_roots_with_candidate(
+        &self,
+        roots: &[(ObjectId, ConnectorStateRoot)],
+        candidate: Option<&StoredObject>,
+    ) -> Result<CrdtRecovery> {
+        let mut recovery = CrdtRecovery {
+            states: HashMap::new(),
+            heads: Vec::new(),
+            merge: None,
+        };
+        if roots.is_empty() && candidate.is_none() {
+            return Ok(recovery);
+        }
+        let first_root = roots.first().map(|(_, root)| root);
+        let model = first_root.map_or(&self.state_model, |root| &root.model);
+        let state_schema_version = first_root.map_or(1, |root| root.state_schema_version);
+        if candidate.is_some() && state_schema_version != 1 {
+            return Err(ConnectorStateStoreError::InvalidCrdtState {
+                reason: "append cannot downgrade the CRDT state schema".to_string(),
+            });
+        }
+        let Some(crdt_type) = model.crdt_type() else {
+            return Err(ConnectorStateStoreError::InvalidCrdtState {
+                reason: "CRDT recovery received a different state model".to_string(),
+            });
+        };
+        let mut budget = ReplicaBudget::new(self.crdt_recovery_limits);
+        for (object_id, root) in roots {
+            if &root.model != model || root.state_schema_version != state_schema_version {
+                return Err(ConnectorStateStoreError::InvalidCrdtState {
+                    reason: "CRDT roots disagree on the state model or schema version".to_string(),
+                });
+            }
+            budget.check_next_object()?;
+            let stored = self.stored_object(&root.header, root, self.retention)?;
+            self.validate_stored_root(*object_id, &stored, root)?;
+            budget.charge(&stored)?;
+            recovery.heads.extend(root.head);
+        }
+        if let Some(candidate) = candidate {
+            let state = self.load_state_from_stored(candidate.object_id, candidate)?;
+            let root = self.root_for_head(&state, candidate.object_id);
+            let root_object = self.stored_object(&root.header, &root, self.retention)?;
+            if !roots.iter().any(|(id, _)| *id == root_object.object_id) {
+                budget.charge(&root_object)?;
+            }
+        }
+        recovery.heads.sort_unstable();
+        recovery.heads.dedup();
+
+        // Merge edges are signed state-header references, not a dependency on
+        // retaining every old root. Authenticate before schema classification so
+        // corrupt metadata cannot disguise an untrusted merge source as payload.
+        let mut non_states: HashSet<_> = roots.iter().map(|(id, _)| *id).collect();
+        let mut pending: Vec<_> = recovery.heads.iter().map(|head| (*head, true)).collect();
+        pending.extend(candidate.map(|state| (state.object_id, true)));
+        while let Some((object_id, require_state)) = pending.pop() {
+            if recovery.states.contains_key(&object_id) {
+                continue;
+            }
+            if non_states.contains(&object_id) {
+                if require_state {
+                    return Err(ConnectorStateStoreError::InvalidCrdtState {
+                        reason: "CRDT predecessor references a non-state object".to_string(),
+                    });
+                }
+                continue;
+            }
+            budget.check_next_object()?;
+            let stored =
+                if let Some(candidate) = candidate.filter(|state| state.object_id == object_id) {
+                    candidate.clone()
+                } else {
+                    self.object_store.get(&object_id).await.map_err(|error| {
+                        if matches!(error, ObjectStoreError::NotFound(_)) {
+                            ConnectorStateStoreError::MissingHead(object_id)
+                        } else {
+                            ConnectorStateStoreError::ObjectStore(error)
+                        }
+                    })?
+                };
+            budget.charge(&stored)?;
+            if stored.header.schema != Self::state_object_schema_id() {
+                if require_state {
+                    return Err(ConnectorStateStoreError::InvalidCrdtState {
+                        reason: "CRDT predecessor references a non-state object".to_string(),
+                    });
+                }
+                self.expect_zone("CRDT reference zone", &stored.header.zone_id)?;
+                let computed =
+                    StoredObject::derive_id(&stored.header, &stored.body, &self.object_id_key)?;
+                if computed != object_id || stored.object_id != object_id {
+                    return Err(ConnectorStateStoreError::ContentIdMismatch {
+                        claimed: object_id,
+                        computed,
+                    });
+                }
+                non_states.insert(object_id);
+                continue;
+            }
+            let state = self.load_state_from_stored(object_id, &stored)?;
+            Self::validate_crdt_payload(crdt_type, &state.state_cbor)?;
+            if let Some(previous) = state.prev {
+                pending.push((previous, true));
+            }
+            pending.extend(state.header.refs.iter().copied().filter_map(|reference| {
+                (reference != state.lease_object_id && Some(reference) != state.prev)
+                    .then_some((reference, false))
+            }));
+            recovery.states.insert(object_id, state);
+        }
+
+        for state in recovery.states.values() {
+            if let Some(previous_id) = state.prev {
+                let previous = &recovery.states[&previous_id];
+                Self::validate_replay_transition(model, previous, state)?;
+            } else if state.seq != 0 {
+                return Err(ConnectorStateStoreError::SequenceMismatch {
+                    expected: 0,
+                    got: state.seq,
+                });
+            }
+            for reference in &state.header.refs {
+                if *reference == state.lease_object_id || Some(*reference) == state.prev {
+                    continue;
+                }
+                let Some(source) = recovery.states.get(reference) else {
+                    continue;
+                };
+                if source.seq >= state.seq {
+                    return Err(ConnectorStateStoreError::InvalidCrdtState {
+                        reason: "CRDT merge references must precede the merge sequence".to_string(),
+                    });
+                }
+                Self::validate_crdt_extension(crdt_type, &source.state_cbor, &state.state_cbor)?;
+            }
+        }
+
+        let Some(parent) = recovery
+            .heads
+            .iter()
+            .copied()
+            .max_by_key(|head| (recovery.states[head].seq, *head))
+        else {
+            return Ok(recovery);
+        };
+        let mut state_cbor = recovery.states[&recovery.heads[0]].state_cbor.clone();
+        for head in recovery.heads.iter().skip(1) {
+            state_cbor = Self::merge_crdt_payloads(
+                crdt_type,
+                &state_cbor,
+                &recovery.states[head].state_cbor,
+            )?;
+        }
+        let mut reachable = recovery.reachable_from(parent);
+        let mut remaining = recovery.heads.clone();
+        remaining.sort_by_key(|head| std::cmp::Reverse((recovery.states[head].seq, *head)));
+        let mut required_refs = Vec::new();
+        for head in remaining {
+            if !reachable.contains(&head) {
+                required_refs.push(head);
+                reachable.extend(recovery.reachable_from(head));
+            }
+        }
+        required_refs.sort_unstable();
+        recovery.merge = Some(ConnectorStateCrdtMerge {
+            crdt_type,
+            state_schema_version,
+            parent,
+            parent_seq: recovery.states[&parent].seq,
+            required_refs,
+            state_cbor,
+        });
+        Ok(recovery)
+    }
+
+    fn canonical_crdt_root(
+        roots: &[(ObjectId, ConnectorStateRoot)],
+        recovery: &CrdtRecovery,
+    ) -> Result<(ObjectId, ConnectorStateRoot)> {
+        let Some(merge) = &recovery.merge else {
+            return Ok(roots
+                .iter()
+                .max_by_key(|(id, root)| (root.header.created_at, *id))
+                .expect("recovery has at least one root")
+                .clone());
+        };
+        // Every authenticated parent and merge edge strictly decreases sequence.
+        // Only a highest-sequence head can cover all roots; repeatedly walking
+        // every historical root makes unchanged-payload forks quadratic.
+        let (root_a, branch_a) = roots
+            .iter()
+            .filter(|(_, root)| root.head.is_some())
+            .max_by_key(|(object_id, root)| {
+                let head = root.head.expect("candidate has a head");
+                (
+                    recovery.states[&head].seq,
+                    root.header.created_at,
+                    *object_id,
+                )
+            })
+            .expect("nonempty CRDT heads");
+        let head_a = branch_a.head.expect("candidate has a head");
+        let reachable = recovery.reachable_from(head_a);
+        if recovery.states[&head_a].state_cbor == merge.state_cbor
+            && recovery.heads.iter().all(|head| reachable.contains(head))
+        {
+            return Ok((*root_a, branch_a.clone()));
+        }
+        let (root_b, branch_b) = roots
+            .iter()
+            .filter(|(_, root)| root.head.is_some_and(|head| !reachable.contains(&head)))
+            .min_by_key(|(object_id, _)| *object_id)
+            .ok_or_else(|| ConnectorStateStoreError::InvalidCrdtState {
+                reason: "CRDT history does not contain its authenticated join".to_string(),
+            })?;
+        Err(ConnectorStateStoreError::ForkDetected {
+            root_a: *root_a,
+            root_b: *root_b,
+            head_a: Box::new(head_a),
+            head_b: Box::new(branch_b.head.expect("candidate has a head")),
+        })
+    }
+
     /// Validate the committed local roots without publishing any donor bytes.
     /// A successful overlay read is not durable state and must never enter the
     /// shared root cache. Only an explicitly authorized retention supplies it.
@@ -1547,6 +1973,7 @@ impl FcpStoreConnectorStateStore {
 
         let mut best: Option<(ObjectId, ConnectorStateRoot, Option<u64>)> = None;
         let mut roots: Vec<(ObjectId, ConnectorStateRoot)> = Vec::new();
+        let mut crdt_root_budget = ReplicaBudget::new(self.crdt_recovery_limits);
 
         for object_id in self.object_store.list_zone(&self.zone_id).await {
             let stored = self.object_store.get(&object_id).await?;
@@ -1559,6 +1986,9 @@ impl FcpStoreConnectorStateStore {
             if !self.root_belongs_to_store(&root) {
                 continue;
             }
+            if root.model.is_crdt() {
+                crdt_root_budget.charge(&stored)?;
+            }
             self.validate_stored_root(object_id, &stored, &root)?;
             if let Some((_known_id, known_root)) = roots.first()
                 && root.model != known_root.model
@@ -1567,6 +1997,11 @@ impl FcpStoreConnectorStateStore {
                     field: "model",
                     expected: format!("{:?}", known_root.model),
                     got: format!("{:?}", root.model),
+                });
+            }
+            if root.model.is_crdt() && roots.len() >= self.crdt_recovery_limits.max_objects {
+                return Err(ConnectorStateStoreError::ReplicaObjectLimitExceeded {
+                    limit: self.crdt_recovery_limits.max_objects,
                 });
             }
             let head_seq = self.root_head_seq_with_repair(&root, repair_states).await?;
@@ -1586,7 +2021,11 @@ impl FcpStoreConnectorStateStore {
             }
         }
 
-        let root = best.map(|(object_id, root, _head_seq)| (object_id, root));
+        let mut root = best.map(|(object_id, root, _head_seq)| (object_id, root));
+        if root.as_ref().is_some_and(|(_, root)| root.model.is_crdt()) {
+            let recovery = self.recover_crdt_roots(&roots).await?;
+            root = Some(Self::canonical_crdt_root(&roots, &recovery)?);
+        }
         if let Some((object_id, root)) = &root {
             self.validate_singleton_root_history(*object_id, root, &roots, repair_states)
                 .await?;
@@ -1787,19 +2226,74 @@ impl FcpStoreConnectorStateStore {
         // Recheck storage at the mutation boundary even when an external
         // writer's root announcement has not reached this adapter yet.
         self.change_bus.mark_root_updated();
-        let root = self.read_root().await?;
-        if let Some((_root_id, root)) = &root
-            && root.model != self.state_model
-        {
-            return Err(ConnectorStateStoreError::IdentityMismatch {
-                field: "model",
-                expected: format!("{:?}", root.model),
-                got: format!("{:?}", self.state_model),
-            });
-        }
-        let current = match root.and_then(|(_root_id, root)| root.head) {
-            Some(head_id) => Some(self.load_state_object(&head_id).await?),
-            None => None,
+        let current = if let Some(crdt_type) = self.state_model.crdt_type() {
+            let roots = self.load_crdt_roots().await?;
+            let candidate = self.stored_object(&state_obj.header, &state_obj, self.retention)?;
+            let recovery = self
+                .recover_crdt_roots_with_candidate(&roots, Some(&candidate))
+                .await?;
+            Self::validate_crdt_payload(crdt_type, &state_obj.state_cbor)?;
+            if let Some(merge) = &recovery.merge {
+                if merge.state_schema_version != 1 {
+                    return Err(ConnectorStateStoreError::InvalidCrdtState {
+                        reason: "append cannot downgrade the CRDT state schema".to_string(),
+                    });
+                }
+                Self::validate_crdt_extension(crdt_type, &merge.state_cbor, &state_obj.state_cbor)?;
+                if merge.required_refs.iter().any(|head| {
+                    *head == state_obj.lease_object_id || !state_obj.header.refs.contains(head)
+                }) {
+                    return Err(ConnectorStateStoreError::InvalidCrdtState {
+                        reason: "signed CRDT merge omits a concurrent branch reference".to_string(),
+                    });
+                }
+                if !merge.required_refs.is_empty() && state_obj.prev != Some(merge.parent) {
+                    return Err(ConnectorStateStoreError::InvalidCrdtState {
+                        reason: "CRDT merge proposal no longer matches the selected parent"
+                            .to_string(),
+                    });
+                }
+            }
+            // Extra signed references to known state must also be valid merge
+            // edges. Refuse before persistence instead of publishing a root that
+            // the recovery verifier would subsequently reject.
+            for reference in &state_obj.header.refs {
+                if *reference == state_obj.lease_object_id || Some(*reference) == state_obj.prev {
+                    continue;
+                }
+                if let Some(source) = recovery.states.get(reference) {
+                    if source.seq >= state_obj.seq {
+                        return Err(ConnectorStateStoreError::InvalidCrdtState {
+                            reason: "CRDT merge references must precede the merge sequence"
+                                .to_string(),
+                        });
+                    }
+                    Self::validate_crdt_extension(
+                        crdt_type,
+                        &source.state_cbor,
+                        &state_obj.state_cbor,
+                    )?;
+                }
+            }
+            recovery
+                .merge
+                .as_ref()
+                .map(|merge| (merge.parent, recovery.states[&merge.parent].clone()))
+        } else {
+            let root = self.read_root().await?;
+            if let Some((_root_id, root)) = &root
+                && root.model != self.state_model
+            {
+                return Err(ConnectorStateStoreError::IdentityMismatch {
+                    field: "model",
+                    expected: format!("{:?}", root.model),
+                    got: format!("{:?}", self.state_model),
+                });
+            }
+            match root.and_then(|(_root_id, root)| root.head) {
+                Some(head_id) => Some(self.load_state_object(&head_id).await?),
+                None => None,
+            }
         };
         if let Some((_head_id, head)) = &current {
             Self::validate_writer_fencing(&self.state_model, head, &state_obj)?;
@@ -1998,6 +2492,9 @@ impl FcpStoreConnectorStateStore {
         let mut next = root.head.ok_or_else(boundary_error)?;
         let snapshot = self.load_snapshot(&snapshot_object_id).await?;
         let (_covered_id, covered_state) = self.load_state_object(&snapshot.covers_head).await?;
+        if let Some(crdt_type) = root.model.crdt_type() {
+            Self::validate_crdt_payload(crdt_type, &covered_state.state_cbor)?;
+        }
         let mut tail = Vec::new();
         let mut visited = HashSet::new();
 
@@ -2052,6 +2549,11 @@ impl FcpStoreConnectorStateStore {
                 expected,
                 got: newer.seq,
             });
+        }
+        if let Some(crdt_type) = model.crdt_type() {
+            Self::validate_crdt_payload(crdt_type, &older.state_cbor)?;
+            Self::validate_crdt_payload(crdt_type, &newer.state_cbor)?;
+            Self::validate_crdt_extension(crdt_type, &older.state_cbor, &newer.state_cbor)?;
         }
         Self::validate_writer_fencing(model, older, newer)
     }
@@ -3141,6 +3643,7 @@ impl FcpStoreConnectorStateStore {
             | ConnectorStateStoreError::UntrustedWriterKey { .. }
             | ConnectorStateStoreError::InvalidReplica { .. }
             | ConnectorStateStoreError::ReplicaObjectConflict { .. }
+            | ConnectorStateStoreError::InvalidCrdtState { .. }
             | ConnectorStateStoreError::Serialization(_) => ConnectorStateError::MalformedState {
                 connector_id: self.connector_id.clone(),
                 reason: err.to_string(),
@@ -3743,6 +4246,41 @@ mod tests {
             .sign_with(signing_key)
             .expect("test connector state should sign");
         state
+    }
+
+    fn crdt_state(seq: u64, prev: Option<ObjectId>, lease: ObjectId) -> ConnectorStateObject {
+        let mut map = fcp_core::LwwMap::<String, serde_json::Value>::default();
+        map.insert(
+            "n".to_string(),
+            serde_json::json!(seq),
+            seq,
+            fcp_core::CrdtActorId::new("test"),
+        );
+        let mut state = state(seq, prev, lease);
+        state.state_cbor = fcp_cbor::to_canonical_cbor(&map).unwrap();
+        state.sign_with(&test_state_signing_key()).unwrap();
+        state
+    }
+
+    fn typed_crdt_state(
+        seq: u64,
+        prev: Option<ObjectId>,
+        lease: ObjectId,
+        state_cbor: Vec<u8>,
+        signing_key: &Ed25519SigningKey,
+    ) -> ConnectorStateObject {
+        let mut state = state(seq, prev, lease);
+        state.state_cbor = state_cbor;
+        state.sign_with(signing_key).unwrap();
+        state
+    }
+
+    fn counter_cbor(counts: &[(&str, u64)]) -> Vec<u8> {
+        let mut counter = fcp_core::GCounter::default();
+        for (actor, count) in counts {
+            counter.increment(fcp_core::CrdtActorId::new(*actor), *count);
+        }
+        fcp_cbor::to_canonical_cbor(&counter).unwrap()
     }
 
     fn root_with_head(head: Option<ObjectId>, created_at: u64) -> ConnectorStateRoot {
@@ -4432,8 +4970,8 @@ mod tests {
         ));
 
         let crdt_store = test_store(store()).with_state_model(crdt);
-        let (crdt_head, _) = append_ok(&crdt_store, state(0, None, lease_id(1)));
-        let mut independent_writer = state(1, Some(crdt_head), lease_id(2));
+        let (crdt_head, _) = append_ok(&crdt_store, crdt_state(0, None, lease_id(1)));
+        let mut independent_writer = crdt_state(1, Some(crdt_head), lease_id(2));
         independent_writer.lease_seq = 1;
         independent_writer
             .sign_with(&test_state_signing_key())
@@ -4563,15 +5101,757 @@ mod tests {
         let state_store = test_store(store()).with_state_model(ConnectorStateModel::Crdt {
             crdt_type: fcp_prelude::CrdtType::LwwMap,
         });
-        let (head0, _) = append_ok(&state_store, state(0, None, lease_id(1)));
+        let (head0, _) = append_ok(&state_store, crdt_state(0, None, lease_id(1)));
         let new_key = Ed25519SigningKey::from_bytes(&[0x79; 32]).unwrap();
-        let mut concurrent = signed_state(1, Some(head0), lease_id(2), &new_key);
+        let mut concurrent = crdt_state(1, Some(head0), lease_id(2));
         concurrent.lease_seq = 1;
         concurrent.sign_with(&new_key).unwrap();
         append_ok(&state_store, concurrent);
         assert_eq!(
             run_async(state_store.read_chain(None, 10)).unwrap().len(),
             2
+        );
+    }
+
+    #[test]
+    fn crdt_signed_join_resolves_forks_and_survives_durable_reopen() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let (authority, writer_a) = write_authorization_with_key();
+        let (_, writer_b) = write_authorization_with_key();
+        let pins = [
+            writer_a.verifying_key().to_bytes(),
+            writer_b.verifying_key().to_bytes(),
+        ];
+        let model = ConnectorStateModel::Crdt {
+            crdt_type: fcp_core::CrdtType::GCounter,
+        };
+        for checkpoint_after_ops in [0, 2] {
+            let mut config = DurableObjectStoreConfig::new(
+                directory.path().join(checkpoint_after_ops.to_string()),
+            );
+            config.checkpoint_after_ops = checkpoint_after_ops;
+            config.mac_key = Some([0x46; 32]);
+            let merged_head = {
+                let objects = Arc::new(DurableObjectStore::open(config.clone()).unwrap());
+                let adapter = test_store(objects)
+                    .with_state_model(model.clone())
+                    .with_trusted_writer_keys(pins)
+                    .with_snapshot_every_entries(0)
+                    .with_snapshot_every_secs(0);
+                let (genesis, _) = append_ok(
+                    &adapter,
+                    typed_crdt_state(0, None, lease_id(1), counter_cbor(&[("a", 1)]), &writer_a),
+                );
+                append_ok(
+                    &adapter,
+                    typed_crdt_state(
+                        1,
+                        Some(genesis),
+                        lease_id(2),
+                        counter_cbor(&[("a", 2)]),
+                        &writer_a,
+                    ),
+                );
+                let (_, branch_root) = store_replicated_state_and_root(
+                    &adapter,
+                    typed_crdt_state(
+                        1,
+                        Some(genesis),
+                        lease_id(3),
+                        counter_cbor(&[("a", 1), ("b", 3)]),
+                        &writer_b,
+                    ),
+                );
+                assert!(matches!(
+                    run_async(adapter.observe_replicated_root(branch_root)),
+                    Err(ConnectorStateStoreError::ForkDetected { .. })
+                ));
+                assert!(matches!(
+                    run_async(ConnectorStateStore::read_root(&adapter, &connector_id())),
+                    Err(ConnectorStateError::ForkDetected { .. })
+                ));
+                assert!(adapter.cached_root().is_none());
+
+                let proposal = run_async(adapter.read_crdt_merge()).unwrap().unwrap();
+                assert_eq!(proposal.parent_seq, 1);
+                assert_eq!(proposal.required_refs.len(), 1);
+                assert_eq!(proposal.state_cbor, counter_cbor(&[("a", 2), ("b", 3)]));
+                let mut merged = typed_crdt_state(
+                    2,
+                    Some(proposal.parent),
+                    lease_id(4),
+                    proposal.state_cbor,
+                    &writer_a,
+                );
+                merged.header.refs.extend(proposal.required_refs);
+                merged.sign_with(&writer_a).unwrap();
+                let outcome = run_async(ConnectorStateStore::append_object(
+                    &adapter,
+                    &connector_id(),
+                    &authority,
+                    merged,
+                ))
+                .unwrap();
+                let ConnectorStateAppendOutcome::Committed {
+                    object_id, seq: 2, ..
+                } = outcome
+                else {
+                    panic!("a signed join must commit through the authorized append boundary");
+                };
+                assert_eq!(
+                    run_async(adapter.read_root()).unwrap().unwrap().1.head,
+                    Some(object_id)
+                );
+                object_id
+            };
+            let restored = test_store(Arc::new(DurableObjectStore::open(config).unwrap()))
+                .with_state_model(model.clone())
+                .with_trusted_writer_keys(pins);
+            assert_eq!(
+                run_async(restored.read_root()).unwrap().unwrap().1.head,
+                Some(merged_head)
+            );
+            let proposal = run_async(restored.read_crdt_merge()).unwrap().unwrap();
+            assert_eq!(proposal.parent, merged_head);
+            assert!(proposal.required_refs.is_empty());
+            assert_eq!(proposal.state_cbor, counter_cbor(&[("a", 2), ("b", 3)]));
+        }
+    }
+
+    #[test]
+    fn crdt_merge_admission_rechecks_concurrent_branches_and_preserves_storage_on_refusal() {
+        let objects = store();
+        let adapter = test_store(objects.clone()).with_state_model(ConnectorStateModel::Crdt {
+            crdt_type: fcp_core::CrdtType::GCounter,
+        });
+        let key = test_state_signing_key();
+        let (genesis, _) = append_ok(
+            &adapter,
+            typed_crdt_state(0, None, lease_id(1), counter_cbor(&[]), &key),
+        );
+        append_ok(
+            &adapter,
+            typed_crdt_state(
+                1,
+                Some(genesis),
+                lease_id(2),
+                counter_cbor(&[("a", 2)]),
+                &key,
+            ),
+        );
+        store_replicated_state_and_root(
+            &adapter,
+            typed_crdt_state(
+                1,
+                Some(genesis),
+                lease_id(3),
+                counter_cbor(&[("b", 3)]),
+                &key,
+            ),
+        );
+        let old = run_async(adapter.read_crdt_merge()).unwrap().unwrap();
+        store_replicated_state_and_root(
+            &adapter,
+            typed_crdt_state(
+                1,
+                Some(genesis),
+                lease_id(4),
+                counter_cbor(&[("c", 4)]),
+                &key,
+            ),
+        );
+        let objects_before = run_async(objects.list_zone(&zone_id())).len();
+        let mut stale = typed_crdt_state(2, Some(old.parent), lease_id(5), old.state_cbor, &key);
+        stale.header.refs.extend(old.required_refs);
+        stale.sign_with(&key).unwrap();
+        assert!(matches!(
+            run_async(adapter.append_object(stale)),
+            Err(ConnectorStateStoreError::InvalidCrdtState { .. })
+        ));
+        assert_eq!(
+            run_async(objects.list_zone(&zone_id())).len(),
+            objects_before
+        );
+
+        let current = run_async(adapter.read_crdt_merge()).unwrap().unwrap();
+        assert_eq!(
+            current.state_cbor,
+            counter_cbor(&[("a", 2), ("b", 3), ("c", 4)])
+        );
+        let mut missing_refs = typed_crdt_state(
+            2,
+            Some(current.parent),
+            lease_id(5),
+            current.state_cbor.clone(),
+            &key,
+        );
+        assert!(matches!(
+            run_async(adapter.append_object(missing_refs.clone())),
+            Err(ConnectorStateStoreError::InvalidCrdtState { .. })
+        ));
+        assert_eq!(
+            run_async(objects.list_zone(&zone_id())).len(),
+            objects_before
+        );
+        missing_refs.header.refs.extend(current.required_refs);
+        missing_refs.sign_with(&key).unwrap();
+        let (merged, _) = append_ok(&adapter, missing_refs);
+
+        let regressive = typed_crdt_state(
+            3,
+            Some(merged),
+            lease_id(6),
+            counter_cbor(&[("a", 1), ("b", 3), ("c", 4)]),
+            &key,
+        );
+        assert!(matches!(
+            run_async(adapter.append_object(regressive)),
+            Err(ConnectorStateStoreError::InvalidCrdtState { .. })
+        ));
+        assert_eq!(
+            run_async(adapter.read_root()).unwrap().unwrap().1.head,
+            Some(merged)
+        );
+    }
+
+    #[test]
+    fn crdt_recovery_bounds_cover_all_roots_and_unique_states() {
+        let objects = store();
+        let adapter = test_store(objects.clone())
+            .with_state_model(ConnectorStateModel::Crdt {
+                crdt_type: fcp_core::CrdtType::GCounter,
+            })
+            .with_snapshot_every_entries(0)
+            .with_snapshot_every_secs(0);
+        let key = test_state_signing_key();
+        let (genesis, _) = append_ok(
+            &adapter,
+            typed_crdt_state(0, None, lease_id(1), counter_cbor(&[]), &key),
+        );
+        append_ok(
+            &adapter,
+            typed_crdt_state(
+                1,
+                Some(genesis),
+                lease_id(2),
+                counter_cbor(&[("a", 2)]),
+                &key,
+            ),
+        );
+        store_replicated_state_and_root(
+            &adapter,
+            typed_crdt_state(
+                1,
+                Some(genesis),
+                lease_id(3),
+                counter_cbor(&[("b", 3)]),
+                &key,
+            ),
+        );
+        let ids = run_async(objects.list_zone(&zone_id()));
+        let bytes = ids
+            .iter()
+            .map(|id| {
+                let stored = run_async(objects.get(id)).unwrap();
+                StoredObject::canonical_bytes(&stored.header, &stored.body)
+                    .unwrap()
+                    .len()
+            })
+            .sum::<usize>();
+        let exact = adapter
+            .clone()
+            .with_crdt_recovery_limits(ConnectorStateReplicaLimits {
+                max_objects: ids.len(),
+                max_bytes: bytes,
+            });
+        assert!(run_async(exact.read_crdt_merge()).unwrap().is_some());
+        let object_limited =
+            adapter
+                .clone()
+                .with_crdt_recovery_limits(ConnectorStateReplicaLimits {
+                    max_objects: ids.len() - 1,
+                    max_bytes: bytes,
+                });
+        assert!(matches!(
+            run_async(object_limited.read_crdt_merge()),
+            Err(ConnectorStateStoreError::ReplicaObjectLimitExceeded { .. })
+        ));
+        let byte_limited = adapter
+            .clone()
+            .with_crdt_recovery_limits(ConnectorStateReplicaLimits {
+                max_objects: ids.len(),
+                max_bytes: bytes - 1,
+            });
+        assert!(matches!(
+            run_async(byte_limited.read_crdt_merge()),
+            Err(ConnectorStateStoreError::ReplicaByteLimitExceeded { .. })
+        ));
+        let tiny = adapter.with_crdt_recovery_limits(ConnectorStateReplicaLimits {
+            max_objects: ids.len(),
+            max_bytes: 1,
+        });
+        assert!(matches!(
+            run_async(tiny.read_root()),
+            Err(ConnectorStateStoreError::ReplicaByteLimitExceeded { .. })
+        ));
+        assert!(tiny.cached_root().is_none());
+        assert_eq!(run_async(objects.list_zone(&zone_id())).len(), ids.len());
+    }
+
+    #[test]
+    fn crdt_recovery_authenticates_losing_branches_and_refuses_ambiguous_lww_clocks() {
+        let objects = store();
+        let adapter = test_store(objects.clone()).with_state_model(ConnectorStateModel::Crdt {
+            crdt_type: fcp_core::CrdtType::LwwMap,
+        });
+        let key = test_state_signing_key();
+        let empty =
+            fcp_cbor::to_canonical_cbor(&fcp_core::LwwMap::<String, serde_json::Value>::default())
+                .unwrap();
+        let (genesis, _) = append_ok(
+            &adapter,
+            typed_crdt_state(0, None, lease_id(1), empty, &key),
+        );
+        let payload = |value| {
+            let mut map = fcp_core::LwwMap::<String, serde_json::Value>::default();
+            map.insert(
+                "same".to_string(),
+                serde_json::json!(value),
+                10,
+                fcp_core::CrdtActorId::new("equivocating"),
+            );
+            fcp_cbor::to_canonical_cbor(&map).unwrap()
+        };
+        append_ok(
+            &adapter,
+            typed_crdt_state(1, Some(genesis), lease_id(2), payload(1), &key),
+        );
+        let (_, root) = store_replicated_state_and_root(
+            &adapter,
+            typed_crdt_state(1, Some(genesis), lease_id(3), payload(2), &key),
+        );
+        assert!(matches!(
+            run_async(adapter.observe_replicated_root(root)),
+            Err(ConnectorStateStoreError::InvalidCrdtState { .. })
+        ));
+        assert!(matches!(
+            run_async(adapter.read_crdt_merge()),
+            Err(ConnectorStateStoreError::InvalidCrdtState { .. })
+        ));
+        assert!(adapter.cached_root().is_none());
+
+        let objects = store();
+        let adapter = test_store(objects)
+            .with_state_model(ConnectorStateModel::Crdt {
+                crdt_type: fcp_core::CrdtType::GCounter,
+            })
+            .with_trusted_writer_keys([key.verifying_key().to_bytes()]);
+        let (genesis, _) = append_ok(
+            &adapter,
+            typed_crdt_state(0, None, lease_id(1), counter_cbor(&[]), &key),
+        );
+        let (head1, _) = append_ok(
+            &adapter,
+            typed_crdt_state(
+                1,
+                Some(genesis),
+                lease_id(2),
+                counter_cbor(&[("a", 1)]),
+                &key,
+            ),
+        );
+        append_ok(
+            &adapter,
+            typed_crdt_state(2, Some(head1), lease_id(3), counter_cbor(&[("a", 2)]), &key),
+        );
+        let untrusted = Ed25519SigningKey::from_bytes(&[0x61; 32]).unwrap();
+        let (_, root) = store_replicated_state_and_root(
+            &adapter,
+            typed_crdt_state(
+                1,
+                Some(genesis),
+                lease_id(4),
+                counter_cbor(&[("b", 3)]),
+                &untrusted,
+            ),
+        );
+        assert!(matches!(
+            run_async(adapter.observe_replicated_root(root)),
+            Err(ConnectorStateStoreError::UntrustedWriterKey { .. })
+        ));
+        assert!(matches!(
+            run_async(adapter.read_crdt_merge()),
+            Err(ConnectorStateStoreError::UntrustedWriterKey { .. })
+        ));
+    }
+
+    #[test]
+    fn crdt_observed_remove_join_preserves_tombstones_and_schema() {
+        let key = test_state_signing_key();
+        let adapter = test_store(store()).with_state_model(ConnectorStateModel::Crdt {
+            crdt_type: fcp_core::CrdtType::OrSet,
+        });
+        let mut original = fcp_core::OrSet::<String>::default();
+        original.add(
+            "removed".to_string(),
+            fcp_core::OrSetTag::new(fcp_core::CrdtActorId::new("a"), 1),
+        );
+        let (genesis, _) = append_ok(
+            &adapter,
+            typed_crdt_state(
+                0,
+                None,
+                lease_id(1),
+                fcp_cbor::to_canonical_cbor(&original).unwrap(),
+                &key,
+            ),
+        );
+        let mut removed = original.clone();
+        removed.remove_observed(&"removed".to_string());
+        append_ok(
+            &adapter,
+            typed_crdt_state(
+                1,
+                Some(genesis),
+                lease_id(2),
+                fcp_cbor::to_canonical_cbor(&removed).unwrap(),
+                &key,
+            ),
+        );
+        let mut concurrent = original;
+        concurrent.add(
+            "retained".to_string(),
+            fcp_core::OrSetTag::new(fcp_core::CrdtActorId::new("b"), 1),
+        );
+        store_replicated_state_and_root(
+            &adapter,
+            typed_crdt_state(
+                1,
+                Some(genesis),
+                lease_id(3),
+                fcp_cbor::to_canonical_cbor(&concurrent).unwrap(),
+                &key,
+            ),
+        );
+        let merge = run_async(adapter.read_crdt_merge()).unwrap().unwrap();
+        let joined: fcp_core::OrSet<String> =
+            ciborium::from_reader(merge.state_cbor.as_slice()).unwrap();
+        assert!(!joined.contains(&"removed".to_string()));
+        assert!(joined.contains(&"retained".to_string()));
+        let mut update =
+            typed_crdt_state(2, Some(merge.parent), lease_id(4), merge.state_cbor, &key);
+        update.header.refs.extend(merge.required_refs);
+        update.sign_with(&key).unwrap();
+        let (head, _) = append_ok(&adapter, update);
+        assert_eq!(
+            run_async(adapter.read_root()).unwrap().unwrap().1.head,
+            Some(head)
+        );
+
+        let wrong_type =
+            typed_crdt_state(3, Some(head), lease_id(5), counter_cbor(&[("a", 9)]), &key);
+        assert!(matches!(
+            run_async(adapter.append_object(wrong_type)),
+            Err(ConnectorStateStoreError::InvalidCrdtState { .. })
+        ));
+        let mut unsigned_join = typed_crdt_state(
+            3,
+            Some(head),
+            lease_id(5),
+            fcp_cbor::to_canonical_cbor(&joined).unwrap(),
+            &key,
+        );
+        unsigned_join.header.refs.push(head);
+        let (authority, _) = write_authorization_with_key();
+        assert!(matches!(
+            run_async(ConnectorStateStore::append_object(
+                &adapter,
+                &connector_id(),
+                &authority,
+                unsigned_join
+            )),
+            Err(ConnectorStateError::MalformedState { .. })
+        ));
+    }
+
+    #[test]
+    fn crdt_merge_sources_remain_authenticated_without_historical_roots() {
+        let source = store();
+        let genesis_key = test_state_signing_key();
+        let writer_a = Ed25519SigningKey::from_bytes(&[0x51; 32]).unwrap();
+        let writer_b = Ed25519SigningKey::from_bytes(&[0x52; 32]).unwrap();
+        let pins = [
+            genesis_key.verifying_key().to_bytes(),
+            writer_a.verifying_key().to_bytes(),
+            writer_b.verifying_key().to_bytes(),
+        ];
+        let model = ConnectorStateModel::Crdt {
+            crdt_type: fcp_core::CrdtType::GCounter,
+        };
+        let adapter = test_store(source.clone())
+            .with_state_model(model.clone())
+            .with_trusted_writer_keys(pins)
+            .with_snapshot_every_entries(0)
+            .with_snapshot_every_secs(0);
+        let (genesis, _) = append_ok(
+            &adapter,
+            typed_crdt_state(0, None, lease_id(1), counter_cbor(&[]), &genesis_key),
+        );
+        append_ok(
+            &adapter,
+            typed_crdt_state(
+                1,
+                Some(genesis),
+                lease_id(2),
+                counter_cbor(&[("a", 2)]),
+                &writer_a,
+            ),
+        );
+        store_replicated_state_and_root(
+            &adapter,
+            typed_crdt_state(
+                1,
+                Some(genesis),
+                lease_id(3),
+                counter_cbor(&[("b", 3)]),
+                &writer_b,
+            ),
+        );
+        let merge = run_async(adapter.read_crdt_merge()).unwrap().unwrap();
+        let merge_source = merge.required_refs[0];
+        let source_key = run_async(adapter.load_state_object(&merge_source))
+            .unwrap()
+            .1
+            .writer_public_key;
+        let mut merged = typed_crdt_state(
+            2,
+            Some(merge.parent),
+            lease_id(4),
+            merge.state_cbor,
+            &genesis_key,
+        );
+        merged.header.refs.extend(merge.required_refs);
+        merged.sign_with(&genesis_key).unwrap();
+        let (head, _) = append_ok(&adapter, merged);
+        let current_root = run_async(adapter.read_root()).unwrap().unwrap().0;
+
+        for mode in ["complete", "missing", "disguised"] {
+            let target = store();
+            for id in run_async(source.list_zone(&zone_id())) {
+                let mut object = run_async(source.get(&id)).unwrap();
+                if object.header.schema == FcpStoreConnectorStateStore::root_schema_id()
+                    && id != current_root
+                {
+                    continue;
+                }
+                if id == merge_source {
+                    if mode == "missing" {
+                        continue;
+                    }
+                    if mode == "disguised" {
+                        object.header.schema =
+                            SchemaId::new("test", "opaque_payload", Version::new(1, 0, 0));
+                        object.body = vec![0xf6];
+                    }
+                }
+                run_async(target.put(object)).unwrap();
+            }
+            let reader = test_store(target.clone())
+                .with_state_model(model.clone())
+                .with_trusted_writer_keys(pins);
+            if mode == "complete" {
+                assert_eq!(
+                    run_async(reader.read_root()).unwrap().unwrap().1.head,
+                    Some(head)
+                );
+                let restricted = test_store(target)
+                    .with_state_model(model.clone())
+                    .with_trusted_writer_keys(pins.into_iter().filter(|key| *key != source_key));
+                assert!(matches!(
+                    run_async(restricted.read_root()),
+                    Err(ConnectorStateStoreError::UntrustedWriterKey { .. })
+                ));
+            } else if mode == "missing" {
+                assert!(
+                    matches!(run_async(reader.read_root()), Err(ConnectorStateStoreError::MissingHead(id)) if id == merge_source)
+                );
+            } else {
+                assert!(matches!(
+                    run_async(reader.read_root()),
+                    Err(ConnectorStateStoreError::ContentIdMismatch { .. })
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn crdt_admission_reserves_recoverable_capacity_and_refuses_unknown_references() {
+        let objects = store();
+        let key = test_state_signing_key();
+        let model = ConnectorStateModel::Crdt {
+            crdt_type: fcp_core::CrdtType::GCounter,
+        };
+        let adapter = test_store(objects.clone())
+            .with_state_model(model)
+            .with_snapshot_every_entries(0)
+            .with_snapshot_every_secs(0);
+        let genesis = typed_crdt_state(0, None, lease_id(1), counter_cbor(&[]), &key);
+        let zero = adapter
+            .clone()
+            .with_crdt_recovery_limits(ConnectorStateReplicaLimits {
+                max_objects: 0,
+                max_bytes: 0,
+            });
+        assert!(matches!(
+            run_async(zero.append_object(genesis.clone())),
+            Err(ConnectorStateStoreError::ReplicaObjectLimitExceeded { .. })
+        ));
+        assert!(run_async(objects.list_zone(&zone_id())).is_empty());
+        let (head, _) = append_ok(&adapter, genesis);
+        let ids = run_async(objects.list_zone(&zone_id()));
+        let bytes = ids
+            .iter()
+            .map(|id| {
+                let object = run_async(objects.get(id)).unwrap();
+                StoredObject::canonical_bytes(&object.header, &object.body)
+                    .unwrap()
+                    .len()
+            })
+            .sum::<usize>();
+        let next = typed_crdt_state(1, Some(head), lease_id(2), counter_cbor(&[("a", 1)]), &key);
+        let exact = adapter
+            .clone()
+            .with_crdt_recovery_limits(ConnectorStateReplicaLimits {
+                max_objects: ids.len(),
+                max_bytes: bytes,
+            });
+        assert!(run_async(exact.read_root()).unwrap().is_some());
+        assert!(run_async(exact.append_object(next.clone())).is_err());
+        assert!(run_async(exact.read_root()).unwrap().is_some());
+        assert_eq!(run_async(objects.list_zone(&zone_id())).len(), ids.len());
+        let byte_limited = adapter
+            .clone()
+            .with_crdt_recovery_limits(ConnectorStateReplicaLimits {
+                max_objects: 100,
+                max_bytes: bytes,
+            });
+        assert!(matches!(
+            run_async(byte_limited.append_object(next.clone())),
+            Err(ConnectorStateStoreError::ReplicaByteLimitExceeded { .. })
+        ));
+        assert_eq!(run_async(objects.list_zone(&zone_id())).len(), ids.len());
+
+        let mut missing = next;
+        missing.header.refs.push(lease_id(0xe1));
+        missing.sign_with(&key).unwrap();
+        assert!(matches!(
+            run_async(adapter.append_object(missing)),
+            Err(ConnectorStateStoreError::MissingHead(_))
+        ));
+        assert_eq!(run_async(objects.list_zone(&zone_id())).len(), ids.len());
+        assert_eq!(
+            run_async(adapter.read_root()).unwrap().unwrap().1.head,
+            Some(head)
+        );
+    }
+
+    #[test]
+    fn crdt_genesis_cannot_downgrade_an_empty_root_schema() {
+        let objects = store();
+        let adapter = test_store(objects.clone()).with_state_model(ConnectorStateModel::Crdt {
+            crdt_type: fcp_core::CrdtType::GCounter,
+        });
+        let mut root = ConnectorStateRoot::crdt(
+            header(
+                FcpStoreConnectorStateStore::root_schema_id(),
+                1_700_000_000,
+                None,
+            ),
+            connector_id(),
+            zone_id(),
+            fcp_core::CrdtType::GCounter,
+        );
+        root.state_schema_version = 2;
+        let root_id = run_async(adapter.store_root(root)).unwrap();
+        assert!(run_async(adapter.read_crdt_merge()).unwrap().is_none());
+        let genesis = typed_crdt_state(
+            0,
+            None,
+            lease_id(1),
+            counter_cbor(&[]),
+            &test_state_signing_key(),
+        );
+        assert!(matches!(
+            run_async(adapter.append_object(genesis)),
+            Err(ConnectorStateStoreError::InvalidCrdtState { .. })
+        ));
+        assert_eq!(run_async(objects.list_zone(&zone_id())), vec![root_id]);
+        assert_eq!(
+            run_async(adapter.read_root())
+                .unwrap()
+                .unwrap()
+                .1
+                .state_schema_version,
+            2
+        );
+    }
+
+    #[test]
+    fn crdt_merge_references_only_the_unrepresented_branch_frontier() {
+        let adapter = test_store(store()).with_state_model(ConnectorStateModel::Crdt {
+            crdt_type: fcp_core::CrdtType::GCounter,
+        });
+        let key = test_state_signing_key();
+        let (genesis, _) = append_ok(
+            &adapter,
+            typed_crdt_state(0, None, lease_id(1), counter_cbor(&[]), &key),
+        );
+        let mut head_a = genesis;
+        let mut head_b = genesis;
+        for seq in 1..=3 {
+            head_a = store_replicated_state_and_root(
+                &adapter,
+                typed_crdt_state(
+                    seq,
+                    Some(head_a),
+                    lease_id(2),
+                    counter_cbor(&[("a", seq)]),
+                    &key,
+                ),
+            )
+            .0;
+            head_b = store_replicated_state_and_root(
+                &adapter,
+                typed_crdt_state(
+                    seq,
+                    Some(head_b),
+                    lease_id(3),
+                    counter_cbor(&[("b", seq)]),
+                    &key,
+                ),
+            )
+            .0;
+        }
+        let proposal = run_async(adapter.read_crdt_merge()).unwrap().unwrap();
+        assert_eq!(proposal.parent_seq, 3);
+        assert_eq!(proposal.required_refs.len(), 1);
+        assert!(
+            proposal.required_refs.contains(&head_a) || proposal.required_refs.contains(&head_b)
+        );
+        assert_eq!(proposal.state_cbor, counter_cbor(&[("a", 3), ("b", 3)]));
+        let mut merged = typed_crdt_state(
+            4,
+            Some(proposal.parent),
+            lease_id(4),
+            proposal.state_cbor,
+            &key,
+        );
+        merged.header.refs.extend(proposal.required_refs);
+        merged.sign_with(&key).unwrap();
+        let (head, _) = append_ok(&adapter, merged);
+        assert_eq!(
+            run_async(adapter.read_root()).unwrap().unwrap().1.head,
+            Some(head)
         );
     }
 
@@ -4930,11 +6210,16 @@ mod tests {
         let state_store = test_store(store()).with_state_model(ConnectorStateModel::Crdt {
             crdt_type: fcp_prelude::CrdtType::LwwMap,
         });
-        let head0 = run_async(state_store.store_state_object(state(0, None, lease_id(1)))).unwrap();
-        store_replicated_state_and_root(&state_store, state(2, Some(head0), lease_id(2)));
-        // CRDT roots do not use the singleton fork validator; this exercises
-        // the ordinary chain reader's own validation despite a one-item limit.
-        assert!(run_async(state_store.read_root()).unwrap().is_some());
+        let head0 =
+            run_async(state_store.store_state_object(crdt_state(0, None, lease_id(1)))).unwrap();
+        store_replicated_state_and_root(&state_store, crdt_state(2, Some(head0), lease_id(2)));
+        assert!(matches!(
+            run_async(state_store.read_root()),
+            Err(ConnectorStateStoreError::SequenceMismatch {
+                expected: 1,
+                got: 2
+            })
+        ));
         assert!(matches!(
             run_async(state_store.read_chain(None, 1)),
             Err(ConnectorStateStoreError::SequenceMismatch {
