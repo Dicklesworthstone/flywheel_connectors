@@ -11,6 +11,38 @@ pub(super) const CONTROL_RESPONSE_BYTES: usize = 64 * 1024;
 const INTROSPECTION_RESPONSE_BYTES: usize = 1024 * 1024;
 pub(super) const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 
+/// Validate the reply envelope after its transport ID has matched. In
+/// particular, an ID alone must never acknowledge configure or shutdown, and
+/// a reply containing both result and error must not be treated as reusable.
+/// FCP string error codes and standard JSON-RPC integer codes are both valid.
+pub(super) fn validate_response_envelope(response: &serde_json::Value) -> io::Result<()> {
+    let valid = response.as_object().is_some_and(|envelope| {
+        envelope.get("jsonrpc").and_then(serde_json::Value::as_str) == Some("2.0")
+            && !envelope.contains_key("method")
+            && match (envelope.contains_key("result"), envelope.get("error")) {
+                (true, None) => true,
+                (false, Some(error)) => error.as_object().is_some_and(|error| {
+                    error.get("message").is_some_and(serde_json::Value::is_string)
+                        && error.get("code").is_some_and(|code| {
+                            code.as_str().is_some_and(|code| !code.is_empty())
+                                || code.is_i64()
+                                || code.is_u64()
+                        })
+                }),
+                _ => false,
+            }
+    });
+    if valid {
+        Ok(())
+    } else {
+        // Never echo untrusted result/error content into host diagnostics.
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "native connector returned an invalid JSON-RPC response envelope",
+        ))
+    }
+}
+
 /// Provider response limits apply before connector output serialization.
 /// JSON escaping can require six bytes per input byte (`\u0000`); base64's
 /// four-for-three expansion fits within that allowance. Reserve a control
@@ -100,6 +132,67 @@ impl ResponseFrame {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn response_envelopes_preserve_null_results_and_error_dialects() {
+        for response in [
+            serde_json::json!({"jsonrpc": "2.0", "id": "0:0", "result": null}),
+            serde_json::json!({"jsonrpc": "2.0", "id": "0:0", "result": {}}),
+            serde_json::json!({"jsonrpc": "2.0", "id": "0:0", "error": {
+                "code": "FCP-5002", "message": "Connector not configured", "retryable": false,
+                "details": {"operation": "configure"}, "ai_recovery_hint": "Configure first"
+            }}),
+            serde_json::json!({"jsonrpc": "2.0", "id": "0:0", "error": {
+                "code": -32601, "message": "Method not found", "data": null
+            }}),
+        ] {
+            validate_response_envelope(&response).expect("valid native reply must be preserved");
+        }
+    }
+
+    #[test]
+    fn response_envelopes_reject_ambiguous_and_malformed_replies_without_payloads() {
+        for response in [
+            serde_json::json!(null),
+            serde_json::json!([]),
+            serde_json::json!({"id": "0:0"}),
+            serde_json::json!({"id": "0:0", "result": {}}),
+            serde_json::json!({"jsonrpc": "1.0", "id": "0:0", "result": {}}),
+            serde_json::json!({"jsonrpc": null, "id": "0:0", "result": {}}),
+            serde_json::json!({"jsonrpc": "2.0", "id": "0:0"}),
+            serde_json::json!({"jsonrpc": "2.0", "id": "0:0", "result": {}, "error": null}),
+            serde_json::json!({"jsonrpc": "2.0", "id": "0:0", "result": null, "error": {
+                "code": "FCP-5002", "message": "private-response-marker"
+            }}),
+            serde_json::json!({"jsonrpc": "2.0", "id": "0:0", "method": "health", "result": {}}),
+            serde_json::json!({"jsonrpc": "2.0", "id": "0:0", "error": null}),
+            serde_json::json!({"jsonrpc": "2.0", "id": "0:0", "error": "private-response-marker"}),
+            serde_json::json!({"jsonrpc": "2.0", "id": "0:0", "error": {}}),
+            serde_json::json!({"jsonrpc": "2.0", "id": "0:0", "error": {"code": "FCP-5002"}}),
+            serde_json::json!({"jsonrpc": "2.0", "id": "0:0", "error": {"message": "private-response-marker"}}),
+            serde_json::json!({"jsonrpc": "2.0", "id": "0:0", "error": {"code": true, "message": "private-response-marker"}}),
+            serde_json::json!({"jsonrpc": "2.0", "id": "0:0", "error": {"code": 1.5, "message": "private-response-marker"}}),
+            serde_json::json!({"jsonrpc": "2.0", "id": "0:0", "error": {"code": "", "message": "private-response-marker"}}),
+            serde_json::json!({"jsonrpc": "2.0", "id": "0:0", "error": {"code": "FCP-5002", "message": null}}),
+        ] {
+            let error = validate_response_envelope(&response)
+                .expect_err("malformed reply cannot acknowledge an RPC");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(
+                error.to_string(),
+                "native connector returned an invalid JSON-RPC response envelope"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_provider_fields_do_not_change_the_transport_envelope() {
+        let response = serde_json::json!({
+            "jsonrpc": "2.0", "id": "0:0",
+            "result": {"jsonrpc": "1.0", "method": "event", "result": null, "error": null}
+        });
+        validate_response_envelope(&response).unwrap();
+    }
 
     #[test]
     fn only_declared_invokes_and_introspection_receive_larger_limits() {

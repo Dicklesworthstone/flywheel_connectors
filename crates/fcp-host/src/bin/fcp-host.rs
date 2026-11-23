@@ -7009,7 +7009,13 @@ impl ConnectorProcessRunner {
             };
 
             match Self::validate_response_id(&expected_id, request_epoch, &response) {
-                Ok(ResponseIdDisposition::Matched) => return Ok(response),
+                Ok(ResponseIdDisposition::Matched) => {
+                    if let Err(error) = native_framing::validate_response_envelope(&response) {
+                        self.poisoned = true;
+                        return Err(error);
+                    }
+                    return Ok(response);
+                }
                 Ok(ResponseIdDisposition::StaleEpoch) => {
                     tracing::warn!(
                         expected_request_id = %expected_id,
@@ -36310,6 +36316,117 @@ while IFS= read -r _line; do :; done
         );
         let second = runner.request("health", json!({})).await.unwrap();
         assert_eq!(second["result"]["next"], true);
+    }
+
+    #[cfg(unix)]
+    #[fcp_async_core::runtime::test]
+    async fn connector_dispatcher_retires_malformed_reply_envelopes_and_rejects_backlog() {
+        for response in [
+            json!({"id": "0:0"}),
+            json!({"jsonrpc": "1.0", "id": "0:0", "result": {}}),
+            json!({"jsonrpc": "2.0", "id": "0:0", "result": {}, "error": {
+                "code": "FCP-5002", "message": "private-response-marker"
+            }}),
+            json!({"jsonrpc": "2.0", "id": "0:0", "error": "private-response-marker"}),
+            json!({"jsonrpc": "2.0", "id": "0:0", "error": {
+                "code": "FCP-5002", "message": null
+            }}),
+        ] {
+            let script = r#"
+IFS= read -r _request || exit 1
+printf '%s\n' "$NATIVE_MALFORMED_REPLY"
+while IFS= read -r _request; do :; done
+"#;
+            let runner = ConnectorProcessRunner::spawn(
+                "/bin/sh",
+                &["-c".to_owned(), script.to_owned()],
+                &BTreeMap::from([("NATIVE_MALFORMED_REPLY".to_owned(), response.to_string())]),
+            )
+            .await
+            .unwrap();
+            let retirement = runner.runtime_retirement.clone();
+            let (sender, receiver) = mpsc::channel(2);
+            let selected = NativeRpc::for_io();
+            let queued = NativeRpc::for_io();
+            let _selected_waiter = selected.waiter();
+            let _queued_waiter = queued.waiter();
+            let (selected_tx, selected_rx) = oneshot::channel();
+            let (queued_tx, queued_rx) = oneshot::channel();
+            sender
+                .send(ConnectorRpcRequest {
+                    method: "configure".to_owned(),
+                    params: json!({}),
+                    response_tx: selected_tx,
+                    rpc: selected.clone(),
+                })
+                .await
+                .unwrap();
+            sender
+                .send(ConnectorRpcRequest {
+                    method: "health".to_owned(),
+                    params: json!({}),
+                    response_tx: queued_tx,
+                    rpc: queued.clone(),
+                })
+                .await
+                .unwrap();
+            let dispatcher = task::try_spawn(native_rpc::run_dispatcher(runner, receiver)).unwrap();
+            let error = fcp_async_core::time::timeout(Duration::from_secs(5), selected_rx)
+                .await
+                .expect("malformed reply must finish without another connector frame")
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+            assert_eq!(
+                error.to_string(),
+                "native connector returned an invalid JSON-RPC response envelope"
+            );
+            let queued_error = fcp_async_core::time::timeout(Duration::from_secs(5), queued_rx)
+                .await
+                .expect("retired transport must reject its queued request")
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(queued_error.kind(), std::io::ErrorKind::BrokenPipe);
+            assert!(queued.is_settled());
+            assert!(!queued.transport_retired());
+            retirement
+                .wait_for_exit(Instant::now() + Duration::from_secs(5))
+                .await
+                .expect("malformed reply must retain custody until the exact child exits");
+            assert!(selected.transport_retired());
+            assert!(selected.is_settled());
+            fcp_async_core::time::timeout(Duration::from_secs(5), dispatcher)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[fcp_async_core::runtime::test]
+    async fn connector_process_runner_preserves_valid_null_results_and_fcp_errors() {
+        let script = r#"
+IFS= read -r _request || exit 1
+printf '%s\n' '{"jsonrpc":"2.0","id":"0:0","result":null}'
+IFS= read -r _request || exit 1
+printf '%s\n' '{"jsonrpc":"2.0","id":"0:1","error":{"code":"FCP-5002","message":"Not configured","retryable":false}}'
+IFS= read -r _request || exit 1
+printf '%s\n' '{"jsonrpc":"2.0","id":"0:2","result":{"healthy":true}}'
+while IFS= read -r _request; do :; done
+"#;
+        let mut runner = ConnectorProcessRunner::spawn(
+            "/bin/sh",
+            &["-c".to_owned(), script.to_owned()],
+            &BTreeMap::new(),
+        )
+        .await
+        .unwrap();
+        let configured = runner.request("configure", json!({})).await.unwrap();
+        assert_eq!(configured.get("result"), Some(&serde_json::Value::Null));
+        let rejected = runner.request("health", json!({})).await.unwrap();
+        assert_eq!(rejected["error"]["code"], "FCP-5002");
+        let healthy = runner.request("health", json!({})).await.unwrap();
+        assert_eq!(healthy["result"]["healthy"], true);
     }
 
     #[cfg(unix)]
