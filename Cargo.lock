@@ -2901,11 +2901,13 @@ version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
  "chrono",
  "ciborium",
  "fcp-async-core",
  "fcp-core",
  "fcp-crypto",
+ "fcp-manifest",
  "fcp-prelude",
  "fcp-sdk",
  "fcp-testkit",

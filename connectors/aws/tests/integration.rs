@@ -222,11 +222,14 @@ async fn self_check_ready_with_custom_sts_override_and_evidence() {
         .and(header_exists("Authorization"))
         .and(header_exists("X-Amz-Date"))
         .and(header_exists("X-Amz-Content-Sha256"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "account": "123456789012",
-            "arn": "arn:aws:sts::123456789012:assumed-role/test/AwsConnector",
-            "user_id": "AIDATESTUSER"
-        })))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"<GetCallerIdentityResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/">
+<GetCallerIdentityResult><Account>123456789012</Account>
+<Arn>arn:aws:sts::123456789012:assumed-role/test/AwsConnector</Arn>
+<UserId>AIDATESTUSER</UserId></GetCallerIdentityResult>
+<ResponseMetadata><RequestId>test-request</RequestId></ResponseMetadata>
+</GetCallerIdentityResponse>"#,
+        ))
         .mount(&server)
         .await;
 
@@ -313,6 +316,7 @@ async fn invoke_s3_list_objects_parses_native_xml() {
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
   <Name>test-bucket</Name>
+  <IsTruncated>false</IsTruncated>
   <Contents>
     <Key>fcp-live/object.txt</Key>
     <LastModified>2026-05-15T11:00:00.000Z</LastModified>
@@ -392,10 +396,11 @@ async fn invoke_dangerous_s3_delete_preserves_artifact_evidence() {
         .and(header_exists("Authorization"))
         .and(header_exists("X-Amz-Date"))
         .and(header_exists("X-Amz-Content-Sha256"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "delete_marker": true,
-            "version_id": "ver-123"
-        })))
+        .respond_with(
+            ResponseTemplate::new(204)
+                .insert_header("x-amz-delete-marker", "true")
+                .insert_header("x-amz-version-id", "ver-123"),
+        )
         .mount(&server)
         .await;
 
@@ -471,11 +476,14 @@ async fn invoke_ec2_terminate_preserves_state_transition_evidence() {
         .and(header_exists("Authorization"))
         .and(header_exists("X-Amz-Date"))
         .and(header_exists("X-Amz-Content-Sha256"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "instance_id": "i-0123456789abcdef0",
-            "previous_state": "running",
-            "current_state": "shutting-down"
-        })))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"<TerminateInstancesResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/">
+<requestId>test-request</requestId><instancesSet><item>
+<instanceId>i-0123456789abcdef0</instanceId>
+<previousState><code>16</code><name>running</name></previousState>
+<currentState><code>32</code><name>shutting-down</name></currentState>
+</item></instancesSet></TerminateInstancesResponse>"#,
+        ))
         .mount(&server)
         .await;
 
@@ -511,17 +519,16 @@ async fn invoke_lambda_list_functions_preserves_artifact_evidence() {
         .and(header_exists("Authorization"))
         .and(header_exists("X-Amz-Date"))
         .and(header_exists("X-Amz-Content-Sha256"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
-            {
-                "function_name": "sync-orders",
-                "function_arn": "arn:aws:lambda:us-east-1:123456789012:function:sync-orders",
-                "runtime": "provided.al2023",
-                "handler": "bootstrap",
-                "memory_size": 256,
-                "timeout": 30,
-                "state": "Active"
-            }
-        ])))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "Functions": [{
+                "FunctionName": "sync-orders",
+                "FunctionArn": "arn:aws:lambda:us-east-1:123456789012:function:sync-orders",
+                "Runtime": "provided.al2023",
+                "Handler": "bootstrap",
+                "MemorySize": 256,
+                "Timeout": 30
+            }]
+        })))
         .mount(&server)
         .await;
 
@@ -557,11 +564,14 @@ async fn invoke_sts_identity_preserves_artifact_evidence() {
         .and(header_exists("Authorization"))
         .and(header_exists("X-Amz-Date"))
         .and(header_exists("X-Amz-Content-Sha256"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "account": "123456789012",
-            "arn": "arn:aws:sts::123456789012:assumed-role/test/AwsConnector",
-            "user_id": "AIDATESTUSER"
-        })))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"<GetCallerIdentityResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/">
+<GetCallerIdentityResult><Account>123456789012</Account>
+<Arn>arn:aws:sts::123456789012:assumed-role/test/AwsConnector</Arn>
+<UserId>AIDATESTUSER</UserId></GetCallerIdentityResult>
+<ResponseMetadata><RequestId>test-request</RequestId></ResponseMetadata>
+</GetCallerIdentityResponse>"#,
+        ))
         .mount(&server)
         .await;
 

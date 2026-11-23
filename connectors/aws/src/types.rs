@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 /// AWS authentication credentials.
 #[derive(Clone, Deserialize)]
 pub struct AwsAuth {
+    #[serde(default)]
     pub access_key_id: String,
+    #[serde(default)]
     pub secret_access_key: String,
     #[serde(default)]
     pub session_token: Option<String>,

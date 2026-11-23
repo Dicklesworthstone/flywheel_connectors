@@ -14,6 +14,15 @@ pub enum AwsError {
     #[error("JSON parse error: {0}")]
     Json(#[from] serde_json::Error),
 
+    #[error("AWS host egress request failed (HTTP status: {status:?})")]
+    HostProxy { status: Option<u16> },
+
+    #[error("AWS response exceeds the {limit}-byte limit")]
+    ResponseTooLarge { limit: usize },
+
+    #[error("AWS may have accepted this request; automatic replay is disabled (HTTP status: {status:?})")]
+    UncertainOutcome { status: Option<u16> },
+
     #[error("AWS API error {code}: {message}")]
     Api { code: u32, message: String },
 
@@ -49,6 +58,9 @@ impl AwsError {
                 matches!(code, 500 | 502 | 503 | 504 | 529)
             }
             Self::ServiceError { .. }
+            | Self::HostProxy { .. }
+            | Self::ResponseTooLarge { .. }
+            | Self::UncertainOutcome { .. }
             | Self::Json(_)
             | Self::Unauthorized(_)
             | Self::NotFound(_)
@@ -75,6 +87,27 @@ impl AwsError {
                 status_code: error.status().map(|status| status.as_u16()),
                 retryable: self.is_retryable(),
                 retry_after: self.retry_after(),
+            },
+            Self::HostProxy { status } => FcpError::External {
+                service: "aws.host_egress".into(),
+                message: "AWS host egress request failed".into(),
+                status_code: *status,
+                retryable: false,
+                retry_after: None,
+            },
+            Self::UncertainOutcome { status } => FcpError::External {
+                service: "aws".into(),
+                message: self.to_string(),
+                status_code: *status,
+                retryable: false,
+                retry_after: None,
+            },
+            Self::ResponseTooLarge { .. } => FcpError::External {
+                service: "aws".into(),
+                message: self.to_string(),
+                status_code: None,
+                retryable: false,
+                retry_after: None,
             },
             Self::Json(error) => FcpError::Internal {
                 message: format!("JSON parse error: {error}"),
@@ -115,6 +148,15 @@ impl AwsError {
                 retryable: false,
                 retry_after: None,
             },
+        }
+    }
+}
+
+impl From<crate::protocol::ProviderDecodeError> for AwsError {
+    fn from(error: crate::protocol::ProviderDecodeError) -> Self {
+        Self::ServiceError {
+            service: error.service.into(),
+            message: error.to_string(),
         }
     }
 }

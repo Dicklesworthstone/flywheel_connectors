@@ -1,12 +1,13 @@
 //! AWS connector implementation.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use fcp_prelude::{
     AgentHint, ApprovalMode, BaseConnector, CapabilityGrant, CapabilityId, CapabilityVerifier,
-    ConnectorId, ConnectorMetrics, EventCaps, FcpConnector, FcpError, FcpResult, HandshakeRequest,
+    ConnectorId, ConnectorMetrics, CredentialId, EventCaps, FcpConnector, FcpError, FcpResult, HandshakeRequest,
     HandshakeResponse, HealthSnapshot, IdempotencyClass, Introspection, InvokeRequest,
     InvokeResponse, OperationId, OperationInfo, RiskLevel, SafetyTier, SelfCheckReport, SessionId,
     ShutdownRequest, SimulateRequest, SimulateResponse, SubscribeRequest, SubscribeResponse,
@@ -62,6 +63,14 @@ pub struct AwsConfig {
     pub region: String,
     #[serde(flatten)]
     pub auth: AwsAuth,
+    /// Service-specific host SigV4 credential references.
+    #[serde(default)]
+    pub credential_ids: Option<BTreeMap<String, CredentialId>>,
+    /// Single-service shorthand; requires credential_service.
+    #[serde(default)]
+    pub credential_id: Option<CredentialId>,
+    #[serde(default)]
+    pub credential_service: Option<String>,
     #[serde(default)]
     pub retry: HttpRetryConfig,
     #[serde(default = "default_timeout_ms")]
@@ -89,6 +98,7 @@ impl std::fmt::Debug for AwsConfig {
         f.debug_struct("AwsConfig")
             .field("region", &self.region)
             .field("auth", &self.auth)
+            .field("auth_mode", &self.auth_mode())
             .field("retry", &self.retry)
             .field("request_timeout_ms", &self.request_timeout_ms)
             .field("s3_base_url", &self.s3_base_url)
@@ -123,6 +133,9 @@ impl AwsConfig {
         if let Some(session_material) = normalized_session {
             self.auth.session_token.replace(session_material);
         }
+        if let Some(service) = &mut self.credential_service {
+            *service = service.trim().to_string();
+        }
         normalize_endpoint_override(&mut self.s3_base_url);
         normalize_endpoint_override(&mut self.ec2_base_url);
         normalize_endpoint_override(&mut self.lambda_base_url);
@@ -133,11 +146,23 @@ impl AwsConfig {
         if self.region.is_empty() {
             return Err("region is required".into());
         }
-        if self.auth.access_key_id.is_empty() {
-            return Err("access_key_id is required".into());
-        }
-        if self.auth.secret_access_key.is_empty() {
-            return Err("secret_access_key is required".into());
+        match self.credential_bindings()? {
+            Some(_) => {
+                if !self.auth.access_key_id.is_empty()
+                    || !self.auth.secret_access_key.is_empty()
+                    || self.auth.session_token.is_some()
+                {
+                    return Err("static AWS credentials and host credential references are mutually exclusive".into());
+                }
+            }
+            None => {
+                if self.auth.access_key_id.is_empty() {
+                    return Err("access_key_id is required".into());
+                }
+                if self.auth.secret_access_key.is_empty() {
+                    return Err("secret_access_key is required".into());
+                }
+            }
         }
         if self.request_timeout_ms == 0 {
             return Err("request_timeout_ms must be greater than 0".into());
@@ -171,8 +196,30 @@ impl AwsConfig {
         Ok(config)
     }
 
+    fn credential_bindings(&self) -> Result<Option<BTreeMap<String, CredentialId>>, String> {
+        let bindings = match (&self.credential_ids, &self.credential_id, &self.credential_service) {
+            (None, None, None) => return Ok(None),
+            (Some(bindings), None, None) => bindings.clone(),
+            (None, Some(id), Some(service)) => BTreeMap::from([(service.clone(), *id)]),
+            _ => return Err("use credential_ids, or credential_id with credential_service; do not mix these forms".into()),
+        };
+        if bindings.is_empty() {
+            return Err("credential_ids must not be empty".into());
+        }
+        if bindings.keys().any(|service| !matches!(service.as_str(), "s3" | "ec2" | "lambda" | "sts")) {
+            return Err("credential service must be one of s3, ec2, lambda, sts".into());
+        }
+        let distinct: BTreeSet<_> = bindings.values().map(ToString::to_string).collect();
+        if distinct.len() != bindings.len() {
+            return Err("each AWS service requires its own SigV4 credential binding".into());
+        }
+        Ok(Some(bindings))
+    }
+
     const fn auth_mode(&self) -> &'static str {
-        if self.auth.session_token.is_some() {
+        if self.credential_ids.is_some() || self.credential_id.is_some() {
+            "host_sigv4"
+        } else if self.auth.session_token.is_some() {
             "static_keys_with_session_token"
         } else {
             "static_keys"
@@ -186,9 +233,34 @@ impl AwsConfig {
             request_timeout_ms: self.request_timeout_ms,
             endpoint_overrides: endpoint_overrides.clone(),
             aws_sigv4_supported: true,
-            sts_self_check_supported: endpoint_overrides.sts.is_some(),
+            sts_self_check_supported: endpoint_overrides.sts.is_some()
+                && self.credential_ids.is_none() && self.credential_id.is_none(),
         }
     }
+}
+
+fn build_client(cfg: &AwsConfig, runtime: &ConnectorRuntime) -> FcpResult<AwsClient> {
+    let mut client = AwsClient::new(
+        cfg.auth.clone(), &cfg.region, cfg.retry.clone(), cfg.request_timeout_ms,
+        cfg.s3_base_url.clone(), cfg.ec2_base_url.clone(),
+        cfg.lambda_base_url.clone(), cfg.sts_base_url.clone(),
+    ).map_err(|error| error.to_fcp_error())?;
+    if let Some(bindings) = cfg.credential_bindings().map_err(|message| FcpError::InvalidRequest {
+        code: 1001, message,
+    })? {
+        let proxy = runtime.host_egress_proxy_client()
+            .map_err(|_| FcpError::InvalidRequest {
+                code: 1001,
+                message: "Invalid host egress proxy configuration".into(),
+            })?
+            .ok_or_else(|| FcpError::InvalidRequest {
+                code: 1001,
+                message: "Host AWS credentials require FCP_HOST_EGRESS_PROXY_URL from the host launcher".into(),
+            })?;
+        client = client.with_credential_ids(bindings, proxy)
+            .map_err(|error| error.to_fcp_error())?;
+    }
+    Ok(client)
 }
 
 fn normalize_endpoint_override(url: &mut Option<String>) {
@@ -301,7 +373,7 @@ fn operator_guidance() -> OperatorGuidance {
         prerequisites: vec![
             "Create a disposable AWS verification environment, LocalStack stack, or signing proxy that can safely emulate S3, EC2, Lambda, and STS.",
             "Provision credentials scoped only to the services and mutations you intend to exercise during verification.",
-            "Configure all four *_base_url overrides if you need the full operation surface to be live-ready before SigV4 signing exists in this connector.",
+            "Configure *_base_url overrides for deterministic verification; production calls use local or host-managed SigV4 signing.",
         ],
         dedicated_environment: "Use staging-only buckets, instances, Lambda functions, and STS verification endpoints. S3 delete and EC2 terminate operations are destructive and should never target production resources during verification.",
         redaction_rules: vec![
@@ -642,10 +714,13 @@ fn operations_info() -> Vec<OperationInfo> {
             capability: CapabilityId::from_static(CAP_S3_WRITE),
             risk_level: RiskLevel::Medium,
             safety_tier: SafetyTier::Risky,
-            idempotency: IdempotencyClass::Strict,
+            idempotency: IdempotencyClass::BestEffort,
             ai_hints: hint(
                 "Upload/create an S3 object",
-                vec!["Overwrites existing objects with same key".into()],
+                vec![
+                    "Overwrites existing objects with same key".into(),
+                    "A repeated write can create another version in a versioned bucket; reconcile uncertain outcomes before retrying".into(),
+                ],
                 vec![],
                 vec![CAP_S3_READ],
             ),
@@ -661,10 +736,13 @@ fn operations_info() -> Vec<OperationInfo> {
             capability: CapabilityId::from_static(CAP_S3_WRITE),
             risk_level: RiskLevel::High,
             safety_tier: SafetyTier::Dangerous,
-            idempotency: IdempotencyClass::Strict,
+            idempotency: IdempotencyClass::BestEffort,
             ai_hints: hint(
                 "Permanently delete an S3 object (irreversible without versioning)",
-                vec!["Verify key before deleting".into()],
+                vec![
+                    "Verify key before deleting".into(),
+                    "A repeated delete can create another delete marker in a versioned bucket; reconcile uncertain outcomes before retrying".into(),
+                ],
                 vec![],
                 vec![CAP_S3_READ],
             ),
@@ -835,23 +913,15 @@ impl FcpConnector for AwsConnector {
 
     async fn configure(&mut self, config: serde_json::Value) -> FcpResult<()> {
         let cfg = AwsConfig::from_value(config)?;
-        self.runtime = Some(ConnectorRuntime::new(
+        let runtime = ConnectorRuntime::new(
             ConnectorRuntimeConfig::default()
-                .with_request_timeout(Duration::from_millis(cfg.request_timeout_ms)),
-        ));
-        let client = AwsClient::new(
-            cfg.auth.clone(),
-            &cfg.region,
-            cfg.retry.clone(),
-            cfg.request_timeout_ms,
-            cfg.s3_base_url.clone(),
-            cfg.ec2_base_url.clone(),
-            cfg.lambda_base_url.clone(),
-            cfg.sts_base_url.clone(),
-        )
-        .map_err(|e| FcpError::Internal {
-            message: format!("Client init: {e}"),
-        })?;
+                .with_request_timeout(Duration::from_millis(cfg.request_timeout_ms))
+                .with_host_egress_proxy_url_from_env(),
+        );
+        let client = build_client(&cfg, &runtime)?;
+        if let Some(previous) = self.runtime.replace(runtime) {
+            previous.shutdown();
+        }
         self.client = Some(client);
         self.config = Some(cfg);
         self.verifier = None;
@@ -904,7 +974,7 @@ impl FcpConnector for AwsConnector {
             Some(_) if self.runtime.is_none() => HealthSnapshot::error("runtime not initialized"),
             Some(readiness) if !readiness.endpoint_overrides.fully_overridden() => {
                 HealthSnapshot::degraded(
-                    "default AWS endpoints still require SigV4 request signing",
+                    "AWS is configured; provider connectivity has not been probed by local health",
                 )
             }
             Some(_) => HealthSnapshot::ready(),
@@ -951,6 +1021,15 @@ impl FcpConnector for AwsConnector {
                 Some(&provisioning),
             ));
         };
+        if client.is_secretless() {
+            return Ok(self.attach_self_check_details(
+                SelfCheckReport::degraded(
+                    "signed_invocation_required",
+                    "Run aws.health with an admitted capability and an STS credential binding to verify host-managed AWS authentication",
+                ),
+                Some(&provisioning),
+            ));
+        }
         if !provisioning.sts_self_check_supported {
             return Ok(self.attach_self_check_details(
                 SelfCheckReport::degraded(
@@ -1075,7 +1154,7 @@ impl AwsConnector {
         let operation = req.operation.as_str();
         if let Some(verifier) = &self.verifier {
             let cap = required_capability(operation)?;
-            verifier.verify_bound(req.capability_token, &cap, &req.operation, &[])?;
+            verifier.verify_bound(req.capability_token.clone(), &cap, &req.operation, &[])?;
         } else {
             return Err(FcpError::Internal {
                 message: "connector ready state missing capability verifier".into(),
@@ -1088,6 +1167,7 @@ impl AwsConnector {
         let client = self.client.as_ref().ok_or_else(|| FcpError::Internal {
             message: "connector ready state missing AWS client".into(),
         })?;
+        let client = client.for_invocation(&req).map_err(|error| error.to_fcp_error())?;
 
         let output = match operation {
             OP_S3_LIST_BUCKETS => {
@@ -1342,6 +1422,107 @@ mod tests {
             correlation_id: None,
             provenance: None,
             approval_tokens: vec![],
+        }
+    }
+
+
+    #[test]
+    fn host_credentials_accept_service_maps_and_unambiguous_single_service_shorthand() {
+        let s3 = CredentialId::new();
+        let sts = CredentialId::new();
+        let config = AwsConfig::from_value(json!({
+            "region": "us-west-2",
+            "credential_ids": {"s3": s3, "sts": sts}
+        })).unwrap();
+        assert_eq!(config.auth_mode(), "host_sigv4");
+        assert!(config.auth.access_key_id.is_empty());
+        assert!(config.auth.secret_access_key.is_empty());
+        let bindings = config.credential_bindings().unwrap().unwrap();
+        assert_eq!(bindings["s3"], s3);
+        assert_eq!(bindings["sts"], sts);
+        let shorthand = AwsConfig::from_value(json!({
+            "region": "us-west-2",
+            "credential_id": s3,
+            "credential_service": " s3 "
+        })).unwrap();
+        assert_eq!(shorthand.credential_bindings().unwrap().unwrap(), BTreeMap::from([("s3".into(), s3)]));
+    }
+
+    #[test]
+    fn host_credentials_reject_mixed_ambiguous_unknown_and_invalid_references() {
+        let id = CredentialId::new();
+        for fields in [
+            json!({"credential_ids": {}}),
+            json!({"credential_ids": {"unknown": id}}),
+            json!({"credential_ids": {"s3": "not-a-credential-reference"}}),
+            json!({"credential_ids": {"s3": id, "ec2": id}}),
+            json!({"credential_id": id}),
+            json!({"credential_service": "s3"}),
+            json!({"credential_id": id, "credential_service": "ec3"}),
+            json!({"credential_ids": {"s3": id}, "credential_id": id, "credential_service": "s3"}),
+            json!({"credential_ids": {"s3": id}, "access_key_id": "direct-key", "secret_access_key": "direct-secret"}),
+            json!({"credential_ids": {"s3": id}, "session_token": "direct-session"}),
+        ] {
+            let mut input = json!({"region": "us-west-2"});
+            input.as_object_mut().unwrap().extend(fields.as_object().unwrap().clone());
+            assert!(AwsConfig::from_value(input).is_err());
+        }
+        assert_eq!(AwsConfig::from_value(tc()).unwrap().auth_mode(), "static_keys");
+    }
+
+    #[test]
+    fn host_credentials_require_a_valid_runtime_proxy_without_exposing_endpoint_credentials() {
+        let config = AwsConfig::from_value(json!({
+            "region": "us-west-2",
+            "credential_ids": {"s3": CredentialId::new()}
+        })).unwrap();
+        let missing = ConnectorRuntime::new(ConnectorRuntimeConfig::default());
+        let error = build_client(&config, &missing).unwrap_err();
+        assert!(error.to_string().contains("FCP_HOST_EGRESS_PROXY_URL"));
+        let invalid = ConnectorRuntime::new(ConnectorRuntimeConfig::default()
+            .with_host_egress_proxy_url("https://secret-proxy-sentinel@proxy.example/"));
+        let error = build_client(&config, &invalid).unwrap_err();
+        assert!(!format!("{error:?} {error}").contains("secret-proxy-sentinel"));
+        let configured = ConnectorRuntime::new(ConnectorRuntimeConfig::default()
+            .with_host_egress_proxy_url("http://127.0.0.1:7878"));
+        assert!(build_client(&config, &configured).unwrap().is_secretless());
+        // An unrelated host-proxy environment never changes explicit direct auth.
+        assert!(!build_client(&AwsConfig::from_value(tc()).unwrap(), &invalid).unwrap().is_secretless());
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn host_auth_self_check_and_unverified_invocations_cannot_dispatch() {
+        let proxy = wiremock::MockServer::start().await;
+        let provider = wiremock::MockServer::start().await;
+        let config = AwsConfig::from_value(json!({
+            "region": "us-west-2",
+            "credential_ids": {"s3": CredentialId::new(), "sts": CredentialId::new()},
+            "s3_base_url": provider.uri(),
+            "sts_base_url": provider.uri()
+        })).unwrap();
+        let runtime = ConnectorRuntime::new(ConnectorRuntimeConfig::default()
+            .with_host_egress_proxy_url(proxy.uri()));
+        let mut connector = AwsConnector::new();
+        connector.client = Some(build_client(&config, &runtime).unwrap());
+        connector.config = Some(config);
+        connector.runtime = Some(runtime);
+        connector.base.set_configured(true);
+        let key = Ed25519SigningKey::from_bytes(&[73; 32]).unwrap();
+        connector.handshake(handshake_req_with_key(key.verifying_key().to_bytes())).await.unwrap();
+        let report = connector.self_check().await.unwrap();
+        assert_eq!(report.reason_code.as_deref(), Some("signed_invocation_required"));
+        assert!(connector.invoke(invoke_req(OP_S3_LIST_BUCKETS, json!({}))).await.is_err());
+        assert!(proxy.received_requests().await.unwrap().is_empty());
+        assert!(provider.received_requests().await.unwrap().is_empty());
+    }
+
+
+    #[test]
+    fn versioned_object_mutations_do_not_claim_strict_idempotency() {
+        let operations = operations_info();
+        for id in [OP_S3_PUT_OBJECT, OP_S3_DELETE_OBJECT] {
+            let operation = operations.iter().find(|operation| operation.id.as_str() == id).unwrap();
+            assert_eq!(operation.idempotency, IdempotencyClass::BestEffort);
         }
     }
 

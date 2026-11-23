@@ -139,7 +139,7 @@ capability = "aws.s3.write"
 risk_level = "medium"
 safety_tier = "risky"
 requires_approval = "none"
-idempotency = "strict"
+idempotency = "best_effort"
 input_schema = { type = "object", required = ["bucket", "key", "body"] }
 output_schema = { type = "object" }
 
@@ -163,7 +163,7 @@ max_response_bytes = 1048576
 
 [provides.operations."aws.s3.put_object".ai_hints]
 when_to_use = "Upload/create an S3 object"
-common_mistakes = ["Overwrites existing objects with same key"]
+common_mistakes = ["Overwrites existing objects with same key", "A repeated write can create another version in a versioned bucket; reconcile uncertain outcomes before retrying"]
 examples = []
 related = ["aws.s3.read"]
 
@@ -173,7 +173,7 @@ capability = "aws.s3.write"
 risk_level = "high"
 safety_tier = "dangerous"
 requires_approval = "interactive"
-idempotency = "strict"
+idempotency = "best_effort"
 input_schema = { type = "object", required = ["bucket", "key"] }
 output_schema = { type = "object" }
 
@@ -197,7 +197,7 @@ max_response_bytes = 1048576
 
 [provides.operations."aws.s3.delete_object".ai_hints]
 when_to_use = "Permanently delete an S3 object (irreversible without versioning)"
-common_mistakes = ["Verify key before deleting"]
+common_mistakes = ["Verify key before deleting", "A repeated delete can create another delete marker in a versioned bucket; reconcile uncertain outcomes before retrying"]
 examples = []
 related = ["aws.s3.read"]
 
