@@ -564,8 +564,8 @@ async fn scenario_d_revocation_seal_sla_under_jitter() {
             // `add_revocation` populates the revocations map but does
             // NOT bump head_seq — that's the caller's responsibility
             // (production code threads head updates from the gossip /
-            // checkpoint path). Seal staleness depends on head_seq, so
-            // we explicitly call `update_head` here. Record the
+            // checkpoint path). This scenario publishes both atomically;
+            // local-only mutations also invalidate seals. Record the
             // publish time outside the lock for the SLA assertion.
             {
                 let mut guard = registry.write().await;
@@ -701,6 +701,10 @@ async fn scenario_d_revocation_seal_sla_under_jitter() {
                     ));
                 }
             }
+            SealValidation::StateChanged => panic!(
+                "scenario D: registry mutations and head publication share one write lock; \
+                 every state change must also advance the observed sequence",
+            ),
             SealValidation::TokenMismatch => panic!(
                 "scenario D: TokenMismatch never expected — every worker validates \
                  against the same token id its seal was taken for",

@@ -490,8 +490,13 @@ pub struct RevocationCheckResult {
 /// ```
 #[derive(Debug, Clone, Default)]
 pub struct RevocationRegistry {
-    /// Active revocations indexed by revoked `ObjectId`.
-    revocations: HashMap<ObjectId, RevocationObject>,
+    /// Signed, non-dominated revocation windows for each revoked `ObjectId`.
+    revocations: HashMap<ObjectId, Vec<RevocationObject>>,
+
+    /// Local mutation history, independent of publication of the chain head.
+    /// A hash chain avoids counter wraparound and distinguishes divergent
+    /// registries that happen to have applied the same number of mutations.
+    revision: [u8; 32],
 
     /// Revocation-aware negative cache for fast definitely-absent checks.
     pub quotient_cache: QuotientFilter<ObjectId>,
@@ -518,6 +523,7 @@ impl RevocationRegistry {
     pub fn with_capacity(expected_revocations: usize) -> Self {
         Self {
             revocations: HashMap::with_capacity(expected_revocations),
+            revision: [0; 32],
             quotient_cache: QuotientFilter::with_capacity(expected_revocations),
             head: None,
             head_seq: 0,
@@ -536,68 +542,83 @@ impl RevocationRegistry {
         self.revocations.contains_key(object_id)
     }
 
-    /// Check if an object ID is revoked at a specific time.
+    /// Check if any retained revocation is active at a specific time.
+    ///
+    /// Independent signed windows combine by union. A later suspension must
+    /// remain effective even when it does not contain an earlier suspension.
     #[must_use]
     pub fn is_revoked_at(&self, object_id: &ObjectId, at: u64) -> bool {
-        self.revocations
-            .get(object_id)
-            .is_some_and(|r| r.is_active(at))
+        self.get_revocations(object_id)
+            .iter()
+            .any(|revocation| revocation.is_active(at))
     }
 
-    /// Get the revocation object for an object ID.
+    /// Get one retained signed revocation for an object ID.
+    ///
+    /// This representative is not necessarily active at the caller's time.
+    /// Use [`Self::is_revoked_at`] for temporal decisions and
+    /// [`Self::get_revocations`] for all retained evidence.
     #[must_use]
     pub fn get_revocation(&self, object_id: &ObjectId) -> Option<&RevocationObject> {
-        self.revocations.get(object_id)
+        self.get_revocations(object_id).first()
+    }
+
+    /// Get every retained signed revocation window for an object ID.
+    ///
+    /// Covered windows in the same zone and scope are redundant and may be
+    /// removed. Remaining objects are preserved byte-for-byte; synthesizing a
+    /// wider window would invalidate their owner signatures and could revoke
+    /// an object during a gap that no owner authorized.
+    #[must_use]
+    pub fn get_revocations(&self, object_id: &ObjectId) -> &[RevocationObject] {
+        self.revocations.get(object_id).map_or(&[], Vec::as_slice)
     }
 
     /// Add a revocation to the registry.
     ///
-    /// An incoming revocation only replaces an existing one when it **strictly
-    /// dominates** it in the 2-D (`effective_at` ↓, `expires_at` ↑) poset: the new
-    /// window must be weakly wider on both axes (starts no later *and* ends no
-    /// sooner) AND strictly wider on at least one axis. Identical windows are
-    /// ties — first-writer wins, so replays cannot churn metadata. This closes
-    /// two symmetric suppression attacks by an owner-key holder or a
-    /// replay-window attacker:
+    /// Each object's windows form a non-dominated set: discard an incoming
+    /// window only if an existing window in the same zone and scope covers it;
+    /// otherwise retain it and remove any windows that it completely covers.
+    /// Identical windows remain first-writer wins, so replays do not churn
+    /// metadata. Disjoint and partially overlapping windows are all retained.
     ///
-    /// * **Far-future deferral:** a new revocation with `effective_at` pushed
-    ///   into the future cannot replace an already-active one, because its
-    ///   start is later.
-    /// * **Past-expiry suppression:** a new revocation with both
-    ///   `effective_at` *and* `expires_at` in the past cannot replace an
-    ///   open-ended (or later-expiring) revocation, because its end is sooner
-    ///   — which would otherwise let `is_revoked_at(now)` flip to `false`.
-    ///
-    /// A same-start upgrade whose `expires_at` is strictly later (e.g.
-    /// tightening a bounded revocation into a permanent one) is also accepted,
-    /// because it strictly widens the active window on the expiry axis without
-    /// regressing on the effective-at axis.
-    ///
-    /// `None` for `expires_at` represents +∞ for the "ends no sooner" check.
+    /// This preserves every authorized revoked instant regardless of delivery
+    /// order, without letting future or already-expired records suppress an
+    /// active revocation. `None` for `expires_at` is an unbounded endpoint.
+    /// Signature and owner authority must be verified before insertion.
     pub fn add_revocation(&mut self, revocation: &RevocationObject) {
         for object_id in &revocation.revoked {
-            let should_replace = self.revocations.get(object_id).is_none_or(|existing| {
-                let starts_no_later = revocation.effective_at <= existing.effective_at;
-                let ends_no_sooner = match (revocation.expires_at, existing.expires_at) {
-                    (None, _) => true,        // new never expires ⇒ dominates any finite expiry
-                    (Some(_), None) => false, // existing never expires ⇒ nothing dominates it
-                    (Some(new_exp), Some(old_exp)) => new_exp >= old_exp,
-                };
-                let ends_strictly_later = match (revocation.expires_at, existing.expires_at) {
-                    (None, Some(_)) => true, // +∞ > finite
-                    (Some(new_exp), Some(old_exp)) => new_exp > old_exp,
-                    _ => false,
-                };
-                let starts_strictly_earlier = revocation.effective_at < existing.effective_at;
-                starts_no_later
-                    && ends_no_sooner
-                    && (starts_strictly_earlier || ends_strictly_later)
-            });
-            if should_replace {
-                self.revocations.insert(*object_id, revocation.clone());
-                self.quotient_cache.insert(object_id);
+            let windows = self.revocations.entry(*object_id).or_default();
+            if windows
+                .iter()
+                .any(|existing| revocation_covers(existing, revocation))
+            {
+                continue;
             }
+            windows.retain(|existing| !revocation_covers(revocation, existing));
+            windows.push(revocation.clone());
+            self.quotient_cache.insert(object_id);
+            self.record_revocation_mutation(object_id, revocation);
         }
+    }
+
+    fn record_revocation_mutation(&mut self, object_id: &ObjectId, revocation: &RevocationObject) {
+        let mut hasher = blake3::Hasher::new_derive_key("FCP/RevocationRegistry/add/v1");
+        hasher.update(&self.revision);
+        hasher.update(object_id.as_bytes());
+        let zone = revocation.zone_id().as_bytes();
+        hasher.update(&(zone.len() as u64).to_le_bytes());
+        hasher.update(zone);
+        hasher.update(revocation.scope.as_str().as_bytes());
+        hasher.update(&revocation.effective_at.to_le_bytes());
+        if let Some(expiry) = revocation.expires_at {
+            hasher.update(&[1]);
+            hasher.update(&expiry.to_le_bytes());
+        } else {
+            hasher.update(&[0]);
+        }
+        hasher.update(&revocation.signature);
+        self.revision = *hasher.finalize().as_bytes();
     }
 
     /// Update the head pointer and sequence.
@@ -693,6 +714,11 @@ impl RevocationRegistry {
 
     /// Clear all revocations.
     pub fn clear(&mut self) {
+        // Never reuse an earlier revision: clearing and rebuilding the same
+        // frontier must not resurrect a seal from before the reset.
+        let mut hasher = blake3::Hasher::new_derive_key("FCP/RevocationRegistry/clear/v1");
+        hasher.update(&self.revision);
+        self.revision = *hasher.finalize().as_bytes();
         self.revocations.clear();
         self.quotient_cache.clear();
         self.head = None;
@@ -705,9 +731,21 @@ impl RevocationRegistry {
     pub fn revocations_by_scope(&self, scope: RevocationScope) -> Vec<&RevocationObject> {
         self.revocations
             .values()
+            .flatten()
             .filter(|r| r.scope == scope)
             .collect()
     }
+}
+
+fn revocation_covers(outer: &RevocationObject, inner: &RevocationObject) -> bool {
+    outer.scope == inner.scope
+        && outer.zone_id() == inner.zone_id()
+        && outer.effective_at <= inner.effective_at
+        && match (outer.expires_at, inner.expires_at) {
+            (None, _) => true,
+            (Some(_), None) => false,
+            (Some(outer_expiry), Some(inner_expiry)) => outer_expiry >= inner_expiry,
+        }
 }
 
 /// Result of a freshness check.
@@ -772,9 +810,9 @@ pub enum RevocationDecision {
 /// A sealed proof of a revocation check at a specific point in time.
 ///
 /// The `RevocationSeal` binds a revocation check result to the registry's
-/// `head_seq` at check time. At operation commit time, the seal MUST be
-/// re-validated: if the registry's `head_seq` has advanced since the seal
-/// was created, the operation must be re-checked or aborted.
+/// head and local revision at check time. At operation commit time, the seal
+/// MUST be re-validated: a new revocation invalidates it immediately, even
+/// before the corresponding chain head has been published.
 ///
 /// This is an optimistic concurrency control mechanism, NOT a lock. Most
 /// operations will find the seal still valid. Only operations that race
@@ -782,15 +820,20 @@ pub enum RevocationDecision {
 ///
 /// # Invariant
 ///
-/// A seal with `decision = NotRevoked` is only valid while
-/// `seal.head_seq == registry.head_seq`. If the registry has advanced,
-/// a new revocation may have been inserted for the sealed token.
+/// A seal is valid only while the head, sequence, local revision, and exact
+/// membership decision still match. This is a consistency proof within a
+/// trusted process, not a signed authorization object for remote callers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RevocationSeal {
     /// Timestamp when the check was performed (monotonic counter or UNIX epoch).
     pub checked_at: u64,
     /// The registry `head_seq` at the time of the check.
     pub head_seq: u64,
+    /// Exact chain head observed, including an uninitialized registry.
+    pub registry_head: Option<ObjectId>,
+    /// Local mutation revision, independent of the published chain head.
+    #[serde(with = "crate::util::hex_or_bytes")]
+    pub registry_revision: [u8; 32],
     /// The object ID that was checked.
     pub token_id: ObjectId,
     /// The decision: was the object revoked or not?
@@ -810,6 +853,9 @@ pub enum SealValidation {
         /// The current registry `head_seq`.
         current_seq: u64,
     },
+    /// Local revocations or the exact head changed without a sequence change,
+    /// or the claimed decision no longer matches exact registry membership.
+    StateChanged,
     /// Seal `token_id` does not match the expected token.
     TokenMismatch,
 }
@@ -821,6 +867,7 @@ impl SealValidation {
         match self {
             Self::Valid => "valid",
             Self::Stale { .. } => "stale",
+            Self::StateChanged => "state_changed",
             Self::TokenMismatch => "token_mismatch",
         }
     }
@@ -841,9 +888,9 @@ impl fmt::Display for SealValidation {
 impl RevocationRegistry {
     /// Check revocation status and return a sealed proof.
     ///
-    /// The seal captures the registry's `head_seq` at check time, enabling
-    /// optimistic concurrency: the caller can proceed with the operation
-    /// and re-validate the seal at commit time.
+    /// The seal captures exact membership and both published and unpublished
+    /// registry changes. Like [`Self::is_revoked`], it conservatively denies
+    /// every known revoked ID regardless of the window's effective time.
     #[must_use]
     pub fn check_with_seal(&self, token_id: &ObjectId, now: u64) -> RevocationSeal {
         let decision = if self.is_revoked(token_id) {
@@ -855,6 +902,8 @@ impl RevocationRegistry {
         RevocationSeal {
             checked_at: now,
             head_seq: self.head_seq,
+            registry_head: self.head,
+            registry_revision: self.revision,
             token_id: *token_id,
             decision,
         }
@@ -862,10 +911,9 @@ impl RevocationRegistry {
 
     /// Validate a seal against the current registry state.
     ///
-    /// Returns `SealValidation::Valid` if the seal's `head_seq` still matches
-    /// the registry. Returns `Stale` if the registry has advanced (meaning a
-    /// new revocation may have been inserted). Returns `TokenMismatch` if the
-    /// seal's `token_id` does not match the expected token.
+    /// Returns `Valid` only if the frontier, local revision and decision match.
+    /// `Stale` reports a sequence change, `StateChanged` a local mutation or
+    /// conflicting head/decision, and `TokenMismatch` an unrelated token.
     #[must_use]
     pub fn validate_seal(
         &self,
@@ -876,14 +924,22 @@ impl RevocationRegistry {
             return SealValidation::TokenMismatch;
         }
 
-        if seal.head_seq == self.head_seq {
-            SealValidation::Valid
-        } else {
-            SealValidation::Stale {
+        if seal.head_seq != self.head_seq {
+            return SealValidation::Stale {
                 seal_seq: seal.head_seq,
                 current_seq: self.head_seq,
-            }
+            };
         }
+
+        let revoked = self.is_revoked(expected_token_id);
+        if seal.registry_head != self.head
+            || seal.registry_revision != self.revision
+            || (seal.decision == RevocationDecision::Revoked) != revoked
+        {
+            return SealValidation::StateChanged;
+        }
+
+        SealValidation::Valid
     }
 }
 
@@ -2368,6 +2424,170 @@ mod tests {
         assert_eq!(stored.reason, "permanent");
     }
 
+    fn window_revocation(
+        id: ObjectId,
+        effective_at: u64,
+        expires_at: Option<u64>,
+        signature_byte: u8,
+    ) -> RevocationObject {
+        RevocationObject {
+            revoked: vec![id],
+            effective_at,
+            expires_at,
+            signature: [signature_byte; 64],
+            ..test_revocation()
+        }
+    }
+
+    #[test]
+    fn registry_retains_disjoint_signed_windows_in_both_delivery_orders() {
+        let id = ObjectId::from_bytes([61; 32]);
+        let first = window_revocation(id, 10, Some(20), 1);
+        let second = window_revocation(id, 30, Some(40), 2);
+
+        for windows in [[&first, &second], [&second, &first]] {
+            let mut registry = RevocationRegistry::new();
+            for window in windows {
+                registry.add_revocation(window);
+            }
+
+            assert_eq!(registry.len(), 1);
+            assert_eq!(registry.get_revocations(&id).len(), 2);
+            for now in [0, 9, 10, 19, 20, 29, 30, 39, 40, u64::MAX] {
+                assert_eq!(
+                    registry.is_revoked_at(&id, now),
+                    first.is_active(now) || second.is_active(now),
+                    "revocation union must preserve exact boundaries at {now}"
+                );
+            }
+
+            // A fabricated encompassing [10, 40) record would revoke the gap
+            // and invalidate the owner's signature. Keep both signed objects.
+            for original in [&first, &second] {
+                let retained = registry
+                    .get_revocations(&id)
+                    .iter()
+                    .find(|record| record.signature == original.signature)
+                    .expect("both original signatures remain available");
+                assert_eq!(
+                    fcp_cbor::to_canonical_cbor(retained).unwrap(),
+                    fcp_cbor::to_canonical_cbor(original).unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn registry_window_union_is_independent_of_all_delivery_permutations() {
+        let id = ObjectId::from_bytes([62; 32]);
+        let windows = [
+            window_revocation(id, 2, Some(8), 1),
+            window_revocation(id, 5, Some(12), 2),
+            window_revocation(id, 15, Some(20), 3),
+            window_revocation(id, 17, None, 4),
+        ];
+
+        for a in 0..4 {
+            for b in 0..4 {
+                for c in 0..4 {
+                    for d in 0..4 {
+                        let order = [a, b, c, d];
+                        if (0..4).any(|index| order[..index].contains(&order[index])) {
+                            continue;
+                        }
+                        let mut registry = RevocationRegistry::new();
+                        for index in order {
+                            registry.add_revocation(&windows[index]);
+                        }
+                        for now in (0..25).chain([u64::MAX]) {
+                            assert_eq!(
+                                registry.is_revoked_at(&id, now),
+                                windows.iter().any(|window| window.is_active(now)),
+                                "delivery {order:?} changed revocation at {now}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn registry_dominating_window_compacts_only_covered_evidence() {
+        let id = ObjectId::from_bytes([63; 32]);
+        let mut registry = RevocationRegistry::new();
+        for window in [
+            window_revocation(id, 10, Some(20), 1),
+            window_revocation(id, 30, Some(40), 2),
+            window_revocation(id, 50, None, 3),
+        ] {
+            registry.add_revocation(&window);
+        }
+
+        let wider = window_revocation(id, 5, Some(45), 4);
+        registry.add_revocation(&wider);
+        assert_eq!(registry.get_revocations(&id).len(), 2);
+        assert!(registry.is_revoked_at(&id, 25));
+        assert!(!registry.is_revoked_at(&id, 47));
+        assert!(registry.is_revoked_at(&id, u64::MAX));
+        assert!(
+            registry
+                .get_revocations(&id)
+                .iter()
+                .any(|record| record.signature == wider.signature)
+        );
+
+        let permanent = window_revocation(id, 0, None, 5);
+        registry.add_revocation(&permanent);
+        assert_eq!(registry.get_revocations(&id).len(), 1);
+        assert_eq!(registry.get_revocation(&id).unwrap().signature, [5; 64]);
+    }
+
+    #[test]
+    fn registry_preserves_evidence_for_distinct_scopes_and_zones() {
+        let id = ObjectId::from_bytes([64; 32]);
+        let capability = window_revocation(id, 10, None, 1);
+        let mut issuer = window_revocation(id, 10, None, 2);
+        issuer.scope = RevocationScope::IssuerKey;
+        let mut other_zone = window_revocation(id, 10, None, 3);
+        other_zone.header.zone_id = ZoneId::private();
+
+        let mut registry = RevocationRegistry::new();
+        for window in [&capability, &issuer, &other_zone] {
+            registry.add_revocation(window);
+        }
+        assert_eq!(registry.get_revocations(&id).len(), 3);
+        assert_eq!(
+            registry
+                .revocations_by_scope(RevocationScope::Capability)
+                .len(),
+            2
+        );
+        assert_eq!(
+            registry
+                .revocations_by_scope(RevocationScope::IssuerKey)
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn registry_duplicate_ids_and_replays_do_not_duplicate_windows_or_revisions() {
+        let id = ObjectId::from_bytes([65; 32]);
+        let mut record = window_revocation(id, 10, Some(20), 1);
+        record.revoked.push(id);
+        let mut registry = RevocationRegistry::new();
+        registry.add_revocation(&record);
+        let seal = registry.check_with_seal(&id, 15);
+
+        for _ in 0..10 {
+            registry.add_revocation(&record);
+            registry.add_revocation(&window_revocation(id, 12, Some(18), 2));
+        }
+        assert_eq!(registry.get_revocations(&id).len(), 1);
+        assert_eq!(registry.validate_seal(&seal, &id), SealValidation::Valid);
+    }
+
     // Re-adding the same revocation must be idempotent: repeated deliveries
     // from gossip or retried apply paths cannot re-order outcomes or leak
     // metadata drift. Length stays at 1 entry per revoked id.
@@ -2792,6 +3012,110 @@ mod tests {
         // (the seal is fresh, the token is just revoked)
         let validation = registry.validate_seal(&seal, &token_id);
         assert!(validation.is_valid());
+    }
+
+    #[test]
+    fn c1_1_insertion_invalidates_allow_seal_before_head_publication() {
+        let id = make_object_id(0xE1);
+        let mut registry = RevocationRegistry::new();
+        registry.update_head(make_object_id(1), 7, 100);
+        let seal = registry.check_with_seal(&id, 101);
+        assert_eq!(seal.decision, RevocationDecision::NotRevoked);
+
+        registry.add_revocation(&make_revocation_for(&[id]));
+        assert_eq!(registry.head_seq, seal.head_seq);
+        assert_eq!(
+            registry.validate_seal(&seal, &id),
+            SealValidation::StateChanged
+        );
+        assert_eq!(
+            registry.check_with_seal(&id, 102).decision,
+            RevocationDecision::Revoked
+        );
+    }
+
+    #[test]
+    fn c1_1_new_window_invalidates_seal_even_when_membership_stays_revoked() {
+        let id = make_object_id(0xE2);
+        let mut registry = RevocationRegistry::new();
+        registry.add_revocation(&window_revocation(id, 10, Some(20), 1));
+        let seal = registry.check_with_seal(&id, 15);
+
+        registry.add_revocation(&window_revocation(id, 30, Some(40), 2));
+        assert_eq!(
+            registry.validate_seal(&seal, &id),
+            SealValidation::StateChanged
+        );
+    }
+
+    #[test]
+    fn c1_1_clear_and_rebuild_cannot_resurrect_seals_at_the_same_frontier() {
+        let id = make_object_id(0xE3);
+        let head = make_object_id(1);
+        let record = make_revocation_for(&[id]);
+        let mut registry = RevocationRegistry::new();
+        registry.add_revocation(&record);
+        registry.update_head(head, 7, 100);
+        let seal = registry.check_with_seal(&id, 101);
+
+        registry.clear();
+        registry.add_revocation(&record);
+        registry.update_head(head, 7, 100);
+        assert_eq!(
+            registry.validate_seal(&seal, &id),
+            SealValidation::StateChanged
+        );
+        let current = registry.check_with_seal(&id, 102);
+        assert_eq!(registry.validate_seal(&current, &id), SealValidation::Valid);
+    }
+
+    #[test]
+    fn c1_1_equal_mutation_counts_do_not_alias_divergent_registries() {
+        let checked_id = make_object_id(0xE4);
+        let mut first = RevocationRegistry::new();
+        let mut second = RevocationRegistry::new();
+        first.add_revocation(&make_revocation_for(&[make_object_id(2)]));
+        second.add_revocation(&make_revocation_for(&[make_object_id(3)]));
+        first.update_head(make_object_id(1), 7, 100);
+        second.update_head(make_object_id(1), 7, 100);
+
+        let seal = first.check_with_seal(&checked_id, 101);
+        assert_eq!(
+            second.validate_seal(&seal, &checked_id),
+            SealValidation::StateChanged
+        );
+        assert_eq!(
+            first.clone().validate_seal(&seal, &checked_id),
+            SealValidation::Valid
+        );
+    }
+
+    #[test]
+    fn c1_1_seal_binds_exact_head_and_decision() {
+        let id = make_object_id(0xE5);
+        let mut registry = RevocationRegistry::new();
+        registry.update_head(make_object_id(1), 7, 100);
+        let mut seal = registry.check_with_seal(&id, 101);
+        seal.registry_head = Some(make_object_id(2));
+        assert_eq!(
+            registry.validate_seal(&seal, &id),
+            SealValidation::StateChanged
+        );
+
+        let mut seal = registry.check_with_seal(&id, 101);
+        seal.decision = RevocationDecision::Revoked;
+        assert_eq!(
+            registry.validate_seal(&seal, &id),
+            SealValidation::StateChanged
+        );
+
+        registry.add_revocation(&make_revocation_for(&[id]));
+        let mut seal = registry.check_with_seal(&id, 102);
+        seal.decision = RevocationDecision::NotRevoked;
+        assert_eq!(
+            registry.validate_seal(&seal, &id),
+            SealValidation::StateChanged
+        );
     }
 
     // ── C1.2 — Exact membership, no false-positive revocation ──────────

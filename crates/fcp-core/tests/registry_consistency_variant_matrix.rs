@@ -3,7 +3,7 @@
 //! There is no public type literally named `RegistryConsistency` in
 //! fcp-core. The registry-consistency result surface is `SealValidation`:
 //! a revocation-registry seal is either still valid, stale because the
-//! registry head advanced, or mismatched against a different token.
+//! registry head advanced, changed locally, or mismatched against another token.
 
 use ciborium::value::Value as CborValue;
 use fcp_core::SealValidation;
@@ -20,7 +20,7 @@ struct Case {
     json: serde_json::Value,
 }
 
-fn cases() -> [Case; 3] {
+fn cases() -> [Case; 4] {
     [
         Case {
             value: SealValidation::Valid,
@@ -38,6 +38,11 @@ fn cases() -> [Case; 3] {
                 "seal_seq": 7,
                 "current_seq": 11,
             }),
+        },
+        Case {
+            value: SealValidation::StateChanged,
+            display: "state_changed",
+            json: serde_json::json!({"type": "state_changed"}),
         },
         Case {
             value: SealValidation::TokenMismatch,
