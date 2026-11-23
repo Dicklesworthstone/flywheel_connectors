@@ -1248,6 +1248,7 @@ fn validate_snapshot(binding: &RunBinding, snapshot: &RunSnapshot, resume: bool)
         "workflow checkpoint has too many step records"
     );
     let mut successful = BTreeMap::new();
+    let mut statuses = BTreeMap::new();
     for (index, record) in snapshot.step_results.iter().enumerate() {
         let id = &binding.execution_order[index];
         ensure!(
@@ -1322,15 +1323,33 @@ fn validate_snapshot(binding: &RunBinding, snapshot: &RunSnapshot, resume: bool)
                         && record["request_id"].is_null()
                         && matches!(
                             record["reason"].as_str(),
-                            Some("condition-false" | "failure-trigger-inactive")
+                            Some(
+                                "condition-false" | "failure-trigger-inactive" | "dependency-skipped"
+                            )
                         ),
                     "workflow checkpoint skip lacks a definite non-invocation reason"
                 );
+                if record["reason"] == "dependency-skipped" {
+                    let dependencies: Vec<String> =
+                        serde_json::from_value(record["depends_on"].clone())
+                            .context("workflow checkpoint skip lacks its success prerequisites")?;
+                    let skipped_by: Vec<String> =
+                        serde_json::from_value(record["skipped_by"].clone())
+                            .context("workflow checkpoint skip lacks its skipped prerequisites")?;
+                    ensure!(
+                        super::pipeline_dependency_outcome(&dependencies, &statuses, false)
+                            == super::PipelineDependencyOutcome::Skipped(skipped_by),
+                        "workflow checkpoint skip does not follow earlier skipped prerequisites"
+                    );
+                }
             }
             Some("error" | "denied" | "blocked" | "outcome_unknown") if !resume => {}
             _ => anyhow::bail!(
                 "workflow checkpoint contains unsuccessful or uncertain steps; reconcile before resuming"
             ),
+        }
+        if let Some(status) = record["status"].as_str() {
+            statuses.insert(id.clone(), status);
         }
     }
     ensure!(
@@ -2022,6 +2041,127 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn dependency_skips_preserve_their_causal_prefix_across_restart() {
+        let order = ["fetch", "child", "grandchild", "notify"].map(str::to_owned);
+        let binding = RunBinding::new(
+            "pipeline",
+            &json!({"name": "conditional-branch"}),
+            "http://127.0.0.1:8787",
+            "z:work",
+            &order,
+        )
+        .unwrap();
+        for reason in ["condition-false", "failure-trigger-inactive"] {
+            let directory = TempDir::new().unwrap();
+            let path = directory.path().join("skipped-branch.json");
+            let records = vec![
+                json!({"id": "fetch", "status": "skipped", "reason": reason}),
+                json!({
+                    "id": "child", "status": "skipped", "reason": "dependency-skipped",
+                    "depends_on": ["fetch"], "skipped_by": ["fetch"], "attempted": false,
+                }),
+                json!({
+                    "id": "grandchild", "status": "skipped", "reason": "dependency-skipped",
+                    "depends_on": ["child"], "skipped_by": ["child"], "invoke_attempted": false,
+                }),
+            ];
+            let mut checkpoint = RunCheckpoint::create_at(
+                &path,
+                binding.clone(),
+                "conditional-run".to_owned(),
+                Some(1_000),
+                START,
+            )
+            .unwrap();
+            checkpoint
+                .save_snapshot_at(
+                    &records,
+                    &BTreeMap::new(),
+                    Some(900),
+                    false,
+                    START + 100,
+                )
+                .unwrap();
+            drop(checkpoint);
+            let mut resumed = RunCheckpoint::resume_at(&path, &binding, START + 200).unwrap();
+            assert_eq!(resumed.snapshot().step_results, records);
+            assert!(resumed.snapshot().outputs.is_empty());
+            resumed
+                .mark_pending_at(pending("notify", 1), Some(700), START + 300)
+                .unwrap();
+            assert_eq!(resumed.snapshot().step_results, records);
+        }
+    }
+
+    #[test]
+    fn dependency_skips_require_prior_skipped_evidence_without_masking_failures() {
+        let skipped = json!({
+            "id": "fetch", "status": "skipped", "reason": "condition-false",
+        });
+        let dependency_skip = json!({
+            "id": "notify", "status": "skipped", "reason": "dependency-skipped",
+            "depends_on": ["fetch"], "skipped_by": ["fetch"],
+        });
+        for (field, invalid) in [
+            ("depends_on", json!([])),
+            ("depends_on", json!(["unknown"])),
+            ("depends_on", json!(["notify"])),
+            ("depends_on", json!(["fetch", "unknown"])),
+            ("skipped_by", json!([])),
+            ("skipped_by", json!(["unknown"])),
+            ("skipped_by", json!(["fetch", "fetch"])),
+            ("skipped_by", Value::Null),
+            ("request_id", json!("unproven-effect")),
+            ("invoke_attempted", json!(true)),
+            ("attempted", json!(true)),
+            ("response", json!({"status": "ok"})),
+        ] {
+            let mut record = dependency_skip.clone();
+            record[field] = invalid;
+            assert!(
+                validate_snapshot(
+                    &binding(),
+                    &RunSnapshot {
+                        step_results: vec![skipped.clone(), record],
+                        outputs: BTreeMap::new(),
+                    },
+                    true,
+                )
+                .is_err(),
+                "{field}"
+            );
+        }
+        for status in ["error", "denied", "blocked", "outcome_unknown"] {
+            let mut first = skipped.clone();
+            first["status"] = json!(status);
+            assert!(
+                validate_snapshot(
+                    &binding(),
+                    &RunSnapshot {
+                        step_results: vec![first, dependency_skip.clone()],
+                        outputs: BTreeMap::new(),
+                    },
+                    false,
+                )
+                .is_err(),
+                "failed evidence must not become a resumable skip: {status}"
+            );
+        }
+        assert!(
+            validate_snapshot(
+                &binding(),
+                &RunSnapshot {
+                    step_results: vec![success("fetch", json!({})), dependency_skip],
+                    outputs: BTreeMap::from([("fetch".to_owned(), json!({}))]),
+                },
+                true,
+            )
+            .is_err(),
+            "successful prerequisites do not justify skipping dependent work"
+        );
     }
 
     #[test]

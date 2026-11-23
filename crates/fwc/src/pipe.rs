@@ -600,6 +600,47 @@ pub struct PipelinePlan {
     pub steps: Vec<PlannedPipelineStep>,
 }
 
+/// Whether success prerequisites permit a pipeline step to proceed.
+///
+/// An intentionally skipped branch stays skipped transitively; it does not
+/// satisfy a prerequisite merely because a downstream input is static. Failed
+/// or unavailable prerequisites take precedence over skips so their evidence
+/// cannot be converted into an apparently successful conditional branch.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum PipelineDependencyOutcome {
+    Ready,
+    Skipped(Vec<String>),
+    Blocked(Vec<String>),
+}
+
+/// Evaluate only success dependencies, never the separate failure trigger.
+/// Dry-run preflight may satisfy a static preview dependency, but it is not
+/// completion evidence for a live run or a durable checkpoint.
+#[must_use]
+pub fn pipeline_dependency_outcome(
+    dependencies: &[String],
+    statuses: &BTreeMap<String, &str>,
+    dry_run: bool,
+) -> PipelineDependencyOutcome {
+    let mut skipped = Vec::new();
+    let mut blocked = Vec::new();
+    for dependency in dependencies {
+        match statuses.get(dependency).copied() {
+            Some("ok" | "reconciled") => {}
+            Some("preflight") if dry_run => {}
+            Some("skipped") => skipped.push(dependency.clone()),
+            _ => blocked.push(dependency.clone()),
+        }
+    }
+    if !blocked.is_empty() {
+        PipelineDependencyOutcome::Blocked(blocked)
+    } else if !skipped.is_empty() {
+        PipelineDependencyOutcome::Skipped(skipped)
+    } else {
+        PipelineDependencyOutcome::Ready
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PipelineOperationMetadata {
     pub connector: String,
@@ -3273,6 +3314,87 @@ on_error = "retry(10)"
         ] {
             assert!(serde_json::from_value::<PipelineTrigger>(value).is_err());
         }
+    }
+
+    #[test]
+    fn pipeline_dependencies_preserve_skipped_branches_transitively() {
+        let mut statuses = BTreeMap::from([
+            ("branch".to_owned(), "skipped"),
+            ("independent".to_owned(), "ok"),
+            // A failure trigger is not a success dependency. Its state cannot
+            // block a handler unless the author explicitly depends on it.
+            ("trigger-source".to_owned(), "error"),
+        ]);
+        for (step, prerequisite) in [("child", "branch"), ("grandchild", "child")] {
+            let dependencies = vec![prerequisite.to_owned(), "independent".to_owned()];
+            for dry_run in [false, true] {
+                assert_eq!(
+                    pipeline_dependency_outcome(&dependencies, &statuses, dry_run),
+                    PipelineDependencyOutcome::Skipped(vec![prerequisite.to_owned()])
+                );
+            }
+            statuses.insert(step.to_owned(), "skipped");
+        }
+        assert_eq!(
+            pipeline_dependency_outcome(&["independent".to_owned()], &statuses, false),
+            PipelineDependencyOutcome::Ready
+        );
+        assert_eq!(
+            pipeline_dependency_outcome(&[], &statuses, false),
+            PipelineDependencyOutcome::Ready
+        );
+    }
+
+    #[test]
+    fn pipeline_dependencies_never_launder_failed_or_missing_evidence_as_skips() {
+        for failed_status in ["error", "denied", "blocked", "outcome_unknown", "pending"] {
+            let statuses = BTreeMap::from([
+                ("inactive".to_owned(), "skipped"),
+                ("failed".to_owned(), failed_status),
+            ]);
+            for dependencies in [
+                vec!["inactive".to_owned(), "failed".to_owned()],
+                vec!["failed".to_owned(), "inactive".to_owned()],
+            ] {
+                assert_eq!(
+                    pipeline_dependency_outcome(&dependencies, &statuses, false),
+                    PipelineDependencyOutcome::Blocked(vec!["failed".to_owned()]),
+                    "{failed_status}"
+                );
+            }
+            assert_eq!(
+                pipeline_dependency_outcome(
+                    &["inactive".to_owned(), "unobserved".to_owned()],
+                    &statuses,
+                    false,
+                ),
+                PipelineDependencyOutcome::Blocked(vec!["unobserved".to_owned()])
+            );
+        }
+    }
+
+    #[test]
+    fn pipeline_dependencies_distinguish_preview_from_completion_evidence() {
+        let statuses = BTreeMap::from([
+            ("received".to_owned(), "ok"),
+            ("recovered".to_owned(), "reconciled"),
+            ("preview".to_owned(), "preflight"),
+        ]);
+        let completed = vec!["received".to_owned(), "recovered".to_owned()];
+        assert_eq!(
+            pipeline_dependency_outcome(&completed, &statuses, false),
+            PipelineDependencyOutcome::Ready
+        );
+        let mut with_preview = completed;
+        with_preview.push("preview".to_owned());
+        assert_eq!(
+            pipeline_dependency_outcome(&with_preview, &statuses, true),
+            PipelineDependencyOutcome::Ready
+        );
+        assert_eq!(
+            pipeline_dependency_outcome(&with_preview, &statuses, false),
+            PipelineDependencyOutcome::Blocked(vec!["preview".to_owned()])
+        );
     }
 
     #[test]

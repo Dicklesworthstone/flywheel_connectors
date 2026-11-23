@@ -33563,33 +33563,45 @@ fn execute_live_pipeline_plan(
             continue;
         }
 
-        let dependency_failures = step
-            .depends_on
-            .iter()
-            .filter(|dependency| {
-                step_statuses
-                    .get(dependency.as_str())
-                    .is_some_and(|status| matches!(*status, "error" | "denied" | "blocked"))
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        if !dependency_failures.is_empty() {
-            blocked_steps += 1;
-            step_statuses.insert(step.id.clone(), "blocked");
-            step_results.push(json!({
-                "id": &step.id,
-                "operation": &step.operation,
-                "connector": {
-                    "slug": &resolved.connector.slug,
-                    "canonical_id": resolved.connector.summary.id.as_str(),
-                    "name": &resolved.connector.summary.name,
-                },
-                "status": "blocked",
-                "reason": "dependency-failed",
-                "depends_on": &step.depends_on,
-                "blocked_by": dependency_failures,
-            }));
-            continue;
+        match pipe::pipeline_dependency_outcome(
+            &step.depends_on,
+            &step_statuses,
+            mode == PipelinePlanMode::DryRun,
+        ) {
+            pipe::PipelineDependencyOutcome::Ready => {}
+            pipe::PipelineDependencyOutcome::Skipped(skipped_by) => {
+                skipped_steps += 1;
+                step_statuses.insert(step.id.clone(), "skipped");
+                step_results.push(json!({
+                    "id": &step.id,
+                    "operation": &step.operation,
+                    "status": "skipped",
+                    "reason": "dependency-skipped",
+                    "depends_on": &step.depends_on,
+                    "skipped_by": skipped_by,
+                    "attempted": false,
+                    "invoke_attempted": false,
+                }));
+                continue;
+            }
+            pipe::PipelineDependencyOutcome::Blocked(blocked_by) => {
+                blocked_steps += 1;
+                step_statuses.insert(step.id.clone(), "blocked");
+                step_results.push(json!({
+                    "id": &step.id,
+                    "operation": &step.operation,
+                    "connector": {
+                        "slug": &resolved.connector.slug,
+                        "canonical_id": resolved.connector.summary.id.as_str(),
+                        "name": &resolved.connector.summary.name,
+                    },
+                    "status": "blocked",
+                    "reason": "dependency-failed",
+                    "depends_on": &step.depends_on,
+                    "blocked_by": blocked_by,
+                }));
+                continue;
+            }
         }
 
         let context = pipeline_execution_context(&plan.params, &step_outputs, &step_errors);
@@ -57117,6 +57129,276 @@ input = {{ query = "independent" }}
                 }
             }
         }
+    }
+
+    fn workflow_skipped_dependency_fixture(
+        directory: &Path,
+        inactive_failure_branch: bool,
+    ) -> (PathBuf, super::pipe::PipelinePlan) {
+        let path = directory.join("skipped-branch.toml");
+        let source_control = if inactive_failure_branch {
+            "on_error = 'fallback(branch)'"
+        } else {
+            "condition = 'false'"
+        };
+        let branch_control = if inactive_failure_branch {
+            ""
+        } else {
+            "depends_on = ['source']"
+        };
+        let source = format!(
+            r#"
+[pipeline]
+name = "skipped-prerequisites"
+
+[[steps]]
+id = "source"
+operation = "github.search_issues"
+{source_control}
+input = {{ query = "source" }}
+
+[[steps]]
+id = "branch"
+operation = "github.search_issues"
+{branch_control}
+input = {{ query = "must not invoke branch" }}
+
+[[steps]]
+id = "child"
+operation = "github.search_issues"
+depends_on = ["branch"]
+condition = "true"
+input = {{ query = "must not invoke child" }}
+
+[[steps]]
+id = "grandchild"
+operation = "github.search_issues"
+depends_on = ["child"]
+input = {{ query = "must not invoke grandchild" }}
+
+[[steps]]
+id = "independent"
+operation = "github.search_issues"
+input = {{ query = "independent" }}
+"#,
+        );
+        fs::write(&path, &source).unwrap();
+        let definition = super::pipe::parse_pipeline_definition(&source).unwrap();
+        let params = super::pipe::bind_pipeline_params(&definition, &[]).unwrap();
+        let plan = super::pipe::build_pipeline_plan(&definition, &params).unwrap();
+        (path, plan)
+    }
+
+    #[test]
+    fn execute_pipeline_skipped_prerequisites_never_dispatch_static_dependents() {
+        let token = test_capability_token_arg();
+        for mode in ["run", "dry-run"] {
+            for inactive_failure_branch in [false, true] {
+                let tempdir = TempDir::new().unwrap();
+                let _history =
+                    super::install_test_history_path(tempdir.path().join("history.jsonl"));
+                let (path, _) =
+                    workflow_skipped_dependency_fixture(tempdir.path(), inactive_failure_branch);
+                let checkpoint_path = tempdir.path().join("conditional.checkpoint.json");
+                let mut routes = pipe_mock_catalog(false);
+                routes.truncate(2);
+                if inactive_failure_branch {
+                    routes.extend([
+                        (
+                            "POST /rpc/preflight".to_owned(),
+                            mock_preflight_response_json(true),
+                        ),
+                        (
+                            "POST /rpc/invoke".to_owned(),
+                            mock_invoke_response_json(json!({"source": true})),
+                        ),
+                    ]);
+                }
+                routes.extend([
+                    (
+                        "POST /rpc/preflight".to_owned(),
+                        mock_preflight_response_json(true),
+                    ),
+                    (
+                        "POST /rpc/invoke".to_owned(),
+                        mock_invoke_response_json(json!({"independent": true})),
+                    ),
+                ]);
+                let expected_requests = routes.len();
+                let (host, server, log) = spawn_mock_host_sequence_with_body_log(routes);
+                let path_text = path.display().to_string();
+                let checkpoint_text = checkpoint_path.display().to_string();
+                let mut argv = vec![
+                    "fwc",
+                    "--json",
+                    "--host",
+                    &host,
+                    "pipeline",
+                    mode,
+                    &path_text,
+                    "--capability-token",
+                    &token,
+                ];
+                if mode == "run" {
+                    argv.extend(["--checkpoint", &checkpoint_text]);
+                }
+                let (exit, payload) = execute_json(&argv);
+                server.join().unwrap();
+                assert_eq!(exit, CliExitCode::Success.into(), "{mode}: {payload}");
+                assert_eq!(payload["status"], "ok");
+                let execution = &payload["execution"];
+                let executed = if inactive_failure_branch { 2usize } else { 1 };
+                assert_eq!(execution["executed_steps"], executed);
+                assert_eq!(execution["skipped_steps"], 5 - executed);
+                assert_eq!(execution["blocked_steps"], 0);
+                assert_eq!(execution["error_steps"], 0);
+                assert_eq!(execution["steps"][1]["status"], "skipped");
+                assert_eq!(
+                    execution["steps"][1]["reason"],
+                    if inactive_failure_branch {
+                        "failure-trigger-inactive"
+                    } else {
+                        "dependency-skipped"
+                    }
+                );
+                for (index, prerequisite) in [(2, "branch"), (3, "child")] {
+                    let step = &execution["steps"][index];
+                    assert_eq!(step["status"], "skipped");
+                    assert_eq!(step["reason"], "dependency-skipped");
+                    assert_eq!(step["skipped_by"], json!([prerequisite]));
+                    assert_eq!(step["invoke_attempted"], false);
+                    assert!(step["request_id"].is_null());
+                    assert!(step["response"].is_null());
+                }
+                assert_eq!(execution["outputs"]["independent"]["independent"], true);
+                let requests = log.lock().unwrap();
+                assert_eq!(requests.len(), expected_requests);
+                let invoked_inputs = requests
+                    .iter()
+                    .filter(|(route, _)| route == "POST /rpc/invoke")
+                    .map(|(_, body)| {
+                        serde_json::from_str::<Value>(body).unwrap()["input"]["query"].clone()
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    invoked_inputs,
+                    if inactive_failure_branch {
+                        vec![json!("source"), json!("independent")]
+                    } else {
+                        vec![json!("independent")]
+                    }
+                );
+                if mode == "run" {
+                    let saved: Value =
+                        serde_json::from_str(&fs::read_to_string(&checkpoint_path).unwrap())
+                            .unwrap();
+                    assert_eq!(saved["state"]["completed"], true);
+                    assert!(saved["state"]["pending"].is_null());
+                    assert_eq!(
+                        saved["state"]["snapshot"]["step_results"],
+                        execution["steps"]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn execute_pipeline_resume_preserves_transitive_skips_and_runs_independent_work() {
+        let tempdir = TempDir::new().unwrap();
+        let _history = super::install_test_history_path(tempdir.path().join("history.jsonl"));
+        let (path, plan) = workflow_skipped_dependency_fixture(tempdir.path(), false);
+        let checkpoint_path = tempdir.path().join("conditional-resume.json");
+        let mut routes = pipe_mock_catalog(false);
+        routes.truncate(2);
+        routes.extend(pipe_mock_catalog(false).into_iter().take(2));
+        routes.extend([
+            (
+                "POST /rpc/preflight".to_owned(),
+                mock_preflight_response_json(true),
+            ),
+            (
+                "POST /rpc/invoke".to_owned(),
+                mock_invoke_response_json(json!({"independent": true})),
+            ),
+        ]);
+        let (host, server, log) = spawn_mock_host_sequence_with_body_log(routes);
+        let host_config = ResolvedHostConfig {
+            endpoint: host.clone(),
+            default_zone: None,
+        };
+        let client = super::HostAdminClient::new(&host).unwrap();
+        let (catalog, _) = client.catalog(None).unwrap();
+        let operations =
+            super::resolve_live_pipeline_operations("pipeline", &plan, &client, &catalog)
+                .unwrap_or_else(|outcome| panic!("{}", outcome.payload));
+        let binding = super::workflow_checkpoint_binding(
+            "pipeline",
+            &plan,
+            &operations,
+            &host_config,
+            "z:work",
+        )
+        .unwrap();
+        let prefix = vec![
+            json!({
+                "id": "source", "operation": "github.search_issues", "status": "skipped",
+                "reason": "condition-false", "condition": {"template": "false", "allowed": false},
+            }),
+            json!({
+                "id": "branch", "operation": "github.search_issues", "status": "skipped",
+                "reason": "dependency-skipped", "depends_on": ["source"], "skipped_by": ["source"],
+                "attempted": false, "invoke_attempted": false,
+            }),
+        ];
+        let mut checkpoint = super::pipe::checkpoint::RunCheckpoint::create(
+            &checkpoint_path,
+            binding,
+            "conditional-resume".to_owned(),
+            None,
+        )
+        .unwrap();
+        checkpoint
+            .save_snapshot(&prefix, &StdBTreeMap::new(), None, false)
+            .unwrap();
+        drop(checkpoint);
+        let token = test_capability_token_arg();
+        let (exit, payload) = execute_json(&[
+            "fwc",
+            "--json",
+            "--host",
+            &host,
+            "pipeline",
+            "run",
+            &path.display().to_string(),
+            "--resume",
+            &checkpoint_path.display().to_string(),
+            "--zone",
+            "z:work",
+            "--capability-token",
+            &token,
+        ]);
+        server.join().unwrap();
+        assert_eq!(exit, CliExitCode::Success.into(), "{payload}");
+        let execution = &payload["execution"];
+        assert_eq!(execution["resumed_steps"], 2);
+        assert_eq!(execution["skipped_steps"], 2);
+        assert_eq!(execution["executed_steps"], 1);
+        assert_eq!(execution["steps"][0], prefix[0]);
+        assert_eq!(execution["steps"][1], prefix[1]);
+        assert_eq!(execution["steps"][2]["skipped_by"], json!(["branch"]));
+        assert_eq!(execution["steps"][3]["skipped_by"], json!(["child"]));
+        assert_eq!(
+            execution["outputs"],
+            json!({"independent": {"independent": true}})
+        );
+        let requests = log.lock().unwrap();
+        assert_eq!(requests.len(), 6);
+        let (_, invoked) = requests.last().unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(invoked).unwrap()["input"]["query"],
+            "independent"
+        );
     }
 
     fn workflow_checkpoint_fixture(directory: &Path) -> (PathBuf, super::pipe::PipelinePlan) {
