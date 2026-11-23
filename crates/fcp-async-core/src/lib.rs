@@ -2945,11 +2945,13 @@ mod cancellation {
                     Poll::Ready(false)
                 }
                 Status::Active => {
-                    let waiter_id = *this.waiter_id.get_or_insert_with(|| loop {
-                        let candidate = state.next_waiter;
-                        state.next_waiter = state.next_waiter.wrapping_add(1);
-                        if !state.waiters.contains_key(&candidate) {
-                            break candidate;
+                    let waiter_id = *this.waiter_id.get_or_insert_with(|| {
+                        loop {
+                            let candidate = state.next_waiter;
+                            state.next_waiter = state.next_waiter.wrapping_add(1);
+                            if !state.waiters.contains_key(&candidate) {
+                                break candidate;
+                            }
                         }
                     });
                     let previous = state.waiters.insert(waiter_id, waker);
@@ -3221,7 +3223,11 @@ mod cancellation {
                 drop(leaf);
                 assert_eq!(lock(&root.tree.state).nodes.len(), 1);
             }
-            assert!(lock(&root.tree.state).nodes[&root.node_id].children.is_empty());
+            assert!(
+                lock(&root.tree.state).nodes[&root.node_id]
+                    .children
+                    .is_empty()
+            );
         }
 
         #[test]

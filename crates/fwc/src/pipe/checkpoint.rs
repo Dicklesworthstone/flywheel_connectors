@@ -1324,7 +1324,9 @@ fn validate_snapshot(binding: &RunBinding, snapshot: &RunSnapshot, resume: bool)
                         && matches!(
                             record["reason"].as_str(),
                             Some(
-                                "condition-false" | "failure-trigger-inactive" | "dependency-skipped"
+                                "condition-false"
+                                    | "failure-trigger-inactive"
+                                    | "dependency-skipped"
                             )
                         ),
                     "workflow checkpoint skip lacks a definite non-invocation reason"
@@ -2077,13 +2079,7 @@ mod tests {
             )
             .unwrap();
             checkpoint
-                .save_snapshot_at(
-                    &records,
-                    &BTreeMap::new(),
-                    Some(900),
-                    false,
-                    START + 100,
-                )
+                .save_snapshot_at(&records, &BTreeMap::new(), Some(900), false, START + 100)
                 .unwrap();
             drop(checkpoint);
             let mut resumed = RunCheckpoint::resume_at(&path, &binding, START + 200).unwrap();

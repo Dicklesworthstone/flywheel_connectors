@@ -159,7 +159,10 @@ fn assert_execution_context_anchored() {
     let sibling = parent2.child();
     let shared_child = child2.clone();
     shared_child.cancel();
-    assert!(child2.is_cancelled(), "ANCHOR: clone cancellation didn't take");
+    assert!(
+        child2.is_cancelled(),
+        "ANCHOR: clone cancellation didn't take"
+    );
     assert!(
         !parent2.is_cancelled(),
         "ANCHOR: child cancellation must not revoke its parent"

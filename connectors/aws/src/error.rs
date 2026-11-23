@@ -20,7 +20,9 @@ pub enum AwsError {
     #[error("AWS response exceeds the {limit}-byte limit")]
     ResponseTooLarge { limit: usize },
 
-    #[error("AWS may have accepted this request; automatic replay is disabled (HTTP status: {status:?})")]
+    #[error(
+        "AWS may have accepted this request; automatic replay is disabled (HTTP status: {status:?})"
+    )]
     UncertainOutcome { status: Option<u16> },
 
     #[error("AWS API error {code}: {message}")]

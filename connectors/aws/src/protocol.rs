@@ -14,8 +14,8 @@ use quick_xml::{Reader, events::Event};
 use serde::{Deserialize, de::DeserializeOwned};
 
 use crate::types::{
-    CallerIdentity, Ec2Instance, Ec2StateChange, Ec2Tag, LambdaFunction,
-    LambdaInvokeResponse, S3Bucket, S3Object,
+    CallerIdentity, Ec2Instance, Ec2StateChange, Ec2Tag, LambdaFunction, LambdaInvokeResponse,
+    S3Bucket, S3Object,
 };
 
 const MAX_METADATA_BYTES: usize = 10 * 1024 * 1024;
@@ -52,7 +52,10 @@ const fn invalid_response(service: &'static str, detail: &'static str) -> Provid
 
 fn check_body_size(body: &[u8], service: &'static str) -> ProviderResult<()> {
     if body.len() > MAX_METADATA_BYTES {
-        return Err(invalid_response(service, "metadata exceeds the response limit"));
+        return Err(invalid_response(
+            service,
+            "metadata exceeds the response limit",
+        ));
     }
     Ok(())
 }
@@ -78,13 +81,19 @@ fn parse_xml<T: DeserializeOwned>(
             Event::Start(element) => {
                 if depth == 0 {
                     if seen_root || element.local_name().as_ref() != expected_root {
-                        return Err(invalid_response(service, "unexpected XML response envelope"));
+                        return Err(invalid_response(
+                            service,
+                            "unexpected XML response envelope",
+                        ));
                     }
                     seen_root = true;
                 }
                 depth += 1;
                 if depth > MAX_XML_DEPTH {
-                    return Err(invalid_response(service, "XML nesting exceeds the response limit"));
+                    return Err(invalid_response(
+                        service,
+                        "XML nesting exceeds the response limit",
+                    ));
                 }
             }
             Event::End(_) => {
@@ -94,21 +103,33 @@ fn parse_xml<T: DeserializeOwned>(
             }
             Event::Text(text) if depth == 0 => {
                 if text.as_ref().iter().any(|byte| !byte.is_ascii_whitespace()) {
-                    return Err(invalid_response(service, "content outside the XML envelope"));
+                    return Err(invalid_response(
+                        service,
+                        "content outside the XML envelope",
+                    ));
                 }
             }
             Event::DocType(_) => {
-                return Err(invalid_response(service, "XML document types are not supported"));
+                return Err(invalid_response(
+                    service,
+                    "XML document types are not supported",
+                ));
             }
             Event::CData(_) | Event::GeneralRef(_) if depth == 0 => {
-                return Err(invalid_response(service, "content outside the XML envelope"));
+                return Err(invalid_response(
+                    service,
+                    "content outside the XML envelope",
+                ));
             }
             Event::Eof => break,
             _ => {}
         }
     }
     if !seen_root || depth != 0 {
-        return Err(invalid_response(service, "incomplete XML response envelope"));
+        return Err(invalid_response(
+            service,
+            "incomplete XML response envelope",
+        ));
     }
     quick_xml::de::from_reader(body)
         .map_err(|_| invalid_response(service, "XML response fields do not match the operation"))
@@ -181,7 +202,10 @@ pub(crate) fn parse_s3_objects(body: &[u8]) -> ProviderResult<ProviderPage<S3Obj
     let response: S3ObjectsResponse = parse_xml(body, "s3", b"ListBucketResult")?;
     let next_token = continuation(response.next_continuation_token);
     if response.is_truncated != next_token.is_some() {
-        return Err(invalid_response("s3", "inconsistent object-list continuation"));
+        return Err(invalid_response(
+            "s3",
+            "inconsistent object-list continuation",
+        ));
     }
     let mut items = Vec::with_capacity(response.contents.len());
     for object in response.contents {
@@ -309,10 +333,16 @@ pub(crate) fn parse_ec2_state_change(
         .next()
         .ok_or_else(|| invalid_response("ec2", "missing instance state change"))?;
     if changes.next().is_some() || change.instance_id != expected_instance_id {
-        return Err(invalid_response("ec2", "state change does not bind the requested instance"));
+        return Err(invalid_response(
+            "ec2",
+            "state change does not bind the requested instance",
+        ));
     }
     if change.previous_state.name.is_empty() || change.current_state.name.is_empty() {
-        return Err(invalid_response("ec2", "instance state change is incomplete"));
+        return Err(invalid_response(
+            "ec2",
+            "instance state change is incomplete",
+        ));
     }
     Ok(Ec2StateChange {
         instance_id: change.instance_id,
@@ -439,7 +469,10 @@ mod tests {
         .unwrap();
         assert_eq!(page.items.len(), 2);
         assert_eq!(page.items[0].name, "alpha");
-        assert_eq!(page.items[0].creation_date.as_deref(), Some("2026-01-01T00:00:00Z"));
+        assert_eq!(
+            page.items[0].creation_date.as_deref(),
+            Some("2026-01-01T00:00:00Z")
+        );
         assert_eq!(page.items[1].name, "beta");
         assert!(page.items[1].creation_date.is_none());
         assert_eq!(page.next_token.as_deref(), Some("a+/=&next"));
@@ -454,10 +487,12 @@ mod tests {
                 .is_empty()
         );
         assert!(
-            parse_ec2_instances(b"<DescribeInstancesResponse><reservationSet/></DescribeInstancesResponse>")
-                .unwrap()
-                .items
-                .is_empty()
+            parse_ec2_instances(
+                b"<DescribeInstancesResponse><reservationSet/></DescribeInstancesResponse>"
+            )
+            .unwrap()
+            .items
+            .is_empty()
         );
         let functions = parse_lambda_functions(br#"{"Functions":[]}"#).unwrap();
         assert!(functions.items.is_empty());
@@ -480,10 +515,12 @@ mod tests {
         assert_eq!(page.items[0].etag.as_deref(), Some("\"etag\""));
         assert_eq!(page.next_token.as_deref(), Some("next+/="));
         assert!(
-            parse_s3_objects(b"<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>")
-                .unwrap()
-                .items
-                .is_empty()
+            parse_s3_objects(
+                b"<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>"
+            )
+            .unwrap()
+            .items
+            .is_empty()
         );
     }
 
@@ -625,7 +662,10 @@ mod tests {
         assert_eq!(response.status_code, 200);
         assert_eq!(response.function_error.as_deref(), Some("Unhandled"));
         assert_eq!(response.executed_version.as_deref(), Some("42"));
-        assert_eq!(response.payload, serde_json::from_slice::<serde_json::Value>(body).unwrap());
+        assert_eq!(
+            response.payload,
+            serde_json::from_slice::<serde_json::Value>(body).unwrap()
+        );
     }
 
     #[test]
@@ -634,7 +674,12 @@ mod tests {
             assert!(parse_lambda_invoke(200, None, None, body).is_ok());
         }
         for status in [202, 204] {
-            assert!(parse_lambda_invoke(status, None, None, b"").unwrap().payload.is_null());
+            assert!(
+                parse_lambda_invoke(status, None, None, b"")
+                    .unwrap()
+                    .payload
+                    .is_null()
+            );
         }
         assert!(parse_lambda_invoke(200, None, None, b"").is_err());
         assert!(parse_lambda_invoke(200, None, None, b"<html>bad gateway</html>").is_err());
@@ -644,7 +689,10 @@ mod tests {
     fn native_decoders_reject_fixture_shapes_and_missing_fields() {
         assert!(parse_s3_buckets(br#"[{"name":"fixture"}]"#).is_err());
         assert!(parse_ec2_instances(br#"[{"instance_id":"fixture"}]"#).is_err());
-        assert!(parse_caller_identity(br#"{"account":"fixture","arn":"fixture","user_id":"fixture"}"#).is_err());
+        assert!(
+            parse_caller_identity(br#"{"account":"fixture","arn":"fixture","user_id":"fixture"}"#)
+                .is_err()
+        );
         assert!(parse_lambda_functions(br#"[{"function_name":"fixture"}]"#).is_err());
         assert!(parse_lambda_functions(br#"{"Functions":[{}]}"#).is_err());
         assert!(parse_lambda_functions(br#"{"Functions":[{"FunctionName":""}]}"#).is_err());

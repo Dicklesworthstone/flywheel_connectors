@@ -189,11 +189,14 @@ impl AwsClient {
             || self.auth.session_token.is_some()
         {
             return Err(AwsError::Config(
-                "static AWS credentials and host credential references are mutually exclusive".into(),
+                "static AWS credentials and host credential references are mutually exclusive"
+                    .into(),
             ));
         }
         if credential_ids.is_empty()
-            || credential_ids.keys().any(|service| !matches!(service.as_str(), "s3" | "ec2" | "lambda" | "sts"))
+            || credential_ids
+                .keys()
+                .any(|service| !matches!(service.as_str(), "s3" | "ec2" | "lambda" | "sts"))
         {
             return Err(AwsError::Config(
                 "credential_ids must contain known AWS services: s3, ec2, lambda, sts".into(),
@@ -230,7 +233,8 @@ impl AwsClient {
                 zone_id: request.zone_id.to_string(),
                 request_id: request.id.to_string(),
                 correlation_id: request.correlation_id.as_ref().map(ToString::to_string),
-                capability_token_cbor_b64: base64::engine::general_purpose::STANDARD.encode(capability),
+                capability_token_cbor_b64: base64::engine::general_purpose::STANDARD
+                    .encode(capability),
             });
         }
         Ok(client)
@@ -239,7 +243,9 @@ impl AwsClient {
     fn transport(&self, operation: &str, service: &str) -> AwsResult<Option<ProxyTransport>> {
         if let Some(proxy) = &self.proxy {
             let context = proxy.context.as_ref().ok_or_else(|| {
-                AwsError::InvalidInput("host credential injection requires an admitted invocation".into())
+                AwsError::InvalidInput(
+                    "host credential injection requires an admitted invocation".into(),
+                )
             })?;
             if context.operation_id != operation {
                 return Err(AwsError::InvalidInput(
@@ -320,7 +326,16 @@ impl AwsClient {
             async move {
                 debug!(attempt, operation, "AWS provider request");
                 let response = if let Some(proxy) = proxy {
-                    proxy.request(service, method.as_str(), url, body, content_type, response_limit).await
+                    proxy
+                        .request(
+                            service,
+                            method.as_str(),
+                            url,
+                            body,
+                            content_type,
+                            response_limit,
+                        )
+                        .await
                 } else {
                     let mut request = sign_request(
                         self.client.request(method.clone(), url),
@@ -337,7 +352,11 @@ impl AwsClient {
                     if let Some(body) = body {
                         request = request.body(body.to_vec());
                     }
-                    request.send().await.map(ProviderResponse::Direct).map_err(AwsError::Http)
+                    request
+                        .send()
+                        .await
+                        .map(ProviderResponse::Direct)
+                        .map_err(AwsError::Http)
                 };
                 let response = match response {
                     Ok(response) => response,
@@ -348,7 +367,8 @@ impl AwsClient {
                             });
                         }
                         return AttemptOutcome::Retryable {
-                            error: AwsError::Http(error), retry_after: None,
+                            error: AwsError::Http(error),
+                            retry_after: None,
                         };
                     }
                     // A proxy failure can occur after AWS accepted a request.
@@ -372,18 +392,29 @@ impl AwsClient {
         decode: fn(&[u8]) -> AwsResult<ProviderPage<T>>,
     ) -> AwsResult<Vec<T>> {
         let ctx = runtime.request_context();
-        let mut url = url::Url::parse(&url)
-            .map_err(|_| AwsError::Config("invalid AWS endpoint".into()))?;
+        let mut url =
+            url::Url::parse(&url).map_err(|_| AwsError::Config("invalid AWS endpoint".into()))?;
         let mut items = Vec::new();
         let mut seen_tokens = BTreeSet::new();
         let mut response_bytes = 0usize;
         for _ in 0..MAX_LIST_PAGES {
-            let response = self.execute_request(
-                &ctx, operation, service, "GET", url.as_str(), None, None, true,
-            ).await?;
+            let response = self
+                .execute_request(
+                    &ctx,
+                    operation,
+                    service,
+                    "GET",
+                    url.as_str(),
+                    None,
+                    None,
+                    true,
+                )
+                .await?;
             response_bytes = response_bytes.saturating_add(response.body.len());
             if response_bytes > MAX_LIST_RESPONSE_BYTES {
-                return Err(pagination_error("inventory exceeds the aggregate response limit"));
+                return Err(pagination_error(
+                    "inventory exceeds the aggregate response limit",
+                ));
             }
             let page = decode(&response.body)?;
             if items.len().saturating_add(page.items.len()) > MAX_LIST_ITEMS {
@@ -394,16 +425,22 @@ impl AwsClient {
                 return Ok(items);
             };
             if next_token.is_empty() || next_token.len() > MAX_CONTINUATION_TOKEN_BYTES {
-                return Err(pagination_error("AWS returned an invalid continuation token"));
+                return Err(pagination_error(
+                    "AWS returned an invalid continuation token",
+                ));
             }
             if !seen_tokens.insert(next_token.clone()) {
                 return Err(pagination_error("AWS repeated a continuation token"));
             }
-            let query: Vec<(String, String)> = url.query_pairs()
+            let query: Vec<(String, String)> = url
+                .query_pairs()
                 .filter(|(key, _)| key != token_parameter)
                 .map(|(key, value)| (key.into_owned(), value.into_owned()))
                 .collect();
-            url.query_pairs_mut().clear().extend_pairs(query).append_pair(token_parameter, &next_token);
+            url.query_pairs_mut()
+                .clear()
+                .extend_pairs(query)
+                .append_pair(token_parameter, &next_token);
         }
         Err(pagination_error("inventory exceeds the page limit"))
     }
@@ -414,9 +451,15 @@ impl AwsClient {
     ///
     /// Returns an error if dispatch, native decoding, or pagination fails.
     pub async fn s3_list_buckets(&self, runtime: &ConnectorRuntime) -> AwsResult<Vec<S3Bucket>> {
-        self.list_pages(runtime, "aws.s3.list_buckets", "s3",
+        self.list_pages(
+            runtime,
+            "aws.s3.list_buckets",
+            "s3",
             format!("{}?max-buckets=1000", self.s3_url()),
-            "continuation-token", |body| Ok(parse_s3_buckets(body)?)).await
+            "continuation-token",
+            |body| Ok(parse_s3_buckets(body)?),
+        )
+        .await
     }
 
     /// List all objects in an S3 bucket matching an optional prefix.
@@ -438,8 +481,15 @@ impl AwsClient {
             let prefix = sanitize_query_param(prefix, "prefix")?;
             url.query_pairs_mut().append_pair("prefix", prefix);
         }
-        self.list_pages(runtime, "aws.s3.list_objects", "s3", url.into(),
-            "continuation-token", |body| Ok(parse_s3_objects(body)?)).await
+        self.list_pages(
+            runtime,
+            "aws.s3.list_objects",
+            "s3",
+            url.into(),
+            "continuation-token",
+            |body| Ok(parse_s3_objects(body)?),
+        )
+        .await
     }
 
     /// Fetch an S3 object's UTF-8 content and response metadata.
@@ -456,14 +506,24 @@ impl AwsClient {
         let bucket = sanitize_path_segment(bucket, "bucket")?;
         let key = sanitize_object_key(key, "key")?;
         let url = format!("{}/{bucket}/{key}", self.s3_url());
-        let response = self.execute_request(
-            &runtime.request_context(), "aws.s3.get_object", "s3", "GET", &url,
-            None, None, true,
-        ).await?;
+        let response = self
+            .execute_request(
+                &runtime.request_context(),
+                "aws.s3.get_object",
+                "s3",
+                "GET",
+                &url,
+                None,
+                None,
+                true,
+            )
+            .await?;
         Ok(S3GetObjectResponse {
             key: key.to_string(),
             content_type: response.header("content-type"),
-            content_length: response.header("content-length").and_then(|value| value.parse().ok()),
+            content_length: response
+                .header("content-length")
+                .and_then(|value| value.parse().ok()),
             etag: response.header("etag"),
             body: String::from_utf8_lossy(&response.body).into_owned(),
         })
@@ -485,10 +545,18 @@ impl AwsClient {
         let bucket = sanitize_path_segment(bucket, "bucket")?;
         let key = sanitize_object_key(key, "key")?;
         let url = format!("{}/{bucket}/{key}", self.s3_url());
-        let response = self.execute_request(
-            &runtime.request_context(), "aws.s3.put_object", "s3", "PUT", &url,
-            Some(body.as_bytes()), Some(content_type.unwrap_or("application/octet-stream")), false,
-        ).await?;
+        let response = self
+            .execute_request(
+                &runtime.request_context(),
+                "aws.s3.put_object",
+                "s3",
+                "PUT",
+                &url,
+                Some(body.as_bytes()),
+                Some(content_type.unwrap_or("application/octet-stream")),
+                false,
+            )
+            .await?;
         Ok(S3PutObjectResponse {
             etag: response.header("etag"),
             version_id: response.header("x-amz-version-id"),
@@ -509,12 +577,21 @@ impl AwsClient {
         let bucket = sanitize_path_segment(bucket, "bucket")?;
         let key = sanitize_object_key(key, "key")?;
         let url = format!("{}/{bucket}/{key}", self.s3_url());
-        let response = self.execute_request(
-            &runtime.request_context(), "aws.s3.delete_object", "s3", "DELETE", &url,
-            None, None, false,
-        ).await?;
+        let response = self
+            .execute_request(
+                &runtime.request_context(),
+                "aws.s3.delete_object",
+                "s3",
+                "DELETE",
+                &url,
+                None,
+                None,
+                false,
+            )
+            .await?;
         Ok(S3DeleteObjectResponse {
-            delete_marker: response.header("x-amz-delete-marker")
+            delete_marker: response
+                .header("x-amz-delete-marker")
                 .is_some_and(|value| value.eq_ignore_ascii_case("true")),
             version_id: response.header("x-amz-version-id"),
         })
@@ -529,9 +606,18 @@ impl AwsClient {
         &self,
         runtime: &ConnectorRuntime,
     ) -> AwsResult<Vec<Ec2Instance>> {
-        self.list_pages(runtime, "aws.ec2.describe_instances", "ec2",
-            format!("{}?Action=DescribeInstances&Version=2016-11-15&MaxResults=1000", self.ec2_url()),
-            "NextToken", |body| Ok(parse_ec2_instances(body)?)).await
+        self.list_pages(
+            runtime,
+            "aws.ec2.describe_instances",
+            "ec2",
+            format!(
+                "{}?Action=DescribeInstances&Version=2016-11-15&MaxResults=1000",
+                self.ec2_url()
+            ),
+            "NextToken",
+            |body| Ok(parse_ec2_instances(body)?),
+        )
+        .await
     }
 
     async fn ec2_state_change(
@@ -542,16 +628,27 @@ impl AwsClient {
         instance_id: &str,
     ) -> AwsResult<Ec2StateChange> {
         let instance_id = sanitize_query_param(
-            sanitize_path_segment(instance_id, "instance_id")?, "instance_id",
+            sanitize_path_segment(instance_id, "instance_id")?,
+            "instance_id",
         )?;
         let mut url = url::Url::parse(&self.ec2_url())
             .map_err(|_| AwsError::Config("invalid EC2 endpoint".into()))?;
-        url.query_pairs_mut().append_pair("Action", action)
-            .append_pair("InstanceId.1", instance_id).append_pair("Version", "2016-11-15");
-        let response = self.execute_request(
-            &runtime.request_context(), operation, "ec2", "POST", url.as_str(),
-            None, None, true,
-        ).await?;
+        url.query_pairs_mut()
+            .append_pair("Action", action)
+            .append_pair("InstanceId.1", instance_id)
+            .append_pair("Version", "2016-11-15");
+        let response = self
+            .execute_request(
+                &runtime.request_context(),
+                operation,
+                "ec2",
+                "POST",
+                url.as_str(),
+                None,
+                None,
+                true,
+            )
+            .await?;
         Ok(parse_ec2_state_change(&response.body, action, instance_id)?)
     }
 
@@ -565,7 +662,13 @@ impl AwsClient {
         runtime: &ConnectorRuntime,
         instance_id: &str,
     ) -> AwsResult<Ec2StateChange> {
-        self.ec2_state_change(runtime, "aws.ec2.start_instance", "StartInstances", instance_id).await
+        self.ec2_state_change(
+            runtime,
+            "aws.ec2.start_instance",
+            "StartInstances",
+            instance_id,
+        )
+        .await
     }
 
     /// Stop one EC2 instance.
@@ -578,7 +681,13 @@ impl AwsClient {
         runtime: &ConnectorRuntime,
         instance_id: &str,
     ) -> AwsResult<Ec2StateChange> {
-        self.ec2_state_change(runtime, "aws.ec2.stop_instance", "StopInstances", instance_id).await
+        self.ec2_state_change(
+            runtime,
+            "aws.ec2.stop_instance",
+            "StopInstances",
+            instance_id,
+        )
+        .await
     }
 
     /// Terminate one EC2 instance.
@@ -591,7 +700,13 @@ impl AwsClient {
         runtime: &ConnectorRuntime,
         instance_id: &str,
     ) -> AwsResult<Ec2StateChange> {
-        self.ec2_state_change(runtime, "aws.ec2.terminate_instance", "TerminateInstances", instance_id).await
+        self.ec2_state_change(
+            runtime,
+            "aws.ec2.terminate_instance",
+            "TerminateInstances",
+            instance_id,
+        )
+        .await
     }
 
     /// List all Lambda functions, following the provider's marker.
@@ -603,9 +718,15 @@ impl AwsClient {
         &self,
         runtime: &ConnectorRuntime,
     ) -> AwsResult<Vec<LambdaFunction>> {
-        self.list_pages(runtime, "aws.lambda.list_functions", "lambda",
+        self.list_pages(
+            runtime,
+            "aws.lambda.list_functions",
+            "lambda",
             format!("{}/2015-03-31/functions", self.lambda_url()),
-            "Marker", |body| Ok(parse_lambda_functions(body)?)).await
+            "Marker",
+            |body| Ok(parse_lambda_functions(body)?),
+        )
+        .await
     }
 
     /// Invoke a Lambda function once. Uncertain provider or proxy failures are terminal.
@@ -620,15 +741,28 @@ impl AwsClient {
         payload: &serde_json::Value,
     ) -> AwsResult<LambdaInvokeResponse> {
         let function_name = sanitize_path_segment(function_name, "function_name")?;
-        let url = format!("{}/2015-03-31/functions/{function_name}/invocations", self.lambda_url());
+        let url = format!(
+            "{}/2015-03-31/functions/{function_name}/invocations",
+            self.lambda_url()
+        );
         let payload = serde_json::to_vec(payload)?;
-        let response = self.execute_request(
-            &runtime.request_context(), "aws.lambda.invoke", "lambda", "POST", &url,
-            Some(&payload), Some("application/json"), false,
-        ).await?;
+        let response = self
+            .execute_request(
+                &runtime.request_context(),
+                "aws.lambda.invoke",
+                "lambda",
+                "POST",
+                &url,
+                Some(&payload),
+                Some("application/json"),
+                false,
+            )
+            .await?;
         Ok(parse_lambda_invoke(
-            response.status, response.header("x-amz-function-error"),
-            response.header("x-amz-executed-version"), &response.body,
+            response.status,
+            response.header("x-amz-function-error"),
+            response.header("x-amz-executed-version"),
+            &response.body,
         )?)
     }
 
@@ -637,11 +771,22 @@ impl AwsClient {
         runtime: &ConnectorRuntime,
         operation: &str,
     ) -> AwsResult<CallerIdentity> {
-        let url = format!("{}?Action=GetCallerIdentity&Version=2011-06-15", self.sts_url());
-        let response = self.execute_request(
-            &runtime.request_context(), operation, "sts", "POST", &url,
-            None, None, true,
-        ).await?;
+        let url = format!(
+            "{}?Action=GetCallerIdentity&Version=2011-06-15",
+            self.sts_url()
+        );
+        let response = self
+            .execute_request(
+                &runtime.request_context(),
+                operation,
+                "sts",
+                "POST",
+                &url,
+                None,
+                None,
+                true,
+            )
+            .await?;
         Ok(parse_caller_identity(&response.body)?)
     }
 
@@ -654,7 +799,8 @@ impl AwsClient {
         &self,
         runtime: &ConnectorRuntime,
     ) -> AwsResult<CallerIdentity> {
-        self.caller_identity(runtime, "aws.sts.get_caller_identity").await
+        self.caller_identity(runtime, "aws.sts.get_caller_identity")
+            .await
     }
 
     /// Probe STS under the signed `aws.health` operation's authority.
@@ -773,8 +919,11 @@ const MAX_CONTINUATION_TOKEN_BYTES: usize = 8192;
 fn provider_response_limit(operation: &str) -> usize {
     match operation {
         "aws.s3.get_object" => MAX_OBJECT_RESPONSE_BYTES,
-        "aws.s3.list_buckets" | "aws.s3.list_objects" | "aws.ec2.describe_instances"
-        | "aws.lambda.list_functions" | "aws.lambda.invoke" => MAX_LIST_RESPONSE_BYTES,
+        "aws.s3.list_buckets"
+        | "aws.s3.list_objects"
+        | "aws.ec2.describe_instances"
+        | "aws.lambda.list_functions"
+        | "aws.lambda.invoke" => MAX_LIST_RESPONSE_BYTES,
         _ => MAX_MUTATION_RESPONSE_BYTES,
     }
 }
@@ -813,9 +962,14 @@ impl ProviderResponse {
 
     fn header(&self, name: &str) -> Option<String> {
         match self {
-            Self::Direct(response) => response.headers().get(name)
-                .and_then(|value| value.to_str().ok()).map(ToOwned::to_owned),
-            Self::Proxy(response) => response.headers.iter()
+            Self::Direct(response) => response
+                .headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(ToOwned::to_owned),
+            Self::Proxy(response) => response
+                .headers
+                .iter()
                 .find(|header| header.name.eq_ignore_ascii_case(name))
                 .map(|header| header.value.clone()),
         }
@@ -824,15 +978,28 @@ impl ProviderResponse {
     async fn read(self, limit: usize) -> AwsResult<ProviderReply> {
         let status = self.status();
         let headers = match &self {
-            Self::Direct(response) => response.headers().iter()
-                .filter_map(|(name, value)| value.to_str().ok().map(|value| (name.as_str().to_owned(), value.to_owned())))
+            Self::Direct(response) => response
+                .headers()
+                .iter()
+                .filter_map(|(name, value)| {
+                    value
+                        .to_str()
+                        .ok()
+                        .map(|value| (name.as_str().to_owned(), value.to_owned()))
+                })
                 .collect(),
-            Self::Proxy(response) => response.headers.iter()
-                .map(|header| (header.name.to_ascii_lowercase(), header.value.clone())).collect(),
+            Self::Proxy(response) => response
+                .headers
+                .iter()
+                .map(|header| (header.name.to_ascii_lowercase(), header.value.clone()))
+                .collect(),
         };
         let body = match self {
             Self::Direct(mut response) => {
-                if response.content_length().is_some_and(|size| size > limit as u64) {
+                if response
+                    .content_length()
+                    .is_some_and(|size| size > limit as u64)
+                {
                     return Err(AwsError::ResponseTooLarge { limit });
                 }
                 let mut body = Vec::new();
@@ -852,7 +1019,11 @@ impl ProviderResponse {
                 body.to_vec()
             }
         };
-        Ok(ProviderReply { status, headers, body })
+        Ok(ProviderReply {
+            status,
+            headers,
+            body,
+        })
     }
 }
 
@@ -868,14 +1039,19 @@ impl ProxyTransport {
         response_limit: usize,
     ) -> AwsResult<ProviderResponse> {
         let context = self.context.clone().ok_or_else(|| {
-            AwsError::InvalidInput("host credential injection requires an admitted invocation".into())
+            AwsError::InvalidInput(
+                "host credential injection requires an admitted invocation".into(),
+            )
         })?;
         let credential_id = self.credential_ids.get(service).ok_or_else(|| {
-            AwsError::Config(format!("credential_ids has no binding for the {service} service"))
+            AwsError::Config(format!(
+                "credential_ids has no binding for the {service} service"
+            ))
         })?;
         let mut headers = Vec::new();
         if let Some(content_type) = content_type {
-            content_type.parse::<reqwest::header::HeaderValue>()
+            content_type
+                .parse::<reqwest::header::HeaderValue>()
                 .map_err(|_| AwsError::InvalidInput("invalid content_type header".into()))?;
             headers.push(HostEgressHttpHeader {
                 name: "content-type".into(),
@@ -892,12 +1068,16 @@ impl ProxyTransport {
         };
         // Allow base64 expansion and bounded attribution metadata, while the
         // provider body still has its operation-specific manifest bound.
-        let proxy = self.client.clone()
+        let proxy = self
+            .client
+            .clone()
             .with_max_response_bytes(response_limit.saturating_mul(2).saturating_add(64 * 1024))
             .map_err(|_| AwsError::HostProxy { status: None })?;
         let response = proxy.http(&request).await.map_err(|error| {
             // A rejected host may echo capability material. Retain only status.
-            AwsError::HostProxy { status: error.status() }
+            AwsError::HostProxy {
+                status: error.status(),
+            }
         })?;
         if !response.egress.credential_injected {
             return Err(AwsError::HostProxy { status: None });
@@ -926,8 +1106,10 @@ async fn handle_response(
     // additional versions or delete markers. Only an explicit 429 is known to
     // reject the request before a side effect for those operations.
     if status == 429 || (status == 503 && replay_safe) {
-        let retry_after = response.header("retry-after")
-            .and_then(|value| value.parse::<u64>().ok()).map(Duration::from_secs);
+        let retry_after = response
+            .header("retry-after")
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(Duration::from_secs);
         return AttemptOutcome::Retryable {
             error: AwsError::RateLimited {
                 retry_after_ms: duration_ms(retry_after.unwrap_or(Duration::from_secs(30))),
@@ -938,7 +1120,9 @@ async fn handle_response(
     let response = match response.read(response_limit).await {
         Ok(response) => response,
         Err(AwsError::Http(_)) if !replay_safe => {
-            return AttemptOutcome::Terminal(AwsError::UncertainOutcome { status: Some(status) });
+            return AttemptOutcome::Terminal(AwsError::UncertainOutcome {
+                status: Some(status),
+            });
         }
         Err(error) => return AttemptOutcome::Terminal(error),
     };
@@ -949,9 +1133,14 @@ async fn handle_response(
         };
         if status >= 500 {
             if !replay_safe {
-                return AttemptOutcome::Terminal(AwsError::UncertainOutcome { status: Some(status) });
+                return AttemptOutcome::Terminal(AwsError::UncertainOutcome {
+                    status: Some(status),
+                });
             }
-            return AttemptOutcome::Retryable { error, retry_after: None };
+            return AttemptOutcome::Retryable {
+                error,
+                retry_after: None,
+            };
         }
         return AttemptOutcome::Terminal(error);
     }
@@ -965,7 +1154,6 @@ mod tests {
     const TEST_ACCESS_KEY_ID: &str = "fcp-test-access-key";
     const TEST_SIGNING_MATERIAL: &str = "fcp-test-signing-material";
     const TEST_SESSION_MATERIAL: &str = "fcp-test-session-material";
-
 
     fn host_invocation(
         operation: &str,
@@ -1002,7 +1190,10 @@ mod tests {
             .issuer("node:aws-proxy-test")
             .target_instance("aws-proxy-test")
             .token_id(id.as_bytes())
-            .validity(now - ChronoDuration::minutes(1), now + ChronoDuration::hours(1))
+            .validity(
+                now - ChronoDuration::minutes(1),
+                now + ChronoDuration::hours(1),
+            )
             .try_constraints_cbor(&cbor)
             .unwrap()
             .sign(&key)
@@ -1016,7 +1207,8 @@ mod tests {
             "input": {},
             "correlation_id": "99c09d94-3189-4608-b390-8fa5e9508a00",
             "capability_token": CapabilityToken::from_raw(token),
-        })).unwrap()
+        }))
+        .unwrap()
     }
 
     fn host_reply(request: &HostEgressHttpRequest, body: Vec<u8>) -> HostEgressHttpResponse {
@@ -1042,8 +1234,10 @@ mod tests {
     }
 
     fn service_credentials() -> BTreeMap<String, CredentialId> {
-        ["s3", "ec2", "lambda", "sts"].into_iter()
-            .map(|service| (service.to_string(), CredentialId::new())).collect()
+        ["s3", "ec2", "lambda", "sts"]
+            .into_iter()
+            .map(|service| (service.to_string(), CredentialId::new()))
+            .collect()
     }
 
     fn host_client(
@@ -1057,10 +1251,17 @@ mod tests {
                 secret_access_key: String::new(),
                 session_token: None,
             },
-            "us-west-2", HttpRetryConfig::default(), 2000,
-            Some(provider.into()), Some(provider.into()),
-            Some(provider.into()), Some(provider.into()),
-        ).unwrap().with_credential_ids(credentials, HostEgressProxyClient::new(proxy).unwrap()).unwrap()
+            "us-west-2",
+            HttpRetryConfig::default(),
+            2000,
+            Some(provider.into()),
+            Some(provider.into()),
+            Some(provider.into()),
+            Some(provider.into()),
+        )
+        .unwrap()
+        .with_credential_ids(credentials, HostEgressProxyClient::new(proxy).unwrap())
+        .unwrap()
     }
 
     fn native_host_body(operation: &str) -> Vec<u8> {
@@ -1096,48 +1297,143 @@ mod tests {
 
         let proxy = MockServer::start().await;
         let provider = MockServer::start().await;
-        Mock::given(method("POST")).and(path("/rpc/egress/http"))
+        Mock::given(method("POST"))
+            .and(path("/rpc/egress/http"))
             .respond_with(|wire: &wiremock::Request| {
                 let request: HostEgressHttpRequest = serde_json::from_slice(&wire.body).unwrap();
-                let mut response = host_reply(&request, native_host_body(&request.context.operation_id));
+                let mut response =
+                    host_reply(&request, native_host_body(&request.context.operation_id));
                 response.headers = vec![
-                    HostEgressHttpHeader { name: "ETag".into(), value: "\"etag\"".into() },
-                    HostEgressHttpHeader { name: "X-Amz-Delete-Marker".into(), value: "true".into() },
-                    HostEgressHttpHeader { name: "X-Amz-Executed-Version".into(), value: "42".into() },
+                    HostEgressHttpHeader {
+                        name: "ETag".into(),
+                        value: "\"etag\"".into(),
+                    },
+                    HostEgressHttpHeader {
+                        name: "X-Amz-Delete-Marker".into(),
+                        value: "true".into(),
+                    },
+                    HostEgressHttpHeader {
+                        name: "X-Amz-Executed-Version".into(),
+                        value: "42".into(),
+                    },
                 ];
                 ResponseTemplate::new(200).set_body_json(response)
-            }).expect(13).mount(&proxy).await;
+            })
+            .expect(13)
+            .mount(&proxy)
+            .await;
         let credentials = service_credentials();
         let client = host_client(&proxy.uri(), &provider.uri(), credentials.clone());
         let runtime = ConnectorRuntime::new(fcp_sdk::ConnectorRuntimeConfig::default());
         let operations = [
-            "aws.s3.list_buckets", "aws.s3.list_objects", "aws.s3.get_object",
-            "aws.s3.put_object", "aws.s3.delete_object", "aws.ec2.describe_instances",
-            "aws.ec2.start_instance", "aws.ec2.stop_instance", "aws.ec2.terminate_instance",
-            "aws.lambda.list_functions", "aws.lambda.invoke",
-            "aws.sts.get_caller_identity", "aws.health",
+            "aws.s3.list_buckets",
+            "aws.s3.list_objects",
+            "aws.s3.get_object",
+            "aws.s3.put_object",
+            "aws.s3.delete_object",
+            "aws.ec2.describe_instances",
+            "aws.ec2.start_instance",
+            "aws.ec2.stop_instance",
+            "aws.ec2.terminate_instance",
+            "aws.lambda.list_functions",
+            "aws.lambda.invoke",
+            "aws.sts.get_caller_identity",
+            "aws.health",
         ];
         let mut invocations = Vec::new();
         for (index, operation) in operations.iter().enumerate() {
-            let invocation = host_invocation(operation, &format!("aws-proxy-{index}"), &credentials);
+            let invocation =
+                host_invocation(operation, &format!("aws-proxy-{index}"), &credentials);
             let bound = client.for_invocation(&invocation).unwrap();
             match index {
-                0 => assert_eq!(bound.s3_list_buckets(&runtime).await.unwrap()[0].name, "bucket"),
-                1 => assert_eq!(bound.s3_list_objects(&runtime, "bucket", None).await.unwrap()[0].key, "key"),
-                2 => assert_eq!(bound.s3_get_object(&runtime, "bucket", "key").await.unwrap().body, "object body"),
-                3 => assert_eq!(bound.s3_put_object(&runtime, "bucket", "key", "uploaded", Some("text/plain")).await.unwrap().etag.as_deref(), Some("\"etag\"")),
-                4 => assert!(bound.s3_delete_object(&runtime, "bucket", "key").await.unwrap().delete_marker),
-                5 => assert_eq!(bound.ec2_describe_instances(&runtime).await.unwrap()[0].instance_id, "i-test"),
-                6 => assert_eq!(bound.ec2_start_instance(&runtime, "i-test").await.unwrap().instance_id, "i-test"),
-                7 => assert_eq!(bound.ec2_stop_instance(&runtime, "i-test").await.unwrap().instance_id, "i-test"),
-                8 => assert_eq!(bound.ec2_terminate_instance(&runtime, "i-test").await.unwrap().instance_id, "i-test"),
-                9 => assert_eq!(bound.lambda_list_functions(&runtime).await.unwrap()[0].function_name, "test-function"),
+                0 => assert_eq!(
+                    bound.s3_list_buckets(&runtime).await.unwrap()[0].name,
+                    "bucket"
+                ),
+                1 => assert_eq!(
+                    bound
+                        .s3_list_objects(&runtime, "bucket", None)
+                        .await
+                        .unwrap()[0]
+                        .key,
+                    "key"
+                ),
+                2 => assert_eq!(
+                    bound
+                        .s3_get_object(&runtime, "bucket", "key")
+                        .await
+                        .unwrap()
+                        .body,
+                    "object body"
+                ),
+                3 => assert_eq!(
+                    bound
+                        .s3_put_object(&runtime, "bucket", "key", "uploaded", Some("text/plain"))
+                        .await
+                        .unwrap()
+                        .etag
+                        .as_deref(),
+                    Some("\"etag\"")
+                ),
+                4 => assert!(
+                    bound
+                        .s3_delete_object(&runtime, "bucket", "key")
+                        .await
+                        .unwrap()
+                        .delete_marker
+                ),
+                5 => assert_eq!(
+                    bound.ec2_describe_instances(&runtime).await.unwrap()[0].instance_id,
+                    "i-test"
+                ),
+                6 => assert_eq!(
+                    bound
+                        .ec2_start_instance(&runtime, "i-test")
+                        .await
+                        .unwrap()
+                        .instance_id,
+                    "i-test"
+                ),
+                7 => assert_eq!(
+                    bound
+                        .ec2_stop_instance(&runtime, "i-test")
+                        .await
+                        .unwrap()
+                        .instance_id,
+                    "i-test"
+                ),
+                8 => assert_eq!(
+                    bound
+                        .ec2_terminate_instance(&runtime, "i-test")
+                        .await
+                        .unwrap()
+                        .instance_id,
+                    "i-test"
+                ),
+                9 => assert_eq!(
+                    bound.lambda_list_functions(&runtime).await.unwrap()[0].function_name,
+                    "test-function"
+                ),
                 10 => {
-                    let result = bound.lambda_invoke(&runtime, "test-function", &serde_json::json!({"hello":"world"})).await.unwrap();
+                    let result = bound
+                        .lambda_invoke(
+                            &runtime,
+                            "test-function",
+                            &serde_json::json!({"hello":"world"}),
+                        )
+                        .await
+                        .unwrap();
                     assert_eq!(result.payload, serde_json::json!({"result":"ok"}));
                     assert_eq!(result.executed_version.as_deref(), Some("42"));
                 }
-                11 => assert_eq!(bound.sts_get_caller_identity(&runtime).await.unwrap().account, "123456789012"),
+                11 => assert_eq!(
+                    bound
+                        .sts_get_caller_identity(&runtime)
+                        .await
+                        .unwrap()
+                        .account,
+                    "123456789012"
+                ),
                 12 => assert!(bound.health_check(&runtime).await.unwrap().authenticated),
                 _ => unreachable!(),
             }
@@ -1151,16 +1447,33 @@ mod tests {
             } else {
                 invocation.operation.as_str().split('.').nth(1).unwrap()
             };
-            assert_eq!(request.credential_id, Some(credentials[service].to_string()));
+            assert_eq!(
+                request.credential_id,
+                Some(credentials[service].to_string())
+            );
             assert_eq!(request.context.connector_id, "fcp.aws");
-            assert_eq!(request.context.operation_id, invocation.operation.to_string());
+            assert_eq!(
+                request.context.operation_id,
+                invocation.operation.to_string()
+            );
             assert_eq!(request.context.zone_id, invocation.zone_id.to_string());
             assert_eq!(request.context.request_id, invocation.id.to_string());
-            assert_eq!(request.context.correlation_id, invocation.correlation_id.as_ref().map(ToString::to_string));
-            assert_eq!(request.context.capability_token_cbor_b64,
-                base64::engine::general_purpose::STANDARD.encode(invocation.capability_token.raw().to_cbor().unwrap()));
+            assert_eq!(
+                request.context.correlation_id,
+                invocation.correlation_id.as_ref().map(ToString::to_string)
+            );
+            assert_eq!(
+                request.context.capability_token_cbor_b64,
+                base64::engine::general_purpose::STANDARD
+                    .encode(invocation.capability_token.raw().to_cbor().unwrap())
+            );
             assert!(request.url.starts_with(&provider.uri()));
-            assert!(request.headers.iter().all(|header| header.name == "content-type"));
+            assert!(
+                request
+                    .headers
+                    .iter()
+                    .all(|header| header.name == "content-type")
+            );
             if invocation.operation.as_str() == "aws.s3.put_object" {
                 assert_eq!(request.method, "PUT");
                 assert_eq!(request.body.as_ref().unwrap().as_bytes(), b"uploaded");
@@ -1168,14 +1481,23 @@ mod tests {
             }
             if invocation.operation.as_str() == "aws.lambda.invoke" {
                 assert_eq!(request.method, "POST");
-                assert_eq!(serde_json::from_slice::<serde_json::Value>(request.body.as_ref().unwrap().as_bytes()).unwrap(),
-                    serde_json::json!({"hello":"world"}));
+                assert_eq!(
+                    serde_json::from_slice::<serde_json::Value>(
+                        request.body.as_ref().unwrap().as_bytes()
+                    )
+                    .unwrap(),
+                    serde_json::json!({"hello":"world"})
+                );
             }
         }
         assert!(provider.received_requests().await.unwrap().is_empty());
         let debug = format!("{client:?}");
-        assert!(!debug.contains(&base64::engine::general_purpose::STANDARD
-            .encode(invocations[0].capability_token.raw().to_cbor().unwrap())));
+        assert!(
+            !debug.contains(
+                &base64::engine::general_purpose::STANDARD
+                    .encode(invocations[0].capability_token.raw().to_cbor().unwrap())
+            )
+        );
         assert!(!debug.contains("capability_token"));
     }
 
@@ -1190,15 +1512,42 @@ mod tests {
         let runtime = ConnectorRuntime::new(fcp_sdk::ConnectorRuntimeConfig::default());
         assert!(client.s3_list_buckets(&runtime).await.is_err());
         let request = host_invocation("aws.lambda.list_functions", "missing-service", &credentials);
-        assert!(client.for_invocation(&request).unwrap().lambda_list_functions(&runtime).await.is_err());
+        assert!(
+            client
+                .for_invocation(&request)
+                .unwrap()
+                .lambda_list_functions(&runtime)
+                .await
+                .is_err()
+        );
         let request = host_invocation("aws.s3.list_buckets", "wrong-operation", &credentials);
-        assert!(client.for_invocation(&request).unwrap().s3_get_object(&runtime, "bucket", "key").await.is_err());
+        assert!(
+            client
+                .for_invocation(&request)
+                .unwrap()
+                .s3_get_object(&runtime, "bucket", "key")
+                .await
+                .is_err()
+        );
         let unsigned = AwsClient::new(
-            AwsAuth { access_key_id: String::new(), secret_access_key: String::new(), session_token: None },
-            "us-east-1", HttpRetryConfig::default(), 2000,
-            Some(provider.uri()), None, None, None,
-        ).unwrap();
-        assert!(matches!(unsigned.s3_list_buckets(&runtime).await, Err(AwsError::Config(_))));
+            AwsAuth {
+                access_key_id: String::new(),
+                secret_access_key: String::new(),
+                session_token: None,
+            },
+            "us-east-1",
+            HttpRetryConfig::default(),
+            2000,
+            Some(provider.uri()),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            unsigned.s3_list_buckets(&runtime).await,
+            Err(AwsError::Config(_))
+        ));
         assert!(proxy.received_requests().await.unwrap().is_empty());
         assert!(provider.received_requests().await.unwrap().is_empty());
     }
@@ -1214,10 +1563,19 @@ mod tests {
         let invocation = host_invocation("aws.lambda.invoke", "host-denial", &credentials);
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(503).set_body_string("secret-capability-sentinel"))
-            .expect(1).mount(&proxy).await;
-        let error = client.for_invocation(&invocation).unwrap()
-            .lambda_invoke(&ConnectorRuntime::new(fcp_sdk::ConnectorRuntimeConfig::default()),
-                "test-function", &serde_json::json!({})).await.unwrap_err();
+            .expect(1)
+            .mount(&proxy)
+            .await;
+        let error = client
+            .for_invocation(&invocation)
+            .unwrap()
+            .lambda_invoke(
+                &ConnectorRuntime::new(fcp_sdk::ConnectorRuntimeConfig::default()),
+                "test-function",
+                &serde_json::json!({}),
+            )
+            .await
+            .unwrap_err();
         assert!(matches!(error, AwsError::HostProxy { status: Some(503) }));
         assert!(!error.is_retryable());
         assert!(!format!("{error:?} {error}").contains("secret-capability-sentinel"));
@@ -1231,27 +1589,36 @@ mod tests {
         for wrong_attribution in [false, true] {
             let proxy = MockServer::start().await;
             let provider = MockServer::start().await;
-            Mock::given(method("POST")).respond_with(move |wire: &wiremock::Request| {
-                let request: HostEgressHttpRequest = serde_json::from_slice(&wire.body).unwrap();
-                let mut response = host_reply(&request, native_host_body("aws.s3.list_buckets"));
-                if wrong_attribution {
-                    response.egress.operation_id = "aws.ec2.describe_instances".into();
-                } else {
-                    response.egress.credential_injected = false;
-                }
-                ResponseTemplate::new(200).set_body_json(response)
-            }).expect(1).mount(&proxy).await;
+            Mock::given(method("POST"))
+                .respond_with(move |wire: &wiremock::Request| {
+                    let request: HostEgressHttpRequest =
+                        serde_json::from_slice(&wire.body).unwrap();
+                    let mut response =
+                        host_reply(&request, native_host_body("aws.s3.list_buckets"));
+                    if wrong_attribution {
+                        response.egress.operation_id = "aws.ec2.describe_instances".into();
+                    } else {
+                        response.egress.credential_injected = false;
+                    }
+                    ResponseTemplate::new(200).set_body_json(response)
+                })
+                .expect(1)
+                .mount(&proxy)
+                .await;
             let credentials = service_credentials();
             let invocation = host_invocation("aws.s3.list_buckets", "host-response", &credentials);
             let error = host_client(&proxy.uri(), &provider.uri(), credentials)
-                .for_invocation(&invocation).unwrap()
-                .s3_list_buckets(&ConnectorRuntime::new(fcp_sdk::ConnectorRuntimeConfig::default()))
-                .await.unwrap_err();
+                .for_invocation(&invocation)
+                .unwrap()
+                .s3_list_buckets(&ConnectorRuntime::new(
+                    fcp_sdk::ConnectorRuntimeConfig::default(),
+                ))
+                .await
+                .unwrap_err();
             assert!(matches!(error, AwsError::HostProxy { .. }));
             assert!(provider.received_requests().await.unwrap().is_empty());
         }
     }
-
 
     #[fcp_async_core::runtime::test]
     async fn host_lists_follow_opaque_continuations_without_changing_authority() {
@@ -1305,14 +1672,43 @@ mod tests {
         let credentials = service_credentials();
         let client = host_client(&proxy.uri(), &provider.uri(), credentials.clone());
         let runtime = ConnectorRuntime::new(fcp_sdk::ConnectorRuntimeConfig::default());
-        for operation in ["aws.s3.list_buckets", "aws.s3.list_objects", "aws.ec2.describe_instances", "aws.lambda.list_functions"] {
+        for operation in [
+            "aws.s3.list_buckets",
+            "aws.s3.list_objects",
+            "aws.ec2.describe_instances",
+            "aws.lambda.list_functions",
+        ] {
             let invocation = host_invocation(operation, operation, &credentials);
             let bound = client.for_invocation(&invocation).unwrap();
             let names: Vec<String> = match operation {
-                "aws.s3.list_buckets" => bound.s3_list_buckets(&runtime).await.unwrap().into_iter().map(|item| item.name).collect(),
-                "aws.s3.list_objects" => bound.s3_list_objects(&runtime, "bucket", Some("logs/2026/")).await.unwrap().into_iter().map(|item| item.key).collect(),
-                "aws.ec2.describe_instances" => bound.ec2_describe_instances(&runtime).await.unwrap().into_iter().map(|item| item.instance_id).collect(),
-                _ => bound.lambda_list_functions(&runtime).await.unwrap().into_iter().map(|item| item.function_name).collect(),
+                "aws.s3.list_buckets" => bound
+                    .s3_list_buckets(&runtime)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|item| item.name)
+                    .collect(),
+                "aws.s3.list_objects" => bound
+                    .s3_list_objects(&runtime, "bucket", Some("logs/2026/"))
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|item| item.key)
+                    .collect(),
+                "aws.ec2.describe_instances" => bound
+                    .ec2_describe_instances(&runtime)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|item| item.instance_id)
+                    .collect(),
+                _ => bound
+                    .lambda_list_functions(&runtime)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|item| item.function_name)
+                    .collect(),
             };
             assert_eq!(names, ["first", "second"]);
         }
@@ -1321,7 +1717,10 @@ mod tests {
             let first: HostEgressHttpRequest = serde_json::from_slice(&pair[0].body).unwrap();
             let second: HostEgressHttpRequest = serde_json::from_slice(&pair[1].body).unwrap();
             assert_eq!(first.context.request_id, second.context.request_id);
-            assert_eq!(first.context.capability_token_cbor_b64, second.context.capability_token_cbor_b64);
+            assert_eq!(
+                first.context.capability_token_cbor_b64,
+                second.context.capability_token_cbor_b64
+            );
             assert_eq!(first.credential_id, second.credential_id);
             assert_ne!(first.url, second.url);
         }
@@ -1334,17 +1733,26 @@ mod tests {
         use wiremock::{Mock, MockServer, ResponseTemplate};
         let proxy = MockServer::start().await;
         let provider = MockServer::start().await;
-        Mock::given(method("POST")).respond_with(|wire: &wiremock::Request| {
-            let request: HostEgressHttpRequest = serde_json::from_slice(&wire.body).unwrap();
-            let body = br#"{"Functions":[{"FunctionName":"partial"}],"NextMarker":"repeated"}"#.to_vec();
-            ResponseTemplate::new(200).set_body_json(host_reply(&request, body))
-        }).expect(2).mount(&proxy).await;
+        Mock::given(method("POST"))
+            .respond_with(|wire: &wiremock::Request| {
+                let request: HostEgressHttpRequest = serde_json::from_slice(&wire.body).unwrap();
+                let body = br#"{"Functions":[{"FunctionName":"partial"}],"NextMarker":"repeated"}"#
+                    .to_vec();
+                ResponseTemplate::new(200).set_body_json(host_reply(&request, body))
+            })
+            .expect(2)
+            .mount(&proxy)
+            .await;
         let credentials = service_credentials();
         let invocation = host_invocation("aws.lambda.list_functions", "cycle", &credentials);
         let error = host_client(&proxy.uri(), &provider.uri(), credentials)
-            .for_invocation(&invocation).unwrap()
-            .lambda_list_functions(&ConnectorRuntime::new(fcp_sdk::ConnectorRuntimeConfig::default()))
-            .await.unwrap_err();
+            .for_invocation(&invocation)
+            .unwrap()
+            .lambda_list_functions(&ConnectorRuntime::new(
+                fcp_sdk::ConnectorRuntimeConfig::default(),
+            ))
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains("repeated a continuation token"));
         assert!(provider.received_requests().await.unwrap().is_empty());
     }
@@ -1355,19 +1763,32 @@ mod tests {
         use wiremock::{Mock, MockServer, ResponseTemplate};
         let proxy = MockServer::start().await;
         let provider = MockServer::start().await;
-        Mock::given(method("POST")).respond_with(|wire: &wiremock::Request| {
-            let request: HostEgressHttpRequest = serde_json::from_slice(&wire.body).unwrap();
-            let mut response = host_reply(&request, b"function may already have executed".to_vec());
-            response.status = 503;
-            ResponseTemplate::new(200).set_body_json(response)
-        }).expect(1).mount(&proxy).await;
+        Mock::given(method("POST"))
+            .respond_with(|wire: &wiremock::Request| {
+                let request: HostEgressHttpRequest = serde_json::from_slice(&wire.body).unwrap();
+                let mut response =
+                    host_reply(&request, b"function may already have executed".to_vec());
+                response.status = 503;
+                ResponseTemplate::new(200).set_body_json(response)
+            })
+            .expect(1)
+            .mount(&proxy)
+            .await;
         let credentials = service_credentials();
         let invocation = host_invocation("aws.lambda.invoke", "lambda-failure", &credentials);
         let result = host_client(&proxy.uri(), &provider.uri(), credentials)
-            .for_invocation(&invocation).unwrap()
-            .lambda_invoke(&ConnectorRuntime::new(fcp_sdk::ConnectorRuntimeConfig::default()),
-                "test-function", &serde_json::json!({})).await;
-        assert!(matches!(result, Err(AwsError::UncertainOutcome { status: Some(503) })));
+            .for_invocation(&invocation)
+            .unwrap()
+            .lambda_invoke(
+                &ConnectorRuntime::new(fcp_sdk::ConnectorRuntimeConfig::default()),
+                "test-function",
+                &serde_json::json!({}),
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(AwsError::UncertainOutcome { status: Some(503) })
+        ));
         assert!(provider.received_requests().await.unwrap().is_empty());
     }
 
@@ -1376,50 +1797,91 @@ mod tests {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
         let provider = MockServer::start().await;
-        Mock::given(method("GET")).and(path("/bucket/key"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("object")
-                .insert_header("content-type", "text/plain").insert_header("etag", "\"direct\""))
-            .expect(1).mount(&provider).await;
-        Mock::given(method("GET")).and(path("/bucket/redirect"))
+        Mock::given(method("GET"))
+            .and(path("/bucket/key"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("object")
+                    .insert_header("content-type", "text/plain")
+                    .insert_header("etag", "\"direct\""),
+            )
+            .expect(1)
+            .mount(&provider)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/bucket/redirect"))
             .respond_with(ResponseTemplate::new(307).insert_header("location", "/bucket/key"))
-            .expect(1).mount(&provider).await;
-        Mock::given(method("GET")).and(path("/bucket/error"))
+            .expect(1)
+            .mount(&provider)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/bucket/error"))
             .respond_with(ResponseTemplate::new(400).set_body_string("not an object"))
-            .expect(1).mount(&provider).await;
+            .expect(1)
+            .mount(&provider)
+            .await;
         let client = AwsClient::new(
             AwsAuth {
                 access_key_id: TEST_ACCESS_KEY_ID.into(),
                 secret_access_key: TEST_SIGNING_MATERIAL.into(),
                 session_token: Some(TEST_SESSION_MATERIAL.into()),
             },
-            "us-west-2", HttpRetryConfig::default(), 2000,
-            Some(provider.uri()), None, None, None,
-        ).unwrap();
+            "us-west-2",
+            HttpRetryConfig::default(),
+            2000,
+            Some(provider.uri()),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         let runtime = ConnectorRuntime::new(fcp_sdk::ConnectorRuntimeConfig::default());
-        let response = client.s3_get_object(&runtime, "bucket", "key").await.unwrap();
+        let response = client
+            .s3_get_object(&runtime, "bucket", "key")
+            .await
+            .unwrap();
         assert_eq!(response.body, "object");
         assert_eq!(response.etag.as_deref(), Some("\"direct\""));
-        assert!(matches!(client.s3_get_object(&runtime, "bucket", "redirect").await,
-            Err(AwsError::Api { code: 307, .. })));
-        assert!(matches!(client.s3_get_object(&runtime, "bucket", "error").await,
-            Err(AwsError::Api { code: 400, .. })));
+        assert!(matches!(
+            client.s3_get_object(&runtime, "bucket", "redirect").await,
+            Err(AwsError::Api { code: 307, .. })
+        ));
+        assert!(matches!(
+            client.s3_get_object(&runtime, "bucket", "error").await,
+            Err(AwsError::Api { code: 400, .. })
+        ));
         let requests = provider.received_requests().await.unwrap();
         assert_eq!(requests.len(), 3);
         for request in requests {
-            let authorization = request.headers.get("authorization").unwrap().to_str().unwrap();
+            let authorization = request
+                .headers
+                .get("authorization")
+                .unwrap()
+                .to_str()
+                .unwrap();
             assert!(authorization.contains("/us-west-2/s3/aws4_request"));
             assert!(authorization.contains("SignedHeaders=host"));
             assert!(request.headers.contains_key("x-amz-date"));
             assert!(request.headers.contains_key("x-amz-content-sha256"));
-            assert_eq!(request.headers.get("x-amz-security-token").unwrap().to_str().unwrap(), TEST_SESSION_MATERIAL);
+            assert_eq!(
+                request
+                    .headers
+                    .get("x-amz-security-token")
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                TEST_SESSION_MATERIAL
+            );
         }
     }
-
 
     #[test]
     fn response_bounds_match_large_lambda_and_small_sts_contracts() {
         assert_eq!(provider_response_limit("aws.lambda.invoke"), 10_485_760);
-        assert_eq!(provider_response_limit("aws.sts.get_caller_identity"), 1_048_576);
+        assert_eq!(
+            provider_response_limit("aws.sts.get_caller_identity"),
+            1_048_576
+        );
         assert_eq!(provider_response_limit("aws.health"), 1_048_576);
         assert_eq!(provider_response_limit("aws.s3.get_object"), 104_857_600);
     }
@@ -1429,43 +1891,87 @@ mod tests {
         use wiremock::matchers::any;
         use wiremock::{Mock, MockServer, ResponseTemplate};
         for mediated in [false, true] {
-            for operation in ["aws.s3.put_object", "aws.s3.delete_object", "aws.lambda.invoke"] {
+            for operation in [
+                "aws.s3.put_object",
+                "aws.s3.delete_object",
+                "aws.lambda.invoke",
+            ] {
                 let provider = MockServer::start().await;
                 let proxy = MockServer::start().await;
                 Mock::given(any())
-                    .respond_with(ResponseTemplate::new(503).set_body_string("provider-payload-sentinel"))
-                    .expect(if mediated { 0 } else { 1 }).mount(&provider).await;
-                Mock::given(any()).respond_with(|wire: &wiremock::Request| {
-                    let request: HostEgressHttpRequest = serde_json::from_slice(&wire.body).unwrap();
-                    let mut response = host_reply(&request, b"provider-payload-sentinel".to_vec());
-                    response.status = 503;
-                    ResponseTemplate::new(200).set_body_json(response)
-                }).expect(if mediated { 1 } else { 0 }).mount(&proxy).await;
+                    .respond_with(
+                        ResponseTemplate::new(503).set_body_string("provider-payload-sentinel"),
+                    )
+                    .expect(if mediated { 0 } else { 1 })
+                    .mount(&provider)
+                    .await;
+                Mock::given(any())
+                    .respond_with(|wire: &wiremock::Request| {
+                        let request: HostEgressHttpRequest =
+                            serde_json::from_slice(&wire.body).unwrap();
+                        let mut response =
+                            host_reply(&request, b"provider-payload-sentinel".to_vec());
+                        response.status = 503;
+                        ResponseTemplate::new(200).set_body_json(response)
+                    })
+                    .expect(if mediated { 1 } else { 0 })
+                    .mount(&proxy)
+                    .await;
                 let credentials = service_credentials();
                 let client = if mediated {
                     let request = host_invocation(operation, operation, &credentials);
                     host_client(&proxy.uri(), &provider.uri(), credentials)
-                        .for_invocation(&request).unwrap()
+                        .for_invocation(&request)
+                        .unwrap()
                 } else {
                     AwsClient::new(
-                        AwsAuth { access_key_id: TEST_ACCESS_KEY_ID.into(),
-                            secret_access_key: TEST_SIGNING_MATERIAL.into(), session_token: None },
-                        "us-west-2", HttpRetryConfig::default(), 2000,
-                        Some(provider.uri()), Some(provider.uri()), Some(provider.uri()), Some(provider.uri()),
-                    ).unwrap()
+                        AwsAuth {
+                            access_key_id: TEST_ACCESS_KEY_ID.into(),
+                            secret_access_key: TEST_SIGNING_MATERIAL.into(),
+                            session_token: None,
+                        },
+                        "us-west-2",
+                        HttpRetryConfig::default(),
+                        2000,
+                        Some(provider.uri()),
+                        Some(provider.uri()),
+                        Some(provider.uri()),
+                        Some(provider.uri()),
+                    )
+                    .unwrap()
                 };
                 let runtime = ConnectorRuntime::new(fcp_sdk::ConnectorRuntimeConfig::default());
                 let error = match operation {
-                    "aws.s3.put_object" => client.s3_put_object(&runtime, "bucket", "key", "body", None).await.map(|_| ()).unwrap_err(),
-                    "aws.s3.delete_object" => client.s3_delete_object(&runtime, "bucket", "key").await.map(|_| ()).unwrap_err(),
-                    _ => client.lambda_invoke(&runtime, "function", &serde_json::json!({})).await.map(|_| ()).unwrap_err(),
+                    "aws.s3.put_object" => client
+                        .s3_put_object(&runtime, "bucket", "key", "body", None)
+                        .await
+                        .map(|_| ())
+                        .unwrap_err(),
+                    "aws.s3.delete_object" => client
+                        .s3_delete_object(&runtime, "bucket", "key")
+                        .await
+                        .map(|_| ())
+                        .unwrap_err(),
+                    _ => client
+                        .lambda_invoke(&runtime, "function", &serde_json::json!({}))
+                        .await
+                        .map(|_| ())
+                        .unwrap_err(),
                 };
-                assert!(matches!(error, AwsError::UncertainOutcome { status: Some(503) }));
+                assert!(matches!(
+                    error,
+                    AwsError::UncertainOutcome { status: Some(503) }
+                ));
                 assert!(!error.is_retryable());
                 assert!(!format!("{error:?} {error}").contains("provider-payload-sentinel"));
-                assert!(matches!(error.to_fcp_error(), fcp_prelude::FcpError::External {
-                    retryable: false, status_code: Some(503), ..
-                }));
+                assert!(matches!(
+                    error.to_fcp_error(),
+                    fcp_prelude::FcpError::External {
+                        retryable: false,
+                        status_code: Some(503),
+                        ..
+                    }
+                ));
             }
         }
     }
@@ -1477,19 +1983,42 @@ mod tests {
         let provider = MockServer::start().await;
         Mock::given(method("PUT"))
             .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(400)))
-            .expect(1).mount(&provider).await;
+            .expect(1)
+            .mount(&provider)
+            .await;
         let client = AwsClient::new(
-            AwsAuth { access_key_id: TEST_ACCESS_KEY_ID.into(),
-                secret_access_key: TEST_SIGNING_MATERIAL.into(), session_token: None },
-            "us-west-2", HttpRetryConfig::default(), 100,
-            Some(provider.uri()), None, None, None,
-        ).unwrap();
-        let error = client.s3_put_object(
-            &ConnectorRuntime::new(fcp_sdk::ConnectorRuntimeConfig::default()),
-            "bucket", "key", "body", None,
-        ).await.unwrap_err();
+            AwsAuth {
+                access_key_id: TEST_ACCESS_KEY_ID.into(),
+                secret_access_key: TEST_SIGNING_MATERIAL.into(),
+                session_token: None,
+            },
+            "us-west-2",
+            HttpRetryConfig::default(),
+            100,
+            Some(provider.uri()),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let error = client
+            .s3_put_object(
+                &ConnectorRuntime::new(fcp_sdk::ConnectorRuntimeConfig::default()),
+                "bucket",
+                "key",
+                "body",
+                None,
+            )
+            .await
+            .unwrap_err();
         assert!(matches!(error, AwsError::UncertainOutcome { .. }));
-        assert!(matches!(error.to_fcp_error(), fcp_prelude::FcpError::External { retryable: false, .. }));
+        assert!(matches!(
+            error.to_fcp_error(),
+            fcp_prelude::FcpError::External {
+                retryable: false,
+                ..
+            }
+        ));
     }
 
     #[test]
