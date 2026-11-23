@@ -752,7 +752,10 @@ pub trait StreamingSession: Send + Sync {
 
     /// Persist session state to storage (connector-specific).
     ///
-    /// Called periodically and before shutdown to preserve state.
+    /// Called after each successfully handled event and before reconnect or
+    /// graceful shutdown. Success must mean the checkpoint is durably committed.
+    /// A failed or interrupted handler is never checkpointed by the supervisor:
+    /// it may have advanced in-memory state before completing its handoff.
     ///
     /// # Errors
     ///
@@ -2107,7 +2110,7 @@ pub struct StreamingSupervisorStats {
     pub successful_connections: u64,
     /// Number of failed connection attempts.
     pub failed_connections: u64,
-    /// Number of events processed.
+    /// Number of events successfully handled and checkpointed.
     pub events_processed: u64,
     /// Total time spent in backoff (milliseconds).
     pub backoff_time_ms: u64,
@@ -2130,19 +2133,76 @@ pub struct StreamingHealthState {
     pub missed_heartbeats: u64,
 }
 
+#[derive(Debug)]
+enum StreamingRunState {
+    Ready,
+    Running,
+    Failed(String),
+}
+
+enum StreamingWorkOutcome<T> {
+    Completed { output: T, shutdown: bool },
+    ShutdownBeforeStart,
+    ShutdownTimeout,
+}
+
+/// Do not begin new work after shutdown. Already-started work gets one bounded
+/// grace period to finish; dropping it after that deadline leaves an uncertain
+/// outcome that the supervisor must fence rather than checkpoint or retry.
+async fn streaming_work_or_shutdown<F: std::future::Future>(
+    work: F,
+    shutdown: &mut watch::Receiver<bool>,
+    grace: Duration,
+    shutdown_started_at: &mut Option<Instant>,
+) -> StreamingWorkOutcome<F::Output> {
+    let mut work = std::pin::pin!(work);
+    let mut started = false;
+    let output = {
+        let mut guarded = std::pin::pin!(std::future::poll_fn(|context| {
+            started = true;
+            work.as_mut().poll(context)
+        }));
+        fcp_async_core::select! {
+            biased;
+            _ = fcp_async_core::shutdown::wait_for_shutdown(shutdown) => None,
+            output = guarded.as_mut() => Some(output),
+        }
+    };
+    if let Some(output) = output {
+        return StreamingWorkOutcome::Completed {
+            output,
+            shutdown: false,
+        };
+    }
+    let shutdown_started = *shutdown_started_at.get_or_insert_with(Instant::now);
+    if !started {
+        return StreamingWorkOutcome::ShutdownBeforeStart;
+    }
+    let remaining = grace.saturating_sub(shutdown_started.elapsed());
+    match fcp_async_core::time::timeout(remaining, work.as_mut()).await {
+        Ok(output) => StreamingWorkOutcome::Completed {
+            output,
+            shutdown: true,
+        },
+        Err(_) => StreamingWorkOutcome::ShutdownTimeout,
+    }
+}
+
 /// Supervised streaming loop with backoff, health tracking, and session resumption.
 ///
 /// The supervisor provides:
 /// - Connection lifecycle management with retry/backoff
 /// - Optional heartbeat timeout detection
 /// - Health state transitions based on success/failure patterns
-/// - Session persistence hooks for resume support
+/// - Durable session checkpoints before processing more events or reconnecting
+/// - Fenced recovery after failed checkpoints or interrupted execution
 #[derive(Debug)]
 pub struct StreamingSupervisor<S: StreamingSession> {
     config: SupervisorConfig,
     session: S,
     health: HealthTracker,
     stats: StreamingSupervisorStats,
+    run_state: StreamingRunState,
 }
 
 impl<S: StreamingSession> StreamingSupervisor<S> {
@@ -2153,6 +2213,7 @@ impl<S: StreamingSession> StreamingSupervisor<S> {
             session,
             health: HealthTracker::new(),
             stats: StreamingSupervisorStats::default(),
+            run_state: StreamingRunState::Ready,
         }
     }
 
@@ -2183,8 +2244,62 @@ impl<S: StreamingSession> StreamingSupervisor<S> {
 
     fn compute_backoff_delay(&self, attempt: u32) -> Duration {
         let jitter = pseudo_random_jitter(attempt);
-        let backoff = self.config.compute_backoff_with_jitter(attempt, jitter);
+        let backoff = self
+            .config
+            .compute_backoff_with_jitter(attempt, jitter)
+            .max(1);
         Duration::from_millis(backoff)
+    }
+
+    fn fail_session(&mut self, message: String) -> SupervisorOutcome {
+        tracing::error!(error = %message, "Streaming supervision requires reconciliation");
+        self.health.transition(HealthTransition::ToUnhealthy {
+            reason: message.clone(),
+        });
+        self.run_state = StreamingRunState::Failed(message.clone());
+        SupervisorOutcome::FatalError { message }
+    }
+
+    fn persist_session(&mut self) -> Result<(), SupervisorOutcome> {
+        self.session.persist().map_err(|error| {
+            self.fail_session(format!(
+                "Streaming session persistence failed; durable progress must be reconciled before restarting: {error}"
+            ))
+        })
+    }
+
+    fn finish_run(&mut self, outcome: SupervisorOutcome) -> SupervisorOutcome {
+        if let Err(failure) = self.persist_session() {
+            return failure;
+        }
+        self.run_state = StreamingRunState::Ready;
+        outcome
+    }
+
+    async fn settle_stream_task(
+        &mut self,
+        task: &mut fcp_async_core::task::JoinHandle<Result<(), StreamingError>>,
+        completed: bool,
+        shutdown_started_at: Option<Instant>,
+    ) -> Result<(), SupervisorOutcome> {
+        if completed {
+            return Ok(());
+        }
+        task.abort();
+        let remaining = shutdown_started_at.map_or(self.config.shutdown_timeout(), |started| {
+            self.config
+                .shutdown_timeout()
+                .saturating_sub(started.elapsed())
+        });
+        if fcp_async_core::time::timeout(remaining, task)
+            .await
+            .is_err()
+        {
+            return Err(self.fail_session(
+                "Streaming producer did not settle within the shutdown timeout; reconcile the prior run before restarting".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     fn health_log_fields(&self) -> (u64, u64, u64, u64) {
@@ -2266,6 +2381,25 @@ impl<S: StreamingSession> StreamingSupervisor<S> {
     /// * `shutdown` - Watch channel receiver that signals shutdown when `true`
     /// * `connect_fn` - Async function that establishes a streaming connection
     /// * `handle_event` - Async function that handles incoming events
+    ///
+    /// A handler must return success only after completing a replay-safe
+    /// handoff. Its in-memory session changes remain provisional until that
+    /// successful result is checkpointed, before another event is handled or a
+    /// reconnect is attempted. Provider acknowledgements remain the connector's
+    /// responsibility; checkpointing does not make downstream effects exactly
+    /// once.
+    ///
+    /// Shutdown (including a dropped signal sender) stops admitting new work.
+    /// In-flight connection/handler work and producer settlement share one
+    /// `shutdown_timeout_ms` grace period. The producer must also settle before
+    /// reconnect. A failed
+    /// restore/checkpoint, failed handler, expired grace period, dropped run
+    /// future, or panic unwinding this run fences the supervisor against reuse.
+    /// Reconcile durable state and prior effects before constructing a
+    /// replacement. Synchronous callbacks and persistence hooks must be bounded;
+    /// async deadlines cannot preempt blocking work inside one future poll.
+    /// Connections that repeatedly end without a checkpointed event consume the
+    /// failure budget even when each transport handshake succeeds.
     #[allow(clippy::too_many_lines)]
     pub async fn run<E, ConnectF, ConnectFut, HandleF, HandleFut>(
         &mut self,
@@ -2280,18 +2414,27 @@ impl<S: StreamingSession> StreamingSupervisor<S> {
         HandleFut: std::future::Future<Output = Result<(), StreamingError>>,
     {
         let mut consecutive_failures: u32 = 0;
-
-        if let Err(e) = self.session.restore() {
-            let (heartbeat_seq, ack_seq, missed_heartbeats, reconnect_count) =
-                self.health_log_fields();
-            tracing::warn!(
-                error = %e,
-                heartbeat_seq,
-                ack_seq,
-                missed_heartbeats,
-                reconnect_count,
-                "Failed to restore streaming session state"
-            );
+        let mut shutdown_started_at = None;
+        match &self.run_state {
+            StreamingRunState::Ready => {}
+            StreamingRunState::Running => {
+                return self.fail_session(
+                    "Streaming supervisor run was interrupted; reconcile durable progress and prior effects before restarting".to_owned(),
+                );
+            }
+            StreamingRunState::Failed(message) => {
+                return SupervisorOutcome::FatalError {
+                    message: message.clone(),
+                };
+            }
+        }
+        // This remains Running across every await and callback. If the caller
+        // drops or unwinds the run future, a later run cannot silently resume.
+        self.run_state = StreamingRunState::Running;
+        if let Err(error) = self.session.restore() {
+            return self.fail_session(format!(
+                "Streaming session restoration failed; durable progress must be reconciled before restarting: {error}"
+            ));
         }
 
         // Remain in `Starting` until the first successful connection proves the
@@ -2311,32 +2454,42 @@ impl<S: StreamingSession> StreamingSupervisor<S> {
                     reconnect_count,
                     "Streaming supervisor received shutdown signal"
                 );
-                if let Err(e) = self.session.persist() {
-                    let (heartbeat_seq, ack_seq, missed_heartbeats, reconnect_count) =
-                        self.health_log_fields();
-                    tracing::error!(
-                        error = %e,
-                        heartbeat_seq,
-                        ack_seq,
-                        missed_heartbeats,
-                        reconnect_count,
-                        "Failed to persist session on shutdown"
-                    );
-                }
-                return SupervisorOutcome::Shutdown;
+                return self.finish_run(SupervisorOutcome::Shutdown);
             }
 
-            self.stats.connection_attempts += 1;
-            let connection = match connect_fn(&mut self.session).await {
+            let grace = self.config.shutdown_timeout();
+            let connection_attempt = streaming_work_or_shutdown(
+                async {
+                    self.stats.connection_attempts =
+                        self.stats.connection_attempts.saturating_add(1);
+                    connect_fn(&mut self.session).await
+                },
+                &mut shutdown,
+                grace,
+                &mut shutdown_started_at,
+            )
+            .await;
+            let (result, shutdown_requested) = match connection_attempt {
+                StreamingWorkOutcome::Completed { output, shutdown } => (output, shutdown),
+                StreamingWorkOutcome::ShutdownBeforeStart => {
+                    return self.finish_run(SupervisorOutcome::Shutdown);
+                }
+                StreamingWorkOutcome::ShutdownTimeout => {
+                    return self.fail_session(
+                        "Streaming connection attempt did not finish within the shutdown timeout; reconcile its outcome before restarting".to_owned(),
+                    );
+                }
+            };
+            let connection = match result {
                 Ok(connection) => {
-                    self.stats.successful_connections += 1;
-                    consecutive_failures = 0;
+                    self.stats.successful_connections =
+                        self.stats.successful_connections.saturating_add(1);
                     self.health.record_success();
                     self.health.evaluate(&self.config);
                     connection
                 }
                 Err(err) => {
-                    self.stats.failed_connections += 1;
+                    self.stats.failed_connections = self.stats.failed_connections.saturating_add(1);
                     consecutive_failures = consecutive_failures.saturating_add(1);
                     let message = err.to_string();
 
@@ -2355,36 +2508,33 @@ impl<S: StreamingSession> StreamingSupervisor<S> {
                         "Streaming connection attempt failed"
                     );
 
+                    if shutdown_requested || *shutdown.borrow() {
+                        return self.finish_run(SupervisorOutcome::Shutdown);
+                    }
                     if consecutive_failures >= self.config.max_consecutive_failures {
-                        if let Err(e) = self.session.persist() {
-                            tracing::error!(error = %e, "Failed to persist session");
-                        }
-                        return SupervisorOutcome::MaxFailuresReached {
+                        self.health
+                            .transition(HealthTransition::ToUnhealthy { reason: message });
+                        return self.finish_run(SupervisorOutcome::MaxFailuresReached {
                             failures: consecutive_failures,
-                        };
+                        });
+                    }
+                    // A failed resume may deliberately clear its resume token.
+                    // Commit that completed callback's state before retrying.
+                    if let Err(failure) = self.persist_session() {
+                        return failure;
                     }
 
                     let delay = self.compute_backoff_delay(consecutive_failures - 1);
-                    self.stats.backoff_time_ms +=
-                        u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+                    self.stats.backoff_time_ms = self
+                        .stats
+                        .backoff_time_ms
+                        .saturating_add(u64::try_from(delay.as_millis()).unwrap_or(u64::MAX));
 
                     if fcp_async_core::shutdown::sleep_or_shutdown(delay, &mut shutdown)
                         .await
                         .is_err()
                     {
-                        let (heartbeat_seq, ack_seq, missed_heartbeats, reconnect_count) =
-                            self.health_log_fields();
-                        if let Err(e) = self.session.persist() {
-                            tracing::error!(
-                                error = %e,
-                                heartbeat_seq,
-                                ack_seq,
-                                missed_heartbeats,
-                                reconnect_count,
-                                "Failed to persist session on shutdown"
-                            );
-                        }
-                        return SupervisorOutcome::Shutdown;
+                        return self.finish_run(SupervisorOutcome::Shutdown);
                     }
 
                     continue;
@@ -2393,79 +2543,36 @@ impl<S: StreamingSession> StreamingSupervisor<S> {
 
             let mut events = connection.events;
             let mut join_handle = connection.join_handle;
+            let mut task_completed = false;
+            if shutdown_requested || *shutdown.borrow() {
+                shutdown_started_at.get_or_insert_with(Instant::now);
+                if let Err(failure) = self
+                    .settle_stream_task(&mut join_handle, false, shutdown_started_at)
+                    .await
+                {
+                    return failure;
+                }
+                return self.finish_run(SupervisorOutcome::Shutdown);
+            }
             let mut heartbeat_interval = self
                 .config
                 .heartbeat_interval()
                 .map(fcp_async_core::time::interval);
 
             let mut exit_message = "stream ended".to_string();
-            let mut exit_fatal = false;
 
             loop {
                 fcp_async_core::select! {
-                    _ = shutdown.changed() => {
-                        if *shutdown.borrow() {
-                            let (heartbeat_seq, ack_seq, missed_heartbeats, reconnect_count) =
-                                self.health_log_fields();
-                            tracing::info!(
-                                heartbeat_seq,
-                                ack_seq,
-                                missed_heartbeats,
-                                reconnect_count,
-                                "Streaming supervisor received shutdown signal"
-                            );
-                            join_handle.abort();
-                            if let Err(e) = self.session.persist() {
-                                let (heartbeat_seq, ack_seq, missed_heartbeats, reconnect_count) =
-                                    self.health_log_fields();
-                                tracing::error!(
-                                    error = %e,
-                                    heartbeat_seq,
-                                    ack_seq,
-                                    missed_heartbeats,
-                                    reconnect_count,
-                                    "Failed to persist session on shutdown"
-                                );
-                            }
-                            return SupervisorOutcome::Shutdown;
+                    biased;
+                    _ = fcp_async_core::shutdown::wait_for_shutdown(&mut shutdown) => {
+                        shutdown_started_at.get_or_insert_with(Instant::now);
+                        if let Err(failure) = self
+                            .settle_stream_task(&mut join_handle, task_completed, shutdown_started_at)
+                            .await
+                        {
+                            return failure;
                         }
-                    },
-                    maybe_event = events.recv() => {
-                        if let Some(event) = maybe_event {
-                            self.stats.events_processed += 1;
-                            if let Err(err) = handle_event(event, &mut self.session).await {
-                                let message = err.to_string();
-                                let (heartbeat_seq, ack_seq, missed_heartbeats, reconnect_count) =
-                                    self.health_log_fields();
-                                tracing::error!(
-                                    error = %message,
-                                    heartbeat_seq,
-                                    ack_seq,
-                                    missed_heartbeats,
-                                    reconnect_count,
-                                    "Streaming event handler failed"
-                                );
-                                exit_message = message;
-                                exit_fatal = true;
-                                break;
-                            }
-                            self.health.record_success();
-                            self.health.evaluate(&self.config);
-                        } else {
-                            break;
-                        }
-                    },
-                    result = &mut join_handle => {
-                        match result {
-                            Ok(Ok(())) => {}
-                            Ok(Err(err)) => {
-                                exit_message = err.to_string();
-                            }
-                            Err(err) => {
-                                exit_message = err.to_string();
-                            }
-                        }
-                        break;
+                        return self.finish_run(SupervisorOutcome::Shutdown);
                     },
                     () = async {
                         if let Some(interval) = &mut heartbeat_interval {
@@ -2490,48 +2597,113 @@ impl<S: StreamingSession> StreamingSupervisor<S> {
                                 break;
                             }
                         }
+                    },
+                    result = async {
+                        if task_completed {
+                            std::future::pending().await
+                        } else {
+                            (&mut join_handle).await
+                        }
+                    } => {
+                        task_completed = true;
+                        match result {
+                            Ok(Ok(())) => {}
+                            Ok(Err(err)) => {
+                                exit_message = err.to_string();
+                            }
+                            Err(err) => {
+                                exit_message = err.to_string();
+                            }
+                        }
+                        // The producer can finish while its final events are
+                        // still queued. Stop new sends and drain those events
+                        // through the same handler/checkpoint boundary.
+                        events.close();
+                    },
+                    maybe_event = events.recv() => {
+                        let Some(event) = maybe_event else { break };
+                        let handling = streaming_work_or_shutdown(
+                            async { handle_event(event, &mut self.session).await },
+                            &mut shutdown,
+                            grace,
+                            &mut shutdown_started_at,
+                        ).await;
+                        let shutdown_requested = match handling {
+                            StreamingWorkOutcome::Completed { output: Ok(()), shutdown } => shutdown,
+                            StreamingWorkOutcome::Completed { output: Err(error), .. } => {
+                                // The handler can mutate the resume position
+                                // before a later effect fails. Never save it.
+                                let failure = self.fail_session(error.to_string());
+                                let _ = self.settle_stream_task(&mut join_handle, task_completed, shutdown_started_at).await;
+                                return failure;
+                            }
+                            StreamingWorkOutcome::ShutdownBeforeStart => {
+                                if let Err(failure) = self.settle_stream_task(&mut join_handle, task_completed, shutdown_started_at).await {
+                                    return failure;
+                                }
+                                return self.finish_run(SupervisorOutcome::Shutdown);
+                            }
+                            StreamingWorkOutcome::ShutdownTimeout => {
+                                let failure = self.fail_session(
+                                    "Streaming event handler did not finish within the shutdown timeout; reconcile its effects and resume position before restarting".to_owned(),
+                                );
+                                let _ = self.settle_stream_task(&mut join_handle, task_completed, shutdown_started_at).await;
+                                return failure;
+                            }
+                        };
+                        if let Err(failure) = self.persist_session() {
+                            let _ = self.settle_stream_task(&mut join_handle, task_completed, shutdown_started_at).await;
+                            return failure;
+                        }
+                        self.stats.events_processed = self.stats.events_processed.saturating_add(1);
+                        consecutive_failures = 0;
+                        self.health.record_success();
+                        self.health.evaluate(&self.config);
+                        if shutdown_requested || *shutdown.borrow() {
+                            shutdown_started_at.get_or_insert_with(Instant::now);
+                            if let Err(failure) = self.settle_stream_task(&mut join_handle, task_completed, shutdown_started_at).await {
+                                return failure;
+                            }
+                            return self.finish_run(SupervisorOutcome::Shutdown);
+                        }
                     }
                 }
             }
 
-            if exit_fatal {
-                self.health.transition(HealthTransition::ToUnhealthy {
-                    reason: exit_message.clone(),
-                });
-                join_handle.abort();
-                if let Err(e) = self.session.persist() {
-                    tracing::error!(error = %e, "Failed to persist session");
-                }
-                return SupervisorOutcome::FatalError {
-                    message: exit_message,
-                };
+            if let Err(failure) = self
+                .settle_stream_task(&mut join_handle, task_completed, shutdown_started_at)
+                .await
+            {
+                return failure;
             }
 
             self.health.record_failure(&exit_message);
             self.health.evaluate(&self.config);
-            join_handle.abort();
 
             consecutive_failures = consecutive_failures.saturating_add(1);
             if consecutive_failures >= self.config.max_consecutive_failures {
-                if let Err(e) = self.session.persist() {
-                    tracing::error!(error = %e, "Failed to persist session");
-                }
-                return SupervisorOutcome::MaxFailuresReached {
+                self.health.transition(HealthTransition::ToUnhealthy {
+                    reason: exit_message,
+                });
+                return self.finish_run(SupervisorOutcome::MaxFailuresReached {
                     failures: consecutive_failures,
-                };
+                });
+            }
+            if let Err(failure) = self.persist_session() {
+                return failure;
             }
 
             let delay = self.compute_backoff_delay(consecutive_failures - 1);
-            self.stats.backoff_time_ms += u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+            self.stats.backoff_time_ms = self
+                .stats
+                .backoff_time_ms
+                .saturating_add(u64::try_from(delay.as_millis()).unwrap_or(u64::MAX));
 
             if fcp_async_core::shutdown::sleep_or_shutdown(delay, &mut shutdown)
                 .await
                 .is_err()
             {
-                if let Err(e) = self.session.persist() {
-                    tracing::error!(error = %e, "Failed to persist session on shutdown");
-                }
-                return SupervisorOutcome::Shutdown;
+                return self.finish_run(SupervisorOutcome::Shutdown);
             }
         }
     }
@@ -3715,6 +3887,10 @@ deny_ptrace = true
         outstanding_heartbeats: VecDeque<Instant>,
         persist_calls: Arc<AtomicUsize>,
         restore_calls: Arc<AtomicUsize>,
+        fail_restore: bool,
+        fail_persist_at: Option<usize>,
+        write_before_failure: bool,
+        persisted_sequences: Arc<Mutex<Vec<u64>>>,
     }
 
     impl TestStreamingSession {
@@ -3782,14 +3958,65 @@ deny_ptrace = true
         }
 
         fn persist(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-            self.persist_calls.fetch_add(1, Ordering::SeqCst);
+            let call = self.persist_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            let fail = self.fail_persist_at == Some(call);
+            if !fail || self.write_before_failure {
+                self.persisted_sequences
+                    .lock()
+                    .expect("session checkpoint lock")
+                    .push(self.sequence);
+            }
+            if fail {
+                return Err(boxed_err("session checkpoint write failed"));
+            }
             Ok(())
         }
 
         fn restore(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             self.restore_calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail_restore {
+                return Err(boxed_err("session checkpoint read failed"));
+            }
             Ok(())
         }
+    }
+
+    struct StreamingDropProbe(Arc<AtomicUsize>);
+
+    impl Drop for StreamingDropProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    async fn queued_stream_with_pending_producer(
+        values: Vec<u64>,
+        producer_drops: Arc<AtomicUsize>,
+    ) -> Result<StreamingConnection<u64>, StreamingError> {
+        let (tx, rx) = mpsc::channel(values.len().max(1));
+        for value in values {
+            tx.send(value).await.expect("event receiver alive");
+        }
+        let probe = StreamingDropProbe(producer_drops);
+        let join_handle = fcp_async_core::task::spawn(async move {
+            let _probe = probe;
+            let _tx = tx;
+            std::future::pending::<Result<(), StreamingError>>().await
+        });
+        Ok(StreamingConnection {
+            events: rx,
+            join_handle,
+        })
+    }
+
+    async fn wait_for_streaming_task_drop(drops: &AtomicUsize) {
+        fcp_async_core::time::timeout(Duration::from_secs(1), async {
+            while drops.load(Ordering::SeqCst) == 0 {
+                fcp_async_core::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the owned producer must observe its cancellation");
     }
 
     #[test]
@@ -4279,6 +4506,459 @@ deny_ptrace = true
             assert_eq!(supervisor.stats().connection_attempts, 2);
             assert_eq!(supervisor.streaming_health_state().reconnect_count, 1);
         });
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn streaming_supervisor_fences_failed_session_restore() {
+        let session = TestStreamingSession {
+            fail_restore: true,
+            sequence: 40,
+            ..Default::default()
+        };
+        let mut supervisor = StreamingSupervisor::new(SupervisorConfig::default(), session);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let attempts = AtomicUsize::new(0);
+
+        for _ in 0..2 {
+            let outcome = supervisor
+                .run::<u64, _, _, _, _>(
+                    shutdown_rx.clone(),
+                    |_| {
+                        attempts.fetch_add(1, Ordering::SeqCst);
+                        std::future::ready(Err(boxed_err("unexpected connection")))
+                    },
+                    |_, _| std::future::ready(Ok(())),
+                )
+                .await;
+            assert!(matches!(
+                outcome,
+                SupervisorOutcome::FatalError { message }
+                    if message.contains("restoration") && message.contains("checkpoint read failed")
+            ));
+            supervisor.session_mut().fail_restore = false;
+        }
+        assert_eq!(attempts.load(Ordering::SeqCst), 0);
+        assert_eq!(supervisor.session().restore_calls(), 1);
+        assert_eq!(supervisor.session().persist_calls(), 0);
+        assert!(supervisor.health().is_unhealthy());
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn streaming_supervisor_fences_uncertain_event_checkpoints() {
+        for write_before_failure in [false, true] {
+            let session = TestStreamingSession {
+                sequence: 40,
+                fail_persist_at: Some(1),
+                write_before_failure,
+                ..Default::default()
+            };
+            let mut supervisor = StreamingSupervisor::new(SupervisorConfig::default(), session);
+            let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+            let producer_drops = Arc::new(AtomicUsize::new(0));
+            let handled = AtomicUsize::new(0);
+            let outcome = supervisor
+                .run(
+                    shutdown_rx.clone(),
+                    |_| {
+                        queued_stream_with_pending_producer(
+                            vec![41, 42],
+                            Arc::clone(&producer_drops),
+                        )
+                    },
+                    |event, session| {
+                        handled.fetch_add(1, Ordering::SeqCst);
+                        session.set_sequence(event);
+                        std::future::ready(Ok(()))
+                    },
+                )
+                .await;
+            assert!(matches!(
+                outcome,
+                SupervisorOutcome::FatalError { message }
+                    if message.contains("persistence") && message.contains("checkpoint write failed")
+            ));
+            assert_eq!(handled.load(Ordering::SeqCst), 1);
+            assert_eq!(supervisor.stats().events_processed, 0);
+            assert_eq!(supervisor.stats().connection_attempts, 1);
+            assert_eq!(producer_drops.load(Ordering::SeqCst), 1);
+            assert_eq!(supervisor.session().persist_calls(), 1);
+            let stored = supervisor.session().persisted_sequences.lock().unwrap();
+            assert_eq!(&*stored, if write_before_failure { &[41][..] } else { &[] });
+            drop(stored);
+
+            supervisor.session_mut().fail_persist_at = None;
+            let retry = supervisor
+                .run::<u64, _, _, _, _>(
+                    shutdown_rx,
+                    |_| async { panic!("uncertain checkpoint must not reconnect") },
+                    |_, _| async { panic!("uncertain event must not be replayed") },
+                )
+                .await;
+            assert!(matches!(retry, SupervisorOutcome::FatalError { .. }));
+            assert_eq!(supervisor.session().restore_calls(), 1);
+            assert_eq!(supervisor.session().persist_calls(), 1);
+            assert!(supervisor.health().is_unhealthy());
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn streaming_supervisor_drains_completed_producer_before_reconnecting() {
+        let session = TestStreamingSession {
+            sequence: 40,
+            ..Default::default()
+        };
+        let config = SupervisorConfig {
+            heartbeat_interval_ms: 0,
+            base_backoff_ms: 1,
+            jitter_enabled: false,
+            ..Default::default()
+        };
+        let mut supervisor = StreamingSupervisor::new(config, session);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let connections = AtomicUsize::new(0);
+        let retained_sender = Arc::new(Mutex::new(None));
+        let handled = Arc::new(Mutex::new(Vec::new()));
+        let outcome = supervisor
+            .run(
+                shutdown_rx,
+                |session| {
+                    let attempt = connections.fetch_add(1, Ordering::SeqCst);
+                    let recorded = session.persisted_sequences.lock().unwrap().clone();
+                    let sequence = session.sequence();
+                    let shutdown_tx = shutdown_tx.clone();
+                    let retained_sender = Arc::clone(&retained_sender);
+                    async move {
+                        if attempt != 0 {
+                            assert_eq!(attempt, 1);
+                            assert_eq!(sequence, 43);
+                            assert!(recorded.starts_with(&[41, 42, 43]));
+                            shutdown_tx.send(true).unwrap();
+                            return Err(boxed_err("stop after inspecting durable resume"));
+                        }
+                        let (tx, rx) = mpsc::channel(3);
+                        for event in [41, 42, 43] {
+                            tx.send(event).await.unwrap();
+                        }
+                        // Even a stray sender must not keep a completed
+                        // producer's event queue open forever.
+                        *retained_sender.lock().unwrap() = Some(tx);
+                        let join_handle = fcp_async_core::task::spawn(async { Ok(()) });
+                        while !join_handle.is_finished() {
+                            fcp_async_core::task::yield_now().await;
+                        }
+                        Ok(StreamingConnection {
+                            events: rx,
+                            join_handle,
+                        })
+                    }
+                },
+                |event, session| {
+                    let prior = handled.lock().unwrap().last().copied();
+                    if let Some(prior) = prior {
+                        assert_eq!(
+                            session.persisted_sequences.lock().unwrap().last().copied(),
+                            Some(prior),
+                        );
+                    }
+                    handled.lock().unwrap().push(event);
+                    session.set_sequence(event);
+                    std::future::ready(Ok(()))
+                },
+            )
+            .await;
+        assert!(matches!(outcome, SupervisorOutcome::Shutdown));
+        assert_eq!(*handled.lock().unwrap(), vec![41, 42, 43]);
+        assert_eq!(supervisor.stats().events_processed, 3);
+        assert_eq!(connections.load(Ordering::SeqCst), 2);
+        assert!(
+            retained_sender
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .is_closed()
+        );
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn streaming_supervisor_never_persists_a_failed_handler_position() {
+        let session = TestStreamingSession {
+            sequence: 40,
+            ..Default::default()
+        };
+        let mut supervisor = StreamingSupervisor::new(SupervisorConfig::default(), session);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let producer_drops = Arc::new(AtomicUsize::new(0));
+        let outcome = supervisor
+            .run(
+                shutdown_rx.clone(),
+                |_| queued_stream_with_pending_producer(vec![41], Arc::clone(&producer_drops)),
+                |event, session| {
+                    session.set_sequence(event);
+                    std::future::ready(Err(boxed_err("delivery failed after advancing memory")))
+                },
+            )
+            .await;
+        assert!(matches!(outcome, SupervisorOutcome::FatalError { .. }));
+        assert_eq!(supervisor.session().sequence(), 41);
+        assert_eq!(supervisor.session().persist_calls(), 0);
+        assert_eq!(supervisor.stats().events_processed, 0);
+        assert_eq!(producer_drops.load(Ordering::SeqCst), 1);
+        let retry = supervisor
+            .run::<u64, _, _, _, _>(
+                shutdown_rx,
+                |_| async { panic!("failed handler must fence reuse") },
+                |_, _| std::future::ready(Ok(())),
+            )
+            .await;
+        assert!(matches!(retry, SupervisorOutcome::FatalError { .. }));
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn streaming_supervisor_reports_terminal_checkpoint_failures() {
+        for shutdown in [false, true] {
+            let session = TestStreamingSession {
+                fail_persist_at: Some(1),
+                ..Default::default()
+            };
+            let config = SupervisorConfig::default().with_max_consecutive_failures(1);
+            let mut supervisor = StreamingSupervisor::new(config, session);
+            let (_shutdown_tx, shutdown_rx) = watch::channel(shutdown);
+            let outcome = supervisor
+                .run::<u64, _, _, _, _>(
+                    shutdown_rx,
+                    |_| std::future::ready(Err(boxed_err("connect failed"))),
+                    |_, _| std::future::ready(Ok(())),
+                )
+                .await;
+            assert!(matches!(
+                outcome,
+                SupervisorOutcome::FatalError { message } if message.contains("persistence")
+            ));
+            assert!(supervisor.health().is_unhealthy());
+            assert_eq!(supervisor.session().persist_calls(), 1);
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn streaming_supervisor_bounds_shutdown_during_connection() {
+        let config = SupervisorConfig {
+            shutdown_timeout_ms: 5,
+            ..Default::default()
+        };
+        let mut supervisor = StreamingSupervisor::new(config, TestStreamingSession::default());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (started_tx, mut started_rx) = watch::channel(false);
+        let connection_drops = Arc::new(AtomicUsize::new(0));
+        let stopper = fcp_async_core::task::spawn(async move {
+            let _ = fcp_async_core::shutdown::wait_for_shutdown(&mut started_rx).await;
+            shutdown_tx.send(true).unwrap();
+        });
+        let run = supervisor.run::<u64, _, _, _, _>(
+            shutdown_rx,
+            |session| {
+                session.set_sequence(99);
+                let started_tx = started_tx.clone();
+                let probe = StreamingDropProbe(Arc::clone(&connection_drops));
+                async move {
+                    let _probe = probe;
+                    started_tx.send(true).unwrap();
+                    std::future::pending().await
+                }
+            },
+            |_, _| std::future::ready(Ok(())),
+        );
+        let outcome = fcp_async_core::time::timeout(Duration::from_secs(1), run)
+            .await
+            .expect("stalled connection must not block shutdown");
+        stopper.await.unwrap();
+        assert!(matches!(
+            outcome,
+            SupervisorOutcome::FatalError { message } if message.contains("connection attempt")
+        ));
+        assert_eq!(connection_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(supervisor.session().persist_calls(), 0);
+        assert!(supervisor.health().is_unhealthy());
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn streaming_supervisor_commits_only_handlers_that_finish_during_shutdown() {
+        for completes in [false, true] {
+            let config = SupervisorConfig {
+                shutdown_timeout_ms: if completes { 1_000 } else { 10 },
+                ..Default::default()
+            };
+            let mut supervisor = StreamingSupervisor::new(config, TestStreamingSession::default());
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let (started_tx, mut started_rx) = watch::channel(false);
+            let (release_tx, release_rx) = watch::channel(false);
+            let producer_drops = Arc::new(AtomicUsize::new(0));
+            let handler_drops = Arc::new(AtomicUsize::new(0));
+            let stopper = fcp_async_core::task::spawn(async move {
+                let _ = fcp_async_core::shutdown::wait_for_shutdown(&mut started_rx).await;
+                shutdown_tx.send(true).unwrap();
+                release_tx.send(true).unwrap();
+            });
+            let run = supervisor.run(
+                shutdown_rx,
+                |_| queued_stream_with_pending_producer(vec![41, 42], Arc::clone(&producer_drops)),
+                |event, session| {
+                    session.set_sequence(event);
+                    let started_tx = started_tx.clone();
+                    let mut release_rx = release_rx.clone();
+                    let probe = StreamingDropProbe(Arc::clone(&handler_drops));
+                    async move {
+                        let _probe = probe;
+                        started_tx.send(true).unwrap();
+                        if completes {
+                            let _ =
+                                fcp_async_core::shutdown::wait_for_shutdown(&mut release_rx).await;
+                            Ok(())
+                        } else {
+                            std::future::pending().await
+                        }
+                    }
+                },
+            );
+            let outcome = fcp_async_core::time::timeout(Duration::from_secs(1), run)
+                .await
+                .expect("stalled event handler must not block shutdown");
+            stopper.await.unwrap();
+            wait_for_streaming_task_drop(&producer_drops).await;
+            assert_eq!(producer_drops.load(Ordering::SeqCst), 1);
+            assert_eq!(handler_drops.load(Ordering::SeqCst), 1);
+            if completes {
+                assert!(matches!(outcome, SupervisorOutcome::Shutdown));
+                assert_eq!(supervisor.stats().events_processed, 1);
+                assert_eq!(supervisor.session().persist_calls(), 2);
+                assert_eq!(
+                    *supervisor.session().persisted_sequences.lock().unwrap(),
+                    vec![41, 41]
+                );
+            } else {
+                assert!(matches!(
+                    outcome,
+                    SupervisorOutcome::FatalError { message } if message.contains("event handler")
+                ));
+                assert_eq!(supervisor.stats().events_processed, 0);
+                assert_eq!(supervisor.session().persist_calls(), 0);
+            }
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn streaming_supervisor_stops_when_shutdown_sender_is_dropped() {
+        let mut supervisor =
+            StreamingSupervisor::new(SupervisorConfig::default(), TestStreamingSession::default());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (connected_tx, mut connected_rx) = watch::channel(false);
+        let producer_drops = Arc::new(AtomicUsize::new(0));
+        let closer = fcp_async_core::task::spawn(async move {
+            let _ = fcp_async_core::shutdown::wait_for_shutdown(&mut connected_rx).await;
+            drop(shutdown_tx);
+        });
+        let run = supervisor.run(
+            shutdown_rx,
+            |_| {
+                let connected_tx = connected_tx.clone();
+                let producer_drops = Arc::clone(&producer_drops);
+                async move {
+                    let connection =
+                        queued_stream_with_pending_producer(Vec::new(), producer_drops).await;
+                    connected_tx.send(true).unwrap();
+                    connection
+                }
+            },
+            |_, _| std::future::ready(Ok(())),
+        );
+        let outcome = fcp_async_core::time::timeout(Duration::from_secs(1), run)
+            .await
+            .expect("closed watch channel must stop without spinning");
+        closer.await.unwrap();
+        assert!(matches!(outcome, SupervisorOutcome::Shutdown));
+        assert_eq!(producer_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(supervisor.session().persist_calls(), 1);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn streaming_supervisor_fences_dropped_run_during_handler() {
+        let mut supervisor =
+            StreamingSupervisor::new(SupervisorConfig::default(), TestStreamingSession::default());
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (started_tx, mut started_rx) = watch::channel(false);
+        let producer_drops = Arc::new(AtomicUsize::new(0));
+        let handler_drops = Arc::new(AtomicUsize::new(0));
+        {
+            let mut run = std::pin::pin!(supervisor.run(
+                shutdown_rx.clone(),
+                |_| queued_stream_with_pending_producer(vec![41], Arc::clone(&producer_drops)),
+                |event, session| {
+                    session.set_sequence(event);
+                    let started_tx = started_tx.clone();
+                    let probe = StreamingDropProbe(Arc::clone(&handler_drops));
+                    async move {
+                        let _probe = probe;
+                        started_tx.send(true).unwrap();
+                        std::future::pending().await
+                    }
+                },
+            ));
+            fcp_async_core::select! {
+                _ = fcp_async_core::shutdown::wait_for_shutdown(&mut started_rx) => {},
+                outcome = run.as_mut() => panic!("handler should still be pending: {outcome:?}"),
+            }
+        }
+        let retry = supervisor
+            .run::<u64, _, _, _, _>(
+                shutdown_rx,
+                |_| async { panic!("dropped run must not reconnect") },
+                |_, _| std::future::ready(Ok(())),
+            )
+            .await;
+        assert!(matches!(
+            retry,
+            SupervisorOutcome::FatalError { message } if message.contains("interrupted")
+        ));
+        assert_eq!(handler_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(supervisor.session().persist_calls(), 0);
+        assert_eq!(supervisor.session().restore_calls(), 1);
+        wait_for_streaming_task_drop(&producer_drops).await;
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn streaming_supervisor_exhausts_repeated_empty_connections() {
+        let config = SupervisorConfig {
+            heartbeat_interval_ms: 0,
+            base_backoff_ms: 0,
+            max_backoff_ms: 0,
+            max_consecutive_failures: 2,
+            ..Default::default()
+        };
+        let mut supervisor = StreamingSupervisor::new(config, TestStreamingSession::default());
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let run = supervisor.run::<u64, _, _, _, _>(
+            shutdown_rx,
+            |_| async {
+                let (tx, rx) = mpsc::channel(1);
+                drop(tx);
+                Ok(StreamingConnection {
+                    events: rx,
+                    join_handle: fcp_async_core::task::spawn(async { Ok(()) }),
+                })
+            },
+            |_, _| std::future::ready(Ok(())),
+        );
+        let outcome = fcp_async_core::time::timeout(Duration::from_secs(1), run)
+            .await
+            .expect("empty connections must not reset the failure budget");
+        assert!(matches!(
+            outcome,
+            SupervisorOutcome::MaxFailuresReached { failures: 2 }
+        ));
+        assert_eq!(supervisor.stats().connection_attempts, 2);
+        assert_eq!(supervisor.stats().events_processed, 0);
+        assert!(supervisor.stats().backoff_time_ms >= 1);
+        assert!(supervisor.health().is_unhealthy());
     }
 
     // ─────────────────────────────────────────────────────────────────────────
