@@ -841,6 +841,134 @@ mod tests {
         .unwrap()
     }
 
+    type ReadOperation = fn(&SqliteClient, &str, &[serde_json::Value]) -> SqliteResult<QueryResult>;
+
+    #[test]
+    fn read_only_operations_reject_prepare_time_pragma_effects() {
+        let operations: [ReadOperation; 2] = [SqliteClient::query, SqliteClient::explain];
+        for operation in operations {
+            for (name, sql) in [
+                ("foreign_keys", "PRAGMA foreign_keys = OFF"),
+                ("foreign_keys", "PRAGMA main.foreign_keys(OFF)"),
+                ("query_only", "PRAGMA query_only = ON"),
+                ("cache_size", "PRAGMA cache_size = 321"),
+                ("writable_schema", "PRAGMA writable_schema = ON"),
+                ("trusted_schema", "PRAGMA trusted_schema = OFF"),
+            ] {
+                let client = memory_client();
+                let before: i64 = client
+                    .connection
+                    .pragma_query_value(None, name, |row| row.get(0))
+                    .unwrap();
+
+                let error = operation(&client, sql, &[]).unwrap_err();
+                assert!(matches!(error, SqliteError::Policy(_)), "{sql}: {error}");
+                assert!(error.to_string().contains("read-only"), "{sql}: {error}");
+
+                let after: i64 = client
+                    .connection
+                    .pragma_query_value(None, name, |row| row.get(0))
+                    .unwrap();
+                assert_eq!(after, before, "{sql} changed state during preparation");
+
+                client
+                    .execute("CREATE TABLE allowed_write (id INTEGER)", &[])
+                    .unwrap();
+                assert_eq!(
+                    client.query("SELECT 1", &[]).unwrap().rows,
+                    vec![vec![json!(1)]]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn read_only_operations_reject_mutations_without_changing_data_or_schema() {
+        let operations: [ReadOperation; 2] = [SqliteClient::query, SqliteClient::explain];
+        for operation in operations {
+            for sql in [
+                "INSERT INTO widgets VALUES (2, 'changed')",
+                "UPDATE widgets SET name = 'changed'",
+                "DELETE FROM widgets",
+                "DROP TABLE widgets",
+                "ALTER TABLE widgets ADD COLUMN extra TEXT",
+                "CREATE TABLE unexpected (id INTEGER)",
+            ] {
+                let client = memory_client();
+                client
+                    .execute("CREATE TABLE widgets (id INTEGER, name TEXT)", &[])
+                    .unwrap();
+                client
+                    .execute("INSERT INTO widgets VALUES (1, 'original')", &[])
+                    .unwrap();
+                let schema_before = client
+                    .query("SELECT name, sql FROM sqlite_schema ORDER BY name", &[])
+                    .unwrap();
+
+                let error = operation(&client, sql, &[]).unwrap_err();
+                assert!(error.to_string().contains("read-only"), "{sql}: {error}");
+                assert_eq!(
+                    client.query("SELECT id, name FROM widgets", &[]).unwrap().rows,
+                    vec![vec![json!(1), json!("original")]],
+                    "{sql}"
+                );
+                assert_eq!(
+                    client
+                        .query("SELECT name, sql FROM sqlite_schema ORDER BY name", &[])
+                        .unwrap(),
+                    schema_before,
+                    "{sql}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn read_only_queries_and_explain_keep_parameter_binding_and_pragma_reads() {
+        let client = memory_client();
+        client
+            .execute("CREATE TABLE widgets (id INTEGER, name TEXT)", &[])
+            .unwrap();
+        client
+            .execute(
+                "INSERT INTO widgets VALUES (?1, ?2)",
+                &[json!(7), json!("needle")],
+            )
+            .unwrap();
+        let sql = "SELECT id FROM widgets WHERE name = ?1";
+        assert_eq!(
+            client.query(sql, &[json!("needle")]).unwrap().rows,
+            vec![vec![json!(7)]]
+        );
+        assert!(client.explain(sql, &[json!("needle")]).unwrap().row_count > 0);
+        assert_eq!(
+            client.read_pragma("foreign_keys").unwrap().rows,
+            vec![vec![json!(1)]]
+        );
+    }
+
+    #[test]
+    fn read_only_preparation_preserves_syntax_and_binding_errors() {
+        let client = memory_client();
+        for operation in [SqliteClient::query as ReadOperation, SqliteClient::explain] {
+            assert!(matches!(
+                operation(&client, "not valid SQL", &[]),
+                Err(SqliteError::Rusqlite(_))
+            ));
+            assert!(matches!(
+                operation(&client, "SELECT ?1", &[]),
+                Err(SqliteError::Rusqlite(_))
+            ));
+        }
+        client
+            .execute("CREATE TABLE after_failure (id INTEGER)", &[])
+            .unwrap();
+        assert_eq!(
+            client.query("SELECT 42", &[]).unwrap().rows,
+            vec![vec![json!(42)]]
+        );
+    }
+
     #[test]
     fn normalize_pragma_name_lowercases_supported_names() {
         assert_eq!(

@@ -152,7 +152,10 @@ async fn file_backed_sqlite_acceptance_exercises_real_local_boundary() {
     )
     .await;
 
-    connector.handle_shutdown(json!({})).await.unwrap();
+    connector
+        .handle_shutdown(json!({"type": "shutdown"}))
+        .await
+        .unwrap();
     let mut reopened = configured_file_connector(&database_path).await;
     let persisted = invoke(
         &mut reopened,

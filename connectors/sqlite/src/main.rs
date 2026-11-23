@@ -57,7 +57,10 @@ fn run_fcp_loop_with_io<R: BufRead, W: Write>(reader: R, writer: W) -> Result<()
     });
     // Flush the shutdown acknowledgement before exit. EOF and transport errors
     // also close the connection, rolling back any uncommitted transaction.
-    let cleanup = runtime.block_on(connector.handle_shutdown(serde_json::json!({})));
+    let cleanup = runtime.block_on(connector.handle_shutdown(serde_json::json!({
+        "type": "shutdown", "drain": false, "deadline_ms": 1_000,
+        "reason": "Native control channel closed",
+    })));
     result?;
     cleanup?;
     Ok(())

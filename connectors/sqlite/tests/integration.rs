@@ -959,7 +959,10 @@ async fn rejected_reconfiguration_and_shutdown_discard_old_session_authority() {
         json!({"sql": "SELECT 1"}),
         database_constraints(),
     );
-    connector.handle_shutdown(json!({})).await.unwrap();
+    connector
+        .handle_shutdown(json!({"type": "shutdown"}))
+        .await
+        .unwrap();
     assert!(connector.handle_invoke(old).await.is_err());
     assert_eq!(
         connector.handle_health().await.unwrap()["details"]["handshaken"],

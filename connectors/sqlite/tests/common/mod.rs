@@ -63,6 +63,7 @@ pub fn signed_request(
         "operation": operation,
         "input": input,
         "capability_token": CapabilityToken::from_raw(token),
+        "lease_seq": 1,
     })
 }
 

@@ -11,7 +11,7 @@ use fcp_manifest::{ConnectorManifest, ManifestApprovalMode, OperationSection};
 use fcp_prelude::{
     ApprovalMode, BaseConnector, ConnectorId, FcpError, FcpResult, HandshakeRequest,
     HealthSnapshot, InstanceId, InvokeRequest, InvokeResponse, OperationId, OperationInfo,
-    SelfCheckReport, SimulateRequest, SimulateResponse, ZoneId,
+    SelfCheckReport, ShutdownRequest, SimulateRequest, SimulateResponse, ZoneId,
 };
 use fcp_sdk::prelude::{OperationContractSet, StandaloneSession};
 use serde::{Deserialize, Serialize};
@@ -20,7 +20,7 @@ use tracing::{info, instrument};
 use uuid::Uuid;
 
 use crate::{
-    client::SqliteClient,
+    client::{MAX_RESULT_BYTES, MAX_RESULT_ROWS, SqliteClient},
     error::SqliteError,
     types::{BatchStatement, SqliteConfig, SqliteHealth, TransactionMode, TransactionState},
 };
@@ -133,6 +133,8 @@ pub struct SqliteConnector {
     session_id: Option<String>,
     active_transaction_id: Option<String>,
     active_transaction_mode: Option<TransactionMode>,
+    transaction_owner: Option<(String, String)>,
+    lease_seq: Option<u64>,
     request_count: AtomicU64,
     error_count: AtomicU64,
     started_at: Instant,
@@ -150,6 +152,8 @@ impl SqliteConnector {
             session_id: None,
             active_transaction_id: None,
             active_transaction_mode: None,
+            transaction_owner: None,
+            lease_seq: None,
             request_count: AtomicU64::new(0),
             error_count: AtomicU64::new(0),
             started_at: Instant::now(),
@@ -178,12 +182,14 @@ impl SqliteConnector {
         self.bound_zone = None;
         self.active_transaction_id = None;
         self.active_transaction_mode = None;
+        self.transaction_owner = None;
+        self.lease_seq = None;
         self.base.set_configured(false);
     }
 
     fn rollback_session_transaction(&mut self) -> FcpResult<()> {
-        if self.active_transaction_id.is_some()
-            && let Some(client) = &self.client
+        if let Some(client) = &self.client
+            && client.is_in_transaction()
             && let Err(error) = client.rollback_transaction()
         {
             // Do not reactivate a connection whose transaction state is unknown.
@@ -192,7 +198,17 @@ impl SqliteConnector {
         }
         self.active_transaction_id = None;
         self.active_transaction_mode = None;
+        self.transaction_owner = None;
         Ok(())
+    }
+
+    fn probe_health(&self) -> Result<SqliteHealth, SqliteError> {
+        let client = self.require_client()?;
+        let _guard = client.begin_invocation(
+            Instant::now() + Duration::from_secs(5),
+            MAX_NATIVE_RESPONSE_BYTES,
+        )?;
+        client.health_check()
     }
 
     /// Handle the `configure` method.
@@ -260,6 +276,7 @@ impl SqliteConnector {
         result["instance_id"] = json!(self.base.instance_id);
         result["connector_id"] = json!(self.base.id);
         result["protocol_version"] = json!("2.0");
+        result["resource_uris"] = json!([DATABASE_RESOURCE_URI]);
         Ok(result)
     }
 
@@ -300,7 +317,7 @@ impl SqliteConnector {
             .config
             .as_ref()
             .map(SqliteConfig::provisioning_readiness);
-        let probe = self.client.as_ref().map(SqliteClient::health_check);
+        let probe = self.client.as_ref().map(|_| self.probe_health());
         let checks = vec![
             DoctorCheck {
                 name: "configuration".into(),
@@ -395,12 +412,12 @@ impl SqliteConnector {
             return serialize_self_check(report);
         }
 
-        let Some(client) = &self.client else {
+        if self.client.is_none() {
             return serialize_self_check(SelfCheckReport::failed(
                 "client_missing",
                 "SQLite client is missing; re-run configure",
             ));
-        };
+        }
 
         if self.session_id.is_none() {
             let mut report = SelfCheckReport::degraded(
@@ -418,7 +435,7 @@ impl SqliteConnector {
             return serialize_self_check(report);
         }
 
-        match client.health_check() {
+        match self.probe_health() {
             Ok(health) if health.query_ok => {
                 let mut report = SelfCheckReport::ok();
                 report.details = Some(self_check_details(
@@ -472,6 +489,12 @@ impl SqliteConnector {
             "operations": serde_json::to_value(operations_info()).unwrap_or_default(),
             "provisioning": self.config.as_ref().map(SqliteConfig::provisioning_readiness),
             "guidance": operator_guidance(),
+            "limits": {
+                "max_deadline_ms": MAX_INVOCATION_TIMEOUT_MS,
+                "max_result_rows": MAX_RESULT_ROWS,
+                "max_result_bytes": MAX_RESULT_BYTES,
+                "max_response_bytes": MAX_NATIVE_RESPONSE_BYTES,
+            },
             "compliance": {
                 "protocol_version": "2.0",
                 "network_required": false,
@@ -526,11 +549,30 @@ impl SqliteConnector {
             ));
         }
         let resources = self.prepare_operation(&request.operation, &request.input)?;
+        let lease_seq = request
+            .lease_seq
+            .ok_or_else(|| invalid_request("SQLite singleton invocations require lease_seq"))?;
+        if self.lease_seq.is_some_and(|previous| lease_seq < previous) {
+            return Err(FcpError::CapabilityDenied {
+                capability: "sqlite.lease".into(),
+                reason: "Invocation carries a stale singleton lease sequence".into(),
+            });
+        }
         let witness = self
             .authority
             .as_ref()
             .ok_or(FcpError::NotHandshaken)?
             .admit_bounded(&request, &resources, MAX_NATIVE_RESPONSE_BYTES)?;
+        let owner = verified_owner(witness.token())?;
+        if self.lease_seq.is_some_and(|previous| lease_seq > previous) {
+            self.rollback_session_transaction()?;
+        }
+        self.lease_seq = Some(lease_seq);
+        self.validate_transaction_owner(&owner)?;
+        // A verified lease handoff first rolls back the previous transaction,
+        // then evaluates the new request against the resulting state.
+        self.validate_operation_input(request.operation.as_str(), &request.input)
+            .map_err(|error| error.to_fcp_error())?;
         let deadline = started_at
             + Duration::from_millis(
                 request
@@ -551,9 +593,12 @@ impl SqliteConnector {
         // The private host channel has already enforced approval, holder-proof,
         // revocation and lease policy. Unsigned approval metadata supplied here
         // is never accepted as an independent source of authority.
-        let result = self
+        let mut result = self
             .dispatch_operation(request.operation.as_str(), &request.input)
             .await;
+        if Instant::now() >= deadline {
+            result = Err(SqliteError::DeadlineExceeded);
+        }
         drop(guard);
         if self
             .client
@@ -564,6 +609,15 @@ impl SqliteConnector {
             // interrupted. Do not retain an unusable transaction identifier.
             self.active_transaction_id = None;
             self.active_transaction_mode = None;
+            self.transaction_owner = None;
+        } else if request.operation.as_str() == "sqlite.transaction.begin" {
+            if result.is_ok() && self.active_transaction_id.is_some() {
+                self.transaction_owner = Some(owner);
+            } else {
+                // BEGIN can take effect immediately before deadline expiry.
+                // Its unpublished ID must not strand an open transaction.
+                self.rollback_session_transaction()?;
+            }
         } else if self.active_transaction_id.is_none() {
             // A deadline can expire immediately after BEGIN succeeds, before
             // its transaction identifier is published. Never let later writes
@@ -582,11 +636,22 @@ impl SqliteConnector {
             Err(error) => InvokeResponse::error(request.id.clone(), error.to_fcp_error()),
         };
         response.resource_uris = resources;
-        operation_contracts()?.validate_response(&request.operation, &request.id, &response)?;
-        if Instant::now() >= deadline {
-            return Err(SqliteError::DeadlineExceeded.to_fcp_error());
+        let completion = operation_contracts()?
+            .validate_response(&request.operation, &request.id, &response)
+            .and_then(|()| {
+                if Instant::now() >= deadline {
+                    return Err(SqliteError::DeadlineExceeded.to_fcp_error());
+                }
+                witness.finish_response(&response)
+            });
+        if let Err(error) = completion {
+            if request.operation.as_str() == "sqlite.transaction.begin" {
+                // A tiny admitted output budget can reject the transaction
+                // envelope after BEGIN. No caller received its ID: roll back.
+                self.rollback_session_transaction()?;
+            }
+            return Err(error);
         }
-        witness.finish_response(&response)?;
         match response {
             InvokeResponse {
                 error: Some(error), ..
@@ -631,7 +696,8 @@ impl SqliteConnector {
         let result = self
             .prepare_operation(&request.operation, &request.input)
             .and_then(|resources| {
-                self.authority
+                let token = self
+                    .authority
                     .as_ref()
                     .ok_or(FcpError::NotHandshaken)?
                     .authorize(
@@ -640,8 +706,10 @@ impl SqliteConnector {
                         &request.operation,
                         request.capability_token,
                         &resources,
-                    )
-                    .map(drop)
+                    )?;
+                self.validate_transaction_owner(&verified_owner(&token)?)?;
+                self.validate_operation_input(request.operation.as_str(), &request.input)
+                    .map_err(|error| error.to_fcp_error())
             });
         encode(match result {
             Ok(()) => SimulateResponse::allowed(request.id),
@@ -658,8 +726,6 @@ impl SqliteConnector {
     ) -> FcpResult<Vec<String>> {
         self.base.check_ready()?;
         operation_contracts()?.validate_input(operation, input)?;
-        self.validate_operation_input(operation.as_str(), input)
-            .map_err(|error| error.to_fcp_error())?;
         // This connector binds one database per instance. SQL is not advertised
         // as table-scoped authority: every statement requires the database URI.
         let mut resources = vec![DATABASE_RESOURCE_URI.to_owned()];
@@ -667,6 +733,20 @@ impl SqliteConnector {
             resources.push(format!("sqlite:transaction:{txn_id}"));
         }
         Ok(resources)
+    }
+
+    fn validate_transaction_owner(&self, owner: &(String, String)) -> FcpResult<()> {
+        if self
+            .transaction_owner
+            .as_ref()
+            .is_some_and(|active| active != owner)
+        {
+            return Err(FcpError::CapabilityDenied {
+                capability: "sqlite.transaction".into(),
+                reason: "The active transaction belongs to another authenticated principal".into(),
+            });
+        }
+        Ok(())
     }
 
     fn validate_operation_input(
@@ -752,10 +832,15 @@ impl SqliteConnector {
     /// Handle the `shutdown` method.
     pub async fn handle_shutdown(
         &mut self,
-        _params: serde_json::Value,
+        params: serde_json::Value,
     ) -> FcpResult<serde_json::Value> {
-        info!("SQLite connector shutting down");
         self.clear_configuration();
+        let request: ShutdownRequest = serde_json::from_value(params)
+            .map_err(|_| invalid_request("Invalid FCP shutdown request"))?;
+        if request.r#type != "shutdown" {
+            return Err(invalid_request("Shutdown requires type shutdown"));
+        }
+        info!("SQLite connector shutting down");
         Ok(json!({"status": "shutdown", "quiescent": true}))
     }
 
@@ -1239,6 +1324,22 @@ fn invalid_request(message: &str) -> FcpError {
     FcpError::InvalidRequest {
         code: 1003,
         message: message.to_owned(),
+    }
+}
+
+fn verified_owner(
+    token: &fcp_prelude::CapabilityToken<fcp_core::BoundVerified>,
+) -> FcpResult<(String, String)> {
+    let claims = token.claims();
+    match (
+        claims.get_issuer().filter(|value| !value.is_empty()),
+        claims.get_principal_id().filter(|value| !value.is_empty()),
+    ) {
+        (Some(issuer), Some(principal)) => Ok((issuer.into(), principal.into())),
+        _ => Err(FcpError::CapabilityDenied {
+            capability: "sqlite.transaction".into(),
+            reason: "SQLite requires an authenticated issuer and principal".into(),
+        }),
     }
 }
 
