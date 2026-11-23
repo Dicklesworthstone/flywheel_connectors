@@ -942,6 +942,20 @@ impl RepairController {
         &self.config
     }
 
+    const fn placement_node_deficit(
+        coverage: &CoverageEvaluation,
+        policy: &ObjectPlacementPolicy,
+    ) -> u8 {
+        // Both placement floors constrain the distinct nodes counted by coverage.
+        // Satisfying source diversity alone must not suppress replica repair.
+        let required = if policy.min_nodes > policy.min_source_diversity {
+            policy.min_nodes
+        } else {
+            policy.min_source_diversity
+        };
+        coverage.diversity_deficit(required)
+    }
+
     const fn evaluate_reason_code(
         &self,
         coverage: &CoverageEvaluation,
@@ -951,14 +965,14 @@ impl RepairController {
             return Some(RepairEvaluationReasonCode::PolicySloDeficit);
         }
 
-        if coverage.diversity_deficit(policy.min_source_diversity) > 0
+        if Self::placement_node_deficit(coverage, policy) > 0
             || coverage.concentration_deficit_bps(policy.max_node_fraction_bps) > 0
         {
             return Some(RepairEvaluationReasonCode::DiversityDeficit);
         }
 
-        if coverage.coverage_deficit_bps(policy.target_coverage_bps) >= self.config.min_deficit_bps
-        {
+        let deficit = coverage.coverage_deficit_bps(policy.target_coverage_bps);
+        if deficit > 0 && deficit >= self.config.min_deficit_bps {
             return Some(RepairEvaluationReasonCode::PolicySloDeficit);
         }
 
@@ -983,7 +997,7 @@ impl RepairController {
         policy: &ObjectPlacementPolicy,
     ) -> u32 {
         let health = coverage.health(policy);
-        let diversity_deficit = coverage.diversity_deficit(policy.min_source_diversity);
+        let diversity_deficit = Self::placement_node_deficit(coverage, policy);
         let concentration_deficit =
             coverage.concentration_deficit_bps(policy.max_node_fraction_bps);
 
@@ -1023,15 +1037,15 @@ impl RepairController {
             return Some(RepairReasonCode::PolicySloDeficit);
         }
 
-        if coverage.diversity_deficit(policy.min_source_diversity) > 0 {
+        if Self::placement_node_deficit(coverage, policy) > 0 {
             return Some(RepairReasonCode::DiversityDeficit);
         }
         if coverage.concentration_deficit_bps(policy.max_node_fraction_bps) > 0 {
             return Some(RepairReasonCode::DiversityDeficit);
         }
 
-        if coverage.coverage_deficit_bps(policy.target_coverage_bps) >= self.config.min_deficit_bps
-        {
+        let deficit = coverage.coverage_deficit_bps(policy.target_coverage_bps);
+        if deficit > 0 && deficit >= self.config.min_deficit_bps {
             return Some(RepairReasonCode::PolicySloDeficit);
         }
 
@@ -1070,7 +1084,7 @@ impl RepairController {
         options: &RepairPlanningOptions,
     ) -> RepairPlanAction {
         let coverage_symbols = coverage.symbols_needed(policy.target_coverage_bps);
-        let diversity_symbols = u32::from(coverage.diversity_deficit(policy.min_source_diversity));
+        let diversity_symbols = u32::from(Self::placement_node_deficit(coverage, policy));
         let concentration_symbols =
             coverage.concentration_repair_symbols_needed(policy.max_node_fraction_bps);
         let hot_symbols = if matches!(reason_code, RepairReasonCode::HotObjectPreStage) {
@@ -1757,6 +1771,125 @@ mod tests {
         policy.min_source_diversity = 2;
 
         assert!(controller.needs_repair(&coverage, &policy));
+    }
+
+    #[test]
+    fn minimum_node_policy_triggers_repair_at_full_coverage() {
+        let controller = RepairController::new(RepairControllerConfig::default());
+        let coverage = test_coverage(10, 10);
+        let mut policy = test_policy();
+        policy.min_nodes = 3;
+
+        assert!(coverage.is_available);
+        assert!(!coverage.meets_policy(&policy));
+        assert!(controller.needs_repair(&coverage, &policy));
+        assert_eq!(controller.calculate_priority(&coverage, &policy), 220);
+
+        // Source diversity may impose a stricter floor than placement.
+        policy.min_source_diversity = 4;
+        assert_eq!(controller.calculate_priority(&coverage, &policy), 230);
+        policy.min_nodes = 5;
+        assert_eq!(controller.calculate_priority(&coverage, &policy), 240);
+    }
+
+    #[test]
+    fn zero_repair_threshold_requires_a_positive_deficit() {
+        let controller = RepairController::new(RepairControllerConfig {
+            min_deficit_bps: 0,
+            ..Default::default()
+        });
+        let mut policy = test_policy();
+
+        for total in [10, 15] {
+            let coverage = test_coverage(total, 10);
+            assert!(!controller.needs_repair(&coverage, &policy));
+            assert_eq!(
+                controller.plan_reason_code(&coverage, &policy, false, &planner_options(1)),
+                None
+            );
+        }
+
+        // A zero threshold still requests repair for the smallest actual deficit.
+        policy.target_coverage_bps = 10_001;
+        let coverage = test_coverage(10, 10);
+        assert!(controller.needs_repair(&coverage, &policy));
+        assert_eq!(
+            controller.plan_reason_code(&coverage, &policy, false, &planner_options(1)),
+            Some(RepairReasonCode::PolicySloDeficit)
+        );
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn minimum_node_repair_plan_and_queue_converge() {
+        let store = MemorySymbolStore::new(MemorySymbolStoreConfig::default());
+        let zone_id = test_zone_id();
+        let object_id = ObjectId::from_bytes([0xA6; 32]);
+        seed_planner_object(&store, object_id, 4, 4, 64, &[1]).await;
+
+        let controller = RepairController::new(RepairControllerConfig {
+            min_deficit_bps: 0,
+            ..Default::default()
+        });
+        let mut policy = test_policy();
+        policy.min_nodes = 3;
+        let policies = HashMap::from([(object_id, policy)]);
+        let options = planner_options(1);
+
+        let plan = controller
+            .plan_zone(&zone_id, &store, &policies, &options)
+            .await;
+        assert_eq!(plan.object_count_below_target, 1);
+        assert_eq!(plan.actions.len(), 1);
+        assert_eq!(plan.actions[0].reason_code, RepairReasonCode::DiversityDeficit);
+        assert_eq!(plan.actions[0].estimated_symbols, 2);
+        assert_eq!(plan.actions[0].estimated_bytes, 128);
+        assert_eq!(plan.actions[0].priority, 220);
+
+        let report = controller
+            .evaluate_zone_with_report(&zone_id, &store, &policies)
+            .await;
+        assert_eq!(report.queue_depth_after, 1);
+        assert_eq!(report.decisions[0].action, RepairQueueAction::Queue);
+        assert_eq!(
+            report.decisions[0].reason_code,
+            RepairEvaluationReasonCode::DiversityDeficit
+        );
+        assert_eq!(report.decisions[0].priority, Some(220));
+
+        // New repair slots from two additional nodes satisfy the placement floor.
+        for (esi, source_node) in [(4, 2), (5, 3)] {
+            store
+                .put_symbol(StoredSymbol {
+                    meta: SymbolMeta {
+                        object_id,
+                        esi,
+                        zone_id: zone_id.clone(),
+                        source_node: Some(source_node),
+                        stored_at: 1_000_000 + u64::from(esi),
+                    },
+                    data: Bytes::from(vec![0_u8; 64]),
+                })
+                .await
+                .unwrap();
+        }
+
+        let repaired = controller
+            .evaluate_zone_with_report(&zone_id, &store, &policies)
+            .await;
+        assert_eq!(repaired.queue_depth_before, 1);
+        assert_eq!(repaired.queue_depth_after, 0);
+        assert_eq!(repaired.decisions[0].action, RepairQueueAction::Remove);
+        assert_eq!(
+            repaired.decisions[0].reason_code,
+            RepairEvaluationReasonCode::Healthy
+        );
+        let repaired_plan = controller
+            .plan_zone(&zone_id, &store, &policies, &options)
+            .await;
+        assert_eq!(repaired_plan.object_count_below_target, 0);
+        assert!(repaired_plan.actions.is_empty());
+        assert!(repaired_plan.deferred.is_empty());
+        assert_eq!(repaired_plan.budget_used, RepairCycleUsage::default());
     }
 
     #[test]
