@@ -50,31 +50,79 @@ fn sanitize_path_segment<'a>(value: &'a str, field: &str) -> AwsResult<&'a str> 
     Ok(value)
 }
 
-/// Sanitize an S3 object key — allows `/` since S3 keys use hierarchical paths
-/// (e.g., `photos/2024/sunset.jpg`), but blocks `..` and backslash.
+/// Validate an S3 object key before encoding its literal UTF-8 bytes.
+///
+/// Standalone dot segments cannot survive the HTTP URL parser unchanged. Other
+/// punctuation, including percent escapes supplied as data, is encoded by
+/// `resource_url` and must never be interpreted as URL syntax.
 fn sanitize_object_key<'a>(value: &'a str, field: &str) -> AwsResult<&'a str> {
-    if value.trim().is_empty() {
+    if value.is_empty() {
         return Err(AwsError::InvalidInput(format!("{field} must not be empty")));
     }
-    let lower = value.to_ascii_lowercase();
-    if value.contains('\\') || value.contains("..") || lower.contains("%5c") {
+    if value.len() > 1024 {
         return Err(AwsError::InvalidInput(format!(
-            "{field} contains path traversal characters"
+            "{field} exceeds the S3 limit of 1024 UTF-8 bytes"
         )));
     }
-    // Reject URL-structure delimiters. `sign_request` parses the assembled URL
-    // with `url::Url`, which treats `?`/`#` as the start of the query/fragment.
-    // A key like `reports/Q?x.pdf` would be silently truncated to `reports/Q`,
-    // so the request (and, for `s3_delete_object`, the deletion) would target a
-    // DIFFERENT object than the caller named. Fail closed rather than act on the
-    // wrong key. (`&` is intentionally allowed: with no `?` it is an ordinary
-    // path byte and the SigV4 canonicalizer percent-encodes it consistently.)
-    if value.contains('?') || value.contains('#') {
+    if value
+        .split('/')
+        .any(|segment| matches!(segment, "." | ".."))
+    {
         return Err(AwsError::InvalidInput(format!(
-            "{field} contains URL control characters ('?' or '#')"
+            "{field} contains a standalone dot segment that the HTTP transport cannot preserve"
         )));
     }
     Ok(value)
+}
+
+/// Append literal path segments without allowing caller data to change the
+/// endpoint, query, fragment, or an existing path segment. Encode before the URL
+/// setter, which otherwise strips tabs/newlines. Literal `%` is also escaped,
+/// so a key named `%2F` stays distinct from a slash.
+fn resource_url<'a>(
+    base_url: &str,
+    segments: impl IntoIterator<Item = &'a str>,
+) -> AwsResult<url::Url> {
+    let mut url =
+        url::Url::parse(base_url).map_err(|_| AwsError::Config("invalid AWS endpoint".into()))?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(AwsError::Config(
+            "AWS endpoint must be an HTTP(S) base URL without credentials, query, or fragment"
+                .into(),
+        ));
+    }
+    const PATH_SEGMENT_ENCODE_SET: &percent_encoding::AsciiSet =
+        &percent_encoding::NON_ALPHANUMERIC
+            .remove(b'-')
+            .remove(b'.')
+            .remove(b'_')
+            .remove(b'~');
+    let mut path = url.path().trim_end_matches('/').to_owned();
+    for segment in segments {
+        if matches!(segment, "." | "..") {
+            return Err(AwsError::InvalidInput(
+                "AWS resource contains a standalone dot segment".into(),
+            ));
+        }
+        path.push('/');
+        path.extend(percent_encoding::utf8_percent_encode(
+            segment,
+            PATH_SEGMENT_ENCODE_SET,
+        ));
+    }
+    url.set_path(&path);
+    if url.path() != path {
+        return Err(AwsError::InvalidInput(
+            "AWS resource path cannot be preserved by the HTTP transport".into(),
+        ));
+    }
+    Ok(url)
 }
 
 /// Validate a query string parameter to prevent injection.
@@ -474,11 +522,10 @@ impl AwsClient {
         prefix: Option<&str>,
     ) -> AwsResult<Vec<S3Object>> {
         let bucket = sanitize_path_segment(bucket, "bucket")?;
-        let mut url = url::Url::parse(&format!("{}/{bucket}", self.s3_url()))
-            .map_err(|_| AwsError::Config("invalid S3 endpoint".into()))?;
+        let mut url = resource_url(&self.s3_url(), [bucket])?;
         url.query_pairs_mut().append_pair("list-type", "2");
+        url.query_pairs_mut().append_pair("encoding-type", "url");
         if let Some(prefix) = prefix {
-            let prefix = sanitize_query_param(prefix, "prefix")?;
             url.query_pairs_mut().append_pair("prefix", prefix);
         }
         self.list_pages(
@@ -505,14 +552,17 @@ impl AwsClient {
     ) -> AwsResult<S3GetObjectResponse> {
         let bucket = sanitize_path_segment(bucket, "bucket")?;
         let key = sanitize_object_key(key, "key")?;
-        let url = format!("{}/{bucket}/{key}", self.s3_url());
+        let url = resource_url(
+            &self.s3_url(),
+            std::iter::once(bucket).chain(key.split('/')),
+        )?;
         let response = self
             .execute_request(
                 &runtime.request_context(),
                 "aws.s3.get_object",
                 "s3",
                 "GET",
-                &url,
+                url.as_str(),
                 None,
                 None,
                 true,
@@ -544,14 +594,17 @@ impl AwsClient {
     ) -> AwsResult<S3PutObjectResponse> {
         let bucket = sanitize_path_segment(bucket, "bucket")?;
         let key = sanitize_object_key(key, "key")?;
-        let url = format!("{}/{bucket}/{key}", self.s3_url());
+        let url = resource_url(
+            &self.s3_url(),
+            std::iter::once(bucket).chain(key.split('/')),
+        )?;
         let response = self
             .execute_request(
                 &runtime.request_context(),
                 "aws.s3.put_object",
                 "s3",
                 "PUT",
-                &url,
+                url.as_str(),
                 Some(body.as_bytes()),
                 Some(content_type.unwrap_or("application/octet-stream")),
                 false,
@@ -576,14 +629,17 @@ impl AwsClient {
     ) -> AwsResult<S3DeleteObjectResponse> {
         let bucket = sanitize_path_segment(bucket, "bucket")?;
         let key = sanitize_object_key(key, "key")?;
-        let url = format!("{}/{bucket}/{key}", self.s3_url());
+        let url = resource_url(
+            &self.s3_url(),
+            std::iter::once(bucket).chain(key.split('/')),
+        )?;
         let response = self
             .execute_request(
                 &runtime.request_context(),
                 "aws.s3.delete_object",
                 "s3",
                 "DELETE",
-                &url,
+                url.as_str(),
                 None,
                 None,
                 false,
@@ -741,10 +797,10 @@ impl AwsClient {
         payload: &serde_json::Value,
     ) -> AwsResult<LambdaInvokeResponse> {
         let function_name = sanitize_path_segment(function_name, "function_name")?;
-        let url = format!(
-            "{}/2015-03-31/functions/{function_name}/invocations",
-            self.lambda_url()
-        );
+        let url = resource_url(
+            &self.lambda_url(),
+            ["2015-03-31", "functions", function_name, "invocations"],
+        )?;
         let payload = serde_json::to_vec(payload)?;
         let response = self
             .execute_request(
@@ -752,7 +808,7 @@ impl AwsClient {
                 "aws.lambda.invoke",
                 "lambda",
                 "POST",
-                &url,
+                url.as_str(),
                 Some(&payload),
                 Some("application/json"),
                 false,
@@ -1325,6 +1381,7 @@ mod tests {
         let credentials = service_credentials();
         let client = host_client(&proxy.uri(), &provider.uri(), credentials.clone());
         let runtime = ConnectorRuntime::new(fcp_sdk::ConnectorRuntimeConfig::default());
+        let object_key = "literal/%2F/Q?x#é\\name//end/";
         let operations = [
             "aws.s3.list_buckets",
             "aws.s3.list_objects",
@@ -1360,7 +1417,7 @@ mod tests {
                 ),
                 2 => assert_eq!(
                     bound
-                        .s3_get_object(&runtime, "bucket", "key")
+                        .s3_get_object(&runtime, "bucket", object_key)
                         .await
                         .unwrap()
                         .body,
@@ -1368,7 +1425,13 @@ mod tests {
                 ),
                 3 => assert_eq!(
                     bound
-                        .s3_put_object(&runtime, "bucket", "key", "uploaded", Some("text/plain"))
+                        .s3_put_object(
+                            &runtime,
+                            "bucket",
+                            object_key,
+                            "uploaded",
+                            Some("text/plain"),
+                        )
                         .await
                         .unwrap()
                         .etag
@@ -1377,7 +1440,7 @@ mod tests {
                 ),
                 4 => assert!(
                     bound
-                        .s3_delete_object(&runtime, "bucket", "key")
+                        .s3_delete_object(&runtime, "bucket", object_key)
                         .await
                         .unwrap()
                         .delete_marker
@@ -1468,6 +1531,22 @@ mod tests {
                     .encode(invocation.capability_token.raw().to_cbor().unwrap())
             );
             assert!(request.url.starts_with(&provider.uri()));
+            if matches!(
+                invocation.operation.as_str(),
+                "aws.s3.get_object" | "aws.s3.put_object" | "aws.s3.delete_object"
+            ) {
+                let url = url::Url::parse(&request.url).unwrap();
+                assert!(url.query().is_none());
+                assert!(url.fragment().is_none());
+                assert_eq!(
+                    percent_encoding::percent_decode_str(
+                        url.path().strip_prefix("/bucket/").unwrap()
+                    )
+                    .decode_utf8()
+                    .unwrap(),
+                    object_key,
+                );
+            }
             assert!(
                 request
                     .headers
@@ -2220,17 +2299,79 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_object_key_allows_slashes_blocks_traversal() {
-        assert!(sanitize_object_key("path/to/file.txt", "test").is_ok());
-        assert!(sanitize_object_key("../etc/passwd", "test").is_err());
-        assert!(sanitize_object_key("path\\to\\file", "test").is_err());
-        // `?`/`#` would be split off as query/fragment by the URL parser in
-        // `sign_request`, retargeting the operation at the wrong S3 object.
-        assert!(sanitize_object_key("reports/Q?x.pdf", "test").is_err());
-        assert!(sanitize_object_key("reports/Q#x.pdf", "test").is_err());
-        // `&` stays valid: without a `?` it is an ordinary path byte and the
-        // SigV4 canonical URI encodes it the same way AWS does.
-        assert!(sanitize_object_key("reports/Q&A.pdf", "test").is_ok());
+    fn object_keys_accept_literal_punctuation_and_reject_transport_normalization() {
+        for key in [
+            "path/to/file.txt",
+            "path\\to\\file",
+            "reports/Q?x#y&A.pdf",
+            "folder/..backup/file",
+            "folder/%2e%2e/%2F/file",
+            " ",
+        ] {
+            assert!(sanitize_object_key(key, "key").is_ok(), "{key:?}");
+        }
+        for key in ["", ".", "..", "../file", "folder/./file", "folder/.."] {
+            assert!(sanitize_object_key(key, "key").is_err(), "{key:?}");
+        }
+        assert!(sanitize_object_key(&"é".repeat(512), "key").is_ok());
+        assert!(sanitize_object_key(&"é".repeat(513), "key").is_err());
+    }
+
+    #[test]
+    fn resource_paths_preserve_exact_object_keys_and_empty_segments() {
+        for key in [
+            "reports/Q?x#y&A.pdf",
+            "literal/%2F/%2e%2e/%25",
+            "日本語/été.txt",
+            "/leading//repeated/trailing/",
+            "path\\with\\backslashes",
+            " tabs\tand\nnewlines ",
+            "folder/..backup/file",
+        ] {
+            let url = resource_url(
+                "https://s3.us-east-1.amazonaws.com/base/",
+                std::iter::once("bucket").chain(key.split('/')),
+            )
+            .unwrap();
+            assert_eq!(url.host_str(), Some("s3.us-east-1.amazonaws.com"));
+            assert!(url.query().is_none());
+            assert!(url.fragment().is_none());
+            let wire_key = url.path().strip_prefix("/base/bucket/").unwrap();
+            assert_eq!(
+                percent_encoding::percent_decode_str(wire_key)
+                    .decode_utf8()
+                    .unwrap(),
+                key,
+            );
+            assert_eq!(url::Url::parse(url.as_str()).unwrap(), url);
+        }
+        let escaped = resource_url("https://s3.example", ["bucket", "%2F"]).unwrap();
+        assert_eq!(escaped.path(), "/bucket/%252F");
+    }
+
+    #[test]
+    fn resource_paths_do_not_promote_identifiers_into_url_syntax() {
+        let url = resource_url(
+            "https://lambda.example/base",
+            ["functions", "name?Qualifier=other#fragment", "invocations"],
+        )
+        .unwrap();
+        assert_eq!(
+            url.path(),
+            "/base/functions/name%3FQualifier%3Dother%23fragment/invocations"
+        );
+        assert!(url.query().is_none());
+        assert!(url.fragment().is_none());
+        assert!(resource_url("https://s3.example", ["bucket", "."]).is_err());
+        assert!(resource_url("https://s3.example", ["bucket", ".."]).is_err());
+        for endpoint in [
+            "file:///tmp/aws",
+            "https://user:secret@s3.example",
+            "https://s3.example?versionId=other",
+            "https://s3.example#fragment",
+        ] {
+            assert!(resource_url(endpoint, ["bucket"]).is_err());
+        }
     }
 
     #[test]

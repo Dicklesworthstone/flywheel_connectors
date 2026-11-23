@@ -25,6 +25,7 @@ use wiremock::matchers::{header_exists, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const OP_S3_LIST_OBJECTS: &str = "aws.s3.list_objects";
+const OP_S3_GET_OBJECT: &str = "aws.s3.get_object";
 const OP_S3_PUT_OBJECT: &str = "aws.s3.put_object";
 const OP_S3_DELETE_OBJECT: &str = "aws.s3.delete_object";
 const OP_EC2_TERMINATE: &str = "aws.ec2.terminate_instance";
@@ -59,7 +60,7 @@ fn generate_valid_token(
     op: &'static str,
 ) -> CapabilityToken {
     let capability = match op {
-        OP_S3_LIST_OBJECTS => "aws.s3.read",
+        OP_S3_LIST_OBJECTS | OP_S3_GET_OBJECT => "aws.s3.read",
         OP_S3_PUT_OBJECT | OP_S3_DELETE_OBJECT => "aws.s3.write",
         OP_EC2_TERMINATE => "aws.ec2.write",
         OP_LAMBDA_LIST => "aws.lambda.read",
@@ -70,6 +71,7 @@ fn generate_valid_token(
         matches!(
             op,
             OP_S3_LIST_OBJECTS
+                | OP_S3_GET_OBJECT
                 | OP_S3_PUT_OBJECT
                 | OP_S3_DELETE_OBJECT
                 | OP_EC2_TERMINATE
@@ -347,6 +349,88 @@ async fn invoke_s3_list_objects_parses_native_xml() {
     let requests = server.received_requests().await.unwrap_or_default();
     assert_eq!(requests.len(), 1);
     assert_sigv4_headers(&requests[0]);
+}
+
+#[fcp_async_core::runtime::test]
+async fn s3_inventory_and_object_lifecycle_preserve_literal_resource_identity() {
+    let server = MockServer::start().await;
+    let key = "reports/%2F/Q?x#é\\name//end/";
+    let prefix = "reports/%2F/Q?x#é&+";
+    let encoded_key =
+        percent_encoding::utf8_percent_encode(key, percent_encoding::NON_ALPHANUMERIC).to_string();
+    Mock::given(method("GET"))
+        .and(path("/test-bucket"))
+        .and(query_param("list-type", "2"))
+        .and(query_param("encoding-type", "url"))
+        .and(query_param("prefix", prefix))
+        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+            "<ListBucketResult><EncodingType>url</EncodingType><IsTruncated>false</IsTruncated><Contents><Key>{encoded_key}</Key></Contents></ListBucketResult>"
+        )))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut object_url = url::Url::parse(&server.uri()).unwrap();
+    object_url
+        .path_segments_mut()
+        .unwrap()
+        .push("test-bucket")
+        .extend(key.split('/'));
+    for verb in ["GET", "PUT", "DELETE"] {
+        Mock::given(method(verb))
+            .and(path(object_url.path()))
+            .respond_with(ResponseTemplate::new(200).set_body_string("object body"))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+
+    let (connector, signing_key) = setup_connector(&server.uri()).await;
+    let inventory = connector
+        .invoke(invoke_req(
+            OP_S3_LIST_OBJECTS,
+            json!({"bucket": "test-bucket", "prefix": prefix}),
+            generate_valid_token(&connector, &signing_key, OP_S3_LIST_OBJECTS),
+        ))
+        .await
+        .unwrap();
+    let returned_key = inventory.result.unwrap()[0]["key"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(returned_key, key);
+    for operation in [OP_S3_PUT_OBJECT, OP_S3_GET_OBJECT, OP_S3_DELETE_OBJECT] {
+        let mut input = json!({"bucket": "test-bucket", "key": returned_key});
+        if operation == OP_S3_PUT_OBJECT {
+            input["body"] = json!("uploaded");
+        }
+        let result = connector
+            .invoke(invoke_req(
+                operation,
+                input,
+                generate_valid_token(&connector, &signing_key, operation),
+            ))
+            .await
+            .unwrap();
+        if operation == OP_S3_GET_OBJECT {
+            assert_eq!(result.result.unwrap()["key"], key);
+        }
+    }
+    let observed = server.received_requests().await.unwrap();
+    assert_eq!(observed.len(), 4);
+    for request in &observed[1..] {
+        assert_sigv4_headers(request);
+        assert!(request.url.query().is_none());
+        assert!(request.url.fragment().is_none());
+        let wire_key = request.url.path().strip_prefix("/test-bucket/").unwrap();
+        assert_eq!(
+            percent_encoding::percent_decode_str(wire_key)
+                .decode_utf8()
+                .unwrap(),
+            key,
+        );
+        assert!(wire_key.contains("%252F"));
+    }
 }
 
 #[fcp_async_core::runtime::test]

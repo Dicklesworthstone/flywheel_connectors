@@ -16,6 +16,7 @@ path = "src/lib.rs"
 
 [dependencies]
 base64.workspace = true
+percent-encoding.workspace = true
 fcp-core.workspace = true
 fcp-manifest.workspace = true
 fcp-prelude.workspace = true
@@ -39,7 +40,6 @@ chrono.workspace = true
 ciborium.workspace = true
 fcp-crypto.workspace = true
 fcp-testkit.workspace = true
-percent-encoding.workspace = true
 wiremock.workspace = true
 
 [lints]

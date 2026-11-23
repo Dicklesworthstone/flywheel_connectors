@@ -185,6 +185,7 @@ struct S3ObjectsResponse {
     contents: Vec<S3ObjectXml>,
     is_truncated: bool,
     next_continuation_token: Option<String>,
+    encoding_type: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -200,6 +201,11 @@ struct S3ObjectXml {
 
 pub(crate) fn parse_s3_objects(body: &[u8]) -> ProviderResult<ProviderPage<S3Object>> {
     let response: S3ObjectsResponse = parse_xml(body, "s3", b"ListBucketResult")?;
+    let encoded_keys = match response.encoding_type.as_deref() {
+        None => false,
+        Some("url") => true,
+        Some(_) => return Err(invalid_response("s3", "unsupported object-key encoding")),
+    };
     let next_token = continuation(response.next_continuation_token);
     if response.is_truncated != next_token.is_some() {
         return Err(invalid_response(
@@ -209,11 +215,16 @@ pub(crate) fn parse_s3_objects(body: &[u8]) -> ProviderResult<ProviderPage<S3Obj
     }
     let mut items = Vec::with_capacity(response.contents.len());
     for object in response.contents {
-        if object.key.is_empty() {
-            return Err(invalid_response("s3", "object is missing its key"));
+        let key = if encoded_keys {
+            decode_s3_key(&object.key)?
+        } else {
+            object.key
+        };
+        if key.is_empty() || key.len() > 1024 {
+            return Err(invalid_response("s3", "invalid object-key length"));
         }
         items.push(S3Object {
-            key: object.key,
+            key,
             size: object.size,
             last_modified: object.last_modified,
             etag: object.etag,
@@ -294,6 +305,23 @@ pub(crate) fn parse_ec2_instances(body: &[u8]) -> ProviderResult<ProviderPage<Ec
         items,
         next_token: continuation(response.next_token),
     })
+}
+
+/// Decode exactly once when S3 explicitly declares `EncodingType=url`.
+/// `+` is literal data in an object key, not form-encoded whitespace.
+fn decode_s3_key(key: &str) -> ProviderResult<String> {
+    let mut remaining = key.as_bytes();
+    while let Some(offset) = remaining.iter().position(|byte| *byte == b'%') {
+        remaining = &remaining[offset + 1..];
+        if remaining.len() < 2 || !remaining[..2].iter().all(u8::is_ascii_hexdigit) {
+            return Err(invalid_response("s3", "malformed object-key encoding"));
+        }
+        remaining = &remaining[2..];
+    }
+    percent_encoding::percent_decode_str(key)
+        .decode_utf8()
+        .map(|value| value.into_owned())
+        .map_err(|_| invalid_response("s3", "object key is not UTF-8"))
 }
 
 #[derive(Deserialize)]
@@ -537,6 +565,41 @@ mod tests {
         ] {
             assert!(parse_s3_objects(body.as_bytes()).is_err());
         }
+    }
+
+    #[test]
+    fn s3_object_keys_decode_only_declared_url_encoding_exactly_once() {
+        let page = parse_s3_objects(
+            br#"<ListBucketResult><EncodingType>url</EncodingType>
+<IsTruncated>true</IsTruncated><NextContinuationToken>token%2F+opaque</NextContinuationToken>
+<Contents><Key>literal%2F%252F%2F%3F%23+%20%C3%A9%00</Key></Contents>
+</ListBucketResult>"#,
+        )
+        .unwrap();
+        assert_eq!(page.items[0].key, "literal/%2F/?#+ é\0");
+        assert_eq!(page.next_token.as_deref(), Some("token%2F+opaque"));
+
+        let unencoded = parse_s3_objects(
+            b"<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>%2F+a</Key></Contents></ListBucketResult>",
+        )
+        .unwrap();
+        assert_eq!(unencoded.items[0].key, "%2F+a");
+    }
+
+    #[test]
+    fn s3_object_keys_reject_malformed_declared_encoding() {
+        for key in ["%", "%2", "%GG", "%FF", "%C0%AF"] {
+            let xml = format!(
+                "<ListBucketResult><EncodingType>url</EncodingType><IsTruncated>false</IsTruncated><Contents><Key>{key}</Key></Contents></ListBucketResult>"
+            );
+            assert!(parse_s3_objects(xml.as_bytes()).is_err(), "{key}");
+        }
+        assert!(
+            parse_s3_objects(
+                b"<ListBucketResult><EncodingType>other</EncodingType><IsTruncated>false</IsTruncated></ListBucketResult>"
+            )
+            .is_err()
+        );
     }
 
     #[test]
