@@ -2800,6 +2800,16 @@ struct WorkflowAuthArgs {
     #[arg(long = "step-holder-key-file", value_name = "STEP=PATH")]
     #[serde(skip_serializing)]
     step_holder_key_file: Vec<String>,
+
+    /// Approval JSON for this independently authorized step. Repeat for multiple approvals.
+    #[arg(long = "step-approval-token", value_name = "STEP=JSON")]
+    #[serde(skip_serializing)]
+    step_approval_token: Vec<String>,
+
+    /// Read approval JSON for this independently authorized step. Repeat as needed.
+    #[arg(long = "step-approval-token-file", value_name = "STEP=PATH")]
+    #[serde(skip_serializing)]
+    step_approval_token_file: Vec<String>,
 }
 
 #[derive(Args, Debug, Clone, Default, Serialize)]
@@ -32587,8 +32597,9 @@ fn parse_workflow_step_bindings(
     values: &[String],
     flag: &str,
     step_ids: &BTreeSet<&str>,
-) -> std::result::Result<BTreeMap<String, String>, LiveAuthError> {
-    let mut bindings = BTreeMap::new();
+    repeated: bool,
+) -> std::result::Result<BTreeMap<String, Vec<String>>, LiveAuthError> {
+    let mut bindings = BTreeMap::<String, Vec<String>>::new();
     for raw in values {
         let Some((step_id, value)) = raw.split_once('=') else {
             return Err(LiveAuthError::InvalidWorkflowAuth {
@@ -32611,18 +32622,20 @@ fn parse_workflow_step_bindings(
                 message: format!("{flag} has an empty value for step `{step_id}`."),
             });
         }
-        if bindings
-            .insert(step_id.to_owned(), value.to_owned())
-            .is_some()
-        {
+        let entries = bindings.entry(step_id.to_owned()).or_default();
+        if !repeated && !entries.is_empty() {
             return Err(LiveAuthError::InvalidWorkflowAuth {
                 message: format!("{flag} was specified more than once for step `{step_id}`."),
             });
         }
+        entries.push(value.to_owned());
     }
     Ok(bindings)
 }
 
+/// Resolve all step authority before preflight, execution, or checkpoint resume.
+/// Each explicit group owns its capability, holder key, and approvals together.
+#[allow(clippy::too_many_lines)]
 fn resolve_workflow_auth(
     args: &WorkflowAuthArgs,
     plan: &pipe::PipelinePlan,
@@ -32633,31 +32646,47 @@ fn resolve_workflow_auth(
         &args.step_capability_token,
         "--step-capability-token",
         &step_ids,
+        false,
     )?;
     let files = parse_workflow_step_bindings(
         &args.step_capability_token_file,
         "--step-capability-token-file",
         &step_ids,
+        false,
     )?;
     let holder_keys = parse_workflow_step_bindings(
         &args.step_holder_key_file,
         "--step-holder-key-file",
         &step_ids,
+        false,
     )?;
-    for step_id in inline.keys() {
-        if files.contains_key(step_id) {
+    let approvals = parse_workflow_step_bindings(
+        &args.step_approval_token,
+        "--step-approval-token",
+        &step_ids,
+        true,
+    )?;
+    let approval_files = parse_workflow_step_bindings(
+        &args.step_approval_token_file,
+        "--step-approval-token-file",
+        &step_ids,
+        true,
+    )?;
+    let explicit_steps = inline
+        .keys()
+        .chain(files.keys())
+        .chain(holder_keys.keys())
+        .chain(approvals.keys())
+        .chain(approval_files.keys())
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    for step_id in &explicit_steps {
+        let has_inline = inline.contains_key(*step_id);
+        let has_file = files.contains_key(*step_id);
+        if has_inline == has_file {
             return Err(LiveAuthError::InvalidWorkflowAuth {
                 message: format!(
-                    "Step `{step_id}` has both --step-capability-token and --step-capability-token-file; choose one."
-                ),
-            });
-        }
-    }
-    for step_id in holder_keys.keys() {
-        if !inline.contains_key(step_id) && !files.contains_key(step_id) {
-            return Err(LiveAuthError::InvalidWorkflowAuth {
-                message: format!(
-                    "--step-holder-key-file for step `{step_id}` requires that step's own capability token."
+                    "Step `{step_id}` requires exactly one of --step-capability-token or --step-capability-token-file. Step credentials never inherit the default token, holder key, or approvals."
                 ),
             });
         }
@@ -32671,7 +32700,7 @@ fn resolve_workflow_auth(
                 .ok_or_else(|| LiveAuthError::InvalidWorkflowAuth {
                     message: format!("Step `{}` is missing resolved live metadata.", step.id),
                 })?;
-        if !inline.contains_key(&step.id) && !files.contains_key(&step.id) {
+        if !explicit_steps.contains(step.id.as_str()) {
             default_connectors.insert(resolved.connector.summary.id.as_str());
         }
     }
@@ -32681,31 +32710,43 @@ fn resolve_workflow_auth(
         });
     }
 
-    let default_requested = args.default_auth.capability_token.is_some()
-        || args.default_auth.capability_token_file.is_some()
-        || args.default_auth.holder_key_file.is_some();
-    let default_auth = if default_requested || !default_connectors.is_empty() {
+    // Supplied defaults remain a complete authority group even when every step
+    // overrides them; malformed or orphan approvals must not be ignored.
+    let default_auth = if args.default_auth.is_present() || !default_connectors.is_empty() {
         Some(resolve_live_auth(&args.default_auth)?)
     } else {
         None
     };
     let mut auth_by_step = BTreeMap::new();
     for step in &plan.steps {
-        let auth = if inline.contains_key(&step.id) || files.contains_key(&step.id) {
+        let auth = if explicit_steps.contains(step.id.as_str()) {
             let step_args = LiveAuthArgs {
-                capability_token: inline.get(&step.id).cloned(),
-                capability_token_file: files.get(&step.id).map(PathBuf::from),
-                // A different capability never inherits the default holder key.
-                holder_key_file: holder_keys.get(&step.id).map(PathBuf::from),
-                approval_token: args.default_auth.approval_token.clone(),
-                approval_token_file: args.default_auth.approval_token_file.clone(),
+                capability_token: inline
+                    .get(&step.id)
+                    .and_then(|values| values.first())
+                    .cloned(),
+                capability_token_file: files
+                    .get(&step.id)
+                    .and_then(|values| values.first())
+                    .map(PathBuf::from),
+                holder_key_file: holder_keys
+                    .get(&step.id)
+                    .and_then(|values| values.first())
+                    .map(PathBuf::from),
+                approval_token: approvals.get(&step.id).cloned().unwrap_or_default(),
+                approval_token_file: approval_files
+                    .get(&step.id)
+                    .map(|values| values.iter().map(PathBuf::from).collect())
+                    .unwrap_or_default(),
             };
             resolve_live_auth(&step_args).map_err(|error| {
                 LiveAuthError::InvalidWorkflowAuth {
+                    // Provider-defined enum values and private file paths can
+                    // appear in parser errors. Only report their safe category.
                     message: format!(
-                        "Invalid credentials for step `{}`: {} Use --step-capability-token-file STEP=PATH and --step-holder-key-file STEP=PATH for this step.",
+                        "Invalid credentials for workflow step `{}` ({}). Supply that step's capability, its holder key when bound, and its required approval tokens.",
                         step.id,
-                        error.message()
+                        error.error_type()
                     ),
                 }
             })?
@@ -34311,7 +34352,7 @@ fn recipe_run_dispatch(
                         host.endpoint
                     ),
                     "Assign each separately authorized step with `--step-capability-token-file STEP=PATH` and its own `--step-holder-key-file STEP=PATH` when holder-bound.".to_owned(),
-                    "Provide approval tokens with `--approval-token-file` when recipe steps require explicit authorization.".to_owned(),
+                    "Supply `--step-approval-token-file STEP=PATH` with that step's explicit capability, or `--approval-token-file` for steps using default credentials.".to_owned(),
                 ],
             ));
         }
@@ -34863,7 +34904,7 @@ fn pipeline_run_dispatch(
                         host.endpoint
                     ),
                     "Assign each separately authorized step with `--step-capability-token-file STEP=PATH` and its own `--step-holder-key-file STEP=PATH` when holder-bound.".to_owned(),
-                    "Provide approval tokens with `--approval-token-file` when pipeline steps require explicit authorization.".to_owned(),
+                    "Supply `--step-approval-token-file STEP=PATH` with that step's explicit capability, or `--approval-token-file` for steps using default credentials.".to_owned(),
                 ],
             ));
         }
@@ -38826,6 +38867,8 @@ fn is_sensitive_flag(flag: &str) -> bool {
             | "--step-capability-token"
             | "--step-capability-token-file"
             | "--step-holder-key-file"
+            | "--step-approval-token"
+            | "--step-approval-token-file"
             | "--member-capability-token"
             | "--member-capability-token-file"
             | "--member-holder-key-file"
@@ -43818,6 +43861,9 @@ deny_ptrace = true
             "--step-capability-token-file",
             "notify=TOKEN_PATH_SECRET",
             "--step-holder-key-file=notify=KEY_PATH_SECRET",
+            "--step-approval-token",
+            "notify=APPROVAL_SECRET",
+            "--step-approval-token-file=notify=APPROVAL_PATH_SECRET",
         ]);
         assert_eq!(exit_code, CliExitCode::Validation.into());
         assert_eq!(payload["error"]["type"], "invalid-extract-filter");
@@ -43826,9 +43872,17 @@ deny_ptrace = true
             assert_eq!(arguments[7], "--step-capability-token=<redacted>");
             assert_eq!(arguments[9], "<redacted>");
             assert_eq!(arguments[10], "--step-holder-key-file=<redacted>");
+            assert_eq!(arguments[12], "<redacted>");
+            assert_eq!(arguments[13], "--step-approval-token-file=<redacted>");
         }
         let encoded = payload.to_string();
-        for secret in ["INLINE_SECRET", "TOKEN_PATH_SECRET", "KEY_PATH_SECRET"] {
+        for secret in [
+            "INLINE_SECRET",
+            "TOKEN_PATH_SECRET",
+            "KEY_PATH_SECRET",
+            "APPROVAL_SECRET",
+            "APPROVAL_PATH_SECRET",
+        ] {
             assert!(!encoded.contains(secret));
         }
 
@@ -56810,6 +56864,16 @@ input = { query = "{{steps.first-read.output.title}}" }
             let (path, plan) = workflow_checkpoint_fixture(tempdir.path());
             let checkpoint_path = tempdir.path().join("run.checkpoint.json");
             let token = test_capability_token_arg();
+            let default_approval = batch_member_approval_fixture(
+                "RESUME_DEFAULT_APPROVAL_SECRET",
+                "fcp.github:enterprise:v1",
+                "github.search_issues",
+            );
+            let step_approval = batch_member_approval_fixture(
+                "RESUME_STEP_APPROVAL_SECRET",
+                "fcp.github:enterprise:v1",
+                "github.search_issues",
+            );
             let mut catalog = pipe_mock_catalog(false);
             catalog.truncate(2);
             let mut routes = catalog.clone();
@@ -56842,6 +56906,12 @@ input = { query = "{{steps.first-read.output.title}}" }
                 "z:work",
                 "--capability-token",
                 &token,
+                "--approval-token",
+                &default_approval.to_string(),
+                "--step-capability-token",
+                &format!("second-read={token}"),
+                "--step-approval-token",
+                &format!("second-read={step_approval}"),
             ]);
             server.join().unwrap();
             assert_eq!(
@@ -56866,6 +56936,7 @@ input = { query = "{{steps.first-read.output.title}}" }
             let requests = log.lock().unwrap();
             assert_eq!(requests.len(), expected_requests);
             let preflight: Value = serde_json::from_str(&requests[4].1).unwrap();
+            assert_eq!(preflight["approval_tokens"], json!([step_approval]));
             assert_eq!(
                 preflight["params"]["query"],
                 first_record["response"]["result"]["title"]
@@ -56879,6 +56950,7 @@ input = { query = "{{steps.first-read.output.title}}" }
             );
             if allowed {
                 let invocation: Value = serde_json::from_str(&requests[5].1).unwrap();
+                assert_eq!(invocation["approval_tokens"], preflight["approval_tokens"]);
                 assert_eq!(invocation["input"], preflight["params"]);
                 assert_eq!(invocation["id"], preflight["request_id"]);
                 assert_ne!(invocation["id"], first_record["request_id"]);
@@ -56889,6 +56961,7 @@ input = { query = "{{steps.first-read.output.title}}" }
             }
             let saved = fs::read_to_string(&checkpoint_path).unwrap();
             assert!(!saved.contains(&token));
+            assert!(!saved.contains("APPROVAL_SECRET"));
             let saved: Value = serde_json::from_str(&saved).unwrap();
             assert_eq!(saved["state"]["completed"], true);
             assert!(saved["state"]["pending"].is_null());
@@ -57449,6 +57522,16 @@ input = {{ query = "{{{{steps.fallback-notify.output.title}}}}" }}
             let path = workflow_fallback_fixture(tempdir.path(), explicit_trigger);
             let token = test_capability_token_arg();
             let (handler_token, holder_path, signing_key) = test_live_holder_auth(tempdir.path());
+            let default_approval = batch_member_approval_fixture(
+                "FALLBACK_DEFAULT_APPROVAL_SECRET",
+                "fcp.github:enterprise:v1",
+                "github.search_issues",
+            );
+            let handler_approval = batch_member_approval_fixture(
+                "FALLBACK_HANDLER_APPROVAL_SECRET",
+                "fcp.slack:team:v1",
+                "slack.post_message",
+            );
             let message = "provider failed with literal {{steps.other.output}} and \"quotes\"";
             let mut routes = pipe_mock_catalog(false);
             routes.extend([
@@ -57488,10 +57571,14 @@ input = {{ query = "{{{{steps.fallback-notify.output.title}}}}" }}
                 &path.display().to_string(),
                 "--capability-token",
                 &token,
+                "--approval-token",
+                &default_approval.to_string(),
                 "--step-capability-token",
                 &format!("fallback-notify={handler_token}"),
                 "--step-holder-key-file",
                 &format!("fallback-notify={}", holder_path.display()),
+                "--step-approval-token",
+                &format!("fallback-notify={handler_approval}"),
             ]);
             server.join().unwrap();
             assert_eq!(exit, CliExitCode::Connector.into(), "{payload}");
@@ -57513,6 +57600,16 @@ input = {{ query = "{{{{steps.fallback-notify.output.title}}}}" }}
             let handler_preflight: Value = serde_json::from_str(&requests[5].1).unwrap();
             let handler: Value = serde_json::from_str(&requests[6].1).unwrap();
             let after: Value = serde_json::from_str(&requests[8].1).unwrap();
+            assert_eq!(source["approval_tokens"], json!([default_approval]));
+            assert_eq!(after["approval_tokens"], source["approval_tokens"]);
+            assert_eq!(
+                handler_preflight["approval_tokens"],
+                json!([handler_approval])
+            );
+            assert_eq!(
+                handler["approval_tokens"],
+                handler_preflight["approval_tokens"]
+            );
             assert_eq!(handler["input"]["text"], format!("Failure: {message}"));
             assert_eq!(handler_preflight["params"], handler["input"]);
             assert_eq!(handler_preflight["request_id"], handler["id"]);
@@ -57524,6 +57621,7 @@ input = {{ query = "{{{{steps.fallback-notify.output.title}}}}" }}
             assert_eq!(after["input"]["query"], "handler completed");
             assert!(!payload.to_string().contains(&token));
             assert!(!payload.to_string().contains(&handler_token));
+            assert!(!payload.to_string().contains("APPROVAL_SECRET"));
         }
     }
 
@@ -59040,6 +59138,142 @@ input = {{ query = "independent" }}
     }
 
     #[test]
+    fn execute_pipeline_approvals_stay_with_their_complete_step_authority() {
+        let directory = TempDir::new().unwrap();
+        let history_path = directory.path().join("history.jsonl");
+        let _history = super::install_test_history_path(history_path.clone());
+        let path = workflow_auth_pipeline_fixture(directory.path());
+        let fetch = test_workflow_holder_auth(directory.path(), "fetch", 0xd1);
+        let notify = test_workflow_holder_auth(directory.path(), "notify", 0xd2);
+        let default_approval = batch_member_approval_fixture(
+            "DEFAULT_WORKFLOW_APPROVAL_SECRET",
+            "fcp.github:enterprise:v1",
+            "github.search_issues",
+        );
+        let approvals = [
+            "INLINE_ONE_SECRET",
+            "INLINE_TWO_SECRET",
+            "FILE_ONE_SECRET",
+            "FILE_TWO_SECRET",
+        ]
+        .map(|id| batch_member_approval_fixture(id, "fcp.slack:team:v1", "slack.post_message"));
+        let approval_paths = [
+            directory.path().join("notify=APPROVAL_ONE_SECRET.json"),
+            directory.path().join("APPROVAL_TWO_SECRET.json"),
+        ];
+        fs::write(&approval_paths[0], approvals[2].to_string()).unwrap();
+        fs::write(&approval_paths[1], json!([approvals[3]]).to_string()).unwrap();
+
+        for mode in ["run", "dry-run"] {
+            for step_approvals in [false, true] {
+                let mut routes = workflow_auth_mock_catalog();
+                for (index, result) in [
+                    json!({"title": "first result"}),
+                    json!({"title": "second result"}),
+                    json!({"delivered": true}),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    routes.push((
+                        "POST /rpc/preflight".to_owned(),
+                        mock_preflight_response_json(true),
+                    ));
+                    if mode == "run" || index < 2 {
+                        routes.push((
+                            "POST /rpc/invoke".to_owned(),
+                            mock_invoke_response_json(result),
+                        ));
+                    }
+                }
+                let (host, server, requests) = spawn_mock_host_sequence_with_body_log(routes);
+                let mut args = vec![
+                    "fwc".to_owned(),
+                    "--json".to_owned(),
+                    "--host".to_owned(),
+                    host,
+                    "pipeline".to_owned(),
+                    mode.to_owned(),
+                    path.display().to_string(),
+                    "--capability-token".to_owned(),
+                    fetch.0.clone(),
+                    "--holder-key-file".to_owned(),
+                    fetch.1.display().to_string(),
+                    "--approval-token".to_owned(),
+                    default_approval.to_string(),
+                    "--step-capability-token".to_owned(),
+                    format!("notify={}", notify.0),
+                    "--step-holder-key-file".to_owned(),
+                    format!("notify={}", notify.1.display()),
+                ];
+                if step_approvals {
+                    for approval in &approvals[..2] {
+                        args.extend([
+                            "--step-approval-token".to_owned(),
+                            format!("notify={approval}"),
+                        ]);
+                    }
+                    for approval_path in &approval_paths {
+                        args.extend([
+                            "--step-approval-token-file".to_owned(),
+                            format!("notify={}", approval_path.display()),
+                        ]);
+                    }
+                }
+                let checkpoint_path = directory
+                    .path()
+                    .join(format!("approval-{step_approvals}.json"));
+                if mode == "run" {
+                    args.extend([
+                        "--checkpoint".to_owned(),
+                        checkpoint_path.display().to_string(),
+                    ]);
+                }
+                let (exit, payload) =
+                    execute_json(&args.iter().map(String::as_str).collect::<Vec<_>>());
+                server.join().unwrap();
+                assert_eq!(
+                    exit,
+                    CliExitCode::Success.into(),
+                    "{mode}, explicit approvals={step_approvals}: {payload}"
+                );
+                let requests = requests.lock().unwrap();
+                assert_eq!(requests.len(), if mode == "run" { 10 } else { 9 });
+                for (_, body) in &requests[4..] {
+                    let request: Value = serde_json::from_str(body).unwrap();
+                    let is_notify = request["connector_id"] == "fcp.slack:team:v1";
+                    let auth = if is_notify { &notify } else { &fetch };
+                    assert_workflow_holder_request(&request, &auth.0, &auth.2);
+                    let expected = if is_notify {
+                        if step_approvals {
+                            approvals.to_vec()
+                        } else {
+                            Vec::new()
+                        }
+                    } else {
+                        vec![default_approval.clone()]
+                    };
+                    assert_eq!(
+                        request["approval_tokens"]
+                            .as_array()
+                            .cloned()
+                            .unwrap_or_default(),
+                        expected
+                    );
+                }
+                let mut retained = payload.to_string();
+                retained.push_str(&fs::read_to_string(&history_path).unwrap());
+                if mode == "run" {
+                    retained.push_str(&fs::read_to_string(&checkpoint_path).unwrap());
+                }
+                assert!(!retained.contains("_SECRET"));
+                assert!(!retained.contains(&fetch.0));
+                assert!(!retained.contains(&notify.0));
+            }
+        }
+    }
+
+    #[test]
     fn execute_pipeline_rejects_invalid_step_credentials_before_any_effect() {
         let tempdir = TempDir::new().unwrap();
         let path = workflow_auth_pipeline_fixture(tempdir.path());
@@ -59105,6 +59339,88 @@ input = {{ query = "independent" }}
                 ],
             ),
             (
+                "duplicate-holder",
+                true,
+                vec![
+                    "--step-capability-token".to_owned(),
+                    token_binding.clone(),
+                    "--step-holder-key-file".to_owned(),
+                    key_binding.clone(),
+                    "--step-holder-key-file".to_owned(),
+                    key_binding.clone(),
+                ],
+            ),
+            (
+                "orphan-approval",
+                true,
+                vec![
+                    "--step-approval-token".to_owned(),
+                    "notify=APPROVAL_SECRET".to_owned(),
+                ],
+            ),
+            (
+                "orphan-approval-file",
+                true,
+                vec![
+                    "--step-approval-token-file".to_owned(),
+                    "notify=APPROVAL_PATH_SECRET".to_owned(),
+                ],
+            ),
+            (
+                "unknown-approval-step",
+                true,
+                vec![
+                    "--step-approval-token".to_owned(),
+                    format!("{secret_marker}=APPROVAL_SECRET"),
+                ],
+            ),
+            (
+                "malformed-approval-binding",
+                true,
+                vec![
+                    "--step-approval-token".to_owned(),
+                    "APPROVAL_SECRET".to_owned(),
+                ],
+            ),
+            (
+                "empty-approval-file",
+                true,
+                vec![
+                    "--step-approval-token-file".to_owned(),
+                    "notify=".to_owned(),
+                ],
+            ),
+            (
+                "invalid-later-approval",
+                true,
+                vec![
+                    "--step-capability-token".to_owned(),
+                    token_binding.clone(),
+                    "--step-holder-key-file".to_owned(),
+                    key_binding.clone(),
+                    "--step-approval-token".to_owned(),
+                    "notify={\"scope\":{\"type\":\"INVALID_ENUM_SECRET\"}}".to_owned(),
+                ],
+            ),
+            (
+                "missing-later-approval-file",
+                true,
+                vec![
+                    "--step-capability-token".to_owned(),
+                    token_binding.clone(),
+                    "--step-holder-key-file".to_owned(),
+                    key_binding.clone(),
+                    "--step-approval-token-file".to_owned(),
+                    format!(
+                        "notify={}",
+                        tempdir
+                            .path()
+                            .join("MISSING_APPROVAL_SECRET.json")
+                            .display()
+                    ),
+                ],
+            ),
+            (
                 "default-holder-must-not-be-inherited",
                 true,
                 vec!["--step-capability-token".to_owned(), token_binding.clone()],
@@ -59122,9 +59438,29 @@ input = {{ query = "independent" }}
                 false,
                 vec![
                     "--step-capability-token".to_owned(),
+                    token_binding.clone(),
+                    "--step-holder-key-file".to_owned(),
+                    key_binding.clone(),
+                ],
+            ),
+            (
+                "orphan-default-approvals-with-all-explicit-steps",
+                false,
+                vec![
+                    "--step-capability-token".to_owned(),
+                    format!("fetch={}", fetch.0),
+                    "--step-holder-key-file".to_owned(),
+                    format!("fetch={}", fetch.1.display()),
+                    "--step-capability-token".to_owned(),
+                    format!("again={}", fetch.0),
+                    "--step-holder-key-file".to_owned(),
+                    format!("again={}", fetch.1.display()),
+                    "--step-capability-token".to_owned(),
                     token_binding,
                     "--step-holder-key-file".to_owned(),
                     key_binding,
+                    "--approval-token".to_owned(),
+                    "ORPHAN_DEFAULT_APPROVAL_SECRET".to_owned(),
                 ],
             ),
         ];
@@ -59169,6 +59505,7 @@ input = {{ query = "independent" }}
                 "{case}: {payload}"
             );
             assert!(!payload.to_string().contains(secret_marker));
+            assert!(!payload.to_string().contains("_SECRET"));
             assert!(!payload.to_string().contains(&fetch.0));
             assert!(!payload.to_string().contains(&notify.0));
             let requests = request_log.lock().unwrap();
@@ -59190,6 +59527,8 @@ input = {{ query = "independent" }}
             step_capability_token: vec!["notify=STEP_SECRET".to_owned()],
             step_capability_token_file: vec!["notify=TOKEN_PATH".to_owned()],
             step_holder_key_file: vec!["notify=HOLDER_PATH".to_owned()],
+            step_approval_token: vec!["notify=APPROVAL_SECRET".to_owned()],
+            step_approval_token_file: vec!["notify=APPROVAL_PATH".to_owned()],
         };
         let encoded = serde_json::to_string(&args).unwrap();
         for private_value in [
@@ -59198,6 +59537,8 @@ input = {{ query = "independent" }}
             "STEP_SECRET",
             "TOKEN_PATH",
             "HOLDER_PATH",
+            "APPROVAL_SECRET",
+            "APPROVAL_PATH",
         ] {
             assert!(!encoded.contains(private_value));
         }
@@ -59774,6 +60115,18 @@ depends_on = ["missing"]
         let key_path_text = key_path.display().to_string();
         let (notify_token, notify_key_path, notify_key) =
             test_workflow_holder_auth(tempdir.path(), "notify", 0x91);
+        let default_approval = batch_member_approval_fixture(
+            "RECIPE_DEFAULT_APPROVAL_SECRET",
+            "fcp.github:enterprise:v1",
+            "github.get_pull_request",
+        );
+        let notify_approval = batch_member_approval_fixture(
+            "RECIPE_NOTIFY_APPROVAL_SECRET",
+            "fcp.slack:team:v1",
+            "slack.post_message",
+        );
+        let notify_approval_path = tempdir.path().join("RECIPE_APPROVAL_PATH_SECRET.json");
+        fs::write(&notify_approval_path, notify_approval.to_string()).unwrap();
         let github_connector = mock_connector_summary_custom_json(
             "fcp.github:enterprise:v1",
             "GitHub Enterprise",
@@ -59877,10 +60230,14 @@ depends_on = ["missing"]
             &capability_token,
             "--holder-key-file",
             &key_path_text,
+            "--approval-token",
+            &default_approval.to_string(),
             "--step-capability-token",
             &format!("notify={notify_token}"),
             "--step-holder-key-file",
             &format!("notify={}", notify_key_path.display()),
+            "--step-approval-token-file",
+            &format!("notify={}", notify_approval_path.display()),
         ]);
 
         server.join().expect("mock host thread should complete");
@@ -59925,6 +60282,20 @@ depends_on = ["missing"]
         let fetch_preflight: Value = serde_json::from_str(&requests[3].1).unwrap();
         let fetch_invoke: Value = serde_json::from_str(&requests[4].1).unwrap();
         let notify_preflight: Value = serde_json::from_str(&requests[5].1).unwrap();
+        assert_eq!(
+            fetch_preflight["approval_tokens"],
+            json!([default_approval])
+        );
+        assert_eq!(
+            fetch_invoke["approval_tokens"],
+            fetch_preflight["approval_tokens"]
+        );
+        assert_eq!(
+            notify_preflight["approval_tokens"],
+            json!([notify_approval])
+        );
+        assert!(!payload.to_string().contains("APPROVAL_SECRET"));
+        assert!(!payload.to_string().contains("APPROVAL_PATH_SECRET"));
         let fetch_proof = assert_live_holder_request(&fetch_preflight, &signing_key);
         assert_live_holder_request(&fetch_invoke, &signing_key);
         let notify_proof =

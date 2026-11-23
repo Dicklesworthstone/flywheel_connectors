@@ -3970,6 +3970,44 @@ Notes on the actual schema:
 
 Pipelines are validated with `fwc pipeline validate <file>`, dry-run with `fwc pipeline dry-run`, and executed with `fwc pipeline run`.
 
+### Authorizing individual workflow steps
+
+Pipelines and bundled recipes accept execution-only credentials for each step:
+`--step-capability-token-file STEP=PATH`, `--step-holder-key-file STEP=PATH`, and
+repeatable `--step-approval-token-file STEP=PATH`. Inline capability and approval
+forms are also available as `--step-capability-token STEP=TOKEN` and
+`--step-approval-token STEP=JSON`. Approval files may contain one token or an
+array of tokens; repeated inline and file options add approvals only to the
+named step.
+
+Any explicit step credential starts a complete, independent authority group.
+That step must supply exactly one capability source and its own holder key when
+holder-bound. Its approval set contains only its step-specific approvals; it
+never borrows the default capability, holder key, or approval tokens. Steps
+without overrides may share the default credentials only when their live
+metadata resolves to the same canonical connector. All bindings and credential
+files are validated before the first preflight or invocation, including for
+failure handlers, dry-runs, and checkpoint resumes. Unknown steps, duplicate
+capability or holder bindings, conflicting capability sources, and incomplete
+authority groups fail without running a step.
+
+For a pipeline whose `notify` step sends a Slack message after GitHub operations:
+
+```bash
+fwc --host http://127.0.0.1:8787 pipeline run issue-workflow.toml \
+    --param owner=octocat --param repo=hello-world --param title="Review auth" \
+    --capability-token-file github.token \
+    --approval-token-file approved-issue.json \
+    --step-capability-token-file notify=slack.token \
+    --step-holder-key-file notify=slack-node.key \
+    --step-approval-token-file notify=approved-message.json
+```
+
+Credential values and private file paths stay out of workflow definitions,
+execution history, checkpoints, and diagnostic argument views. Resuming a run
+requires current credentials again; a completed step's checkpoint does not
+authorize a later step.
+
 An execution deadline exhausted before dispatch stops further execution even
 with `on_error = "skip"`. A failed invocation result received after its deadline
 also stops the workflow while retaining the actual response.
@@ -4048,7 +4086,9 @@ Every activated handler uses its own operation, request identity, capability,
 holder proof, approvals, and optional lease evidence through normal host
 preflight. Assign cross-connector authority with
 `--step-capability-token-file STEP=PATH` and, when needed,
-`--step-holder-key-file STEP=PATH`. Failure handling does not bypass authorization
+`--step-holder-key-file STEP=PATH` plus repeatable
+`--step-approval-token-file STEP=PATH`. Explicit handler credentials never
+inherit the default approvals. Failure handling does not bypass authorization
 or renew the workflow deadline. Dry-run follows the normal per-operation rules:
 eligible safe reads may run; other activated handlers receive preflight only.
 Inactive handlers are recorded as skipped without invocation.
