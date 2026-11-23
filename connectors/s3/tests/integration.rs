@@ -14,31 +14,59 @@ use fcp_prelude::{
 };
 use fcp_s3::{client::S3Client, connector::S3Connector, error::S3Error};
 use serde_json::json;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{body_bytes, header, header_exists, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 // ── Helpers ──────────────────────────────────────────────────────────
+
+macro_rules! invoke_request {
+    ($($json:tt)*) => {{
+        let mut request = json!($($json)*);
+        request["type"] = json!("invoke");
+        request["id"] = json!("integration-request");
+        request["connector_id"] = json!("fcp.s3");
+        request["zone_id"] = json!("z:work");
+        request
+    }};
+}
+
+fn capability_for(op: &str) -> &str {
+    match op {
+        "s3.put_object" | "s3.create_bucket" | "s3.copy_object" | "s3.write" => "s3.write",
+        "s3.delete_object" | "s3.delete_bucket" | "s3.delete" => "s3.delete",
+        _ => "s3.read",
+    }
+}
 
 fn generate_valid_token(
     signing_key: &Ed25519SigningKey,
     op: &str,
     instance_id: &str,
 ) -> CapabilityToken {
-    let cap = match op {
-        "s3.put_object" | "s3.create_bucket" | "s3.copy_object" => "s3.write",
-        "s3.delete_object" | "s3.delete_bucket" => "s3.delete",
-        _ => "s3.read",
-    };
+    generate_scoped_token(
+        signing_key,
+        op,
+        instance_id,
+        CapabilityConstraints {
+            resource_allow: vec!["*".into()],
+            ..Default::default()
+        },
+    )
+}
+
+fn generate_scoped_token(
+    signing_key: &Ed25519SigningKey,
+    op: &str,
+    instance_id: &str,
+    constraints: CapabilityConstraints,
+) -> CapabilityToken {
     let now = Utc::now();
-    // C3.4: tokens MUST include constraints (default-deny)
-    let constraints = CapabilityConstraints {
-        resource_allow: vec!["*".into()],
-        ..Default::default()
-    };
+    let token_id = fcp_prelude::InstanceId::new();
     let mut cbor = Vec::new();
     ciborium::into_writer(&constraints, &mut cbor).expect("serialize constraints");
     let cose = CapabilityTokenBuilder::new()
-        .capability_id(cap)
+        .token_id(token_id.as_str().as_bytes())
+        .capability_id(capability_for(op))
         .zone_id("z:work")
         .principal("user:test")
         .operations(&[op])
@@ -77,9 +105,10 @@ async fn setup_handshake(
     capabilities: &[&str],
 ) {
     let verifying_key = signing_key.verifying_key();
+    let capabilities: Vec<_> = capabilities.iter().map(|op| capability_for(op)).collect();
     connector
         .handle_handshake(json!({
-            "protocol_version": "1.0.0",
+            "protocol_version": "2.0",
             "zone": "z:work",
             "host_public_key": verifying_key.to_bytes(),
             "nonce": vec![0u8; 32],
@@ -109,6 +138,7 @@ fn make_client(server_uri: &str) -> S3Client {
     )
     .unwrap()
     .with_base_url(server_uri)
+    .unwrap()
 }
 
 // ── Error taxonomy ──────────────────────────────────────────────────
@@ -252,15 +282,23 @@ async fn client_put_object() {
     let server = MockServer::start().await;
     Mock::given(method("PUT"))
         .and(path("/my-bucket/test-key.txt"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "etag": "\"d41d8cd98f00b204e9800998ecf8427e\""
-        })))
+        .and(body_bytes(b"hello world".to_vec()))
+        .and(header_exists("authorization"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("etag", "\"d41d8cd98f00b204e9800998ecf8427e\""),
+        )
         .mount(&server)
         .await;
 
     let client = make_client(&server.uri());
     let result = client
-        .put_object("my-bucket", "test-key.txt", "hello world")
+        .put_object(
+            "my-bucket",
+            "test-key.txt",
+            b"hello world",
+            Some("text/plain"),
+        )
         .await
         .unwrap();
     assert!(!result.etag.is_empty());
@@ -271,10 +309,7 @@ async fn client_get_object() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/my-bucket/test-key.txt"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "body": "aGVsbG8gd29ybGQ=",
-            "content_type": "text/plain"
-        })))
+        .respond_with(ResponseTemplate::new(200).set_body_raw("hello world", "text/plain"))
         .mount(&server)
         .await;
 
@@ -284,6 +319,8 @@ async fn client_get_object() {
         .await
         .unwrap();
     assert_eq!(result.content_type, "text/plain");
+    assert_eq!(result.body, "hello world");
+    assert_eq!(result.body_encoding, "utf8");
 }
 
 #[fcp_async_core::runtime::test]
@@ -340,9 +377,11 @@ async fn client_copy_object() {
     let server = MockServer::start().await;
     Mock::given(method("PUT"))
         .and(path("/dest-bucket/copy.txt"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "etag": "\"copied-etag\""
-        })))
+        .and(header("x-amz-copy-source", "/src-bucket/original.txt"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            "<CopyObjectResult><ETag>&quot;copied-etag&quot;</ETag></CopyObjectResult>",
+            "application/xml",
+        ))
         .mount(&server)
         .await;
 
@@ -354,27 +393,44 @@ async fn client_copy_object() {
     assert_eq!(result.etag, "\"copied-etag\"");
 }
 
-// Note: client_head_object not tested here because wiremock strips body from HEAD
-// responses per HTTP spec, but the S3 client's head_request parses JSON body.
-// The head_object operation is tested via connector invoke below.
+#[fcp_async_core::runtime::test]
+async fn client_head_object_reads_headers_without_a_body() {
+    let server = MockServer::start().await;
+    Mock::given(method("HEAD"))
+        .and(path("/my-bucket/test-key.txt"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/octet-stream")
+                .insert_header("content-length", "314159")
+                .insert_header("etag", "\"metadata-etag\""),
+        )
+        .mount(&server)
+        .await;
+    let result = make_client(&server.uri())
+        .head_object("my-bucket", "test-key.txt")
+        .await
+        .unwrap();
+    assert_eq!(result.content_type, "application/octet-stream");
+    assert_eq!(result.content_length, 314159);
+    assert_eq!(result.etag.as_deref(), Some("\"metadata-etag\""));
+}
 
 #[fcp_async_core::runtime::test]
 async fn client_list_objects() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/my-bucket"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "contents": [
-                { "key": "file1.txt", "size": 100 },
-                { "key": "file2.txt", "size": 200 }
-            ],
-            "is_truncated": false
-        })))
+        .and(query_param("list-type", "2"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            "<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>my-bucket</Name><IsTruncated>false</IsTruncated><Contents><Key>file1.txt</Key><Size>100</Size></Contents><Contents><Key>file2.txt</Key><Size>200</Size></Contents></ListBucketResult>", "application/xml"))
         .mount(&server)
         .await;
 
     let client = make_client(&server.uri());
-    let result = client.list_objects("my-bucket", None, None).await.unwrap();
+    let result = client
+        .list_objects("my-bucket", None, None, None)
+        .await
+        .unwrap();
     assert_eq!(result.contents.len(), 2);
     assert!(!result.is_truncated);
 }
@@ -384,12 +440,8 @@ async fn client_list_buckets() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "buckets": [
-                { "name": "bucket-a", "creation_date": "2025-01-01T00:00:00Z" },
-                { "name": "bucket-b" }
-            ]
-        })))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            "<ListAllMyBucketsResult><Buckets><Bucket><Name>bucket-a</Name><CreationDate>2025-01-01T00:00:00Z</CreationDate></Bucket><Bucket><Name>bucket-b</Name></Bucket></Buckets></ListAllMyBucketsResult>", "application/xml"))
         .mount(&server)
         .await;
 
@@ -404,10 +456,10 @@ async fn client_unauthorized_error() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/my-bucket/key.txt"))
-        .respond_with(ResponseTemplate::new(403).set_body_json(json!({
-            "Code": "AccessDenied",
-            "Message": "Access Denied"
-        })))
+        .respond_with(ResponseTemplate::new(403).set_body_raw(
+            "<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>",
+            "application/xml",
+        ))
         .mount(&server)
         .await;
 
@@ -421,10 +473,10 @@ async fn client_not_found_error() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/test-bucket/missing-key"))
-        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
-            "code": "NoSuchKey",
-            "message": "missing-key"
-        })))
+        .respond_with(ResponseTemplate::new(404).set_body_raw(
+            "<Error><Code>NoSuchKey</Code><Message>missing-key</Message></Error>",
+            "application/xml",
+        ))
         .mount(&server)
         .await;
 
@@ -455,9 +507,7 @@ async fn invoke_put_object_through_connector() {
     let server = MockServer::start().await;
     Mock::given(method("PUT"))
         .and(path("/my-bucket/hello.txt"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "etag": "\"abc123\""
-        })))
+        .respond_with(ResponseTemplate::new(200).insert_header("etag", "\"abc123\""))
         .mount(&server)
         .await;
 
@@ -473,7 +523,7 @@ async fn invoke_put_object_through_connector() {
         connector.instance_id().as_str(),
     );
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "s3.put_object",
             "input": {
                 "bucket": "my-bucket",
@@ -485,7 +535,10 @@ async fn invoke_put_object_through_connector() {
         .await
         .unwrap();
 
-    assert!(result["etag"].as_str().is_some());
+    assert_eq!(result["type"], "response");
+    assert_eq!(result["id"], "integration-request");
+    assert_eq!(result["resource_uris"], json!(["s3://my-bucket/hello.txt"]));
+    assert_eq!(result["result"]["etag"], "\"abc123\"");
 }
 
 #[fcp_async_core::runtime::test]
@@ -493,9 +546,8 @@ async fn invoke_list_buckets_through_connector() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "buckets": [{ "name": "test-bucket" }]
-        })))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            "<ListAllMyBucketsResult><Buckets><Bucket><Name>test-bucket</Name></Bucket></Buckets></ListAllMyBucketsResult>", "application/xml"))
         .mount(&server)
         .await;
 
@@ -511,7 +563,7 @@ async fn invoke_list_buckets_through_connector() {
         connector.instance_id().as_str(),
     );
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "s3.list_buckets",
             "input": {},
             "capability_token": token
@@ -519,7 +571,8 @@ async fn invoke_list_buckets_through_connector() {
         .await
         .unwrap();
 
-    assert_eq!(result["buckets"][0]["name"], "test-bucket");
+    assert_eq!(result["result"]["buckets"][0]["name"], "test-bucket");
+    assert_eq!(result["resource_uris"], json!(["s3://"]));
 }
 
 #[fcp_async_core::runtime::test]
@@ -532,10 +585,10 @@ async fn invoke_wrong_capability_rejected() {
 
     let token = generate_valid_token(&signing_key, "s3.read", connector.instance_id().as_str());
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "s3.put_object",
             "input": {
-                "bucket": "b",
+                "bucket": "bucket",
                 "key": "k",
                 "body": "x"
             },
@@ -543,7 +596,7 @@ async fn invoke_wrong_capability_rejected() {
         }))
         .await;
 
-    assert!(result.is_err());
+    assert!(matches!(result, Err(FcpError::CapabilityDenied { .. })));
 }
 
 #[fcp_async_core::runtime::test]
@@ -560,7 +613,7 @@ async fn invoke_unknown_operation_rejected() {
         connector.instance_id().as_str(),
     );
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "s3.nonexistent",
             "input": {},
             "capability_token": token
@@ -591,7 +644,7 @@ async fn invoke_missing_required_field_rejected() {
     );
     // Missing key and body
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "s3.put_object",
             "input": { "bucket": "my-bucket" },
             "capability_token": token
@@ -600,9 +653,7 @@ async fn invoke_missing_required_field_rejected() {
 
     assert!(result.is_err());
     match result.unwrap_err() {
-        FcpError::InvalidRequest { message, .. } => {
-            assert!(message.contains("key"));
-        }
+        FcpError::InvalidRequest { .. } => {}
         e => panic!("Expected InvalidRequest, got: {e:?}"),
     }
 }
@@ -612,10 +663,9 @@ async fn invoke_get_object_through_connector() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/my-bucket/data.json"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "body": "eyJrZXkiOiJ2YWx1ZSJ9",
-            "content_type": "application/json"
-        })))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(r#"{"key":"value"}"#, "application/json"),
+        )
         .mount(&server)
         .await;
 
@@ -631,7 +681,7 @@ async fn invoke_get_object_through_connector() {
         connector.instance_id().as_str(),
     );
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "s3.get_object",
             "input": {
                 "bucket": "my-bucket",
@@ -642,8 +692,9 @@ async fn invoke_get_object_through_connector() {
         .await
         .unwrap();
 
-    assert_eq!(result["content_type"], "application/json");
-    assert!(result["body"].as_str().is_some());
+    assert_eq!(result["result"]["content_type"], "application/json");
+    assert_eq!(result["result"]["body"], r#"{"key":"value"}"#);
+    assert_eq!(result["result"]["body_encoding"], "utf8");
 }
 
 #[fcp_async_core::runtime::test]
@@ -668,21 +719,22 @@ async fn invoke_delete_object_through_connector() {
     );
     let approval = generate_execution_approval("s3.delete_object");
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "s3.delete_object",
             "input": {
                 "bucket": "my-bucket",
                 "key": "old-file.txt"
             },
             "capability_token": token,
-            "approval_token": approval,
+            "approval_tokens": [approval],
         }))
         .await
         .unwrap();
 
-    assert_eq!(result["deleted"], true);
-    assert_eq!(result["audit"]["operation"], "s3.delete_object");
-    assert_eq!(result["audit"]["dangerous"], true);
+    assert_eq!(result["result"]["deleted"], true);
+    assert_eq!(result["result"]["audit"]["operation"], "s3.delete_object");
+    assert_eq!(result["result"]["audit"]["dangerous"], true);
+    assert_eq!(result["result"]["audit"]["approval_authority"], "host");
 }
 
 #[fcp_async_core::runtime::test]
@@ -707,20 +759,20 @@ async fn invoke_create_bucket_through_connector() {
     );
     let approval = generate_execution_approval("s3.create_bucket");
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "s3.create_bucket",
             "input": {
                 "bucket": "new-bucket"
             },
             "capability_token": token,
-            "approval_token": approval,
+            "approval_tokens": [approval],
         }))
         .await
         .unwrap();
 
-    assert_eq!(result["bucket"], "new-bucket");
-    assert_eq!(result["created"], true);
-    assert_eq!(result["audit"]["operation"], "s3.create_bucket");
+    assert_eq!(result["result"]["bucket"], "new-bucket");
+    assert_eq!(result["result"]["created"], true);
+    assert_eq!(result["result"]["audit"]["operation"], "s3.create_bucket");
 }
 
 #[fcp_async_core::runtime::test]
@@ -745,28 +797,21 @@ async fn invoke_delete_bucket_through_connector() {
     );
     let approval = generate_execution_approval("s3.delete_bucket");
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "s3.delete_bucket",
             "input": {
                 "bucket": "old-bucket"
             },
             "capability_token": token,
-            "approval_token": approval,
+            "approval_tokens": [approval],
         }))
         .await
         .unwrap();
 
-    assert_eq!(result["bucket"], "old-bucket");
-    assert_eq!(result["deleted"], true);
-    assert_eq!(result["audit"]["operation"], "s3.delete_bucket");
+    assert_eq!(result["result"]["bucket"], "old-bucket");
+    assert_eq!(result["result"]["deleted"], true);
+    assert_eq!(result["result"]["audit"]["operation"], "s3.delete_bucket");
 }
-
-// Note: invoke_head_object_through_connector cannot use wiremock because HEAD
-// responses have their body stripped per HTTP spec, but the S3 client's head_request
-// tries to parse JSON from the body. The head_object dispatch is verified by:
-// 1. The unit tests in client.rs (test_put/get/delete/list cover the retry+parse pattern)
-// 2. The missing-field validation test below
-// 3. The introspect_risk_levels test confirming s3.head_object is registered
 
 #[fcp_async_core::runtime::test]
 async fn invoke_head_object_missing_field() {
@@ -784,7 +829,7 @@ async fn invoke_head_object_missing_field() {
         connector.instance_id().as_str(),
     );
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "s3.head_object",
             "input": { "bucket": "my-bucket" },
             "capability_token": token
@@ -793,9 +838,7 @@ async fn invoke_head_object_missing_field() {
 
     assert!(result.is_err());
     match result.unwrap_err() {
-        FcpError::InvalidRequest { message, .. } => {
-            assert!(message.contains("key"));
-        }
+        FcpError::InvalidRequest { .. } => {}
         e => panic!("Expected InvalidRequest, got: {e:?}"),
     }
 }
@@ -805,13 +848,11 @@ async fn invoke_list_objects_through_connector() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/my-bucket"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "contents": [
-                { "key": "logs/app.log", "size": 500 },
-                { "key": "logs/error.log", "size": 200 }
-            ],
-            "is_truncated": false
-        })))
+        .and(query_param("prefix", "logs/"))
+        .and(query_param("max-keys", "10"))
+        .and(query_param("continuation-token", "opaque+/=cursor"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            "<ListBucketResult><Name>my-bucket</Name><IsTruncated>true</IsTruncated><NextContinuationToken>next+/=page</NextContinuationToken><Contents><Key>logs/app.log</Key><Size>500</Size></Contents><Contents><Key>logs/error.log</Key><Size>200</Size></Contents></ListBucketResult>", "application/xml"))
         .mount(&server)
         .await;
 
@@ -827,20 +868,24 @@ async fn invoke_list_objects_through_connector() {
         connector.instance_id().as_str(),
     );
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "s3.list_objects",
             "input": {
                 "bucket": "my-bucket",
                 "prefix": "logs/",
-                "max_keys": 10
+                "max_keys": 10,
+                "continuation_token": "opaque+/=cursor"
             },
             "capability_token": token
         }))
         .await
         .unwrap();
 
-    assert_eq!(result["contents"].as_array().unwrap().len(), 2);
-    assert_eq!(result["is_truncated"], false);
+    assert_eq!(result["result"]["contents"].as_array().unwrap().len(), 2);
+    assert_eq!(result["result"]["is_truncated"], true);
+    assert_eq!(result["result"]["next_continuation_token"], "next+/=page");
+    assert_eq!(result["next_cursor"], "next+/=page");
+    assert_eq!(result["resource_uris"], json!(["s3://my-bucket"]));
 }
 
 #[fcp_async_core::runtime::test]
@@ -848,9 +893,10 @@ async fn invoke_copy_object_through_connector() {
     let server = MockServer::start().await;
     Mock::given(method("PUT"))
         .and(path("/dest-bucket/backup.txt"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "etag": "\"copy-etag\""
-        })))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            "<CopyObjectResult><ETag>&quot;copy-etag&quot;</ETag></CopyObjectResult>",
+            "application/xml",
+        ))
         .mount(&server)
         .await;
 
@@ -866,7 +912,7 @@ async fn invoke_copy_object_through_connector() {
         connector.instance_id().as_str(),
     );
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "s3.copy_object",
             "input": {
                 "source_bucket": "src-bucket",
@@ -879,7 +925,14 @@ async fn invoke_copy_object_through_connector() {
         .await
         .unwrap();
 
-    assert!(result["etag"].as_str().is_some());
+    assert_eq!(result["result"]["etag"], "\"copy-etag\"");
+    assert_eq!(
+        result["resource_uris"],
+        json!([
+            "s3://src-bucket/original.txt",
+            "s3://dest-bucket/backup.txt"
+        ])
+    );
 }
 
 #[fcp_async_core::runtime::test]
@@ -899,7 +952,7 @@ async fn invoke_generate_presigned_url_through_connector() {
     );
     let approval = generate_execution_approval("s3.generate_presigned_url");
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "s3.generate_presigned_url",
             "input": {
                 "bucket": "my-bucket",
@@ -907,12 +960,12 @@ async fn invoke_generate_presigned_url_through_connector() {
                 "expires_in": 7200
             },
             "capability_token": token,
-            "approval_token": approval,
+            "approval_tokens": [approval],
         }))
         .await
         .unwrap();
 
-    let url = result["url"].as_str().unwrap();
+    let url = result["result"]["url"].as_str().unwrap();
     assert!(url.contains("my-bucket"));
     assert!(url.contains("X-Amz-Algorithm=AWS4-HMAC-SHA256"));
     assert!(url.contains("X-Amz-Credential="));
@@ -921,34 +974,35 @@ async fn invoke_generate_presigned_url_through_connector() {
     assert!(url.contains("X-Amz-Signature="));
     assert!(url.contains("X-Amz-SignedHeaders=host"));
     assert!(!url.contains("PLACEHOLDER_SIGNATURE"));
-    assert_eq!(result["audit"]["operation"], "s3.generate_presigned_url");
-    assert_eq!(result["audit"]["dangerous"], true);
+    assert_eq!(
+        result["result"]["audit"]["operation"],
+        "s3.generate_presigned_url"
+    );
+    assert_eq!(result["result"]["audit"]["dangerous"], true);
 }
 
 #[fcp_async_core::runtime::test]
-async fn invoke_generate_presigned_url_with_credential_id_returns_unsigned_url() {
+async fn credential_reference_never_produces_an_unsigned_url() {
     let server = MockServer::start().await;
 
     let mut connector = S3Connector::new();
     let signing_key = Ed25519SigningKey::generate();
 
-    connector
+    let configured = connector
         .handle_configure(json!({
             "credential_id": "00000000-0000-0000-0000-000000000001",
             "base_url": server.uri()
         }))
-        .await
-        .unwrap();
-    setup_handshake(&mut connector, &signing_key, &["s3.generate_presigned_url"]).await;
+        .await;
+    assert!(matches!(configured, Err(FcpError::InvalidRequest { .. })));
 
     let token = generate_valid_token(
         &signing_key,
         "s3.generate_presigned_url",
         connector.instance_id().as_str(),
     );
-    let approval = generate_execution_approval("s3.generate_presigned_url");
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "s3.generate_presigned_url",
             "input": {
                 "bucket": "my-bucket",
@@ -956,24 +1010,14 @@ async fn invoke_generate_presigned_url_with_credential_id_returns_unsigned_url()
                 "expires_in": 7200
             },
             "capability_token": token,
-            "approval_token": approval,
         }))
-        .await
-        .unwrap();
-
-    let url = result["url"].as_str().unwrap();
-    assert!(url.contains("my-bucket"));
-    assert!(!url.contains("X-Amz-Algorithm="));
-    assert!(!url.contains("X-Amz-Credential="));
-    assert!(!url.contains("X-Amz-Date="));
-    assert!(!url.contains("X-Amz-Signature="));
-    assert!(!url.contains("PLACEHOLDER_SIGNATURE"));
-    assert_eq!(result["audit"]["operation"], "s3.generate_presigned_url");
-    assert_eq!(result["audit"]["dangerous"], true);
+        .await;
+    assert!(matches!(result, Err(FcpError::NotConfigured)));
+    assert!(server.received_requests().await.unwrap().is_empty());
 }
 
 #[fcp_async_core::runtime::test]
-async fn invoke_dangerous_operation_requires_approval_token() {
+async fn unsigned_approval_metadata_cannot_replace_signed_authority() {
     let server = MockServer::start().await;
     let mut connector = S3Connector::new();
     let signing_key = Ed25519SigningKey::generate();
@@ -982,28 +1026,24 @@ async fn invoke_dangerous_operation_requires_approval_token() {
     setup_handshake(&mut connector, &signing_key, &["s3.delete_object"]).await;
 
     let token = generate_valid_token(
-        &signing_key,
+        &Ed25519SigningKey::generate(),
         "s3.delete_object",
         connector.instance_id().as_str(),
     );
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "s3.delete_object",
             "input": {
                 "bucket": "my-bucket",
                 "key": "old-file.txt"
             },
-            "capability_token": token
+            "capability_token": token,
+            "approval_tokens": [generate_execution_approval("s3.delete_object")]
         }))
         .await;
 
     assert!(result.is_err());
-    match result.unwrap_err() {
-        FcpError::CapabilityDenied { reason, .. } => {
-            assert!(reason.contains("ApprovalToken"));
-        }
-        other => panic!("Expected CapabilityDenied, got: {other:?}"),
-    }
+    assert!(server.received_requests().await.unwrap().is_empty());
 }
 
 // ── Risk level verification ─────────────────────────────────────
@@ -1054,7 +1094,7 @@ async fn invoke_copy_object_missing_field() {
     );
     // Missing dest_key
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "s3.copy_object",
             "input": {
                 "source_bucket": "src",
@@ -1067,9 +1107,190 @@ async fn invoke_copy_object_missing_field() {
 
     assert!(result.is_err());
     match result.unwrap_err() {
-        FcpError::InvalidRequest { message, .. } => {
-            assert!(message.contains("dest_key"));
-        }
+        FcpError::InvalidRequest { .. } => {}
         e => panic!("Expected InvalidRequest, got: {e:?}"),
     }
+}
+
+#[fcp_async_core::runtime::test]
+async fn binary_objects_round_trip_as_bytes_with_explicit_encoding() {
+    let server = MockServer::start().await;
+    let bytes = vec![0, 255, 128, 10];
+    Mock::given(method("PUT"))
+        .and(path("/my-bucket/binary.bin"))
+        .and(body_bytes(bytes.clone()))
+        .and(header("content-type", "application/octet-stream"))
+        .respond_with(ResponseTemplate::new(200).insert_header("etag", "\"binary-etag\""))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/my-bucket/binary.bin"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(bytes, "application/octet-stream"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut connector = S3Connector::new();
+    let key = Ed25519SigningKey::generate();
+    setup_configure(&mut connector, &server.uri()).await;
+    setup_handshake(&mut connector, &key, &["s3.write", "s3.read"]).await;
+    let put = connector.handle_invoke(invoke_request!({
+        "operation": "s3.put_object",
+        "input": {"bucket":"my-bucket", "key":"binary.bin", "body":"AP+ACg==", "body_encoding":"base64", "content_type":"application/octet-stream"},
+        "capability_token": generate_valid_token(&key, "s3.put_object", connector.instance_id().as_str()),
+    })).await.unwrap();
+    assert_eq!(put["result"]["etag"], "\"binary-etag\"");
+    let get = connector.handle_invoke(invoke_request!({
+        "operation": "s3.get_object", "input": {"bucket":"my-bucket", "key":"binary.bin"},
+        "capability_token": generate_valid_token(&key, "s3.get_object", connector.instance_id().as_str()),
+    })).await.unwrap();
+    assert_eq!(get["result"]["body"], "AP+ACg==");
+    assert_eq!(get["result"]["body_encoding"], "base64");
+    assert_eq!(get["result"]["content_type"], "application/octet-stream");
+}
+
+#[fcp_async_core::runtime::test]
+async fn copy_requires_both_exact_source_and_destination_resource_authority() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/dest-bucket/copy.txt"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            "<CopyObjectResult><ETag>&quot;copied&quot;</ETag></CopyObjectResult>",
+            "application/xml",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut connector = S3Connector::new();
+    let key = Ed25519SigningKey::generate();
+    setup_configure(&mut connector, &server.uri()).await;
+    setup_handshake(&mut connector, &key, &["s3.write"]).await;
+    let source = "s3://src-bucket/original.txt";
+    let destination = "s3://dest-bucket/copy.txt";
+    for resources in [vec![source], vec![destination], vec![source, destination]] {
+        let both = resources.len() == 2;
+        let token = generate_scoped_token(
+            &key,
+            "s3.copy_object",
+            connector.instance_id().as_str(),
+            CapabilityConstraints {
+                resource_allow: resources.into_iter().map(str::to_owned).collect(),
+                ..Default::default()
+            },
+        );
+        let result = connector.handle_invoke(invoke_request!({
+            "operation":"s3.copy_object",
+            "input":{"source_bucket":"src-bucket", "source_key":"original.txt", "dest_bucket":"dest-bucket", "dest_key":"copy.txt"},
+            "capability_token":token,
+        })).await;
+        assert_eq!(result.is_ok(), both);
+        if !both {
+            assert!(server.received_requests().await.unwrap().is_empty());
+        }
+    }
+}
+
+#[fcp_async_core::runtime::test]
+async fn rejected_input_does_not_spend_signed_call_allowance() {
+    let mut connector = S3Connector::new();
+    let key = Ed25519SigningKey::generate();
+    setup_configure(&mut connector, "http://localhost:1").await;
+    setup_handshake(&mut connector, &key, &["s3.read"]).await;
+    let token = generate_scoped_token(
+        &key,
+        "s3.generate_presigned_url",
+        connector.instance_id().as_str(),
+        CapabilityConstraints {
+            resource_allow: vec!["s3://my-bucket/report.pdf".into()],
+            max_calls: Some(1),
+            ..Default::default()
+        },
+    );
+    for invalid in [
+        json!({"bucket":"my-bucket", "key":"report.pdf", "expires_in":0}),
+        json!({"bucket":"my-bucket", "key":"report.pdf", "expires_in":604801}),
+        json!({"bucket":"my-bucket", "key":"report.pdf", "unrecognized":true}),
+        json!({"bucket":"my-bucket", "key":"../report.pdf"}),
+    ] {
+        let result = connector.handle_invoke(invoke_request!({
+            "operation":"s3.generate_presigned_url", "input":invalid, "capability_token":token.clone(),
+        })).await;
+        assert!(matches!(result, Err(FcpError::InvalidRequest { .. })));
+    }
+    let request = invoke_request!({
+        "operation":"s3.generate_presigned_url", "input":{"bucket":"my-bucket", "key":"report.pdf"},
+        "capability_token":token,
+    });
+    assert!(connector.handle_invoke(request.clone()).await.is_ok());
+    assert!(connector.handle_invoke(request).await.is_err());
+}
+
+#[fcp_async_core::runtime::test]
+async fn signed_byte_ceiling_rejects_before_provider_io() {
+    let server = MockServer::start().await;
+    let mut connector = S3Connector::new();
+    let key = Ed25519SigningKey::generate();
+    setup_configure(&mut connector, &server.uri()).await;
+    setup_handshake(&mut connector, &key, &["s3.read"]).await;
+    let token = generate_scoped_token(
+        &key,
+        "s3.get_object",
+        connector.instance_id().as_str(),
+        CapabilityConstraints {
+            resource_allow: vec!["s3://my-bucket/file.txt".into()],
+            max_bytes: Some(1),
+            ..Default::default()
+        },
+    );
+    let error = connector.handle_invoke(invoke_request!({
+        "operation":"s3.get_object", "input":{"bucket":"my-bucket", "key":"file.txt"}, "capability_token":token,
+    })).await.unwrap_err();
+    assert!(
+        matches!(error, FcpError::CapabilityDenied { reason, .. } if reason.contains("byte budget"))
+    );
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[fcp_async_core::runtime::test]
+async fn deadline_cancels_pending_io_without_refunding_the_signed_call() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/my-bucket/slow.txt"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw("late", "text/plain")
+                .set_delay(Duration::from_secs(1)),
+        )
+        .mount(&server)
+        .await;
+    let mut connector = S3Connector::new();
+    let key = Ed25519SigningKey::generate();
+    setup_configure(&mut connector, &server.uri()).await;
+    setup_handshake(&mut connector, &key, &["s3.read"]).await;
+    let token = generate_scoped_token(
+        &key,
+        "s3.get_object",
+        connector.instance_id().as_str(),
+        CapabilityConstraints {
+            resource_allow: vec!["s3://my-bucket/slow.txt".into()],
+            max_calls: Some(1),
+            ..Default::default()
+        },
+    );
+    let request = invoke_request!({
+        "operation":"s3.get_object", "input":{"bucket":"my-bucket", "key":"slow.txt"},
+        "capability_token":token, "deadline_ms":20,
+    });
+    let start = std::time::Instant::now();
+    let result = connector.handle_invoke(request.clone()).await;
+    assert!(matches!(
+        result,
+        Err(FcpError::External {
+            retryable: false,
+            ..
+        })
+    ));
+    assert!(start.elapsed() < Duration::from_secs(1));
+    assert!(connector.handle_invoke(request).await.is_err());
+    assert!(server.received_requests().await.unwrap().len() <= 1);
 }

@@ -1,6 +1,6 @@
-# S3 Connector V3 Contract
+# S3 Connector
 
-> **Status**: runtime contract documented; AWS/API drift documented
+> **Status**: native FCP runtime with AWS SigV4 and S3 REST response handling
 > **Bead**: `flywheel_connectors-4kw5f.12`
 > **Parent**: `flywheel_connectors-4kw5f`
 > **Verification script**: none tracked; use the commands below
@@ -11,158 +11,100 @@
 
 ## Purpose
 
-This document fixes the operator-facing contract for `fcp.s3`. The connector currently exposes the S3-shaped object-storage surface implemented in this crate: bucket list/create/delete, object put/get/head/list/copy/delete, and presigned URL generation.
+`fcp-s3` exposes ten bounded operations for general-purpose S3 buckets: bucket list/create/delete, object put/get/head/list/copy/delete, and signed download URLs. Runtime and manifest identify the connector as `fcp.s3`. The manifest declares a native, stateless process.
 
-The connector is intentionally a bounded object-storage bridge. It is not a complete AWS SDK, IAM/STSesion client, multipart upload manager, event-notification listener, inventory client, lifecycle-policy tool, bucket-policy admin client, S3 Select client, Glacier restore client, or general S3 API proxy.
+Normal HTTP requests use AWS Signature Version 4, including the exact payload digest, region, endpoint authority, and temporary-session token when configured. Object data travels as bytes; metadata comes from HTTP headers; bucket listings, object listings, copy results, and provider errors use S3 XML shapes. This is an FCP 2.0 JSONL executable, not an FCP3 transport cutover.
 
-## Current Runtime Snapshot
+## Configuration
 
-The current crate exposes these operations:
+Send `configure` with direct credentials:
 
-- `s3.put_object`
-- `s3.get_object`
-- `s3.delete_object`
-- `s3.create_bucket`
-- `s3.delete_bucket`
-- `s3.head_object`
-- `s3.list_objects`
-- `s3.list_buckets`
-- `s3.copy_object`
-- `s3.generate_presigned_url`
+```json
+{
+  "access_key_id": "AKIAEXAMPLE",
+  "secret_access_key": "configured-secret",
+  "region": "us-east-1",
+  "session_token": "optional-temporary-session-token"
+}
+```
 
-Important runtime truths the contract preserves:
+Omit `session_token` for long-lived credentials. The connector does not discover credentials from profiles, assume roles, or refresh an expired session. `credential_id` is rejected because this native executable has no host SigV4 signing transport. It never converts an unsupported signing mode into an unsigned sharing URL.
 
-- Package and binary name are `fcp-s3`.
-- Runtime `BaseConnector` ID is `s3`.
-- Manifest connector ID is `fcp.s3`.
-- Manifest interface hash is `blake3-256:fcp.interface.v2:64aa293ebcaba6acf7045b72e715585f9b45ae9731dc2d07ec94de1b85f63eeb`.
-- Configuration requires exactly one auth source:
-  - direct `access_key_id` plus `secret_access_key`
-  - `credential_id`
-- Direct-key mode also accepts `region`, defaulting to `us-east-1`.
-- `credential_id` must be a valid UUID.
-- Default base URL is `https://s3.amazonaws.com`.
-- `base_url` is optional and is not validated by `configure`.
-- `base_url` is not trimmed by the S3 client; callers should avoid trailing slashes.
-- Direct-key normal HTTP operations send `Authorization: Bearer {access_key_id}` and `x-amz-content-sha256: UNSIGNED-PAYLOAD`.
-- Direct-key normal HTTP operations do not use AWS SigV4 request signing.
-- `secret_access_key` is used for `s3.generate_presigned_url`, not for normal runtime requests.
-- `credential_id` mode sends `X-FCP-Credential-ID` and expects host egress policy to inject real secret material.
-- Client builder timeout is 300 seconds; shared request context timeout is 30 seconds.
-- The client uses the shared retry loop for S3 HTTP helpers with `max_retries = 2`.
-- Runtime `invoke` uses `operation`, not `operation_id`.
-- Runtime `invoke` requires a serialized `capability_token`.
-- Runtime installs a `CapabilityVerifier` during handshake and verifies bound capability tokens for invoke and simulate.
-- `handle_configure()` replaces the old client, clears verifier/session state, sets configured, and clears the handshaken flag.
-- `handle_handshake()` requires prior configuration, stores a host-key verifier, creates a fresh session ID, and returns a SHA-256 hash of the bundled `manifest.toml`.
-- `health()` reports configured/not_configured and request counters; it does not report handshake state.
-- `doctor()` reports configuration, client, base URL, auth mode, network target, and credential-injection mode; it does not do a live probe.
-- `self_check()` calls `list_buckets()` in direct-key mode and returns degraded for `credential_id` mode.
-- `handle_shutdown()` shuts down the client and clears config, verifier, session, configured, and handshaken state.
+The region defaults to `us-east-1`, whose default endpoint is `https://s3.amazonaws.com`. Other regions use `https://s3.<region>.amazonaws.com`; `cn-` regions use the `.amazonaws.com.cn` suffix. Set `base_url` to an HTTPS origin for an alternate S3-compatible endpoint. A non-default port is included in signing. Only the root path is accepted; credentials, query strings and fragments in an endpoint are rejected. Plain HTTP is accepted only for loopback development fixtures.
 
-## Drift Visible In This Checkout
+The embedded network policy allows AWS hosts over port 443 and denies private/loopback addresses. An alternate endpoint requires the corresponding host policy; endpoint syntax validation does not grant egress. Configure or handshake failure revokes earlier session authority. A failed replacement configuration also discards the previous credentials.
 
-This README documents runtime truth and keeps current drift visible:
+## Native Protocol And Authority
 
-- Current Amazon S3 docs describe REST object APIs and SigV4-authenticated requests. This runtime uses simplified bearer-style auth for normal operations and expects JSON fixtures, so it is S3-shaped and S3-compatible-test friendly rather than a production AWS S3 client for normal operations.
-- Real S3 `GET Object` returns object bytes and metadata headers. Runtime `get_object()` expects a JSON body with `body` and `content_type`.
-- Real S3 `HEAD Object` returns metadata in headers and no response body. Runtime `head_object()` issues HEAD and then tries to parse a JSON body; connector tests explicitly avoid a full HEAD fixture because HTTP bodies are stripped for HEAD.
-- Real S3 error bodies are commonly XML. Runtime error parsing is JSON-first and only has fallback string handling.
-- Manifest network constraints allow Amazon S3 hosts on port 443 and deny localhost/private ranges. Runtime accepts any `base_url` string that later reaches reqwest, including local HTTP fixtures.
-- Manifest marks `s3.put_object` and `s3.copy_object` as policy-approved risky writes. Runtime introspection also says risky operations require policy approval, but invoke only requires `approval_token` for `s3.delete_object`, `s3.create_bucket`, `s3.delete_bucket`, and `s3.generate_presigned_url`.
-- Runtime approval-token checks validate local time, execution scope, connector ID, operation pattern, and input constraints. They do not validate token signatures in this connector.
-- Runtime `s3.generate_presigned_url` creates a SigV4 presigned URL only in direct-key mode. In `credential_id` mode it returns an unsigned object URL because the connector does not hold the secret key.
-- Manifest says connector state uses singleton-writer storage. Runtime keeps configuration in process memory and does not persist connector state itself.
-- Manifest rate-limit pools are documented intent only; runtime does not enforce connector-local rate limits.
-- There is no dedicated tracked verification shell script for this connector.
+After configuration, handshake with `protocol_version` `2.0` or `2.0.0`, a host public key, a nonce, an allowed target zone (`z:private` or `z:work`), and requested capability IDs (`s3.read`, `s3.write`, `s3.delete`). The returned `connector_id`, fresh actual `instance_id`, `session_id`, granted capabilities and bundled-manifest SHA-256 identify the negotiated session. Bind signed tokens to the returned instance; a requested instance ID is not reused. An empty capability request grants nothing. Changing the session zone requires reconfiguration.
 
-A follow-up parity bead should decide whether this connector targets real AWS S3 or a JSON S3-compatible facade, add SigV4 signing for normal AWS requests if real AWS is in scope, align HEAD/GET/error parsing with AWS response shapes, enforce endpoint policy at configure time, add approval signature validation or route through a shared verifier, align policy approval for risky writes, make credential-ID presigning explicit or unsupported, and add a tracked verification bundle.
+Invocations use the canonical request envelope, inside the JSON-RPC `params` object:
 
-## First-Slice Scope
+```json
+{
+  "type": "invoke",
+  "id": "read-report",
+  "connector_id": "fcp.s3",
+  "zone_id": "z:work",
+  "operation": "s3.get_object",
+  "input": { "bucket": "reports", "key": "2026/report.txt" },
+  "capability_token": "<host-issued serialized token>",
+  "deadline_ms": 10000
+}
+```
 
-The current S3 README slice documents the existing runtime surface:
+Successful replies contain one canonical `response` envelope with the same ID, a `result`, and the actual `resource_uris`. Schema and domain validation happen before admission. Signed capability checks bind the host key, instance, zone, operation, negotiated capability and these input-derived resources:
 
-- direct access-key and host credential-reference configuration
-- S3-shaped HTTP paths, simplified JSON response handling, timeout, retry, and error mapping
-- bucket and object CRUD operations, object copy, object listing, metadata lookup, and presigned URL behavior
-- bound capability-token verification for invoke and simulate
-- local approval-token checks for dangerous operations
-- lifecycle, health, doctor, self-check, simulation, introspection, and shutdown behavior
-- deterministic WireMock tests and direct proof commands
+| Operation target | Authorized resource |
+|---|---|
+| Object operations and presigning | `s3://bucket/percent-encoded-key` |
+| Bucket operations and object-list pages | `s3://bucket` |
+| Account bucket listing | `s3://` |
+| Object copy | Both source and destination object URIs |
 
-## Auth And Scope Boundary
+Object-key slashes are preserved. Glob metacharacters and URI delimiters in keys are encoded as data. Keys must be 1–1024 UTF-8 bytes; literal `.` or `..` path segments are rejected because URL normalization could target another object. General-purpose bucket names must pass the supported DNS validation.
 
-- Authentication mechanisms: direct access key plus secret key, or host credential reference.
-- Home zone: `z:private`.
-- Allowed source zones: `z:owner`, `z:private`, and `z:work`.
-- Allowed target zones: `z:private` and `z:work`.
-- Forbidden zone: `z:public`.
-- Runtime capability surface:
-  - `s3.read`
-  - `s3.write`
-  - `s3.delete`
-- Handshake stores a bound-token verifier for the host public key, zone, and connector instance ID.
-- Invoke rejects missing, malformed, unbound, wrong-operation, or wrong-capability tokens before dispatch.
-- Dangerous runtime operations also require an execution-scope approval token:
-  - `s3.delete_object`
-  - `s3.create_bucket`
-  - `s3.delete_bucket`
-  - `s3.generate_presigned_url`
-- The connector does not persist access keys, secret keys, credential secret material, object bodies, bucket listings, object metadata, provider error bodies, or API responses outside process memory.
-- Bucket names, object keys, object bodies, and presigned URLs can expose private or work data. Treat live output according to the configured bucket zone and account policy.
+Admission consumes signed call allowances and reserves the compact JSON request plus a bounded response against signed byte allowances. Simulation checks authority without spending a call. Timeouts, cancellation and provider errors do not refund a potentially executed invocation. Byte limits are FCP message accounting, not S3 billing measurements.
 
-## Network And Runtime Invariants
+This executable relies on its private host-to-connector control channel. The host must verify approval signatures, holder proofs, revocation, leases, provenance and policy before dispatch. Manifest approval requirements remain policy approval for put/copy and elevation approval for delete/create-bucket/delete-bucket/presign. Canonical `approval_tokens` are host evidence; unsigned local metadata never substitutes for signed capability authority. Local simulation does not prove those host checks or live AWS availability.
 
-- Default endpoint: `https://s3.amazonaws.com`.
-- Runtime object URL shape: `{base_url}/{bucket}/{key}` with bucket and key percent-encoded.
-- Runtime bucket URL shape: `{base_url}/{bucket}`.
-- Runtime list-buckets URL shape: `{base_url}/`.
-- Runtime list-objects request: `GET {base_url}/{bucket}?list-type=2[&prefix=...][&max-keys=...]`.
-- Runtime copy-object request sends `x-amz-copy-source`.
-- Runtime request timeout through request context: `30 seconds`.
-- Runtime retry policy: `max_retries = 2` using the shared retry loop.
-- Runtime direct-key normal requests send bearer auth with only the access-key ID.
-- Runtime direct-key presigning uses SigV4 with `service = "s3"` and the configured region.
-- Runtime credential-ID presigning returns an unsigned URL because the secret key is not available.
-- Runtime expects JSON success responses for all HTTP helper paths.
-- Provider HTTP 401/403, 404, 429, and other API errors map to typed connector/FCP errors.
-- `Retry-After` on 429 is honored when present and otherwise defaults to 30000 ms.
-- Manifest connect timeout is `10000 ms`, operation total timeout ranges from `30000 ms` to `300000 ms`, and maximum response bytes vary by operation.
-- Sandbox profile is `strict`, with `512 MB` memory, `50%` CPU, no exec, and no inbound listener capability.
-- The connector does not open inbound sockets, subscribe to bucket events, or manage AWS credentials outside the configured process state.
+## Data, Pagination And Execution Bounds
+
+`s3.put_object` accepts `body` with optional `body_encoding` (`utf8`, the default, or standard `base64`) and `content_type`. Uploads and downloads are limited to 2 MiB of actual object data. Oversized objects fail instead of returning a successful truncated value. `s3.get_object` returns `body`, `body_encoding` and `content_type`; invalid UTF-8 bytes are represented in base64. `s3.head_object` reads metadata headers without downloading a response body.
+
+`s3.list_objects` uses ListObjectsV2. Optional inputs are `prefix`, `max_keys` (1–1000), and the opaque `continuation_token`. A truncated page returns `next_continuation_token` in its result and `next_cursor` in its response envelope. Each subsequent page is a new authorized invocation. List/copy XML is bounded at 2 MiB, and provider error bodies at 64 KiB.
+
+Presigned GET URLs use the configured credentials and endpoint, including temporary-session credentials. `expires_in` defaults to 3600 seconds and must be 1–604800; invalid lifetimes are rejected, not clamped. A temporary credential can expire before the requested URL lifetime. Presigning creates a bearer URL and therefore remains a dangerous operation requiring host approval.
+
+The JSONL reader bounds each request at 16 MiB. Invocation deadlines cover dispatch, response validation and accounting, with a maximum of 30 seconds. Timing out drops pending I/O and reports that the provider outcome may be unknown. Redirects and automatic HTTP retries are disabled. The explicit retry path is limited to safe read operations and eligible failures within the remaining budget. Mutations are never automatically replayed after an uncertain result. Their declared idempotency is `best_effort`, accounting for versioned-object effects; this is not an idempotency-result cache.
+
+Successful shutdown flushes its reply and exits even while stdin remains open. EOF, I/O errors, malformed shutdown, failed configuration and failed handshake all revoke local authority. `health` and `doctor` distinguish configuration from negotiated readiness; `self_check` performs a signed list-buckets request. These checks do not establish that every object or bucket permission is available.
 
 ## Operation Inventory
 
 | Operation | Runtime request shape | Capability | SafetyTier | RiskLevel | Idempotency | Required input |
 |-----------|-----------------------|------------|------------|-----------|-------------|----------------|
-| `s3.put_object` | `PUT /{bucket}/{key}` | `s3.write` | `Risky` | `Medium` | `Strict` | `bucket`, `key`, `body` |
+| `s3.put_object` | `PUT /{bucket}/{key}` | `s3.write` | `Risky` | `Medium` | `BestEffort` | `bucket`, `key`, `body` |
 | `s3.get_object` | `GET /{bucket}/{key}` | `s3.read` | `Safe` | `Low` | `Strict` | `bucket`, `key` |
-| `s3.delete_object` | `DELETE /{bucket}/{key}` | `s3.delete` | `Dangerous` | `High` | `Strict` | `bucket`, `key`, approval token |
-| `s3.create_bucket` | `PUT /{bucket}` | `s3.write` | `Dangerous` | `High` | `Strict` | `bucket`, approval token |
-| `s3.delete_bucket` | `DELETE /{bucket}` | `s3.delete` | `Dangerous` | `High` | `Strict` | `bucket`, approval token |
+| `s3.delete_object` | `DELETE /{bucket}/{key}` | `s3.delete` | `Dangerous` | `High` | `BestEffort` | `bucket`, `key` |
+| `s3.create_bucket` | `PUT /{bucket}` | `s3.write` | `Dangerous` | `High` | `BestEffort` | `bucket` |
+| `s3.delete_bucket` | `DELETE /{bucket}` | `s3.delete` | `Dangerous` | `High` | `BestEffort` | `bucket` |
 | `s3.head_object` | `HEAD /{bucket}/{key}` | `s3.read` | `Safe` | `Low` | `Strict` | `bucket`, `key` |
-| `s3.list_objects` | `GET /{bucket}?list-type=2` | `s3.read` | `Safe` | `Low` | `Strict` | `bucket`; optional `prefix`, `max_keys` |
+| `s3.list_objects` | `GET /{bucket}?list-type=2` | `s3.read` | `Safe` | `Low` | `Strict` | `bucket`; optional `prefix`, `max_keys`, `continuation_token` |
 | `s3.list_buckets` | `GET /` | `s3.read` | `Safe` | `Low` | `Strict` | none |
-| `s3.copy_object` | `PUT /{dest_bucket}/{dest_key}` | `s3.write` | `Risky` | `Medium` | `Strict` | `source_bucket`, `source_key`, `dest_bucket`, `dest_key` |
-| `s3.generate_presigned_url` | local signing only | `s3.read` | `Dangerous` | `High` | `None` | `bucket`, `key`; optional `expires_in`; approval token |
+| `s3.copy_object` | `PUT /{dest_bucket}/{dest_key}` | `s3.write` | `Risky` | `Medium` | `BestEffort` | `source_bucket`, `source_key`, `dest_bucket`, `dest_key` |
+| `s3.generate_presigned_url` | local signing only | `s3.read` | `Dangerous` | `High` | `None` | `bucket`, `key`; optional `expires_in` |
 
 ## Explicit Non-Goals
 
 The current implementation does not include:
 
-- AWS SigV4 signing for normal S3 HTTP operations
-- AWS STS, IAM role assumption, session tokens, MFA, profile discovery, or credential refresh
+- AWS STS, IAM role assumption, MFA, profile discovery, or credential refresh
 - multipart upload, resumable upload, checksum selection, server-side encryption options, object tags, ACLs, object lock, legal holds, or retention policies
 - bucket policy, CORS, website hosting, lifecycle, replication, inventory, notification, versioning, requester-pays, or access-point management
-- pagination continuation tokens, delimiter/common-prefix handling, S3 Select, Glacier restore, batch operations, or object-lambda routing
+- delimiter/common-prefix handling, S3 Select, Glacier restore, batch operations, directory buckets, access-point or object-lambda routing
 - inbound event notifications, SQS/SNS/EventBridge integration, durable cursors, or replay
-- durable local object cache, large-object streaming, binary-body handling, or content-type negotiation
-
-These are excluded on purpose:
-
-- S3 write/delete and presigned URL operations can leak or destroy durable storage state.
-- A general AWS SDK facade would bypass the connector's typed capability model.
-- Real AWS S3 parity requires auth, body, header, error, and pagination contracts beyond the current JSON fixture facade.
+- durable local object cache, large-object streaming, or provider-wide rate-limit enforcement
 
 ## Readiness And Verification Surface
 
@@ -170,43 +112,34 @@ These are excluded on purpose:
 
 - local configuration, client, auth mode, base URL, and request/error counter state
 - direct-key live list-buckets self-check behavior
-- degraded self-check for credential-ID mode
+- fail-closed rejection of unsupported credential-reference signing
 - typed introspection with operations, schemas, capability IDs, risk levels, safety tiers, idempotency, and approval metadata
-- simulation allow/deny with the same bound capability and dangerous-operation approval checks used by invoke
-- provider/FCP error mapping for auth failures, missing resources, rate limits, retryable provider errors, JSON errors, and transport errors
+- simulation allow/deny with the same local signed operation/resource authority checks used by invoke
+- provider/FCP error mapping for auth failures, missing resources, rate limits, malformed XML, oversized responses, and transport errors
 
 The deterministic integration evidence is anchored on connector-local tests covering:
 
 - lifecycle, configuration, health, handshake, introspection, simulation, shutdown, and missing-input behavior
-- client-level put/get/delete/list/copy/list-buckets and presigning behavior through deterministic HTTP fixtures
+- client-level put/get/head/delete/list/copy/list-buckets and presigning behavior through deterministic REST fixtures
 - connector-level invoke dispatch with bound capability tokens
 - wrong-capability rejection, unknown-operation rejection, and missing required input rejection
-- approval-token requirement for dangerous operations
-- direct-key presigning and credential-ID unsigned URL behavior
+- signed authority rejection even when unsigned approval metadata is supplied
+- direct-key presigning and refusal to emit unsigned URLs
 - provider 401/403, 404, 429, and retryable server-error classes
-- auth redaction and JSON error-shape handling
+- auth redaction, XML response handling, exact resource scopes, pagination and binary data
 
 ## Source Notes
 
-- `connectors/s3/src/connector.rs` defines configuration parsing, lifecycle handlers, capability verification, approval-token checks, operation catalog, simulation, introspection, and invoke dispatch.
-- `connectors/s3/src/client.rs` defines URL construction, auth headers, timeout, retry behavior, simplified S3 HTTP helpers, presigning, and provider error mapping.
+- `connectors/s3/src/connector.rs` defines configuration parsing, lifecycle handlers, signed admission, operation catalog, simulation, introspection, and invoke dispatch.
+- `connectors/s3/src/client.rs` defines URL validation, SigV4 signing, bounded REST requests, retry behavior, presigning, and provider error mapping.
 - `connectors/s3/src/types.rs` defines runtime response and API error shapes.
 - `connectors/s3/src/error.rs` defines connector error classes and FCP error conversion.
 - `connectors/s3/manifest.toml` defines the manifest operation catalog, network constraints, sandbox boundary, zone policy, and rate-limit intent.
-- `connectors/s3/tests/integration.rs` contains the runtime contract proof surface.
+- `connectors/s3/tests/integration.rs` and `tests/local_non_mock.rs` exercise the native and REST contracts.
 
 ## Verification Bundle
 
-Run these after changing this connector contract:
-
-```bash
-git diff --check -- connectors/s3/README.md
-ubs connectors/s3/README.md
-LC_ALL=C rg -n '[^ -~]' connectors/s3/README.md
-rg -n '\bmaster\b' connectors/s3/README.md
-```
-
-For source or behavior changes, also run the connector proof lane through `rch`:
+Run the connector proof lane through `rch` when the remote builder is available:
 
 ```bash
 rch exec -- cargo test -p fcp-s3
@@ -215,11 +148,4 @@ rch exec -- cargo clippy -p fcp-s3 --all-targets -- -D warnings
 rch exec -- cargo fmt --check
 ```
 
-## Operator Guidance
-
-- Treat this connector as a JSON S3-compatible facade unless and until normal operations gain AWS SigV4 signing and AWS response-shape parsing.
-- Keep direct-key mode pointed at deterministic test endpoints or S3-compatible services that accept the simplified bearer-style auth and JSON response shape.
-- Do not rely on `self_check()` as proof of full AWS S3 compatibility; it only calls runtime `list_buckets()`.
-- Prefer host-managed credential references for secret injection, but do not use credential-ID mode to generate shareable presigned URLs.
-- Treat `s3.delete_object`, `s3.create_bucket`, `s3.delete_bucket`, and `s3.generate_presigned_url` as high-review operations even though the current approval token is locally validated rather than signature-verified here.
-- Do not use this connector for large binary objects, streaming downloads, multipart uploads, or bucket-admin workflows without a follow-up runtime contract.
+The deterministic fixtures exercise production request construction and response decoding without AWS credentials. They do not constitute a live AWS account acceptance run. Use the intended account, region, bucket policy and native host approval path for deployment validation.

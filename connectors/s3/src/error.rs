@@ -10,6 +10,14 @@ use thiserror::Error;
 /// S3-specific errors.
 #[derive(Error, Debug)]
 pub enum S3Error {
+    /// Invalid local input, rejected before provider access.
+    #[error("Invalid S3 input: {0}")]
+    InvalidInput(String),
+
+    /// A delivered response cannot establish a complete successful outcome.
+    #[error("S3 response could not be verified: {0}")]
+    InvalidResponse(String),
+
     /// HTTP request failed
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
@@ -50,13 +58,13 @@ impl S3Error {
     #[must_use]
     pub fn is_retryable(&self) -> bool {
         match self {
-            Self::Http(_) => true,
+            Self::Http(error) => error.is_connect(),
             Self::RateLimited { .. } => true,
             Self::Api { status_code, .. } => {
                 matches!(status_code, Some(500..=599 | 429))
             }
             Self::Unauthorized | Self::NotFound { .. } | Self::BucketNotFound { .. } => false,
-            Self::Json(_) => false,
+            Self::Json(_) | Self::InvalidInput(_) | Self::InvalidResponse(_) => false,
         }
     }
 
@@ -73,9 +81,20 @@ impl S3Error {
     #[must_use]
     pub fn to_fcp_error(&self) -> FcpError {
         match self {
+            Self::InvalidInput(message) => FcpError::InvalidRequest {
+                code: 1001,
+                message: message.clone(),
+            },
+            Self::InvalidResponse(message) => FcpError::External {
+                service: "s3".into(),
+                message: message.clone(),
+                status_code: None,
+                retryable: false,
+                retry_after: None,
+            },
             Self::Http(e) => FcpError::External {
                 service: "s3".into(),
-                message: e.to_string(),
+                message: "S3 HTTP transport failed".into(),
                 status_code: e.status().map(|s| s.as_u16()),
                 retryable: self.is_retryable(),
                 retry_after: self.retry_after(),

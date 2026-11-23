@@ -6922,6 +6922,7 @@ dependencies = [
  "hex",
  "hmac 0.12.1",
  "percent-encoding",
+ "quick-xml",
  "reqwest 0.13.2",
  "serde",
  "serde_json",

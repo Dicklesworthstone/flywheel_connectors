@@ -44,6 +44,8 @@ pub struct GetObjectResponse {
     pub body: String,
     /// Content type of the object
     pub content_type: String,
+    /// Explicit representation of `body`: `utf8` or `base64`.
+    pub body_encoding: String,
 }
 
 /// Response from head_object.
@@ -68,6 +70,9 @@ pub struct ListObjectsResponse {
     pub contents: Vec<ObjectInfo>,
     /// Whether results are truncated
     pub is_truncated: bool,
+    /// Opaque continuation for the next individually authorized page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_continuation_token: Option<String>,
 }
 
 /// Response from list_buckets.
@@ -172,12 +177,15 @@ mod tests {
     #[test]
     fn get_object_response_serde() {
         let resp = GetObjectResponse {
-            body: "base64data".into(),
+            body: "{\"ok\":true}".into(),
             content_type: "application/json".into(),
+            body_encoding: "utf8".into(),
         };
         let json_str = serde_json::to_string(&resp).unwrap();
         let back: GetObjectResponse = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(back.body, "{\"ok\":true}");
         assert_eq!(back.content_type, "application/json");
+        assert_eq!(back.body_encoding, "utf8");
     }
 
     #[test]
@@ -204,6 +212,7 @@ mod tests {
                 storage_class: None,
             }],
             is_truncated: false,
+            next_continuation_token: None,
         };
         let json_str = serde_json::to_string(&resp).unwrap();
         let back: ListObjectsResponse = serde_json::from_str(&json_str).unwrap();
@@ -450,10 +459,12 @@ mod tests {
         let resp = GetObjectResponse {
             body: String::new(),
             content_type: "application/octet-stream".into(),
+            body_encoding: "utf8".into(),
         };
         let json_str = serde_json::to_string(&resp).unwrap();
         let back: GetObjectResponse = serde_json::from_str(&json_str).unwrap();
         assert_eq!(back.body, "");
+        assert_eq!(back.body_encoding, "utf8");
     }
 
     #[test]
@@ -461,10 +472,12 @@ mod tests {
         let resp = GetObjectResponse {
             body: "data".into(),
             content_type: "text/plain".into(),
+            body_encoding: "utf8".into(),
         };
         let c = resp.clone();
         assert_eq!(c.body, "data");
         assert_eq!(c.content_type, "text/plain");
+        assert_eq!(c.body_encoding, "utf8");
         assert_eq!(resp.body, "data");
     }
 
@@ -473,6 +486,7 @@ mod tests {
         let resp = GetObjectResponse {
             body: "x".into(),
             content_type: "text/html".into(),
+            body_encoding: "utf8".into(),
         };
         let dbg = format!("{resp:?}");
         assert!(dbg.contains("GetObjectResponse"));
@@ -480,12 +494,18 @@ mod tests {
 
     #[test]
     fn get_object_response_roundtrip_json() {
-        let json = json!({"body": "SGVsbG8=", "content_type": "image/png"});
-        let resp: GetObjectResponse = serde_json::from_value(json).unwrap();
-        assert_eq!(resp.body, "SGVsbG8=");
-        assert_eq!(resp.content_type, "image/png");
+        let json = json!({
+            "body": "AP+A",
+            "content_type": "application/octet-stream",
+            "body_encoding": "base64"
+        });
+        let resp: GetObjectResponse = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(resp.body_encoding, "base64");
+        let bytes =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &resp.body).unwrap();
+        assert_eq!(bytes, [0, 0xff, 0x80]);
         let re_json = serde_json::to_value(&resp).unwrap();
-        assert_eq!(re_json["body"], "SGVsbG8=");
+        assert_eq!(re_json, json);
     }
 
     // ---- HeadObjectResponse edge cases ----
@@ -549,11 +569,14 @@ mod tests {
         let resp = ListObjectsResponse {
             contents: vec![],
             is_truncated: false,
+            next_continuation_token: None,
         };
         let json_str = serde_json::to_string(&resp).unwrap();
+        assert!(!json_str.contains("next_continuation_token"));
         let back: ListObjectsResponse = serde_json::from_str(&json_str).unwrap();
         assert!(back.contents.is_empty());
         assert!(!back.is_truncated);
+        assert!(back.next_continuation_token.is_none());
     }
 
     #[test]
@@ -567,11 +590,16 @@ mod tests {
                 storage_class: None,
             }],
             is_truncated: true,
+            next_continuation_token: Some("opaque+/=%2F token".into()),
         };
         let json_str = serde_json::to_string(&resp).unwrap();
         let back: ListObjectsResponse = serde_json::from_str(&json_str).unwrap();
         assert!(back.is_truncated);
         assert_eq!(back.contents.len(), 1);
+        assert_eq!(
+            back.next_continuation_token.as_deref(),
+            Some("opaque+/=%2F token")
+        );
     }
 
     #[test]
@@ -581,11 +609,13 @@ mod tests {
                 {"key": "x", "size": 10},
                 {"key": "y", "size": 20, "etag": "\"e\""}
             ],
-            "is_truncated": true
+            "is_truncated": true,
+            "next_continuation_token": "next-page"
         });
         let resp: ListObjectsResponse = serde_json::from_value(json).unwrap();
         assert_eq!(resp.contents.len(), 2);
         assert!(resp.is_truncated);
+        assert_eq!(resp.next_continuation_token.as_deref(), Some("next-page"));
         assert!(resp.contents[0].etag.is_none());
         assert_eq!(resp.contents[1].etag.as_deref(), Some("\"e\""));
     }
@@ -595,6 +625,7 @@ mod tests {
         let resp = ListObjectsResponse {
             contents: vec![],
             is_truncated: false,
+            next_continuation_token: None,
         };
         let c = resp.clone();
         assert!(c.contents.is_empty());
@@ -606,6 +637,7 @@ mod tests {
         let resp = ListObjectsResponse {
             contents: vec![],
             is_truncated: false,
+            next_continuation_token: None,
         };
         let dbg = format!("{resp:?}");
         assert!(dbg.contains("ListObjectsResponse"));
@@ -825,7 +857,14 @@ mod tests {
 
     #[test]
     fn get_object_response_missing_body_fails() {
-        let json = json!({"content_type": "text/plain"});
+        let json = json!({"content_type": "text/plain", "body_encoding": "utf8"});
+        let result = serde_json::from_value::<GetObjectResponse>(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn get_object_response_requires_explicit_encoding() {
+        let json = json!({"body": "AP+A", "content_type": "application/octet-stream"});
         let result = serde_json::from_value::<GetObjectResponse>(json);
         assert!(result.is_err());
     }
@@ -919,11 +958,13 @@ mod tests {
                 },
             ],
             is_truncated: true,
+            next_continuation_token: Some("next-page".into()),
         };
         let val = serde_json::to_value(&resp).unwrap();
         assert!(val["contents"].is_array());
         assert_eq!(val["contents"].as_array().unwrap().len(), 2);
         assert_eq!(val["is_truncated"], true);
+        assert_eq!(val["next_continuation_token"], "next-page");
     }
 
     // ---- Extra field handling (serde default: ignore unknown) ----
@@ -994,10 +1035,11 @@ mod tests {
 
     #[test]
     fn get_object_response_body_and_content_type() {
-        let json = json!({"body": "data", "content_type": "text/plain"});
+        let json = json!({"body": "data", "content_type": "text/plain", "body_encoding": "utf8"});
         let resp: GetObjectResponse = serde_json::from_value(json).unwrap();
         assert_eq!(resp.body, "data");
         assert_eq!(resp.content_type, "text/plain");
+        assert_eq!(resp.body_encoding, "utf8");
     }
 
     // ── HeadObjectResponse additional ─────────────────────────────
@@ -1049,11 +1091,13 @@ mod tests {
     fn list_objects_response_with_truncated_flag() {
         let json = json!({
             "contents": [{"key": "a", "size": 1}],
-            "is_truncated": true
+            "is_truncated": true,
+            "next_continuation_token": "next-page"
         });
         let resp: ListObjectsResponse = serde_json::from_value(json).unwrap();
         assert!(resp.is_truncated);
         assert_eq!(resp.contents.len(), 1);
+        assert_eq!(resp.next_continuation_token.as_deref(), Some("next-page"));
     }
 
     #[test]
@@ -1062,6 +1106,7 @@ mod tests {
         let resp: ListObjectsResponse = serde_json::from_value(json).unwrap();
         assert!(resp.contents.is_empty());
         assert!(!resp.is_truncated);
+        assert!(resp.next_continuation_token.is_none());
     }
 
     #[test]

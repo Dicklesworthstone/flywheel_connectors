@@ -5,7 +5,7 @@ min_mesh_version = "2.0.0"
 min_protocol = "fcp2-sym/2.0"
 protocol_features = []
 max_datagram_bytes = 65000
-interface_hash = "blake3-256:fcp.interface.v2:64aa293ebcaba6acf7045b72e715585f9b45ae9731dc2d07ec94de1b85f63eeb"
+interface_hash = "blake3-256:fcp.interface.v2:bdb3a6d35919ccf9b66165cf7bc03bc7b0e346c56187394e216fca93db735cf8"
 
 [connector]
 id = "fcp.s3"
@@ -13,12 +13,11 @@ name = "S3 Connector"
 version = "0.1.0"
 description = "FCP connector for AWS S3 compatible object storage (buckets, objects, presigned URLs)"
 archetypes = ["storage", "operational"]
-format = "wasi"
+format = "native"
 
 [connector.state]
-model = "singleton_writer"
+model = "stateless"
 state_schema_version = "1"
-migration_hint = "init"
 
 [zones]
 home = "z:private"
@@ -27,7 +26,7 @@ allowed_targets = ["z:private", "z:work"]
 forbidden = ["z:public"]
 
 [capabilities]
-required = ["network.dns", "network.egress", "network.tls.sni", "storage.state"]
+required = ["network.dns", "network.egress", "network.tls.sni"]
 optional = [
     "media.download",
     "media.upload",
@@ -45,18 +44,28 @@ capability = "s3.write"
 risk_level = "medium"
 safety_tier = "risky"
 requires_approval = "policy"
-idempotency = "strict"
+idempotency = "best_effort"
 revocation_freshness = "risky"
 
 [provides.operations."s3.put_object".input_schema]
 required = ["bucket", "key", "body"]
 type = "object"
+additionalProperties = false
 [provides.operations."s3.put_object".input_schema.properties.bucket]
 type = "string"
 [provides.operations."s3.put_object".input_schema.properties.key]
 type = "string"
 [provides.operations."s3.put_object".input_schema.properties.body]
 type = "string"
+maxLength = 2796204
+[provides.operations."s3.put_object".input_schema.properties.body_encoding]
+type = "string"
+enum = ["utf8", "base64"]
+default = "utf8"
+[provides.operations."s3.put_object".input_schema.properties.content_type]
+type = "string"
+minLength = 1
+maxLength = 1024
 
 [provides.operations."s3.put_object".output_schema]
 required = ["etag"]
@@ -65,7 +74,7 @@ type = "object"
 type = "string"
 
 [provides.operations."s3.put_object".network_constraints]
-host_allow = ["*.s3.amazonaws.com", "s3.amazonaws.com", "*.amazonaws.com"]
+host_allow = ["*.s3.amazonaws.com", "s3.amazonaws.com", "*.amazonaws.com", "*.amazonaws.com.cn"]
 port_allow = [443]
 deny_localhost = true
 deny_private_ranges = true
@@ -74,9 +83,9 @@ require_sni = true
 deny_ip_literals = true
 require_host_canonicalization = true
 dns_max_ips = 16
-max_redirects = 5
+max_redirects = 0
 connect_timeout_ms = 10000
-total_timeout_ms = 300000
+total_timeout_ms = 30000
 max_response_bytes = 1048576
 
 [provides.operations."s3.put_object".ai_hints]
@@ -99,21 +108,25 @@ revocation_freshness = "safe"
 [provides.operations."s3.get_object".input_schema]
 required = ["bucket", "key"]
 type = "object"
+additionalProperties = false
 [provides.operations."s3.get_object".input_schema.properties.bucket]
 type = "string"
 [provides.operations."s3.get_object".input_schema.properties.key]
 type = "string"
 
 [provides.operations."s3.get_object".output_schema]
-required = ["body", "content_type"]
+required = ["body", "content_type", "body_encoding"]
 type = "object"
 [provides.operations."s3.get_object".output_schema.properties.body]
 type = "string"
 [provides.operations."s3.get_object".output_schema.properties.content_type]
 type = "string"
+[provides.operations."s3.get_object".output_schema.properties.body_encoding]
+type = "string"
+enum = ["utf8", "base64"]
 
 [provides.operations."s3.get_object".network_constraints]
-host_allow = ["*.s3.amazonaws.com", "s3.amazonaws.com", "*.amazonaws.com"]
+host_allow = ["*.s3.amazonaws.com", "s3.amazonaws.com", "*.amazonaws.com", "*.amazonaws.com.cn"]
 port_allow = [443]
 deny_localhost = true
 deny_private_ranges = true
@@ -122,14 +135,14 @@ require_sni = true
 deny_ip_literals = true
 require_host_canonicalization = true
 dns_max_ips = 16
-max_redirects = 5
+max_redirects = 0
 connect_timeout_ms = 10000
-total_timeout_ms = 300000
-max_response_bytes = 104857600
+total_timeout_ms = 30000
+max_response_bytes = 2097152
 
 [provides.operations."s3.get_object".ai_hints]
 when_to_use = "Download a file from an S3 bucket."
-common_mistakes = ["Not handling large objects — response may be truncated at max_response_bytes for very large files."]
+common_mistakes = ["Objects larger than 2 MiB are rejected, never truncated; decode body according to body_encoding."]
 examples = ['{"bucket": "my-bucket", "key": "data/file.json"}']
 related = ["s3.put_object", "s3.list_objects"]
 
@@ -141,12 +154,13 @@ capability = "s3.delete"
 risk_level = "high"
 safety_tier = "dangerous"
 requires_approval = "elevation_token"
-idempotency = "strict"
+idempotency = "best_effort"
 revocation_freshness = "critical"
 
 [provides.operations."s3.delete_object".input_schema]
 required = ["bucket", "key"]
 type = "object"
+additionalProperties = false
 [provides.operations."s3.delete_object".input_schema.properties.bucket]
 type = "string"
 [provides.operations."s3.delete_object".input_schema.properties.key]
@@ -161,7 +175,7 @@ type = "boolean"
 type = "object"
 
 [provides.operations."s3.delete_object".network_constraints]
-host_allow = ["*.s3.amazonaws.com", "s3.amazonaws.com", "*.amazonaws.com"]
+host_allow = ["*.s3.amazonaws.com", "s3.amazonaws.com", "*.amazonaws.com", "*.amazonaws.com.cn"]
 port_allow = [443]
 deny_localhost = true
 deny_private_ranges = true
@@ -170,7 +184,7 @@ require_sni = true
 deny_ip_literals = true
 require_host_canonicalization = true
 dns_max_ips = 16
-max_redirects = 5
+max_redirects = 0
 connect_timeout_ms = 10000
 total_timeout_ms = 30000
 max_response_bytes = 1048576
@@ -189,12 +203,13 @@ capability = "s3.write"
 risk_level = "high"
 safety_tier = "dangerous"
 requires_approval = "elevation_token"
-idempotency = "strict"
+idempotency = "best_effort"
 revocation_freshness = "critical"
 
 [provides.operations."s3.create_bucket".input_schema]
 required = ["bucket"]
 type = "object"
+additionalProperties = false
 [provides.operations."s3.create_bucket".input_schema.properties.bucket]
 type = "string"
 
@@ -209,7 +224,7 @@ type = "boolean"
 type = "object"
 
 [provides.operations."s3.create_bucket".network_constraints]
-host_allow = ["*.s3.amazonaws.com", "s3.amazonaws.com", "*.amazonaws.com"]
+host_allow = ["*.s3.amazonaws.com", "s3.amazonaws.com", "*.amazonaws.com", "*.amazonaws.com.cn"]
 port_allow = [443]
 deny_localhost = true
 deny_private_ranges = true
@@ -218,7 +233,7 @@ require_sni = true
 deny_ip_literals = true
 require_host_canonicalization = true
 dns_max_ips = 16
-max_redirects = 5
+max_redirects = 0
 connect_timeout_ms = 10000
 total_timeout_ms = 30000
 max_response_bytes = 1048576
@@ -237,12 +252,13 @@ capability = "s3.delete"
 risk_level = "high"
 safety_tier = "dangerous"
 requires_approval = "elevation_token"
-idempotency = "strict"
+idempotency = "best_effort"
 revocation_freshness = "critical"
 
 [provides.operations."s3.delete_bucket".input_schema]
 required = ["bucket"]
 type = "object"
+additionalProperties = false
 [provides.operations."s3.delete_bucket".input_schema.properties.bucket]
 type = "string"
 
@@ -257,7 +273,7 @@ type = "boolean"
 type = "object"
 
 [provides.operations."s3.delete_bucket".network_constraints]
-host_allow = ["*.s3.amazonaws.com", "s3.amazonaws.com", "*.amazonaws.com"]
+host_allow = ["*.s3.amazonaws.com", "s3.amazonaws.com", "*.amazonaws.com", "*.amazonaws.com.cn"]
 port_allow = [443]
 deny_localhost = true
 deny_private_ranges = true
@@ -266,7 +282,7 @@ require_sni = true
 deny_ip_literals = true
 require_host_canonicalization = true
 dns_max_ips = 16
-max_redirects = 5
+max_redirects = 0
 connect_timeout_ms = 10000
 total_timeout_ms = 30000
 max_response_bytes = 1048576
@@ -291,12 +307,20 @@ revocation_freshness = "safe"
 [provides.operations."s3.list_objects".input_schema]
 required = ["bucket"]
 type = "object"
+additionalProperties = false
 [provides.operations."s3.list_objects".input_schema.properties.bucket]
 type = "string"
 [provides.operations."s3.list_objects".input_schema.properties.prefix]
 type = "string"
+maxLength = 1024
 [provides.operations."s3.list_objects".input_schema.properties.max_keys]
 type = "integer"
+minimum = 1
+maximum = 1000
+[provides.operations."s3.list_objects".input_schema.properties.continuation_token]
+type = "string"
+minLength = 1
+maxLength = 8192
 
 [provides.operations."s3.list_objects".output_schema]
 required = ["contents", "is_truncated"]
@@ -305,9 +329,11 @@ type = "object"
 type = "array"
 [provides.operations."s3.list_objects".output_schema.properties.is_truncated]
 type = "boolean"
+[provides.operations."s3.list_objects".output_schema.properties.next_continuation_token]
+type = "string"
 
 [provides.operations."s3.list_objects".network_constraints]
-host_allow = ["*.s3.amazonaws.com", "s3.amazonaws.com", "*.amazonaws.com"]
+host_allow = ["*.s3.amazonaws.com", "s3.amazonaws.com", "*.amazonaws.com", "*.amazonaws.com.cn"]
 port_allow = [443]
 deny_localhost = true
 deny_private_ranges = true
@@ -316,10 +342,10 @@ require_sni = true
 deny_ip_literals = true
 require_host_canonicalization = true
 dns_max_ips = 16
-max_redirects = 5
+max_redirects = 0
 connect_timeout_ms = 10000
-total_timeout_ms = 60000
-max_response_bytes = 10485760
+total_timeout_ms = 30000
+max_response_bytes = 2097152
 
 [provides.operations."s3.list_objects".ai_hints]
 when_to_use = "List objects in a bucket, optionally filtered by prefix."
@@ -341,6 +367,7 @@ revocation_freshness = "safe"
 [provides.operations."s3.head_object".input_schema]
 required = ["bucket", "key"]
 type = "object"
+additionalProperties = false
 [provides.operations."s3.head_object".input_schema.properties.bucket]
 type = "string"
 [provides.operations."s3.head_object".input_schema.properties.key]
@@ -353,9 +380,13 @@ type = "object"
 type = "string"
 [provides.operations."s3.head_object".output_schema.properties.content_length]
 type = "integer"
+[provides.operations."s3.head_object".output_schema.properties.etag]
+type = "string"
+[provides.operations."s3.head_object".output_schema.properties.last_modified]
+type = "string"
 
 [provides.operations."s3.head_object".network_constraints]
-host_allow = ["*.s3.amazonaws.com", "s3.amazonaws.com", "*.amazonaws.com"]
+host_allow = ["*.s3.amazonaws.com", "s3.amazonaws.com", "*.amazonaws.com", "*.amazonaws.com.cn"]
 port_allow = [443]
 deny_localhost = true
 deny_private_ranges = true
@@ -364,7 +395,7 @@ require_sni = true
 deny_ip_literals = true
 require_host_canonicalization = true
 dns_max_ips = 16
-max_redirects = 5
+max_redirects = 0
 connect_timeout_ms = 10000
 total_timeout_ms = 30000
 max_response_bytes = 65536
@@ -383,12 +414,13 @@ capability = "s3.write"
 risk_level = "medium"
 safety_tier = "risky"
 requires_approval = "policy"
-idempotency = "strict"
+idempotency = "best_effort"
 revocation_freshness = "risky"
 
 [provides.operations."s3.copy_object".input_schema]
 required = ["source_bucket", "source_key", "dest_bucket", "dest_key"]
 type = "object"
+additionalProperties = false
 [provides.operations."s3.copy_object".input_schema.properties.source_bucket]
 type = "string"
 [provides.operations."s3.copy_object".input_schema.properties.source_key]
@@ -405,7 +437,7 @@ type = "object"
 type = "string"
 
 [provides.operations."s3.copy_object".network_constraints]
-host_allow = ["*.s3.amazonaws.com", "s3.amazonaws.com", "*.amazonaws.com"]
+host_allow = ["*.s3.amazonaws.com", "s3.amazonaws.com", "*.amazonaws.com", "*.amazonaws.com.cn"]
 port_allow = [443]
 deny_localhost = true
 deny_private_ranges = true
@@ -414,9 +446,9 @@ require_sni = true
 deny_ip_literals = true
 require_host_canonicalization = true
 dns_max_ips = 16
-max_redirects = 5
+max_redirects = 0
 connect_timeout_ms = 10000
-total_timeout_ms = 300000
+total_timeout_ms = 30000
 max_response_bytes = 1048576
 
 [provides.operations."s3.copy_object".ai_hints]
@@ -437,8 +469,10 @@ idempotency = "strict"
 revocation_freshness = "safe"
 
 [provides.operations."s3.list_buckets".input_schema]
+additionalProperties = false
 required = []
 type = "object"
+properties = {}
 
 [provides.operations."s3.list_buckets".output_schema]
 required = ["buckets"]
@@ -447,7 +481,7 @@ type = "object"
 type = "array"
 
 [provides.operations."s3.list_buckets".network_constraints]
-host_allow = ["s3.amazonaws.com", "*.amazonaws.com"]
+host_allow = ["s3.amazonaws.com", "*.amazonaws.com", "*.amazonaws.com.cn"]
 port_allow = [443]
 deny_localhost = true
 deny_private_ranges = true
@@ -456,10 +490,10 @@ require_sni = true
 deny_ip_literals = true
 require_host_canonicalization = true
 dns_max_ips = 16
-max_redirects = 5
+max_redirects = 0
 connect_timeout_ms = 10000
 total_timeout_ms = 30000
-max_response_bytes = 5242880
+max_response_bytes = 2097152
 
 [provides.operations."s3.list_buckets".ai_hints]
 when_to_use = "List available S3 buckets."
@@ -481,12 +515,15 @@ revocation_freshness = "critical"
 [provides.operations."s3.generate_presigned_url".input_schema]
 required = ["bucket", "key"]
 type = "object"
+additionalProperties = false
 [provides.operations."s3.generate_presigned_url".input_schema.properties.bucket]
 type = "string"
 [provides.operations."s3.generate_presigned_url".input_schema.properties.key]
 type = "string"
 [provides.operations."s3.generate_presigned_url".input_schema.properties.expires_in]
 type = "integer"
+minimum = 1
+maximum = 604800
 
 [provides.operations."s3.generate_presigned_url".output_schema]
 required = ["url", "audit"]
@@ -497,7 +534,7 @@ type = "string"
 type = "object"
 
 [provides.operations."s3.generate_presigned_url".network_constraints]
-host_allow = ["*.s3.amazonaws.com", "s3.amazonaws.com", "*.amazonaws.com"]
+host_allow = ["*.s3.amazonaws.com", "s3.amazonaws.com", "*.amazonaws.com", "*.amazonaws.com.cn"]
 port_allow = [443]
 deny_localhost = true
 deny_private_ranges = true
@@ -525,7 +562,7 @@ memory_mb = 512
 cpu_percent = 50
 wall_clock_timeout_ms = 600000
 fs_readonly_paths = ["/usr", "/lib"]
-fs_writable_paths = ["$CONNECTOR_STATE"]
+fs_writable_paths = []
 deny_exec = true
 deny_ptrace = true
 
