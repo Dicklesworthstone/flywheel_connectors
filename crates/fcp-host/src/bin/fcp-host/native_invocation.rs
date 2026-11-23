@@ -5,10 +5,7 @@
 //! Physical process custody remains in the exact RPC tickets owned by the
 //! parent module; this boundary never terminates a replacement by connector ID.
 
-use super::{
-    Future, HostError, HostResult, InvokeResponse, NativeInvocationTermination,
-    NativeInvocationWaiter,
-};
+use super::{Future, HostError, HostResult, NativeInvocationTermination, NativeInvocationWaiter};
 use futures_util::future::{Either, select};
 use std::pin::{Pin, pin};
 use std::task::{Context, Poll};
@@ -21,13 +18,13 @@ impl NativeInvocationTermination {
     /// Fence both sides of every work poll, including a poll that returns Ready
     /// or requests cancellation and then returns Pending without another wake.
     /// A synchronous poll cannot be preempted here; its late result is withheld.
-    fn poll_operation<F>(
+    fn poll_operation<F, T>(
         &self,
         operation: Pin<&mut F>,
         context: &mut Context<'_>,
-    ) -> Poll<HostResult<InvokeResponse>>
+    ) -> Poll<HostResult<T>>
     where
-        F: Future<Output = HostResult<InvokeResponse>>,
+        F: Future<Output = HostResult<T>>,
     {
         if self.is_cancel_requested() {
             return Poll::Ready(Err(stopped()));
@@ -42,12 +39,12 @@ impl NativeInvocationTermination {
 
     /// Own the operation and its cleanup even when this future is never polled.
     /// Only the operation's captures constrain the returned future's lifetime.
-    pub(in super::super) fn invoke<F>(
+    pub(in super::super) fn invoke<F, T>(
         &self,
         operation: F,
-    ) -> impl Future<Output = HostResult<InvokeResponse>> + use<F>
+    ) -> impl Future<Output = HostResult<T>> + use<F, T>
     where
-        F: Future<Output = HostResult<InvokeResponse>>,
+        F: Future<Output = HostResult<T>>,
     {
         let invocation = self.clone();
         let waiter = NativeInvocationWaiter {
@@ -94,6 +91,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use fcp_host::{CancellationController, CancellationScope, ConnectorArchetype};
+    use fcp_kernel::InvokeResponse;
 
     use super::super::{NativeRpc, invocation_deadline};
     use super::*;
@@ -108,7 +106,8 @@ mod tests {
 
     fn tracked(id: &str) -> (Arc<CancellationController>, NativeInvocationTermination) {
         let controller = Arc::new(CancellationController::new());
-        let invocation = NativeInvocationTermination::new(invocation_deadline(Instant::now(), None));
+        let invocation =
+            NativeInvocationTermination::new(invocation_deadline(Instant::now(), None));
         let registration = controller
             .track_operation(
                 id,
@@ -188,7 +187,9 @@ mod tests {
             polled.store(true, Ordering::SeqCst);
             pending::<HostResult<InvokeResponse>>().await
         }));
-        let result = future.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+        let result = future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()));
         assert!(matches!(result, std::task::Poll::Ready(Err(_))));
         assert!(!polled.load(Ordering::SeqCst));
         assert!(dropped.load(Ordering::SeqCst));
@@ -221,7 +222,9 @@ mod tests {
     }
 
     fn assert_stopped(result: HostResult<InvokeResponse>) {
-        let diagnostic = result.expect_err("stopped work must not publish a result").to_string();
+        let diagnostic = result
+            .expect_err("stopped work must not publish a result")
+            .to_string();
         assert_eq!(diagnostic, stopped().to_string());
         assert!(!diagnostic.contains("private-response-marker"));
         assert!(!diagnostic.contains("private-error-marker"));
@@ -270,7 +273,10 @@ mod tests {
             Poll::<HostResult<InvokeResponse>>::Pending
         });
         let mut future = Box::pin(invocation.invoke(operation));
-        let Poll::Ready(result) = future.as_mut().poll(&mut Context::from_waker(Waker::noop())) else {
+        let Poll::Ready(result) = future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+        else {
             panic!("a stop observed during Pending must settle in this poll");
         };
         assert_stopped(result);
@@ -307,7 +313,10 @@ mod tests {
             polled.store(true, Ordering::SeqCst);
             Ok(response())
         }));
-        let Poll::Ready(result) = future.as_mut().poll(&mut Context::from_waker(Waker::noop())) else {
+        let Poll::Ready(result) = future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+        else {
             panic!("pre-cancelled invocation must be immediately refused");
         };
         assert_stopped(result);
@@ -337,10 +346,16 @@ mod tests {
                 }
             });
             let mut future = Box::pin(invocation.invoke(operation));
-            let Poll::Ready(result) = future.as_mut().poll(&mut Context::from_waker(Waker::noop())) else {
+            let Poll::Ready(result) = future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+            else {
                 panic!("an elapsed poll must be refused without a timer repoll");
             };
-            assert!(polled.load(Ordering::SeqCst), "fixture must exercise a real work poll");
+            assert!(
+                polled.load(Ordering::SeqCst),
+                "fixture must exercise a real work poll"
+            );
             assert_stopped(result);
             assert!(invocation.is_finished());
         }
@@ -349,7 +364,7 @@ mod tests {
     #[fcp_async_core::runtime::test]
     async fn early_operation_errors_keep_their_original_meaning() {
         let (_, invocation) = tracked("early-error");
-        let result = invocation
+        let result: HostResult<InvokeResponse> = invocation
             .invoke(std::future::ready(Err(HostError::RegistryError(
                 "original-early-error".to_owned(),
             ))))
@@ -373,8 +388,14 @@ mod tests {
         let child = command.spawn().unwrap();
         let mut future = Box::pin(invocation.invoke(std::future::ready(Ok(response()))));
         assert!(futures_util::poll!(future.as_mut()).is_pending());
-        assert!(selected.is_cancelled(), "settlement must be draining selected work");
-        assert!(!invocation.is_cancel_requested(), "candidate drain is not logical cancellation");
+        assert!(
+            selected.is_cancelled(),
+            "settlement must be draining selected work"
+        );
+        assert!(
+            !invocation.is_cancel_requested(),
+            "candidate drain is not logical cancellation"
+        );
         invocation.cancel();
         selected.retire(child);
         let result = fcp_async_core::time::timeout(Duration::from_secs(5), future)
@@ -382,7 +403,10 @@ mod tests {
             .unwrap();
         assert_stopped(result);
         assert!(selected.transport_retired());
-        assert!(selected.is_settled(), "a refusal cannot bypass child exit custody");
+        assert!(
+            selected.is_settled(),
+            "a refusal cannot bypass child exit custody"
+        );
         assert!(invocation.is_finished());
         register_replacement(&controller, "retirement-cancel");
     }

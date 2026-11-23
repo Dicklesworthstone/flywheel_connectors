@@ -2425,10 +2425,8 @@ impl WasiConnector {
             .await
     }
 
-    async fn simulate(&self, _request: SimulateRequest) -> HostResult<SimulateResponse> {
-        Err(HostError::PreflightFailed(
-            "WASI guest simulation is not supported; use host preflight to inspect invocation policy".into(),
-        ))
+    async fn simulate(&self, request: SimulateRequest) -> HostResult<SimulateResponse> {
+        self.simulate_prepared(request, None).await
     }
 
     fn introspect(&self) -> HostResult<Introspection> {
@@ -2752,6 +2750,83 @@ impl InventoryDispatchFence {
             return Err(HostError::PreflightFailed(
                 "connector inventory changed after admission; retry against current configuration"
                     .to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// A simulation may wait behind another call on its prepared WASI guest. Keep
+/// the original admission fences, and refresh policy without spending quota
+/// again immediately before that guest receives the simulation request.
+struct SimulationDispatchGuards<'a> {
+    state: &'a AppState,
+    request: &'a InvokeRequest,
+    asserted_principal: Option<&'a str>,
+    inventory: InventoryDispatchFence,
+    authority: live_authority::LiveAuthorityDispatchGuard,
+    deadline: Instant,
+}
+
+impl<'a> SimulationDispatchGuards<'a> {
+    async fn admit(
+        state: &'a AppState,
+        request: &'a InvokeRequest,
+        asserted_principal: Option<&'a str>,
+        deadline: Instant,
+    ) -> HostResult<Self> {
+        let inventory = state.registry.inventory_fence(state.registry.version());
+        let capability_fence = state.lifecycle.capability_revocation_fence();
+        let execution_fence = state
+            .lifecycle
+            .connector_execution_fence(&request.connector_id)
+            .await?;
+        let preflight = evaluate_live_preflight(state, request, asserted_principal).await;
+        if !preflight.allowed {
+            return Err(HostError::PreflightFailed(preflight.reason.unwrap_or_else(
+                || "preflight denied live simulate request".to_string(),
+            )));
+        }
+        let authority = live_authority::LiveAuthorityDispatchGuard::new(
+            state,
+            request,
+            capability_fence,
+            Some(execution_fence),
+            None,
+        )?;
+        inventory.require_current()?;
+        Ok(Self {
+            state,
+            request,
+            asserted_principal,
+            inventory,
+            authority,
+            deadline,
+        })
+    }
+
+    async fn require_current(&self, safety_tier: SafetyTier) -> HostResult<()> {
+        self.inventory.require_current()?;
+        let preflight =
+            evaluate_live_preflight(self.state, self.request, self.asserted_principal).await;
+        if !preflight.allowed {
+            return Err(HostError::PreflightFailed(preflight.reason.unwrap_or_else(
+                || "current policy denied queued simulation".to_string(),
+            )));
+        }
+        let deployment = deployment_evidence::DeploymentDispatchGuard::new(
+            self.state.deployment_evidence.clone(),
+            self.request.zone_id.clone(),
+            safety_tier,
+        )
+        .refresh()?;
+        let authority = self.authority.refresh()?;
+        self.inventory.require_current()?;
+        deployment.require_current()?;
+        authority.require_current()?;
+        if Instant::now() >= self.deadline {
+            return Err(HostError::Unavailable(
+                "simulation deadline expired before guest dispatch".to_string(),
             ));
         }
         Ok(())
@@ -4854,7 +4929,11 @@ impl SubprocessRegistry {
         )))
     }
 
-    async fn simulate(&self, request: SimulateRequest) -> HostResult<SimulateResponse> {
+    async fn simulate(
+        &self,
+        request: SimulateRequest,
+        guards: Option<&SimulationDispatchGuards<'_>>,
+    ) -> HostResult<SimulateResponse> {
         let connector_id = request.connector_id.clone();
         let connector = {
             let state = self.state.read().await;
@@ -4865,6 +4944,35 @@ impl SubprocessRegistry {
                 .map(|entry| entry.connector.clone())
         }
         .ok_or_else(|| HostError::ConnectorNotFound(connector_id.to_string()))?;
+        if let Some(guards) = guards {
+            guards.inventory.require_current()?;
+            if Instant::now() >= guards.deadline {
+                return Err(HostError::Unavailable(
+                    "simulation deadline expired before connector dispatch".to_string(),
+                ));
+            }
+            if let ConnectorRuntime::Wasi(wasi) = &connector {
+                // The logical cancellation owner retains this exact Store
+                // future. Dropping it retires only a guest that actually began
+                // execution; a cancelled session-lock waiter leaves it intact.
+                let invocation = NativeInvocationTermination::new(guards.deadline);
+                let scope = CancellationScope::new(
+                    connector_id.to_string(),
+                    ConnectorArchetype::RequestResponse,
+                )
+                .with_terminator(invocation.terminator());
+                let registration = track_verified_cancellation_owner(
+                    guards.state.cancellation.as_ref(),
+                    &request.id.to_string(),
+                    guards.request,
+                    scope,
+                )?;
+                invocation.bind_registration(&guards.state.cancellation, registration);
+                return invocation
+                    .invoke(wasi.simulate_prepared(request, Some(guards)))
+                    .await;
+            }
+        }
         connector.simulate(request).await
     }
 }
@@ -14753,6 +14861,7 @@ async fn local_simulate(
     let operation = request.operation.clone();
     let request_id = request.request_id.clone();
     let started_at = Instant::now();
+    let deadline = invocation_deadline(started_at, Some(request.deadline_ms));
 
     tracing::debug!(
         event = "simulate_request",
@@ -14773,36 +14882,57 @@ async fn local_simulate(
         }
     };
 
-    let preflight = evaluate_live_preflight(state, &preflight_request, asserted_principal).await;
-    if !preflight.allowed {
-        return simulate_preflight_denial(
-            state,
-            request,
-            started_at,
-            preflight
-                .reason
-                .unwrap_or_else(|| "preflight denied live simulate request".to_string()),
-        )
-        .await;
-    }
+    let guards = match fcp_async_core::time::timeout(
+        deadline.saturating_duration_since(Instant::now()),
+        SimulationDispatchGuards::admit(state, &preflight_request, asserted_principal, deadline),
+    )
+    .await
+    {
+        Ok(Ok(guards)) => guards,
+        Ok(Err(error)) => {
+            return simulate_preflight_denial(state, request, started_at, error.to_string()).await;
+        }
+        Err(_) => {
+            let response = simulate_timeout_response(
+                request,
+                &preflight_request.input,
+                elapsed_millis(started_at),
+                false,
+            )
+            .map_err(map_host_error)?;
+            record_simulate_receipt_summary(state.lifecycle.as_ref(), &response.receipt).await;
+            return Ok(response);
+        }
+    };
 
     let simulate_request = simulate_request_from_host(request).map_err(map_host_error)?;
     let simulate_input = simulate_request.input.clone();
     let simulate_result = fcp_async_core::time::timeout(
-        Duration::from_millis(request.deadline_ms),
-        state.registry.simulate(simulate_request),
+        deadline.saturating_duration_since(Instant::now()),
+        state.registry.simulate(simulate_request, Some(&guards)),
     )
-    .await;
+    .await
+    .ok();
+    // A synchronous work poll can finish after its deadline before the timer
+    // wakes. Never publish that late response or reset the admission budget.
+    let simulate_result = if Instant::now() >= deadline {
+        None
+    } else {
+        simulate_result
+    };
     let duration_ms = elapsed_millis(started_at);
 
     let response = match simulate_result {
-        Ok(Ok(simulate_response)) if simulate_response.id != preflight_request.id => {
+        Some(Ok(simulate_response))
+            if simulate_response.r#type != "simulate_response"
+                || simulate_response.id != preflight_request.id =>
+        {
             return Err((
                 StatusCode::BAD_GATEWAY,
-                "connector returned a simulation response for a different request".to_string(),
+                "connector returned an invalid simulation response envelope".to_string(),
             ));
         }
-        Ok(Ok(simulate_response)) => HostSimulateResponse {
+        Some(Ok(simulate_response)) => HostSimulateResponse {
             request_id: request_id.clone(),
             would_succeed: simulate_response.would_succeed,
             phase: SimulatePhase::ConnectorReached,
@@ -14826,7 +14956,7 @@ async fn local_simulate(
             )
             .map_err(map_host_error)?,
         },
-        Ok(Err(error)) if is_simulate_unsupported(&error) => HostSimulateResponse {
+        Some(Err(error)) if is_simulate_unsupported(&error) => HostSimulateResponse {
             request_id: request_id.clone(),
             would_succeed: false,
             phase: SimulatePhase::ConnectorUnsupported,
@@ -14848,7 +14978,7 @@ async fn local_simulate(
             )
             .map_err(map_host_error)?,
         },
-        Ok(Err(error)) => {
+        Some(Err(error)) => {
             tracing::warn!(
                 event = "simulate_error",
                 connector_id = %connector_id,
@@ -14860,26 +14990,8 @@ async fn local_simulate(
             );
             return Err(map_host_error(error));
         }
-        Err(_) => HostSimulateResponse {
-            request_id: request_id.clone(),
-            would_succeed: false,
-            phase: SimulatePhase::TimedOut,
-            preflight_allowed: true,
-            failure_reason: Some("simulation deadline exceeded".to_string()),
-            denial_code: None,
-            missing_capabilities: Vec::new(),
-            cost_estimate: None,
-            availability: None,
-            duration_ms,
-            receipt: simulate_receipt_for_request(
-                request,
-                &simulate_input,
-                SimulatePhase::TimedOut,
-                false,
-                duration_ms,
-            )
+        None => simulate_timeout_response(request, &simulate_input, duration_ms, true)
             .map_err(map_host_error)?,
-        },
     };
 
     record_simulate_receipt_summary(state.lifecycle.as_ref(), &response.receipt).await;
@@ -14897,6 +15009,33 @@ async fn local_simulate(
     );
 
     Ok(response)
+}
+
+fn simulate_timeout_response(
+    request: &HostSimulateRequest,
+    input: &Value,
+    duration_ms: u64,
+    preflight_allowed: bool,
+) -> HostResult<HostSimulateResponse> {
+    Ok(HostSimulateResponse {
+        request_id: request.request_id.clone(),
+        would_succeed: false,
+        phase: SimulatePhase::TimedOut,
+        preflight_allowed,
+        failure_reason: Some("simulation deadline exceeded".to_string()),
+        denial_code: None,
+        missing_capabilities: Vec::new(),
+        cost_estimate: None,
+        availability: None,
+        duration_ms,
+        receipt: simulate_receipt_for_request(
+            request,
+            input,
+            SimulatePhase::TimedOut,
+            false,
+            duration_ms,
+        )?,
+    })
 }
 
 const MCP_SAMPLING_HANDLE_OPERATION: &str = "mcp.sampling.handle";
@@ -42597,7 +42736,7 @@ while IFS= read -r request; do exit 2; done
         let simulation = warm_pool_test_simulate_request(request.clone());
         for error in [
             registry.invoke(request).await.unwrap_err(),
-            registry.simulate(simulation).await.unwrap_err(),
+            registry.simulate(simulation, None).await.unwrap_err(),
         ] {
             assert!(error.to_string().contains("shutting down"), "{error}");
         }

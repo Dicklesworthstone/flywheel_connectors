@@ -88,6 +88,50 @@ fn component_fixture() -> String {
     let (prefix, suffix) = split_fragment(&error, &encode(&id).unwrap());
     insert_fragment(&mut component, "ERROR_PREFIX", prefix);
     insert_fragment(&mut component, "ERROR_SUFFIX", suffix);
+
+    let credits = 1_987_654_321_u64;
+    let cost = fcp_core::CostEstimate::with_credits(credits);
+    let availability = ResourceAvailability::available();
+    let simulation = SimulateResponse::allowed(id.clone())
+        .with_cost_estimate(cost.clone())
+        .with_availability(availability.clone());
+    let response = encode(&simulation).unwrap();
+    let (prefix, rest) = split_fragment(&response, &encode(&id).unwrap());
+    let (after_id, rest) = split_fragment(rest, &encode(&availability).unwrap());
+    let (after_availability, suffix) = split_fragment(rest, &encode(&cost).unwrap());
+    insert_fragment(&mut component, "SIMULATE_PREFIX", prefix);
+    insert_fragment(&mut component, "SIMULATE_AFTER_ID", after_id);
+    insert_fragment(
+        &mut component,
+        "SIMULATE_AFTER_AVAILABILITY",
+        after_availability,
+    );
+    insert_fragment(&mut component, "SIMULATE_SUFFIX", suffix);
+    insert_fragment(
+        &mut component,
+        "SIMULATE_AVAILABILITY",
+        &encode(&availability).unwrap(),
+    );
+    let cost = encode(&cost).unwrap();
+    let (prefix, suffix) = split_fragment(&cost, &encode(&credits).unwrap());
+    insert_fragment(&mut component, "SIMULATE_COST_PREFIX", prefix);
+    insert_fragment(&mut component, "SIMULATE_COST_SUFFIX", suffix);
+
+    let denied = encode(&SimulateResponse::denied(
+        id.clone(),
+        "guest rejected simulation",
+        "FCP-1002",
+    ))
+    .unwrap();
+    let (prefix, suffix) = split_fragment(&denied, &encode(&id).unwrap());
+    insert_fragment(&mut component, "SIMULATE_DENIED_PREFIX", prefix);
+    insert_fragment(&mut component, "SIMULATE_DENIED_SUFFIX", suffix);
+    let mut wrong_type = SimulateResponse::allowed(id.clone());
+    wrong_type.r#type = "response".into();
+    let wrong_type = encode(&wrong_type).unwrap();
+    let (prefix, suffix) = split_fragment(&wrong_type, &encode(&id).unwrap());
+    insert_fragment(&mut component, "SIMULATE_WRONG_TYPE_PREFIX", prefix);
+    insert_fragment(&mut component, "SIMULATE_WRONG_TYPE_SUFFIX", suffix);
     assert!(
         !component.contains("{{"),
         "all component fragments must be populated"
@@ -272,6 +316,27 @@ impl Fixture {
     async fn invoke(&self, request: InvokeRequest) -> HostResult<InvokeResponse> {
         self.connector
             .invoke_prepared(request, None, None, None)
+            .await
+    }
+
+    fn simulation(request: InvokeRequest) -> HostSimulateRequest {
+        serde_json::from_value(json!({
+            "connector_id": request.connector_id,
+            "operation": request.operation,
+            "request_id": request.id,
+            "zone_id": request.zone_id,
+            "input": request.input,
+            "capability_token": request.capability_token,
+            "estimate_cost": true,
+            "check_availability": true,
+            "deadline_ms": request.deadline_ms.unwrap_or(10_000),
+        }))
+        .unwrap()
+    }
+
+    async fn simulate(&self, request: &HostSimulateRequest) -> HostResult<SimulateResponse> {
+        self.connector
+            .simulate(simulate_request_from_host(request)?)
             .await
     }
 
@@ -892,6 +957,372 @@ async fn prepared_wasi_dispatches_real_input_through_live_host_and_reuses_instan
             "preparation must not silently rehandshake a live guest"
         );
     }
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn wasi_simulation_reaches_real_guest_and_preserves_invocation_state() {
+    let fixture = Fixture::new().await;
+    let prepared = fixture.prepare(ZoneId::work(), ECHO).await;
+    let before = fixture
+        .invoke(fixture.request(&prepared.instance_id, ZoneId::work(), ECHO, json!({})))
+        .await
+        .unwrap();
+    assert_eq!(before.result.unwrap()["calls"], 1);
+
+    for (estimate_cost, check_availability, credits) in [
+        (false, false, 3),
+        (true, false, 17),
+        (false, true, 29),
+        (true, true, 71),
+    ] {
+        let mut request = Fixture::simulation(fixture.request(
+            &prepared.instance_id,
+            ZoneId::work(),
+            ECHO,
+            json!({"credits": credits}),
+        ));
+        request.estimate_cost = estimate_cost;
+        request.check_availability = check_availability;
+        let expected_id = request.request_id.clone();
+        let response = simulate_handler(
+            State(Arc::clone(&fixture.host)),
+            HeaderMap::new(),
+            Json(request),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(response.request_id, expected_id);
+        assert_eq!(response.phase, SimulatePhase::ConnectorReached);
+        assert!(response.preflight_allowed && response.would_succeed);
+        assert_eq!(
+            response.cost_estimate.and_then(|cost| cost.api_credits),
+            estimate_cost.then_some(credits),
+        );
+        assert_eq!(response.availability.is_some(), check_availability);
+        assert!(
+            response
+                .availability
+                .is_none_or(|availability| availability.available)
+        );
+        assert_eq!(response.receipt.phase, SimulatePhase::ConnectorReached);
+        assert!(response.receipt.would_succeed);
+    }
+
+    let denied = Fixture::simulation(fixture.request(
+        &prepared.instance_id,
+        ZoneId::work(),
+        ECHO,
+        json!({"mode": "error"}),
+    ));
+    let denied = local_simulate(&fixture.host, &denied, None).await.unwrap();
+    assert_eq!(denied.phase, SimulatePhase::ConnectorReached);
+    assert!(!denied.would_succeed);
+    assert_eq!(denied.denial_code.as_deref(), Some("FCP-1002"));
+    assert_eq!(
+        denied.failure_reason.as_deref(),
+        Some("guest rejected simulation")
+    );
+    assert_eq!(
+        fixture.prepare(ZoneId::work(), ECHO).await.instance_id,
+        prepared.instance_id
+    );
+    let after = fixture
+        .invoke(fixture.request(&prepared.instance_id, ZoneId::work(), ECHO, json!({})))
+        .await
+        .unwrap();
+    assert_eq!(
+        after.result.unwrap()["calls"],
+        2,
+        "simulation must never call invoke"
+    );
+    let receipts = fixture
+        .host
+        .lifecycle
+        .query_simulate_receipts(&SimulateReceiptQueryRequest {
+            connector_id: CONNECTOR.into(),
+            operation: Some(ECHO.into()),
+            after: None,
+            limit: 10,
+        })
+        .await;
+    assert_eq!(receipts.total_receipts, 5);
+    assert!(
+        receipts
+            .receipts
+            .iter()
+            .all(|receipt| receipt.phase == SimulatePhase::ConnectorReached)
+    );
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn wasi_simulation_requires_exact_prepared_instance_and_scope() {
+    let fixture = Fixture::new().await;
+    let unprepared =
+        Fixture::simulation(fixture.request(&InstanceId::new(), ZoneId::work(), ECHO, json!({})));
+    assert!(fixture.simulate(&unprepared).await.is_err());
+    assert!(!fixture.connector.sessions.has_ready_session());
+
+    let prepared = fixture.prepare(ZoneId::work(), ECHO).await;
+    let other = fixture.prepare(ZoneId::work(), OTHER).await;
+    let private = fixture.prepare(ZoneId::private(), ECHO).await;
+    for (zone, operation) in [(ZoneId::work(), OTHER), (ZoneId::private(), ECHO)] {
+        let mismatched =
+            Fixture::simulation(fixture.request(&prepared.instance_id, zone, operation, json!({})));
+        assert!(fixture.simulate(&mismatched).await.is_err());
+    }
+    let mut unbound = Fixture::simulation(fixture.request(
+        &prepared.instance_id,
+        ZoneId::work(),
+        ECHO,
+        json!({}),
+    ));
+    unbound.capability_token = Some(crate::tests::test_capability_token(
+        &fixture.key,
+        CAPABILITY,
+        ECHO,
+        "z:work",
+    ));
+    assert!(fixture.simulate(&unbound).await.is_err());
+    for (instance, zone, operation) in [
+        (&prepared.instance_id, ZoneId::work(), ECHO),
+        (&other.instance_id, ZoneId::work(), OTHER),
+        (&private.instance_id, ZoneId::private(), ECHO),
+    ] {
+        let response = fixture
+            .invoke(fixture.request(instance, zone, operation, json!({})))
+            .await
+            .unwrap();
+        assert_eq!(response.result.unwrap()["calls"], 1);
+    }
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn wasi_simulation_invalid_responses_retire_only_selected_guest() {
+    let fixture = Fixture::new().await;
+    let unaffected = fixture.prepare(ZoneId::work(), OTHER).await;
+    for mode in [
+        "trap",
+        "malformed",
+        "wrong_id",
+        "wrong_type",
+        "noncanonical",
+        "trailing",
+        "oversized",
+    ] {
+        let prepared = fixture.prepare(ZoneId::work(), ECHO).await;
+        let request = Fixture::simulation(fixture.request(
+            &prepared.instance_id,
+            ZoneId::work(),
+            ECHO,
+            json!({"mode": mode}),
+        ));
+        assert!(fixture.simulate(&request).await.is_err(), "{mode}");
+        assert!(
+            fixture.simulate(&request).await.is_err(),
+            "{mode} must require explicit preparation"
+        );
+        let replacement = fixture.prepare(ZoneId::work(), ECHO).await;
+        assert_ne!(prepared.instance_id, replacement.instance_id);
+        assert!(
+            fixture.simulate(&request).await.is_err(),
+            "{mode}: stale token must not select replacement"
+        );
+        let response = fixture
+            .invoke(fixture.request(&replacement.instance_id, ZoneId::work(), ECHO, json!({})))
+            .await
+            .unwrap();
+        assert_eq!(response.result.unwrap()["calls"], 1);
+    }
+    assert_eq!(
+        fixture.prepare(ZoneId::work(), OTHER).await.instance_id,
+        unaffected.instance_id
+    );
+    let response = fixture
+        .invoke(fixture.request(&unaffected.instance_id, ZoneId::work(), OTHER, json!({})))
+        .await
+        .unwrap();
+    assert_eq!(response.result.unwrap()["calls"], 1);
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn wasi_simulation_queue_rechecks_inventory_revocation_and_lifecycle() {
+    for change in ["inventory", "revocation", "lifecycle"] {
+        let fixture = Fixture::new().await;
+        let prepared = fixture.prepare(ZoneId::work(), ECHO).await;
+        let request = Fixture::simulation(fixture.request(
+            &prepared.instance_id,
+            ZoneId::work(),
+            ECHO,
+            json!({}),
+        ));
+        let admission = invoke_request_from_simulate(&request).unwrap();
+        let guards = SimulationDispatchGuards::admit(
+            &fixture.host,
+            &admission,
+            None,
+            Instant::now() + Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+        let slot = fixture
+            .connector
+            .sessions
+            .slot(&ZoneId::work(), &OperationId::from_static(ECHO), false)
+            .unwrap();
+        let owner = slot.guest.lock().await;
+        let mut queued = Box::pin(
+            fixture
+                .connector
+                .simulate_prepared(simulate_request_from_host(&request).unwrap(), Some(&guards)),
+        );
+        assert!(futures_util::poll!(queued.as_mut()).is_pending());
+        match change {
+            "inventory" => {
+                fixture.host.registry.version.fetch_add(1, Ordering::SeqCst);
+            }
+            "revocation" => {
+                fixture
+                    .host
+                    .lifecycle
+                    .revoke_token(&fcp_host::TokenRevocationRequest {
+                        token_id: "simulation-queued-revocation".into(),
+                        reason: None,
+                    })
+                    .await
+                    .unwrap();
+            }
+            _ => {
+                let connector_id = ConnectorId::from_static(CONNECTOR);
+                fixture
+                    .host
+                    .lifecycle
+                    .set_desired_state(&connector_id, fcp_host::DesiredRuntimeState::Disabled, None)
+                    .await
+                    .unwrap();
+                fixture
+                    .host
+                    .lifecycle
+                    .set_desired_state(&connector_id, fcp_host::DesiredRuntimeState::Enabled, None)
+                    .await
+                    .unwrap();
+            }
+        }
+        drop(owner);
+        assert!(queued.await.is_err(), "{change}");
+        assert_eq!(
+            fixture.prepare(ZoneId::work(), ECHO).await.instance_id,
+            prepared.instance_id
+        );
+        let response = fixture
+            .invoke(fixture.request(&prepared.instance_id, ZoneId::work(), ECHO, json!({})))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.result.unwrap()["calls"],
+            1,
+            "{change} refusal must preserve an unused guest"
+        );
+    }
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn wasi_simulation_cancellation_and_deadline_preserve_queued_guest() {
+    for cancel in [false, true] {
+        let fixture = Fixture::new().await;
+        let prepared = fixture.prepare(ZoneId::work(), ECHO).await;
+        let mut request = Fixture::simulation(fixture.request(
+            &prepared.instance_id,
+            ZoneId::work(),
+            ECHO,
+            json!({}),
+        ));
+        request.deadline_ms = if cancel { 10_000 } else { 100 };
+        let slot = fixture
+            .connector
+            .sessions
+            .slot(&ZoneId::work(), &OperationId::from_static(ECHO), false)
+            .unwrap();
+        let owner = slot.guest.lock().await;
+        let mut queued = Box::pin(local_simulate(&fixture.host, &request, None));
+        // Admission itself has async lookups. Wait for the exact logical
+        // registration instead of assuming the first poll reaches the queue.
+        for _ in 0..100 {
+            assert!(futures_util::poll!(queued.as_mut()).is_pending());
+            if fixture.host.cancellation.tracked_count() == 1 {
+                break;
+            }
+            fcp_async_core::task::yield_now().await;
+        }
+        assert_eq!(fixture.host.cancellation.tracked_count(), 1);
+        if cancel {
+            fixture
+                .host
+                .cancellation
+                .cancel(
+                    &CancellationRequest {
+                        operation_id: request.request_id.clone(),
+                        reason: fcp_host::CancelReason::UserRequested,
+                        cleanup: fcp_host::CleanupBehavior::default(),
+                        return_partial: false,
+                        capability_token: None,
+                    },
+                    Some("user:test"),
+                    Utc::now(),
+                )
+                .unwrap();
+            assert!(queued.await.is_err());
+        } else {
+            let response = queued.await.unwrap();
+            assert_eq!(response.phase, SimulatePhase::TimedOut);
+            assert!(!response.would_succeed);
+        }
+        drop(owner);
+        assert_eq!(
+            fixture.prepare(ZoneId::work(), ECHO).await.instance_id,
+            prepared.instance_id
+        );
+        // Completion must release the cancellation registration for this ID.
+        fixture
+            .host
+            .cancellation
+            .track_operation(
+                &request.request_id,
+                Some("user:test"),
+                CancellationScope::new(CONNECTOR, ConnectorArchetype::RequestResponse),
+            )
+            .unwrap();
+        let response = fixture
+            .invoke(fixture.request(&prepared.instance_id, ZoneId::work(), ECHO, json!({})))
+            .await
+            .unwrap();
+        assert_eq!(response.result.unwrap()["calls"], 1);
+    }
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn wasi_simulation_dropped_during_guest_execution_retires_its_instance() {
+    let fixture = Fixture::new().await;
+    let prepared = fixture.prepare(ZoneId::work(), ECHO).await;
+    let other = fixture.prepare(ZoneId::work(), OTHER).await;
+    let request = Fixture::simulation(fixture.request(
+        &prepared.instance_id,
+        ZoneId::work(),
+        ECHO,
+        json!({"mode": "spin"}),
+    ));
+    let mut running = Box::pin(fixture.simulate(&request));
+    assert!(futures_util::poll!(running.as_mut()).is_pending());
+    drop(running);
+    assert!(fixture.simulate(&request).await.is_err());
+    assert_ne!(
+        fixture.prepare(ZoneId::work(), ECHO).await.instance_id,
+        prepared.instance_id
+    );
+    assert_eq!(
+        fixture.prepare(ZoneId::work(), OTHER).await.instance_id,
+        other.instance_id
+    );
 }
 
 #[fcp_async_core::runtime::test(flavor = "multi_thread")]

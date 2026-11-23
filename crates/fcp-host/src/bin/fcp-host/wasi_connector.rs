@@ -1,7 +1,8 @@
 //! Retained, operation-isolated WASI sessions carrying actual FCP messages.
 //!
-//! Preparation obtains the guest's real instance identity. Invocations reuse
-//! that exact guest; a signed token never creates or renames a guest instance.
+//! Preparation obtains the guest's real instance identity. Invocations and
+//! simulations reuse that exact guest; a signed token never creates or renames
+//! a guest instance.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -613,6 +614,68 @@ impl WasiConnector {
             guard.record_dispatch_refusal();
         }
         result
+    }
+
+    /// Simulation uses the exact prepared operation instance, with the same
+    /// signed binding and queued-authority checks as an invocation. It never
+    /// instantiates a guest or falls back to the invoke method.
+    pub(super) async fn simulate_prepared(
+        &self,
+        request: SimulateRequest,
+        guards: Option<&SimulationDispatchGuards<'_>>,
+    ) -> HostResult<SimulateResponse> {
+        if request.r#type != "simulate" {
+            return Err(unavailable("WASI simulation requires a simulate request"));
+        }
+        let slot = self
+            .sessions
+            .slot(&request.zone_id, &request.operation, false)?;
+        let mut held = slot.guest.lock().await;
+        self.sessions.require_open()?;
+        let guest = held.as_ref().ok_or_else(|| {
+            unavailable("WASI operation session was retired; prepare a new instance")
+        })?;
+        self.verify_instance(
+            &request.connector_id,
+            &request.zone_id,
+            &request.operation,
+            &request.input,
+            &request.capability_token,
+            &guest.instance_id,
+        )?;
+        let payload = encode(&request)?;
+        if let Some(guards) = guards {
+            // Admission may have changed while invoke/simulate owned this
+            // session. Refusal preserves the guest because it has not run.
+            let authority = self.operation_authority(&request.zone_id, &request.operation)?;
+            guards.require_current(authority.safety_tier).await?;
+            // Lifecycle retirement may have sealed this runtime while current
+            // policy and revocation evidence were being refreshed.
+            self.sessions.require_open()?;
+        }
+        let mut guest = held
+            .take()
+            .expect("prepared guest was checked under the session lock");
+        // Taking before await retires the Store if this future is dropped,
+        // traps, exceeds its limit, or returns an invalid canonical response.
+        let bytes = guest
+            .session
+            .call("simulate", &payload, CONTROL_BYTES.min(MAX_WASI_RPC_BYTES))
+            .await
+            .map_err(|_| {
+                HostError::RegistryError(
+                    "WASI simulation failed and its session was retired; prepare a new session"
+                        .into(),
+                )
+            })?;
+        let response: SimulateResponse = decode(&bytes)?;
+        if response.r#type != "simulate_response" || response.id != request.id {
+            return Err(protocol_failure());
+        }
+        // A normal provider/precondition denial is a valid simulation result.
+        // Preserve that outcome during drain without reviving a closed runtime.
+        let _ = self.sessions.retain_guest(&mut held, guest);
+        Ok(response)
     }
 
     async fn invoke_prepared_inner(
