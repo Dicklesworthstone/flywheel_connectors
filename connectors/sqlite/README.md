@@ -1,6 +1,6 @@
 # SQLite Connector V3 Contract
 
-> **Status**: runtime contract documented; runtime operation metadata derives from manifest
+> **Status**: native host protocol with signed session authority and bounded local SQL execution
 > **Bead**: `flywheel_connectors-4kw5f.12`
 > **Parent**: `flywheel_connectors-4kw5f`
 > **Verification script**: none tracked; use the commands below
@@ -35,9 +35,9 @@ The current crate exposes these operations:
 Important runtime truths the contract preserves:
 
 - Package and binary name are `fcp-sqlite`.
-- Runtime `BaseConnector` ID is `sqlite`.
-- Manifest connector ID and handshake connector ID are `fcp.sqlite`.
-- Manifest interface hash is `blake3-256:fcp.interface.v2:0133b7c75dee87ffe347dcda9891710ebc43f66092c02c42d72b2b1dfcb5e4ae`.
+- Runtime, manifest, handshake, health, and invocation connector ID is `fcp.sqlite`.
+- The manifest declares a native executable. The shared JSONL transport bounds request frames to 16 MiB, keeps outer RPC IDs separate from invocation IDs, and exits after flushing a successful shutdown acknowledgment.
+- The embedded manifest and its interface hash are validated before configuration can activate the connection. Operation schemas and policy metadata come from that manifest.
 - Configuration requires `database_path` or its alias `path`.
 - `database_path` is trimmed and rejected when missing or blank.
 - `:memory:` is accepted and opens an in-memory database.
@@ -45,7 +45,7 @@ Important runtime truths the contract preserves:
 - Paths containing a parent-directory component `..` are rejected.
 - `read_only` defaults to `false`.
 - `create_if_missing` defaults to `!read_only`.
-- `busy_timeout_ms` defaults to `5000` and must be greater than zero.
+- `busy_timeout_ms` defaults to `5000`, must fit a positive signed 32-bit millisecond count, and is shortened when the invocation deadline is nearer.
 - `enable_wal` defaults to `true`.
 - `enforce_foreign_keys` defaults to `true`.
 - File-backed read-only mode opens the database with read-only flags.
@@ -53,34 +53,32 @@ Important runtime truths the contract preserves:
 - Writable connections enable foreign-key enforcement when configured.
 - Writable file-backed connections request WAL mode when configured and warn if WAL is unavailable.
 - Runtime opens no network connections.
-- Runtime `invoke` uses `operation_id`, not `operation`.
-- Runtime `invoke` checks connector readiness but does not verify `capability_token`.
-- Runtime does not verify approval tokens for `sqlite.execute`, `sqlite.batch`, or `sqlite.vacuum`.
-- `simulate` only checks whether `operation_id` is present in the local operation inventory.
-- `handle_configure()` creates a fresh SQLite client, clears session and transaction state, sets configured, and clears handshaken state.
-- `handle_handshake()` requires configuration and a client, accepts an optional `session_id`, and returns `sqlite.read`, `sqlite.write`, and `sqlite.admin` capability strings.
-- `health()` reports healthy only when a session ID exists and the probe query succeeds.
+- `invoke` requires a typed `InvokeRequest` with `type`, nonempty `id`, canonical `connector_id`, `zone_id`, `operation`, object `input`, and `capability_token`. Legacy `operation_id` envelopes are rejected.
+- `StandaloneSession` verifies the host signature, expiration, operation, negotiated capability, actual instance, private zone, resource constraints, and signed idempotency-key scope before SQL execution. It atomically charges signed call and request/response-byte budgets; failures do not refund admissions.
+- The host remains responsible for approval, revocation, holder-proof, provenance, and lease enforcement before using this private channel. Caller-supplied unsigned approval metadata does not grant permission.
+- `simulate` validates the same session authority, operation/input schema, resource scope, and transaction prerequisites without executing SQL or spending a signed call. It does not promise that a SQL statement will compile or succeed against the current schema.
+- Every configuration attempt first revokes the old instance and closes its connection, including attempts that fail validation. A fresh configuration requires a new handshake.
+- `handshake` accepts FCP protocol `2.0` or `2.0.0`, binds to `z:private`, and grants only requested capabilities declared by operations. Each attempt revokes old authority; any active transaction is rolled back before a replacement session can begin. Caller-selected instance IDs never override the actual rotated instance.
+- `health` returns a typed `HealthSnapshot`. Local configuration plus an established session makes it ready; `details` includes the actual instance, zone, session, request counters, and transaction-active flag. Database probes remain in `doctor`, `self_check`, and the authorized `sqlite.health` operation.
 - `doctor()` checks configuration, client state, database probe, filesystem readiness, WAL preconditions, and handshake state.
 - `self_check()` is `ok` only after configuration, session establishment, filesystem readiness, and a successful health probe.
-- `handle_shutdown()` clears client, config, session, active transaction, and base lifecycle flags, but request/error counters remain in memory.
+- Shutdown, EOF, and transport failure clear connection and authority and roll back uncommitted transactions. Committed file-backed data remains in SQLite; in-memory data ends with its connection.
 
-## Drift Visible In This Checkout
+## Scope And Remaining Limits
 
-This README documents runtime truth and keeps current drift visible:
+The runtime preserves these boundaries:
 
 - Runtime introspection derives operation descriptions, schemas, capabilities, risk, safety, idempotency, approval mode, rate limits, and AI hints from `manifest.toml`.
-- Manifest marks `sqlite.execute`, `sqlite.batch`, and `sqlite.vacuum` as requiring interactive approval, and runtime operation metadata now exposes that approval intent. Invoke still checks no approval token.
-- Runtime does not verify capability tokens even though the connector is a local database mutation surface.
+- Manifest marks `sqlite.execute`, `sqlite.batch`, and `sqlite.vacuum` as requiring interactive approval. Runtime metadata exposes that intent for host admission.
 - Manifest says singleton-writer state stores configured database path and transaction state. Runtime keeps configuration, session, and active transaction state in process memory only.
-- Runtime uses one connector-wide active transaction. Concurrent callers share that state and must pass the matching `txn_id` while a transaction is open.
+- Runtime serializes native requests and permits one active transaction per instance. Callers must pass the matching `txn_id` while a transaction is open. Active transactions do not migrate or survive a session replacement.
 - Runtime rejects `txn_id` when no transaction is active and rejects missing or mismatched `txn_id` while one is active.
-- `sqlite.health` is an invoke operation that reports the active transaction ID, while lifecycle `health()` reports session/probe readiness.
-- `health()` exposes `handshaken` as `session_id.is_some()`, not directly from the base handshaken flag.
+- `sqlite.health` is an authorized invoke operation that reports the active transaction ID and probes the database; lifecycle `health` exposes only local session readiness.
 - `sqlite.pragma` is read-only and allowlisted, despite SQLite PRAGMA generally including both query and mutation forms.
 - Runtime path policy rejects `..` components but does not create a durable sandbox boundary by itself; filesystem containment still depends on host/sandbox policy.
 - There is no dedicated tracked verification shell script for this connector.
 
-A follow-up parity bead should add bound capability-token verification, add approval-token verification for mutating/admin operations, decide whether SQLite state should be durable outside process memory, document or redesign the single-active-transaction model for concurrency, and add a tracked verification bundle.
+Durable transaction migration, per-table SQL authorization, and multi-connection concurrency remain outside the current surface. Host filesystem sandbox policy must contain the configured database and its journal files.
 
 ## First-Slice Scope
 
@@ -91,21 +89,21 @@ The current SQLite README slice documents the existing runtime surface:
 - SQLite authorizer policy for denying dangerous SQL actions
 - connector-local transaction state and batch savepoint behavior
 - lifecycle, health, doctor, self-check, simulation, introspection, and shutdown behavior
-- remaining capability-token and approval-token enforcement gaps
-- deterministic connector tests and direct proof commands
+- native host sessions, signed capability budgets, and fail-closed lifecycle transitions
+- deterministic connector tests, actual executable protocol transcripts, and direct proof commands
 
 ## Auth And Scope Boundary
 
-- Authentication mechanism: none at the provider layer; local database access is governed by connector configuration, capability metadata, and host policy.
-- Home zone: local private/work data, depending on the configured database path.
+- Provider authentication is filesystem authority; the native control channel additionally requires host-signed, instance-bound capabilities.
+- Home and session zone: `z:private`. Other handshake zones are refused.
 - Runtime capability metadata:
   - `sqlite.read`
   - `sqlite.write`
   - `sqlite.admin`
-- Handshake returns capability strings but does not install a verifier.
-- Invoke does not reject missing, malformed, wrong-operation, or wrong-capability tokens.
-- Write/admin operations do not verify approval tokens at runtime.
-- The connector does not persist SQL statements, parameters, result rows, database contents, database paths, provider errors, or request counters outside process memory.
+- Every operation requires the resource URI `sqlite:database`, meaning the database configured for this exact instance. This does not promise per-table SQL isolation. Calls with `txn_id` additionally require `sqlite:transaction:<txn_id>`; these URIs are derived from the validated request.
+- Capability tokens must target the actual `instance_id` returned in handshake and health, and must use a negotiated capability. Missing, forged, stale-instance, wrong-operation, wrong-zone, or out-of-scope tokens are denied before dispatch.
+- Approval and higher-level policy checks are enforced by the host. The connector should run only on its private supervised control channel.
+- The connector persists committed file-backed SQLite data and journal files. It does not separately persist SQL history, input/output payloads, session keys, capability tokens, or request counters.
 - SQLite databases can contain private, work, or credential-adjacent data. Treat live query output according to the configured file path and host zone.
 
 ## Runtime And Storage Invariants
@@ -115,14 +113,15 @@ The current SQLite README slice documents the existing runtime surface:
 - File-backed databases are opened through rusqlite with URI support enabled, while `file:` URI input is rejected by configuration policy.
 - Read-only mode prevents `sqlite.execute`, `sqlite.batch`, transaction writes, `sqlite.vacuum`, and other mutating SQL through the client policy.
 - Writable mode may create the database file when `create_if_missing = true`.
-- `busy_timeout_ms` is applied to the connection.
+- Each invocation uses the shorter of the caller's `deadline_ms` and the 30-second connector ceiling. SQLite VM progress checks interrupt execution cooperatively, and the lock-wait timeout is clamped to the remaining budget before each statement. A lock wait that begins later inside a statement can overrun that budget; a final deadline check after response validation refuses late success. These checks bound synchronous SQL work without promising hard real-time preemption.
+- Results are limited to 10,000 rows and 8 MiB of encoded JSON, narrowed by the signed response allowance. Exceeding a limit returns an error without releasing a partial result. SQLite cell/row bytes are capped at 8 MiB and SQL text at 1 MiB before those allocations can grow without bound.
 - `PRAGMA foreign_keys = ON` is applied for writable connections when configured.
 - `PRAGMA journal_mode = WAL` is requested for writable file-backed connections when configured.
 - The authorizer denies attach, detach, virtual table creation/drop, load extension, direct transaction control, unsafe savepoints, and non-allowlisted pragma access.
 - The connector's batch operation uses internal savepoint `fcp_sqlite_batch` and rolls back the full batch on error.
 - Result blobs are returned as objects with `$blob_base64`.
 - JSON null maps to SQLite NULL, booleans map to integers, integers map to integers, floats map to reals, strings map to text, and arrays/objects are serialized as JSON text.
-- Request counters increment before dispatch; error counters increment on typed SQLite connector errors.
+- Requests, including rejected requests, increment local request counters; errors increment the error counter. Signed call budgets are charged only after schema/scope validation and before execution.
 - No native listener, network socket, replication stream, or cross-process coordinator is opened by this connector.
 
 ## Operation Inventory
@@ -191,7 +190,7 @@ These are excluded on purpose:
 - filesystem readiness and WAL precondition guidance
 - transaction model metadata with `single_active_transaction`
 - local database-only compliance metadata with `network_required = false`
-- simulation allow/deny for known versus unknown operation IDs only
+- simulation allow/deny for readiness, operation/input contracts, signed authority, resources, and transaction prerequisites
 - typed SQLite/FCP error mapping for configuration, path policy, read-only violations, denied SQL actions, transaction mismatches, missing input, rusqlite errors, and serialization errors
 
 The deterministic integration evidence is anchored on connector-local tests covering:
@@ -202,6 +201,8 @@ The deterministic integration evidence is anchored on connector-local tests cove
 - read-only enforcement and denied SQL categories
 - transaction ID matching, active transaction exclusion, and vacuum rejection during transactions
 - JSON parameter mapping, result mapping, missing input, unknown operation, and error conversion
+- signature, instance, zone, grant, operation, and resource denials before effects; signed call/byte/key budgets; simulation without effects or charges
+- session replacement rollback, rejected configuration revocation, real subprocess request/result correlation, shutdown exit, and EOF rollback
 
 ## Source Notes
 
@@ -235,8 +236,8 @@ rch exec -- cargo fmt --check
 ## Operator Guidance
 
 - Prefer read-only mode for inspection workloads and only enable write mode for controlled mutation.
-- Treat `sqlite.execute`, `sqlite.batch`, `sqlite.transaction.*`, `sqlite.vacuum`, and `sqlite.pragma` as high-review operations until capability and approval verification are implemented.
+- Grant only the required read, write, or admin capability and bind it to the negotiated instance and database resource. Route mutations through host approval policy.
 - Do not point this connector at broad or user-writable filesystem locations without a host sandbox policy.
 - Use `:memory:` only for tests or ephemeral sessions.
 - Keep long-running transactions short; the runtime permits only one active transaction per connector instance.
-- Do not rely on `simulate()` as an authorization check; it only validates operation existence.
+- Use `simulate` for local admission checks. It does not execute or compile SQL, reserve a later invocation, or replace host approval and revocation checks.

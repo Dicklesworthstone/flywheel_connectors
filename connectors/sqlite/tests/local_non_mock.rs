@@ -2,7 +2,6 @@
 
 #![allow(clippy::future_not_send)]
 
-use fcp_sqlite::connector::SqliteConnector;
 use fcp_testkit::database_helpers::{
     CleanupVerificationResult, FixtureCleanupCheck, FixtureMutationRecord, FixtureSeedRecord,
     FixtureStartupProbe, FixtureStartupProbeKind, SeededStatefulFixturePack, StatefulFixtureFamily,
@@ -11,33 +10,33 @@ use fcp_testkit::database_helpers::{
 use serde_json::{Value, json};
 use tempfile::tempdir;
 
+mod common;
+use common::TestConnector;
+
 const ACCEPTANCE_SUITE_CLASS: &str = "local_non_mock";
-const CONNECTOR_ID: &str = "sqlite";
+const CONNECTOR_ID: &str = "fcp.sqlite";
 const FIXTURE_ID: &str = "sqlite-file-backed-local-acceptance";
 const NAMESPACE: &str = "fcp_sqlite_local_acceptance";
 const TABLE_NAME: &str = "fcp_acceptance_items";
 
-async fn configured_file_connector(database_path: &str, session_id: &str) -> SqliteConnector {
-    let mut connector = SqliteConnector::new();
+async fn configured_file_connector(database_path: &str) -> TestConnector {
+    let mut connector = TestConnector::new();
     connector
         .handle_configure(json!({ "database_path": database_path }))
         .await
         .unwrap();
-    connector
-        .handle_handshake(json!({ "session_id": session_id }))
-        .await
-        .unwrap();
+    connector.handshake().await;
     connector
 }
 
 async fn invoke(
-    connector: &mut SqliteConnector,
+    connector: &mut TestConnector,
     operation_id: &str,
     input: Value,
 ) -> serde_json::Value {
     connector
-        .handle_invoke(json!({
-            "operation_id": operation_id,
+        .invoke(json!({
+            "operation": operation_id,
             "input": input
         }))
         .await
@@ -92,7 +91,7 @@ async fn file_backed_sqlite_acceptance_exercises_real_local_boundary() {
     let fixture = fixture_contract();
     assert_stateful_fixture_pack_complete(&fixture);
 
-    let mut connector = configured_file_connector(&database_path, "sqlite-local-acceptance").await;
+    let mut connector = configured_file_connector(&database_path).await;
     let health = invoke(&mut connector, "sqlite.health", json!({})).await;
     assert_eq!(health["health"]["query_ok"], true);
 
@@ -154,8 +153,7 @@ async fn file_backed_sqlite_acceptance_exercises_real_local_boundary() {
     .await;
 
     connector.handle_shutdown(json!({})).await.unwrap();
-    let mut reopened =
-        configured_file_connector(&database_path, "sqlite-local-acceptance-reopen").await;
+    let mut reopened = configured_file_connector(&database_path).await;
     let persisted = invoke(
         &mut reopened,
         "sqlite.query",
@@ -170,8 +168,8 @@ async fn file_backed_sqlite_acceptance_exercises_real_local_boundary() {
     assert_eq!(persisted["result"]["rows"][0][1], 2);
 
     let blocked = reopened
-        .handle_invoke(json!({
-            "operation_id": "sqlite.query",
+        .invoke(json!({
+            "operation": "sqlite.query",
             "input": {
                 "sql": format!("DELETE FROM {TABLE_NAME} WHERE namespace = ?1"),
                 "params": [NAMESPACE]

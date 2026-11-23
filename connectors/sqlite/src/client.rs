@@ -92,10 +92,13 @@ impl ResultBudget {
     }
 
     fn charge(&mut self, bytes: u64) -> SqliteResult<()> {
-        self.remaining = self.remaining.checked_sub(bytes).ok_or(SqliteError::ResultLimit {
-            resource: "JSON bytes",
-            limit: self.limit,
-        })?;
+        self.remaining = self
+            .remaining
+            .checked_sub(bytes)
+            .ok_or(SqliteError::ResultLimit {
+                resource: "JSON bytes",
+                limit: self.limit,
+            })?;
         Ok(())
     }
 
@@ -237,9 +240,10 @@ impl SqliteClient {
                 limit: 0,
             });
         }
-        let mut limits = self.invocation_limits.lock().map_err(|_| {
-            SqliteError::Policy("SQLite execution budget is unavailable".into())
-        })?;
+        let mut limits = self
+            .invocation_limits
+            .lock()
+            .map_err(|_| SqliteError::Policy("SQLite execution budget is unavailable".into()))?;
         if limits.is_some() {
             return Err(SqliteError::Policy(
                 "an SQLite invocation is already active".into(),
@@ -288,12 +292,16 @@ impl SqliteClient {
 
     fn result_budget(&self) -> SqliteResult<ResultBudget> {
         Ok(ResultBudget::new(
-            self.limits()?.map_or(MAX_RESULT_BYTES, |limits| limits.result_bytes),
+            self.limits()?
+                .map_or(MAX_RESULT_BYTES, |limits| limits.result_bytes),
         ))
     }
 
     fn classify_execution<T>(&self, result: SqliteResult<T>) -> SqliteResult<T> {
-        if self.limits()?.is_some_and(|limits| Instant::now() >= limits.deadline) {
+        if self
+            .limits()?
+            .is_some_and(|limits| Instant::now() >= limits.deadline)
+        {
             return Err(SqliteError::DeadlineExceeded);
         }
         result
@@ -441,7 +449,11 @@ impl SqliteClient {
     pub fn begin_transaction(&self, mode: TransactionMode) -> SqliteResult<()> {
         self.require_writable()?;
         self.check_execution()?;
-        self.classify_execution(self.connection.execute_batch(mode.begin_sql()).map_err(Into::into))
+        self.classify_execution(
+            self.connection
+                .execute_batch(mode.begin_sql())
+                .map_err(Into::into),
+        )
     }
 
     /// Commit the active transaction.
@@ -453,7 +465,11 @@ impl SqliteClient {
     /// Roll back the active transaction.
     pub fn rollback_transaction(&self) -> SqliteResult<()> {
         self.check_execution()?;
-        self.classify_execution(self.connection.execute_batch("ROLLBACK").map_err(Into::into))
+        self.classify_execution(
+            self.connection
+                .execute_batch("ROLLBACK")
+                .map_err(Into::into),
+        )
     }
 
     /// Execute a batch atomically via a savepoint.
@@ -526,6 +542,7 @@ impl SqliteClient {
                 "pragma `{normalized}` is not allowlisted"
             )));
         }
+
         Ok(normalized)
     }
 
@@ -579,21 +596,26 @@ impl SqliteClient {
         // Cleanup must still run after the caller's deadline. It performs only
         // these fixed savepoint statements, with no lock wait or user SQL. The
         // progress callback is suspended so it cannot interrupt the rollback.
-        let previous = self.invocation_limits.lock().map_err(|_| {
-            SqliteError::Policy("SQLite execution budget is unavailable".into())
-        })?.take();
+        let previous = self
+            .invocation_limits
+            .lock()
+            .map_err(|_| SqliteError::Policy("SQLite execution budget is unavailable".into()))?
+            .take();
         let result = self.connection.busy_timeout(Duration::ZERO).and_then(|()| {
             self.connection.execute_batch(
                 "ROLLBACK TO SAVEPOINT fcp_sqlite_batch; RELEASE SAVEPOINT fcp_sqlite_batch",
             )
         });
-        *self.invocation_limits.lock().map_err(|_| {
-            SqliteError::Policy("SQLite execution budget is unavailable".into())
-        })? = previous;
+        *self
+            .invocation_limits
+            .lock()
+            .map_err(|_| SqliteError::Policy("SQLite execution budget is unavailable".into()))? =
+            previous;
         if result.is_err() {
             self.cleanup_failed.set(true);
             return Err(SqliteError::Transaction(
-                "SQLite batch rollback failed; reconfigure the connector before further execution".into(),
+                "SQLite batch rollback failed; reconfigure the connector before further execution"
+                    .into(),
             ));
         }
         Ok(())
@@ -759,7 +781,10 @@ fn json_to_sql_value(value: &serde_json::Value) -> SqliteResult<SqlValue> {
     }
 }
 
-fn sql_value_to_json(value: ValueRef<'_>, budget: &mut ResultBudget) -> SqliteResult<serde_json::Value> {
+fn sql_value_to_json(
+    value: ValueRef<'_>,
+    budget: &mut ResultBudget,
+) -> SqliteResult<serde_json::Value> {
     let scalar = match value {
         ValueRef::Null => serde_json::Value::Null,
         ValueRef::Integer(integer) => json!(integer),
@@ -768,9 +793,8 @@ fn sql_value_to_json(value: ValueRef<'_>, budget: &mut ResultBudget) -> SqliteRe
             serde_json::Value::Number,
         ),
         ValueRef::Text(bytes) => {
-            let text = std::str::from_utf8(bytes).map_err(|_| {
-                SqliteError::Query("SQLite text result is not valid UTF-8".into())
-            })?;
+            let text = std::str::from_utf8(bytes)
+                .map_err(|_| SqliteError::Query("SQLite text result is not valid UTF-8".into()))?;
             budget.charge_json(text)?;
             return Ok(serde_json::Value::String(text.to_owned()));
         }
@@ -813,7 +837,8 @@ mod tests {
             busy_timeout_ms: 5_000,
             enable_wal: false,
             enforce_foreign_keys: true,
-        }).unwrap()
+        })
+        .unwrap()
     }
 
     #[test]
@@ -838,7 +863,8 @@ mod tests {
 
     #[test]
     fn sql_blob_values_are_base64_wrapped() {
-        let json = sql_value_to_json(ValueRef::Blob(&[1, 2, 3]), &mut ResultBudget::new(1024)).unwrap();
+        let json =
+            sql_value_to_json(ValueRef::Blob(&[1, 2, 3]), &mut ResultBudget::new(1024)).unwrap();
         assert_eq!(json["$blob_base64"], "AQID");
     }
 
@@ -849,7 +875,13 @@ mod tests {
             "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 10001) SELECT x FROM n",
             &[],
         ).unwrap_err();
-        assert!(matches!(error, SqliteError::ResultLimit { resource: "rows", limit: 10_000 }));
+        assert!(matches!(
+            error,
+            SqliteError::ResultLimit {
+                resource: "rows",
+                limit: 10_000
+            }
+        ));
         let exact = client.query(
             "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 10000) SELECT x FROM n",
             &[],
@@ -861,11 +893,17 @@ mod tests {
     #[test]
     fn string_and_blob_limits_count_encoded_bytes_before_allocation() {
         let mut escaped = ResultBudget::new(4);
-        assert_eq!(sql_value_to_json(ValueRef::Text(b"\n"), &mut escaped).unwrap(), json!("\n"));
+        assert_eq!(
+            sql_value_to_json(ValueRef::Text(b"\n"), &mut escaped).unwrap(),
+            json!("\n")
+        );
         assert_eq!(escaped.remaining, 0);
         assert!(sql_value_to_json(ValueRef::Text(b"\n"), &mut ResultBudget::new(3)).is_err());
         let mut blob = ResultBudget::new(23);
-        assert_eq!(sql_value_to_json(ValueRef::Blob(&[1, 2, 3]), &mut blob).unwrap(), json!({"$blob_base64": "AQID"}));
+        assert_eq!(
+            sql_value_to_json(ValueRef::Blob(&[1, 2, 3]), &mut blob).unwrap(),
+            json!({"$blob_base64": "AQID"})
+        );
         assert_eq!(blob.remaining, 0);
         assert!(sql_value_to_json(ValueRef::Blob(&[1, 2, 3]), &mut ResultBudget::new(22)).is_err());
     }
@@ -874,7 +912,10 @@ mod tests {
     fn invalid_utf8_text_is_refused_without_returning_database_bytes() {
         let client = memory_client();
         let error = client.query("SELECT CAST(x'ff' AS TEXT)", &[]).unwrap_err();
-        assert_eq!(error.to_string(), "SQLite query error: SQLite text result is not valid UTF-8");
+        assert_eq!(
+            error.to_string(),
+            "SQLite query error: SQLite text result is not valid UTF-8"
+        );
         assert!(!error.is_retryable());
         assert!(client.query("SELECT 1", &[]).is_ok());
     }
@@ -882,9 +923,14 @@ mod tests {
     #[test]
     fn signed_response_cap_narrows_the_result_budget() {
         let client = memory_client();
-        let guard = client.begin_invocation(Instant::now() + Duration::from_secs(5), 256).unwrap();
+        let guard = client
+            .begin_invocation(Instant::now() + Duration::from_secs(5), 256)
+            .unwrap();
         assert!(client.query("SELECT 1", &[]).is_ok());
-        assert!(matches!(client.query("SELECT ?1", &[json!("x".repeat(300))]), Err(SqliteError::ResultLimit { limit: 256, .. })));
+        assert!(matches!(
+            client.query("SELECT ?1", &[json!("x".repeat(300))]),
+            Err(SqliteError::ResultLimit { limit: 256, .. })
+        ));
         drop(guard);
         assert!(client.query("SELECT ?1", &[json!("x".repeat(300))]).is_ok());
     }
@@ -892,23 +938,39 @@ mod tests {
     #[test]
     fn recursive_aggregate_is_interrupted_and_next_invocation_can_run() {
         let client = memory_client();
-        let guard = client.begin_invocation(Instant::now() + Duration::from_millis(20), MAX_RESULT_BYTES).unwrap();
+        let guard = client
+            .begin_invocation(Instant::now() + Duration::from_millis(20), MAX_RESULT_BYTES)
+            .unwrap();
         let result = client.query(
             "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n) SELECT sum(x) FROM n",
             &[],
         );
         assert!(matches!(result, Err(SqliteError::DeadlineExceeded)));
         drop(guard);
-        let _guard = client.begin_invocation(Instant::now() + Duration::from_secs(5), MAX_RESULT_BYTES).unwrap();
-        assert_eq!(client.query("SELECT 7", &[]).unwrap().rows, vec![vec![json!(7)]]);
+        let _guard = client
+            .begin_invocation(Instant::now() + Duration::from_secs(5), MAX_RESULT_BYTES)
+            .unwrap();
+        assert_eq!(
+            client.query("SELECT 7", &[]).unwrap().rows,
+            vec![vec![json!(7)]]
+        );
     }
 
     #[test]
     fn expired_and_nested_admission_never_replace_the_live_budget() {
         let client = memory_client();
-        assert!(matches!(client.begin_invocation(Instant::now(), MAX_RESULT_BYTES), Err(SqliteError::DeadlineExceeded)));
-        let guard = client.begin_invocation(Instant::now() + Duration::from_secs(1), 128).unwrap();
-        assert!(client.begin_invocation(Instant::now() + Duration::from_secs(30), MAX_RESULT_BYTES).is_err());
+        assert!(matches!(
+            client.begin_invocation(Instant::now(), MAX_RESULT_BYTES),
+            Err(SqliteError::DeadlineExceeded)
+        ));
+        let guard = client
+            .begin_invocation(Instant::now() + Duration::from_secs(1), 128)
+            .unwrap();
+        assert!(
+            client
+                .begin_invocation(Instant::now() + Duration::from_secs(30), MAX_RESULT_BYTES)
+                .is_err()
+        );
         assert_eq!(client.result_budget().unwrap().limit, 128);
         drop(guard);
         assert_eq!(client.result_budget().unwrap().limit, MAX_RESULT_BYTES);
@@ -917,89 +979,156 @@ mod tests {
     #[test]
     fn batch_response_limit_rolls_back_every_statement() {
         let client = memory_client();
-        client.execute("CREATE TABLE items (value INTEGER)", &[]).unwrap();
-        let statements = (0..8).map(|index| BatchStatement {
-            sql: "INSERT INTO items VALUES (?1)".into(),
-            params: vec![json!(index)],
-        }).collect::<Vec<_>>();
-        let guard = client.begin_invocation(Instant::now() + Duration::from_secs(5), 128).unwrap();
-        assert!(matches!(client.batch(&statements), Err(SqliteError::ResultLimit { .. })));
+        client
+            .execute("CREATE TABLE items (value INTEGER)", &[])
+            .unwrap();
+        let statements = (0..8)
+            .map(|index| BatchStatement {
+                sql: "INSERT INTO items VALUES (?1)".into(),
+                params: vec![json!(index)],
+            })
+            .collect::<Vec<_>>();
+        let guard = client
+            .begin_invocation(Instant::now() + Duration::from_secs(5), 128)
+            .unwrap();
+        assert!(matches!(
+            client.batch(&statements),
+            Err(SqliteError::ResultLimit { .. })
+        ));
         assert!(!client.is_in_transaction());
         drop(guard);
-        assert_eq!(client.query("SELECT count(*) FROM items", &[]).unwrap().rows, vec![vec![json!(0)]]);
+        assert_eq!(
+            client
+                .query("SELECT count(*) FROM items", &[])
+                .unwrap()
+                .rows,
+            vec![vec![json!(0)]]
+        );
     }
 
     #[test]
     fn batch_response_limit_preserves_prior_outer_transaction_work() {
         let client = memory_client();
-        client.execute("CREATE TABLE items (value INTEGER)", &[]).unwrap();
-        client.begin_transaction(TransactionMode::Immediate).unwrap();
-        client.execute("INSERT INTO items VALUES (99)", &[]).unwrap();
-        let statements = (0..8).map(|index| BatchStatement {
-            sql: "INSERT INTO items VALUES (?1)".into(),
-            params: vec![json!(index)],
-        }).collect::<Vec<_>>();
-        let guard = client.begin_invocation(Instant::now() + Duration::from_secs(5), 128).unwrap();
-        assert!(matches!(client.batch(&statements), Err(SqliteError::ResultLimit { .. })));
+        client
+            .execute("CREATE TABLE items (value INTEGER)", &[])
+            .unwrap();
+        client
+            .begin_transaction(TransactionMode::Immediate)
+            .unwrap();
+        client
+            .execute("INSERT INTO items VALUES (99)", &[])
+            .unwrap();
+        let statements = (0..8)
+            .map(|index| BatchStatement {
+                sql: "INSERT INTO items VALUES (?1)".into(),
+                params: vec![json!(index)],
+            })
+            .collect::<Vec<_>>();
+        let guard = client
+            .begin_invocation(Instant::now() + Duration::from_secs(5), 128)
+            .unwrap();
+        assert!(matches!(
+            client.batch(&statements),
+            Err(SqliteError::ResultLimit { .. })
+        ));
         assert!(client.is_in_transaction());
         drop(guard);
         client.commit_transaction().unwrap();
-        assert_eq!(client.query("SELECT value FROM items", &[]).unwrap().rows, vec![vec![json!(99)]]);
+        assert_eq!(
+            client.query("SELECT value FROM items", &[]).unwrap().rows,
+            vec![vec![json!(99)]]
+        );
     }
 
     #[test]
     fn interrupted_batch_exposes_sqlite_automatic_outer_rollback() {
         let client = memory_client();
-        client.execute("CREATE TABLE items (value INTEGER)", &[]).unwrap();
-        client.begin_transaction(TransactionMode::Immediate).unwrap();
-        client.execute("INSERT INTO items VALUES (99)", &[]).unwrap();
+        client
+            .execute("CREATE TABLE items (value INTEGER)", &[])
+            .unwrap();
+        client
+            .begin_transaction(TransactionMode::Immediate)
+            .unwrap();
+        client
+            .execute("INSERT INTO items VALUES (99)", &[])
+            .unwrap();
         let statements = vec![BatchStatement {
             sql: "INSERT INTO items WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n) SELECT x FROM n".into(),
             params: vec![],
         }];
-        let guard = client.begin_invocation(Instant::now() + Duration::from_secs(30), MAX_RESULT_BYTES).unwrap();
+        let guard = client
+            .begin_invocation(Instant::now() + Duration::from_secs(30), MAX_RESULT_BYTES)
+            .unwrap();
         // Expire the real budget only after the INSERT is executing. A tiny
         // wall-clock deadline could instead expire before dispatch on a loaded
         // machine, which correctly leaves the outer transaction untouched.
         let limits = Arc::clone(&client.invocation_limits);
         let mut callbacks = 0;
-        client.connection.progress_handler(
-            PROGRESS_INTERVAL,
-            Some(move || {
-                callbacks += 1;
-                if callbacks < 5 {
-                    return false;
-                }
-                if let Some(limits) = limits.lock().unwrap().as_mut() {
-                    limits.deadline = Instant::now();
-                    true
-                } else {
-                    false
-                }
-            }),
-        ).unwrap();
-        assert!(matches!(client.batch(&statements), Err(SqliteError::DeadlineExceeded)));
+        client
+            .connection
+            .progress_handler(
+                PROGRESS_INTERVAL,
+                Some(move || {
+                    callbacks += 1;
+                    if callbacks < 5 {
+                        return false;
+                    }
+                    if let Some(limits) = limits.lock().unwrap().as_mut() {
+                        limits.deadline = Instant::now();
+                        true
+                    } else {
+                        false
+                    }
+                }),
+            )
+            .unwrap();
+        assert!(matches!(
+            client.batch(&statements),
+            Err(SqliteError::DeadlineExceeded)
+        ));
         assert!(!client.is_in_transaction());
         drop(guard);
-        assert_eq!(client.query("SELECT count(*) FROM items", &[]).unwrap().rows, vec![vec![json!(0)]]);
+        assert_eq!(
+            client
+                .query("SELECT count(*) FROM items", &[])
+                .unwrap()
+                .rows,
+            vec![vec![json!(0)]]
+        );
     }
 
     #[test]
     fn engine_limits_reject_huge_values_and_sql_without_losing_connection() {
         let client = memory_client();
         assert!(client.query("SELECT zeroblob(8388609)", &[]).is_err());
-        assert!(client.query(&format!("SELECT 1{}", " ".repeat(MAX_SQL_BYTES as usize)), &[]).is_err());
+        assert!(
+            client
+                .query(
+                    &format!("SELECT 1{}", " ".repeat(MAX_SQL_BYTES as usize)),
+                    &[]
+                )
+                .is_err()
+        );
         assert_eq!(client.query("SELECT 1", &[]).unwrap().row_count, 1);
     }
 
     #[test]
     fn oversized_batch_is_refused_before_any_statement() {
         let client = memory_client();
-        let statements = vec![BatchStatement {
-            sql: "CREATE TABLE must_not_exist (value INTEGER)".into(),
-            params: vec![],
-        }; MAX_RESULT_ROWS + 1];
-        assert!(matches!(client.batch(&statements), Err(SqliteError::ResultLimit { resource: "batch statements", .. })));
+        let statements = vec![
+            BatchStatement {
+                sql: "CREATE TABLE must_not_exist (value INTEGER)".into(),
+                params: vec![]
+            };
+            MAX_RESULT_ROWS + 1
+        ];
+        assert!(matches!(
+            client.batch(&statements),
+            Err(SqliteError::ResultLimit {
+                resource: "batch statements",
+                ..
+            })
+        ));
         assert!(client.list_tables().unwrap().is_empty());
     }
 
@@ -1008,7 +1137,11 @@ mod tests {
         let mut config = memory_client().config().clone();
         config.read_only = true;
         let client = SqliteClient::new(config).unwrap();
-        assert!(client.execute("CREATE TABLE nope (id INTEGER)", &[]).is_err());
+        assert!(
+            client
+                .execute("CREATE TABLE nope (id INTEGER)", &[])
+                .is_err()
+        );
         assert!(client.begin_transaction(TransactionMode::Deferred).is_err());
         assert!(client.vacuum().is_err());
         assert!(client.query("SELECT 1", &[]).is_ok());
@@ -1018,7 +1151,10 @@ mod tests {
     fn busy_timeout_overflow_is_a_configuration_error_not_a_panic() {
         let mut config = memory_client().config().clone();
         config.busy_timeout_ms = u64::MAX;
-        assert!(matches!(SqliteClient::new(config), Err(SqliteError::InvalidConfig(_))));
+        assert!(matches!(
+            SqliteClient::new(config),
+            Err(SqliteError::InvalidConfig(_))
+        ));
     }
 
     #[test]
@@ -1028,16 +1164,26 @@ mod tests {
         let mut config = memory_client().config().clone();
         config.database_path = path.to_string_lossy().into_owned();
         let client = SqliteClient::new(config).unwrap();
-        client.execute("CREATE TABLE items (value INTEGER)", &[]).unwrap();
+        client
+            .execute("CREATE TABLE items (value INTEGER)", &[])
+            .unwrap();
         let locker = Connection::open(&path).unwrap();
         locker.execute_batch("BEGIN EXCLUSIVE").unwrap();
-        let guard = client.begin_invocation(Instant::now() + Duration::from_millis(25), MAX_RESULT_BYTES).unwrap();
+        let guard = client
+            .begin_invocation(Instant::now() + Duration::from_millis(25), MAX_RESULT_BYTES)
+            .unwrap();
         let before = Instant::now();
         let result = client.execute("INSERT INTO items VALUES (1)", &[]);
         assert!(result.is_err());
         assert!(before.elapsed() < Duration::from_secs(2));
         drop(guard);
         locker.execute_batch("ROLLBACK").unwrap();
-        assert_eq!(client.query("SELECT count(*) FROM items", &[]).unwrap().rows, vec![vec![json!(0)]]);
+        assert_eq!(
+            client
+                .query("SELECT count(*) FROM items", &[])
+                .unwrap()
+                .rows,
+            vec![vec![json!(0)]]
+        );
     }
 }

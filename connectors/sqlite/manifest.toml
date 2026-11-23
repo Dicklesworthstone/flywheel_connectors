@@ -13,7 +13,7 @@ name = "SQLite Connector"
 version = "0.1.0"
 description = "FCP connector for local SQLite databases with safe query, schema, and transaction operations"
 archetypes = ["storage", "operational"]
-format = "wasi"
+format = "native"
 
 [connector.state]
 model = "singleton_writer"
