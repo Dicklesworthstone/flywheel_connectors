@@ -1519,10 +1519,18 @@ mod tests {
 
     #[test]
     fn versioned_object_mutations_do_not_claim_strict_idempotency() {
+        // Manifest validation includes its canonical interface hash, so a
+        // metadata change cannot silently leave an unloadable connector bundle.
+        let manifest = fcp_manifest::ConnectorManifest::parse_str(MANIFEST_TOML)
+            .expect("bundled manifest must validate with its declared interface hash");
         let operations = operations_info();
         for id in [OP_S3_PUT_OBJECT, OP_S3_DELETE_OBJECT] {
             let operation = operations.iter().find(|operation| operation.id.as_str() == id).unwrap();
             assert_eq!(operation.idempotency, IdempotencyClass::BestEffort);
+            assert_eq!(
+                manifest.provides.operations[id].idempotency,
+                operation.idempotency,
+            );
         }
     }
 

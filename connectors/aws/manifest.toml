@@ -5,13 +5,13 @@ min_mesh_version = "2.0.0"
 min_protocol = "fcp2-sym/2.0"
 protocol_features = []
 max_datagram_bytes = 65000
-interface_hash = "blake3-256:fcp.interface.v2:b381bd4a256cb16cb481b65312841b7480883d6ca28b6a860481a9127ef0a890"
+interface_hash = "blake3-256:fcp.interface.v2:bad77a492f19ffeb7af6bc6bbd30605a7273891b883f72024f67c2c77d8a088a"
 
 [connector]
 id = "fcp.aws"
 name = "AWS"
 version = "0.1.0"
-description = "AWS connector for S3, EC2, Lambda, and STS workflows; deterministic verification currently relies on custom endpoint overrides until SigV4 signing is implemented"
+description = "AWS connector for S3, EC2, Lambda, and STS workflows with native provider protocols, bounded inventory pagination, and local or host-managed SigV4 signing"
 archetypes = ["operational", "storage"]
 format = "native"
 
@@ -416,7 +416,7 @@ input_schema = { type = "object" }
 output_schema = { type = "object" }
 
 [provides.operations."aws.sts.get_caller_identity".network_constraints]
-host_allow = ["sts.amazonaws.com"]
+host_allow = ["*.amazonaws.com", "sts.amazonaws.com"]
 port_allow = [443]
 ip_allow = []
 cidr_deny = []
@@ -450,7 +450,7 @@ input_schema = { type = "object" }
 output_schema = { type = "object" }
 
 [provides.operations."aws.health".network_constraints]
-host_allow = ["sts.amazonaws.com"]
+host_allow = ["*.amazonaws.com", "sts.amazonaws.com"]
 port_allow = [443]
 ip_allow = []
 cidr_deny = []
