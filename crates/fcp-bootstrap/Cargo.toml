@@ -14,12 +14,6 @@ workspace = true
 [dependencies]
 # Internal crates
 fcp-crypto.workspace = true
-fcp-core.workspace = true
-fcp-prelude.workspace = true
-
-# Async runtime
-fcp-async-core = { path = "../fcp-async-core" }
-async-trait.workspace = true
 
 # Serialization
 serde = { workspace = true, features = ["derive"] }
@@ -73,6 +67,7 @@ windows = { version = "0.62", features = ["Win32_System_Time"] }
 [dev-dependencies]
 # Testing
 criterion.workspace = true
+uuid.workspace = true
 ed25519-dalek = { workspace = true, features = ["pkcs8"] }
 pretty_assertions.workspace = true
 rand_chacha = "0.3"

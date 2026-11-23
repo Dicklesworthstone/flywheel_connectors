@@ -89,6 +89,11 @@ impl ColdRecovery {
     /// * `phrase` - The BIP39 recovery phrase.
     /// * `expected_fingerprint` - Optional expected genesis fingerprint for verification.
     ///
+    /// Fresh phrase-backed bootstrap and import use the same deterministic
+    /// genesis. Older timestamped genesis records cannot be reconstructed from
+    /// a phrase alone; restore their saved metadata instead. Their fingerprints
+    /// remain distinct and are refused rather than silently treated as matches.
+    ///
     /// # Returns
     ///
     /// A `ColdRecovery` struct containing the recreated genesis and warnings.
@@ -267,6 +272,25 @@ mod tests {
             result,
             Err(ColdRecoveryError::FingerprintMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn cold_recovery_refuses_original_timestamped_genesis_fingerprint() {
+        let phrase = test_phrase();
+        let owner_key = phrase.derive_owner_keypair().public();
+        let mut timestamped = crate::genesis::GenesisState::create(&owner_key);
+        timestamped.created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let original_bytes = timestamped.to_cbor().unwrap();
+        let expected = timestamped.fingerprint();
+        let deterministic = crate::genesis::GenesisState::create_deterministic(&owner_key);
+
+        let result = ColdRecovery::from_phrase(&phrase, Some(&expected));
+        assert!(matches!(
+            result,
+            Err(ColdRecoveryError::FingerprintMismatch { expected: rejected, actual })
+                if rejected == expected && actual == deterministic.fingerprint()
+        ));
+        assert_eq!(timestamped.to_cbor().unwrap(), original_bytes);
     }
 
     #[test]

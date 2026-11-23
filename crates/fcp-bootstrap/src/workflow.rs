@@ -526,9 +526,12 @@ impl BootstrapWorkflow {
         let phrase =
             RecoveryPhrase::generate().map_err(|e| BootstrapError::Crypto(e.to_string()))?;
 
-        // Derive keypair and create genesis
+        // Phrase-only recovery has no original wall-clock timestamp. Use the
+        // same canonical genesis as import and ColdRecovery so the fingerprint
+        // handed to the operator can be verified after losing every device.
+        // Timestamped genesis records remain distinct and are never rewritten.
         let keypair = phrase.derive_owner_keypair();
-        let genesis = GenesisState::create(&keypair.public());
+        let genesis = GenesisState::create_deterministic(&keypair.public());
 
         // NO plaintext disk persistence (AGENTS.md). The phrase flows
         // back to the caller via BootstrapOutcome; the caller is
@@ -1089,8 +1092,8 @@ mod tests {
         assert!(matches!(result, Err(BootstrapError::AlreadyExists { .. })));
     }
 
-    #[fcp_async_core::runtime::test]
-    async fn test_single_device_bootstrap() {
+    #[test]
+    fn test_single_device_bootstrap() {
         let dir = tempdir().unwrap();
         let config = BootstrapConfig::builder()
             .data_dir(dir.path())
@@ -1112,8 +1115,8 @@ mod tests {
     /// words, fed to a `tracing::debug` no-op `save_recovery_phrase`,
     /// then silently dropped — total device loss = total owner
     /// identity loss with no recovery path.
-    #[fcp_async_core::runtime::test]
-    async fn single_device_bootstrap_outcome_carries_recovery_phrase() {
+    #[test]
+    fn single_device_bootstrap_outcome_carries_recovery_phrase() {
         let dir = tempdir().unwrap();
         let config = BootstrapConfig::builder()
             .data_dir(dir.path())
@@ -1151,12 +1154,100 @@ mod tests {
         );
     }
 
+    #[test]
+    fn phrase_backed_bootstrap_recovers_original_genesis() {
+        let dir = tempdir().unwrap();
+        let config = BootstrapConfig::builder()
+            .data_dir(dir.path())
+            .mode(BootstrapMode::SingleDevice)
+            .skip_time_validation(true)
+            .build()
+            .unwrap();
+        let outcome = BootstrapWorkflow::new(config).unwrap().run().unwrap();
+        let original_bytes = std::fs::read(dir.path().join("genesis.cbor")).unwrap();
+        let original = GenesisState::from_cbor(&original_bytes).unwrap();
+        let expected_fingerprint = original.fingerprint();
+        assert_eq!(outcome.genesis.fingerprint(), expected_fingerprint);
+
+        // Begin with an actual fresh bootstrap and its persisted fingerprint,
+        // not with a prior recovery, which would hide a timestamp mismatch.
+        let phrase = outcome.recovery_phrase.as_ref().unwrap();
+        let recovered =
+            crate::cold_recovery::ColdRecovery::from_phrase(phrase, Some(&expected_fingerprint))
+                .expect("the saved phrase must recover the original mesh identity");
+
+        assert!(recovered.was_verified());
+        assert_eq!(recovered.fingerprint(), expected_fingerprint);
+        assert_eq!(
+            recovered.genesis.owner_public_key,
+            original.owner_public_key
+        );
+        assert_eq!(
+            recovered.owner_keypair.public().to_bytes(),
+            original.owner_public_key
+        );
+        assert_eq!(recovered.genesis.to_cbor().unwrap(), original_bytes);
+        assert_eq!(
+            recovered.warnings,
+            vec![
+                crate::cold_recovery::ColdRecoveryWarning::NoAuditHistory,
+                crate::cold_recovery::ColdRecoveryWarning::RevocationStateUnknown,
+                crate::cold_recovery::ColdRecoveryWarning::SingleNodeStart,
+                crate::cold_recovery::ColdRecoveryWarning::DataLoss,
+            ],
+            "recovering genesis does not restore later state or revocations"
+        );
+    }
+
+    #[test]
+    fn phrase_backed_bootstrap_import_preserves_persisted_genesis() {
+        let original_dir = tempdir().unwrap();
+        let config = BootstrapConfig::builder()
+            .data_dir(original_dir.path())
+            .mode(BootstrapMode::SingleDevice)
+            .skip_time_validation(true)
+            .build()
+            .unwrap();
+        let original = BootstrapWorkflow::new(config).unwrap().run().unwrap();
+        let original_bytes = std::fs::read(original_dir.path().join("genesis.cbor")).unwrap();
+        let fingerprint = original.genesis.fingerprint();
+
+        let imported_dir = tempdir().unwrap();
+        let import_config = BootstrapConfig::builder()
+            .data_dir(imported_dir.path())
+            .mode(BootstrapMode::Import {
+                phrase: original.recovery_phrase.unwrap(),
+            })
+            .skip_time_validation(true)
+            .build()
+            .unwrap();
+        let imported = BootstrapWorkflow::new(import_config)
+            .unwrap()
+            .run()
+            .unwrap();
+
+        assert!(imported.recovery_phrase.is_none());
+        assert_eq!(imported.genesis.fingerprint(), fingerprint);
+        assert_eq!(
+            imported.genesis.owner_public_key,
+            original.genesis.owner_public_key
+        );
+        assert_eq!(
+            std::fs::read(imported_dir.path().join("genesis.cbor")).unwrap(),
+            original_bytes
+        );
+        assert!(matches!(
+            check_initialization_state(imported_dir.path(), false).unwrap(),
+            InitCheckResult::AlreadyExists { fingerprint: saved } if saved == fingerprint
+        ));
+    }
+
     /// Regression for br-sy5ks: multi-device bootstrap uses FROST
     /// threshold sharing and has no single recovery phrase; the
     /// outcome MUST carry `recovery_phrase == None` so callers don't
     /// display a spurious "phrase" that would only be a decoy.
-    #[fcp_async_core::runtime::test]
-    async fn multi_device_bootstrap_outcome_carries_no_recovery_phrase() {
+    #[test]
+    fn multi_device_bootstrap_outcome_carries_no_recovery_phrase() {
         let dir = tempdir().unwrap();
         let config = BootstrapConfig::builder()
             .data_dir(dir.path())
@@ -1182,8 +1273,8 @@ mod tests {
     /// carry `recovery_phrase == None` — the caller already possesses
     /// the canonical copy; re-emitting it would be a leak, not a
     /// feature.
-    #[fcp_async_core::runtime::test]
-    async fn import_bootstrap_outcome_does_not_re_emit_phrase() {
+    #[test]
+    fn import_bootstrap_outcome_does_not_re_emit_phrase() {
         let dir = tempdir().unwrap();
         let phrase = RecoveryPhrase::generate().unwrap();
 

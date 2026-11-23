@@ -12,10 +12,10 @@ use zeroize::ZeroizeOnDrop;
 
 /// A genesis state representing the initial state of an FCP2 mesh.
 ///
-/// Regular bootstrap genesis records its creation time, so repeated creation
-/// with the same owner key still yields distinct fingerprints. Use
-/// [`Self::create_deterministic`] when cold recovery needs a stable
-/// recreation fingerprint.
+/// [`Self::create`] records its creation time, so repeated creation with the
+/// same owner key still yields distinct fingerprints. Phrase-backed bootstrap,
+/// import, and cold recovery use [`Self::create_deterministic`] from the outset
+/// so losing the original timestamp does not prevent identity verification.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GenesisState {
     /// Schema version for the genesis format.
@@ -25,7 +25,7 @@ pub struct GenesisState {
     #[serde(with = "hex::serde")]
     pub owner_public_key: [u8; 32],
 
-    /// The time this genesis was created.
+    /// Creation time, or the Unix epoch for a phrase-recoverable genesis.
     pub created_at: DateTime<Utc>,
 
     /// Initial zone definitions (typically z:owner, z:private, z:work, z:community, z:public).
@@ -132,10 +132,12 @@ impl GenesisState {
         }
     }
 
-    /// Create a genesis state for cold recovery (deterministic creation time).
+    /// Create a phrase-recoverable genesis (deterministic creation time).
     ///
-    /// Used during cold recovery when we need to recreate a genesis with
-    /// a predictable fingerprint.
+    /// Fresh phrase-backed bootstrap must use this constructor, just like
+    /// import and cold recovery: a phrase cannot recover a wall-clock timestamp.
+    /// This does not reconstruct an older timestamped genesis or change its
+    /// fingerprint. Such a genesis requires its original saved metadata.
     ///
     /// # Panics
     ///

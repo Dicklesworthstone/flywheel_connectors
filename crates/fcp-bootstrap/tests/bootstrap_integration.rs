@@ -9,10 +9,10 @@ use fcp_bootstrap::{
     GenesisState, GenesisValidationError, RecoveryPhrase, RecoveryPhraseError,
 };
 use fcp_crypto::Ed25519SigningKey;
-use fcp_prelude::Uuid;
 use serde::Serialize;
 use std::path::PathBuf;
 use tempfile::TempDir;
+use uuid::Uuid;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Test Logging Infrastructure (per 1n78.35)

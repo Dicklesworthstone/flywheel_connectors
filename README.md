@@ -2335,6 +2335,14 @@ Phase 4: Zone Initialization
 
 Crash recovery: a lock file tracks the current phase. If the process crashes and restarts, it detects the lock and resumes from the last completed phase. Recovery phrases use `zeroize::ZeroizeOnDrop`; constant-time comparison via `subtle::ConstantTimeEq` prevents timing side channels.
 
+Single-device bootstrap, phrase import, and cold recovery use the same deterministic
+genesis: its `created_at` is the Unix epoch, so the recovery phrase reproduces the
+original owner key, genesis bytes, and fingerprint without needing the original
+creation time. Cold recovery still cannot restore later objects, audit history,
+or revocation state. Older timestamped genesis records retain their original
+fingerprints and require their saved metadata; a mismatched fingerprint is
+rejected rather than silently accepted as the recovered identity.
+
 ### Post-Compromise Security (PCS) Zones
 
 Sensitive zones can use MLS/TreeKEM-based post-compromise security. The on-the-wire enum is `PcsMode` in `crates/fcp-core/src/pcs.rs`:
