@@ -3261,13 +3261,33 @@ struct UndoArgs {
     /// History entry ID to undo.
     entry_id: String,
 
-    /// Actually execute the reversal if safe.
+    /// Execute a reviewed compensation after current host authorization and preflight.
     #[arg(long, default_value_t = false)]
     execute: bool,
 
-    /// Skip safety warnings.
+    /// Legacy flag; live compensation never bypasses source or authority checks.
     #[arg(long, default_value_t = false)]
     force: bool,
+
+    /// Original complete input JSON, matching the recorded history hash (16 MiB maximum).
+    #[arg(long, value_name = "PATH", requires = "original_response_file")]
+    original_input_file: Option<PathBuf>,
+
+    /// Original complete InvokeResponse JSON, matching the history output hash (16 MiB maximum).
+    #[arg(long, value_name = "PATH", requires = "original_input_file")]
+    original_response_file: Option<PathBuf>,
+
+    /// Expected singleton-writer lease sequence for the compensation.
+    #[arg(long)]
+    lease_seq: Option<u64>,
+
+    /// Total preparation and execution budget in milliseconds.
+    #[arg(long, default_value_t = 30_000, value_parser = clap::value_parser!(u64).range(1..=pipe::budget::MAX_STEP_TIMEOUT_MS))]
+    timeout_ms: u64,
+
+    /// Current authority for the inverse operation; source authority is never reused.
+    #[command(flatten)]
+    auth: LiveAuthArgs,
 }
 
 #[derive(Args, Debug, Serialize)]
@@ -5153,7 +5173,7 @@ fn dispatch(cli: &Cli) -> Result<DispatchOutcome> {
         Commands::History(args) => history_dispatch(args)?,
         Commands::Replay(args) => replay_dispatch(&args, cli.host.as_deref())?,
         Commands::Compare(args) => compare_dispatch(&args)?,
-        Commands::Undo(args) => undo_dispatch(&args)?,
+        Commands::Undo(args) => undo_dispatch(&args, cli.host.as_deref())?,
         Commands::Approvals(args) => approvals_dispatch(&args)?,
         Commands::Pipe(args) => pipe_dispatch(args, cli.host.as_deref())?,
         Commands::Pipeline(args) => pipeline_dispatch(args, cli.host.as_deref())?,
@@ -6524,8 +6544,16 @@ impl HostAdminClient {
             response.receipt.input_digest.as_deref() == Some(input_digest.as_str()),
             "host returned a simulation receipt for different input"
         );
+        let preflight_consistent = match response.phase {
+            SimulatePhase::PreflightOnly => !response.preflight_allowed,
+            SimulatePhase::ConnectorReached | SimulatePhase::ConnectorUnsupported => {
+                response.preflight_allowed
+            }
+            // The shared deadline can expire during admission or guest work.
+            SimulatePhase::TimedOut => true,
+        };
         anyhow::ensure!(
-            response.preflight_allowed == (response.phase != SimulatePhase::PreflightOnly)
+            preflight_consistent
                 && (!response.would_succeed || response.phase == SimulatePhase::ConnectorReached),
             "host returned a simulation verdict inconsistent with its admission phase"
         );
@@ -30074,7 +30102,9 @@ fn compare_dispatch(args: &CompareArgs) -> Result<DispatchOutcome> {
 
 // ── Undo dispatch ───────────────────────────────────────────────────────────
 
-fn undo_dispatch(args: &UndoArgs) -> Result<DispatchOutcome> {
+fn undo_dispatch(args: &UndoArgs, explicit_host: Option<&str>) -> Result<DispatchOutcome> {
+    let budget =
+        pipe::budget::ExecutionBudget::start(Some(args.timeout_ms), std::time::Instant::now());
     let store = cli_history_store()?;
 
     let entry = match store.get(&args.entry_id)? {
@@ -30112,65 +30142,85 @@ fn undo_dispatch(args: &UndoArgs) -> Result<DispatchOutcome> {
             "none".to_owned(),
             "This was a read-only or denied operation. Nothing to undo.".to_owned(),
         )
-    } else if check.reversible {
-        ("safe".to_owned(), check.guidance.clone())
+    } else if check.reversible && entry.status == history::OpStatus::Success {
+        ("requires-authorization".to_owned(), check.guidance.clone())
     } else {
         ("unsafe".to_owned(), check.guidance.clone())
     };
 
-    let reversible = check.reversible && !is_read_only;
+    let reversible = check.reversible
+        && entry.status == history::OpStatus::Success
+        && entry.error_code.is_none();
 
-    // If --execute requested, check if we can actually do it.
-    if args.execute {
-        if !reversible && !args.force {
-            return Ok(DispatchOutcome {
-                payload: json!({
-                    "status": "error",
-                    "command": "undo",
-                    "error": {
-                        "type": "not-reversible",
-                        "message": format!(
-                            "Operation `{}` has no safe reversal path. Use --force to override.",
-                            entry.operation_id,
-                        ),
-                    },
-                    "reversible": false,
-                    "safety_level": safety_level,
-                    "guidance": guidance,
-                    "next_actions": [
-                        format!("fwc undo {}", args.entry_id),
-                        format!("fwc undo {} --execute --force", args.entry_id),
-                    ],
-                }),
-                exit_code: CliExitCode::PolicyDenied,
-            });
+    if args.force {
+        return Ok(undo_refusal(
+            &entry,
+            "undo-force-not-supported",
+            "Compensation cannot bypass source evidence, current authorization, or an existing execution fence. Remove --force and inspect the recorded operation.",
+            CliExitCode::PolicyDenied,
+        ));
+    }
+    if args.execute || args.original_input_file.is_some() || args.original_response_file.is_some() {
+        if !reversible {
+            return Ok(undo_refusal(
+                &entry,
+                "not-reversible",
+                "The source is not a definite successful operation with a reviewed compensation. Inspect its effects and plan a separately authorized repair.",
+                CliExitCode::PolicyDenied,
+            ));
         }
-
-        // Even with --execute, we need a host to actually run the reversal.
-        let envelope = CommandEnvelope::new(CommandAvailability::Unavailable, "undo");
-        let mut payload = json!({
-            "status": "error",
-            "command": "undo",
-            "mode": "execute",
-            "entry_id": args.entry_id,
-            "operation_id": entry.operation_id,
-            "reversible": reversible,
-            "reversal_path": check.inverse_operation,
-            "safety_level": safety_level,
-            "guidance": guidance,
-            "error": {
-                "type": "host-required",
-                "message": "Executing undo requires an fcp-host connection.",
-            },
-            "next_actions": [
-                format!("fwc undo {}", args.entry_id),
-                "fwc undo <entry_id> --execute --host http://127.0.0.1:8787".to_owned(),
-            ],
+        let (Some(input_path), Some(response_path)) = (
+            args.original_input_file.as_deref(),
+            args.original_response_file.as_deref(),
+        ) else {
+            return Ok(undo_refusal(
+                &entry,
+                "undo-source-evidence-required",
+                "Supply --original-input-file and --original-response-file. History summaries cannot reconstruct the original payload or the created resource.",
+                CliExitCode::Validation,
+            ));
+        };
+        let source = undo::read_source_json(input_path).and_then(|input| {
+            undo::read_source_json(response_path).map(|response| (input, response))
         });
-        envelope.inject_into(&mut payload);
+        let (input, response) = match source {
+            Ok(source) => source,
+            Err(_) => {
+                return Ok(undo_refusal(
+                    &entry,
+                    "undo-source-evidence-invalid",
+                    "Each source must be a readable regular JSON file of at most 16 MiB. Provide the complete original InvokeResponse, not its nested result or CLI wrapper.",
+                    CliExitCode::Validation,
+                ));
+            }
+        };
+        let plan = match undo::plan_history_undo(&entry, &input, &response) {
+            Ok(plan) => plan,
+            Err(error) => {
+                return Ok(undo_refusal(
+                    &entry,
+                    error.error_type(),
+                    &error.to_string(),
+                    CliExitCode::Validation,
+                ));
+            }
+        };
+        if args.execute {
+            return undo_live_dispatch(args, &entry, &plan, explicit_host, budget);
+        }
+        let mut payload = json!({
+            "status": "ok", "command": "undo", "mode": "preview",
+            "entry_id": entry.entry_id, "connector_id": entry.connector_id,
+            "zone": entry.zone, "plan": plan,
+            "source_hashes_verified": true, "invoke_attempted": false,
+            "authorization_granted": false,
+            "next_actions": ["Inspect the compensation target, then repeat with --execute, --host and current capability/approval credentials."],
+        });
+        CommandEnvelope::new(CommandAvailability::OfflineArtifact, "undo")
+            .inject_into(&mut payload);
         return Ok(DispatchOutcome {
             payload,
-            exit_code: CliExitCode::Transport,
+            exit_code: CliExitCode::Success,
         });
     }
 
@@ -30190,7 +30240,7 @@ fn undo_dispatch(args: &UndoArgs) -> Result<DispatchOutcome> {
         "guidance": guidance,
         "next_actions": if reversible {
             vec![
-                format!("fwc undo {} --execute", args.entry_id),
+                format!("fwc undo {} --original-input-file <input.json> --original-response-file <response.json>", args.entry_id),
                 format!("fwc history {}", args.entry_id),
             ]
         } else {
@@ -30204,6 +30254,331 @@ fn undo_dispatch(args: &UndoArgs) -> Result<DispatchOutcome> {
     Ok(DispatchOutcome {
         payload,
         exit_code: CliExitCode::Success,
+    })
+}
+
+fn undo_refusal(
+    entry: &history::HistoryEntry,
+    error_type: &str,
+    message: &str,
+    exit_code: CliExitCode,
+) -> DispatchOutcome {
+    let mut payload = json!({
+        "status": "error", "command": "undo", "entry_id": entry.entry_id,
+        "connector_id": entry.connector_id, "operation_id": entry.operation_id,
+        "zone": entry.zone, "invoke_attempted": false, "automatic_retry_allowed": false,
+        "error": { "type": error_type, "message": message, "recoverable": false },
+        "next_actions": [format!("fwc history {}", entry.entry_id)],
+    });
+    CommandEnvelope::new(CommandAvailability::OfflineArtifact, "undo").inject_into(&mut payload);
+    DispatchOutcome { payload, exit_code }
+}
+
+#[allow(clippy::too_many_lines)]
+fn undo_live_dispatch(
+    args: &UndoArgs,
+    entry: &history::HistoryEntry,
+    plan: &undo::UndoPlan,
+    explicit_host: Option<&str>,
+    budget: pipe::budget::ExecutionBudget,
+) -> Result<DispatchOutcome> {
+    let history_path = cli_history_store_path()?;
+    let directory = history_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("undo");
+    match undo::UndoExecutionFence::inspect(&directory, &entry.entry_id) {
+        Ok(Some(evidence)) => {
+            let mut outcome = undo_refusal(
+                entry,
+                "undo-already-admitted",
+                "This source already has a compensation attempt. Completed, interrupted, and uncertain attempts cannot be replayed. Inspect its retained host invocation before any separate repair.",
+                CliExitCode::PolicyDenied,
+            );
+            outcome.payload["execution"] = serde_json::to_value(evidence)?;
+            return Ok(outcome);
+        }
+        Err(_) => {
+            return Ok(undo_refusal(
+                entry,
+                "undo-fence-unreadable",
+                "Existing compensation evidence is incomplete or unreadable. Execution is refused; preserve and reconcile the evidence before repair.",
+                CliExitCode::Internal,
+            ));
+        }
+        Ok(None) => {}
+    }
+    let Some(mut host) = resolve_host_config(explicit_host)? else {
+        return Ok(undo_refusal(
+            entry,
+            "host-required",
+            "Live compensation requires an fcp-host connection. Select --host explicitly or configure a host context.",
+            CliExitCode::Transport,
+        ));
+    };
+    host.endpoint = normalize_host_endpoint(&host.endpoint)?;
+    let auth = match resolve_live_auth(&args.auth) {
+        Ok(auth) => auth,
+        Err(error) => {
+            return Ok(undo_refusal(
+                entry,
+                error.error_type(),
+                "Supply current capability credentials for the inverse operation, its holder key when bound, and any required approval tokens. Source credentials are not inherited.",
+                CliExitCode::PolicyDenied,
+            ));
+        }
+    };
+    let zone = entry
+        .zone
+        .as_deref()
+        .context("validated undo source has a zone")?;
+    let client = HostAdminClient::new(&host.endpoint)?.with_read_budget(budget);
+    let prepared = (|| -> Result<_> {
+        let (catalog, _) = client.catalog(None)?;
+        let connector = catalog
+            .resolve_connector(&entry.connector_id)
+            .map_err(|_| anyhow::anyhow!("recorded connector is unavailable"))?;
+        anyhow::ensure!(
+            connector.summary.id.as_str() == entry.connector_id,
+            "recorded connector identity changed"
+        );
+        let introspection = client.introspect(&entry.connector_id)?;
+        anyhow::ensure!(
+            introspection.connector.id.as_str() == entry.connector_id,
+            "introspection connector identity changed"
+        );
+        let operation = introspection
+            .tools
+            .iter()
+            .find(|operation| operation.name == plan.inverse_operation)
+            .context("exact compensation operation is unavailable")?;
+        anyhow::ensure!(
+            matches!(operation.idempotency, fcp_core::IdempotencyClass::Strict),
+            "compensation no longer declares strict idempotency"
+        );
+        let validation = validate::validate(&plan.inverse_input, &operation.input_schema);
+        anyhow::ensure!(
+            validation.is_valid(),
+            "compensation input no longer matches the live schema"
+        );
+        budget.remaining_ms(std::time::Instant::now())?;
+        let idempotency_key = format!("undo:{}", entry.entry_id);
+        let request_id = derive_live_request_id(
+            &entry.connector_id,
+            &operation.name,
+            zone,
+            &plan.inverse_input,
+            Some(&idempotency_key),
+            Some("undo"),
+        )?;
+        build_live_invoke_request(
+            &entry.connector_id,
+            &operation.name,
+            zone,
+            plan.inverse_input.clone(),
+            request_id,
+            &auth,
+            Some(idempotency_key),
+            args.lease_seq,
+            None,
+        )
+    })();
+    let mut request = match prepared {
+        Ok(request) => request,
+        Err(_) => {
+            return Ok(undo_refusal(
+                entry,
+                "undo-preparation-failed",
+                "Live preparation did not confirm the exact recorded connector, strictly idempotent inverse, and current input schema within the deadline. No compensation was invoked.",
+                CliExitCode::Validation,
+            ));
+        }
+    };
+    let preflight = match client.workflow_preflight(
+        &HostPreflightRequest {
+            holder_proof: request.holder_proof.clone(),
+            request_id: request.id.clone(),
+            connector_id: request.connector_id.clone(),
+            operation: plan.inverse_operation.clone(),
+            params: Some(plan.inverse_input.clone()),
+            principal: auth.principal_hint.clone(),
+            zone_id: Some(request.zone_id.clone()),
+            lease_seq: args.lease_seq,
+            capability_token: Some(auth.capability_token.clone()),
+            approval_tokens: auth.approval_tokens.clone(),
+        },
+        budget,
+    ) {
+        Ok(preflight) => preflight,
+        Err(_) => {
+            return Ok(undo_refusal(
+                entry,
+                "undo-preflight-unavailable",
+                "The host did not return a usable preflight response within the shared deadline. No compensation was invoked.",
+                CliExitCode::Transport,
+            ));
+        }
+    };
+    if !preflight.allowed {
+        let mut outcome = undo_refusal(
+            entry,
+            "policy-denied",
+            "The host denied the compensation before execution. Obtain the required current authority or repair the reported blocker.",
+            CliExitCode::PolicyDenied,
+        );
+        outcome.payload["preflight"] = serde_json::to_value(preflight)?;
+        CommandEnvelope::new(CommandAvailability::Denied, "undo").inject_into(&mut outcome.payload);
+        inject_truth_source_metadata(&mut outcome.payload, KnowledgeState::HostBacked);
+        return Ok(outcome);
+    }
+    let identity = undo::UndoExecutionIdentity {
+        source_entry_id: entry.entry_id.clone(),
+        connector_id: entry.connector_id.clone(),
+        source_operation: entry.operation_id.clone(),
+        zone: zone.to_owned(),
+        source_input_hash: entry.input_hash.clone(),
+        source_response_hash: entry
+            .output_hash
+            .clone()
+            .context("validated undo response hash")?,
+        inverse_operation: plan.inverse_operation.clone(),
+        inverse_input_digest: blake3::hash(&serde_json::to_vec(&plan.inverse_input)?)
+            .to_hex()
+            .to_string(),
+        host: host.endpoint.clone(),
+        request_id: request.id.to_string(),
+        idempotency_key: request
+            .idempotency_key
+            .clone()
+            .context("undo identity has an idempotency key")?,
+    };
+    // Exclusive creation and fsync precede all effectful network I/O. Even a
+    // failed or interrupted write permanently refuses an implicit second try.
+    let fence = match undo::UndoExecutionFence::begin(&directory, identity.clone()) {
+        Ok(fence) => fence,
+        Err(_) => {
+            return Ok(undo_refusal(
+                entry,
+                "undo-admission-failed",
+                "The durable compensation fence could not be created, or another attempt already reserved this source. No invocation was sent by this attempt.",
+                CliExitCode::Internal,
+            ));
+        }
+    };
+    request.deadline_ms = match budget.invocation_timeout_ms(std::time::Instant::now()) {
+        Ok(remaining) => remaining,
+        Err(_) => {
+            let mut outcome = undo_refusal(
+                entry,
+                "undo-deadline-exceeded",
+                "The deadline expired after durable admission but before dispatch. The source remains fenced; no invocation was sent by this attempt.",
+                CliExitCode::Transport,
+            );
+            outcome.payload["execution"] = serde_json::to_value(&identity)?;
+            return Ok(outcome);
+        }
+    };
+    let started = std::time::Instant::now();
+    let response = match client.invoke(&request).and_then(|response| {
+        anyhow::ensure!(
+            response.r#type == "response"
+                && ((response.status == InvokeStatus::Ok
+                    && response.result.is_some()
+                    && response.error.is_none()
+                    && response.decision_receipt_id.is_none())
+                    || (response.status == InvokeStatus::Error
+                        && response.result.is_none()
+                        && response.error.is_some())),
+            "inconsistent compensation response"
+        );
+        Ok(response)
+    }) {
+        Ok(response) => response,
+        Err(error) => {
+            let mut outcome = error
+                .downcast_ref::<invocation_cmd::InvokeOutcomeUnknown>()
+                .map_or_else(
+                    || {
+                        invocation_cmd::InvokeOutcomeUnknown::from_request(
+                            &request,
+                            &host.endpoint,
+                            &error,
+                        )
+                        .dispatch("undo")
+                    },
+                    |unknown| unknown.dispatch("undo"),
+                );
+            outcome.payload["entry_id"] = json!(entry.entry_id);
+            outcome.payload["execution"] = serde_json::to_value(identity)?;
+            outcome.payload["compensation_fenced"] = json!(true);
+            outcome.payload["invoke_attempted"] = json!(true);
+            outcome.payload["source_hashes_verified"] = json!(true);
+            return Ok(outcome);
+        }
+    };
+    let response_value = serde_json::to_value(&response)?;
+    let success = response.status == InvokeStatus::Ok;
+    let history_recorded = append_history_entry(
+        if success {
+            history::OpStatus::Success
+        } else {
+            history::OpStatus::Error
+        },
+        &entry.connector_id,
+        &plan.inverse_operation,
+        Some(zone),
+        &plan.inverse_input,
+        Some(&response_value),
+        response.error.as_ref().map(ToString::to_string),
+        request.idempotency_key.as_deref(),
+        u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+    )
+    .is_ok();
+    let receipt_recorded = fence
+        .complete(
+            if success {
+                undo::UndoExecutionStatus::Completed
+            } else {
+                undo::UndoExecutionStatus::ReportedError
+            },
+            &response_value,
+            history_recorded,
+        )
+        .is_ok();
+    let mut payload = json!({
+        "status": if success && history_recorded && receipt_recorded { "ok" } else { "error" },
+        "command": "undo", "mode": "execute", "entry_id": entry.entry_id,
+        "execution": identity, "response": response_value, "preflight": preflight,
+        "invoke_attempted": true, "source_hashes_verified": true,
+        "compensation_completed": success, "compensation_fenced": true,
+        "history_recorded": history_recorded, "receipt_recorded": receipt_recorded,
+        "automatic_retry_allowed": false, "warnings": plan.warnings,
+        "next_actions": [format!("fwc history --connector {}", entry.connector_id)],
+    });
+    if !history_recorded || !receipt_recorded {
+        payload["error"] = json!({
+            "type": "undo-evidence-not-persisted",
+            "message": "The host reply is retained here, but local evidence persistence failed. Preserve this response and reconcile the host invocation; the compensation remains fenced.",
+            "recoverable": false,
+        });
+    } else if !success {
+        payload["error"] = json!({
+            "type": "undo-reported-error",
+            "message": "The host reported an error. Partial effects are possible; reconcile the retained invocation before a separate repair. This source remains fenced.",
+            "recoverable": false,
+        });
+    }
+    CommandEnvelope::new(CommandAvailability::LiveRuntime, "undo").inject_into(&mut payload);
+    inject_truth_source_metadata(&mut payload, invoke_response_knowledge_state(&response));
+    Ok(DispatchOutcome {
+        payload,
+        exit_code: if !history_recorded || !receipt_recorded {
+            CliExitCode::Internal
+        } else if success {
+            CliExitCode::Success
+        } else {
+            CliExitCode::Connector
+        },
     })
 }
 
@@ -62605,27 +62980,38 @@ depends_on = ["missing"]
         });
         let input_text = input.to_string();
 
-        for (phase, expected_phase, expected_status, expected_error) in [
+        for (phase, preflight_allowed, expected_phase, expected_status, expected_error) in [
             (
                 SimulatePhase::ConnectorReached,
+                true,
                 "connector_reached",
                 "denied",
                 "simulation-denied",
             ),
             (
                 SimulatePhase::ConnectorUnsupported,
+                true,
                 "connector_unsupported",
                 "unsupported",
                 "simulation-unsupported",
             ),
             (
                 SimulatePhase::TimedOut,
+                true,
+                "timed_out",
+                "timed_out",
+                "simulation-timed-out",
+            ),
+            (
+                SimulatePhase::TimedOut,
+                false,
                 "timed_out",
                 "timed_out",
                 "simulation-timed-out",
             ),
         ] {
             let mut response = mock_simulate_response_json(&input, phase, false);
+            response["preflight_allowed"] = json!(preflight_allowed);
             if phase == SimulatePhase::ConnectorReached {
                 response["denial_code"] = json!("FCP-3001");
                 response["missing_capabilities"] = json!(["github.issue.write"]);
@@ -62657,7 +63043,7 @@ depends_on = ["missing"]
             assert_eq!(payload["phase"], expected_phase);
             assert_eq!(payload["status"], expected_status);
             assert_eq!(payload["error"]["type"], expected_error);
-            assert_eq!(payload["preflight"]["allowed"], true);
+            assert_eq!(payload["preflight"]["allowed"], preflight_allowed);
             assert_eq!(payload["would_succeed"], false);
             assert_eq!(payload["_truth_source"], "simulated");
             assert_eq!(
@@ -72129,6 +72515,609 @@ require_attestation_types = ["in-toto"]"#,
 
     // ── Undo tests ──────────────────────────────────────────────────────
 
+    fn seed_live_undo_source() -> (
+        TempDir,
+        super::history::HistoryEntry,
+        PathBuf,
+        PathBuf,
+        super::HistoryPathOverrideGuard,
+    ) {
+        let root = TempDir::new().unwrap();
+        let history_path = root.path().join("history.jsonl");
+        let guard = super::install_test_history_path(history_path.clone());
+        let input = json!({"channel_id": "123456", "content": "private-original-message"});
+        let response = mock_invoke_response_json(json!({"id": "789012", "channel_id": "123456"}));
+        let entry = super::history::HistoryEntry {
+            entry_id: "undo-source-fixture".to_owned(),
+            timestamp: chrono::Utc::now(),
+            connector_id: "fcp.discord:messaging:v1".to_owned(),
+            operation_id: "discord.send_message".to_owned(),
+            zone: Some("z:work".to_owned()),
+            input_hash: super::history::content_hash(&input),
+            input_summary: "source input".to_owned(),
+            output_hash: Some(super::history::content_hash(&response)),
+            output_summary: Some("source response".to_owned()),
+            status: super::history::OpStatus::Success,
+            latency_ms: 1,
+            error_code: None,
+            idempotency_key: Some("source-create-key".to_owned()),
+            agent_session: None,
+        };
+        super::history::HistoryStore::new(history_path)
+            .append(&entry)
+            .unwrap();
+        let input_path = root.path().join("original-input.json");
+        let response_path = root.path().join("original-response.json");
+        fs::write(&input_path, input.to_string()).unwrap();
+        fs::write(&response_path, response.to_string()).unwrap();
+        (root, entry, input_path, response_path, guard)
+    }
+
+    fn undo_host_setup_routes(idempotency: &str) -> Vec<(String, Value)> {
+        let connector =
+            mock_connector_summary_custom_json("fcp.discord:messaging:v1", "Discord", 1, "risky");
+        let operation = mock_tool_descriptor_json(
+            "discord.delete_message",
+            "discord.write",
+            "high",
+            "risky",
+            idempotency,
+            Some("policy"),
+            json!({
+                "type": "object", "required": ["channel_id", "message_id"],
+                "properties": {"channel_id": {"type": "string"}, "message_id": {"type": "string"}},
+                "additionalProperties": false,
+            }),
+            json!({"type": "object"}),
+        );
+        vec![
+            (
+                "POST /rpc/discover".to_owned(),
+                mock_discovery_response_with_connectors(vec![connector.clone()]),
+            ),
+            (
+                "GET /rpc/introspect/fcp.discord:messaging:v1".to_owned(),
+                mock_introspection_response_with_tools(connector, vec![operation]),
+            ),
+        ]
+    }
+
+    #[test]
+    fn undo_preview_is_offline_and_source_evidence_cannot_choose_another_target() {
+        let (root, entry, input, response, _guard) = seed_live_undo_source();
+        let args = [
+            "fwc",
+            "--json",
+            "--host",
+            "http://127.0.0.1:1",
+            "undo",
+            &entry.entry_id,
+            "--original-input-file",
+            input.to_str().unwrap(),
+            "--original-response-file",
+            response.to_str().unwrap(),
+        ];
+        let (code, payload) = execute_json(&args);
+        assert_eq!(code, CliExitCode::Success.into(), "{payload}");
+        assert_eq!(payload["mode"], "preview");
+        assert_eq!(
+            payload["plan"]["inverse_input"],
+            json!({"channel_id": "123456", "message_id": "789012"})
+        );
+        assert_eq!(payload["authorization_granted"], false);
+        assert!(!root.path().join("undo").exists());
+        assert!(!payload.to_string().contains("private-original-message"));
+
+        fs::write(&input, json!({"channel_id": "other-target"}).to_string()).unwrap();
+        let (code, payload) = execute_json(&args);
+        assert_eq!(code, CliExitCode::Validation.into());
+        assert_eq!(payload["error"]["type"], "undo-input-mismatch");
+        assert_eq!(payload["invoke_attempted"], false);
+        assert!(!payload.to_string().contains("other-target"));
+    }
+
+    #[test]
+    fn undo_execute_preserves_selected_host_authority_and_durable_fence() {
+        let (root, entry, input, response, _guard) = seed_live_undo_source();
+        let (token, holder, signing_key) = test_live_holder_auth(root.path());
+        let approval = json!({
+            "token_id": "private-undo-approval", "issued_at_ms": 0, "expires_at_ms": u64::MAX,
+            "issuer": "undo-approver", "zone_id": "z:work",
+            "scope": {"type": "execution", "connector_id": entry.connector_id, "method_pattern": "discord.delete_message"},
+            "signature": [17, 29, 53, 97],
+        });
+        let approval_path = root.path().join("approval.json");
+        fs::write(&approval_path, approval.to_string()).unwrap();
+        let mut routes = undo_host_setup_routes("strict");
+        routes.extend([
+            (
+                "POST /rpc/preflight".to_owned(),
+                mock_preflight_response_json(true),
+            ),
+            (
+                "POST /rpc/invoke".to_owned(),
+                mock_invoke_response_json(json!({"deleted": true})),
+            ),
+        ]);
+        let evidence_directory = root.path().join("undo");
+        let observed_directory = evidence_directory.clone();
+        let (host, server, requests, stop) = spawn_mock_host_sequence_with_observer(
+            routes
+                .into_iter()
+                .map(|(route, body)| (route, body, Duration::ZERO))
+                .collect(),
+            move |route, body| {
+                if route == "POST /rpc/invoke" {
+                    let request: Value = serde_json::from_str(body).unwrap();
+                    let evidence = super::undo::UndoExecutionFence::inspect(
+                        &observed_directory,
+                        "undo-source-fixture",
+                    )
+                    .unwrap()
+                    .unwrap();
+                    assert_eq!(evidence.identity.request_id, request["id"]);
+                    assert!(evidence.completion.is_none());
+                }
+            },
+        );
+        let args = [
+            "fwc",
+            "--json",
+            "--host",
+            &host,
+            "undo",
+            &entry.entry_id,
+            "--execute",
+            "--original-input-file",
+            input.to_str().unwrap(),
+            "--original-response-file",
+            response.to_str().unwrap(),
+            "--capability-token",
+            &token,
+            "--holder-key-file",
+            holder.to_str().unwrap(),
+            "--approval-token-file",
+            approval_path.to_str().unwrap(),
+            "--lease-seq",
+            "17",
+        ];
+        let (code, payload) = execute_json(&args);
+        assert_eq!(code, CliExitCode::Success.into(), "{payload}");
+        assert_eq!(payload["compensation_completed"], true);
+        assert_eq!(payload["receipt_recorded"], true);
+        assert_eq!(payload["history_recorded"], true);
+        assert_eq!(payload["execution"]["host"], host);
+        assert_eq!(
+            payload["execution"]["idempotency_key"],
+            "undo:undo-source-fixture"
+        );
+        let (second_code, second) = execute_json(&args);
+        assert_eq!(second_code, CliExitCode::PolicyDenied.into(), "{second}");
+        assert_eq!(second["error"]["type"], "undo-already-admitted");
+        assert_eq!(second["execution"]["completion"]["status"], "completed");
+        stop.send(()).unwrap();
+        server.join().unwrap();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 4);
+        let preflight: Value = serde_json::from_str(&requests[2].1).unwrap();
+        let invoke: Value = serde_json::from_str(&requests[3].1).unwrap();
+        for request in [&preflight, &invoke] {
+            assert_live_holder_request(request, &signing_key);
+            assert_eq!(request["connector_id"], entry.connector_id);
+            assert_eq!(request["zone_id"], "z:work");
+            assert_eq!(request["operation"], "discord.delete_message");
+            assert_eq!(request["approval_tokens"], json!([approval]));
+            assert_eq!(request["lease_seq"], 17);
+        }
+        assert_eq!(preflight["request_id"], invoke["id"]);
+        assert_eq!(
+            invoke["input"],
+            json!({"channel_id": "123456", "message_id": "789012"})
+        );
+        assert!(
+            invoke["deadline_ms"]
+                .as_u64()
+                .is_some_and(|deadline| deadline > 0 && deadline <= 30_000)
+        );
+        let evidence =
+            super::undo::UndoExecutionFence::inspect(&evidence_directory, &entry.entry_id)
+                .unwrap()
+                .unwrap();
+        let durable = serde_json::to_string(&evidence).unwrap();
+        for secret in [
+            token.as_str(),
+            "private-original-message",
+            "private-undo-approval",
+        ] {
+            assert!(!durable.contains(secret));
+            assert!(!payload.to_string().contains(secret));
+        }
+        let history = super::cli_history_store()
+            .unwrap()
+            .query(&super::history::HistoryFilter::new())
+            .unwrap();
+        assert!(
+            history
+                .iter()
+                .any(|record| record.operation_id == "discord.delete_message"
+                    && record.idempotency_key.as_deref() == Some("undo:undo-source-fixture"))
+        );
+    }
+
+    #[test]
+    fn undo_preflight_denial_and_changed_contract_never_admit_effects() {
+        for reason in ["policy", "idempotency", "connector", "schema"] {
+            let (root, entry, input, response, _guard) = seed_live_undo_source();
+            let token = test_capability_token_arg();
+            let mut routes = undo_host_setup_routes(if reason == "idempotency" {
+                "best_effort"
+            } else {
+                "strict"
+            });
+            if reason == "connector" {
+                routes[1].1["connector"]["id"] = json!("fcp.discord:other:v1");
+            } else if reason == "schema" {
+                routes[1].1["tools"][0]["input_schema"]["required"] =
+                    json!(["channel_id", "message_id", "new_required_field"]);
+            } else if reason == "policy" {
+                routes.push((
+                    "POST /rpc/preflight".to_owned(),
+                    mock_preflight_response_json(false),
+                ));
+            }
+            let (host, server, requests) = spawn_mock_host_sequence_with_body_log(routes);
+            let (code, payload) = execute_json(&[
+                "fwc",
+                "--json",
+                "--host",
+                &host,
+                "undo",
+                &entry.entry_id,
+                "--execute",
+                "--original-input-file",
+                input.to_str().unwrap(),
+                "--original-response-file",
+                response.to_str().unwrap(),
+                "--capability-token",
+                &token,
+            ]);
+            server.join().unwrap();
+            assert_ne!(code, CliExitCode::Success.into(), "{payload}");
+            assert_eq!(payload["invoke_attempted"], false);
+            assert_eq!(
+                payload["error"]["type"],
+                if reason == "policy" {
+                    "policy-denied"
+                } else {
+                    "undo-preparation-failed"
+                }
+            );
+            assert!(!root.path().join("undo").exists());
+            assert!(
+                !requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(route, _)| route == "POST /rpc/invoke")
+            );
+        }
+    }
+
+    #[test]
+    fn undo_unknown_host_reply_retains_identity_and_fences_other_hosts() {
+        let (root, entry, input, response, _guard) = seed_live_undo_source();
+        let token = test_capability_token_arg();
+        let mut routes = undo_host_setup_routes("strict");
+        routes.extend([
+            (
+                "POST /rpc/preflight".to_owned(),
+                mock_preflight_response_json(true),
+            ),
+            (
+                "POST /rpc/invoke".to_owned(),
+                json!({"invalid": "private-reflected-body"}),
+            ),
+        ]);
+        let (host, server, requests) = spawn_mock_host_sequence_with_body_log(routes);
+        let mut args = vec![
+            "fwc",
+            "--json",
+            "--host",
+            &host,
+            "undo",
+            &entry.entry_id,
+            "--execute",
+            "--original-input-file",
+            input.to_str().unwrap(),
+            "--original-response-file",
+            response.to_str().unwrap(),
+            "--capability-token",
+            &token,
+        ];
+        let (code, payload) = execute_json(&args);
+        server.join().unwrap();
+        assert_eq!(code, CliExitCode::Transport.into(), "{payload}");
+        assert_eq!(payload["outcome"], "outcome_unknown");
+        assert_eq!(payload["compensation_fenced"], true);
+        assert!(!payload.to_string().contains("private-reflected-body"));
+        let requests = requests.lock().unwrap();
+        let invoke: Value = serde_json::from_str(&requests[3].1).unwrap();
+        assert_eq!(payload["execution"]["request_id"], invoke["id"]);
+        let evidence =
+            super::undo::UndoExecutionFence::inspect(&root.path().join("undo"), &entry.entry_id)
+                .unwrap()
+                .unwrap();
+        assert!(evidence.completion.is_none());
+        args[3] = "http://127.0.0.1:1";
+        let (code, retry) = execute_json(&args);
+        assert_eq!(code, CliExitCode::PolicyDenied.into(), "{retry}");
+        assert_eq!(retry["error"]["type"], "undo-already-admitted");
+    }
+
+    #[test]
+    fn undo_reported_error_and_inconsistent_envelopes_remain_fenced() {
+        for envelope in [
+            "reported-error",
+            "ok-with-error",
+            "error-with-result",
+            "ok-without-result",
+            "ok-with-decision-receipt",
+        ] {
+            let (root, entry, input, response, _guard) = seed_live_undo_source();
+            let token = test_capability_token_arg();
+            let mut reply = serde_json::to_value(InvokeResponse::error(
+                RequestId::random(),
+                fcp_kernel::FcpError::ConnectorUnavailable {
+                    code: 5001,
+                    message: "provider reported an error".to_owned(),
+                },
+            ))
+            .unwrap();
+            match envelope {
+                "ok-with-error" => reply["status"] = json!("ok"),
+                "error-with-result" => reply["result"] = json!({"deleted": true}),
+                "ok-without-result" => {
+                    reply["status"] = json!("ok");
+                    reply["error"] = Value::Null;
+                }
+                "ok-with-decision-receipt" => {
+                    reply = mock_invoke_response_json(json!({"deleted": true}));
+                    reply["decision_receipt_id"] =
+                        json!(fcp_core::ObjectId::from_bytes([0x75; 32]));
+                }
+                _ => {}
+            }
+            let mut routes = undo_host_setup_routes("strict");
+            routes.extend([
+                (
+                    "POST /rpc/preflight".to_owned(),
+                    mock_preflight_response_json(true),
+                ),
+                ("POST /rpc/invoke".to_owned(), reply),
+            ]);
+            let (host, server, _) = spawn_mock_host_sequence_with_body_log(routes);
+            let args = [
+                "fwc",
+                "--json",
+                "--host",
+                &host,
+                "undo",
+                &entry.entry_id,
+                "--execute",
+                "--original-input-file",
+                input.to_str().unwrap(),
+                "--original-response-file",
+                response.to_str().unwrap(),
+                "--capability-token",
+                &token,
+            ];
+            let (code, payload) = execute_json(&args);
+            server.join().unwrap();
+            assert_eq!(payload["invoke_attempted"], true);
+            assert_eq!(payload["compensation_fenced"], true);
+            let evidence = super::undo::UndoExecutionFence::inspect(
+                &root.path().join("undo"),
+                &entry.entry_id,
+            )
+            .unwrap()
+            .unwrap();
+            if envelope != "reported-error" {
+                assert_eq!(code, CliExitCode::Transport.into(), "{payload}");
+                assert_eq!(payload["outcome"], "outcome_unknown");
+                assert!(evidence.completion.is_none());
+            } else {
+                assert_eq!(code, CliExitCode::Connector.into(), "{payload}");
+                assert_eq!(payload["error"]["type"], "undo-reported-error");
+                assert_eq!(payload["compensation_completed"], false);
+                assert_eq!(
+                    evidence.completion.unwrap().status,
+                    super::undo::UndoExecutionStatus::ReportedError
+                );
+            }
+            let (code, retry) = execute_json(&args);
+            assert_eq!(code, CliExitCode::PolicyDenied.into(), "{retry}");
+            assert_eq!(retry["error"]["type"], "undo-already-admitted");
+        }
+    }
+
+    #[test]
+    fn undo_admission_failure_after_preflight_never_sends_invocation() {
+        let (root, entry, input, response, _guard) = seed_live_undo_source();
+        let token = test_capability_token_arg();
+        let mut routes = undo_host_setup_routes("strict");
+        routes.push((
+            "POST /rpc/preflight".to_owned(),
+            mock_preflight_response_json(true),
+        ));
+        let blocked_directory = root.path().join("undo");
+        let (host, server, requests, stop) = spawn_mock_host_sequence_with_observer(
+            routes
+                .into_iter()
+                .map(|(route, body)| (route, body, Duration::ZERO))
+                .collect(),
+            move |route, _| {
+                if route == "POST /rpc/preflight" {
+                    fs::write(&blocked_directory, b"unwritable evidence directory").unwrap();
+                }
+            },
+        );
+        let (code, payload) = execute_json(&[
+            "fwc",
+            "--json",
+            "--host",
+            &host,
+            "undo",
+            &entry.entry_id,
+            "--execute",
+            "--original-input-file",
+            input.to_str().unwrap(),
+            "--original-response-file",
+            response.to_str().unwrap(),
+            "--capability-token",
+            &token,
+        ]);
+        stop.send(()).unwrap();
+        server.join().unwrap();
+        assert_eq!(code, CliExitCode::Internal.into(), "{payload}");
+        assert_eq!(payload["error"]["type"], "undo-admission-failed");
+        assert_eq!(payload["invoke_attempted"], false);
+        assert_eq!(requests.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn undo_late_preflight_cannot_admit_compensation_after_deadline() {
+        let (root, entry, input, response, _guard) = seed_live_undo_source();
+        let token = test_capability_token_arg();
+        let mut routes = undo_host_setup_routes("strict")
+            .into_iter()
+            .map(|(route, body)| (route, body, Duration::ZERO))
+            .collect::<Vec<_>>();
+        routes.push((
+            "POST /rpc/preflight".to_owned(),
+            mock_preflight_response_json(true),
+            Duration::from_millis(1_500),
+        ));
+        let (host, server, requests, stop) =
+            spawn_mock_host_sequence_with_observer(routes, |_, _| {});
+        let (code, payload) = execute_json(&[
+            "fwc",
+            "--json",
+            "--host",
+            &host,
+            "undo",
+            &entry.entry_id,
+            "--execute",
+            "--original-input-file",
+            input.to_str().unwrap(),
+            "--original-response-file",
+            response.to_str().unwrap(),
+            "--capability-token",
+            &token,
+            "--timeout-ms",
+            "1000",
+        ]);
+        stop.send(()).unwrap();
+        server.join().unwrap();
+        assert_eq!(code, CliExitCode::Transport.into(), "{payload}");
+        assert_eq!(payload["error"]["type"], "undo-preflight-unavailable");
+        assert_eq!(payload["invoke_attempted"], false);
+        assert_eq!(requests.lock().unwrap().len(), 3);
+        assert!(!root.path().join("undo").exists());
+    }
+
+    #[test]
+    fn undo_failed_receipt_preserves_observed_completion_and_refuses_replay() {
+        let (root, entry, input, response, _guard) = seed_live_undo_source();
+        let token = test_capability_token_arg();
+        let mut routes = undo_host_setup_routes("strict");
+        routes.extend([
+            (
+                "POST /rpc/preflight".to_owned(),
+                mock_preflight_response_json(true),
+            ),
+            (
+                "POST /rpc/invoke".to_owned(),
+                mock_invoke_response_json(json!({"deleted": true})),
+            ),
+        ]);
+        let receipt_path = root.path().join("undo").join(format!(
+            "{}.result.json",
+            blake3::hash(entry.entry_id.as_bytes()).to_hex()
+        ));
+        let (host, server, _, stop) = spawn_mock_host_sequence_with_observer(
+            routes
+                .into_iter()
+                .map(|(route, body)| (route, body, Duration::ZERO))
+                .collect(),
+            move |route, _| {
+                if route == "POST /rpc/invoke" {
+                    fs::create_dir(&receipt_path).unwrap();
+                }
+            },
+        );
+        let args = [
+            "fwc",
+            "--json",
+            "--host",
+            &host,
+            "undo",
+            &entry.entry_id,
+            "--execute",
+            "--original-input-file",
+            input.to_str().unwrap(),
+            "--original-response-file",
+            response.to_str().unwrap(),
+            "--capability-token",
+            &token,
+        ];
+        let (code, payload) = execute_json(&args);
+        assert_eq!(code, CliExitCode::Internal.into(), "{payload}");
+        assert_eq!(payload["error"]["type"], "undo-evidence-not-persisted");
+        assert_eq!(payload["compensation_completed"], true);
+        assert_eq!(payload["response"]["result"]["deleted"], true);
+        assert_eq!(payload["receipt_recorded"], false);
+        let (code, retry) = execute_json(&args);
+        assert_eq!(code, CliExitCode::Internal.into(), "{retry}");
+        assert_eq!(retry["error"]["type"], "undo-fence-unreadable");
+        stop.send(()).unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn undo_force_and_missing_authority_cannot_bypass_live_checks() {
+        let (root, entry, input, response, _guard) = seed_live_undo_source();
+        for force in [false, true] {
+            let mut args = vec![
+                "fwc",
+                "--json",
+                "--host",
+                "http://127.0.0.1:1",
+                "undo",
+                &entry.entry_id,
+                "--execute",
+                "--original-input-file",
+                input.to_str().unwrap(),
+                "--original-response-file",
+                response.to_str().unwrap(),
+            ];
+            if force {
+                args.push("--force");
+            }
+            let (code, payload) = execute_json(&args);
+            assert_eq!(code, CliExitCode::PolicyDenied.into(), "{payload}");
+            assert_eq!(
+                payload["error"]["type"],
+                if force {
+                    "undo-force-not-supported"
+                } else {
+                    "missing-capability-token"
+                }
+            );
+            assert_eq!(payload["invoke_attempted"], false);
+            assert!(!root.path().join("undo").exists());
+        }
+    }
+
     #[test]
     fn undo_guidance_for_reversible_operation() {
         let (_root, ids, _guard) = seed_history_entries();
@@ -75440,23 +76429,4 @@ require_attestation_types = ["in-toto"]"#,
     fn invariant_json_output_always_has_status_field() {
         // Every JSON response from execute_json must contain a "status" field
         // at the top level, regardless of success or failure.
-        let scenarios: Vec<Vec<&str>> = vec![
-            vec!["fwc", "--json", "guide"],
-            vec!["fwc", "--json", "list", "--offline"],
-            vec!["fwc", "--json", "show", "github", "--offline"],
-            vec!["fwc", "--json", "zzqxwplm"],
-            vec!["fwc", "--json", "delete", "github"],
-        ];
-
-        for scenario in &scenarios {
-            let (_exit_code, payload) = execute_json(scenario);
-            assert!(
-                payload.get("status").is_some(),
-                "JSON output for {scenario:?} must have a 'status' field, got keys: {:?}",
-                payload
-                    .as_object()
-                    .map(|obj| obj.keys().collect::<Vec<_>>())
-            );
-        }
-    }
-}
+        let

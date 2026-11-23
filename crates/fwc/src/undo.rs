@@ -15,8 +15,261 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
+
+/// Maximum size of either caller-supplied source JSON file.
+pub const MAX_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_EXECUTION_RECORD_BYTES: u64 = 16 * 1024;
+
+/// Read a bounded, regular JSON source file without retaining its raw bytes.
+///
+/// # Errors
+/// Refuses unreadable, non-regular, oversized, or malformed input. Diagnostics
+/// deliberately omit private paths and source data.
+pub fn read_source_json(path: &Path) -> Result<serde_json::Value> {
+    read_bounded_json(path, MAX_SOURCE_BYTES)
+        .map_err(|_| anyhow::anyhow!("source must be a readable JSON file of at most 16 MiB"))
+}
+
+/// Payload-free identity persisted before a compensation can have effects.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UndoExecutionIdentity {
+    /// Local source history entry; determines the exclusive fence filename.
+    pub source_entry_id: String,
+    /// Exact canonical connector identity recorded for the original operation.
+    pub connector_id: String,
+    /// Original successful operation.
+    pub source_operation: String,
+    /// Recorded execution zone, preserved by the compensation.
+    pub zone: String,
+    /// Continuity hash recorded by local history for the original input.
+    pub source_input_hash: String,
+    /// Continuity hash recorded by local history for the full original response.
+    pub source_response_hash: String,
+    /// Exact reviewed inverse operation.
+    pub inverse_operation: String,
+    /// BLAKE3 digest of the inverse input; no resource payload is persisted.
+    pub inverse_input_digest: String,
+    /// Normalized host endpoint selected for this attempt.
+    pub host: String,
+    /// Host invocation identity retained for inspection after interruption.
+    pub request_id: String,
+    /// Stable compensation key linking the inverse history entry to its source.
+    pub idempotency_key: String,
+}
+
+/// A terminal reply does not authorize another compensation attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UndoExecutionStatus {
+    /// The host returned a successful terminal response.
+    Completed,
+    /// The host returned an error; partial effects remain possible.
+    ReportedError,
+}
+
+/// Immutable, payload-free summary of an observed terminal host reply.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UndoCompletion {
+    /// Invocation identity, required to match the original fence.
+    pub request_id: String,
+    /// Terminal response classification.
+    pub status: UndoExecutionStatus,
+    /// BLAKE3 digest of the full host response.
+    pub response_digest: String,
+    /// Whether the inverse operation was appended to ordinary CLI history.
+    pub history_recorded: bool,
+}
+
+/// Inspectable evidence for a compensation already admitted locally.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UndoExecutionEvidence {
+    /// Original pre-effect admission record.
+    pub identity: UndoExecutionIdentity,
+    /// Absent after interruption or an unconfirmed result.
+    pub completion: Option<UndoCompletion>,
+}
+
+/// A permanent, exclusively-created effect fence for one source history entry.
+///
+/// The pending marker is never replaced or deleted. A second caller therefore
+/// cannot race admission, and a restart, changed host, or missing completion
+/// receipt cannot cause implicit replay. A terminal reply is recorded in a
+/// separate immutable file. The local state is evidence, not host authority.
+pub struct UndoExecutionFence {
+    path: PathBuf,
+    identity: UndoExecutionIdentity,
+}
+
+impl UndoExecutionFence {
+    /// Inspect a prior attempt before any live discovery or preflight.
+    ///
+    /// # Errors
+    /// A malformed, partial, or non-regular marker fails closed.
+    pub fn inspect(
+        directory: &Path,
+        source_entry_id: &str,
+    ) -> Result<Option<UndoExecutionEvidence>> {
+        let path = Self::path(directory, source_entry_id);
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => anyhow::bail!("could not inspect the existing compensation fence"),
+            Ok(metadata) => ensure!(
+                metadata.is_file(),
+                "compensation fence is not a regular file"
+            ),
+        }
+        let identity: UndoExecutionIdentity =
+            serde_json::from_value(read_bounded_json(&path, MAX_EXECUTION_RECORD_BYTES)?)
+                .context("compensation fence is incomplete or malformed")?;
+        ensure!(
+            identity.source_entry_id == source_entry_id,
+            "compensation fence belongs to a different source"
+        );
+        let completion_path = path.with_extension("result.json");
+        let completion = match fs::symlink_metadata(&completion_path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => anyhow::bail!("could not inspect the compensation receipt"),
+            Ok(metadata) => {
+                ensure!(
+                    metadata.is_file(),
+                    "compensation receipt is not a regular file"
+                );
+                let completion: UndoCompletion = serde_json::from_value(read_bounded_json(
+                    &completion_path,
+                    MAX_EXECUTION_RECORD_BYTES,
+                )?)
+                .context("compensation receipt is incomplete or malformed")?;
+                ensure!(
+                    completion.request_id == identity.request_id,
+                    "compensation receipt belongs to a different invocation"
+                );
+                Some(completion)
+            }
+        };
+        Ok(Some(UndoExecutionEvidence {
+            identity,
+            completion,
+        }))
+    }
+
+    /// Durably reserve the source immediately before sending an invocation.
+    ///
+    /// # Errors
+    /// Refuses any existing marker, including a partial prior write. A failed
+    /// sync must never be followed by invocation.
+    pub fn begin(directory: &Path, identity: UndoExecutionIdentity) -> Result<Self> {
+        ensure!(
+            valid_identity(&identity.source_entry_id, 128),
+            "invalid compensation source identity"
+        );
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        match builder.create(directory) {
+            Ok(()) => sync_parent(directory)?,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(_) => anyhow::bail!("could not create compensation evidence directory"),
+        }
+        ensure!(
+            fs::symlink_metadata(directory)?.is_dir(),
+            "compensation evidence directory must not be a symlink"
+        );
+        let path = Self::path(directory, &identity.source_entry_id);
+        write_new_record(&path, &identity)?;
+        Ok(Self { path, identity })
+    }
+
+    /// Persist the observed terminal reply without storing provider payloads.
+    ///
+    /// # Errors
+    /// Refuses duplicate receipt writes or any persistence failure. The pending
+    /// fence is retained regardless, so failed recording cannot enable replay.
+    pub fn complete(
+        &self,
+        status: UndoExecutionStatus,
+        response: &serde_json::Value,
+        history_recorded: bool,
+    ) -> Result<()> {
+        let completion = UndoCompletion {
+            request_id: self.identity.request_id.clone(),
+            status,
+            response_digest: blake3::hash(&serde_json::to_vec(response)?)
+                .to_hex()
+                .to_string(),
+            history_recorded,
+        };
+        write_new_record(&self.path.with_extension("result.json"), &completion)
+    }
+
+    fn path(directory: &Path, source_entry_id: &str) -> PathBuf {
+        directory.join(format!(
+            "{}.json",
+            blake3::hash(source_entry_id.as_bytes()).to_hex()
+        ))
+    }
+}
+
+fn read_bounded_json(path: &Path, maximum: u64) -> Result<serde_json::Value> {
+    ensure!(
+        fs::symlink_metadata(path)?.is_file(),
+        "expected a regular JSON file"
+    );
+    let file = File::open(path)?;
+    ensure!(file.metadata()?.is_file(), "expected a regular JSON file");
+    let mut bytes = zeroize::Zeroizing::new(Vec::new());
+    file.take(maximum + 1).read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() as u64 <= maximum,
+        "JSON file exceeds its size limit"
+    );
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn write_new_record(path: &Path, record: &impl Serialize) -> Result<()> {
+    let bytes = serde_json::to_vec(record)?;
+    ensure!(
+        bytes.len() as u64 <= MAX_EXECUTION_RECORD_BYTES,
+        "compensation evidence exceeds its size limit"
+    );
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .context("compensation evidence already exists or cannot be created")?;
+    file.write_all(&bytes)
+        .and_then(|()| file.sync_all())
+        .context("could not persist compensation evidence")?;
+    sync_parent(path)
+}
+
+#[cfg(unix)]
+fn sync_parent(path: &Path) -> Result<()> {
+    File::open(path.parent().unwrap_or_else(|| Path::new(".")))?
+        .sync_all()
+        .context("could not sync compensation evidence directory")
+}
+
+#[cfg(not(unix))]
+fn sync_parent(_path: &Path) -> Result<()> {
+    Ok(())
+}
 
 // ── Error type ──────────────────────────────────────────────────────────────
 
@@ -656,6 +909,177 @@ pub fn check_reversibility(registry: &UndoRegistry, operation_id: &str) -> Rever
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn execution_identity() -> UndoExecutionIdentity {
+        UndoExecutionIdentity {
+            source_entry_id: "history-source".to_owned(),
+            connector_id: "fcp.discord:messaging:v1".to_owned(),
+            source_operation: "discord.send_message".to_owned(),
+            zone: "z:work".to_owned(),
+            source_input_hash: "input-hash".to_owned(),
+            source_response_hash: "response-hash".to_owned(),
+            inverse_operation: "discord.delete_message".to_owned(),
+            inverse_input_digest: "inverse-digest".to_owned(),
+            host: "http://127.0.0.1:8787".to_owned(),
+            request_id: "undo-request".to_owned(),
+            idempotency_key: "undo:history-source".to_owned(),
+        }
+    }
+
+    #[test]
+    fn execution_fence_survives_interruption_completion_and_host_changes() {
+        for complete in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let directory = root.path().join("undo");
+            let identity = execution_identity();
+            assert!(
+                UndoExecutionFence::inspect(&directory, &identity.source_entry_id)
+                    .unwrap()
+                    .is_none()
+            );
+            let fence = UndoExecutionFence::begin(&directory, identity.clone()).unwrap();
+            if complete {
+                fence
+                    .complete(
+                        UndoExecutionStatus::Completed,
+                        &json!({"private_result": "never-persist"}),
+                        true,
+                    )
+                    .unwrap();
+            }
+            drop(fence);
+
+            let evidence = UndoExecutionFence::inspect(&directory, &identity.source_entry_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(evidence.identity, identity);
+            assert_eq!(evidence.completion.is_some(), complete);
+            assert!(
+                !serde_json::to_string(&evidence)
+                    .unwrap()
+                    .contains("never-persist")
+            );
+            let mut changed = identity;
+            changed.host = "https://different-host.example".to_owned();
+            changed.request_id = "different-request".to_owned();
+            assert!(UndoExecutionFence::begin(&directory, changed).is_err());
+        }
+    }
+
+    #[test]
+    fn execution_fence_exclusively_admits_one_concurrent_attempt() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("undo");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let attempts = (0..2)
+            .map(|_| {
+                let directory = directory.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    UndoExecutionFence::begin(&directory, execution_identity()).is_ok()
+                })
+            })
+            .collect::<Vec<_>>();
+        let admitted = attempts
+            .into_iter()
+            .map(|attempt| usize::from(attempt.join().unwrap()))
+            .sum::<usize>();
+        assert_eq!(admitted, 1);
+        assert!(
+            UndoExecutionFence::inspect(&directory, "history-source")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn execution_fence_refuses_partial_records_and_failed_receipt_rewrites() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("undo");
+        fs::create_dir(&directory).unwrap();
+        let identity = execution_identity();
+        let path = UndoExecutionFence::path(&directory, &identity.source_entry_id);
+        fs::write(&path, b"{partial").unwrap();
+        assert!(UndoExecutionFence::inspect(&directory, &identity.source_entry_id).is_err());
+        assert!(UndoExecutionFence::begin(&directory, identity.clone()).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"{partial");
+
+        let separate = root.path().join("separate");
+        let fence = UndoExecutionFence::begin(&separate, identity.clone()).unwrap();
+        let receipt = fence.path.with_extension("result.json");
+        fs::create_dir(&receipt).unwrap();
+        assert!(
+            fence
+                .complete(UndoExecutionStatus::Completed, &json!({"ok": true}), true)
+                .is_err()
+        );
+        assert!(UndoExecutionFence::begin(&separate, identity).is_err());
+        assert!(UndoExecutionFence::inspect(&separate, "history-source").is_err());
+    }
+
+    #[test]
+    fn execution_fence_receipt_is_immutable_and_bound_to_invocation() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("undo");
+        let identity = execution_identity();
+        let fence = UndoExecutionFence::begin(&directory, identity.clone()).unwrap();
+        fence
+            .complete(
+                UndoExecutionStatus::ReportedError,
+                &json!({"error": true}),
+                false,
+            )
+            .unwrap();
+        assert!(
+            fence
+                .complete(UndoExecutionStatus::Completed, &json!({"ok": true}), true)
+                .is_err()
+        );
+        let evidence = UndoExecutionFence::inspect(&directory, &identity.source_entry_id)
+            .unwrap()
+            .unwrap();
+        let completion = evidence.completion.unwrap();
+        assert_eq!(completion.request_id, identity.request_id);
+        assert_eq!(completion.status, UndoExecutionStatus::ReportedError);
+        assert!(!completion.history_recorded);
+    }
+
+    #[test]
+    fn source_json_read_is_bounded_and_diagnostics_do_not_echo_private_data() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("private-source.json");
+        fs::write(&source, b"{\"data\":\"private-marker\"}").unwrap();
+        assert_eq!(
+            read_source_json(&source).unwrap(),
+            json!({"data": "private-marker"})
+        );
+        fs::write(&source, b"private-marker not JSON").unwrap();
+        let error = read_source_json(&source).unwrap_err().to_string();
+        assert!(!error.contains("private-marker"));
+        assert!(!error.contains("private-source"));
+        let file = OpenOptions::new().write(true).open(&source).unwrap();
+        file.set_len(MAX_SOURCE_BYTES + 1).unwrap();
+        assert!(read_source_json(&source).is_err());
+        assert!(read_source_json(root.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execution_fence_and_source_read_refuse_symlinks() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target");
+        fs::create_dir(&target).unwrap();
+        let directory = root.path().join("undo");
+        symlink(&target, &directory).unwrap();
+        assert!(UndoExecutionFence::begin(&directory, execution_identity()).is_err());
+        let source = root.path().join("input.json");
+        fs::write(&source, b"{}").unwrap();
+        let source_link = root.path().join("input-link.json");
+        symlink(&source, &source_link).unwrap();
+        assert!(read_source_json(&source_link).is_err());
+    }
 
     // ── UndoRegistry: built-in lookups ──────────────────────────────────
 
