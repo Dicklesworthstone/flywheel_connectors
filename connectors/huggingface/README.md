@@ -1,224 +1,143 @@
 # Hugging Face Connector V3 Contract
 
-> **Status**: PROVEN runtime contract documented with inference-endpoint and credential-injection drift
-> **Bead**: `flywheel_connectors-4kw5f.2.4.4`
-> **Parent**: `flywheel_connectors-4kw5f`
-> **Verification script**: `scripts/e2e/huggingface_connector_verification.sh`
-> **Hugging Face Inference Providers upstream**: https://huggingface.co/docs/inference-providers/index
-> **Text generation upstream**: https://huggingface.co/docs/inference-providers/tasks/text-generation
-> **Summarization upstream**: https://huggingface.co/docs/api-inference/en/tasks/summarization
-> **Hub API upstream**: https://huggingface.co/docs/hub/api
+> **Status**: INCUBATING — native invocation and provider transports are implemented; credential-backed production evidence remains outstanding.
+> **Connector**: `fcp.huggingface` (`fcp-huggingface` package and binary)
+> **Original contract bead**: `flywheel_connectors-4kw5f.2.4.4`
 
-## Purpose
+## Supported operations
 
-This document fixes the operator-facing contract for `fcp.huggingface`. The connector exposes the Hugging Face surfaces implemented in this crate: bounded text generation, bounded summarization, Hub model listing, and Hub model metadata lookup.
+The connector exposes Hugging Face's first-party `hf-inference` task API and the Hub model catalog. Every operation requires a configured, negotiated FCP session and a signed capability token, including anonymous public-model reads.
 
-The connector is intentionally a small inference and model-catalog bridge. It is not a full Hugging Face Hub client, repository manager, dataset client, Space runtime client, router-backed Inference Providers SDK, streaming chat client, fine-tuning client, model uploader, organization admin client, or durable model registry.
+| Operation | Provider route | Capability | Safety / risk | Idempotency |
+|-----------|----------------|------------|---------------|-------------|
+| `huggingface.inference.text_generation` | `POST https://router.huggingface.co/hf-inference/models/{model_id}` | `huggingface.inference` | Risky / medium | None |
+| `huggingface.inference.summarization` | `POST https://router.huggingface.co/hf-inference/models/{model_id}` | `huggingface.inference` | Risky / medium | None |
+| `huggingface.models.list` | `GET https://huggingface.co/api/models` | `huggingface.models` | Safe / low | Strict |
+| `huggingface.models.info` | `GET https://huggingface.co/api/models/{model_id}` | `huggingface.models` | Safe / low | Strict |
 
-## Current Runtime Snapshot
+The embedded manifest is the source of operation schemas, capabilities, approval requirements, safety metadata, idempotency, and AI hints. Runtime introspection reads that same manifest. Inputs are validated before provider I/O; successful outputs are validated before delivery.
 
-The current crate exposes these operations:
+This connector does not implement streaming, chat completions, third-party provider selection, dedicated Inference Endpoints, model uploads, datasets, Spaces, fine-tuning, billing, or account administration. Model availability still depends on the provider, account permissions, and current hosted inventory.
 
-- `huggingface.inference.text_generation`
-- `huggingface.inference.summarization`
-- `huggingface.models.list`
-- `huggingface.models.info`
+The upstream text-generation task page currently reports no provider support for that task. Its retained operation and default model are not a claim of live availability; production callers must verify a serving model. Summarization and catalog fixtures likewise do not replace credential-backed provider checks.
 
-Important runtime truths the contract preserves:
+## Configuration and credentials
 
-- Package and binary name are `fcp-huggingface`.
-- Runtime connector ID is `fcp.huggingface`.
-- Manifest connector ID is `fcp.huggingface`.
-- Runtime connector version is `0.2.0`.
-- Configuration accepts:
-  - `api_token`
-  - `credential_id`
-  - neither auth source, for anonymous/public-model attempts
-- `api_token` and `credential_id` are mutually exclusive.
-- `credential_id` must be a valid UUID when present.
-- Direct-token mode sends `Authorization: Bearer <token>`.
-- Default inference URL is `https://api-inference.huggingface.co`.
-- Default Hub URL is `https://huggingface.co/api`.
-- Runtime request timeout defaults to `30000 ms`.
-- Runtime uses the shared retry loop for inference, model-list, model-info, and `whoami` requests.
-- Text generation defaults to model `gpt2` when `model_id` is omitted.
-- Summarization defaults to model `facebook/bart-large-cnn` when `model_id` is omitted.
-- Model listing defaults to `limit = 25` and rejects limits over `100`.
-- Model IDs are locally rejected when empty, path-traversal-shaped, percent-encoded slash/backslash-shaped, or containing more than one slash.
-- Inference requests post JSON to `{inference_url}/models/{model_id}`.
-- Model listing calls `GET {hub_url}/models` with optional `search`, `pipeline_tag`, and `limit`.
-- Model metadata calls `GET {hub_url}/models/{model_id}`.
-- `self_check` calls `/whoami-v2` for direct-token mode after stripping a trailing `/api` from `hub_url`.
-- HTTP 401 and 403 map to unauthorized, 404 maps to not-found, 429 maps to rate-limited, model-loading 503 responses are retryable, and other 5xx responses are retryable.
-- `health` reports `ready` only for configured direct-token mode; configured credential-id and anonymous modes report `degraded`.
-- `doctor` checks configuration, handshake, client initialization, runtime initialization, and auth source.
-- `handle_shutdown` clears client, runtime, config, configured state, and handshaken state.
-- `invoke` only checks connector ready state and operation ID. It does not require or verify an FCP capability token in this checkout.
-- `simulate` checks known operation ID plus configured state. It does not check handshake state, approval policy, or capability tokens.
+Configuration accepts:
 
-## Drift Visible In This Checkout
+| Field | Default / behavior |
+|-------|--------------------|
+| `api_token` | Optional direct Hugging Face bearer token. |
+| `credential_id` | Optional UUID referencing a host-managed credential. Mutually exclusive with `api_token`. |
+| `inference_url` | `https://router.huggingface.co/hf-inference` |
+| `hub_url` | `https://huggingface.co/api` |
+| `request_timeout_ms` | `30000`; accepted range `1..=60000`. |
+| `retry` | Shared SDK retry configuration, subject to the operation's replay rules and total invocation deadline. |
 
-This README documents runtime truth and keeps current drift visible:
+With neither credential field, the connector can attempt public model-catalog access. Anonymous mode does not remove FCP authorization requirements, and provider authentication may still be required for inference or gated resources.
 
-- Runtime uses the legacy-style `api-inference.huggingface.co/models/{model_id}` endpoint shape, while current Hugging Face docs emphasize Inference Providers and router-backed endpoints such as `router.huggingface.co`.
-- Runtime accepts `credential_id`, reports credential-injection readiness, and includes it in the provider contract test, but `HuggingfaceClient` stores only `api_token` and never sends an `X-FCP-Credential-Id` header. Credential-id mode cannot perform live requests unless a surrounding proxy rewrites requests without connector help.
-- Runtime custom `inference_url` and `hub_url` validation accepts any absolute `http` or `https` URL without query or fragment. The manifest pins live egress to `api-inference.huggingface.co` and `huggingface.co`, denies localhost/private/tailnet/IP literals, and requires canonical host checks.
-- Runtime `introspect` marks inference operations with `safety_tier = "safe"`, while the manifest marks text generation and summarization as `risky`.
-- Runtime `invoke` does not verify bound capability tokens for either inference or model-catalog operations.
-- Runtime `simulate` can allow a configured operation without checking the handshake or caller authority.
-- Runtime summarization manifest input schema includes `do_sample`, but the invoke path currently forwards only `max_length` and `min_length`.
-- Runtime model-list output includes the connector-local `catalog` and `limit` wrapper, not just the raw Hub list.
-- Runtime direct requests may work anonymously for public endpoints, but self-check still uses `whoami-v2` and will degrade without a usable token.
+Production endpoint overrides must retain the supported HTTPS host and path above, with port 443. Query strings, fragments, embedded credentials, arbitrary remote hosts, and obsolete inference endpoints are rejected. Explicit `localhost` or literal loopback URLs are accepted for deterministic fixtures; the production manifest continues to deny loopback and private-network egress.
 
-A follow-up parity bead should either migrate to the current Inference Providers router contract or clearly preserve the legacy Inference API surface, implement real credential-id header/proxy behavior, enforce manifest host policy at configure time, align runtime safety metadata with the manifest, verify bound capability tokens, and remove or implement unsupported summarization schema fields.
+### Host-managed credentials
 
-## First-Slice Scope
+`credential_id` now uses the SDK's real host egress proxy. Set `FCP_HOST_EGRESS_PROXY_URL` in the connector's launch environment and provision a matching credential in the host. Configuration fails if the proxy is missing or invalid.
 
-The current Hugging Face README slice documents the existing runtime surface:
+For each admitted invocation, the connector forwards the original signed COSE capability, connector ID, operation, zone, request ID, correlation ID, requested URL, and credential reference to the host. The host validates authority and injects the provider secret. The connector never substitutes a credential-reference header for authentication and never falls back to direct HTTP if the proxy rejects or fails. It verifies host response attribution and requires confirmation that credentials were injected.
 
-- direct token, credential-id, and anonymous configuration modes
-- text generation and summarization request shapes
-- Hub model list and model-info operations
-- default model selection and model-list bounding
-- retry, timeout, provider error, readiness, doctor, health, self-check, simulate, introspect, invoke, and shutdown behavior
-- runtime/manifest drift around endpoint policy, credential injection, capability-token verification, and inference safety metadata
-- mock-only provider contract tests
+The signed capability must authorize both the connector's logical resource (below) and the actual HTTP URL checked by host egress. The host's credential allow-list must also permit the supplied credential reference. Each invocation gets a private client clone, so concurrent requests cannot share or overwrite authority context.
 
-## Auth And Zone Boundary
+## Native process contract
 
-- Authentication mechanisms: Hugging Face user access token, host credential reference, or anonymous public-model access.
-- Official Hugging Face docs describe bearer-token authentication for Inference Providers requests and Hub API access.
-- Runtime does not implement token creation, token rotation, OAuth login, model access approval, provider selection policy, billing controls, organization administration, or connector-local credential vaulting.
-- Home zone: `z:work`.
-- Allowed source zones: `z:owner`, `z:private`, and `z:work`.
-- Allowed target zone: `z:work`.
-- Runtime handshake advertises:
-  - `huggingface.inference`
-  - `huggingface.models`
-- The connector does not persist prompts, generated text, summaries, model metadata, tokens, credential IDs beyond configuration metadata, provider payloads, provider error bodies, model catalog caches, or usage records.
-- Prompts and summaries can include sensitive source text, customer data, private code, or private research context. Treat live inference input and output as work-zone data.
+The binary uses the shared SDK JSONL control channel with a **1 MiB input-frame limit** and one process-wide async runtime. A successful shutdown writes its acknowledgement and exits even if stdin remains open. EOF, oversized frames, and channel failures clear configuration and revoke the active session.
 
-## Network And Runtime Invariants
+Each outer frame is an SDK request with `id`, `method`, and `params`. Methods are `configure`, `handshake`, `health`, `doctor`, `self_check`, `introspect`, `invoke`, `simulate`, and `shutdown`. The outer frame ID correlates the control reply; the canonical invoke ID inside `params` identifies the invocation. They need not be equal.
 
-- Default inference host: `api-inference.huggingface.co`.
-- Default Hub host: `huggingface.co`.
-- Default Hub API prefix: `/api`.
-- Runtime request construction appends `/models/{model_id}` or `/models` to the configured base URLs.
-- Runtime reqwest timeout is configured from `request_timeout_ms`.
-- Runtime request contexts use the same configured timeout.
-- Runtime base URL normalization strips trailing slashes and rejects query strings and fragments.
-- Runtime permits HTTP base URLs, including loopback test fixtures.
-- Manifest live-operation policy requires TLS/SNI, denies localhost, private ranges, tailnet ranges, and IP literals, and allows only the default Hugging Face hosts.
-- Sandbox profile is `strict`, with `96 MB` memory, `25%` CPU, `60000 ms` wall-clock timeout, no exec, and no ptrace.
-- The connector does not open inbound sockets and does not implement streaming responses.
+A host must perform these steps:
 
-## Capability Families
+1. Configure provider credentials and endpoint policy.
+2. Send a canonical `HandshakeRequest` with the supported protocol version, target zone, nonce, requested capabilities, and Ed25519 host verification key. The only accepted target zone is `z:work`, matching the manifest.
+3. Read the newly generated `instance_id` from the handshake response.
+4. Issue signed capabilities bound to that instance, connector, zone, operation, capability family, validity interval, and permitted resources.
+5. Send a complete canonical `InvokeRequest`, including its signed token and a nonempty `idempotency_key`. All four operations require a key because inference is risky and catalog reads have strict idempotency. Successful replies contain a canonical `InvokeResponse` with `result` and `resource_uris`; errors use the SDK error envelope.
 
-| Capability | Purpose |
-|-----------|---------|
-| `huggingface.inference` | Run text generation and summarization against a selected model. |
-| `huggingface.models` | List Hub models and read one model's metadata. |
+Malformed or failed replacement configuration, failed handshake, re-handshake, and shutdown revoke previous authority. Tokens for an old instance cannot be reused after these transitions. Negotiation cannot grant capabilities absent from the manifest or requested handshake.
 
-## Operation Inventory
+### Resource and usage boundaries
 
-| Operation | Endpoint shape | Capability | SafetyTier | RiskLevel | Idempotency | Rationale |
-|-----------|----------------|------------|------------|-----------|-------------|-----------|
-| `huggingface.inference.text_generation` | `POST {inference_url}/models/{model_id}` | `huggingface.inference` | `Risky` in manifest, `safe` in runtime introspection | `Medium` | `None` | Sends caller prompt text to a model and returns generated text. |
-| `huggingface.inference.summarization` | `POST {inference_url}/models/{model_id}` | `huggingface.inference` | `Risky` in manifest, `safe` in runtime introspection | `Medium` | `None` | Sends caller text to a summarization model and returns summaries. |
-| `huggingface.models.list` | `GET {hub_url}/models` | `huggingface.models` | `Safe` | `Low` | `Strict` | Reads bounded Hub model catalog entries with optional filters. |
-| `huggingface.models.info` | `GET {hub_url}/models/{model_id}` | `huggingface.models` | `Safe` | `Low` | `Strict` | Reads metadata for one caller-selected Hub model. |
+| Operation target | Logical resource URI |
+|------------------|----------------------|
+| Text generation, summarization, or model metadata | `huggingface:model:{model_id}` |
+| Model catalog listing | `huggingface:models` |
 
-## Explicit Non-Goals
+Resource authorization uses the actual selected model, including a default model when omitted. Model identifiers must be a single model name or `organization/model`, with no empty segments, traversal, encoded separators, query/fragment syntax, controls, or whitespace.
 
-The current implementation does not include:
+Admission checks signature, issuer key, connector, actual instance, target zone, negotiated capability, operation, resource restrictions, expiration, and cumulative call/byte constraints through `StandaloneSession`. Usage is reserved before execution and is not refunded when effects may have occurred. Accounting is scoped to the current connector session; host admission remains responsible for its durable and cross-process policy.
 
-- Inference Providers router support, chat completions, provider selection, streaming tokens, structured outputs, tools, or OpenAI-compatible routes
-- model upload, repository creation, dataset access, Space management, comments, discussions, likes, follows, billing, or organization administration
-- token creation, token exchange, OAuth login, model access approval workflows, or credential rotation
-- image, audio, video, embedding, reranking, classification, or speech tasks
-- persistent model catalog cache, usage accounting, request transcripts, or response storage
-- direct FCP capability-token verification at connector invoke time
+`simulate` accepts a canonical `SimulateRequest` and checks the same input schema and authority without provider I/O or consuming the token's call budget. It reports `would_succeed` and missing capabilities. Simulation does not promise that a model is available or that a later provider request will succeed.
 
-These are excluded on purpose:
+## Inputs and results
 
-- Inference inputs can contain private text and source code.
-- Provider selection and billing policy need explicit operator controls before broader inference expansion.
-- Model generation is non-idempotent and can produce unsafe or non-deterministic output, so expansion needs stronger approval and audit boundaries.
+Text generation defaults to `gpt2`. It accepts `prompt`, optional `model_id`, and optional `max_new_tokens`, `temperature`, `top_p`, `top_k`, `repetition_penalty`, `do_sample`, and `return_full_text`. Results are arrays of objects containing `generated_text`.
 
-## Readiness And Verification Surface
+Summarization defaults to `facebook/bart-large-cnn`. It accepts `text`, optional `model_id`, and optional `max_length`, `min_length`, and `do_sample`. All advertised parameters are forwarded. When both lengths are supplied, `min_length` must not exceed `max_length`. Results are arrays of objects containing `summary_text`.
 
-`handle_doctor()`, `handle_health()`, `handle_self_check()`, `handle_simulate()`, and `handle_introspect()` are part of the public closeout contract. They surface:
+Prompts and source text must be nonempty and at most 262144 characters, subject to the smaller JSONL frame budget after encoding. Model IDs are at most 256 characters. Integer options must fit their declared positive or nonnegative 32-bit range. Unknown input properties and wrong parameter types are rejected rather than silently ignored.
 
-- configuration, client, runtime, and handshake state
-- auth mode as API token, credential ID, or anonymous
-- credential-injection requirement for credential-id mode
-- provider-backed token validation through `whoami-v2` for direct-token mode
-- known operation metadata, schemas, capability IDs, risk levels, safety tiers, idempotency, and AI hints
-- model defaults and the bounded model-list catalog behavior
-- retry, rate-limit, model-loading, not-found, unauthorized, timeout, and JSON parse error mapping
+Model listing accepts optional `search` (up to 512 characters), `pipeline_tag` (up to 128), and `limit` (`1..=100`, default `25`). Its result contains `models`, `catalog`, and `limit`; it is not a raw Hub array. Model metadata requires `model_id` and returns the typed metadata object. See `manifest.toml` for the exact schemas.
 
-The deterministic integration evidence is anchored on connector-local tests covering:
+## Bounded requests and replay behavior
 
-- provider contract advertisement, default models, auth modes, base URLs, and secret redaction
-- WireMock model-list filters, text-generation request shape, model-info auth failure, not-found mapping, rate-limit retry, malformed catalog JSON, timeout cancellation, self-check, and shutdown behavior
-- lifecycle health, configure defaults, invalid credential IDs, mixed auth rejection, base URL query rejection, handshake requirements, unknown operations, missing inputs, model-list limit bounds, and simulate behavior
+The invocation deadline covers all provider attempts, retry delays, and body reads. Its budget is the minimum of the caller's relative `deadline_ms`, configured timeout, and 60 seconds. A zero deadline is rejected. Once execution may have occurred, cancellation or deadline exhaustion reports a nonretryable error with an unknown provider outcome and retains the admission charge.
 
-## Source Notes
+Provider response bodies are limited to **1 MiB**, including chunked bodies and error responses. Host proxy envelopes have a separate **2 MiB** cap to accommodate base64 encoding and attribution. HTTP redirects, implicit transport retries, and ambient HTTP proxies are disabled on the direct provider client.
 
-- `connectors/huggingface/src/connector.rs` defines configuration parsing, lifecycle handlers, diagnostics, introspection, simulation, invoke dispatch, operation IDs, default models, and model-list bounds.
-- `connectors/huggingface/src/client.rs` defines Hugging Face HTTP request construction, auth headers, base URL normalization, model ID sanitization, retry dispatch, whoami checks, and response parsing.
-- `connectors/huggingface/src/types.rs` defines inference request/response shapes, model metadata, model-list query fields, and provider error envelopes.
-- `connectors/huggingface/src/error.rs` defines connector error classes and FCP error conversion.
-- `connectors/huggingface/manifest.toml` defines the operation catalog, network constraints, sandbox boundary, zone policy, and AI hints.
-- `connectors/huggingface/tests/provider_contract.rs` covers provider-contract and loopback behavior.
+Read-only Hub requests can use bounded retries for transient provider errors. Inference POSTs use stricter rules:
 
-## Verification Bundle
+- Connection failures proven to precede dispatch can be retried.
+- Explicit rate limits and recognized model-loading responses can be retried within policy and the total deadline.
+- Model-loading delays preserve the provider's fractional estimate, with at least a one-second delay.
+- Other provider failures after dispatch, truncated or malformed successful responses, and ambiguous host-proxy failures are terminal. They do not trigger a second billable inference attempt.
+- Redirects are rejected without forwarding tokens or prompt bodies.
 
-The dedicated closeout bundle is `scripts/e2e/huggingface_connector_verification.sh`. It runs the manifest check, focused `rch` check/fmt/test/clippy lanes, extracts redaction-safe loopback JSONL evidence, and writes a replay script plus summary artifact.
+Provider body text and request URLs are not copied into external error messages. Authentication, not-found, rate-limit, oversized-response, malformed-response, and uncertain-outcome errors retain useful classifications without echoing tokens, prompts, or provider payloads.
 
-The verification surface captures:
+## Health and lifecycle
 
-- runtime operation inventory and policy metadata
-- deterministic WireMock coverage for Hugging Face HTTP paths
-- auth, provider error, retry, timeout, lifecycle, simulation, introspection, doctor, and self-check coverage
-- formatting, check, test, and clippy proof through `rch`
-- replayable verification artifacts under `artifacts/e2e/huggingface/<run-id>/`
-- UBS on changed files before commit
+`health` uses the canonical SDK `HealthSnapshot` on the wire. Local readiness requires configuration and successful handshake; authenticated or host-injected sessions can be locally ready. This is not evidence of provider availability or account access. Anonymous configurations remain degraded.
 
-## Operator Guidance
+`doctor` reports local configuration, handshake, client, runtime, and auth mode. `self_check` returns a canonical `SelfCheckReport`:
 
-**Prerequisites**:
+- Direct-token mode, after handshake, checks `https://huggingface.co/api/whoami-v2`.
+- Anonymous mode reports that there is no token to validate and does not probe the provider.
+- Host-injected mode reports `credential_injection_requires_invoke`. A health check cannot manufacture signed invocation authority; use an authorized provider invocation to validate that path.
 
-- Use WireMock fixtures for routine verification.
-- Use a disposable Hugging Face token for live direct-token checks.
-- Prefer direct token mode until credential-id injection is actually wired through the HTTP client or egress layer.
+The connector does not persist provider prompts, generated text, summaries, tokens, responses, or model catalogs. Shutdown clears the active runtime, client, credentials, configuration, and negotiated session.
 
-**Dedicated environment**:
+## Verification
 
-- Keep live prompts synthetic and non-sensitive.
-- Pin `model_id` explicitly when reproducibility matters.
-- Use `huggingface.models.info` before invoking unfamiliar gated or large models.
-- Keep `limit` small for catalog listing.
+The crate contains three complementary integration surfaces:
 
-**Redaction rules**:
+- `tests/provider_contract.rs`: deterministic provider behavior, signed authority rejection, selected/default resource scope, cumulative call constraints, non-consuming simulation, session invalidation, schema validation, retries, privacy, and lifecycle.
+- `tests/local_non_mock.rs`: real loopback HTTP sockets for invocation, parameter forwarding, and failure behavior.
+- `tests/native_stdio.rs`: the actual compiled binary, canonical configure/handshake/health/invoke dialogue, distinct control and invocation IDs, unauthorized no-egress checks, real HTTP dispatch, and process termination while stdin remains open.
 
-- Redact API tokens, credential IDs where needed, prompts, generated text when sensitive, summaries, private model IDs, gated-model names, provider payloads, provider error bodies, and request URLs containing custom test hosts.
-- Verification output should use operation IDs, endpoint classes, model ID hashes, HTTP status classes, retry decisions, and synthetic prompt text.
+Client unit tests additionally exercise real host proxy envelopes, original capability preservation, credential injection and attribution checks, operation isolation, refusal without direct fallback, response bounds, and inference replay rules. These are local deterministic tests; their presence alone does not establish a live provider or production-readiness claim.
 
-**Common remediation**:
+Run the focused suite using the repository's pinned toolchain and shared remote compiler where available:
 
-- If configuration rejects auth, provide only one of `api_token` or `credential_id`.
-- If self-check reports `credential_injection_required`, use direct token mode or implement host-side injection.
-- If self-check reports `token_validation_failed` in anonymous mode, remember that anonymous public-model calls may still work but `whoami-v2` cannot validate a token.
-- If model listing rejects input, keep `limit` between `1` and `100`.
-- If inference rejects a model ID, use either `model` or `org/model` shape without encoded separators.
-- If provider returns model-loading 503, let the retry loop consume the `estimated_time` hint or retry later.
-- If `simulate` allows an operation but policy should deny it, remember that current simulation only checks configured state and operation ID.
+```bash
+rch exec -- cargo check -p fcp-huggingface --all-targets --locked
+cargo fmt --package fcp-huggingface --check
+rch exec -- cargo test -p fcp-huggingface --locked
+rch exec -- cargo clippy -p fcp-huggingface --all-targets --no-deps --locked -- -D warnings
+```
 
-**Rerun commands**:
+The existing `scripts/e2e/huggingface_connector_verification.sh` also emits redaction-safe provider-fixture JSONL and replay metadata. Set `REPO_TOOLCHAIN` to the toolchain in `rust-toolchain.toml` when using that older wrapper. Production graduation still needs credential-backed evidence for model availability and real host egress policy.
 
-- `RUN_ID=manual-huggingface OUT_ROOT=artifacts/e2e/huggingface/manual-huggingface scripts/e2e/huggingface_connector_verification.sh`
-- `rch exec -- env CARGO_TARGET_DIR=/tmp/fcp-huggingface-readme cargo check -p fcp-huggingface --all-targets`
-- `rch exec -- env CARGO_TARGET_DIR=/tmp/fcp-huggingface-readme cargo test -p fcp-huggingface --tests -- --nocapture`
-- `rch exec -- env CARGO_TARGET_DIR=/tmp/fcp-huggingface-readme cargo clippy -p fcp-huggingface --all-targets --no-deps -- -D warnings`
-- `ubs connectors/huggingface/README.md`
+## Upstream references
+
+- [Hugging Face Inference Providers](https://huggingface.co/docs/inference-providers/index)
+- [HF Inference provider](https://huggingface.co/docs/inference-providers/providers/hf-inference)
+- [Text generation](https://huggingface.co/docs/inference-providers/tasks/text-generation)
+- [Summarization](https://huggingface.co/docs/inference-providers/tasks/summarization)
+- [Hub API](https://huggingface.co/docs/hub/api)

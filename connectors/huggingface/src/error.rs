@@ -21,10 +21,18 @@ pub enum HuggingfaceError {
 
     /// Inference may already have consumed provider compute. Neither a
     /// connector retry nor a new host invoke can safely repeat this request.
-    /// Do not retain upstream bodies or transport URLs in this error: they
-    /// can contain the input prompt or credentials.
-    #[error("inference outcome unknown; the request may already have executed; automatic retry suppressed")]
+    /// Do not retain upstream bodies or transport URLs in this error.
+    #[error(
+        "inference outcome unknown; the request may already have executed; automatic retry suppressed"
+    )]
     InferenceOutcomeUnknown { status: Option<u16> },
+
+    #[error("provider response exceeded {limit} bytes")]
+    ResponseTooLarge { limit: usize },
+
+    /// Do not retain host rejection bodies or capability material in errors.
+    #[error("host egress proxy could not return an admitted provider response")]
+    HostProxy { status: Option<u16> },
 
     #[error("Rate limited (retry after {retry_after_ms}ms)")]
     RateLimited { retry_after_ms: u64 },
@@ -35,8 +43,8 @@ pub enum HuggingfaceError {
     #[error("Not found: {0}")]
     NotFound(String),
 
-    #[error("Model loading: {0}")]
-    ModelLoading(String),
+    #[error("Hugging Face model is loading; retry after {retry_after:?}")]
+    ModelLoading { retry_after: Duration },
 
     #[error("Async error: {0}")]
     Async(String),
@@ -50,10 +58,12 @@ impl HuggingfaceError {
     pub fn is_retryable(&self) -> bool {
         match self {
             Self::Http(error) => error.is_timeout() || error.is_connect(),
-            Self::RateLimited { .. } | Self::ModelLoading(_) => true,
+            Self::RateLimited { .. } | Self::ModelLoading { .. } => true,
             Self::Api { status, .. } => matches!(status, 500 | 502 | 503 | 504),
             Self::Json(_)
             | Self::InferenceOutcomeUnknown { .. }
+            | Self::ResponseTooLarge { .. }
+            | Self::HostProxy { .. }
             | Self::Unauthorized(_)
             | Self::NotFound(_)
             | Self::Async(_)
@@ -65,7 +75,7 @@ impl HuggingfaceError {
     pub const fn retry_after(&self) -> Option<Duration> {
         match self {
             Self::RateLimited { retry_after_ms } => Some(Duration::from_millis(*retry_after_ms)),
-            Self::ModelLoading(_) => Some(Duration::from_secs(10)),
+            Self::ModelLoading { retry_after } => Some(*retry_after),
             _ => None,
         }
     }
@@ -75,13 +85,13 @@ impl HuggingfaceError {
         match self {
             Self::Http(error) => FcpError::External {
                 service: "huggingface".into(),
-                message: error.to_string(),
+                message: "Hugging Face HTTP transport failed".into(),
                 status_code: error.status().map(|s| s.as_u16()),
                 retryable: self.is_retryable(),
                 retry_after: self.retry_after(),
             },
-            Self::Json(error) => FcpError::Internal {
-                message: format!("JSON parse error: {error}"),
+            Self::Json(_) => FcpError::Internal {
+                message: "Hugging Face JSON could not be encoded or decoded".into(),
             },
             Self::Api { status, message } => FcpError::External {
                 service: "huggingface".into(),
@@ -92,6 +102,20 @@ impl HuggingfaceError {
             },
             Self::InferenceOutcomeUnknown { status } => FcpError::External {
                 service: "huggingface".into(),
+                message: self.to_string(),
+                status_code: *status,
+                retryable: false,
+                retry_after: None,
+            },
+            Self::ResponseTooLarge { .. } => FcpError::External {
+                service: "huggingface".into(),
+                message: self.to_string(),
+                status_code: None,
+                retryable: false,
+                retry_after: None,
+            },
+            Self::HostProxy { status } => FcpError::External {
+                service: "huggingface.host_egress".into(),
                 message: self.to_string(),
                 status_code: *status,
                 retryable: false,
@@ -108,12 +132,12 @@ impl HuggingfaceError {
             Self::NotFound(resource) => FcpError::ResourceNotFound {
                 resource: resource.clone(),
             },
-            Self::ModelLoading(message) => FcpError::External {
+            Self::ModelLoading { retry_after } => FcpError::External {
                 service: "huggingface".into(),
-                message: message.clone(),
+                message: "Hugging Face model is loading".into(),
                 status_code: Some(503),
                 retryable: true,
-                retry_after: Some(Duration::from_secs(10)),
+                retry_after: Some(*retry_after),
             },
             Self::Async(message) => FcpError::Internal {
                 message: format!("Async error: {message}"),
@@ -181,10 +205,20 @@ mod tests {
     }
 
     #[test]
-    fn model_loading_is_retryable() {
-        let err = HuggingfaceError::ModelLoading("model is loading".into());
+    fn model_loading_is_retryable_without_shortening_provider_wait() {
+        let wait = Duration::from_millis(180_500);
+        let err = HuggingfaceError::ModelLoading { retry_after: wait };
         assert!(err.is_retryable());
-        assert_eq!(err.retry_after(), Some(Duration::from_secs(10)));
+        assert_eq!(err.retry_after(), Some(wait));
+        assert!(matches!(
+            err.to_fcp_error(),
+            FcpError::External {
+                status_code: Some(503),
+                retryable: true,
+                retry_after: Some(actual),
+                ..
+            } if actual == wait
+        ));
     }
 
     #[test]
@@ -254,5 +288,20 @@ mod tests {
                 } if status_code == status && message.contains("outcome unknown")
             ));
         }
+    }
+
+    #[test]
+    fn oversized_response_is_not_retryable() {
+        let err = HuggingfaceError::ResponseTooLarge { limit: 1024 * 1024 };
+        assert!(!err.is_retryable());
+        assert!(err.retry_after().is_none());
+        assert!(matches!(
+            err.to_fcp_error(),
+            FcpError::External {
+                retryable: false,
+                retry_after: None,
+                ..
+            }
+        ));
     }
 }

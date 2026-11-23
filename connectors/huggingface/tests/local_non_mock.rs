@@ -16,6 +16,9 @@ use std::{
     time::Duration,
 };
 
+use chrono::{Duration as ChronoDuration, Utc};
+use fcp_core::{CapabilityToken, FcpError};
+use fcp_crypto::{cose::CapabilityTokenBuilder, ed25519::Ed25519SigningKey};
 use fcp_huggingface::connector::HuggingfaceConnector;
 use serde_json::{Value, json};
 
@@ -29,6 +32,37 @@ const SUMMARIZATION_PATH: &str = "/models/facebook/bart-large-cnn";
 const TEXT_GENERATION_RESPONSE_BODY: &str =
     r#"[{"generated_text":"Flywheel connectors ship local proof."}]"#;
 const SUMMARIZATION_RESPONSE_BODY: &str = r#"[{"summary_text":"Local Hugging Face summary."}]"#;
+
+fn signing_key() -> Ed25519SigningKey {
+    Ed25519SigningKey::from_bytes(&[75; 32]).expect("valid local acceptance signing key")
+}
+
+fn signed_request(connector: &HuggingfaceConnector, operation: &str, input: Value) -> Value {
+    let now = Utc::now();
+    let token = CapabilityTokenBuilder::new()
+        .capability_id("huggingface.inference")
+        .zone_id("z:work")
+        .principal("user:huggingface-local")
+        .operations(&[operation])
+        .issuer("node:huggingface-local")
+        .target_instance(connector.instance_id().as_str())
+        .validity(
+            now - ChronoDuration::minutes(1),
+            now + ChronoDuration::hours(1),
+        )
+        .sign(&signing_key())
+        .expect("sign bound capability");
+    json!({
+        "type": "invoke",
+        "id": "local-acceptance",
+        "connector_id": "fcp.huggingface",
+        "operation": operation,
+        "zone_id": "z:work",
+        "input": input,
+        "idempotency_key": "local-acceptance",
+        "capability_token": CapabilityToken::from_raw(token)
+    })
+}
 
 #[derive(Debug)]
 struct FixtureObservation {
@@ -185,7 +219,13 @@ async fn setup_connector(base_url: &str) -> HuggingfaceConnector {
         .await
         .expect("configure connector");
     connector
-        .handle_handshake(json!({}))
+        .handle_handshake(json!({
+            "protocol_version": "2.0",
+            "zone": "z:work",
+            "host_public_key": signing_key().verifying_key().to_bytes(),
+            "nonce": vec![18_u8; 32],
+            "capabilities_requested": ["huggingface.inference", "huggingface.models"]
+        }))
         .await
         .expect("handshake connector");
     connector
@@ -197,19 +237,20 @@ async fn loopback_text_generation_uses_production_client_request() {
     let mut connector = setup_connector(fixture.base_url()).await;
 
     let result = connector
-        .handle_invoke(json!({
-            "operation_id": OP_TEXT_GENERATION,
-            "input": {
-                "model_id": "gpt2",
-                "prompt": "Flywheel connectors",
-                "max_new_tokens": 8,
-                "return_full_text": false
-            }
-        }))
+        .handle_invoke(signed_request(
+            &connector,
+            OP_TEXT_GENERATION,
+            json!({
+                    "model_id": "gpt2",
+                    "prompt": "Flywheel connectors",
+                    "max_new_tokens": 8,
+                    "return_full_text": false
+            }),
+        ))
         .await
         .expect("text generation through loopback fixture");
     connector
-        .handle_shutdown(json!({}))
+        .handle_shutdown(json!({"type": "shutdown"}))
         .await
         .expect("shutdown connector");
     let observation = fixture.join();
@@ -232,7 +273,7 @@ async fn loopback_text_generation_uses_production_client_request() {
         })
     );
     assert_eq!(
-        result["output"][0]["generated_text"],
+        result["result"][0]["generated_text"],
         "Flywheel connectors ship local proof."
     );
 
@@ -267,19 +308,21 @@ async fn loopback_summarization_uses_production_client_request() {
     let mut connector = setup_connector(fixture.base_url()).await;
 
     let result = connector
-        .handle_invoke(json!({
-            "operation_id": OP_SUMMARIZATION,
-            "input": {
-                "model_id": "facebook/bart-large-cnn",
-                "text": "Flywheel connectors need a concise local acceptance proof.",
-                "max_length": 32,
-                "min_length": 4
-            }
-        }))
+        .handle_invoke(signed_request(
+            &connector,
+            OP_SUMMARIZATION,
+            json!({
+                    "model_id": "facebook/bart-large-cnn",
+                    "text": "Flywheel connectors need a concise local acceptance proof.",
+                    "max_length": 32,
+                    "min_length": 4,
+                    "do_sample": true
+            }),
+        ))
         .await
         .expect("summarization through loopback fixture");
     connector
-        .handle_shutdown(json!({}))
+        .handle_shutdown(json!({"type": "shutdown"}))
         .await
         .expect("shutdown connector");
     let observation = fixture.join();
@@ -296,13 +339,16 @@ async fn loopback_summarization_uses_production_client_request() {
         json!({
             "inputs": "Flywheel connectors need a concise local acceptance proof.",
             "parameters": {
-                "max_length": 32,
-                "min_length": 4
+                "generate_parameters": {
+                    "max_length": 32,
+                    "min_length": 4,
+                    "do_sample": true
+                }
             }
         })
     );
     assert_eq!(
-        result["output"][0]["summary_text"],
+        result["result"][0]["summary_text"],
         "Local Hugging Face summary."
     );
 
@@ -341,15 +387,16 @@ async fn missing_summarization_text_fails_before_loopback_network_dispatch() {
     let connector = setup_connector(&base_url).await;
 
     let error = connector
-        .handle_invoke(json!({
-            "operation_id": OP_SUMMARIZATION,
-            "input": {
-                "model_id": "facebook/bart-large-cnn"
-            }
-        }))
+        .handle_invoke(signed_request(
+            &connector,
+            OP_SUMMARIZATION,
+            json!({
+                    "model_id": "facebook/bart-large-cnn"
+            }),
+        ))
         .await
         .expect_err("missing summarization text should fail before HTTP dispatch");
-    assert!(error.to_string().contains("text"));
+    assert!(matches!(error, FcpError::InvalidRequest { code: 1003, .. }));
 
     let accept_error = listener
         .accept()

@@ -5,16 +5,16 @@ min_mesh_version = "2.0.0"
 min_protocol = "fcp2-sym/2.0"
 protocol_features = []
 max_datagram_bytes = 65000
-interface_hash = "blake3-256:fcp.interface.v2:dcaf5b5b4b7afdeca97f2639553dbde137d5163a9fafd60d9b7d1093009b2430"
+interface_hash = "blake3-256:fcp.interface.v2:88004ec190700332869c28dc257f88e979e753de1ef4a0978b21cc2eef72d035"
 
 [connector]
 id = "fcp.huggingface"
 name = "Hugging Face"
 version = "0.2.0"
-description = "Proven Hugging Face Inference API and Hub catalog connector with bounded model discovery"
+description = "Hugging Face hf-inference router and Hub catalog connector with bounded model discovery"
 archetypes = ["operational"]
 format = "native"
-status = "proven"
+status = "incubating"
 
 [connector.state]
 model = "stateless"
@@ -32,7 +32,7 @@ optional = ["huggingface.inference", "huggingface.models"]
 forbidden = ["network.listen", "system.exec"]
 
 [provides.operations."huggingface.inference.text_generation"]
-description = "Run text generation through the Hugging Face Inference API for a caller-selected model."
+description = "Run text generation through the Hugging Face hf-inference router for a caller-selected model."
 capability = "huggingface.inference"
 risk_level = "medium"
 safety_tier = "risky"
@@ -42,18 +42,43 @@ idempotency = "none"
 [provides.operations."huggingface.inference.text_generation".input_schema]
 required = ["prompt"]
 type = "object"
+additionalProperties = false
 
 [provides.operations."huggingface.inference.text_generation".input_schema.properties.model_id]
 type = "string"
+minLength = 1
+maxLength = 256
 
 [provides.operations."huggingface.inference.text_generation".input_schema.properties.prompt]
 type = "string"
+minLength = 1
+maxLength = 262144
 
 [provides.operations."huggingface.inference.text_generation".input_schema.properties.max_new_tokens]
 type = "integer"
+minimum = 1
+maximum = 4294967295
 
 [provides.operations."huggingface.inference.text_generation".input_schema.properties.temperature]
 type = "number"
+exclusiveMinimum = 0
+
+[provides.operations."huggingface.inference.text_generation".input_schema.properties.top_p]
+type = "number"
+exclusiveMinimum = 0
+maximum = 1
+
+[provides.operations."huggingface.inference.text_generation".input_schema.properties.top_k]
+type = "integer"
+minimum = 1
+maximum = 4294967295
+
+[provides.operations."huggingface.inference.text_generation".input_schema.properties.repetition_penalty]
+type = "number"
+exclusiveMinimum = 0
+
+[provides.operations."huggingface.inference.text_generation".input_schema.properties.do_sample]
+type = "boolean"
 
 [provides.operations."huggingface.inference.text_generation".input_schema.properties.return_full_text]
 type = "boolean"
@@ -61,8 +86,15 @@ type = "boolean"
 [provides.operations."huggingface.inference.text_generation".output_schema]
 type = "array"
 
+[provides.operations."huggingface.inference.text_generation".output_schema.items]
+type = "object"
+required = ["generated_text"]
+
+[provides.operations."huggingface.inference.text_generation".output_schema.items.properties.generated_text]
+type = "string"
+
 [provides.operations."huggingface.inference.text_generation".network_constraints]
-host_allow = ["api-inference.huggingface.co"]
+host_allow = ["router.huggingface.co"]
 port_allow = [443]
 ip_allow = []
 cidr_deny = []
@@ -86,7 +118,7 @@ examples = ['{"prompt":"hello","model_id":"gpt2","max_new_tokens":32}']
 related = ["huggingface.models.list", "huggingface.models.info"]
 
 [provides.operations."huggingface.inference.summarization"]
-description = "Run summarization through the Hugging Face Inference API for a caller-selected model."
+description = "Run summarization through the Hugging Face hf-inference router for a caller-selected model."
 capability = "huggingface.inference"
 risk_level = "medium"
 safety_tier = "risky"
@@ -96,18 +128,27 @@ idempotency = "none"
 [provides.operations."huggingface.inference.summarization".input_schema]
 required = ["text"]
 type = "object"
+additionalProperties = false
 
 [provides.operations."huggingface.inference.summarization".input_schema.properties.model_id]
 type = "string"
+minLength = 1
+maxLength = 256
 
 [provides.operations."huggingface.inference.summarization".input_schema.properties.text]
 type = "string"
+minLength = 1
+maxLength = 262144
 
 [provides.operations."huggingface.inference.summarization".input_schema.properties.max_length]
 type = "integer"
+minimum = 1
+maximum = 4294967295
 
 [provides.operations."huggingface.inference.summarization".input_schema.properties.min_length]
 type = "integer"
+minimum = 0
+maximum = 4294967295
 
 [provides.operations."huggingface.inference.summarization".input_schema.properties.do_sample]
 type = "boolean"
@@ -115,8 +156,15 @@ type = "boolean"
 [provides.operations."huggingface.inference.summarization".output_schema]
 type = "array"
 
+[provides.operations."huggingface.inference.summarization".output_schema.items]
+type = "object"
+required = ["summary_text"]
+
+[provides.operations."huggingface.inference.summarization".output_schema.items.properties.summary_text]
+type = "string"
+
 [provides.operations."huggingface.inference.summarization".network_constraints]
-host_allow = ["api-inference.huggingface.co"]
+host_allow = ["router.huggingface.co"]
 port_allow = [443]
 ip_allow = []
 cidr_deny = []
@@ -150,15 +198,20 @@ idempotency = "strict"
 [provides.operations."huggingface.models.list".input_schema]
 required = []
 type = "object"
+additionalProperties = false
 
 [provides.operations."huggingface.models.list".input_schema.properties.search]
 type = "string"
+maxLength = 512
 
 [provides.operations."huggingface.models.list".input_schema.properties.pipeline_tag]
 type = "string"
+maxLength = 128
 
 [provides.operations."huggingface.models.list".input_schema.properties.limit]
 type = "integer"
+minimum = 1
+maximum = 100
 
 [provides.operations."huggingface.models.list".output_schema]
 required = ["models", "catalog", "limit"]
@@ -208,9 +261,12 @@ idempotency = "strict"
 [provides.operations."huggingface.models.info".input_schema]
 required = ["model_id"]
 type = "object"
+additionalProperties = false
 
 [provides.operations."huggingface.models.info".input_schema.properties.model_id]
 type = "string"
+minLength = 1
+maxLength = 256
 
 [provides.operations."huggingface.models.info".output_schema]
 type = "object"

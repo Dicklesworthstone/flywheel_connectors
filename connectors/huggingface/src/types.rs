@@ -43,8 +43,42 @@ pub struct TextGenerationResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SummarizationRequest {
     pub inputs: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_summarization_parameters",
+        deserialize_with = "deserialize_summarization_parameters"
+    )]
     pub parameters: Option<SummarizationParameters>,
+}
+
+/// HF task inference separates generation controls from tokenizer settings.
+/// Keep the connector's typed controls together while emitting that wire shape.
+fn serialize_summarization_parameters<S: serde::Serializer>(
+    parameters: &Option<SummarizationParameters>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    #[derive(Serialize)]
+    struct Parameters<'a> {
+        generate_parameters: &'a SummarizationParameters,
+    }
+    parameters
+        .as_ref()
+        .map(|parameters| Parameters {
+            generate_parameters: parameters,
+        })
+        .serialize(serializer)
+}
+
+fn deserialize_summarization_parameters<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<SummarizationParameters>, D::Error> {
+    #[derive(Deserialize)]
+    struct Parameters {
+        generate_parameters: SummarizationParameters,
+    }
+    Option::<Parameters>::deserialize(deserializer)
+        .map(|parameters| parameters.map(|parameters| parameters.generate_parameters))
 }
 
 /// Optional parameters for summarization.
@@ -54,6 +88,8 @@ pub struct SummarizationParameters {
     pub max_length: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub min_length: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub do_sample: Option<bool>,
 }
 
 /// Single summarization result.
@@ -205,11 +241,21 @@ mod tests {
             parameters: Some(SummarizationParameters {
                 max_length: Some(100),
                 min_length: Some(30),
+                do_sample: Some(false),
             }),
         };
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["inputs"], "Long text to summarize...");
-        assert_eq!(json["parameters"]["max_length"], 100);
+        assert_eq!(json["parameters"]["generate_parameters"]["max_length"], 100);
+        assert_eq!(
+            json["parameters"]["generate_parameters"]["do_sample"],
+            false
+        );
+        assert!(json["parameters"].get("max_length").is_none());
+        let decoded: SummarizationRequest = serde_json::from_value(json).unwrap();
+        let parameters = decoded.parameters.unwrap();
+        assert_eq!(parameters.min_length, Some(30));
+        assert_eq!(parameters.do_sample, Some(false));
     }
 
     #[test]

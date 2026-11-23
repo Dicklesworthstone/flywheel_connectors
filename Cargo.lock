@@ -5110,9 +5110,14 @@ name = "fcp-huggingface"
 version = "0.2.1"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "blake3",
+ "chrono",
+ "ciborium",
  "fcp-async-core",
  "fcp-core",
+ "fcp-crypto",
+ "fcp-manifest",
  "fcp-prelude",
  "fcp-sdk",
  "fcp-testkit",

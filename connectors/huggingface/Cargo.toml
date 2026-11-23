@@ -22,10 +22,12 @@ workspace = true
 [dependencies]
 fcp-async-core = { path = "../../crates/fcp-async-core" }
 fcp-core = { path = "../../crates/fcp-core" }
+fcp-manifest = { path = "../../crates/fcp-manifest" }
 fcp-prelude = { path = "../../crates/fcp-prelude" }
 fcp-sdk = { workspace = true, features = ["connector-http"] }
 
 anyhow.workspace = true
+base64.workspace = true
 reqwest = { workspace = true, features = ["json"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
@@ -36,5 +38,8 @@ url.workspace = true
 
 [dev-dependencies]
 blake3.workspace = true
+chrono.workspace = true
+ciborium.workspace = true
+fcp-crypto = { path = "../../crates/fcp-crypto" }
 fcp-testkit = { path = "../../crates/fcp-testkit" }
 wiremock.workspace = true

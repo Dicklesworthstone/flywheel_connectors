@@ -120,8 +120,7 @@ mod tests {
         assert_eq!(replies.len(), 2);
         assert!(replies[0].get("error").is_some());
         assert_eq!(replies[1]["id"], "health");
-        let health: HealthSnapshot =
-            serde_json::from_value(replies[1]["result"].clone()).unwrap();
+        let health: HealthSnapshot = serde_json::from_value(replies[1]["result"].clone()).unwrap();
         assert!(!health.is_ready());
         assert_eq!(health.details.unwrap()["configured"], false);
     }
@@ -169,6 +168,10 @@ mod tests {
             "handshaken": true
         }))
         .unwrap();
-        assert!(serde_json::from_value::<HealthSnapshot>(response).unwrap().is_ready());
+        assert!(
+            serde_json::from_value::<HealthSnapshot>(response)
+                .unwrap()
+                .is_ready()
+        );
     }
 }
