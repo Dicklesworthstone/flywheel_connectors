@@ -93,7 +93,7 @@ fn operator_guidance() -> OperatorGuidance {
             "Ensure the configured vault_path already exists and the connector process has read access; add write access if you need create, update, delete, or writable-health coverage.",
             "Keep verification fixtures markdown-only for the first slice because non-.md artifacts are intentionally excluded from note discovery and search evidence.",
         ],
-        dedicated_environment: "Use a disposable or copied vault, never a live personal/work vault. create, update, and delete mutate real files, and health performs a temporary .fcp_write_test probe in the vault root.",
+        dedicated_environment: "Use a disposable or copied vault for verification. Create, update, and delete mutate real note files.",
         redaction_rules: vec![
             "Redact absolute vault paths before sharing logs or stored evidence bundles outside the local machine.",
             "Treat note titles, note bodies, search excerpts, tags, backlink contexts, and folder names as potentially sensitive knowledge-base data.",
@@ -212,7 +212,7 @@ impl ObsidianConnector {
             local_only: true,
             markdown_only: true,
             hidden_directories_skipped: true,
-            write_probe_path: ".fcp_write_test",
+            write_probe_path: ".",
         })
     }
 

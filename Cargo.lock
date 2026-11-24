@@ -6115,6 +6115,9 @@ version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
+ "cap-fs-ext",
+ "cap-primitives",
+ "cap-std",
  "chrono",
  "ciborium",
  "fcp-async-core",

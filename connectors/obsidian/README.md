@@ -37,7 +37,7 @@ Important runtime truths that the contract must preserve:
 - `notes.create` automatically creates missing parent directories for nested note paths.
 - `backlinks.get` is a best-effort wikilink scan keyed off the target note stem and the literal pattern `[[<stem>`, not a full Obsidian graph resolver.
 - `tags.list` is a best-effort extractor for inline `#tags` plus simple YAML-style frontmatter tag declarations. It is not a full YAML parser.
-- `health` checks writability by creating and deleting a temporary `.fcp_write_test` file in the vault root.
+- `health` checks the process's write and search access to the vault directory. A later write can still fail due to quota or filesystem errors.
 
 ## First-Slice Scope
 
@@ -83,7 +83,7 @@ This slice is optimized for note-centric workflows, not for every artifact Obsid
 - Filesystem-only connector: no network egress, no exec, no privileged system access
 - Vault root must already exist and must be a directory
 - Only `.md` files are treated as notes in the first slice
-- Hidden directories are skipped recursively
+- Vault-wide scans skip hidden directories, symbolic links, and special files. Direct note I/O uses the open vault directory as its filesystem root. Relative links can resolve within that root. Absolute link targets are refused.
 - Request timeout default is `10_000 ms`
 - Create may materialize missing parent directories inside the vault root
 - Delete removes the note file directly from the filesystem; there is no trash or recovery layer
@@ -170,7 +170,7 @@ Prerequisites:
 - Keep fixtures markdown-only for the first slice because non-`.md` artifacts and hidden directories are intentionally excluded from note discovery evidence.
 
 Dedicated environment:
-- Never point the verification bundle at a live personal or work vault. `notes.create`, `notes.update`, and `notes.delete` mutate real files, and `health` performs a temporary `.fcp_write_test` write probe in the vault root.
+- Use a disposable vault for verification. `notes.create`, `notes.update`, and `notes.delete` mutate real files.
 
 Redaction rules:
 - Redact absolute vault paths before sharing logs or archived artifacts.

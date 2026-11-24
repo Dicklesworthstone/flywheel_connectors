@@ -1,8 +1,12 @@
 //! Obsidian vault filesystem client.
 
 use std::collections::HashMap;
+use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 
+use cap_fs_ext::{AccessType, DirExt};
+use cap_primitives::fs::AccessModes;
+use cap_std::fs::{Dir, OpenOptions};
 use fcp_sdk::{ConnectorRuntime, ConnectorRuntimeConfig};
 
 use crate::error::{ObsidianError, ObsidianResult};
@@ -11,13 +15,14 @@ use crate::types::{Backlink, Note, NoteEntry, SearchMatch, SearchResult, TagInfo
 /// Client for interacting with an Obsidian vault on the local filesystem.
 pub struct ObsidianClient {
     vault_path: PathBuf,
+    vault: Dir,
 }
 
 impl std::fmt::Debug for ObsidianClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ObsidianClient")
             .field("vault_path", &self.vault_path)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -43,54 +48,23 @@ impl ObsidianClient {
         let canonical = path.canonicalize().map_err(|e| {
             ObsidianError::InvalidVault(format!("failed to canonicalize vault path: {e}"))
         })?;
+        let vault = Dir::open_ambient_dir(&canonical, cap_std::ambient_authority())?;
         Ok(Self {
             vault_path: canonical,
+            vault,
         })
     }
 
-    /// Validate and resolve a note path within the vault, preventing directory traversal.
-    ///
-    /// The path must:
-    /// 1. Not contain `..` components.
-    /// 2. Resolve to a location within the vault root after canonicalization.
-    fn safe_note_path(&self, relative_path: &str) -> ObsidianResult<PathBuf> {
-        sanitize_path_segment(relative_path)?;
-        let joined = self.vault_path.join(relative_path);
-        // For existing files, canonicalize and check prefix.
-        // For new files, canonicalize the parent and check.
-        let resolved = if joined.exists() {
-            joined
-                .canonicalize()
-                .map_err(|e| ObsidianError::InvalidInput(format!("failed to resolve path: {e}")))?
-        } else {
-            // For new files, check parent
-            let parent = joined
-                .parent()
-                .ok_or_else(|| ObsidianError::InvalidInput("note path has no parent".into()))?;
-            if !parent.exists() {
-                // Create parent directories for nested notes
-                std::fs::create_dir_all(parent)?;
+    /// Resolve an existing note relative to the open vault directory.
+    fn existing_note_path(&self, path: &str) -> ObsidianResult<PathBuf> {
+        sanitize_path_segment(path)?;
+        self.vault.canonicalize(path).map_err(|error| {
+            if error.kind() == ErrorKind::NotFound {
+                ObsidianError::NotFound(path.into())
+            } else {
+                error.into()
             }
-            let canonical_parent = parent.canonicalize().map_err(|e| {
-                ObsidianError::InvalidInput(format!("failed to resolve parent: {e}"))
-            })?;
-            if !canonical_parent.starts_with(&self.vault_path) {
-                return Err(ObsidianError::InvalidInput(
-                    "path escapes vault root".into(),
-                ));
-            }
-            canonical_parent.join(
-                joined
-                    .file_name()
-                    .ok_or_else(|| ObsidianError::InvalidInput("empty filename".into()))?,
-            )
-        };
-        if !resolved.starts_with(&self.vault_path) {
-            return Err(ObsidianError::InvalidInput(
-                "path escapes vault root".into(),
-            ));
-        }
-        Ok(resolved)
+        })
     }
 
     /// List all markdown notes in the vault.
@@ -99,63 +73,71 @@ impl ObsidianClient {
     ///
     /// Returns an error if the folder path is invalid or directory traversal fails.
     pub fn list_notes(&self, folder: Option<&str>) -> ObsidianResult<Vec<NoteEntry>> {
-        let search_root = match folder {
-            Some(f) => {
-                sanitize_path_segment(f)?;
-                let p = self.vault_path.join(f);
-                if !p.exists() || !p.is_dir() {
-                    return Ok(Vec::new());
-                }
-                p
+        let root = Path::new(folder.unwrap_or("."));
+        if let Some(folder) = folder {
+            sanitize_path_segment(folder)?;
+            if root.components().any(|component| {
+                matches!(component, std::path::Component::Normal(name) if name.to_string_lossy().starts_with('.'))
+            }) {
+                return Ok(Vec::new());
             }
-            None => self.vault_path.clone(),
-        };
+            let normalized = root.strip_prefix(".").unwrap_or(root);
+            if !normalized.as_os_str().is_empty() {
+                match self.vault.canonicalize(root) {
+                    Ok(path) if path == normalized && self.vault.is_dir(root) => {}
+                    Ok(_) => return Ok(Vec::new()),
+                    Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
         let mut entries = Vec::new();
-        self.collect_notes(&search_root, &mut entries)?;
+        self.visit_notes(root, |path| {
+            if let Ok(entry) = self.read_note_entry(path) {
+                entries.push(entry);
+            }
+        })?;
         entries.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(entries)
     }
 
-    fn collect_notes(&self, dir: &Path, entries: &mut Vec<NoteEntry>) -> ObsidianResult<()> {
-        let read_dir = std::fs::read_dir(dir)?;
-        for entry in read_dir {
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_dir() {
-                // Skip .obsidian and other hidden dirs
+    fn visit_notes(&self, root: &Path, mut visit: impl FnMut(&Path)) -> ObsidianResult<()> {
+        let mut pending = vec![root.to_owned()];
+        while let Some(dir) = pending.pop() {
+            for entry in self.vault.read_dir(&dir)? {
+                let entry = entry?;
+                let kind = entry.file_type()?;
                 let name = entry.file_name();
-                let name_str = name.to_string_lossy();
-                if !name_str.starts_with('.') {
-                    self.collect_notes(&path, entries)?;
+                let path = if dir == Path::new(".") {
+                    PathBuf::from(&name)
+                } else {
+                    dir.join(&name)
+                };
+                if kind.is_dir() && !name.to_string_lossy().starts_with('.') {
+                    pending.push(path);
+                } else if kind.is_file() && path.extension().is_some_and(|ext| ext == "md") {
+                    visit(&path);
                 }
-            } else if path.extension().is_some_and(|ext| ext == "md")
-                && let Ok(note_entry) = self.read_note_entry(&path)
-            {
-                entries.push(note_entry);
             }
         }
         Ok(())
     }
 
-    fn read_note_entry(&self, full_path: &Path) -> ObsidianResult<NoteEntry> {
-        let relative = full_path
-            .strip_prefix(&self.vault_path)
-            .map_err(|_| ObsidianError::InvalidInput("path outside vault".into()))?;
-        let metadata = std::fs::metadata(full_path)?;
-        let content = std::fs::read_to_string(full_path)?;
-        let tags = extract_tags(&content);
-        let title = full_path
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_default();
-
+    fn read_note_entry(&self, path: &Path) -> ObsidianResult<NoteEntry> {
+        let mut file = self.vault.open(path)?.into_std();
+        let metadata = file.metadata()?;
+        let mut content = String::new();
+        file.read_to_string(&mut content)?;
         Ok(NoteEntry {
-            path: relative.to_string_lossy().to_string(),
-            title,
+            path: path.to_string_lossy().into_owned(),
+            title: path.file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
             size: metadata.len(),
             modified: format_system_time(metadata.modified().ok()),
             created: format_system_time(metadata.created().ok()),
-            tags,
+            tags: extract_tags(&content),
         })
     }
 
@@ -165,24 +147,18 @@ impl ObsidianClient {
     ///
     /// Returns an error if the path is invalid, the note does not exist, or reading fails.
     pub fn get_note(&self, note_path: &str) -> ObsidianResult<Note> {
-        let full_path = self.safe_note_path(note_path)?;
-        if !full_path.exists() {
-            return Err(ObsidianError::NotFound(note_path.to_string()));
-        }
-        let metadata = std::fs::metadata(&full_path)?;
-        let content = std::fs::read_to_string(&full_path)?;
+        let path = self.existing_note_path(note_path)?;
+        let mut file = self.vault.open(&path)?.into_std();
+        let metadata = file.metadata()?;
+        let mut content = String::new();
+        file.read_to_string(&mut content)?;
         let tags = extract_tags(&content);
-        let relative = full_path
-            .strip_prefix(&self.vault_path)
-            .map_err(|_| ObsidianError::InvalidInput("path outside vault".into()))?;
-        let title = full_path
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_default();
-
         Ok(Note {
-            path: relative.to_string_lossy().to_string(),
-            title,
+            path: path.to_string_lossy().into_owned(),
+            title: path.file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
             content: Some(content),
             size: metadata.len(),
             modified: format_system_time(metadata.modified().ok()),
@@ -197,21 +173,18 @@ impl ObsidianClient {
     ///
     /// Returns an error if the path is invalid, the note already exists, or writing fails.
     pub fn create_note(&self, note_path: &str, content: &str) -> ObsidianResult<Note> {
-        let full_path = self.safe_note_path(note_path)?;
-        if let Some(parent) = full_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        // Atomic create-if-not-exists to avoid TOCTOU race between
-        // exists() check and write().
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&full_path)
+        sanitize_path_segment(note_path)?;
+        if let Some(parent) = Path::new(note_path)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
         {
-            Ok(mut file) => {
-                use std::io::Write;
-                file.write_all(content.as_bytes())?;
-            }
+            self.vault.create_dir_all(parent)?;
+        }
+        match self
+            .vault
+            .open_with(note_path, OpenOptions::new().write(true).create_new(true))
+        {
+            Ok(mut file) => file.write_all(content.as_bytes())?,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 return Err(ObsidianError::AlreadyExists(note_path.to_string()));
             }
@@ -226,18 +199,12 @@ impl ObsidianClient {
     ///
     /// Returns an error if the path is invalid, the note does not exist, or writing fails.
     pub fn update_note(&self, note_path: &str, content: &str) -> ObsidianResult<Note> {
-        let full_path = self.safe_note_path(note_path)?;
-        // Open with write+truncate but WITHOUT create — fails if file doesn't exist.
-        // This avoids TOCTOU: the open() call atomically checks existence and locks.
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(&full_path)
+        let path = self.existing_note_path(note_path)?;
+        match self
+            .vault
+            .open_with(path, OpenOptions::new().write(true).truncate(true))
         {
-            Ok(mut file) => {
-                use std::io::Write;
-                file.write_all(content.as_bytes())?;
-            }
+            Ok(mut file) => file.write_all(content.as_bytes())?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Err(ObsidianError::NotFound(note_path.to_string()));
             }
@@ -252,10 +219,10 @@ impl ObsidianClient {
     ///
     /// Returns an error if the path is invalid, the note does not exist, or deletion fails.
     pub fn delete_note(&self, note_path: &str) -> ObsidianResult<()> {
-        let full_path = self.safe_note_path(note_path)?;
+        let full_path = self.existing_note_path(note_path)?;
         // Remove directly — if the file doesn't exist, map to NotFound,
         // avoiding TOCTOU between exists() and remove_file().
-        match std::fs::remove_file(&full_path) {
+        match self.vault.remove_file(&full_path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 Err(ObsidianError::NotFound(note_path.to_string()))
@@ -272,53 +239,32 @@ impl ObsidianClient {
     pub fn search(&self, query: &str) -> ObsidianResult<Vec<SearchResult>> {
         let query_lower = query.to_lowercase();
         let mut results = Vec::new();
-        self.search_dir(&self.vault_path, &query_lower, &mut results)?;
-        results.sort_by(|a, b| a.path.cmp(&b.path));
-        Ok(results)
-    }
-
-    fn search_dir(
-        &self,
-        dir: &Path,
-        query: &str,
-        results: &mut Vec<SearchResult>,
-    ) -> ObsidianResult<()> {
-        let read_dir = std::fs::read_dir(dir)?;
-        for entry in read_dir {
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_dir() {
-                let name = entry.file_name();
-                if !name.to_string_lossy().starts_with('.') {
-                    self.search_dir(&path, query, results)?;
-                }
-            } else if path.extension().is_some_and(|ext| ext == "md")
-                && let Ok(content) = std::fs::read_to_string(&path)
-            {
-                let mut matches = Vec::new();
-                for (i, line) in content.lines().enumerate() {
-                    if line.to_lowercase().contains(query) {
-                        matches.push(SearchMatch {
-                            line: i + 1,
-                            text: line.to_string(),
-                        });
-                    }
-                }
+        self.visit_notes(Path::new("."), |path| {
+            if let Ok(content) = self.vault.read_to_string(path) {
+                let matches: Vec<_> = content
+                    .lines()
+                    .enumerate()
+                    .filter(|(_, line)| line.to_lowercase().contains(&query_lower))
+                    .map(|(i, line)| SearchMatch {
+                        line: i + 1,
+                        text: line.to_owned(),
+                    })
+                    .collect();
                 if !matches.is_empty() {
-                    let relative = path.strip_prefix(&self.vault_path).unwrap_or(&path);
-                    let title = path
-                        .file_stem()
-                        .map(|s| s.to_string_lossy().to_string())
-                        .unwrap_or_default();
                     results.push(SearchResult {
-                        path: relative.to_string_lossy().to_string(),
-                        title,
+                        path: path.to_string_lossy().into_owned(),
+                        title: path
+                            .file_stem()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into_owned(),
                         matches,
                     });
                 }
             }
-        }
-        Ok(())
+        })?;
+        results.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(results)
     }
 
     /// List all tags across the vault.
@@ -328,34 +274,19 @@ impl ObsidianClient {
     /// Returns an error if reading the vault directory fails.
     pub fn list_tags(&self) -> ObsidianResult<Vec<TagInfo>> {
         let mut tag_counts: HashMap<String, usize> = HashMap::new();
-        Self::collect_tags(&self.vault_path, &mut tag_counts)?;
+        self.visit_notes(Path::new("."), |path| {
+            if let Ok(content) = self.vault.read_to_string(path) {
+                for tag in extract_tags(&content) {
+                    *tag_counts.entry(tag).or_default() += 1;
+                }
+            }
+        })?;
         let mut tags: Vec<TagInfo> = tag_counts
             .into_iter()
             .map(|(tag, count)| TagInfo { tag, count })
             .collect();
         tags.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.tag.cmp(&b.tag)));
         Ok(tags)
-    }
-
-    fn collect_tags(dir: &Path, counts: &mut HashMap<String, usize>) -> ObsidianResult<()> {
-        let read_dir = std::fs::read_dir(dir)?;
-        for entry in read_dir {
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_dir() {
-                let name = entry.file_name();
-                if !name.to_string_lossy().starts_with('.') {
-                    Self::collect_tags(&path, counts)?;
-                }
-            } else if path.extension().is_some_and(|ext| ext == "md")
-                && let Ok(content) = std::fs::read_to_string(&path)
-            {
-                for tag in extract_tags(&content) {
-                    *counts.entry(tag).or_insert(0) += 1;
-                }
-            }
-        }
-        Ok(())
     }
 
     /// Get backlinks for a note (other notes linking to this one).
@@ -372,56 +303,29 @@ impl ObsidianClient {
 
         let link_pattern = format!("[[{target_name}");
         let mut backlinks = Vec::new();
-        self.find_backlinks(&self.vault_path, &link_pattern, note_path, &mut backlinks)?;
-        backlinks.sort_by(|a, b| a.source_path.cmp(&b.source_path));
-        Ok(backlinks)
-    }
-
-    fn find_backlinks(
-        &self,
-        dir: &Path,
-        pattern: &str,
-        skip_path: &str,
-        backlinks: &mut Vec<Backlink>,
-    ) -> ObsidianResult<()> {
-        let read_dir = std::fs::read_dir(dir)?;
-        for entry in read_dir {
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_dir() {
-                let name = entry.file_name();
-                if !name.to_string_lossy().starts_with('.') {
-                    self.find_backlinks(&path, pattern, skip_path, backlinks)?;
-                }
-            } else if path.extension().is_some_and(|ext| ext == "md") {
-                let relative = path
-                    .strip_prefix(&self.vault_path)
-                    .unwrap_or(&path)
-                    .to_string_lossy()
-                    .to_string();
-                // Don't count self-references
-                if relative == skip_path {
-                    continue;
-                }
-                if let Ok(content) = std::fs::read_to_string(&path) {
-                    for (i, line) in content.lines().enumerate() {
-                        if line.contains(pattern) {
-                            let title = path
+        self.visit_notes(Path::new("."), |path| {
+            if path == Path::new(note_path) {
+                return;
+            }
+            if let Ok(content) = self.vault.read_to_string(path) {
+                for (i, line) in content.lines().enumerate() {
+                    if line.contains(&link_pattern) {
+                        backlinks.push(Backlink {
+                            source_path: path.to_string_lossy().into_owned(),
+                            source_title: path
                                 .file_stem()
-                                .map(|s| s.to_string_lossy().to_string())
-                                .unwrap_or_default();
-                            backlinks.push(Backlink {
-                                source_path: relative.clone(),
-                                source_title: title,
-                                line: i + 1,
-                                context: line.to_string(),
-                            });
-                        }
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .into_owned(),
+                            line: i + 1,
+                            context: line.to_owned(),
+                        });
                     }
                 }
             }
-        }
-        Ok(())
+        })?;
+        backlinks.sort_by(|a, b| a.source_path.cmp(&b.source_path));
+        Ok(backlinks)
     }
 
     /// Get vault health information.
@@ -432,9 +336,23 @@ impl ObsidianClient {
     pub fn vault_health(&self) -> ObsidianResult<VaultHealth> {
         let mut note_count = 0_usize;
         let mut total_size = 0_u64;
-        Self::count_notes(&self.vault_path, &mut note_count, &mut total_size)?;
-
-        let writable = self.check_writable();
+        self.visit_notes(Path::new("."), |path| {
+            note_count += 1;
+            if let Ok(metadata) = self.vault.metadata(path) {
+                total_size += metadata.len();
+            }
+        })?;
+        let writable = self
+            .vault
+            .access(
+                ".",
+                AccessType::Access(AccessModes {
+                    readable: false,
+                    writable: true,
+                    executable: true,
+                }),
+            )
+            .is_ok();
 
         Ok(VaultHealth {
             vault_path: self.vault_path.to_string_lossy().to_string(),
@@ -443,36 +361,6 @@ impl ObsidianClient {
             readable: true,
             writable,
         })
-    }
-
-    fn count_notes(dir: &Path, count: &mut usize, size: &mut u64) -> ObsidianResult<()> {
-        let read_dir = std::fs::read_dir(dir)?;
-        for entry in read_dir {
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_dir() {
-                let name = entry.file_name();
-                if !name.to_string_lossy().starts_with('.') {
-                    Self::count_notes(&path, count, size)?;
-                }
-            } else if path.extension().is_some_and(|ext| ext == "md") {
-                *count += 1;
-                if let Ok(m) = std::fs::metadata(&path) {
-                    *size += m.len();
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn check_writable(&self) -> bool {
-        let test_path = self.vault_path.join(".fcp_write_test");
-        if std::fs::write(&test_path, "test").is_ok() {
-            let _ = std::fs::remove_file(&test_path);
-            true
-        } else {
-            false
-        }
     }
 
     /// Get the vault path (for diagnostics).
@@ -800,6 +688,53 @@ mod tests {
         assert!(health.readable);
         assert!(health.writable);
         assert!(health.total_size_bytes > 0);
+    }
+
+    #[test]
+    fn diagnostics_and_missing_note_lookups_leave_vault_untouched() {
+        let (dir, client) = setup_vault();
+        let marker = dir.path().join(".fcp_write_test");
+        fs::write(&marker, "keep").unwrap();
+        assert!(client.vault_health().unwrap().writable);
+        assert_eq!(fs::read_to_string(marker).unwrap(), "keep");
+        assert!(client.get_note("absent/sub/n.md").is_err());
+        assert!(client.update_note("absent/sub/n.md", "text").is_err());
+        assert!(client.delete_note("absent/sub/n.md").is_err());
+        assert!(!dir.path().join("absent").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_visits_each_regular_note_once() {
+        use std::os::unix::fs::symlink;
+
+        let (dir, client) = setup_vault();
+        client.create_note("docs/one.md", "reference [[two]] #shared").unwrap();
+        client.create_note("two.md", "target").unwrap();
+        symlink("docs", dir.path().join("alias")).unwrap();
+        symlink("docs/one.md", dir.path().join("linked.md")).unwrap();
+        assert_eq!(client.list_notes(None).unwrap().len(), 2);
+        assert_eq!(client.search("reference").unwrap().len(), 1);
+        assert_eq!(client.list_tags().unwrap()[0].count, 1);
+        assert_eq!(client.get_backlinks("two.md").unwrap().len(), 1);
+        assert_eq!(client.vault_health().unwrap().note_count, 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_vault_survives_directory_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("vault");
+        fs::create_dir(&root).unwrap();
+        let client = ObsidianClient::new(root.to_str().unwrap()).unwrap();
+        client.create_note("first.md", "first").unwrap();
+        fs::rename(&root, dir.path().join("renamed")).unwrap();
+        fs::create_dir(&root).unwrap();
+
+        client.create_note("sub/second.md", "second").unwrap();
+        assert_eq!(client.list_notes(None).unwrap().len(), 2);
+        assert_eq!(client.get_note("first.md").unwrap().content.as_deref(), Some("first"));
+        assert!(root.read_dir().unwrap().next().is_none());
     }
 
     #[test]
