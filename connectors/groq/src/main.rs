@@ -4,7 +4,7 @@ use std::io::{self, BufRead, Write};
 
 use anyhow::Result;
 use fcp_prelude::{FcpConnector, FcpError, FcpResult};
-use fcp_sdk::prelude::{JsonlConfig, dispatch_raw_invoke, serve_jsonl};
+use fcp_sdk::prelude::{JsonlConfig, serve_jsonl};
 use serde_json::{Value, json};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -60,7 +60,13 @@ async fn handle_request(
         "doctor" => connector.handle_doctor().await,
         "self_check" => connector.handle_self_check().await,
         "introspect" => connector.handle_introspect().await,
-        "invoke" => dispatch_raw_invoke(params, |params| connector.handle_invoke(params)).await,
+        "invoke" => {
+            let request = serde_json::from_value(params).map_err(|_| FcpError::InvalidRequest {
+                code: 1003,
+                message: "Invalid FCP invoke request".into(),
+            })?;
+            encode_response(connector.invoke(request).await?)
+        }
         "simulate" => {
             let request = serde_json::from_value(params).map_err(|_| FcpError::InvalidRequest {
                 code: 1003,
@@ -174,7 +180,11 @@ mod tests {
             &mut connector,
             &[
                 rpc("health-start", "health", json!({})),
-                rpc("configure", "configure", json!({"api_key": "groq-test-key"})),
+                rpc(
+                    "configure",
+                    "configure",
+                    json!({"api_key": "groq-test-key"}),
+                ),
                 rpc("health-configured", "health", json!({})),
                 rpc("handshake", "handshake", json!(handshake)),
                 rpc("health-ready", "health", json!({})),
@@ -196,7 +206,11 @@ mod tests {
             let details = snapshot.details.expect("provider health details");
             assert_eq!(details["configured"], configured);
             assert_eq!(details["handshaken"], handshaken);
-            assert_eq!(details["instance_id"], instance);
+            if index == 0 {
+                assert_eq!(details["instance_id"], instance);
+            } else {
+                assert_ne!(details["instance_id"], instance);
+            }
             assert_eq!(responses[index]["jsonrpc"], "2.0");
             assert!(responses[index].get("error").is_none());
         }
@@ -205,6 +219,14 @@ mod tests {
         assert_eq!(responses[4]["id"], "health-ready");
         assert!(responses[1].get("result").is_some());
         assert!(responses[3].get("result").is_some());
+        assert_ne!(
+            responses[2]["result"]["details"]["instance_id"],
+            responses[4]["result"]["details"]["instance_id"]
+        );
+        assert_eq!(
+            responses[4]["result"]["details"]["instance_id"],
+            json!(connector.instance_id())
+        );
     }
 
     #[fcp_async_core::runtime::test]
@@ -275,8 +297,7 @@ mod tests {
         assert_eq!(result["content"], "hello from Groq");
         assert_eq!(result["usage"]["total_tokens"], 5);
 
-        let wrong_instance =
-            signed_token(&signing_key, &InstanceId::new(), CAP_CHAT, OP_CHAT);
+        let wrong_instance = signed_token(&signing_key, &InstanceId::new(), CAP_CHAT, OP_CHAT);
         let rejected = test_invoke_request("rejected-id", OP_CHAT, input, wrong_instance);
         assert!(
             handle_request(&mut connector, "invoke", json!(rejected))
@@ -296,6 +317,25 @@ mod tests {
     fn jsonl_simulate_preserves_outer_and_inner_ids_with_typed_results() {
         let mut connector = GroqConnector::new();
         let signing_key = Ed25519SigningKey::generate();
+        let setup = run_frames(
+            &mut connector,
+            &[
+                rpc(
+                    "configure",
+                    "configure",
+                    json!({"api_key": "groq-test-key"}),
+                ),
+                rpc(
+                    "handshake",
+                    "handshake",
+                    json!(test_handshake_request(
+                        vec![CapabilityId::from_static(CAP_CHAT)],
+                        signing_key.verifying_key().to_bytes(),
+                    )),
+                ),
+            ],
+        );
+        assert!(setup.iter().all(|response| response.get("error").is_none()));
         let token = signed_token(&signing_key, connector.instance_id(), CAP_CHAT, OP_CHAT);
         let mut request = SimulateRequest::new(
             ConnectorId::from_static(CONNECTOR_ID),
@@ -311,29 +351,18 @@ mod tests {
         let responses = run_frames(
             &mut connector,
             &[
-                rpc("configure", "configure", json!({"api_key": "groq-test-key"})),
-                rpc(
-                    "handshake",
-                    "handshake",
-                    json!(test_handshake_request(
-                        vec![CapabilityId::from_static(CAP_CHAT)],
-                        signing_key.verifying_key().to_bytes(),
-                    )),
-                ),
                 rpc("rpc-allowed", "simulate", allowed),
                 rpc("rpc-denied", "simulate", json!(request)),
             ],
         );
 
-        assert_eq!(responses.len(), 4);
-        let allowed: SimulateResponse =
-            serde_json::from_value(responses[2]["result"].clone())
-                .expect("typed allowed simulation");
-        let denied: SimulateResponse =
-            serde_json::from_value(responses[3]["result"].clone())
-                .expect("typed denied simulation");
-        assert_eq!(responses[2]["id"], "rpc-allowed");
-        assert_eq!(responses[3]["id"], "rpc-denied");
+        assert_eq!(responses.len(), 2);
+        let allowed: SimulateResponse = serde_json::from_value(responses[0]["result"].clone())
+            .expect("typed allowed simulation");
+        let denied: SimulateResponse = serde_json::from_value(responses[1]["result"].clone())
+            .expect("typed denied simulation");
+        assert_eq!(responses[0]["id"], "rpc-allowed");
+        assert_eq!(responses[1]["id"], "rpc-denied");
         assert_eq!(allowed.r#type, "simulate_response");
         assert_eq!(allowed.id, RequestId::new("simulate-allowed"));
         assert!(allowed.would_succeed);
@@ -421,7 +450,10 @@ mod tests {
 
             fn flush(&mut self) -> io::Result<()> {
                 self.flushes += 1;
-                Err(io::Error::new(io::ErrorKind::BrokenPipe, "test output failure"))
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "test output failure",
+                ))
             }
         }
 
@@ -430,7 +462,11 @@ mod tests {
         let setup = run_frames(
             &mut connector,
             &[
-                rpc("configure", "configure", json!({"api_key": "groq-test-key"})),
+                rpc(
+                    "configure",
+                    "configure",
+                    json!({"api_key": "groq-test-key"}),
+                ),
                 rpc(
                     "handshake",
                     "handshake",
@@ -441,7 +477,11 @@ mod tests {
                 ),
             ],
         );
-        assert!(setup.iter().all(|response| response.get("result").is_some()));
+        assert!(
+            setup
+                .iter()
+                .all(|response| response.get("result").is_some())
+        );
         let token = signed_token(
             &signing_key,
             connector.instance_id(),

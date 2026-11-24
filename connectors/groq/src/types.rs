@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
 use fcp_openai_compat::{
-    ChatCompletionsRequest, ChatMessage, CompletionsRequest, PromptInput, ProviderExtensions,
-    ResponseFormat, ToolChoice, ToolDefinition,
+    ChatCompletionsRequest, ChatMessage, CompletionsRequest, ContentPart, ContentParts,
+    PromptInput, ProviderExtensions, ResponseFormat, ToolChoice, ToolDefinition,
 };
 use fcp_prelude::{FcpError, FcpResult};
 use serde::Deserialize;
@@ -35,8 +35,9 @@ pub struct ChatInvokeInput {
 }
 
 impl ChatInvokeInput {
-    pub fn into_request(self, default_model: &str) -> FcpResult<ChatCompletionsRequest> {
+    pub fn into_request(mut self, default_model: &str) -> FcpResult<ChatCompletionsRequest> {
         validate_groq_chat_input(&self)?;
+        normalize_image_urls(&mut self.messages)?;
         Ok(ChatCompletionsRequest {
             model: self.model.unwrap_or_else(|| default_model.to_string()),
             messages: self.messages,
@@ -149,10 +150,91 @@ fn message_has_name(message: &ChatMessage) -> bool {
     }
 }
 
+fn normalize_image_urls(messages: &mut [ChatMessage]) -> FcpResult<()> {
+    for message in messages {
+        if let ChatMessage::User {
+            content: ContentParts::Multimodal(parts),
+            ..
+        } = message
+        {
+            for part in parts {
+                if let ContentPart::ImageUrl { image_url } = part {
+                    if image_url.url.starts_with("data:") {
+                        continue;
+                    }
+                    let invalid_url = || {
+                        FcpError::InvalidRequest {
+                        code: 1003,
+                        message: "image_url must be HTTP(S) without embedded credentials or a fragment, or inline data".into(),
+                    }
+                    };
+                    let url = url::Url::parse(&image_url.url).map_err(|_| invalid_url())?;
+                    if !matches!(url.scheme(), "http" | "https")
+                        || url.host_str().is_none()
+                        || !url.username().is_empty()
+                        || url.password().is_some()
+                        || url.fragment().is_some()
+                    {
+                        return Err(invalid_url());
+                    }
+                    // Authorization and dispatch must use exactly the same URL.
+                    image_url.url = url.to_string();
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn chat_image_resources(request: &ChatCompletionsRequest) -> Vec<String> {
+    let mut resources = Vec::new();
+    for message in &request.messages {
+        if let ChatMessage::User {
+            content: ContentParts::Multimodal(parts),
+            ..
+        } = message
+        {
+            for part in parts {
+                if let ContentPart::ImageUrl { image_url } = part
+                    && !image_url.url.starts_with("data:")
+                {
+                    resources.push(format!("groq:image_url:{}", image_url.url));
+                }
+            }
+        }
+    }
+    resources
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn remote_image_resource_matches_canonical_provider_url() {
+        let request = chat_request_from_value(
+            json!({"messages":[{"role":"user","content":[
+                {"type":"image_url","image_url":{"url":"https://EXAMPLE.com:443/input.png"}},
+                {"type":"image_url","image_url":{"url":"data:image/png;base64,aGVsbG8="}}
+            ]}]}),
+            DEFAULT_MODEL,
+        )
+        .unwrap();
+        assert_eq!(
+            chat_image_resources(&request),
+            vec!["groq:image_url:https://example.com/input.png"]
+        );
+        let body = serde_json::to_value(request).unwrap();
+        assert_eq!(
+            body["messages"][0]["content"][0]["image_url"]["url"],
+            "https://example.com/input.png"
+        );
+        assert_eq!(
+            body["messages"][0]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,aGVsbG8="
+        );
+    }
 
     #[test]
     fn groq_chat_request_uses_default_model_and_preserves_user() {

@@ -58,12 +58,13 @@ pub fn openai_error_to_fcp(error: &OpenAiError) -> FcpError {
             retryable: true,
             retry_after: None,
         },
-        OpenAiError::Network(NetworkError::Cancelled { message }) => {
-            FcpError::ConnectorUnavailable {
-                code: 5000,
-                message: format!("Groq request cancelled: {message}"),
-            }
-        }
+        OpenAiError::Network(NetworkError::Cancelled { .. }) => FcpError::External {
+            service: "groq".into(),
+            message: "request cancelled; provider outcome may be unknown".into(),
+            status_code: None,
+            retryable: false,
+            retry_after: None,
+        },
         OpenAiError::Network(NetworkError::DeadlineExceeded { timeout_ms }) => FcpError::External {
             service: "groq".into(),
             message: format!(

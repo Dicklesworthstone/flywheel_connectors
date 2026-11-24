@@ -27,12 +27,12 @@ Important runtime truths the contract preserves:
 
 - Configuration accepts exactly one of `api_key` or `credential_id`.
 - API-key mode sends `Authorization: Bearer ...`.
-- Credential-id mode sends `x-fcp-credential-id` and requires host-side egress credential injection for live traffic.
+- Credential-id configuration is retained for diagnostics, but invocation fails before network I/O: this connector's native transport does not yet implement host-mediated credential injection. Use API-key mode for live traffic.
 - Default base URL is `https://api.groq.com/openai/v1`.
 - Base URL overrides must use `/openai/v1` or `/v1`, must not include query or fragment components, and may only target `api.groq.com` or loopback test hosts.
 - Loopback HTTP/HTTPS base URLs are accepted only for deterministic tests.
 - Default model is `llama-3.1-8b-instant`.
-- Default `request_timeout_ms` is `60_000`.
+- Default `request_timeout_ms` is `60_000`, with a maximum of `120_000`. Each invocation uses the smallest configured, manifest-operation, caller and native-context deadline.
 - Default `model_cache_ttl_seconds` is `3600`.
 - `wait_on_rate_limit_ms` switches rate-limit behavior from fail-fast to bounded wait/retry.
 - Chat input rejects unsupported OpenAI fields before network dispatch: `logprobs`, `logit_bias`, `top_logprobs`, `messages[].name`, and `n` values other than 1.
@@ -40,6 +40,36 @@ Important runtime truths the contract preserves:
 - `groq.completions.legacy` is available only for old prompt-completion callers; new work should use chat completions.
 - FCP subscribe is not implemented; streaming is exposed as the bounded invoke operation `groq.chat.completions_stream`.
 - Runtime handshake returns a SHA-256 hash of the bundled `manifest.toml`.
+
+### Invocation authority and execution limits
+
+Both the JSONL process boundary and the Rust `FcpConnector` interface require
+the complete canonical `InvokeRequest`: `type`, `id`, `connector_id`, `zone_id`,
+`operation`, `input` and a signed capability. Ad hoc operation/input/token objects
+do not acquire an implicit connector or zone. Handshakes accept protocol `2.0`
+or `2.0.0`, bind to `z:work`, and negotiate only declared capabilities. Every
+handshake rotates the actual instance ID; obtain it from handshake or health
+before signing invocation tokens. Failed handshakes and configuration changes
+invalidate the prior authority, and failed reconfiguration clears old credentials.
+
+The shared SDK atomically charges signed `max_calls` and `max_bytes` allowances,
+checks the signed idempotency-key scope, and rejects reused token IDs with
+different claims. Model-list and health requests require a non-empty
+`idempotency_key`. Byte accounting measures the complete compact JSON request
+and response envelopes, with a 16 MiB response ceiling; it does not replace host
+accounting for provider traffic. Failed, cancelled and unknown outcomes retain
+their reservations. Simulation validates the same input, resource and session
+authority without spending a call or causing provider I/O. This admission ledger
+does not deduplicate provider calls or cache results for an idempotency key.
+
+Resource checks use the model actually selected by the request or configured
+default. Remote image inputs also require `groq:image_url:<canonical-url>`
+resource authority, and dispatch sends that same canonical URL. Inline data is
+covered by request-byte accounting. Provider extensions cannot override typed fields such as `model`,
+`messages`, `stream` or generation limits. A single narrowing execution budget
+covers cache access, provider attempts, retry waits, stream collection and result
+validation. Cancellation and deadline exhaustion return terminal errors because
+the provider outcome may be unknown.
 
 ### Streaming response
 
@@ -70,7 +100,7 @@ The first Groq README slice documents the existing runtime surface:
 
 ## Auth And Scope Boundary
 
-- Authentication mechanisms: Groq API key or host-injected credential ID.
+- Live authentication mechanism: Groq API key. Credential references are accepted for configuration diagnostics and denied at invocation until host egress is wired into this transport.
 - Home zone: `z:work`.
 - Allowed source zones: `z:owner`, `z:private`, `z:work`, and `z:project:*`.
 - Allowed target zone: `z:work`.
@@ -81,7 +111,7 @@ The first Groq README slice documents the existing runtime surface:
   - `groq.health.read` gates the health probe.
   - `groq.embeddings` is associated only with the not-supported embeddings declaration.
 - The connector does not persist prompts, completions, streamed chunks, tool-call arguments, model catalogs, provider payloads, or provider responses.
-- Credential-id mode is a host-egress contract, not proof that live Groq will accept a request without an injection layer.
+- Credential-id mode never sends a credential reference directly to Groq as an authentication substitute.
 
 ## Network And Runtime Invariants
 
@@ -97,7 +127,7 @@ The first Groq README slice documents the existing runtime surface:
 - Manifest streaming network constraints set total timeout `300_000 ms`.
 - Manifest model-list network constraints set total timeout `30_000 ms`.
 - Manifest health network constraints set total timeout `5_000 ms`.
-- Maximum response bytes are `10_485_760`.
+- Manifest provider response limit is `10_485_760` bytes. The standalone FCP response ceiling is 16 MiB and may be narrowed by the signed grant's remaining byte allowance.
 - Sandbox profile is `strict`, with `128 MB` memory, `25%` CPU, `120_000 ms` wall-clock timeout, no exec, and no ptrace.
 - Event capability metadata declares streaming support, no replay, no acknowledgement requirement, and a minimum buffer of 0 events.
 
@@ -149,7 +179,7 @@ These are excluded on purpose:
 - base URL policy for `api.groq.com/openai/v1` and loopback-compatible test origins
 - credential-injection status for secretless mode
 - operation schemas, safety, risk, idempotency, and AI hints
-- simulate-time operation support, including the embeddings not-supported explanation
+- simulate-time input, resource and negotiated-authority checks without provider execution
 - capability-token checks against bound resources before dispatch
 
 The deterministic integration evidence is anchored on WireMock and connector-local tests covering:
@@ -164,6 +194,7 @@ The deterministic integration evidence is anchored on WireMock and connector-loc
 - unsupported OpenAI fields failing locally before network dispatch
 - FCP trait invoke, capability-token validation, and shutdown behavior
 - manifest operation coverage and runtime introspection parity
+- canonical request routing, negotiated capabilities, stale-instance denial, failed reconfiguration, cumulative call/byte ceilings, configured default model binding and reserved provider-extension denial
 
 ## Source Notes
 
@@ -192,7 +223,7 @@ The verification surface captures:
 **Prerequisites**:
 
 - Use a Groq API key only for live provider verification.
-- Use `credential_id` only behind a host egress injection layer.
+- Use API-key mode for this transport; `credential_id` invocation is explicitly unavailable until a host-mediated adapter is implemented.
 - Use WireMock loopback fixtures for deterministic proof.
 
 **Dedicated environment**:
@@ -209,8 +240,8 @@ The verification surface captures:
 **Common remediation**:
 
 - If `health` reports `unconfigured`, configure with exactly one of `api_key` or `credential_id`.
-- If `health` reports `degraded`, complete handshake before invoking operations that require bound capability tokens.
-- If `self_check` reports `credential_injection_required`, run behind the host egress injection layer or switch to direct API-key mode for live probes.
+- If `health` reports `degraded`, complete handshake and check `auth_ready`; credential-ID configurations require a transport with host-mediated credential injection.
+- If `self_check` reports `credential_injection_required`, use API-key mode for live probes; configuring a host proxy alone does not wire this connector's native client into it.
 - If base URL validation fails, use `https://api.groq.com/openai/v1`, `https://api.groq.com/v1`, or a loopback `/openai/v1` or `/v1` origin for tests.
 - If chat input is rejected for unsupported fields, remove `logprobs`, `logit_bias`, `top_logprobs`, `messages[].name`, or set `n` to 1.
 - If `groq.embeddings.create` is requested, route the request to a connector that actually supports embeddings.

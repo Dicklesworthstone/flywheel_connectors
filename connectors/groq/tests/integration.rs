@@ -4,7 +4,10 @@ use chrono::{Duration as ChronoDuration, Utc};
 use fcp_crypto::{cose::CapabilityTokenBuilder, ed25519::Ed25519SigningKey};
 use fcp_groq::GroqConnector;
 use fcp_groq::connector::{CONNECTOR_ID, test_handshake_request, test_invoke_request};
-use fcp_prelude::{CapabilityConstraints, CapabilityId, FcpConnector, FcpError, InstanceId};
+use fcp_prelude::{
+    CapabilityConstraints, CapabilityId, CapabilityToken, ConnectorId, FcpConnector, FcpError,
+    InstanceId, RequestId, SimulateRequest, ZoneId,
+};
 use serde_json::{Value, json};
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
@@ -93,11 +96,12 @@ async fn invoke(
 ) -> fcp_core::FcpResult<Value> {
     let capability_grant = valid_token(signing_key, connector.instance_id(), capability, operation);
     connector
-        .handle_invoke(json!({
-            "operation": operation,
-            "input": input,
-            "capability_token": capability_grant,
-        }))
+        .handle_invoke(json!(test_invoke_request(
+            "groq-integration",
+            operation,
+            input,
+            capability_grant,
+        )))
         .await
 }
 
@@ -404,4 +408,330 @@ async fn fcp_connector_trait_happy_path_validates_capability_token() {
 #[test]
 fn connector_id_matches_manifest_contract() {
     assert_eq!(CONNECTOR_ID, "fcp.groq");
+}
+
+fn constrained_token(
+    signing_key: &Ed25519SigningKey,
+    instance_id: &InstanceId,
+    constraints: CapabilityConstraints,
+    token_id: &[u8],
+) -> CapabilityToken {
+    let now = Utc::now();
+    let mut encoded = Vec::new();
+    ciborium::into_writer(&constraints, &mut encoded).unwrap();
+    CapabilityToken::from_raw(
+        CapabilityTokenBuilder::new()
+            .capability_id(CAP_CHAT)
+            .zone_id("z:work")
+            .principal("user:limited")
+            .operations(&[OP_CHAT, OP_CHAT_STREAM])
+            .issuer("node:test")
+            .target_instance(instance_id.as_str())
+            .token_id(token_id)
+            .validity(now, now + ChronoDuration::hours(1))
+            .try_constraints_cbor(&encoded)
+            .unwrap()
+            .sign(signing_key)
+            .unwrap(),
+    )
+}
+
+fn chat_reply(model: &str, content: &str) -> Value {
+    json!({
+        "id": "chatcmpl-admission", "object": "chat.completion", "created": 1,
+        "model": model,
+        "choices": [{"index":0, "message":{"role":"assistant", "content":content},
+            "finish_reason":"stop"}]
+    })
+}
+
+#[fcp_async_core::runtime::test]
+async fn canonical_authority_and_input_denials_do_not_spend_the_same_finite_grant() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/openai/v1/chat/completions"))
+        .and(body_partial_json(json!({"model":"configured-model"})))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(chat_reply("configured-model", "ok")),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let (connector, key) = configured_connector(
+        &server,
+        &[CAP_CHAT],
+        json!({"default_model":"configured-model"}),
+    )
+    .await;
+    let token = constrained_token(
+        &key,
+        connector.instance_id(),
+        CapabilityConstraints {
+            resource_allow: vec!["groq:model:configured-model".into()],
+            max_calls: Some(1),
+            idempotency_key: Some("scope".into()),
+            ..Default::default()
+        },
+        b"shared-finite-grant",
+    );
+    let mut valid = test_invoke_request(
+        "valid",
+        OP_CHAT,
+        json!({"messages":[{"role":"user","content":"hello"}]}),
+        token,
+    );
+    valid.idempotency_key = Some("scope".into());
+
+    let mut invalid = valid.clone();
+    invalid.connector_id = ConnectorId::from_static("fcp.deepseek");
+    assert!(connector.invoke(invalid).await.is_err());
+    let mut invalid = valid.clone();
+    invalid.zone_id = ZoneId::owner();
+    assert!(connector.invoke(invalid).await.is_err());
+    let mut invalid = valid.clone();
+    invalid.r#type = "simulate".into();
+    assert!(connector.invoke(invalid).await.is_err());
+    let mut invalid = valid.clone();
+    invalid.id = RequestId::new("");
+    assert!(connector.invoke(invalid).await.is_err());
+    let mut invalid = valid.clone();
+    invalid.deadline_ms = Some(0);
+    assert!(connector.invoke(invalid).await.is_err());
+    let mut invalid = valid.clone();
+    invalid.idempotency_key = Some("different".into());
+    assert!(connector.invoke(invalid).await.is_err());
+    for input in [
+        json!({"messages":[]}),
+        json!({"messages":[{"role":"user","content":"hello"}],"top_p":2}),
+        json!({"messages":[{"role":"user","content":"hello"}],"model":"llama-3.1-8b-instant"}),
+        json!({"messages":[{"role":"user","content":"hello"}],
+            "provider_extensions":{"model":"ungranted-model"}}),
+        json!({"messages":[{"role":"user","content":[
+            {"type":"image_url","image_url":{"url":"https://example.com/ungranted.png"}}
+        ]}]}),
+    ] {
+        let mut invalid = valid.clone();
+        invalid.input = input;
+        assert!(connector.handle_invoke(json!(invalid)).await.is_err());
+    }
+    assert!(
+        connector
+            .handle_invoke(json!({
+                "operation":OP_CHAT,"input":valid.input,"capability_token":valid.capability_token,
+            }))
+            .await
+            .is_err(),
+        "ad hoc invocation must not acquire implicit route authority"
+    );
+    assert!(server.received_requests().await.unwrap().is_empty());
+    assert_eq!(connector.handle_health().await.unwrap()["requests"], 0);
+
+    let simulation = SimulateRequest::new(
+        valid.connector_id.clone(),
+        valid.operation.clone(),
+        valid.zone_id.clone(),
+        valid.input.clone(),
+        valid.capability_token.clone(),
+    );
+    assert!(
+        connector
+            .simulate(simulation.clone())
+            .await
+            .unwrap()
+            .would_succeed
+    );
+    let output = connector.handle_invoke(json!(valid)).await.unwrap();
+    assert_eq!(output["content"], "ok");
+    let mut replay = valid;
+    replay.id = RequestId::new("changed-request-id");
+    assert!(
+        connector.invoke(replay).await.is_err(),
+        "raw and typed entry points share accounting"
+    );
+    assert!(!connector.simulate(simulation).await.unwrap().would_succeed);
+    assert_eq!(connector.handle_health().await.unwrap()["requests"], 1);
+    server.verify().await;
+}
+
+#[fcp_async_core::runtime::test]
+async fn handshake_negotiation_and_failed_lifecycle_changes_revoke_prior_tokens() {
+    let server = MockServer::start().await;
+    let (mut connector, key) = configured_connector(&server, &[CAP_CHAT], json!({})).await;
+    let old = test_invoke_request(
+        "old",
+        OP_CHAT,
+        json!({"messages":[{"role":"user","content":"hello"}]}),
+        valid_token(&key, connector.instance_id(), CAP_CHAT, OP_CHAT),
+    );
+    let instance = connector.instance_id().clone();
+    let response = connector
+        .handshake(test_handshake_request(
+            vec![CapabilityId::from_static("unrelated.capability")],
+            key.verifying_key().to_bytes(),
+        ))
+        .await
+        .unwrap();
+    assert!(response.capabilities_granted.is_empty());
+    assert_ne!(connector.instance_id(), &instance);
+    assert!(connector.invoke(old.clone()).await.is_err());
+    let fresh = test_invoke_request(
+        "unnegotiated",
+        OP_CHAT,
+        old.input.clone(),
+        valid_token(&key, connector.instance_id(), CAP_CHAT, OP_CHAT),
+    );
+    assert!(connector.invoke(fresh).await.is_err());
+
+    connector
+        .handshake(test_handshake_request(
+            vec![CapabilityId::from_static(CAP_CHAT)],
+            key.verifying_key().to_bytes(),
+        ))
+        .await
+        .unwrap();
+    let current = test_invoke_request(
+        "current",
+        OP_CHAT,
+        old.input.clone(),
+        valid_token(&key, connector.instance_id(), CAP_CHAT, OP_CHAT),
+    );
+    let mut wrong_zone = test_handshake_request(
+        vec![CapabilityId::from_static(CAP_CHAT)],
+        key.verifying_key().to_bytes(),
+    );
+    wrong_zone.zone = ZoneId::owner();
+    assert!(connector.handshake(wrong_zone).await.is_err());
+    assert!(matches!(
+        connector.invoke(current).await,
+        Err(FcpError::NotHandshaken)
+    ));
+    assert_eq!(
+        connector.handle_health().await.unwrap()["handshaken"],
+        false
+    );
+
+    connector
+        .handshake(test_handshake_request(
+            vec![CapabilityId::from_static(CAP_CHAT)],
+            key.verifying_key().to_bytes(),
+        ))
+        .await
+        .unwrap();
+    let mut unsupported = test_handshake_request(Vec::new(), key.verifying_key().to_bytes());
+    unsupported.protocol_version = "1.0".into();
+    assert!(connector.handshake(unsupported).await.is_err());
+    assert_eq!(
+        connector.handle_health().await.unwrap()["handshaken"],
+        false
+    );
+    assert!(
+        connector
+            .handle_configure(json!({"api_key":false}))
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        connector.handle_health().await.unwrap()["configured"],
+        false
+    );
+    assert!(matches!(
+        connector.invoke(old).await,
+        Err(FcpError::NotConfigured)
+    ));
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[fcp_async_core::runtime::test]
+async fn finite_byte_grants_withhold_oversized_results_and_remain_spent() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/openai/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(chat_reply(
+            "llama-3.1-8b-instant",
+            &"private-output-sentinel".repeat(1024),
+        )))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let (connector, key) = configured_connector(&server, &[CAP_CHAT], json!({})).await;
+    let input = json!({"messages":[{"role":"user","content":"hello"}]});
+    for (token_id, limit) in [(b"zero-calls".as_slice(), 0), (b"one-byte".as_slice(), 1)] {
+        let token = constrained_token(
+            &key,
+            connector.instance_id(),
+            CapabilityConstraints {
+                resource_allow: vec!["*".into()],
+                max_calls: Some(u32::from(limit != 0)),
+                max_bytes: Some(limit),
+                ..Default::default()
+            },
+            token_id,
+        );
+        assert!(
+            connector
+                .invoke(test_invoke_request("denied", OP_CHAT, input.clone(), token))
+                .await
+                .is_err()
+        );
+    }
+    assert!(server.received_requests().await.unwrap().is_empty());
+    let token = constrained_token(
+        &key,
+        connector.instance_id(),
+        CapabilityConstraints {
+            resource_allow: vec!["*".into()],
+            max_calls: Some(1),
+            max_bytes: Some(16_384),
+            ..Default::default()
+        },
+        b"bounded-output",
+    );
+    let request = test_invoke_request("oversized", OP_CHAT, input, token);
+    let error = connector.invoke(request.clone()).await.unwrap_err();
+    assert!(matches!(
+        error,
+        FcpError::External {
+            retryable: false,
+            ..
+        }
+    ));
+    assert!(!error.to_string().contains("private-output-sentinel"));
+    assert!(connector.invoke(request).await.is_err());
+    assert_eq!(connector.handle_health().await.unwrap()["requests"], 1);
+    server.verify().await;
+}
+
+#[fcp_async_core::runtime::test]
+async fn secretless_configuration_cannot_send_credentials_or_direct_requests() {
+    let server = MockServer::start().await;
+    let mut connector = GroqConnector::new();
+    connector
+        .handle_configure(json!({"credential_id":"host-owned-credential",
+        "base_url":format!("{}/openai/v1",server.uri())}))
+        .await
+        .unwrap();
+    let key = Ed25519SigningKey::generate();
+    connector
+        .handshake(test_handshake_request(
+            vec![CapabilityId::from_static(CAP_CHAT)],
+            key.verifying_key().to_bytes(),
+        ))
+        .await
+        .unwrap();
+    let request = test_invoke_request(
+        "secretless",
+        OP_CHAT,
+        json!({"messages":[{"role":"user","content":"hello"}]}),
+        valid_token(&key, connector.instance_id(), CAP_CHAT, OP_CHAT),
+    );
+    assert!(connector.invoke(request).await.is_err());
+    assert!(server.received_requests().await.unwrap().is_empty());
+    let health = connector.handle_health().await.unwrap();
+    assert_eq!(health["requests"], 0);
+    assert_eq!(health["status"], "degraded");
+    assert_eq!(health["auth_ready"], false);
+    assert!(!connector.health().await.is_ready());
+    let doctor = connector.handle_doctor().await.unwrap();
+    assert_eq!(doctor["status"], "degraded");
+    assert!(!doctor.to_string().contains("host-owned-credential"));
 }

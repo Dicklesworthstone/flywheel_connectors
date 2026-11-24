@@ -10,7 +10,7 @@ use std::time::Duration as StdDuration;
 use chrono::{Duration as ChronoDuration, Utc};
 use fcp_crypto::{cose::CapabilityTokenBuilder, ed25519::Ed25519SigningKey};
 use fcp_groq::GroqConnector;
-use fcp_groq::connector::test_handshake_request;
+use fcp_groq::connector::{test_handshake_request, test_invoke_request};
 use fcp_prelude::{CapabilityConstraints, CapabilityId, FcpConnector, FcpError, InstanceId};
 use serde_json::{Value, json};
 
@@ -286,11 +286,12 @@ async fn invoke(
 ) -> Result<Value, FcpError> {
     let capability_token = valid_token(signing_key, connector.instance_id(), capability, operation);
     connector
-        .handle_invoke(json!({
-            "operation_id": operation,
-            "input": input,
-            "capability_token": capability_token
-        }))
+        .handle_invoke(json!(test_invoke_request(
+            "groq-local-proof",
+            operation,
+            input,
+            capability_token,
+        )))
         .await
 }
 
@@ -676,4 +677,92 @@ async fn local_non_mock_rate_limit_maps_retry_after_seconds() {
             "mapped_error": "RateLimited"
         }),
     );
+}
+
+#[fcp_async_core::runtime::test]
+async fn local_non_mock_invocation_budget_interrupts_headers_and_stream_body_waits() {
+    for (streaming, cancel) in [(false, false), (true, false), (false, true), (true, true)] {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base_url = format!("http://{}/openai/v1", listener.local_addr().unwrap());
+        let (connector, key) = setup_connector(&base_url, &[CAP_CHAT]).await;
+        let cx = fcp_async_core::compatibility_cx();
+        let server_cx = cx.clone();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            started.elapsed() < StdDuration::from_secs(3),
+                            "invocation was not dispatched"
+                        );
+                        thread::sleep(StdDuration::from_millis(2));
+                    }
+                    Err(error) => panic!("loopback accept failed: {error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(StdDuration::from_secs(2)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(StdDuration::from_secs(2)))
+                .unwrap();
+            let request = read_complete_request(&mut stream);
+            if streaming {
+                stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 4096\r\nconnection: close\r\n\r\n").unwrap();
+                stream.flush().unwrap();
+            }
+            if cancel {
+                server_cx.set_cancel_requested(true);
+            }
+            // Keep the provider silent until the caller completes. The test
+            // deadline is independent of the connector's configured five seconds.
+            let _ = finished_rx.recv_timeout(StdDuration::from_secs(2));
+            request
+        });
+        let operation = if streaming { OP_CHAT_STREAM } else { OP_CHAT };
+        let token = valid_token(&key, connector.instance_id(), CAP_CHAT, operation);
+        let mut request = test_invoke_request(
+            "interrupted",
+            operation,
+            json!({"messages":[{"role":"user","content":"private prompt"}]}),
+            token,
+        );
+        request.deadline_ms = Some(if cancel { 5_000 } else { 100 });
+        let result =
+            fcp_async_core::time::timeout(StdDuration::from_secs(1), connector.invoke(request))
+                .await;
+        cx.set_cancel_requested(false);
+        let _ = finished_tx.send(());
+        let captured = server.join().unwrap();
+        assert_request(&captured, "POST", "/openai/v1/chat/completions");
+        let error = result
+            .expect("caller deadline or cancellation must wake the pending invocation")
+            .expect_err("an interrupted provider request cannot publish success");
+        assert!(matches!(
+            error,
+            FcpError::External {
+                retryable: false,
+                ..
+            }
+        ));
+        assert!(error.to_string().contains(if cancel {
+            "cancelled"
+        } else {
+            "budget exhausted"
+        }));
+        assert!(!error.to_string().contains("private prompt"));
+        assert_eq!(connector.handle_health().await.unwrap()["requests"], 1);
+        print_artifact(
+            "invocation_interruption",
+            &json!({
+                "method":"POST", "path":"/openai/v1/chat/completions",
+                "streaming":streaming, "cancelled":cancel,
+                "provider_requests":1, "retryable":false, "partial_success":false,
+            }),
+        );
+    }
 }

@@ -4,17 +4,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use fcp_manifest::{ConnectorManifest, ManifestApprovalMode};
-use fcp_openai_compat::RateLimitPolicy;
+use fcp_openai_compat::{RateLimitPolicy, RequestBudget};
 use fcp_prelude::{
-    ApprovalMode, BaseConnector, CapabilityGrant, CapabilityId, CapabilityToken,
-    CapabilityVerifier, ConnectorId, ConnectorMetrics, EventCaps, FcpConnector, FcpError,
-    FcpResult, HandshakeRequest, HandshakeResponse, HealthSnapshot, InstanceId, Introspection,
-    InvokeRequest, InvokeResponse, OperationId, OperationInfo, RequestId, SelfCheckReport,
-    SessionId, ShutdownRequest, SimulateRequest, SimulateResponse, SubscribeRequest,
-    SubscribeResponse, UnsubscribeRequest, ZoneId,
+    ApprovalMode, BaseConnector, CapabilityId, CapabilityToken, ConnectorId, ConnectorMetrics,
+    EventCaps, FcpConnector, FcpError, FcpResult, HandshakeRequest, HandshakeResponse,
+    HealthSnapshot, InstanceId, Introspection, InvokeRequest, InvokeResponse, OperationId,
+    OperationInfo, RequestId, SelfCheckReport, SessionId, ShutdownRequest, SimulateRequest,
+    SimulateResponse, SubscribeRequest, SubscribeResponse, UnsubscribeRequest, ZoneId,
 };
+use fcp_sdk::prelude::{OperationContractSet, StandaloneSession};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use tracing::info;
 
 use crate::client::{
@@ -22,11 +21,13 @@ use crate::client::{
     validate_auth_material,
 };
 use crate::error::openai_error_to_fcp;
-use crate::types::{chat_request_from_value, legacy_request_from_value};
+use crate::types::{chat_image_resources, chat_request_from_value, legacy_request_from_value};
 
 pub const CONNECTOR_ID: &str = "fcp.groq";
 pub const CONNECTOR_VERSION: &str = "0.1.0";
 const MANIFEST_TOML: &str = include_str!("../manifest.toml");
+const MAX_INVOCATION_TIMEOUT_MS: u64 = 120_000;
+const MAX_NATIVE_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
 
 const OP_CHAT: &str = "groq.chat.completions";
 const OP_CHAT_STREAM: &str = "groq.chat.completions_stream";
@@ -60,15 +61,14 @@ struct GroqConfig {
 
 impl GroqConfig {
     fn from_params(params: &Value) -> FcpResult<Self> {
-        let inline_auth = params
-            .get("api_key")
-            .and_then(Value::as_str)
+        if !params.is_object() {
+            return Err(invalid_input("Groq configuration must be an object"));
+        }
+        let inline_auth = optional_string(params, "api_key")?
             .map(|value| validate_auth_material("api_key", value))
             .transpose()
             .map_err(invalid_config)?;
-        let credential_id = params
-            .get("credential_id")
-            .and_then(Value::as_str)
+        let credential_id = optional_string(params, "credential_id")?
             .map(|value| validate_auth_material("credential_id", value))
             .transpose()
             .map_err(invalid_config)?;
@@ -90,27 +90,30 @@ impl GroqConfig {
             }
         };
 
-        let base_url = normalize_groq_base_url(params.get("base_url").and_then(Value::as_str))
+        let base_url = normalize_groq_base_url(optional_string(params, "base_url")?)
             .map_err(invalid_config)?;
-        let default_model = params
-            .get("default_model")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
+        let default_model = optional_string(params, "default_model")?
             .unwrap_or(DEFAULT_MODEL)
             .to_string();
-        let request_timeout =
-            Duration::from_millis(optional_positive_u64(params, "request_timeout_ms", 60_000)?);
+        validate_model(&default_model)?;
+        let timeout_ms = optional_positive_u64(params, "request_timeout_ms", 60_000)?;
+        if timeout_ms > MAX_INVOCATION_TIMEOUT_MS {
+            return Err(invalid_input("request_timeout_ms must not exceed 120000"));
+        }
+        let request_timeout = Duration::from_millis(timeout_ms);
         let model_cache_ttl = Duration::from_secs(optional_positive_u64(
             params,
             "model_cache_ttl_seconds",
             3600,
         )?);
-        let rate_limit_policy = params
-            .get("wait_on_rate_limit_ms")
-            .and_then(Value::as_u64)
-            .map(Duration::from_millis)
-            .map_or(RateLimitPolicy::FailFast, RateLimitPolicy::WaitUpTo);
+        let rate_limit_policy = match params.get("wait_on_rate_limit_ms") {
+            None => RateLimitPolicy::FailFast,
+            Some(value) => {
+                RateLimitPolicy::WaitUpTo(Duration::from_millis(value.as_u64().ok_or_else(
+                    || invalid_input("wait_on_rate_limit_ms must be a nonnegative integer"),
+                )?))
+            }
+        };
 
         Ok(Self {
             auth,
@@ -133,10 +136,11 @@ impl GroqConfig {
 }
 
 pub struct GroqConnector {
-    base: Arc<BaseConnector>,
+    base: BaseConnector,
     config: Option<GroqConfig>,
     client: Option<Arc<GroqClient>>,
-    verifier: Option<CapabilityVerifier>,
+    authority: Option<StandaloneSession>,
+    configured_zone: Option<ZoneId>,
     session_id: Option<SessionId>,
     request_count: AtomicU64,
     error_count: AtomicU64,
@@ -146,10 +150,11 @@ impl GroqConnector {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            base: Arc::new(BaseConnector::new(ConnectorId::from_static(CONNECTOR_ID))),
+            base: BaseConnector::new(ConnectorId::from_static(CONNECTOR_ID)),
             config: None,
             client: None,
-            verifier: None,
+            authority: None,
+            configured_zone: None,
             session_id: None,
             request_count: AtomicU64::new(0),
             error_count: AtomicU64::new(0),
@@ -161,20 +166,41 @@ impl GroqConnector {
         &self.base.instance_id
     }
 
-    fn manifest_hash() -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(MANIFEST_TOML.as_bytes());
-        format!("sha256:{}", hex::encode(hasher.finalize()))
+    fn invalidate_session(&mut self) {
+        self.session_id = None;
+        self.base.set_handshaken(false);
+        if let Some(authority) = self.authority.as_mut() {
+            authority.invalidate();
+            self.base.instance_id = authority.instance_id().clone();
+        } else {
+            self.base.instance_id = InstanceId::new();
+        }
+    }
+
+    fn clear_configuration(&mut self) {
+        self.invalidate_session();
+        self.base.set_configured(false);
+        self.client = None;
+        self.config = None;
+        self.authority = None;
+        self.configured_zone = None;
     }
 
     pub async fn handle_configure(&mut self, params: Value) -> FcpResult<Value> {
+        // Even an unsuccessful replacement must revoke the old credentials
+        // and every capability bound to their preceding instance.
+        self.clear_configuration();
         let config = GroqConfig::from_params(&params)?;
+        operation_contracts()?;
+        let authority = StandaloneSession::new(MANIFEST_TOML)?;
         let client = config.build_client();
         let auth_mode = config.auth.redacted_label();
         let base_url = config.base_url.clone();
         let default_model = config.default_model.clone();
         self.client = Some(Arc::new(client));
         self.config = Some(config);
+        self.base.instance_id = authority.instance_id().clone();
+        self.authority = Some(authority);
         self.base.set_configured(true);
         info!(auth = %auth_mode, base_url = %base_url, "Groq connector configured");
         Ok(json!({
@@ -187,58 +213,52 @@ impl GroqConnector {
     }
 
     pub async fn handle_handshake(&mut self, params: Value) -> FcpResult<Value> {
+        self.invalidate_session();
         if self.config.is_none() {
             return Err(FcpError::NotConfigured);
         }
-        let req: HandshakeRequest =
-            serde_json::from_value(params).map_err(|err| FcpError::InvalidRequest {
-                code: 1003,
-                message: format!("Invalid handshake request: {err}"),
-            })?;
-        self.verifier = Some(CapabilityVerifier::new(
-            req.host_public_key,
-            req.zone.clone(),
-            self.base.instance_id.clone(),
-        ));
-        let session_id = SessionId::new();
-        self.session_id = Some(session_id.clone());
+        let req: HandshakeRequest = serde_json::from_value(params)
+            .map_err(|_| invalid_input("Invalid FCP handshake request"))?;
+        if req.zone != ZoneId::work()
+            || self
+                .configured_zone
+                .as_ref()
+                .is_some_and(|zone| zone != &req.zone)
+        {
+            return Err(FcpError::CapabilityDenied {
+                capability: "groq.handshake".into(),
+                reason: "Groq requires its manifest's z:work target zone".into(),
+            });
+        }
+        let zone = req.zone.clone();
+        let authority = self.authority.as_mut().ok_or(FcpError::NotConfigured)?;
+        let response = authority.handshake(req);
+        self.base.instance_id = authority.instance_id().clone();
+        let mut response = response?;
+        response.event_caps = Some(EventCaps {
+            streaming: true,
+            replay: false,
+            min_buffer_events: 0,
+            requires_ack: false,
+        });
+        let mut encoded = serde_json::to_value(&response).map_err(|_| FcpError::Internal {
+            message: "Failed to serialize handshake response".into(),
+        })?;
+        encoded["instance_id"] = json!(self.instance_id());
+        self.configured_zone = Some(zone);
+        self.session_id = Some(response.session_id);
         self.base.set_handshaken(true);
-        let capabilities_granted = req
-            .capabilities_requested
-            .into_iter()
-            .map(|capability| CapabilityGrant {
-                capability,
-                operation: None,
-            })
-            .collect::<Vec<_>>();
-
-        serde_json::to_value(HandshakeResponse {
-            status: "accepted".into(),
-            capabilities_granted,
-            session_id,
-            manifest_hash: Self::manifest_hash(),
-            nonce: req.nonce,
-            event_caps: Some(EventCaps {
-                streaming: true,
-                replay: false,
-                min_buffer_events: 0,
-                requires_ack: false,
-            }),
-            auth_caps: None,
-            op_catalog_hash: None,
-        })
-        .map_err(|err| FcpError::Internal {
-            message: format!("Failed to serialize handshake response: {err}"),
-        })
+        Ok(encoded)
     }
 
     pub async fn handle_health(&self) -> FcpResult<Value> {
         let configured = self.config.is_some();
         let handshaken = self.session_id.is_some();
         Ok(json!({
-            "status": health_status(configured, handshaken),
+            "status": health_status(configured, handshaken && self.live_auth_ready()),
             "configured": configured,
             "handshaken": handshaken,
+            "auth_ready": self.live_auth_ready(),
             "auth_mode": self.config.as_ref().map(|config| config.auth.redacted_label()),
             "base_url": self.config.as_ref().map(|config| config.base_url.clone()),
             "default_model": self.config.as_ref().map(|config| config.default_model.clone()),
@@ -249,7 +269,7 @@ impl GroqConnector {
 
     pub async fn handle_doctor(&self) -> FcpResult<Value> {
         Ok(json!({
-            "status": if self.config.is_some() && self.client.is_some() && self.session_id.is_some() {
+            "status": if self.live_auth_ready() && self.client.is_some() && self.session_id.is_some() {
                 "healthy"
             } else if self.config.is_some() && self.client.is_some() {
                 "degraded"
@@ -270,6 +290,12 @@ impl GroqConnector {
                     "message": "auth material is represented only by redacted labels"
                 },
                 {
+                    "name": "native_auth",
+                    "passed": self.live_auth_ready(),
+                    "critical": true,
+                    "message": "API-key mode is supported; host-mediated credential injection is not wired into this native transport"
+                },
+                {
                     "name": "base_url_policy",
                     "passed": self.config.as_ref().is_none_or(|config| config.base_url == DEFAULT_BASE_URL || config.base_url.contains("127.0.0.1") || config.base_url.contains("localhost")),
                     "critical": true,
@@ -283,6 +309,12 @@ impl GroqConnector {
                 }
             ]
         }))
+    }
+
+    fn live_auth_ready(&self) -> bool {
+        self.config
+            .as_ref()
+            .is_some_and(|config| !config.auth.is_secretless())
     }
 
     pub async fn handle_self_check(&self) -> FcpResult<Value> {
@@ -299,57 +331,139 @@ impl GroqConnector {
     }
 
     pub async fn handle_invoke(&self, params: Value) -> FcpResult<Value> {
-        let result = self.handle_invoke_internal(params).await;
-        self.base.record_request(result.is_ok());
-        if result.is_err() {
-            self.error_count.fetch_add(1, Ordering::Relaxed);
+        let request: InvokeRequest = serde_json::from_value(params)
+            .map_err(|_| invalid_input("Invalid FCP invoke request"))?;
+        let response = self.invoke(request).await?;
+        match response.error {
+            Some(error) => Err(error),
+            None => response.result.ok_or_else(|| FcpError::Internal {
+                message: "Validated invocation response omitted its result".into(),
+            }),
         }
-        result
     }
 
-    async fn handle_invoke_internal(&self, params: Value) -> FcpResult<Value> {
+    async fn execute_invoke(&self, request: InvokeRequest) -> FcpResult<InvokeResponse> {
         self.base.check_ready()?;
-        let operation = params
-            .get("operation_id")
-            .or_else(|| params.get("operation"))
-            .and_then(Value::as_str)
-            .ok_or_else(|| FcpError::InvalidRequest {
-                code: 1003,
-                message: "Missing operation_id".into(),
-            })?;
-        let input = params.get("input").cloned().unwrap_or_else(|| json!({}));
-        let capability_grant_value =
-            params
-                .get("capability_token")
-                .cloned()
-                .ok_or_else(|| FcpError::InvalidRequest {
-                    code: 1003,
-                    message: "Missing capability_token".into(),
-                })?;
-        let capability_grant = serde_json::from_value::<CapabilityToken>(capability_grant_value)
-            .map_err(|err| FcpError::InvalidRequest {
-                code: 1003,
-                message: format!("Invalid capability_token: {err}"),
-            })?;
-        self.verify_capability(operation, &input, capability_grant)?;
-        self.invoke_operation(operation, input).await
+        if request.r#type != "invoke"
+            || request.id.0.is_empty()
+            || !request.input.is_object()
+            || request.deadline_ms == Some(0)
+        {
+            return Err(invalid_input(
+                "Invocation requires type invoke, a non-empty ID, object input and a nonzero deadline",
+            ));
+        }
+        if matches!(request.operation.as_str(), OP_MODELS | OP_HEALTH)
+            && request
+                .idempotency_key
+                .as_deref()
+                .is_none_or(|key| key.trim().is_empty())
+        {
+            return Err(invalid_input(
+                "Strict operations require a non-empty idempotency_key",
+            ));
+        }
+        let config = self.config.as_ref().ok_or(FcpError::NotConfigured)?;
+        let timeout = config
+            .request_timeout
+            .min(Duration::from_millis(operation_timeout_ms(
+                request.operation.as_str(),
+            )))
+            .min(Duration::from_millis(
+                request.deadline_ms.unwrap_or(MAX_INVOCATION_TIMEOUT_MS),
+            ));
+        let cx = fcp_async_core::compatibility_cx();
+        let mut budget = RequestBudget::new(&cx, timeout);
+        budget
+            .checkpoint()
+            .map_err(|error| openai_error_to_fcp(&error))?;
+        let resources = self.prepare_operation(&request.operation, &request.input)?;
+        budget
+            .checkpoint()
+            .map_err(|error| openai_error_to_fcp(&error))?;
+        let witness = self
+            .authority
+            .as_ref()
+            .ok_or(FcpError::NotHandshaken)?
+            .admit_bounded(&request, &resources, MAX_NATIVE_RESPONSE_BYTES)?;
+        self.request_count.fetch_add(1, Ordering::Relaxed);
+
+        // This outer budget includes cache locking, all retries, the entire
+        // stream and response validation. Cancellation never refunds admission.
+        let result = budget
+            .run(self.invoke_operation(&cx, request.operation.as_str(), request.input.clone()))
+            .await
+            .unwrap_or_else(|error| Err(openai_error_to_fcp(&error)));
+        let mut response = match result {
+            Ok(value) => InvokeResponse::ok(request.id.clone(), value),
+            Err(error) => InvokeResponse::error(request.id.clone(), error),
+        };
+        response.resource_uris = resources;
+        operation_contracts()?.validate_response(&request.operation, &request.id, &response)?;
+        budget
+            .checkpoint()
+            .map_err(|error| openai_error_to_fcp(&error))?;
+        witness.finish_response(&response)?;
+        Ok(response)
     }
 
-    async fn invoke_operation(&self, operation: &str, input: Value) -> FcpResult<Value> {
-        self.request_count.fetch_add(1, Ordering::Relaxed);
+    fn prepare_operation(&self, operation: &OperationId, input: &Value) -> FcpResult<Vec<String>> {
+        self.base.check_ready()?;
+        required_capability(operation.as_str())?;
+        operation_contracts()?.validate_input(operation, input)?;
+        let config = self.config.as_ref().ok_or(FcpError::NotConfigured)?;
+        if config.auth.is_secretless() {
+            return Err(invalid_input(
+                "credential_id requires host-mediated credential injection; this Groq transport does not implement it",
+            ));
+        }
+        let mut resources = Vec::new();
+        let model = match operation.as_str() {
+            OP_CHAT | OP_CHAT_STREAM => {
+                let request = chat_request_from_value(input.clone(), &config.default_model)?;
+                request
+                    .validate_provider_extensions()
+                    .map_err(|error| openai_error_to_fcp(&error))?;
+                resources.extend(chat_image_resources(&request));
+                request.model
+            }
+            OP_LEGACY => {
+                let request = legacy_request_from_value(input.clone(), &config.default_model)?;
+                request
+                    .validate_provider_extensions()
+                    .map_err(|error| openai_error_to_fcp(&error))?;
+                request.model
+            }
+            OP_MODELS | OP_HEALTH => return Ok(vec!["groq:models".into()]),
+            OP_EMBEDDINGS => {
+                return Err(invalid_input(
+                    "groq.embeddings.create is not supported by Groq's first-party API; use another embeddings connector",
+                ));
+            }
+            _ => return Err(invalid_input("Unknown Groq operation")),
+        };
+        validate_model(&model)?;
+        resources.push(format!("groq:model:{model}"));
+        resources.sort();
+        resources.dedup();
+        Ok(resources)
+    }
+
+    async fn invoke_operation(
+        &self,
+        cx: &fcp_async_core::Cx,
+        operation: &str,
+        input: Value,
+    ) -> FcpResult<Value> {
         let client = self.client.as_ref().ok_or_else(|| FcpError::Internal {
             message: "Groq client not initialized".into(),
         })?;
         let config = self.config.as_ref().ok_or(FcpError::NotConfigured)?;
-        // asupersync 0.3.2 gates `Cx::for_testing` out of production builds
-        // (cap-mask bypass hardening); operations run under the connector
-        // runtime, so take the ambient context instead of fabricating one.
-        let cx = fcp_async_core::compatibility_cx();
         match operation {
             OP_CHAT => {
                 let request = chat_request_from_value(input, &config.default_model)?;
                 client
-                    .chat_completions(&cx, request)
+                    .chat_completions(cx, request)
                     .await
                     .map(chat_response_to_value)
                     .map_err(|err| openai_error_to_fcp(&err))
@@ -357,7 +471,7 @@ impl GroqConnector {
             OP_CHAT_STREAM => {
                 let request = chat_request_from_value(input, &config.default_model)?;
                 let stream = client
-                    .chat_completions_stream(&cx, request)
+                    .chat_completions_stream(cx, request)
                     .await
                     .map_err(|err| openai_error_to_fcp(&err))?;
                 collect_stream_response(stream).await
@@ -371,7 +485,7 @@ impl GroqConnector {
                     client.invalidate_model_cache().await;
                 }
                 let models = client
-                    .list_models(&cx)
+                    .list_models(cx)
                     .await
                     .map_err(|err| openai_error_to_fcp(&err))?;
                 Ok(json!({
@@ -382,7 +496,7 @@ impl GroqConnector {
             }
             OP_HEALTH => {
                 let models = client
-                    .list_models(&cx)
+                    .list_models(cx)
                     .await
                     .map_err(|err| openai_error_to_fcp(&err))?;
                 Ok(json!({
@@ -400,7 +514,7 @@ impl GroqConnector {
             OP_LEGACY => {
                 let request = legacy_request_from_value(input, &config.default_model)?;
                 client
-                    .legacy_completions(&cx, request)
+                    .legacy_completions(cx, request)
                     .await
                     .map(|response| json!({ "raw": response }))
                     .map_err(|err| openai_error_to_fcp(&err))
@@ -413,50 +527,16 @@ impl GroqConnector {
     }
 
     pub async fn handle_simulate(&self, params: Value) -> FcpResult<Value> {
-        let operation = params
-            .get("operation_id")
-            .or_else(|| params.get("operation"))
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        Ok(json!({
-            "allowed": matches!(operation, OP_CHAT | OP_CHAT_STREAM | OP_MODELS | OP_HEALTH | OP_LEGACY),
-            "reason": if operation == OP_EMBEDDINGS {
-                "Groq embeddings are intentionally not supported."
-            } else if matches!(operation, OP_CHAT | OP_CHAT_STREAM | OP_MODELS | OP_HEALTH | OP_LEGACY) {
-                "Supported operation."
-            } else {
-                "Unknown operation."
-            }
-        }))
+        let request = serde_json::from_value(params)
+            .map_err(|_| invalid_input("Invalid FCP simulate request"))?;
+        serde_json::to_value(self.simulate(request).await?).map_err(|_| FcpError::Internal {
+            message: "Failed to serialize simulation response".into(),
+        })
     }
 
     pub async fn handle_shutdown(&mut self, _params: Value) -> FcpResult<Value> {
-        self.client = None;
-        self.config = None;
-        self.verifier = None;
-        self.session_id = None;
-        self.base.set_configured(false);
-        self.base.set_handshaken(false);
+        self.clear_configuration();
         Ok(json!({ "status": "shutdown" }))
-    }
-
-    fn verify_capability(
-        &self,
-        operation: &str,
-        input: &Value,
-        token: CapabilityToken,
-    ) -> FcpResult<()> {
-        let verifier = self.verifier.as_ref().ok_or(FcpError::NotHandshaken)?;
-        let operation_id: OperationId =
-            operation.parse().map_err(|_| FcpError::InvalidRequest {
-                code: 1003,
-                message: "Invalid operation ID format".into(),
-            })?;
-        let capability = required_capability(operation)?;
-        let resources = resource_uris_for_operation(operation, input);
-        verifier
-            .verify_bound(token, &capability, &operation_id, &resources)
-            .map(|_| ())
     }
 }
 
@@ -490,7 +570,9 @@ impl FcpConnector for GroqConnector {
     }
 
     async fn health(&self) -> HealthSnapshot {
-        if self.config.is_some() && self.session_id.is_some() {
+        if self.config.is_some() && !self.live_auth_ready() {
+            HealthSnapshot::degraded("groq_credential_injection_unavailable")
+        } else if self.config.is_some() && self.session_id.is_some() {
             HealthSnapshot::ready()
         } else if self.config.is_some() {
             HealthSnapshot::degraded("groq_handshake_pending")
@@ -513,7 +595,7 @@ impl FcpConnector for GroqConnector {
         {
             return Ok(SelfCheckReport::degraded(
                 "credential_injection_required",
-                "Configured with credential_id; host-side egress credential injection is required for live checks",
+                "Configured with credential_id; host-side egress credential injection is not wired into this native transport",
             ));
         }
         Ok(SelfCheckReport::ok())
@@ -545,30 +627,46 @@ impl FcpConnector for GroqConnector {
     }
 
     async fn invoke(&self, req: InvokeRequest) -> FcpResult<InvokeResponse> {
-        let request_id = req.id;
-        self.verify_capability(req.operation.as_str(), &req.input, req.capability_token)?;
-        match self
-            .invoke_operation(req.operation.as_str(), req.input)
-            .await
-        {
-            Ok(value) => Ok(InvokeResponse::ok(request_id, value)),
-            Err(error) => Ok(InvokeResponse::error(request_id, error)),
+        let result = self.execute_invoke(req).await;
+        let succeeded = result
+            .as_ref()
+            .is_ok_and(|response| response.error.is_none());
+        self.base.record_request(succeeded);
+        if !succeeded {
+            self.error_count.fetch_add(1, Ordering::Relaxed);
         }
+        result
     }
 
     async fn simulate(&self, req: SimulateRequest) -> FcpResult<SimulateResponse> {
-        if matches!(
-            req.operation.as_str(),
-            OP_CHAT | OP_CHAT_STREAM | OP_MODELS | OP_HEALTH | OP_LEGACY
-        ) {
-            Ok(SimulateResponse::allowed(req.id))
-        } else {
-            Ok(SimulateResponse::denied(
-                req.id,
-                "operation is not supported by Groq",
-                "FCP-3010",
-            ))
+        if req.r#type != "simulate" || req.id.0.is_empty() {
+            return Err(invalid_input(
+                "Simulation requires type simulate and a non-empty ID",
+            ));
         }
+        let result = self
+            .prepare_operation(&req.operation, &req.input)
+            .and_then(|resources| {
+                self.authority
+                    .as_ref()
+                    .ok_or(FcpError::NotHandshaken)?
+                    .authorize(
+                        &req.connector_id,
+                        &req.zone_id,
+                        &req.operation,
+                        req.capability_token,
+                        &resources,
+                    )
+                    .map(|_| ())
+            });
+        Ok(match result {
+            Ok(()) => SimulateResponse::allowed(req.id),
+            Err(_) => SimulateResponse::denied(
+                req.id,
+                "Groq operation input or negotiated authority denied this simulation",
+                "FCP-3010",
+            ),
+        })
     }
 
     async fn subscribe(&self, _req: SubscribeRequest) -> FcpResult<SubscribeResponse> {
@@ -661,29 +759,62 @@ fn required_capability(operation: &str) -> FcpResult<CapabilityId> {
     }
 }
 
-fn resource_uris_for_operation(operation: &str, input: &Value) -> Vec<String> {
+fn operation_contracts() -> FcpResult<&'static OperationContractSet> {
+    static CONTRACTS: OnceLock<FcpResult<OperationContractSet>> = OnceLock::new();
+    CONTRACTS
+        .get_or_init(|| OperationContractSet::from_manifest_toml(MANIFEST_TOML))
+        .as_ref()
+        .map_err(Clone::clone)
+}
+
+fn operation_timeout_ms(operation: &str) -> u64 {
     match operation {
-        OP_CHAT | OP_CHAT_STREAM | OP_LEGACY => {
-            let model = input
-                .get("model")
-                .and_then(Value::as_str)
-                .unwrap_or(DEFAULT_MODEL);
-            vec![format!("groq:model:{model}")]
-        }
-        OP_MODELS | OP_HEALTH | OP_EMBEDDINGS => vec!["groq:models".into()],
-        _ => Vec::new(),
+        OP_HEALTH => 5_000,
+        OP_MODELS | OP_EMBEDDINGS => 30_000,
+        OP_CHAT | OP_LEGACY => 60_000,
+        _ => MAX_INVOCATION_TIMEOUT_MS,
     }
 }
 
+fn validate_model(model: &str) -> FcpResult<()> {
+    if model.is_empty()
+        || model.len() > 256
+        || model.chars().any(|character| {
+            character.is_whitespace()
+                || character.is_control()
+                || matches!(character, '*' | '?' | '[' | ']')
+        })
+    {
+        return Err(invalid_input(
+            "model must be a non-empty literal identifier of at most 256 bytes",
+        ));
+    }
+    Ok(())
+}
+
+fn optional_string<'a>(params: &'a Value, field: &str) -> FcpResult<Option<&'a str>> {
+    params
+        .get(field)
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or_else(|| invalid_config(format!("{field} must be a string")))
+        })
+        .transpose()
+}
+
 fn optional_positive_u64(params: &Value, field: &str, default: u64) -> FcpResult<u64> {
-    match params.get(field).and_then(Value::as_u64) {
-        Some(0) => Err(FcpError::InvalidRequest {
-            code: 1003,
-            message: format!("{field} must be greater than 0"),
-        }),
-        Some(value) => Ok(value),
+    match params.get(field) {
+        Some(value) => value
+            .as_u64()
+            .filter(|number| *number > 0)
+            .ok_or_else(|| invalid_config(format!("{field} must be a positive integer"))),
         None => Ok(default),
     }
+}
+
+fn invalid_input(message: &str) -> FcpError {
+    invalid_config(message.to_owned())
 }
 
 fn invalid_config(message: String) -> FcpError {
@@ -755,7 +886,7 @@ pub fn test_invoke_request(
         capability_token,
         holder_proof: None,
         context: None,
-        idempotency_key: None,
+        idempotency_key: Some(id.to_owned()),
         lease_seq: None,
         deadline_ms: None,
         correlation_id: None,
@@ -784,14 +915,24 @@ pub fn test_handshake_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
 
-    #[test]
-    fn handshake_manifest_hash_tracks_bundled_manifest() {
+    #[fcp_async_core::runtime::test]
+    async fn handshake_manifest_hash_tracks_bundled_manifest() {
         let mut hasher = Sha256::new();
         hasher.update(MANIFEST_TOML.as_bytes());
         let expected = format!("sha256:{}", hex::encode(hasher.finalize()));
+        let mut connector = GroqConnector::new();
+        connector
+            .handle_configure(json!({"api_key":"fixture"}))
+            .await
+            .unwrap();
+        let response = connector
+            .handshake(test_handshake_request(Vec::new(), [0; 32]))
+            .await
+            .unwrap();
 
-        assert_eq!(GroqConnector::manifest_hash(), expected);
-        assert_ne!(GroqConnector::manifest_hash(), "sha256:groq-connector-v1");
+        assert_eq!(response.manifest_hash, expected);
+        assert_ne!(response.manifest_hash, "sha256:groq-connector-v1");
     }
 }
