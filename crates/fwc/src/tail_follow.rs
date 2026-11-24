@@ -2,18 +2,20 @@
 //!
 //! Cursor resolution belongs to the host and precedes filtering. A missing
 //! cursor fails closed instead of silently replaying retained history. Every
-//! record is flushed; closed output stops polling immediately. The deadline
-//! covers network reads and poll waits. As with other synchronous CLI writers,
+//! record is flushed; closed output drops the response immediately. Only a
+//! validated bounded completion permits another HTTP stream. One deadline
+//! covers all connections and reads. As with other synchronous CLI writers,
 //! blocked stdout must make progress before execution can return.
 
 use std::collections::BTreeSet;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use chrono::{DateTime, TimeDelta, Utc};
-use fcp_host::{EventPageQueryRequest, EventPageQueryResponse, EventQueryRequest};
+use fcp_host::HostEvent;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::{
@@ -22,9 +24,49 @@ use super::{
     pipe::budget::ExecutionBudget, resolve_host_config,
 };
 
-const PAGE_LIMIT: usize = 1_000;
+const MAX_STREAM_EVENTS: usize = 10_000;
+const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
-const PAGE_ROUTE: &str = "/rpc/admin/events/page";
+const FOLLOW_ROUTE: &str = "/rpc/admin/events/follow";
+const TERMINAL_ALLOWANCE_MS: u64 = 250;
+
+#[derive(Serialize)]
+struct FollowRequest {
+    connector_id: Option<String>,
+    after_event_id: Option<String>,
+    timeout_ms: u64,
+    poll_interval_ms: u64,
+    max_events: usize,
+}
+
+#[derive(Deserialize)]
+struct WireRecord {
+    source: String,
+    latest_cursor: Option<String>,
+    event_count: usize,
+    #[serde(flatten)]
+    payload: WirePayload,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum WirePayload {
+    Start {
+        timeout_ms: u64,
+        poll_interval_ms: u64,
+        max_events: usize,
+    },
+    Event {
+        event: HostEvent,
+    },
+    Checkpoint,
+    Complete {
+        reason: String,
+    },
+    Error {
+        code: String,
+    },
+}
 
 #[derive(Debug)]
 struct Failure {
@@ -249,7 +291,7 @@ fn follow(
     if write_record(writer, &json!({
         "type": "start", "command": "tail", "mode": "follow",
         "source": "local-validation", "latest_cursor": progress.cursor,
-        "timeout_ms": args.timeout_ms, "poll_interval_ms": args.poll_interval_ms,
+        "timeout_ms": args.timeout_ms, "poll_interval_ms": args.poll_interval_ms.clamp(10, 5000),
         "event_limit": args.limit,
         "filters": {"connectors": connectors, "event_type": args.event_type, "since": args.since, "since_cutoff": cutoff},
     })).is_err() {
@@ -259,97 +301,77 @@ fn follow(
         if budget.remaining_ms(Instant::now()).is_err() {
             return Stopped::Timeout;
         }
-        let request = EventPageQueryRequest {
-            query: EventQueryRequest {
-                connector_id: if connectors.len() == 1 {
-                    Some(connectors[0].clone())
-                } else {
-                    None
-                },
-                kind: None,
-                unacknowledged_only: false,
-                limit: PAGE_LIMIT,
+        let Ok(timeout) = budget.preflight_timeout(client.read_timeout, Instant::now()) else {
+            return Stopped::Timeout;
+        };
+        let timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+        if timeout_ms == 0 {
+            return Stopped::Timeout;
+        }
+        let request = FollowRequest {
+            connector_id: if connectors.len() == 1 {
+                Some(connectors[0].clone())
+            } else {
+                None
             },
             after_event_id: progress.cursor.clone(),
+            // Leave room for the host's terminal record within both the
+            // configured read timeout and the original command deadline.
+            timeout_ms: timeout_ms
+                .saturating_sub(TERMINAL_ALLOWANCE_MS)
+                .clamp(1, 60_000),
+            // The host owns the poll timer and admits only this range. Report
+            // the effective interval in the CLI start record too.
+            poll_interval_ms: args.poll_interval_ms.clamp(10, 5000),
+            max_events: MAX_STREAM_EVENTS,
         };
         progress.polls = progress.polls.saturating_add(1);
-        let response: EventPageQueryResponse = match client.read_json(
-            client
-                .client
-                .post(format!("{}{PAGE_ROUTE}", client.base_url))
-                .bearer_auth(token)
-                .header("x-fcp-zone", "z:owner")
-                .json(&request),
-            "POST",
-            PAGE_ROUTE,
-        ) {
+        let response = match client
+            .client
+            .post(format!("{}{FOLLOW_ROUTE}", client.base_url))
+            .bearer_auth(token)
+            .header("x-fcp-zone", "z:owner")
+            .header(reqwest::header::ACCEPT, "application/x-ndjson")
+            .json(&request)
+            .timeout(timeout)
+            .send()
+        {
             Ok(response) => response,
             Err(_) if budget.remaining_ms(Instant::now()).is_err() => return Stopped::Timeout,
             Err(_) => {
                 return Stopped::Failed(Failure::transport(
-                    "event-query-failed",
-                    "The selected host could not provide a bounded authenticated event page. Check its admin credential and event-page API support; resume from the retained cursor.",
+                    "event-stream-failed",
+                    "The selected host could not open an authenticated event stream. Check its admin credential and event-follow API support; resume from the retained cursor.",
                 ));
             }
         };
-        if let Err(failure) = validate_page(&request, &response) {
-            return Stopped::Failed(failure);
-        }
-        for event in &response.events {
-            if budget.remaining_ms(Instant::now()).is_err() {
-                return Stopped::Timeout;
-            }
-            if (connectors.is_empty()
-                || event
-                    .connector_id
-                    .as_ref()
-                    .is_some_and(|id| connectors.contains(id)))
-                && cutoff.is_none_or(|cutoff| event.timestamp >= cutoff)
-                && args
-                    .event_type
-                    .as_deref()
-                    .is_none_or(|filter| host_event_matches_type_filter(event, filter))
-            {
-                if write_record(
-                    writer,
-                    &json!({
-                        "type": "event", "command": "tail", "source": "host-admin-api",
-                        "event_id": event.event_id, "latest_cursor": event.event_id,
-                        "event": host_event_to_connector_event(event),
-                    }),
-                )
-                .is_err()
-                {
-                    return Stopped::OutputClosed;
-                }
-                progress.events = progress.events.saturating_add(1);
-            }
-            progress.cursor = Some(event.event_id.clone());
-            if args.limit != 0 && progress.events >= args.limit {
-                // Stop at the consumed event, not the host's end-of-page cursor.
-                return Stopped::Limit;
-            }
-        }
-        if let Some(cursor) = response.next_cursor {
-            progress.cursor = Some(cursor);
-        }
-        if write_record(
-            writer,
-            &json!({
-                "type": "checkpoint", "command": "tail", "source": "host-admin-api",
-                "latest_cursor": progress.cursor, "event_count": progress.events,
-                "polls": progress.polls, "caught_up": !response.has_more,
-            }),
-        )
-        .is_err()
+        if !response.status().is_success()
+            || !response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.split(';').next())
+                .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/x-ndjson"))
+            || response
+                .content_length()
+                .is_some_and(|bytes| bytes > MAX_RESPONSE_BYTES)
         {
-            return Stopped::OutputClosed;
+            return Stopped::Failed(invalid_stream());
         }
-        if !response.has_more {
+        if let Err(stopped) = consume_stream(
+            response, &request, args, connectors, cutoff, budget, progress, writer,
+        ) {
+            return stopped;
+        }
+        // A peer returning empty terminal records immediately must not cause
+        // an unbounded request loop. This wait shares the original deadline.
+        if progress.cursor == request.after_event_id {
             let Ok(Some(remaining)) = budget.remaining_ms(Instant::now()) else {
                 return Stopped::Timeout;
             };
-            std::thread::sleep(Duration::from_millis(args.poll_interval_ms.min(remaining)));
+            std::thread::sleep(Duration::from_millis(
+                request.poll_interval_ms.min(remaining),
+            ));
         }
     }
 }
@@ -358,57 +380,213 @@ fn valid_cursor(cursor: &str) -> bool {
     !cursor.trim().is_empty() && cursor.len() <= 1_024 && !cursor.chars().any(char::is_control)
 }
 
-fn validate_page(
-    request: &EventPageQueryRequest,
-    response: &EventPageQueryResponse,
-) -> std::result::Result<(), Failure> {
-    let invalid = || {
-        Failure::transport(
-            "invalid-event-page",
-            "The host returned an inconsistent event page or cursor. No events from this page were consumed; resume from the retained cursor.",
-        )
-    };
-    if response.after_event_id != request.after_event_id {
-        return Err(invalid());
+fn invalid_stream() -> Failure {
+    Failure::transport(
+        "invalid-event-stream",
+        "The host returned an invalid, incomplete, or oversized event stream. Resume explicitly from the last flushed cursor; no automatic replay was attempted.",
+    )
+}
+
+fn read_record<R: BufRead>(
+    reader: &mut R,
+    received_bytes: &mut u64,
+) -> std::result::Result<WireRecord, Failure> {
+    let capacity = MAX_FRAME_BYTES.min(
+        usize::try_from(MAX_RESPONSE_BYTES.saturating_sub(*received_bytes)).unwrap_or(usize::MAX),
+    );
+    if capacity == 0 {
+        return Err(invalid_stream());
     }
-    if request.after_event_id.is_some() && response.cursor_found == Some(false) {
-        return Err(Failure::transport(
-            "event-cursor-unavailable",
-            "The host no longer retains the requested cursor. Follow stopped without restarting or skipping history; select a new starting point explicitly.",
-        ));
+    let mut line = Vec::new();
+    // read_until alone is unbounded on a peer that omits the newline. Take
+    // one extra byte so a limit is detected without allocating its suffix.
+    (&mut *reader)
+        .take(capacity as u64 + 1)
+        .read_until(b'\n', &mut line)
+        .map_err(|_| invalid_stream())?;
+    if line.len() > capacity || line.last() != Some(&b'\n') {
+        return Err(invalid_stream());
     }
-    if response.cursor_found != request.after_event_id.as_ref().map(|_| true)
-        || response.events.len() > PAGE_LIMIT
-        || response
-            .next_cursor
-            .as_deref()
-            .is_some_and(|cursor| !valid_cursor(cursor))
-    {
-        return Err(invalid());
+    *received_bytes += line.len() as u64;
+    serde_json::from_slice(&line).map_err(|_| invalid_stream())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn consume_stream<R: Read>(
+    response: R,
+    request: &FollowRequest,
+    args: &TailArgs,
+    connectors: &[String],
+    cutoff: Option<DateTime<Utc>>,
+    budget: ExecutionBudget,
+    progress: &mut Progress,
+    writer: &mut dyn Write,
+) -> std::result::Result<(), Stopped> {
+    let mut reader = BufReader::new(response.take(MAX_RESPONSE_BYTES + 1));
+    let mut received_bytes = 0;
+    let mut received_events = 0;
+    let mut started = false;
+    // Both the byte cap and server event cap bound this per-connection set.
+    let mut seen = BTreeSet::new();
+    if let Some(cursor) = &request.after_event_id {
+        seen.insert(cursor.clone());
     }
-    let mut ids = BTreeSet::new();
-    for event in &response.events {
-        if !valid_cursor(&event.event_id)
-            || Some(&event.event_id) == request.after_event_id.as_ref()
-            || !ids.insert(event.event_id.as_str())
+    loop {
+        if budget.remaining_ms(Instant::now()).is_err() {
+            return Err(Stopped::Timeout);
+        }
+        let record = read_record(&mut reader, &mut received_bytes).map_err(|failure| {
+            if budget.remaining_ms(Instant::now()).is_err() {
+                Stopped::Timeout
+            } else {
+                Stopped::Failed(failure)
+            }
+        })?;
+        if budget.remaining_ms(Instant::now()).is_err() {
+            return Err(Stopped::Timeout);
+        }
+        if record.source != "host-admin-api"
+            || record
+                .latest_cursor
+                .as_deref()
+                .is_some_and(|cursor| !valid_cursor(cursor))
         {
-            return Err(invalid());
+            return Err(Stopped::Failed(invalid_stream()));
+        }
+        if !started {
+            let WirePayload::Start {
+                timeout_ms,
+                poll_interval_ms,
+                max_events,
+            } = record.payload
+            else {
+                return Err(Stopped::Failed(invalid_stream()));
+            };
+            if record.event_count != 0
+                || record.latest_cursor != request.after_event_id
+                || timeout_ms != request.timeout_ms
+                || poll_interval_ms != request.poll_interval_ms
+                || max_events != request.max_events
+            {
+                return Err(Stopped::Failed(invalid_stream()));
+            }
+            started = true;
+            continue;
+        }
+        match record.payload {
+            WirePayload::Start { .. } => return Err(Stopped::Failed(invalid_stream())),
+            WirePayload::Event { event } => {
+                if received_events >= request.max_events
+                    || record.event_count != received_events + 1
+                    || record.latest_cursor.as_deref() != Some(event.event_id.as_str())
+                    || !seen.insert(event.event_id.clone())
+                    || request
+                        .connector_id
+                        .as_ref()
+                        .is_some_and(|id| event.connector_id.as_ref() != Some(id))
+                {
+                    return Err(Stopped::Failed(invalid_stream()));
+                }
+                let matches = (connectors.is_empty()
+                    || event
+                        .connector_id
+                        .as_ref()
+                        .is_some_and(|id| connectors.contains(id)))
+                    && cutoff.is_none_or(|cutoff| event.timestamp >= cutoff)
+                    && args
+                        .event_type
+                        .as_deref()
+                        .is_none_or(|filter| host_event_matches_type_filter(&event, filter));
+                let output = if matches {
+                    json!({
+                        "type": "event", "command": "tail", "source": "host-admin-api",
+                        "event_id": event.event_id, "latest_cursor": event.event_id,
+                        "event": host_event_to_connector_event(&event),
+                    })
+                } else {
+                    // Filtered events still advance the scan cursor. Publish
+                    // that checkpoint before committing the resume position.
+                    json!({
+                        "type": "checkpoint", "command": "tail", "source": "host-admin-api",
+                        "latest_cursor": event.event_id, "event_count": progress.events,
+                        "polls": progress.polls, "caught_up": false,
+                    })
+                };
+                write_record(writer, &output).map_err(|_| Stopped::OutputClosed)?;
+                received_events += 1;
+                progress.events += usize::from(matches);
+                progress.cursor = Some(event.event_id);
+                if args.limit != 0 && progress.events >= args.limit {
+                    return Err(Stopped::Limit);
+                }
+            }
+            WirePayload::Checkpoint => {
+                if record.event_count != received_events
+                    || (progress.cursor.is_some() && record.latest_cursor.is_none())
+                    || (record.latest_cursor != progress.cursor
+                        && record
+                            .latest_cursor
+                            .as_ref()
+                            .is_some_and(|cursor| !seen.insert(cursor.clone())))
+                {
+                    return Err(Stopped::Failed(invalid_stream()));
+                }
+                write_record(
+                    writer,
+                    &json!({
+                        "type": "checkpoint", "command": "tail", "source": "host-admin-api",
+                        "latest_cursor": record.latest_cursor, "event_count": progress.events,
+                        "polls": progress.polls, "caught_up": true,
+                    }),
+                )
+                .map_err(|_| Stopped::OutputClosed)?;
+                progress.cursor = record.latest_cursor;
+            }
+            terminal @ (WirePayload::Complete { .. } | WirePayload::Error { .. }) => {
+                if record.event_count != received_events || record.latest_cursor != progress.cursor
+                {
+                    return Err(Stopped::Failed(invalid_stream()));
+                }
+                // A terminal record does not authorize a subsequent stream
+                // until this HTTP body ends cleanly. Reject trailing data.
+                let mut suffix = [0_u8; 1];
+                let suffix_length = reader.read(&mut suffix).map_err(|_| {
+                    if budget.remaining_ms(Instant::now()).is_err() {
+                        Stopped::Timeout
+                    } else {
+                        Stopped::Failed(invalid_stream())
+                    }
+                })?;
+                if budget.remaining_ms(Instant::now()).is_err() {
+                    return Err(Stopped::Timeout);
+                }
+                if suffix_length != 0 {
+                    return Err(Stopped::Failed(invalid_stream()));
+                }
+                return match terminal {
+                    WirePayload::Complete { reason }
+                        if reason == "timeout"
+                            || reason == "byte-limit"
+                            || (reason == "event-limit"
+                                && received_events == request.max_events) =>
+                    {
+                        Ok(())
+                    }
+                    WirePayload::Error { code } if code == "cursor-not-found" => {
+                        Err(Stopped::Failed(Failure::transport(
+                            "event-cursor-unavailable",
+                            "The host no longer retains the requested cursor. Follow stopped without restarting or skipping history; select a new starting point explicitly.",
+                        )))
+                    }
+                    WirePayload::Error { .. } => Err(Stopped::Failed(Failure::transport(
+                        "event-stream-failed",
+                        "The selected host stopped event delivery. Resume explicitly from the last flushed cursor after resolving the host error.",
+                    ))),
+                    _ => Err(Stopped::Failed(invalid_stream())),
+                };
+            }
         }
     }
-    if let Some(last) = response.events.last() {
-        let Some(next) = response.next_cursor.as_deref() else {
-            return Err(invalid());
-        };
-        if response.next_cursor == request.after_event_id
-            || (response.has_more && next != last.event_id)
-            || (ids.contains(next) && next != last.event_id)
-        {
-            return Err(invalid());
-        }
-    } else if response.has_more {
-        return Err(invalid());
-    }
-    Ok(())
 }
 
 fn write_record(writer: &mut dyn Write, record: &Value) -> std::io::Result<()> {
@@ -444,6 +622,10 @@ mod tests {
 
     impl Server {
         fn start(replies: Vec<(Value, Duration)>) -> Self {
+            Self::start_with_pause(replies, None)
+        }
+
+        fn start_with_pause(replies: Vec<(Value, Duration)>, pause: Option<Duration>) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
             let endpoint = format!("http://{}", listener.local_addr().unwrap());
@@ -492,22 +674,53 @@ mod tests {
                         .unwrap_or(0);
                     let mut bytes = vec![0; length];
                     reader.read_exact(&mut bytes).unwrap();
+                    let request_body: Value = serde_json::from_slice(&bytes).unwrap();
                     thread_requests.lock().unwrap().push(Request {
                         route,
                         headers,
-                        body: serde_json::from_slice(&bytes).unwrap(),
+                        body: request_body.clone(),
                     });
                     let (reply, delay) = replies.get(served).expect("unexpected extra event query");
                     std::thread::sleep(*delay);
-                    let body = serde_json::to_vec(reply).unwrap();
+                    let mut frames = reply.as_array().unwrap().clone();
+                    for frame in &mut frames {
+                        if frame["type"] == "start" {
+                            for field in ["timeout_ms", "poll_interval_ms", "max_events"] {
+                                if frame.get(field).is_none() {
+                                    frame[field] = request_body[field].clone();
+                                }
+                            }
+                        }
+                    }
+                    let frames = frames
+                        .iter()
+                        .map(|frame| {
+                            let mut bytes = serde_json::to_vec(frame).unwrap();
+                            bytes.push(b'\n');
+                            bytes
+                        })
+                        .collect::<Vec<_>>();
                     let header = format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                        body.len()
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        frames.iter().map(Vec::len).sum::<usize>()
                     );
                     // Deadline tests intentionally close before a delayed reply.
-                    let _ = stream
-                        .write_all(header.as_bytes())
-                        .and_then(|()| stream.write_all(&body));
+                    if stream.write_all(header.as_bytes()).is_ok() {
+                        for (index, frame) in frames.iter().enumerate() {
+                            if stream
+                                .write_all(frame)
+                                .and_then(|()| stream.flush())
+                                .is_err()
+                            {
+                                break;
+                            }
+                            if index == 1
+                                && let Some(pause) = pause
+                            {
+                                std::thread::sleep(pause);
+                            }
+                        }
+                    }
                     served += 1;
                 }
             });
@@ -564,8 +777,44 @@ mod tests {
         })
     }
 
-    fn page(after: Option<&str>, next: Option<&str>, more: bool, events: Vec<Value>) -> Value {
-        json!({"after_event_id": after, "cursor_found": after.map(|_| true), "next_cursor": next, "has_more": more, "events": events})
+    fn start(cursor: Option<&str>) -> Value {
+        json!({"type":"start", "source":"host-admin-api", "latest_cursor":cursor, "event_count":0})
+    }
+
+    fn checkpoint(cursor: Option<&str>, count: usize) -> Value {
+        json!({"type":"checkpoint", "source":"host-admin-api", "latest_cursor":cursor, "event_count":count})
+    }
+
+    fn terminal(cursor: Option<&str>, count: usize, reason: &str) -> Value {
+        json!({"type":"complete", "source":"host-admin-api", "latest_cursor":cursor, "event_count":count, "reason":reason})
+    }
+
+    fn event_record(event: Value, count: usize) -> Value {
+        json!({"type":"event", "source":"host-admin-api", "latest_cursor":event["event_id"], "event_count":count, "event":event})
+    }
+
+    fn batch(after: Option<&str>, next: Option<&str>, more: bool, events: Vec<Value>) -> Value {
+        let count = events.len();
+        let last = events
+            .last()
+            .and_then(|event| event["event_id"].as_str())
+            .map(str::to_owned);
+        let mut frames = vec![start(after)];
+        frames.extend(
+            events
+                .into_iter()
+                .enumerate()
+                .map(|(index, event)| event_record(event, index + 1)),
+        );
+        if !more || next != last.as_deref() {
+            frames.push(checkpoint(next, count));
+        }
+        frames.push(terminal(
+            next,
+            count,
+            if count == 0 { "timeout" } else { "byte-limit" },
+        ));
+        json!(frames)
     }
 
     #[derive(Default)]
@@ -598,10 +847,10 @@ mod tests {
     }
 
     #[test]
-    fn tail_follow_pages_keep_filters_auth_and_exact_mid_page_cursor() {
+    fn tail_follow_streams_keep_filters_auth_and_exact_consumed_cursor() {
         let server = Server::start(vec![
             (
-                page(
+                batch(
                     Some("evt-1"),
                     Some("evt-4"),
                     true,
@@ -614,7 +863,7 @@ mod tests {
                 Duration::ZERO,
             ),
             (
-                page(
+                batch(
                     Some("evt-4"),
                     Some("evt-6"),
                     false,
@@ -646,10 +895,12 @@ mod tests {
         let requests = server.finish();
         assert_eq!(requests.len(), 2);
         for request in &requests {
-            assert_eq!(request.route, "POST /rpc/admin/events/page");
+            assert_eq!(request.route, "POST /rpc/admin/events/follow");
             assert_eq!(request.headers["authorization"], "Bearer tail-test-secret");
             assert_eq!(request.headers["x-fcp-zone"], "z:owner");
-            assert_eq!(request.body["query"]["limit"], 1_000);
+            assert_eq!(request.headers["accept"], "application/x-ndjson");
+            assert_eq!(request.body["max_events"], 10_000);
+            assert!(request.body["timeout_ms"].as_u64().unwrap() <= 60_000);
         }
         assert_eq!(requests[1].body["after_event_id"], "evt-4");
         let records = records(&writer);
@@ -659,10 +910,17 @@ mod tests {
                 .iter()
                 .map(|record| record["type"].as_str().unwrap())
                 .collect::<Vec<_>>(),
-            ["start", "event", "checkpoint", "event", "complete"]
+            [
+                "start",
+                "checkpoint",
+                "event",
+                "checkpoint",
+                "event",
+                "complete"
+            ]
         );
-        assert_eq!(records[1]["event_id"], "evt-3");
-        assert_eq!(records[3]["event_id"], "evt-5");
+        assert_eq!(records[2]["event_id"], "evt-3");
+        assert_eq!(records[4]["event_id"], "evt-5");
         assert_eq!(records.last().unwrap()["latest_cursor"], "evt-5");
         assert_eq!(records.last().unwrap()["event_count"], 2);
         assert!(
@@ -673,39 +931,38 @@ mod tests {
     }
 
     #[test]
-    fn tail_follow_refuses_gaps_mismatched_pages_and_nonprogress() {
-        let mut missing = page(Some("anchor"), Some("anchor"), false, vec![]);
-        missing["cursor_found"] = json!(false);
+    fn tail_follow_refuses_gaps_invalid_framing_and_cursor_regression() {
+        let missing = json!({"type":"error", "source":"host-admin-api", "latest_cursor":"anchor", "event_count":0,
+            "code":"cursor-not-found", "message":"tail-test-secret"});
+        let mut wrong_source = checkpoint(Some("anchor"), 0);
+        wrong_source["source"] = json!("untrusted");
+        let mut wrong_count = event_record(event("next", "github", "health_check"), 3);
+        wrong_count["latest_cursor"] = json!("next");
         for response in [
-            missing,
-            page(
-                Some("wrong"),
-                Some("next"),
-                false,
-                vec![event("next", "github", "health_check")],
-            ),
-            page(
-                Some("anchor"),
-                Some("anchor"),
-                false,
-                vec![event("anchor", "github", "health_check")],
-            ),
-            page(Some("anchor"), Some("next"), true, vec![]),
-            page(
-                Some("anchor"),
-                Some("next"),
-                false,
-                vec![
-                    event("next", "github", "health_check"),
-                    event("next", "github", "health_check"),
-                ],
-            ),
-            page(
-                Some("anchor"),
-                Some("anchor"),
-                true,
-                vec![event("next", "github", "health_check")],
-            ),
+            json!([start(Some("anchor")), missing]),
+            json!([start(Some("wrong"))]),
+            json!([checkpoint(Some("anchor"), 0)]),
+            json!([start(Some("anchor")), start(Some("anchor"))]),
+            json!([start(Some("anchor")), checkpoint(None, 0)]),
+            json!([start(Some("anchor")), wrong_source]),
+            json!([start(Some("anchor")), wrong_count]),
+            json!([
+                start(Some("anchor")),
+                event_record(event("anchor", "github", "health_check"), 1)
+            ]),
+            json!([
+                start(Some("anchor")),
+                terminal(Some("anchor"), 0, "unknown")
+            ]),
+            json!([
+                start(Some("anchor")),
+                terminal(Some("anchor"), 0, "event-limit")
+            ]),
+            json!([
+                start(Some("anchor")),
+                terminal(Some("anchor"), 0, "timeout"),
+                checkpoint(Some("next"), 0)
+            ]),
         ] {
             let server = Server::start(vec![(response, Duration::ZERO)]);
             let (_directory, prepared) =
@@ -721,6 +978,11 @@ mod tests {
             assert_eq!(records[1]["type"], "error");
             assert_eq!(records[1]["latest_cursor"], "anchor");
             assert_eq!(records[1]["event_count"], 0);
+            assert!(
+                !String::from_utf8(writer.bytes)
+                    .unwrap()
+                    .contains("tail-test-secret")
+            );
         }
     }
 
@@ -728,7 +990,7 @@ mod tests {
     fn tail_follow_shares_one_deadline_across_reads_and_poll_waits() {
         let server = Server::start(vec![
             (
-                page(
+                batch(
                     None,
                     Some("evt-1"),
                     true,
@@ -737,7 +999,7 @@ mod tests {
                 Duration::from_millis(100),
             ),
             (
-                page(
+                batch(
                     Some("evt-1"),
                     Some("evt-2"),
                     false,
@@ -760,7 +1022,7 @@ mod tests {
         assert_eq!(records.last().unwrap()["reason"], "timeout");
         assert_eq!(records.last().unwrap()["latest_cursor"], "evt-1");
 
-        let server = Server::start(vec![(page(None, None, false, vec![]), Duration::ZERO)]);
+        let server = Server::start(vec![(batch(None, None, false, vec![]), Duration::ZERO)]);
         let (_directory, prepared) = self::prepared(
             &server.endpoint,
             &[
@@ -787,7 +1049,7 @@ mod tests {
     fn tail_follow_closed_output_stops_without_more_requests_or_frames() {
         for fail_after in [0, 1] {
             let server = Server::start(vec![(
-                page(
+                batch(
                     None,
                     Some("evt-1"),
                     true,
@@ -810,14 +1072,14 @@ mod tests {
     }
 
     #[test]
-    fn tail_follow_polls_after_catch_up_without_repeating_history() {
+    fn tail_follow_resumes_after_checkpoint_without_repeating_history() {
         let server = Server::start(vec![
             (
-                page(Some("anchor"), Some("filtered-end"), false, vec![]),
+                batch(Some("anchor"), Some("filtered-end"), false, vec![]),
                 Duration::ZERO,
             ),
             (
-                page(
+                batch(
                     Some("filtered-end"),
                     Some("new-event"),
                     false,
@@ -846,7 +1108,7 @@ mod tests {
         let requests = server.finish();
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[1].body["after_event_id"], "filtered-end");
-        assert_eq!(requests[1].body["query"]["connector_id"], "github");
+        assert_eq!(requests[1].body["connector_id"], "github");
         let records = records(&writer);
         assert_eq!(records[1]["type"], "checkpoint");
         assert_eq!(records[1]["latest_cursor"], "filtered-end");
@@ -854,12 +1116,62 @@ mod tests {
     }
 
     #[test]
-    fn tail_follow_keeps_the_initial_since_cutoff_for_later_pages() {
+    fn tail_follow_resumes_checkpoint_only_byte_limits() {
+        for cursor in ["anchor", "scanned-end"] {
+            let server = Server::start(vec![
+                (
+                    json!([
+                        start(Some("anchor")),
+                        checkpoint(Some(cursor), 0),
+                        terminal(Some(cursor), 0, "byte-limit"),
+                    ]),
+                    Duration::ZERO,
+                ),
+                (
+                    batch(
+                        Some(cursor),
+                        Some("new-event"),
+                        false,
+                        vec![event("new-event", "github", "health_check")],
+                    ),
+                    Duration::ZERO,
+                ),
+            ]);
+            let (_directory, prepared) = prepared(
+                &server.endpoint,
+                &[
+                    "github",
+                    "--cursor",
+                    "anchor",
+                    "--limit",
+                    "1",
+                    "--poll-interval-ms",
+                    "10",
+                ],
+            );
+            let mut writer = Writer::default();
+            assert_eq!(
+                execute_with_writer(&prepared, &mut writer).unwrap(),
+                CliExitCode::Success.into()
+            );
+            let requests = server.finish();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[1].body["after_event_id"], cursor);
+            let records = records(&writer);
+            assert_eq!(records[1]["type"], "checkpoint");
+            assert_eq!(records[1]["latest_cursor"], cursor);
+            assert_eq!(records.last().unwrap()["latest_cursor"], "new-event");
+            assert_eq!(records.last().unwrap()["event_count"], 1);
+        }
+    }
+
+    #[test]
+    fn tail_follow_keeps_the_initial_since_cutoff_for_later_streams() {
         let mut recent = event("evt-2", "github", "health_check");
         recent["timestamp"] = json!((Utc::now() - TimeDelta::milliseconds(100)).to_rfc3339());
         let server = Server::start(vec![
             (
-                page(
+                batch(
                     None,
                     Some("evt-1"),
                     true,
@@ -868,7 +1180,7 @@ mod tests {
                 Duration::from_millis(1_100),
             ),
             (
-                page(Some("evt-1"), Some("evt-2"), false, vec![recent]),
+                batch(Some("evt-1"), Some("evt-2"), false, vec![recent]),
                 Duration::ZERO,
             ),
         ]);
@@ -893,6 +1205,149 @@ mod tests {
         let records = records(&writer);
         assert_eq!(records.last().unwrap()["event_count"], 1);
         assert_eq!(records.last().unwrap()["latest_cursor"], "evt-2");
+    }
+
+    #[test]
+    fn tail_follow_delivers_before_the_http_body_finishes() {
+        let server = Server::start_with_pause(
+            vec![(
+                batch(
+                    None,
+                    Some("evt-1"),
+                    false,
+                    vec![event("evt-1", "github", "health_check")],
+                ),
+                Duration::ZERO,
+            )],
+            Some(Duration::from_millis(750)),
+        );
+        let (_directory, prepared) = prepared(&server.endpoint, &["--limit", "1"]);
+        let mut writer = Writer::default();
+        let started = Instant::now();
+        assert_eq!(
+            execute_with_writer(&prepared, &mut writer).unwrap(),
+            CliExitCode::Success.into()
+        );
+        assert!(started.elapsed() < Duration::from_millis(600));
+        assert_eq!(server.finish().len(), 1);
+        assert_eq!(records(&writer)[1]["event_id"], "evt-1");
+    }
+
+    #[test]
+    fn tail_follow_retains_flushed_evidence_after_disconnect_duplicate_or_terminal_suffix() {
+        let delivered = event_record(event("evt-1", "github", "health_check"), 1);
+        for frames in [
+            json!([start(None), delivered]),
+            json!([
+                start(None),
+                delivered,
+                event_record(event("evt-1", "github", "health_check"), 2)
+            ]),
+            json!([
+                start(None),
+                delivered,
+                terminal(Some("evt-1"), 1, "byte-limit"),
+                checkpoint(Some("untrusted"), 1)
+            ]),
+        ] {
+            let server = Server::start(vec![(frames, Duration::ZERO)]);
+            let (_directory, prepared) = prepared(&server.endpoint, &["--limit", "0"]);
+            let mut writer = Writer::default();
+            assert_eq!(
+                execute_with_writer(&prepared, &mut writer).unwrap(),
+                CliExitCode::Transport.into()
+            );
+            assert_eq!(
+                server.finish().len(),
+                1,
+                "uncertain streams must not reconnect"
+            );
+            let records = records(&writer);
+            assert_eq!(records.len(), 3);
+            assert_eq!(records[1]["event_id"], "evt-1");
+            assert_eq!(records[2]["type"], "error");
+            assert_eq!(records[2]["latest_cursor"], "evt-1");
+            assert_eq!(records[2]["event_count"], 1);
+        }
+    }
+
+    #[test]
+    fn tail_follow_bounds_unterminated_frames_and_total_encoded_bytes() {
+        let mut oversized = std::io::Cursor::new(vec![b' '; MAX_FRAME_BYTES * 2]);
+        assert!(read_record(&mut oversized, &mut 0).is_err());
+        assert_eq!(oversized.position(), (MAX_FRAME_BYTES + 1) as u64);
+
+        let mut bytes = serde_json::to_vec(&checkpoint(Some("evt-1"), 0)).unwrap();
+        bytes.push(b'\n');
+        let mut reader = std::io::Cursor::new(&bytes);
+        let mut received = MAX_RESPONSE_BYTES - bytes.len() as u64 + 1;
+        assert!(read_record(&mut reader, &mut received).is_err());
+        assert_eq!(received, MAX_RESPONSE_BYTES - bytes.len() as u64 + 1);
+
+        let mut reader = std::io::Cursor::new(&bytes);
+        let mut received = MAX_RESPONSE_BYTES - bytes.len() as u64;
+        assert!(read_record(&mut reader, &mut received).is_ok());
+        assert_eq!(received, MAX_RESPONSE_BYTES);
+        assert!(read_record(&mut reader, &mut received).is_err());
+    }
+
+    #[test]
+    fn tail_follow_terminal_drain_keeps_the_original_deadline() {
+        struct DelayedEof {
+            bytes: std::io::Cursor<Vec<u8>>,
+            fail: bool,
+        }
+
+        impl Read for DelayedEof {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                if self.bytes.position() == self.bytes.get_ref().len() as u64 {
+                    std::thread::sleep(Duration::from_millis(40));
+                    if self.fail {
+                        return Err(std::io::ErrorKind::TimedOut.into());
+                    }
+                    return Ok(0);
+                }
+                self.bytes.read(buffer)
+            }
+        }
+
+        let (_directory, prepared) = prepared("http://127.0.0.1:9", &["--limit", "0"]);
+        let Commands::Tail(args) = &prepared.cli.command else {
+            panic!("tail command");
+        };
+        let request = FollowRequest {
+            connector_id: None,
+            after_event_id: None,
+            timeout_ms: 1,
+            poll_interval_ms: 10,
+            max_events: MAX_STREAM_EVENTS,
+        };
+        let mut begin = start(None);
+        begin["timeout_ms"] = json!(request.timeout_ms);
+        begin["poll_interval_ms"] = json!(request.poll_interval_ms);
+        begin["max_events"] = json!(request.max_events);
+        let mut bytes = Vec::new();
+        for record in [begin, terminal(None, 0, "timeout")] {
+            serde_json::to_writer(&mut bytes, &record).unwrap();
+            bytes.push(b'\n');
+        }
+        for fail in [false, true] {
+            let budget = ExecutionBudget::start(Some(20), Instant::now());
+            let result = consume_stream(
+                DelayedEof {
+                    bytes: std::io::Cursor::new(bytes.clone()),
+                    fail,
+                },
+                &request,
+                args,
+                &[],
+                None,
+                budget,
+                &mut Progress::default(),
+                &mut Writer::default(),
+            );
+            assert!(matches!(result, Err(Stopped::Timeout)));
+        }
     }
 
     #[test]

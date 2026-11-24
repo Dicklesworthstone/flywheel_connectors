@@ -4475,9 +4475,10 @@ fwc tail --follow \
 
 The token can also come from `FCP_HOST_ADMIN_BEARER_TOKEN`. Follow accepts HTTPS,
 literal loopback HTTP, or a Unix socket; it refuses redirects and automatic HTTP
-retries. It requires the authenticated `POST /rpc/admin/events/page` endpoint.
+retries. It consumes the authenticated `POST /rpc/admin/events/follow` endpoint
+as a live NDJSON stream; events become visible before the HTTP body completes.
 
-Without a cursor, the command starts with retained history and then polls for
+Without a cursor, the command starts with retained history and then follows
 new events. `--since` fixes the lookback cutoff once at startup. Connector and
 event-type filters retain their ordinary tail meanings. Resume with
 `--cursor <latest_cursor>` from a received event, checkpoint, or terminal record,
@@ -4494,17 +4495,24 @@ error; the command never silently restarts from the beginning.
 
 The default event limit is **50**. `--limit 0` follows until the timeout, which
 defaults to **300,000 ms** and is bounded to one day. `--poll-interval-ms` defaults
-to **1,000 ms** and accepts 1–60,000 ms. Catch-up pages are read immediately;
-the interval applies once the retained history is exhausted. Network reads and
-poll waits share the original deadline. A blocked synchronous output writer
-must make progress before the command can return.
+to **1,000 ms**. The CLI accepts 1–60,000 ms and clamps the effective host polling
+interval to **10–5,000 ms**, reporting it in the `start` record. Catch-up events
+arrive immediately; the host polls once retained history is exhausted. All
+connections, network reads, and reconnect waits share the original deadline.
+A blocked synchronous output writer must make progress before the command can
+return.
 
-Each HTTP page contains at most **1,000 events** and its encoded response is
-limited to **8 MiB**. Stopping partway through a page retains the exact consumed
-event cursor, so a subsequent run does not skip the page's remaining events.
-Closing the output consumer stops further polling. Follow emits NDJSON directly
-and rejects buffered rendering transforms; `--follow --dry-run` previews the
-settings without contacting the host or reading the admin token.
+Each HTTP stream is limited to **10,000 events**, **1 MiB per frame**, and
+**8 MiB** overall. Its duration is bounded by the configured host read timeout
+and the remaining command deadline, with time reserved for terminal delivery.
+After a validated timeout, byte-limit, or event-limit completion and clean HTTP
+EOF, the CLI reconnects from the last flushed cursor using the same credentials,
+filters, and initial lookback cutoff. A truncated stream, invalid frame, missing
+cursor, or host error stops the command and retains that cursor for explicit
+recovery. Closing the output consumer drops the response immediately. Follow
+emits NDJSON directly and rejects buffered rendering transforms;
+`--follow --dry-run` previews settings without contacting the host or reading
+the admin token.
 
 ### Direct HTTP event following
 
