@@ -2375,6 +2375,26 @@ genesis. Clock checking is enabled unless `--skip-time-validation` is explicitly
 selected. These commands establish the owner identity and genesis; cold recovery
 reports the missing audit history, revocation state, and later objects.
 
+Hardware-token enrollment uses an existing Ed25519 signing key and its selected
+certificate through PKCS#11:
+
+```bash
+fwc bootstrap tokens --provider /path/to/pkcs11-provider.so
+fwc bootstrap enroll-token --data-dir "$HOME/.fcp-token" \
+  --provider /path/to/pkcs11-provider.so --slot 0
+fwc bootstrap status --data-dir "$HOME/.fcp-token"
+```
+
+Enrollment prompts for the PIN with echo disabled; `--pin-stdin` accepts a single
+PIN line from a pipe. It proves possession of the exact certificate key before
+publishing genesis, then saves a public enrollment record named by the full
+genesis hash. The record contains no PIN or private key. `status` verifies that
+record against the saved genesis and reports its signer path. Applications can
+load `HardwareTokenEnrollment` with their expected genesis and call `sign` to reopen
+the recorded token and key; every returned signature is verified locally. Other
+key algorithms, ambiguous private-key IDs, changed token identities, and invalid
+proofs are refused. A hardware-token identity has no recovery phrase.
+
 ### Post-Compromise Security (PCS) Zones
 
 Sensitive zones can use MLS/TreeKEM-based post-compromise security. The on-the-wire enum is `PcsMode` in `crates/fcp-core/src/pcs.rs`:

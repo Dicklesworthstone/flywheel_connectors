@@ -13,7 +13,8 @@ use anyhow::{Context, Result, ensure};
 use clap::Args;
 use console::Term;
 use fcp_bootstrap::{
-    BootstrapConfig, BootstrapMode, BootstrapWorkflow, ColdRecovery, GenesisState, RecoveryPhrase,
+    BootstrapConfig, BootstrapMode, BootstrapWorkflow, ColdRecovery, DetectedToken, GenesisState,
+    HardwareTokenEnrollment, HardwareTokenPin, RecoveryPhrase, TokenDetectionReport, TokenDetector,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -68,6 +69,114 @@ pub struct StatusArgs {
     /// Directory containing genesis.cbor, or an incomplete bootstrap.
     #[arg(long, value_name = "DIRECTORY")]
     pub data_dir: PathBuf,
+}
+
+#[derive(Args, Debug, Serialize)]
+pub struct TokensArgs {
+    /// Probe only this PKCS#11 library instead of the platform defaults.
+    #[arg(long, value_name = "LIBRARY")]
+    pub provider: Option<PathBuf>,
+}
+
+#[derive(Args, Debug, Serialize)]
+pub struct EnrollTokenArgs {
+    #[command(flatten)]
+    pub run: RunArgs,
+
+    /// Exact PKCS#11 provider library containing the selected token.
+    #[arg(long, value_name = "LIBRARY")]
+    pub provider: PathBuf,
+
+    /// Slot reported by bootstrap tokens for this provider.
+    #[arg(long)]
+    pub slot: u32,
+
+    /// Read the PIN from a pipe instead of the hidden terminal prompt.
+    #[arg(long)]
+    pub pin_stdin: bool,
+}
+
+/// Discover public token identities and report provider failures without logging in.
+pub fn tokens(args: &TokensArgs) -> Result<Value> {
+    let detector = args.provider.as_ref().map_or_else(
+        TokenDetector::new,
+        |provider| TokenDetector::from_provider_paths(vec![provider.clone()]),
+    );
+    let report = detector.detect_report();
+    Ok(json!({
+        "command": "bootstrap tokens",
+        "status": "inspected",
+        "discovery": report,
+    }))
+}
+
+/// Complete real proof-of-possession enrollment of a selected hardware token.
+pub fn enroll_token(args: &EnrollTokenArgs) -> Result<Value> {
+    let report = TokenDetector::from_provider_paths(vec![args.provider.clone()]).detect_report();
+    let token = select_token(&report, &args.provider, args.slot)?;
+    let input = read_secret(args.pin_stdin, "Enter the selected hardware token's PIN:")?;
+    let pin = pin_from_input(&input)?;
+    let mut config = BootstrapConfig::builder()
+        .data_dir(&args.run.data_dir)
+        .mode(BootstrapMode::HardwareToken { token })
+        .skip_time_validation(args.run.skip_time_validation)
+        .allow_time_drift_warning(args.run.allow_drift)
+        .build()?;
+    config.hardware_token_pin = Some(pin);
+    let workflow = if args.run.resume {
+        BootstrapWorkflow::resume(config)
+    } else {
+        BootstrapWorkflow::new(config)
+    }.context("cannot enroll a hardware token in this directory")?;
+    let outcome = workflow.run().context("hardware-token enrollment failed")?;
+    let enrollment = outcome.hardware_token.as_ref()
+        .context("hardware-token bootstrap returned no verified signer enrollment")?;
+    enrollment.validate_for_genesis(&outcome.genesis)?;
+    let mut output = genesis_output(
+        "bootstrap enroll-token", "enrolled", &args.run.data_dir, &outcome.genesis,
+    );
+    output["signer"] = signer_output(&args.run.data_dir, &outcome.genesis)?;
+    Ok(output)
+}
+
+fn select_token(
+    report: &TokenDetectionReport,
+    provider: &Path,
+    slot: u32,
+) -> Result<DetectedToken> {
+    let mut selected = report.providers.iter()
+        .flat_map(|provider| &provider.tokens)
+        .filter(|token| token.provider.as_path() == provider && token.slot == slot);
+    let token = selected.next().context(
+        "the requested token was not discovered; inspect bootstrap tokens for provider failures",
+    )?;
+    ensure!(selected.next().is_none(), "token selection is ambiguous");
+    ensure!(
+        token.supports_ed25519(),
+        "the selected token does not advertise Ed25519 signing support"
+    );
+    Ok(token.clone())
+}
+
+fn pin_from_input(input: &str) -> Result<HardwareTokenPin> {
+    validate_secret(input)?;
+    // A pipe commonly terminates its single PIN with CRLF. Whitespace within
+    // the PIN remains meaningful; do not trim it into a different credential.
+    let value = input.trim_end_matches(&['\r', '\n'][..]);
+    ensure!(
+        !value.is_empty() && !value.contains('\r') && !value.contains('\n'),
+        "PIN input must contain exactly one nonempty line"
+    );
+    Ok(HardwareTokenPin::new(value))
+}
+
+fn signer_output(data_dir: &Path, genesis: &GenesisState) -> Result<Value> {
+    Ok(json!({
+        "kind": "pkcs11",
+        "algorithm": "Ed25519",
+        "enrollment_path": HardwareTokenEnrollment::path_for_genesis(data_dir, genesis)?,
+        "proof_of_possession_verified": true,
+    }))
 }
 
 /// Create a new phrase-backed mesh, delivering the recovery material first.
@@ -209,7 +318,11 @@ pub fn status(args: &StatusArgs) -> Result<Value> {
     ensure!(bytes.len() as u64 <= MAX_GENESIS_BYTES, "genesis exceeds the input limit");
     let genesis = GenesisState::from_cbor(&bytes).context("saved genesis is malformed")?;
     genesis.validate().context("saved genesis is invalid")?;
-    Ok(genesis_output("bootstrap status", "initialized", &args.data_dir, &genesis))
+    let mut output = genesis_output("bootstrap status", "initialized", &args.data_dir, &genesis);
+    if HardwareTokenEnrollment::load(&args.data_dir, &genesis)?.is_some() {
+        output["signer"] = signer_output(&args.data_dir, &genesis)?;
+    }
+    Ok(output)
 }
 
 fn genesis_output(command: &str, status: &str, data_dir: &Path, genesis: &GenesisState) -> Value {
@@ -285,6 +398,64 @@ mod tests {
             skip_time_validation: true,
             allow_drift: false,
         }
+    }
+
+    fn detected_token(provider: &Path, slot: u32) -> DetectedToken {
+        DetectedToken {
+            provider: provider.to_path_buf(),
+            slot,
+            label: "owner token".to_owned(),
+            manufacturer: "test provider".to_owned(),
+            serial: "stable-serial".to_owned(),
+            mechanisms: vec!["CKM_EDDSA".to_owned()],
+        }
+    }
+
+    #[test]
+    fn token_selection_is_exact_unambiguous_and_requires_ed25519() {
+        use fcp_bootstrap::ProviderDetectionResult;
+
+        let provider = Path::new("/configured/provider.so");
+        let token = detected_token(provider, 7);
+        let mut report = TokenDetectionReport {
+            providers: vec![ProviderDetectionResult {
+                provider: provider.to_path_buf(),
+                tokens: vec![token.clone()],
+                issues: vec![],
+            }],
+        };
+        assert_eq!(select_token(&report, provider, 7).unwrap(), token);
+        assert!(select_token(&report, provider, 8).is_err());
+        assert!(select_token(&report, Path::new("/other/provider.so"), 7).is_err());
+        report.providers[0].tokens.push(token);
+        assert!(select_token(&report, provider, 7).is_err());
+        report.providers[0].tokens.pop();
+        report.providers[0].tokens[0].mechanisms = vec!["CKM_RSA_PKCS".to_owned()];
+        assert!(select_token(&report, provider, 7).is_err());
+    }
+
+    #[test]
+    fn pin_input_preserves_significant_spaces_and_never_leaks_into_debug() {
+        let pin = pin_from_input(" 1234 \r\n").unwrap();
+        assert_eq!(pin, HardwareTokenPin::new(" 1234 "));
+        assert!(!format!("{pin:?}").contains("1234"));
+        assert!(pin_from_input("1234\n5678").is_err());
+        assert!(pin_from_input("\r\n").is_err());
+        assert!(pin_from_input("1234\0").is_err());
+    }
+
+    #[test]
+    fn status_refuses_a_corrupt_enrollment_instead_of_claiming_verified_signer() {
+        let directory = tempfile::tempdir().unwrap();
+        init_with_confirmation(&run_args(directory.path()), |_| Ok(())).unwrap();
+        let bytes = std::fs::read(directory.path().join("genesis.cbor")).unwrap();
+        let genesis = GenesisState::from_cbor(&bytes).unwrap();
+        let path = HardwareTokenEnrollment::path_for_genesis(directory.path(), &genesis).unwrap();
+        std::fs::write(path, b"{broken enrollment").unwrap();
+        assert!(status(&StatusArgs {
+            data_dir: directory.path().to_path_buf(),
+        }).is_err());
+        assert_eq!(std::fs::read(directory.path().join("genesis.cbor")).unwrap(), bytes);
     }
 
     #[test]

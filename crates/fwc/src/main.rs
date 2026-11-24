@@ -856,6 +856,12 @@ enum BootstrapCommand {
     /// Inspect the saved public mesh identity or an incomplete bootstrap.
     Status(bootstrap_cmd::StatusArgs),
 
+    /// Discover PKCS#11 token identities and provider diagnostics without login.
+    Tokens(bootstrap_cmd::TokensArgs),
+
+    /// Create a mesh owner identity using an existing Ed25519 hardware-token key.
+    EnrollToken(bootstrap_cmd::EnrollTokenArgs),
+
     /// Build the V3 Ed25519 to V4 ML-DSA-65 owner-key migration attestation.
     #[command(name = "migrate-owner-key")]
     MigrateOwnerKey(bootstrap_migrate_owner_key::MigrateOwnerKeyArgs),
@@ -5205,6 +5211,8 @@ fn bootstrap_dispatch(args: &BootstrapArgs) -> Result<DispatchOutcome> {
         BootstrapCommand::Init(args) => bootstrap_cmd::init(args)?,
         BootstrapCommand::Recover(args) => bootstrap_cmd::recover(args)?,
         BootstrapCommand::Status(args) => bootstrap_cmd::status(args)?,
+        BootstrapCommand::Tokens(args) => bootstrap_cmd::tokens(args)?,
+        BootstrapCommand::EnrollToken(args) => bootstrap_cmd::enroll_token(args)?,
         BootstrapCommand::MigrateOwnerKey(args) => {
             serde_json::to_value(bootstrap_migrate_owner_key::run(args)?)?
         }
