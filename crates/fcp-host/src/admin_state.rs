@@ -629,6 +629,42 @@ pub struct EventQueryResponse {
     pub unacknowledged_count: usize,
 }
 
+/// Host admin API request for a cursor-based page of control-plane events.
+///
+/// The cursor names an event in the global journal, before query filters are
+/// applied. An absent cursor starts at the beginning; an unknown cursor is
+/// reported explicitly and never silently restarts the query.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventPageQueryRequest {
+    /// Event filters and requested page size (clamped to 1..=1000).
+    pub query: EventQueryRequest,
+    /// Resume strictly after this previously observed event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_event_id: Option<String>,
+}
+
+/// One consistent page from the host's retained control-plane journal.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventPageQueryResponse {
+    /// Matching events in journal order.
+    pub events: Vec<HostEvent>,
+    /// The requested cursor, echoed without modification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_event_id: Option<String>,
+    /// Whether the requested cursor exists; absent for an initial query.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor_found: Option<bool>,
+    /// Resume cursor for the next page or poll.
+    ///
+    /// When more matches remain this is the last returned event. Otherwise it
+    /// advances over filtered events to the journal's observed end. Cursors
+    /// belong to this host's journal, not to a connector's provider stream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    /// Another matching event was observed beyond this page.
+    pub has_more: bool,
+}
+
 /// Host admin API request for acknowledging events.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventAcknowledgeRequest {
@@ -5088,6 +5124,83 @@ impl HostAdminStateStore {
         EventQueryResponse {
             events,
             unacknowledged_count,
+        }
+    }
+
+    /// Query a bounded event page without repeatedly transferring old history.
+    ///
+    /// Cursor lookup precedes filtering so a cursor remains valid when its
+    /// event is acknowledged or does not match this query. Every response is
+    /// computed under one snapshot read lock. Missing cursors return no events;
+    /// callers must explicitly choose a new starting point instead of losing
+    /// evidence of a journal gap.
+    pub async fn query_events_page(
+        &self,
+        request: &EventPageQueryRequest,
+    ) -> EventPageQueryResponse {
+        let state = self.state.read().await;
+        let cursor_index = request.after_event_id.as_deref().and_then(|cursor| {
+            // Emitted IDs are evt-N, starting at one. Validate the positional
+            // hint before using it; restored or compacted journals can have
+            // different positions and opaque IDs remain valid via exact lookup.
+            cursor
+                .strip_prefix("evt-")
+                .and_then(|sequence| sequence.parse::<usize>().ok())
+                .and_then(|sequence| sequence.checked_sub(1))
+                .filter(|&index| {
+                    state
+                        .events
+                        .get(index)
+                        .is_some_and(|event| event.event_id == cursor)
+                })
+                .or_else(|| {
+                    state
+                        .events
+                        .iter()
+                        .rposition(|event| event.event_id == cursor)
+                })
+        });
+        let cursor_found = request.after_event_id.as_ref().map(|_| cursor_index.is_some());
+        if cursor_found == Some(false) {
+            return EventPageQueryResponse {
+                events: Vec::new(),
+                after_event_id: request.after_event_id.clone(),
+                cursor_found,
+                next_cursor: request.after_event_id.clone(),
+                has_more: false,
+            };
+        }
+
+        let start = cursor_index.map_or(0, |index| index + 1);
+        let query = &request.query;
+        let mut matching = state.events[start..].iter().filter(|event| {
+            query
+                .connector_id
+                .as_ref()
+                .is_none_or(|id| event.connector_id.as_deref() == Some(id.as_str()))
+                && query.kind.is_none_or(|kind| event.kind == kind)
+                && (!query.unacknowledged_only || !event.acknowledged)
+        });
+        let events: Vec<_> = matching
+            .by_ref()
+            .take(query.limit.clamp(1, 1_000))
+            .cloned()
+            .collect();
+        let has_more = matching.next().is_some();
+        let next_cursor = if has_more {
+            events.last()
+        } else {
+            state.events.last()
+        }
+        .map(|event| event.event_id.clone())
+        .or_else(|| request.after_event_id.clone());
+
+        EventPageQueryResponse {
+            events,
+            after_event_id: request.after_event_id.clone(),
+            cursor_found,
+            next_cursor,
+            has_more,
         }
     }
 
@@ -10322,6 +10435,254 @@ mod tests {
             .await;
         assert_eq!(unacked.events.len(), 1);
         assert_eq!(unacked.unacknowledged_count, 1);
+    }
+
+    fn event_page_request(limit: usize, after: Option<&str>) -> EventPageQueryRequest {
+        EventPageQueryRequest {
+            query: EventQueryRequest {
+                connector_id: None,
+                kind: None,
+                unacknowledged_only: false,
+                limit,
+            },
+            after_event_id: after.map(str::to_owned),
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn event_pages_resume_across_restart_and_new_events() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("events.json");
+        let store = HostAdminStateStore::with_state_path(path.clone()).unwrap();
+        for summary in ["first", "second", "third"] {
+            store
+                .emit_event(HostEventKind::HealthCheck, None, summary.to_owned(), None)
+                .await;
+        }
+
+        let first = store.query_events_page(&event_page_request(2, None)).await;
+        assert_eq!(
+            first.events.iter().map(|event| event.summary.as_str()).collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
+        assert!(first.has_more);
+        assert_eq!(first.cursor_found, None);
+        assert_eq!(first.after_event_id, None);
+        assert_eq!(first.next_cursor.as_deref(), Some("evt-2"));
+        drop(store);
+
+        let reopened = HostAdminStateStore::with_state_path(path).unwrap();
+        reopened
+            .emit_event(HostEventKind::HealthCheck, None, "fourth".to_owned(), None)
+            .await;
+        let second = reopened
+            .query_events_page(&event_page_request(2, first.next_cursor.as_deref()))
+            .await;
+        assert_eq!(
+            second.events.iter().map(|event| event.summary.as_str()).collect::<Vec<_>>(),
+            vec!["third", "fourth"]
+        );
+        assert_eq!(second.after_event_id.as_deref(), Some("evt-2"));
+        assert_eq!(second.cursor_found, Some(true));
+        assert_eq!(second.next_cursor.as_deref(), Some("evt-4"));
+        assert!(!second.has_more);
+
+        let idle = reopened
+            .query_events_page(&event_page_request(2, second.next_cursor.as_deref()))
+            .await;
+        assert!(idle.events.is_empty());
+        assert_eq!(idle.cursor_found, Some(true));
+        assert_eq!(idle.next_cursor, second.next_cursor);
+        assert!(!idle.has_more);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn event_pages_resolve_global_cursor_before_filters_and_acknowledgements() {
+        let store = HostAdminStateStore::new();
+        for (connector, kind) in [
+            ("alpha", HostEventKind::HealthCheck),
+            ("beta", HostEventKind::LifecycleTransition),
+            ("alpha", HostEventKind::HealthCheck),
+            ("beta", HostEventKind::HealthCheck),
+            ("beta", HostEventKind::LifecycleTransition),
+        ] {
+            store
+                .emit_event(kind, Some(connector), "observed".to_owned(), None)
+                .await;
+        }
+        store
+            .acknowledge_events(&EventAcknowledgeRequest {
+                event_ids: vec!["evt-1".to_owned()],
+            })
+            .await;
+        let mut request = event_page_request(1, Some("evt-1"));
+        request.query.connector_id = Some("alpha".to_owned());
+        request.query.kind = Some(HostEventKind::HealthCheck);
+        request.query.unacknowledged_only = true;
+        let first = store.query_events_page(&request).await;
+        assert_eq!(first.cursor_found, Some(true));
+        assert_eq!(first.events.len(), 1);
+        assert_eq!(first.events[0].event_id, "evt-3");
+        assert!(!first.has_more);
+        assert_eq!(first.next_cursor.as_deref(), Some("evt-5"));
+
+        // The global resume anchor belongs to another connector and kind.
+        // It remains valid, and prior matching history is not replayed.
+        request.after_event_id = first.next_cursor;
+        store
+            .emit_event(HostEventKind::HealthCheck, Some("beta"), "skip".to_owned(), None)
+            .await;
+        store
+            .emit_event(HostEventKind::HealthCheck, Some("alpha"), "new".to_owned(), None)
+            .await;
+        let second = store.query_events_page(&request).await;
+        assert_eq!(second.cursor_found, Some(true));
+        assert_eq!(second.events.len(), 1);
+        assert_eq!(second.events[0].event_id, "evt-7");
+        assert_eq!(second.next_cursor.as_deref(), Some("evt-7"));
+        assert!(!second.has_more);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn event_pages_never_guess_an_unknown_resume_cursor() {
+        let store = HostAdminStateStore::new();
+        let empty = store.query_events_page(&event_page_request(10, None)).await;
+        assert!(empty.events.is_empty());
+        assert_eq!(empty.cursor_found, None);
+        assert_eq!(empty.next_cursor, None);
+        assert!(!empty.has_more);
+
+        store
+            .emit_event(HostEventKind::HealthCheck, None, "present".to_owned(), None)
+            .await;
+        for missing in ["", "evt-0", "evt-2", "evt-01", "another-journal"] {
+            let page = store
+                .query_events_page(&event_page_request(10, Some(missing)))
+                .await;
+            assert!(page.events.is_empty());
+            assert_eq!(page.cursor_found, Some(false));
+            assert_eq!(page.after_event_id.as_deref(), Some(missing));
+            assert_eq!(page.next_cursor.as_deref(), Some(missing));
+            assert!(!page.has_more);
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn event_pages_advance_over_filtered_history_without_losing_matches() {
+        let store = HostAdminStateStore::new();
+        for kind in [
+            HostEventKind::HealthCheck,
+            HostEventKind::LifecycleTransition,
+            HostEventKind::HealthCheck,
+            HostEventKind::LifecycleTransition,
+        ] {
+            store.emit_event(kind, None, "observed".to_owned(), None).await;
+        }
+        let mut request = event_page_request(1, None);
+        request.query.kind = Some(HostEventKind::HealthCheck);
+        let first = store.query_events_page(&request).await;
+        assert_eq!(first.events[0].event_id, "evt-1");
+        assert!(first.has_more);
+        assert_eq!(first.next_cursor.as_deref(), Some("evt-1"));
+        request.after_event_id = first.next_cursor;
+        let second = store.query_events_page(&request).await;
+        assert_eq!(second.events[0].event_id, "evt-3");
+        assert!(!second.has_more);
+        assert_eq!(second.next_cursor.as_deref(), Some("evt-4"));
+
+        request.after_event_id = second.next_cursor;
+        store
+            .emit_event(HostEventKind::LifecycleTransition, None, "filtered".to_owned(), None)
+            .await;
+        let empty = store.query_events_page(&request).await;
+        assert!(empty.events.is_empty());
+        assert_eq!(empty.next_cursor.as_deref(), Some("evt-5"));
+        assert!(!empty.has_more);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn event_pages_clamp_limits_and_preserve_boundary_events() {
+        let store = HostAdminStateStore::new();
+        {
+            let mut state = store.state.write().await;
+            state.events = (1..=1_001)
+                .map(|sequence| HostEvent {
+                    event_id: format!("evt-{sequence}"),
+                    kind: HostEventKind::HealthCheck,
+                    connector_id: None,
+                    summary: "observed".to_owned(),
+                    payload: None,
+                    timestamp: Utc::now(),
+                    acknowledged: false,
+                })
+                .collect();
+            state.next_event_sequence = 1_002;
+        }
+        let smallest = store.query_events_page(&event_page_request(0, None)).await;
+        assert_eq!(smallest.events.len(), 1);
+        assert!(smallest.has_more);
+        assert_eq!(smallest.next_cursor.as_deref(), Some("evt-1"));
+        let largest = store
+            .query_events_page(&event_page_request(usize::MAX, None))
+            .await;
+        assert_eq!(largest.events.len(), 1_000);
+        assert!(largest.has_more);
+        assert_eq!(largest.next_cursor.as_deref(), Some("evt-1000"));
+        let last = store
+            .query_events_page(&event_page_request(1_000, largest.next_cursor.as_deref()))
+            .await;
+        assert_eq!(last.events.len(), 1);
+        assert_eq!(last.events[0].event_id, "evt-1001");
+        assert!(!last.has_more);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn event_pages_validate_position_hints_and_accept_opaque_retained_ids() {
+        let store = HostAdminStateStore::new();
+        for summary in ["first", "second", "third"] {
+            store
+                .emit_event(HostEventKind::HealthCheck, None, summary.to_owned(), None)
+                .await;
+        }
+        {
+            let mut state = store.state.write().await;
+            state.events.remove(0);
+            state.events[1].event_id = "retained-opaque-id".to_owned();
+        }
+        let shifted = store
+            .query_events_page(&event_page_request(10, Some("evt-2")))
+            .await;
+        assert_eq!(shifted.cursor_found, Some(true));
+        assert_eq!(shifted.events.len(), 1);
+        assert_eq!(shifted.events[0].summary, "third");
+        assert_eq!(shifted.next_cursor.as_deref(), Some("retained-opaque-id"));
+        let opaque = store
+            .query_events_page(&event_page_request(10, shifted.next_cursor.as_deref()))
+            .await;
+        assert_eq!(opaque.cursor_found, Some(true));
+        assert!(opaque.events.is_empty());
+        assert!(!opaque.has_more);
+    }
+
+    #[test]
+    fn event_page_wire_contract_preserves_query_defaults_and_cursor_evidence() {
+        let request: EventPageQueryRequest =
+            serde_json::from_value(serde_json::json!({"query": {}})).unwrap();
+        assert_eq!(request.query.limit, 100);
+        assert_eq!(request.after_event_id, None);
+        let response = EventPageQueryResponse {
+            events: Vec::new(),
+            after_event_id: Some("evt-42".to_owned()),
+            cursor_found: Some(false),
+            next_cursor: Some("evt-42".to_owned()),
+            has_more: false,
+        };
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["cursor_found"], false);
+        assert_eq!(json["after_event_id"], "evt-42");
+        let parsed: EventPageQueryResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.next_cursor, response.next_cursor);
+        assert!(!parsed.has_more);
     }
 
     #[fcp_async_core::runtime::test]
