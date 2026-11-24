@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io::Cursor;
-use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr};
 #[cfg(unix)]
 use std::path::Path as FsPath;
 use std::path::{Path as StdPath, PathBuf};
@@ -172,6 +172,8 @@ mod connector_state_transfer;
 mod deployment_evidence;
 #[path = "fcp-host/egress_auth.rs"]
 mod egress_auth;
+#[path = "fcp-host/egress_dns.rs"]
+mod egress_dns;
 #[path = "fcp-host/egress_oauth.rs"]
 mod egress_oauth;
 #[path = "fcp-host/guarded_invoke.rs"]
@@ -17261,54 +17263,14 @@ async fn resolve_host_egress_decision(
             .map(|ip| SocketAddr::new(ip, decision.port))
             .collect());
     }
-    let ips = resolve_host_egress_ips(
-        decision.canonical_host.clone(),
+    let ips = egress_dns::resolve(
+        &decision.canonical_host,
         decision.port,
-        constraints.connect_timeout_ms,
+        constraints,
         protocol,
     )
     .await?;
     validate_host_egress_resolved_ips(decision, constraints, ips, protocol)
-}
-
-async fn resolve_host_egress_ips(
-    host: String,
-    port: u16,
-    connect_timeout_ms: u32,
-    protocol: &'static str,
-) -> HostResult<Vec<IpAddr>> {
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        return Ok(vec![ip]);
-    }
-    let host_for_error = host.clone();
-    let resolver = task::spawn(async move {
-        (host.as_str(), port)
-            .to_socket_addrs()
-            .map(|addrs| addrs.map(|addr| addr.ip()).collect::<Vec<_>>())
-    });
-    let ips = fcp_async_core::time::timeout(Duration::from_millis(u64::from(connect_timeout_ms)), resolver)
-        .await
-        .map_err(|_| {
-            HostError::PreflightFailed(format!(
-                "host-egress {protocol} DNS resolution for `{host_for_error}` timed out after {connect_timeout_ms}ms"
-            ))
-        })?
-        .map_err(|err| {
-            HostError::PreflightFailed(format!(
-                "host-egress {protocol} DNS resolution task for `{host_for_error}` failed: {err}"
-            ))
-        })?
-        .map_err(|err| {
-            HostError::PreflightFailed(format!(
-                "host-egress {protocol} DNS resolution for `{host_for_error}` failed: {err}"
-            ))
-        })?;
-    if ips.is_empty() {
-        return Err(HostError::PreflightFailed(format!(
-            "host-egress {protocol} DNS resolution for `{host_for_error}` returned no addresses"
-        )));
-    }
-    Ok(ips)
 }
 
 fn validate_host_egress_resolved_ips(
@@ -17361,18 +17323,18 @@ fn verify_host_egress_tls_requirements(
 async fn connect_host_egress_tcp_socket(
     decision: &mut fcp_sandbox::EgressDecision,
     constraints: &NetworkConstraints,
+    deadline: Instant,
     protocol: &'static str,
 ) -> HostResult<fcp_async_core::net::TcpStream> {
     let addrs = resolve_host_egress_decision(decision, constraints, protocol).await?;
-    let timeout = Duration::from_millis(u64::from(constraints.connect_timeout_ms));
     let mut last_error = None;
     for addr in addrs {
-        match fcp_async_core::time::timeout(timeout, fcp_async_core::net::TcpStream::connect(addr))
-            .await
-        {
-            Ok(Ok(stream)) => return Ok(stream),
-            Ok(Err(err)) => last_error = Some(format!("{addr}: {err}")),
-            Err(_) => last_error = Some(format!("{addr}: timed out after {timeout:?}")),
+        if Instant::now() >= deadline {
+            break;
+        }
+        match fcp_async_core::net::TcpStream::connect(addr).await {
+            Ok(stream) => return Ok(stream),
+            Err(err) => last_error = Some(format!("{addr}: {err}")),
         }
     }
     Err(HostError::PreflightFailed(format!(
@@ -17476,6 +17438,7 @@ async fn host_egress_tcp_io(
     request: &HostEgressTcpRequest,
     decision: &mut fcp_sandbox::EgressDecision,
     constraints: &NetworkConstraints,
+    deadline: Instant,
 ) -> HostResult<Box<dyn HostEgressIo>> {
     if !request.tls {
         if !decision.spki_pins.is_empty() {
@@ -17484,7 +17447,7 @@ async fn host_egress_tcp_io(
                 decision.canonical_host
             )));
         }
-        let tcp = connect_host_egress_tcp_socket(decision, constraints, "TCP").await?;
+        let tcp = connect_host_egress_tcp_socket(decision, constraints, deadline, "TCP").await?;
         return Ok(Box::new(tcp));
     }
     let actual_sni = request
@@ -17504,28 +17467,19 @@ async fn host_egress_tcp_io(
             decision.canonical_host
         )));
     }
-    let tcp = connect_host_egress_tcp_socket(decision, constraints, "TCP").await?;
+    let tcp = connect_host_egress_tcp_socket(decision, constraints, deadline, "TCP").await?;
     let connector = asupersync::tls::TlsConnector::new(host_egress_rustls_client_config(
         "TCP",
         &decision.canonical_host,
         &decision.spki_pins,
         Vec::new(),
     )?);
-    let timeout = Duration::from_millis(u64::from(constraints.connect_timeout_ms));
-    let tls = fcp_async_core::time::timeout(timeout, connector.connect(&actual_sni, tcp))
-        .await
-        .map_err(|_| {
-            HostError::PreflightFailed(format!(
-                "host-egress TCP TLS handshake with `{}` timed out after {}ms",
-                decision.canonical_host, constraints.connect_timeout_ms
-            ))
-        })?
-        .map_err(|err| {
-            HostError::PreflightFailed(format!(
-                "host-egress TCP TLS handshake with `{}` failed: {err}",
-                decision.canonical_host
-            ))
-        })?;
+    let tls = connector.connect(&actual_sni, tcp).await.map_err(|err| {
+        HostError::PreflightFailed(format!(
+            "host-egress TCP TLS handshake with `{}` failed: {err}",
+            decision.canonical_host
+        ))
+    })?;
     Ok(Box::new(tls))
 }
 
@@ -17634,7 +17588,24 @@ async fn perform_host_tcp_egress(
 ) -> HostResult<RawTcpEgressResponse> {
     authorized.require_current()?;
     let constraints = &authorized.constraints;
-    let mut stream = host_egress_tcp_io(request, &mut decision.decision, constraints).await?;
+    // One connection budget covers DNS, every admitted socket candidate and TLS.
+    // Only a timely connection may proceed to credential selection and writes.
+    let timeout = Duration::from_millis(u64::from(constraints.connect_timeout_ms));
+    let deadline = Instant::now() + timeout;
+    let connection = fcp_async_core::time::timeout(
+        timeout,
+        host_egress_tcp_io(request, &mut decision.decision, constraints, deadline),
+    )
+    .await;
+    let mut stream = match connection {
+        Ok(result) if Instant::now() < deadline => result?,
+        _ => {
+            return Err(HostError::PreflightFailed(format!(
+                "host-egress TCP connection to `{}` timed out after {}ms",
+                decision.decision.canonical_host, constraints.connect_timeout_ms
+            )));
+        }
+    };
     // DNS, connection, TLS and pool contention may all outlive admission.
     // A cloned credential payload is not a grant: replacement, removal,
     // cooldown and explicit lease release must still prevent disclosure.
