@@ -19,7 +19,7 @@ use crate::phase::{
 use crate::recovery_phrase::RecoveryPhrase;
 use crate::time_validation::{TimeValidation, TimeValidationResult};
 
-use std::fs::{File, OpenOptions};
+use std::fs::{File, OpenOptions, TryLockError};
 use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
@@ -277,16 +277,24 @@ pub struct BootstrapWorkflow {
     phase: BootstrapPhase,
     time_validation: Option<TimeValidation>,
     ceremony: Option<ThresholdCeremony>,
+    // Retain the OS lease from state inspection through durable completion.
+    // Dropping the file releases the lock, including after errors or abandonment.
+    _lease: File,
 }
 
 impl BootstrapWorkflow {
     /// Create a new bootstrap workflow.
     ///
+    /// Reserves the data directory until this workflow completes or is dropped.
+    /// Even force overwrite must wait for an existing workflow to release it.
+    ///
     /// # Errors
     ///
-    /// Returns an error if initialization state is invalid or filesystem setup fails.
+    /// Returns an error if another workflow owns the directory, initialization
+    /// state is invalid, or filesystem setup fails.
     pub fn new(config: BootstrapConfig) -> BootstrapResult<Self> {
         ensure_secure_data_dir(&config.data_dir)?;
+        let lease = acquire_bootstrap_lease(&config.data_dir)?;
 
         // Check for existing genesis or partial state
         let init_result = check_initialization_state(&config.data_dir, config.force_overwrite)?;
@@ -299,6 +307,7 @@ impl BootstrapWorkflow {
                     phase: BootstrapPhase::Uninitialized,
                     time_validation: None,
                     ceremony: None,
+                    _lease: lease,
                 })
             }
             InitCheckResult::AlreadyExists { fingerprint } => {
@@ -322,20 +331,32 @@ impl BootstrapWorkflow {
     /// the partial state and starting over — the genesis ceremony has
     /// real side effects (key generation, user-entered recovery phrases)
     /// that should not be regenerated unnecessarily.
+    /// `force_overwrite` is incompatible with resuming: use [`Self::new`]
+    /// with force overwrite when deliberately replacing an existing mesh.
     ///
     /// # Errors
     ///
+    /// - [`BootstrapError::BootstrapInProgress`] if another workflow owns
+    ///   the directory, including when `force_overwrite` is enabled.
+    /// - [`BootstrapError::Config`] if `force_overwrite` is enabled.
     /// - [`BootstrapError::AlreadyExists`] if the data directory already
     ///   contains a completed genesis (nothing to resume).
     /// - [`BootstrapError::PartialState`] if the recorded phase is
     ///   [`BootstrapPhase::Failed`] — the caller must decide to retry
-    ///   with `force_overwrite` or abort.
+    ///   using [`Self::new`] with `force_overwrite` or abort.
     /// - [`BootstrapError::NotInitialized`] if there is no partial
     ///   state to resume (caller should use [`Self::new`] instead).
     pub fn resume(config: BootstrapConfig) -> BootstrapResult<Self> {
         ensure_secure_data_dir(&config.data_dir)?;
+        let lease = acquire_bootstrap_lease(&config.data_dir)?;
 
-        let init_result = check_initialization_state(&config.data_dir, config.force_overwrite)?;
+        if config.force_overwrite {
+            return Err(BootstrapError::Config(
+                "force_overwrite cannot be used with resume; use BootstrapWorkflow::new for a replacement"
+                    .to_string(),
+            ));
+        }
+        let init_result = check_initialization_state(&config.data_dir, false)?;
 
         match init_result {
             InitCheckResult::Fresh => Err(BootstrapError::NotInitialized),
@@ -359,6 +380,7 @@ impl BootstrapWorkflow {
                     phase,
                     time_validation: None,
                     ceremony: None,
+                    _lease: lease,
                 })
             }
         }
@@ -781,6 +803,48 @@ impl BootstrapWorkflow {
     }
 }
 
+/// Lock a stable inode distinct from the rewritable `init.lock` phase marker.
+/// The pathname must never be removed: unlinking a locked file would let a
+/// competing workflow create another inode and acquire a second lease.
+fn acquire_bootstrap_lease(data_dir: &Path) -> BootstrapResult<File> {
+    let path = data_dir.join(".bootstrap.lock");
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "bootstrap lease path must be a regular file, not a symlink or directory",
+            )
+            .into());
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "bootstrap lease must be a regular file",
+        )
+        .into());
+    }
+    match file.try_lock() {
+        Ok(()) => {
+            #[cfg(unix)]
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            Ok(file)
+        }
+        Err(TryLockError::WouldBlock) => Err(BootstrapError::BootstrapInProgress {
+            data_dir: data_dir.to_path_buf(),
+        }),
+        Err(TryLockError::Error(error)) => Err(error.into()),
+    }
+}
+
 fn secure_create_file(path: &Path) -> std::io::Result<File> {
     let mut options = OpenOptions::new();
     options.write(true).create(true).truncate(true);
@@ -1069,6 +1133,303 @@ mod tests {
 
         let workflow = BootstrapWorkflow::new(config).unwrap();
         assert!(matches!(workflow.phase(), BootstrapPhase::Uninitialized));
+    }
+
+    fn lease_test_config(data_dir: &Path) -> BootstrapConfig {
+        BootstrapConfig::builder()
+            .data_dir(data_dir)
+            .mode(BootstrapMode::SingleDevice)
+            .skip_time_validation(true)
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn bootstrap_lease_rejects_competing_workflows_until_completion() {
+        let dir = tempdir().unwrap();
+        let first = BootstrapWorkflow::new(lease_test_config(dir.path())).unwrap();
+
+        // Both constructors must refuse before inspecting state. Previously,
+        // two new() calls could succeed and each run() overwrote the other's
+        // owner identity while handing out a different recovery phrase.
+        assert!(matches!(
+            BootstrapWorkflow::new(lease_test_config(dir.path())),
+            Err(BootstrapError::BootstrapInProgress { data_dir }) if data_dir == dir.path()
+        ));
+        assert!(matches!(
+            BootstrapWorkflow::resume(lease_test_config(dir.path())),
+            Err(BootstrapError::BootstrapInProgress { .. })
+        ));
+
+        let outcome = first.run().unwrap();
+        let persisted = std::fs::read(dir.path().join("genesis.cbor")).unwrap();
+        assert_eq!(persisted, outcome.genesis.to_cbor().unwrap());
+        assert!(!dir.path().join("init.lock").exists());
+        let expected = outcome.genesis.fingerprint();
+        assert!(matches!(
+            BootstrapWorkflow::new(lease_test_config(dir.path())),
+            Err(BootstrapError::AlreadyExists { fingerprint }) if fingerprint == expected
+        ));
+        assert!(matches!(
+            BootstrapWorkflow::resume(lease_test_config(dir.path())),
+            Err(BootstrapError::AlreadyExists { fingerprint }) if fingerprint == expected
+        ));
+        assert_eq!(std::fs::read(dir.path().join("genesis.cbor")).unwrap(), persisted);
+    }
+
+    #[test]
+    fn bootstrap_lease_reuses_same_file_after_workflow_is_abandoned() {
+        let dir = tempdir().unwrap();
+        assert!(matches!(
+            BootstrapWorkflow::resume(lease_test_config(dir.path())),
+            Err(BootstrapError::NotInitialized)
+        ));
+        let first = BootstrapWorkflow::new(lease_test_config(dir.path())).unwrap();
+        let path = dir.path().join(".bootstrap.lock");
+        let observer = OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        drop(first);
+
+        assert!(path.is_file(), "dropping a lease must not unlink its inode");
+        let second = BootstrapWorkflow::new(lease_test_config(dir.path())).unwrap();
+        assert!(matches!(observer.try_lock(), Err(TryLockError::WouldBlock)));
+        drop(second);
+
+        // Locking the original handle must still exclude future workflows.
+        // This catches unlink/recreate implementations even if the path exists.
+        observer.try_lock().unwrap();
+        assert!(matches!(
+            BootstrapWorkflow::new(lease_test_config(dir.path())),
+            Err(BootstrapError::BootstrapInProgress { .. })
+        ));
+        drop(observer);
+        let outcome = BootstrapWorkflow::new(lease_test_config(dir.path()))
+            .unwrap()
+            .run()
+            .unwrap();
+        assert!(outcome.genesis.validate().is_ok());
+    }
+
+    #[test]
+    fn bootstrap_lease_serializes_resume_and_preserves_phase_marker() {
+        let dir = tempdir().unwrap();
+        write_phase_lock(dir.path(), &BootstrapPhase::KeyGeneration).unwrap();
+        let marker = std::fs::read(dir.path().join("init.lock")).unwrap();
+        let first = BootstrapWorkflow::resume(lease_test_config(dir.path())).unwrap();
+
+        assert!(matches!(
+            BootstrapWorkflow::resume(lease_test_config(dir.path())),
+            Err(BootstrapError::BootstrapInProgress { .. })
+        ));
+        assert_eq!(std::fs::read(dir.path().join("init.lock")).unwrap(), marker);
+        drop(first);
+
+        let resumed = BootstrapWorkflow::resume(lease_test_config(dir.path())).unwrap();
+        assert_eq!(resumed.phase(), &BootstrapPhase::KeyGeneration);
+        let outcome = resumed.run().unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join("genesis.cbor")).unwrap(),
+            outcome.genesis.to_cbor().unwrap()
+        );
+        assert!(!dir.path().join("init.lock").exists());
+    }
+
+    #[test]
+    fn bootstrap_lease_blocks_force_before_mutating_genesis_or_phase() {
+        let dir = tempdir().unwrap();
+        let mut first = BootstrapWorkflow::new(lease_test_config(dir.path())).unwrap();
+        let (genesis, _phrase) = first.run_single_device_bootstrap().unwrap();
+        first.save_genesis(&genesis).unwrap();
+        let persisted = std::fs::read(dir.path().join("genesis.cbor")).unwrap();
+        let marker = std::fs::read(dir.path().join("init.lock")).unwrap();
+
+        let mut force_new = lease_test_config(dir.path());
+        force_new.force_overwrite = true;
+        assert!(matches!(
+            BootstrapWorkflow::new(force_new),
+            Err(BootstrapError::BootstrapInProgress { .. })
+        ));
+        let mut force_resume = lease_test_config(dir.path());
+        force_resume.force_overwrite = true;
+        assert!(matches!(
+            BootstrapWorkflow::resume(force_resume),
+            Err(BootstrapError::BootstrapInProgress { .. })
+        ));
+        assert_eq!(std::fs::read(dir.path().join("genesis.cbor")).unwrap(), persisted);
+        assert_eq!(std::fs::read(dir.path().join("init.lock")).unwrap(), marker);
+
+        first.finalize_bootstrap(&genesis).unwrap();
+        assert!(!dir.path().join("init.lock").exists());
+        drop(first);
+        let mut replacement = lease_test_config(dir.path());
+        replacement.force_overwrite = true;
+        let replacement = BootstrapWorkflow::new(replacement).unwrap().run().unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join("genesis.cbor")).unwrap(),
+            replacement.genesis.to_cbor().unwrap()
+        );
+    }
+
+    #[test]
+    fn bootstrap_lease_releases_on_failed_run_without_erasing_recovery_state() {
+        let dir = tempdir().unwrap();
+        let workflow = BootstrapWorkflow::new(lease_test_config(dir.path())).unwrap();
+        // A directory at the destination makes the final atomic rename fail.
+        std::fs::create_dir(dir.path().join("genesis.cbor")).unwrap();
+        assert!(matches!(workflow.run(), Err(BootstrapError::Io(_))));
+        assert_eq!(
+            crate::phase::detect_partial_state(dir.path()),
+            Some(BootstrapPhase::GenesisCreate)
+        );
+        assert!(matches!(
+            BootstrapWorkflow::new(lease_test_config(dir.path())),
+            Err(BootstrapError::PartialState { .. })
+        ));
+        assert!(matches!(
+            BootstrapWorkflow::resume(lease_test_config(dir.path())),
+            Err(BootstrapError::PartialState { .. })
+        ));
+        let _lease = acquire_bootstrap_lease(dir.path()).unwrap();
+    }
+
+    #[test]
+    fn bootstrap_lease_refuses_force_resume_without_changing_artifacts() {
+        for completed in [false, true] {
+            let dir = tempdir().unwrap();
+            let original_genesis = if completed {
+                let _outcome = BootstrapWorkflow::new(lease_test_config(dir.path()))
+                    .unwrap()
+                    .run()
+                    .unwrap();
+                Some(std::fs::read(dir.path().join("genesis.cbor")).unwrap())
+            } else {
+                None
+            };
+            write_phase_lock(dir.path(), &BootstrapPhase::KeyGeneration).unwrap();
+            let marker = std::fs::read(dir.path().join("init.lock")).unwrap();
+            let mut config = lease_test_config(dir.path());
+            config.force_overwrite = true;
+
+            assert!(matches!(
+                BootstrapWorkflow::resume(config),
+                Err(BootstrapError::Config(message))
+                    if message.contains("use BootstrapWorkflow::new for a replacement")
+            ));
+            assert_eq!(std::fs::read(dir.path().join("init.lock")).unwrap(), marker);
+            match original_genesis {
+                Some(bytes) => {
+                    assert_eq!(std::fs::read(dir.path().join("genesis.cbor")).unwrap(), bytes);
+                    assert!(matches!(
+                        BootstrapWorkflow::resume(lease_test_config(dir.path())),
+                        Err(BootstrapError::AlreadyExists { .. })
+                    ));
+                }
+                None => {
+                    assert!(!dir.path().join("genesis.cbor").exists());
+                    let resumed = BootstrapWorkflow::resume(lease_test_config(dir.path())).unwrap();
+                    assert_eq!(resumed.phase(), &BootstrapPhase::KeyGeneration);
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bootstrap_lease_refuses_symlink_without_modifying_target() {
+        let dir = tempdir().unwrap();
+        let target_dir = tempdir().unwrap();
+        let target = target_dir.path().join("unrelated-file");
+        std::fs::write(&target, b"unchanged").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join(".bootstrap.lock")).unwrap();
+
+        let mut config = lease_test_config(dir.path());
+        config.force_overwrite = true;
+        assert!(matches!(
+            BootstrapWorkflow::new(config),
+            Err(BootstrapError::Io(error)) if error.kind() == std::io::ErrorKind::InvalidInput
+        ));
+        assert_eq!(std::fs::read(&target).unwrap(), b"unchanged");
+        assert_eq!(std::fs::metadata(&target).unwrap().permissions().mode() & 0o777, 0o640);
+        assert!(!dir.path().join("genesis.cbor").exists());
+    }
+
+    const LEASE_CHILD_DIRECTORY: &str = "FCP_BOOTSTRAP_LEASE_TEST_CHILD_DIRECTORY";
+
+    #[test]
+    fn bootstrap_lease_child_process_holder() {
+        use std::io::Read as _;
+
+        let Some(data_dir) = std::env::var_os(LEASE_CHILD_DIRECTORY) else {
+            return;
+        };
+        let data_dir = PathBuf::from(data_dir);
+        let workflow = BootstrapWorkflow::new(lease_test_config(&data_dir)).unwrap();
+        write_phase_lock(&data_dir, &BootstrapPhase::KeyGeneration).unwrap();
+        std::fs::write(data_dir.join("lease-child.ready"), b"ready").unwrap();
+        // The parent kills this process after observing the acquired lease,
+        // proving crash recovery without Rust destructors or manual unlocks.
+        let mut byte = [0];
+        std::io::stdin().lock().read_exact(&mut byte).unwrap();
+        drop(workflow);
+    }
+
+    #[test]
+    fn bootstrap_lease_excludes_other_processes_and_recovers_after_crash() {
+        use std::process::{Child, Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        struct LeaseChild(Child);
+        impl Drop for LeaseChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let mut child = LeaseChild(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "workflow::tests::bootstrap_lease_child_process_holder",
+                    "--nocapture",
+                ])
+                .env(LEASE_CHILD_DIRECTORY, dir.path())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !dir.path().join("lease-child.ready").exists() {
+            assert!(child.0.try_wait().unwrap().is_none(), "lease holder exited early");
+            assert!(Instant::now() < deadline, "lease holder did not become ready");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(matches!(
+            BootstrapWorkflow::new(lease_test_config(dir.path())),
+            Err(BootstrapError::BootstrapInProgress { .. })
+        ));
+        let mut force = lease_test_config(dir.path());
+        force.force_overwrite = true;
+        assert!(matches!(
+            BootstrapWorkflow::resume(force),
+            Err(BootstrapError::BootstrapInProgress { .. })
+        ));
+        child.0.kill().unwrap();
+        assert!(!child.0.wait().unwrap().success());
+
+        assert!(dir.path().join(".bootstrap.lock").is_file());
+        let resumed = BootstrapWorkflow::resume(lease_test_config(dir.path())).unwrap();
+        assert_eq!(resumed.phase(), &BootstrapPhase::KeyGeneration);
+        let outcome = resumed.run().unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join("genesis.cbor")).unwrap(),
+            outcome.genesis.to_cbor().unwrap()
+        );
+        assert!(!dir.path().join("init.lock").exists());
     }
 
     #[test]
@@ -2054,6 +2415,13 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(genesis_mode, 0o600);
+
+        let lease_mode = std::fs::metadata(dir.path().join(".bootstrap.lock"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(lease_mode, 0o600);
     }
 
     // ---- Hardware token not implemented ----

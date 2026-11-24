@@ -2333,7 +2333,15 @@ Phase 4: Zone Initialization
     └─ Initialize audit chain (genesis event, HLC=0)
 ```
 
-Crash recovery: a lock file tracks the current phase. If the process crashes and restarts, it detects the lock and resumes from the last completed phase. Recovery phrases use `zeroize::ZeroizeOnDrop`; constant-time comparison via `subtle::ConstantTimeEq` prevents timing side channels.
+Bootstrap holds an exclusive OS lease for the data directory from initialization
+inspection through durable genesis publication. Competing workflows, including
+forced replacements, refuse while that lease is held. The persistent
+`.bootstrap.lock` file stays in place; the OS releases its lock when the workflow
+finishes or the process exits. A separate `init.lock` phase marker records crash
+recovery progress. Resume only accepts safe resumable phases and refuses
+`force_overwrite`; explicitly start a new workflow for an intended replacement.
+Recovery phrases use `zeroize::ZeroizeOnDrop`; constant-time comparison via
+`subtle::ConstantTimeEq` prevents timing side channels.
 
 Single-device bootstrap, phrase import, and cold recovery use the same deterministic
 genesis: its `created_at` is the Unix epoch, so the recovery phrase reproduces the

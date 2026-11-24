@@ -28,6 +28,16 @@ pub enum BootstrapError {
         fingerprint: String,
     },
 
+    /// Another workflow holds the data directory's bootstrap lease.
+    #[error(
+        "bootstrap already in progress in {path}; remediation: wait for the active workflow to finish before retrying; force overwrite cannot bypass the bootstrap lease",
+        path = .data_dir.display()
+    )]
+    BootstrapInProgress {
+        /// Data directory owned by the active workflow.
+        data_dir: std::path::PathBuf,
+    },
+
     /// Partial state detected from a crashed initialization.
     #[error(
         "partial bootstrap state detected at phase: {phase}; remediation: resume bootstrap from the recorded phase or clean the partial state before restarting"

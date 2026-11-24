@@ -9,7 +9,7 @@ struct BootstrapErrorDisplayCase {
     remediation_hint: &'static str,
 }
 
-const BOOTSTRAP_ERROR_VARIANT_COUNT: usize = 27;
+const BOOTSTRAP_ERROR_VARIANT_COUNT: usize = 28;
 
 #[allow(clippy::too_many_lines)]
 fn display_cases() -> Vec<BootstrapErrorDisplayCase> {
@@ -30,6 +30,14 @@ fn display_cases() -> Vec<BootstrapErrorDisplayCase> {
             },
             expected: "genesis already exists: fingerprint=blake3:abc123; remediation: resume the existing bootstrap or choose an empty data directory",
             remediation_hint: "resume the existing bootstrap",
+        },
+        BootstrapErrorDisplayCase {
+            variant: "BootstrapInProgress",
+            error: BootstrapError::BootstrapInProgress {
+                data_dir: "mesh-data".into(),
+            },
+            expected: "bootstrap already in progress in mesh-data; remediation: wait for the active workflow to finish before retrying; force overwrite cannot bypass the bootstrap lease",
+            remediation_hint: "wait for the active workflow to finish",
         },
         BootstrapErrorDisplayCase {
             variant: "PartialState",
