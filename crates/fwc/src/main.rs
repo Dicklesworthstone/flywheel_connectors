@@ -32809,20 +32809,36 @@ fn pipeline_evaluate_condition(template: &str, context: &Value) -> Result<bool> 
     }
 }
 
-fn pipeline_value_uses_dynamic_outputs(value: &Value) -> bool {
-    match value {
-        Value::String(text) => text.contains("{{steps."),
-        Value::Array(items) => items.iter().any(pipeline_value_uses_dynamic_outputs),
-        Value::Object(fields) => fields.values().any(pipeline_value_uses_dynamic_outputs),
-        _ => false,
-    }
+/// A simple path rooted at a materialized step cannot consult an absent
+/// sibling. Operators, interpolation and dynamic indexing need full context.
+fn pipeline_known_output_path(expression: &str, context: &Value) -> bool {
+    let path = expression.trim();
+    let Some(rest) = path.strip_prefix('.').unwrap_or(path).strip_prefix("steps.") else {
+        return false;
+    };
+    let mut parts = rest.split('.');
+    let Some(id) = parts.next() else {
+        return false;
+    };
+    !id.is_empty()
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        && parts.next() == Some("output")
+        && parts.all(|field| {
+            !field.is_empty()
+                && field
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        })
+        && context["steps"]
+            .get(id)
+            .is_some_and(|record| record.get("output").is_some())
 }
 
-/// Recovery cannot evaluate arbitrary jq against an incomplete steps object:
-/// missing keys, bracket syntax and default operators can turn unknown results
-/// into plausible inputs. Only provable parameter lookups and literal data are
-/// independent of all missing results. Parameter values remain data.
-fn pipeline_recovery_template_is_parameter_only(template: &str, context: &Value) -> bool {
+/// Missing keys and defaults can make absent results look like legitimate
+/// data. Check the authored expression, never strings supplied as values.
+fn pipeline_template_has_known_inputs(template: &str, context: &Value, dry_run: bool) -> bool {
     let mut cursor = 0;
     while let Some(start) = template[cursor..].find("{{") {
         let expression_start = cursor + start + 2;
@@ -32830,7 +32846,9 @@ fn pipeline_recovery_template_is_parameter_only(template: &str, context: &Value)
             return false;
         };
         let expression_end = expression_start + end;
-        if pipeline_parameter_filter(&template[expression_start..expression_end], context).is_none()
+        let expression = &template[expression_start..expression_end];
+        if pipeline_parameter_filter(expression, context).is_none()
+            && !(dry_run && pipeline_known_output_path(expression, context))
         {
             return false;
         }
@@ -32839,43 +32857,38 @@ fn pipeline_recovery_template_is_parameter_only(template: &str, context: &Value)
     true
 }
 
-fn pipeline_recovery_input_is_parameter_only(value: &Value, context: &Value) -> bool {
+fn pipeline_input_is_available(value: &Value, context: &Value, dry_run: bool) -> bool {
     match value {
-        Value::String(template) => pipeline_recovery_template_is_parameter_only(template, context),
+        Value::String(template) => pipeline_template_has_known_inputs(template, context, dry_run),
         Value::Array(values) => values
             .iter()
-            .all(|value| pipeline_recovery_input_is_parameter_only(value, context)),
+            .all(|value| pipeline_input_is_available(value, context, dry_run)),
         Value::Object(fields) => fields
             .values()
-            .all(|value| pipeline_recovery_input_is_parameter_only(value, context)),
+            .all(|value| pipeline_input_is_available(value, context, dry_run)),
         _ => true,
     }
 }
 
-fn pipeline_recovery_condition_is_parameter_only(condition: &str, context: &Value) -> bool {
+fn pipeline_condition_has_known_inputs(condition: &str, context: &Value, dry_run: bool) -> bool {
     let condition = condition.trim();
     if matches!(condition, "true" | "false") {
         return true;
     }
     if let Some(expression) = pipeline_exact_placeholder_expr(condition) {
-        return pipeline_parameter_filter(expression, context).is_some();
+        return pipeline_parameter_filter(expression, context).is_some()
+            || (dry_run && pipeline_known_output_path(expression, context));
     }
-    // Bare conditions are executed as jq, while parameter placeholders are
-    // rewritten to getpath. Punctuation in a parameter key must not disguise
-    // a jq operator that reads the incomplete steps object.
+    // Bare conditions execute as jq; a hyphen in an unquoted key can mean
+    // subtraction. Placeholders above use the workflow's quoted path syntax.
+    if dry_run && condition.starts_with(".steps.") && !condition.contains('-') {
+        return pipeline_known_output_path(condition, context);
+    }
     condition.starts_with(".params.")
         && condition
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'[' | b']'))
         && pipeline_parameter_filter(condition, context).is_some()
-}
-
-fn pipeline_step_uses_dynamic_outputs(step: &pipe::PlannedPipelineStep) -> bool {
-    pipeline_value_uses_dynamic_outputs(&step.input_template)
-        || step
-            .condition_template
-            .as_deref()
-            .is_some_and(|condition| condition.contains("{{steps."))
 }
 
 const fn pipeline_dry_run_can_materialize_output(operation: &HostToolDescriptor) -> bool {
@@ -33466,6 +33479,15 @@ fn execute_live_pipeline_plan(
     }
     // Restored records are already durable evidence and must remain identical.
     let mut decorated_steps = resumed_steps;
+    // Both reconciled successes and dry-run preflights can leave holes in
+    // the jq context. Expressions may read them without declaring depends_on.
+    let mut missing_outputs = step_results
+        .iter()
+        .filter(|record| record["status"] == "reconciled")
+        .filter_map(|record| record["id"].as_str())
+        .filter(|id| !step_outputs.contains_key(*id))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
 
     'steps: for (step_index, step_id) in plan.execution_order.iter().enumerate() {
         if step_index < resumed_steps {
@@ -33626,53 +33648,15 @@ fn execute_live_pipeline_plan(
         }
 
         let context = pipeline_execution_context(&plan.params, &step_outputs, &step_errors);
-        let unavailable_reconciled_outputs = step_results
-            .iter()
-            .filter(|record| record["status"] == "reconciled")
-            .filter_map(|record| record["id"].as_str())
-            .filter(|id| !step_outputs.contains_key(*id))
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-        if !unavailable_reconciled_outputs.is_empty()
-            && (!pipeline_recovery_input_is_parameter_only(&step.input_template, &context)
+        // Recovery retains its stricter parameter-only contract. In a dry run
+        // fresh outputs from other steps are available for simple lookups.
+        let dry_run = mode == PipelinePlanMode::DryRun;
+        if !missing_outputs.is_empty()
+            && (!pipeline_input_is_available(&step.input_template, &context, dry_run)
                 || step.condition_template.as_deref().is_some_and(|condition| {
-                    !pipeline_recovery_condition_is_parameter_only(condition, &context)
+                    !pipeline_condition_has_known_inputs(condition, &context, dry_run)
                 }))
         {
-            blocked_steps += 1;
-            step_statuses.insert(step.id.clone(), "blocked");
-            step_results.push(json!({
-                "id": &step.id,
-                "operation": &step.operation,
-                "status": "blocked",
-                "reason": "missing-dependency-output",
-                "depends_on": &step.depends_on,
-                "missing_outputs": unavailable_reconciled_outputs,
-                "invoke_attempted": false,
-                "notes": [
-                    "A reconciled step has no recovered output. Only static inputs, simple parameter lookups and parameter-only conditions may continue; general expressions require complete result data."
-                ],
-            }));
-            failure.get_or_insert_with(|| {
-                pipeline_execution_failure(
-                    command,
-                    &step.id,
-                    "input-authoring",
-                    "pipeline-reconciled-output-unavailable",
-                    "A prior step completed according to retained host evidence, but its result body is unavailable. This step cannot prove its inputs and condition are independent of that result and was not invoked.",
-                    CliExitCode::Validation,
-                )
-            });
-            continue;
-        }
-
-        let missing_outputs = step
-            .depends_on
-            .iter()
-            .filter(|dependency| !step_outputs.contains_key(dependency.as_str()))
-            .cloned()
-            .collect::<Vec<_>>();
-        if !missing_outputs.is_empty() && pipeline_step_uses_dynamic_outputs(step) {
             blocked_steps += 1;
             step_statuses.insert(step.id.clone(), "blocked");
             step_results.push(json!({
@@ -33687,10 +33671,23 @@ fn execute_live_pipeline_plan(
                 "reason": "missing-dependency-output",
                 "depends_on": &step.depends_on,
                 "missing_outputs": missing_outputs,
+                "invoke_attempted": false,
                 "notes": [
-                    "A prior step did not materialize an output value, so this step could not render a truthful live input."
+                    "A prior step has no materialized output. The input or condition cannot be proven independent of the missing result."
                 ],
             }));
+            if mode == PipelinePlanMode::Run {
+                failure.get_or_insert_with(|| {
+                    pipeline_execution_failure(
+                        command,
+                        &step.id,
+                        "input-authoring",
+                        "pipeline-reconciled-output-unavailable",
+                        "A prior step completed according to retained host evidence, but its result body is unavailable. This step cannot prove its inputs and condition are independent of that result and was not invoked.",
+                        CliExitCode::Validation,
+                    )
+                });
+            }
             continue;
         }
 
@@ -34052,6 +34049,7 @@ fn execute_live_pipeline_plan(
                 && !pipeline_dry_run_can_materialize_output(&resolved.operation)
             {
                 preflight_only_steps += 1;
+                missing_outputs.push(step.id.clone());
                 step_statuses.insert(step.id.clone(), "preflight");
                 let _ = append_history_entry(
                     history::OpStatus::Simulated,
@@ -58009,9 +58007,10 @@ input = { query = "{{steps.first-read.output.title}}" }
         });
         let disguised_condition = ".params.x//.steps.missing.output==null";
         assert!(super::pipeline_parameter_filter(disguised_condition, &context).is_some());
-        assert!(!super::pipeline_recovery_condition_is_parameter_only(
+        assert!(!super::pipeline_condition_has_known_inputs(
             disguised_condition,
-            &context
+            &context,
+            false,
         ));
         for template in [
             "{{steps.missing.output}}",
@@ -58026,9 +58025,10 @@ input = { query = "{{steps.first-read.output.title}}" }
             "{{params.enabled",
         ] {
             assert!(
-                !super::pipeline_recovery_input_is_parameter_only(
+                !super::pipeline_input_is_available(
                     &json!({"nested": [template]}),
                     &context,
+                    false,
                 ),
                 "{template}"
             );
@@ -58041,7 +58041,7 @@ input = { query = "{{steps.first-read.output.title}}" }
             json!({"query": "{{params.rows[0]}}", "count": 1}),
         ] {
             assert!(
-                super::pipeline_recovery_input_is_parameter_only(&input, &context),
+                super::pipeline_input_is_available(&input, &context, false),
                 "{input}"
             );
         }
@@ -58052,16 +58052,49 @@ input = { query = "{{steps.first-read.output.title}}" }
             "{{params.enabled}} and (.steps.missing == null)",
         ] {
             assert!(
-                !super::pipeline_recovery_condition_is_parameter_only(condition, &context),
+                !super::pipeline_condition_has_known_inputs(condition, &context, false),
                 "{condition}"
             );
         }
         for condition in ["true", "false", ".params.enabled", "{{ .params.enabled }}"] {
             assert!(
-                super::pipeline_recovery_condition_is_parameter_only(condition, &context),
+                super::pipeline_condition_has_known_inputs(condition, &context, false),
                 "{condition}"
             );
         }
+    }
+
+    #[test]
+    fn workflow_preview_accepts_only_proven_sibling_outputs() {
+        let context = json!({
+            "steps": {
+                "real-read": { "output": { "enabled": true } },
+                "known": { "output": null }
+            },
+            "params": { "key": "preview" }
+        });
+        for reference in [
+            "{{steps.real-read.output.enabled}}",
+            "value {{ .steps.known.output }}",
+        ] {
+            let input = json!({"nested": [reference]});
+            assert!(super::pipeline_input_is_available(&input, &context, true));
+            assert!(!super::pipeline_input_is_available(&input, &context, false));
+        }
+        for reference in [
+            "{{steps.real-read.output // .steps.preview}}",
+            "{{steps[.params.key].output}}",
+            "{{steps.missing.output}}",
+            "{{steps.known.output[",
+        ] {
+            assert!(!super::pipeline_input_is_available(&json!(reference), &context, true));
+        }
+        assert!(super::pipeline_condition_has_known_inputs(
+            "{{steps.real-read.output.enabled}}", &context, true
+        ));
+        assert!(!super::pipeline_condition_has_known_inputs(
+            ".steps.real-read.output.enabled", &context, true
+        ));
     }
 
     #[test]
@@ -60520,6 +60553,107 @@ default = "#general"
         assert_eq!(steps[1]["input"]["channel"], "#general");
         assert_eq!(steps[1]["input"]["text"], "New issues: 1");
         assert_eq!(steps[1]["condition"]["allowed"], true);
+    }
+
+    #[test]
+    fn execute_pipeline_dry_run_blocks_unknown_outputs_and_runs_independent_reads() {
+        let dir = TempDir::new().unwrap();
+        let _history = super::install_test_history_path(dir.path().join("history.jsonl"));
+        let path = dir.path().join("partial-dry-run.toml");
+        fs::write(
+            &path,
+            r#"
+[pipeline]
+name = "partial-dry-run"
+
+[[steps]]
+id = "preview"
+operation = "github.search_issues"
+input = { query = "preflight only" }
+
+[[steps]]
+id = "implicit"
+operation = "slack.post_message"
+input = { text = '{{ .steps["preview"].output.title // "guessed" }}' }
+
+[[steps]]
+id = "conditional"
+operation = "slack.post_message"
+depends_on = ["preview"]
+input = { text = "guessed condition" }
+condition = '.steps["preview"].output == null'
+
+[[steps]]
+id = "independent"
+operation = "slack.post_message"
+input = { text = "{{params.literal}}" }
+
+[[steps]]
+id = "follow-up"
+operation = "slack.post_message"
+depends_on = ["independent"]
+input = { text = "{{steps.independent.output.title}}" }
+
+[params.literal]
+type = "string"
+default = "{{steps.preview.output.title}}"
+"#,
+        )
+        .unwrap();
+        let token = test_capability_token_arg();
+        let mut routes = pipe_mock_catalog(true);
+        // The fixture's second operation is classified safe and idempotent.
+        routes.push((
+            "POST /rpc/preflight".to_owned(),
+            mock_preflight_response_json(true),
+        ));
+        for result in [json!({"title": "observed"}), json!({"done": true})] {
+            routes.extend([
+                (
+                    "POST /rpc/preflight".to_owned(),
+                    mock_preflight_response_json(true),
+                ),
+                ("POST /rpc/invoke".to_owned(), mock_invoke_response_json(result)),
+            ]);
+        }
+        let (host, server, log) = spawn_mock_host_sequence_with_body_log(routes);
+        let (exit, payload) = execute_json(&[
+            "fwc",
+            "--json",
+            "--host",
+            &host,
+            "pipeline",
+            "dry-run",
+            &path.display().to_string(),
+            "--capability-token",
+            &token,
+            "--step-capability-token",
+            &format!("preview={token}"),
+        ]);
+        server.join().unwrap();
+        assert_eq!(exit, CliExitCode::Success.into(), "{payload}");
+        assert_eq!(payload["status"], "partial");
+        let execution = &payload["execution"];
+        assert_eq!(execution["preflight_only_steps"], 1);
+        assert_eq!(execution["blocked_steps"], 2);
+        assert_eq!(execution["executed_steps"], 2);
+        for index in [1, 2] {
+            let step = &execution["steps"][index];
+            assert_eq!(step["reason"], "missing-dependency-output");
+            assert_eq!(step["missing_outputs"], json!(["preview"]));
+            assert_eq!(step["invoke_attempted"], false);
+        }
+        let invoked_inputs = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(route, _)| route == "POST /rpc/invoke")
+            .map(|(_, body)| serde_json::from_str::<Value>(body).unwrap()["input"].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(invoked_inputs, [
+            json!({"text": "{{steps.preview.output.title}}"}),
+            json!({"text": "observed"}),
+        ]);
     }
 
     #[test]
