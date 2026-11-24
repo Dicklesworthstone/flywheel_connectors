@@ -77,13 +77,13 @@ use fcp_host::{
     CredentialPoolError, CredentialPoolKey, CredentialPoolRegistry, CredentialPoolStrategy,
     CredentialPoolView, CredentialUpsertMode, DiscoveryEndpoint, DiscoveryFilter,
     DiscoveryResponse, DoctorReport, DoctorRequest, DoctorService, EventAcknowledgeRequest,
-    EventAcknowledgeResponse, EventQueryRequest, EventQueryResponse, GateOutcome,
-    HostAdminStateStore, HostHealthResponse, HostHealthStatus, HostPreflightRequest,
-    HostSimulateRequest, HostSimulateResponse, IntrospectionResponse, JournalQueryRequest,
-    JournalQueryResponse, LifecycleTransitionRequest, LifecycleTransitionResponse,
-    LocalPlacementController, LocalPlacementPlan, LocalPlacementPressureSnapshot,
-    LocalPlacementRequest, LogQueryRequest, LogQueryResponse, ManagedConnectorConfig,
-    ManagedNetworkConstraints, ManagedPortConstraint, MeshQuorumSignals,
+    EventAcknowledgeResponse, EventPageQueryRequest, EventPageQueryResponse, EventQueryRequest,
+    EventQueryResponse, GateOutcome, HostAdminStateStore, HostHealthResponse, HostHealthStatus,
+    HostPreflightRequest, HostSimulateRequest, HostSimulateResponse, IntrospectionResponse,
+    JournalQueryRequest, JournalQueryResponse, LifecycleTransitionRequest,
+    LifecycleTransitionResponse, LocalPlacementController, LocalPlacementPlan,
+    LocalPlacementPressureSnapshot, LocalPlacementRequest, LogQueryRequest, LogQueryResponse,
+    ManagedConnectorConfig, ManagedNetworkConstraints, ManagedPortConstraint, MeshQuorumSignals,
     NativeProxyOnlySandboxDecision, NativeProxyOnlySandboxSupport, OperationResult,
     OperationResultStatus, PLACEMENT_EVIDENCE_EVENT, PlacementHintDerivationInput,
     PlacementOperationClass, PoolExhaustedBehavior, PooledCredentialInput, PreflightRequest,
@@ -10792,6 +10792,7 @@ async fn async_main(telemetry_config: TelemetryConfig) -> HostResult<()> {
             post(simulate_receipt_query_handler),
         )
         .route("/rpc/admin/events", post(event_query_handler))
+        .merge(admin_event_page_routes())
         .route(
             fcp_host::mesh_routing::MESH_INVENTORY_ROUTE,
             get(mesh_inventory_handler),
@@ -20436,6 +20437,33 @@ async fn event_query_handler(
         "processing event query"
     );
     Json(state.lifecycle.query_events(&request).await)
+}
+
+/// This router is mounted inside `protected_routes` so event history requires
+/// the same owner-zone admin authorization as the snapshot and acknowledgement
+/// endpoints. Keeping the bounded mount here lets route tests use its real
+/// path, request limit, and handler.
+fn admin_event_page_routes() -> Router<Arc<AppState>> {
+    Router::new().route(
+        "/rpc/admin/events/page",
+        post(event_page_query_handler).layer(axum::extract::DefaultBodyLimit::max(16 * 1024)),
+    )
+}
+
+async fn event_page_query_handler(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<EventPageQueryRequest>,
+) -> Json<EventPageQueryResponse> {
+    tracing::debug!(
+        event = "event_page_query_request",
+        connector_id = ?request.query.connector_id,
+        kind = ?request.query.kind,
+        unacknowledged_only = request.query.unacknowledged_only,
+        has_cursor = request.after_event_id.is_some(),
+        limit = request.query.limit,
+        "processing event page query"
+    );
+    Json(state.lifecycle.query_events_page(&request).await)
 }
 
 async fn event_acknowledge_handler(
@@ -43691,6 +43719,15 @@ while IFS= read -r request; do exit 2; done
             .with_state(Arc::clone(&state))
     }
 
+    fn event_page_test_app(state: Arc<AppState>) -> axum::Router {
+        admin_event_page_routes()
+            .route_layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&state),
+                admin_auth_middleware,
+            ))
+            .with_state(state)
+    }
+
     fn connector_state_explain_test_app(state: Arc<AppState>) -> axum::Router {
         let protected = axum::Router::new()
             .route(
@@ -46838,6 +46875,206 @@ while IFS= read -r request; do exit 2; done
             ObjectId::from_bytes([0x92; 32]).to_string()
         );
         assert_eq!(payload["telemetry"]["outcome_label"], "success");
+        Ok(())
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn event_page_route_requires_configured_owner_admin_authority()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let state = cancel_route_test_state();
+        let app = event_page_test_app(Arc::clone(&state));
+        for headers in [
+            vec![],
+            vec![(ADMIN_ZONE_HEADER, "z:owner")],
+            vec![("Authorization", "Bearer topsecret")],
+            vec![
+                ("Authorization", "Bearer incorrect"),
+                (ADMIN_ZONE_HEADER, "z:owner"),
+            ],
+            vec![
+                ("Authorization", "Bearer topsecret"),
+                (ADMIN_ZONE_HEADER, "z:work"),
+            ],
+        ] {
+            // Authorization runs before JSON extraction, including for a
+            // malformed request that must not reach the event handler.
+            let response = send_json_request(
+                app.clone(),
+                axum::http::Method::POST,
+                "/rpc/admin/events/page",
+                json!({ "query": null }),
+                &headers,
+            )
+            .await?;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+
+        let unconfigured = Arc::new(AppState {
+            admin_bearer_token: None,
+            ..(*state).clone()
+        });
+        let response = send_json_request(
+            event_page_test_app(unconfigured),
+            axum::http::Method::POST,
+            "/rpc/admin/events/page",
+            json!({ "query": {} }),
+            &[
+                ("Authorization", "Bearer topsecret"),
+                (ADMIN_ZONE_HEADER, "z:owner"),
+            ],
+        )
+        .await?;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        Ok(())
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn event_page_route_resumes_filtered_history_and_later_events()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let state = cancel_route_test_state();
+        for (connector, summary) in [
+            ("alpha", "first"),
+            ("beta", "skip one"),
+            ("alpha", "second"),
+            ("beta", "skip two"),
+        ] {
+            state
+                .lifecycle
+                .emit_event(
+                    fcp_host::HostEventKind::HealthCheck,
+                    Some(connector),
+                    summary.to_owned(),
+                    None,
+                )
+                .await;
+        }
+        let app = event_page_test_app(Arc::clone(&state));
+        let headers = [
+            ("Authorization", "Bearer topsecret"),
+            (ADMIN_ZONE_HEADER, "z:owner"),
+        ];
+        let mut cursor: Option<String> = None;
+        for (summary, expected_cursor, has_more) in
+            [("first", "evt-1", true), ("second", "evt-4", false)]
+        {
+            let response = send_json_request(
+                app.clone(),
+                axum::http::Method::POST,
+                "/rpc/admin/events/page",
+                json!({
+                    "query": { "connector_id": "alpha", "limit": 1 },
+                    "after_event_id": cursor,
+                }),
+                &headers,
+            )
+            .await?;
+            assert_eq!(response.status(), StatusCode::OK);
+            let page: EventPageQueryResponse =
+                serde_json::from_value(response_body_json(response).await?)?;
+            assert_eq!(page.after_event_id, cursor);
+            assert_eq!(page.cursor_found, cursor.as_ref().map(|_| true));
+            assert_eq!(page.events.len(), 1);
+            assert_eq!(page.events[0].summary, summary);
+            assert_eq!(page.events[0].connector_id.as_deref(), Some("alpha"));
+            assert_eq!(page.next_cursor.as_deref(), Some(expected_cursor));
+            assert_eq!(page.has_more, has_more);
+            cursor = page.next_cursor;
+        }
+
+        for new_event in [false, true] {
+            if new_event {
+                state
+                    .lifecycle
+                    .emit_event(
+                        fcp_host::HostEventKind::HealthCheck,
+                        Some("alpha"),
+                        "arrived after catch-up".to_owned(),
+                        None,
+                    )
+                    .await;
+            }
+            let response = send_json_request(
+                app.clone(),
+                axum::http::Method::POST,
+                "/rpc/admin/events/page",
+                json!({
+                    "query": { "connector_id": "alpha", "limit": 1 },
+                    "after_event_id": cursor,
+                }),
+                &headers,
+            )
+            .await?;
+            assert_eq!(response.status(), StatusCode::OK);
+            let page: EventPageQueryResponse =
+                serde_json::from_value(response_body_json(response).await?)?;
+            assert_eq!(page.after_event_id, cursor);
+            assert_eq!(page.cursor_found, Some(true));
+            assert!(!page.has_more);
+            if new_event {
+                assert_eq!(page.events.len(), 1);
+                assert_eq!(page.events[0].summary, "arrived after catch-up");
+                assert_eq!(page.next_cursor.as_deref(), Some("evt-5"));
+            } else {
+                assert!(page.events.is_empty());
+                assert_eq!(page.next_cursor, cursor);
+            }
+            cursor = page.next_cursor;
+        }
+        Ok(())
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn event_page_route_reports_cursor_gaps_and_bounds_request_bodies()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let state = cancel_route_test_state();
+        state
+            .lifecycle
+            .emit_event(
+                fcp_host::HostEventKind::HealthCheck,
+                None,
+                "must not be replayed for a missing cursor".to_owned(),
+                None,
+            )
+            .await;
+        let app = event_page_test_app(state);
+        let headers = [
+            ("Authorization", "Bearer topsecret"),
+            (ADMIN_ZONE_HEADER, "z:owner"),
+        ];
+        let response = send_json_request(
+            app.clone(),
+            axum::http::Method::POST,
+            "/rpc/admin/events/page",
+            json!({ "query": {}, "after_event_id": "unknown-cursor" }),
+            &headers,
+        )
+        .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let page: EventPageQueryResponse =
+            serde_json::from_value(response_body_json(response).await?)?;
+        assert_eq!(page.cursor_found, Some(false));
+        assert_eq!(page.after_event_id.as_deref(), Some("unknown-cursor"));
+        assert_eq!(page.next_cursor, page.after_event_id);
+        assert!(page.events.is_empty());
+        assert!(!page.has_more);
+
+        for (body, expected) in [
+            (json!({ "query": null }), StatusCode::UNPROCESSABLE_ENTITY),
+            (
+                json!({ "query": {}, "after_event_id": "x".repeat(16 * 1024) }),
+                StatusCode::PAYLOAD_TOO_LARGE,
+            ),
+        ] {
+            let response = send_json_request(
+                app.clone(),
+                axum::http::Method::POST,
+                "/rpc/admin/events/page",
+                body,
+                &headers,
+            )
+            .await?;
+            assert_eq!(response.status(), expected);
+        }
         Ok(())
     }
 
