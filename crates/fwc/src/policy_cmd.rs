@@ -3,8 +3,8 @@
 //! Provides a policy simulation CLI for `DecisionReceipt` previews.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::io::{self, Read};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -527,7 +527,18 @@ struct BundleApplyResult {
 
 fn run_bundle_apply(args: &BundleApplyArgs) -> Result<()> {
     let bundle = load_policy_bundle(&args.bundle)?;
-    let existing_state = load_bundle_state_optional(&args.state)?;
+    // The lock must precede the read: locking only the final replacement would
+    // let two commands both validate against the same predecessor and lose a
+    // committed transition (including its audit event).
+    let transaction = if args.plan {
+        None
+    } else {
+        Some(PolicyBundleStateTransaction::acquire(&args.state)?)
+    };
+    let state_path = transaction
+        .as_ref()
+        .map_or(args.state.as_path(), |transaction| transaction.path.as_path());
+    let existing_state = load_bundle_state_optional(state_path)?;
     if let Some(state) = &existing_state {
         validate_bundle_state_zone(state, &bundle.zone_id, &args.state)?;
     }
@@ -590,7 +601,12 @@ fn run_bundle_apply(args: &BundleApplyArgs) -> Result<()> {
         new_state.audit_events = existing_state.audit_events;
     }
     new_state.audit_events.push(audit_event.clone());
-    write_bundle_state(&args.state, &new_state)?;
+    write_bundle_state(
+        transaction
+            .as_ref()
+            .context("policy bundle apply requires an exclusive state transaction")?,
+        &new_state,
+    )?;
 
     tracing::info!(
         event = POLICY_BUNDLE_EVENT_APPLIED,
@@ -638,7 +654,15 @@ struct BundleRollbackResult {
 
 fn run_bundle_rollback(args: &BundleRollbackArgs) -> Result<()> {
     let target_bundle = load_policy_bundle(&args.to)?;
-    let Some(existing_state) = load_bundle_state_optional(&args.state)? else {
+    let transaction = if args.plan {
+        None
+    } else {
+        Some(PolicyBundleStateTransaction::acquire(&args.state)?)
+    };
+    let state_path = transaction
+        .as_ref()
+        .map_or(args.state.as_path(), |transaction| transaction.path.as_path());
+    let Some(existing_state) = load_bundle_state_optional(state_path)? else {
         anyhow::bail!(
             "bundle rollback requires an existing state file at {}",
             args.state.display()
@@ -694,7 +718,12 @@ fn run_bundle_rollback(args: &BundleRollbackArgs) -> Result<()> {
     new_state.previous = Some(existing_state.current);
     new_state.audit_events = existing_state.audit_events;
     new_state.audit_events.push(audit_event.clone());
-    write_bundle_state(&args.state, &new_state)?;
+    write_bundle_state(
+        transaction
+            .as_ref()
+            .context("policy bundle rollback requires an exclusive state transaction")?,
+        &new_state,
+    )?;
 
     tracing::info!(
         event = POLICY_BUNDLE_EVENT_ROLLED_BACK,
@@ -815,7 +844,166 @@ fn write_bundle_output(bundle: &PolicyBundle, out: Option<&PathBuf>) -> Result<(
     Ok(())
 }
 
+/// Owns one read/validate/replace transition. The lock is a stable companion
+/// file because replacing the state file would otherwise replace its lock too.
+/// Keep the companion in place after unlocking so concurrent openers always
+/// coordinate on the same inode.
+struct PolicyBundleStateTransaction {
+    path: PathBuf,
+    lock: File,
+}
+
+impl PolicyBundleStateTransaction {
+    fn acquire(path: &Path) -> Result<Self> {
+        let filename = path
+            .file_name()
+            .context("policy bundle state requires a filename")?;
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create policy bundle state directory {}",
+                parent.display()
+            )
+        })?;
+        // Relative paths and directory symlinks must not create distinct locks
+        // for the same destination. State-file symlinks are refused below.
+        let parent = fs::canonicalize(parent).with_context(|| {
+            format!(
+                "failed to resolve policy bundle state directory {}",
+                parent.display()
+            )
+        })?;
+        let path = parent.join(filename);
+        let lock_path = bundle_state_companion(&path, ".lock");
+        bundle_state_metadata(&lock_path)?;
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let lock = options.open(&lock_path).with_context(|| {
+            format!(
+                "failed to open policy bundle state lock {}",
+                lock_path.display()
+            )
+        })?;
+        anyhow::ensure!(
+            lock.metadata()?.is_file(),
+            "policy bundle state lock must be a regular file"
+        );
+        bundle_state_metadata(&lock_path)?;
+        lock.try_lock().map_err(|error| {
+            anyhow::anyhow!(
+                "cannot exclusively lock policy bundle state {}: {error}",
+                path.display()
+            )
+        })?;
+        bundle_state_metadata(&path)?;
+        let transaction = Self { path, lock };
+        transaction.validate_lock()?;
+        Ok(transaction)
+    }
+
+    fn validate_lock(&self) -> Result<()> {
+        let path = bundle_state_companion(&self.path, ".lock");
+        let current = bundle_state_metadata(&path)?
+            .context("policy bundle state lock disappeared during the transaction")?;
+        let held = self.lock.metadata().context("failed to inspect held policy bundle state lock")?;
+        anyhow::ensure!(
+            held.is_file() && current.is_file(),
+            "policy bundle state lock must remain a regular file"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            anyhow::ensure!(
+                held.dev() == current.dev() && held.ino() == current.ino(),
+                "policy bundle state lock ownership changed during the transaction"
+            );
+        }
+        Ok(())
+    }
+
+    /// Write and sync a complete replacement before publishing it atomically.
+    /// A failed staged write leaves the committed state and audit history
+    /// untouched. Incomplete temporary files are never read as policy state.
+    fn replace(&self, write: impl FnOnce(&mut File) -> io::Result<()>) -> Result<()> {
+        self.validate_lock()?;
+        let temporary =
+            bundle_state_companion(&self.path, &format!(".{}.tmp", uuid::Uuid::new_v4()));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&temporary)
+            .context("failed to prepare policy bundle state replacement")?;
+        write(&mut file)
+            .and_then(|()| file.sync_all())
+            .context("failed to sync policy bundle state replacement; committed state is unchanged")?;
+        drop(file);
+        self.validate_lock()?;
+        bundle_state_metadata(&self.path)?;
+        fs::rename(&temporary, &self.path)
+            .context("failed to commit policy bundle state replacement")?;
+        // A failure after rename is an uncertain durability outcome, not an
+        // invitation to restore an older snapshot over the complete new one.
+        #[cfg(unix)]
+        File::open(
+            self.path
+                .parent()
+                .context("policy bundle state requires a parent directory")?,
+        )
+        .and_then(|parent| parent.sync_all())
+        .context("policy bundle state was replaced, but directory durability could not be confirmed")?;
+        Ok(())
+    }
+}
+
+fn bundle_state_companion(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+fn bundle_state_metadata(path: &Path) -> Result<Option<fs::Metadata>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            anyhow::ensure!(
+                metadata.is_file() && !metadata.file_type().is_symlink(),
+                "policy bundle state artifacts must be regular files, not symlinks: {}",
+                path.display()
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                anyhow::ensure!(
+                    metadata.nlink() == 1,
+                    "policy bundle state artifacts must not be hard-linked: {}",
+                    path.display()
+                );
+            }
+            Ok(Some(metadata))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| {
+            format!("failed to inspect policy bundle state artifact {}", path.display())
+        }),
+    }
+}
+
 fn load_bundle_state_optional(path: &Path) -> Result<Option<PolicyBundleState>> {
+    if bundle_state_metadata(path)?.is_none() {
+        return Ok(None);
+    }
     let raw = match fs::read_to_string(path) {
         Ok(raw) => raw,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -831,21 +1019,13 @@ fn load_bundle_state_optional(path: &Path) -> Result<Option<PolicyBundleState>> 
     Ok(Some(state))
 }
 
-fn write_bundle_state(path: &Path, state: &PolicyBundleState) -> Result<()> {
+fn write_bundle_state(
+    transaction: &PolicyBundleStateTransaction,
+    state: &PolicyBundleState,
+) -> Result<()> {
     state.validate()?;
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent).with_context(|| {
-                format!(
-                    "failed to create policy bundle state directory {}",
-                    parent.display()
-                )
-            })?;
-        }
-    }
     let json = serde_json::to_string_pretty(state)?;
-    fs::write(path, json)
-        .with_context(|| format!("failed to write policy bundle state {}", path.display()))
+    transaction.replace(|file| file.write_all(json.as_bytes()))
 }
 
 fn validate_bundle_state_zone(
@@ -2124,6 +2304,281 @@ mod tests {
     }
 
     #[test]
+    fn bundle_mutations_share_one_lock_and_plans_do_not_mutate() {
+        let dir = TempDir::new().unwrap();
+        let bundle_a = test_bundle("bundle-a", ZoneId::work(), 1, None);
+        let bundle_b = test_bundle("bundle-b", ZoneId::work(), 2, Some("bundle-a"));
+        let bundle_c = test_bundle("bundle-c", ZoneId::work(), 3, Some("bundle-b"));
+        let path_a = write_bundle_file(&dir, "a.json", &bundle_a);
+        let path_b = write_bundle_file(&dir, "b.json", &bundle_b);
+        let path_c = write_bundle_file(&dir, "c.json", &bundle_c);
+        let state_path = dir.path().join("state.json");
+        for bundle in [&path_a, &path_b] {
+            run_bundle_apply(&BundleApplyArgs {
+                bundle: bundle.clone(),
+                state: state_path.clone(),
+                plan: false,
+                json: true,
+            })
+            .unwrap();
+        }
+        let committed = fs::read(&state_path).unwrap();
+        let transaction = PolicyBundleStateTransaction::acquire(&state_path).unwrap();
+        let mut apply = BundleApplyArgs {
+            bundle: path_c,
+            state: state_path.clone(),
+            plan: false,
+            json: true,
+        };
+        let mut rollback = BundleRollbackArgs {
+            to: path_a,
+            state: state_path.clone(),
+            plan: false,
+            json: true,
+        };
+
+        std::thread::scope(|scope| {
+            let competing = scope.spawn(|| {
+                let apply_error = run_bundle_apply(&apply).unwrap_err();
+                let rollback_error = run_bundle_rollback(&rollback).unwrap_err();
+                assert!(apply_error.to_string().contains("exclusively lock"));
+                assert!(rollback_error.to_string().contains("exclusively lock"));
+            });
+            competing.join().unwrap();
+        });
+        apply.plan = true;
+        rollback.plan = true;
+        run_bundle_apply(&apply).unwrap();
+        run_bundle_rollback(&rollback).unwrap();
+        assert_eq!(fs::read(&state_path).unwrap(), committed);
+
+        drop(transaction);
+        apply.plan = false;
+        run_bundle_apply(&apply).unwrap();
+        rollback.plan = false;
+        rollback.to = path_b;
+        run_bundle_rollback(&rollback).unwrap();
+        let state = load_bundle_state_optional(&state_path).unwrap().unwrap();
+        assert_eq!(state.current.bundle.bundle_id, "bundle-b");
+        assert_eq!(state.audit_events.len(), 4);
+        assert_eq!(
+            state.audit_events.iter().map(|event| event.seq).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+        assert_eq!(
+            state.audit_events.last().unwrap().event_type,
+            POLICY_BUNDLE_EVENT_ROLLED_BACK
+        );
+    }
+
+    #[test]
+    fn bundle_competing_successors_cannot_fork_or_erase_history() {
+        let dir = TempDir::new().unwrap();
+        let state_path = dir.path().join("state.json");
+        let bundle_a = test_bundle("bundle-a", ZoneId::work(), 1, None);
+        let path_a = write_bundle_file(&dir, "a.json", &bundle_a);
+        run_bundle_apply(&BundleApplyArgs {
+            bundle: path_a,
+            state: state_path.clone(),
+            plan: false,
+            json: true,
+        })
+        .unwrap();
+        let first = BundleApplyArgs {
+            bundle: write_bundle_file(
+                &dir,
+                "b.json",
+                &test_bundle("bundle-b", ZoneId::work(), 2, Some("bundle-a")),
+            ),
+            state: state_path.clone(),
+            plan: false,
+            json: true,
+        };
+        let second = BundleApplyArgs {
+            bundle: write_bundle_file(
+                &dir,
+                "c.json",
+                &test_bundle("bundle-c", ZoneId::work(), 2, Some("bundle-a")),
+            ),
+            state: state_path.clone(),
+            plan: false,
+            json: true,
+        };
+        let barrier = std::sync::Barrier::new(3);
+        let (first_result, second_result) = std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                barrier.wait();
+                run_bundle_apply(&first)
+            });
+            let second = scope.spawn(|| {
+                barrier.wait();
+                run_bundle_apply(&second)
+            });
+            barrier.wait();
+            (first.join().unwrap(), second.join().unwrap())
+        });
+        assert_ne!(first_result.is_ok(), second_result.is_ok());
+        let winner = if first_result.is_ok() { "bundle-b" } else { "bundle-c" };
+        let state = load_bundle_state_optional(&state_path).unwrap().unwrap();
+        assert_eq!(state.current.bundle.bundle_id, winner);
+        assert_eq!(state.previous.unwrap().bundle.bundle_id, "bundle-a");
+        assert_eq!(state.audit_events.len(), 2);
+        assert_eq!(state.audit_events[0].bundle_id, "bundle-a");
+        assert_eq!(state.audit_events[0].seq, 1);
+        assert_eq!(state.audit_events[1].bundle_id, winner);
+        assert_eq!(state.audit_events[1].seq, 2);
+    }
+
+    #[test]
+    fn bundle_failed_staged_write_preserves_committed_bytes_and_history() {
+        let dir = TempDir::new().unwrap();
+        let state_path = dir.path().join("state.json");
+        let path_a = write_bundle_file(
+            &dir,
+            "a.json",
+            &test_bundle("bundle-a", ZoneId::work(), 1, None),
+        );
+        run_bundle_apply(&BundleApplyArgs {
+            bundle: path_a,
+            state: state_path.clone(),
+            plan: false,
+            json: true,
+        })
+        .unwrap();
+        let committed = fs::read(&state_path).unwrap();
+        let transaction = PolicyBundleStateTransaction::acquire(&state_path).unwrap();
+        let error = transaction
+            .replace(|file| {
+                file.write_all(b"{\"format\": \"incomplete")?;
+                // Readers still see the complete prior snapshot while the
+                // replacement is being written, even before the write fails.
+                assert_eq!(fs::read(&state_path)?, committed);
+                Err(io::Error::other("injected staged-write failure"))
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("committed state is unchanged"));
+        assert_eq!(fs::read(&state_path).unwrap(), committed);
+        drop(transaction);
+
+        // An abandoned temporary file must not block the next valid command or
+        // get mistaken for a newer policy snapshot.
+        let path_b = write_bundle_file(
+            &dir,
+            "b.json",
+            &test_bundle("bundle-b", ZoneId::work(), 2, Some("bundle-a")),
+        );
+        run_bundle_apply(&BundleApplyArgs {
+            bundle: path_b,
+            state: state_path.clone(),
+            plan: false,
+            json: true,
+        })
+        .unwrap();
+        let state = load_bundle_state_optional(&state_path).unwrap().unwrap();
+        assert_eq!(state.current.bundle.bundle_id, "bundle-b");
+        assert_eq!(state.audit_events.len(), 2);
+        assert_eq!(state.audit_events[0].bundle_id, "bundle-a");
+        assert_eq!(state.audit_events[1].bundle_id, "bundle-b");
+    }
+
+    #[test]
+    fn bundle_failed_initial_write_never_publishes_partial_state() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.json");
+        let transaction = PolicyBundleStateTransaction::acquire(&path).unwrap();
+        assert!(
+            transaction
+                .replace(|file| {
+                    file.write_all(b"{\"format\":")?;
+                    Err(io::Error::other("injected initial-write failure"))
+                })
+                .is_err()
+        );
+        assert!(!path.exists());
+        assert!(load_bundle_state_optional(&path).unwrap().is_none());
+        let state = PolicyBundleState::new(
+            test_bundle("bundle-a", ZoneId::work(), 1, None),
+            Utc::now(),
+        );
+        write_bundle_state(&transaction, &state).unwrap();
+        assert_eq!(
+            load_bundle_state_optional(&path)
+                .unwrap()
+                .unwrap()
+                .current
+                .bundle
+                .bundle_id,
+            "bundle-a"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bundle_directory_aliases_share_lock_and_file_symlinks_are_refused() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let real_dir = dir.path().join("real");
+        let alias_dir = dir.path().join("alias");
+        fs::create_dir(&real_dir).unwrap();
+        symlink(&real_dir, &alias_dir).unwrap();
+        let path = real_dir.join("state.json");
+        let transaction = PolicyBundleStateTransaction::acquire(&path).unwrap();
+        assert!(PolicyBundleStateTransaction::acquire(&alias_dir.join("state.json")).is_err());
+        let state = PolicyBundleState::new(
+            test_bundle("bundle-a", ZoneId::work(), 1, None),
+            Utc::now(),
+        );
+        write_bundle_state(&transaction, &state).unwrap();
+        let committed = fs::read(&path).unwrap();
+        drop(transaction);
+
+        let file_alias = dir.path().join("state-alias.json");
+        symlink(&path, &file_alias).unwrap();
+        assert!(PolicyBundleStateTransaction::acquire(&file_alias).is_err());
+        assert!(load_bundle_state_optional(&file_alias).is_err());
+        let other_state = dir.path().join("other.json");
+        symlink(&path, bundle_state_companion(&other_state, ".lock")).unwrap();
+        assert!(PolicyBundleStateTransaction::acquire(&other_state).is_err());
+        assert_eq!(fs::read(&path).unwrap(), committed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bundle_hardlinked_state_and_replaced_lock_refuse_publication() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.json");
+        let transaction = PolicyBundleStateTransaction::acquire(&path).unwrap();
+        let state = PolicyBundleState::new(
+            test_bundle("bundle-a", ZoneId::work(), 1, None),
+            Utc::now(),
+        );
+        write_bundle_state(&transaction, &state).unwrap();
+        let committed = fs::read(&path).unwrap();
+        let alias = dir.path().join("hardlink.json");
+        fs::hard_link(&path, &alias).unwrap();
+        assert!(PolicyBundleStateTransaction::acquire(&alias).is_err());
+        assert!(load_bundle_state_optional(&path).is_err());
+        assert!(write_bundle_state(&transaction, &state).is_err());
+        assert_eq!(fs::read(&path).unwrap(), committed);
+        assert_eq!(fs::read(&alias).unwrap(), committed);
+
+        let other_path = dir.path().join("other.json");
+        let other = PolicyBundleStateTransaction::acquire(&other_path).unwrap();
+        write_bundle_state(&other, &state).unwrap();
+        let other_committed = fs::read(&other_path).unwrap();
+        let lock_path = bundle_state_companion(&other_path, ".lock");
+        // Simulate a stale-lock cleanup/replacement outside the protocol. The
+        // old owner must not publish through a now-unrelated lock handle.
+        fs::rename(&lock_path, dir.path().join("old.lock")).unwrap();
+        fs::write(&lock_path, b"").unwrap();
+        let error = write_bundle_state(&other, &state).unwrap_err();
+        assert!(error.to_string().contains("lock ownership changed"));
+        assert_eq!(fs::read(&other_path).unwrap(), other_committed);
+        assert!(PolicyBundleStateTransaction::acquire(&other_path).is_ok());
+    }
+
+    #[test]
     fn bundle_apply_rejects_chain_mismatch() {
         let temp_dir = TempDir::new().unwrap();
         let bundle_a = test_bundle("bundle-a", ZoneId::work(), 1, None);
@@ -3023,7 +3478,8 @@ mod tests {
         let path = temp_dir.path().join("sub").join("dir").join("state.json");
         let bundle = test_bundle("bundle-wd", ZoneId::work(), 1, None);
         let state = PolicyBundleState::new(bundle, Utc::now());
-        write_bundle_state(&path, &state).unwrap();
+        let transaction = PolicyBundleStateTransaction::acquire(&path).unwrap();
+        write_bundle_state(&transaction, &state).unwrap();
         assert!(path.exists());
     }
 
@@ -3034,7 +3490,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let bundle = test_bundle("bundle-plan", ZoneId::work(), 1, None);
         let bundle_path = write_bundle_file(&temp_dir, "bundle-plan.json", &bundle);
-        let state_path = temp_dir.path().join("state.json");
+        let state_path = temp_dir.path().join("absent").join("state.json");
 
         run_bundle_apply(&BundleApplyArgs {
             bundle: bundle_path,
@@ -3044,8 +3500,9 @@ mod tests {
         })
         .unwrap();
 
-        // State file should not exist since we only planned
+        // Planning must not create a state file, lock, or parent directories.
         assert!(!state_path.exists());
+        assert!(!state_path.parent().unwrap().exists());
     }
 
     // ---- bundle_apply idempotent ----
@@ -3585,7 +4042,8 @@ mod tests {
         let state = PolicyBundleState::new(bundle, Utc::now());
         let path = temp_dir.path().join("rt-state.json");
 
-        write_bundle_state(&path, &state).unwrap();
+        let transaction = PolicyBundleStateTransaction::acquire(&path).unwrap();
+        write_bundle_state(&transaction, &state).unwrap();
         let loaded = load_bundle_state_optional(&path).unwrap().unwrap();
         assert_eq!(loaded.current.bundle.bundle_id, "bnd-rt");
         assert_eq!(loaded.format, POLICY_BUNDLE_STATE_FORMAT);
