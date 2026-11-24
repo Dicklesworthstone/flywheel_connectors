@@ -4454,6 +4454,54 @@ delivery capacity, cancellation, and final execution/delivery accounting.
 
 ---
 
+## Following Live Host Events
+
+`fwc tail --follow` follows the host's retained control-plane event journal and
+flushes one NDJSON record at a time. Supply the same owner admin credential used
+by the host's protected administrative routes:
+
+```bash
+fwc tail --follow \
+    --host http://127.0.0.1:8787 \
+    --admin-token-file host-admin.token \
+    --since 5m --limit 0 --timeout-ms 300000
+```
+
+The token can also come from `FCP_HOST_ADMIN_BEARER_TOKEN`. Follow accepts HTTPS,
+literal loopback HTTP, or a Unix socket; it refuses redirects and automatic HTTP
+retries. It requires the authenticated `POST /rpc/admin/events/page` endpoint.
+
+Without a cursor, the command starts with retained history and then polls for
+new events. `--since` fixes the lookback cutoff once at startup. Connector and
+event-type filters retain their ordinary tail meanings. Resume with
+`--cursor <latest_cursor>` from a received event, checkpoint, or terminal record,
+using the same filters. An unknown or no-longer-retained cursor stops with an
+error; the command never silently restarts from the beginning.
+
+| Record | Meaning |
+|---|---|
+| `start` | Local follow settings and the initial cursor; no host admission is implied. |
+| `event` | One matching event and its exact resume cursor, flushed immediately. |
+| `checkpoint` | The consumed journal position, including filtered entries, and whether catch-up is complete. |
+| `complete` | The event limit or total timeout was reached; retain `latest_cursor` to continue. |
+| `error` | Validation, transport, or cursor consistency failed; earlier received records remain usable. |
+
+The default event limit is **50**. `--limit 0` follows until the timeout, which
+defaults to **300,000 ms** and is bounded to one day. `--poll-interval-ms` defaults
+to **1,000 ms** and accepts 1–60,000 ms. Catch-up pages are read immediately;
+the interval applies once the retained history is exhausted. Network reads and
+poll waits share the original deadline. A blocked synchronous output writer
+must make progress before the command can return.
+
+Each HTTP page contains at most **1,000 events** and its encoded response is
+limited to **8 MiB**. Stopping partway through a page retains the exact consumed
+event cursor, so a subsequent run does not skip the page's remaining events.
+Closing the output consumer stops further polling. Follow emits NDJSON directly
+and rejects buffered rendering transforms; `--follow --dry-run` previews the
+settings without contacting the host or reading the admin token.
+
+---
+
 ## CRDT-Backed Multi-Writer Connector State
 
 Connectors declaring `singleton_writer = false` can take advantage of CRDTs (Conflict-free Replicated Data Types) for state that legitimately admits concurrent writes. The supported types live in `crates/fcp-core/src/crdt.rs`:

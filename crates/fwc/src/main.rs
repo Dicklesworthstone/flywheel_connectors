@@ -278,6 +278,7 @@ mod snapshot_recovery;
 mod snapshot_workflow;
 mod supply_chain_cmd;
 mod swarm_evidence_cmd;
+mod tail_follow;
 mod task_reconcile;
 mod task_reconcile_cmd;
 mod template;
@@ -1767,9 +1768,27 @@ struct TailArgs {
     #[arg(long)]
     since: Option<String>,
 
-    /// Maximum number of events to return in snapshot mode.
+    /// Maximum events to emit (in follow mode, 0 means until the deadline).
     #[arg(long, default_value_t = 50)]
     limit: usize,
+
+    /// Follow retained host events, flushing resumable NDJSON records as they arrive.
+    #[arg(long)]
+    follow: bool,
+
+    /// Wait between follow polls once caught up, in milliseconds.
+    #[arg(long, default_value_t = 1_000, value_parser = clap::value_parser!(u64).range(1..=60_000))]
+    poll_interval_ms: u64,
+
+    /// Total follow deadline in milliseconds, shared by all reads and poll waits.
+    #[arg(long, default_value_t = 300_000, value_parser = clap::value_parser!(u64).range(1..=86_400_000))]
+    timeout_ms: u64,
+
+    /// Read the host admin bearer secret from this file for --follow.
+    /// Defaults to FCP_HOST_ADMIN_BEARER_TOKEN.
+    #[arg(long, value_name = "PATH", requires = "follow")]
+    #[serde(skip_serializing)]
+    admin_token_file: Option<PathBuf>,
 
     /// Event type filter (e.g. "lifecycle", "health-check").
     #[arg(long)]
@@ -3760,6 +3779,9 @@ fn execute(raw_args: &[String]) -> Result<ExecutionOutcome> {
 
 fn execute_passthrough_command(prepared: &PreparedCli) -> Result<Option<ExecutionOutcome>> {
     match &prepared.cli.command {
+        Commands::Tail(args) if args.follow && !args.dry_run => {
+            tail_follow::execute(prepared).map(Some)
+        }
         Commands::Map(args) if args.stream => execute_streaming_batch(prepared).map(Some),
         Commands::BatchFile(args) if args.stream => execute_streaming_batch(prepared).map(Some),
         Commands::ServeMcp(args) => execute_serve_mcp(prepared, args).map(Some),
@@ -5226,6 +5248,9 @@ fn bootstrap_dispatch(args: &BootstrapArgs) -> Result<DispatchOutcome> {
 // ── tail / watch dispatch ────────────────────────────────────────────────
 
 fn tail_dispatch(args: &TailArgs, explicit_host: Option<&str>) -> Result<DispatchOutcome> {
+    if args.follow && !args.dry_run {
+        return Ok(passthrough_only_dispatch("tail --follow"));
+    }
     // Parse --since into seconds.
     let since_seconds = match args.since.as_deref() {
         Some(raw) => match event_stream::parse_since(raw) {
@@ -5293,6 +5318,15 @@ fn tail_dispatch(args: &TailArgs, explicit_host: Option<&str>) -> Result<Dispatc
                 ),
             ],
         });
+        if args.follow {
+            payload["follow"] = json!({
+                "enabled": true,
+                "poll_interval_ms": args.poll_interval_ms,
+                "timeout_ms": args.timeout_ms,
+                "event_limit": args.limit,
+                "format": "ndjson",
+            });
+        }
         envelope.inject_into(&mut payload);
         return Ok(DispatchOutcome {
             payload,
@@ -32813,7 +32847,11 @@ fn pipeline_evaluate_condition(template: &str, context: &Value) -> Result<bool> 
 /// sibling. Operators, interpolation and dynamic indexing need full context.
 fn pipeline_known_output_path(expression: &str, context: &Value) -> bool {
     let path = expression.trim();
-    let Some(rest) = path.strip_prefix('.').unwrap_or(path).strip_prefix("steps.") else {
+    let Some(rest) = path
+        .strip_prefix('.')
+        .unwrap_or(path)
+        .strip_prefix("steps.")
+    else {
         return false;
     };
     let mut parts = rest.split('.');
@@ -58087,13 +58125,21 @@ input = { query = "{{steps.first-read.output.title}}" }
             "{{steps.missing.output}}",
             "{{steps.known.output[",
         ] {
-            assert!(!super::pipeline_input_is_available(&json!(reference), &context, true));
+            assert!(!super::pipeline_input_is_available(
+                &json!(reference),
+                &context,
+                true
+            ));
         }
         assert!(super::pipeline_condition_has_known_inputs(
-            "{{steps.real-read.output.enabled}}", &context, true
+            "{{steps.real-read.output.enabled}}",
+            &context,
+            true
         ));
         assert!(!super::pipeline_condition_has_known_inputs(
-            ".steps.real-read.output.enabled", &context, true
+            ".steps.real-read.output.enabled",
+            &context,
+            true
         ));
     }
 
@@ -60613,7 +60659,10 @@ default = "{{steps.preview.output.title}}"
                     "POST /rpc/preflight".to_owned(),
                     mock_preflight_response_json(true),
                 ),
-                ("POST /rpc/invoke".to_owned(), mock_invoke_response_json(result)),
+                (
+                    "POST /rpc/invoke".to_owned(),
+                    mock_invoke_response_json(result),
+                ),
             ]);
         }
         let (host, server, log) = spawn_mock_host_sequence_with_body_log(routes);
@@ -60650,10 +60699,13 @@ default = "{{steps.preview.output.title}}"
             .filter(|(route, _)| route == "POST /rpc/invoke")
             .map(|(_, body)| serde_json::from_str::<Value>(body).unwrap()["input"].clone())
             .collect::<Vec<_>>();
-        assert_eq!(invoked_inputs, [
-            json!({"text": "{{steps.preview.output.title}}"}),
-            json!({"text": "observed"}),
-        ]);
+        assert_eq!(
+            invoked_inputs,
+            [
+                json!({"text": "{{steps.preview.output.title}}"}),
+                json!({"text": "observed"}),
+            ]
+        );
     }
 
     #[test]
@@ -69605,6 +69657,10 @@ require_attestation_types = ["in-toto"]"#,
     #[test]
     fn tail_dry_run_shows_plan() {
         let args = super::TailArgs {
+            follow: false,
+            poll_interval_ms: 1_000,
+            timeout_ms: 300_000,
+            admin_token_file: None,
             connector: Some("slack".to_owned()),
             since: Some("5m".to_owned()),
             limit: 20,
@@ -69626,6 +69682,10 @@ require_attestation_types = ["in-toto"]"#,
     #[test]
     fn tail_dry_run_all_connectors() {
         let args = super::TailArgs {
+            follow: false,
+            poll_interval_ms: 1_000,
+            timeout_ms: 300_000,
+            admin_token_file: None,
             connector: None,
             since: None,
             limit: 50,
@@ -69643,6 +69703,10 @@ require_attestation_types = ["in-toto"]"#,
     #[test]
     fn tail_no_host_returns_transport_error() {
         let args = super::TailArgs {
+            follow: false,
+            poll_interval_ms: 1_000,
+            timeout_ms: 300_000,
+            admin_token_file: None,
             connector: Some("github".to_owned()),
             since: None,
             limit: 50,
@@ -69658,6 +69722,10 @@ require_attestation_types = ["in-toto"]"#,
     #[test]
     fn tail_invalid_since_returns_validation_error() {
         let args = super::TailArgs {
+            follow: false,
+            poll_interval_ms: 1_000,
+            timeout_ms: 300_000,
+            admin_token_file: None,
             connector: None,
             since: Some("abc".to_owned()),
             limit: 50,
@@ -69673,6 +69741,10 @@ require_attestation_types = ["in-toto"]"#,
     #[test]
     fn tail_multi_connector_parse() {
         let args = super::TailArgs {
+            follow: false,
+            poll_interval_ms: 1_000,
+            timeout_ms: 300_000,
+            admin_token_file: None,
             connector: Some("slack,github, jira".to_owned()),
             since: Some("1h".to_owned()),
             limit: 10,
@@ -69705,6 +69777,10 @@ require_attestation_types = ["in-toto"]"#,
     #[test]
     fn tail_dry_run_has_envelope_fields() {
         let args = super::TailArgs {
+            follow: false,
+            poll_interval_ms: 1_000,
+            timeout_ms: 300_000,
+            admin_token_file: None,
             connector: None,
             since: None,
             limit: 50,
@@ -69757,6 +69833,10 @@ require_attestation_types = ["in-toto"]"#,
         )]);
 
         let args = super::TailArgs {
+            follow: false,
+            poll_interval_ms: 1_000,
+            timeout_ms: 300_000,
+            admin_token_file: None,
             connector: Some("fcp.github:enterprise:v1".to_owned()),
             since: None,
             limit: 10,
@@ -69816,6 +69896,10 @@ require_attestation_types = ["in-toto"]"#,
         )]);
 
         let args = super::TailArgs {
+            follow: false,
+            poll_interval_ms: 1_000,
+            timeout_ms: 300_000,
+            admin_token_file: None,
             connector: Some("fcp.github:enterprise:v1".to_owned()),
             since: Some("1m".to_owned()),
             limit: 10,

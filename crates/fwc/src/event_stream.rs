@@ -99,7 +99,8 @@ pub fn parse_since(s: &str) -> Result<u64, String> {
         _ => return Err(format!("unknown duration suffix: '{suffix}'")),
     };
 
-    Ok(num * multiplier)
+    num.checked_mul(multiplier)
+        .ok_or_else(|| "duration exceeds the supported range".to_owned())
 }
 
 // ── Backpressure ring buffer ───────────────────────────────────────────
@@ -670,6 +671,14 @@ mod tests {
     }
 
     // ── parse_since ────────────────────────────────────────────────
+
+    #[test]
+    fn parse_since_overflow_is_rejected() {
+        assert!(parse_since("18446744073709551615d").is_err());
+        assert!(parse_since("18446744073709551615h").is_err());
+        assert!(parse_since("18446744073709551615m").is_err());
+        assert_eq!(parse_since("18446744073709551615s"), Ok(u64::MAX));
+    }
 
     #[test]
     fn parse_since_seconds() {
