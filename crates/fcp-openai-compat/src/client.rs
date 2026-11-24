@@ -378,6 +378,7 @@ impl<P: OpenAiCompatProvider> OpenAiCompatClient<P> {
         cx: &Cx,
         mut req: ChatCompletionsRequest,
     ) -> Result<ChatCompletionsResponse, OpenAiError> {
+        req.validate_provider_extensions()?;
         req.stream = false;
         self.request_json(cx, Method::Post, "/chat/completions", &req.model, &req)
             .await
@@ -389,6 +390,7 @@ impl<P: OpenAiCompatProvider> OpenAiCompatClient<P> {
         cx: &Cx,
         mut req: ChatCompletionsRequest,
     ) -> Result<ChatCompletionStream, OpenAiError> {
+        req.validate_provider_extensions()?;
         req.stream = true;
         let mut budget = RequestBudget::new(cx, self.config.request_timeout);
         let response = self
@@ -403,6 +405,7 @@ impl<P: OpenAiCompatProvider> OpenAiCompatClient<P> {
         cx: &Cx,
         req: EmbeddingsRequest,
     ) -> Result<EmbeddingsResponse, OpenAiError> {
+        req.validate_provider_extensions()?;
         self.request_json(cx, Method::Post, "/embeddings", &req.model, &req)
             .await
     }
@@ -436,6 +439,7 @@ impl<P: OpenAiCompatProvider> OpenAiCompatClient<P> {
         cx: &Cx,
         req: CompletionsRequest,
     ) -> Result<CompletionsResponse, OpenAiError> {
+        req.validate_provider_extensions()?;
         self.request_json(cx, Method::Post, "/completions", &req.model, &req)
             .await
     }

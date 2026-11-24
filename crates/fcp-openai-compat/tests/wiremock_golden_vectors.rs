@@ -9,10 +9,10 @@ use std::time::Duration;
 
 use fcp_async_core::http::HttpClientBuilder;
 use fcp_openai_compat::{
-    ChatCompletionStream, ChatCompletionsRequest, ChatMessage, EmbeddingInput, EmbeddingsRequest,
-    ErrorMapper, HeaderList, HttpRequest, ModelInfo, NetworkError, OpenAiCompatClient,
-    OpenAiCompatClientConfig, OpenAiCompatProvider, OpenAiError, RateLimitConfig, RateLimitPolicy,
-    RateLimitSnapshot,
+    ChatCompletionStream, ChatCompletionsRequest, ChatMessage, CompletionsRequest, EmbeddingInput,
+    EmbeddingsRequest, ErrorMapper, HeaderList, HttpRequest, ModelInfo, NetworkError,
+    OpenAiCompatClient, OpenAiCompatClientConfig, OpenAiCompatProvider, OpenAiError, PromptInput,
+    RateLimitConfig, RateLimitPolicy, RateLimitSnapshot,
 };
 use futures_util::StreamExt as _;
 use serde_json::json;
@@ -206,6 +206,77 @@ async fn collect_stream(stream: ChatCompletionStream) -> Result<String, OpenAiEr
         }
     }
     Ok(content)
+}
+
+#[fcp_async_core::runtime::test]
+async fn reserved_extensions_are_rejected_before_any_provider_request() {
+    let server = MockServer::start().await;
+    let client = client(
+        provider(&server, "extension-guard"),
+        RateLimitPolicy::FailFast,
+    );
+    let cx = fcp_async_core::compatibility_cx();
+    let assert_collision = |error: OpenAiError| {
+        assert!(
+            matches!(error, OpenAiError::InvalidRequest { code: Some(ref code), .. }
+            if code == "reserved_provider_extension"),
+            "{error}"
+        );
+    };
+    for field in ["model", "stream", "messages", "max_tokens"] {
+        let mut request =
+            ChatCompletionsRequest::new("authorized-model", vec![ChatMessage::user_text("hello")]);
+        request
+            .provider_extensions
+            .insert(field.into(), json!("override"));
+        assert_collision(
+            client
+                .chat_completions(&cx, request.clone())
+                .await
+                .unwrap_err(),
+        );
+        assert_collision(
+            client
+                .chat_completions_stream(&cx, request)
+                .await
+                .err()
+                .expect("stream override rejected"),
+        );
+    }
+    assert_collision(
+        client
+            .embeddings(
+                &cx,
+                EmbeddingsRequest {
+                    model: "authorized-model".into(),
+                    input: EmbeddingInput::Single("text".into()),
+                    encoding_format: None,
+                    dimensions: None,
+                    provider_extensions: BTreeMap::from([("input".into(), json!("override"))]),
+                },
+            )
+            .await
+            .unwrap_err(),
+    );
+    assert_collision(
+        client
+            .legacy_completions(
+                &cx,
+                CompletionsRequest {
+                    model: "authorized-model".into(),
+                    prompt: PromptInput::Single("text".into()),
+                    max_tokens: None,
+                    temperature: None,
+                    provider_extensions: BTreeMap::from([("stream".into(), json!(true))]),
+                },
+            )
+            .await
+            .unwrap_err(),
+    );
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "invalid extensions reached the provider"
+    );
 }
 
 #[fcp_async_core::runtime::test]

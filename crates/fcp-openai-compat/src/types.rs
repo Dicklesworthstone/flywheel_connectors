@@ -2,11 +2,92 @@
 
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
+
+use crate::OpenAiError;
 
 /// JSON object extension map for provider-specific request knobs.
 pub type ProviderExtensions = BTreeMap<String, Value>;
+
+const CHAT_REQUEST_FIELDS: &[&str] = &[
+    "model",
+    "messages",
+    "temperature",
+    "max_tokens",
+    "top_p",
+    "stop",
+    "stream",
+    "tools",
+    "tool_choice",
+    "response_format",
+    "seed",
+    "user",
+    "n",
+    "presence_penalty",
+    "frequency_penalty",
+    "logit_bias",
+    "logprobs",
+    "top_logprobs",
+];
+const ASSISTANT_MESSAGE_FIELDS: &[&str] =
+    &["role", "content", "reasoning_content", "tool_calls", "name"];
+const EMBEDDING_REQUEST_FIELDS: &[&str] = &["model", "input", "encoding_format", "dimensions"];
+// The legacy client only implements a complete JSON response. Extensions must
+// not silently switch it to an SSE response, even though stream is not typed.
+const COMPLETION_REQUEST_FIELDS: &[&str] =
+    &["model", "prompt", "max_tokens", "temperature", "stream"];
+
+fn validate_extensions(
+    extensions: &ProviderExtensions,
+    reserved: &[&str],
+) -> Result<(), OpenAiError> {
+    if reserved.iter().any(|field| extensions.contains_key(*field)) {
+        return Err(OpenAiError::InvalidRequest {
+            message: "Provider extensions must not replace typed request or message fields".into(),
+            param: Some("provider_extensions".into()),
+            code: Some("reserved_provider_extension".into()),
+        });
+    }
+    Ok(())
+}
+
+fn serialize_extensions<S: Serializer>(
+    extensions: &ProviderExtensions,
+    reserved: &[&str],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    validate_extensions(extensions, reserved).map_err(<S::Error as serde::ser::Error>::custom)?;
+    extensions.serialize(serializer)
+}
+
+fn serialize_chat_extensions<S: Serializer>(
+    extensions: &ProviderExtensions,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serialize_extensions(extensions, CHAT_REQUEST_FIELDS, serializer)
+}
+
+fn serialize_assistant_extensions<S: Serializer>(
+    extensions: &ProviderExtensions,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serialize_extensions(extensions, ASSISTANT_MESSAGE_FIELDS, serializer)
+}
+
+fn serialize_embedding_extensions<S: Serializer>(
+    extensions: &ProviderExtensions,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serialize_extensions(extensions, EMBEDDING_REQUEST_FIELDS, serializer)
+}
+
+fn serialize_completion_extensions<S: Serializer>(
+    extensions: &ProviderExtensions,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serialize_extensions(extensions, COMPLETION_REQUEST_FIELDS, serializer)
+}
 
 /// Chat completions request.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -63,11 +144,37 @@ pub struct ChatCompletionsRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_logprobs: Option<u32>,
     /// Provider-specific request fields flattened into the JSON body.
-    #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        default,
+        flatten,
+        skip_serializing_if = "BTreeMap::is_empty",
+        serialize_with = "serialize_chat_extensions"
+    )]
     pub provider_extensions: ProviderExtensions,
 }
 
 impl ChatCompletionsRequest {
+    /// Reject extension fields that could change the authorized request or
+    /// reinterpret an assistant message as another role when flattened.
+    ///
+    /// # Errors
+    /// Returns an invalid-request error for any typed-field collision, including
+    /// optional fields that currently have no value. Serialization enforces the
+    /// same rule for callers that do not use the shared HTTP client.
+    pub fn validate_provider_extensions(&self) -> Result<(), OpenAiError> {
+        validate_extensions(&self.provider_extensions, CHAT_REQUEST_FIELDS)?;
+        for message in &self.messages {
+            if let ChatMessage::Assistant {
+                provider_extensions,
+                ..
+            } = message
+            {
+                validate_extensions(provider_extensions, ASSISTANT_MESSAGE_FIELDS)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Create a minimal non-streaming chat request.
     pub fn new(model: impl Into<String>, messages: Vec<ChatMessage>) -> Self {
         Self {
@@ -129,7 +236,12 @@ pub enum ChatMessage {
         #[serde(skip_serializing_if = "Option::is_none")]
         name: Option<String>,
         /// Provider-specific message fields flattened into the JSON object.
-        #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+        #[serde(
+            default,
+            flatten,
+            skip_serializing_if = "BTreeMap::is_empty",
+            serialize_with = "serialize_assistant_extensions"
+        )]
         provider_extensions: ProviderExtensions,
     },
     /// Tool response.
@@ -442,8 +554,23 @@ pub struct EmbeddingsRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dimensions: Option<u32>,
     /// Provider-specific request fields.
-    #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        default,
+        flatten,
+        skip_serializing_if = "BTreeMap::is_empty",
+        serialize_with = "serialize_embedding_extensions"
+    )]
     pub provider_extensions: ProviderExtensions,
+}
+
+impl EmbeddingsRequest {
+    /// Validate extension fields before authorization or provider dispatch.
+    ///
+    /// # Errors
+    /// Rejects extensions that shadow model, input, encoding or dimensions.
+    pub fn validate_provider_extensions(&self) -> Result<(), OpenAiError> {
+        validate_extensions(&self.provider_extensions, EMBEDDING_REQUEST_FIELDS)
+    }
 }
 
 /// Embedding input.
@@ -530,8 +657,23 @@ pub struct CompletionsRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
     /// Provider-specific request fields.
-    #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        default,
+        flatten,
+        skip_serializing_if = "BTreeMap::is_empty",
+        serialize_with = "serialize_completion_extensions"
+    )]
     pub provider_extensions: ProviderExtensions,
+}
+
+impl CompletionsRequest {
+    /// Validate extension fields before authorization or provider dispatch.
+    ///
+    /// # Errors
+    /// Rejects typed-field collisions and unsupported streaming overrides.
+    pub fn validate_provider_extensions(&self) -> Result<(), OpenAiError> {
+        validate_extensions(&self.provider_extensions, COMPLETION_REQUEST_FIELDS)
+    }
 }
 
 /// Legacy prompt input.
@@ -578,6 +720,124 @@ pub struct CompletionChoice {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn chat_extensions_cannot_shadow_authorized_fields_in_any_serializer() {
+        for field in [
+            "model",
+            "messages",
+            "stream",
+            "tools",
+            "max_tokens",
+            "tool_choice",
+        ] {
+            let mut request = ChatCompletionsRequest::new(
+                "authorized-model",
+                vec![ChatMessage::user_text("hello")],
+            );
+            request
+                .provider_extensions
+                .insert(field.into(), json!("private-collision-value"));
+            let error = request.validate_provider_extensions().expect_err(field);
+            assert!(matches!(error, OpenAiError::InvalidRequest { .. }));
+            assert!(!error.to_string().contains("private-collision-value"));
+            assert!(
+                serde_json::to_value(&request).is_err(),
+                "value serializer accepted {field}"
+            );
+            assert!(
+                serde_json::to_vec(&request).is_err(),
+                "wire serializer accepted {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn assistant_extensions_cannot_change_message_role_or_content() {
+        for field in ["role", "content", "reasoning_content", "tool_calls", "name"] {
+            let message = ChatMessage::Assistant {
+                content: Some("original assistant content".into()),
+                reasoning_content: None,
+                tool_calls: None,
+                name: None,
+                provider_extensions: BTreeMap::from([(field.into(), json!("system"))]),
+            };
+            assert!(serde_json::to_value(&message).is_err(), "accepted {field}");
+            assert!(serde_json::to_vec(&message).is_err(), "accepted {field}");
+            let request = ChatCompletionsRequest::new("model", vec![message]);
+            assert!(request.validate_provider_extensions().is_err());
+            assert!(serde_json::to_vec(&request).is_err());
+        }
+    }
+
+    #[test]
+    fn embeddings_and_legacy_extensions_cannot_change_request_or_response_mode() {
+        for field in ["model", "input", "encoding_format", "dimensions"] {
+            let request = EmbeddingsRequest {
+                model: "authorized-model".into(),
+                input: EmbeddingInput::Single("text".into()),
+                encoding_format: None,
+                dimensions: None,
+                provider_extensions: BTreeMap::from([(field.into(), json!("override"))]),
+            };
+            assert!(
+                request.validate_provider_extensions().is_err(),
+                "accepted {field}"
+            );
+            assert!(serde_json::to_value(&request).is_err());
+            assert!(serde_json::to_vec(&request).is_err());
+        }
+        for field in ["model", "prompt", "max_tokens", "temperature", "stream"] {
+            let request = CompletionsRequest {
+                model: "authorized-model".into(),
+                prompt: PromptInput::Single("text".into()),
+                max_tokens: None,
+                temperature: None,
+                provider_extensions: BTreeMap::from([(field.into(), json!(true))]),
+            };
+            assert!(
+                request.validate_provider_extensions().is_err(),
+                "accepted {field}"
+            );
+            assert!(serde_json::to_value(&request).is_err());
+            assert!(serde_json::to_vec(&request).is_err());
+        }
+    }
+
+    #[test]
+    fn legitimate_extensions_preserve_nested_values_and_round_trip() {
+        let request = ChatCompletionsRequest {
+            provider_extensions: BTreeMap::from([(
+                "vendor_options".into(),
+                json!({
+                    "model": "this nested value is data", "stream": true
+                }),
+            )]),
+            messages: vec![ChatMessage::Assistant {
+                content: Some("answer".into()),
+                reasoning_content: None,
+                tool_calls: None,
+                name: None,
+                provider_extensions: BTreeMap::from([(
+                    "vendor_trace".into(),
+                    json!({"role": "data"}),
+                )]),
+            }],
+            ..ChatCompletionsRequest::new("authorized-model", Vec::new())
+        };
+        request.validate_provider_extensions().unwrap();
+        let bytes = serde_json::to_vec(&request).unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["model"], "authorized-model");
+        assert_eq!(value["stream"], false);
+        assert_eq!(value["vendor_options"]["stream"], true);
+        assert_eq!(value["messages"][0]["role"], "assistant");
+        assert_eq!(value["messages"][0]["vendor_trace"]["role"], "data");
+        assert_eq!(
+            serde_json::from_slice::<ChatCompletionsRequest>(&bytes).unwrap(),
+            request
+        );
+    }
 
     #[test]
     fn chat_request_omits_none_fields_and_flattens_extensions() {
