@@ -3,6 +3,7 @@
 //! A local meta-connector that manages cron schedules and execution history
 //! in memory. No external API calls are needed.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -231,7 +232,7 @@ pub struct CronConnector {
     started_at: Instant,
     provisioning: ProvisioningPolicy,
     schedules: Vec<Schedule>,
-    executions: Vec<Execution>,
+    executions: VecDeque<Execution>,
     request_count: AtomicU64,
     error_count: AtomicU64,
 }
@@ -247,7 +248,7 @@ impl CronConnector {
             started_at: Instant::now(),
             provisioning: ProvisioningPolicy::default(),
             schedules: Vec::new(),
-            executions: Vec::new(),
+            executions: VecDeque::new(),
             request_count: AtomicU64::new(0),
             error_count: AtomicU64::new(0),
         }
@@ -283,8 +284,21 @@ impl CronConnector {
             })?;
         let provisioning = provisioning.normalize();
         provisioning.validate()?;
+        if self.schedules.len() > provisioning.state_store.max_schedules {
+            return Err(FcpError::Conflict {
+                message: format!(
+                    "Cannot lower max_schedules below the {} existing schedules",
+                    self.schedules.len()
+                ),
+            });
+        }
 
         info!("Configuring Cron connector (local meta-connector, no external auth)");
+        let expired = self
+            .executions
+            .len()
+            .saturating_sub(provisioning.state_store.max_executions);
+        self.executions.drain(..expired);
         self.provisioning = provisioning;
         self.configured = true;
         self.base.set_configured(true);
@@ -603,6 +617,11 @@ impl CronConnector {
         if self.schedules.iter().any(|s| s.name == name) {
             return Err(CronError::DuplicateName { name: name.into() });
         }
+        if self.schedules.len() >= self.provisioning.state_store.max_schedules {
+            return Err(CronError::ScheduleCapacity {
+                limit: self.provisioning.state_store.max_schedules,
+            });
+        }
 
         let enabled = input
             .get("enabled")
@@ -681,7 +700,10 @@ impl CronConnector {
             status: "triggered".into(),
         };
 
-        self.executions.push(execution);
+        if self.executions.len() == self.provisioning.state_store.max_executions {
+            self.executions.pop_front();
+        }
+        self.executions.push_back(execution);
 
         Ok(json!({ "execution_id": execution_id }))
     }
@@ -1518,6 +1540,47 @@ mod tests {
         let c = CronConnector::new();
         let result = c.invoke_schedules_list().unwrap();
         assert_eq!(result["schedules"].as_array().unwrap().len(), 0);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn catalog_limits_preserve_schedules_and_retain_newest_history() {
+        let mut c = CronConnector::new();
+        c.handle_configure(json!({"state_store": {"max_schedules": 2, "max_executions": 2}}))
+            .await
+            .unwrap();
+        let create = |name: &str| {
+            json!({
+                "name": name, "expression": "* * * * *", "target_operation": "test.run",
+            })
+        };
+        let first = c.invoke_schedules_create(&create("first")).unwrap();
+        let second = c.invoke_schedules_create(&create("second")).unwrap();
+        assert!(matches!(
+            c.invoke_schedules_create(&create("third"))
+                .unwrap_err()
+                .to_fcp_error(),
+            FcpError::ResourceExhausted { .. }
+        ));
+        c.invoke_trigger(&first).unwrap();
+        let older = c.invoke_trigger(&second).unwrap();
+        let latest = c.invoke_trigger(&first).unwrap();
+        assert_eq!(c.executions.len(), 2);
+        assert_eq!(json!(c.executions[0].id), older["execution_id"]);
+        assert!(
+            c.handle_configure(json!({"state_store": {"max_schedules": 1, "max_executions": 1}}))
+                .await
+                .is_err()
+        );
+        assert_eq!(c.executions.len(), 2);
+        assert_eq!(c.provisioning.state_store.max_executions, 2);
+        c.invoke_schedules_delete(&first).unwrap();
+        c.invoke_schedules_create(&create("third")).unwrap();
+        c.handle_configure(json!({"state_store": {"max_schedules": 2, "max_executions": 1}}))
+            .await
+            .unwrap();
+        let history = c.invoke_executions_list(&json!({})).unwrap();
+        assert_eq!(history["executions"].as_array().unwrap().len(), 1);
+        assert_eq!(history["executions"][0]["id"], latest["execution_id"]);
     }
 
     #[test]

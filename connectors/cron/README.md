@@ -36,6 +36,8 @@ Important runtime truths the contract preserves:
 - `persist_to_disk = true` is rejected with an in-memory-only error.
 - Configured `max_schedules` must be in `1..=100000`.
 - Configured `max_executions` must be in `1..=1000000`.
+- Creating a schedule at capacity returns `ResourceExhausted`. Deleting a schedule frees its slot.
+- Execution history retains the newest `max_executions` records across all schedules. A smaller history limit takes effect immediately. Reconfiguration rejects a schedule limit below the current schedule count and preserves the previous policy and history on failure.
 - Default clock source is `system_utc`.
 - Default timezone is `UTC`.
 - Default `max_clock_skew_seconds` is `30`; configured values above `300` are rejected.

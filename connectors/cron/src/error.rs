@@ -25,6 +25,10 @@ pub enum CronError {
     #[error("Duplicate schedule name: {name}")]
     DuplicateName { name: String },
 
+    /// All configured schedule slots are occupied.
+    #[error("Schedule limit reached ({limit})")]
+    ScheduleCapacity { limit: usize },
+
     /// Internal error
     #[error("Internal error: {message}")]
     Internal { message: String },
@@ -44,6 +48,9 @@ impl CronError {
             },
             Self::DuplicateName { name } => FcpError::Conflict {
                 message: format!("Schedule with name '{name}' already exists"),
+            },
+            Self::ScheduleCapacity { limit } => FcpError::ResourceExhausted {
+                resource: format!("cron schedule slots (max_schedules={limit})"),
             },
             Self::Internal { message } => FcpError::Internal {
                 message: message.clone(),
