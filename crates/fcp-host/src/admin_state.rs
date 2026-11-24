@@ -5204,15 +5204,20 @@ impl HostAdminStateStore {
         }
     }
 
-    /// Acknowledge events by ID.
+    /// Acknowledge events by ID after committing the updated snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if persistence fails or earlier uncertain persistence
+    /// has fenced this store. No acknowledgement count is reported until the
+    /// mutation has been committed.
     pub async fn acknowledge_events(
         &self,
         request: &EventAcknowledgeRequest,
-    ) -> EventAcknowledgeResponse {
-        let mut acknowledged_count = 0;
-        let mut not_found = Vec::new();
-
+    ) -> Result<EventAcknowledgeResponse, LifecycleError> {
         self.apply_mutation(|snapshot| {
+            let mut acknowledged_count = 0;
+            let mut not_found = Vec::new();
             for event_id in &request.event_ids {
                 if let Some(event) = snapshot.events.iter_mut().find(|e| e.event_id == *event_id) {
                     if !event.acknowledged {
@@ -5223,15 +5228,12 @@ impl HostAdminStateStore {
                     not_found.push(event_id.clone());
                 }
             }
-            Ok(())
+            Ok(EventAcknowledgeResponse {
+                acknowledged_count,
+                not_found,
+            })
         })
         .await
-        .ok();
-
-        EventAcknowledgeResponse {
-            acknowledged_count,
-            not_found,
-        }
     }
 
     // ── Capability issuance and token management ────────────────────────────
@@ -10420,7 +10422,8 @@ mod tests {
             .acknowledge_events(&EventAcknowledgeRequest {
                 event_ids: vec![all.events[0].event_id.clone()],
             })
-            .await;
+            .await
+            .expect("acknowledgement should commit");
         assert_eq!(ack_response.acknowledged_count, 1);
         assert!(ack_response.not_found.is_empty());
 
@@ -10435,6 +10438,131 @@ mod tests {
             .await;
         assert_eq!(unacked.events.len(), 1);
         assert_eq!(unacked.unacknowledged_count, 1);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn acknowledge_events_commit_once_and_survive_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("events.json");
+        let store = HostAdminStateStore::with_state_path(path.clone()).unwrap();
+        for summary in ["first", "second", "third"] {
+            store
+                .emit_event(HostEventKind::HealthCheck, None, summary.to_owned(), None)
+                .await;
+        }
+        let response = store
+            .acknowledge_events(&EventAcknowledgeRequest {
+                event_ids: vec![
+                    "evt-1".to_owned(),
+                    "evt-1".to_owned(),
+                    "not-retained".to_owned(),
+                    "evt-3".to_owned(),
+                ],
+            })
+            .await
+            .expect("acknowledgements must commit before returning success");
+        assert_eq!(response.acknowledged_count, 2);
+        assert_eq!(response.not_found, vec!["not-retained"]);
+        drop(store);
+
+        let reopened = HostAdminStateStore::with_state_path(path.clone()).unwrap();
+        let page = reopened
+            .query_events_page(&event_page_request(10, None))
+            .await;
+        assert_eq!(
+            page.events
+                .iter()
+                .map(|event| event.acknowledged)
+                .collect::<Vec<_>>(),
+            vec![true, false, true]
+        );
+        let repeated = reopened
+            .acknowledge_events(&EventAcknowledgeRequest {
+                event_ids: vec!["evt-1".to_owned(), "evt-3".to_owned()],
+            })
+            .await
+            .expect("committed acknowledgements are idempotent after restart");
+        assert_eq!(repeated.acknowledged_count, 0);
+        assert!(repeated.not_found.is_empty());
+        let mut unacknowledged = event_page_request(10, None);
+        unacknowledged.query.unacknowledged_only = true;
+        let page = reopened.query_events_page(&unacknowledged).await;
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(page.events[0].event_id, "evt-2");
+        drop(reopened);
+
+        let reopened_again = HostAdminStateStore::with_state_path(path).unwrap();
+        let page = reopened_again.query_events_page(&unacknowledged).await;
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(page.events[0].event_id, "evt-2");
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn acknowledge_events_persistence_failure_never_reports_success_or_lifts_fence() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("events.json");
+        let store = HostAdminStateStore::with_state_path(path.clone()).unwrap();
+        store
+            .emit_event(
+                HostEventKind::HealthCheck,
+                None,
+                "retained".to_owned(),
+                None,
+            )
+            .await;
+        let committed = std::fs::read(&path).unwrap();
+        let blocked_temp_path = temporary_admin_state_path(&path);
+        std::fs::create_dir(&blocked_temp_path).unwrap();
+        let request = EventAcknowledgeRequest {
+            event_ids: vec!["evt-1".to_owned()],
+        };
+
+        let error = store
+            .acknowledge_events(&request)
+            .await
+            .expect_err("a failed snapshot write cannot acknowledge an event");
+        assert!(
+            error
+                .to_string()
+                .contains("could not create temporary admin state file")
+        );
+        let page = store.query_events_page(&event_page_request(10, None)).await;
+        assert_eq!(page.events.len(), 1);
+        assert!(!page.events[0].acknowledged);
+        assert_eq!(std::fs::read(&path).unwrap(), committed);
+
+        // Remove the obstruction by preserving it under another name. A
+        // writable path does not make this store's uncertain state reusable.
+        std::fs::rename(
+            &blocked_temp_path,
+            directory.path().join("preserved-obstruction"),
+        )
+        .unwrap();
+        let retry = store
+            .acknowledge_events(&request)
+            .await
+            .expect_err("an uncertain store must remain fenced");
+        assert!(retry.to_string().contains("writes are fenced"));
+        assert_eq!(std::fs::read(&path).unwrap(), committed);
+        drop(store);
+
+        let reopened = HostAdminStateStore::with_state_path(path.clone()).unwrap();
+        let retained = reopened
+            .query_events_page(&event_page_request(10, None))
+            .await;
+        assert_eq!(retained.events.len(), 1);
+        assert!(!retained.events[0].acknowledged);
+        let response = reopened.acknowledge_events(&request).await.unwrap();
+        assert_eq!(response.acknowledged_count, 1);
+        assert!(response.not_found.is_empty());
+        drop(reopened);
+
+        let confirmed = HostAdminStateStore::with_state_path(path).unwrap();
+        let page = confirmed
+            .query_events_page(&event_page_request(10, None))
+            .await;
+        assert_eq!(page.events.len(), 1);
+        assert!(page.events[0].acknowledged);
     }
 
     fn event_page_request(limit: usize, after: Option<&str>) -> EventPageQueryRequest {
@@ -10514,7 +10642,8 @@ mod tests {
             .acknowledge_events(&EventAcknowledgeRequest {
                 event_ids: vec!["evt-1".to_owned()],
             })
-            .await;
+            .await
+            .expect("acknowledgement should commit");
         let mut request = event_page_request(1, Some("evt-1"));
         request.query.connector_id = Some("alpha".to_owned());
         request.query.kind = Some(HostEventKind::HealthCheck);
@@ -10692,7 +10821,8 @@ mod tests {
             .acknowledge_events(&EventAcknowledgeRequest {
                 event_ids: vec!["evt-999".to_string()],
             })
-            .await;
+            .await
+            .expect("missing event should be reported after commit");
         assert_eq!(response.acknowledged_count, 0);
         assert_eq!(response.not_found, vec!["evt-999"]);
     }

@@ -20469,13 +20469,19 @@ async fn event_page_query_handler(
 async fn event_acknowledge_handler(
     State(state): State<Arc<AppState>>,
     Json(request): Json<EventAcknowledgeRequest>,
-) -> Json<EventAcknowledgeResponse> {
+) -> Result<Json<EventAcknowledgeResponse>, (StatusCode, String)> {
     tracing::debug!(
         event = "event_acknowledge_request",
         count = request.event_ids.len(),
         "processing event acknowledgement"
     );
-    Json(state.lifecycle.acknowledge_events(&request).await)
+    let response = state
+        .lifecycle
+        .acknowledge_events(&request)
+        .await
+        .map_err(map_lifecycle_host_error)
+        .map_err(map_host_error)?;
+    Ok(Json(response))
 }
 
 fn parse_connector_id(raw: &str) -> Result<ConnectorId, (StatusCode, String)> {
@@ -43721,6 +43727,10 @@ while IFS= read -r request; do exit 2; done
 
     fn event_page_test_app(state: Arc<AppState>) -> axum::Router {
         admin_event_page_routes()
+            .route(
+                "/rpc/admin/events/acknowledge",
+                post(event_acknowledge_handler),
+            )
             .route_layer(axum::middleware::from_fn_with_state(
                 Arc::clone(&state),
                 admin_auth_middleware,
@@ -47075,6 +47085,90 @@ while IFS= read -r request; do exit 2; done
             .await?;
             assert_eq!(response.status(), expected);
         }
+        Ok(())
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn event_acknowledge_route_reports_persistence_failure_without_false_success()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("events.json");
+        let lifecycle = Arc::new(HostAdminStateStore::with_state_path(path.clone())?);
+        lifecycle
+            .emit_event(
+                fcp_host::HostEventKind::HealthCheck,
+                None,
+                "acknowledgement must remain pending".to_owned(),
+                None,
+            )
+            .await;
+        let base = cancel_route_test_state();
+        let state = Arc::new(AppState {
+            lifecycle,
+            ..(*base).clone()
+        });
+        let app = event_page_test_app(state);
+        std::fs::create_dir(directory.path().join("events.json.tmp"))?;
+        let request = json!({ "event_ids": ["evt-1"] });
+        let denied = send_json_request(
+            app.clone(),
+            axum::http::Method::POST,
+            "/rpc/admin/events/acknowledge",
+            request.clone(),
+            &[],
+        )
+        .await?;
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+        let headers = [
+            ("Authorization", "Bearer topsecret"),
+            (ADMIN_ZONE_HEADER, "z:owner"),
+        ];
+        for expected_error in [
+            "could not create temporary admin state file",
+            "writes are fenced",
+        ] {
+            let response = send_json_request(
+                app.clone(),
+                axum::http::Method::POST,
+                "/rpc/admin/events/acknowledge",
+                request.clone(),
+                &headers,
+            )
+            .await?;
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024).await?;
+            let body = std::str::from_utf8(&bytes)?;
+            assert!(body.contains(expected_error));
+            assert!(!body.contains("acknowledged_count"));
+        }
+
+        let response = send_json_request(
+            app,
+            axum::http::Method::POST,
+            "/rpc/admin/events/page",
+            json!({ "query": { "unacknowledged_only": true } }),
+            &headers,
+        )
+        .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let page: EventPageQueryResponse =
+            serde_json::from_value(response_body_json(response).await?)?;
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(page.events[0].event_id, "evt-1");
+        assert!(!page.events[0].acknowledged);
+
+        let reopened = HostAdminStateStore::with_state_path(path)?;
+        let retained = reopened
+            .query_events(&EventQueryRequest {
+                connector_id: None,
+                kind: None,
+                unacknowledged_only: true,
+                limit: 10,
+            })
+            .await;
+        assert_eq!(retained.unacknowledged_count, 1);
+        assert_eq!(retained.events[0].event_id, "evt-1");
         Ok(())
     }
 
