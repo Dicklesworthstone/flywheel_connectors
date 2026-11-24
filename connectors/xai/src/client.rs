@@ -18,6 +18,10 @@ pub const DEFAULT_BASE_URL: &str = "https://api.x.ai/v1";
 pub const DEFAULT_MODEL: &str = "grok-4.3";
 pub const USER_AGENT: &str = "fcp-xai/0.1.0";
 
+// Enforce the manifest's response bound while reading JSON or SSE bodies,
+// before the completed FCP response is checked against its admission budget.
+const MAX_PROVIDER_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
+
 const ACCEPT_HEADER: &str = "Accept";
 const CONTENT_TYPE_HEADER: &str = "Content-Type";
 const JSON_CONTENT_TYPE: &str = "application/json";
@@ -109,8 +113,12 @@ impl XaiClient {
         model_cache_ttl: Duration,
         rate_limit_policy: RateLimitPolicy,
     ) -> Self {
-        let inner_http_client = HttpClientBuilder::new().build();
-        let direct_http_client = HttpClientBuilder::new().build();
+        let inner_http_client = HttpClientBuilder::new()
+            .max_body_size(MAX_PROVIDER_RESPONSE_BYTES)
+            .build();
+        let direct_http_client = HttpClientBuilder::new()
+            .max_body_size(MAX_PROVIDER_RESPONSE_BYTES)
+            .build();
         Self {
             inner: OpenAiCompatClient::new_with_config(
                 provider.clone(),
@@ -161,6 +169,7 @@ impl XaiClient {
         cx: &Cx,
         request: ResponsesCreateRequest,
     ) -> Result<Value, OpenAiError> {
+        request.validate_provider_extensions()?;
         self.request_json(cx, "/responses", &request.model, &request)
             .await
     }

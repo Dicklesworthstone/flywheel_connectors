@@ -1,6 +1,6 @@
 # xAI Connector V3 Contract
 
-> **Status**: PROVEN (2026-10-20; 12/12 graduation gauntlet, verifier + unit/integration/local_non_mock suites verified)
+> **Status**: Initial provider slice verified on 2026-10-20; canonical standalone authority and deadline integration added subsequently. New runtime regressions still require execution; the shared build environment blocked compilation.
 > **Bead**: `flywheel_connectors-4kw5f.12`
 > **Parent**: `flywheel_connectors-4kw5f`
 > **Verification script**: `scripts/e2e/xai_connector_verification.sh`
@@ -26,15 +26,40 @@ Important runtime truths the contract preserves:
 
 - Configuration accepts exactly one of `api_key` or `credential_id`, plus optional `base_url`, default model, request timeout, model-cache TTL, and rate-limit wait policy.
 - API-key mode sends a bearer token to xAI.
-- Credential-id mode emits an `x-fcp-credential-id` header and requires host-side egress credential injection for live traffic.
+- Credential-id configuration reports degraded readiness and refuses invocation before provider I/O because this standalone transport does not implement host-mediated credential injection.
 - Default base URL is `https://api.x.ai/v1`.
 - Loopback HTTP base URLs ending in `/v1` are accepted for deterministic tests.
 - Default model is `grok-4.3`.
-- Chat completions can forward explicit legacy `search_parameters`, but this connector does not add them automatically.
-- Responses API web search requires either `web_search` shorthand or a raw `type = "web_search"` tool.
+- Chat completions reject search-enabling legacy `search_parameters`; live search requires the separately authorized Responses operation.
+- Responses API web search requires either `web_search` shorthand or a raw `type = "web_search"` tool. Additional tool types require their own authority and are refused by this operation.
 - Responses output includes `output_text`, byte counts, structured citations, citation hosts, usage, server-side tool usage, and the raw provider response for authorized invoke callers.
 - SSE chat streaming returns redaction-safe chunk metadata and assembled text from a bounded invoke call; FCP subscribe is not implemented.
 - Runtime handshake returns a SHA-256 hash of the bundled `manifest.toml`.
+
+## Standalone Invocation Boundary
+
+The JSONL entry point and typed connector use the same canonical `InvokeRequest`
+and return the complete metered `InvokeResponse`, including its resource metadata.
+Admission checks the negotiated capability, connector and zone routing, current
+instance, signed call and byte allowances, effective configured model, and any
+supported external input references. Provider extension maps cannot replace
+typed request fields after authorization.
+
+Configuration, replacement handshakes and shutdown revoke prior session
+authority. Failed replacement configuration cannot keep using the old account.
+Simulation validates the same operation and authority without consuming a call
+or contacting xAI.
+
+A single budget covers cache access, provider retries, the full SSE body and
+response validation. Its limit is the minimum of the caller deadline, configured
+timeout and operation limit. Cancellation and deadline expiration are terminal;
+interrupted provider effects retain their admission debit. Responses exceeding
+the native byte reservation or output contract are withheld.
+
+Strict model-list and health operations require a non-empty `idempotency_key`.
+This enforces admission constraints; it does not provide a persistent result
+cache or cross-process deduplication. Shared mesh quotas, credential injection,
+approval processing and global revocation remain host responsibilities.
 
 ## First-Slice Scope
 
@@ -51,7 +76,7 @@ The first xAI slice is intentionally narrow:
 
 ## Auth And Scope Boundary
 
-- Authentication mechanism: xAI API key, with host-injected credential-id mode.
+- Authentication mechanism: xAI API key. Credential-id configuration is inspectable but cannot invoke until host-mediated injection is implemented.
 - Home zone: `z:work`.
 - Allowed source zones: `z:owner`, `z:private`, `z:work`, and `z:project:*`.
 - Allowed target zone: `z:work`.
@@ -62,7 +87,7 @@ The first xAI slice is intentionally narrow:
   - `xai.models.read` gates model discovery.
   - `xai.health.read` gates the health probe.
 - The connector does not persist prompts, completions, streamed chunks, Responses input, citation URL paths, model catalogs, provider payloads, or provider responses.
-- Credential-id mode is a host-egress contract, not direct proof that live xAI will accept the request without an injection layer.
+- Credential-id mode fails closed before any live provider request.
 
 ## Network And Runtime Invariants
 
@@ -112,7 +137,7 @@ The first implementation slice does not include:
 These are excluded on purpose:
 
 - The useful first slice is Grok chat plus current xAI Responses API web search with clear citation and redaction boundaries.
-- Legacy chat `search_parameters` remain pass-through only for explicit callers; new work should use `xai.responses.create`.
+- Search-enabling legacy chat `search_parameters` are refused; use `xai.responses.create` with its web-search capability.
 - Full citation URL paths can reveal user intent and browsing context, so operator evidence records use citation hostnames rather than raw URLs.
 
 ## Readiness And Verification Surface

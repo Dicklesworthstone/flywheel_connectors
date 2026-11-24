@@ -1,17 +1,19 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use fcp_openai_compat::RateLimitPolicy;
+use fcp_openai_compat::{RateLimitPolicy, RequestBudget};
 use fcp_prelude::{
-    AgentHint, ApprovalMode, BaseConnector, CapabilityGrant, CapabilityId, CapabilityToken,
-    CapabilityVerifier, ConnectorId, ConnectorMetrics, EventCaps, FcpConnector, FcpError,
-    FcpResult, HandshakeRequest, HandshakeResponse, HealthSnapshot, IdempotencyClass, InstanceId,
-    Introspection, InvokeRequest, InvokeResponse, OperationId, OperationInfo, RequestId, RiskLevel,
-    SafetyTier, SelfCheckReport, SessionId, ShutdownRequest, SimulateRequest, SimulateResponse,
-    SubscribeRequest, SubscribeResponse, UnsubscribeRequest, ZoneId,
+    AgentHint, ApprovalMode, BaseConnector, CapabilityId, CapabilityToken, ConnectorId,
+    ConnectorMetrics, EventCaps, FcpConnector, FcpError, FcpResult, HandshakeRequest,
+    HandshakeResponse, HealthSnapshot, IdempotencyClass, InstanceId, Introspection, InvokeRequest,
+    InvokeResponse, OperationId, OperationInfo, RequestId, RiskLevel, SafetyTier, SelfCheckReport,
+    SessionId, ShutdownRequest, SimulateRequest, SimulateResponse, SubscribeRequest,
+    SubscribeResponse, UnsubscribeRequest, ZoneId,
 };
+use fcp_sdk::prelude::{OperationContractSet, StandaloneSession};
 use serde_json::{Value, json};
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 use tracing::info;
 
@@ -21,12 +23,14 @@ use crate::client::{
 };
 use crate::error::openai_error_to_fcp;
 use crate::types::{
-    chat_request_from_value, responses_request_from_value, summarize_responses_value,
+    chat_request_from_value, chat_resource_uris, responses_request_from_value,
+    responses_resource_uris, summarize_responses_value,
 };
 
 pub const CONNECTOR_ID: &str = "fcp.xai";
 pub const CONNECTOR_VERSION: &str = "0.1.0";
 const MANIFEST_TOML: &str = include_str!("../manifest.toml");
+const MAX_NATIVE_RESPONSE_BYTES: u64 = 10 * 1024 * 1024;
 
 const OP_CHAT: &str = "xai.chat.completions";
 const OP_CHAT_STREAM: &str = "xai.chat.completions_stream";
@@ -127,10 +131,11 @@ impl XaiConfig {
 }
 
 pub struct XaiConnector {
-    base: Arc<BaseConnector>,
+    base: BaseConnector,
     config: Option<XaiConfig>,
     client: Option<Arc<XaiClient>>,
-    verifier: Option<CapabilityVerifier>,
+    authority: Option<StandaloneSession>,
+    bound_zone: Option<ZoneId>,
     session_id: Option<SessionId>,
     request_count: AtomicU64,
     error_count: AtomicU64,
@@ -140,10 +145,11 @@ impl XaiConnector {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            base: Arc::new(BaseConnector::new(ConnectorId::from_static(CONNECTOR_ID))),
+            base: BaseConnector::new(ConnectorId::from_static(CONNECTOR_ID)),
             config: None,
             client: None,
-            verifier: None,
+            authority: None,
+            bound_zone: None,
             session_id: None,
             request_count: AtomicU64::new(0),
             error_count: AtomicU64::new(0),
@@ -155,13 +161,32 @@ impl XaiConnector {
         &self.base.instance_id
     }
 
+    #[cfg(test)]
     fn manifest_hash() -> String {
         let mut hasher = Sha256::new();
         hasher.update(MANIFEST_TOML.as_bytes());
         format!("sha256:{}", hex::encode(hasher.finalize()))
     }
 
+    fn invalidate_authority(&mut self) {
+        self.authority = None;
+        self.session_id = None;
+        self.base.instance_id = InstanceId::new();
+        self.base.set_handshaken(false);
+    }
+
+    fn clear_configuration(&mut self) {
+        self.invalidate_authority();
+        self.client = None;
+        self.config = None;
+        self.bound_zone = None;
+        self.base.set_configured(false);
+    }
+
     pub async fn handle_configure(&mut self, params: Value) -> FcpResult<Value> {
+        // A failed replacement must revoke the old account and its tokens too.
+        self.clear_configuration();
+        operation_contracts()?;
         let config = XaiConfig::from_params(&params)?;
         let client = config.build_client();
         let auth_mode = config.auth.redacted_label();
@@ -182,56 +207,59 @@ impl XaiConnector {
     }
 
     pub async fn handle_handshake(&mut self, params: Value) -> FcpResult<Value> {
+        self.invalidate_authority();
         if self.config.is_none() {
             return Err(FcpError::NotConfigured);
         }
         let req: HandshakeRequest =
-            serde_json::from_value(params).map_err(|err| FcpError::InvalidRequest {
+            serde_json::from_value(params).map_err(|_| FcpError::InvalidRequest {
                 code: 1003,
-                message: format!("Invalid handshake request: {err}"),
+                message: "Invalid handshake request".into(),
             })?;
-        self.verifier = Some(CapabilityVerifier::new(
-            req.host_public_key,
-            req.zone.clone(),
-            self.base.instance_id.clone(),
-        ));
-        let session_id = SessionId::new();
-        self.session_id = Some(session_id.clone());
+        if req.zone != ZoneId::work()
+            || self
+                .bound_zone
+                .as_ref()
+                .is_some_and(|zone| zone != &req.zone)
+        {
+            return Err(FcpError::CapabilityDenied {
+                capability: "xai.handshake".into(),
+                reason: "xAI requires its manifest target zone z:work and reconfiguration before rebinding".into(),
+            });
+        }
+        let zone = req.zone.clone();
+        let mut authority = StandaloneSession::new(MANIFEST_TOML)?;
+        let mut response = authority.handshake(req)?;
+        response.event_caps = Some(EventCaps {
+            streaming: true,
+            replay: false,
+            min_buffer_events: 0,
+            requires_ack: false,
+        });
+        let mut result = serde_json::to_value(&response).map_err(|_| FcpError::Internal {
+            message: "Failed to serialize handshake response".into(),
+        })?;
+        result["instance_id"] = json!(authority.instance_id());
+        result["connector_id"] = json!(CONNECTOR_ID);
+        result["protocol_version"] = json!("2.0");
+        self.base.instance_id = authority.instance_id().clone();
+        self.session_id = Some(response.session_id);
+        self.bound_zone = Some(zone);
+        self.authority = Some(authority);
         self.base.set_handshaken(true);
-        let capabilities_granted = req
-            .capabilities_requested
-            .into_iter()
-            .map(|capability| CapabilityGrant {
-                capability,
-                operation: None,
-            })
-            .collect::<Vec<_>>();
-
-        serde_json::to_value(HandshakeResponse {
-            status: "accepted".into(),
-            capabilities_granted,
-            session_id,
-            manifest_hash: Self::manifest_hash(),
-            nonce: req.nonce,
-            event_caps: Some(EventCaps {
-                streaming: true,
-                replay: false,
-                min_buffer_events: 0,
-                requires_ack: false,
-            }),
-            auth_caps: None,
-            op_catalog_hash: None,
-        })
-        .map_err(|err| FcpError::Internal {
-            message: format!("Failed to serialize handshake response: {err}"),
-        })
+        Ok(result)
     }
 
     pub async fn handle_health(&self) -> FcpResult<Value> {
         let configured = self.config.is_some();
         let handshaken = self.session_id.is_some();
+        let injection_required = self
+            .config
+            .as_ref()
+            .is_some_and(|config| config.auth.is_secretless());
         Ok(json!({
-            "status": health_status(configured, handshaken),
+            "status": if injection_required { "degraded" } else { health_status(configured, handshaken) },
+            "credential_injection_required": injection_required,
             "configured": configured,
             "handshaken": handshaken,
             "auth_mode": self.config.as_ref().map(|config| config.auth.redacted_label()),
@@ -244,7 +272,9 @@ impl XaiConnector {
 
     pub async fn handle_doctor(&self) -> FcpResult<Value> {
         Ok(json!({
-            "status": if self.config.is_some() && self.client.is_some() && self.session_id.is_some() {
+            "status": if self.config.as_ref().is_some_and(|config| config.auth.is_secretless()) {
+                "degraded"
+            } else if self.config.is_some() && self.client.is_some() && self.session_id.is_some() {
                 "healthy"
             } else if self.config.is_some() && self.client.is_some() {
                 "degraded"
@@ -300,57 +330,134 @@ impl XaiConnector {
     }
 
     pub async fn handle_invoke(&self, params: Value) -> FcpResult<Value> {
-        let result = self.handle_invoke_internal(params).await;
-        self.base.record_request(result.is_ok());
-        if result.is_err() {
-            self.error_count.fetch_add(1, Ordering::Relaxed);
+        let request: InvokeRequest = serde_json::from_value(params)
+            .map_err(|_| invalid_config("Invalid FCP invoke request".into()))?;
+        let response = self.invoke(request).await?;
+        match response.error {
+            Some(error) => Err(error),
+            None => response.result.ok_or_else(|| FcpError::Internal {
+                message: "Validated invocation response omitted its result".into(),
+            }),
         }
-        result
     }
 
-    async fn handle_invoke_internal(&self, params: Value) -> FcpResult<Value> {
+    async fn execute_invoke(&self, request: InvokeRequest) -> FcpResult<InvokeResponse> {
         self.base.check_ready()?;
-        let operation = params
-            .get("operation_id")
-            .or_else(|| params.get("operation"))
-            .and_then(Value::as_str)
-            .ok_or_else(|| FcpError::InvalidRequest {
-                code: 1003,
-                message: "Missing operation_id".into(),
-            })?;
-        let input = params.get("input").cloned().unwrap_or_else(|| json!({}));
-        let capability_grant_value =
-            params
-                .get("capability_token")
-                .cloned()
-                .ok_or_else(|| FcpError::InvalidRequest {
-                    code: 1003,
-                    message: "Missing capability_token".into(),
-                })?;
-        let capability_grant = serde_json::from_value::<CapabilityToken>(capability_grant_value)
-            .map_err(|err| FcpError::InvalidRequest {
-                code: 1003,
-                message: format!("Invalid capability_token: {err}"),
-            })?;
-        self.verify_capability(operation, &input, capability_grant)?;
-        self.invoke_operation(operation, input).await
+        if request.r#type != "invoke"
+            || request.id.0.is_empty()
+            || !request.input.is_object()
+            || request.deadline_ms == Some(0)
+        {
+            return Err(invalid_config("Invocation requires type invoke, a non-empty ID, object input and a nonzero deadline".into()));
+        }
+        if matches!(request.operation.as_str(), OP_MODELS | OP_HEALTH)
+            && request
+                .idempotency_key
+                .as_deref()
+                .is_none_or(|key| key.trim().is_empty())
+        {
+            return Err(invalid_config(
+                "Strict operations require a non-empty idempotency_key".into(),
+            ));
+        }
+        let config = self.config.as_ref().ok_or(FcpError::NotConfigured)?;
+        let timeout = config
+            .request_timeout
+            .min(Duration::from_millis(operation_timeout_ms(
+                request.operation.as_str(),
+            )))
+            .min(Duration::from_millis(
+                request.deadline_ms.unwrap_or(u64::MAX),
+            ));
+        let cx = fcp_async_core::compatibility_cx();
+        let mut budget = RequestBudget::new(&cx, timeout);
+        budget
+            .checkpoint()
+            .map_err(|error| openai_error_to_fcp(&error))?;
+        let resources = self.prepare_operation(&request.operation, &request.input)?;
+        budget
+            .checkpoint()
+            .map_err(|error| openai_error_to_fcp(&error))?;
+        let witness = self
+            .authority
+            .as_ref()
+            .ok_or(FcpError::NotHandshaken)?
+            .admit_bounded(&request, &resources, MAX_NATIVE_RESPONSE_BYTES)?;
+        self.request_count.fetch_add(1, Ordering::Relaxed);
+
+        // A single caller-narrowed budget owns cache access, retries and the
+        // complete stream. Interrupted provider effects retain their debit.
+        let result = budget
+            .run(self.invoke_operation(&cx, request.operation.as_str(), request.input.clone()))
+            .await
+            .unwrap_or_else(|error| Err(openai_error_to_fcp(&error)));
+        let mut response = match result {
+            Ok(value) => InvokeResponse::ok(request.id.clone(), value),
+            Err(error) => InvokeResponse::error(request.id.clone(), error),
+        };
+        response.resource_uris = resources;
+        operation_contracts()?.validate_response(&request.operation, &request.id, &response)?;
+        budget
+            .checkpoint()
+            .map_err(|error| openai_error_to_fcp(&error))?;
+        witness.finish_response(&response)?;
+        Ok(response)
     }
 
-    async fn invoke_operation(&self, operation: &str, input: Value) -> FcpResult<Value> {
-        self.request_count.fetch_add(1, Ordering::Relaxed);
+    fn prepare_operation(&self, operation: &OperationId, input: &Value) -> FcpResult<Vec<String>> {
+        self.base.check_ready()?;
+        required_capability(operation.as_str())?;
+        operation_contracts()?.validate_input(operation, input)?;
+        let config = self.config.as_ref().ok_or(FcpError::NotConfigured)?;
+        if config.auth.is_secretless() {
+            return Err(invalid_config("credential_id requires host-mediated credential injection; this xAI transport does not implement it".into()));
+        }
+        match operation.as_str() {
+            OP_CHAT | OP_CHAT_STREAM => {
+                let request = chat_request_from_value(input.clone(), &config.default_model)?;
+                request
+                    .validate_provider_extensions()
+                    .map_err(|error| openai_error_to_fcp(&error))?;
+                validate_model(&request.model)?;
+                let mut resources = chat_resource_uris(&request);
+                resources.push(format!("xai:model:{}", request.model));
+                resources.sort();
+                resources.dedup();
+                Ok(resources)
+            }
+            OP_RESPONSES => {
+                let request = responses_request_from_value(input.clone(), &config.default_model)?;
+                request
+                    .validate_provider_extensions()
+                    .map_err(|error| openai_error_to_fcp(&error))?;
+                validate_model(&request.model)?;
+                let mut resources = responses_resource_uris(&request);
+                resources.push(format!("xai:responses:model:{}", request.model));
+                resources.push("xai:web_search".into());
+                resources.sort();
+                resources.dedup();
+                Ok(resources)
+            }
+            OP_MODELS | OP_HEALTH => Ok(vec!["xai:models".into()]),
+            _ => Err(invalid_config("Unknown xAI operation".into())),
+        }
+    }
+
+    async fn invoke_operation(
+        &self,
+        cx: &fcp_async_core::Cx,
+        operation: &str,
+        input: Value,
+    ) -> FcpResult<Value> {
         let client = self.client.as_ref().ok_or_else(|| FcpError::Internal {
             message: "xAI client not initialized".into(),
         })?;
         let config = self.config.as_ref().ok_or(FcpError::NotConfigured)?;
-        // asupersync 0.3.2 gates `Cx::for_testing` out of production builds
-        // (cap-mask bypass hardening); operations run under the connector
-        // runtime, so take the ambient context instead of fabricating one.
-        let cx = fcp_async_core::compatibility_cx();
         match operation {
             OP_CHAT => {
                 let request = chat_request_from_value(input, &config.default_model)?;
                 client
-                    .chat_completions(&cx, request)
+                    .chat_completions(cx, request)
                     .await
                     .map(chat_response_to_value)
                     .map_err(|err| openai_error_to_fcp(&err))
@@ -358,7 +465,7 @@ impl XaiConnector {
             OP_CHAT_STREAM => {
                 let request = chat_request_from_value(input, &config.default_model)?;
                 let stream = client
-                    .chat_completions_stream(&cx, request)
+                    .chat_completions_stream(cx, request)
                     .await
                     .map_err(|err| openai_error_to_fcp(&err))?;
                 collect_stream_response(stream).await
@@ -372,7 +479,7 @@ impl XaiConnector {
                     client.invalidate_model_cache().await;
                 }
                 let models = client
-                    .list_models(&cx)
+                    .list_models(cx)
                     .await
                     .map_err(|err| openai_error_to_fcp(&err))?;
                 Ok(json!({
@@ -384,7 +491,7 @@ impl XaiConnector {
             OP_RESPONSES => {
                 let request = responses_request_from_value(input, &config.default_model)?;
                 let raw = client
-                    .responses_create(&cx, request)
+                    .responses_create(cx, request)
                     .await
                     .map_err(|err| openai_error_to_fcp(&err))?;
                 let summary = summarize_responses_value(&raw);
@@ -404,7 +511,7 @@ impl XaiConnector {
             }
             OP_HEALTH => {
                 let models = client
-                    .list_models(&cx)
+                    .list_models(cx)
                     .await
                     .map_err(|err| openai_error_to_fcp(&err))?;
                 Ok(json!({
@@ -423,48 +530,16 @@ impl XaiConnector {
     }
 
     pub async fn handle_simulate(&self, params: Value) -> FcpResult<Value> {
-        let operation = params
-            .get("operation_id")
-            .or_else(|| params.get("operation"))
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        Ok(json!({
-            "allowed": matches!(operation, OP_CHAT | OP_CHAT_STREAM | OP_MODELS | OP_RESPONSES | OP_HEALTH),
-            "reason": if matches!(operation, OP_CHAT | OP_CHAT_STREAM | OP_MODELS | OP_RESPONSES | OP_HEALTH) {
-                "Supported operation."
-            } else {
-                "Unknown operation."
-            }
-        }))
+        let request = serde_json::from_value(params)
+            .map_err(|_| invalid_config("Invalid FCP simulate request".into()))?;
+        serde_json::to_value(self.simulate(request).await?).map_err(|_| FcpError::Internal {
+            message: "Failed to serialize simulation response".into(),
+        })
     }
 
     pub async fn handle_shutdown(&mut self, _params: Value) -> FcpResult<Value> {
-        self.client = None;
-        self.config = None;
-        self.verifier = None;
-        self.session_id = None;
-        self.base.set_configured(false);
-        self.base.set_handshaken(false);
+        self.clear_configuration();
         Ok(json!({ "status": "shutdown" }))
-    }
-
-    fn verify_capability(
-        &self,
-        operation: &str,
-        input: &Value,
-        token: CapabilityToken,
-    ) -> FcpResult<()> {
-        let verifier = self.verifier.as_ref().ok_or(FcpError::NotHandshaken)?;
-        let operation_id: OperationId =
-            operation.parse().map_err(|_| FcpError::InvalidRequest {
-                code: 1003,
-                message: "Invalid operation ID format".into(),
-            })?;
-        let capability = required_capability(operation)?;
-        let resources = resource_uris_for_operation(operation, input);
-        verifier
-            .verify_bound(token, &capability, &operation_id, &resources)
-            .map(|_| ())
     }
 }
 
@@ -498,7 +573,13 @@ impl FcpConnector for XaiConnector {
     }
 
     async fn health(&self) -> HealthSnapshot {
-        if self.config.is_some() && self.session_id.is_some() {
+        if self
+            .config
+            .as_ref()
+            .is_some_and(|config| config.auth.is_secretless())
+        {
+            HealthSnapshot::degraded("credential_injection_required")
+        } else if self.config.is_some() && self.session_id.is_some() {
             HealthSnapshot::ready()
         } else if self.config.is_some() {
             HealthSnapshot::degraded("xai_handshake_pending")
@@ -553,30 +634,46 @@ impl FcpConnector for XaiConnector {
     }
 
     async fn invoke(&self, req: InvokeRequest) -> FcpResult<InvokeResponse> {
-        let request_id = req.id;
-        self.verify_capability(req.operation.as_str(), &req.input, req.capability_token)?;
-        match self
-            .invoke_operation(req.operation.as_str(), req.input)
-            .await
-        {
-            Ok(value) => Ok(InvokeResponse::ok(request_id, value)),
-            Err(error) => Ok(InvokeResponse::error(request_id, error)),
+        let result = self.execute_invoke(req).await;
+        let succeeded = result
+            .as_ref()
+            .is_ok_and(|response| response.error.is_none());
+        self.base.record_request(succeeded);
+        if !succeeded {
+            self.error_count.fetch_add(1, Ordering::Relaxed);
         }
+        result
     }
 
     async fn simulate(&self, req: SimulateRequest) -> FcpResult<SimulateResponse> {
-        if matches!(
-            req.operation.as_str(),
-            OP_CHAT | OP_CHAT_STREAM | OP_MODELS | OP_RESPONSES | OP_HEALTH
-        ) {
-            Ok(SimulateResponse::allowed(req.id))
-        } else {
-            Ok(SimulateResponse::denied(
-                req.id,
-                "operation is not supported by xAI",
-                "FCP-3010",
-            ))
+        if req.r#type != "simulate" || req.id.0.is_empty() || !req.input.is_object() {
+            return Err(invalid_config(
+                "Simulation requires type simulate, a non-empty ID and object input".into(),
+            ));
         }
+        let result = self
+            .prepare_operation(&req.operation, &req.input)
+            .and_then(|resources| {
+                self.authority
+                    .as_ref()
+                    .ok_or(FcpError::NotHandshaken)?
+                    .authorize(
+                        &req.connector_id,
+                        &req.zone_id,
+                        &req.operation,
+                        req.capability_token,
+                        &resources,
+                    )
+                    .map(|_| ())
+            });
+        Ok(match result {
+            Ok(()) => SimulateResponse::allowed(req.id),
+            Err(_) => SimulateResponse::denied(
+                req.id,
+                "Operation input or current xAI session authority does not permit this request",
+                "FCP-3010",
+            ),
+        })
     }
 
     async fn subscribe(&self, _req: SubscribeRequest) -> FcpResult<SubscribeResponse> {
@@ -593,7 +690,7 @@ fn operations_info() -> Vec<OperationInfo> {
         OperationInfo {
             id: OperationId::from_static(OP_CHAT),
             summary: "Create an xAI chat completion".into(),
-            description: Some("Uses xAI POST /chat/completions without enabling live search unless the caller explicitly supplies legacy search_parameters.".into()),
+            description: Some("Uses xAI POST /chat/completions without live search. Search requires xai.responses.create and its web-search capability.".into()),
             input_schema: chat_schema(false),
             output_schema: json!({ "type": "object" }),
             capability: CapabilityId::from_static(CAP_CHAT),
@@ -713,7 +810,7 @@ fn chat_schema(streaming: bool) -> Value {
             "tools": { "type": "array" },
             "tool_choice": {},
             "reasoning_effort": { "type": "string" },
-            "search_parameters": { "type": "object", "description": "Legacy chat live-search parameters. Prefer xai.responses.create for current web search." },
+            "search_parameters": { "type": "object", "description": "Only explicitly disabled legacy search is accepted (mode: off). Live search requires xai.responses.create." },
             "streaming_response": { "const": streaming },
             "provider_extensions": { "type": "object" }
         }
@@ -762,28 +859,37 @@ fn required_capability(operation: &str) -> FcpResult<CapabilityId> {
     }
 }
 
-fn resource_uris_for_operation(operation: &str, input: &Value) -> Vec<String> {
+fn operation_timeout_ms(operation: &str) -> u64 {
     match operation {
-        OP_CHAT | OP_CHAT_STREAM => {
-            let model = input
-                .get("model")
-                .and_then(Value::as_str)
-                .unwrap_or(DEFAULT_MODEL);
-            vec![format!("xai:model:{model}")]
-        }
-        OP_RESPONSES => {
-            let model = input
-                .get("model")
-                .and_then(Value::as_str)
-                .unwrap_or(DEFAULT_MODEL);
-            vec![
-                format!("xai:responses:model:{model}"),
-                "xai:web_search".into(),
-            ]
-        }
-        OP_MODELS | OP_HEALTH => vec!["xai:models".into()],
-        _ => Vec::new(),
+        OP_HEALTH => 5_000,
+        OP_MODELS => 30_000,
+        OP_CHAT_STREAM | OP_RESPONSES => 300_000,
+        _ => 180_000,
     }
+}
+
+fn operation_contracts() -> FcpResult<&'static OperationContractSet> {
+    static CONTRACTS: OnceLock<FcpResult<OperationContractSet>> = OnceLock::new();
+    CONTRACTS
+        .get_or_init(|| OperationContractSet::from_manifest_toml(MANIFEST_TOML))
+        .as_ref()
+        .map_err(Clone::clone)
+}
+
+fn validate_model(model: &str) -> FcpResult<()> {
+    if model.is_empty()
+        || model.len() > 256
+        || model.chars().any(|character| {
+            character.is_whitespace()
+                || character.is_control()
+                || matches!(character, '*' | '?' | '[' | ']')
+        })
+    {
+        return Err(invalid_config(
+            "model must be a non-empty literal identifier of at most 256 bytes".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn optional_positive_u64(params: &Value, field: &str, default: u64) -> FcpResult<u64> {
@@ -866,7 +972,7 @@ pub fn test_invoke_request(
         capability_token,
         holder_proof: None,
         context: None,
-        idempotency_key: None,
+        idempotency_key: Some(id.to_owned()),
         lease_seq: None,
         deadline_ms: None,
         correlation_id: None,

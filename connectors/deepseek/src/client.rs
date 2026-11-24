@@ -13,6 +13,10 @@ pub const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
 pub const DEFAULT_MODEL: &str = "deepseek-v4-pro";
 pub const USER_AGENT: &str = "fcp-deepseek/0.1.0";
 
+// Enforce the manifest's response bound while reading JSON or SSE bodies,
+// before the completed FCP response is checked against its admission budget.
+const MAX_PROVIDER_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DeepSeekAuth {
     ApiKey(String),
@@ -90,7 +94,9 @@ impl DeepSeekClient {
         Self {
             inner: OpenAiCompatClient::new_with_config(
                 provider,
-                HttpClientBuilder::new().build(),
+                HttpClientBuilder::new()
+                    .max_body_size(MAX_PROVIDER_RESPONSE_BYTES)
+                    .build(),
                 OpenAiCompatClientConfig {
                     request_timeout,
                     model_cache_ttl,

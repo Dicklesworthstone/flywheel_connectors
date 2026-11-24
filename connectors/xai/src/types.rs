@@ -1,11 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use fcp_openai_compat::{
-    ChatCompletionsRequest, ChatMessage, ProviderExtensions, ResponseFormat, ToolChoice,
-    ToolDefinition,
+    ChatCompletionsRequest, ChatMessage, ContentPart, ContentParts, OpenAiError,
+    ProviderExtensions, ResponseFormat, ToolChoice, ToolDefinition,
 };
 use fcp_prelude::{FcpError, FcpResult};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{Map, Value, json};
 use url::Url;
 
@@ -40,6 +40,7 @@ pub struct ChatInvokeInput {
 impl ChatInvokeInput {
     pub fn into_request(mut self, default_model: &str) -> FcpResult<ChatCompletionsRequest> {
         validate_xai_chat_input(&self)?;
+        normalize_chat_images(&mut self.messages)?;
         if let Some(reasoning_effort) = self.reasoning_effort {
             self.provider_extensions
                 .insert("reasoning_effort".to_string(), json!(reasoning_effort));
@@ -74,6 +75,7 @@ impl ChatInvokeInput {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WebSearchOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_domains: Option<Vec<String>>,
@@ -128,7 +130,60 @@ pub struct ResponsesCreateRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Value>,
     #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(serialize_with = "serialize_response_extensions")]
     pub provider_extensions: ProviderExtensions,
+}
+
+const RESPONSE_FIELDS: &[&str] = &[
+    "model",
+    "input",
+    "instructions",
+    "include",
+    "tools",
+    "tool_choice",
+    "max_output_tokens",
+    "temperature",
+    "top_p",
+    "store",
+    "previous_response_id",
+    "metadata",
+    "stream",
+    "web_search",
+    // These modes/reference forms have no authority representation in this
+    // synchronous, web-search operation.
+    "background",
+    "conversation",
+    "prompt",
+];
+
+fn validate_response_extensions(extensions: &ProviderExtensions) -> Result<(), OpenAiError> {
+    if RESPONSE_FIELDS
+        .iter()
+        .any(|field| extensions.contains_key(*field))
+    {
+        return Err(OpenAiError::InvalidRequest {
+            message: "Provider extensions must not replace typed Responses fields or response mode"
+                .into(),
+            param: Some("provider_extensions".into()),
+            code: Some("reserved_provider_extension".into()),
+        });
+    }
+    Ok(())
+}
+
+fn serialize_response_extensions<S: Serializer>(
+    extensions: &ProviderExtensions,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    validate_response_extensions(extensions).map_err(<S::Error as serde::ser::Error>::custom)?;
+    extensions.serialize(serializer)
+}
+
+impl ResponsesCreateRequest {
+    /// Reject extensions that change authorized fields or select unsupported SSE.
+    pub fn validate_provider_extensions(&self) -> Result<(), OpenAiError> {
+        validate_response_extensions(&self.provider_extensions)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -248,8 +303,12 @@ pub fn summarize_responses_value(raw: &Value) -> ResponsesSummary {
 }
 
 impl ResponsesCreateInput {
-    fn into_request(self, default_model: &str) -> FcpResult<ResponsesCreateRequest> {
+    fn into_request(mut self, default_model: &str) -> FcpResult<ResponsesCreateRequest> {
         validate_responses_input(&self)?;
+        normalize_responses_input(&mut self.input)?;
+        if let Some(id) = &self.previous_response_id {
+            validate_reference_id(id)?;
+        }
         let mut tools = self.tools.unwrap_or_default();
         match self.web_search {
             Some(options) => {
@@ -272,6 +331,10 @@ impl ResponsesCreateInput {
             }
             None => {}
         }
+        for tool in &tools {
+            validate_raw_web_search_tool(tool)?;
+        }
+        validate_search_tool_choice(self.tool_choice.as_ref())?;
 
         Ok(ResponsesCreateRequest {
             model: self.model.unwrap_or_else(|| default_model.to_string()),
@@ -292,6 +355,23 @@ impl ResponsesCreateInput {
 }
 
 fn validate_xai_chat_input(input: &ChatInvokeInput) -> FcpResult<()> {
+    if ["reasoning_effort", "search_parameters"]
+        .iter()
+        .any(|field| input.provider_extensions.contains_key(*field))
+    {
+        return Err(invalid_input(
+            "Provider extensions must not replace typed xAI chat fields",
+        ));
+    }
+    if let Some(parameters) = &input.search_parameters
+        && !parameters.as_object().is_some_and(|object| {
+            object.len() == 1 && object.get("mode").and_then(Value::as_str) == Some("off")
+        })
+    {
+        return Err(invalid_input(
+            "Live search requires xai.responses.create; chat search_parameters may only explicitly disable search with mode off",
+        ));
+    }
     if input.messages.is_empty() {
         return Err(FcpError::InvalidRequest {
             code: 1003,
@@ -305,6 +385,382 @@ fn validate_xai_chat_input(input: &ChatInvokeInput) -> FcpResult<()> {
         });
     }
     Ok(())
+}
+
+fn invalid_input(message: &str) -> FcpError {
+    FcpError::InvalidRequest {
+        code: 1003,
+        message: message.into(),
+    }
+}
+
+fn canonical_input_url(raw: &str, allow_inline: bool) -> FcpResult<String> {
+    if allow_inline && raw.starts_with("data:") {
+        return Ok(raw.to_owned());
+    }
+    let invalid = || {
+        invalid_input(
+            "Input URL must be absolute HTTP(S) without embedded credentials or a fragment",
+        )
+    };
+    let url = Url::parse(raw).map_err(|_| invalid())?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(invalid());
+    }
+    Ok(url.to_string())
+}
+
+fn validate_reference_id(id: &str) -> FcpResult<()> {
+    if id.is_empty()
+        || id.len() > 256
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(invalid_input(
+            "Stored resource IDs must be literal ASCII identifiers of at most 256 bytes",
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_chat_images(messages: &mut [ChatMessage]) -> FcpResult<()> {
+    for message in messages {
+        if let ChatMessage::User {
+            content: ContentParts::Multimodal(parts),
+            ..
+        } = message
+        {
+            for part in parts {
+                if let ContentPart::ImageUrl { image_url } = part {
+                    image_url.url = canonical_input_url(&image_url.url, true)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Return remote image resources from the normalized request sent to xAI.
+pub(crate) fn chat_resource_uris(request: &ChatCompletionsRequest) -> Vec<String> {
+    let mut resources = BTreeSet::new();
+    for message in &request.messages {
+        if let ChatMessage::User {
+            content: ContentParts::Multimodal(parts),
+            ..
+        } = message
+        {
+            for part in parts {
+                if let ContentPart::ImageUrl { image_url } = part
+                    && !image_url.url.starts_with("data:")
+                {
+                    resources.insert(format!("xai:image_url:{}", image_url.url));
+                }
+            }
+        }
+    }
+    resources.into_iter().collect()
+}
+
+/// Return every stored or remote input resource after request normalization.
+pub(crate) fn responses_resource_uris(request: &ResponsesCreateRequest) -> Vec<String> {
+    let mut resources = BTreeSet::new();
+    if let Some(id) = &request.previous_response_id {
+        resources.insert(format!("xai:response:{id}"));
+    }
+    collect_input_resources(&request.input, &mut resources);
+    resources.into_iter().collect()
+}
+
+fn collect_input_resources(value: &Value, resources: &mut BTreeSet<String>) {
+    match value {
+        Value::Array(values) => {
+            for child in values {
+                collect_input_resources(child, resources);
+            }
+        }
+        Value::Object(object) => {
+            if matches!(
+                object.get("type").and_then(Value::as_str),
+                Some("input_image" | "input_file")
+            ) {
+                for (field, prefix) in [
+                    ("image_url", "xai:image_url:"),
+                    ("file_url", "xai:file_url:"),
+                    ("file_id", "xai:file:"),
+                ] {
+                    if let Some(source) = object.get(field).and_then(Value::as_str)
+                        && !source.starts_with("data:")
+                    {
+                        resources.insert(format!("{prefix}{source}"));
+                    }
+                }
+            }
+            for child in object.values() {
+                collect_input_resources(child, resources);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn allowed_fields(object: &Map<String, Value>, fields: &[&str]) -> FcpResult<()> {
+    if object.keys().any(|key| !fields.contains(&key.as_str())) {
+        return Err(invalid_input(
+            "Unsupported field in Responses input or web-search tool",
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_responses_input(input: &mut Value) -> FcpResult<()> {
+    match input {
+        Value::String(_) => Ok(()),
+        Value::Array(items) => {
+            for item in items {
+                normalize_response_item(item)?;
+            }
+            Ok(())
+        }
+        _ => Err(invalid_input(
+            "Responses input must be text or an array of supported input items",
+        )),
+    }
+}
+
+fn normalize_response_item(item: &mut Value) -> FcpResult<()> {
+    let object = item
+        .as_object_mut()
+        .ok_or_else(|| invalid_input("Responses input items must be objects"))?;
+    let kind = match object.get("type") {
+        None => "message".to_owned(),
+        Some(Value::String(kind)) => kind.clone(),
+        _ => return Err(invalid_input("Responses item type must be a string")),
+    };
+    match kind.as_str() {
+        "message" => {
+            allowed_fields(object, &["type", "role", "content", "id", "status"])?;
+            if !matches!(
+                object.get("role").and_then(Value::as_str),
+                Some("user" | "assistant" | "system" | "developer")
+            ) {
+                return Err(invalid_input("Responses message requires a supported role"));
+            }
+            normalize_response_content(
+                object
+                    .get_mut("content")
+                    .ok_or_else(|| invalid_input("Responses message requires content"))?,
+            )
+        }
+        "function_call_output" => {
+            allowed_fields(object, &["type", "call_id", "output", "id", "status"])?;
+            validate_reference_id(
+                object
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| invalid_input("Tool output requires a literal call_id"))?,
+            )?;
+            normalize_response_content(
+                object
+                    .get_mut("output")
+                    .ok_or_else(|| invalid_input("Tool output requires output content"))?,
+            )
+        }
+        // These are inline conversation history, not instructions to execute a
+        // new tool. Preserve opaque reasoning and prior call payloads unchanged.
+        "reasoning" | "function_call" | "web_search_call" => reject_unbound_references(item),
+        _ => Err(invalid_input(
+            "Unsupported Responses input reference or control item",
+        )),
+    }
+}
+
+fn normalize_response_content(content: &mut Value) -> FcpResult<()> {
+    match content {
+        Value::String(_) => Ok(()),
+        Value::Array(parts) => {
+            for part in parts {
+                normalize_response_part(part)?;
+            }
+            Ok(())
+        }
+        _ => Err(invalid_input(
+            "Responses content must be text or a content-part array",
+        )),
+    }
+}
+
+fn normalize_response_part(part: &mut Value) -> FcpResult<()> {
+    let object = part
+        .as_object_mut()
+        .ok_or_else(|| invalid_input("Responses content parts must be objects"))?;
+    let kind = object
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_input("Responses content part requires a type"))?
+        .to_owned();
+    let sources: &[&str] = match kind.as_str() {
+        "input_text" | "output_text" | "summary_text" => {
+            if !object.get("text").is_some_and(Value::is_string) {
+                return Err(invalid_input("Text content parts require string text"));
+            }
+            return reject_unbound_references(part);
+        }
+        "refusal" => {
+            if !object.get("refusal").is_some_and(Value::is_string) {
+                return Err(invalid_input("Refusal content requires string text"));
+            }
+            return reject_unbound_references(part);
+        }
+        "input_image" => {
+            allowed_fields(object, &["type", "image_url", "file_id", "detail"])?;
+            &["image_url", "file_id"]
+        }
+        "input_file" => {
+            allowed_fields(
+                object,
+                &[
+                    "type",
+                    "file_url",
+                    "file_id",
+                    "file_data",
+                    "filename",
+                    "detail",
+                ],
+            )?;
+            &["file_url", "file_id", "file_data"]
+        }
+        _ => {
+            return Err(invalid_input(
+                "Unsupported Responses content or reference type",
+            ));
+        }
+    };
+    let present: Vec<_> = sources
+        .iter()
+        .copied()
+        .filter(|field| object.get(*field).is_some_and(|value| !value.is_null()))
+        .collect();
+    let [source] = present.as_slice() else {
+        return Err(invalid_input(
+            "Image/file content requires exactly one source",
+        ));
+    };
+    for field in ["filename", "detail"] {
+        if object
+            .get(field)
+            .is_some_and(|value| !value.is_null() && !value.is_string())
+        {
+            return Err(invalid_input("Image/file metadata must be string-valued"));
+        }
+    }
+    let value = object
+        .get_mut(*source)
+        .ok_or_else(|| invalid_input("Image/file source is missing"))?;
+    let raw = value
+        .as_str()
+        .ok_or_else(|| invalid_input("Image/file sources must be strings"))?;
+    match *source {
+        "image_url" | "file_url" => {
+            *value = Value::String(canonical_input_url(raw, *source == "image_url")?);
+        }
+        "file_id" => validate_reference_id(raw)?,
+        "file_data" if raw.is_empty() => {
+            return Err(invalid_input("Inline file data must not be empty"));
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn reject_unbound_references(value: &Value) -> FcpResult<()> {
+    match value {
+        Value::Array(values) => {
+            for child in values {
+                reject_unbound_references(child)?;
+            }
+        }
+        Value::Object(object) => {
+            if object.keys().any(|key| {
+                matches!(
+                    key.as_str(),
+                    "image_url"
+                        | "file_url"
+                        | "file_id"
+                        | "file_data"
+                        | "previous_response_id"
+                        | "response_id"
+                        | "conversation"
+                )
+            }) || object.get("type").and_then(Value::as_str) == Some("item_reference")
+            {
+                return Err(invalid_input(
+                    "External references require a supported image/file content part or previous_response_id",
+                ));
+            }
+            for child in object.values() {
+                reject_unbound_references(child)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_raw_web_search_tool(tool: &Value) -> FcpResult<()> {
+    let object = tool
+        .as_object()
+        .ok_or_else(|| invalid_input("Responses tools must be web_search objects"))?;
+    allowed_fields(object, &["type", "filters", "enable_image_understanding"])?;
+    if !is_web_search_tool(tool) {
+        return Err(invalid_input(
+            "This Responses operation only authorizes web_search tools",
+        ));
+    }
+    let mut options = WebSearchOptions {
+        allowed_domains: None,
+        excluded_domains: None,
+        enable_image_understanding: None,
+    };
+    if let Some(filters) = object.get("filters") {
+        let filter_object = filters
+            .as_object()
+            .ok_or_else(|| invalid_input("Web-search filters must be an object"))?;
+        allowed_fields(filter_object, &["allowed_domains", "excluded_domains"])?;
+        options = serde_json::from_value(filters.clone())
+            .map_err(|_| invalid_input("Invalid web-search domain filters"))?;
+    }
+    if let Some(enabled) = object.get("enable_image_understanding") {
+        options.enable_image_understanding = Some(
+            enabled
+                .as_bool()
+                .ok_or_else(|| invalid_input("enable_image_understanding must be a boolean"))?,
+        );
+    }
+    validate_web_search_options(&options)
+}
+
+fn validate_search_tool_choice(choice: Option<&Value>) -> FcpResult<()> {
+    match choice {
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::String(choice)) if matches!(choice.as_str(), "auto" | "none" | "required") => {
+            Ok(())
+        }
+        Some(Value::Object(object))
+            if object.len() == 1
+                && object.get("type").and_then(Value::as_str) == Some("web_search") =>
+        {
+            Ok(())
+        }
+        _ => Err(invalid_input(
+            "tool_choice must select the authorized web_search tool or a supported selection mode",
+        )),
+    }
 }
 
 fn validate_responses_input(input: &ResponsesCreateInput) -> FcpResult<()> {
@@ -515,19 +971,257 @@ mod tests {
     }
 
     #[test]
-    fn chat_request_preserves_explicit_legacy_search_parameters() {
+    fn chat_request_only_preserves_explicitly_disabled_legacy_search() {
         let request = chat_request_from_value(
             json!({
                 "messages": [{"role": "user", "content": "fresh news"}],
-                "search_parameters": {"mode": "auto", "return_citations": true}
+                "search_parameters": {"mode": "off"}
             }),
             DEFAULT_MODEL,
         )
         .expect("chat request should build");
         let value = serde_json::to_value(request).expect("request serializes");
 
-        assert_eq!(value["search_parameters"]["mode"], "auto");
-        assert_eq!(value["search_parameters"]["return_citations"], true);
+        assert_eq!(value["search_parameters"]["mode"], "off");
+        for parameters in [
+            json!({"mode":"auto"}),
+            json!({"mode":"on"}),
+            json!({}),
+            json!({"mode":"off", "sources":[{"type":"web"}]}),
+            json!("off"),
+        ] {
+            assert!(
+                chat_request_from_value(
+                    json!({"messages":[{"role":"user","content":"hello"}],
+                    "search_parameters":parameters}),
+                    DEFAULT_MODEL,
+                )
+                .is_err()
+            );
+        }
+        for field in ["reasoning_effort", "search_parameters"] {
+            assert!(
+                chat_request_from_value(
+                    json!({"messages":[{"role":"user","content":"hello"}],
+                    "provider_extensions":{field:{"mode":"off"}}}),
+                    DEFAULT_MODEL,
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn chat_image_authority_matches_the_canonical_body() {
+        let request = chat_request_from_value(
+            json!({"messages":[{"role":"user","content":[
+                {"type":"image_url","image_url":{"url":"https://EXAMPLE.com:443/a/../input.png"}},
+                {"type":"image_url","image_url":{"url":"data:image/png;base64,aGVsbG8="}}
+            ]}]}),
+            DEFAULT_MODEL,
+        )
+        .unwrap();
+        assert_eq!(
+            chat_resource_uris(&request),
+            vec!["xai:image_url:https://example.com/input.png"]
+        );
+        let body = serde_json::to_value(request).unwrap();
+        assert_eq!(
+            body["messages"][0]["content"][0]["image_url"]["url"],
+            "https://example.com/input.png"
+        );
+        assert_eq!(
+            body["messages"][0]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,aGVsbG8="
+        );
+        for url in [
+            "file:///etc/hosts",
+            "https://user:secret@example.com/image",
+            "https://example.com/image#fragment",
+            "relative/image",
+        ] {
+            assert!(
+                chat_request_from_value(
+                    json!({"messages":[{"role":"user","content":[
+                        {"type":"image_url","image_url":{"url":url}}
+                    ]}]}),
+                    DEFAULT_MODEL,
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn responses_authority_covers_all_remote_and_stored_sources() {
+        let request = responses_request_from_value(
+            json!({
+                "input":[{"role":"user","content":[
+                    {"type":"input_text","text":"Compare these"},
+                    {"type":"input_image","image_url":"https://EXAMPLE.com:443/a/../image.png"},
+                    {"type":"input_image","image_url":"data:image/png;base64,aGVsbG8="},
+                    {"type":"input_file","file_url":"https://EXAMPLE.com:443/report.pdf"},
+                    {"type":"input_file","file_id":"file-1"},
+                    {"type":"input_image","file_id":"file-2"},
+                    {"type":"input_file","file_data":"aGVsbG8=","filename":"inline.txt"}
+                ]}],
+                "previous_response_id":"resp-1",
+                "web_search":{}
+            }),
+            DEFAULT_MODEL,
+        )
+        .unwrap();
+        assert_eq!(
+            responses_resource_uris(&request),
+            vec![
+                "xai:file:file-1",
+                "xai:file:file-2",
+                "xai:file_url:https://example.com/report.pdf",
+                "xai:image_url:https://example.com/image.png",
+                "xai:response:resp-1",
+            ]
+        );
+        let body = serde_json::to_value(request).unwrap();
+        assert_eq!(
+            body["input"][0]["content"][1]["image_url"],
+            "https://example.com/image.png"
+        );
+        assert_eq!(
+            body["input"][0]["content"][3]["file_url"],
+            "https://example.com/report.pdf"
+        );
+    }
+
+    #[test]
+    fn responses_preserve_inline_history_and_meter_tool_output_sources() {
+        let reasoning =
+            json!({"type":"reasoning", "summary":[], "encrypted_content":"opaque-inline-history"});
+        let call = json!({"type":"function_call", "name":"describe", "call_id":"call-1", "arguments":"{}"});
+        let request = responses_request_from_value(
+            json!({"input":[
+                reasoning,
+                call,
+                {"type":"function_call_output","call_id":"call-1","output":[
+                    {"type":"input_image","image_url":"https://EXAMPLE.com:443/image.png"}
+                ]},
+                {"type":"message","role":"assistant","id":"msg-1","status":"completed",
+                    "content":[{"type":"output_text","text":"Prior answer","annotations":[]}]}
+            ],"web_search":{}}),
+            DEFAULT_MODEL,
+        )
+        .unwrap();
+        assert_eq!(request.input[0], reasoning);
+        assert_eq!(request.input[1], call);
+        assert_eq!(
+            responses_resource_uris(&request),
+            vec!["xai:image_url:https://example.com/image.png"]
+        );
+    }
+
+    #[test]
+    fn responses_reject_ambiguous_or_unbound_reference_shapes() {
+        for part in [
+            json!({"type":"input_image","image_url":"https://example.com/a","file_id":"file-1"}),
+            json!({"type":"input_image","image_url":{"url":"https://example.com/a"}}),
+            json!({"type":"input_image","image_url":"https://user:private@example.com/a"}),
+            json!({"type":"input_file","file_id":"file-*"}),
+            json!({"type":"input_file","file_url":"file:///etc/hosts"}),
+            json!({"type":"input_file","file_data":"aGVsbG8=","file_url":"https://example.com/a"}),
+            json!({"type":"input_file"}),
+            json!({"type":"input_text","text":"hello","file_id":"file-1"}),
+            json!({"type":"unknown_reference","id":"file-1"}),
+        ] {
+            assert!(
+                responses_request_from_value(
+                    json!({"input":[{"role":"user","content":[part]}],"web_search":{}}),
+                    DEFAULT_MODEL,
+                )
+                .is_err()
+            );
+        }
+        for input in [
+            json!(false),
+            json!({"file_id":"file-1"}),
+            json!([{"type":"item_reference","id":"msg-1"}]),
+            json!([{"type":"mcp_approval_response","approval_request_id":"mcp-1","approve":true}]),
+            json!([{"type":"reasoning","summary":[],"file_id":"file-1"}]),
+        ] {
+            assert!(responses_request_from_value(
+                json!({"input":input,"web_search":{}}), DEFAULT_MODEL,
+            ).is_err());
+        }
+        for id in ["", "resp-*", " resp-1", "resp/1"] {
+            assert!(
+                responses_request_from_value(
+                    json!({"input":"hello","web_search":{},"previous_response_id":id}),
+                    DEFAULT_MODEL,
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn responses_reject_additional_tools_and_unvalidated_tool_controls() {
+        for tool in [
+            json!({"type":"code_interpreter"}),
+            json!({"type":"mcp","server_url":"https://example.com"}),
+            json!({"type":"function","name":"side_effect"}),
+            json!({"type":"web_search","filters":{"allowed_domains":["x.ai"],"excluded_domains":["example.com"]}}),
+            json!({"type":"web_search","enable_image_understanding":"true"}),
+            json!({"type":"web_search","server_url":"https://example.com"}),
+        ] {
+            assert!(
+                responses_request_from_value(
+                    json!({"input":"hello","tools":[{"type":"web_search"},tool]}),
+                    DEFAULT_MODEL,
+                )
+                .is_err()
+            );
+        }
+        for choice in [
+            json!({"type":"function","name":"side_effect"}),
+            json!({"type":"mcp"}),
+            json!(true),
+        ] {
+            assert!(
+                responses_request_from_value(
+                    json!({"input":"hello","web_search":{},"tool_choice":choice}),
+                    DEFAULT_MODEL,
+                )
+                .is_err()
+            );
+        }
+        assert!(responses_request_from_value(
+            json!({"input":"hello","tools":[{"type":"web_search","filters":{"allowed_domains":["x.ai"]}}],"tool_choice":{"type":"web_search"}}),
+            DEFAULT_MODEL,
+        ).is_ok());
+    }
+
+    #[test]
+    fn responses_extensions_cannot_shadow_any_typed_field_or_response_mode() {
+        let request =
+            responses_request_from_value(json!({"input":"hello","web_search":{}}), DEFAULT_MODEL)
+                .unwrap();
+        for field in RESPONSE_FIELDS {
+            let mut malicious = request.clone();
+            malicious
+                .provider_extensions
+                .insert((*field).into(), json!("private-value-sentinel"));
+            let error = malicious.validate_provider_extensions().unwrap_err();
+            assert!(!error.to_string().contains("private-value-sentinel"));
+            assert!(serde_json::to_value(&malicious).is_err());
+            assert!(serde_json::to_vec(&malicious).is_err());
+        }
+        let mut allowed = request;
+        allowed
+            .provider_extensions
+            .insert("parallel_tool_calls".into(), json!(false));
+        allowed.validate_provider_extensions().unwrap();
+        assert_eq!(
+            serde_json::to_value(allowed).unwrap()["parallel_tool_calls"],
+            false
+        );
     }
 
     #[test]

@@ -8,11 +8,15 @@ use std::time::Duration;
 use chrono::{Duration as ChronoDuration, Utc};
 use fcp_crypto::{cose::CapabilityTokenBuilder, ed25519::Ed25519SigningKey};
 use fcp_openai_compat::{NetworkError, OpenAiError, RateLimitPolicy};
-use fcp_prelude::{CapabilityConstraints, CapabilityId, FcpConnector, FcpError, InstanceId};
+use fcp_prelude::{
+    CapabilityConstraints, CapabilityId, ConnectorId, FcpConnector, FcpError, InstanceId,
+    InvokeRequest, OperationId, SimulateRequest, ZoneId,
+};
 use fcp_xai::XaiConnector;
 use fcp_xai::client::{XaiAuth, XaiClient, XaiProvider};
 use fcp_xai::connector::{CONNECTOR_ID, test_handshake_request, test_invoke_request};
 use fcp_xai::types::responses_request_from_value;
+use futures_util::FutureExt;
 use serde_json::{Value, json};
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
@@ -35,14 +39,31 @@ fn valid_token(
     capability: &str,
     operation: &str,
 ) -> fcp_prelude::CapabilityToken {
+    constrained_token(
+        signing_key,
+        instance_id,
+        capability,
+        operation,
+        None,
+        &CapabilityConstraints {
+            resource_allow: vec!["*".into()],
+            ..Default::default()
+        },
+    )
+}
+
+fn constrained_token(
+    signing_key: &Ed25519SigningKey,
+    instance_id: &InstanceId,
+    capability: &str,
+    operation: &str,
+    token_id: Option<&[u8]>,
+    constraints: &CapabilityConstraints,
+) -> fcp_prelude::CapabilityToken {
     let now = Utc::now();
-    let constraints = CapabilityConstraints {
-        resource_allow: vec!["*".into()],
-        ..Default::default()
-    };
     let mut cbor = Vec::new();
-    ciborium::into_writer(&constraints, &mut cbor).expect("serialize constraints");
-    let cose = CapabilityTokenBuilder::new()
+    ciborium::into_writer(constraints, &mut cbor).expect("serialize constraints");
+    let mut builder = CapabilityTokenBuilder::new()
         .capability_id(capability)
         .zone_id("z:work")
         .principal("user:test")
@@ -51,7 +72,11 @@ fn valid_token(
         .target_instance(instance_id.as_str())
         .validity(now, now + ChronoDuration::hours(1))
         .try_constraints_cbor(&cbor)
-        .expect("constraints CBOR should validate")
+        .expect("constraints CBOR should validate");
+    if let Some(id) = token_id {
+        builder = builder.token_id(id);
+    }
+    let cose = builder
         .sign(signing_key)
         .expect("capability grant should sign");
     fcp_prelude::CapabilityToken::from_raw(cose)
@@ -124,12 +149,38 @@ async fn invoke(
 ) -> fcp_core::FcpResult<Value> {
     let capability_grant = valid_token(signing_key, connector.instance_id(), capability, operation);
     connector
-        .handle_invoke(json!({
-            "operation": operation,
-            "input": input,
-            "capability_token": capability_grant,
-        }))
+        .handle_invoke(
+            serde_json::to_value(test_invoke_request(
+                "xai-integration",
+                operation,
+                input,
+                capability_grant,
+            ))
+            .expect("canonical invoke request"),
+        )
         .await
+}
+
+async fn invoke_request(
+    connector: &XaiConnector,
+    request: &InvokeRequest,
+) -> fcp_core::FcpResult<Value> {
+    connector
+        .handle_invoke(serde_json::to_value(request).expect("canonical invoke request"))
+        .await
+}
+
+fn chat_fixture(content: &str) -> Value {
+    json!({
+        "id": "chatcmpl-boundary", "object": "chat.completion", "created": 1,
+        "model": "grok-4.3",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": content},
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}
+    })
 }
 
 fn e2e_log_path() -> Option<PathBuf> {
@@ -559,7 +610,7 @@ async fn responses_timeout_and_cancellation_are_bounded() {
         OpenAiError::Network(NetworkError::DeadlineExceeded { .. })
     ));
 
-    let cx = fcp_async_core::compatibility_cx();
+    let cx = fcp_async_core::Cx::for_testing();
     cx.set_cancel_requested(true);
     let client = XaiClient::new(
         provider,
@@ -580,9 +631,6 @@ async fn responses_timeout_and_cancellation_are_bounded() {
         cancel_error,
         OpenAiError::Network(NetworkError::Cancelled { .. })
     ));
-    // compatibility_cx() returns the shared ambient runtime context; clear the
-    // cancel flag so runtime teardown is not poisoned by the cancellation.
-    cx.set_cancel_requested(false);
 }
 
 #[fcp_async_core::runtime::test]
@@ -628,6 +676,687 @@ async fn fcp_connector_trait_happy_path_validates_capability_token_and_shutdown(
         .expect("shutdown should pass");
     let health = connector.health().await;
     assert!(matches!(health.status.as_str(), "error" | "degraded"));
+}
+
+#[fcp_async_core::runtime::test]
+async fn canonical_admission_preserves_grants_after_route_and_contract_rejection() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("connection", "close")
+                .set_body_json(chat_fixture("accepted")),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let (connector, key) = configured_connector(&server, &[CAP_CHAT], json!({})).await;
+    let token = constrained_token(
+        &key,
+        connector.instance_id(),
+        CAP_CHAT,
+        OP_CHAT,
+        Some(b"canonical-once"),
+        &CapabilityConstraints {
+            resource_allow: vec!["*".into()],
+            max_calls: Some(1),
+            ..Default::default()
+        },
+    );
+    let request = test_invoke_request(
+        "canonical",
+        OP_CHAT,
+        json!({"messages":[{"role":"user","content":"hello"}]}),
+        token,
+    );
+    for (field, value) in [
+        ("type", json!("simulate")),
+        ("id", json!("")),
+        ("connector_id", json!("fcp.groq")),
+        ("zone_id", json!("z:private")),
+        ("deadline_ms", json!(0)),
+        ("input", json!([])),
+        ("input", json!({"messages":[]})),
+        (
+            "input",
+            json!({"messages":[{"role":"invented","content":"hello"}]}),
+        ),
+        (
+            "input",
+            json!({"messages":[{"role":"user","content":"hello"}],"temperature":3}),
+        ),
+    ] {
+        let mut invalid = serde_json::to_value(&request).unwrap();
+        invalid[field] = value;
+        assert!(
+            connector.handle_invoke(invalid).await.is_err(),
+            "accepted invalid {field}"
+        );
+    }
+    assert!(
+        connector
+            .handle_invoke(json!({"operation":OP_CHAT,"input":{}}))
+            .await
+            .is_err()
+    );
+    assert_eq!(connector.handle_health().await.unwrap()["requests"], 0);
+    assert!(server.received_requests().await.unwrap().is_empty());
+    let response = connector.invoke(request.clone()).await.unwrap();
+    assert_eq!(response.result.unwrap()["content"], "accepted");
+    assert_eq!(response.resource_uris, vec!["xai:model:grok-4.3"]);
+    assert!(
+        invoke_request(&connector, &request).await.is_err(),
+        "raw path reused an admitted grant"
+    );
+    assert_eq!(connector.handle_health().await.unwrap()["requests"], 1);
+}
+
+#[fcp_async_core::runtime::test]
+async fn effective_models_and_web_search_resources_cannot_be_overridden_by_extensions() {
+    for (operation, capability, endpoint, input, resources, shadows) in [
+        (
+            OP_CHAT,
+            CAP_CHAT,
+            "/v1/chat/completions",
+            json!({"messages":[{"role":"user","content":"hello"}]}),
+            vec!["xai:model:grok-configured"],
+            vec![
+                "model",
+                "messages",
+                "stream",
+                "temperature",
+                "reasoning_effort",
+                "search_parameters",
+            ],
+        ),
+        (
+            OP_RESPONSES,
+            CAP_RESPONSES,
+            "/v1/responses",
+            json!({"input":"hello", "tools":[{"type":"web_search"}]}),
+            vec!["xai:responses:model:grok-configured", "xai:web_search"],
+            vec![
+                "model",
+                "input",
+                "tools",
+                "stream",
+                "store",
+                "previous_response_id",
+                "temperature",
+            ],
+        ),
+    ] {
+        let server = MockServer::start().await;
+        let fixture = if operation == OP_CHAT {
+            chat_fixture("configured model")
+        } else {
+            response_fixture()
+        };
+        Mock::given(method("POST"))
+            .and(path(endpoint))
+            .and(body_partial_json(json!({"model":"grok-configured"})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("connection", "close")
+                    .set_body_json(fixture),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (connector, key) = configured_connector(
+            &server,
+            &[capability],
+            json!({"default_model":"grok-configured"}),
+        )
+        .await;
+        let wrong_default = constrained_token(
+            &key,
+            connector.instance_id(),
+            capability,
+            operation,
+            Some(b"wrong-default"),
+            &CapabilityConstraints {
+                resource_allow: vec![
+                    "xai:model:grok-4.3".into(),
+                    "xai:responses:model:grok-4.3".into(),
+                    "xai:web_search".into(),
+                ],
+                ..Default::default()
+            },
+        );
+        assert!(
+            invoke_request(
+                &connector,
+                &test_invoke_request("wrong-model", operation, input.clone(), wrong_default)
+            )
+            .await
+            .is_err()
+        );
+        if operation == OP_RESPONSES {
+            for allowed in &resources {
+                let partial = constrained_token(
+                    &key,
+                    connector.instance_id(),
+                    capability,
+                    operation,
+                    None,
+                    &CapabilityConstraints {
+                        resource_allow: vec![(*allowed).into()],
+                        ..Default::default()
+                    },
+                );
+                assert!(
+                    invoke_request(
+                        &connector,
+                        &test_invoke_request(
+                            "partial-resources",
+                            operation,
+                            input.clone(),
+                            partial
+                        )
+                    )
+                    .await
+                    .is_err()
+                );
+            }
+        }
+        let token = constrained_token(
+            &key,
+            connector.instance_id(),
+            capability,
+            operation,
+            Some(b"effective-model-once"),
+            &CapabilityConstraints {
+                resource_allow: resources
+                    .iter()
+                    .map(|resource| (*resource).into())
+                    .collect(),
+                max_calls: Some(1),
+                ..Default::default()
+            },
+        );
+        let request = test_invoke_request("effective-model", operation, input, token);
+        for field in shadows {
+            let mut invalid = request.clone();
+            let mut extensions = serde_json::Map::new();
+            extensions.insert(field.into(), json!("unchecked-override"));
+            invalid.input["provider_extensions"] = json!(extensions);
+            assert!(
+                invoke_request(&connector, &invalid).await.is_err(),
+                "accepted shadow {field}"
+            );
+        }
+        assert_eq!(connector.handle_health().await.unwrap()["requests"], 0);
+        assert!(server.received_requests().await.unwrap().is_empty());
+        let response = connector.invoke(request).await.unwrap();
+        assert!(response.error.is_none());
+        assert_eq!(response.resource_uris, resources);
+        assert_eq!(connector.handle_health().await.unwrap()["requests"], 1);
+    }
+}
+
+#[fcp_async_core::runtime::test]
+async fn remote_images_files_and_previous_responses_require_their_actual_resource_scopes() {
+    for (operation, capability, endpoint, input, expected_body, mut resources) in [
+        (
+            OP_CHAT,
+            CAP_CHAT,
+            "/v1/chat/completions",
+            json!({"messages":[{"role":"user","content":[
+                {"type":"text","text":"inspect"},
+                {"type":"image_url","image_url":{"url":"HTTPS://EXAMPLE.COM:443/images/../scan.png"}},
+                {"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}
+            ]}]}),
+            json!({"messages":[{"role":"user","content":[
+                {"type":"text","text":"inspect"},
+                {"type":"image_url","image_url":{"url":"https://example.com/scan.png"}},
+                {"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}
+            ]}]}),
+            vec![
+                "xai:model:grok-4.3",
+                "xai:image_url:https://example.com/scan.png",
+            ],
+        ),
+        (
+            OP_RESPONSES,
+            CAP_RESPONSES,
+            "/v1/responses",
+            json!({"input":[{"role":"user","content":[
+                {"type":"input_text","text":"inspect"},
+                {"type":"input_image","image_url":"HTTPS://EXAMPLE.COM:443/images/../scan.png"},
+                {"type":"input_file","file_url":"HTTPS://EXAMPLE.COM:443/files/../report.pdf"},
+                {"type":"input_file","file_id":"file-1"}
+            ]}], "previous_response_id":"resp-1", "tools":[{"type":"web_search"}]}),
+            json!({"input":[{"role":"user","content":[
+                {"type":"input_text","text":"inspect"},
+                {"type":"input_image","image_url":"https://example.com/scan.png"},
+                {"type":"input_file","file_url":"https://example.com/report.pdf"},
+                {"type":"input_file","file_id":"file-1"}
+            ]}], "previous_response_id":"resp-1"}),
+            vec![
+                "xai:responses:model:grok-4.3",
+                "xai:web_search",
+                "xai:image_url:https://example.com/scan.png",
+                "xai:file_url:https://example.com/report.pdf",
+                "xai:file:file-1",
+                "xai:response:resp-1",
+            ],
+        ),
+    ] {
+        let server = MockServer::start().await;
+        let fixture = if operation == OP_CHAT {
+            chat_fixture("scoped")
+        } else {
+            response_fixture()
+        };
+        Mock::given(method("POST"))
+            .and(path(endpoint))
+            .and(body_partial_json(expected_body))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("connection", "close")
+                    .set_body_json(fixture),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (connector, key) = configured_connector(&server, &[capability], json!({})).await;
+        for missing in &resources {
+            let token = constrained_token(
+                &key,
+                connector.instance_id(),
+                capability,
+                operation,
+                None,
+                &CapabilityConstraints {
+                    resource_allow: resources
+                        .iter()
+                        .filter(|resource| *resource != missing)
+                        .map(|resource| (*resource).into())
+                        .collect(),
+                    ..Default::default()
+                },
+            );
+            assert!(
+                invoke_request(
+                    &connector,
+                    &test_invoke_request("missing-resource", operation, input.clone(), token)
+                )
+                .await
+                .is_err(),
+                "authorized a request without {missing}"
+            );
+        }
+        let token = constrained_token(
+            &key,
+            connector.instance_id(),
+            capability,
+            operation,
+            Some(b"remote-resources-once"),
+            &CapabilityConstraints {
+                resource_allow: resources
+                    .iter()
+                    .map(|resource| (*resource).into())
+                    .collect(),
+                max_calls: Some(1),
+                ..Default::default()
+            },
+        );
+        let request = test_invoke_request("remote-resources", operation, input, token);
+        let mut unsupported_control = request.clone();
+        if operation == OP_CHAT {
+            unsupported_control.input["search_parameters"] = json!({"mode":"auto"});
+        } else {
+            unsupported_control.input["tools"] =
+                json!([{"type":"web_search"}, {"type":"code_interpreter"}]);
+        }
+        assert!(
+            invoke_request(&connector, &unsupported_control)
+                .await
+                .is_err()
+        );
+        assert_eq!(connector.handle_health().await.unwrap()["requests"], 0);
+        assert!(server.received_requests().await.unwrap().is_empty());
+        let mut response = connector.invoke(request).await.unwrap();
+        assert!(response.error.is_none());
+        response.resource_uris.sort();
+        resources.sort();
+        assert_eq!(response.resource_uris, resources);
+    }
+}
+
+#[fcp_async_core::runtime::test]
+async fn negotiation_rotation_and_failed_reconfiguration_revoke_old_authority() {
+    let server = MockServer::start().await;
+    let (mut connector, key) = configured_connector(&server, &[CAP_CHAT], json!({})).await;
+    let previous_instance = connector.instance_id().clone();
+    let old = test_invoke_request(
+        "old-session",
+        OP_MODELS,
+        json!({}),
+        valid_token(&key, &previous_instance, CAP_MODELS, OP_MODELS),
+    );
+    assert!(
+        invoke_request(&connector, &old).await.is_err(),
+        "unnegotiated capability was accepted"
+    );
+    let handshake = test_handshake_request(
+        vec![
+            CapabilityId::from_static(CAP_MODELS),
+            CapabilityId::from_static("unknown.capability"),
+        ],
+        key.verifying_key().to_bytes(),
+    );
+    let response = connector
+        .handle_handshake(serde_json::to_value(handshake).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        response["capabilities_granted"].as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(response["instance_id"], json!(connector.instance_id()));
+    assert_ne!(connector.instance_id(), &previous_instance);
+    assert!(
+        invoke_request(&connector, &old).await.is_err(),
+        "old token survived rehandshake"
+    );
+    let current = test_invoke_request(
+        "before-failed-handshake",
+        OP_MODELS,
+        json!({}),
+        valid_token(&key, connector.instance_id(), CAP_MODELS, OP_MODELS),
+    );
+    let mut forbidden = test_handshake_request(
+        vec![CapabilityId::from_static(CAP_MODELS)],
+        key.verifying_key().to_bytes(),
+    );
+    forbidden.zone = ZoneId::private();
+    assert!(connector.handshake(forbidden).await.is_err());
+    assert!(matches!(
+        invoke_request(&connector, &current).await,
+        Err(FcpError::NotHandshaken)
+    ));
+    assert_eq!(
+        connector.handle_health().await.unwrap()["handshaken"],
+        false
+    );
+    connector
+        .handshake(test_handshake_request(
+            vec![CapabilityId::from_static(CAP_MODELS)],
+            key.verifying_key().to_bytes(),
+        ))
+        .await
+        .unwrap();
+    let current = test_invoke_request(
+        "before-failed-configure",
+        OP_MODELS,
+        json!({}),
+        valid_token(&key, connector.instance_id(), CAP_MODELS, OP_MODELS),
+    );
+    assert!(
+        connector
+            .handle_configure(json!({"api_key":""}))
+            .await
+            .is_err()
+    );
+    assert!(matches!(
+        invoke_request(&connector, &current).await,
+        Err(FcpError::NotConfigured)
+    ));
+    assert_eq!(
+        connector.handle_health().await.unwrap()["configured"],
+        false
+    );
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[fcp_async_core::runtime::test]
+async fn signed_keys_and_byte_limits_withhold_oversized_responses_without_refunds() {
+    let server = MockServer::start().await;
+    let mut fixture = response_fixture();
+    fixture["output"][0]["content"][0]["text"] = json!("x".repeat(8_000));
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("connection", "close")
+                .set_body_json(fixture),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let (connector, key) = configured_connector(&server, &[CAP_RESPONSES], json!({})).await;
+    let input = json!({"input":"hello", "tools":[{"type":"web_search"}]});
+    for (id, max_calls, max_bytes) in [("zero-calls", Some(0), None), ("tiny-bytes", None, Some(1))]
+    {
+        let token = constrained_token(
+            &key,
+            connector.instance_id(),
+            CAP_RESPONSES,
+            OP_RESPONSES,
+            Some(id.as_bytes()),
+            &CapabilityConstraints {
+                resource_allow: vec!["*".into()],
+                max_calls,
+                max_bytes,
+                ..Default::default()
+            },
+        );
+        assert!(
+            invoke_request(
+                &connector,
+                &test_invoke_request(id, OP_RESPONSES, input.clone(), token)
+            )
+            .await
+            .is_err()
+        );
+    }
+    let token = constrained_token(
+        &key,
+        connector.instance_id(),
+        CAP_RESPONSES,
+        OP_RESPONSES,
+        Some(b"key-and-bytes"),
+        &CapabilityConstraints {
+            resource_allow: vec!["*".into()],
+            max_calls: Some(1),
+            max_bytes: Some(4096),
+            idempotency_key: Some("required-key".into()),
+            ..Default::default()
+        },
+    );
+    let mut request = test_invoke_request("bounded-output", OP_RESPONSES, input, token);
+    for key in [None, Some("wrong-key".to_string())] {
+        request.idempotency_key = key;
+        assert!(invoke_request(&connector, &request).await.is_err());
+    }
+    assert_eq!(connector.handle_health().await.unwrap()["requests"], 0);
+    assert!(server.received_requests().await.unwrap().is_empty());
+    request.idempotency_key = Some("required-key".into());
+    let error = invoke_request(&connector, &request)
+        .await
+        .expect_err("oversized response must be withheld");
+    assert!(matches!(
+        error,
+        FcpError::External {
+            retryable: false,
+            ..
+        }
+    ));
+    assert!(
+        invoke_request(&connector, &request).await.is_err(),
+        "oversized response refunded the grant"
+    );
+    assert_eq!(connector.handle_health().await.unwrap()["requests"], 1);
+}
+
+#[fcp_async_core::runtime::test]
+async fn simulations_and_invalid_strict_keys_do_not_consume_call_budget() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("connection", "close")
+                .set_body_json(json!({"object":"list", "data":[]})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let (connector, key) = configured_connector(&server, &[CAP_MODELS], json!({})).await;
+    let token = constrained_token(
+        &key,
+        connector.instance_id(),
+        CAP_MODELS,
+        OP_MODELS,
+        Some(b"preview-once"),
+        &CapabilityConstraints {
+            resource_allow: vec!["xai:models".into()],
+            max_calls: Some(1),
+            ..Default::default()
+        },
+    );
+    let simulate = SimulateRequest::new(
+        ConnectorId::from_static(CONNECTOR_ID),
+        OperationId::from_static(OP_MODELS),
+        ZoneId::work(),
+        json!({}),
+        token.clone(),
+    );
+    for _ in 0..2 {
+        assert!(
+            connector
+                .simulate(simulate.clone())
+                .await
+                .unwrap()
+                .would_succeed
+        );
+    }
+    for (field, value) in [
+        ("type", json!("invoke")),
+        ("id", json!("")),
+        ("connector_id", json!("fcp.groq")),
+        ("zone_id", json!("z:private")),
+        ("input", json!([])),
+    ] {
+        let mut invalid = serde_json::to_value(&simulate).unwrap();
+        invalid[field] = value;
+        let result = connector.handle_simulate(invalid).await;
+        assert!(
+            !result.is_ok_and(|response| response["would_succeed"] == true),
+            "simulation accepted invalid {field}"
+        );
+    }
+    let mut request = test_invoke_request("after-preview", OP_MODELS, json!({}), token);
+    for key in [None, Some("  ".into())] {
+        request.idempotency_key = key;
+        assert!(invoke_request(&connector, &request).await.is_err());
+    }
+    assert!(server.received_requests().await.unwrap().is_empty());
+    assert_eq!(connector.handle_health().await.unwrap()["requests"], 0);
+    request.idempotency_key = Some("after-preview".into());
+    assert!(invoke_request(&connector, &request).await.is_ok());
+    assert!(!connector.simulate(simulate).await.unwrap().would_succeed);
+}
+
+#[fcp_async_core::runtime::test]
+async fn expired_or_cancelled_native_context_refuses_before_debit_or_cache_access() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("connection", "close")
+                .set_body_json(json!({"object":"list", "data":[]})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let (connector, key) = configured_connector(&server, &[CAP_MODELS], json!({})).await;
+    let token = constrained_token(
+        &key,
+        connector.instance_id(),
+        CAP_MODELS,
+        OP_MODELS,
+        Some(b"native-budget"),
+        &CapabilityConstraints {
+            resource_allow: vec!["*".into()],
+            max_calls: Some(1),
+            ..Default::default()
+        },
+    );
+    let request = test_invoke_request("native-budget", OP_MODELS, json!({"refresh":true}), token);
+    let parent = fcp_async_core::compatibility_cx();
+    let expired =
+        fcp_async_core::Cx::for_testing_with_budget(parent.budget_for_timeout(Duration::ZERO));
+    let cancelled = fcp_async_core::Cx::for_testing();
+    cancelled.set_cancel_requested(true);
+    for context in [expired, cancelled] {
+        let guard = fcp_async_core::Cx::set_current(Some(context));
+        let error = connector
+            .invoke(request.clone())
+            .now_or_never()
+            .expect("invalid native budget must not poll I/O")
+            .expect_err("invalid native budget must reject admission");
+        drop(guard);
+        assert!(!error.is_retryable());
+    }
+    assert_eq!(connector.handle_health().await.unwrap()["requests"], 0);
+    assert!(server.received_requests().await.unwrap().is_empty());
+    assert!(
+        invoke_request(&connector, &request).await.is_ok(),
+        "pre-admission interruption spent the grant"
+    );
+}
+
+#[fcp_async_core::runtime::test]
+async fn credential_id_refuses_provider_work_without_host_injection() {
+    let server = MockServer::start().await;
+    let mut connector = XaiConnector::new();
+    connector
+        .handle_configure(json!({
+            "credential_id":"vault-ref", "base_url":format!("{}/v1", server.uri()),
+        }))
+        .await
+        .unwrap();
+    let key = Ed25519SigningKey::generate();
+    connector
+        .handshake(test_handshake_request(
+            vec![
+                CapabilityId::from_static(CAP_MODELS),
+                CapabilityId::from_static(CAP_CHAT),
+                CapabilityId::from_static(CAP_RESPONSES),
+            ],
+            key.verifying_key().to_bytes(),
+        ))
+        .await
+        .unwrap();
+    for (operation, capability, input) in [
+        (OP_MODELS, CAP_MODELS, json!({})),
+        (
+            OP_CHAT,
+            CAP_CHAT,
+            json!({"messages":[{"role":"user","content":"hello"}]}),
+        ),
+        (
+            OP_RESPONSES,
+            CAP_RESPONSES,
+            json!({"input":"hello", "tools":[{"type":"web_search"}]}),
+        ),
+    ] {
+        let error = invoke(&connector, &key, operation, capability, input)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("credential injection"));
+    }
+    assert_eq!(
+        connector.handle_health().await.unwrap()["credential_injection_required"],
+        true
+    );
+    assert_eq!(connector.handle_health().await.unwrap()["requests"], 0);
+    assert!(server.received_requests().await.unwrap().is_empty());
 }
 
 #[fcp_async_core::runtime::test]

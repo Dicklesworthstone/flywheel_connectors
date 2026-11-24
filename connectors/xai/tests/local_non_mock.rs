@@ -5,7 +5,7 @@
 use std::fmt::Write as _;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -13,7 +13,8 @@ use chrono::{Duration as ChronoDuration, Utc};
 use fcp_crypto::{cose::CapabilityTokenBuilder, ed25519::Ed25519SigningKey};
 use fcp_prelude::{CapabilityConstraints, CapabilityId, FcpConnector, FcpError, InstanceId};
 use fcp_xai::XaiConnector;
-use fcp_xai::connector::test_handshake_request;
+use fcp_xai::connector::{test_handshake_request, test_invoke_request};
+use futures_util::FutureExt;
 use serde_json::{Value, json};
 
 const CONNECTOR: &str = "xai";
@@ -22,6 +23,7 @@ const BEAD_ID: &str = "flywheel_connectors-bky21.3.6.20";
 const ACCEPTANCE_SUITE_CLASS: &str = "local_non_mock";
 const API_KEY: &str = "xai-local-acceptance-key";
 const OP_CHAT: &str = "xai.chat.completions";
+const OP_CHAT_STREAM: &str = "xai.chat.completions_stream";
 const OP_RESPONSES: &str = "xai.responses.create";
 const CAP_CHAT: &str = "xai.chat";
 const CAP_RESPONSES: &str = "xai.responses.web_search";
@@ -111,6 +113,92 @@ struct HttpResponse {
     body: &'static str,
 }
 
+/// Holds a real HTTP response open after headers and a body prefix. The test
+/// releases the socket only after the invocation has returned, so an EOF or a
+/// provider status cannot masquerade as deadline/cancellation enforcement.
+struct IncompleteBodyServer {
+    base_url: String,
+    received: Receiver<CapturedRequest>,
+    release: Sender<()>,
+    join: JoinHandle<()>,
+}
+
+impl IncompleteBodyServer {
+    fn start(streaming: bool, cancel_after_prefix: Option<fcp_async_core::Cx>) -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind incomplete-body server");
+        listener.set_nonblocking(true).expect("bounded accept loop");
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let (request_tx, received) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        let join = thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        assert!(
+                            started.elapsed() < Duration::from_secs(5),
+                            "provider request never arrived"
+                        );
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("accept failed: {error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let captured = read_complete_request(&mut stream);
+            let (content_type, prefix) = if streaming {
+                (
+                    "text/event-stream",
+                    concat!(
+                        "data: {\"id\":\"chunk-local\",\"object\":\"chat.completion.chunk\",\"created\":1,",
+                        "\"model\":\"grok-4.3\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n"
+                    ),
+                )
+            } else {
+                (
+                    "application/json",
+                    "{\"id\":\"unfinished\",\"model\":\"grok-4.3\",",
+                )
+            };
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                prefix.len() + 1024,
+            );
+            stream
+                .write_all(head.as_bytes())
+                .expect("write successful response headers");
+            stream
+                .write_all(prefix.as_bytes())
+                .expect("write incomplete response body");
+            request_tx
+                .send(captured)
+                .expect("record dispatched request");
+            if let Some(context) = cancel_after_prefix {
+                context.set_cancel_requested(true);
+            }
+            let _ = release_rx.recv_timeout(Duration::from_secs(10));
+        });
+        Self {
+            base_url,
+            received,
+            release,
+            join,
+        }
+    }
+
+    fn finish(self) -> CapturedRequest {
+        let _ = self.release.send(());
+        let captured = self.received.recv_timeout(Duration::from_secs(5));
+        self.join
+            .join()
+            .expect("incomplete-body thread should finish");
+        captured.expect("provider must have received the admitted request")
+    }
+}
+
 impl HttpResponse {
     const fn json(status: &'static str, body: &'static str) -> Self {
         Self { status, body }
@@ -194,14 +282,31 @@ fn valid_token(
     capability: &str,
     operation: &str,
 ) -> fcp_prelude::CapabilityToken {
+    constrained_token(
+        signing_key,
+        instance_id,
+        capability,
+        operation,
+        None,
+        &CapabilityConstraints {
+            resource_allow: vec!["*".into()],
+            ..Default::default()
+        },
+    )
+}
+
+fn constrained_token(
+    signing_key: &Ed25519SigningKey,
+    instance_id: &InstanceId,
+    capability: &str,
+    operation: &str,
+    token_id: Option<&[u8]>,
+    constraints: &CapabilityConstraints,
+) -> fcp_prelude::CapabilityToken {
     let now = Utc::now();
-    let constraints = CapabilityConstraints {
-        resource_allow: vec!["*".into()],
-        ..Default::default()
-    };
     let mut cbor = Vec::new();
-    ciborium::into_writer(&constraints, &mut cbor).expect("serialize capability constraints");
-    let cose = CapabilityTokenBuilder::new()
+    ciborium::into_writer(constraints, &mut cbor).expect("serialize capability constraints");
+    let mut builder = CapabilityTokenBuilder::new()
         .capability_id(capability)
         .zone_id("z:work")
         .principal("user:local-non-mock")
@@ -210,7 +315,11 @@ fn valid_token(
         .target_instance(instance_id.as_str())
         .validity(now, now + ChronoDuration::hours(1))
         .try_constraints_cbor(&cbor)
-        .expect("constraints CBOR should validate")
+        .expect("constraints CBOR should validate");
+    if let Some(id) = token_id {
+        builder = builder.token_id(id);
+    }
+    let cose = builder
         .sign(signing_key)
         .expect("capability token should sign");
     fcp_prelude::CapabilityToken::from_raw(cose)
@@ -254,11 +363,15 @@ async fn invoke(
 ) -> Result<Value, FcpError> {
     let capability_token = valid_token(signing_key, connector.instance_id(), capability, operation);
     connector
-        .handle_invoke(json!({
-            "operation_id": operation,
-            "input": input,
-            "capability_token": capability_token
-        }))
+        .handle_invoke(
+            serde_json::to_value(test_invoke_request(
+                "xai-local-boundary",
+                operation,
+                input,
+                capability_token,
+            ))
+            .expect("canonical invoke request"),
+        )
         .await
 }
 
@@ -485,4 +598,96 @@ async fn local_non_mock_wrong_capability_fails_before_egress() {
             "egress_observed": false
         }),
     );
+}
+
+async fn incomplete_body_is_bounded(cancel: bool) {
+    for (operation, capability, endpoint, input) in [
+        (
+            OP_CHAT,
+            CAP_CHAT,
+            "/v1/chat/completions",
+            json!({"messages":[{"role":"user","content":"hello"}]}),
+        ),
+        (
+            OP_CHAT_STREAM,
+            CAP_CHAT,
+            "/v1/chat/completions",
+            json!({"messages":[{"role":"user","content":"hello"}]}),
+        ),
+        (
+            OP_RESPONSES,
+            CAP_RESPONSES,
+            "/v1/responses",
+            json!({"input":"hello", "tools":[{"type":"web_search"}]}),
+        ),
+    ] {
+        let context = fcp_async_core::Cx::for_testing();
+        let server = IncompleteBodyServer::start(
+            operation == OP_CHAT_STREAM,
+            cancel.then(|| context.clone()),
+        );
+        let (connector, signing_key) = setup_connector(&server.base_url, &[capability]).await;
+        let token = constrained_token(
+            &signing_key,
+            connector.instance_id(),
+            capability,
+            operation,
+            Some(b"incomplete-body-once"),
+            &CapabilityConstraints {
+                resource_allow: vec!["*".into()],
+                max_calls: Some(1),
+                ..Default::default()
+            },
+        );
+        let mut request = test_invoke_request("incomplete-body", operation, input, token);
+        request.deadline_ms = Some(if cancel { 5_000 } else { 500 });
+        let started = std::time::Instant::now();
+        let future = connector.invoke(request.clone());
+        futures_util::pin_mut!(future);
+        let first_poll = if cancel {
+            let guard = fcp_async_core::Cx::set_current(Some(context));
+            // Capture the native caller context on the first poll, then drop
+            // the thread-local guard before awaiting the pending I/O.
+            let first_poll = future.as_mut().now_or_never();
+            drop(guard);
+            first_poll
+        } else {
+            None
+        };
+        let result = match first_poll {
+            Some(result) => result,
+            None => future.await,
+        };
+        let elapsed = started.elapsed();
+        let captured = server.finish();
+        assert_request(&captured, "POST", endpoint);
+        if operation == OP_CHAT_STREAM {
+            assert_eq!(captured.body.unwrap()["stream"], true);
+        }
+        let error = result.expect_err("incomplete body must be interrupted by caller budget");
+        assert!(
+            !error.is_retryable(),
+            "interrupted admitted work must not advertise retry"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "caller limit did not bound the full response: {elapsed:?}"
+        );
+        assert_eq!(connector.handle_health().await.unwrap()["requests"], 1);
+        assert!(
+            connector.invoke(request).await.is_err(),
+            "interrupted provider work refunded the grant"
+        );
+        assert_eq!(connector.handle_health().await.unwrap()["requests"], 1);
+    }
+}
+
+#[fcp_async_core::runtime::test]
+async fn local_non_mock_caller_deadline_bounds_chat_sse_and_responses_bodies() {
+    incomplete_body_is_bounded(false).await;
+}
+
+#[fcp_async_core::runtime::test]
+async fn local_non_mock_active_cancellation_interrupts_dispatched_chat_sse_and_responses() {
+    incomplete_body_is_bounded(true).await;
 }
