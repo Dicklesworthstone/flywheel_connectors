@@ -8723,6 +8723,7 @@ dependencies = [
  "chrono",
  "ciborium",
  "clap",
+ "console",
  "criterion",
  "fcp-async-core",
  "fcp-audit",

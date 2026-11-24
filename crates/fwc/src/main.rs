@@ -123,6 +123,7 @@ mod batch_stream;
 mod bench_cmd;
 #[cfg(test)]
 mod bench_helpers;
+mod bootstrap_cmd;
 mod bootstrap_migrate_owner_key;
 mod capability_replay;
 #[allow(dead_code)]
@@ -846,6 +847,15 @@ struct BootstrapArgs {
 #[derive(Subcommand, Debug, Serialize)]
 #[serde(tag = "subcommand", content = "args", rename_all = "kebab-case")]
 enum BootstrapCommand {
+    /// Create a mesh after securely displaying and confirming its recovery words.
+    Init(bootstrap_cmd::InitArgs),
+
+    /// Recover a mesh from its phrase and previously saved genesis fingerprint.
+    Recover(bootstrap_cmd::RecoverArgs),
+
+    /// Inspect the saved public mesh identity or an incomplete bootstrap.
+    Status(bootstrap_cmd::StatusArgs),
+
     /// Build the V3 Ed25519 to V4 ML-DSA-65 owner-key migration attestation.
     #[command(name = "migrate-owner-key")]
     MigrateOwnerKey(bootstrap_migrate_owner_key::MigrateOwnerKeyArgs),
@@ -5191,15 +5201,18 @@ fn dispatch(cli: &Cli) -> Result<DispatchOutcome> {
 }
 
 fn bootstrap_dispatch(args: &BootstrapArgs) -> Result<DispatchOutcome> {
-    match &args.command {
+    let payload = match &args.command {
+        BootstrapCommand::Init(args) => bootstrap_cmd::init(args)?,
+        BootstrapCommand::Recover(args) => bootstrap_cmd::recover(args)?,
+        BootstrapCommand::Status(args) => bootstrap_cmd::status(args)?,
         BootstrapCommand::MigrateOwnerKey(args) => {
-            let output = bootstrap_migrate_owner_key::run(args)?;
-            Ok(DispatchOutcome {
-                payload: serde_json::to_value(output)?,
-                exit_code: CliExitCode::Success,
-            })
+            serde_json::to_value(bootstrap_migrate_owner_key::run(args)?)?
         }
-    }
+    };
+    Ok(DispatchOutcome {
+        payload,
+        exit_code: CliExitCode::Success,
+    })
 }
 
 // ── tail / watch dispatch ────────────────────────────────────────────────

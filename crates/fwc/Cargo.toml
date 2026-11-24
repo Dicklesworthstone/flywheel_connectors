@@ -28,6 +28,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 chrono.workspace = true
 clap = { workspace = true, features = ["derive", "env"] }
+console = { version = "=0.16.3", default-features = false, features = ["std"] }
 ciborium.workspace = true
 fcp-audit.workspace = true
 fcp-async-core.workspace = true

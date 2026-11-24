@@ -2351,6 +2351,30 @@ or revocation state. Older timestamped genesis records retain their original
 fingerprints and require their saved metadata; a mismatched fingerprint is
 rejected rather than silently accepted as the recovered identity.
 
+The public identity workflow is available through `fwc bootstrap`:
+
+```bash
+# Display recovery words on the terminal and verify a complete re-entry before saving genesis.
+fwc bootstrap init --data-dir "$HOME/.fcp"
+
+# Inspect public identity without creating or changing any state.
+fwc bootstrap status --data-dir "$HOME/.fcp"
+
+# Restore into a fresh directory; prompts for the phrase with terminal echo disabled.
+fwc bootstrap recover --data-dir "$HOME/.fcp-recovered" \
+  --expected-fingerprint 'BLAKE3:<saved-fingerprint>'
+```
+
+`init` requires terminal stdin and stderr; it never places recovery words in the
+JSON response, command-line arguments, or a plaintext file. For automation,
+`recover --phrase-stdin` accepts a bounded phrase from a pipe, and still requires
+the previously saved fingerprint. A valid phrase for another identity is refused
+before the destination directory is created. `--resume` resumes only phases
+accepted by the bootstrap library; none of these commands overwrites an existing
+genesis. Clock checking is enabled unless `--skip-time-validation` is explicitly
+selected. These commands establish the owner identity and genesis; cold recovery
+reports the missing audit history, revocation state, and later objects.
+
 ### Post-Compromise Security (PCS) Zones
 
 Sensitive zones can use MLS/TreeKEM-based post-compromise security. The on-the-wire enum is `PcsMode` in `crates/fcp-core/src/pcs.rs`:
