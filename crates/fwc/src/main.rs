@@ -1784,9 +1784,9 @@ struct TailArgs {
     #[arg(long, default_value_t = 300_000, value_parser = clap::value_parser!(u64).range(1..=86_400_000))]
     timeout_ms: u64,
 
-    /// Read the host admin bearer secret from this file for --follow.
+    /// Read the host admin bearer secret from this file.
     /// Defaults to FCP_HOST_ADMIN_BEARER_TOKEN.
-    #[arg(long, value_name = "PATH", requires = "follow")]
+    #[arg(long, value_name = "PATH")]
     #[serde(skip_serializing)]
     admin_token_file: Option<PathBuf>,
 
@@ -5253,7 +5253,14 @@ fn tail_dispatch(args: &TailArgs, explicit_host: Option<&str>) -> Result<Dispatc
     }
     // Parse --since into seconds.
     let since_seconds = match args.since.as_deref() {
-        Some(raw) => match event_stream::parse_since(raw) {
+        Some(raw) => match event_stream::parse_since(raw).and_then(|seconds| {
+            i64::try_from(seconds)
+                .ok()
+                .and_then(ChronoDuration::try_seconds)
+                .and_then(|duration| Utc::now().checked_sub_signed(duration))
+                .map(|_| seconds)
+                .ok_or_else(|| "duration exceeds the supported timestamp range".to_owned())
+        }) {
             Ok(secs) => Some(secs),
             Err(msg) => {
                 return Ok(DispatchOutcome {
@@ -5348,7 +5355,26 @@ fn tail_dispatch(args: &TailArgs, explicit_host: Option<&str>) -> Result<Dispatc
         ));
     };
 
-    let client = HostAdminClient::new(&host.endpoint)?;
+    let client = match HostAdminClient::for_invocation_inspection(&host.endpoint) {
+        Ok(client) => client.with_response_limit(8 * 1024 * 1024),
+        Err(_) => {
+            return Ok(tail_error_dispatch(
+                "invalid-host-endpoint",
+                "Event snapshots require HTTPS, literal loopback HTTP, or a Unix socket with a valid host read deadline.",
+                CliExitCode::Validation,
+            ));
+        }
+    };
+    let token = match invocation_cmd::read_admin_token(args.admin_token_file.as_deref()) {
+        Ok(token) => token,
+        Err(_) => {
+            return Ok(tail_error_dispatch(
+                "invalid-admin-credential",
+                "Provide a bounded ASCII host admin bearer token with --admin-token-file or FCP_HOST_ADMIN_BEARER_TOKEN.",
+                CliExitCode::Validation,
+            ));
+        }
+    };
     let request_limit = if since_seconds.is_some()
         || args.event_type.is_some()
         || args.cursor.is_some()
@@ -5370,7 +5396,10 @@ fn tail_dispatch(args: &TailArgs, explicit_host: Option<&str>) -> Result<Dispatc
         limit: request_limit,
     };
 
-    let response = client.events(&request)?;
+    let response = match client.events(&request, &token) {
+        Ok(response) => response,
+        Err(error) => return Ok(error.dispatch()),
+    };
     let (tail_events, cursor_found, skipped_by_cursor, truncated_after_filtering) =
         select_tail_events(
             &response.events,
@@ -5462,6 +5491,64 @@ fn tail_dispatch(args: &TailArgs, explicit_host: Option<&str>) -> Result<Dispatc
     })
 }
 
+fn tail_error_dispatch(kind: &str, message: &str, exit_code: CliExitCode) -> DispatchOutcome {
+    DispatchOutcome {
+        payload: json!({
+            "status": "error",
+            "command": "tail",
+            "source": "local-validation",
+            "error": { "type": kind, "message": message, "recoverable": true },
+        }),
+        exit_code,
+    }
+}
+
+#[derive(Debug)]
+enum EventSnapshotFailure {
+    Http(u16),
+    Timeout,
+    Transport,
+    InvalidResponse,
+}
+
+impl EventSnapshotFailure {
+    fn dispatch(self) -> DispatchOutcome {
+        let (kind, message, exit_code) = match self {
+            Self::Http(401 | 403) => (
+                "event-query-denied",
+                "The selected host denied event inspection. Check its admin bearer credential and owner-zone access.",
+                CliExitCode::PolicyDenied,
+            ),
+            Self::Http(_) => (
+                "event-query-unavailable",
+                "The selected host did not accept the event snapshot request.",
+                CliExitCode::Transport,
+            ),
+            Self::Timeout => (
+                "event-query-timeout",
+                "The selected host exceeded the event snapshot read deadline.",
+                CliExitCode::Transport,
+            ),
+            Self::Transport => (
+                "event-query-failed",
+                "The selected host could not be reached for event inspection.",
+                CliExitCode::Transport,
+            ),
+            Self::InvalidResponse => (
+                "invalid-event-query-response",
+                "The selected host returned an invalid, unreadable, or oversized event snapshot. The response limit is 8 MiB.",
+                CliExitCode::Transport,
+            ),
+        };
+        let mut outcome = tail_error_dispatch(kind, message, exit_code);
+        outcome.payload["source"] = json!("host-admin-api");
+        if let Self::Http(status) = self {
+            outcome.payload["error"]["http_status"] = json!(status);
+        }
+        outcome
+    }
+}
+
 fn watch_dispatch(args: &WatchArgs, explicit_host: Option<&str>) -> Result<DispatchOutcome> {
     invocation_cmd::watch(args, explicit_host)
 }
@@ -5481,7 +5568,8 @@ fn select_tail_events(
     let since_cutoff = since_seconds.and_then(|seconds| {
         i64::try_from(seconds)
             .ok()
-            .map(|seconds| Utc::now() - ChronoDuration::seconds(seconds))
+            .and_then(ChronoDuration::try_seconds)
+            .and_then(|duration| Utc::now().checked_sub_signed(duration))
     });
 
     let mut filtered = events
@@ -6701,8 +6789,31 @@ impl HostAdminClient {
         )
     }
 
-    fn events(&self, request: &HostEventQueryRequest) -> Result<HostEventQueryResponse> {
-        self.post_json("/rpc/admin/events", request)
+    fn events(
+        &self,
+        request: &HostEventQueryRequest,
+        token: &str,
+    ) -> std::result::Result<HostEventQueryResponse, EventSnapshotFailure> {
+        let response = self
+            .client
+            .post(format!("{}/rpc/admin/events", self.base_url))
+            .bearer_auth(token)
+            .header("x-fcp-zone", "z:owner")
+            .json(request)
+            .timeout(self.read_timeout)
+            .send()
+            .map_err(|error| {
+                if error.is_timeout() {
+                    EventSnapshotFailure::Timeout
+                } else {
+                    EventSnapshotFailure::Transport
+                }
+            })?;
+        if !response.status().is_success() {
+            return Err(EventSnapshotFailure::Http(response.status().as_u16()));
+        }
+        self.decode_client_response(response, "POST", "/rpc/admin/events")
+            .map_err(|_| EventSnapshotFailure::InvalidResponse)
     }
 
     fn batch(&self, request: &HostBatchInvokeRequest) -> Result<HostBatchInvokeResponse> {
@@ -69795,6 +69906,7 @@ require_attestation_types = ["in-toto"]"#,
 
     #[test]
     fn tail_live_filters_event_type_and_cursor() {
+        let (directory, token_file) = tail_admin_credential();
         let now = Utc::now();
         let (host, server) = spawn_mock_host_sequence(vec![(
             "POST /rpc/admin/events".to_owned(),
@@ -69836,7 +69948,7 @@ require_attestation_types = ["in-toto"]"#,
             follow: false,
             poll_interval_ms: 1_000,
             timeout_ms: 300_000,
-            admin_token_file: None,
+            admin_token_file: Some(token_file),
             connector: Some("fcp.github:enterprise:v1".to_owned()),
             since: None,
             limit: 10,
@@ -69863,10 +69975,12 @@ require_attestation_types = ["in-toto"]"#,
         );
         assert_eq!(outcome.payload["resume"]["skipped_events"], 2);
         assert_eq!(outcome.payload["latest_cursor"], "evt-3");
+        drop(directory);
     }
 
     #[test]
     fn tail_live_since_filter_excludes_old_events() {
+        let (directory, token_file) = tail_admin_credential();
         let now = Utc::now();
         let (host, server) = spawn_mock_host_sequence(vec![(
             "POST /rpc/admin/events".to_owned(),
@@ -69899,7 +70013,7 @@ require_attestation_types = ["in-toto"]"#,
             follow: false,
             poll_interval_ms: 1_000,
             timeout_ms: 300_000,
-            admin_token_file: None,
+            admin_token_file: Some(token_file),
             connector: Some("fcp.github:enterprise:v1".to_owned()),
             since: Some("1m".to_owned()),
             limit: 10,
@@ -69920,6 +70034,243 @@ require_attestation_types = ["in-toto"]"#,
         );
         assert_eq!(outcome.payload["filters"]["since"], "1m");
         assert_eq!(outcome.payload["fetched_event_count"], 2);
+        drop(directory);
+    }
+
+    fn tail_admin_credential() -> (tempfile::TempDir, PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let token_file = directory.path().join("tail-admin-token");
+        std::fs::write(&token_file, "tail-admin-test\n").unwrap();
+        (directory, token_file)
+    }
+
+    fn spawn_tail_snapshot_host(
+        status: &'static str,
+        body: String,
+        advertised_length: Option<usize>,
+        delay: Duration,
+    ) -> (String, thread::JoinHandle<Value>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let worker = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "snapshot did not contact the host"
+                        );
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(error) => panic!("snapshot host accept failed: {error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
+            assert!(request_line.starts_with("POST /rpc/admin/events HTTP/"));
+            let mut headers = StdBTreeMap::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.is_empty() || line == "\r\n" {
+                    break;
+                }
+                let (name, value) = line.split_once(':').unwrap();
+                headers.insert(name.to_ascii_lowercase(), value.trim().to_owned());
+            }
+            assert_eq!(headers["authorization"], "Bearer tail-admin-test");
+            assert_eq!(headers["x-fcp-zone"], "z:owner");
+            let length = headers["content-length"].parse::<usize>().unwrap();
+            let mut bytes = vec![0; length];
+            reader.read_exact(&mut bytes).unwrap();
+            let request: Value = serde_json::from_slice(&bytes).unwrap();
+            thread::sleep(delay);
+            let header = format!(
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                advertised_length.unwrap_or(body.len()),
+            );
+            // Size and deadline tests can close before body delivery finishes.
+            let _ = stream
+                .write_all(header.as_bytes())
+                .and_then(|()| stream.write_all(body.as_bytes()));
+            request
+        });
+        (endpoint, worker)
+    }
+
+    #[test]
+    fn tail_snapshot_authenticates_owner_without_requiring_follow() {
+        let (_directory, token_file) = tail_admin_credential();
+        let body = json!({
+            "events": [{
+                "event_id": "evt-1", "kind": "health_check", "connector_id": "github",
+                "summary": "authenticated snapshot", "payload": null,
+                "timestamp": Utc::now().to_rfc3339(), "acknowledged": false,
+            }],
+            "unacknowledged_count": 1,
+        });
+        let (host, server) =
+            spawn_tail_snapshot_host("200 OK", body.to_string(), None, Duration::ZERO);
+        let (exit, payload) = execute_json(&[
+            "fwc",
+            "--json",
+            "--host",
+            &host,
+            "tail",
+            "github",
+            "--limit",
+            "5",
+            "--admin-token-file",
+            token_file.to_str().unwrap(),
+        ]);
+        let request = server.join().unwrap();
+        assert_eq!(exit, CliExitCode::Success.into());
+        assert_eq!(request["connector_id"], "github");
+        assert_eq!(request["limit"], 5);
+        assert_eq!(payload["source"], "host-admin-api");
+        assert_eq!(payload["event_count"], 1);
+        assert_eq!(payload["latest_cursor"], "evt-1");
+        assert!(!payload.to_string().contains("tail-admin-test"));
+    }
+
+    #[test]
+    fn tail_snapshot_classifies_denials_without_echoing_host_bodies() {
+        let (_directory, token_file) = tail_admin_credential();
+        for (status, code, expected_kind, expected_exit) in [
+            (
+                "401 Unauthorized",
+                401,
+                "event-query-denied",
+                CliExitCode::PolicyDenied,
+            ),
+            (
+                "403 Forbidden",
+                403,
+                "event-query-denied",
+                CliExitCode::PolicyDenied,
+            ),
+            (
+                "500 Internal Server Error",
+                500,
+                "event-query-unavailable",
+                CliExitCode::Transport,
+            ),
+        ] {
+            let (host, server) = spawn_tail_snapshot_host(
+                status,
+                "untrusted response echo: tail-admin-test".to_owned(),
+                None,
+                Duration::ZERO,
+            );
+            let (exit, payload) = execute_json(&[
+                "fwc",
+                "--json",
+                "--host",
+                &host,
+                "tail",
+                "--admin-token-file",
+                token_file.to_str().unwrap(),
+            ]);
+            server.join().unwrap();
+            assert_eq!(exit, expected_exit.into());
+            assert_eq!(payload["error"]["type"], expected_kind);
+            assert_eq!(payload["error"]["http_status"], code);
+            assert!(!payload.to_string().contains("tail-admin-test"));
+            assert!(!payload.to_string().contains("untrusted response"));
+        }
+    }
+
+    #[test]
+    fn tail_snapshot_bounds_response_bytes_and_request_time() {
+        let (_directory, token_file) = tail_admin_credential();
+        let (host, server) = spawn_tail_snapshot_host(
+            "200 OK",
+            "tail-admin-test".to_owned(),
+            Some(8 * 1024 * 1024 + 1),
+            Duration::ZERO,
+        );
+        let (exit, payload) = execute_json(&[
+            "fwc",
+            "--json",
+            "--host",
+            &host,
+            "tail",
+            "--admin-token-file",
+            token_file.to_str().unwrap(),
+        ]);
+        server.join().unwrap();
+        assert_eq!(exit, CliExitCode::Transport.into());
+        assert_eq!(payload["error"]["type"], "invalid-event-query-response");
+        assert!(!payload.to_string().contains("tail-admin-test"));
+
+        let (host, server) = spawn_tail_snapshot_host(
+            "200 OK",
+            json!({"events": [], "unacknowledged_count": 0}).to_string(),
+            None,
+            Duration::from_millis(300),
+        );
+        let mut client = super::HostAdminClient::for_invocation_inspection(&host)
+            .unwrap()
+            .with_response_limit(8 * 1024 * 1024);
+        client.read_timeout = Duration::from_millis(30);
+        let error = client
+            .events(
+                &super::HostEventQueryRequest {
+                    connector_id: None,
+                    kind: None,
+                    unacknowledged_only: false,
+                    limit: 50,
+                },
+                "tail-admin-test",
+            )
+            .expect_err("snapshot reads must have a deadline");
+        assert!(matches!(error, super::EventSnapshotFailure::Timeout));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn tail_snapshot_rejects_unsafe_transport_credentials_and_timestamp_ranges() {
+        let (directory, token_file) = tail_admin_credential();
+        let (exit, payload) = execute_json(&[
+            "fwc",
+            "--json",
+            "--host",
+            "http://192.0.2.1",
+            "tail",
+            "--admin-token-file",
+            token_file.to_str().unwrap(),
+        ]);
+        assert_eq!(exit, CliExitCode::Validation.into());
+        assert_eq!(payload["error"]["type"], "invalid-host-endpoint");
+        let invalid_token = directory.path().join("invalid-token");
+        std::fs::write(&invalid_token, "embedded secret whitespace").unwrap();
+        let (exit, payload) = execute_json(&[
+            "fwc",
+            "--json",
+            "--host",
+            "http://127.0.0.1:9",
+            "tail",
+            "--admin-token-file",
+            invalid_token.to_str().unwrap(),
+        ]);
+        assert_eq!(exit, CliExitCode::Validation.into());
+        assert_eq!(payload["error"]["type"], "invalid-admin-credential");
+        assert!(!payload.to_string().contains("embedded secret whitespace"));
+        for duration in ["9223372036854775807s", "18446744073709551615s"] {
+            let (exit, payload) = execute_json(&["fwc", "--json", "tail", "--since", duration]);
+            assert_eq!(exit, CliExitCode::Validation.into());
+            assert_eq!(payload["error"]["type"], "invalid-since-duration");
+        }
     }
 
     #[test]

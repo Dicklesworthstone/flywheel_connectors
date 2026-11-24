@@ -4456,6 +4456,12 @@ delivery capacity, cancellation, and final execution/delivery accounting.
 
 ## Following Live Host Events
 
+Both snapshot `fwc tail` and live follow require the host's owner admin
+credential. Omitting `--follow` returns one formatted snapshot. Both modes
+accept `--admin-token-file` or `FCP_HOST_ADMIN_BEARER_TOKEN` and use confidential
+transport; denied snapshot requests report a policy error without echoing the
+host's response body or credential. Dry-run previews remain local.
+
 `fwc tail --follow` follows the host's retained control-plane event journal and
 flushes one NDJSON record at a time. Supply the same owner admin credential used
 by the host's protected administrative routes:

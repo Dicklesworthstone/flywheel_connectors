@@ -3612,6 +3612,9 @@ fn workflow_search_to_invoke_to_history_full_chain() {
 
 #[test]
 fn live_tail_host_admin_events_apply_resume_cursor_before_type_filtering() {
+    let directory = tempfile::tempdir().expect("tail credential directory");
+    let token_file = directory.path().join("admin-token");
+    std::fs::write(&token_file, "tail-integration-owner\n").expect("tail credential fixture");
     let connector_id = "fcp.github:enterprise:v1";
     let store = Arc::new(HostAdminStateStore::new());
     emit_host_admin_event(
@@ -3643,6 +3646,8 @@ fn live_tail_host_admin_events_apply_resume_cursor_before_type_filtering() {
         &host,
         "tail",
         connector_id,
+        "--admin-token-file",
+        token_file.to_str().expect("token path is UTF-8"),
         "--event-type",
         "health",
         "--cursor",
