@@ -177,8 +177,17 @@ pub enum BootstrapError {
         detail: String,
     },
 
-    /// Hardware-token bootstrap reached the provisioning-handoff step
-    /// but the enrollment path is not yet implemented (br-nh2xl).
+    /// Hardware-token enrollment or its proof failed validation.
+    #[error(
+        "hardware token enrollment failed: {detail}; remediation: verify the token identity, certificate, and enrolled owner key before retrying"
+    )]
+    HardwareTokenEnrollmentFailed {
+        /// Public diagnostic detail; never includes the supplied PIN.
+        detail: String,
+    },
+
+    /// Legacy refusal retained for callers that recognize older bootstrap versions.
+    /// Current hardware-token bootstrap performs enrollment and does not return it.
     ///
     /// The certificate selection succeeded — this error carries the
     /// locator + chosen key material type so the operator knows the

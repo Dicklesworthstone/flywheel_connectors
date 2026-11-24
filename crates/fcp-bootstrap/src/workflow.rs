@@ -9,8 +9,8 @@ use crate::ceremony::{
 use crate::error::{BootstrapError, BootstrapResult};
 use crate::genesis::GenesisState;
 use crate::hardware_token::{
-    DetectedToken, HardwareTokenPin, HardwareTokenSessionDriver, Pkcs11SessionDriver,
-    TokenDetectionReport, TokenDetector, TokenError, select_and_authenticate,
+    DetectedToken, HardwareTokenEnrollment, HardwareTokenPin, HardwareTokenSessionDriver,
+    Pkcs11SessionDriver, TokenDetectionReport, TokenDetector, TokenError, select_and_authenticate,
     select_certificate_for_provisioning,
 };
 use crate::phase::{
@@ -251,6 +251,10 @@ pub struct BootstrapOutcome {
     /// the phrase via `ZeroizeOnDrop` — safe default, but leaves
     /// the operator without a recovery path.
     pub recovery_phrase: Option<RecoveryPhrase>,
+
+    /// Verified public token locator and possession proof in hardware-token mode.
+    /// The same record is persisted before the genesis is committed.
+    pub hardware_token: Option<HardwareTokenEnrollment>,
 }
 
 impl BootstrapOutcome {
@@ -277,6 +281,7 @@ pub struct BootstrapWorkflow {
     phase: BootstrapPhase,
     time_validation: Option<TimeValidation>,
     ceremony: Option<ThresholdCeremony>,
+    hardware_token: Option<HardwareTokenEnrollment>,
     // Retain the OS lease from state inspection through durable completion.
     // Dropping the file releases the lock, including after errors or abandonment.
     _lease: File,
@@ -307,6 +312,7 @@ impl BootstrapWorkflow {
                     phase: BootstrapPhase::Uninitialized,
                     time_validation: None,
                     ceremony: None,
+                    hardware_token: None,
                     _lease: lease,
                 })
             }
@@ -380,6 +386,7 @@ impl BootstrapWorkflow {
                     phase,
                     time_validation: None,
                     ceremony: None,
+                    hardware_token: None,
                     _lease: lease,
                 })
             }
@@ -406,7 +413,15 @@ impl BootstrapWorkflow {
     /// # Errors
     ///
     /// Returns an error if any bootstrap phase fails.
-    pub fn run(mut self) -> BootstrapResult<BootstrapOutcome> {
+    pub fn run(self) -> BootstrapResult<BootstrapOutcome> {
+        self.run_with_hardware_driver(&Pkcs11SessionDriver, None)
+    }
+
+    pub(crate) fn run_with_hardware_driver<D: HardwareTokenSessionDriver>(
+        mut self,
+        driver: &D,
+        detection_report: Option<&TokenDetectionReport>,
+    ) -> BootstrapResult<BootstrapOutcome> {
         // Phase 1: Time validation (skipped on resume if already past).
         if self.needs_time_validation() && !self.config.skip_time_validation {
             self.run_time_validation()?;
@@ -427,9 +442,10 @@ impl BootstrapWorkflow {
                 self.run_multi_device_bootstrap(threshold, device_count)?,
                 None,
             ),
-            BootstrapMode::HardwareToken { token } => {
-                (self.run_hardware_token_bootstrap(&token)?, None)
-            }
+            BootstrapMode::HardwareToken { token } => (
+                self.run_hardware_token_bootstrap(&token, driver, detection_report)?,
+                None,
+            ),
             BootstrapMode::Import { phrase } => (self.run_import_bootstrap(&phrase)?, None),
         };
 
@@ -438,6 +454,7 @@ impl BootstrapWorkflow {
         Ok(BootstrapOutcome {
             genesis,
             recovery_phrase,
+            hardware_token: self.hardware_token.take(),
         })
     }
 
@@ -446,6 +463,14 @@ impl BootstrapWorkflow {
         genesis
             .validate()
             .map_err(|e| BootstrapError::Internal(e.to_string()))?;
+
+        // Publish public enrollment evidence first. Its genesis-specific name
+        // cannot replace another mesh's locator. A failed genesis write may
+        // leave an orphan record, but never a completed genesis without its key
+        // locator. The bootstrap lease spans both durable publications.
+        if let Some(enrollment) = &self.hardware_token {
+            self.save_hardware_token_enrollment(enrollment, genesis)?;
+        }
 
         // Update phase to completed
         self.phase = BootstrapPhase::Completed {
@@ -664,16 +689,18 @@ impl BootstrapWorkflow {
     }
 
     /// Run hardware token bootstrap.
-    fn run_hardware_token_bootstrap(
+    fn run_hardware_token_bootstrap<D: HardwareTokenSessionDriver>(
         &mut self,
         token: &DetectedToken,
+        driver: &D,
+        detection_report: Option<&TokenDetectionReport>,
     ) -> BootstrapResult<GenesisState> {
-        let detection_report = detect_hardware_tokens_report();
-        self.run_hardware_token_bootstrap_with_driver(
-            token,
-            &detection_report,
-            &Pkcs11SessionDriver,
-        )
+        // The selected token may use a provider outside the platform defaults
+        // (including SoftHSM). Probe that exact provider on the production path.
+        let report = detection_report.cloned().unwrap_or_else(|| {
+            TokenDetector::from_provider_paths(vec![token.provider.clone()]).detect_report()
+        });
+        self.run_hardware_token_bootstrap_with_driver(token, &report, driver)
     }
 
     pub(crate) fn run_hardware_token_bootstrap_with_driver<D: HardwareTokenSessionDriver>(
@@ -708,6 +735,11 @@ impl BootstrapWorkflow {
             "Hardware-token session-selection complete; handing off to certificate selection"
         );
 
+        outcome
+            .session
+            .check_alive()
+            .map_err(|err| map_hardware_token_error(detection_report, err))?;
+
         // Enumerate certificates and keys, then select the best pair.
         let provisioning_material =
             select_certificate_for_provisioning(outcome.session.token(), pin, driver)
@@ -721,21 +753,42 @@ impl BootstrapWorkflow {
             "Certificate selected; closing session before provisioning handoff"
         );
 
-        // Close the authenticated session — provisioning uses its own session.
+        outcome
+            .session
+            .check_alive()
+            .map_err(|err| map_hardware_token_error(detection_report, err))?;
+
+        // Close the discovery session before opening the signing session. Both
+        // must complete cleanup before any durable enrollment can be published.
         outcome.session.close().map_err(|err| {
             BootstrapError::HardwareToken(format!(
                 "hardware token session cleanup failed after certificate selection: {err}"
             ))
         })?;
 
-        // Provisioning handoff: the enrollment path is not yet wired.
-        // Returns a typed refusal variant (br-nh2xl) so callers can
-        // match on the specific "not implemented" signal instead of
-        // substring-matching the legacy HardwareToken message.
-        Err(BootstrapError::HardwareTokenEnrollmentNotImplemented {
-            token_display,
-            key_material: provisioning_material.pair.key.key_type.to_string(),
-        })
+        let owner = provisioning_material
+            .owner_verifying_key()
+            .map_err(|err| map_hardware_token_error(detection_report, err))?;
+        // A reusable hardware owner key can recover its mesh identity without
+        // an unavailable original timestamp, just like a recovery phrase.
+        let genesis = GenesisState::create_deterministic(&owner);
+        let enrollment = HardwareTokenEnrollment::enroll_with_driver(
+            &provisioning_material,
+            &genesis,
+            pin,
+            driver,
+        )
+        .map_err(|err| map_hardware_token_error(detection_report, err))?;
+
+        self.hardware_token = Some(enrollment);
+        self.phase = BootstrapPhase::GenesisCreate;
+        write_phase_lock(&self.config.data_dir, &self.phase)?;
+        tracing::info!(
+            token = %token_display,
+            fingerprint = genesis.fingerprint(),
+            "Hardware owner possession verified; ready to commit enrollment and genesis"
+        );
+        Ok(genesis)
     }
 
     /// Run import bootstrap from existing recovery phrase.
@@ -760,6 +813,27 @@ impl BootstrapWorkflow {
         write_phase_lock(&self.config.data_dir, &self.phase)?;
 
         Ok(genesis)
+    }
+
+    fn save_hardware_token_enrollment(
+        &self,
+        enrollment: &HardwareTokenEnrollment,
+        genesis: &GenesisState,
+    ) -> BootstrapResult<()> {
+        let encoded = enrollment.to_json_for_genesis(genesis)?;
+        let path = HardwareTokenEnrollment::path_for_genesis(&self.config.data_dir, genesis)?;
+        let temporary = path.with_extension(format!("{}.tmp", hex::encode(enrollment.challenge)));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&temporary)?;
+        file.write_all(&encoded)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temporary, &path)?;
+        sync_directory(&self.config.data_dir)?;
+        Ok(())
     }
 
     /// Save the genesis state to disk.
@@ -1004,6 +1078,7 @@ fn map_hardware_token_error(
         }
         TokenError::Cancelled => BootstrapError::HardwareTokenCancelled,
         TokenError::Pkcs11(detail) => BootstrapError::HardwareTokenProviderFault { detail },
+        TokenError::Enrollment(detail) => BootstrapError::HardwareTokenEnrollmentFailed { detail },
         TokenError::KeyNotFound(key) => BootstrapError::HardwareTokenKeyNotFound { key },
         TokenError::CertificateSelectionFailed(refusal) => {
             BootstrapError::HardwareTokenCertificateSelectionFailed { refusal }
@@ -2783,6 +2858,16 @@ mod tests {
             _pin: &HardwareTokenPin,
         ) -> Result<Vec<crate::hardware_token::TokenKeyInfo>, TokenError> {
             Ok(Vec::new())
+        }
+
+        fn sign_ed25519(
+            &self,
+            _token: &DetectedToken,
+            _pin: &HardwareTokenPin,
+            key_id: &[u8],
+            _message: &[u8],
+        ) -> Result<Vec<u8>, TokenError> {
+            Err(TokenError::KeyNotFound(hex::encode(key_id)))
         }
     }
 

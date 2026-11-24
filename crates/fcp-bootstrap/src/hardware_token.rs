@@ -3,12 +3,18 @@
 //! This module provides cross-platform support for detecting and using
 //! hardware security modules (HSMs) and smart cards via PKCS#11.
 
+use crate::error::{BootstrapError, BootstrapResult};
+use crate::genesis::GenesisState;
+
 use cryptoki::context::{CInitializeArgs, CInitializeFlags, Pkcs11};
 use cryptoki::error::{Error as Pkcs11Error, RvError};
+use cryptoki::mechanism::Mechanism;
+use cryptoki::mechanism::eddsa::{EddsaParams, EddsaSignatureScheme};
 use cryptoki::object::{Attribute, AttributeType, KeyType, ObjectClass, ObjectHandle};
 use cryptoki::session::{Session, SessionState, UserType};
 use cryptoki::slot::Slot;
 use cryptoki::types::AuthPin;
+use fcp_crypto::{Ed25519Signature, Ed25519VerifyingKey};
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
@@ -434,6 +440,16 @@ pub(crate) trait HardwareTokenSessionDriver: Send + Sync {
         token: &DetectedToken,
         pin: &HardwareTokenPin,
     ) -> Result<Vec<TokenKeyInfo>, TokenError>;
+
+    /// Sign with the unique Ed25519 private key having this exact `CKA_ID`.
+    /// The driver must close its authenticated session before returning.
+    fn sign_ed25519(
+        &self,
+        token: &DetectedToken,
+        pin: &HardwareTokenPin,
+        key_id: &[u8],
+        message: &[u8],
+    ) -> Result<Vec<u8>, TokenError>;
 }
 
 /// Real PKCS#11-backed session driver.
@@ -462,6 +478,10 @@ impl HardwareTokenSessionDriver for Pkcs11SessionDriver {
             }
         };
 
+        if let Err(error) = validate_live_token_identity(&pkcs11, slot, token) {
+            cleanup_failed_session(&token.provider, session, pkcs11);
+            return Err(error);
+        }
         let auth_pin = pin.to_auth_pin();
         match session.login(UserType::User, Some(&auth_pin)) {
             Ok(()) | Err(Pkcs11Error::Pkcs11(RvError::UserAlreadyLoggedIn, _)) => {}
@@ -525,7 +545,7 @@ impl HardwareTokenSessionDriver for Pkcs11SessionDriver {
             }
         }
 
-        let _ = enumeration.close();
+        enumeration.close()?;
         Ok(certs)
     }
 
@@ -559,8 +579,60 @@ impl HardwareTokenSessionDriver for Pkcs11SessionDriver {
             }
         }
 
-        let _ = enumeration.close();
+        enumeration.close()?;
         Ok(keys)
+    }
+
+    fn sign_ed25519(
+        &self,
+        token: &DetectedToken,
+        pin: &HardwareTokenPin,
+        key_id: &[u8],
+        message: &[u8],
+    ) -> Result<Vec<u8>, TokenError> {
+        if key_id.is_empty() {
+            return Err(TokenError::Enrollment("owner key identifier is empty".into()));
+        }
+
+        // Reopen by token identity and object ID, never by a session-local
+        // object handle or a potentially duplicated human-readable label.
+        let signing = open_enumeration_session(token, pin)?;
+        let result = (|| {
+            let handles = signing
+                .session()
+                .find_objects(&[
+                    Attribute::Class(ObjectClass::PRIVATE_KEY),
+                    Attribute::Id(key_id.to_vec()),
+                ])
+                .map_err(map_pkcs11_error)?;
+            let handle = match handles.as_slice() {
+                [] => return Err(TokenError::KeyNotFound(hex::encode(key_id))),
+                [handle] => *handle,
+                _ => {
+                    return Err(TokenError::Enrollment(
+                        "multiple private keys have the enrolled identifier".into(),
+                    ));
+                }
+            };
+            let key = read_key_object(signing.session(), handle)?;
+            if key.id != key_id || !is_owner_signing_key(&key) {
+                return Err(TokenError::UnsupportedMechanism(
+                    "the enrolled key must support Ed25519 signing".into(),
+                ));
+            }
+            signing
+                .session()
+                .sign(
+                    &Mechanism::Eddsa(EddsaParams::new(EddsaSignatureScheme::Ed25519)),
+                    handle,
+                    message,
+                )
+                .map_err(map_pkcs11_error)
+        })();
+        let cleanup = signing.close();
+        let signature = result?;
+        cleanup?;
+        Ok(signature)
     }
 }
 
@@ -666,6 +738,12 @@ fn open_enumeration_session(
         }
     };
 
+    // Slot numbers may be reassigned after removal. Check the physical token
+    // identity on the reopened slot before presenting its PIN or using a key.
+    if let Err(error) = validate_live_token_identity(&pkcs11, slot, token) {
+        cleanup_failed_session(&token.provider, session, pkcs11);
+        return Err(error);
+    }
     let auth_pin = pin.to_auth_pin();
     match session.login(UserType::User, Some(&auth_pin)) {
         Ok(()) | Err(Pkcs11Error::Pkcs11(RvError::UserAlreadyLoggedIn, _)) => {}
@@ -680,6 +758,21 @@ fn open_enumeration_session(
         pkcs11: Some(pkcs11),
         session: Some(session),
     })
+}
+
+fn validate_live_token_identity(
+    pkcs11: &Pkcs11,
+    slot: Slot,
+    expected: &DetectedToken,
+) -> Result<(), TokenError> {
+    let info = pkcs11.get_token_info(slot).map_err(map_pkcs11_error)?;
+    if normalize_token_field(info.serial_number()) != expected.serial
+        || normalize_token_field(info.label()) != expected.label
+        || normalize_token_field(info.manufacturer_id()) != expected.manufacturer
+    {
+        return Err(TokenError::TokenNotFound(token_locator(expected)));
+    }
+    Ok(())
 }
 
 /// Read a certificate object's attributes from its handle.
@@ -833,7 +926,9 @@ fn token_identity_matches(requested: &DetectedToken, candidate: &DetectedToken) 
 }
 
 fn token_field_matches(requested: &str, candidate: &str) -> bool {
-    requested == candidate || requested == "unknown" || candidate == "unknown"
+    // An unspecified request may accept discovered metadata. Discovery must
+    // never erase a known requested identity by replacing it with "unknown".
+    requested == candidate || requested == "unknown"
 }
 
 /// Canonicalize a requested bootstrap token against the latest discovery pass.
@@ -1024,6 +1119,335 @@ pub struct ProvisioningMaterial {
     pub candidates_considered: usize,
     /// Human-readable reason for selecting this pair.
     pub selection_reason: String,
+}
+
+impl ProvisioningMaterial {
+    /// Extract the owner key from the selected certificate's actual SPKI.
+    ///
+    /// Key metadata alone is insufficient: `CKK_EC_EDWARDS` also includes
+    /// Ed448, and matching object IDs do not prove possession of either key.
+    ///
+    /// # Errors
+    ///
+    /// Rejects mismatched IDs, CA identities, unsupported public-key
+    /// algorithms, malformed encodings, and certificates that forbid signing.
+    pub fn owner_verifying_key(&self) -> Result<Ed25519VerifyingKey, TokenError> {
+        if self.pair.key.id.is_empty()
+            || self.pair.key.id != self.pair.certificate.id
+            || self.pair.certificate.is_ca
+        {
+            return Err(TokenError::Enrollment(
+                "certificate and owner key identifiers do not match".into(),
+            ));
+        }
+        if !is_owner_signing_key(&self.pair.key) {
+            return Err(TokenError::UnsupportedMechanism(
+                "an Ed25519 owner-signing key is required".into(),
+            ));
+        }
+        owner_key_from_certificate(&self.pair.certificate.der_bytes)
+    }
+}
+
+const HARDWARE_TOKEN_ENROLLMENT_VERSION: u32 = 1;
+pub(crate) const MAX_HARDWARE_TOKEN_ENROLLMENT_BYTES: usize = 1024 * 1024;
+const HARDWARE_TOKEN_ENROLLMENT_DOMAIN: &[u8] = b"FCP-HARDWARE-TOKEN-ENROLLMENT-V1\0";
+
+/// Durable public evidence and the exact key locator for a hardware owner.
+///
+/// This record contains no PIN or private key. Its proof binds the token,
+/// certificate, object ID, and a fresh challenge to an expected genesis.
+/// Always validate against that independently supplied genesis before use.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HardwareTokenEnrollment {
+    /// Enrollment record version.
+    pub schema_version: u32,
+    /// BLAKE3 of the canonical genesis CBOR.
+    #[serde(with = "hex::serde")]
+    pub genesis_hash: [u8; 32],
+    /// Owner public key proved by the token.
+    #[serde(with = "hex::serde")]
+    pub owner_public_key: [u8; 32],
+    /// Provider, slot, and physical token identity used for enrollment.
+    pub token: DetectedToken,
+    /// Exact private-key `CKA_ID`; labels are never used for key lookup.
+    #[serde(with = "hex::serde")]
+    pub key_id: Vec<u8>,
+    /// Selected leaf certificate as DER, retained as public evidence.
+    #[serde(with = "hex::serde")]
+    pub certificate_der: Vec<u8>,
+    /// Fresh random challenge used for proof of possession.
+    #[serde(with = "hex::serde")]
+    pub challenge: [u8; 32],
+    /// Ed25519 signature over the domain-separated enrollment binding.
+    #[serde(with = "hex::serde")]
+    pub signature: Vec<u8>,
+}
+
+impl HardwareTokenEnrollment {
+    /// The record path associated with this exact genesis.
+    ///
+    /// The genesis hash in the filename prevents a partial bootstrap from
+    /// replacing the locator belonging to a different committed genesis.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the supplied genesis is invalid or cannot be encoded.
+    pub fn path_for_genesis(data_dir: &Path, genesis: &GenesisState) -> BootstrapResult<PathBuf> {
+        let hash = enrollment_genesis_hash(genesis).map_err(enrollment_bootstrap_error)?;
+        Ok(data_dir.join(format!("hardware-token-{}.json", hex::encode(hash))))
+    }
+
+    /// Load and verify enrollment for an independently supplied genesis.
+    ///
+    /// Returns `None` when that genesis has no hardware enrollment record.
+    /// A record for any other genesis is never selected as a fallback.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid files, incompatible records, and invalid possession proofs.
+    pub fn load(
+        data_dir: &Path,
+        expected_genesis: &GenesisState,
+    ) -> BootstrapResult<Option<Self>> {
+        let path = Self::path_for_genesis(data_dir, expected_genesis)?;
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if !metadata.is_file() || metadata.file_type().is_symlink() => {
+                return Err(BootstrapError::HardwareTokenEnrollmentFailed {
+                    detail: "enrollment record must be a regular file".into(),
+                });
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        }
+        use std::io::Read;
+
+        let mut raw = Vec::new();
+        std::fs::File::open(path)?
+            .take((MAX_HARDWARE_TOKEN_ENROLLMENT_BYTES + 1) as u64)
+            .read_to_end(&mut raw)?;
+        if raw.len() > MAX_HARDWARE_TOKEN_ENROLLMENT_BYTES {
+            return Err(BootstrapError::HardwareTokenEnrollmentFailed {
+                detail: "enrollment record exceeds the 1 MiB size limit".into(),
+            });
+        }
+        let enrollment: Self = serde_json::from_slice(&raw)
+            .map_err(|error| BootstrapError::Serialization(error.to_string()))?;
+        enrollment
+            .validate_for_genesis(expected_genesis)
+            .map_err(enrollment_bootstrap_error)?;
+        Ok(Some(enrollment))
+    }
+
+    pub(crate) fn to_json_for_genesis(&self, genesis: &GenesisState) -> BootstrapResult<Vec<u8>> {
+        let encoded = serde_json::to_vec_pretty(self)
+            .map_err(|error| BootstrapError::Serialization(error.to_string()))?;
+        if encoded.len() > MAX_HARDWARE_TOKEN_ENROLLMENT_BYTES {
+            return Err(BootstrapError::HardwareTokenEnrollmentFailed {
+                detail: "enrollment record exceeds the 1 MiB size limit".into(),
+            });
+        }
+        self.validate_for_genesis(genesis).map_err(enrollment_bootstrap_error)?;
+        Ok(encoded)
+    }
+
+    /// Verify the certificate, genesis binding, and possession proof.
+    ///
+    /// The historical certificate's expiry is not reinterpreted here:
+    /// enrollment already validated its issuer chain and validity. The owner
+    /// key from the independently supplied genesis is the trust anchor.
+    ///
+    /// # Errors
+    ///
+    /// Rejects changed metadata, another genesis, unsupported keys, or bad proofs.
+    pub fn validate_for_genesis(&self, expected_genesis: &GenesisState) -> Result<(), TokenError> {
+        if self.schema_version != HARDWARE_TOKEN_ENROLLMENT_VERSION {
+            return Err(TokenError::Enrollment("unsupported enrollment version".into()));
+        }
+        if self.key_id.is_empty()
+            || self.owner_public_key != expected_genesis.owner_public_key
+            || self.genesis_hash != enrollment_genesis_hash(expected_genesis)?
+        {
+            return Err(TokenError::Enrollment(
+                "enrollment does not match the expected genesis and owner key".into(),
+            ));
+        }
+        let owner = owner_key_from_certificate(&self.certificate_der)?;
+        if owner.to_bytes() != self.owner_public_key {
+            return Err(TokenError::Enrollment(
+                "enrollment certificate does not contain the expected owner key".into(),
+            ));
+        }
+        verify_token_signature(&owner, &self.proof_message()?, &self.signature)?;
+        Ok(())
+    }
+
+    /// Sign a message with this enrolled hardware owner.
+    ///
+    /// Revalidates the enrollment against the expected genesis, checks physical
+    /// token identity on the reopened slot, and verifies the returned signature.
+    /// The caller supplies the PIN in memory; it is never retained in the record.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed token error for invalid enrollment, failed login, changed
+    /// token identity, missing or ambiguous keys, cleanup failure, or a bad signature.
+    pub fn sign(
+        &self,
+        expected_genesis: &GenesisState,
+        pin: &HardwareTokenPin,
+        message: &[u8],
+    ) -> Result<Ed25519Signature, TokenError> {
+        self.sign_with_driver(expected_genesis, pin, message, &Pkcs11SessionDriver)
+    }
+
+    pub(crate) fn sign_with_driver<D: HardwareTokenSessionDriver>(
+        &self,
+        expected_genesis: &GenesisState,
+        pin: &HardwareTokenPin,
+        message: &[u8],
+        driver: &D,
+    ) -> Result<Ed25519Signature, TokenError> {
+        self.validate_for_genesis(expected_genesis)?;
+        let signature = driver.sign_ed25519(&self.token, pin, &self.key_id, message)?;
+        let owner = expected_genesis
+            .owner_verifying_key()
+            .map_err(|error| TokenError::Enrollment(error.to_string()))?;
+        verify_token_signature(&owner, message, &signature)
+    }
+
+    pub(crate) fn enroll_with_driver<D: HardwareTokenSessionDriver>(
+        material: &ProvisioningMaterial,
+        genesis: &GenesisState,
+        pin: &HardwareTokenPin,
+        driver: &D,
+    ) -> Result<Self, TokenError> {
+        use rand::RngCore;
+
+        let owner = material.owner_verifying_key()?;
+        if owner.to_bytes() != genesis.owner_public_key {
+            return Err(TokenError::Enrollment(
+                "selected certificate does not match the genesis owner".into(),
+            ));
+        }
+        let mut challenge = [0u8; 32];
+        rand::rngs::OsRng
+            .try_fill_bytes(&mut challenge)
+            .map_err(|_| TokenError::Enrollment("secure challenge generation failed".into()))?;
+        let mut enrollment = Self {
+            schema_version: HARDWARE_TOKEN_ENROLLMENT_VERSION,
+            genesis_hash: enrollment_genesis_hash(genesis)?,
+            owner_public_key: owner.to_bytes(),
+            token: material.token.clone(),
+            key_id: material.pair.key.id.clone(),
+            certificate_der: material.pair.certificate.der_bytes.clone(),
+            challenge,
+            signature: Vec::new(),
+        };
+        enrollment.signature = driver.sign_ed25519(
+            &enrollment.token,
+            pin,
+            &enrollment.key_id,
+            &enrollment.proof_message()?,
+        )?;
+        enrollment.validate_for_genesis(genesis)?;
+        Ok(enrollment)
+    }
+
+    fn proof_message(&self) -> Result<Vec<u8>, TokenError> {
+        // A fixed-position tuple makes every variable-length field unambiguous.
+        // The signature is deliberately excluded from its own signed message.
+        let binding = serde_json::to_vec(&(
+            self.schema_version,
+            self.genesis_hash,
+            self.owner_public_key,
+            (
+                &self.token.provider,
+                self.token.slot,
+                &self.token.label,
+                &self.token.manufacturer,
+                &self.token.serial,
+                &self.token.mechanisms,
+            ),
+            &self.key_id,
+            &self.certificate_der,
+            self.challenge,
+        ))
+        .map_err(|_| TokenError::Enrollment("enrollment binding cannot be encoded".into()))?;
+        let mut message = Vec::with_capacity(HARDWARE_TOKEN_ENROLLMENT_DOMAIN.len() + binding.len());
+        message.extend_from_slice(HARDWARE_TOKEN_ENROLLMENT_DOMAIN);
+        message.extend_from_slice(&binding);
+        Ok(message)
+    }
+}
+
+fn enrollment_genesis_hash(genesis: &GenesisState) -> Result<[u8; 32], TokenError> {
+    genesis
+        .validate()
+        .map_err(|error| TokenError::Enrollment(error.to_string()))?;
+    let encoded = genesis
+        .to_cbor()
+        .map_err(|error| TokenError::Enrollment(error.to_string()))?;
+    Ok(*blake3::hash(&encoded).as_bytes())
+}
+
+fn enrollment_bootstrap_error(error: TokenError) -> BootstrapError {
+    BootstrapError::HardwareTokenEnrollmentFailed {
+        detail: error.to_string(),
+    }
+}
+
+fn verify_token_signature(
+    owner: &Ed25519VerifyingKey,
+    message: &[u8],
+    signature: &[u8],
+) -> Result<Ed25519Signature, TokenError> {
+    let signature = Ed25519Signature::try_from_slice(signature)
+        .map_err(|_| TokenError::Enrollment("token returned an invalid signature length".into()))?;
+    owner
+        .verify(message, &signature)
+        .map_err(|_| TokenError::Enrollment("token signature does not match the owner key".into()))?;
+    Ok(signature)
+}
+
+fn owner_key_from_certificate(der: &[u8]) -> Result<Ed25519VerifyingKey, TokenError> {
+    let (remaining, certificate) = parse_x509_certificate(der)
+        .map_err(|_| TokenError::Enrollment("owner certificate is not valid DER".into()))?;
+    if !remaining.is_empty() || x509_basic_constraints_ca(&certificate) != Some(false) {
+        return Err(TokenError::Enrollment(
+            "owner certificate must be a single non-CA leaf certificate".into(),
+        ));
+    }
+    let public_key = certificate.public_key();
+    // RFC 8410: Ed25519 is 1.3.101.112, parameters MUST be absent, and the
+    // BIT STRING contains exactly the 32 public-key bytes, without padding.
+    if public_key.algorithm.algorithm.to_id_string() != "1.3.101.112"
+        || public_key.algorithm.parameters.is_some()
+        || public_key.subject_public_key.unused_bits != 0
+        || public_key.subject_public_key.data.len() != 32
+    {
+        return Err(TokenError::UnsupportedMechanism(
+            "the owner certificate must contain an RFC 8410 Ed25519 public key".into(),
+        ));
+    }
+    match certificate.key_usage() {
+        Ok(Some(usage)) if !usage.value.digital_signature() => {
+            return Err(TokenError::UnsupportedMechanism(
+                "the owner certificate does not permit digital signatures".into(),
+            ));
+        }
+        Err(_) => {
+            return Err(TokenError::Enrollment("owner certificate key usage is invalid".into()));
+        }
+        _ => {}
+    }
+    let bytes: [u8; 32] = public_key.subject_public_key.data.as_ref().try_into().map_err(|_| {
+        TokenError::Enrollment("owner certificate public-key length is invalid".into())
+    })?;
+    Ed25519VerifyingKey::from_bytes(&bytes)
+        .map_err(|_| TokenError::Enrollment("owner certificate public key is invalid".into()))
 }
 
 /// Result of selecting a certificate/key pair from token object metadata.
@@ -1677,6 +2101,13 @@ fn map_pkcs11_error(error: Pkcs11Error) -> TokenError {
             _,
         ) => TokenError::Cancelled,
         Pkcs11Error::Pkcs11(
+            RvError::MechanismInvalid
+            | RvError::MechanismParamInvalid
+            | RvError::KeyTypeInconsistent
+            | RvError::KeyFunctionNotPermitted,
+            _,
+        ) => TokenError::UnsupportedMechanism("Ed25519 owner signing".into()),
+        Pkcs11Error::Pkcs11(
             RvError::DeviceRemoved
             | RvError::TokenNotPresent
             | RvError::SessionClosed
@@ -1761,6 +2192,10 @@ pub enum TokenError {
     /// Token disconnected during operation.
     #[error("token disconnected")]
     Disconnected,
+
+    /// Enrollment metadata or proof of possession was rejected.
+    #[error("hardware token enrollment: {0}")]
+    Enrollment(String),
 
     /// Certificate selection failed — no suitable identity on this token.
     #[error("certificate selection failed: {0}")]
@@ -2832,14 +3267,26 @@ mod tests {
     }
 
     #[test]
-    fn token_identity_matches_unknown_candidate_wildcards() {
+    fn token_identity_does_not_downgrade_known_requested_metadata() {
         let requested = test_token();
 
-        let mut candidate = test_token();
+        let mut candidate = requested.clone();
         candidate.manufacturer = "unknown".to_string();
+        assert!(!token_identity_matches(&requested, &candidate));
+        assert!(matches!(
+            select_bootstrap_token(&requested, &[candidate]),
+            Err(TokenError::TokenNotFound(_))
+        ));
 
-        // "unknown" in candidate should also wildcard
-        assert!(token_identity_matches(&requested, &candidate));
+        let mut candidate = requested.clone();
+        candidate.serial = "unknown".to_string();
+        assert!(matches!(
+            select_bootstrap_token(&requested, &[candidate.clone()]),
+            Err(TokenError::TokenNotFound(_))
+        ));
+        let mut unspecified = requested;
+        unspecified.serial = "unknown".to_string();
+        assert!(select_bootstrap_token(&unspecified, &[candidate]).is_ok());
     }
 
     #[test]
@@ -3318,6 +3765,16 @@ mod tests {
             _pin: &HardwareTokenPin,
         ) -> Result<Vec<TokenKeyInfo>, TokenError> {
             Ok(self.keys.lock().unwrap().clone())
+        }
+
+        fn sign_ed25519(
+            &self,
+            _token: &DetectedToken,
+            _pin: &HardwareTokenPin,
+            key_id: &[u8],
+            _message: &[u8],
+        ) -> Result<Vec<u8>, TokenError> {
+            Err(TokenError::KeyNotFound(hex::encode(key_id)))
         }
     }
 

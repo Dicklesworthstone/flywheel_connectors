@@ -174,9 +174,8 @@ struct MaterializedIdentity {
     certificate: TokenCertificate,
     /// The key metadata.
     key_info: TokenKeyInfo,
-    /// The raw Ed25519 signing key (32 bytes).  Used for signing operations
-    /// if the harness is extended to support them.
-    #[allow(dead_code)]
+    /// The raw Ed25519 signing key (32 bytes), used for real proof-of-possession
+    /// and enrolled-owner signing in the deterministic test provider.
     signing_key_bytes: [u8; 32],
 }
 
@@ -276,7 +275,11 @@ impl SoftTokenDriver {
             return Err(TokenError::InvalidPin);
         }
 
-        if token.provider != self.detected_token.provider || token.slot != self.detected_token.slot
+        if token.provider != self.detected_token.provider
+            || token.slot != self.detected_token.slot
+            || token.serial != self.detected_token.serial
+            || token.label != self.detected_token.label
+            || token.manufacturer != self.detected_token.manufacturer
         {
             return Err(TokenError::TokenNotFound(format!(
                 "{} slot {}",
@@ -336,6 +339,47 @@ impl HardwareTokenSessionDriver for SoftTokenDriver {
             .iter()
             .map(|id| id.key_info.clone())
             .collect())
+    }
+
+    fn sign_ed25519(
+        &self,
+        token: &DetectedToken,
+        pin: &HardwareTokenPin,
+        key_id: &[u8],
+        message: &[u8],
+    ) -> Result<Vec<u8>, TokenError> {
+        use ed25519_dalek::Signer;
+
+        let session = self.open_authenticated_session(token, pin)?;
+        let result = (|| {
+            let identities: Vec<_> = self
+                .identities
+                .iter()
+                .filter(|identity| identity.id == key_id)
+                .collect();
+            let identity = match identities.as_slice() {
+                [] => return Err(TokenError::KeyNotFound(hex::encode(key_id))),
+                [identity] => *identity,
+                _ => {
+                    return Err(TokenError::Enrollment(
+                        "multiple private keys have the enrolled identifier".into(),
+                    ));
+                }
+            };
+            if !matches!(identity.key_info.key_type, TokenKeyType::Ed25519)
+                || !identity.key_info.can_sign
+            {
+                return Err(TokenError::UnsupportedMechanism("Ed25519 owner signing".into()));
+            }
+            Ok(SigningKey::from_bytes(&identity.signing_key_bytes)
+                .sign(message)
+                .to_bytes()
+                .to_vec())
+        })();
+        let cleanup = session.close();
+        let signature = result?;
+        cleanup?;
+        Ok(signature)
     }
 }
 
@@ -628,6 +672,25 @@ impl SoftTokenHarness {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hardware_token::HardwareTokenEnrollment;
+
+    fn bootstrap_soft_token(
+        data_dir: &std::path::Path,
+        driver: &SoftTokenDriver,
+    ) -> crate::error::BootstrapResult<crate::workflow::BootstrapOutcome> {
+        use crate::workflow::{BootstrapConfig, BootstrapMode, BootstrapWorkflow};
+
+        let mut config = BootstrapConfig::builder()
+            .data_dir(data_dir)
+            .mode(BootstrapMode::HardwareToken {
+                token: driver.detected_token().clone(),
+            })
+            .skip_time_validation(true)
+            .build()?;
+        config.hardware_token_pin = Some(driver.pin());
+        let report = driver.detection_report();
+        BootstrapWorkflow::new(config)?.run_with_hardware_driver(driver, Some(&report))
+    }
 
     // ── Determinism tests ──────────────────────────────────────────────
 
@@ -1127,41 +1190,273 @@ mod tests {
 
     #[test]
     fn workflow_bootstrap_with_soft_token_reaches_provisioning() {
-        use crate::error::BootstrapError;
-        use crate::workflow::{BootstrapConfig, BootstrapMode, BootstrapWorkflow};
         let dir = tempfile::tempdir().unwrap();
-        let config = BootstrapConfig::builder()
-            .data_dir(dir.path())
-            .mode(BootstrapMode::SingleDevice)
-            .hardware_token_pin("654321")
-            .build()
+        let soft = SoftTokenDriver::deterministic(SoftTokenConfig {
+            pin: "PIN-MUST-NEVER-PERSIST-94172".into(),
+            ..SoftTokenConfig::default()
+        });
+        let outcome = bootstrap_soft_token(dir.path(), &soft).unwrap();
+        assert!(outcome.recovery_phrase.is_none());
+        let enrollment = outcome.hardware_token.as_ref().unwrap();
+        enrollment.validate_for_genesis(&outcome.genesis).unwrap();
+        assert_eq!(soft.close_count(), 2, "discovery and signing sessions must close");
+        assert!(!dir.path().join("init.lock").exists());
+
+        let persisted = crate::GenesisState::from_cbor(
+            &std::fs::read(dir.path().join("genesis.cbor")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(persisted.fingerprint(), outcome.genesis.fingerprint());
+        let expected_owner = SigningKey::from_bytes(&soft.identities[0].signing_key_bytes)
+            .verifying_key()
+            .to_bytes();
+        assert_eq!(persisted.owner_public_key, expected_owner);
+        let loaded = HardwareTokenEnrollment::load(dir.path(), &persisted)
+            .unwrap()
             .unwrap();
-        let mut workflow = BootstrapWorkflow::new(config).unwrap();
+        let signature = loaded
+            .sign_with_driver(&persisted, &soft.pin(), b"owner-operation", &soft)
+            .unwrap();
+        persisted
+            .owner_verifying_key()
+            .unwrap()
+            .verify(b"owner-operation", &signature)
+            .unwrap();
+        assert!(persisted.owner_verifying_key().unwrap()
+            .verify(b"different-operation", &signature).is_err());
+
+        let path = HardwareTokenEnrollment::path_for_genesis(dir.path(), &persisted).unwrap();
+        let record = std::fs::read_to_string(path).unwrap();
+        assert!(!record.contains("PIN-MUST-NEVER-PERSIST-94172"));
+        assert!(!record.contains("signing_key"));
+        assert!(!record.contains(&hex::encode(soft.identities[0].signing_key_bytes)));
+        assert!(!format!("{loaded:?}").contains("PIN-MUST-NEVER-PERSIST-94172"));
+    }
+
+    #[test]
+    fn hardware_enrollment_reuses_owner_identity_with_fresh_possession_proofs() {
+        let first_dir = tempfile::tempdir().unwrap();
+        let second_dir = tempfile::tempdir().unwrap();
+        let soft = SoftTokenDriver::deterministic(SoftTokenConfig::default());
+        let first = bootstrap_soft_token(first_dir.path(), &soft).unwrap();
+        let second = bootstrap_soft_token(second_dir.path(), &soft).unwrap();
+        assert_eq!(first.genesis.fingerprint(), second.genesis.fingerprint());
+        let first_record = first.hardware_token.unwrap();
+        let mut second_record = second.hardware_token.unwrap();
+        assert_ne!(first_record.challenge, second_record.challenge);
+        assert_ne!(first_record.signature, second_record.signature);
+        second_record.validate_for_genesis(&first.genesis).unwrap();
+
+        // A prior proof cannot satisfy the fresh challenge, even for the same key.
+        second_record.signature = first_record.signature;
+        assert!(second_record.validate_for_genesis(&first.genesis).is_err());
+    }
+
+    #[test]
+    fn hardware_enrollment_rejects_tampering_and_an_unrelated_expected_genesis() {
+        let dir = tempfile::tempdir().unwrap();
+        let soft = SoftTokenDriver::deterministic(SoftTokenConfig::default());
+        let outcome = bootstrap_soft_token(dir.path(), &soft).unwrap();
+        let enrollment = outcome.hardware_token.unwrap();
+        let mut altered = Vec::new();
+
+        let mut record = enrollment.clone();
+        record.challenge[0] ^= 1;
+        altered.push(record);
+        let mut record = enrollment.clone();
+        record.signature[0] ^= 1;
+        altered.push(record);
+        let mut record = enrollment.clone();
+        record.signature.truncate(63);
+        altered.push(record);
+        let mut record = enrollment.clone();
+        record.key_id.push(0);
+        altered.push(record);
+        let mut record = enrollment.clone();
+        record.token.serial.push_str("-replacement");
+        altered.push(record);
+        let mut record = enrollment.clone();
+        record.certificate_der.push(0);
+        altered.push(record);
+        let mut record = enrollment.clone();
+        record.genesis_hash[0] ^= 1;
+        altered.push(record);
+        for record in altered {
+            assert!(record.validate_for_genesis(&outcome.genesis).is_err());
+        }
+
+        let mut other_genesis = outcome.genesis.clone();
+        other_genesis.created_at += chrono::Duration::seconds(1);
+        let closes = soft.close_count();
+        assert!(enrollment
+            .sign_with_driver(&other_genesis, &soft.pin(), b"owner-operation", &soft)
+            .is_err());
+        assert_eq!(soft.close_count(), closes, "reject before opening a signing session");
+        assert!(HardwareTokenEnrollment::load(dir.path(), &other_genesis)
+            .unwrap().is_none());
+
+        // Even a genuine, self-signed record is rejected when placed at another
+        // genesis's path. The caller's expected genesis remains authoritative.
+        let other_path = HardwareTokenEnrollment::path_for_genesis(dir.path(), &other_genesis)
+            .unwrap();
+        std::fs::write(other_path, serde_json::to_vec(&enrollment).unwrap()).unwrap();
+        assert!(HardwareTokenEnrollment::load(dir.path(), &other_genesis).is_err());
+    }
+
+    #[test]
+    fn hardware_enrollment_bounds_loading_and_persistence_size() {
+        use crate::hardware_token::MAX_HARDWARE_TOKEN_ENROLLMENT_BYTES;
+
+        let dir = tempfile::tempdir().unwrap();
+        let soft = SoftTokenDriver::deterministic(SoftTokenConfig::default());
+        let outcome = bootstrap_soft_token(dir.path(), &soft).unwrap();
+        let enrollment = outcome.hardware_token.unwrap();
+        let path = HardwareTokenEnrollment::path_for_genesis(dir.path(), &outcome.genesis)
+            .unwrap();
+
+        // The read boundary is inclusive, and even valid JSON plus harmless
+        // trailing whitespace cannot bypass the cap by growing after metadata.
+        let mut encoded = serde_json::to_vec(&enrollment).unwrap();
+        encoded.resize(MAX_HARDWARE_TOKEN_ENROLLMENT_BYTES, b' ');
+        std::fs::write(&path, &encoded).unwrap();
+        assert!(HardwareTokenEnrollment::load(dir.path(), &outcome.genesis)
+            .unwrap().is_some());
+        encoded.push(b' ');
+        std::fs::write(&path, encoded).unwrap();
+        let error = HardwareTokenEnrollment::load(dir.path(), &outcome.genesis).unwrap_err();
+        assert!(error.to_string().contains("1 MiB size limit"));
+
+        let mut oversized = enrollment;
+        oversized.token.label = "x".repeat(MAX_HARDWARE_TOKEN_ENROLLMENT_BYTES);
+        let error = oversized.to_json_for_genesis(&outcome.genesis).unwrap_err();
+        assert!(error.to_string().contains("1 MiB size limit"));
+    }
+
+    #[test]
+    fn hardware_enrollment_requires_the_certificate_private_key_and_closes_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut soft = SoftTokenDriver::deterministic(SoftTokenConfig::default());
+        // Preserve the certificate and CKA_ID but substitute a different actual
+        // private key. Metadata matching must never be accepted as possession.
+        soft.identities[0].signing_key_bytes[0] ^= 1;
+        let error = bootstrap_soft_token(dir.path(), &soft).unwrap_err();
+        assert!(matches!(
+            error,
+            crate::BootstrapError::HardwareTokenEnrollmentFailed { .. }
+        ));
+        assert_eq!(soft.close_count(), 2);
+        assert!(!dir.path().join("genesis.cbor").exists());
+        assert!(std::fs::read_dir(dir.path()).unwrap().all(|entry| {
+            !entry.unwrap().file_name().to_string_lossy().starts_with("hardware-token-")
+        }));
+    }
+
+    #[test]
+    fn hardware_enrollment_uses_exact_key_id_and_rechecks_token_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut soft = SoftTokenDriver::deterministic(SoftTokenConfig {
+            identities: vec![
+                SoftTokenIdentitySpec::ed25519("same-label", "First Owner"),
+                SoftTokenIdentitySpec::ed25519("same-label", "Second Owner"),
+            ],
+            ..SoftTokenConfig::default()
+        });
+        let outcome = bootstrap_soft_token(dir.path(), &soft).unwrap();
+        let enrollment = outcome.hardware_token.unwrap();
+        let selected = soft.identities.iter_mut()
+            .find(|identity| identity.id == enrollment.key_id).unwrap();
+        let expected = SigningKey::from_bytes(&selected.signing_key_bytes)
+            .verifying_key().to_bytes();
+        assert_eq!(outcome.genesis.owner_public_key, expected);
+        selected.key_info.label = "label-changed-after-enrollment".into();
+        enrollment.sign_with_driver(&outcome.genesis, &soft.pin(), b"message", &soft)
+            .unwrap();
+
+        let closes = soft.close_count();
+        soft.detected_token.serial = "NEW-TOKEN-IN-SAME-SLOT".into();
+        let error = enrollment
+            .sign_with_driver(&outcome.genesis, &soft.pin(), b"message", &soft)
+            .unwrap_err();
+        assert!(matches!(error, TokenError::TokenNotFound(_)));
+        assert_eq!(soft.close_count(), closes);
+
+        let duplicate_dir = tempfile::tempdir().unwrap();
+        let mut duplicate = SoftTokenDriver::deterministic(SoftTokenConfig::default());
+        duplicate.identities.push(duplicate.identities[0].clone());
+        let error = bootstrap_soft_token(duplicate_dir.path(), &duplicate).unwrap_err();
+        assert!(matches!(error, crate::BootstrapError::HardwareTokenEnrollmentFailed { .. }));
+        assert_eq!(duplicate.close_count(), 2);
+        assert!(!duplicate_dir.path().join("genesis.cbor").exists());
+    }
+
+    #[test]
+    fn hardware_enrollment_checks_certificate_algorithm_and_signing_usage() {
+        for incompatible_algorithm in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let config = SoftTokenConfig::default();
+            let mut soft = SoftTokenDriver::deterministic(config.clone());
+            let issuer = certified_issuer(
+                "FCP SoftToken CA",
+                &implicit_ca_signing_key_bytes(&soft_token_derivation_context(&config)),
+            );
+            let mut parameters = build_certificate_params("FCP Owner Key", false);
+            let key = if incompatible_algorithm {
+                KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap()
+            } else {
+                parameters.key_usages = vec![rcgen::KeyUsagePurpose::KeyAgreement];
+                rcgen_key_pair_from_signing_key(&soft.identities[0].signing_key_bytes)
+            };
+            soft.identities[0].certificate.der_bytes =
+                parameters.signed_by(&key, &issuer).unwrap().der().to_vec();
+
+            let error = bootstrap_soft_token(dir.path(), &soft).unwrap_err();
+            assert!(matches!(error, crate::BootstrapError::HardwareTokenUnsupported { .. }));
+            assert_eq!(soft.close_count(), 1, "refuse before opening the signing session");
+            assert!(!dir.path().join("genesis.cbor").exists());
+        }
+    }
+
+    #[test]
+    fn hardware_enrollment_persistence_precedes_genesis_and_never_publishes_partial_records() {
+        use crate::hardware_token::select_certificate_for_provisioning;
+        use crate::workflow::{BootstrapConfig, BootstrapMode, BootstrapWorkflow};
 
         let soft = SoftTokenDriver::deterministic(SoftTokenConfig::default());
-        let token = soft.detected_token().clone();
-        let report = soft.detection_report();
-
-        let result = workflow.run_hardware_token_bootstrap_with_driver(&token, &report, &soft);
-
-        // The soft token has a valid Ed25519 cert+key pair, so the workflow
-        // proceeds through discovery -> auth -> certificate selection successfully.
-        // It reaches the provisioning boundary and reports "not implemented yet"
-        // which proves the entire upstream pipeline works.
-        let err = result.unwrap_err();
-        assert!(
-            matches!(
-                &err,
-                BootstrapError::HardwareTokenEnrollmentNotImplemented { .. }
-            ),
-            "expected provisioning-not-implemented boundary, got: {err}"
+        let material = select_certificate_for_provisioning(soft.detected_token(), &soft.pin(), &soft)
+            .unwrap();
+        let genesis = crate::GenesisState::create_deterministic(
+            &material.owner_verifying_key().unwrap(),
         );
-        let err_text = err.to_string();
-        assert!(!err_text.contains("ProvisioningMaterial("));
-        assert!(!err_text.contains("id="));
+        let record_failure_dir = tempfile::tempdir().unwrap();
+        let record_path = HardwareTokenEnrollment::path_for_genesis(
+            record_failure_dir.path(), &genesis,
+        ).unwrap();
+        std::fs::create_dir(&record_path).unwrap();
+        assert!(bootstrap_soft_token(record_failure_dir.path(), &soft).is_err());
+        assert!(!record_failure_dir.path().join("genesis.cbor").exists());
+        assert!(HardwareTokenEnrollment::load(record_failure_dir.path(), &genesis).is_err());
 
-        // Session was cleaned up via Drop during error unwind
-        assert_eq!(soft.close_count(), 1);
+        let genesis_failure_dir = tempfile::tempdir().unwrap();
+        let config = BootstrapConfig::builder()
+            .data_dir(genesis_failure_dir.path())
+            .mode(BootstrapMode::HardwareToken { token: soft.detected_token().clone() })
+            .hardware_token_pin("654321")
+            .skip_time_validation(true)
+            .build().unwrap();
+        let workflow = BootstrapWorkflow::new(config).unwrap();
+        // Force publication failure only after the workflow owns its lease.
+        std::fs::create_dir(genesis_failure_dir.path().join("genesis.cbor")).unwrap();
+        let report = soft.detection_report();
+        assert!(workflow.run_with_hardware_driver(&soft, Some(&report)).is_err());
+        assert!(genesis_failure_dir.path().join("genesis.cbor").is_dir());
+        let orphan = HardwareTokenEnrollment::load(genesis_failure_dir.path(), &genesis)
+            .unwrap().unwrap();
+        orphan.validate_for_genesis(&genesis).unwrap();
+        let mut other = genesis.clone();
+        other.created_at += chrono::Duration::seconds(1);
+        assert!(HardwareTokenEnrollment::load(genesis_failure_dir.path(), &other)
+            .unwrap().is_none());
+        assert!(genesis_failure_dir.path().join("init.lock").exists());
     }
 
     #[test]
@@ -1222,7 +1517,6 @@ mod tests {
 
     #[test]
     fn workflow_bootstrap_mixed_keys_selects_ed25519() {
-        use crate::error::BootstrapError;
         use crate::workflow::{BootstrapConfig, BootstrapMode, BootstrapWorkflow};
         let dir = tempfile::tempdir().unwrap();
         let config = BootstrapConfig::builder()
@@ -1246,19 +1540,14 @@ mod tests {
         let token = soft.detected_token().clone();
         let report = soft.detection_report();
 
-        // The workflow selects the Ed25519 key (highest priority) and reaches
-        // the provisioning boundary, proving mixed-key selection works.
-        let err = workflow
+        let genesis = workflow
             .run_hardware_token_bootstrap_with_driver(&token, &report, &soft)
-            .unwrap_err();
-        assert!(
-            matches!(
-                &err,
-                BootstrapError::HardwareTokenEnrollmentNotImplemented { key_material, .. }
-                    if key_material == "Ed25519"
-            ),
-            "expected provisioning boundary with Ed25519 selection, got: {err}"
-        );
+            .unwrap();
+        let expected = SigningKey::from_bytes(&soft.identities[2].signing_key_bytes)
+            .verifying_key()
+            .to_bytes();
+        assert_eq!(genesis.owner_public_key, expected);
+        assert_eq!(soft.close_count(), 2);
     }
 
     // ── Deterministic rerun verification ───────────────────────────────
@@ -1449,6 +1738,16 @@ mod verification_pack {
             _pin: &HardwareTokenPin,
         ) -> Result<Vec<TokenKeyInfo>, TokenError> {
             Ok(Vec::new())
+        }
+
+        fn sign_ed25519(
+            &self,
+            token: &DetectedToken,
+            pin: &HardwareTokenPin,
+            key_id: &[u8],
+            message: &[u8],
+        ) -> Result<Vec<u8>, TokenError> {
+            self.inner.sign_ed25519(token, pin, key_id, message)
         }
     }
 
@@ -1957,12 +2256,7 @@ mod verification_pack {
         let result = workflow.run_hardware_token_bootstrap_with_driver(&token, &report, &soft);
         {
             let step = record.add_step("action", "Run hardware-token bootstrap workflow");
-            // Expect provisioning-not-implemented boundary (proves upstream pipeline works)
-            let reached_provisioning = matches!(
-                &result,
-                Err(BootstrapError::HardwareTokenEnrollmentNotImplemented { .. })
-            );
-            step.passed = reached_provisioning;
+            step.passed = result.as_ref().is_ok_and(|genesis| genesis.validate().is_ok());
             step.duration_ms = millis_u64(t.elapsed());
             match &result {
                 Ok(_) => step.evidence.push("result=genesis_created".to_string()),
@@ -1971,8 +2265,8 @@ mod verification_pack {
         }
 
         {
-            let step = record.add_step("assert", "Session cleanup occurred during workflow");
-            step.passed = soft.close_count() == 1;
+            let step = record.add_step("assert", "Discovery and signing sessions were cleaned up");
+            step.passed = soft.close_count() == 2;
             step.evidence
                 .push(format!("close_count={}", soft.close_count()));
         }
@@ -2315,6 +2609,16 @@ mod verification_pack {
             pin: &HardwareTokenPin,
         ) -> Result<Vec<TokenKeyInfo>, TokenError> {
             self.inner.enumerate_keys(token, pin)
+        }
+
+        fn sign_ed25519(
+            &self,
+            token: &DetectedToken,
+            pin: &HardwareTokenPin,
+            key_id: &[u8],
+            message: &[u8],
+        ) -> Result<Vec<u8>, TokenError> {
+            self.inner.sign_ed25519(token, pin, key_id, message)
         }
     }
 

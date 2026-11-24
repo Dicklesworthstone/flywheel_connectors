@@ -107,8 +107,9 @@ pub use error::{BootstrapError, BootstrapResult};
 pub use genesis::{GenesisState, GenesisValidationError};
 pub use hardware_token::{
     AuthenticatedSessionState, AuthenticatedTokenSession, CertificateKeyPair,
-    CertificateSelectionRefusal, DetectedToken, DetectionIssue, DetectionStage, HardwareTokenPin,
-    HardwareTokenProvider, ProviderDetectionResult, ProvisioningMaterial, SessionSelectionOutcome,
+    CertificateSelectionRefusal, DetectedToken, DetectionIssue, DetectionStage, HardwareTokenEnrollment,
+    HardwareTokenPin, HardwareTokenProvider, ProviderDetectionResult, ProvisioningMaterial,
+    SessionSelectionOutcome,
     TokenCertificate, TokenDetectionReport, TokenDetector, TokenKeyInfo, TokenKeyType,
 };
 pub use phase::{BootstrapPhase, InitResult, InitSuggestion, PartialStateSuggestion};
