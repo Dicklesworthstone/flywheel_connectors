@@ -4,7 +4,7 @@ use std::io::{self, BufRead, Write};
 
 use anyhow::Result;
 use fcp_prelude::{FcpConnector, FcpError, FcpResult};
-use fcp_sdk::prelude::{JsonlConfig, dispatch_raw_invoke, serve_jsonl};
+use fcp_sdk::prelude::{JsonlConfig, serve_jsonl};
 use serde_json::{Value, json};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -60,7 +60,13 @@ async fn handle_request(
         "doctor" => connector.handle_doctor().await,
         "self_check" => connector.handle_self_check().await,
         "introspect" => connector.handle_introspect().await,
-        "invoke" => dispatch_raw_invoke(params, |params| connector.handle_invoke(params)).await,
+        "invoke" => {
+            let request = serde_json::from_value(params).map_err(|_| FcpError::InvalidRequest {
+                code: 1003,
+                message: "Invalid FCP invoke request".into(),
+            })?;
+            encode_response(connector.invoke(request).await?)
+        }
         "simulate" => {
             let request = serde_json::from_value(params).map_err(|_| FcpError::InvalidRequest {
                 code: 1003,

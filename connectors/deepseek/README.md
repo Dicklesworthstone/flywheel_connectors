@@ -27,7 +27,7 @@ Important runtime truths the contract preserves:
 
 - Configuration accepts exactly one of `api_key` or `credential_id`, plus optional `base_url`, default model, request timeout, model-cache TTL, and rate-limit wait policy.
 - API-key mode sends a bearer token to DeepSeek.
-- Credential-id mode emits an `x-fcp-credential-id` header and requires host-side egress credential injection for live traffic.
+- Credential-id configuration is recognized, but this connector does not yet implement host-mediated credential injection. Readiness is degraded and invoke/simulate refuse provider work in this mode.
 - Default base URL is `https://api.deepseek.com`.
 - `https://api.deepseek.com/v1` is also accepted.
 - Loopback HTTP base URLs are accepted for deterministic tests.
@@ -38,6 +38,10 @@ Important runtime truths the contract preserves:
 - SSE chat streaming assembles `reasoning_content` and final `content` separately and records only delta byte counts in chunk metadata.
 - FCP subscribe is not implemented; streaming is a bounded invoke operation.
 - Runtime handshake returns a SHA-256 hash of the bundled `manifest.toml`.
+- Handshake accepts only the manifest's `z:work` target zone, negotiates declared capabilities, and reports the actual rotated instance ID. Configure, rehandshake, and shutdown invalidate the preceding authority, including failed replacement attempts.
+- Native and typed invokes use the complete FCP request envelope. Connector, zone, operation, instance, model resources, and signed key scopes are checked before provider traffic.
+- Signed call and message-byte limits use the shared SDK's atomic session accounting. Request bytes and response reservations are charged before dispatch; failures, cancellation, and oversized responses retain the charge. This is FCP-message accounting, not provider billing or mesh-global quota.
+- Simulate performs the same input and authority checks without provider I/O or consuming the call allowance. Strict model-list and health invokes require a non-empty `idempotency_key`; this requirement does not add result deduplication.
 - Runtime introspection derives operation descriptions, schemas, capabilities, safety, risk, idempotency, approval mode, rate-limit metadata, and AI hints from the embedded manifest while preserving the five-operation order below.
 
 ## First-Slice Scope
@@ -55,7 +59,7 @@ The first DeepSeek slice is intentionally narrow:
 
 ## Auth And Scope Boundary
 
-- Authentication mechanism: DeepSeek API key, with host-injected credential-id mode.
+- Authentication mechanism: DeepSeek API key. Credential-id mode remains unavailable for live invocation until host-mediated transport is implemented.
 - Home zone: `z:work`.
 - Allowed source zones: `z:owner`, `z:private`, and `z:work`.
 - Allowed target zone: `z:work`.
@@ -66,7 +70,7 @@ The first DeepSeek slice is intentionally narrow:
   - `deepseek.health.read` gates the health probe.
   - `deepseek.embeddings` gates the introspection-only embeddings placeholder.
 - The connector does not persist prompts, completions, reasoning content, streamed chunks, model catalogs, provider payloads, or provider responses.
-- Credential-id mode is a host-egress contract, not direct proof that live DeepSeek will accept the request without an injection layer.
+- Model resource checks bind the exact typed model sent to the provider, including a configured default. Accepted remote image URLs also require `deepseek:image_url:<canonical-url>` resource authority; inline data remains part of the metered request. Provider extensions cannot override standard request fields or bypass typed DeepSeek controls.
 
 ## Network And Runtime Invariants
 
@@ -78,8 +82,10 @@ The first DeepSeek slice is intentionally narrow:
 - Default request timeout: `240_000 ms`.
 - Model-list timeout: `30_000 ms`.
 - Health probe timeout: `5_000 ms`.
-- SSE chat streaming may run up to `300_000 ms`.
+- SSE chat streaming declares a `300_000 ms` network ceiling, but the configured timeout and `240_000 ms` sandbox ceiling further constrain each invocation. Configuration cannot extend that sandbox limit.
+- One shared request budget covers input validation, cache access, provider retries, streaming setup, and the complete SSE body. The caller's deadline, configured timeout, native execution deadline, and operation ceiling can only shorten it. Expired or cancelled work is not automatically retried.
 - Maximum response bytes are `10_485_760`.
+- The complete returned FCP envelope is also capped at `10_485_760` bytes, or the signed grant's remaining byte allowance if smaller. Responses exceeding that allowance are withheld.
 - Sandbox profile is `strict`, with `128 MB` memory, `25%` CPU, `240_000 ms` wall-clock timeout, no exec, and no ptrace.
 
 ## Capability Families

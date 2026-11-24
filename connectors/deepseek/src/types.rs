@@ -105,6 +105,19 @@ pub fn chat_request_from_value(
 }
 
 fn validate_deepseek_chat_input(input: &ChatInvokeInput) -> FcpResult<()> {
+    // DeepSeek-specific controls also have typed fields. Flattened extension
+    // keys must not bypass their validation or override an explicit value.
+    if ["thinking", "reasoning_effort", "user_id"]
+        .iter()
+        .any(|field| input.provider_extensions.contains_key(*field))
+    {
+        return Err(FcpError::InvalidRequest {
+            code: 1003,
+            message:
+                "Use typed thinking, reasoning_effort and user_id fields, not provider_extensions"
+                    .into(),
+        });
+    }
     if input.messages.is_empty() {
         return Err(FcpError::InvalidRequest {
             code: 1003,
@@ -197,5 +210,21 @@ mod tests {
         .expect_err("invalid thinking type should fail");
 
         assert!(matches!(error, FcpError::InvalidRequest { .. }));
+    }
+
+    #[test]
+    fn provider_extensions_cannot_shadow_typed_deepseek_controls() {
+        for field in ["thinking", "reasoning_effort", "user_id"] {
+            let mut extensions = serde_json::Map::new();
+            extensions.insert(field.into(), json!("unchecked"));
+            let result = chat_request_from_value(
+                json!({
+                    "messages": [{"role":"user", "content":"hello"}],
+                    "provider_extensions": extensions,
+                }),
+                DEFAULT_MODEL,
+            );
+            assert!(matches!(result, Err(FcpError::InvalidRequest { .. })));
+        }
     }
 }

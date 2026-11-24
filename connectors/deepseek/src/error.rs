@@ -58,12 +58,13 @@ pub fn openai_error_to_fcp(error: &OpenAiError) -> FcpError {
             retryable: true,
             retry_after: None,
         },
-        OpenAiError::Network(NetworkError::Cancelled { message }) => {
-            FcpError::ConnectorUnavailable {
-                code: 5000,
-                message: format!("DeepSeek request cancelled: {message}"),
-            }
-        }
+        OpenAiError::Network(NetworkError::Cancelled { .. }) => FcpError::External {
+            service: "deepseek".into(),
+            message: "DeepSeek request cancelled; provider outcome may be unknown".into(),
+            status_code: None,
+            retryable: false,
+            retry_after: None,
+        },
         OpenAiError::Network(NetworkError::DeadlineExceeded { timeout_ms }) => FcpError::External {
             service: "deepseek".into(),
             message: format!(
@@ -117,4 +118,23 @@ fn duration_millis(duration: Option<Duration>) -> u64 {
     duration.map_or(0, |duration| {
         u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancellation_and_expired_budget_never_advertise_automatic_retry() {
+        for error in [
+            OpenAiError::Network(NetworkError::Cancelled {
+                message: "cancelled".into(),
+            }),
+            OpenAiError::Network(NetworkError::DeadlineExceeded { timeout_ms: 50 }),
+        ] {
+            let mapped = openai_error_to_fcp(&error);
+            assert!(!mapped.is_retryable());
+            assert!(mapped.to_string().contains("outcome may be unknown"));
+        }
+    }
 }

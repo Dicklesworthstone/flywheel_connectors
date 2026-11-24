@@ -4,16 +4,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use fcp_manifest::{ConnectorManifest, OperationSection};
-use fcp_openai_compat::{ChatMessage, RateLimitPolicy};
-use fcp_prelude::{
-    ApprovalMode, BaseConnector, CapabilityGrant, CapabilityId, CapabilityToken,
-    CapabilityVerifier, ConnectorId, ConnectorMetrics, EventCaps, FcpConnector, FcpError,
-    FcpResult, HandshakeRequest, HandshakeResponse, HealthSnapshot, InstanceId, Introspection,
-    InvokeRequest, InvokeResponse, OperationId, OperationInfo, RequestId, SelfCheckReport,
-    SessionId, ShutdownRequest, SimulateRequest, SimulateResponse, SubscribeRequest,
-    SubscribeResponse, UnsubscribeRequest, ZoneId,
+use fcp_openai_compat::{
+    ChatCompletionsRequest, ChatMessage, ContentPart, ContentParts, RateLimitPolicy, RequestBudget,
 };
+use fcp_prelude::{
+    ApprovalMode, BaseConnector, CapabilityId, CapabilityToken, ConnectorId, ConnectorMetrics,
+    EventCaps, FcpConnector, FcpError, FcpResult, HandshakeRequest, HandshakeResponse,
+    HealthSnapshot, InstanceId, Introspection, InvokeRequest, InvokeResponse, OperationId,
+    OperationInfo, RequestId, SelfCheckReport, SessionId, ShutdownRequest, SimulateRequest,
+    SimulateResponse, SubscribeRequest, SubscribeResponse, UnsubscribeRequest, ZoneId,
+};
+use fcp_sdk::prelude::{OperationContractSet, StandaloneSession};
 use serde_json::{Value, json};
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 use tracing::info;
 
@@ -39,6 +42,15 @@ const CAP_CHAT: &str = "deepseek.chat";
 const CAP_MODELS: &str = "deepseek.models.read";
 const CAP_HEALTH: &str = "deepseek.health.read";
 const CAP_EMBEDDINGS: &str = "deepseek.embeddings";
+const MAX_NATIVE_RESPONSE_BYTES: u64 = 10 * 1024 * 1024;
+const MAX_INVOCATION_TIMEOUT_MS: u64 = 240_000;
+
+enum PreparedOperation {
+    Chat(ChatCompletionsRequest),
+    Stream(ChatCompletionsRequest),
+    Models { refresh: bool },
+    Health,
+}
 
 #[derive(Debug, Clone)]
 struct DeepSeekConfig {
@@ -91,11 +103,17 @@ impl DeepSeekConfig {
             .filter(|value| !value.is_empty())
             .unwrap_or(DEFAULT_MODEL)
             .to_string();
+        model_resource(&default_model)?;
         let request_timeout = Duration::from_millis(optional_positive_u64(
             params,
             "request_timeout_ms",
             240_000,
         )?);
+        if request_timeout > Duration::from_millis(MAX_INVOCATION_TIMEOUT_MS) {
+            return Err(invalid_config(
+                "request_timeout_ms exceeds the 240000 ms sandbox ceiling".into(),
+            ));
+        }
         let model_cache_ttl = Duration::from_secs(optional_positive_u64(
             params,
             "model_cache_ttl_seconds",
@@ -128,10 +146,10 @@ impl DeepSeekConfig {
 }
 
 pub struct DeepSeekConnector {
-    base: Arc<BaseConnector>,
+    base: BaseConnector,
     config: Option<DeepSeekConfig>,
     client: Option<Arc<DeepSeekClient>>,
-    verifier: Option<CapabilityVerifier>,
+    authority: Option<StandaloneSession>,
     session_id: Option<SessionId>,
     request_count: AtomicU64,
     error_count: AtomicU64,
@@ -141,10 +159,10 @@ impl DeepSeekConnector {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            base: Arc::new(BaseConnector::new(ConnectorId::from_static(CONNECTOR_ID))),
+            base: BaseConnector::new(ConnectorId::from_static(CONNECTOR_ID)),
             config: None,
             client: None,
-            verifier: None,
+            authority: None,
             session_id: None,
             request_count: AtomicU64::new(0),
             error_count: AtomicU64::new(0),
@@ -156,18 +174,44 @@ impl DeepSeekConnector {
         &self.base.instance_id
     }
 
+    #[cfg(test)]
     fn manifest_hash() -> String {
         let mut hasher = Sha256::new();
         hasher.update(MANIFEST_TOML.as_bytes());
         format!("sha256:{}", hex::encode(hasher.finalize()))
     }
 
+    fn invalidate_authority(&mut self) {
+        if let Some(authority) = self.authority.as_mut() {
+            authority.invalidate();
+            self.base.instance_id = authority.instance_id().clone();
+        } else {
+            self.base.instance_id = InstanceId::new();
+        }
+        self.session_id = None;
+        self.base.set_handshaken(false);
+    }
+
+    fn clear_configuration(&mut self) {
+        self.invalidate_authority();
+        self.authority = None;
+        self.client = None;
+        self.config = None;
+        self.base.set_configured(false);
+    }
+
     pub async fn handle_configure(&mut self, params: Value) -> FcpResult<Value> {
+        // A failed replacement revokes the previous account and its grants.
+        self.clear_configuration();
+        operation_contracts()?;
         let config = DeepSeekConfig::from_params(&params)?;
         let client = config.build_client();
+        let authority = StandaloneSession::new(MANIFEST_TOML)?;
         let auth_mode = config.auth.redacted_label();
         let base_url = config.base_url.clone();
         let default_model = config.default_model.clone();
+        self.base.instance_id = authority.instance_id().clone();
+        self.authority = Some(authority);
         self.client = Some(Arc::new(client));
         self.config = Some(config);
         self.base.set_configured(true);
@@ -182,6 +226,7 @@ impl DeepSeekConnector {
     }
 
     pub async fn handle_handshake(&mut self, params: Value) -> FcpResult<Value> {
+        self.invalidate_authority();
         if self.config.is_none() {
             return Err(FcpError::NotConfigured);
         }
@@ -190,50 +235,45 @@ impl DeepSeekConnector {
                 code: 1003,
                 message: format!("Invalid handshake request: {err}"),
             })?;
-        self.verifier = Some(CapabilityVerifier::new(
-            req.host_public_key,
-            req.zone.clone(),
-            self.base.instance_id.clone(),
-        ));
-        let session_id = SessionId::new();
-        self.session_id = Some(session_id.clone());
-        self.base.set_handshaken(true);
-        let capabilities_granted = req
-            .capabilities_requested
-            .into_iter()
-            .map(|capability| CapabilityGrant {
-                capability,
-                operation: None,
-            })
-            .collect::<Vec<_>>();
-
-        serde_json::to_value(HandshakeResponse {
-            status: "accepted".into(),
-            capabilities_granted,
-            session_id,
-            manifest_hash: Self::manifest_hash(),
-            nonce: req.nonce,
-            event_caps: Some(EventCaps {
-                streaming: true,
-                replay: false,
-                min_buffer_events: 0,
-                requires_ack: false,
-            }),
-            auth_caps: None,
-            op_catalog_hash: None,
-        })
-        .map_err(|err| FcpError::Internal {
+        if req.zone != ZoneId::work() {
+            return Err(FcpError::CapabilityDenied {
+                capability: "deepseek.handshake".into(),
+                reason: "DeepSeek requires its manifest's z:work target zone".into(),
+            });
+        }
+        let authority = self.authority.as_mut().ok_or(FcpError::NotConfigured)?;
+        let response = authority.handshake(req);
+        self.base.instance_id = authority.instance_id().clone();
+        let mut response = response?;
+        response.event_caps = Some(EventCaps {
+            streaming: true,
+            replay: false,
+            min_buffer_events: 0,
+            requires_ack: false,
+        });
+        let mut value = serde_json::to_value(&response).map_err(|err| FcpError::Internal {
             message: format!("Failed to serialize handshake response: {err}"),
-        })
+        })?;
+        value["instance_id"] = json!(self.base.instance_id);
+        value["connector_id"] = json!(CONNECTOR_ID);
+        value["protocol_version"] = json!("2.0");
+        self.session_id = Some(response.session_id);
+        self.base.set_handshaken(true);
+        Ok(value)
     }
 
     pub async fn handle_health(&self) -> FcpResult<Value> {
         let configured = self.config.is_some();
         let handshaken = self.session_id.is_some();
+        let injection_required = self
+            .config
+            .as_ref()
+            .is_some_and(|config| config.auth.is_secretless());
         Ok(json!({
-            "status": health_status(configured, handshaken),
+            "status": if injection_required { "degraded" } else { health_status(configured, handshaken) },
             "configured": configured,
             "handshaken": handshaken,
+            "credential_injection_required": injection_required,
             "auth_mode": self.config.as_ref().map(|config| config.auth.redacted_label()),
             "base_url": self.config.as_ref().map(|config| config.base_url.clone()),
             "default_model": self.config.as_ref().map(|config| config.default_model.clone()),
@@ -244,7 +284,7 @@ impl DeepSeekConnector {
 
     pub async fn handle_doctor(&self) -> FcpResult<Value> {
         Ok(json!({
-            "status": if self.config.is_some() && self.client.is_some() && self.session_id.is_some() {
+            "status": if self.config.as_ref().is_some_and(|config| !config.auth.is_secretless()) && self.client.is_some() && self.session_id.is_some() {
                 "healthy"
             } else if self.config.is_some() && self.client.is_some() {
                 "degraded"
@@ -269,6 +309,12 @@ impl DeepSeekConnector {
                     "passed": self.config.as_ref().is_none_or(|config| normalize_deepseek_base_url(Some(&config.base_url)).is_ok()),
                     "critical": true,
                     "message": "base_url is constrained to api.deepseek.com, with loopback allowed for tests"
+                },
+                {
+                    "name": "credential_injection",
+                    "passed": self.config.as_ref().is_none_or(|config| !config.auth.is_secretless()),
+                    "critical": true,
+                    "message": "credential_id cannot dispatch until a host-mediated transport is implemented"
                 },
                 {
                     "name": "reasoning_redaction_policy",
@@ -300,76 +346,158 @@ impl DeepSeekConnector {
     }
 
     pub async fn handle_invoke(&self, params: Value) -> FcpResult<Value> {
-        let result = self.handle_invoke_internal(params).await;
-        self.base.record_request(result.is_ok());
-        if result.is_err() {
-            self.error_count.fetch_add(1, Ordering::Relaxed);
+        let request: InvokeRequest = serde_json::from_value(params)
+            .map_err(|_| invalid_config("Invalid FCP invoke request".into()))?;
+        let response = self.invoke(request).await?;
+        match (response.result, response.error) {
+            (Some(result), None) => Ok(result),
+            (None, Some(error)) => Err(error),
+            _ => Err(FcpError::Internal {
+                message: "Invalid DeepSeek invocation response".into(),
+            }),
         }
-        result
     }
 
-    async fn handle_invoke_internal(&self, params: Value) -> FcpResult<Value> {
+    async fn execute_invoke(&self, request: InvokeRequest) -> FcpResult<InvokeResponse> {
         self.base.check_ready()?;
-        let operation = params
-            .get("operation_id")
-            .or_else(|| params.get("operation"))
-            .and_then(Value::as_str)
-            .ok_or_else(|| FcpError::InvalidRequest {
-                code: 1003,
-                message: "Missing operation_id".into(),
-            })?;
-        let input = params.get("input").cloned().unwrap_or_else(|| json!({}));
-        let capability_grant_value =
-            params
-                .get("capability_token")
-                .cloned()
-                .ok_or_else(|| FcpError::InvalidRequest {
-                    code: 1003,
-                    message: "Missing capability_token".into(),
-                })?;
-        let capability_grant = serde_json::from_value::<CapabilityToken>(capability_grant_value)
-            .map_err(|err| FcpError::InvalidRequest {
-                code: 1003,
-                message: format!("Invalid capability_token: {err}"),
-            })?;
-        self.verify_capability(operation, &input, capability_grant)?;
-        self.invoke_operation(operation, input).await
+        if request.r#type != "invoke"
+            || request.id.0.is_empty()
+            || !request.input.is_object()
+            || request.deadline_ms == Some(0)
+        {
+            return Err(invalid_config(
+                "Invocation requires type invoke, a non-empty ID, object input and a nonzero deadline"
+                    .into(),
+            ));
+        }
+        if matches!(request.operation.as_str(), OP_MODELS | OP_HEALTH)
+            && request
+                .idempotency_key
+                .as_deref()
+                .is_none_or(|key| key.trim().is_empty())
+        {
+            return Err(invalid_config(
+                "Strict DeepSeek operations require a non-empty idempotency_key".into(),
+            ));
+        }
+        let config = self.config.as_ref().ok_or(FcpError::NotConfigured)?;
+        let timeout = config
+            .request_timeout
+            .min(operation_timeout(request.operation.as_str())?)
+            .min(Duration::from_millis(
+                request.deadline_ms.unwrap_or(u64::MAX),
+            ));
+        let cx = fcp_async_core::compatibility_cx();
+        let mut budget = RequestBudget::new(&cx, timeout);
+        budget
+            .checkpoint()
+            .map_err(|error| openai_error_to_fcp(&error))?;
+        let (prepared, resources) = self.prepare_operation(&request.operation, &request.input)?;
+        budget
+            .checkpoint()
+            .map_err(|error| openai_error_to_fcp(&error))?;
+        let witness = self
+            .authority
+            .as_ref()
+            .ok_or(FcpError::NotHandshaken)?
+            .admit_bounded(&request, &resources, MAX_NATIVE_RESPONSE_BYTES)?;
+        self.request_count.fetch_add(1, Ordering::Relaxed);
+
+        // The original budget includes cache waits, retries and the full SSE
+        // body. A timeout or cancellation never refunds the signed admission.
+        let result = budget
+            .run(self.invoke_operation(prepared, &cx))
+            .await
+            .unwrap_or_else(|error| Err(openai_error_to_fcp(&error)));
+        let mut response = match result {
+            Ok(value) => InvokeResponse::ok(request.id.clone(), value),
+            Err(error) => InvokeResponse::error(request.id.clone(), error),
+        };
+        response.resource_uris = resources;
+        operation_contracts()?.validate_response(&request.operation, &request.id, &response)?;
+        budget
+            .checkpoint()
+            .map_err(|error| openai_error_to_fcp(&error))?;
+        witness.finish_response(&response)?;
+        Ok(response)
     }
 
-    async fn invoke_operation(&self, operation: &str, input: Value) -> FcpResult<Value> {
-        self.request_count.fetch_add(1, Ordering::Relaxed);
+    fn prepare_operation(
+        &self,
+        operation: &OperationId,
+        input: &Value,
+    ) -> FcpResult<(PreparedOperation, Vec<String>)> {
+        self.base.check_ready()?;
+        required_capability(operation.as_str())?;
+        operation_contracts()?.validate_input(operation, input)?;
+        let config = self.config.as_ref().ok_or(FcpError::NotConfigured)?;
+        if config.auth.is_secretless() {
+            return Err(invalid_config(
+                "credential_id requires host-side credential injection, which this connector does not implement"
+                    .into(),
+            ));
+        }
+        match operation.as_str() {
+            OP_CHAT | OP_CHAT_STREAM => {
+                let mut request = chat_request_from_value(input.clone(), &config.default_model)?;
+                request
+                    .validate_provider_extensions()
+                    .map_err(|error| openai_error_to_fcp(&error))?;
+                let resources = chat_resources(&mut request)?;
+                let prepared = if operation.as_str() == OP_CHAT {
+                    PreparedOperation::Chat(request)
+                } else {
+                    PreparedOperation::Stream(request)
+                };
+                Ok((prepared, resources))
+            }
+            OP_MODELS => Ok((
+                PreparedOperation::Models {
+                    refresh: input
+                        .get("refresh")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                },
+                vec!["deepseek:models".into()],
+            )),
+            OP_HEALTH => Ok((PreparedOperation::Health, vec!["deepseek:models".into()])),
+            OP_EMBEDDINGS => Err(invalid_config(
+                "deepseek.embeddings.create is not supported by DeepSeek's first-party API".into(),
+            )),
+            _ => Err(FcpError::OperationNotGranted {
+                operation: operation.as_str().into(),
+            }),
+        }
+    }
+
+    async fn invoke_operation(
+        &self,
+        operation: PreparedOperation,
+        cx: &fcp_async_core::Cx,
+    ) -> FcpResult<Value> {
         let client = self.client.as_ref().ok_or_else(|| FcpError::Internal {
             message: "DeepSeek client not initialized".into(),
         })?;
         let config = self.config.as_ref().ok_or(FcpError::NotConfigured)?;
-        let cx = fcp_async_core::compatibility_cx();
         match operation {
-            OP_CHAT => {
-                let request = chat_request_from_value(input, &config.default_model)?;
-                client
-                    .chat_completions(&cx, request)
-                    .await
-                    .map(chat_response_to_value)
-                    .map_err(|err| openai_error_to_fcp(&err))
-            }
-            OP_CHAT_STREAM => {
-                let request = chat_request_from_value(input, &config.default_model)?;
+            PreparedOperation::Chat(request) => client
+                .chat_completions(cx, request)
+                .await
+                .map(chat_response_to_value)
+                .map_err(|err| openai_error_to_fcp(&err)),
+            PreparedOperation::Stream(request) => {
                 let stream = client
-                    .chat_completions_stream(&cx, request)
+                    .chat_completions_stream(cx, request)
                     .await
                     .map_err(|err| openai_error_to_fcp(&err))?;
                 collect_stream_response(stream).await
             }
-            OP_MODELS => {
-                if input
-                    .get("refresh")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false)
-                {
+            PreparedOperation::Models { refresh } => {
+                if refresh {
                     client.invalidate_model_cache().await;
                 }
                 let models = client
-                    .list_models(&cx)
+                    .list_models(cx)
                     .await
                     .map_err(|err| openai_error_to_fcp(&err))?;
                 Ok(json!({
@@ -378,9 +506,9 @@ impl DeepSeekConnector {
                     "cache": "shared_in_memory"
                 }))
             }
-            OP_HEALTH => {
+            PreparedOperation::Health => {
                 let models = client
-                    .list_models(&cx)
+                    .list_models(cx)
                     .await
                     .map_err(|err| openai_error_to_fcp(&err))?;
                 Ok(json!({
@@ -391,64 +519,20 @@ impl DeepSeekConnector {
                     "base_url": config.base_url,
                 }))
             }
-            OP_EMBEDDINGS => Err(FcpError::InvalidRequest {
-                code: 1003,
-                message:
-                    "deepseek.embeddings.create is not supported by DeepSeek's first-party API"
-                        .into(),
-            }),
-            _ => Err(FcpError::InvalidRequest {
-                code: 1002,
-                message: format!("Unknown operation: {operation}"),
-            }),
         }
     }
 
     pub async fn handle_simulate(&self, params: Value) -> FcpResult<Value> {
-        let operation = params
-            .get("operation_id")
-            .or_else(|| params.get("operation"))
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        Ok(json!({
-            "allowed": matches!(operation, OP_CHAT | OP_CHAT_STREAM | OP_MODELS | OP_HEALTH),
-            "reason": if operation == OP_EMBEDDINGS {
-                "DeepSeek embeddings are intentionally not supported."
-            } else if matches!(operation, OP_CHAT | OP_CHAT_STREAM | OP_MODELS | OP_HEALTH) {
-                "Supported operation."
-            } else {
-                "Unknown operation."
-            }
-        }))
+        let request: SimulateRequest = serde_json::from_value(params)
+            .map_err(|_| invalid_config("Invalid FCP simulate request".into()))?;
+        serde_json::to_value(self.simulate(request).await?).map_err(|_| FcpError::Internal {
+            message: "Failed to encode DeepSeek simulation response".into(),
+        })
     }
 
     pub async fn handle_shutdown(&mut self, _params: Value) -> FcpResult<Value> {
-        self.client = None;
-        self.config = None;
-        self.verifier = None;
-        self.session_id = None;
-        self.base.set_configured(false);
-        self.base.set_handshaken(false);
+        self.clear_configuration();
         Ok(json!({ "status": "shutdown" }))
-    }
-
-    fn verify_capability(
-        &self,
-        operation: &str,
-        input: &Value,
-        token: CapabilityToken,
-    ) -> FcpResult<()> {
-        let verifier = self.verifier.as_ref().ok_or(FcpError::NotHandshaken)?;
-        let operation_id: OperationId =
-            operation.parse().map_err(|_| FcpError::InvalidRequest {
-                code: 1003,
-                message: "Invalid operation ID format".into(),
-            })?;
-        let capability = required_capability(operation)?;
-        let resources = resource_uris_for_operation(operation, input);
-        verifier
-            .verify_bound(token, &capability, &operation_id, &resources)
-            .map(|_| ())
     }
 }
 
@@ -482,7 +566,13 @@ impl FcpConnector for DeepSeekConnector {
     }
 
     async fn health(&self) -> HealthSnapshot {
-        if self.config.is_some() && self.session_id.is_some() {
+        if self
+            .config
+            .as_ref()
+            .is_some_and(|config| config.auth.is_secretless())
+        {
+            HealthSnapshot::degraded("credential_injection_required")
+        } else if self.config.is_some() && self.session_id.is_some() {
             HealthSnapshot::ready()
         } else if self.config.is_some() {
             HealthSnapshot::degraded("deepseek_handshake_pending")
@@ -537,30 +627,42 @@ impl FcpConnector for DeepSeekConnector {
     }
 
     async fn invoke(&self, req: InvokeRequest) -> FcpResult<InvokeResponse> {
-        let request_id = req.id;
-        self.verify_capability(req.operation.as_str(), &req.input, req.capability_token)?;
-        match self
-            .invoke_operation(req.operation.as_str(), req.input)
-            .await
-        {
-            Ok(value) => Ok(InvokeResponse::ok(request_id, value)),
-            Err(error) => Ok(InvokeResponse::error(request_id, error)),
+        let result = self.execute_invoke(req).await;
+        let success = result
+            .as_ref()
+            .is_ok_and(|response| response.error.is_none());
+        self.base.record_request(success);
+        if !success {
+            self.error_count.fetch_add(1, Ordering::Relaxed);
         }
+        result
     }
 
     async fn simulate(&self, req: SimulateRequest) -> FcpResult<SimulateResponse> {
-        if matches!(
-            req.operation.as_str(),
-            OP_CHAT | OP_CHAT_STREAM | OP_MODELS | OP_HEALTH
-        ) {
-            Ok(SimulateResponse::allowed(req.id))
-        } else {
-            Ok(SimulateResponse::denied(
-                req.id,
-                "operation is not supported by DeepSeek",
-                "FCP-3010",
-            ))
+        if req.r#type != "simulate" || req.id.0.is_empty() || !req.input.is_object() {
+            return Err(invalid_config(
+                "Simulation requires type simulate, a non-empty ID and object input".into(),
+            ));
         }
+        let authorization =
+            self.prepare_operation(&req.operation, &req.input)
+                .and_then(|(_, resources)| {
+                    self.authority
+                        .as_ref()
+                        .ok_or(FcpError::NotHandshaken)?
+                        .authorize(
+                            &req.connector_id,
+                            &req.zone_id,
+                            &req.operation,
+                            req.capability_token,
+                            &resources,
+                        )
+                        .map(drop)
+                });
+        Ok(match authorization {
+            Ok(()) => SimulateResponse::allowed(req.id),
+            Err(error) => SimulateResponse::denied(req.id, error.to_string(), error.error_code()),
+        })
     }
 
     async fn subscribe(&self, _req: SubscribeRequest) -> FcpResult<SubscribeResponse> {
@@ -643,18 +745,84 @@ fn required_capability(operation: &str) -> FcpResult<CapabilityId> {
     }
 }
 
-fn resource_uris_for_operation(operation: &str, input: &Value) -> Vec<String> {
-    match operation {
-        OP_CHAT | OP_CHAT_STREAM => {
-            let model = input
-                .get("model")
-                .and_then(Value::as_str)
-                .unwrap_or(DEFAULT_MODEL);
-            vec![format!("deepseek:model:{model}")]
+fn operation_contracts() -> FcpResult<&'static OperationContractSet> {
+    static CONTRACTS: OnceLock<FcpResult<OperationContractSet>> = OnceLock::new();
+    CONTRACTS
+        .get_or_init(|| OperationContractSet::from_manifest_toml(MANIFEST_TOML))
+        .as_ref()
+        .map_err(Clone::clone)
+}
+
+fn operation_timeout(operation: &str) -> FcpResult<Duration> {
+    let millis = match operation {
+        OP_CHAT => 240_000,
+        OP_CHAT_STREAM => 300_000,
+        OP_MODELS | OP_EMBEDDINGS => 30_000,
+        OP_HEALTH => 5_000,
+        _ => {
+            return Err(FcpError::OperationNotGranted {
+                operation: operation.into(),
+            });
         }
-        OP_MODELS | OP_HEALTH | OP_EMBEDDINGS => vec!["deepseek:models".into()],
-        _ => Vec::new(),
+    };
+    Ok(Duration::from_millis(millis))
+}
+
+fn model_resource(model: &str) -> FcpResult<String> {
+    if model.is_empty()
+        || model.len() > 256
+        || model.chars().any(|character| {
+            character.is_whitespace()
+                || character.is_control()
+                || matches!(character, '*' | '?' | '[' | ']')
+        })
+    {
+        return Err(invalid_config(
+            "model must be a non-empty literal identifier of at most 256 bytes".into(),
+        ));
     }
+    Ok(format!("deepseek:model:{model}"))
+}
+
+fn chat_resources(request: &mut ChatCompletionsRequest) -> FcpResult<Vec<String>> {
+    let mut resources = vec![model_resource(&request.model)?];
+    for message in &mut request.messages {
+        if let ChatMessage::User {
+            content: ContentParts::Multimodal(parts),
+            ..
+        } = message
+        {
+            for part in parts {
+                if let ContentPart::ImageUrl { image_url } = part {
+                    if image_url.url.starts_with("data:") {
+                        continue;
+                    }
+                    let url = url::Url::parse(&image_url.url).map_err(|_| {
+                        invalid_config(
+                            "image_url must be an absolute HTTP(S) URL or inline data".into(),
+                        )
+                    })?;
+                    if !matches!(url.scheme(), "http" | "https")
+                        || url.host_str().is_none()
+                        || !url.username().is_empty()
+                        || url.password().is_some()
+                        || url.fragment().is_some()
+                    {
+                        return Err(invalid_config(
+                            "image_url must be HTTP(S) without embedded credentials or a fragment"
+                                .into(),
+                        ));
+                    }
+                    // Authorize the same canonical URL supplied to the provider.
+                    image_url.url = url.to_string();
+                    resources.push(format!("deepseek:image_url:{}", image_url.url));
+                }
+            }
+        }
+    }
+    resources.sort();
+    resources.dedup();
+    Ok(resources)
 }
 
 fn optional_positive_u64(params: &Value, field: &str, default: u64) -> FcpResult<u64> {
@@ -743,7 +911,7 @@ pub fn test_invoke_request(
         capability_token,
         holder_proof: None,
         context: None,
-        idempotency_key: None,
+        idempotency_key: matches!(operation, OP_MODELS | OP_HEALTH).then(|| id.to_owned()),
         lease_seq: None,
         deadline_ms: None,
         correlation_id: None,
@@ -889,5 +1057,61 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    #[test]
+    fn invocation_network_and_sandbox_bounds_match_embedded_manifest() {
+        let manifest = ConnectorManifest::parse_str(MANIFEST_TOML).unwrap();
+        for (id, operation) in manifest.provides.operations {
+            let network = operation.network_constraints.unwrap();
+            assert_eq!(
+                operation_timeout(&id).unwrap().as_millis(),
+                u128::from(network.total_timeout_ms)
+            );
+            assert_eq!(network.max_response_bytes, MAX_NATIVE_RESPONSE_BYTES);
+        }
+        assert!(
+            DeepSeekConfig::from_params(&json!({
+                "api_key": "test", "request_timeout_ms": MAX_INVOCATION_TIMEOUT_MS + 1,
+            }))
+            .is_err()
+        );
+        assert!(
+            DeepSeekConfig::from_params(&json!({
+                "api_key": "test", "request_timeout_ms": MAX_INVOCATION_TIMEOUT_MS,
+            }))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn chat_resources_cover_canonical_remote_images_and_preserve_inline_input() {
+        let mut request = chat_request_from_value(
+            json!({
+                "messages":[{"role":"user", "content":[
+                    {"type":"image_url", "image_url":{"url":"https://EXAMPLE.com:443/input.png"}},
+                    {"type":"image_url", "image_url":{"url":"data:image/png;base64,aGVsbG8="}}
+                ]}]
+            }),
+            "deepseek-v4-flash",
+        )
+        .unwrap();
+        let resources = chat_resources(&mut request).unwrap();
+        assert_eq!(
+            resources,
+            vec![
+                "deepseek:image_url:https://example.com/input.png",
+                "deepseek:model:deepseek-v4-flash",
+            ]
+        );
+        let body = serde_json::to_value(request).unwrap();
+        assert_eq!(
+            body["messages"][0]["content"][0]["image_url"]["url"],
+            "https://example.com/input.png"
+        );
+        assert_eq!(
+            body["messages"][0]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,aGVsbG8="
+        );
     }
 }
