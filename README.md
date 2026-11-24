@@ -4506,6 +4506,43 @@ Closing the output consumer stops further polling. Follow emits NDJSON directly
 and rejects buffered rendering transforms; `--follow --dry-run` previews the
 settings without contacting the host or reading the admin token.
 
+### Direct HTTP event following
+
+HTTP clients can follow the same retained journal through the protected
+`POST /rpc/admin/events/follow` route:
+
+```bash
+curl --no-buffer \
+  --user-agent 'flywheel_connectors-agent (+https://github.com/Dicklesworthstone/flywheel_connectors)' \
+  --header "Authorization: Bearer $FCP_HOST_ADMIN_BEARER_TOKEN" \
+  --header 'x-fcp-zone: z:owner' \
+  --header 'Content-Type: application/json' \
+  --data '{"timeout_ms":30000,"max_events":1000}' \
+  http://127.0.0.1:8787/rpc/admin/events/follow
+```
+
+The flat request also accepts `connector_id`, `kind`, `unacknowledged_only`,
+`after_event_id`, and `poll_interval_ms`. It emits `start`, `event`, `checkpoint`,
+and terminal `complete` or `error` NDJSON records. Retain the latest received
+`latest_cursor` and reuse it as `after_event_id` with the same filters when
+reconnecting. An unavailable cursor produces an error record without replay.
+
+The HTTP stream has a **30-second default / 60-second maximum** deadline and a
+default maximum of **1,000 events**; `max_events: 0` follows until the deadline.
+Its poll interval defaults to **1,000 ms** and accepts 10–5,000 ms. Requests are
+limited to **16 KiB**, each encoded frame to **1 MiB**, and the encoded stream to
+**8 MiB**, including space reserved for a terminal record. An oversized event
+stops the stream without advancing past that event. These are encoded output
+limits; the journal retains its own state and may clone one event for a read.
+
+The stream is polled on demand and owns no detached producer task or unbounded
+queue. Dropping the response drops its pending read or wait. The original
+deadline bounds journal reads and poll waits while the body is being polled;
+HTTP backpressure can delay delivery and socket closure. The next poll after
+expiry reports completion without restarting its budget. Consumers must inspect
+the terminal record, since a successful HTTP status alone does not establish
+that the stream completed successfully.
+
 ---
 
 ## CRDT-Backed Multi-Writer Connector State

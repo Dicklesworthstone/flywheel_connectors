@@ -176,6 +176,8 @@ mod egress_auth;
 mod egress_dns;
 #[path = "fcp-host/egress_oauth.rs"]
 mod egress_oauth;
+#[path = "fcp-host/event_follow.rs"]
+mod event_follow;
 #[path = "fcp-host/guarded_invoke.rs"]
 mod guarded_invoke;
 #[path = "fcp-host/http_batch.rs"]
@@ -10793,6 +10795,7 @@ async fn async_main(telemetry_config: TelemetryConfig) -> HostResult<()> {
         )
         .route("/rpc/admin/events", post(event_query_handler))
         .merge(admin_event_page_routes())
+        .merge(event_follow::routes())
         .route(
             fcp_host::mesh_routing::MESH_INVENTORY_ROUTE,
             get(mesh_inventory_handler),
