@@ -48,7 +48,7 @@ Important runtime truths the contract preserves:
 - `invoke` uses the `operation_id` request field, not `operation`.
 - `invoke` currently does not read or verify a `capability_token`.
 - `simulate` checks only whether `operation_id` is present in the runtime operation inventory.
-- `cron.schedules.create` validates only that the cron expression has exactly five non-empty whitespace-separated fields.
+- `cron.schedules.create` validates minutes (0–59), hours (0–23), days of month (1–31), months (1–12), and weekdays (0–7, Sunday at either end). Fields accept comma-separated values, ascending ranges, wildcards, and positive steps on ranges and wildcards. Months and weekdays also accept three-letter English names regardless of case.
 - `cron.schedules.create` rejects duplicate schedule names.
 - `cron.schedules.create` generates `sched_<uuid>` IDs and stores schedules in process memory.
 - `cron.schedules.delete` removes the schedule record and returns `{}`.
@@ -69,12 +69,11 @@ This README documents the runtime truth and keeps current drift visible:
 - Runtime `simulate` checks operation existence only; it does not validate input, configured state, handshake state, or capability grants.
 - Manifest marks schedule create/trigger as policy approval and schedule delete as interactive approval, but runtime introspection sets `requires_approval = None` for every Cron operation.
 - `cron.trigger` currently records a local execution only; it does not invoke `target_operation`.
-- The basic cron-expression validator accepts any five non-empty fields, including fields that are not valid cron syntax.
 - `target_operation` is stored as provided and is not resolved, invoked, or capability-checked.
 - `handle_shutdown()` does not clear schedule/execution vectors or verifier state.
 - There is no dedicated tracked verification shell script for this connector.
 
-A follow-up parity bead should decide whether Cron is a durable scheduler or a process-local catalog, align manifest proof, add capability-token enforcement, reconcile approval metadata, strengthen cron-expression and target-operation validation, and implement or rename the non-dispatching trigger path.
+A follow-up parity bead should decide whether Cron is a durable scheduler or a process-local catalog, align manifest proof, add capability-token enforcement, reconcile approval metadata, validate target operations, and implement or rename the non-dispatching trigger path.
 
 ## First-Slice Scope
 
@@ -225,7 +224,7 @@ The verification surface captures:
 
 - If configuration fails, keep `state_store.backend = "memory"`, `persist_to_disk = false`, `clock.source = "system_utc"`, and `clock.timezone = "UTC"`.
 - If schedule creation fails, provide all required fields: `name`, `expression`, and `target_operation`.
-- If expression validation rejects input, provide exactly five non-empty whitespace-separated fields.
+- If expression validation rejects input, check the five field ranges, list separators, and step values. For example, `*/15 9-17 * * MON-FRI` is valid.
 - If duplicate-name rejection fires, list schedules and choose a unique schedule name.
 - If trigger fails, verify the schedule ID exists; schedule names are not accepted for trigger/delete.
 - If execution listing returns fewer records than expected, check `schedule_id` filtering and the `100` record limit cap.

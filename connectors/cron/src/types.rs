@@ -35,10 +35,62 @@ pub struct Execution {
     pub status: String,
 }
 
-/// Validate a cron expression (basic: must have exactly 5 non-empty space-separated fields).
+/// Validate five-field UTC cron syntax, including lists, ranges and steps.
 pub fn validate_cron_expression(expression: &str) -> bool {
-    let fields: Vec<&str> = expression.split_whitespace().collect();
-    fields.len() == 5 && fields.iter().all(|f| !f.is_empty())
+    const MONTHS: &[&str] = &[
+        "JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC",
+    ];
+    const WEEKDAYS: &[&str] = &["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
+    let mut fields = expression.split_ascii_whitespace();
+    for (min, max, names) in [
+        (0, 59, &[][..]),
+        (0, 23, &[][..]),
+        (1, 31, &[][..]),
+        (1, 12, MONTHS),
+        (0, 7, WEEKDAYS),
+    ] {
+        let Some(field) = fields.next() else {
+            return false;
+        };
+        if !field
+            .split(',')
+            .all(|part| valid_cron_part(part, min, max, names))
+        {
+            return false;
+        }
+    }
+    fields.next().is_none()
+}
+
+fn valid_cron_part(part: &str, min: u8, max: u8, names: &[&str]) -> bool {
+    let value = |text: &str| {
+        if text.bytes().all(|b| b.is_ascii_digit()) {
+            return text.parse::<u8>().ok().filter(|n| (min..=max).contains(n));
+        }
+        names
+            .iter()
+            .position(|name| name.eq_ignore_ascii_case(text))
+            .and_then(|i| u8::try_from(i).ok())
+            .map(|i| i + min)
+    };
+    let base = if let Some((base, step)) = part.split_once('/') {
+        if !step.bytes().all(|b| b.is_ascii_digit())
+            || !step.parse::<u32>().is_ok_and(|n| n > 0)
+            || (base != "*" && !base.contains('-'))
+        {
+            return false;
+        }
+        base
+    } else {
+        part
+    };
+    if base == "*" {
+        return true;
+    }
+    if let Some((first, last)) = base.split_once('-') {
+        return matches!((value(first), value(last)), (Some(a), Some(b)) if a <= b);
+    }
+    value(base).is_some()
 }
 
 #[cfg(test)]
@@ -312,9 +364,29 @@ mod tests {
     }
 
     #[test]
-    fn valid_at_sign_fields() {
-        // Non-standard but technically 5 fields with non-empty content
-        assert!(validate_cron_expression("@reboot 0 0 0 0"));
+    fn cron_field_boundaries_and_named_ranges() {
+        for expr in [
+            "0,59 0,23 1,31 1,12 0,7",
+            "*/15 9-17/2 * jan,mAr Mon-Fri",
+        ] {
+            assert!(validate_cron_expression(expr), "{expr}");
+        }
+        for expr in [
+            "@reboot 0 0 0 0",
+            "60 * * * *",
+            "* 24 * * *",
+            "* * 0 * *",
+            "* * * 13 *",
+            "* * * * 8",
+            "* * * * FRI-MON",
+            "*/0 * * * *",
+            "1,,5 * * * *",
+            "*//2 * * * *",
+            "* * * Smarch *",
+            "1- * * * *",
+        ] {
+            assert!(!validate_cron_expression(expr), "{expr}");
+        }
     }
 
     // -- Additional serde tests --
