@@ -165,6 +165,8 @@ async fn dispatch_message(
         "invoke" => dispatch_raw_invoke(params, |params| connector.handle_invoke(params)).await,
         "simulate" => connector.handle_simulate(params).await,
         "subscribe" => connector.handle_subscribe(params).await,
+        "state.checkpoint" => connector.handle_state_checkpoint(params).await,
+        "state.restore" => connector.handle_state_restore(params).await,
         "shutdown" => connector.handle_shutdown(params).await,
         _ => Err(fcp_core::FcpError::InvalidRequest {
             code: 1002,
@@ -243,6 +245,29 @@ mod tests {
         assert_eq!(response["id"], "transport:error");
         assert_eq!(response["error"], serde_json::to_value(expected).unwrap());
         assert!(response.get("result").is_none());
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn state_controls_dispatch_through_the_native_jsonl_adapter() {
+        for (method, params) in [
+            ("state.checkpoint", serde_json::json!({"deadline_ms": 0})),
+            ("state.restore", serde_json::json!({"checkpoint": {"unexpected": true}})),
+        ] {
+            let mut connector = TelegramConnector::new();
+            let response = handle_message(
+                &mut connector,
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": "state-control",
+                    "method": method,
+                    "params": params,
+                }).to_string(),
+            ).await;
+            assert_eq!(response["id"], "state-control");
+            assert_eq!(response["error"]["code"], "FCP-1003");
+            assert!(response.get("result").is_none());
+            assert!(!response["error"]["message"].as_str().unwrap().contains("Unknown method"));
+        }
     }
 
     #[test]

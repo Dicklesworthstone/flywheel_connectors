@@ -1053,6 +1053,30 @@ pub struct TelegramPollingCursorState {
     pub updated_at: u64,
 }
 
+/// Portable local polling checkpoint returned by the native host control API.
+///
+/// This content digest identifies the snapshot; it is not an authenticated mesh
+/// object or a grant to become the next singleton writer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TelegramPollingCheckpoint {
+    pub checkpoint_id: String,
+    pub state: TelegramPollingCheckpointState,
+}
+
+/// Secret-free cursor state bound to its connector, handshake zone, and bot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TelegramPollingCheckpointState {
+    pub version: u8,
+    pub connector_id: String,
+    pub zone_id: String,
+    pub bot_id: String,
+    pub offset: Option<i64>,
+    pub last_poll_count: usize,
+    pub updated_at: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TelegramPollLeaseRecord {
     pub holder_instance_id: String,

@@ -145,6 +145,110 @@ For webhooks, use `receive_mode: "webhook"`. The ingest operation returns an acc
 
 The connector does not offer arbitrary historical replay. Telegram's own pending-update retention and the host's retained journal bound recovery. A native stream still draining a provider long poll returns a retryable error on reopen; it does not manufacture a successful subscription or discard an outstanding update.
 
+## Polling Checkpoint And Restore
+
+The native JSONL adapter provides two host control extensions, `state.checkpoint`
+and `state.restore`. These operate on the polling cursor only. They are not
+connector invocation operations, do not consume an invocation capability token,
+and must stay on the same trusted host-owned control channel as configure,
+handshake, and shutdown.
+
+After configuring, handshaking, and consuming events, the host can quiesce a
+polling session:
+
+```json
+{"jsonrpc":"2.0","id":"checkpoint-1","method":"state.checkpoint","params":{"deadline_ms":10000}}
+```
+
+The deadline is optional, defaults to 10 seconds, and must be between 1 and
+30,000 milliseconds. The connector stops the actual polling task, cancels any
+pending provider request or consumer-ACK wait, synchronizes the replay-safe
+cursor, and releases its TTL lease before returning success. A partially
+acknowledged batch retains the previous cursor and can replay on the next
+instance. A forced task exit, failed cursor flush, or failed lease release
+cannot produce a successful checkpoint.
+
+The JSON-RPC result is a portable, secret-free object with this shape:
+
+```json
+{
+  "checkpoint_id": "sha256:<64 lowercase hex digits>",
+  "state": {
+    "version": 1,
+    "connector_id": "fcp.telegram",
+    "zone_id": "z:work",
+    "bot_id": "123456",
+    "offset": 2003,
+    "last_poll_count": 0,
+    "updated_at": 1700000000
+  }
+}
+```
+
+An offset is the next Telegram update ID to request; it can be `null` before
+any progress has been committed. The ID is SHA-256 over the domain separator
+`fcp.telegram.polling-checkpoint.v1\0` followed by the compact JSON encoding of
+the typed `state` fields in the order shown. It detects corruption and identifies
+this local snapshot. It is not a signature, a mesh `ObjectId`, or writer authority.
+Keep the complete returned object without editing its fields.
+
+The source session remains quiesced: invoke and subscribe fail, and repeated
+checkpoint requests return the same object. A timeout also leaves the session
+quiesced while retaining its exact task for another checkpoint attempt; it does
+not silently abort and report a flush. Once a task or persistence failure is
+observed, that session cannot subsequently manufacture a successful checkpoint.
+Shut down the source after preserving a successful result.
+
+Configure and handshake the destination with the same bot and zone, using its
+own `zone_dir`, then send the complete saved object before its first subscription:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "restore-1",
+  "method": "state.restore",
+  "params": {
+    "checkpoint": {
+      "checkpoint_id": "sha256:<the ID returned by state.checkpoint>",
+      "state": {
+        "version": 1,
+        "connector_id": "fcp.telegram",
+        "zone_id": "z:work",
+        "bot_id": "123456",
+        "offset": 2003,
+        "last_poll_count": 0,
+        "updated_at": 1700000000
+      }
+    }
+  }
+}
+```
+
+Restore verifies the schema, connector, configured bot identity, handshake zone,
+content digest, and nonnegative cursor. It refuses a cursor behind the
+destination's already committed position, including replacing a known position
+with `null`. It writes only the fixed cursor filename beneath the handshake's
+`zone_dir`, synchronizes that replacement, and returns the checkpoint ID and
+offset. The restore handler makes no provider calls and does not start polling;
+a subsequent authorized subscription starts `getUpdates` from that offset.
+A restore write or sync failure leaves the session quiesced because the
+replacement may already be visible; shut it down and reconcile in a new session.
+Requests are limited to 8 KiB and reject unknown fields. Webhook mode is not
+supported because its replay cache is separate in-memory state.
+
+The poller, checkpoint, and restore paths share a persistent OS lock file,
+`telegram_poll_state.lock`. An expired TTL does not admit a second local writer
+while the first still owns that lock. A successful checkpoint retains the lock
+until the source shuts down or exits; restoring into the same directory must
+wait for that release. The lock pathname is never deleted.
+
+This is a connector-local handoff primitive. The host still must authenticate
+the saved checkpoint, preserve its downstream acknowledgement journal, stop the
+old writer, and authorize the next singleton writer before subscribing it.
+Different hosts or directories do not share the local OS lock. Canonical mesh
+state publication, signed append authority, cross-node fencing, and automatic
+stateful host registry replacement are not enabled by these extensions.
+
 ## Drift Visible In This Checkout
 
 This README documents runtime truth and keeps current drift visible:

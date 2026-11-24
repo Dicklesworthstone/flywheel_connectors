@@ -21,7 +21,7 @@ use fcp_sdk::{
     ErrorClass, FormatMode, Formatter, InMemoryThreadOwnershipChecker, Limits, ThreadId,
     ThreadOwnershipChecker, classify_error_message,
     prelude::JsonlEventStream,
-    runtime::{PollResult, PollingCursor, PollingSupervisor, SupervisorConfig},
+    runtime::{PollResult, PollingCursor, PollingSupervisor, SupervisorConfig, SupervisorOutcome},
     validate_input_with_limits, validate_output_with_limits,
 };
 use reqwest::Url;
@@ -41,6 +41,10 @@ use crate::types::*;
 
 const TELEGRAM_POLL_CURSOR_FILE: &str = "telegram_poll_cursor.json";
 const TELEGRAM_POLL_LEASE_FILE: &str = "telegram_poll_lease.json";
+const TELEGRAM_POLL_STATE_LOCK_FILE: &str = "telegram_poll_state.lock";
+const TELEGRAM_POLL_CHECKPOINT_VERSION: u8 = 1;
+const MAX_TELEGRAM_POLL_CHECKPOINT_BYTES: usize = 8192;
+const MAX_TELEGRAM_CHECKPOINT_DEADLINE_MS: u64 = 30_000;
 const TELEGRAM_BOT_ID_MAX_DIGITS: usize = 20;
 const TELEGRAM_BOT_SECRET_MAX_CHARS: usize = 128;
 const MAX_TELEGRAM_WEBHOOK_PAYLOAD_BYTES: usize = 1024 * 1024;
@@ -244,6 +248,162 @@ where
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TelegramCheckpointRequest {
+    #[serde(default = "default_checkpoint_deadline_ms")]
+    deadline_ms: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TelegramRestoreRequest {
+    checkpoint: TelegramPollingCheckpoint,
+}
+
+const fn default_checkpoint_deadline_ms() -> u64 {
+    10_000
+}
+
+fn polling_state_error(message: impl Into<String>) -> FcpError {
+    FcpError::ConnectorUnavailable {
+        code: 5001,
+        message: message.into(),
+    }
+}
+
+fn parse_polling_state_request<T: for<'de> Deserialize<'de>>(params: Value) -> FcpResult<T> {
+    let bytes = serde_json::to_vec(&params).map_err(|error| FcpError::InvalidRequest {
+        code: 1003,
+        message: format!("Invalid Telegram polling state request: {error}"),
+    })?;
+    if bytes.len() > MAX_TELEGRAM_POLL_CHECKPOINT_BYTES {
+        return Err(FcpError::InvalidRequest {
+            code: 1003,
+            message: "Telegram polling state request exceeds 8192 bytes".into(),
+        });
+    }
+    serde_json::from_slice(&bytes).map_err(|error| FcpError::InvalidRequest {
+        code: 1003,
+        message: format!("Invalid Telegram polling state request: {error}"),
+    })
+}
+
+fn polling_checkpoint_id(state: &TelegramPollingCheckpointState) -> FcpResult<String> {
+    let payload = serde_json::to_vec(state).map_err(|error| FcpError::Internal {
+        message: format!("Failed to encode Telegram polling checkpoint: {error}"),
+    })?;
+    let mut digest = Sha256::new();
+    digest.update(b"fcp.telegram.polling-checkpoint.v1\0");
+    digest.update(payload);
+    Ok(format!("sha256:{}", hex::encode(digest.finalize())))
+}
+
+/// All local polling writers share one persistent lock inode. The TTL record
+/// remains useful diagnostics, but cannot by itself serialize a read/replace.
+fn lock_polling_state(zone_dir: &Path) -> FcpResult<fs::File> {
+    let path = zone_dir.join(TELEGRAM_POLL_STATE_LOCK_FILE);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            return Err(polling_state_error("Telegram polling state lock is not a regular file"));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(polling_state_error(format!("Cannot inspect Telegram polling state lock: {error}"))),
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(&path).map_err(|error| {
+        polling_state_error(format!("Cannot open Telegram polling state lock: {error}"))
+    })?;
+    let opened = file.metadata().map_err(|error| {
+        polling_state_error(format!("Cannot inspect open Telegram polling state lock: {error}"))
+    })?;
+    if !opened.is_file() {
+        return Err(polling_state_error("Telegram polling state lock is not a regular file"));
+    }
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(fs::TryLockError::WouldBlock) => {
+            return Err(FcpError::Conflict {
+                message: "Telegram polling state is held by another live writer".into(),
+            });
+        }
+        Err(fs::TryLockError::Error(error)) => {
+            return Err(polling_state_error(format!("Cannot lock Telegram polling state: {error}")));
+        }
+    }
+    let named = fs::symlink_metadata(&path).map_err(|error| {
+        polling_state_error(format!("Cannot verify Telegram polling state lock: {error}"))
+    })?;
+    if !named.file_type().is_file() {
+        return Err(polling_state_error("Telegram polling state lock pathname changed"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if opened.dev() != named.dev() || opened.ino() != named.ino() || named.nlink() != 1 {
+            return Err(polling_state_error("Telegram polling state lock identity changed"));
+        }
+    }
+    // Never unlink this pathname: another process may already have it open.
+    Ok(file)
+}
+
+fn read_polling_cursor_for_handoff(
+    path: &Path,
+    bot_id: &str,
+) -> FcpResult<TelegramPollingCursorState> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata)
+            if !metadata.file_type().is_file()
+                || metadata.len() > MAX_TELEGRAM_POLL_CHECKPOINT_BYTES as u64 =>
+        {
+            return Err(polling_state_error("Telegram polling cursor is not a bounded regular file"));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(TelegramPollingCursorState {
+                version: TELEGRAM_POLLING_CURSOR_STATE_VERSION,
+                bot_id: Some(bot_id.to_owned()),
+                offset: None,
+                last_poll_count: 0,
+                updated_at: 0,
+            });
+        }
+        Err(error) => return Err(polling_state_error(format!("Cannot inspect Telegram polling cursor: {error}"))),
+    }
+    use std::io::Read as _;
+    let file = fs::File::open(path).map_err(|error| {
+        polling_state_error(format!("Cannot open Telegram polling cursor: {error}"))
+    })?;
+    let mut bytes = Vec::new();
+    file.take(MAX_TELEGRAM_POLL_CHECKPOINT_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| polling_state_error(format!("Cannot read Telegram polling cursor: {error}")))?;
+    if bytes.len() > MAX_TELEGRAM_POLL_CHECKPOINT_BYTES {
+        return Err(polling_state_error("Telegram polling cursor exceeds its size limit"));
+    }
+    let state: TelegramPollingCursorState = serde_json::from_slice(&bytes).map_err(|error| {
+        polling_state_error(format!("Cannot decode Telegram polling cursor: {error}"))
+    })?;
+    if state.version > TELEGRAM_POLLING_CURSOR_STATE_VERSION
+        || state.bot_id.as_deref() != Some(bot_id)
+        || state.offset.is_some_and(|offset| offset < 0)
+        || state.last_poll_count > 100
+    {
+        return Err(polling_state_error(
+            "Telegram polling cursor has an unsupported version, bot identity, or offset",
+        ));
+    }
+    Ok(state)
+}
+
 #[derive(Debug, Default)]
 struct TelegramPollingCursor {
     offset: Option<i64>,
@@ -364,10 +524,13 @@ struct TelegramPollLease {
     holder_instance_id: String,
     lease_seq: u64,
     ttl_secs: u64,
+    _state_lock: Arc<fs::File>,
 }
 
 impl TelegramPollLease {
     fn acquire(path: PathBuf, holder_instance_id: String, ttl_secs: u64) -> FcpResult<Self> {
+        let parent = path.parent().ok_or_else(|| polling_state_error("Polling lease has no directory"))?;
+        let state_lock = Arc::new(lock_polling_state(parent)?);
         let ttl_secs = ttl_secs.max(MIN_POLL_LEASE_TTL_SECS);
         let now = current_unix_timestamp_secs();
         let previous =
@@ -415,6 +578,7 @@ impl TelegramPollLease {
             holder_instance_id,
             lease_seq,
             ttl_secs,
+            _state_lock: state_lock,
         })
     }
 
@@ -469,20 +633,21 @@ impl TelegramPollLease {
                 }
             })?;
 
-        if let Some(record) = record
-            && record.holder_instance_id == self.holder_instance_id
-            && record.lease_seq == self.lease_seq
-            && let Err(err) = fs::remove_file(&self.path)
-            && err.kind() != io::ErrorKind::NotFound
-        {
-            return Err(FcpError::Internal {
-                message: format!(
-                    "Failed to release polling lease file '{}': {err}",
-                    self.path.display()
-                ),
-            });
+        let record = record.ok_or_else(|| {
+            polling_state_error("Telegram polling lease disappeared before release")
+        })?;
+        if record.holder_instance_id != self.holder_instance_id || record.lease_seq != self.lease_seq {
+            return Err(polling_state_error("Telegram polling lease changed before release"));
         }
-
+        fs::remove_file(&self.path).map_err(|error| {
+            polling_state_error(format!("Failed to release Telegram polling lease: {error}"))
+        })?;
+        #[cfg(unix)]
+        if let Some(parent) = self.path.parent() {
+            fs::File::open(parent).and_then(|directory| directory.sync_all()).map_err(|error| {
+                polling_state_error(format!("Failed to synchronize Telegram polling lease release: {error}"))
+            })?;
+        }
         Ok(())
     }
 }
@@ -569,8 +734,12 @@ pub struct TelegramConnector {
 
     // Polling state
     poll_running: Arc<RwLock<bool>>,
-    poll_task: Option<fcp_async_core::task::JoinHandle<()>>,
+    poll_task: Option<fcp_async_core::task::JoinHandle<FcpResult<()>>>,
     poll_shutdown_tx: Option<watch::Sender<bool>>,
+    poll_quiesced: bool,
+    poll_checkpoint: Option<TelegramPollingCheckpoint>,
+    poll_checkpoint_error: Option<String>,
+    poll_checkpoint_lock: Option<fs::File>,
 
     // Native delivery is accepted only after the host's durable consumer ACK.
     event_stream: Option<JsonlEventStream>,
@@ -808,6 +977,10 @@ impl TelegramConnector {
             poll_running: Arc::new(RwLock::new(false)),
             poll_task: None,
             poll_shutdown_tx: None,
+            poll_quiesced: false,
+            poll_checkpoint: None,
+            poll_checkpoint_error: None,
+            poll_checkpoint_lock: None,
             event_stream: None,
             event_subscription: None,
             #[cfg(any(test, feature = "test-support"))]
@@ -2150,7 +2323,11 @@ impl TelegramConnector {
 
     /// Handle invoke method.
     pub async fn handle_invoke(&self, params: serde_json::Value) -> FcpResult<serde_json::Value> {
-        let result = self.handle_invoke_internal(params).await;
+        let result = if self.poll_quiesced {
+            Err(polling_state_error("Telegram session is quiesced for polling state handoff"))
+        } else {
+            self.handle_invoke_internal(params).await
+        };
         self.base.record_request(result.is_ok());
         result
     }
@@ -3031,6 +3208,9 @@ impl TelegramConnector {
         params: serde_json::Value,
     ) -> FcpResult<serde_json::Value> {
         self.base.check_ready()?;
+        if self.poll_quiesced {
+            return Err(polling_state_error("Telegram session is quiesced for polling state handoff"));
+        }
         let stream_id = params
             .get("stream_id")
             .and_then(Value::as_str)
@@ -3147,6 +3327,186 @@ impl TelegramConnector {
         })
     }
 
+    fn polling_state_scope(&self) -> FcpResult<(String, String, PathBuf)> {
+        self.base.check_ready()?;
+        let config = self.config.as_ref().ok_or(FcpError::NotConfigured)?;
+        if config.receive_mode != TelegramReceiveMode::Polling {
+            return Err(FcpError::InvalidRequest {
+                code: 1003,
+                message: "Polling checkpoints do not include webhook replay state".into(),
+            });
+        }
+        let bot_id = config.credential.as_deref()
+            .and_then(extract_bot_id_from_token)
+            .ok_or(FcpError::NotConfigured)?;
+        let zone_id = self.verifier.as_ref().ok_or(FcpError::NotHandshaken)?
+            .zone_id.to_string();
+        let zone_dir = self.zone_dir.clone().ok_or(FcpError::NotHandshaken)?;
+        Ok((bot_id, zone_id, zone_dir))
+    }
+
+    /// Quiesce this polling session and export its durable, replay-safe cursor.
+    ///
+    /// This native host control extension is not an invocation capability or a
+    /// canonical mesh write. Unacknowledged batches remain eligible for replay.
+    /// A successful call leaves the session quiesced until shutdown. Timeouts
+    /// retain the exact task so a retry cannot mistake cancellation for a flush.
+    pub async fn handle_state_checkpoint(&mut self, params: Value) -> FcpResult<Value> {
+        let request: TelegramCheckpointRequest = parse_polling_state_request(params)?;
+        if request.deadline_ms == 0 || request.deadline_ms > MAX_TELEGRAM_CHECKPOINT_DEADLINE_MS {
+            return Err(FcpError::InvalidRequest {
+                code: 1003,
+                message: "checkpoint deadline_ms must be between 1 and 30000".into(),
+            });
+        }
+        let (bot_id, zone_id, zone_dir) = self.polling_state_scope()?;
+        if let Some(checkpoint) = &self.poll_checkpoint {
+            return serde_json::to_value(checkpoint).map_err(|error| FcpError::Internal {
+                message: format!("Failed to encode Telegram polling checkpoint: {error}"),
+            });
+        }
+        if let Some(error) = &self.poll_checkpoint_error {
+            return Err(polling_state_error(error.clone()));
+        }
+
+        self.poll_quiesced = true;
+        // Signal first: the poll future selects shutdown before observing a
+        // closed event stream as an unrelated terminal delivery failure.
+        if let Some(shutdown) = &self.poll_shutdown_tx {
+            let _ = shutdown.send(true);
+        }
+        if let Some(stream) = &self.event_stream {
+            stream.close();
+        }
+        self.event_subscription = None;
+        if let Some(client) = &self.client {
+            client.shutdown();
+        }
+
+        if let Some(task) = self.poll_task.as_mut() {
+            let result = fcp_async_core::time::timeout(
+                Duration::from_millis(request.deadline_ms),
+                task,
+            ).await;
+            let outcome = match result {
+                Err(_) => {
+                    return Err(polling_state_error(
+                        "Telegram polling checkpoint timed out; session remains quiesced, retry checkpoint or shut down",
+                    ));
+                }
+                Ok(outcome) => outcome,
+            };
+            self.poll_task = None;
+            self.poll_shutdown_tx = None;
+            let error = match outcome {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(error.to_string()),
+                Err(error) => Some(format!("Telegram polling task did not finish cleanly: {error}")),
+            };
+            if let Some(error) = error {
+                self.poll_checkpoint_error = Some(error.clone());
+                return Err(polling_state_error(error));
+            }
+        }
+
+        // Keep the local writer lock until shutdown/drop, including failures.
+        // Another process cannot replace the exported cursor behind this session.
+        if self.poll_checkpoint_lock.is_none() {
+            self.poll_checkpoint_lock = Some(lock_polling_state(&zone_dir)?);
+        }
+        let result = (|| -> FcpResult<TelegramPollingCheckpoint> {
+            let cursor_path = zone_dir.join(TELEGRAM_POLL_CURSOR_FILE);
+            let cursor = read_polling_cursor_for_handoff(&cursor_path, &bot_id)?;
+            // This also materializes a durable empty checkpoint for a session
+            // that has never opened a subscription.
+            write_json_file_atomic(&cursor_path, &cursor).map_err(|error| {
+                polling_state_error(format!("Failed to persist Telegram handoff cursor: {error}"))
+            })?;
+            let state = TelegramPollingCheckpointState {
+                version: TELEGRAM_POLL_CHECKPOINT_VERSION,
+                connector_id: self.base.id.to_string(),
+                zone_id,
+                bot_id,
+                offset: cursor.offset,
+                last_poll_count: cursor.last_poll_count,
+                updated_at: cursor.updated_at,
+            };
+            Ok(TelegramPollingCheckpoint {
+                checkpoint_id: polling_checkpoint_id(&state)?,
+                state,
+            })
+        })();
+        let checkpoint = match result {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => {
+                self.poll_checkpoint_error = Some(error.to_string());
+                return Err(error);
+            }
+        };
+        self.poll_checkpoint = Some(checkpoint.clone());
+        serde_json::to_value(checkpoint).map_err(|error| FcpError::Internal {
+            message: format!("Failed to encode Telegram polling checkpoint: {error}"),
+        })
+    }
+
+    /// Install a host-supplied local polling checkpoint before subscribing.
+    ///
+    /// The digest detects corruption, not authority. The host must authenticate
+    /// the source and retire the old writer before activating this session.
+    pub async fn handle_state_restore(&mut self, params: Value) -> FcpResult<Value> {
+        let request: TelegramRestoreRequest = parse_polling_state_request(params)?;
+        let (bot_id, zone_id, zone_dir) = self.polling_state_scope()?;
+        if self.poll_quiesced || self.poll_task.is_some() || self.event_subscription.is_some() {
+            return Err(polling_state_error(
+                "Restore requires a fresh Telegram session before its first subscription",
+            ));
+        }
+        let checkpoint = request.checkpoint;
+        let state = &checkpoint.state;
+        if state.version != TELEGRAM_POLL_CHECKPOINT_VERSION
+            || state.connector_id != self.base.id.to_string()
+            || state.zone_id != zone_id
+            || state.bot_id != bot_id
+            || state.offset.is_some_and(|offset| offset < 0)
+            || state.last_poll_count > 100
+            || checkpoint.checkpoint_id != polling_checkpoint_id(state)?
+        {
+            return Err(FcpError::InvalidRequest {
+                code: 1003,
+                message: "Telegram checkpoint version, identity, cursor, or content digest does not match this session".into(),
+            });
+        }
+
+        let _state_lock = lock_polling_state(&zone_dir)?;
+        let cursor_path = zone_dir.join(TELEGRAM_POLL_CURSOR_FILE);
+        let current = read_polling_cursor_for_handoff(&cursor_path, &bot_id)?;
+        if current.offset.is_some_and(|offset| state.offset.is_none_or(|next| next < offset)) {
+            return Err(FcpError::Conflict {
+                message: "Telegram checkpoint would rewind an already committed polling cursor".into(),
+            });
+        }
+        let cursor = TelegramPollingCursorState {
+            version: TELEGRAM_POLLING_CURSOR_STATE_VERSION,
+            bot_id: Some(bot_id),
+            offset: state.offset,
+            last_poll_count: state.last_poll_count,
+            updated_at: state.updated_at,
+        };
+        if let Err(error) = write_json_file_atomic(&cursor_path, &cursor) {
+            // A directory-sync failure can occur after the replacement became
+            // visible. Fence this session until a new session reconciles disk.
+            let message = format!("Failed to restore Telegram polling cursor: {error}");
+            self.poll_quiesced = true;
+            self.poll_checkpoint_error = Some(message.clone());
+            return Err(polling_state_error(message));
+        }
+        Ok(json!({
+            "status": "restored",
+            "checkpoint_id": checkpoint.checkpoint_id,
+            "offset": cursor.offset,
+        }))
+    }
+
     /// Handle shutdown method.
     pub async fn handle_shutdown(
         &mut self,
@@ -3183,6 +3543,10 @@ impl TelegramConnector {
         self.verifier = None;
         self.session_id = None;
         self.zone_dir = None;
+        self.poll_checkpoint = None;
+        self.poll_checkpoint_error = None;
+        self.poll_checkpoint_lock = None;
+        self.poll_quiesced = false;
         self.webhook_replay_cache.write().await.clear();
         self.base.set_handshaken(false);
         self.base.set_configured(false);
@@ -3230,6 +3594,7 @@ impl TelegramConnector {
         )?;
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let poll_shutdown = shutdown_rx.clone();
         self.poll_shutdown_tx = Some(shutdown_tx.clone());
 
         *poll_running.write().await = true;
@@ -3256,7 +3621,8 @@ impl TelegramConnector {
                         let base = Arc::clone(&base);
                         #[cfg(any(test, feature = "test-support"))]
                         let event_tx = event_tx.clone();
-                        async move {
+                        let mut shutdown = poll_shutdown.clone();
+                        let poll = async move {
                             if !subscription.stream.is_open() {
                                 return PollResult::fatal("Telegram native stream closed");
                             }
@@ -3334,6 +3700,16 @@ impl TelegramConnector {
                                 }
                                 Err(err) => PollResult::fatal(err.to_string()),
                             }
+                        };
+                        async move {
+                            // Drop an uncommitted batch on shutdown, including
+                            // a provider long poll or outstanding consumer ACK.
+                            // The supervisor then persists the previous cursor.
+                            fcp_async_core::select! {
+                                biased;
+                                _ = fcp_async_core::shutdown::wait_for_shutdown(&mut shutdown) => PollResult::empty(),
+                                result = poll => result,
+                            }
                         }
                     },
                     |updates, cursor| {
@@ -3354,12 +3730,17 @@ impl TelegramConnector {
 
             info!(?outcome, "Telegram polling supervisor stopped");
             subscription.stream.close();
-            if let Err(err) = poll_lease.release() {
-                warn!(error = %err, "Failed to release Telegram polling lease");
-            }
+            let release = poll_lease.release();
 
             info!("Telegram polling loop stopped");
             *poll_running.write().await = false;
+            release?;
+            match outcome {
+                SupervisorOutcome::Shutdown => Ok(()),
+                other => Err(polling_state_error(format!(
+                    "Telegram polling did not checkpoint cleanly: {other:?}"
+                ))),
+            }
         });
 
         self.poll_task = Some(task);
@@ -6448,6 +6829,324 @@ mod tests {
             ),
             "blocked long-poll path should have been exercised"
         );
+    }
+
+    async fn prepare_polling_handoff(
+        base_url: &str,
+        zone_dir: &str,
+    ) -> (TelegramConnector, Ed25519SigningKey, NativeTestTransport) {
+        let mut connector = TelegramConnector::new();
+        let transport = install_native_test_transport(&mut connector);
+        connector.handle_configure(json!({
+            "credential": test_bot_credential(),
+            "base_url": base_url,
+            "poll_timeout": 1,
+            "inbound_policy": {"mode": "open"},
+        })).await.unwrap();
+        let signing_key = Ed25519SigningKey::generate();
+        connector.handle_handshake(json!({
+            "protocol_version": "1.0.0",
+            "zone": "z:work",
+            "zone_dir": zone_dir,
+            "host_public_key": signing_key.verifying_key().to_bytes(),
+            "nonce": vec![0u8; 32],
+            "capabilities_requested": ["telegram.read"],
+        })).await.unwrap();
+        (connector, signing_key, transport)
+    }
+
+    async fn wait_for_handoff_cursor(path: &Path, offset: i64) {
+        fcp_async_core::time::timeout(StdDuration::from_secs(3), async {
+            loop {
+                if read_json_file_if_exists::<TelegramPollingCursorState>(path)
+                    .unwrap().is_some_and(|cursor| cursor.offset == Some(offset))
+                {
+                    break;
+                }
+                fcp_async_core::time::sleep(StdDuration::from_millis(5)).await;
+            }
+        }).await.expect("acknowledged batch must reach durable cursor");
+    }
+
+    fn polling_handoff_fixture(offset: Option<i64>) -> TelegramPollingCheckpoint {
+        let state = TelegramPollingCheckpointState {
+            version: TELEGRAM_POLL_CHECKPOINT_VERSION,
+            connector_id: "fcp.telegram".into(),
+            zone_id: "z:work".into(),
+            bot_id: TEST_BOT_ID.into(),
+            offset,
+            last_poll_count: 0,
+            updated_at: 1_700_000_000,
+        };
+        TelegramPollingCheckpoint {
+            checkpoint_id: polling_checkpoint_id(&state).unwrap(),
+            state,
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn polling_handoff_restores_acked_progress_into_a_fresh_cache() {
+        let server = LoopbackTelegramServer::start();
+        let first_dir = unique_zone_dir("checkpoint-source");
+        let first_cursor = Path::new(&first_dir).join(TELEGRAM_POLL_CURSOR_FILE);
+        let (mut first, first_key, first_transport) =
+            prepare_polling_handoff(&server.base_url, &first_dir).await;
+        open_native_test_subscription(&mut first, &first_key).await;
+        wait_for_handoff_cursor(&first_cursor, 2003).await;
+        assert!(!first_transport.frames.lock().unwrap().is_empty());
+
+        let checkpoint = first.handle_state_checkpoint(json!({"deadline_ms": 1500}))
+            .await.expect("actual poll task must stop and persist");
+        assert_eq!(checkpoint["state"]["offset"], 2003);
+        assert_eq!(checkpoint["state"]["bot_id"], TEST_BOT_ID);
+        assert_eq!(checkpoint["state"]["zone_id"], "z:work");
+        assert!(first.poll_task.is_none());
+        assert!(!*first.poll_running.read().await);
+        assert!(!Path::new(&first_dir).join(TELEGRAM_POLL_LEASE_FILE).exists());
+        assert_eq!(first.handle_state_checkpoint(json!({})).await.unwrap(), checkpoint);
+        assert!(first.handle_subscribe(json!({})).await.is_err());
+        assert!(first.handle_invoke(json!({})).await.is_err());
+        first.handle_shutdown(json!({})).await.unwrap();
+
+        let second_dir = unique_zone_dir("checkpoint-destination");
+        assert_ne!(first_dir, second_dir);
+        let second_cursor = Path::new(&second_dir).join(TELEGRAM_POLL_CURSOR_FILE);
+        let (mut second, second_key, _) =
+            prepare_polling_handoff(&server.base_url, &second_dir).await;
+        let requests_before_restore = server.request_log_snapshot().len();
+        let restored = second.handle_state_restore(json!({"checkpoint": checkpoint}))
+            .await.expect("fresh session must restore the exported checkpoint");
+        assert_eq!(restored["offset"], 2003);
+        assert_eq!(server.request_log_snapshot().len(), requests_before_restore);
+        assert_eq!(
+            read_json_file_if_exists::<TelegramPollingCursorState>(&second_cursor)
+                .unwrap().unwrap().offset,
+            Some(2003)
+        );
+        open_native_test_subscription(&mut second, &second_key).await;
+        let resumed = wait_for_get_updates_log_after(&server, requests_before_restore)
+            .await.expect("restored session must actually poll");
+        assert!(resumed["body"].as_str()
+            .is_some_and(|body| body.contains("\"offset\":2003")));
+        second.handle_shutdown(json!({})).await.unwrap();
+        let _ = server.shutdown();
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn polling_handoff_cancels_unacked_batch_without_skipping_it() {
+        let server = TestTelegramServer::start();
+        server.respond(TestTelegramRoute::new("POST", token_path("getUpdates"), json!({
+            "ok": true,
+            "result": [{
+                "update_id": 1000,
+                "message": {
+                    "message_id": 55,
+                    "from": {"id": 7, "is_bot": false, "first_name": "Test"},
+                    "chat": {"id": 99, "type": "private"},
+                    "date": 1700000000,
+                    "text": "must replay after handoff without ACK"
+                }
+            }]
+        })));
+        let zone_dir = unique_zone_dir("checkpoint-unacked");
+        let cursor_path = Path::new(&zone_dir).join(TELEGRAM_POLL_CURSOR_FILE);
+        let (mut connector, key, transport) =
+            prepare_polling_handoff(&server.uri(), &zone_dir).await;
+        transport.acknowledge.store(false, Ordering::SeqCst);
+        write_json_file_atomic(&cursor_path, &TelegramPollingCursorState {
+            version: TELEGRAM_POLLING_CURSOR_STATE_VERSION,
+            bot_id: Some(TEST_BOT_ID.into()),
+            offset: Some(1000),
+            last_poll_count: 0,
+            updated_at: 1_700_000_000,
+        }).unwrap();
+        open_native_test_subscription(&mut connector, &key).await;
+        fcp_async_core::time::timeout(StdDuration::from_secs(3), async {
+            while transport.frames.lock().unwrap().is_empty() {
+                fcp_async_core::time::sleep(StdDuration::from_millis(5)).await;
+            }
+        }).await.unwrap();
+
+        let checkpoint = connector.handle_state_checkpoint(json!({"deadline_ms": 1500}))
+            .await.expect("pending ACK cancellation must persist the replay-safe cursor");
+        assert_eq!(checkpoint["state"]["offset"], 1000);
+        assert_eq!(
+            read_json_file_if_exists::<TelegramPollingCursorState>(&cursor_path)
+                .unwrap().unwrap().offset,
+            Some(1000)
+        );
+        assert!(connector.poll_task.is_none());
+        assert!(!transport.stream.is_open());
+        assert_eq!(count_requests_for_path(&server.requests(), &token_path("getUpdates")), 1);
+        connector.handle_shutdown(json!({})).await.unwrap();
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn polling_handoff_restore_rejects_invalid_identity_and_rewind_without_writes() {
+        let server = TestTelegramServer::start();
+        let zone_dir = unique_zone_dir("restore-binding");
+        let (mut connector, _, _) = prepare_polling_handoff(&server.uri(), &zone_dir).await;
+        let cursor_path = Path::new(&zone_dir).join(TELEGRAM_POLL_CURSOR_FILE);
+        write_json_file_atomic(&cursor_path, &TelegramPollingCursorState {
+            version: TELEGRAM_POLLING_CURSOR_STATE_VERSION,
+            bot_id: Some(TEST_BOT_ID.into()),
+            offset: Some(42),
+            last_poll_count: 0,
+            updated_at: 1_700_000_000,
+        }).unwrap();
+        let before = fs::read(&cursor_path).unwrap();
+        let request_count = server.requests().len();
+        let valid = polling_handoff_fixture(Some(64));
+        let mut invalid = Vec::new();
+        for field in ["bot", "zone", "connector", "version", "negative", "rewind", "empty"] {
+            let mut snapshot = valid.clone();
+            match field {
+                "bot" => snapshot.state.bot_id = "999999".into(),
+                "zone" => snapshot.state.zone_id = "z:private".into(),
+                "connector" => snapshot.state.connector_id = "fcp.discord".into(),
+                "version" => snapshot.state.version += 1,
+                "negative" => snapshot.state.offset = Some(-1),
+                "rewind" => snapshot.state.offset = Some(41),
+                "empty" => snapshot.state.offset = None,
+                _ => unreachable!(),
+            }
+            snapshot.checkpoint_id = polling_checkpoint_id(&snapshot.state).unwrap();
+            invalid.push(snapshot);
+        }
+        let mut corrupt = valid.clone();
+        corrupt.state.offset = Some(65);
+        invalid.push(corrupt);
+        for snapshot in invalid {
+            assert!(connector.handle_state_restore(json!({"checkpoint": snapshot})).await.is_err());
+            assert_eq!(fs::read(&cursor_path).unwrap(), before);
+        }
+        let mut unknown_field = json!({"checkpoint": valid.clone()});
+        unknown_field["checkpoint"]["state"]["path"] = json!("/tmp/untrusted-destination");
+        assert!(connector.handle_state_restore(unknown_field).await.is_err());
+        assert!(connector.handle_state_restore(json!({
+            "checkpoint": valid.clone(), "padding": "x".repeat(MAX_TELEGRAM_POLL_CHECKPOINT_BYTES)
+        })).await.is_err());
+        assert_eq!(fs::read(&cursor_path).unwrap(), before);
+        assert_eq!(server.requests().len(), request_count);
+
+        connector.handle_state_restore(json!({"checkpoint": valid.clone()})).await.unwrap();
+        connector.handle_state_restore(json!({"checkpoint": valid})).await.unwrap();
+        assert_eq!(
+            read_json_file_if_exists::<TelegramPollingCursorState>(&cursor_path)
+                .unwrap().unwrap().offset,
+            Some(64)
+        );
+        assert_eq!(server.requests().len(), request_count);
+        connector.handle_shutdown(json!({})).await.unwrap();
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn polling_handoff_keeps_state_exclusive_until_source_shutdown() {
+        let server = TestTelegramServer::start();
+        let zone_dir = unique_zone_dir("checkpoint-exclusive");
+        let (mut source, _, _) = prepare_polling_handoff(&server.uri(), &zone_dir).await;
+        let checkpoint = source.handle_state_checkpoint(json!({})).await.unwrap();
+        let (mut destination, key, _) = prepare_polling_handoff(&server.uri(), &zone_dir).await;
+        assert!(matches!(
+            destination.handle_state_restore(json!({"checkpoint": checkpoint.clone()})).await,
+            Err(FcpError::Conflict { .. })
+        ));
+        source.handle_shutdown(json!({})).await.unwrap();
+        destination.handle_state_restore(json!({"checkpoint": checkpoint.clone()})).await.unwrap();
+        open_native_test_subscription(&mut destination, &key).await;
+        assert!(destination.handle_state_restore(json!({"checkpoint": checkpoint})).await.is_err());
+        destination.handle_shutdown(json!({})).await.unwrap();
+    }
+
+    #[test]
+    fn polling_state_lock_fences_an_expired_ttl_until_the_writer_retires() {
+        let zone_dir = unique_zone_dir("polling-expired-ttl");
+        let lease_path = Path::new(&zone_dir).join(TELEGRAM_POLL_LEASE_FILE);
+        let writer = TelegramPollLease::acquire(lease_path.clone(), "writer-a".into(), 10)
+            .expect("first writer owns both local locks");
+        write_json_file_atomic(&lease_path, &TelegramPollLeaseRecord {
+            holder_instance_id: "writer-a".into(),
+            lease_seq: writer.lease_seq,
+            updated_at: 0,
+            expires_at: 0,
+        }).unwrap();
+        let before = fs::read(&lease_path).unwrap();
+        assert!(matches!(
+            TelegramPollLease::acquire(lease_path.clone(), "writer-b".into(), 10),
+            Err(FcpError::Conflict { .. })
+        ));
+        assert_eq!(fs::read(&lease_path).unwrap(), before);
+        drop(writer);
+        let successor = TelegramPollLease::acquire(lease_path, "writer-b".into(), 10)
+            .expect("an abandoned expired lease can be recovered after OS lock release");
+        successor.release().unwrap();
+        assert!(Path::new(&zone_dir).join(TELEGRAM_POLL_STATE_LOCK_FILE).is_file());
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn polling_handoff_surfaces_flush_and_lease_release_failures() {
+        for fail_release in [false, true] {
+            let server = LoopbackTelegramServer::start_blocking_get_updates();
+            let zone_dir = unique_zone_dir("checkpoint-stop-failure");
+            let cursor_path = Path::new(&zone_dir).join(TELEGRAM_POLL_CURSOR_FILE);
+            let (mut connector, key, _) =
+                prepare_polling_handoff(&server.base_url, &zone_dir).await;
+            write_json_file_atomic(&cursor_path, &TelegramPollingCursorState {
+                version: TELEGRAM_POLLING_CURSOR_STATE_VERSION,
+                bot_id: Some(TEST_BOT_ID.into()),
+                offset: Some(42),
+                last_poll_count: 0,
+                updated_at: 1_700_000_000,
+            }).unwrap();
+            open_native_test_subscription(&mut connector, &key).await;
+            // The blocked provider request proves the pre-poll lease renewal
+            // has finished. No further renewal can race the injected failure.
+            assert!(wait_for_loopback_get_updates(&server).await);
+            if fail_release {
+                write_json_file_atomic(
+                    &Path::new(&zone_dir).join(TELEGRAM_POLL_LEASE_FILE),
+                    &TelegramPollLeaseRecord {
+                        holder_instance_id: "different-writer".into(),
+                        lease_seq: 999,
+                        updated_at: current_unix_timestamp_secs(),
+                        expires_at: current_unix_timestamp_secs() + 60,
+                    },
+                ).unwrap();
+            } else {
+                fs::rename(&cursor_path, cursor_path.with_extension("saved")).unwrap();
+                fs::create_dir(&cursor_path).unwrap();
+            }
+            let error = connector.handle_state_checkpoint(json!({"deadline_ms": 1500}))
+                .await.expect_err("failed flush or release must never produce a checkpoint");
+            assert!(error.to_string().contains(if fail_release { "lease" } else { "persistence" }));
+            assert!(connector.poll_checkpoint.is_none());
+            assert!(connector.handle_state_checkpoint(json!({})).await.is_err());
+            connector.handle_shutdown(json!({})).await.unwrap();
+            let _ = server.shutdown();
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn polling_handoff_timeout_retains_exact_task_and_later_failure() {
+        let server = TestTelegramServer::start();
+        let zone_dir = unique_zone_dir("checkpoint-stop-timeout");
+        let (mut connector, _, _) = prepare_polling_handoff(&server.uri(), &zone_dir).await;
+        let (finish, stopped) = fcp_async_core::channel::oneshot::channel::<FcpResult<()>>();
+        connector.poll_task = Some(fcp_async_core::task::spawn(async move {
+            stopped.await.expect("test stop sender")
+        }));
+        let error = connector.handle_state_checkpoint(json!({"deadline_ms": 1}))
+            .await.expect_err("a task still draining must not yield a checkpoint");
+        assert!(error.to_string().contains("timed out"));
+        assert!(connector.poll_task.is_some());
+        assert!(connector.poll_quiesced);
+        assert!(!Path::new(&zone_dir).join(TELEGRAM_POLL_CURSOR_FILE).exists());
+        finish.send(Err(polling_state_error("delayed checkpoint failed"))).unwrap();
+        assert!(connector.handle_state_checkpoint(json!({})).await.is_err());
+        assert!(connector.poll_task.is_none());
+        assert!(connector.handle_state_checkpoint(json!({})).await.is_err());
+        assert!(connector.poll_checkpoint.is_none());
+        connector.handle_shutdown(json!({})).await.unwrap();
     }
 
     #[fcp_async_core::runtime::test]
