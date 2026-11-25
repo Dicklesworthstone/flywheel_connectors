@@ -368,6 +368,110 @@ fn map_google_api_error(error: GoogleApiError) -> DocsError {
 mod tests {
     use super::*;
 
+    fn replay_test_client(base_url: &str) -> DocsClient {
+        let mut client = DocsClient::new_with_auth(GoogleMaterializedAuth::CredentialReference {
+            credential_id: fcp_core::CredentialId::new(),
+            quota_project_id: None,
+        })
+        .unwrap()
+        .with_base_url(base_url);
+        client.retry_config = HttpRetryConfig {
+            max_retries: 2,
+            initial_delay_ms: 1,
+            max_delay_ms: 1,
+            jitter_enabled: false,
+        };
+        client.executor = GoogleRestExecutor::new().with_client(
+            Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+        );
+        client
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn create_document_does_not_replay_server_error_claiming_rate_limit() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/documents"))
+            .respond_with(
+                ResponseTemplate::new(500)
+                    .insert_header("Retry-After", "0")
+                    .set_body_json(serde_json::json!({
+                        "error": {
+                            "code": 429,
+                            "message": "Mutation outcome is unknown",
+                            "status": "RESOURCE_EXHAUSTED",
+                            "errors": [{"reason": "rateLimitExceeded"}]
+                        }
+                    })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = replay_test_client(&server.uri());
+        let error = client.create_document("Create once").await.unwrap_err();
+        assert!(matches!(
+            &error,
+            DocsError::Api {
+                status_code: 500,
+                ..
+            }
+        ));
+        assert!(error.is_retryable());
+        assert!(!error.replay_is_safe());
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        server.verify().await;
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn create_document_retries_http_rate_limit_with_conflicting_body_code() {
+        use std::sync::Arc;
+        use wiremock::{
+            Mock, MockServer, Request, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        let server = MockServer::start().await;
+        let attempts = Arc::new(AtomicU64::new(0));
+        let response_attempts = Arc::clone(&attempts);
+        Mock::given(method("POST"))
+            .and(path("/documents"))
+            .respond_with(move |_: &Request| {
+                if response_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(429)
+                        .insert_header("Retry-After", "0")
+                        .set_body_json(serde_json::json!({
+                            "error": {"code": 500, "message": "Request refused before execution"}
+                        }))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "documentId": "created-once",
+                        "title": "Create after refusal"
+                    }))
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+        let client = replay_test_client(&server.uri());
+        let document = client
+            .create_document("Create after refusal")
+            .await
+            .unwrap();
+        assert_eq!(document.document_id, "created-once");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+        server.verify().await;
+    }
+
     #[test]
     fn map_google_api_error_401() {
         let err = map_google_api_error(GoogleApiError {

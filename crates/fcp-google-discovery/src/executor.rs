@@ -500,8 +500,7 @@ impl GoogleRestExecutor {
         request: &GoogleExecuteRequest<'_>,
         max_response_bytes: usize,
     ) -> Result<GoogleExecuteResponse, GoogleRestError> {
-        self.execute_with_limit(request, max_response_bytes)
-            .await
+        self.execute_with_limit(request, max_response_bytes).await
     }
 
     /// Send one chunk or status probe to a validated resumable-upload session.
@@ -541,19 +540,14 @@ impl GoogleRestExecutor {
             .map_err(|source| GoogleRestError::Http {
                 source: source.without_url(),
             })?;
-        Self::read_response(
-            response,
-            GoogleResponseMode::Json,
-            max_response_bytes,
-            true,
-        )
-        .await
-        .map_err(|error| match error {
-            GoogleRestError::Http { source } => GoogleRestError::Http {
-                source: source.without_url(),
-            },
-            other => other,
-        })
+        Self::read_response(response, GoogleResponseMode::Json, max_response_bytes, true)
+            .await
+            .map_err(|error| match error {
+                GoogleRestError::Http { source } => GoogleRestError::Http {
+                    source: source.without_url(),
+                },
+                other => other,
+            })
     }
 
     async fn execute_with_limit(
@@ -611,9 +605,10 @@ impl GoogleRestExecutor {
             .and_then(|value| value.to_str().ok())
             .map(str::to_ascii_lowercase);
         let headers = collect_headers(response.headers());
-        if response.content_length().is_some_and(|length| {
-            length > u64::try_from(max_response_bytes).unwrap_or(u64::MAX)
-        }) {
+        if response
+            .content_length()
+            .is_some_and(|length| length > u64::try_from(max_response_bytes).unwrap_or(u64::MAX))
+        {
             return Err(GoogleRestError::ResponseTooLarge {
                 limit: max_response_bytes,
             });
@@ -1344,8 +1339,6 @@ struct GoogleErrorEnvelope {
 #[derive(Debug, Clone, serde::Deserialize)]
 struct GoogleErrorBody {
     #[serde(default)]
-    code: Option<u16>,
-    #[serde(default)]
     message: Option<String>,
     #[serde(default)]
     status: Option<String>,
@@ -1366,6 +1359,8 @@ struct GoogleErrorDetail {
 /// Handles the standard `{ "error": { "code": N, "message": "...", ... } }`
 /// envelope used by all Google REST APIs, falling back to a plain HTTP-status
 /// message when the body is not valid JSON or does not match the envelope shape.
+/// The transport status always remains authoritative: a body claiming a 429
+/// must not turn a possibly committed mutation's 5xx into a safe-to-replay refusal.
 #[must_use]
 pub fn parse_google_api_error(status: StatusCode, body: &[u8]) -> GoogleApiError {
     let fallback_message = String::from_utf8_lossy(body).trim().to_string();
@@ -1391,7 +1386,7 @@ pub fn parse_google_api_error(status: StatusCode, body: &[u8]) -> GoogleApiError
             || message.contains("has not been used in project");
 
         return GoogleApiError {
-            status_code: error.code.unwrap_or_else(|| status.as_u16()),
+            status_code: status.as_u16(),
             message,
             status: error.status,
             reason,
@@ -1754,7 +1749,8 @@ mod tests {
     async fn default_response_caps_streamed_bodies_without_replaying_a_post() {
         for status in [200, 500] {
             for framing in [ResponseFraming::Chunked, ResponseFraming::CloseDelimited] {
-                let peer = ResponseLimitPeer::start(status, DEFAULT_MAX_RESPONSE_BYTES + 1, framing);
+                let peer =
+                    ResponseLimitPeer::start(status, DEFAULT_MAX_RESPONSE_BYTES + 1, framing);
                 let method = method_fixture("POST", "create", BTreeMap::new());
                 let schemas = BTreeMap::new();
                 let mut request = GoogleExecuteRequest::new(&method, &schemas, &peer.url);
@@ -1853,6 +1849,62 @@ mod tests {
             let response = result.unwrap();
             assert_eq!(response.body.as_bytes().unwrap().len(), length);
         }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn executor_preserves_http_status_when_google_error_code_disagrees() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        let server = MockServer::start().await;
+        let executor = GoogleRestExecutor::new().with_client(
+            reqwest::Client::builder()
+                .no_proxy()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+                .unwrap(),
+        );
+        for (http_status, claimed_code) in
+            [(500, 429), (502, 429), (401, 500), (403, 429), (429, 500)]
+        {
+            let request_path = format!("create/{http_status}");
+            Mock::given(method("POST"))
+                .and(path(format!("/{request_path}")))
+                .respond_with(
+                    ResponseTemplate::new(http_status)
+                        .insert_header("Retry-After", "0")
+                        .set_body_json(serde_json::json!({
+                            "error": {
+                                "code": claimed_code,
+                                "message": "Provider response with a conflicting code",
+                                "status": "RESOURCE_EXHAUSTED",
+                                "errors": [{"reason": "rateLimitExceeded", "domain": "usageLimits"}]
+                            }
+                        })),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            let discovery_method = method_fixture("POST", &request_path, BTreeMap::new());
+            let schemas = BTreeMap::new();
+            let base_url = server.uri();
+            let mut request = GoogleExecuteRequest::new(&discovery_method, &schemas, &base_url);
+            request.body = Some(serde_json::json!({"effect": "once"}));
+            let error = executor.execute(&request).await.unwrap_err();
+            let GoogleRestError::Api {
+                status_code, error, ..
+            } = error
+            else {
+                panic!("expected a normalized Google API error for HTTP {http_status}");
+            };
+            assert_eq!(status_code, http_status);
+            assert_eq!(error.status_code, http_status);
+            assert_eq!(error.retry_after_ms, Some(0));
+            assert_eq!(error.reason.as_deref(), Some("rateLimitExceeded"));
+        }
+        server.verify().await;
     }
 
     fn method_fixture(
@@ -3618,6 +3670,64 @@ mod tests {
         assert_eq!(parsed.reason.as_deref(), Some("rateLimitExceeded"));
         assert_eq!(parsed.domain.as_deref(), Some("usageLimits"));
         assert!(!parsed.access_not_configured_hint);
+    }
+
+    #[test]
+    fn parse_google_api_error_transport_status_controls_retry_and_auth_classification() {
+        for (http_status, retryable) in [
+            (400, false),
+            (401, false),
+            (403, false),
+            (404, false),
+            (409, false),
+            (429, true),
+            (500, true),
+            (502, true),
+            (503, true),
+        ] {
+            for claimed_code in [
+                serde_json::json!(0),
+                serde_json::json!(200),
+                serde_json::json!(400),
+                serde_json::json!(429),
+                serde_json::json!(500),
+                serde_json::json!(70_000),
+                serde_json::json!("429"),
+                serde_json::Value::Null,
+            ] {
+                let body = serde_json::json!({
+                    "error": {
+                        "code": claimed_code,
+                        "message": "Provider diagnostic",
+                        "status": "RESOURCE_EXHAUSTED",
+                        "errors": [{"reason": "rateLimitExceeded", "domain": "usageLimits"}]
+                    }
+                });
+                let parsed = parse_google_api_error(
+                    StatusCode::from_u16(http_status).unwrap(),
+                    &serde_json::to_vec(&body).unwrap(),
+                );
+                assert_eq!(parsed.status_code, http_status, "body: {body}");
+                assert_eq!(parsed.is_retryable(), retryable, "body: {body}");
+                assert_eq!(parsed.message, "Provider diagnostic");
+                assert_eq!(parsed.status.as_deref(), Some("RESOURCE_EXHAUSTED"));
+                assert_eq!(parsed.reason.as_deref(), Some("rateLimitExceeded"));
+                assert_eq!(parsed.domain.as_deref(), Some("usageLimits"));
+                let mapped = parsed.to_fcp_error("google-test");
+                match http_status {
+                    401 | 403 => assert!(matches!(mapped, fcp_core::FcpError::Unauthorized { .. })),
+                    429 => assert!(matches!(mapped, fcp_core::FcpError::RateLimited { .. })),
+                    _ => assert!(matches!(
+                        mapped,
+                        fcp_core::FcpError::External {
+                            status_code: Some(code),
+                            retryable: actual_retryable,
+                            ..
+                        } if code == http_status && actual_retryable == retryable
+                    )),
+                }
+            }
+        }
     }
 
     #[test]
