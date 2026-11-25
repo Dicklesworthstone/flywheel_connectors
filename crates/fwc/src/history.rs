@@ -3,10 +3,10 @@
 //! Records every `fwc` operation invocation in a structured JSONL file,
 //! supporting filtered queries for debugging, replay, and accountability.
 
-use std::collections::{BTreeMap, BTreeSet, hash_map::DefaultHasher};
+use std::collections::{BTreeMap, BTreeSet, VecDeque, hash_map::DefaultHasher};
 use std::fs::{self, File, OpenOptions};
 use std::hash::{Hash, Hasher};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -241,6 +241,59 @@ fn truncate_str(s: &str, max: usize) -> String {
 
 // ── History store ───────────────────────────────────────────────────────
 
+/// Maximum encoded history record, including its newline when present.
+/// Rotation bounds a normal log, but cannot bound a single provider response
+/// or an externally supplied log record. Reject these before retaining them.
+const MAX_HISTORY_RECORD_BYTES: usize = 1024 * 1024;
+
+struct EncodedHistoryRecord(Vec<u8>);
+
+impl Write for EncodedHistoryRecord {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        // Reserve the final newline before any filesystem changes occur.
+        if bytes.len() > (MAX_HISTORY_RECORD_BYTES - 1).saturating_sub(self.0.len()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "history record exceeds the 1 MiB limit",
+            ));
+        }
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Read one bounded physical record. Unlike `BufRead::lines`, hostile input
+/// without a newline cannot grow an allocation until the entire file is read.
+fn read_history_record(reader: &mut impl BufRead, record: &mut Vec<u8>) -> io::Result<bool> {
+    record.clear();
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(!record.is_empty());
+        }
+        let end = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |index| index + 1);
+        if end > MAX_HISTORY_RECORD_BYTES.saturating_sub(record.len()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "history record exceeds the 1 MiB limit",
+            ));
+        }
+        let complete = available[end - 1] == b'\n';
+        record.extend_from_slice(&available[..end]);
+        reader.consume(end);
+        if complete {
+            return Ok(true);
+        }
+    }
+}
+
 /// Manages the append-only JSONL history log.
 pub struct HistoryStore {
     log_path: PathBuf,
@@ -259,32 +312,39 @@ impl HistoryStore {
     }
 
     /// Append a new entry to the log. Rotates if needed.
+    /// Oversized records fail before creating, rotating, or writing a log.
     pub fn append(&self, entry: &HistoryEntry) -> Result<()> {
+        let mut record = EncodedHistoryRecord(Vec::new());
+        serde_json::to_writer(&mut record, entry).context("failed to encode history record")?;
+        record.0.push(b'\n');
         self.ensure_dir()?;
         self.rotate_if_needed()?;
-        let line = serde_json::to_string(entry)?;
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.log_path)?;
-        writeln!(file, "{line}")?;
+        file.write_all(&record.0)?;
         Ok(())
     }
 
     /// Query the log with filters. Returns entries in reverse chronological order.
+    /// Retains only the newest requested matches, not the complete log.
     pub fn query(&self, filter: &HistoryFilter) -> Result<Vec<HistoryEntry>> {
-        if !self.log_path.exists() {
+        if filter.limit == 0 || !self.log_path.exists() {
             return Ok(Vec::new());
         }
 
-        let entries = self.read_all_entries()?;
-        let filtered: Vec<HistoryEntry> = entries
-            .into_iter()
-            .rev()
-            .filter(|e| matches_filter(e, filter))
-            .take(filter.limit)
-            .collect();
-        Ok(filtered)
+        let mut entries = VecDeque::new();
+        self.visit_entries(|entry| {
+            if matches_filter(&entry, filter) {
+                if entries.len() == filter.limit {
+                    entries.pop_front();
+                }
+                entries.push_back(entry);
+            }
+            true
+        })?;
+        Ok(entries.into_iter().rev().collect())
     }
 
     /// Read a single entry by ID.
@@ -292,8 +352,16 @@ impl HistoryStore {
         if !self.log_path.exists() {
             return Ok(None);
         }
-        let entries = self.read_all_entries()?;
-        Ok(entries.into_iter().find(|e| e.entry_id == entry_id))
+        let mut found = None;
+        self.visit_entries(|entry| {
+            if entry.entry_id == entry_id {
+                found = Some(entry);
+                false
+            } else {
+                true
+            }
+        })?;
+        Ok(found)
     }
 
     /// Count total entries.
@@ -302,24 +370,47 @@ impl HistoryStore {
             return Ok(0);
         }
         let file = File::open(&self.log_path)?;
-        let reader = BufReader::new(file);
-        Ok(reader.lines().count())
+        let bytes = file.metadata()?.len();
+        let mut reader = BufReader::new(file.take(bytes));
+        let mut count = 0usize;
+        let mut unterminated = false;
+        loop {
+            let available = reader.fill_buf()?;
+            if available.is_empty() {
+                break;
+            }
+            count = count
+                .checked_add(available.iter().filter(|byte| **byte == b'\n').count())
+                .context("history record count overflow")?;
+            unterminated = available.last() != Some(&b'\n');
+            let consumed = available.len();
+            reader.consume(consumed);
+        }
+        count
+            .checked_add(usize::from(unterminated))
+            .context("history record count overflow")
     }
 
-    fn read_all_entries(&self) -> Result<Vec<HistoryEntry>> {
+    /// Returning false stops after the current entry. A captured file length
+    /// prevents concurrent appends from extending this scan indefinitely; it
+    /// does not claim atomic snapshot isolation against in-place file edits.
+    fn visit_entries(&self, mut visit: impl FnMut(HistoryEntry) -> bool) -> Result<()> {
         let file = File::open(&self.log_path)?;
-        let reader = BufReader::new(file);
-        let mut entries = Vec::new();
-        for line in reader.lines() {
-            let line = line?;
+        let bytes = file.metadata()?.len();
+        let mut reader = BufReader::new(file.take(bytes));
+        let mut record = Vec::new();
+        while read_history_record(&mut reader, &mut record)? {
+            let line = std::str::from_utf8(&record).context("history record is not valid UTF-8")?;
             if line.trim().is_empty() {
                 continue;
             }
-            if let Ok(entry) = serde_json::from_str::<HistoryEntry>(&line) {
-                entries.push(entry);
+            if let Ok(entry) = serde_json::from_str::<HistoryEntry>(line)
+                && !visit(entry)
+            {
+                break;
             }
         }
-        Ok(entries)
+        Ok(())
     }
 
     fn ensure_dir(&self) -> Result<()> {
@@ -486,6 +577,119 @@ mod tests {
         let results = store.query(&HistoryFilter::new()).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].connector_id, "fcp.github");
+        cleanup(&store);
+    }
+
+    #[test]
+    fn record_byte_limit_round_trips_and_rejects_before_filesystem_changes() {
+        let store = temp_store();
+        let mut entry = sample_entry("github", "list_issues", OpStatus::Success);
+        entry.input_summary.clear();
+        let overhead = serde_json::to_vec(&entry).unwrap().len();
+        entry.input_summary = "x".repeat(MAX_HISTORY_RECORD_BYTES - 1 - overhead);
+        store.append(&entry).unwrap();
+        assert_eq!(
+            fs::metadata(&store.log_path).unwrap().len(),
+            MAX_HISTORY_RECORD_BYTES as u64
+        );
+        let results = store.query(&HistoryFilter::new()).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].input_summary, entry.input_summary);
+
+        let before = fs::read(&store.log_path).unwrap();
+        entry.input_summary.push('x');
+        assert!(store.append(&entry).is_err());
+        assert_eq!(fs::read(&store.log_path).unwrap(), before);
+        assert!(!rotated_path(&store.log_path, 1).exists());
+
+        let fresh = temp_store();
+        assert!(fresh.append(&entry).is_err());
+        assert!(!fresh.log_path.parent().unwrap().exists());
+        cleanup(&store);
+    }
+
+    #[test]
+    fn oversized_external_records_fail_bounded_reads_and_preserve_early_lookup() {
+        let store = temp_store();
+        let entry = sample_entry("github", "list_issues", OpStatus::Success);
+        store.append(&entry).unwrap();
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&store.log_path)
+            .unwrap();
+        // No terminator: line-oriented readers must not allocate the rest of
+        // a malformed or provider-controlled record before enforcing a bound.
+        file.write_all(&vec![b'x'; MAX_HISTORY_RECORD_BYTES + 1])
+            .unwrap();
+        assert!(store.query(&HistoryFilter::new()).is_err());
+        assert!(store.get("absent").is_err());
+        assert_eq!(
+            store.get(&entry.entry_id).unwrap().unwrap().entry_id,
+            entry.entry_id
+        );
+        // Counting physical records does not need to allocate or parse them.
+        assert_eq!(store.count().unwrap(), 2);
+        let mut filter = HistoryFilter::new();
+        filter.limit = 0;
+        assert!(store.query(&filter).unwrap().is_empty());
+
+        let mut reader = BufReader::with_capacity(
+            17,
+            std::io::Cursor::new(vec![b'x'; MAX_HISTORY_RECORD_BYTES + 1]),
+        );
+        let mut record = Vec::new();
+        assert_eq!(
+            read_history_record(&mut reader, &mut record)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert!(record.len() <= MAX_HISTORY_RECORD_BYTES);
+        cleanup(&store);
+    }
+
+    #[test]
+    fn history_scan_does_not_chase_concurrent_appends() {
+        let store = temp_store();
+        let first = sample_entry("github", "list_issues", OpStatus::Success);
+        let later = sample_entry("github", "list_issues", OpStatus::Success);
+        store.append(&first).unwrap();
+        let mut observed = Vec::new();
+        store
+            .visit_entries(|entry| {
+                observed.push(entry.entry_id);
+                if observed.len() == 1 {
+                    store.append(&later).unwrap();
+                }
+                true
+            })
+            .unwrap();
+        assert_eq!(observed, vec![first.entry_id]);
+        assert_eq!(store.count().unwrap(), 2);
+        assert_eq!(
+            store.query(&HistoryFilter::new()).unwrap()[0].entry_id,
+            later.entry_id
+        );
+        cleanup(&store);
+    }
+
+    #[test]
+    fn bounded_history_scan_preserves_crlf_invalid_lines_and_final_record() {
+        let store = temp_store();
+        store.ensure_dir().unwrap();
+        let first = sample_entry("github", "list_issues", OpStatus::Success);
+        let second = sample_entry("github", "get_issue", OpStatus::Success);
+        let contents = format!(
+            "{}\r\n\ninvalid-json\n{}",
+            serde_json::to_string(&first).unwrap(),
+            serde_json::to_string(&second).unwrap(),
+        );
+        fs::write(&store.log_path, contents).unwrap();
+        let results = store.query(&HistoryFilter::new()).unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].entry_id, second.entry_id);
+        assert_eq!(results[1].entry_id, first.entry_id);
+        assert_eq!(store.count().unwrap(), 4);
         cleanup(&store);
     }
 
@@ -691,6 +895,13 @@ mod tests {
         filter.limit = 3;
         let results = store.query(&filter).unwrap();
         assert_eq!(results.len(), 3);
+        assert_eq!(
+            results
+                .iter()
+                .map(|entry| entry.input_summary.as_str())
+                .collect::<Vec<_>>(),
+            ["run 9", "run 8", "run 7"]
+        );
         cleanup(&store);
     }
 
@@ -1054,7 +1265,7 @@ mod tests {
         let mut file = File::create(&store.log_path).unwrap();
         writeln!(file, "not valid json").unwrap();
         writeln!(file, "{good_line}").unwrap();
-        writeln!(file, "").unwrap();
+        writeln!(file).unwrap();
         writeln!(file, "{{broken").unwrap();
         drop(file);
         let results = store.query(&HistoryFilter::new()).unwrap();
