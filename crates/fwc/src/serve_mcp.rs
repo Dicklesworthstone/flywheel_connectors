@@ -14,7 +14,7 @@ use fcp_async_core::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteEx
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::history::{HistoryFilter, HistoryStore};
+use crate::history::{HistoryFilter, HistoryScope, HistoryStore};
 use crate::mcp_resources::{
     self, McpPrompt as RegistryPrompt, McpResource as RegistryResource, McpResourceRegistry,
     ParsedUri,
@@ -71,6 +71,10 @@ pub struct McpServerConfig {
     /// Optional zone filter — only expose connectors in this zone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zone_filter: Option<String>,
+    /// Effective invocation zone used to scope local history, even when the
+    /// operator leaves the tool inventory unfiltered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_zone: Option<String>,
     /// Optional connector filter — only expose this specific connector.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connector_filter: Option<String>,
@@ -94,6 +98,7 @@ impl Default for McpServerConfig {
         Self {
             transport: TransportMode::default(),
             zone_filter: None,
+            history_zone: None,
             connector_filter: None,
             risk_max: None,
             include_resources: true,
@@ -117,6 +122,12 @@ impl McpServerConfig {
     /// Builder: set zone filter.
     pub fn with_zone_filter(mut self, zone: impl Into<String>) -> Self {
         self.zone_filter = Some(zone.into());
+        self
+    }
+
+    /// Builder: bind local history to the effective invocation zone.
+    pub fn with_history_zone(mut self, zone: impl Into<String>) -> Self {
+        self.history_zone = Some(zone.into());
         self
     }
 
@@ -1835,7 +1846,12 @@ fn resolve_resource_content(
                     &connector_id,
                     &connector_tools,
                 )),
-                "history" => Some(connector_history_content(uri, &connector_id)),
+                "history" => Some(connector_history_content(
+                    state,
+                    uri,
+                    &connector_id,
+                    &connector_tools,
+                )),
                 _ => None,
             }
         }
@@ -1977,13 +1993,19 @@ fn connector_operations_content(
     )
 }
 
-fn connector_history_content(uri: &str, connector_id: &str) -> mcp_resources::ResourceContent {
-    match load_connector_history(connector_id, 10) {
+fn connector_history_content(
+    state: &McpServerState,
+    uri: &str,
+    connector_id: &str,
+    tools: &[&McpToolDefinition],
+) -> mcp_resources::ResourceContent {
+    match load_connector_history(&state.config, tools, 10) {
         Ok((history_path, entries)) => mcp_resources::ResourceContent::new(
             uri.to_owned(),
             json!({
                 "connector_id": connector_id,
                 "source": "local-history-log",
+                "zone": state.config.history_zone.as_ref().or(state.config.zone_filter.as_ref()),
                 "history_path": history_path.display().to_string(),
                 "entry_count": entries.len(),
                 "entries": entries,
@@ -2102,18 +2124,55 @@ fn inventory_truth_summary(tools: &[&McpToolDefinition]) -> Value {
 }
 
 fn load_connector_history(
-    connector_id: &str,
+    config: &McpServerConfig,
+    tools: &[&McpToolDefinition],
     limit: usize,
 ) -> Result<(std::path::PathBuf, Vec<Value>)> {
-    let history_path = HistoryStore::default_path()?;
+    // Tool metadata proves neither membership in every zone nor ownership of
+    // similarly named connectors. Resolve an exact disclosure scope before
+    // opening the log, and apply it before the query's result limit.
+    let zone = config
+        .history_zone
+        .as_deref()
+        .or(config.zone_filter.as_deref())
+        .context("Local history requires an explicit execution zone")?
+        .parse::<fcp_core::ZoneId>()
+        .context("Local history execution zone is invalid")?;
+    anyhow::ensure!(
+        config
+            .zone_filter
+            .as_deref()
+            .is_none_or(|filter| filter == zone.as_str()),
+        "Local history zone does not match the MCP zone filter"
+    );
+    let mut scope = HistoryScope {
+        zone: zone.to_string(),
+        ..HistoryScope::default()
+    };
+    for tool in tools {
+        // Offline tool slugs and guessed operation aliases cannot establish
+        // the exact runtime identity recorded by live invocation history.
+        let Some(connector) = tool.runtime_connector_id.as_deref() else {
+            continue;
+        };
+        if !tool.supports_zone(zone.as_str()) {
+            continue;
+        }
+        scope
+            .operations
+            .entry(connector.to_owned())
+            .or_default()
+            .insert(tool.operation_id.clone());
+    }
+    let history_path = crate::cli_history_store_path()?;
     let store = HistoryStore::new(history_path.clone());
     let mut filter = HistoryFilter::new();
-    filter.connector = Some(connector_id.to_owned());
+    filter.scope = Some(scope);
     filter.limit = limit;
 
     let entries = store
         .query(&filter)
-        .with_context(|| format!("failed to query history for connector `{connector_id}`"))?
+        .context("failed to query scoped local connector history")?
         .into_iter()
         .map(serde_json::to_value)
         .collect::<std::result::Result<Vec<_>, _>>()
@@ -3933,6 +3992,190 @@ mod tests {
             payload.get("pools").is_none(),
             "unknown rate-limit state must not fabricate an empty pools list"
         );
+    }
+
+    fn history_resource_payload(state: &McpServerState) -> Value {
+        let request = make_request(
+            "resources/read",
+            Some(json!({"uri": "resource://connector/github/history"})),
+        );
+        let response = handle_request(state, &request);
+        serde_json::from_str(
+            response.result().unwrap()["contents"][0]["text"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn append_mcp_history(
+        store: &HistoryStore,
+        id: &str,
+        connector: &str,
+        operation: &str,
+        zone: Option<&str>,
+    ) {
+        let entry = serde_json::from_value(json!({
+            "entry_id": id,
+            "timestamp": "2026-11-24T20:00:00Z",
+            "connector_id": connector,
+            "operation_id": operation,
+            "zone": zone,
+            "input_hash": "input-hash",
+            "input_summary": format!("input-{id}"),
+            "output_summary": format!("output-{id}"),
+            "status": "success",
+            "latency_ms": 1,
+        }))
+        .unwrap();
+        store.append(&entry).unwrap();
+    }
+
+    fn history_tool(operation: &str, risk: &str) -> McpToolDefinition {
+        let mut tool = risk_annotated_tool(operation, risk)
+            .with_runtime_connector_id("fcp.github")
+            .with_live_contract_digest([1; 32]);
+        tool.operation_id = operation.to_owned();
+        tool
+    }
+
+    #[test]
+    fn handle_resources_read_history_scopes_zone_identity_and_visible_operations() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("history.jsonl");
+        let _history = crate::install_test_history_path(path.clone());
+        let store = HistoryStore::new(path);
+        append_mcp_history(
+            &store,
+            "allowed",
+            "fcp.github",
+            "github.list_issues",
+            Some("z:work"),
+        );
+        for (id, connector, operation, zone) in [
+            (
+                "private",
+                "fcp.github",
+                "github.list_issues",
+                Some("z:private"),
+            ),
+            ("unknown-zone", "fcp.github", "github.list_issues", None),
+            (
+                "high-risk",
+                "fcp.github",
+                "github.delete_repo",
+                Some("z:work"),
+            ),
+            (
+                "removed",
+                "fcp.github",
+                "github.old_operation",
+                Some("z:work"),
+            ),
+            ("op-alias", "fcp.github", "list_issues", Some("z:work")),
+            (
+                "op-prefix",
+                "fcp.github",
+                "github.list_issues_extra",
+                Some("z:work"),
+            ),
+            (
+                "connector-alias",
+                "github",
+                "github.list_issues",
+                Some("z:work"),
+            ),
+            (
+                "connector-prefix",
+                "fcp.github.v10",
+                "github.list_issues",
+                Some("z:work"),
+            ),
+        ] {
+            append_mcp_history(&store, id, connector, operation, zone);
+        }
+        let state = state_from_tools(
+            [
+                history_tool("github.list_issues", "low"),
+                history_tool("github.delete_repo", "high"),
+            ],
+            McpServerConfig::new()
+                .with_zone_filter("z:work")
+                .with_history_zone("z:work")
+                .with_risk_max("low"),
+        );
+        let payload = history_resource_payload(&state);
+        assert_eq!(payload["source"], "local-history-log");
+        assert_eq!(payload["zone"], "z:work");
+        assert_eq!(payload["entry_count"], 1);
+        assert_eq!(payload["entries"][0]["entry_id"], "allowed");
+        assert_eq!(payload["entries"][0]["input_summary"], "input-allowed");
+        let encoded = payload.to_string();
+        for excluded in [
+            "private",
+            "unknown-zone",
+            "high-risk",
+            "removed",
+            "op-alias",
+            "op-prefix",
+            "connector-alias",
+            "connector-prefix",
+        ] {
+            assert!(!encoded.contains(&format!("input-{excluded}")));
+            assert!(!encoded.contains(&format!("output-{excluded}")));
+        }
+    }
+
+    #[test]
+    fn handle_resources_read_history_uses_effective_zone_without_inventory_filter() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("history.jsonl");
+        let _history = crate::install_test_history_path(path.clone());
+        let store = HistoryStore::new(path);
+        for (id, zone) in [("work", "z:work"), ("private", "z:private")] {
+            append_mcp_history(&store, id, "fcp.github", "github.list_issues", Some(zone));
+        }
+        let state = state_from_tools(
+            [history_tool("github.list_issues", "low")],
+            McpServerConfig::new().with_history_zone("z:private"),
+        );
+        assert!(state.config.zone_filter.is_none());
+        let payload = history_resource_payload(&state);
+        assert_eq!(payload["zone"], "z:private");
+        assert_eq!(payload["entry_count"], 1);
+        assert_eq!(payload["entries"][0]["entry_id"], "private");
+    }
+
+    #[test]
+    fn handle_resources_read_history_refuses_unknown_or_conflicting_zone() {
+        for config in [
+            McpServerConfig::new(),
+            McpServerConfig::new().with_history_zone("not-a-zone"),
+            McpServerConfig::new()
+                .with_zone_filter("z:work")
+                .with_history_zone("z:private"),
+        ] {
+            let state = state_from_tools([history_tool("github.list_issues", "low")], config);
+            let payload = history_resource_payload(&state);
+            assert_eq!(payload["status"], "unavailable");
+            assert!(payload.get("entries").is_none());
+            assert!(payload.get("history_path").is_none());
+        }
+    }
+
+    #[test]
+    fn handle_resources_read_history_does_not_infer_runtime_identity_from_slug() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("history.jsonl");
+        let _history = crate::install_test_history_path(path.clone());
+        let store = HistoryStore::new(path);
+        append_mcp_history(&store, "live", "fcp.github", "list_issues", Some("z:work"));
+        let state = state_from_tools(
+            [sample_tool()],
+            McpServerConfig::new().with_zone_filter("z:work"),
+        );
+        let payload = history_resource_payload(&state);
+        assert_eq!(payload["entry_count"], 0);
     }
 
     #[test]

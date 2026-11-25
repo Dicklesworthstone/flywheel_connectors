@@ -4027,6 +4027,9 @@ fn execute_serve_mcp(prepared: &PreparedCli, args: &ServeMcpArgs) -> Result<Exec
             );
         }
     };
+    let history_zone = resolved_zone(args.zone.as_deref(), &resolved_host)
+        .parse::<ZoneId>()
+        .context("MCP execution history requires a valid effective invocation zone")?;
     let startup_budget = pipe::budget::ExecutionBudget::start(
         Some(u64::try_from(
             serve_mcp::LIVE_INVENTORY_TIMEOUT.as_millis(),
@@ -4074,7 +4077,8 @@ fn execute_serve_mcp(prepared: &PreparedCli, args: &ServeMcpArgs) -> Result<Exec
     let mut config = serve_mcp_config(
         args.connector.as_ref().and(connectors.first()),
         args.risk_max.as_deref(),
-    );
+    )
+    .with_history_zone(history_zone.to_string());
     if let Some(zone) = zone.as_ref() {
         config = config.with_zone_filter(zone.as_str());
     }

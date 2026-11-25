@@ -3,7 +3,7 @@
 //! Records every `fwc` operation invocation in a structured JSONL file,
 //! supporting filtered queries for debugging, replay, and accountability.
 
-use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeMap, BTreeSet, hash_map::DefaultHasher};
 use std::fs::{self, File, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Write};
@@ -154,6 +154,9 @@ pub struct HistoryFilter {
     pub since: Option<DateTime<Utc>>,
     /// Look up a specific entry by ID.
     pub entry_id: Option<String>,
+    /// Restrict disclosure to an exact zone and connector/operation identities.
+    /// This is an additional restriction, separate from the CLI's fuzzy search.
+    pub scope: Option<HistoryScope>,
     /// Maximum number of entries to return.
     pub limit: usize,
 }
@@ -164,6 +167,29 @@ impl HistoryFilter {
             limit: default_limit(),
             ..Default::default()
         }
+    }
+}
+
+/// An explicit disclosure boundary for consumers of the local history log.
+///
+/// An empty operation map permits no entries. Unknown zones, connector aliases
+/// and operation prefixes cannot establish membership in this scope.
+#[derive(Debug, Default, Clone)]
+pub struct HistoryScope {
+    /// Exact execution zone. Entries without a zone are never in scope.
+    pub zone: String,
+    /// Exact operation identifiers grouped by their exact runtime connector.
+    pub operations: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl HistoryScope {
+    fn contains(&self, entry: &HistoryEntry) -> bool {
+        !self.zone.is_empty()
+            && entry.zone.as_deref() == Some(self.zone.as_str())
+            && self
+                .operations
+                .get(&entry.connector_id)
+                .is_some_and(|operations| operations.contains(&entry.operation_id))
     }
 }
 
@@ -345,6 +371,11 @@ fn rotated_path(base: &Path, index: usize) -> PathBuf {
 }
 
 fn matches_filter(entry: &HistoryEntry, filter: &HistoryFilter) -> bool {
+    if let Some(scope) = &filter.scope
+        && !scope.contains(entry)
+    {
+        return false;
+    }
     if let Some(ref connector) = filter.connector {
         if !entry.connector_id.contains(connector.as_str())
             && !entry.connector_id.ends_with(&format!(".{connector}"))
@@ -494,6 +525,107 @@ mod tests {
         let results = store.query(&filter).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].connector_id, "fcp.github");
+        cleanup(&store);
+    }
+
+    #[test]
+    fn query_scope_excludes_other_zones_and_aliases_before_limiting() {
+        let store = temp_store();
+        let allowed = sample_entry("github", "list_issues", OpStatus::Success);
+        store.append(&allowed).unwrap();
+        for (connector, operation, zone) in [
+            ("fcp.github", "github.list_issues", Some("z:private")),
+            ("fcp.github", "github.list_issues", None),
+            ("fcp.github", "github.delete_repo", Some("z:work")),
+            ("fcp.github", "github.removed_operation", Some("z:work")),
+            ("fcp.github", "list_issues", Some("z:work")),
+            ("fcp.github", "github.list_issues_extra", Some("z:work")),
+            (
+                "fcp.github.enterprise",
+                "github.list_issues",
+                Some("z:work"),
+            ),
+            ("github", "github.list_issues", Some("z:work")),
+        ] {
+            let mut hidden = allowed.clone();
+            hidden.entry_id = uuid::Uuid::new_v4().to_string();
+            hidden.connector_id = connector.to_owned();
+            hidden.operation_id = operation.to_owned();
+            hidden.zone = zone.map(str::to_owned);
+            store.append(&hidden).unwrap();
+        }
+        let mut filter = HistoryFilter::new();
+        filter.limit = 1;
+        filter.scope = Some(HistoryScope {
+            zone: "z:work".to_owned(),
+            operations: BTreeMap::from([(
+                "fcp.github".to_owned(),
+                BTreeSet::from(["github.list_issues".to_owned()]),
+            )]),
+        });
+        let results = store.query(&filter).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].entry_id, allowed.entry_id);
+
+        // The disclosure boundary does not change ordinary CLI fuzzy search.
+        filter.scope = None;
+        filter.connector = Some("github".to_owned());
+        filter.limit = 20;
+        assert_eq!(store.query(&filter).unwrap().len(), 9);
+        cleanup(&store);
+    }
+
+    #[test]
+    fn query_scope_keeps_connector_and_operation_membership_paired() {
+        let store = temp_store();
+        let allowed = sample_entry("github", "list_issues", OpStatus::Success);
+        let mut other = sample_entry("slack", "list_channels", OpStatus::Success);
+        store.append(&allowed).unwrap();
+        store.append(&other).unwrap();
+        other.connector_id.clone_from(&allowed.connector_id);
+        store.append(&other).unwrap();
+
+        let mut filter = HistoryFilter::new();
+        filter.scope = Some(HistoryScope {
+            zone: "z:work".to_owned(),
+            operations: BTreeMap::from([
+                (
+                    "fcp.github".to_owned(),
+                    BTreeSet::from(["github.list_issues".to_owned()]),
+                ),
+                (
+                    "fcp.slack".to_owned(),
+                    BTreeSet::from(["slack.list_channels".to_owned()]),
+                ),
+            ]),
+        });
+        let results = store.query(&filter).unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].connector_id, "fcp.slack");
+        assert_eq!(results[1].entry_id, allowed.entry_id);
+        cleanup(&store);
+    }
+
+    #[test]
+    fn query_scope_without_zone_or_operations_discloses_nothing() {
+        let store = temp_store();
+        store
+            .append(&sample_entry("github", "list_issues", OpStatus::Success))
+            .unwrap();
+        let mut filter = HistoryFilter::new();
+        filter.scope = Some(HistoryScope {
+            zone: "z:work".to_owned(),
+            ..HistoryScope::default()
+        });
+        assert!(store.query(&filter).unwrap().is_empty());
+        filter.scope = Some(HistoryScope {
+            zone: String::new(),
+            operations: BTreeMap::from([(
+                "fcp.github".to_owned(),
+                BTreeSet::from(["github.list_issues".to_owned()]),
+            )]),
+        });
+        assert!(store.query(&filter).unwrap().is_empty());
         cleanup(&store);
     }
 
