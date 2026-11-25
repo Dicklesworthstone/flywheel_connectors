@@ -23,6 +23,14 @@ const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC
 
 const MAX_SCHEMA_VALIDATION_DEPTH: usize = 64;
 
+/// Default retained-body ceiling for Google REST responses (16 MiB).
+///
+/// The ceiling covers successful and error responses before JSON decoding,
+/// including chunked bodies and responses without a declared length. Callers
+/// that intentionally accept larger media or attachment payloads must choose
+/// their own limit with [`GoogleRestExecutor::execute_bounded`].
+pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
 /// Upload mode for methods that expose Discovery `mediaUpload` metadata.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum GoogleUploadMode {
@@ -456,24 +464,34 @@ impl GoogleRestExecutor {
         self
     }
 
-    /// Execute a normalized Google API method request.
+    /// Execute a normalized Google API method request with a 16 MiB body limit.
+    ///
+    /// Both successful and error bodies are capped at
+    /// [`DEFAULT_MAX_RESPONSE_BYTES`] before decoding. Use
+    /// [`Self::execute_bounded`] to choose an explicit per-operation limit.
     ///
     /// # Errors
     ///
     /// Returns [`GoogleRestError`] when validation fails, transport fails, or
-    /// the response is a non-success Google API error.
+    /// the response is a non-success Google API error. An oversized response
+    /// returns [`GoogleRestError::ResponseTooLarge`]; this does not establish
+    /// whether a mutation committed and must not cause an automatic replay.
     pub async fn execute(
         &self,
         request: &GoogleExecuteRequest<'_>,
     ) -> Result<GoogleExecuteResponse, GoogleRestError> {
-        self.execute_with_limit(request, None).await
+        self.execute_bounded(request, DEFAULT_MAX_RESPONSE_BYTES)
+            .await
     }
 
     /// Execute with a limit on bytes retained from either a success or error body.
     ///
     /// The limit is checked while reading, including responses without a
-    /// `Content-Length`. An oversized response may follow a committed mutation;
-    /// callers must not interpret this error as permission to replay the request.
+    /// `Content-Length`. This explicitly overrides the default ceiling, so a
+    /// media operation can choose a larger bounded response without raising the
+    /// limit for other operations. Zero accepts only an empty body. An oversized
+    /// response may follow a committed mutation; callers must not interpret
+    /// this error as permission to replay the request.
     ///
     /// # Errors
     /// Returns the usual execution errors, or [`GoogleRestError::ResponseTooLarge`].
@@ -482,7 +500,7 @@ impl GoogleRestExecutor {
         request: &GoogleExecuteRequest<'_>,
         max_response_bytes: usize,
     ) -> Result<GoogleExecuteResponse, GoogleRestError> {
-        self.execute_with_limit(request, Some(max_response_bytes))
+        self.execute_with_limit(request, max_response_bytes)
             .await
     }
 
@@ -526,7 +544,7 @@ impl GoogleRestExecutor {
         Self::read_response(
             response,
             GoogleResponseMode::Json,
-            Some(max_response_bytes),
+            max_response_bytes,
             true,
         )
         .await
@@ -541,7 +559,7 @@ impl GoogleRestExecutor {
     async fn execute_with_limit(
         &self,
         request: &GoogleExecuteRequest<'_>,
-        max_response_bytes: Option<usize>,
+        max_response_bytes: usize,
     ) -> Result<GoogleExecuteResponse, GoogleRestError> {
         validate_parameters(request.method, &request.parameters)?;
         let method = parse_http_method(&request.method.http_method)?;
@@ -583,7 +601,7 @@ impl GoogleRestExecutor {
     async fn read_response(
         mut response: reqwest::Response,
         response_mode: GoogleResponseMode,
-        max_response_bytes: Option<usize>,
+        max_response_bytes: usize,
         accept_resume_incomplete: bool,
     ) -> Result<GoogleExecuteResponse, GoogleRestError> {
         let status = response.status();
@@ -593,31 +611,29 @@ impl GoogleRestExecutor {
             .and_then(|value| value.to_str().ok())
             .map(str::to_ascii_lowercase);
         let headers = collect_headers(response.headers());
-        let bytes = if let Some(limit) = max_response_bytes {
-            if response
-                .content_length()
-                .is_some_and(|length| length > u64::try_from(limit).unwrap_or(u64::MAX))
-            {
-                return Err(GoogleRestError::ResponseTooLarge { limit });
+        if response.content_length().is_some_and(|length| {
+            length > u64::try_from(max_response_bytes).unwrap_or(u64::MAX)
+        }) {
+            return Err(GoogleRestError::ResponseTooLarge {
+                limit: max_response_bytes,
+            });
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|source| GoogleRestError::Http { source })?
+        {
+            // Enforce the actual retained bytes independently of the advertised
+            // length. Transfer framing (and enabled content decoding) has
+            // already been removed by reqwest before these chunks arrive.
+            if chunk.len() > max_response_bytes.saturating_sub(bytes.len()) {
+                return Err(GoogleRestError::ResponseTooLarge {
+                    limit: max_response_bytes,
+                });
             }
-            let mut bytes = Vec::new();
-            while let Some(chunk) = response
-                .chunk()
-                .await
-                .map_err(|source| GoogleRestError::Http { source })?
-            {
-                if chunk.len() > limit.saturating_sub(bytes.len()) {
-                    return Err(GoogleRestError::ResponseTooLarge { limit });
-                }
-                bytes.extend_from_slice(&chunk);
-            }
-            bytes.into()
-        } else {
-            response
-                .bytes()
-                .await
-                .map_err(|source| GoogleRestError::Http { source })?
-        };
+            bytes.extend_from_slice(&chunk);
+        }
 
         let resume_incomplete = accept_resume_incomplete && status.as_u16() == 308;
         if !status.is_success() && !resume_incomplete {
@@ -1548,6 +1564,295 @@ mod tests {
             Err(GoogleRestError::ResponseTooLarge { limit: 12 }),
         ));
         server.join().unwrap();
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum ResponseFraming {
+        ContentLength,
+        Chunked,
+        CloseDelimited,
+        AnnouncedOnly,
+        ChunkedWithShortLength,
+    }
+
+    /// A real HTTP peer that streams a large response without allocating it.
+    /// It also records any unexpected replay before the caller closes the peer.
+    struct ResponseLimitPeer {
+        url: String,
+        stop: std::sync::mpsc::Sender<()>,
+        worker: Option<std::thread::JoinHandle<Vec<String>>>,
+    }
+
+    impl ResponseLimitPeer {
+        fn start(status: u16, length: usize, framing: ResponseFraming) -> Self {
+            use std::io::{BufRead, Read};
+            use std::time::{Duration, Instant};
+
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let url = format!("http://{}/", listener.local_addr().unwrap());
+            let (stop, stopped) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let mut requests = Vec::new();
+                loop {
+                    let connection = match listener.accept() {
+                        Ok((connection, _)) => connection,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            if stopped.try_recv().is_ok() || Instant::now() >= deadline {
+                                return requests;
+                            }
+                            std::thread::sleep(Duration::from_millis(1));
+                            continue;
+                        }
+                        Err(error) => panic!("accept Google request: {error}"),
+                    };
+                    connection
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    connection
+                        .set_write_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let mut reader = std::io::BufReader::new(connection);
+                    let mut request_line = String::new();
+                    assert!(reader.read_line(&mut request_line).unwrap() > 0);
+                    let mut content_length = 0;
+                    let mut header_bytes = request_line.len();
+                    loop {
+                        let mut line = String::new();
+                        let read = reader.read_line(&mut line).unwrap();
+                        assert!(read > 0);
+                        header_bytes += read;
+                        assert!(header_bytes <= 16 * 1024);
+                        if line == "\r\n" {
+                            break;
+                        }
+                        if let Some((name, value)) = line.split_once(':')
+                            && name.eq_ignore_ascii_case("content-length")
+                        {
+                            content_length = value.trim().parse::<usize>().unwrap();
+                        }
+                    }
+                    assert!(content_length <= 4096);
+                    reader.read_exact(&mut vec![0; content_length]).unwrap();
+                    requests.push(request_line);
+                    // An early size refusal intentionally closes the socket.
+                    let _ = write_limit_response(&mut reader.into_inner(), status, length, framing);
+                    if requests.len() >= 8 {
+                        return requests;
+                    }
+                }
+            });
+            Self {
+                url,
+                stop,
+                worker: Some(worker),
+            }
+        }
+
+        fn executor(&self) -> GoogleRestExecutor {
+            GoogleRestExecutor::new().with_client(
+                reqwest::Client::builder()
+                    .no_proxy()
+                    .timeout(std::time::Duration::from_secs(5))
+                    .build()
+                    .unwrap(),
+            )
+        }
+
+        fn finish(mut self) -> Vec<String> {
+            let _ = self.stop.send(());
+            self.worker.take().unwrap().join().unwrap()
+        }
+    }
+
+    impl Drop for ResponseLimitPeer {
+        fn drop(&mut self) {
+            let _ = self.stop.send(());
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+        }
+    }
+
+    fn write_limit_response(
+        connection: &mut std::net::TcpStream,
+        status: u16,
+        length: usize,
+        framing: ResponseFraming,
+    ) -> std::io::Result<()> {
+        use std::io::Write;
+
+        write!(
+            connection,
+            "HTTP/1.1 {status} Test\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n"
+        )?;
+        let chunked = matches!(
+            framing,
+            ResponseFraming::Chunked | ResponseFraming::ChunkedWithShortLength
+        );
+        match framing {
+            ResponseFraming::ContentLength | ResponseFraming::AnnouncedOnly => {
+                write!(connection, "Content-Length: {length}\r\n")?;
+            }
+            ResponseFraming::Chunked => {
+                connection.write_all(b"Transfer-Encoding: chunked\r\n")?;
+            }
+            ResponseFraming::ChunkedWithShortLength => {
+                connection.write_all(b"Transfer-Encoding: chunked\r\nContent-Length: 1\r\n")?;
+            }
+            ResponseFraming::CloseDelimited => {}
+        }
+        connection.write_all(b"\r\n")?;
+        if matches!(framing, ResponseFraming::AnnouncedOnly) {
+            return Ok(());
+        }
+        let payload = [b'x'; 8192];
+        let mut remaining = length;
+        while remaining > 0 {
+            let count = remaining.min(payload.len());
+            if chunked {
+                write!(connection, "{count:x}\r\n")?;
+            }
+            connection.write_all(&payload[..count])?;
+            if chunked {
+                connection.write_all(b"\r\n")?;
+            }
+            remaining -= count;
+        }
+        if chunked {
+            connection.write_all(b"0\r\n\r\n")?;
+        }
+        Ok(())
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn default_response_rejects_announced_oversize_without_collecting_body() {
+        for status in [200, 500] {
+            let peer = ResponseLimitPeer::start(
+                status,
+                DEFAULT_MAX_RESPONSE_BYTES + 1,
+                ResponseFraming::AnnouncedOnly,
+            );
+            let method = method_fixture("GET", "data", BTreeMap::new());
+            let schemas = BTreeMap::new();
+            let request = GoogleExecuteRequest::new(&method, &schemas, &peer.url);
+            let result = peer.executor().execute(&request).await;
+            assert_eq!(peer.finish().len(), 1);
+            assert!(
+                matches!(
+                    result,
+                    Err(GoogleRestError::ResponseTooLarge { limit })
+                        if limit == DEFAULT_MAX_RESPONSE_BYTES
+                ),
+                "unexpected result for HTTP {status}"
+            );
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn default_response_caps_streamed_bodies_without_replaying_a_post() {
+        for status in [200, 500] {
+            for framing in [ResponseFraming::Chunked, ResponseFraming::CloseDelimited] {
+                let peer = ResponseLimitPeer::start(status, DEFAULT_MAX_RESPONSE_BYTES + 1, framing);
+                let method = method_fixture("POST", "create", BTreeMap::new());
+                let schemas = BTreeMap::new();
+                let mut request = GoogleExecuteRequest::new(&method, &schemas, &peer.url);
+                request.body = Some(serde_json::json!({"effect": "once"}));
+                request.response_mode = GoogleResponseMode::Binary;
+                let result = peer.executor().execute(&request).await;
+                let requests = peer.finish();
+                assert_eq!(requests, ["POST /create HTTP/1.1\r\n"]);
+                assert!(
+                    matches!(
+                        result,
+                        Err(GoogleRestError::ResponseTooLarge { limit })
+                            if limit == DEFAULT_MAX_RESPONSE_BYTES
+                    ),
+                    "unexpected result for HTTP {status}/{framing:?}"
+                );
+            }
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn bounded_response_exact_and_zero_limits_count_payload_bytes() {
+        for framing in [
+            ResponseFraming::ContentLength,
+            ResponseFraming::Chunked,
+            ResponseFraming::CloseDelimited,
+        ] {
+            for (length, limit, allowed) in [
+                (0, 0, true),
+                (1, 0, false),
+                (1, 1, true),
+                (16, 16, true),
+                (17, 16, false),
+            ] {
+                let peer = ResponseLimitPeer::start(200, length, framing);
+                let method = method_fixture("GET", "data", BTreeMap::new());
+                let schemas = BTreeMap::new();
+                let mut request = GoogleExecuteRequest::new(&method, &schemas, &peer.url);
+                request.response_mode = GoogleResponseMode::Binary;
+                let result = peer.executor().execute_bounded(&request, limit).await;
+                assert_eq!(peer.finish().len(), 1);
+                if allowed {
+                    assert_eq!(
+                        result.unwrap().body.as_bytes().unwrap_or_default().len(),
+                        length,
+                        "{framing:?} length={length} limit={limit}",
+                    );
+                } else {
+                    assert!(
+                        matches!(
+                            result,
+                            Err(GoogleRestError::ResponseTooLarge { limit: actual }) if actual == limit
+                        ),
+                        "unexpected result for {framing:?} length={length} limit={limit}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn bounded_response_cannot_be_bypassed_by_a_short_content_length() {
+        let peer = ResponseLimitPeer::start(200, 32, ResponseFraming::ChunkedWithShortLength);
+        let method = method_fixture("GET", "data", BTreeMap::new());
+        let schemas = BTreeMap::new();
+        let mut request = GoogleExecuteRequest::new(&method, &schemas, &peer.url);
+        request.response_mode = GoogleResponseMode::Binary;
+        let result = peer.executor().execute_bounded(&request, 16).await;
+        assert_eq!(peer.finish().len(), 1);
+        // A transport may reject conflicting framing itself; if it accepts
+        // chunked framing, the actual decoded payload still must be bounded.
+        assert!(
+            matches!(
+                result,
+                Err(GoogleRestError::ResponseTooLarge { limit: 16 } | GoogleRestError::Http { .. })
+            ),
+            "misleading Content-Length admitted a large body"
+        );
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn default_response_accepts_its_boundary_and_explicit_larger_media_limits() {
+        for explicit_limit in [None, Some(DEFAULT_MAX_RESPONSE_BYTES + 1)] {
+            let length = explicit_limit.unwrap_or(DEFAULT_MAX_RESPONSE_BYTES);
+            let peer = ResponseLimitPeer::start(200, length, ResponseFraming::Chunked);
+            let method = method_fixture("GET", "media", BTreeMap::new());
+            let schemas = BTreeMap::new();
+            let mut request = GoogleExecuteRequest::new(&method, &schemas, &peer.url);
+            request.response_mode = GoogleResponseMode::Binary;
+            let executor = peer.executor();
+            let result = match explicit_limit {
+                Some(limit) => executor.execute_bounded(&request, limit).await,
+                None => executor.execute(&request).await,
+            };
+            assert_eq!(peer.finish().len(), 1);
+            let response = result.unwrap();
+            assert_eq!(response.body.as_bytes().unwrap().len(), length);
+        }
     }
 
     fn method_fixture(
