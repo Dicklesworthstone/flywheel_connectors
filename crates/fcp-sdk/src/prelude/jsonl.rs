@@ -101,6 +101,10 @@ impl JsonlWriter {
         writer.failed = result.is_err();
         result
     }
+
+    fn has_failed(&self) -> bool {
+        self.writer.lock().map_or(true, |writer| writer.failed)
+    }
 }
 
 struct BoundedEventFrame(Vec<u8>);
@@ -131,6 +135,9 @@ struct NativeEventIdentity {
 
 struct PendingNativeEvent {
     identity: NativeEventIdentity,
+    // Local ownership is distinct from the wire identity: a retransmission
+    // may reuse every sequence/cursor field while an old future still exists.
+    owner: Arc<()>,
     acknowledged: oneshot::Sender<()>,
 }
 
@@ -237,6 +244,7 @@ impl JsonlEventStream {
             seq: event.seq,
             cursor: event.cursor.clone(),
         };
+        let owner = Arc::new(());
         let (stream_id, acknowledged) = {
             let mut state = self.lock_state()?;
             let active = state
@@ -252,19 +260,26 @@ impl JsonlEventStream {
             }
             let (sender, receiver) = oneshot::channel();
             active.pending = Some(PendingNativeEvent {
-                identity: identity.clone(),
+                identity,
+                owner: Arc::clone(&owner),
                 acknowledged: sender,
             });
             (active.stream_id.clone(), receiver)
         };
         let delivery = JsonlEventDelivery {
             stream: self.clone(),
-            stream_id: stream_id.clone(),
-            identity,
+            owner,
             acknowledged,
         };
         if self.writer.write_event(&stream_id, event).is_err() {
-            self.close();
+            // Encoding can fail before touching the shared transport. In
+            // that case the delivery's exact-owner Drop retires only its own
+            // pending credit, never a stream reopened during serialization.
+            // Partial writes or writer poisoning invalidate every generation
+            // sharing stdout, including a concurrently opened replacement.
+            if self.writer.has_failed() {
+                self.close();
+            }
             return Err(native_stream_unavailable(
                 "native event transport write failed",
             ));
@@ -363,11 +378,13 @@ impl JsonlEventStream {
 ///
 /// Dropping this future before its matching ACK closes the stream. A timeout
 /// or cancellation therefore cannot leave a stale ACK able to advance a
-/// subsequent provider cursor. The owner supplies a bounded deadline.
+/// subsequent provider cursor. Closure is scoped to this exact delivery;
+/// retaining an old future cannot cancel a retransmission or reopened stream
+/// that happens to reuse the same wire identifiers. The owner supplies a
+/// bounded deadline.
 pub struct JsonlEventDelivery {
     stream: JsonlEventStream,
-    stream_id: String,
-    identity: NativeEventIdentity,
+    owner: Arc<()>,
     acknowledged: oneshot::Receiver<()>,
 }
 
@@ -388,9 +405,10 @@ impl Drop for JsonlEventDelivery {
     fn drop(&mut self) {
         if let Ok(mut state) = self.stream.state.lock()
             && state.as_ref().is_some_and(|active| {
-                active.stream_id == self.stream_id
-                    && active.pending.as_ref().map(|pending| &pending.identity)
-                        == Some(&self.identity)
+                active
+                    .pending
+                    .as_ref()
+                    .is_some_and(|pending| Arc::ptr_eq(&pending.owner, &self.owner))
             })
         {
             *state = None;
@@ -887,6 +905,68 @@ mod tests {
     }
 
     #[test]
+    fn native_old_acknowledged_delivery_cannot_cancel_pending_retransmission() {
+        let stream = JsonlEventStream::new(JsonlWriter::new(io::sink()));
+        stream.open("stream-1", "test.events", 1).unwrap();
+        let event = native_test_event(7);
+        let old = stream.deliver(&event).unwrap();
+        stream.acknowledge(native_ack("stream-1", 7)).unwrap();
+        // The ACK reader can release credit before the original producer
+        // polls or drops its future. Replay deliberately reuses wire identity.
+        let mut current = stream.deliver(&event).unwrap();
+        assert!(pending_delivery(&mut current));
+
+        drop(old);
+
+        assert!(stream.is_open());
+        assert!(pending_delivery(&mut current));
+        assert!(stream.deliver(&native_test_event(8)).is_err());
+        stream.acknowledge(native_ack("stream-1", 7)).unwrap();
+        run_ready(current).unwrap();
+        assert!(stream.is_open());
+    }
+
+    #[test]
+    fn native_old_closed_delivery_cannot_cancel_reopened_identical_stream() {
+        let stream = JsonlEventStream::new(JsonlWriter::new(io::sink()));
+        stream.open("stream-1", "test.events", 1).unwrap();
+        let event = native_test_event(7);
+        let old = stream.deliver(&event).unwrap();
+        stream
+            .close_named(&json!({"stream_id": "stream-1"}))
+            .unwrap();
+        stream.open("stream-1", "test.events", 1).unwrap();
+        let mut current = stream.deliver(&event).unwrap();
+
+        // Completing the old failed future also drops it. Neither operation
+        // owns the fresh subscription, even with identical wire identifiers.
+        assert!(run_ready(old).is_err());
+
+        assert!(stream.is_open());
+        assert!(pending_delivery(&mut current));
+        stream.acknowledge(native_ack("stream-1", 7)).unwrap();
+        run_ready(current).unwrap();
+        assert!(stream.is_open());
+    }
+
+    #[test]
+    fn native_current_retransmission_cancellation_still_closes_credit() {
+        let stream = JsonlEventStream::new(JsonlWriter::new(io::sink()));
+        stream.open("stream-1", "test.events", 1).unwrap();
+        let event = native_test_event(7);
+        let old = stream.deliver(&event).unwrap();
+        stream.acknowledge(native_ack("stream-1", 7)).unwrap();
+        let current = stream.deliver(&event).unwrap();
+
+        drop(current);
+
+        assert!(!stream.is_open());
+        assert!(stream.acknowledge(native_ack("stream-1", 7)).is_err());
+        run_ready(old).unwrap();
+        assert!(!stream.is_open());
+    }
+
+    #[test]
     fn native_cancelled_delivery_closes_credit_and_rejects_late_ack() {
         let stream = JsonlEventStream::new(JsonlWriter::new(io::sink()));
         stream.open("stream-1", "test.events", 1).unwrap();
@@ -957,6 +1037,54 @@ mod tests {
         assert!(stream.deliver(&event).is_err());
         assert!(capture.0.lock().unwrap().is_empty());
         assert!(!stream.is_open());
+        // Rejection before output retires the delivery, not the physical
+        // writer. A newly authorized stream can still emit and receive ACKs.
+        stream.open("stream-2", "test.events", 1).unwrap();
+        let delivery = stream.deliver(&native_test_event(8)).unwrap();
+        stream.acknowledge(native_ack("stream-2", 8)).unwrap();
+        run_ready(delivery).unwrap();
+        assert!(stream.is_open());
+    }
+
+    #[test]
+    fn native_physical_write_failure_fences_concurrently_reopened_stream() {
+        use std::time::Duration;
+
+        struct BlockingFailure {
+            writing: mpsc::SyncSender<()>,
+            resume: mpsc::Receiver<()>,
+        }
+
+        impl Write for BlockingFailure {
+            fn write(&mut self, _bytes: &[u8]) -> io::Result<usize> {
+                self.writing.send(()).unwrap();
+                self.resume.recv_timeout(Duration::from_secs(3)).unwrap();
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "fixture"))
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (writing, began) = mpsc::sync_channel(1);
+        let (resume, paused) = mpsc::sync_channel(1);
+        let stream = JsonlEventStream::new(JsonlWriter::new(BlockingFailure {
+            writing,
+            resume: paused,
+        }));
+        stream.open("stream-1", "test.events", 1).unwrap();
+        let producer = stream.clone();
+        let delivery = std::thread::spawn(move || producer.deliver(&native_test_event(7)).is_err());
+        began.recv_timeout(Duration::from_secs(3)).unwrap();
+        stream.close();
+        stream.open("stream-1", "test.events", 1).unwrap();
+        assert!(stream.is_open());
+        resume.send(()).unwrap();
+
+        assert!(delivery.join().unwrap());
+        assert!(!stream.is_open());
+        assert!(stream.writer.write_response(&json!({"ok": true})).is_err());
     }
 
     #[test]
