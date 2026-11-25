@@ -75,7 +75,12 @@ impl JsonlWriter {
         result
     }
 
-    fn write_event(&self, stream_id: &str, event: &EventEnvelope) -> io::Result<()> {
+    fn write_event(
+        &self,
+        stream_id: &str,
+        event: &EventEnvelope,
+        require_current: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<()> {
         let notification = json!({
             "jsonrpc": "2.0",
             "method": "event",
@@ -93,6 +98,11 @@ impl JsonlWriter {
                 "JSONL transport has failed",
             ));
         }
+        // Encoding and the stdout lock can both wait behind retirement or a
+        // replacement delivery. Reject stale queued frames before any bytes.
+        // The state lock is not held during blocking IO; writes selected here
+        // before retirement remain in flight and cannot be retracted.
+        require_current()?;
         let result = (|| {
             writer.output.write_all(&frame.0)?;
             writer.output.write_all(b"\n")?;
@@ -148,6 +158,24 @@ struct NativeSubscription {
     last_acknowledged: Option<NativeEventIdentity>,
 }
 
+#[derive(Default)]
+struct NativeStreamState {
+    retired: bool,
+    subscription: Option<NativeSubscription>,
+}
+
+impl NativeStreamState {
+    fn owns_delivery(&self, owner: &Arc<()>) -> bool {
+        !self.retired
+            && self.subscription.as_ref().is_some_and(|active| {
+                active
+                    .pending
+                    .as_ref()
+                    .is_some_and(|pending| Arc::ptr_eq(&pending.owner, owner))
+            })
+    }
+}
+
 /// A bounded, acknowledged native event stream with one event in flight.
 ///
 /// The connector must authorize `open` and bind each event to the negotiated
@@ -161,7 +189,7 @@ struct NativeSubscription {
 /// never drops the unacknowledged event or silently increases credit.
 #[derive(Clone)]
 pub struct JsonlEventStream {
-    state: Arc<Mutex<Option<NativeSubscription>>>,
+    state: Arc<Mutex<NativeStreamState>>,
     writer: JsonlWriter,
 }
 
@@ -170,7 +198,7 @@ impl JsonlEventStream {
     #[must_use]
     pub fn new(writer: JsonlWriter) -> Self {
         Self {
-            state: Arc::new(Mutex::new(None)),
+            state: Arc::new(Mutex::new(NativeStreamState::default())),
             writer,
         }
     }
@@ -178,8 +206,9 @@ impl JsonlEventStream {
     /// Open one already-authorized exact topic.
     ///
     /// # Errors
-    /// Rejects invalid identifiers, windows outside `1..=64`, and replacing a
-    /// live stream. Repeating an identical open is idempotent.
+    /// Rejects invalid identifiers, windows outside `1..=64`, a retired
+    /// transport, and replacing a live stream. Repeating an identical open is
+    /// idempotent while the transport remains live.
     pub fn open(&self, stream_id: &str, topic: &str, window: u32) -> FcpResult<()> {
         if stream_id.is_empty()
             || stream_id.len() > 128
@@ -194,7 +223,12 @@ impl JsonlEventStream {
             ));
         }
         let mut state = self.lock_state()?;
-        if let Some(active) = state.as_ref() {
+        if state.retired {
+            return Err(native_stream_unavailable(
+                "native event transport is retired",
+            ));
+        }
+        if let Some(active) = state.subscription.as_ref() {
             if active.stream_id == stream_id && active.topic == topic {
                 return Ok(());
             }
@@ -202,7 +236,7 @@ impl JsonlEventStream {
                 "a native event stream is already open",
             ));
         }
-        *state = Some(NativeSubscription {
+        state.subscription = Some(NativeSubscription {
             stream_id: stream_id.into(),
             topic: topic.into(),
             pending: None,
@@ -217,22 +251,31 @@ impl JsonlEventStream {
         self.state
             .lock()
             .ok()
-            .and_then(|state| state.as_ref().map(|active| active.topic == topic))
+            .and_then(|state| {
+                state
+                    .subscription
+                    .as_ref()
+                    .map(|active| active.topic == topic)
+            })
             .unwrap_or(false)
     }
 
     /// Return whether a stream remains open, without exposing its identifier.
     #[must_use]
     pub fn is_open(&self) -> bool {
-        self.state.lock().is_ok_and(|state| state.is_some())
+        self.state
+            .lock()
+            .is_ok_and(|state| state.subscription.is_some())
     }
 
     /// Emit one event and return its acknowledgement obligation.
     ///
     /// # Errors
     /// Fails before emission for a closed/full stream, wrong topic, invalid
-    /// cursor, or missing acknowledgement flag. A write failure closes the
-    /// stream, releasing every waiter as a failure rather than an ACK.
+    /// cursor, or missing acknowledgement flag. A physical write failure
+    /// permanently retires the transport, releasing every waiter as a failure
+    /// rather than an ACK. Writes selected before retirement may still reach
+    /// stdout; retirement never asserts that those events were acknowledged.
     pub fn deliver(&self, event: &EventEnvelope) -> FcpResult<JsonlEventDelivery> {
         if !event.requires_ack || event.cursor.is_empty() || event.cursor.len() > 512 {
             return Err(native_stream_invalid(
@@ -248,6 +291,7 @@ impl JsonlEventStream {
         let (stream_id, acknowledged) = {
             let mut state = self.lock_state()?;
             let active = state
+                .subscription
                 .as_mut()
                 .ok_or_else(|| native_stream_unavailable("native event stream is closed"))?;
             if active.topic != event.topic {
@@ -271,14 +315,18 @@ impl JsonlEventStream {
             owner,
             acknowledged,
         };
-        if self.writer.write_event(&stream_id, event).is_err() {
+        if self
+            .writer
+            .write_event(&stream_id, event, || delivery.require_current())
+            .is_err()
+        {
             // Encoding can fail before touching the shared transport. In
             // that case the delivery's exact-owner Drop retires only its own
             // pending credit, never a stream reopened during serialization.
             // Partial writes or writer poisoning invalidate every generation
             // sharing stdout, including a concurrently opened replacement.
             if self.writer.has_failed() {
-                self.close();
+                self.retire();
             }
             return Err(native_stream_unavailable(
                 "native event transport write failed",
@@ -317,6 +365,7 @@ impl JsonlEventStream {
         let sender = {
             let mut state = self.lock_state()?;
             let active = state
+                .subscription
                 .as_mut()
                 .filter(|active| active.stream_id == stream_id)
                 .ok_or_else(|| native_stream_invalid("ACK stream is not active"))?;
@@ -349,28 +398,46 @@ impl JsonlEventStream {
             .and_then(Value::as_str)
             .ok_or_else(|| native_stream_invalid("stream_close requires stream_id"))?;
         let mut state = self.lock_state()?;
-        if let Some(active) = state.as_ref() {
+        if let Some(active) = state.subscription.as_ref() {
             if active.stream_id != stream_id {
                 return Err(native_stream_invalid(
                     "stream_close does not match active stream",
                 ));
             }
-            *state = None;
+            state.subscription = None;
         }
         Ok(())
     }
 
-    /// Close the session and fail outstanding acknowledgement obligations.
+    /// Close the subscription and fail outstanding acknowledgement obligations.
+    /// A live transport may accept a newly authorized subscription afterwards.
     pub fn close(&self) {
         if let Ok(mut state) = self.state.lock() {
-            *state = None;
+            state.subscription = None;
         }
     }
 
-    fn lock_state(&self) -> FcpResult<std::sync::MutexGuard<'_, Option<NativeSubscription>>> {
+    fn retire(&self) {
+        // One lock orders termination against both open and delivery ownership.
+        // No queued dispatcher may reopen after the input reader has exited.
+        if let Ok(mut state) = self.state.lock() {
+            state.retired = true;
+            state.subscription = None;
+        }
+    }
+
+    fn lock_state(&self) -> FcpResult<std::sync::MutexGuard<'_, NativeStreamState>> {
         self.state
             .lock()
             .map_err(|_| native_stream_unavailable("native event state poisoned"))
+    }
+}
+
+struct NativeEventRetirementGuard(JsonlEventStream);
+
+impl Drop for NativeEventRetirementGuard {
+    fn drop(&mut self) {
+        self.0.retire();
     }
 }
 
@@ -386,6 +453,23 @@ pub struct JsonlEventDelivery {
     stream: JsonlEventStream,
     owner: Arc<()>,
     acknowledged: oneshot::Receiver<()>,
+}
+
+impl JsonlEventDelivery {
+    fn require_current(&self) -> io::Result<()> {
+        let state = self
+            .stream
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("native event state poisoned"))?;
+        if !state.owns_delivery(&self.owner) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "native event delivery retired before emission",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl std::future::Future for JsonlEventDelivery {
@@ -404,14 +488,9 @@ impl std::future::Future for JsonlEventDelivery {
 impl Drop for JsonlEventDelivery {
     fn drop(&mut self) {
         if let Ok(mut state) = self.stream.state.lock()
-            && state.as_ref().is_some_and(|active| {
-                active
-                    .pending
-                    .as_ref()
-                    .is_some_and(|pending| Arc::ptr_eq(&pending.owner, &self.owner))
-            })
+            && state.owns_delivery(&self.owner)
         {
-            *state = None;
+            state.subscription = None;
         }
     }
 }
@@ -493,7 +572,9 @@ impl Default for JsonlConfig {
 ///
 /// A successful shutdown is flushed before returning. The reader may remain
 /// blocked on process stdin until the executable exits; it owns no connector
-/// state, and EOF or a read failure closes outstanding event obligations.
+/// state. Reader EOF/failure and every serving-scope exit (including unwind)
+/// permanently retire event delivery. Queued handlers cannot reopen a stream
+/// after its acknowledgement reader has gone away.
 ///
 /// # Errors
 /// Returns framing, reader, writer, or dispatcher transport failures. Handler
@@ -508,6 +589,7 @@ where
     R: BufRead + Send + 'static,
     F: FnMut(&str, Value) -> FcpResult<Value>,
 {
+    let _serving_retirement = NativeEventRetirementGuard(events.clone());
     let read_limit = config
         .max_request_bytes
         .checked_add(2)
@@ -523,9 +605,9 @@ where
     std::thread::Builder::new()
         .name("fcp-jsonl-input".into())
         .spawn(move || {
+            let _reader_retirement = NativeEventRetirementGuard(reader_events.clone());
             let result =
                 read_native_requests(reader, &reader_events, &requests, config, read_limit);
-            reader_events.close();
             if let Err(error) = result
                 && let Ok(mut slot) = reader_error_slot.lock()
             {
@@ -533,30 +615,26 @@ where
             }
         })?;
 
-    let result = (|| {
-        for request in incoming {
-            let result = dispatch(&request.method, request.params);
-            let should_exit = request.method == "shutdown" && result.is_ok();
-            let mut response = match result {
-                Ok(value) => json!({"jsonrpc": "2.0", "result": value}),
-                Err(error) => json!({"jsonrpc": "2.0", "error": error.to_response()}),
-            };
-            if let Some(id) = request.id {
-                response["id"] = id;
-            }
-            events.writer.write_response(&response)?;
-            if should_exit {
-                return Ok(());
-            }
+    for request in incoming {
+        let result = dispatch(&request.method, request.params);
+        let should_exit = request.method == "shutdown" && result.is_ok();
+        let mut response = match result {
+            Ok(value) => json!({"jsonrpc": "2.0", "result": value}),
+            Err(error) => json!({"jsonrpc": "2.0", "error": error.to_response()}),
+        };
+        if let Some(id) = request.id {
+            response["id"] = id;
         }
-        reader_error
-            .lock()
-            .map_err(|_| io::Error::other("JSONL reader error state poisoned"))?
-            .take()
-            .map_or(Ok(()), Err)
-    })();
-    events.close();
-    result
+        events.writer.write_response(&response)?;
+        if should_exit {
+            return Ok(());
+        }
+    }
+    reader_error
+        .lock()
+        .map_err(|_| io::Error::other("JSONL reader error state poisoned"))?
+        .take()
+        .map_or(Ok(()), Err)
 }
 
 fn read_native_requests(
@@ -850,6 +928,19 @@ mod tests {
         std::pin::Pin::new(delivery).poll(&mut cx).is_pending()
     }
 
+    fn wait_for_native_state(mut condition: impl FnMut() -> bool) {
+        use std::time::{Duration, Instant};
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !condition() {
+            assert!(
+                Instant::now() < deadline,
+                "native state transition timed out"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     #[test]
     fn native_credit_is_released_only_by_exact_consumer_ack() {
         let capture = NativeCapture::default();
@@ -1084,6 +1175,7 @@ mod tests {
 
         assert!(delivery.join().unwrap());
         assert!(!stream.is_open());
+        assert!(stream.open("stream-1", "test.events", 1).is_err());
         assert!(stream.writer.write_response(&json!({"ok": true})).is_err());
     }
 
@@ -1103,6 +1195,149 @@ mod tests {
         assert!(stream.deliver(&native_test_event(7)).is_err());
         assert!(!stream.is_open());
         assert!(stream.acknowledge(native_ack("stream-1", 7)).is_err());
+        assert!(stream.open("stream-2", "test.events", 1).is_err());
+    }
+
+    #[test]
+    fn native_queued_frames_are_fenced_before_stdout_after_close_or_retirement() {
+        for terminal in [false, true] {
+            let capture = NativeCapture::default();
+            let stream = JsonlEventStream::new(JsonlWriter::new(capture.clone()));
+            stream.open("stream-1", "test.events", 1).unwrap();
+            // Hold stdout while the producer acquires its pending credit.
+            // This deterministically puts close/retirement before emission.
+            let writer = stream.writer.writer.lock().unwrap();
+            let producer = stream.clone();
+            let emission =
+                std::thread::spawn(move || producer.deliver(&native_test_event(7)).is_err());
+            wait_for_native_state(|| {
+                stream
+                    .state
+                    .lock()
+                    .unwrap()
+                    .subscription
+                    .as_ref()
+                    .is_some_and(|active| active.pending.is_some())
+            });
+            if terminal {
+                stream.retire();
+            } else {
+                stream.close();
+                stream.open("stream-1", "test.events", 1).unwrap();
+            }
+            drop(writer);
+
+            assert!(emission.join().unwrap());
+            assert!(capture.0.lock().unwrap().is_empty());
+            if terminal {
+                assert!(!stream.is_open());
+                assert!(stream.open("stream-2", "test.events", 1).is_err());
+            } else {
+                assert!(stream.is_open());
+                let current = stream.deliver(&native_test_event(7)).unwrap();
+                stream.acknowledge(native_ack("stream-1", 7)).unwrap();
+                run_ready(current).unwrap();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_reader_eof_permanently_fences_late_dispatcher_subscriptions() {
+        use std::os::unix::net::UnixStream;
+        use std::time::Duration;
+
+        let (mut input, reader) = UnixStream::pair().unwrap();
+        let stream = JsonlEventStream::new(JsonlWriter::new(io::sink()));
+        stream.open("before-eof", "test.events", 1).unwrap();
+        let pending = stream.deliver(&native_test_event(7)).unwrap();
+        let server_events = stream.clone();
+        let producer = stream.clone();
+        let (entered, paused) = mpsc::sync_channel(1);
+        let (resume, resumed) = mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            serve_jsonl_events(
+                BufReader::new(reader),
+                server_events,
+                JsonlConfig::default(),
+                |_, _| {
+                    entered.send(()).unwrap();
+                    resumed.recv_timeout(Duration::from_secs(3)).unwrap();
+                    assert!(producer.open("after-eof", "test.events", 1).is_err());
+                    assert!(producer.deliver(&native_test_event(8)).is_err());
+                    Ok(json!({"retired": true}))
+                },
+            )
+        });
+        writeln!(input, "{}", json!({"id": 1, "method": "invoke"})).unwrap();
+        paused.recv_timeout(Duration::from_secs(3)).unwrap();
+        drop(input);
+        wait_for_native_state(|| !stream.is_open());
+        assert!(run_ready(pending).is_err());
+        resume.send(()).unwrap();
+        worker.join().unwrap().unwrap();
+        assert!(stream.open("after-serving", "test.events", 1).is_err());
+    }
+
+    #[test]
+    fn native_reader_error_retires_pending_delivery_and_future_subscriptions() {
+        struct FailedReader;
+
+        impl Read for FailedReader {
+            fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "fixture"))
+            }
+        }
+
+        impl BufRead for FailedReader {
+            fn fill_buf(&mut self) -> io::Result<&[u8]> {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "fixture"))
+            }
+
+            fn consume(&mut self, _amt: usize) {}
+        }
+
+        let stream = JsonlEventStream::new(JsonlWriter::new(io::sink()));
+        stream.open("stream-1", "test.events", 1).unwrap();
+        let pending = stream.deliver(&native_test_event(7)).unwrap();
+        let error = serve_jsonl_events(
+            FailedReader,
+            stream.clone(),
+            JsonlConfig::default(),
+            |_, _| panic!("failed input cannot dispatch"),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert!(run_ready(pending).is_err());
+        assert!(stream.open("stream-2", "test.events", 1).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_dispatcher_unwind_retires_stream_while_reader_remains_open() {
+        use std::os::unix::net::UnixStream;
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        let (mut input, reader) = UnixStream::pair().unwrap();
+        let stream = JsonlEventStream::new(JsonlWriter::new(io::sink()));
+        stream.open("stream-1", "test.events", 1).unwrap();
+        let pending = stream.deliver(&native_test_event(7)).unwrap();
+        writeln!(input, "{}", json!({"id": 1, "method": "invoke"})).unwrap();
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            serve_jsonl_events(
+                BufReader::new(reader),
+                stream.clone(),
+                JsonlConfig::default(),
+                |_, _| panic!("fixture dispatcher unwind"),
+            )
+        }));
+
+        assert!(result.is_err());
+        assert!(run_ready(pending).is_err());
+        assert!(!stream.is_open());
+        assert!(stream.open("stream-2", "test.events", 1).is_err());
+        drop(input);
     }
 
     #[cfg(unix)]
@@ -1115,6 +1350,7 @@ mod tests {
         let capture = NativeCapture::default();
         let stream = JsonlEventStream::new(JsonlWriter::new(capture.clone()));
         stream.open("stream-1", "test.events", 1).unwrap();
+        let observer = stream.clone();
         let producer = stream.clone();
         let (emitted, emitted_rx) = mpsc::sync_channel(1);
         let worker = std::thread::spawn(move || {
@@ -1172,6 +1408,8 @@ mod tests {
         )
         .unwrap();
         worker.join().unwrap().unwrap();
+        assert!(!observer.is_open());
+        assert!(observer.open("after-shutdown", "test.events", 1).is_err());
         let frames = capture.0.lock().unwrap();
         let responses: Vec<Value> = frames
             .split(|byte| *byte == b'\n')
