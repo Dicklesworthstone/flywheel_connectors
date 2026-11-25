@@ -174,7 +174,10 @@ fwc explain
 fwc do --approve
 
 # Expose connectors to MCP clients
-fwc serve-mcp --host http://127.0.0.1:8787 github slack gmail
+fwc serve-mcp --host http://127.0.0.1:8787 \
+    --connector-capability-token-file github=github.token \
+    --connector-capability-token-file slack=slack.token \
+    --connector-capability-token-file gmail=gmail.token
 
 # Audit + history
 fwc history --connector github --limit 20
@@ -1950,9 +1953,10 @@ batch reply still preserves all member identities as an uncertain outcome.
 ### MCP Tool Export
 
 ```bash
-# Serve the host's connector inventory with explicit invocation authority
+# Serve multiple connectors with their independent invocation capabilities
 fwc serve-mcp --host http://127.0.0.1:8787 \
-    --capability-token-file invoke.token
+    --connector-capability-token-file github=github.token \
+    --connector-capability-token-file slack=slack.token
 
 # Serve one connector, with owner-scoped cancellation of active host calls
 fwc serve-mcp --host http://127.0.0.1:8787 github \
@@ -1973,6 +1977,32 @@ fwc export-tools --offline --format claude github
 fwc export-tools --offline --format openai --risk-max medium --output tools.json
 ```
 
+MCP invocation capabilities are bound to individual connector instances. Use
+`--connector-capability-token-file CONNECTOR=PATH` for each connector, or the
+inline `--connector-capability-token CONNECTOR=TOKEN` form. The connector selector
+resolves once to an exact canonical identity. Only connectors with a credential
+binding are exposed, and a new canonical connector identity requires a new
+session with its own binding. Restarting a process under the same canonical
+identity can use a rotated capability file bound to the new process instance.
+
+Each explicit connector has an independent credential group. Add its holder key
+with `--connector-holder-key-file CONNECTOR=PATH`, and repeat
+`--connector-approval-token-file CONNECTOR=PATH` or
+`--connector-approval-token CONNECTOR=JSON` for its approvals. An explicit group
+must provide exactly one capability source and never inherits the default token,
+holder key, or approvals. Credential values and paths are omitted from serialized
+command plans and redacted from argument diagnostics. Files are read again for
+each call, so credentials can rotate without reassigning their connector binding.
+
+The existing `--capability-token[-file]`, `--holder-key-file`, and approval flags
+remain available for a single connector, or for exactly one enabled connector
+not covered by explicit bindings. When the host discovers multiple unassigned
+connectors, supply a positional connector selector or explicit bindings; default
+authority is resolved before the optional zone inventory filter. Every capability
+must match the effective invocation zone (the explicit `--zone`, host default, or
+`z:work`) and the optional `--principal`. These local consistency checks do not
+replace the host's signature, instance, grants, expiry, and revocation checks.
+
 `--risk-max` excludes operations above a risk threshold, preventing agents from accidentally invoking dangerous operations. Both `export-tools` and `serve-mcp` honor it with the same inclusive boundary semantics; a live `serve-mcp` server enforces the ceiling on `tools/list` and on `tools/call`, and tools without declared risk metadata are excluded whenever a ceiling is set.
 
 `serve-mcp --zone` filters the live inventory using the host's explicit managed
@@ -1984,9 +2014,10 @@ MCP tool to a similarly named replacement. Normal host preflight, capabilities,
 approvals, and current admission rules still apply to every call.
 
 Live MCP sessions refresh the host's inventory when tools, catalog resources, or
-prompts are requested. Newly installed connectors and changed schemas become
-visible without reconnecting. An explicit connector selector stays bound to its
-original canonical identity. Every tool call refreshes metadata before dispatch
+prompts are requested. Changed operations and schemas on credential-bound
+connectors become visible without reconnecting. Credential bindings and an
+explicit connector selector stay pinned to their original canonical identities.
+Every tool call refreshes metadata before dispatch
 and compares the listed tool's deployment version, schemas, operation authority,
 risk, and zone contract with the current definition. A changed or removed tool
 is refused until the client requests and reviews `tools/list` again. Host errors,

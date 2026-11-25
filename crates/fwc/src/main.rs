@@ -3099,7 +3099,7 @@ struct ExportToolsArgs {
 
 #[derive(Args, Debug, Serialize)]
 struct ServeMcpArgs {
-    /// Optional connector selector. Omit to expose all discovered connectors.
+    /// Optional connector selector. Omit to expose connectors with explicit credential bindings.
     connector: Option<String>,
 
     /// Restrict tool exposure to connectors matching this zone.
@@ -3116,6 +3116,9 @@ struct ServeMcpArgs {
 
     #[command(flatten)]
     auth: LiveAuthArgs,
+
+    #[command(flatten)]
+    connector_auth: serve_mcp_host::ConnectorAuthArgs,
 
     #[command(flatten)]
     cancellation: serve_mcp_host::CancellationArgs,
@@ -3990,13 +3993,20 @@ fn execute_serve_mcp(prepared: &PreparedCli, args: &ServeMcpArgs) -> Result<Exec
             &prepared.render_options,
         );
     };
-    if let Err(error) = resolve_live_auth(&args.auth) {
+    if !args.connector_auth.is_present()
+        && let Err(error) = resolve_live_auth(&args.auth)
+    {
+        let error = if matches!(error, LiveAuthError::MissingCapabilityToken) {
+            error
+        } else {
+            serve_mcp_host::redacted_auth_error(&error)
+        };
         return render_dispatch(
             live_auth_dispatch(
                 "serve-mcp",
                 &error,
                 &[
-                    "Pass `--capability-token` or `--capability-token-file` so MCP tool calls can execute against the live host."
+                    "Select one connector with `--capability-token-file`, or bind independent credentials with `--connector-capability-token-file CONNECTOR=PATH`."
                         .to_owned(),
                     "Pass `--approval-token` or `--approval-token-file` as needed for risky or dangerous tools."
                         .to_owned(),
@@ -4057,6 +4067,35 @@ fn execute_serve_mcp(prepared: &PreparedCli, args: &ServeMcpArgs) -> Result<Exec
     } else {
         catalog.connectors.clone()
     };
+
+    let auth = match serve_mcp_host::McpAuthorityRegistry::resolve(
+        &args.auth,
+        &args.connector_auth,
+        &catalog,
+        &connectors,
+        history_zone.as_str(),
+        args.principal.as_deref(),
+    ) {
+        Ok(auth) => std::sync::Arc::new(auth),
+        Err(error) => {
+            return render_dispatch(
+                live_auth_dispatch(
+                    "serve-mcp",
+                    &error,
+                    &["Bind each connector with --connector-capability-token-file CONNECTOR=PATH; add that connector's holder key and approvals when required.".to_owned()],
+                ),
+                prepared.format,
+                prepared.cli.token_stats,
+                &prepared.render_options,
+            );
+        }
+    };
+    // Do not inspect or expose unrelated connectors. These exact identity
+    // bindings also constrain every subsequent live inventory refresh.
+    let connectors = connectors
+        .into_iter()
+        .filter(|connector| auth.contains(connector.summary.id.as_str()))
+        .collect();
 
     let connectors = if let Some(zone) = zone.as_ref() {
         match serve_mcp_zone_connectors(&client, connectors, zone, args.connector.is_some()) {
@@ -4131,7 +4170,7 @@ fn execute_serve_mcp(prepared: &PreparedCli, args: &ServeMcpArgs) -> Result<Exec
     let stdout = std::io::stdout();
     let host_context = resolved_host.clone();
     let principal = args.principal.clone();
-    let auth = args.auth.clone();
+    let inventory_auth = std::sync::Arc::clone(&auth);
     let cancellation = args.cancellation.clone();
     serve_mcp::run_live_stdio_transport_blocking(
         &state,
@@ -4142,10 +4181,19 @@ fn execute_serve_mcp(prepared: &PreparedCli, args: &ServeMcpArgs) -> Result<Exec
                 &client,
                 selected_identity.as_deref(),
                 inventory_zone.as_ref(),
+                Some(&inventory_auth),
                 deadline,
             )
         },
         move |tool, id, arguments, context| {
+            let Some(auth) = auth.get(tool.execution_connector_id()) else {
+                return serve_mcp::JsonRpcResponse::error(
+                    id,
+                    serve_mcp::JsonRpcError::internal(
+                        "MCP tool has no credential binding in this session",
+                    ),
+                );
+            };
             mcp_tool_call_response(
                 tool,
                 id,
@@ -4153,7 +4201,7 @@ fn execute_serve_mcp(prepared: &PreparedCli, args: &ServeMcpArgs) -> Result<Exec
                 Some(&host_context),
                 principal.as_deref(),
                 zone.as_deref(),
-                &auth,
+                auth,
                 &cancellation,
                 context,
             )
@@ -4195,6 +4243,7 @@ fn refresh_serve_mcp_inventory(
     client: &HostAdminClient,
     selected_identity: Option<&str>,
     zone: Option<&ZoneId>,
+    authority: Option<&serve_mcp_host::McpAuthorityRegistry>,
     deadline: std::time::Instant,
 ) -> Result<Vec<serve_mcp::McpToolDefinition>> {
     let now = std::time::Instant::now();
@@ -4213,6 +4262,7 @@ fn refresh_serve_mcp_inventory(
         let id = connector.summary.id.to_string();
         if selected_identity.is_some_and(|selected| selected != id.as_str())
             || !connector.summary.enabled
+            || authority.is_some_and(|authority| !authority.contains(&id))
         {
             continue;
         }
@@ -26295,6 +26345,7 @@ enum LiveAuthError {
     InvalidHolderProof { message: String },
     InvalidWorkflowAuth { message: String },
     InvalidBatchAuth { message: String },
+    InvalidMcpAuth { message: String },
 }
 
 impl LiveAuthError {
@@ -26307,6 +26358,7 @@ impl LiveAuthError {
             Self::InvalidHolderProof { .. } => "invalid-holder-proof",
             Self::InvalidWorkflowAuth { .. } => "invalid-workflow-auth",
             Self::InvalidBatchAuth { .. } => "invalid-batch-auth",
+            Self::InvalidMcpAuth { .. } => "invalid-mcp-auth",
         }
     }
 
@@ -26322,7 +26374,8 @@ impl LiveAuthError {
             }
             Self::InvalidHolderProof { message }
             | Self::InvalidWorkflowAuth { message }
-            | Self::InvalidBatchAuth { message } => {
+            | Self::InvalidBatchAuth { message }
+            | Self::InvalidMcpAuth { message } => {
                 message.clone()
             }
         }
@@ -27100,6 +27153,11 @@ fn invoke_dispatch_host_controlled(
     ) {
         Ok(auth) => auth,
         Err(error) => {
+            let error = if control.is_some() {
+                serve_mcp_host::redacted_auth_error(&error)
+            } else {
+                error
+            };
             return Ok(live_auth_dispatch(
                 command,
                 &error,
@@ -39433,6 +39491,11 @@ fn is_sensitive_flag(flag: &str) -> bool {
             | "--member-holder-key-file"
             | "--member-approval-token"
             | "--member-approval-token-file"
+            | "--connector-capability-token"
+            | "--connector-capability-token-file"
+            | "--connector-holder-key-file"
+            | "--connector-approval-token"
+            | "--connector-approval-token-file"
             | "--approval-token"
             | "--token"
             | "--api-token"
@@ -44558,6 +44621,88 @@ deny_ptrace = true
             let encoded = payload.to_string();
             assert!(!encoded.contains("CANCEL_TOKEN_SECRET"));
             assert!(!encoded.contains("CANCEL_PATH_SECRET"));
+        }
+    }
+
+    #[test]
+    fn mcp_connector_credentials_parse_without_persisting_or_echoing_secrets() {
+        let args = [
+            "fwc",
+            "--json",
+            "serve-mcp",
+            "--connector-capability-token=github=MCP_INLINE_SECRET",
+            "--connector-capability-token-file",
+            "slack=MCP_TOKEN_PATH_SECRET",
+            "--connector-holder-key-file=github=MCP_KEY_PATH_SECRET",
+            "--connector-approval-token",
+            "slack=MCP_APPROVAL_SECRET",
+            "--connector-approval-token-file=slack=MCP_APPROVAL_PATH_SECRET",
+        ]
+        .map(str::to_owned);
+        let cli = Cli::try_parse_from(&args).expect("connector credentials should parse");
+        let Commands::ServeMcp(mcp_args) = cli.command else {
+            panic!("expected serve-mcp command");
+        };
+        assert!(mcp_args.connector_auth.is_present());
+        let serialized = serde_json::to_string(&mcp_args).unwrap();
+        let debug = format!("{:?}", mcp_args.connector_auth);
+        let mut diagnostic_args = args.to_vec();
+        diagnostic_args.insert(2, "--extract".to_owned());
+        diagnostic_args.insert(3, ".connector[".to_owned());
+        let (exit, payload) = execute_json(
+            &diagnostic_args
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(exit, CliExitCode::Validation.into());
+        assert_eq!(payload["error"]["type"], "invalid-extract-filter");
+        for view in ["received", "normalized"] {
+            let arguments = payload["input"][view].as_array().unwrap();
+            for flag in [
+                "--connector-capability-token=<redacted>",
+                "--connector-holder-key-file=<redacted>",
+                "--connector-approval-token-file=<redacted>",
+            ] {
+                assert!(arguments.iter().any(|argument| argument == flag));
+            }
+            for flag in [
+                "--connector-capability-token-file",
+                "--connector-approval-token",
+            ] {
+                let index = arguments
+                    .iter()
+                    .position(|argument| argument == flag)
+                    .unwrap();
+                assert_eq!(arguments[index + 1], "<redacted>");
+            }
+        }
+        for rendered in [serialized, debug, payload.to_string()] {
+            for secret in [
+                "MCP_INLINE_SECRET",
+                "MCP_TOKEN_PATH_SECRET",
+                "MCP_KEY_PATH_SECRET",
+                "MCP_APPROVAL_SECRET",
+                "MCP_APPROVAL_PATH_SECRET",
+            ] {
+                assert!(!rendered.contains(secret));
+            }
+        }
+        for flag in [
+            "--connector-capability-token",
+            "--connector-capability-token-file",
+            "--connector-holder-key-file",
+            "--connector-approval-token",
+            "--connector-approval-token-file",
+        ] {
+            let raw = [
+                flag.to_owned(),
+                "github=MCP_SECRET".to_owned(),
+                format!("{flag}=slack=MCP_SECRET"),
+            ];
+            let redacted = super::redact_sensitive_args(&raw);
+            assert_eq!(redacted[1], "<redacted>");
+            assert_eq!(redacted[2], format!("{flag}=<redacted>"));
         }
     }
 
@@ -62190,6 +62335,7 @@ depends_on = ["missing"]
             &client,
             Some("fcp.github:enterprise:v1"),
             None,
+            None,
             Instant::now() + Duration::from_secs(5),
         )
         .unwrap();
@@ -62207,6 +62353,7 @@ depends_on = ["missing"]
         let removed = super::refresh_serve_mcp_inventory(
             &client,
             Some("fcp.github:enterprise:v1"),
+            None,
             None,
             Instant::now() + Duration::from_secs(5),
         )
@@ -62254,6 +62401,7 @@ depends_on = ["missing"]
                     &client,
                     None,
                     None,
+                    None,
                     Instant::now() + Duration::from_secs(5),
                 )
                 .is_err(),
@@ -62261,6 +62409,97 @@ depends_on = ["missing"]
             );
             server.join().unwrap();
         }
+    }
+
+    #[test]
+    fn live_mcp_refresh_only_introspects_bound_identities_and_never_reassigns_authority() {
+        let initial: HostDiscoveryResponse =
+            serde_json::from_value(mock_discovery_response_json()).unwrap();
+        let catalog = HostConnectorCatalog::from_response(&initial);
+        let registry = super::serve_mcp_host::McpAuthorityRegistry::resolve(
+            &LiveAuthArgs {
+                capability_token: Some(test_capability_token_arg()),
+                ..LiveAuthArgs::default()
+            },
+            &super::serve_mcp_host::ConnectorAuthArgs::default(),
+            &catalog,
+            &catalog.connectors,
+            "z:work",
+            None,
+        )
+        .unwrap();
+        let slack =
+            mock_connector_summary_custom_json("fcp.slack:enterprise:v1", "Slack", 2, "safe");
+        let expanded = mock_discovery_response_with_connectors(vec![
+            mock_connector_summary_json(),
+            slack.clone(),
+        ]);
+        let mut replacement = mock_connector_summary_json();
+        replacement["id"] = json!("fcp.github:enterprise:v10");
+        let replaced = mock_discovery_response_with_connectors(vec![replacement, slack]);
+        let (host, server, requests) = spawn_mock_host_sequence_with_body_log(vec![
+            ("POST /rpc/discover".to_owned(), expanded.clone()),
+            (
+                "GET /rpc/introspect/fcp.github:enterprise:v1".to_owned(),
+                mock_introspection_response_json(),
+            ),
+            ("POST /rpc/discover".to_owned(), expanded),
+            ("POST /rpc/discover".to_owned(), replaced.clone()),
+            ("POST /rpc/discover".to_owned(), replaced),
+        ]);
+        let client = super::HostAdminClient::new(&host).unwrap();
+        let tools = super::refresh_serve_mcp_inventory(
+            &client,
+            None,
+            None,
+            Some(&registry),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(tools.len(), 2);
+        assert!(
+            tools
+                .iter()
+                .all(|tool| tool.execution_connector_id() == "fcp.github:enterprise:v1")
+        );
+        let removed = super::refresh_serve_mcp_inventory(
+            &client,
+            None,
+            None,
+            Some(&registry),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+        server.join().unwrap();
+        assert!(removed.is_empty());
+        assert_eq!(requests.lock().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn serve_mcp_rejects_shared_default_authority_before_introspection() {
+        let discovery = mock_discovery_response_with_connectors(vec![
+            mock_connector_summary_json(),
+            mock_connector_summary_custom_json("fcp.slack:enterprise:v1", "Slack", 2, "safe"),
+        ]);
+        let (host, server, requests) = spawn_mock_host_sequence_with_body_log(vec![(
+            "POST /rpc/discover".to_owned(),
+            discovery,
+        )]);
+        let grant = test_capability_token_arg();
+        let (exit, payload) = execute_json(&[
+            "fwc",
+            "--json",
+            "--host",
+            &host,
+            "serve-mcp",
+            "--capability-token",
+            &grant,
+        ]);
+        server.join().unwrap();
+        assert_eq!(exit, CliExitCode::Validation.into());
+        assert_eq!(payload["error"]["type"], "invalid-mcp-auth");
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        assert!(!payload.to_string().contains(&grant));
     }
 
     #[test]
@@ -62281,6 +62520,7 @@ depends_on = ["missing"]
             &client,
             None,
             Some(&ZoneId::work()),
+            None,
             Instant::now() + Duration::from_secs(5),
         )
         .unwrap();
@@ -62294,7 +62534,9 @@ depends_on = ["missing"]
             Duration::from_millis(200),
         )]);
         let client = super::HostAdminClient::new(&host).unwrap();
-        assert!(super::refresh_serve_mcp_inventory(&client, None, None, Instant::now(),).is_err());
+        assert!(
+            super::refresh_serve_mcp_inventory(&client, None, None, None, Instant::now()).is_err()
+        );
         assert!(
             requests.lock().unwrap().is_empty(),
             "an exhausted budget sends no HTTP request"
@@ -62302,6 +62544,7 @@ depends_on = ["missing"]
         assert!(
             super::refresh_serve_mcp_inventory(
                 &client,
+                None,
                 None,
                 None,
                 Instant::now() + Duration::from_millis(50),
@@ -62606,6 +62849,46 @@ depends_on = ["missing"]
                 .unwrap()
                 .contains("runtime connector identity no longer matches")
         );
+    }
+
+    #[test]
+    fn serve_mcp_invalid_rotated_credentials_do_not_expose_private_paths() {
+        let discovery: HostDiscoveryResponse =
+            serde_json::from_value(mock_discovery_response_json()).unwrap();
+        let catalog = HostConnectorCatalog::from_response(&discovery);
+        let introspection: HostIntrospectionResponse =
+            serde_json::from_value(mock_introspection_response_json()).unwrap();
+        let tools = try_host_mcp_tool_definitions(&catalog.connectors[0], &introspection).unwrap();
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("MCP_PRIVATE_CREDENTIAL_PATH");
+        fs::write(&path, "MCP_PRIVATE_CREDENTIAL_CONTENT").unwrap();
+        let auth = LiveAuthArgs {
+            capability_token_file: Some(path),
+            ..LiveAuthArgs::default()
+        };
+        let host = ResolvedHostConfig {
+            endpoint: "http://127.0.0.1:1".to_owned(),
+            default_zone: None,
+        };
+        let response = super::mcp_tool_call_response(
+            &tools[0],
+            json!(1),
+            &json!({}),
+            Some(&host),
+            None,
+            Some("z:work"),
+            &auth,
+            &super::serve_mcp_host::CancellationArgs::default(),
+            serve_mcp::McpCallContext::default(),
+        );
+        assert_eq!(response.result().unwrap()["isError"], true);
+        assert_eq!(
+            response.result().unwrap()["structuredContent"]["error"]["type"],
+            "invalid-mcp-auth"
+        );
+        let encoded = serde_json::to_string(&response).unwrap();
+        assert!(!encoded.contains("MCP_PRIVATE_CREDENTIAL_PATH"));
+        assert!(!encoded.contains("MCP_PRIVATE_CREDENTIAL_CONTENT"));
     }
 
     #[test]

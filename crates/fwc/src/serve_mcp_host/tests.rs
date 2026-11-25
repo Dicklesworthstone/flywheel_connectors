@@ -205,6 +205,337 @@ fn cancellation_response(id: &str, outcome: &str) -> Value {
     })
 }
 
+fn credential_catalog() -> HostConnectorCatalog {
+    let connectors = ["fcp.github:enterprise:v1", "fcp.slack:enterprise:v1"].map(|id| {
+        json!({
+            "id": id, "name": id, "description": "MCP credential fixture",
+            "version": "1.0.0", "categories": [], "tool_count": 1,
+            "max_safety_tier": "safe", "enabled": true,
+            "health": fcp_core::ConnectorHealth::healthy(),
+            "last_health_check": "2026-03-10T00:00:00Z",
+        })
+    });
+    let discovery: crate::HostDiscoveryResponse = serde_json::from_value(json!({
+        "connectors": connectors, "registry_version": 1,
+        "supports_streaming": false, "supports_batching": false,
+        "timestamp": "2026-03-10T00:00:00Z",
+    }))
+    .unwrap();
+    HostConnectorCatalog::from_response(&discovery)
+}
+
+fn inline_auth(grant: &CapabilityToken) -> LiveAuthArgs {
+    LiveAuthArgs {
+        capability_token: Some(serde_json::to_string(grant).unwrap()),
+        ..LiveAuthArgs::default()
+    }
+}
+
+fn connector_binding(selector: &str, grant: &CapabilityToken) -> String {
+    format!("{selector}={}", serde_json::to_string(grant).unwrap())
+}
+
+#[test]
+fn independent_instance_credentials_reach_their_own_host_invocations() {
+    let catalog = credential_catalog();
+    let key = fcp_crypto::Ed25519SigningKey::from_bytes(&[0x37; 32]).unwrap();
+    let instances = [fcp_core::InstanceId::new(), fcp_core::InstanceId::new()];
+    let constraints = fcp_core::CapabilityConstraints {
+        resource_allow: vec!["*".to_owned()],
+        ..Default::default()
+    };
+    let mut cbor = Vec::new();
+    ciborium::into_writer(&constraints, &mut cbor).unwrap();
+    let now = chrono::Utc::now();
+    let grants = instances.each_ref().map(|instance| {
+        CapabilityToken::from_raw(
+            fcp_crypto::cose::CapabilityTokenBuilder::new()
+                .capability_id("test.echo")
+                .zone_id("z:work")
+                .principal("alice")
+                .operations(&["test.echo"])
+                .issuer("node:mcp-test")
+                .target_instance(instance.as_str())
+                .validity(now, now + chrono::Duration::hours(1))
+                .try_constraints_cbor(&cbor)
+                .unwrap()
+                .sign(&key)
+                .unwrap(),
+        )
+    });
+    let public_key = key.verifying_key().to_bytes();
+    let verifiers = instances.map(|instance| {
+        fcp_core::CapabilityVerifier::new(public_key, fcp_core::ZoneId::work(), instance)
+    });
+    let capability: fcp_core::CapabilityId = "test.echo".parse().unwrap();
+    let operation: fcp_core::OperationId = "test.echo".parse().unwrap();
+    assert!(
+        verifiers[1]
+            .verify_bound(grants[0].clone(), &capability, &operation, &[])
+            .is_err(),
+        "one token cannot authorize both runtime instances"
+    );
+    let args = ConnectorAuthArgs {
+        connector_capability_token: vec![
+            connector_binding("github", &grants[0]),
+            connector_binding("slack", &grants[1]),
+        ],
+        ..Default::default()
+    };
+    let registry = McpAuthorityRegistry::resolve(
+        &LiveAuthArgs::default(),
+        &args,
+        &catalog,
+        &catalog.connectors,
+        "z:work",
+        Some("alice"),
+    )
+    .unwrap();
+    let peer = HostPeer::start(2, move |index, recorded| {
+        assert_eq!(recorded.path, "/rpc/invoke");
+        let request: InvokeRequest = serde_json::from_value(recorded.body.clone()).unwrap();
+        verifiers[index]
+            .verify_bound(
+                request.capability_token.clone(),
+                &capability,
+                &operation,
+                &[],
+            )
+            .unwrap();
+        Reply::json(
+            200,
+            serde_json::to_value(InvokeResponse::ok(request.id, json!({"ok": true}))).unwrap(),
+        )
+    });
+    let client = peer.client();
+    for (index, connector) in catalog.connectors.iter().enumerate() {
+        let auth = resolve_live_auth(registry.get(connector.summary.id.as_str()).unwrap()).unwrap();
+        let control =
+            McpInvocationControl::new(McpCallContext::default(), &CancellationArgs::default())
+                .unwrap();
+        control
+            .validate_authority(&auth, "z:work", Some("alice"))
+            .unwrap();
+        let mut request = invoke_request(&format!("independent-{index}"), auth.capability_token);
+        request.connector_id = connector.summary.id.clone();
+        control.invoke(&client, &request).unwrap();
+    }
+    for (index, request) in peer.finish().into_iter().enumerate() {
+        assert_eq!(
+            request.body["capability_token"],
+            serde_json::to_value(&grants[index]).unwrap()
+        );
+        assert_eq!(
+            request.body["connector_id"],
+            catalog.connectors[index].summary.id.as_str()
+        );
+    }
+}
+
+#[test]
+fn default_authority_is_pinned_to_one_identity_and_explicit_groups_never_inherit() {
+    let catalog = credential_catalog();
+    let grant = token("alice", "z:work", "test.echo", None);
+    let defaults = inline_auth(&grant);
+    let resolve = |defaults: &LiveAuthArgs, args: &ConnectorAuthArgs| {
+        McpAuthorityRegistry::resolve(
+            defaults,
+            args,
+            &catalog,
+            &catalog.connectors,
+            "z:work",
+            None,
+        )
+    };
+    assert!(resolve(&defaults, &ConnectorAuthArgs::default()).is_err());
+    let single = McpAuthorityRegistry::resolve(
+        &defaults,
+        &ConnectorAuthArgs::default(),
+        &catalog,
+        &catalog.connectors[..1],
+        "z:work",
+        None,
+    )
+    .unwrap();
+    assert!(single.contains("fcp.github:enterprise:v1"));
+    assert!(!single.contains("fcp.github:enterprise:v10"));
+    assert!(!single.contains("fcp.slack:enterprise:v1"));
+
+    let explicit = ConnectorAuthArgs {
+        connector_capability_token: vec![connector_binding("github", &grant)],
+        ..Default::default()
+    };
+    let subset = resolve(&LiveAuthArgs::default(), &explicit).unwrap();
+    assert!(subset.contains("fcp.github:enterprise:v1"));
+    assert!(!subset.contains("fcp.slack:enterprise:v1"));
+
+    let directory = tempfile::tempdir().unwrap();
+    let key_path = directory.path().join("holder.key");
+    std::fs::write(&key_path, [0x73; 32]).unwrap();
+    let claims = grant
+        .raw()
+        .claims_unverified()
+        .unwrap()
+        .holder_node("node:default-holder")
+        .token_id(b"mcp-default-holder");
+    let key = fcp_crypto::Ed25519SigningKey::from_bytes(&[0x37; 32]).unwrap();
+    let holder_grant =
+        CapabilityToken::from_raw(fcp_crypto::cose::CoseToken::sign(&key, &claims).unwrap());
+    let holder_defaults = LiveAuthArgs {
+        holder_key_file: Some(key_path),
+        approval_token: vec!["[]".to_owned()],
+        ..inline_auth(&holder_grant)
+    };
+    let mixed = resolve(&holder_defaults, &explicit).unwrap();
+    let github = mixed.get("fcp.github:enterprise:v1").unwrap();
+    assert!(github.holder_key_file.is_none());
+    assert!(github.approval_token.is_empty());
+    assert!(
+        mixed
+            .get("fcp.slack:enterprise:v1")
+            .unwrap()
+            .holder_key_file
+            .is_some()
+    );
+
+    for incomplete in [
+        ConnectorAuthArgs {
+            connector_approval_token: vec!["github=[]".to_owned()],
+            ..Default::default()
+        },
+        ConnectorAuthArgs {
+            connector_capability_token: vec![connector_binding("github", &holder_grant)],
+            ..Default::default()
+        },
+    ] {
+        assert!(resolve(&holder_defaults, &incomplete).is_err());
+    }
+}
+
+#[test]
+fn connector_bindings_reject_alias_duplicates_conflicts_and_secret_bearing_errors() {
+    let catalog = credential_catalog();
+    let grant = token("alice", "z:work", "test.echo", None);
+    let binding = connector_binding("github", &grant);
+    for args in [
+        ConnectorAuthArgs {
+            connector_capability_token: vec![
+                binding.clone(),
+                connector_binding("fcp.github:enterprise:v1", &grant),
+            ],
+            ..Default::default()
+        },
+        ConnectorAuthArgs {
+            connector_capability_token: vec![binding],
+            connector_capability_token_file: vec!["github=PRIVATE_PATH_SECRET".to_owned()],
+            ..Default::default()
+        },
+        ConnectorAuthArgs {
+            connector_capability_token: vec!["MALFORMED_TOKEN_SECRET=padding==".to_owned()],
+            ..Default::default()
+        },
+        ConnectorAuthArgs {
+            connector_capability_token: vec!["=PRIVATE_TOKEN_SECRET".to_owned()],
+            ..Default::default()
+        },
+        ConnectorAuthArgs {
+            connector_capability_token_file: vec!["github=PRIVATE_PATH_SECRET".to_owned()],
+            ..Default::default()
+        },
+    ] {
+        let error = McpAuthorityRegistry::resolve(
+            &LiveAuthArgs::default(),
+            &args,
+            &catalog,
+            &catalog.connectors,
+            "z:work",
+            None,
+        )
+        .err()
+        .expect("invalid binding must fail");
+        let diagnostics = format!(
+            "{} {args:?} {}",
+            error.message(),
+            serde_json::to_string(&args).unwrap()
+        );
+        assert_eq!(error.error_type(), "invalid-mcp-auth");
+        for secret in [
+            "MALFORMED_TOKEN_SECRET",
+            "PRIVATE_TOKEN_SECRET",
+            "PRIVATE_PATH_SECRET",
+        ] {
+            assert!(!diagnostics.contains(secret));
+        }
+        assert_eq!(serde_json::to_value(&args).unwrap(), json!({}));
+    }
+    let args = ConnectorAuthArgs {
+        connector_capability_token: vec![connector_binding("slack", &grant)],
+        ..Default::default()
+    };
+    assert!(
+        McpAuthorityRegistry::resolve(
+            &LiveAuthArgs::default(),
+            &args,
+            &catalog,
+            &catalog.connectors[..1],
+            "z:work",
+            None,
+        )
+        .is_err(),
+        "explicit bindings cannot escape the connector selection"
+    );
+}
+
+#[test]
+fn rotating_connector_credentials_rechecks_scope_without_cancellation_authority() {
+    let catalog = credential_catalog();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("invocation.token");
+    let original = token("alice", "z:work", "test.echo", None);
+    std::fs::write(&path, original.raw().to_cbor().unwrap()).unwrap();
+    let args = ConnectorAuthArgs {
+        connector_capability_token_file: vec![format!("github={}", path.display())],
+        ..Default::default()
+    };
+    let registry = McpAuthorityRegistry::resolve(
+        &LiveAuthArgs::default(),
+        &args,
+        &catalog,
+        &catalog.connectors,
+        "z:work",
+        Some("alice"),
+    )
+    .unwrap();
+    let control =
+        McpInvocationControl::new(McpCallContext::default(), &CancellationArgs::default()).unwrap();
+    for (owner, zone) in [("alice", "z:private"), ("bob", "z:work")] {
+        let rotated = token(owner, zone, "test.echo", None);
+        std::fs::write(&path, rotated.raw().to_cbor().unwrap()).unwrap();
+        let auth = resolve_live_auth(registry.get("fcp.github:enterprise:v1").unwrap()).unwrap();
+        assert!(
+            control
+                .validate_authority(&auth, "z:work", Some("alice"))
+                .is_err()
+        );
+        assert!(
+            McpAuthorityRegistry::resolve(
+                &LiveAuthArgs::default(),
+                &args,
+                &catalog,
+                &catalog.connectors,
+                "z:work",
+                Some("alice"),
+            )
+            .is_err()
+        );
+    }
+    std::fs::write(&path, original.raw().to_cbor().unwrap()).unwrap();
+    let auth = resolve_live_auth(registry.get("fcp.github:enterprise:v1").unwrap()).unwrap();
+    control
+        .validate_authority(&auth, "z:work", Some("alice"))
+        .unwrap();
+}
+
 #[test]
 fn identical_calls_and_reused_client_contexts_get_distinct_host_identities() {
     let context = McpCallContext::default();
