@@ -11043,12 +11043,176 @@ fn request_host_shutdown(
 }
 
 #[cfg(unix)]
+const SIGNAL_RELOAD_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HostShutdownSignal {
+    Terminate,
+    Interrupt,
+    SourceClosed(&'static str),
+}
+
+#[cfg(unix)]
+enum HostSignalEvent {
+    Reload,
+    Shutdown(HostShutdownSignal),
+}
+
+#[cfg(unix)]
+enum SignalReloadOutcome {
+    Finished(HostResult<usize>),
+    Shutdown(HostShutdownSignal),
+    TimedOut,
+}
+
+/// Keep termination ahead of reload traffic, including simultaneous signals.
+#[cfg(unix)]
+async fn next_host_shutdown_signal(
+    sigterm: &mut fcp_async_core::signal::Signal,
+    sigint: &mut fcp_async_core::signal::Signal,
+) -> HostShutdownSignal {
+    use futures_util::FutureExt;
+
+    let term = sigterm.recv().fuse();
+    let interrupt = sigint.recv().fuse();
+    futures_util::pin_mut!(term, interrupt);
+    futures_util::select_biased! {
+        delivered = term => if delivered.is_some() {
+            HostShutdownSignal::Terminate
+        } else {
+            HostShutdownSignal::SourceClosed("SIGTERM")
+        },
+        delivered = interrupt => if delivered.is_some() {
+            HostShutdownSignal::Interrupt
+        } else {
+            HostShutdownSignal::SourceClosed("SIGINT")
+        },
+    }
+}
+
+#[cfg(unix)]
+async fn next_host_signal(
+    sighup: &mut fcp_async_core::signal::Signal,
+    sigterm: &mut fcp_async_core::signal::Signal,
+    sigint: &mut fcp_async_core::signal::Signal,
+) -> HostSignalEvent {
+    use futures_util::FutureExt;
+
+    let shutdown = next_host_shutdown_signal(sigterm, sigint).fuse();
+    let reload = sighup.recv().fuse();
+    futures_util::pin_mut!(shutdown, reload);
+    futures_util::select_biased! {
+        signal = shutdown => HostSignalEvent::Shutdown(signal),
+        delivered = reload => if delivered.is_some() {
+            HostSignalEvent::Reload
+        } else {
+            HostSignalEvent::Shutdown(HostShutdownSignal::SourceClosed("SIGHUP"))
+        },
+    }
+}
+
+/// Own the reload directly: returning drops its pending locks, prepared
+/// runtimes and reconciliation future before shutdown starts. No background
+/// reload may outlive the signal handler or publish after the shutdown sweep.
+/// The deadline bounds cooperative waits; it cannot preempt synchronous I/O.
+/// Injecting the deadline future permits deterministic cancellation tests.
+#[cfg(unix)]
+async fn await_signal_reload<R, S, D>(reload: R, shutdown: S, deadline: D) -> SignalReloadOutcome
+where
+    R: std::future::Future<Output = HostResult<usize>>,
+    S: std::future::Future<Output = HostShutdownSignal>,
+    D: std::future::Future<Output = ()>,
+{
+    use futures_util::FutureExt;
+
+    let reload = reload.fuse();
+    let shutdown = shutdown.fuse();
+    let deadline = deadline.fuse();
+    futures_util::pin_mut!(reload, shutdown, deadline);
+    futures_util::select_biased! {
+        signal = shutdown => SignalReloadOutcome::Shutdown(signal),
+        () = deadline => SignalReloadOutcome::TimedOut,
+        result = reload => SignalReloadOutcome::Finished(result),
+    }
+}
+
+#[cfg(unix)]
+fn log_host_shutdown_signal(signal: HostShutdownSignal) {
+    match signal {
+        HostShutdownSignal::Terminate => {
+            tracing::info!(event = "sigterm_received", "initiating graceful shutdown");
+        }
+        HostShutdownSignal::Interrupt => {
+            tracing::info!(event = "sigint_received", "initiating graceful shutdown");
+        }
+        HostShutdownSignal::SourceClosed(signal) => {
+            tracing::error!(
+                event = "signal_source_closed",
+                signal,
+                "signal ownership was lost; initiating graceful shutdown"
+            );
+        }
+    }
+}
+
+/// Only an unpublished reload may fail while the host keeps serving. After
+/// publication, cancellation or failed reconciliation leaves the new runtime
+/// inventory installed; stop admission and drain it instead of pretending that
+/// the previous inventory is still active. Boot reconciliation repairs the
+/// durable lifecycle view before a later host starts accepting work.
+#[cfg(unix)]
+fn finish_signal_reload(
+    state: &AppState,
+    shutdown_tx: &fcp_async_core::channel::watch::Sender<bool>,
+    outcome: SignalReloadOutcome,
+    published: bool,
+) -> bool {
+    let shutdown_required = match outcome {
+        SignalReloadOutcome::Finished(Ok(count)) => {
+            tracing::info!(
+                event = "config_reload_complete",
+                connectors_reloaded = count,
+                "configuration reloaded successfully"
+            );
+            false
+        }
+        SignalReloadOutcome::Finished(Err(error)) => {
+            tracing::error!(
+                event = "config_reload_failed",
+                %error,
+                registry_published = published,
+                shutdown_required = published,
+                "configuration reload failed"
+            );
+            published
+        }
+        SignalReloadOutcome::TimedOut => {
+            tracing::error!(
+                event = "config_reload_timed_out",
+                registry_published = published,
+                shutdown_required = published,
+                "configuration reload exhausted its cooperative deadline"
+            );
+            published
+        }
+        SignalReloadOutcome::Shutdown(signal) => {
+            log_host_shutdown_signal(signal);
+            true
+        }
+    };
+    if shutdown_required {
+        request_host_shutdown(state, shutdown_tx);
+    }
+    !shutdown_required
+}
+
+#[cfg(unix)]
 async fn signal_handler_loop(
     state: Arc<AppState>,
     shutdown_tx: fcp_async_core::channel::watch::Sender<bool>,
 ) {
     use fcp_async_core::signal::{sighup, sigint, sigterm};
-    use futures_util::FutureExt;
 
     let mut sighup_stream = match sighup() {
         Ok(stream) => stream,
@@ -11091,50 +11255,30 @@ async fn signal_handler_loop(
     };
 
     loop {
-        let sighup_recv = sighup_stream.recv().fuse();
-        let sigterm_recv = sigterm_stream.recv().fuse();
-        let sigint_recv = sigint_stream.recv().fuse();
-        futures_util::pin_mut!(sighup_recv, sigterm_recv, sigint_recv);
-
-        futures_util::select! {
-            delivered = sighup_recv => {
-                if delivered.is_none() {
-                    break;
-                }
+        match next_host_signal(&mut sighup_stream, &mut sigterm_stream, &mut sigint_stream).await {
+            HostSignalEvent::Reload => {
                 tracing::info!(
                     event = "sighup_received",
                     "reloading connector configuration"
                 );
-                match reload_connectors(&state).await {
-                    Ok(count) => {
-                        tracing::info!(
-                            event = "config_reload_complete",
-                            connectors_reloaded = count,
-                            "configuration reloaded successfully"
-                        );
-                    }
-                    Err(err) => {
-                        tracing::error!(
-                            event = "config_reload_failed",
-                            error = %err,
-                            "configuration reload failed; continuing with previous config"
-                        );
-                    }
-                }
-            }
-            delivered = sigterm_recv => {
-                if delivered.is_none() {
+                let published = AtomicBool::new(false);
+                let outcome = await_signal_reload(
+                    reload_connectors(&state, &published),
+                    next_host_shutdown_signal(&mut sigterm_stream, &mut sigint_stream),
+                    fcp_async_core::time::sleep(SIGNAL_RELOAD_TIMEOUT),
+                )
+                .await;
+                if !finish_signal_reload(
+                    &state,
+                    &shutdown_tx,
+                    outcome,
+                    published.load(Ordering::Acquire),
+                ) {
                     break;
                 }
-                tracing::info!(event = "sigterm_received", "initiating graceful shutdown");
-                request_host_shutdown(&state, &shutdown_tx);
-                break;
             }
-            delivered = sigint_recv => {
-                if delivered.is_none() {
-                    break;
-                }
-                tracing::info!(event = "sigint_received", "initiating graceful shutdown");
+            HostSignalEvent::Shutdown(signal) => {
+                log_host_shutdown_signal(signal);
                 request_host_shutdown(&state, &shutdown_tx);
                 break;
             }
@@ -11169,7 +11313,7 @@ async fn signal_handler_loop(
 /// registry (adding/updating/removing connectors), and reconciles the
 /// lifecycle state with the updated inventory.
 #[cfg(unix)]
-async fn reload_connectors(state: &AppState) -> Result<usize, HostError> {
+async fn reload_connectors(state: &AppState, published: &AtomicBool) -> Result<usize, HostError> {
     let _transaction = state.registry.inventory_transaction.lock().await;
     let loaded = load_connector_configs()?;
     let count = loaded.configs.len();
@@ -11179,6 +11323,9 @@ async fn reload_connectors(state: &AppState) -> Result<usize, HostError> {
         .registry
         .apply_configs_with_lifecycle(loaded.configs, &state.lifecycle)
         .await?;
+    // publish_configs has no await after its atomic map swap. Mark completion
+    // in the same poll, before reconciliation can yield or be cancelled.
+    published.store(true, Ordering::Release);
     tracing::info!(
         event = "config_reload_applied",
         added = report.added.len(),
@@ -39180,7 +39327,8 @@ done"#;
             HashMap::new(),
         );
         let preceding_transaction = registry.inventory_transaction.lock().await;
-        let mut pending = Box::pin(reload_connectors(&state));
+        let published = AtomicBool::new(false);
+        let mut pending = Box::pin(reload_connectors(&state, &published));
         assert!(futures_util::poll!(pending.as_mut()).is_pending());
 
         // Cancellation while waiting must not consume or poison the gate.
@@ -39189,6 +39337,272 @@ done"#;
         assert!(registry.inventory_transaction.try_lock().is_some());
         assert!(registry.inventory().await.is_empty());
         assert_eq!(registry.version(), 1);
+        assert!(!published.load(Ordering::Acquire));
+    }
+
+    #[cfg(unix)]
+    #[fcp_async_core::runtime::test]
+    async fn signal_reload_termination_preempts_a_blocked_inventory_transaction() {
+        for signal in [
+            HostShutdownSignal::Terminate,
+            HostShutdownSignal::Interrupt,
+            HostShutdownSignal::SourceClosed("SIGTERM"),
+            HostShutdownSignal::SourceClosed("SIGINT"),
+            HostShutdownSignal::SourceClosed("SIGHUP"),
+        ] {
+            let registry = Arc::new(empty_registry(1));
+            let state = dispatcher_app_state(
+                Arc::clone(&registry),
+                Arc::new(HostAdminStateStore::new()),
+                None,
+                HashMap::new(),
+            );
+            let (shutdown_tx, shutdown_rx) = fcp_async_core::channel::watch::channel(false);
+            let transaction = registry.inventory_transaction.lock().await;
+            let published = AtomicBool::new(false);
+            let signalled = AtomicBool::new(false);
+            let shutdown = std::future::poll_fn(|_| {
+                if signalled.load(Ordering::Acquire) {
+                    std::task::Poll::Ready(signal)
+                } else {
+                    std::task::Poll::Pending
+                }
+            });
+            let mut reloading = Box::pin(await_signal_reload(
+                reload_connectors(&state, &published),
+                shutdown,
+                std::future::pending(),
+            ));
+            assert!(futures_util::poll!(reloading.as_mut()).is_pending());
+            signalled.store(true, Ordering::Release);
+            let outcome = reloading.await;
+            assert!(
+                matches!(outcome, SignalReloadOutcome::Shutdown(observed) if observed == signal)
+            );
+            assert!(!finish_signal_reload(&state, &shutdown_tx, outcome, false));
+            assert!(*shutdown_rx.borrow());
+            assert!(!published.load(Ordering::Acquire));
+            assert!(
+                state
+                    .invoke_jobs
+                    .spawn(
+                        "after-reload-shutdown".to_owned(),
+                        Instant::now() + Duration::from_secs(1),
+                        std::future::pending(),
+                    )
+                    .is_err(),
+                "shutdown must refuse new invocation ownership"
+            );
+            drop(transaction);
+            assert!(registry.inventory_transaction.try_lock().is_some());
+            assert!(registry.inventory().await.is_empty());
+            assert_eq!(registry.version(), 1);
+        }
+    }
+
+    #[cfg(unix)]
+    #[fcp_async_core::runtime::test]
+    async fn signal_reload_timeout_before_publication_preserves_live_inventory() {
+        let registry = Arc::new(empty_registry(1));
+        let state = dispatcher_app_state(
+            Arc::clone(&registry),
+            Arc::new(HostAdminStateStore::new()),
+            None,
+            HashMap::new(),
+        );
+        let (shutdown_tx, shutdown_rx) = fcp_async_core::channel::watch::channel(false);
+        let transaction = registry.inventory_transaction.lock().await;
+        let published = AtomicBool::new(false);
+        let expired = AtomicBool::new(false);
+        let deadline = std::future::poll_fn(|_| {
+            if expired.load(Ordering::Acquire) {
+                std::task::Poll::Ready(())
+            } else {
+                std::task::Poll::Pending
+            }
+        });
+        let mut reloading = Box::pin(await_signal_reload(
+            reload_connectors(&state, &published),
+            std::future::pending(),
+            deadline,
+        ));
+        assert!(futures_util::poll!(reloading.as_mut()).is_pending());
+        expired.store(true, Ordering::Release);
+        let outcome = reloading.await;
+        assert!(matches!(outcome, SignalReloadOutcome::TimedOut));
+        assert!(finish_signal_reload(&state, &shutdown_tx, outcome, false));
+        assert!(!*shutdown_rx.borrow());
+        assert!(!published.load(Ordering::Acquire));
+        drop(transaction);
+        assert!(registry.inventory_transaction.try_lock().is_some());
+        assert!(registry.inventory().await.is_empty());
+        assert_eq!(registry.version(), 1);
+    }
+
+    #[cfg(unix)]
+    #[fcp_async_core::runtime::test]
+    async fn signal_reload_incomplete_reconciliation_stops_without_reverting_publication() {
+        for outcome in [
+            SignalReloadOutcome::TimedOut,
+            SignalReloadOutcome::Finished(Err(HostError::Unavailable(
+                "lifecycle reconciliation failed".to_owned(),
+            ))),
+        ] {
+            let registry = Arc::new(empty_registry(1));
+            let config = dispatcher_test_config("fcp.test.reload-published:utility:1.0.0");
+            registry
+                .publish_configs(
+                    registry_publication_fixture(&registry, vec![config.clone()]).await,
+                )
+                .await
+                .expect("publish prepared runtime inventory");
+            let generation = registry.version();
+            let state = dispatcher_app_state(
+                Arc::clone(&registry),
+                Arc::new(HostAdminStateStore::new()),
+                None,
+                HashMap::new(),
+            );
+            let (shutdown_tx, shutdown_rx) = fcp_async_core::channel::watch::channel(false);
+            assert!(!finish_signal_reload(&state, &shutdown_tx, outcome, true));
+            assert!(*shutdown_rx.borrow());
+            assert_eq!(registry.inventory().await, vec![config]);
+            assert_eq!(registry.version(), generation);
+            assert!(
+                state
+                    .invoke_jobs
+                    .spawn(
+                        "after-incomplete-reconciliation".to_owned(),
+                        Instant::now() + Duration::from_secs(1),
+                        std::future::pending(),
+                    )
+                    .is_err(),
+                "partially reconciled inventory must not admit another invocation"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signal_reload_success_and_unpublished_errors_preserve_signal_ownership() {
+        for (outcome, published) in [
+            (SignalReloadOutcome::Finished(Ok(3)), true),
+            (
+                SignalReloadOutcome::Finished(Err(HostError::InvalidFilter(
+                    "invalid replacement inventory".to_owned(),
+                ))),
+                false,
+            ),
+        ] {
+            let state = cancel_route_test_state();
+            let (shutdown_tx, shutdown_rx) = fcp_async_core::channel::watch::channel(false);
+            assert!(finish_signal_reload(
+                &state,
+                &shutdown_tx,
+                outcome,
+                published
+            ));
+            assert!(!*shutdown_rx.borrow());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signal_reload_shutdown_wins_even_when_reload_and_deadline_are_ready() {
+        use std::future::Future as _;
+
+        for signal in [HostShutdownSignal::Terminate, HostShutdownSignal::Interrupt] {
+            let reload_polled = AtomicBool::new(false);
+            let mut reloading = Box::pin(await_signal_reload(
+                async {
+                    reload_polled.store(true, Ordering::Release);
+                    Ok(1)
+                },
+                std::future::ready(signal),
+                std::future::ready(()),
+            ));
+            let mut context = std::task::Context::from_waker(futures_util::task::noop_waker_ref());
+            assert!(matches!(
+                reloading.as_mut().poll(&mut context),
+                std::task::Poll::Ready(SignalReloadOutcome::Shutdown(observed)) if observed == signal
+            ));
+            assert!(!reload_polled.load(Ordering::Acquire));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signal_reload_expired_deadline_never_starts_ready_replacement_work() {
+        use std::future::Future as _;
+
+        let reload_polled = AtomicBool::new(false);
+        let mut reloading = Box::pin(await_signal_reload(
+            async {
+                reload_polled.store(true, Ordering::Release);
+                Ok(1)
+            },
+            std::future::pending(),
+            std::future::ready(()),
+        ));
+        let mut context = std::task::Context::from_waker(futures_util::task::noop_waker_ref());
+        assert!(matches!(
+            reloading.as_mut().poll(&mut context),
+            std::task::Poll::Ready(SignalReloadOutcome::TimedOut)
+        ));
+        assert!(!reload_polled.load(Ordering::Acquire));
+    }
+
+    #[cfg(unix)]
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn signal_reload_cancellation_and_timeout_retire_unpublished_native_children() {
+        for timeout in [false, true] {
+            let connector = registry_shutdown_test_connector(
+                "fcp.test.reload-prepared:utility:1.0.0",
+                "while IFS= read -r request; do :; done",
+                &BTreeMap::new(),
+            )
+            .await;
+            let retirement = connector.runtime_retirement.clone();
+            let triggered = AtomicBool::new(false);
+            let shutdown = std::future::poll_fn(|_| {
+                if !timeout && triggered.load(Ordering::Acquire) {
+                    std::task::Poll::Ready(HostShutdownSignal::Terminate)
+                } else {
+                    std::task::Poll::Pending
+                }
+            });
+            let deadline = std::future::poll_fn(|_| {
+                if timeout && triggered.load(Ordering::Acquire) {
+                    std::task::Poll::Ready(())
+                } else {
+                    std::task::Poll::Pending
+                }
+            });
+            let mut reloading = Box::pin(await_signal_reload(
+                async move {
+                    let _prepared = connector;
+                    std::future::pending::<HostResult<usize>>().await
+                },
+                shutdown,
+                deadline,
+            ));
+            assert!(futures_util::poll!(reloading.as_mut()).is_pending());
+            assert!(!retirement.is_exited());
+            triggered.store(true, Ordering::Release);
+            let outcome = reloading.await;
+            if timeout {
+                assert!(matches!(outcome, SignalReloadOutcome::TimedOut));
+            } else {
+                assert!(matches!(
+                    outcome,
+                    SignalReloadOutcome::Shutdown(HostShutdownSignal::Terminate)
+                ));
+            }
+            retirement
+                .wait_for_exit(Instant::now() + Duration::from_secs(5))
+                .await
+                .expect("abandoned preparation must not leave a child process alive");
+        }
     }
 
     #[fcp_async_core::runtime::test(flavor = "multi_thread")]
