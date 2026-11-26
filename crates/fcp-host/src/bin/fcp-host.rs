@@ -36251,7 +36251,7 @@ output_schema = { type = "object" }
             let denied = http_batch::stream_handler(
                 State(Arc::clone(&state)),
                 headers,
-                Json(HttpBatchInvokeRequest {
+                mesh_forward_intake::RpcJson::for_test(HttpBatchInvokeRequest {
                     operations: vec![member("25-principal-denied", "success", Vec::new())],
                     options: BatchOptions::default(),
                 }),
@@ -36305,7 +36305,7 @@ output_schema = { type = "object" }
                 let response = http_batch::stream_handler(
                     State(http_state),
                     HeaderMap::new(),
-                    Json(disconnected_batch),
+                    mesh_forward_intake::RpcJson::for_test(disconnected_batch),
                 )
                 .await
                 .expect("streaming HTTP response");
@@ -50203,8 +50203,53 @@ while IFS= read -r request; do exit 2; done
         let parsed: CancellationResponse =
             serde_json::from_slice(&body).expect("parse cancel-self response");
         assert_eq!(parsed.operation_id, "op-self-owner");
-        assert_eq!(parsed.outcome, fcp_host::CancellationOutcome::Cancelled);
+        assert_eq!(parsed.outcome, fcp_host::CancellationOutcome::Pending);
         assert!(state.cancellation.is_cancel_requested("op-self-owner"));
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn rpc_cancel_self_reports_pending_without_fabricated_recovery_artifacts() {
+        let state = cancel_route_test_state();
+        let operation_id = "cancel-without-runtime-evidence";
+        state
+            .cancellation
+            .track_with_owner(operation_id, Some("user:test"));
+        let token = issue_cancel_self_test_token(state.lifecycle.as_ref(), "user:test").await;
+        let app = cancel_test_app(Arc::clone(&state));
+        let request = serde_json::to_value(CancellationRequest {
+            operation_id: operation_id.to_owned(),
+            reason: CancelReason::UserRequested,
+            cleanup: CleanupBehavior::Checkpoint,
+            return_partial: true,
+            capability_token: Some(token),
+        })
+        .unwrap();
+
+        for _ in 0..2 {
+            let response =
+                send_cancel_request(app.clone(), "/rpc/cancel-self", request.clone(), &[]).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+            let cancelled: CancellationResponse = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(cancelled.operation_id, operation_id);
+            assert_eq!(cancelled.outcome, fcp_host::CancellationOutcome::Pending);
+            assert!(cancelled.checkpoint.is_none());
+            assert!(cancelled.cleanup_result.is_none());
+            assert!(cancelled.partial_result.is_none());
+            assert!(state.cancellation.is_cancel_requested(operation_id));
+        }
+
+        // Ordinary completion supplies no evidence that cancellation or any
+        // requested checkpoint/cleanup actually happened.
+        state.cancellation.complete(operation_id);
+        let response = send_cancel_request(app, "/rpc/cancel-self", request, &[]).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        let completed: CancellationResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(completed.outcome, fcp_host::CancellationOutcome::TooLate);
+        assert!(completed.checkpoint.is_none());
+        assert!(completed.cleanup_result.is_none());
+        assert!(completed.partial_result.is_none());
     }
 
     #[fcp_async_core::runtime::test]
