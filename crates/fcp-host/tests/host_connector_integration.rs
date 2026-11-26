@@ -5273,16 +5273,36 @@ async fn fcp_host_binary_cancel_route_cancels_in_flight_invoke()
     .body;
 
     assert_eq!(cancel_response.operation_id, operation_id);
-    assert_eq!(cancel_response.outcome, CancellationOutcome::Cancelled);
+    assert_eq!(cancel_response.outcome, CancellationOutcome::Pending);
     assert!(cancel_response.partial_result.is_none());
     assert!(cancel_response.checkpoint.is_none());
-    assert!(cancel_response.cleanup_result.is_some());
+    assert!(cancel_response.cleanup_result.is_none());
 
     let invoke_response = invoke_task
         .await
         .map_err(std::io::Error::other)?
         .map_err(std::io::Error::other)?;
     assert_eq!(invoke_response.status, InvokeStatus::Ok);
+
+    // A successful response that wins before cancellation takes effect remains
+    // successful; a later cancellation cannot relabel it as stopped.
+    let late_response: CancellationResponse = http_post_json_response(
+        host.client.clone(),
+        url("/rpc/operations/cancel"),
+        CancellationRequest {
+            operation_id: operation_id.clone(),
+            reason: CancelReason::UserRequested,
+            cleanup: CleanupBehavior::Checkpoint,
+            return_partial: true,
+            capability_token: None,
+        },
+        Some(cancel_admin_headers(TEST_PRINCIPAL)),
+    )
+    .await?
+    .body;
+    assert_eq!(late_response.outcome, CancellationOutcome::TooLate);
+    assert!(late_response.checkpoint.is_none());
+    assert!(late_response.cleanup_result.is_none());
 
     let logs = wait_for_log_events(
         &host.stderr_logs,
@@ -5301,7 +5321,7 @@ async fn fcp_host_binary_cancel_route_cancels_in_flight_invoke()
     assert!(logs.iter().any(|entry| {
         entry.get("event").and_then(Value::as_str) == Some("cancel_response")
             && entry.get("operation_id").and_then(Value::as_str) == Some(operation_id.as_str())
-            && entry.get("outcome").and_then(Value::as_str) == Some("Cancelled")
+            && entry.get("outcome").and_then(Value::as_str) == Some("Pending")
     }));
     assert!(logs.iter().any(|entry| {
         entry.get("event").and_then(Value::as_str) == Some("invoke_response")
@@ -5313,7 +5333,7 @@ async fn fcp_host_binary_cancel_route_cancels_in_flight_invoke()
 }
 
 #[fcp_async_core::runtime::test(flavor = "multi_thread")]
-async fn fcp_host_binary_cancel_route_allows_follow_up_invoke_after_cleanup()
+async fn fcp_host_binary_cancel_route_allows_follow_up_invoke_after_settlement()
 -> Result<(), Box<dyn std::error::Error>> {
     let connector_id = ConnectorId::from_static("fcp.test.cancel-follow-up:utility:1.0.0");
     let capability_signing_key = Ed25519SigningKey::generate();
@@ -5374,8 +5394,8 @@ async fn fcp_host_binary_cancel_route_allows_follow_up_invoke_after_cleanup()
     .body;
 
     assert_eq!(cancel_response.operation_id, cancelled_operation_id);
-    assert_eq!(cancel_response.outcome, CancellationOutcome::Cancelled);
-    assert!(cancel_response.cleanup_result.is_some());
+    assert_eq!(cancel_response.outcome, CancellationOutcome::Pending);
+    assert!(cancel_response.cleanup_result.is_none());
 
     let cancelled_response = invoke_task
         .await
@@ -5412,7 +5432,7 @@ async fn fcp_host_binary_cancel_route_allows_follow_up_invoke_after_cleanup()
         entry.get("event").and_then(Value::as_str) == Some("cancel_response")
             && entry.get("operation_id").and_then(Value::as_str)
                 == Some(cancelled_operation_id.as_str())
-            && entry.get("outcome").and_then(Value::as_str) == Some("Cancelled")
+            && entry.get("outcome").and_then(Value::as_str) == Some("Pending")
     }));
     assert!(logs.iter().any(|entry| {
         entry.get("event").and_then(Value::as_str) == Some("invoke_request")
