@@ -4,6 +4,8 @@
 //! bounded successful responses, under the exact durable attempt and effect
 //! binding, for explicit operator recovery. A retained response is never an
 //! instruction to execute again or authority to bypass current host policy.
+//! Byte-limited attempts retain their exact settled envelope binding too;
+//! recovery reads validate that binding without spending the same bytes again.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -17,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     HostError, HostResult, InvocationIdempotency, InvocationOutcome, InvocationRecord,
-    InvocationTicket,
+    InvocationResponseBudget, InvocationTicket,
 };
 
 /// Maximum complete encoded custody record, including its response and binding.
@@ -54,6 +56,10 @@ pub struct InvocationResultBinding {
     pub idempotency: InvocationIdempotency,
     pub transport_idempotency: InvocationIdempotency,
     pub audit_event_id: String,
+    /// Exact allowed response settlement for a byte-limited admission.
+    /// Historical records and grants without a byte ceiling omit this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_response: Option<InvocationResponseBudget>,
 }
 
 impl InvocationResultBinding {
@@ -78,6 +84,10 @@ impl InvocationResultBinding {
             || (finalization.sampling_operation_id.is_some()
                 && finalization.sampling_completed != Some(true))
             || record.ticket.operation_id != record.admission.operation_id
+            || record
+                .capability_response
+                .as_ref()
+                .is_some_and(|budget| !budget.is_settled())
         {
             return Err(incomplete());
         }
@@ -100,6 +110,7 @@ impl InvocationResultBinding {
                 .clone()
                 .ok_or_else(incomplete)?,
             audit_event_id: finalization.audit_event_id.clone().ok_or_else(incomplete)?,
+            capability_response: record.capability_response.clone(),
         };
         binding.validate()?;
         Ok(binding)
@@ -136,6 +147,10 @@ impl InvocationResultBinding {
             ]
             .into_iter()
             .any(|digest| !valid_digest(digest))
+            || self
+                .capability_response
+                .as_ref()
+                .is_some_and(|budget| !budget.is_settled())
         {
             return Err(invalid("invalid invocation result binding"));
         }
@@ -200,6 +215,9 @@ impl RetainedInvocationResult {
         .map_err(|_| invalid("invocation result has an invalid response envelope"))?;
         if self.response.status != InvokeStatus::Ok {
             return Err(invalid("invocation result is not a successful response"));
+        }
+        if let Some(budget) = &self.binding.capability_response {
+            budget.validate_response(&self.response)?;
         }
         let encoded = encode_bounded(&self.response)?;
         if digest(RESPONSE_DOMAIN, &encoded) != self.response_digest {
@@ -373,6 +391,9 @@ impl InvocationResultStore {
         now: DateTime<Utc>,
     ) -> HostResult<bool> {
         let binding = InvocationResultBinding::from_record(record)?;
+        if let Some(budget) = &binding.capability_response {
+            budget.validate_response(response)?;
+        }
         if now < binding.finished_at {
             return Err(invalid("invocation result precedes completion"));
         }
@@ -703,7 +724,12 @@ fn incomplete() -> HostError {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use crate::{InvocationAdmission, InvocationFinalization, InvocationTerminal};
+    use crate::{
+        HostAdminStateStore, InvocationAdmission, InvocationFinalization, InvocationTerminal,
+    };
+    use fcp_crypto::{cose::CapabilityTokenBuilder, ed25519::Ed25519SigningKey};
+    use fcp_kernel::{ConnectorId, InvokeRequest};
+    use fcp_prelude::{CapabilityConstraints, CapabilityToken, OperationId, ZoneId};
     use serde_json::json;
 
     fn time() -> DateTime<Utc> {
@@ -716,6 +742,7 @@ mod tests {
         InvocationRecord {
             budget_requests_reserved: false,
             budget_usage_digest: None,
+            capability_response: None,
             ticket: InvocationTicket {
                 operation_id: id.into(),
                 attempt_id: 7,
@@ -761,6 +788,173 @@ mod tests {
             RequestId(id.into()),
             json!({"created_id": "resource-123", "private": "result-secret-canary"}),
         )
+    }
+
+    async fn byte_limited_attempt(
+        directory: &Path,
+        id: &str,
+        limit: u64,
+    ) -> (HostAdminStateStore, InvocationTicket) {
+        let key = Ed25519SigningKey::from_bytes(&[73; 32]).unwrap();
+        let constraints = CapabilityConstraints {
+            max_bytes: Some(limit),
+            ..Default::default()
+        };
+        let mut encoded = Vec::new();
+        ciborium::into_writer(&constraints, &mut encoded).unwrap();
+        let now = Utc::now();
+        let request = InvokeRequest {
+            r#type: "invoke".into(),
+            id: RequestId::new(id),
+            connector_id: ConnectorId::from_static("fcp.test.results:utility:1.0.0"),
+            operation: OperationId::from_static("test.create"),
+            zone_id: ZoneId::work(),
+            input: serde_json::Value::Null,
+            capability_token: CapabilityToken::from_raw(
+                CapabilityTokenBuilder::new()
+                    .capability_id("test.create")
+                    .zone_id("z:work")
+                    .principal("alice")
+                    .issuer("node:test")
+                    .audience("*")
+                    .operations(&["test.create"])
+                    .token_id(b"result-budget-private-token")
+                    .validity(now - Duration::minutes(1), now + Duration::hours(1))
+                    .try_constraints_cbor(&encoded)
+                    .unwrap()
+                    .sign(&key)
+                    .unwrap(),
+            ),
+            holder_proof: None,
+            context: None,
+            idempotency_key: Some("result-budget-recovery".into()),
+            lease_seq: None,
+            deadline_ms: None,
+            correlation_id: None,
+            provenance: None,
+            approval_tokens: Vec::new(),
+        };
+        let admission = InvocationAdmission {
+            operation_id: id.into(),
+            connector_id: request.connector_id.to_string(),
+            operation: request.operation.to_string(),
+            zone_id: request.zone_id.to_string(),
+            principal: "alice".into(),
+            correlation_id: None,
+            deadline_at: now + Duration::minutes(1),
+            idempotency: InvocationIdempotency::from_request(&request, "alice").unwrap(),
+            transport_idempotency: InvocationIdempotency::from_relay_request(&request, None)
+                .unwrap(),
+        };
+        let store = HostAdminStateStore::with_state_path(directory.join("admin-state.json"))
+            .unwrap();
+        let ticket = store
+            .admit_capability_invocation(admission, &request, &key.verifying_key())
+            .await
+            .unwrap();
+        store
+            .finish_invocation(
+                &ticket,
+                InvocationTerminal {
+                    outcome: InvocationOutcome::Succeeded,
+                    receipt_id: None,
+                    duration_ms: 1,
+                    http_status: 200,
+                },
+            )
+            .await
+            .unwrap();
+        (store, ticket)
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn signed_response_settlement_survives_custody_and_recovery_without_recharging() {
+        let directory = tempfile::tempdir().unwrap();
+        let (admin, ticket) = byte_limited_attempt(directory.path(), "metered", 4_096).await;
+        let output = response("metered");
+        admin.settle_capability_response(&ticket, &output).await.unwrap();
+        admin
+            .record_invocation_finalization(
+                &ticket,
+                InvocationFinalization {
+                    budget_finalized: true,
+                    audit_event_id: Some("metered-audit".into()),
+                    response_http_status: Some(200),
+                    response_status: Some(InvokeStatus::Ok),
+                    ..InvocationFinalization::default()
+                },
+            )
+            .await
+            .unwrap();
+        let entry = admin
+            .invocation_record(&ticket.operation_id, Some(ticket.attempt_id))
+            .await
+            .unwrap();
+        let binding = InvocationResultBinding::from_record(&entry).unwrap();
+        assert!(binding.capability_response.as_ref().unwrap().is_settled());
+        let before_recovery = admin.export_snapshot_json().await.unwrap();
+        let now = Utc::now();
+        let path = directory.path().join("results");
+        let store = InvocationResultStore::open_at(path.clone(), now).unwrap();
+
+        // An equal-length replacement must not acquire custody under the
+        // allowance settled for the original complete envelope.
+        let mut changed = output.clone();
+        changed.result.as_mut().unwrap()["created_id"] = json!("resource-999");
+        assert_eq!(
+            serde_json::to_vec(&output).unwrap().len(),
+            serde_json::to_vec(&changed).unwrap().len()
+        );
+        assert!(store.retain(&entry, &changed, now).is_err());
+        assert!(store.retain(&entry, &output, now).unwrap());
+        let retained = store.get(&binding, now).unwrap().unwrap();
+        assert_eq!(retained.response.result, output.result);
+        let mut omitted = binding.clone();
+        omitted.capability_response = None;
+        assert!(store.get(&omitted, now).unwrap().is_none());
+
+        // A fresh custody checksum cannot replace the independently settled
+        // response binding when restored by a workflow or another client.
+        let mut replaced = retained.clone();
+        replaced.response = changed;
+        replaced.response_digest =
+            digest(RESPONSE_DOMAIN, &encode_bounded(&replaced.response).unwrap());
+        assert!(replaced.validate(&binding, now).is_err());
+        drop(store);
+        let reopened = InvocationResultStore::open_at(path, now).unwrap();
+        for _ in 0..2 {
+            let recovered = reopened.get(&binding, now).unwrap().unwrap();
+            recovered.validate(&binding, now).unwrap();
+            assert_eq!(recovered.response.result, output.result);
+        }
+        assert_eq!(admin.export_snapshot_json().await.unwrap(), before_recovery);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn unresolved_or_denied_byte_authority_never_becomes_result_custody() {
+        let directory = tempfile::tempdir().unwrap();
+        let (admin, ticket) = byte_limited_attempt(directory.path(), "denied", 1).await;
+        let mut entry = admin
+            .invocation_record(&ticket.operation_id, Some(ticket.attempt_id))
+            .await
+            .unwrap();
+        // Public record construction must not turn a delivery marker into
+        // evidence of byte settlement. Only the captured allowed binding does.
+        entry.finalization = record("denied").finalization;
+        assert!(InvocationResultBinding::from_record(&entry).is_err());
+        let now = Utc::now();
+        let store = InvocationResultStore::open_at(directory.path().join("results"), now)
+            .unwrap();
+        assert!(store.retain(&entry, &response("denied"), now).is_err());
+        assert!(admin.settle_capability_response(&ticket, &response("denied")).await.is_err());
+        let mut denied = admin
+            .invocation_record(&ticket.operation_id, Some(ticket.attempt_id))
+            .await
+            .unwrap();
+        denied.finalization = entry.finalization;
+        assert!(InvocationResultBinding::from_record(&denied).is_err());
+        assert!(store.retain(&denied, &response("denied"), now).is_err());
+        assert_eq!(denied.terminal.unwrap().outcome, InvocationOutcome::Succeeded);
     }
 
     #[test]

@@ -37,6 +37,7 @@ mod mesh_invocations;
 mod telegram_restart;
 mod usage_budget;
 use capability_usage::{CapabilityUsageLedger, CapabilityUsageScope};
+pub use capability_usage::InvocationResponseBudget;
 pub use mesh_invocations::*;
 pub use telegram_restart::*;
 
@@ -1057,6 +1058,11 @@ pub struct InvocationRecord {
     /// This retains no provider payload or metric labels.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget_usage_digest: Option<String>,
+    /// Signed response-byte authority captured before dispatch, with a once-only
+    /// settlement for the final executor response. Historical records and grants
+    /// without a byte ceiling omit this; omission is not evidence of accounting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_response: Option<InvocationResponseBudget>,
     /// Whether admission used a filesystem path with file and directory sync.
     ///
     /// Explicit memory-only hosts and platforms without directory sync report
@@ -3367,6 +3373,21 @@ impl HostAdminStateSnapshot {
         let mut unresolved_operations = HashSet::new();
         let mut changed = false;
         for record in &mut self.invocations {
+            if let Some(budget) = &record.capability_response {
+                budget.validate()?;
+                if budget.is_settled()
+                    && record.terminal.as_ref().is_none_or(|terminal| {
+                        !matches!(
+                            terminal.outcome,
+                            InvocationOutcome::Succeeded | InvocationOutcome::ConnectorError
+                        )
+                    })
+                {
+                    return Err(HostError::Internal(
+                        "persisted response settlement has no definite source observation".to_owned(),
+                    ));
+                }
+            }
             if record.budget_usage_digest.as_ref().is_some_and(|digest| {
                 record.terminal.is_none()
                     || digest.len() != 64
@@ -6048,6 +6069,7 @@ impl HostAdminStateStore {
                 finalization: None,
                 budget_requests_reserved,
                 budget_usage_digest: None,
+                capability_response: usage.as_ref().and_then(CapabilityUsageScope::response_budget),
                 durable,
             });
             snapshot.next_invocation_attempt_id = next_attempt_id;
@@ -8524,6 +8546,7 @@ mod tests {
             finalization: None,
             budget_requests_reserved: false,
             budget_usage_digest: None,
+            capability_response: None,
             durable: true,
         });
         assert!(

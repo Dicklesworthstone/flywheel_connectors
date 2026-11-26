@@ -6226,6 +6226,7 @@ mod tests {
             invocation: Some(InvocationRecord {
                 budget_requests_reserved: false,
                 budget_usage_digest: None,
+                capability_response: None,
                 ticket: InvocationTicket {
                     operation_id: request_id.to_owned(),
                     attempt_id: 7,

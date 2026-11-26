@@ -1317,6 +1317,7 @@ mod tests {
         InvocationRecord {
             budget_requests_reserved: false,
             budget_usage_digest: None,
+            capability_response: None,
             ticket: InvocationTicket {
                 operation_id: "req-inspect".to_owned(),
                 attempt_id: 7,

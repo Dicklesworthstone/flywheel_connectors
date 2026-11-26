@@ -58169,6 +58169,7 @@ input = { query = "{{steps.first-read.output.title}}" }
                 invocation: Some(fcp_host::InvocationRecord {
                     budget_requests_reserved: false,
                     budget_usage_digest: None,
+                    capability_response: None,
                     ticket: fcp_host::InvocationTicket {
                         operation_id: target.binding.request_id.clone(),
                         attempt_id: 1,

@@ -118,6 +118,19 @@ those envelope checks without claiming schema validation. An invalid delivered
 reply may follow external effects: the host withholds its payload and receipt,
 retains an unknown outcome, and refuses automatic replay of that invocation.
 
+The host also enforces cumulative signed `max_calls` and `max_bytes` allowances
+on each executor. Admission durably charges one call and the deterministic-CBOR
+input size. Before delivery or result retention, the host charges the final
+compact-JSON invocation response, including errors, sampling enrichment, and local
+route metadata, against the same byte allowance. An over-budget response is
+withheld while the original connector outcome remains recorded: a delivery
+refusal does not prove that an external effect failed. Each exact attempt settles
+once; restart and repeated recovery reads cannot charge it again, and retained
+results must match the settled envelope. Historical records without this binding
+do not claim response accounting. Provider traffic, event payloads, routing
+annotations added by a remote entry host, and recovery downloads are outside this
+executor-local quota; it is not a mesh-wide or physical-bandwidth limit.
+
 For continuously renewed revocation, configure an independently pinned owner-signed
 feed for each served zone with `FCP_HOST_REVOCATION_CONFIG_FILE`. The host checks
 current evidence at admission and dispatch, including issuer and ancestor key

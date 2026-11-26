@@ -703,6 +703,7 @@ mod tests {
             invocation: Some(InvocationRecord {
                 budget_requests_reserved: false,
                 budget_usage_digest: None,
+                capability_response: None,
                 ticket: InvocationTicket {
                     operation_id: pending.binding.request_id.clone(),
                     attempt_id,

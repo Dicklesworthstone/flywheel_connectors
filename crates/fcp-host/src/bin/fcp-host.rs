@@ -18217,6 +18217,7 @@ async fn route_invoke_with_intake(
             None,
             None,
             None,
+            None,
             intake,
         )
         .await
@@ -18292,7 +18293,7 @@ async fn route_invoke_with_intake(
         .await;
     }
     constrain_invoke_deadline(&mut request, deadline);
-    let mut response = invoke_jobs::execute_with_intake(
+    invoke_jobs::execute_with_intake(
         state,
         request,
         asserted_principal,
@@ -18300,18 +18301,14 @@ async fn route_invoke_with_intake(
         None,
         Some(execution_fence),
         None,
+        Some(InvokeRouteProvenance::host_backed(
+            Some(router.local_node().as_str().to_owned()),
+            decision.code(),
+        )),
         intake,
     )
     .await
-    .map_err(map_host_error)?;
-    stamp_invoke_route(
-        &mut response,
-        InvokeRouteProvenance::host_backed(
-            Some(router.local_node().as_str().to_owned()),
-            decision.code(),
-        ),
-    );
-    Ok(response)
+    .map_err(map_host_error)
 }
 
 /// Keep each handoff within the entry node's original monotonic budget.

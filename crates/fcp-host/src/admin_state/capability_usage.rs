@@ -4,16 +4,21 @@
 //! the same snapshot transaction as its invocation ticket. Stream controls debit
 //! the same account before changing custody or dispatching provider work.
 //! Nothing refunds these debits: cancellation, a missing reply, or a crash may
-//! follow an external effect. Byte charges cover admitted input, not response
-//! bodies, provider traffic, or delivered event payloads. Accounts are not
+//! follow an external effect. Before releasing an invocation response, the host
+//! also debits its complete compact-JSON envelope against the same signed byte
+//! ceiling. Response settlement is once per exact attempt, including optional
+//! sampling enrichment and executor-local routing metadata, and does not refund
+//! an admission. Provider traffic, event payloads, remote origin routing metadata
+//! and repeated operator recovery reads are not metered here. Accounts are not
 //! mesh-wide quotas.
 //! Persistence follows the containing store: explicit in-memory stores retain
-//! counters only for that store's lifetime. A persisted admission-time high-water
+//! counters only for that store's lifetime. A persisted observed-time high-water
 //! allows expired accounts to be reclaimed without allowing a backward clock
 //! adjustment to restore their authority. At most 4,096 live limited identities
 //! are retained; live grants are never evicted to admit a new grant.
 
 use std::collections::BTreeMap;
+use std::io::{self, Write};
 use std::sync::atomic::Ordering;
 
 use chrono::{DateTime, Utc};
@@ -22,11 +27,11 @@ use fcp_crypto::{
     cose::{cwt_claims, fcp2_claims},
     ed25519::Ed25519VerifyingKey,
 };
-use fcp_kernel::{InvokeRequest, LifecycleError, UsageBudgetPolicy};
+use fcp_kernel::{InvokeRequest, InvokeResponse, InvokeStatus, LifecycleError, UsageBudgetPolicy};
 use fcp_prelude::CapabilityConstraints;
 use serde::{Deserialize, Serialize};
 
-use super::{HostAdminStateStore, InvocationAdmission, InvocationTicket};
+use super::{HostAdminStateStore, InvocationAdmission, InvocationOutcome, InvocationTicket};
 use crate::{HostError, HostResult};
 
 const MAX_TRACKED_CAPABILITY_GRANTS: usize = 4096;
@@ -42,6 +47,8 @@ struct CapabilityUsageAccount {
     grant_digest: String,
     calls: u64,
     input_bytes: u64,
+    #[serde(default)]
+    response_bytes: u64,
     max_calls: Option<u32>,
     max_input_bytes: Option<u64>,
     expires_at_unix_secs: i64,
@@ -58,6 +65,123 @@ pub(super) struct CapabilityUsageScope {
     not_before: Option<i64>,
 }
 
+
+/// Signed byte authority captured with an exact invocation admission.
+///
+/// This contains only opaque grant/account digests and accounting metadata.
+/// Absence on a historical record does not establish response accounting. New
+/// byte-limited admissions always persist this binding before connector work.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InvocationResponseBudget {
+    account_key: String,
+    grant_digest: String,
+    max_bytes: u64,
+    expires_at_unix_secs: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    settlement: Option<ResponseSettlement>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+enum ResponseSettlement {
+    Allowed { bytes: u64, digest: String },
+    Denied,
+}
+
+fn valid_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn response_denied() -> HostError {
+    HostError::RegistryError(
+        "invocation response withheld by signed capability byte accounting; connector work may have completed; inspect the exact invocation attempt before retrying"
+            .to_owned(),
+    )
+}
+
+/// Count and bind the actual serialized envelope without allocating a copy of
+/// its payload. Stop immediately when even the entire grant cannot cover it.
+fn response_measurement(response: &InvokeResponse, limit: u64) -> Option<(u64, String)> {
+    struct Meter {
+        bytes: u64,
+        limit: u64,
+        hash: blake3::Hasher,
+    }
+
+    impl Write for Meter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            let length = u64::try_from(buffer.len())
+                .map_err(|_| io::Error::other("response byte count overflow"))?;
+            let next = self
+                .bytes
+                .checked_add(length)
+                .filter(|next| *next <= self.limit)
+                .ok_or_else(|| io::Error::other("response byte limit exceeded"))?;
+            self.hash.update(buffer);
+            self.bytes = next;
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut meter = Meter {
+        bytes: 0,
+        limit,
+        hash: blake3::Hasher::new(),
+    };
+    meter.hash.update(b"FCP-HOST-CAPABILITY-RESPONSE-V1");
+    serde_json::to_writer(&mut meter, response).ok()?;
+    Some((meter.bytes, meter.hash.finalize().to_hex().to_string()))
+}
+
+impl InvocationResponseBudget {
+    /// Whether this exact attempt has a persisted, allowed response settlement.
+    #[must_use]
+    pub const fn is_settled(&self) -> bool {
+        matches!(self.settlement, Some(ResponseSettlement::Allowed { .. }))
+    }
+
+    /// Verify that response custody contains exactly the envelope charged at
+    /// settlement. Reading a retained result does not debit the invocation again.
+    ///
+    /// # Errors
+    /// Rejects unsettled/denied budgets, malformed bindings, or a different
+    /// envelope even if the replacement has the same serialized byte count.
+    pub fn validate_response(&self, response: &InvokeResponse) -> HostResult<()> {
+        self.validate()?;
+        if let Some(ResponseSettlement::Allowed { bytes, digest }) = &self.settlement
+            && response_measurement(response, *bytes)
+                .is_some_and(|(actual, hash)| actual == *bytes && hash == *digest)
+        {
+            return Ok(());
+        }
+        Err(response_denied())
+    }
+
+    pub(super) fn validate(&self) -> HostResult<()> {
+        if !valid_digest(&self.account_key)
+            || !valid_digest(&self.grant_digest)
+            || self.expires_at_unix_secs <= 0
+            || self.settlement.as_ref().is_some_and(|settlement| match settlement {
+                ResponseSettlement::Allowed { bytes, digest } => {
+                    *bytes == 0 || *bytes > self.max_bytes || !valid_digest(digest)
+                }
+                ResponseSettlement::Denied => false,
+            })
+        {
+            return Err(response_denied());
+        }
+        Ok(())
+    }
+}
+
 fn denied(reason: &str) -> HostError {
     HostError::PreflightFailed(reason.to_owned())
 }
@@ -69,6 +193,17 @@ fn policy_denied(reason: &str) -> LifecycleError {
 }
 
 impl CapabilityUsageScope {
+    pub(super) fn response_budget(&self) -> Option<InvocationResponseBudget> {
+        self.max_input_bytes.map(|max_bytes| InvocationResponseBudget {
+            // from_request() refuses byte-limited grants without this identity.
+            account_key: self.key.clone().expect("verified limited grant identity"),
+            grant_digest: self.grant_digest.clone(),
+            max_bytes,
+            expires_at_unix_secs: self.expires_at,
+            settlement: None,
+        })
+    }
+
     fn from_request(
         request: &InvokeRequest,
         verifying_key: &Ed25519VerifyingKey,
@@ -146,17 +281,69 @@ impl CapabilityUsageScope {
 }
 
 impl CapabilityUsageLedger {
+
+    /// A refusal is a successful state transition so it survives restart. An
+    /// expired/pruned grant is never recreated, and conflicting repeat calls
+    /// cannot replace either an allowed response or a recorded denial.
+    fn settle_response(
+        &mut self,
+        budget: &mut InvocationResponseBudget,
+        measurement: Option<&(u64, String)>,
+        now: DateTime<Utc>,
+    ) -> bool {
+        if let Some(previous) = &budget.settlement {
+            return match (previous, measurement) {
+                (ResponseSettlement::Allowed { bytes, digest }, Some((actual, hash))) => {
+                    bytes == actual && digest == hash
+                }
+                _ => false,
+            };
+        }
+        let effective_now = now.timestamp().max(self.observed_at_unix_secs);
+        self.observed_at_unix_secs = effective_now;
+        self.accounts
+            .retain(|_, account| account.expires_at_unix_secs > effective_now);
+        let allowed = measurement.is_some_and(|(bytes, _)| {
+            let Some(account) = self.accounts.get_mut(&budget.account_key) else {
+                return false;
+            };
+            if account.grant_digest != budget.grant_digest
+                || account.max_input_bytes != Some(budget.max_bytes)
+                || account.expires_at_unix_secs != budget.expires_at_unix_secs
+                || effective_now >= budget.expires_at_unix_secs
+            {
+                return false;
+            }
+            let Some(next_response_bytes) = account.response_bytes.checked_add(*bytes) else {
+                return false;
+            };
+            if account
+                .input_bytes
+                .checked_add(next_response_bytes)
+                .is_none_or(|total| total > budget.max_bytes)
+            {
+                return false;
+            }
+            account.response_bytes = next_response_bytes;
+            true
+        });
+        budget.settlement = Some(if allowed {
+            let (bytes, digest) = measurement.expect("allowed response was measured");
+            ResponseSettlement::Allowed {
+                bytes: *bytes,
+                digest: digest.clone(),
+            }
+        } else {
+            ResponseSettlement::Denied
+        });
+        allowed
+    }
+
     pub(super) fn is_empty(&self) -> bool {
         self.accounts.is_empty() && self.observed_at_unix_secs == 0
     }
 
     pub(super) fn validate(&self) -> HostResult<()> {
-        let valid_digest = |value: &str| {
-            value.len() == 64
-                && value
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        };
         if self.observed_at_unix_secs < 0
             || self.accounts.len() > MAX_TRACKED_CAPABILITY_GRANTS
             || self.accounts.iter().any(|(key, account)| {
@@ -170,7 +357,12 @@ impl CapabilityUsageLedger {
                         .is_some_and(|limit| account.calls > u64::from(limit))
                     || account
                         .max_input_bytes
-                        .is_some_and(|limit| account.input_bytes > limit)
+                        .is_some_and(|limit| {
+                            account
+                                .input_bytes
+                                .checked_add(account.response_bytes)
+                                .is_none_or(|total| total > limit)
+                        })
             })
         {
             return Err(HostError::Internal(
@@ -216,9 +408,12 @@ impl CapabilityUsageLedger {
             .map_or(0, |account| account.input_bytes)
             .checked_add(scope.input_bytes)
             .ok_or_else(|| policy_denied("signed capability input byte budget exhausted"))?;
+        let total_bytes = input_bytes
+            .checked_add(account.map_or(0, |account| account.response_bytes))
+            .ok_or_else(|| policy_denied("signed capability byte budget exhausted"))?;
         if scope
             .max_input_bytes
-            .is_some_and(|limit| input_bytes > limit)
+            .is_some_and(|limit| total_bytes > limit)
         {
             return Err(policy_denied(
                 "signed capability input byte budget exhausted",
@@ -267,6 +462,7 @@ impl CapabilityUsageLedger {
                 grant_digest: scope.grant_digest.clone(),
                 calls: 0,
                 input_bytes: 0,
+                response_bytes: 0,
                 max_calls: scope.max_calls,
                 max_input_bytes: scope.max_input_bytes,
                 expires_at_unix_secs: scope.expires_at,
@@ -280,7 +476,99 @@ impl CapabilityUsageLedger {
 }
 
 impl HostAdminStateStore {
-    /// Check cumulative signed call and input-byte allowances without spending.
+
+    /// Debit the complete final response before returning or retaining it.
+    ///
+    /// The exact attempt carries its signed grant binding from admission; no
+    /// caller-supplied byte count or replacement token is accepted. The charged
+    /// unit is the compact JSON envelope, including error details and sampling
+    /// enrichment, in addition to previously charged deterministic-CBOR input.
+    /// Calls and input bytes are never refunded. A refusal is persisted and
+    /// remains refused across restart; a repeated identical allowed settlement
+    /// does not spend twice. Provider traffic, remote origin routing annotations
+    /// and recovery downloads are outside this once-per-invocation boundary.
+    ///
+    /// # Errors
+    /// Withholds output for an invalid response/ticket, an unknown source
+    /// outcome, an exhausted/expired/missing grant, a conflicting settlement, or
+    /// unavailable persistence. The recorded source outcome is left intact.
+    pub async fn settle_capability_response(
+        &self,
+        ticket: &InvocationTicket,
+        response: &InvokeResponse,
+    ) -> HostResult<()> {
+        if response.r#type != "response"
+            || response.id.0 != ticket.operation_id
+            || match response.status {
+                InvokeStatus::Ok => response.result.is_none() || response.error.is_some(),
+                InvokeStatus::Error => response.error.is_none() || response.result.is_some(),
+            }
+        {
+            return Err(response_denied());
+        }
+        let binding = {
+            let state = self.state.read().await;
+            if self.persistence_failed.load(Ordering::Acquire) {
+                return Err(response_denied());
+            }
+            let record = state
+                .invocations
+                .iter()
+                .find(|record| record.ticket == *ticket)
+                .ok_or_else(response_denied)?;
+            let Some(budget) = &record.capability_response else {
+                // Unlimited grants do not need an additional snapshot write.
+                return Ok(());
+            };
+            budget.validate()?;
+            if record.terminal.as_ref().is_none_or(|terminal| {
+                !matches!(
+                    terminal.outcome,
+                    InvocationOutcome::Succeeded | InvocationOutcome::ConnectorError
+                )
+            }) {
+                return Err(response_denied());
+            }
+            budget.clone()
+        };
+        // Serialization is bounded and outside the snapshot's write lock.
+        let measurement = response_measurement(response, binding.max_bytes);
+        let allowed = self
+            .apply_mutation(|snapshot| {
+                let record = snapshot
+                    .invocations
+                    .iter_mut()
+                    .find(|record| record.ticket == *ticket)
+                    .ok_or_else(|| policy_denied("unknown response settlement ticket"))?;
+                let budget = record
+                    .capability_response
+                    .as_mut()
+                    .ok_or_else(|| policy_denied("response admission binding is missing"))?;
+                if budget.account_key != binding.account_key
+                    || budget.grant_digest != binding.grant_digest
+                    || budget.max_bytes != binding.max_bytes
+                    || budget.expires_at_unix_secs != binding.expires_at_unix_secs
+                    || record.terminal.as_ref().is_none_or(|terminal| {
+                        !matches!(
+                            terminal.outcome,
+                            InvocationOutcome::Succeeded | InvocationOutcome::ConnectorError
+                        )
+                    })
+                {
+                    return Err(policy_denied("response admission binding changed"));
+                }
+                Ok(snapshot.capability_usage.settle_response(
+                    budget,
+                    measurement.as_ref(),
+                    Utc::now(),
+                ))
+            })
+            .await
+            .map_err(|_| response_denied())?;
+        if allowed { Ok(()) } else { Err(response_denied()) }
+    }
+
+    /// Check cumulative signed call and byte allowances without spending.
     ///
     /// This executor-local preview is not a reservation or complete request
     /// authorization. Live local dispatch repeats it atomically at admission;
@@ -365,7 +653,9 @@ impl HostAdminStateStore {
     /// independently verifies the exact request's signature and binds its
     /// principal, zone and metadata before deriving quotas. Calls and canonical
     /// input bytes remain spent after every outcome, including uncertain work
-    /// recovered on restart. Output and provider traffic are not metered here.
+    /// recovered on restart. Response authority is bound to the ticket here and
+    /// debited by [`Self::settle_capability_response`] before delivery. Provider
+    /// traffic is not metered here.
     /// Expired accounts are reclaimed using a persisted monotonic admission
     /// clock; a backward wall-clock adjustment or invocation-history pruning
     /// cannot refill previously spent authority. Live accounts are never evicted.
@@ -517,6 +807,227 @@ mod tests {
             fcp_crypto::cose::CoseToken::sign(&signing_key(), &claims).unwrap(),
         );
         request
+    }
+
+
+    fn response(request: &InvokeRequest, text: &str) -> InvokeResponse {
+        InvokeResponse::ok(request.id.clone(), serde_json::json!({ "text": text }))
+    }
+
+    async fn finish_source(store: &HostAdminStateStore, ticket: &InvocationTicket) {
+        store
+            .finish_invocation(
+                ticket,
+                InvocationTerminal {
+                    outcome: InvocationOutcome::Succeeded,
+                    receipt_id: None,
+                    duration_ms: 1,
+                    http_status: 200,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn response_meter_counts_the_complete_json_envelope_and_binds_its_contents() {
+        let request = request(None, Some(10_000));
+        let response = response(&request, "escaped \"text\" and unicode \u{1f680}");
+        let bytes = u64::try_from(serde_json::to_vec(&response).unwrap().len()).unwrap();
+        let measured = response_measurement(&response, bytes).unwrap();
+        assert_eq!(measured.0, bytes);
+        assert!(response_measurement(&response, bytes - 1).is_none());
+        let mut budget = scope(&request).response_budget().unwrap();
+        assert!(!budget.is_settled());
+        assert!(budget.validate_response(&response).is_err());
+        budget.settlement = Some(ResponseSettlement::Allowed {
+            bytes,
+            digest: measured.1,
+        });
+        budget.validate_response(&response).unwrap();
+        let mut changed = response.clone();
+        changed.result = Some(serde_json::json!({ "text": "different" }));
+        assert!(budget.validate_response(&changed).is_err());
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn response_settlement_is_durable_exact_and_once_per_attempt() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("response-usage.json");
+        let store = HostAdminStateStore::with_state_path(path.clone()).unwrap();
+        let key = signing_key().verifying_key();
+        let draft = request(None, None);
+        let reply = response(&draft, "private-response-A");
+        let bytes = response_measurement(&reply, u64::MAX).unwrap().0;
+        let request = request(None, Some(scope(&draft).input_bytes + bytes));
+        let ticket = store
+            .admit_capability_invocation(admission(&request), &request, &key)
+            .await
+            .unwrap();
+        assert!(
+            store.settle_capability_response(&ticket, &reply).await.is_err(),
+            "a source response must be observed first"
+        );
+        finish_source(&store, &ticket).await;
+        store.settle_capability_response(&ticket, &reply).await.unwrap();
+        store.settle_capability_response(&ticket, &reply).await.unwrap();
+        let snapshot = store.export_snapshot_json().await.unwrap();
+        let serialized = serde_json::to_string(&snapshot).unwrap();
+        assert!(!serialized.contains("private-response-A"));
+        assert!(!serialized.contains("usage-private-token-id"));
+        let account = snapshot["capability_usage"]["accounts"]
+            .as_object().unwrap().values().next().unwrap();
+        assert_eq!(account["response_bytes"], bytes);
+        assert_eq!(account["calls"], 1);
+        drop(store);
+        let reopened = HostAdminStateStore::with_state_path(path).unwrap();
+        reopened.settle_capability_response(&ticket, &reply).await.unwrap();
+        let replacement = response(&request, "private-response-B");
+        assert_eq!(
+            serde_json::to_vec(&replacement).unwrap().len(),
+            serde_json::to_vec(&reply).unwrap().len()
+        );
+        assert!(reopened.settle_capability_response(&ticket, &replacement).await.is_err());
+        let retained = reopened
+            .invocation_record(&ticket.operation_id, Some(ticket.attempt_id))
+            .await.unwrap();
+        retained.capability_response.unwrap().validate_response(&reply).unwrap();
+        let mut next = request.clone();
+        next.id = RequestId::new("response-exhausted");
+        assert!(reopened.check_capability_usage(&next, &key, "user:test").await.is_err());
+        assert!(reopened.reserve_capability_usage(&next, &key, "user:test").await.is_err());
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn concurrent_response_settlements_cannot_spend_the_same_remaining_bytes() {
+        let store = HostAdminStateStore::new();
+        let key = signing_key().verifying_key();
+        let draft = request(None, None);
+        let one_reply = response(&draft, "one remaining response");
+        let bytes = response_measurement(&one_reply, u64::MAX).unwrap().0;
+        let first = request(None, Some(scope(&draft).input_bytes * 2 + bytes));
+        let mut second = first.clone();
+        second.id = RequestId::new("usage-other");
+        assert_eq!(first.id.0.len(), second.id.0.len());
+        let first_ticket = store
+            .admit_capability_invocation(admission(&first), &first, &key).await.unwrap();
+        let second_ticket = store
+            .admit_capability_invocation(admission(&second), &second, &key).await.unwrap();
+        finish_source(&store, &first_ticket).await;
+        finish_source(&store, &second_ticket).await;
+        let other_reply = response(&second, "one remaining response");
+        let (left, right) = futures_util::future::join(
+            store.settle_capability_response(&first_ticket, &one_reply),
+            store.settle_capability_response(&second_ticket, &other_reply),
+        ).await;
+        assert_eq!(usize::from(left.is_ok()) + usize::from(right.is_ok()), 1);
+        let snapshot = store.export_snapshot_json().await.unwrap();
+        let account = snapshot["capability_usage"]["accounts"]
+            .as_object().unwrap().values().next().unwrap();
+        assert_eq!(account["response_bytes"], bytes);
+        assert_eq!(account["calls"], 2);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn refused_response_stays_refused_after_restart_and_preserves_source_success() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("response-denied.json");
+        let store = HostAdminStateStore::with_state_path(path.clone()).unwrap();
+        let key = signing_key().verifying_key();
+        let request = request(Some(3), Some(200));
+        let ticket = store
+            .admit_capability_invocation(admission(&request), &request, &key).await.unwrap();
+        finish_source(&store, &ticket).await;
+        let oversized = response(&request, &"x".repeat(300));
+        assert!(store.settle_capability_response(&ticket, &oversized).await.is_err());
+        drop(store);
+        let reopened = HostAdminStateStore::with_state_path(path).unwrap();
+        assert!(reopened
+            .settle_capability_response(&ticket, &response(&request, ""))
+            .await.is_err());
+        let record = reopened
+            .invocation_record(&ticket.operation_id, Some(ticket.attempt_id)).await.unwrap();
+        assert_eq!(record.terminal.unwrap().outcome, InvocationOutcome::Succeeded);
+        let budget = record.capability_response.unwrap();
+        assert_eq!(budget.settlement, Some(ResponseSettlement::Denied));
+        assert!(!budget.is_settled());
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn response_settlement_refuses_wrong_tickets_and_absent_source_effects() {
+        for outcome in [
+            InvocationOutcome::OutcomeUnknown,
+            InvocationOutcome::HostError,
+            InvocationOutcome::DeadlineExceeded,
+            InvocationOutcome::Cancelled,
+        ] {
+            let store = HostAdminStateStore::new();
+            let request = request(None, Some(1_000));
+            let reply = response(&request, "must remain private");
+            let ticket = store
+                .admit_capability_invocation(
+                    admission(&request), &request, &signing_key().verifying_key(),
+                ).await.unwrap();
+            store.finish_invocation(&ticket, InvocationTerminal {
+                outcome, receipt_id: None, duration_ms: 1, http_status: 503,
+            }).await.unwrap();
+            assert!(store.settle_capability_response(&ticket, &reply).await.is_err());
+            let mut wrong = ticket.clone();
+            wrong.attempt_id += 1;
+            assert!(store.settle_capability_response(&wrong, &reply).await.is_err());
+            assert_eq!(store.state.read().await.capability_usage.accounts
+                .values().next().unwrap().response_bytes, 0);
+        }
+    }
+
+    #[test]
+    fn response_settlement_cannot_recreate_an_expired_or_pruned_account() {
+        let now = Utc::now();
+        let request = request_expiring_at(
+            request(None, Some(1_000)), now + Duration::seconds(10),
+        );
+        let scope = scope(&request);
+        let mut ledger = CapabilityUsageLedger::default();
+        ledger.reserve(&scope, now).unwrap();
+        let mut expired = scope.response_budget().unwrap();
+        let reply = response(&request, "payload");
+        let measurement = response_measurement(&reply, 1_000).unwrap();
+        assert!(!ledger.settle_response(
+            &mut expired, Some(&measurement), now + Duration::seconds(11),
+        ));
+        assert_eq!(
+            ledger.observed_at_unix_secs,
+            (now + Duration::seconds(11)).timestamp()
+        );
+        ledger.validate().unwrap();
+        let mut pending = scope.response_budget().unwrap();
+        assert!(
+            !ledger.settle_response(&mut pending, Some(&measurement), now),
+            "a backward clock adjustment cannot restore a second pending attempt"
+        );
+        assert!(ledger.accounts.is_empty());
+        let mut pruned_ledger = CapabilityUsageLedger::default();
+        let mut pruned = scope.response_budget().unwrap();
+        assert!(!pruned_ledger.settle_response(&mut pruned, Some(&measurement), now));
+        assert!(pruned_ledger.accounts.is_empty());
+    }
+
+    #[test]
+    fn response_accounting_preserves_old_input_debt_and_rejects_corrupt_totals() {
+        let request = request(None, Some(1_000));
+        let mut ledger = CapabilityUsageLedger::default();
+        ledger.reserve(&scope(&request), Utc::now()).unwrap();
+        let mut old = serde_json::to_value(&ledger).unwrap();
+        let account = old["accounts"].as_object_mut().unwrap().values_mut().next().unwrap();
+        account.as_object_mut().unwrap().remove("response_bytes");
+        let restored: CapabilityUsageLedger = serde_json::from_value(old.clone()).unwrap();
+        restored.validate().unwrap();
+        let account = restored.accounts.values().next().unwrap();
+        assert_eq!(account.input_bytes, scope(&request).input_bytes);
+        assert_eq!(account.response_bytes, 0);
+        let account = old["accounts"].as_object_mut().unwrap().values_mut().next().unwrap();
+        account["response_bytes"] = serde_json::json!(u64::MAX);
+        assert!(serde_json::from_value::<CapabilityUsageLedger>(old).unwrap().validate().is_err());
     }
 
     #[fcp_async_core::runtime::test]
@@ -1257,6 +1768,7 @@ mod tests {
                     grant_digest: "0".repeat(64),
                     calls: 1,
                     input_bytes: 1,
+                    response_bytes: 0,
                     max_calls: Some(1),
                     max_input_bytes: None,
                     expires_at_unix_secs: known.expires_at,
@@ -1296,6 +1808,7 @@ mod tests {
                     grant_digest: "0".repeat(64),
                     calls: 1,
                     input_bytes: 1,
+                    response_bytes: 0,
                     max_calls: Some(1),
                     max_input_bytes: None,
                     expires_at_unix_secs: old.expires_at,

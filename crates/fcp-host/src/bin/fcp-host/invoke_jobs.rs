@@ -438,6 +438,7 @@ pub(super) fn execute<'a>(
         execution_fence,
         origin,
         None,
+        None,
     )
 }
 
@@ -453,6 +454,7 @@ pub(super) fn execute_with_intake<'a>(
     relay: Option<fcp_host::RelayCancellationBinding>,
     execution_fence: Option<ConnectorExecutionFence>,
     origin: Option<MeshInvokeOrigin>,
+    response_route: Option<super::InvokeRouteProvenance>,
     intake: Option<super::mesh_forward_intake::Permit>,
 ) -> std::pin::Pin<Box<dyn Future<Output = HostResult<InvokeResponse>> + Send + 'a>> {
     Box::pin(async move {
@@ -579,6 +581,7 @@ pub(super) fn execute_with_intake<'a>(
                         registry_generation,
                         execution_fence,
                         origin,
+                        response_route,
                     },
                 )
                 .await
@@ -905,6 +908,7 @@ struct AdmittedInvocationContext {
     registry_generation: u64,
     execution_fence: ConnectorExecutionFence,
     origin: Option<MeshInvokeOrigin>,
+    response_route: Option<super::InvokeRouteProvenance>,
 }
 
 async fn run_owned(
@@ -921,6 +925,7 @@ async fn run_owned(
         registry_generation,
         execution_fence,
         origin,
+        response_route,
     } = admitted;
     let remaining_ms = u64::try_from(
         deadline
@@ -1062,7 +1067,7 @@ async fn run_owned(
     if sampling {
         persist_finalization(state, &ticket, finalization.clone(), finalize_by).await;
     }
-    let result = match terminal_persistence {
+    let mut result = match terminal_persistence {
         Err(error) => Err(HostError::Unavailable(format!(
             "connector outcome could not be persisted; inspect the invocation record before retrying: {error}"
         ))),
@@ -1096,6 +1101,24 @@ async fn run_owned(
             (result, Ok(_)) => result,
         },
     };
+    // Account the complete executor envelope after sampling and local routing
+    // annotations. The durable source observation remains intact if delivery
+    // exceeds the signed grant; a refusal must never suggest the effect failed.
+    if let (Some(route), Ok(response)) = (response_route, &mut result) {
+        super::stamp_invoke_route(response, route);
+    }
+    if let Ok(response) = &result {
+        let settlement = before_deadline(
+            finalize_by,
+            state.lifecycle.settle_capability_response(&ticket, response),
+            "signed response byte settlement",
+        )
+        .await
+        .and_then(std::convert::identity);
+        if let Err(error) = settlement {
+            result = Err(error);
+        }
+    }
     if source_persisted && audit_persisted && finalization.sampling_completed != Some(false) {
         finalization.response_http_status = Some(match &result {
             Ok(_) => axum::http::StatusCode::OK.as_u16(),
@@ -1407,6 +1430,145 @@ mod tests {
         })
         .await
         .expect("owned invocation completes before testing persisted retry refusal");
+    }
+
+    #[cfg(unix)]
+    #[fcp_async_core::runtime::test]
+    async fn signed_response_budget_covers_local_route_before_delivery_and_custody() {
+        for allow_route in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut fixture = dispatch_fixture();
+            fixture.request.idempotency_key = Some("route-byte-budget".to_owned());
+            fixture.state = crate::tests::dispatcher_app_state(
+                Arc::clone(&fixture.state.registry),
+                Arc::new(
+                    fcp_host::HostAdminStateStore::with_state_path(
+                        directory.path().join("admin-state.json"),
+                    )
+                    .unwrap(),
+                ),
+                Some(fixture.signing_key.verifying_key()),
+                HashMap::from([(
+                    fcp_core::ZoneId::work(),
+                    crate::host_runtime_policy(fcp_core::ZoneId::work()),
+                )]),
+            );
+            let results_path = directory.path().join("results");
+            let results = Arc::new(
+                fcp_host::InvocationResultStore::open(results_path.clone()).unwrap(),
+            );
+            let mut jobs = InvocationJobs::new();
+            jobs.result_store = Some(Arc::clone(&results));
+            Arc::get_mut(&mut fixture.state).unwrap().invoke_jobs = Arc::new(jobs);
+
+            let bare = InvokeResponse::ok(
+                fixture.request.id.clone(),
+                serde_json::json!({ "dispatched": true }),
+            );
+            let route = crate::InvokeRouteProvenance::host_backed(
+                Some("route-budget-executor".to_owned()),
+                "local-installed",
+            );
+            let mut expected = bare.clone();
+            crate::stamp_invoke_route(&mut expected, route.clone());
+            let input_bytes = u64::try_from(
+                fcp_crypto::canonicalize::to_deterministic_cbor(&fixture.request.input)
+                    .unwrap()
+                    .len(),
+            )
+            .unwrap();
+            let bare_bytes = u64::try_from(serde_json::to_vec(&bare).unwrap().len()).unwrap();
+            let routed_bytes =
+                u64::try_from(serde_json::to_vec(&expected).unwrap().len()).unwrap();
+            assert!(routed_bytes > bare_bytes);
+            let constraints = fcp_core::CapabilityConstraints {
+                resource_allow: vec!["*".to_owned()],
+                max_bytes: Some(input_bytes + if allow_route { routed_bytes } else { bare_bytes }),
+                ..Default::default()
+            };
+            let mut encoded = Vec::new();
+            ciborium::into_writer(&constraints, &mut encoded).unwrap();
+            let claims = fixture
+                .request
+                .capability_token
+                .raw()
+                .verify(&fixture.signing_key.verifying_key())
+                .unwrap()
+                .token_id(b"local-route-response-budget")
+                .try_constraints_cbor(&encoded)
+                .unwrap();
+            fixture.request.capability_token = fcp_core::CapabilityToken::from_raw(
+                fcp_crypto::cose::CoseToken::sign(&fixture.signing_key, &claims).unwrap(),
+            );
+
+            let delivered = execute_with_intake(
+                &fixture.state,
+                fixture.request.clone(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(route),
+                None,
+            )
+            .await;
+            wait_for_dispatch_fixture_job_retirement(&fixture).await;
+            assert_eq!(fixture.invoke_count.load(Ordering::SeqCst), 1);
+            let record = fixture
+                .state
+                .lifecycle
+                .invocation_record(&fixture.request.id.to_string(), None)
+                .await
+                .unwrap();
+            assert_eq!(
+                record.terminal.as_ref().unwrap().outcome,
+                fcp_host::InvocationOutcome::Succeeded,
+                "withholding delivery must preserve the observed connector success",
+            );
+            let budget = record.capability_response.as_ref().unwrap();
+            if allow_route {
+                let delivered = delivered.unwrap();
+                assert_eq!(
+                    serde_json::to_value(&delivered).unwrap(),
+                    serde_json::to_value(&expected).unwrap(),
+                );
+                budget.validate_response(&delivered).unwrap();
+                let binding = fcp_host::InvocationResultBinding::from_record(&record).unwrap();
+                let retained = results
+                    .get(&binding, chrono::Utc::now())
+                    .unwrap()
+                    .expect("the charged routed envelope is recoverable");
+                assert_eq!(
+                    serde_json::to_value(&retained.response).unwrap(),
+                    serde_json::to_value(&expected).unwrap(),
+                );
+                budget.validate_response(&retained.response).unwrap();
+            } else {
+                assert!(
+                    delivered
+                        .unwrap_err()
+                        .to_string()
+                        .contains("signed capability byte accounting"),
+                );
+                assert!(!budget.is_settled());
+                assert!(budget.validate_response(&expected).is_err());
+                assert!(fcp_host::InvocationResultBinding::from_record(&record).is_err());
+                assert!(record.finalization.as_ref().unwrap().response_status.is_none());
+            }
+            let result_files = std::fs::read_dir(&results_path)
+                .unwrap()
+                .filter(|entry| {
+                    entry
+                        .as_ref()
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("result-")
+                })
+                .count();
+            assert_eq!(result_files, usize::from(allow_route));
+        }
     }
 
     #[fcp_async_core::runtime::test]

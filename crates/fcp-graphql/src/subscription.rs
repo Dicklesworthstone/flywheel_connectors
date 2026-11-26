@@ -647,6 +647,7 @@ async fn while_subscribed<T, F: Future>(tx: &mpsc::Sender<T>, future: F) -> Opti
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn reconnect_connection<T>(
     client: &WsClient,
     service_name: &str,
