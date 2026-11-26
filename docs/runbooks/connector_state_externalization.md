@@ -20,10 +20,21 @@ The expected local cache layout is:
 <state-root>/<connector-id>/cache/<zone>/.fcp-cache-only
 ```
 
-Use `fwc connector state explain --connector <id> --json` before treating any
-state file as authoritative. The command reports `schema_version: "1.0.0"`,
-`canonical_storage`, cache marker evidence, and any live-host downgrade or
-offline-inspection warnings.
+Inspect the selected host with an owner credential. The query zone selects the
+state or lease being inspected. The bearer authenticates the operator in the
+owner zone.
+
+```bash
+fwc --host https://node-b.example.invalid connector state explain \
+  --connector <id> --zone z:work --admin-token-file ./host-admin.token --json
+fwc --host https://node-b.example.invalid connector lease status \
+  --connector <id> --zone z:work --admin-token-file ./host-admin.token --json
+```
+
+Both commands also accept the bearer from `FCP_HOST_ADMIN_BEARER_TOKEN`.
+Use HTTPS, a Unix socket, or literal loopback HTTP. The state report includes
+`canonical_storage`, verified canonical state or cache-marker evidence, and the
+scope observed by the host. Use `--offline` for local artifacts.
 
 ## Runtime Lifecycle and State Handoff
 

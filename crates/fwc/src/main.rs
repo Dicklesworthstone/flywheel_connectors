@@ -136,6 +136,7 @@ mod computation_migration;
 mod confusion_workflow;
 mod connector_state;
 mod connector_state_pull_cmd;
+mod connector_state_admin;
 #[allow(dead_code)] // Auth verify + credential backend trait.
 mod credential;
 #[allow(dead_code)]
@@ -1166,6 +1167,11 @@ struct ConnectorStateExplainArgs {
     #[arg(long, default_value_t = false)]
     offline: bool,
 
+    /// Read the owner bearer from this file (defaults to FCP_HOST_ADMIN_BEARER_TOKEN).
+    #[arg(long, value_name = "PATH", conflicts_with = "offline")]
+    #[serde(skip_serializing)]
+    admin_token_file: Option<PathBuf>,
+
     /// Fail unless the command resolves from at least this truth source.
     #[arg(long, value_enum)]
     require_source: Option<RequiredTruthSource>,
@@ -1197,6 +1203,11 @@ struct ConnectorLeaseStatusArgs {
     /// Inspect the local HRW plan without contacting a host.
     #[arg(long, default_value_t = false)]
     offline: bool,
+
+    /// Read the owner bearer from this file (defaults to FCP_HOST_ADMIN_BEARER_TOKEN).
+    #[arg(long, value_name = "PATH", conflicts_with = "offline")]
+    #[serde(skip_serializing)]
+    admin_token_file: Option<PathBuf>,
 
     /// Fail unless the command resolves from at least this truth source.
     #[arg(long, value_enum)]
@@ -6613,30 +6624,6 @@ impl HostAdminClient {
         self.get_json(&format!("/rpc/connectors/{connector_id}/status"))
     }
 
-    fn connector_state_explain(&self, connector_id: &str, zone: Option<&str>) -> Result<Value> {
-        let mut path = format!("/rpc/admin/connectors/{connector_id}/state/explain");
-        if let Some(zone) = zone.map(str::trim).filter(|zone| !zone.is_empty()) {
-            let query = url::form_urlencoded::Serializer::new(String::new())
-                .append_pair("zone", zone)
-                .finish();
-            path.push('?');
-            path.push_str(&query);
-        }
-        self.get_json(&path)
-    }
-
-    fn connector_lease_status(&self, connector_id: &str, zone: Option<&str>) -> Result<Value> {
-        let mut path = format!("/rpc/admin/connectors/{connector_id}/lease/status");
-        if let Some(zone) = zone.map(str::trim).filter(|zone| !zone.is_empty()) {
-            let query = url::form_urlencoded::Serializer::new(String::new())
-                .append_pair("zone", zone)
-                .finish();
-            path.push('?');
-            path.push_str(&query);
-        }
-        self.get_json(&path)
-    }
-
     fn config_snapshot(&self, connector_id: &str) -> Result<ConnectorConfigSnapshot> {
         self.get_json(&format!("/rpc/connectors/{connector_id}/config"))
     }
@@ -10873,7 +10860,7 @@ fn connector_state_explain_host_dispatch(
         return Ok(outcome);
     }
 
-    let client = HostAdminClient::new(&host.endpoint)?;
+    let client = connector_state_admin::discovery_client(&host.endpoint)?;
     let (catalog, discovery) = client.catalog(None)?;
     let connector = match catalog.resolve_connector(&args.connector) {
         Ok(connector) => connector,
@@ -10890,7 +10877,13 @@ fn connector_state_explain_host_dispatch(
         .map(str::trim)
         .filter(|zone| !zone.is_empty())
         .or(host.default_zone.as_deref());
-    let mut payload = client.connector_state_explain(connector.summary.id.as_str(), zone)?;
+    let mut payload = connector_state_admin::read(
+        &client,
+        connector_state_admin::ReadKind::State,
+        connector.summary.id.as_str(),
+        zone,
+        args.admin_token_file.as_deref(),
+    )?;
     let host_payload_source = payload
         .get("source")
         .cloned()
@@ -11071,7 +11064,7 @@ fn connector_lease_status_host_dispatch(
         return Ok(outcome);
     }
 
-    let client = HostAdminClient::new(&host.endpoint)?;
+    let client = connector_state_admin::discovery_client(&host.endpoint)?;
     let (catalog, discovery) = client.catalog(None)?;
     let connector = match catalog.resolve_connector(&args.connector) {
         Ok(connector) => connector,
@@ -11088,7 +11081,13 @@ fn connector_lease_status_host_dispatch(
     let (zone, effective_target) =
         host_connector_lease_status_zone(args.zone.as_deref(), connector, &args.connector)?;
     let mut payload =
-        client.connector_lease_status(connector.summary.id.as_str(), Some(zone.as_str()))?;
+        connector_state_admin::read(
+        &client,
+        connector_state_admin::ReadKind::Lease,
+        connector.summary.id.as_str(),
+        Some(zone.as_str()),
+        args.admin_token_file.as_deref(),
+    )?;
     let host_payload_source = payload
         .get("source")
         .cloned()
@@ -51147,6 +51146,12 @@ deny_ptrace = true
         }
     }
 
+    fn connector_state_test_owner() -> tempfile::NamedTempFile {
+        let mut token = tempfile::NamedTempFile::new().unwrap();
+        token.write_all(b"test-owner-credential").unwrap();
+        token
+    }
+
     #[test]
     fn execute_connector_state_explain_reports_local_storage_without_marker() {
         let state_root = TempDir::new().expect("state root tempdir should exist");
@@ -51321,6 +51326,7 @@ deny_ptrace = true
 
     #[test]
     fn execute_connector_state_explain_uses_context_default_zone_unless_explicit() {
+        let owner = connector_state_test_owner();
         for (explicit_zone, expected_zone) in [
             (None, "z:community"),
             (Some("   "), "z:community"),
@@ -51345,8 +51351,10 @@ deny_ptrace = true
                             "connector_id": "fcp.github:enterprise:v1",
                             "canonical_storage": "mesh",
                             "last_canonical_seq": 17,
+                            "zone": {"requested": expected_zone},
                             "canonical_state": {
                                 "root_present": true,
+                                "connector_id": "fcp.github:enterprise:v1",
                                 "zone_id": expected_zone,
                                 "status_source": "fcp-store",
                             },
@@ -51374,6 +51382,7 @@ deny_ptrace = true
                 "connector",
                 "state",
                 "explain",
+                "--admin-token-file", owner.path().to_str().unwrap(),
                 "--connector",
                 "github",
                 "--require-source",
@@ -51396,6 +51405,7 @@ deny_ptrace = true
 
     #[test]
     fn execute_connector_read_commands_use_context_host_and_honor_explicit_override() {
+        let owner = connector_state_test_owner();
         for (family, action, evidence_field, evidence_value, host_source) in [
             (
                 "state",
@@ -51425,6 +51435,11 @@ deny_ptrace = true
                         "route_available": true,
                     },
                 });
+                if family == "state" {
+                    response["zone"] = json!({"requested":"z:work"});
+                    response["canonical_state"] = json!({"root_present":true,
+                        "connector_id":"fcp.github:enterprise:v1","zone_id":"z:work"});
+                }
                 response[evidence_field] = json!(evidence_value);
                 let (host, server) = spawn_mock_host(
                     StdBTreeMap::from([
@@ -51461,6 +51476,7 @@ deny_ptrace = true
                     "connector",
                     family,
                     action,
+                    "--admin-token-file", owner.path().to_str().unwrap(),
                     "--connector",
                     "github",
                     "--zone",
@@ -51566,6 +51582,7 @@ deny_ptrace = true
 
     #[test]
     fn execute_connector_state_explain_with_host_queries_admin_route() {
+        let owner = connector_state_test_owner();
         let (host, server) = spawn_mock_host(
             StdBTreeMap::from([
                 (
@@ -51580,7 +51597,7 @@ deny_ptrace = true
                         "command": "fcp-host",
                         "subcommand": "connector state explain",
                         "schema_version": "1.0.0",
-                        "source": "host-cache-markers",
+                        "source": "host-canonical-state",
                         "connector_id": "fcp.github:enterprise:v1",
                         "canonical_storage": "mesh",
                         "last_canonical_seq": 17,
@@ -51624,6 +51641,7 @@ deny_ptrace = true
             "connector",
             "state",
             "explain",
+            "--admin-token-file", owner.path().to_str().unwrap(),
             "--connector",
             "github",
             "--zone",
@@ -51637,10 +51655,10 @@ deny_ptrace = true
         assert_eq!(payload["schema_version"], "1.0.0");
         assert_eq!(payload["_truth_source"], "host");
         assert_eq!(payload["source"], "host-admin-api");
-        assert_eq!(payload["host_payload_source"], "host-cache-markers");
+        assert_eq!(payload["host_payload_source"], "host-canonical-state");
         assert_eq!(
             payload["message"],
-            "Explained connector state storage for `github` from live fcp-host cache-marker evidence."
+            "Explained connector state storage for `github` from live fcp-host canonical fcp-store state."
         );
         assert_eq!(
             payload["connector"]["canonical_id"],
@@ -51706,6 +51724,7 @@ deny_ptrace = true
 
     #[test]
     fn execute_connector_state_explain_with_host_preserves_canonical_state_evidence() {
+        let owner = connector_state_test_owner();
         let (host, server) = spawn_mock_host(
             StdBTreeMap::from([
                 (
@@ -51762,6 +51781,7 @@ deny_ptrace = true
             "connector",
             "state",
             "explain",
+            "--admin-token-file", owner.path().to_str().unwrap(),
             "--connector",
             "github",
             "--zone",
@@ -51935,6 +51955,7 @@ deny_ptrace = true
 
     #[test]
     fn execute_connector_lease_status_with_host_queries_admin_route() {
+        let owner = connector_state_test_owner();
         let (host, server) = spawn_mock_host(
             StdBTreeMap::from([
                 (
@@ -51989,6 +52010,7 @@ deny_ptrace = true
             "connector",
             "lease",
             "status",
+            "--admin-token-file", owner.path().to_str().unwrap(),
             "--connector",
             "github",
             "--zone",
@@ -52055,6 +52077,7 @@ deny_ptrace = true
 
     #[test]
     fn execute_connector_lease_status_with_host_uses_context_target_zone() {
+        let owner = connector_state_test_owner();
         let (_tempdir, path, _guard) = temp_context_config();
         let mut config = super::default_context_config();
         let mesh_targets = &mut config
@@ -52125,6 +52148,7 @@ deny_ptrace = true
             "connector",
             "lease",
             "status",
+            "--admin-token-file", owner.path().to_str().unwrap(),
             "--connector",
             "github",
         ]);
