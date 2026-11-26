@@ -1376,7 +1376,7 @@ impl MigratableComputation {
         }
     }
 
-    fn validate_checkpoint_binding(
+    fn validate_checkpoint_contents(
         &self,
         checkpoint: &ComputationCheckpoint,
         checkpoint_object_id: ObjectId,
@@ -1433,6 +1433,15 @@ impl MigratableComputation {
             });
         }
 
+        Ok(())
+    }
+
+    fn validate_checkpoint_binding(
+        &self,
+        checkpoint: &ComputationCheckpoint,
+        checkpoint_object_id: ObjectId,
+    ) -> Result<(), ComputationMigrationError> {
+        self.validate_checkpoint_contents(checkpoint, checkpoint_object_id)?;
         if self
             .checkpoint_object_id
             .is_some_and(|expected| expected != checkpoint_object_id)
@@ -1463,7 +1472,24 @@ impl MigratableComputation {
             });
         }
 
-        self.validate_checkpoint_binding(checkpoint, checkpoint_object_id)?;
+        self.validate_checkpoint_contents(checkpoint, checkpoint_object_id)?;
+        // The last checkpoint remains pinned after resume. New work must extend
+        // that boundary; an exact re-suspension can retain the same checkpoint.
+        let previous = self.checkpoint_object_id.or(self.capability_context.checkpoint_id);
+        let advances = previous.is_some_and(|id| id != checkpoint_object_id);
+        if advances && checkpoint.capability_context.checkpoint_id != previous {
+            return Err(ComputationMigrationError::CheckpointObjectMismatch {
+                expected: previous,
+                got: checkpoint_object_id,
+            });
+        }
+        let current = self.capability_context.checkpoint_seq;
+        if checkpoint.checkpoint_seq < current || (advances && checkpoint.checkpoint_seq == current) {
+            return Err(ComputationMigrationError::CheckpointSequenceConflict {
+                current,
+                candidate: checkpoint.checkpoint_seq,
+            });
+        }
         self.state = MigratableComputationState::Suspended;
         self.checkpoint_object_id = Some(checkpoint_object_id);
         self.capability_context = checkpoint.capability_context.clone();
@@ -1521,6 +1547,12 @@ impl MigratableComputation {
         now: u64,
     ) -> Result<(), ComputationMigrationError> {
         self.validate_checkpoint_binding(checkpoint, checkpoint_object_id)?;
+        if checkpoint.checkpoint_seq < self.capability_context.checkpoint_seq {
+            return Err(ComputationMigrationError::CheckpointSequenceConflict {
+                current: self.capability_context.checkpoint_seq,
+                candidate: checkpoint.checkpoint_seq,
+            });
+        }
 
         match &self.state {
             MigratableComputationState::Suspended => {
@@ -2425,6 +2457,8 @@ impl ResumeEvidence {
 /// Errors produced while advancing the computation migration state machine.
 #[derive(Debug, Error)]
 pub enum ComputationMigrationError {
+    #[error("checkpoint sequence {candidate} would replace or roll back durable sequence {current}")]
+    CheckpointSequenceConflict { current: u64, candidate: u64 },
     #[error("cannot {action} while computation is in state {state:?}")]
     InvalidStateTransition {
         state: MigratableComputationState,
@@ -6795,6 +6829,51 @@ mod tests {
     }
 
     // --- Multiple suspend/resume cycles ---
+
+    #[test]
+    fn resumed_holder_can_suspend_new_work_and_migrate_again() {
+        let source = test_object_id("source-lease");
+        let target = test_object_id("target-lease");
+        let third = test_object_id("third-lease");
+        let first = test_computation_checkpoint("source", source, 7, 1);
+        let first_id = first.object_id().unwrap();
+        let mut comp = MigratableComputation::new(
+            first.computation_id, ZoneId::work(), test_node_id("source"),
+            source, 7, test_migration_context(0),
+        );
+        let first_handoff = test_migration_handoff_with_checkpoint(
+            source, target, "source", "target", 7, 8, Some(first_id),
+        );
+        let target_lease = test_migration_lease("target", 8, 2_000);
+        comp.suspend(&first, first_id).unwrap();
+        comp.begin_transfer(&test_migration_lease("source", 7, 2_000), &first_handoff, 1_500).unwrap();
+        comp.resume(&first, first_id, target, &target_lease, 1_500).unwrap();
+
+        let mut next = test_computation_checkpoint("target", target, 8, 2);
+        next.state_cbor = vec![0xbb; 32];
+        let saved = serde_json::to_value(&comp).unwrap();
+        for (parent, seq) in [
+            (None, 2), (Some(test_object_id("unrelated")), 2),
+            (Some(first_id), 1), (Some(first_id), 0),
+        ] {
+            next.capability_context.checkpoint_id = parent;
+            next.checkpoint_seq = seq;
+            assert!(comp.suspend(&next, next.object_id().unwrap()).is_err());
+            assert_eq!(serde_json::to_value(&comp).unwrap(), saved);
+        }
+        next.capability_context.checkpoint_id = Some(first_id);
+        next.checkpoint_seq = 2;
+        let next_id = next.object_id().unwrap();
+        let next_handoff = test_migration_handoff_with_checkpoint(
+            target, third, "target", "third", 8, 9, Some(next_id),
+        );
+        comp.suspend(&next, next_id).unwrap();
+        comp.begin_transfer(&target_lease, &next_handoff, 1_500).unwrap();
+        comp.resume(&next, next_id, third, &test_migration_lease("third", 9, 2_000), 1_500).unwrap();
+        assert_eq!(comp.current_holder, test_node_id("third"));
+        assert_eq!(comp.capability_context.checkpoint_id, Some(next_id));
+        assert_eq!(comp.capability_context.checkpoint_seq, 2);
+    }
 
     #[test]
     fn double_suspend_resume_cycle_same_holder() {
