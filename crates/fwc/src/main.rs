@@ -252,6 +252,7 @@ mod render;
 mod replay;
 #[allow(dead_code)] // Retry controller with exponential backoff and jitter.
 mod retry_controller;
+mod rollout_evaluate;
 #[allow(dead_code)] // Smart connector auto-routing for ambiguous intents.
 mod routing;
 mod rules_cmd;
@@ -2157,6 +2158,9 @@ struct RolloutArgs {
 enum RolloutCommand {
     /// Set the canary percentage for a connector rollout.
     Set(RolloutSetArgs),
+
+    /// Apply one observed health sample and evaluate the host's rollout decision.
+    Evaluate(rollout_evaluate::EvaluateArgs),
 
     /// Show current rollout state for a connector.
     Status(TargetArgs),
@@ -19141,6 +19145,7 @@ fn parse_lifecycle_action(s: &str) -> Option<lifecycle_mutations::LifecycleActio
 
 fn rollout_dispatch(args: &RolloutArgs, explicit_host: Option<&str>) -> Result<DispatchOutcome> {
     let command = match &args.command {
+        RolloutCommand::Evaluate(_) => "rollout evaluate",
         RolloutCommand::Set(_) => "rollout set",
         RolloutCommand::Status(_) => "rollout status",
         RolloutCommand::Rollback(_) => "rollout rollback",
@@ -19158,10 +19163,26 @@ fn rollout_dispatch(args: &RolloutArgs, explicit_host: Option<&str>) -> Result<D
         ));
     };
 
-    let client = HostAdminClient::new(&host.endpoint)?;
+    let client = if matches!(&args.command, RolloutCommand::Evaluate(_)) {
+        // Resolve aliases on the same direct, confidential transport used to
+        // submit the observation, without giving discovery the owner bearer.
+        HostAdminClient::new_with_transport(&host.endpoint, None, true)
+            .map_err(|_| anyhow::anyhow!("evaluation requires a valid HTTPS, literal loopback HTTP, or Unix socket endpoint and host read deadline"))?
+            .with_response_limit(8 * 1024 * 1024)
+    } else {
+        HostAdminClient::new(&host.endpoint)?
+    };
     let (catalog, _) = client.catalog(None)?;
 
     match &args.command {
+        RolloutCommand::Evaluate(args) => match catalog.resolve_connector(&args.connector) {
+            Ok(connector) => rollout_evaluate::dispatch(args, connector, &host),
+            Err(error) => Ok(connector_resolution_dispatch(
+                "rollout evaluate",
+                &args.connector,
+                &error,
+            )),
+        },
         RolloutCommand::Set(set_args) => {
             if set_args.canary > 100 {
                 anyhow::bail!("canary percentage must be 0-100, got {}", set_args.canary);
@@ -19378,26 +19399,19 @@ fn rollout_dispatch(args: &RolloutArgs, explicit_host: Option<&str>) -> Result<D
 
 const MAX_ROLLBACK_TARGET_BYTES: u64 = 1024 * 1024;
 
-fn read_rollback_target_config(
-    path: &Path,
-    connector_id: &str,
-    version: &semver::Version,
-) -> Result<ManagedConnectorConfig> {
-    let source_error = || {
-        anyhow::anyhow!(
-            "--target-config must name a readable regular JSON file no larger than 1 MiB"
-        )
-    };
+fn read_rollout_file(path: &Path, flag: &str) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+    let source_error =
+        || anyhow::anyhow!("{flag} must name a readable regular JSON file no larger than 1 MiB");
     let metadata = std::fs::metadata(path).map_err(|_| source_error())?;
     anyhow::ensure!(
         metadata.is_file() && metadata.len() <= MAX_ROLLBACK_TARGET_BYTES,
-        "--target-config must name a regular JSON file no larger than 1 MiB"
+        source_error()
     );
     let file = std::fs::File::open(path).map_err(|_| source_error())?;
     let metadata = file.metadata().map_err(|_| source_error())?;
     anyhow::ensure!(
         metadata.is_file() && metadata.len() <= MAX_ROLLBACK_TARGET_BYTES,
-        "--target-config must name a regular JSON file no larger than 1 MiB"
+        source_error()
     );
     let mut raw = zeroize::Zeroizing::new(Vec::new());
     file.take(MAX_ROLLBACK_TARGET_BYTES + 1)
@@ -19405,8 +19419,17 @@ fn read_rollback_target_config(
         .map_err(|_| source_error())?;
     anyhow::ensure!(
         raw.len() as u64 <= MAX_ROLLBACK_TARGET_BYTES,
-        "--target-config exceeds 1 MiB"
+        source_error()
     );
+    Ok(raw)
+}
+
+fn read_rollback_target_config(
+    path: &Path,
+    connector_id: &str,
+    expected_version: Option<&semver::Version>,
+) -> Result<ManagedConnectorConfig> {
+    let raw = read_rollout_file(path, "--target-config")?;
     // Deserialize the actual type first, which also rejects duplicate known
     // fields. Explicitly reject unknown fields instead of dropping a misspelled
     // authority setting while forwarding the rest of the deployment.
@@ -19448,13 +19471,13 @@ fn read_rollback_target_config(
         config.id.parse::<ConnectorId>().is_ok() && config.id == connector_id,
         "--target-config must name the selected connector's exact canonical ID"
     );
+    let version = config
+        .version
+        .as_deref()
+        .and_then(|value| value.parse::<semver::Version>().ok())
+        .context("--target-config must declare a semantic version")?;
     anyhow::ensure!(
-        config
-            .version
-            .as_deref()
-            .and_then(|value| value.parse::<semver::Version>().ok())
-            .as_ref()
-            == Some(version),
+        expected_version.is_none_or(|expected| expected == &version),
         "--target-config must declare a semantic version matching --to"
     );
     anyhow::ensure!(
@@ -19519,7 +19542,8 @@ fn pinned_rollout_rollback_dispatch(
             .target_config
             .as_deref()
             .context("--target-config is required for pinned rollback")?;
-        let target = read_rollback_target_config(path, connector.summary.id.as_str(), &version)?;
+        let target =
+            read_rollback_target_config(path, connector.summary.id.as_str(), Some(&version))?;
         let client =
             HostAdminClient::for_provider_auth(&host.endpoint, args.admin_token_file.as_deref())?;
         Ok::<_, anyhow::Error>((
@@ -39563,6 +39587,7 @@ fn enrich_unknown_guide_command(payload: &mut Value, command: Option<&str>) {
 #[cfg(test)]
 mod tests {
     mod cancel_cli;
+    mod rollout_evaluate_cli;
 
     use crate::supply_chain_cmd::{SignArgs, SupplyChainArgs, SupplyChainCommand};
     use crate::truth::RequiredTruthSource;

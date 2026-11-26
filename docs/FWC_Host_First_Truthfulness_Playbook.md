@@ -529,30 +529,49 @@ version, and the target must preserve the current zone envelope. Both current
 and target deployments must be admitted stateless deployments; stateful
 restoration still requires a canonical state handoff.
 
-Health-policy evaluation can use that same explicit target through the
-authenticated `POST /rpc/rollout/evaluate` route. Starting with an evaluation
-document containing the actual observation and rollout policy, attach the full
-inventory object and explicitly permit automatic rollback:
+Submit an observed invocation and the policy to apply with `fwc rollout evaluate`.
+The command records one health sample, including when the decision is Hold.
+Supply the observed values from that invocation. For example, a successful call
+with 18 ms latency at 480 seconds of uptime could use this observation file:
 
-```bash
-jq --slurpfile target ./github-1.2.2.inventory.json \
-  '.rollback_target = $target[0] | .policy.rollback_rules.auto_rollback = true' \
-  rollout-observation.json > rollout-evaluation.json
-
-curl --fail-with-body --silent --show-error \
-  --header "Authorization: Bearer ${FCP_HOST_ADMIN_BEARER_TOKEN:?}" \
-  --header 'X-FCP-Zone: z:owner' \
-  --header 'Content-Type: application/json' \
-  --data-binary @rollout-evaluation.json \
-  http://127.0.0.1:8787/rpc/rollout/evaluate
+```json
+{
+  "invocation_succeeded": true,
+  "latency_ms": 18,
+  "uptime_secs": 480,
+  "policy": {
+    "format": "fcp-rollout-policy",
+    "schema_version": "1.0",
+    "canary_percent": 10,
+    "min_canary_duration_secs": 300,
+    "success_thresholds": {
+      "min_success_rate_bps": 9500, "max_error_rate_bps": 500,
+      "min_samples": 100, "window_secs": 300
+    },
+    "rollback_rules": {
+      "max_error_rate_bps": 2000, "max_consecutive_failures": 5,
+      "min_samples": 10, "window_secs": 60, "auto_rollback": true
+    }
+  }
+}
 ```
 
-The evaluation document's `connector_id` must identify the same connector as
-the target. Its existing `invocation_succeeded`, optional latency and uptime,
-and policy thresholds remain the inputs to the decision. An explicit target
-does not override the policy: `policy.rollback_rules.auto_rollback` must be
-true before the evaluator can restore an executable. Hold and Promote decisions
-do not open or prepare the target's binary or manifest.
+```bash
+fwc rollout evaluate github --observation ./rollout-observation.json \
+  --target-config ./github-1.2.2.inventory.json \
+  --admin-token-file ./host-admin.token --host http://127.0.0.1:8787 --json
+```
+
+The owner bearer can also come from `FCP_HOST_ADMIN_BEARER_TOKEN`. Use HTTPS,
+literal loopback HTTP, or a Unix socket. Optional `connector_id` binds the
+observation to its exact canonical connector. Optional `observed_at` (RFC 3339)
+and `crashed` carry the observation time and crash signal. The host uses its
+persisted pin state. Hold and Promote work without `--target-config`.
+Rollback requires both `policy.rollback_rules.auto_rollback` and the matching
+prior deployment file. A confirmed result includes the decision, state,
+version, health counts, and evidence digest. A verified rollback also reports
+the restored version and its desired state. If the result is unconfirmed,
+inspect `fwc rollout status` before submitting another sample.
 
 Read the truth contract literally:
 
