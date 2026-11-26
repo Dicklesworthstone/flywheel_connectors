@@ -5,11 +5,18 @@
 //! - Cleanup behavior control (best-effort, full, abandon, checkpoint)
 //! - Partial result capture from cancelled operations
 //! - Checkpoint/resume support for resumable operations
-//! - Audit trail for all cancellation decisions
+//! - Bounded in-memory history of cancellation decisions
+//!
+//! Recent completed registrations are retained for late cancellation diagnostics.
+//! Active operations, unsettled runtimes and owned, unacknowledged termination
+//! attempts are never evicted to make room for history. Durable invocation
+//! records remain the authority for historical outcomes after this cache evicts
+//! a completed registration. Audit history is also bounded; its discarded-event
+//! counter makes truncation and explicit clears observable.
 //!
 //! Based on bead `flywheel_connectors-2653`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -231,15 +238,92 @@ fn disarm_scope(scope: Option<CancellationScope>) {
     }
 }
 
+/// Maximum number of recent completed registrations retained as history.
+///
+/// Live and settling operations are not history and remain owned independently.
+const MAX_COMPLETED_OPERATION_HISTORY: usize = 1024;
+/// Maximum number of cancellation audit events retained in memory.
+const MAX_CANCELLATION_AUDIT_HISTORY: usize = 1024;
+
+#[derive(Default)]
+struct OperationTracker {
+    entries: HashMap<String, TrackedOperation>,
+    completed: VecDeque<CancellationRegistration>,
+}
+
+impl OperationTracker {
+    /// Remove only completed registrations, and only the exact generation that
+    /// entered the history queue. A pending force-result owner pins its record
+    /// until acknowledgement or loss of the last attempt handle. This history
+    /// limit never authorizes dropping live runtime custody.
+    fn prune_completed(&mut self) {
+        // Visit each queued generation at most once. If every remaining record
+        // is pinned by outstanding work, stop rather than evicting one or spinning.
+        let candidates = self.completed.len();
+        for _ in 0..candidates {
+            if self.completed.len() <= MAX_COMPLETED_OPERATION_HISTORY {
+                break;
+            }
+            let Some(registration) = self.completed.pop_front() else {
+                break;
+            };
+            let Some(operation) = self.entries.get(&registration.operation_id) else {
+                continue;
+            };
+            if !Arc::ptr_eq(&operation.registration, &registration.identity) {
+                continue;
+            }
+            if !operation.completed
+                || operation.completion_pending
+                || operation.scope.is_some()
+                || (!operation.forced_cancel_recorded
+                    && operation.force_attempt.strong_count() != 0)
+            {
+                self.completed.push_back(registration);
+                continue;
+            }
+            self.entries.remove(&registration.operation_id);
+        }
+    }
+}
+
+#[derive(Default)]
+struct CancellationAuditLog {
+    events: VecDeque<CancellationAuditEvent>,
+    discarded: u64,
+}
+
+impl CancellationAuditLog {
+    fn push(&mut self, event: CancellationAuditEvent) {
+        if self.events.len() == MAX_CANCELLATION_AUDIT_HISTORY {
+            self.events.pop_front();
+            self.discarded = self.discarded.saturating_add(1);
+        }
+        self.events.push_back(event);
+    }
+
+    fn clear(&mut self) {
+        self.discarded = self
+            .discarded
+            .saturating_add(u64::try_from(self.events.len()).unwrap_or(u64::MAX));
+        self.events.clear();
+    }
+}
+
 /// Controller that manages operation tracking and cancellation.
+///
+/// Completed-operation and audit history are bounded to 1,024 entries each.
+/// Outstanding force-result owners can temporarily pin completed registrations
+/// beyond that history limit; acknowledgement and the regular reaper release
+/// those pins. Active and settling registrations are never evicted.
 ///
 /// # Panics
 ///
 /// Methods that access the internal mutex will panic if the mutex is
 /// poisoned (only possible if a thread panicked while holding the lock).
 pub struct CancellationController {
-    operations: Mutex<HashMap<String, TrackedOperation>>,
-    audit_log: Mutex<Vec<CancellationAuditEvent>>,
+    operations: Mutex<OperationTracker>,
+    audit_log: Mutex<CancellationAuditLog>,
 }
 
 impl std::fmt::Debug for CancellationController {
@@ -256,8 +340,8 @@ impl CancellationController {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            operations: Mutex::new(HashMap::new()),
-            audit_log: Mutex::new(Vec::new()),
+            operations: Mutex::new(OperationTracker::default()),
+            audit_log: Mutex::new(CancellationAuditLog::default()),
         }
     }
 
@@ -279,7 +363,12 @@ impl CancellationController {
     pub fn track_with_owner(&self, operation_id: &str, owner: Option<&str>) {
         let previous = {
             let mut ops = self.operations.lock().expect("operations lock");
-            ops.insert(
+            ops.prune_completed();
+            if ops.entries.contains_key(operation_id) {
+                ops.completed
+                    .retain(|registration| registration.operation_id != operation_id);
+            }
+            ops.entries.insert(
                 operation_id.to_string(),
                 TrackedOperation {
                     registration: Arc::new(()),
@@ -339,7 +428,9 @@ impl CancellationController {
         };
         let previous = {
             let mut ops = self.operations.lock().expect("operations lock");
+            ops.prune_completed();
             if ops
+                .entries
                 .get(operation_id)
                 .is_some_and(|operation| !operation.completed)
             {
@@ -347,7 +438,11 @@ impl CancellationController {
                     "operation ID is already active: {operation_id}"
                 )));
             }
-            ops.insert(
+            if ops.entries.contains_key(operation_id) {
+                ops.completed
+                    .retain(|completed| completed.operation_id != operation_id);
+            }
+            ops.entries.insert(
                 operation_id.to_string(),
                 TrackedOperation {
                     registration: Arc::clone(&registration.identity),
@@ -402,7 +497,7 @@ impl CancellationController {
     pub fn complete_registration_when_settled(&self, registration: &CancellationRegistration) {
         let terminator = {
             let mut ops = self.operations.lock().expect("operations lock");
-            let Some(op) = ops.get_mut(&registration.operation_id) else {
+            let Some(op) = ops.entries.get_mut(&registration.operation_id) else {
                 return;
             };
             if op.completed || !Arc::ptr_eq(&registration.identity, &op.registration) {
@@ -422,7 +517,8 @@ impl CancellationController {
     fn complete_settled_registrations(&self) {
         let pending: Vec<_> = {
             let ops = self.operations.lock().expect("operations lock");
-            ops.iter()
+            ops.entries
+                .iter()
                 .filter(|(_, op)| op.completion_pending && !op.completed)
                 .map(|(operation_id, op)| {
                     (
@@ -443,20 +539,35 @@ impl CancellationController {
                 self.complete_registration(&registration);
             }
         }
+        // A completed record may have been pinned by a force-result handle
+        // which disappeared without an acknowledgement between reaper sweeps.
+        self.operations
+            .lock()
+            .expect("operations lock")
+            .prune_completed();
     }
 
     fn complete_matching(&self, operation_id: &str, identity: Option<&Arc<()>>) {
         let scope = {
             let mut ops = self.operations.lock().expect("operations lock");
-            let Some(op) = ops.get_mut(operation_id) else {
+            let Some(op) = ops.entries.get_mut(operation_id) else {
                 return;
             };
-            if identity.is_some_and(|identity| !Arc::ptr_eq(identity, &op.registration)) {
+            if op.completed
+                || identity.is_some_and(|identity| !Arc::ptr_eq(identity, &op.registration))
+            {
                 return;
             }
             op.completed = true;
             op.completion_pending = false;
-            op.scope.take()
+            let completed = CancellationRegistration {
+                operation_id: operation_id.to_owned(),
+                identity: Arc::clone(&op.registration),
+            };
+            let scope = op.scope.take();
+            ops.completed.push_back(completed);
+            ops.prune_completed();
+            scope
         };
         // Completed tombstones retain ownership/audit metadata, not processes.
         // Revoke callbacks outside the controller lock to avoid drop lock chains.
@@ -473,6 +584,7 @@ impl CancellationController {
         self.operations
             .lock()
             .expect("operations lock")
+            .entries
             .get(operation_id)
             .is_some_and(|op| op.cancel_requested)
     }
@@ -552,7 +664,7 @@ impl CancellationController {
 
         let outcome = {
             let mut ops = self.operations.lock().expect("operations lock");
-            match ops.get_mut(&request.operation_id) {
+            match ops.entries.get_mut(&request.operation_id) {
                 None => {
                     return Err(HostError::ConnectorNotFound(format!(
                         "operation not found: {}",
@@ -673,7 +785,7 @@ impl CancellationController {
         self.complete_settled_registrations();
         let mut ops = self.operations.lock().expect("operations lock");
         let mut expired = Vec::new();
-        for (operation_id, op) in ops.iter_mut() {
+        for (operation_id, op) in &mut ops.entries {
             if !op.cancel_requested || op.completed || op.forced_cancel_recorded {
                 continue;
             }
@@ -749,7 +861,7 @@ impl CancellationController {
     ) -> bool {
         let (reason, duration_ms) = {
             let mut ops = self.operations.lock().expect("operations lock");
-            let Some(op) = ops.get_mut(operation_id) else {
+            let Some(op) = ops.entries.get_mut(operation_id) else {
                 return false;
             };
             if op.forced_cancel_recorded
@@ -763,12 +875,14 @@ impl CancellationController {
                 .cancel_requested_at
                 .map(|at| u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX))
                 .unwrap_or_default();
-            (
+            let result = (
                 op.cancel_reason
                     .clone()
                     .unwrap_or(CancelReason::UserRequested),
                 duration_ms,
-            )
+            );
+            ops.prune_completed();
+            result
         };
         self.audit_log
             .lock()
@@ -810,7 +924,7 @@ impl CancellationController {
 
     fn rearm_matching(&self, operation_id: &str, expiration: Option<&ExpiredCancellation>) {
         let mut ops = self.operations.lock().expect("operations lock");
-        if let Some(op) = ops.get_mut(operation_id) {
+        if let Some(op) = ops.entries.get_mut(operation_id) {
             if expiration.is_some_and(|expired| !op.owns_expiration(expired)) {
                 return;
             }
@@ -828,11 +942,14 @@ impl CancellationController {
     ///
     /// Panics if the internal mutex is poisoned.
     pub fn remove(&self, operation_id: &str) {
-        let removed = self
-            .operations
-            .lock()
-            .expect("operations lock")
-            .remove(operation_id);
+        let removed = {
+            let mut ops = self.operations.lock().expect("operations lock");
+            let removed = ops.entries.remove(operation_id);
+            ops.completed
+                .retain(|registration| registration.operation_id != operation_id);
+            ops.prune_completed();
+            removed
+        };
         disarm_scope(removed.and_then(|operation| operation.scope));
     }
 
@@ -843,25 +960,48 @@ impl CancellationController {
     /// Panics if the internal mutex is poisoned.
     #[must_use]
     pub fn tracked_count(&self) -> usize {
-        self.operations.lock().expect("operations lock").len()
+        self.operations
+            .lock()
+            .expect("operations lock")
+            .entries
+            .len()
     }
 
-    /// Get audit events, newest first.
+    /// Get at most 1,024 retained in-memory audit events, newest first.
+    ///
+    /// This is a recent-history view, not a complete durable audit trail.
+    /// See [`Self::discarded_audit_event_count`] for prior history loss.
     ///
     /// # Panics
     ///
     /// Panics if the internal mutex is poisoned.
     #[must_use]
     pub fn audit_events(&self) -> Vec<CancellationAuditEvent> {
-        let mut result = {
-            let guard = self.audit_log.lock().expect("audit lock");
-            guard.clone()
-        };
-        result.reverse();
-        result
+        self.audit_log
+            .lock()
+            .expect("audit lock")
+            .events
+            .iter()
+            .rev()
+            .cloned()
+            .collect()
     }
 
-    /// Clear all audit events.
+    /// Number of in-memory audit events discarded over this controller's life.
+    ///
+    /// Includes capacity eviction and explicit clears, saturates at `u64::MAX`,
+    /// and never resets when history is cleared. This count and [`Self::audit_events`]
+    /// are separate observations when cancellation is concurrent.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    #[must_use]
+    pub fn discarded_audit_event_count(&self) -> u64 {
+        self.audit_log.lock().expect("audit lock").discarded
+    }
+
+    /// Clear retained audit events without resetting the discarded-event count.
     ///
     /// # Panics
     ///
@@ -891,6 +1031,322 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
     use fcp_kernel::OperationId;
+
+    fn retain_completed_history(
+        controller: &CancellationController,
+        operation_id: &str,
+    ) -> CancellationRegistration {
+        let registration = controller
+            .track_operation(
+                operation_id,
+                Some("history-owner"),
+                CancellationScope::new("history", ConnectorArchetype::RequestResponse),
+            )
+            .unwrap();
+        controller.complete_registration(&registration);
+        registration
+    }
+
+    #[test]
+    fn completed_history_is_bounded_and_duplicate_completion_does_not_age_it() {
+        let controller = CancellationController::new();
+        for index in 0..MAX_COMPLETED_OPERATION_HISTORY * 3 {
+            let registration = retain_completed_history(&controller, &format!("done-{index}"));
+            controller.complete_registration(&registration);
+            assert!(controller.tracked_count() <= MAX_COMPLETED_OPERATION_HISTORY);
+        }
+        assert_eq!(controller.tracked_count(), MAX_COMPLETED_OPERATION_HISTORY);
+        assert_eq!(
+            controller.operations.lock().unwrap().completed.len(),
+            MAX_COMPLETED_OPERATION_HISTORY,
+        );
+        assert!(matches!(
+            controller.cancel(
+                &cancel_request("done-0", CancelReason::UserRequested),
+                Some("history-owner"),
+                fixed_now(),
+            ),
+            Err(HostError::ConnectorNotFound(_)),
+        ));
+        let newest = format!("done-{}", MAX_COMPLETED_OPERATION_HISTORY * 3 - 1);
+        assert_eq!(
+            controller
+                .cancel(
+                    &cancel_request(&newest, CancelReason::UserRequested),
+                    Some("history-owner"),
+                    fixed_now(),
+                )
+                .unwrap()
+                .outcome,
+            CancellationOutcome::TooLate,
+        );
+    }
+
+    #[test]
+    fn repeated_id_reuse_and_removal_do_not_accumulate_completion_queue_entries() {
+        let controller = CancellationController::new();
+        for index in 0..MAX_COMPLETED_OPERATION_HISTORY * 2 {
+            let registration = retain_completed_history(&controller, "same-id");
+            controller.complete_registration(&registration);
+            controller.complete("same-id");
+            let tracker = controller.operations.lock().unwrap();
+            assert_eq!(tracker.entries.len(), 1);
+            assert_eq!(tracker.completed.len(), 1);
+            drop(tracker);
+            if index % 2 == 0 {
+                controller.remove("same-id");
+                let tracker = controller.operations.lock().unwrap();
+                assert!(tracker.entries.is_empty());
+                assert!(tracker.completed.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn history_pressure_preserves_live_and_unsettled_runtime_ownership() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let controller = CancellationController::new();
+        let active = controller
+            .track_operation(
+                "live",
+                Some("live-owner"),
+                CancellationScope::new("live", ConnectorArchetype::RequestResponse),
+            )
+            .unwrap();
+        let finished = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&finished);
+        let settling = controller
+            .track_operation(
+                "settling",
+                Some("settling-owner"),
+                CancellationScope::new("native", ConnectorArchetype::RequestResponse)
+                    .with_terminator(CancellationTerminator::new(
+                        || panic!("retention must not terminate a live runtime"),
+                        move || observed.load(Ordering::SeqCst),
+                    )),
+            )
+            .unwrap();
+        controller.complete_registration_when_settled(&settling);
+        for index in 0..MAX_COMPLETED_OPERATION_HISTORY * 2 {
+            retain_completed_history(&controller, &format!("history-{index}"));
+        }
+        assert_eq!(controller.tracked_count(), MAX_COMPLETED_OPERATION_HISTORY + 2);
+        for operation_id in ["live", "settling"] {
+            assert!(
+                controller
+                    .track_operation(
+                        operation_id,
+                        Some("replacement"),
+                        CancellationScope::new("other", ConnectorArchetype::RequestResponse),
+                    )
+                    .is_err()
+            );
+        }
+        assert!(controller.reap_expired(Instant::now()).is_empty());
+        {
+            let tracker = controller.operations.lock().unwrap();
+            assert!(!tracker.entries["live"].completed);
+            assert!(!tracker.entries["settling"].completed);
+            assert!(tracker.entries["settling"].completion_pending);
+            assert!(tracker.entries["settling"].scope.is_some());
+        }
+        finished.store(true, Ordering::SeqCst);
+        assert!(controller.reap_expired(Instant::now()).is_empty());
+        assert_eq!(controller.tracked_count(), MAX_COMPLETED_OPERATION_HISTORY + 1);
+        controller.complete_registration(&active);
+        assert_eq!(controller.tracked_count(), MAX_COMPLETED_OPERATION_HISTORY);
+        assert!(controller.audit_events().is_empty());
+    }
+
+    #[test]
+    fn eviction_and_id_reuse_preserve_registration_owner_and_relay_fences() {
+        let controller = CancellationController::new();
+        let old_binding = RelayCancellationBinding {
+            origin_node: "entry".to_owned(),
+            origin_attempt_id: 7,
+        };
+        let scope_for = |relay: RelayCancellationBinding| {
+            let mut scope =
+                CancellationScope::new("native", ConnectorArchetype::RequestResponse);
+            scope.relay = Some(relay);
+            scope
+        };
+        let old = controller
+            .track_operation("reused-history", Some("old-owner"), scope_for(old_binding.clone()))
+            .unwrap();
+        controller.complete_registration(&old);
+        for index in 0..MAX_COMPLETED_OPERATION_HISTORY {
+            retain_completed_history(&controller, &format!("replacement-history-{index}"));
+        }
+        assert!(
+            !controller
+                .operations
+                .lock()
+                .unwrap()
+                .entries
+                .contains_key("reused-history")
+        );
+        let new_binding = RelayCancellationBinding {
+            origin_attempt_id: 8,
+            ..old_binding.clone()
+        };
+        let replacement = controller
+            .track_operation(
+                "reused-history",
+                Some("new-owner"),
+                scope_for(new_binding.clone()),
+            )
+            .unwrap();
+        controller.complete_registration(&old);
+        controller.complete_registration_when_settled(&old);
+        let request = cancel_request("reused-history", CancelReason::UserRequested);
+        for (owner, binding) in [("old-owner", &old_binding), ("new-owner", &old_binding)] {
+            assert!(matches!(
+                controller.cancel_relay(&request, owner, binding, fixed_now()),
+                Err(HostError::PreflightFailed(_)),
+            ));
+        }
+        assert!(!controller.is_cancel_requested("reused-history"));
+        assert_eq!(
+            controller
+                .cancel_relay(&request, "new-owner", &new_binding, fixed_now())
+                .unwrap()
+                .outcome,
+            CancellationOutcome::Cancelled,
+        );
+        assert_eq!(controller.audit_events().len(), 1);
+        controller.complete_registration(&replacement);
+    }
+
+    #[test]
+    fn owned_force_result_survives_completion_history_pressure() {
+        let controller = CancellationController::new();
+        let registration = cancellable_attempt(&controller, "pinned-result");
+        let expired = controller
+            .reap_expired(Instant::now() + Duration::from_secs(1))
+            .pop()
+            .unwrap();
+        controller.complete_registration(&registration);
+        for index in 0..MAX_COMPLETED_OPERATION_HISTORY * 2 {
+            retain_completed_history(&controller, &format!("pinned-history-{index}"));
+        }
+        assert!(controller.record_forced_expiration(&expired, fixed_now()));
+        assert_eq!(
+            controller.audit_events().iter().filter(|event| event.forced).count(),
+            1,
+        );
+        for index in 0..MAX_COMPLETED_OPERATION_HISTORY {
+            retain_completed_history(&controller, &format!("released-history-{index}"));
+        }
+        let replacement = controller
+            .track_operation(
+                "pinned-result",
+                Some("replacement-owner"),
+                CancellationScope::new("replacement", ConnectorArchetype::RequestResponse),
+            )
+            .unwrap();
+        assert!(!controller.record_forced_expiration(&expired, fixed_now()));
+        controller.rearm_expiration(&expired);
+        controller.complete_registration(&registration);
+        assert!(!controller.is_cancel_requested("pinned-result"));
+        assert!(!controller.operations.lock().unwrap().entries["pinned-result"].completed);
+        controller.complete_registration(&replacement);
+    }
+
+    #[test]
+    fn reaper_reclaims_history_after_outstanding_force_result_handles_disappear() {
+        let controller = CancellationController::new();
+        let registrations: Vec<_> = (0..=MAX_COMPLETED_OPERATION_HISTORY)
+            .map(|index| cancellable_attempt(&controller, &format!("pending-result-{index}")))
+            .collect();
+        let expired = controller.reap_expired(Instant::now() + Duration::from_secs(1));
+        assert_eq!(expired.len(), MAX_COMPLETED_OPERATION_HISTORY + 1);
+        for registration in &registrations {
+            controller.complete_registration(registration);
+        }
+        // Every extra entry is pinned by real outstanding attempt ownership.
+        assert_eq!(controller.tracked_count(), MAX_COMPLETED_OPERATION_HISTORY + 1);
+        drop(expired);
+        assert!(controller.reap_expired(Instant::now()).is_empty());
+        assert_eq!(controller.tracked_count(), MAX_COMPLETED_OPERATION_HISTORY);
+        assert!(controller.audit_events().iter().all(|event| !event.forced));
+    }
+
+    #[test]
+    fn concurrent_completion_keeps_history_bounded_without_evicting_active_work() {
+        let controller = CancellationController::new();
+        controller
+            .track_operation(
+                "still-live",
+                Some("owner"),
+                CancellationScope::new("live", ConnectorArchetype::RequestResponse),
+            )
+            .unwrap();
+        std::thread::scope(|scope| {
+            for worker in 0..8 {
+                let controller = &controller;
+                scope.spawn(move || {
+                    for index in 0..MAX_COMPLETED_OPERATION_HISTORY / 4 {
+                        retain_completed_history(controller, &format!("worker-{worker}-{index}"));
+                    }
+                });
+            }
+        });
+        assert_eq!(controller.tracked_count(), MAX_COMPLETED_OPERATION_HISTORY + 1);
+        let tracker = controller.operations.lock().unwrap();
+        assert_eq!(tracker.completed.len(), MAX_COMPLETED_OPERATION_HISTORY);
+        assert!(!tracker.entries["still-live"].completed);
+    }
+
+    #[test]
+    fn audit_history_retains_newest_events_and_reports_eviction_and_clear_loss() {
+        let controller = CancellationController::new();
+        controller.track_with_owner("audit-retention", None);
+        let request = cancel_request("audit-retention", CancelReason::UserRequested);
+        let total = MAX_CANCELLATION_AUDIT_HISTORY + 7;
+        for index in 0..total {
+            controller
+                .cancel(
+                    &request,
+                    None,
+                    fixed_now() + chrono::Duration::milliseconds(i64::try_from(index).unwrap()),
+                )
+                .unwrap();
+        }
+        let events = controller.audit_events();
+        assert_eq!(events.len(), MAX_CANCELLATION_AUDIT_HISTORY);
+        assert_eq!(controller.discarded_audit_event_count(), 7);
+        assert_eq!(
+            events[0].timestamp,
+            fixed_now() + chrono::Duration::milliseconds(i64::try_from(total - 1).unwrap()),
+        );
+        assert_eq!(
+            events.last().unwrap().timestamp,
+            fixed_now() + chrono::Duration::milliseconds(7),
+        );
+        controller.record_forced_cancellation("audit-retention", fixed_now());
+        assert!(controller.audit_events()[0].forced);
+        assert_eq!(controller.audit_events().len(), MAX_CANCELLATION_AUDIT_HISTORY);
+        assert_eq!(controller.discarded_audit_event_count(), 8);
+        // Repeated acknowledgement must not consume history capacity again.
+        controller.record_forced_cancellation("audit-retention", fixed_now());
+        assert_eq!(controller.discarded_audit_event_count(), 8);
+
+        controller.clear_audit_log();
+        assert!(controller.audit_events().is_empty());
+        assert_eq!(
+            controller.discarded_audit_event_count(),
+            u64::try_from(total + 1).unwrap(),
+        );
+        controller.clear_audit_log();
+        controller.cancel(&request, None, fixed_now()).unwrap();
+        assert_eq!(controller.audit_events().len(), 1);
+        assert_eq!(
+            controller.discarded_audit_event_count(),
+            u64::try_from(total + 1).unwrap(),
+        );
+    }
 
     #[test]
     fn abandoned_waiter_keeps_registration_until_runtime_settles_without_cancel() {
@@ -4189,7 +4645,7 @@ mod tests {
     fn lost_attempt_retries_only_after_last_clone_without_resetting_deadline() {
         let controller = CancellationController::new();
         let registration = cancellable_attempt(&controller, "lost");
-        let requested_at = controller.operations.lock().unwrap()["lost"]
+        let requested_at = controller.operations.lock().unwrap().entries["lost"]
             .cancel_requested_at.unwrap();
         let at_deadline = requested_at + Duration::from_millis(500);
         assert!(controller.reap_expired(at_deadline - Duration::from_nanos(1)).is_empty());
@@ -4203,7 +4659,7 @@ mod tests {
         assert!(!Weak::ptr_eq(&old_attempt, &Arc::downgrade(&retry.attempt)));
         assert!(Arc::ptr_eq(&registration.identity, &retry.registration));
         assert_eq!(retry.deadline, Duration::from_millis(500));
-        assert_eq!(controller.operations.lock().unwrap()["lost"].cancel_requested_at, Some(requested_at));
+        assert_eq!(controller.operations.lock().unwrap().entries["lost"].cancel_requested_at, Some(requested_at));
         assert!(controller.audit_events().iter().all(|event| !event.forced));
         assert!(controller.track_operation(
             "lost", None, CancellationScope::new("replacement", ConnectorArchetype::RequestResponse),
