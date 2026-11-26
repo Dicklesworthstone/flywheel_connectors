@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 /// A Google Chat space (room, DM, or group chat).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", try_from = "WireSpace")]
 pub struct Space {
     /// Resource name of the space (e.g. `spaces/AAAA`).
     pub name: String,
@@ -12,21 +12,58 @@ pub struct Space {
     #[serde(default)]
     pub display_name: String,
     /// Type of the space.
-    #[serde(default, rename = "spaceType", alias = "type")]
+    #[serde(rename = "spaceType")]
     pub space_type: SpaceType,
     /// Whether the space uses threaded replies.
     #[serde(default)]
     pub threaded: bool,
 }
 
+// The REST resource can include both the current spaceType and deprecated type.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireSpace {
+    name: String,
+    #[serde(default)]
+    display_name: String,
+    space_type: Option<SpaceType>,
+    #[serde(rename = "type")]
+    legacy_type: Option<String>,
+    #[serde(default)]
+    threaded: bool,
+}
+
+impl TryFrom<WireSpace> for Space {
+    type Error = serde::de::value::Error;
+
+    fn try_from(wire: WireSpace) -> Result<Self, Self::Error> {
+        use serde::de::IntoDeserializer;
+
+        let space_type = match (wire.space_type, wire.legacy_type) {
+            (Some(kind), _) => kind,
+            (None, Some(legacy)) => SpaceType::deserialize(legacy.as_str().into_deserializer())?,
+            (None, None) => SpaceType::default(),
+        };
+        Ok(Self {
+            name: wire.name,
+            display_name: wire.display_name,
+            space_type,
+            threaded: wire.threaded,
+        })
+    }
+}
+
 /// Type of a Google Chat space.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum SpaceType {
+    /// A named space in the current REST representation.
+    Space,
     /// A named space (room).
     #[default]
     Room,
     /// A direct message between two users.
+    #[serde(alias = "DM")]
     DirectMessage,
     /// A group chat (unnamed, multiple users).
     GroupChat,
@@ -221,6 +258,9 @@ pub struct Membership {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum MembershipState {
+    /// No membership state supplied by the provider.
+    #[serde(rename = "MEMBERSHIP_STATE_UNSPECIFIED")]
+    Unspecified,
     /// The user has joined the space.
     #[default]
     Joined,
@@ -236,9 +276,17 @@ pub enum MembershipState {
 pub enum MembershipRole {
     /// Regular member.
     #[default]
+    #[serde(alias = "ROLE_MEMBER")]
     Member,
-    /// Space manager.
+    /// Space owner, called a manager in the API.
+    #[serde(alias = "ROLE_MANAGER")]
     Manager,
+    /// A manager with delegated administrative permissions.
+    #[serde(alias = "ROLE_ASSISTANT_MANAGER")]
+    AssistantManager,
+    /// No role assigned.
+    #[serde(rename = "MEMBERSHIP_ROLE_UNSPECIFIED")]
+    Unspecified,
 }
 
 /// Response from listing spaces.
@@ -324,6 +372,57 @@ mod tests {
         }"#;
         let space: Space = serde_json::from_str(json).unwrap();
         assert_eq!(space.space_type, SpaceType::GroupChat);
+    }
+
+    #[test]
+    fn space_lists_accept_both_type_fields_and_preserve_direct_messages() {
+        let page: ListSpacesResponse = serde_json::from_value(serde_json::json!({
+            "spaces": [
+                {"name": "spaces/A", "type": "ROOM", "spaceType": "SPACE"},
+                {"name": "spaces/B", "type": "ROOM", "spaceType": "DIRECT_MESSAGE"},
+                {"name": "spaces/C", "type": "DM"},
+                {"name": "spaces/D", "type": "TYPE_UNSPECIFIED", "spaceType": "GROUP_CHAT"}
+            ], "nextPageToken": "more"
+        }))
+        .unwrap();
+        assert_eq!(page.next_page_token, "more");
+        let kinds: Vec<_> = page.spaces.iter().map(|space| &space.space_type).collect();
+        assert_eq!(
+            kinds,
+            [
+                &SpaceType::Space,
+                &SpaceType::DirectMessage,
+                &SpaceType::DirectMessage,
+                &SpaceType::GroupChat
+            ]
+        );
+        assert_eq!(
+            serde_json::to_value(&page.spaces[0]).unwrap()["spaceType"],
+            "SPACE"
+        );
+    }
+
+    #[test]
+    fn native_membership_roles_decode_on_the_same_page() {
+        let page: ListMembershipsResponse = serde_json::from_value(serde_json::json!({
+            "memberships": [
+                {"name": "members/1", "role": "ROLE_MEMBER"},
+                {"name": "members/2", "role": "ROLE_MANAGER"},
+                {"name": "members/3", "role": "ROLE_ASSISTANT_MANAGER"},
+                {"name": "members/4", "role": "MEMBERSHIP_ROLE_UNSPECIFIED", "state": "MEMBERSHIP_STATE_UNSPECIFIED"}
+            ]
+        })).unwrap();
+        let roles: Vec<_> = page.memberships.iter().map(|member| &member.role).collect();
+        assert_eq!(
+            roles,
+            [
+                &MembershipRole::Member,
+                &MembershipRole::Manager,
+                &MembershipRole::AssistantManager,
+                &MembershipRole::Unspecified
+            ]
+        );
+        assert_eq!(page.memberships[3].state, MembershipState::Unspecified);
     }
 
     #[test]
