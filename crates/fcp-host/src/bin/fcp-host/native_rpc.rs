@@ -1718,7 +1718,10 @@ exec sleep 30
             capability_token: None,
         };
         assert_eq!(
-            controller.cancel(&request, Some("owner"), chrono::Utc::now()).unwrap().outcome,
+            controller
+                .cancel(&request, Some("owner"), chrono::Utc::now())
+                .unwrap()
+                .outcome,
             CancellationOutcome::Pending
         );
         drop(NativeInvocationWaiter {
