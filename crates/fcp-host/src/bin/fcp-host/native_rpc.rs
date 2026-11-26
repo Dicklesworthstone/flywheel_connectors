@@ -16,7 +16,8 @@ use fcp_async_core::channel::mpsc;
 use fcp_async_core::process::Child;
 use fcp_core::{InvokeResponse, ShutdownRequest};
 use fcp_host::{
-    CancellationController, CancellationRegistration, CancellationTerminator, HostError, HostResult,
+    CancellationController, CancellationEvidence, CancellationRegistration, CancellationTerminator,
+    HostError, HostResult,
 };
 use futures_util::future::{Either, select};
 
@@ -1098,12 +1099,26 @@ impl NativeInvocationTermination {
 struct NativeInvocationWaiter {
     invocation: NativeInvocationTermination,
     returned: bool,
+    /// Set by the result-producing cancellation path, not by a late stop latch.
+    cancelled: bool,
+    /// Set only after settlement and the final cancellation check both succeed.
+    returned_normally: bool,
 }
 
 impl Drop for NativeInvocationWaiter {
     fn drop(&mut self) {
+        let cancelled = self.cancelled || !self.returned;
         if !self.returned {
             self.invocation.cancel();
+        }
+        if self.returned_normally
+            && let Some((controller, registration)) = self.invocation.state.registration.get()
+            && let Some(controller) = controller.upgrade()
+        {
+            // Publish the known result BEFORE waiter_finished becomes visible.
+            // Otherwise a late reaper can acknowledge forced cancellation in
+            // the gap between exposing settlement and completing the tracker.
+            let _ = controller.record_returned_registration(registration);
         }
         // No RPC can be registered after the waiter closes. Registration
         // checks this flag while holding the same command-admission lock.
@@ -1121,7 +1136,16 @@ impl Drop for NativeInvocationWaiter {
         if let Some((controller, registration)) = self.invocation.state.registration.get()
             && let Some(controller) = controller.upgrade()
         {
-            controller.complete_registration_when_settled(registration);
+            // This proves stopping the invocation, not provider rollback or a
+            // persisted checkpoint. Pending remains until owned RPCs retire.
+            if !cancelled
+                || !controller.complete_cancelled_registration_when_settled(
+                    registration,
+                    CancellationEvidence::default(),
+                )
+            {
+                controller.complete_registration_when_settled(registration);
+            }
         }
     }
 }
@@ -1469,6 +1493,8 @@ mod tests {
         drop(NativeInvocationWaiter {
             invocation: invocation.clone(),
             returned: false,
+            cancelled: false,
+            returned_normally: false,
         });
         assert!(invocation.is_finished());
     }
@@ -1661,7 +1687,10 @@ exec sleep 30
     #[cfg(unix)]
     #[fcp_async_core::runtime::test(flavor = "multi_thread")]
     async fn abandoned_invocation_retains_registration_until_its_child_exits() {
-        use fcp_host::{CancellationScope, ConnectorArchetype};
+        use fcp_host::{
+            CancelReason, CancellationOutcome, CancellationRequest, CancellationScope,
+            CleanupBehavior, ConnectorArchetype,
+        };
 
         let controller = Arc::new(CancellationController::new());
         let invocation =
@@ -1671,6 +1700,7 @@ exec sleep 30
                 "native-drop",
                 Some("owner"),
                 CancellationScope::new("native", ConnectorArchetype::RequestResponse)
+                    .with_deadline_override_ms(Some(60_000))
                     .with_terminator(invocation.terminator()),
             )
             .unwrap();
@@ -1680,11 +1710,31 @@ exec sleep 30
         let mut command = fcp_async_core::process::Command::new("/bin/sh");
         command.args(["-c", "exec sleep 30"]).kill_on_drop(true);
         let child = command.spawn().unwrap();
+        let request = CancellationRequest {
+            operation_id: "native-drop".into(),
+            reason: CancelReason::UserRequested,
+            cleanup: CleanupBehavior::Checkpoint,
+            return_partial: true,
+            capability_token: None,
+        };
+        assert_eq!(
+            controller.cancel(&request, Some("owner"), chrono::Utc::now()).unwrap().outcome,
+            CancellationOutcome::Pending
+        );
         drop(NativeInvocationWaiter {
             invocation: invocation.clone(),
             returned: false,
+            cancelled: false,
+            returned_normally: false,
         });
         assert!(selected.is_cancelled());
+        let pending = controller
+            .cancel(&request, Some("owner"), chrono::Utc::now())
+            .unwrap();
+        assert_eq!(pending.outcome, CancellationOutcome::Pending);
+        assert!(pending.partial_result.is_none());
+        assert!(pending.checkpoint.is_none());
+        assert!(pending.cleanup_result.is_none());
         assert!(
             controller
                 .track_operation(
@@ -1696,10 +1746,19 @@ exec sleep 30
         );
 
         selected.retire(child);
-        selected.wait_for_settlement().await;
+        fcp_async_core::time::timeout(Duration::from_secs(5), selected.wait_for_settlement())
+            .await
+            .expect("owned child must be observed exited");
         assert!(selected.is_settled());
         assert!(selected.transport_retired());
         assert!(controller.reap_expired(Instant::now()).is_empty());
+        let completed = controller
+            .cancel(&request, Some("owner"), chrono::Utc::now())
+            .unwrap();
+        assert_eq!(completed.outcome, CancellationOutcome::Cancelled);
+        assert!(completed.partial_result.is_none());
+        assert!(completed.checkpoint.is_none());
+        assert!(completed.cleanup_result.is_none());
         controller
             .track_operation(
                 "native-drop",
@@ -2313,6 +2372,8 @@ mod queue_shutdown_tests {
         drop(NativeInvocationWaiter {
             invocation,
             returned: true,
+            cancelled: false,
+            returned_normally: true,
         });
         controller
             .track_operation(
