@@ -243,7 +243,6 @@ mod tests {
         assert!(!diagnostic.contains("private-error-marker"));
     }
 
-
     fn cancellation_request(id: &str) -> fcp_host::CancellationRequest {
         fcp_host::CancellationRequest {
             operation_id: id.to_owned(),
