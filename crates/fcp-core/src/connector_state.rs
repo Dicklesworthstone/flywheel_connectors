@@ -1516,19 +1516,67 @@ impl MigratableComputation {
             });
         }
 
-        if handoff.previous_lease_id != self.execution_lease_id {
-            return Err(ComputationMigrationError::UnexpectedPriorLeaseId {
-                expected: self.execution_lease_id,
-                got: handoff.previous_lease_id,
-            });
-        }
-
+        self.validate_handoff_source(handoff)?;
         validate_lease_handoff(active_lease, handoff, now)?;
         self.state = MigratableComputationState::Transferring {
             target_holder: handoff.to_holder.clone(),
             next_lease_id: handoff.next_lease_id,
             next_fencing_token: handoff.next_fencing_token,
         };
+        Ok(())
+    }
+
+    fn validate_handoff_source(&self, handoff: &LeaseHandoff) -> Result<(), ComputationMigrationError> {
+        if handoff.previous_lease_id != self.execution_lease_id {
+            return Err(ComputationMigrationError::UnexpectedPriorLeaseId {
+                expected: self.execution_lease_id,
+                got: handoff.previous_lease_id,
+            });
+        }
+        let checkpoint = self
+            .checkpoint_object_id
+            .ok_or(ComputationMigrationError::MissingSuspendedCheckpoint)?;
+        if handoff.checkpoint_object_id != Some(checkpoint) {
+            return Err(ComputationMigrationError::HandoffCheckpointMismatch {
+                expected: checkpoint,
+                got: handoff.checkpoint_object_id,
+            });
+        }
+        if handoff.from_holder != self.current_holder {
+            return Err(LeaseTransferValidationError::FromHolderMismatch {
+                expected: self.current_holder.clone(),
+                got: handoff.from_holder.clone(),
+            }
+            .into());
+        }
+        if handoff.subject_object_id != self.computation_id {
+            return Err(LeaseTransferValidationError::SubjectMismatch {
+                expected: self.computation_id,
+                got: handoff.subject_object_id,
+            }
+            .into());
+        }
+        if handoff.zone_id != self.zone_id {
+            return Err(LeaseTransferValidationError::ZoneMismatch {
+                expected: self.zone_id.clone(),
+                got: handoff.zone_id.clone(),
+            }
+            .into());
+        }
+        if handoff.purpose != LeasePurpose::ComputationMigration {
+            return Err(LeaseTransferValidationError::PurposeMismatch {
+                expected: LeasePurpose::ComputationMigration,
+                got: handoff.purpose,
+            }
+            .into());
+        }
+        if handoff.previous_fencing_token != self.lease_fencing_token {
+            return Err(LeaseTransferValidationError::PreviousFenceMismatch {
+                expected: self.lease_fencing_token,
+                got: handoff.previous_fencing_token,
+            }
+            .into());
+        }
         Ok(())
     }
 
@@ -2162,18 +2210,7 @@ impl CheckpointHandoffArtifact {
             inputs.receipt_head,
         )?;
 
-        if handoff.previous_lease_id != computation.execution_lease_id {
-            return Err(ComputationMigrationError::UnexpectedPriorLeaseId {
-                expected: computation.execution_lease_id,
-                got: handoff.previous_lease_id,
-            });
-        }
-        if handoff.checkpoint_object_id != Some(checkpoint_object_id) {
-            return Err(ComputationMigrationError::HandoffCheckpointMismatch {
-                expected: checkpoint_object_id,
-                got: handoff.checkpoint_object_id,
-            });
-        }
+        computation.validate_handoff_source(handoff)?;
 
         let (target_holder, next_lease_id, next_fencing_token) = match &computation.state {
             MigratableComputationState::Transferring {
@@ -2486,6 +2523,8 @@ pub enum ComputationMigrationError {
     },
     #[error("handoff referenced prior lease {got}, expected {expected}")]
     UnexpectedPriorLeaseId { expected: LeaseId, got: LeaseId },
+    #[error("suspended computation has no durable checkpoint")]
+    MissingSuspendedCheckpoint,
     #[error("handoff checkpoint mismatch: expected {expected}, got {got:?}")]
     HandoffCheckpointMismatch {
         expected: ObjectId,
@@ -4673,13 +4712,14 @@ mod tests {
             .unwrap();
 
         let active_lease = test_migration_lease("node-source", 7, 2_000);
-        let handoff = test_migration_handoff(
+        let handoff = test_migration_handoff_with_checkpoint(
             source_lease_id,
             target_lease_id,
             "node-source",
             "node-target",
             7,
             8,
+            Some(checkpoint_object_id),
         );
         computation
             .begin_transfer(&active_lease, &handoff, 1_500)
@@ -4731,13 +4771,14 @@ mod tests {
             .suspend(&checkpoint, checkpoint_object_id)
             .unwrap();
         let active_lease = test_migration_lease("node-source", 7, 2_000);
-        let handoff = test_migration_handoff(
+        let handoff = test_migration_handoff_with_checkpoint(
             source_lease_id,
             target_lease_id,
             "node-source",
             "node-target",
             7,
             8,
+            Some(checkpoint_object_id),
         );
         computation
             .begin_transfer(&active_lease, &handoff, 1_500)
@@ -6603,13 +6644,14 @@ mod tests {
         );
         comp.suspend(&checkpoint, checkpoint_object_id).unwrap();
         let active_lease = test_migration_lease("node-source", 7, 2_000);
-        let handoff = test_migration_handoff(
+        let handoff = test_migration_handoff_with_checkpoint(
             source_lease_id,
             target_lease_id,
             "node-source",
             "node-target",
             7,
             8,
+            Some(checkpoint_object_id),
         );
         comp.begin_transfer(&active_lease, &handoff, 1_500).unwrap();
 
@@ -6645,13 +6687,14 @@ mod tests {
         );
         comp.suspend(&checkpoint, checkpoint_object_id).unwrap();
         let active_lease = test_migration_lease("node-source", 7, 2_000);
-        let handoff = test_migration_handoff(
+        let handoff = test_migration_handoff_with_checkpoint(
             source_lease_id,
             target_lease_id,
             "node-source",
             "node-target",
             7,
             8,
+            Some(checkpoint_object_id),
         );
         comp.begin_transfer(&active_lease, &handoff, 1_500).unwrap();
 
@@ -6688,13 +6731,14 @@ mod tests {
         );
         comp.suspend(&checkpoint, checkpoint_object_id).unwrap();
         let active_lease = test_migration_lease("node-source", 7, 2_000);
-        let handoff = test_migration_handoff(
+        let handoff = test_migration_handoff_with_checkpoint(
             source_lease_id,
             target_lease_id,
             "node-source",
             "node-target",
             7,
             8,
+            Some(checkpoint_object_id),
         );
         comp.begin_transfer(&active_lease, &handoff, 1_500).unwrap();
 
@@ -6799,13 +6843,14 @@ mod tests {
         );
         comp.suspend(&checkpoint, checkpoint_object_id).unwrap();
         let active_lease = test_migration_lease("node-source", 7, 2_000);
-        let handoff = test_migration_handoff(
+        let handoff = test_migration_handoff_with_checkpoint(
             source_lease_id,
             target_lease_id,
             "node-source",
             "node-target",
             7,
             8,
+            Some(checkpoint_object_id),
         );
         comp.begin_transfer(&active_lease, &handoff, 1_500).unwrap();
 
@@ -6907,6 +6952,76 @@ mod tests {
     // --- begin_transfer with expired active lease ---
 
     #[test]
+    fn handoff_must_match_the_suspended_authority_even_when_its_source_lease_agrees() {
+        let source = test_object_id("lease-source");
+        let checkpoint = test_computation_checkpoint("holder", source, 7, 1);
+        let checkpoint_id = checkpoint.object_id().unwrap();
+        let mut comp = MigratableComputation::new(
+            test_object_id("computation"),
+            ZoneId::work(),
+            test_node_id("holder"),
+            source,
+            7,
+            test_migration_context(0),
+        );
+        comp.suspend(&checkpoint, checkpoint_id).unwrap();
+        let active = test_migration_lease("holder", 7, 2_000);
+        let handoff = test_migration_handoff_with_checkpoint(
+            source,
+            test_object_id("lease-target"),
+            "holder",
+            "target",
+            7,
+            8,
+            Some(checkpoint_id),
+        );
+
+        for case in 0..7 {
+            let mut lease = active.clone();
+            let mut candidate = handoff.clone();
+            match case {
+                0 => {
+                    lease.holder = test_node_id("unrelated-holder");
+                    candidate.from_holder = lease.holder.clone();
+                }
+                1 => {
+                    lease.subject_object_id = test_object_id("another-computation");
+                    candidate.subject_object_id = lease.subject_object_id;
+                }
+                2 => {
+                    lease.header.zone_id = ZoneId::private();
+                    candidate.zone_id = lease.header.zone_id.clone();
+                }
+                3 => {
+                    lease.purpose = LeasePurpose::ConnectorStateWrite;
+                    candidate.purpose = lease.purpose;
+                }
+                4 => {
+                    lease.lease_seq = 3;
+                    candidate.previous_fencing_token = 3;
+                    candidate.next_fencing_token = 4;
+                }
+                5 => candidate.checkpoint_object_id = None,
+                _ => candidate.checkpoint_object_id = Some(test_object_id("another-checkpoint")),
+            }
+
+            validate_lease_handoff(&lease, &candidate, 1_500).unwrap();
+            assert!(comp.begin_transfer(&lease, &candidate, 1_500).is_err());
+            assert_eq!(comp.state, MigratableComputationState::Suspended);
+            assert_eq!(comp.checkpoint_object_id, Some(checkpoint_id));
+            assert_eq!(comp.lease_fencing_token, 7);
+        }
+
+        let mut missing_checkpoint = comp.clone();
+        missing_checkpoint.checkpoint_object_id = None;
+        assert!(matches!(
+            missing_checkpoint.begin_transfer(&active, &handoff, 1_500),
+            Err(ComputationMigrationError::MissingSuspendedCheckpoint)
+        ));
+        comp.begin_transfer(&active, &handoff, 1_500).unwrap();
+    }
+
+    #[test]
     fn begin_transfer_rejects_expired_active_lease() {
         let lease_id = test_object_id("lease");
         let target_lease_id = test_object_id("lease-target");
@@ -6924,7 +7039,15 @@ mod tests {
 
         // Lease expired at 1_000
         let expired_lease = test_migration_lease("holder", 7, 1_000);
-        let handoff = test_migration_handoff(lease_id, target_lease_id, "holder", "target", 7, 8);
+        let handoff = test_migration_handoff_with_checkpoint(
+            lease_id,
+            target_lease_id,
+            "holder",
+            "target",
+            7,
+            8,
+            Some(checkpoint_object_id),
+        );
         let err = comp
             .begin_transfer(&expired_lease, &handoff, 1_500)
             .unwrap_err();
@@ -7002,13 +7125,14 @@ mod tests {
         );
         comp.suspend(&checkpoint, checkpoint_object_id).unwrap();
         let active_lease = test_migration_lease("node-source", 7, 2_000);
-        let handoff = test_migration_handoff(
+        let handoff = test_migration_handoff_with_checkpoint(
             source_lease_id,
             target_lease_id,
             "node-source",
             "node-target",
             7,
             8,
+            Some(checkpoint_object_id),
         );
         comp.begin_transfer(&active_lease, &handoff, 1_500).unwrap();
 
@@ -7287,13 +7411,14 @@ mod tests {
 
         // transfer
         let active_lease = test_migration_lease("node-source", 7, 2_000);
-        let handoff = test_migration_handoff(
+        let handoff = test_migration_handoff_with_checkpoint(
             source_lease_id,
             target_lease_id,
             "node-source",
             "node-target",
             7,
             8,
+            Some(checkpoint_object_id),
         );
         comp.begin_transfer(&active_lease, &handoff, 1_500).unwrap();
         assert_eq!(comp.zone_id, zone);
@@ -7379,6 +7504,27 @@ mod tests {
         )
         .unwrap();
 
+        let mut unrelated = handoff.clone();
+        unrelated.subject_object_id = test_object_id("another-computation");
+        assert!(matches!(
+            CheckpointHandoffArtifact::capture(
+                &comp,
+                &checkpoint,
+                checkpoint_object_id,
+                &transfer_encoding,
+                &unrelated,
+                &HandoffArtifactInputs {
+                    state_object_id: None,
+                    receipt_head: None,
+                    resume_cause: ResumeCause::PlannedHandoff,
+                    observed_at_ms: 42,
+                },
+            ),
+            Err(ComputationMigrationError::LeaseTransfer(
+                LeaseTransferValidationError::SubjectMismatch { .. }
+            ))
+        ));
+
         assert_eq!(artifact.subject_id, test_object_id("computation"));
         assert_eq!(
             artifact.export.boundary.checkpoint_object_id,
@@ -7416,13 +7562,14 @@ mod tests {
         );
         comp.suspend(&checkpoint, checkpoint_object_id).unwrap();
         let active_lease = test_migration_lease("node-source", 7, 2_000);
-        let handoff = test_migration_handoff(
+        let handoff = test_migration_handoff_with_checkpoint(
             source_lease_id,
             target_lease_id,
             "node-source",
             "node-target",
             7,
             8,
+            Some(checkpoint_object_id),
         );
         comp.begin_transfer(&active_lease, &handoff, 1_500).unwrap();
 
@@ -7481,13 +7628,14 @@ mod tests {
         );
         comp.suspend(&checkpoint, checkpoint_object_id).unwrap();
         let active_lease = test_migration_lease("node-source", 7, 2_000);
-        let handoff = test_migration_handoff(
+        let handoff = test_migration_handoff_with_checkpoint(
             source_lease_id,
             target_lease_id,
             "node-source",
             "node-target",
             7,
             8,
+            Some(checkpoint_object_id),
         );
         comp.begin_transfer(&active_lease, &handoff, 1_500).unwrap();
 
