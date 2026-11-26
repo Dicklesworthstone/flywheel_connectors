@@ -30,8 +30,9 @@ use crate::{
 
 const DEFAULT_CONTACT_FIELDS: &[&str] =
     &["names", "emailAddresses", "phoneNumbers", "organizations"];
+const DEFAULT_OTHER_CONTACT_FIELDS: &[&str] = &["names", "emailAddresses", "phoneNumbers"];
 const DEFAULT_DIRECTORY_FIELDS: &[&str] = &["names", "emailAddresses", "organizations"];
-const DEFAULT_GROUP_FIELDS: &[&str] = &["name", "formattedName", "groupType", "memberCount"];
+const DEFAULT_GROUP_FIELDS: &[&str] = &["name", "groupType", "memberCount"];
 const MANIFEST_TOML: &str = include_str!("../manifest.toml");
 
 fn is_local_test_host(host: &str) -> bool {
@@ -607,7 +608,7 @@ impl GooglePeopleConnector {
                         "properties": {
                             "person_fields": { "type": "array", "items": { "type": "string" }, "description": "Explicit People field mask entries to return." },
                             "page_size": { "type": "integer", "minimum": 1, "maximum": 1000 },
-                            "page_token": { "type": "string" },
+                            "page_token": { "type": "string", "minLength": 1 },
                             "sort_order": { "type": "string", "description": "People API sort order such as LAST_MODIFIED_ASCENDING." }
                         }
                     }),
@@ -615,8 +616,10 @@ impl GooglePeopleConnector {
                         "type": "object",
                         "properties": {
                             "connections": { "type": "array", "items": { "type": "object" } },
-                            "next_page_token": { "type": "string" },
-                            "next_sync_token": { "type": "string" }
+                            "next_page_token": { "type": ["string", "null"] },
+                            "next_sync_token": { "type": ["string", "null"] },
+                            "total_people": { "type": ["integer", "null"] },
+                            "total_items": { "type": ["integer", "null"] }
                         }
                     }),
                     IdempotencyClass::Strict,
@@ -624,6 +627,7 @@ impl GooglePeopleConnector {
                         when_to_use: "Enumerate the authenticated user's contact corpus with an explicit field mask.".into(),
                         common_mistakes: vec![
                             "Broad field masks widen privacy exposure; request only the fields you need.".into(),
+                            "Pass next_page_token as page_token with the same field mask, page size, and sort order until no token remains.".into(),
                         ],
                         examples: vec![
                             r#"{"person_fields":["names","emailAddresses"],"page_size":50}"#.into(),
@@ -672,7 +676,7 @@ impl GooglePeopleConnector {
                         "properties": {
                             "query": { "type": "string" },
                             "person_fields": { "type": "array", "items": { "type": "string" } },
-                            "page_size": { "type": "integer", "minimum": 1, "maximum": 1000 }
+                            "page_size": { "type": "integer", "minimum": 1, "maximum": 30 }
                         }
                     }),
                     json!({
@@ -684,6 +688,7 @@ impl GooglePeopleConnector {
                         when_to_use: "Find matching contacts by name, email, or phone fragments.".into(),
                         common_mistakes: vec![
                             "Remember that `person_fields` controls the returned fields, not the search query.".into(),
+                            "Contact search returns at most 30 matches and does not support page_token; use list_connections to enumerate contacts.".into(),
                         ],
                         examples: vec![
                             r#"{"query":"alice","person_fields":["names","emailAddresses"]}"#.into(),
@@ -701,14 +706,15 @@ impl GooglePeopleConnector {
                         "properties": {
                             "person_fields": { "type": "array", "items": { "type": "string" } },
                             "page_size": { "type": "integer", "minimum": 1, "maximum": 1000 },
-                            "page_token": { "type": "string" }
+                            "page_token": { "type": "string", "minLength": 1 }
                         }
                     }),
                     json!({
                         "type": "object",
                         "properties": {
                             "other_contacts": { "type": "array", "items": { "type": "object" } },
-                            "next_page_token": { "type": "string" }
+                            "next_page_token": { "type": ["string", "null"] },
+                            "total_size": { "type": ["integer", "null"] }
                         }
                     }),
                     IdempotencyClass::Strict,
@@ -735,18 +741,24 @@ impl GooglePeopleConnector {
                             "query": { "type": "string" },
                             "person_fields": { "type": "array", "items": { "type": "string" } },
                             "page_size": { "type": "integer", "minimum": 1, "maximum": 500 },
+                            "page_token": { "type": "string", "minLength": 1, "description": "Continuation token; keep all other query options unchanged." },
                             "sources": { "type": "array", "items": { "type": "string" }, "description": "Optional directory source filters. Defaults to DIRECTORY_SOURCE_TYPE_DOMAIN_PROFILE." }
                         }
                     }),
                     json!({
                         "type": "object",
-                        "properties": { "results": { "type": "array", "items": { "type": "object" } } }
+                        "properties": {
+                            "results": { "type": "array", "items": { "type": "object" }, "description": "Matching Person resources from the directory." },
+                            "next_page_token": { "type": ["string", "null"] },
+                            "total_size": { "type": ["integer", "null"] }
+                        }
                     }),
                     IdempotencyClass::Strict,
                     AgentHint {
                         when_to_use: "Search org-wide directory profiles after explicitly opting into directory.readonly.".into(),
                         common_mistakes: vec![
                             "Directory results are not the same as the user's personal contacts corpus.".into(),
+                            "Pass next_page_token as page_token with the same query, person_fields, page_size, and sources until no token remains.".into(),
                         ],
                         examples: vec![
                             r#"{"query":"alice","person_fields":["names","emailAddresses","organizations"]}"#.into(),
@@ -764,14 +776,15 @@ impl GooglePeopleConnector {
                         "properties": {
                             "group_fields": { "type": "array", "items": { "type": "string" } },
                             "page_size": { "type": "integer", "minimum": 1, "maximum": 1000 },
-                            "page_token": { "type": "string" }
+                            "page_token": { "type": "string", "minLength": 1 }
                         }
                     }),
                     json!({
                         "type": "object",
                         "properties": {
                             "contact_groups": { "type": "array", "items": { "type": "object" } },
-                            "next_page_token": { "type": "string" }
+                            "next_page_token": { "type": ["string", "null"] },
+                            "total_items": { "type": ["integer", "null"] }
                         }
                     }),
                     IdempotencyClass::Strict,
@@ -1008,15 +1021,20 @@ impl GooglePeopleConnector {
         let client = self.client.as_ref().ok_or(FcpError::NotConfigured)?;
         let person_fields =
             field_list_with_default(&input, "person_fields", DEFAULT_CONTACT_FIELDS)?;
-        let page_size = parse_u32_field(&input, "page_size")?;
-        let page_cursor = input.get("page_token").and_then(Value::as_str);
+        let (page_size, page_cursor) = parse_people_pagination("people.list_connections", &input)?;
         let sort_order = input.get("sort_order").and_then(Value::as_str);
 
         let response = client
             .list_connections(&person_fields, page_size, page_cursor, sort_order)
             .await
             .map_err(|error| error.to_fcp_error())?;
-        Ok(json!(response))
+        Ok(json!({
+            "connections": response.connections,
+            "next_page_token": response.next_page_token,
+            "next_sync_token": response.next_sync_token,
+            "total_people": response.total_people,
+            "total_items": response.total_items
+        }))
     }
 
     async fn invoke_get_person(&self, input: Value) -> FcpResult<Value> {
@@ -1044,7 +1062,7 @@ impl GooglePeopleConnector {
         let query = require_str(&input, "query")?;
         let person_fields =
             field_list_with_default(&input, "person_fields", DEFAULT_CONTACT_FIELDS)?;
-        let page_size = parse_u32_field(&input, "page_size")?;
+        let (page_size, _) = parse_people_pagination("people.search_contacts", &input)?;
 
         let response = client
             .search_contacts(query, &person_fields, page_size)
@@ -1056,15 +1074,19 @@ impl GooglePeopleConnector {
     async fn invoke_list_other_contacts(&self, input: Value) -> FcpResult<Value> {
         let client = self.client.as_ref().ok_or(FcpError::NotConfigured)?;
         let person_fields =
-            field_list_with_default(&input, "person_fields", DEFAULT_CONTACT_FIELDS)?;
-        let page_size = parse_u32_field(&input, "page_size")?;
-        let page_cursor = input.get("page_token").and_then(Value::as_str);
+            field_list_with_default(&input, "person_fields", DEFAULT_OTHER_CONTACT_FIELDS)?;
+        let (page_size, page_cursor) =
+            parse_people_pagination("people.list_other_contacts", &input)?;
 
         let response = client
             .list_other_contacts(&person_fields, page_size, page_cursor)
             .await
             .map_err(|error| error.to_fcp_error())?;
-        Ok(json!(response))
+        Ok(json!({
+            "other_contacts": response.other_contacts,
+            "next_page_token": response.next_page_token,
+            "total_size": response.total_size
+        }))
     }
 
     async fn invoke_search_directory_people(&self, input: Value) -> FcpResult<Value> {
@@ -1072,28 +1094,37 @@ impl GooglePeopleConnector {
         let query = require_str(&input, "query")?;
         let person_fields =
             field_list_with_default(&input, "person_fields", DEFAULT_DIRECTORY_FIELDS)?;
-        let page_size = parse_u32_field(&input, "page_size")?;
+        let (page_size, page_cursor) =
+            parse_people_pagination("people.search_directory_people", &input)?;
         let sources = parse_string_list_or_csv(&input, "sources")?
             .unwrap_or_else(|| vec!["DIRECTORY_SOURCE_TYPE_DOMAIN_PROFILE".to_string()]);
 
         let response = client
-            .search_directory_people(query, &person_fields, page_size, &sources)
+            .search_directory_people(query, &person_fields, page_size, page_cursor, &sources)
             .await
             .map_err(|error| error.to_fcp_error())?;
-        Ok(json!(response))
+        Ok(json!({
+            "results": response.people,
+            "next_page_token": response.next_page_token,
+            "total_size": response.total_size
+        }))
     }
 
     async fn invoke_list_contact_groups(&self, input: Value) -> FcpResult<Value> {
         let client = self.client.as_ref().ok_or(FcpError::NotConfigured)?;
         let group_fields = field_list_with_default(&input, "group_fields", DEFAULT_GROUP_FIELDS)?;
-        let page_size = parse_u32_field(&input, "page_size")?;
-        let page_cursor = input.get("page_token").and_then(Value::as_str);
+        let (page_size, page_cursor) =
+            parse_people_pagination("people.list_contact_groups", &input)?;
 
         let response = client
             .list_contact_groups(&group_fields, page_size, page_cursor)
             .await
             .map_err(|error| error.to_fcp_error())?;
-        Ok(json!(response))
+        Ok(json!({
+            "contact_groups": response.contact_groups,
+            "next_page_token": response.next_page_token,
+            "total_items": response.total_items
+        }))
     }
 
     async fn invoke_create_contact(&self, input: Value) -> FcpResult<Value> {
@@ -1255,6 +1286,7 @@ fn validate_people_simulate_input(operation: &str, input: &Value) -> FcpResult<(
         }
         "people.search_contacts" | "people.search_directory_people" => {
             require_str(input, "query")?;
+            parse_people_pagination(operation, input)?;
         }
         "people.create_contact" => {
             require_object(input, "person")?;
@@ -1293,6 +1325,7 @@ fn validate_people_simulate_input(operation: &str, input: &Value) -> FcpResult<(
             require_str(input, "resource_name")?;
         }
         "people.list_connections" | "people.list_other_contacts" | "people.list_contact_groups" => {
+            parse_people_pagination(operation, input)?;
         }
         _ => {
             return Err(FcpError::OperationNotGranted {
@@ -1383,20 +1416,55 @@ fn require_str<'a>(input: &'a Value, field: &str) -> FcpResult<&'a str> {
         })
 }
 
-fn parse_u32_field(input: &Value, field: &str) -> FcpResult<Option<u32>> {
-    let Some(value) = input.get(field) else {
-        return Ok(None);
-    };
-    let raw = value.as_u64().ok_or(FcpError::InvalidRequest {
-        code: 1003,
-        message: format!("`{field}` must be a positive integer"),
-    })?;
-    u32::try_from(raw)
-        .map(Some)
-        .map_err(|_| FcpError::InvalidRequest {
+fn parse_people_pagination<'a>(
+    operation: &str,
+    input: &'a Value,
+) -> FcpResult<(Option<u32>, Option<&'a str>)> {
+    if !input.is_object() {
+        return Err(FcpError::InvalidRequest {
             code: 1003,
-            message: format!("`{field}` is out of range for Google People API"),
+            message: "People input must be an object".into(),
+        });
+    }
+    let max_page_size = match operation {
+        "people.search_contacts" => 30,
+        "people.search_directory_people" => 500,
+        _ => 1000,
+    };
+    let page_size = input
+        .get("page_size")
+        .map(|value| {
+            value
+                .as_u64()
+                .filter(|size| (1..=max_page_size).contains(size))
+                .and_then(|size| u32::try_from(size).ok())
+                .ok_or_else(|| FcpError::InvalidRequest {
+                    code: 1003,
+                    message: format!(
+                        "`page_size` must be an integer between 1 and {max_page_size}"
+                    ),
+                })
         })
+        .transpose()?;
+    let page_token = input
+        .get("page_token")
+        .map(|value| {
+            if operation == "people.search_contacts" {
+                return Err(FcpError::InvalidRequest {
+                    code: 1003,
+                    message: "Contact search does not support `page_token`; use list_connections to enumerate contacts".into(),
+                });
+            }
+            value
+                .as_str()
+                .filter(|token| !token.trim().is_empty())
+                .ok_or_else(|| FcpError::InvalidRequest {
+                    code: 1003,
+                    message: "`page_token` must be a non-empty string".into(),
+                })
+        })
+        .transpose()?;
+    Ok((page_size, page_token))
 }
 
 fn field_list_with_default(
@@ -1459,6 +1527,8 @@ mod tests {
         normalize_snapshot_bytes,
     };
     use fcp_prelude::{CapabilityConstraints, ZoneId};
+    use wiremock::matchers::{header, method, path, query_param, query_param_is_missing};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn config_with_test_bearer(extra: &[(&str, Value)]) -> Value {
         let mut params = serde_json::Map::new();
@@ -1552,6 +1622,346 @@ mod tests {
             .await
             .unwrap();
         (connector, signing_key)
+    }
+
+    async fn handshaken_loopback_connector(
+        server: &MockServer,
+    ) -> (GooglePeopleConnector, Ed25519SigningKey) {
+        let mut connector = GooglePeopleConnector::new();
+        connector
+            .handle_configure(config_with_test_bearer(&[
+                ("base_url", json!(format!("{}/v1", server.uri()))),
+                (
+                    "required_scopes",
+                    json!([
+                        "https://www.googleapis.com/auth/contacts.readonly",
+                        "https://www.googleapis.com/auth/contacts.other.readonly",
+                        "https://www.googleapis.com/auth/directory.readonly"
+                    ]),
+                ),
+            ]))
+            .await
+            .unwrap();
+        let signing_key = Ed25519SigningKey::generate();
+        connector
+            .handle_handshake(json!({
+                "protocol_version": "1.0.0",
+                "zone": "z:work",
+                "host_public_key": signing_key.verifying_key().to_bytes(),
+                "nonce": vec![0u8; 32],
+                "capabilities_requested": [
+                    "people.contacts.read",
+                    "people.other_contacts.read",
+                    "people.contact_groups.read",
+                    "people.directory.read"
+                ]
+            }))
+            .await
+            .unwrap();
+        (connector, signing_key)
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn directory_search_invocation_preserves_people_and_continues_with_unchanged_filters() {
+        let server = MockServer::start().await;
+        let cursor = "next+/=&?opaque";
+        for (page_token, resource_name, next_page_token) in [
+            (None, "people/directory-1", Some(cursor)),
+            (Some(cursor), "people/directory-2", None),
+        ] {
+            let mock = Mock::given(method("GET"))
+                .and(path("/v1/people:searchDirectoryPeople"))
+                .and(query_param("query", "Ada + Research"))
+                .and(query_param("readMask", "emailAddresses,names"))
+                .and(query_param("pageSize", "1"))
+                .and(query_param(
+                    "sources",
+                    "DIRECTORY_SOURCE_TYPE_DOMAIN_PROFILE",
+                ))
+                .and(header("authorization", "Bearer ya29.people-test"));
+            let mock = if let Some(page_token) = page_token {
+                mock.and(query_param("pageToken", page_token))
+            } else {
+                mock.and(query_param_is_missing("pageToken"))
+            };
+            let mut response = json!({
+                "people": [{
+                    "resourceName": resource_name,
+                    "emailAddresses": [{ "value": "ada@example.com" }]
+                }],
+                "totalSize": 2
+            });
+            if let Some(next_page_token) = next_page_token {
+                response["nextPageToken"] = json!(next_page_token);
+            }
+            mock.respond_with(ResponseTemplate::new(200).set_body_json(response))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+
+        let (connector, signing_key) = handshaken_loopback_connector(&server).await;
+        let operation = "people.search_directory_people";
+        let capability = generate_valid_token(&signing_key, &connector, operation);
+        let mut input = json!({
+            "query": "Ada + Research",
+            "person_fields": ["names", "emailAddresses"],
+            "page_size": 1,
+            "sources": ["DIRECTORY_SOURCE_TYPE_DOMAIN_PROFILE"]
+        });
+        let first = connector
+            .handle_invoke(json!({
+                "operation": operation,
+                "input": input,
+                "capability_token": capability
+            }))
+            .await
+            .unwrap();
+        assert_eq!(first["results"][0]["resourceName"], "people/directory-1");
+        assert_eq!(
+            first["results"][0]["emailAddresses"][0]["value"],
+            "ada@example.com"
+        );
+        assert!(first["results"][0].get("person").is_none());
+        assert_eq!(first["next_page_token"], cursor);
+        assert_eq!(first["total_size"], 2);
+        assert!(first.get("nextPageToken").is_none());
+
+        input["page_token"] = first["next_page_token"].clone();
+        let second = connector
+            .handle_invoke(json!({
+                "operation": operation,
+                "input": input,
+                "capability_token": capability
+            }))
+            .await
+            .unwrap();
+        assert_eq!(second["results"][0]["resourceName"], "people/directory-2");
+        assert!(second["next_page_token"].is_null());
+        assert_eq!(second["total_size"], 2);
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        let query_options = |request: &wiremock::Request| {
+            request
+                .url
+                .query_pairs()
+                .filter(|(key, _)| key != "pageToken")
+                .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                .collect::<BTreeSet<_>>()
+        };
+        assert_eq!(query_options(&requests[0]), query_options(&requests[1]));
+        server.verify().await;
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn list_invocations_expose_continuation_tokens_and_public_collection_names() {
+        let server = MockServer::start().await;
+        let (connector, signing_key) = handshaken_loopback_connector(&server).await;
+        for (operation, endpoint, wire_field, public_field, wire_total, public_total) in [
+            (
+                "people.list_connections",
+                "/v1/people/me/connections",
+                "connections",
+                "connections",
+                "totalPeople",
+                "total_people",
+            ),
+            (
+                "people.list_other_contacts",
+                "/v1/otherContacts",
+                "otherContacts",
+                "other_contacts",
+                "totalSize",
+                "total_size",
+            ),
+            (
+                "people.list_contact_groups",
+                "/v1/contactGroups",
+                "contactGroups",
+                "contact_groups",
+                "totalItems",
+                "total_items",
+            ),
+        ] {
+            let cursor = format!("{operation}+/=&?page-2");
+            let (mask_parameter, default_mask) = match operation {
+                "people.list_connections" => (
+                    "personFields",
+                    "names,emailAddresses,phoneNumbers,organizations",
+                ),
+                "people.list_other_contacts" => ("readMask", "names,emailAddresses,phoneNumbers"),
+                "people.list_contact_groups" => ("groupFields", "name,groupType,memberCount"),
+                _ => unreachable!(),
+            };
+            for (page_token, resource_name, next_page_token) in [
+                (None, "first-resource", Some(cursor.as_str())),
+                (Some(cursor.as_str()), "second-resource", None),
+            ] {
+                let mock = Mock::given(method("GET"))
+                    .and(path(endpoint))
+                    .and(query_param("pageSize", "1"))
+                    .and(query_param(mask_parameter, default_mask))
+                    .and(header("authorization", "Bearer ya29.people-test"));
+                let mock = if let Some(page_token) = page_token {
+                    mock.and(query_param("pageToken", page_token))
+                } else {
+                    mock.and(query_param_is_missing("pageToken"))
+                };
+                let mut response = json!({
+                    (wire_field): [{ "resourceName": resource_name }],
+                    (wire_total): 2
+                });
+                if let Some(next_page_token) = next_page_token {
+                    response["nextPageToken"] = json!(next_page_token);
+                }
+                mock.respond_with(ResponseTemplate::new(200).set_body_json(response))
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+            }
+
+            let capability = generate_valid_token(&signing_key, &connector, operation);
+            let first = connector
+                .handle_invoke(json!({
+                    "operation": operation,
+                    "input": { "page_size": 1 },
+                    "capability_token": capability
+                }))
+                .await
+                .unwrap();
+            assert_eq!(first[public_field][0]["resourceName"], "first-resource");
+            assert_eq!(first["next_page_token"], cursor);
+            assert_eq!(first[public_total], 2);
+            assert!(first.get("nextPageToken").is_none());
+            if wire_field != public_field {
+                assert!(first.get(wire_field).is_none());
+            }
+            let second = connector
+                .handle_invoke(json!({
+                    "operation": operation,
+                    "input": { "page_size": 1, "page_token": first["next_page_token"] },
+                    "capability_token": capability
+                }))
+                .await
+                .unwrap();
+            assert_eq!(second[public_field][0]["resourceName"], "second-resource");
+            assert!(second["next_page_token"].is_null());
+        }
+        assert_eq!(server.received_requests().await.unwrap().len(), 6);
+        server.verify().await;
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn invalid_pagination_is_denied_by_invoke_and_simulate_before_provider_io() {
+        let server = MockServer::start().await;
+        let (connector, signing_key) = handshaken_loopback_connector(&server).await;
+        for (operation, max_page_size) in [
+            ("people.list_connections", 1000),
+            ("people.list_other_contacts", 1000),
+            ("people.list_contact_groups", 1000),
+            ("people.search_directory_people", 500),
+            ("people.search_contacts", 30),
+        ] {
+            let capability = generate_valid_token(&signing_key, &connector, operation);
+            for invalid_field in [
+                json!({ "page_token": null }),
+                json!({ "page_token": false }),
+                json!({ "page_token": 7 }),
+                json!({ "page_token": [] }),
+                json!({ "page_token": {} }),
+                json!({ "page_token": "" }),
+                json!({ "page_token": " \t" }),
+                json!({ "page_size": null }),
+                json!({ "page_size": "1" }),
+                json!({ "page_size": 0 }),
+                json!({ "page_size": -1 }),
+                json!({ "page_size": 1.5 }),
+                json!({ "page_size": max_page_size + 1 }),
+                json!({ "page_size": u64::MAX }),
+            ] {
+                let mut input = json!({ "query": "Ada" });
+                input
+                    .as_object_mut()
+                    .unwrap()
+                    .extend(invalid_field.as_object().unwrap().clone());
+                let result = connector
+                    .handle_invoke(json!({
+                        "operation": operation,
+                        "input": input,
+                        "capability_token": capability
+                    }))
+                    .await;
+                assert!(
+                    matches!(result, Err(FcpError::InvalidRequest { .. })),
+                    "{operation}: {input}"
+                );
+                let simulation = connector
+                    .handle_simulate(simulate_request(operation, input, capability.clone()))
+                    .await
+                    .unwrap();
+                assert!(
+                    !parse_simulate_response(simulation).would_succeed,
+                    "{operation}"
+                );
+            }
+            assert!(
+                parse_people_pagination(operation, &json!({ "page_size": max_page_size })).is_ok()
+            );
+        }
+        assert!(
+            parse_people_pagination("people.search_contacts", &json!({ "page_token": "next" }))
+                .is_err()
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
+        assert_eq!(connector.client.as_ref().unwrap().total_requests(), 0);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn contact_search_keeps_person_wrappers_and_refuses_continuation() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/people:searchContacts"))
+            .and(query_param("query", "Ada"))
+            .and(query_param("pageSize", "30"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [{ "person": { "resourceName": "people/contact-1" } }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (connector, signing_key) = handshaken_loopback_connector(&server).await;
+        let operation = "people.search_contacts";
+        let capability = generate_valid_token(&signing_key, &connector, operation);
+        let result = connector
+            .handle_invoke(json!({
+                "operation": operation,
+                "input": { "query": "Ada", "page_size": 30 },
+                "capability_token": capability
+            }))
+            .await
+            .unwrap();
+        assert_eq!(
+            result["results"][0]["person"]["resourceName"],
+            "people/contact-1"
+        );
+        assert!(result.get("next_page_token").is_none());
+        let input = json!({ "query": "Ada", "page_token": "unsupported" });
+        let result = connector
+            .handle_invoke(json!({
+                "operation": operation,
+                "input": input,
+                "capability_token": capability
+            }))
+            .await;
+        assert!(matches!(result, Err(FcpError::InvalidRequest { .. })));
+        let simulation = connector
+            .handle_simulate(simulate_request(operation, input, capability))
+            .await
+            .unwrap();
+        assert!(!parse_simulate_response(simulation).would_succeed);
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        server.verify().await;
     }
 
     #[test]

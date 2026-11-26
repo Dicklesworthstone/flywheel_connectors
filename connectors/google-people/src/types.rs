@@ -19,11 +19,23 @@ pub struct ListConnectionsResponse {
     pub total_items: Option<u32>,
 }
 
-/// Generic search response wrapper used by People search endpoints.
+/// Response from `people.searchContacts`, whose entries wrap a `person`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResultsResponse {
     #[serde(default)]
     pub results: Vec<Value>,
+}
+
+/// Response from `people.searchDirectoryPeople`, which returns people directly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchDirectoryPeopleResponse {
+    #[serde(default)]
+    pub people: Vec<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_page_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_size: Option<u32>,
 }
 
 /// Response from `otherContacts.list`.
@@ -76,5 +88,30 @@ mod tests {
             serde_json::from_value(json!({ "contactGroups": [] })).unwrap();
         assert!(decoded.contact_groups.is_empty());
         assert!(decoded.next_page_token.is_none());
+    }
+
+    #[test]
+    fn directory_response_decodes_people_and_continuation_metadata() {
+        let response: SearchDirectoryPeopleResponse = serde_json::from_value(json!({
+            "people": [{
+                "resourceName": "people/directory-1",
+                "emailAddresses": [{ "value": "ada@example.com" }]
+            }],
+            "nextPageToken": "directory-page-2",
+            "totalSize": 2
+        }))
+        .unwrap();
+
+        assert_eq!(response.people[0]["resourceName"], "people/directory-1");
+        assert_eq!(
+            response.next_page_token.as_deref(),
+            Some("directory-page-2")
+        );
+        assert_eq!(response.total_size, Some(2));
+
+        let empty: SearchDirectoryPeopleResponse = serde_json::from_value(json!({})).unwrap();
+        assert!(empty.people.is_empty());
+        assert!(empty.next_page_token.is_none());
+        assert!(empty.total_size.is_none());
     }
 }

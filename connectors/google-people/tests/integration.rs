@@ -242,13 +242,13 @@ async fn contacts_directory_groups_and_mutations_use_people_contracts() {
         ))
         .and(header(GOOGLE_AUTHORIZATION_HEADER, AUTH_HEADER_VALUE))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "results": [{
-                "person": {
-                    "resourceName": "people/directory-1",
-                    "names": [{ "displayName": "Alice Directory" }],
-                    "organizations": [{ "name": "Example Engineering" }]
-                }
-            }]
+            "people": [{
+                "resourceName": "people/directory-1",
+                "names": [{ "displayName": "Alice Directory" }],
+                "organizations": [{ "name": "Example Engineering" }]
+            }],
+            "nextPageToken": "directory-page-2",
+            "totalSize": 2
         })))
         .expect(1)
         .mount(&server)
@@ -353,11 +353,17 @@ async fn contacts_directory_groups_and_mutations_use_people_contracts() {
                 "organizations".into(),
             ],
             Some(5),
+            None,
             &["DIRECTORY_SOURCE_TYPE_DOMAIN_PROFILE".into()],
         )
         .await
         .expect("directory search should decode");
-    assert_eq!(directory.results.len(), 1);
+    assert_eq!(directory.people[0]["resourceName"], "people/directory-1");
+    assert_eq!(
+        directory.next_page_token.as_deref(),
+        Some("directory-page-2")
+    );
+    assert_eq!(directory.total_size, Some(2));
 
     let groups = client
         .list_contact_groups(

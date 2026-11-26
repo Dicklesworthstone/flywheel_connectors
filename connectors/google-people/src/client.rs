@@ -23,7 +23,7 @@ use crate::{
     error::{GooglePeopleError, PeopleResult},
     types::{
         ListConnectionsResponse, ListContactGroupsResponse, ListOtherContactsResponse,
-        SearchResultsResponse,
+        SearchDirectoryPeopleResponse, SearchResultsResponse,
     },
 };
 
@@ -215,21 +215,29 @@ impl GooglePeopleClient {
         self.get_json(&url).await
     }
 
-    /// Search Google Workspace directory people.
-    #[instrument(skip(self, person_fields, sources))]
+    /// Search one page of Google Workspace directory people.
+    ///
+    /// Reuse the query, field mask, page size, and sources when passing a returned
+    /// continuation token. Directory responses contain people, unlike contact
+    /// search responses whose entries wrap a person.
+    #[instrument(skip(self, person_fields, sources, page_token))]
     pub async fn search_directory_people(
         &self,
         query: &str,
         person_fields: &[String],
         page_size: Option<u32>,
+        page_token: Option<&str>,
         sources: &[String],
-    ) -> PeopleResult<SearchResultsResponse> {
+    ) -> PeopleResult<SearchDirectoryPeopleResponse> {
         let mut params = vec![
             ("query", query.to_string()),
             ("readMask", person_fields.join(",")),
         ];
         if let Some(size) = page_size {
             params.push(("pageSize", size.to_string()));
+        }
+        if let Some(token) = page_token {
+            params.push(("pageToken", token.to_string()));
         }
         for source in sources {
             params.push(("sources", source.clone()));

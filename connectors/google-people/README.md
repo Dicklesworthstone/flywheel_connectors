@@ -150,6 +150,25 @@ The runtime keeps People field exposure explicit:
 - If `update_person_fields` is omitted, the connector derives it from non-empty mutable top-level fields in `person`.
 - `people.update_contact` requires `person.etag` to preserve People API concurrency semantics.
 - Empty field lists, non-string field entries, and empty update masks are rejected before provider execution.
+- Other Contacts defaults to `names`, `emailAddresses`, and `phoneNumbers`, which its CONTACT source accepts. Contact groups default to `name`, `groupType`, and `memberCount`; response-only `formattedName` is not sent as a field-mask entry.
+
+## Pagination And Response Fields
+
+Directory search, connections, Other Contacts, and contact groups return one page per invocation. Pass `next_page_token` back as `page_token` until it is null. Keep the original query, field mask, page size, source filters, and sort order unchanged across pages. Tokens are opaque strings; the connector preserves their contents when encoding the provider request and rejects empty or incorrectly typed tokens before making a request.
+
+The connector uses snake_case for its response envelope: `next_page_token`, `next_sync_token`, `total_people`, `total_items`, and `total_size`. Person and ContactGroup resources inside the result arrays retain Google's field names such as `resourceName` and `emailAddresses`.
+
+| Operation | Result array | Maximum page_size |
+|-----------|--------------|-------------------|
+| `people.list_connections` | `connections` | 1000 |
+| `people.list_other_contacts` | `other_contacts` | 1000 |
+| `people.list_contact_groups` | `contact_groups` | 1000 |
+| `people.search_directory_people` | `results` containing Person resources | 500 |
+| `people.search_contacts` | `results` containing Google's contact-search wrappers | 30 |
+
+Contact search does not support continuation tokens; use `people.list_connections` when the complete contact corpus is needed. Directory search decodes Google's `people` array and publishes it as `results`, together with `next_page_token` and `total_size`. Unknown totals are null. Both `simulate` and `invoke` reject page sizes outside the documented ranges and unsupported contact-search continuation tokens.
+
+Provider references: [directory search](https://developers.google.com/people/api/rest/v1/people/searchDirectoryPeople), [contact search](https://developers.google.com/people/api/rest/v1/people/searchContacts), [connections](https://developers.google.com/people/api/rest/v1/people.connections/list), [Other Contacts](https://developers.google.com/people/api/rest/v1/otherContacts/list), and [contact groups](https://developers.google.com/people/api/rest/v1/contactGroups/list).
 
 ## Explicit Non-Goals
 

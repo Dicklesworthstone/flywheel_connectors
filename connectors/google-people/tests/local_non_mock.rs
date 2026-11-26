@@ -377,6 +377,10 @@ async fn local_non_mock_list_connections_uses_people_request_boundary() {
     assert!(observation.user_agent_seen());
     assert!(observation.body.is_empty());
     assert_eq!(result["connections"][0]["resourceName"], "people/contact-1");
+    assert_eq!(result["next_page_token"], "contacts-page-2");
+    assert_eq!(result["total_people"], 1);
+    assert_eq!(result["total_items"], 1);
+    assert!(result.get("nextPageToken").is_none());
     assert_eq!(
         result["connections"][0]["emailAddresses"][0]["value"],
         "ada@example.com"

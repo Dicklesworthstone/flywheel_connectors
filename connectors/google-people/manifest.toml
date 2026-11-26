@@ -74,14 +74,25 @@ type = "array"
 type = "string"
 [provides.operations."people.list_connections".input_schema.properties.page_size]
 type = "integer"
+minimum = 1
+maximum = 1000
 [provides.operations."people.list_connections".input_schema.properties.page_token]
 type = "string"
+minLength = 1
 [provides.operations."people.list_connections".input_schema.properties.sort_order]
 type = "string"
 [provides.operations."people.list_connections".output_schema]
 type = "object"
 [provides.operations."people.list_connections".output_schema.properties.connections]
 type = "array"
+[provides.operations."people.list_connections".output_schema.properties.next_page_token]
+type = ["string", "null"]
+[provides.operations."people.list_connections".output_schema.properties.next_sync_token]
+type = ["string", "null"]
+[provides.operations."people.list_connections".output_schema.properties.total_people]
+type = ["integer", "null"]
+[provides.operations."people.list_connections".output_schema.properties.total_items]
+type = ["integer", "null"]
 [provides.operations."people.list_connections".network_constraints]
 host_allow = ["people.googleapis.com"]
 port_allow = [443]
@@ -168,6 +179,9 @@ type = "array"
 type = "string"
 [provides.operations."people.search_contacts".input_schema.properties.page_size]
 type = "integer"
+minimum = 1
+maximum = 30
+description = "Contact search returns at most 30 matches and has no continuation token; use list_connections to enumerate contacts."
 [provides.operations."people.search_contacts".output_schema]
 type = "object"
 [provides.operations."people.search_contacts".output_schema.properties.results]
@@ -209,12 +223,19 @@ type = "array"
 type = "string"
 [provides.operations."people.list_other_contacts".input_schema.properties.page_size]
 type = "integer"
+minimum = 1
+maximum = 1000
 [provides.operations."people.list_other_contacts".input_schema.properties.page_token]
 type = "string"
+minLength = 1
 [provides.operations."people.list_other_contacts".output_schema]
 type = "object"
 [provides.operations."people.list_other_contacts".output_schema.properties.other_contacts]
 type = "array"
+[provides.operations."people.list_other_contacts".output_schema.properties.next_page_token]
+type = ["string", "null"]
+[provides.operations."people.list_other_contacts".output_schema.properties.total_size]
+type = ["integer", "null"]
 [provides.operations."people.list_other_contacts".network_constraints]
 host_allow = ["people.googleapis.com"]
 port_allow = [443]
@@ -242,6 +263,7 @@ when_to_use = "Search org-wide directory profiles after explicitly opting into d
 common_mistakes = [
   "Directory results are not the same as the user's personal contacts corpus.",
   "Use directory source filters when the caller needs domain profile results only.",
+  "Pass next_page_token as page_token with the same query, person_fields, page_size, and sources until no token remains.",
 ]
 examples = ['{"query":"alice","person_fields":["names","emailAddresses","organizations"]}']
 [provides.operations."people.search_directory_people".input_schema]
@@ -255,6 +277,12 @@ type = "array"
 type = "string"
 [provides.operations."people.search_directory_people".input_schema.properties.page_size]
 type = "integer"
+minimum = 1
+maximum = 500
+[provides.operations."people.search_directory_people".input_schema.properties.page_token]
+type = "string"
+minLength = 1
+description = "Continuation token; keep all other query options unchanged."
 [provides.operations."people.search_directory_people".input_schema.properties.sources]
 type = "array"
 [provides.operations."people.search_directory_people".input_schema.properties.sources.items]
@@ -263,6 +291,11 @@ type = "string"
 type = "object"
 [provides.operations."people.search_directory_people".output_schema.properties.results]
 type = "array"
+description = "Matching Person resources from the directory."
+[provides.operations."people.search_directory_people".output_schema.properties.next_page_token]
+type = ["string", "null"]
+[provides.operations."people.search_directory_people".output_schema.properties.total_size]
+type = ["integer", "null"]
 [provides.operations."people.search_directory_people".network_constraints]
 host_allow = ["people.googleapis.com"]
 port_allow = [443]
@@ -300,12 +333,19 @@ type = "array"
 type = "string"
 [provides.operations."people.list_contact_groups".input_schema.properties.page_size]
 type = "integer"
+minimum = 1
+maximum = 1000
 [provides.operations."people.list_contact_groups".input_schema.properties.page_token]
 type = "string"
+minLength = 1
 [provides.operations."people.list_contact_groups".output_schema]
 type = "object"
 [provides.operations."people.list_contact_groups".output_schema.properties.contact_groups]
 type = "array"
+[provides.operations."people.list_contact_groups".output_schema.properties.next_page_token]
+type = ["string", "null"]
+[provides.operations."people.list_contact_groups".output_schema.properties.total_items]
+type = ["integer", "null"]
 [provides.operations."people.list_contact_groups".network_constraints]
 host_allow = ["people.googleapis.com"]
 port_allow = [443]
