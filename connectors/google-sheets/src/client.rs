@@ -1,5 +1,6 @@
 //! Google Sheets API v4 client.
 
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -199,10 +200,17 @@ impl SheetsClient {
         let context = self.runtime.request_context();
         let started = AtomicBool::new(false);
         let response_status = AtomicU16::new(0);
+        let response_retry_floor = OnceLock::new();
         // One context owns sending, body reads and decoding. In particular,
         // shutdown must wake a request even while a provider withholds its body.
         let result = context
-            .run(self.send_json_in_context(request, replay_safe, &started, &response_status))
+            .run(self.send_json_in_context(
+                request,
+                replay_safe,
+                &started,
+                &response_status,
+                &response_retry_floor,
+            ))
             .await;
         // JSON decoding is synchronous: recheck before publishing its result
         // so decoding cannot return success after shutdown or the same deadline.
@@ -232,6 +240,18 @@ impl SheetsClient {
                     status_code: (status != 0).then_some(status),
                     message: error.to_string(),
                 })
+            } else if replay_safe
+                && (500..600).contains(&status)
+                && matches!(error, fcp_async_core::AsyncError::Timeout { .. })
+            {
+                // The server's failure and retry minimum remain authoritative
+                // when only its error body outlives our deadline. Cancellation
+                // must stay terminal even after the same headers were observed.
+                Err(map_api_error(
+                    status,
+                    error.to_string(),
+                    response_retry_floor.get().copied(),
+                ))
             } else {
                 Err(<SheetsError as fcp_sdk::ConnectorErrorMapping>::from_async_error(error))
             }
@@ -244,6 +264,7 @@ impl SheetsClient {
         replay_safe: bool,
         started: &AtomicBool,
         response_status: &AtomicU16,
+        response_retry_floor: &OnceLock<u64>,
     ) -> SheetsResult<T> {
         self.total_requests.fetch_add(1, Ordering::Relaxed);
         started.store(true, Ordering::Relaxed);
@@ -287,6 +308,9 @@ impl SheetsClient {
                 .iter()
                 .filter_map(|value| value.to_str().ok()),
         );
+        if let Some(retry_floor) = retry_floor {
+            let _ = response_retry_floor.set(retry_floor);
+        }
         if matches!(status.as_u16(), 401 | 429) {
             // Neither classification uses the body. Do not let an irrelevant
             // body stall hide a known refusal or the provider's retry minimum.
@@ -523,13 +547,10 @@ mod tests {
         }
 
         async fn wait_for_request(&mut self) {
-            fcp_async_core::time::timeout(
-                Duration::from_secs(1),
-                self.observed.take().unwrap(),
-            )
-            .await
-            .expect("provider saw request")
-            .expect("provider observer");
+            fcp_async_core::time::timeout(Duration::from_secs(1), self.observed.take().unwrap())
+                .await
+                .expect("provider saw request")
+                .expect("provider observer");
         }
     }
 
@@ -551,10 +572,9 @@ mod tests {
         })
         .unwrap()
         .with_base_url(&provider.url);
-        client.client = build_google_api_client(
-            Client::builder().no_proxy().timeout(Duration::from_secs(3)),
-        )
-        .unwrap();
+        client.client =
+            build_google_api_client(Client::builder().no_proxy().timeout(Duration::from_secs(3)))
+                .unwrap();
         client
     }
 
@@ -628,6 +648,78 @@ mod tests {
             }
         ));
         assert!(!error.is_retryable());
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn body_deadline_preserves_retry_floor_without_retrying_cancellation_or_unsafe_writes() {
+        for cancelled in [false, true] {
+            for operation_name in ["read", "append", "update"] {
+                let mut provider = PausedProvider::start(
+                    b"HTTP/1.1 503 Unavailable\r\nRetry-After: 125\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{"
+                        .to_vec(),
+                );
+                let mut client = paused_provider_client(&provider);
+                client.runtime = ConnectorRuntime::new(
+                    ConnectorRuntimeConfig::default().with_request_timeout(Duration::from_secs(1)),
+                );
+                let client = std::sync::Arc::new(client);
+                let worker_client = std::sync::Arc::clone(&client);
+                let mut operation = fcp_async_core::task::spawn(async move {
+                    match operation_name {
+                        "append" => worker_client
+                            .append_values("id", "A1", vec![vec![serde_json::json!(1)]])
+                            .await
+                            .map(|_| ()),
+                        "update" => worker_client
+                            .update_values("id", "A1", vec![vec![serde_json::json!(1)]])
+                            .await
+                            .map(|_| ()),
+                        _ => worker_client.get_values("id", "A1").await.map(|_| ()),
+                    }
+                });
+                provider.wait_for_request().await;
+                if cancelled {
+                    client.shutdown();
+                }
+                let completed =
+                    fcp_async_core::time::timeout(Duration::from_millis(1500), &mut operation)
+                        .await;
+                operation.abort();
+                let error = completed
+                    .expect("body wait must end within the request budget")
+                    .expect("operation task")
+                    .unwrap_err();
+                if operation_name != "read" {
+                    assert!(matches!(error, SheetsError::WriteOutcomeUnknown { .. }));
+                    assert!(!error.is_retryable());
+                    assert_eq!(error.retry_after(), None);
+                } else if cancelled {
+                    assert!(error.to_string().contains("cancelled"));
+                    assert!(!error.is_retryable());
+                    assert_eq!(error.retry_after(), None);
+                } else {
+                    assert!(matches!(
+                        error,
+                        SheetsError::TransientApi {
+                            status_code: 503,
+                            retry_after_ms: 125_000,
+                            ..
+                        }
+                    ));
+                    assert!(error.to_string().contains("timed out"));
+                    assert!(matches!(
+                        error.to_fcp_error(),
+                        fcp_core::FcpError::External {
+                            status_code: Some(503),
+                            retryable: true,
+                            retry_after: Some(delay),
+                            ..
+                        } if delay == Duration::from_secs(125)
+                    ));
+                }
+                assert_eq!(client.total_requests(), 1);
+            }
+        }
     }
 
     #[fcp_async_core::runtime::test]

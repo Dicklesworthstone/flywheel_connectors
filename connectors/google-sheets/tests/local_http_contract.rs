@@ -137,11 +137,9 @@ async fn writes_with_unknown_outcomes_never_advertise_a_retry() {
         };
         assert!(!error.is_retryable());
         let wire_error = error.to_fcp_error();
-        assert!(
-            matches!(wire_error, fcp_core::FcpError::External {
+        assert!(matches!(wire_error, fcp_core::FcpError::External {
             status_code: Some(actual), retryable: false, retry_after: None, ref message, ..
-        } if actual == status && message.contains("Check the affected range"))
-        );
+        } if actual == status && message.contains("Check the affected range")));
         server.verify().await;
     }
 }
