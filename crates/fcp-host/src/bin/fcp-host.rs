@@ -2850,6 +2850,17 @@ struct RegistryEntry {
 }
 
 impl RegistryEntry {
+    fn allow_list_snapshot(&self) -> AllowListSnapshot {
+        AllowListSnapshot {
+            allowed_zones: self.config.allowed_zones.clone(),
+            allowed_operations: self.config.allowed_operations.clone(),
+            singleton_writer: self.state_policy.is_singleton_writer(),
+            enforce_operation_network_constraints: self.config.enforce_operation_network_constraints,
+            enforce_empty_allow_lists: self.config.enforce_empty_allow_lists,
+            manifest_constraints: self.manifest_constraints.clone(),
+        }
+    }
+
     fn admitted_native_executable(&self) -> Option<&native_artifact::AdmittedNativeExecutable> {
         match &self.connector {
             ConnectorRuntime::Native(connector) => connector.admitted_executable.as_ref(),
@@ -3507,6 +3518,9 @@ struct RuntimeNetworkPolicySnapshot {
     enforcement: RuntimeNetworkEnforcement,
     operation_constraints: Option<ManagedNetworkConstraints>,
     connector_config: Option<Value>,
+    /// Egress must obey the same inventory generation's zone, operation and
+    /// manifest authority as invocation, including policy-only updates.
+    governance: AllowListSnapshot,
 }
 
 #[derive(Default)]
@@ -4520,17 +4534,10 @@ impl SubprocessRegistry {
     /// Returns `None` when the connector is unknown.
     async fn allow_list_snapshot(&self, connector_id: &ConnectorId) -> Option<AllowListSnapshot> {
         let state = self.state.read().await;
-        state.connectors.get(connector_id).map(|entry| {
-            let cfg = &entry.config;
-            AllowListSnapshot {
-                allowed_zones: cfg.allowed_zones.clone(),
-                allowed_operations: cfg.allowed_operations.clone(),
-                singleton_writer: entry.state_policy.is_singleton_writer(),
-                enforce_operation_network_constraints: cfg.enforce_operation_network_constraints,
-                enforce_empty_allow_lists: cfg.enforce_empty_allow_lists,
-                manifest_constraints: entry.manifest_constraints.clone(),
-            }
-        })
+        state
+            .connectors
+            .get(connector_id)
+            .map(RegistryEntry::allow_list_snapshot)
     }
 
     async fn runtime_network_policy_snapshot(
@@ -4548,6 +4555,7 @@ impl SubprocessRegistry {
                     .get(operation.as_str())
                     .cloned(),
                 connector_config: cfg.config.clone(),
+                governance: entry.allow_list_snapshot(),
             }
         })
     }
@@ -9132,42 +9140,12 @@ fn enforce_connector_allow_lists(
     snapshot: &AllowListSnapshot,
     request: &InvokeRequest,
 ) -> HostResult<()> {
-    let allowed = &snapshot.allowed_zones;
-    require_allowed_zones_configured(&request.connector_id, allowed)?;
-    if !allowed.iter().any(|zone| zone == request.zone_id.as_str()) {
-        return Err(HostError::PreflightFailed(format!(
-            "connector `{}` is not bound to zone `{}` (allowed: [{}])",
-            request.connector_id,
-            request.zone_id.as_str(),
-            allowed.join(", ")
-        )));
-    }
-
-    let allowed_ops = &snapshot.allowed_operations;
-    if allowed_ops.is_empty() {
-        if snapshot.enforce_empty_allow_lists {
-            return Err(HostError::PreflightFailed(format!(
-                "connector `{}` has no `allowed_operations` and is configured \
-                 enforce_empty_allow_lists=true; deny-all (br-v2kt4)",
-                request.connector_id
-            )));
-        }
-        // Empty operations without deny-all still require signed capability
-        // and connector catalog checks in the rest of the admission pipeline.
-    } else if !allowed_ops
-        .iter()
-        .any(|op| op == request.operation.as_str())
-    {
-        return Err(HostError::PreflightFailed(format!(
-            "connector `{}` does not allow operation `{}` (allowed: [{}])",
-            request.connector_id,
-            request.operation.as_str(),
-            allowed_ops.join(", ")
-        )));
-    }
-    let _ = snapshot
-        .manifest_constraints
-        .operation_authority(&request.connector_id, request.operation.as_str())?;
+    enforce_connector_scope(
+        snapshot,
+        &request.connector_id,
+        &request.operation,
+        &request.zone_id,
+    )?;
     if let Some(contracts) = &snapshot.manifest_constraints.operation_contracts {
         contracts
             .validate_input(&request.operation, &request.input)
@@ -9177,6 +9155,46 @@ fn enforce_connector_allow_lists(
                 )
             })?;
     }
+    Ok(())
+}
+
+/// Shared inventory authority for both invocation and host-owned transport.
+/// An egress envelope contains provider bytes, not the connector operation's
+/// input, so only invocation performs the original input-schema validation.
+fn enforce_connector_scope(
+    snapshot: &AllowListSnapshot,
+    connector_id: &ConnectorId,
+    operation: &OperationId,
+    zone_id: &ZoneId,
+) -> HostResult<()> {
+    let allowed = &snapshot.allowed_zones;
+    require_allowed_zones_configured(connector_id, allowed)?;
+    if !allowed.iter().any(|zone| zone == zone_id.as_str()) {
+        return Err(HostError::PreflightFailed(format!(
+            "connector `{connector_id}` is not bound to zone `{zone_id}` (allowed: [{}])",
+            allowed.join(", ")
+        )));
+    }
+
+    let allowed_ops = &snapshot.allowed_operations;
+    if allowed_ops.is_empty() {
+        if snapshot.enforce_empty_allow_lists {
+            return Err(HostError::PreflightFailed(format!(
+                "connector `{connector_id}` has no `allowed_operations` and is configured \
+                 enforce_empty_allow_lists=true; deny-all (br-v2kt4)"
+            )));
+        }
+        // Empty operations without deny-all still require signed capability
+        // and connector catalog checks in the rest of the admission pipeline.
+    } else if !allowed_ops.iter().any(|op| op == operation.as_str()) {
+        return Err(HostError::PreflightFailed(format!(
+            "connector `{connector_id}` does not allow operation `{operation}` (allowed: [{}])",
+            allowed_ops.join(", ")
+        )));
+    }
+    let _ = snapshot
+        .manifest_constraints
+        .operation_authority(connector_id, operation.as_str())?;
     Ok(())
 }
 
@@ -16526,6 +16544,10 @@ async fn authorize_host_egress_context(
         .runtime_network_policy_snapshot(&connector_id, &operation)
         .await
         .ok_or_else(|| HostError::ConnectorNotFound(connector_id.to_string()))?;
+    inventory_fence.require_current()?;
+    // A signed capability is necessary but cannot override the operator's
+    // inventory. Refuse scope before introspection, credential selection or DNS.
+    enforce_connector_scope(&snapshot.governance, &connector_id, &operation, &zone_id)?;
     if snapshot.enforcement != RuntimeNetworkEnforcement::HostEgressProxy {
         return Err(HostError::PreflightFailed(format!(
             "host-egress proxy rejected connector `{connector_id}` operation `{operation}`: \
@@ -16552,15 +16574,12 @@ async fn authorize_host_egress_context(
         "host-egress capability_token_cbor_b64",
     )?;
     let introspection = state.discovery.introspect(&connector_id).await?;
-    let tool = introspection
-        .tools
-        .iter()
-        .find(|tool| tool.name == operation.as_str())
-        .ok_or_else(|| {
-            HostError::InvalidFilter(format!(
-                "connector `{connector_id}` does not expose operation `{operation}`"
-            ))
-        })?;
+    let tool = admitted_operation_tool(
+        Some(&snapshot.governance),
+        &connector_id,
+        operation.as_str(),
+        &introspection.tools,
+    )?;
     let capability_key = state.capability_verifying_key.as_ref().ok_or_else(|| {
         HostError::PreflightFailed(
             "FCP_HOST_CAPABILITY_PUBLIC_KEY[_FILE] is not configured, so host-egress auth checks cannot be verified"
@@ -28293,17 +28312,29 @@ output_schema = {{ type = "object" }}
         operation_id: &'static str,
         constraints: ManagedNetworkConstraints,
     ) -> Arc<SubprocessRegistry> {
-        let introspection = serde_json::to_value(dispatcher_introspection(
+        d9us6_host_egress_registry_with_catalog(
+            connector_id,
             operation_id,
-            "cap.test.egress",
-            SafetyTier::Safe,
-        ))
-        .expect("introspection serializes");
+            constraints,
+            dispatcher_introspection(operation_id, "cap.test.egress", SafetyTier::Safe),
+            Arc::new(AtomicU64::new(0)),
+        )
+    }
+
+    fn d9us6_host_egress_registry_with_catalog(
+        connector_id: &'static str,
+        operation_id: &'static str,
+        constraints: ManagedNetworkConstraints,
+        catalog: Introspection,
+        introspections: Arc<AtomicU64>,
+    ) -> Arc<SubprocessRegistry> {
+        let introspection = serde_json::to_value(catalog).expect("introspection serializes");
         let (runner_tx, mut runner_rx) = mpsc::channel::<ConnectorRpcRequest>(4);
         let runner_task = task::spawn(async move {
             while let Some(request) = runner_rx.recv().await {
                 match request.method.as_str() {
                     "introspect" => {
+                        introspections.fetch_add(1, Ordering::SeqCst);
                         let _ = request.response_tx.send(Ok(json!({
                             "result": introspection.clone(),
                         })));
@@ -28357,6 +28388,23 @@ output_schema = {{ type = "object" }}
         credential_id: CredentialId,
         credential_payload: Value,
     ) -> (Arc<AppState>, fcp_crypto::ed25519::Ed25519SigningKey) {
+        d9us6_host_egress_state_with_registry(
+            connector_id,
+            operation_id,
+            d9us6_host_egress_registry_with_constraints(connector_id, operation_id, constraints),
+            credential_id,
+            credential_payload,
+        )
+        .await
+    }
+
+    async fn d9us6_host_egress_state_with_registry(
+        connector_id: &'static str,
+        operation_id: &'static str,
+        registry: Arc<SubprocessRegistry>,
+        credential_id: CredentialId,
+        credential_payload: Value,
+    ) -> (Arc<AppState>, fcp_crypto::ed25519::Ed25519SigningKey) {
         let signing_key = fcp_crypto::ed25519::Ed25519SigningKey::generate();
         let lifecycle = Arc::new(HostAdminStateStore::new());
         register_test_capability_issuer(
@@ -28371,7 +28419,7 @@ output_schema = {{ type = "object" }}
         let mut policies = HashMap::new();
         policies.insert(ZoneId::work(), host_runtime_policy(ZoneId::work()));
         let state = dispatcher_app_state(
-            d9us6_host_egress_registry_with_constraints(connector_id, operation_id, constraints),
+            registry,
             lifecycle,
             Some(signing_key.verifying_key()),
             policies,
@@ -28399,6 +28447,396 @@ output_schema = {{ type = "object" }}
             )
             .expect("install host-egress credential");
         (state, signing_key)
+    }
+
+    const EGRESS_GOVERNANCE_CONNECTOR: &str = "fcp.test.egress-governance:utility:1.0.0";
+    const EGRESS_GOVERNANCE_OPERATION: &str = "test.egress";
+
+    fn egress_governance_manifest() -> ManifestOperationConstraintCatalog {
+        let raw = append_test_manifest_operations(
+            state_policy_test_manifest_for(EGRESS_GOVERNANCE_CONNECTOR, Some("stateless"), false),
+            r#"
+[provides.operations."test.egress"]
+description = "Governed transport fixture"
+capability = "cap.test.egress"
+risk_level = "high"
+safety_tier = "safe"
+requires_approval = "none"
+idempotency = "strict"
+input_schema = { type = "object", required = ["message"], properties = { message = { type = "string" } } }
+output_schema = { type = "object" }
+"#,
+        );
+        let manifest = ConnectorManifest::parse_str(&raw).expect("valid egress manifest");
+        ManifestOperationConstraintCatalog::from_manifest(&manifest, "egress-governance-fixture")
+            .expect("admit egress manifest")
+    }
+
+    async fn egress_governance_request(
+        state: Arc<AppState>,
+        protocol: &str,
+        addr: SocketAddr,
+        credential_id: CredentialId,
+        token: &fcp_core::CapabilityToken,
+    ) -> Result<(), (StatusCode, String)> {
+        let context = d9us6_host_egress_context(
+            EGRESS_GOVERNANCE_CONNECTOR,
+            EGRESS_GOVERNANCE_OPERATION,
+            "req-egress-governance",
+            "corr-egress-governance",
+            token,
+        );
+        if protocol == "http" {
+            host_egress_http_handler(
+                State(state),
+                Json(HostEgressHttpRequest {
+                    context,
+                    url: format!("http://{addr}/governed"),
+                    method: "POST".to_owned(),
+                    headers: Vec::new(),
+                    body: Some(fcp_manifest::Base64Bytes::from_vec(b"PING".to_vec())),
+                    credential_id: Some(credential_id.to_string()),
+                }),
+            )
+            .await
+            .map(|_| ())
+        } else {
+            host_egress_tcp_handler(
+                State(state),
+                Json(HostEgressTcpRequest {
+                    context,
+                    host: addr.ip().to_string(),
+                    port: addr.port(),
+                    tls: false,
+                    sni_override: None,
+                    write: Some(fcp_manifest::Base64Bytes::from_vec(b"PING".to_vec())),
+                    read_limit_bytes: Some(4),
+                    credential_id: Some(credential_id.to_string()),
+                }),
+            )
+            .await
+            .map(|_| ())
+        }
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn host_egress_inventory_scope_denies_http_and_tcp_before_runtime_or_credentials() {
+        for protocol in ["http", "tcp"] {
+            for (case, expected) in [
+                ("other_zone", "not bound to zone"),
+                ("missing_zone", "allowed_zones"),
+                ("other_operation", "does not allow operation"),
+                ("empty_deny_all", "deny-all"),
+            ] {
+                let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+                listener.set_nonblocking(true).unwrap();
+                let addr = listener.local_addr().unwrap();
+                let introspections = Arc::new(AtomicU64::new(0));
+                let registry = d9us6_host_egress_registry_with_catalog(
+                    EGRESS_GOVERNANCE_CONNECTOR,
+                    EGRESS_GOVERNANCE_OPERATION,
+                    d9us6_loopback_constraints(addr.port()),
+                    dispatcher_introspection(
+                        EGRESS_GOVERNANCE_OPERATION,
+                        "cap.test.egress",
+                        SafetyTier::Safe,
+                    ),
+                    Arc::clone(&introspections),
+                );
+                {
+                    let mut inventory = registry.state.write().await;
+                    let entry = inventory
+                        .connectors
+                        .get_mut(&ConnectorId::from_static(EGRESS_GOVERNANCE_CONNECTOR))
+                        .unwrap();
+                    match case {
+                        "other_zone" => {
+                            entry.config.allowed_zones = vec![ZoneId::private().to_string()];
+                        }
+                        "missing_zone" => entry.config.allowed_zones.clear(),
+                        "other_operation" => {
+                            entry.config.allowed_operations = vec!["test.other".to_owned()];
+                        }
+                        _ => entry.config.enforce_empty_allow_lists = true,
+                    }
+                }
+                let credential_id =
+                    CredentialId::parse("eee10000-1111-4111-8111-111111111111").unwrap();
+                let (state, signing_key) = d9us6_host_egress_state_with_registry(
+                    EGRESS_GOVERNANCE_CONNECTOR,
+                    EGRESS_GOVERNANCE_OPERATION,
+                    registry,
+                    credential_id,
+                    json!({
+                        "host_allow": ["127.0.0.1"],
+                        "http": {"bearer_token": "governance-credential-sentinel"},
+                        "tcp": {"auth": "governance-credential-sentinel"}
+                    }),
+                )
+                .await;
+                let token = d9us6_token_with_credentials(
+                    &signing_key,
+                    EGRESS_GOVERNANCE_OPERATION,
+                    vec![credential_id],
+                );
+                // A policy denial must not reach the credential mutex at all.
+                // Holding it makes that ordering observable, even if a later
+                // transport failure would have released its reservation.
+                let pools = state.credential_pools.lock().await;
+                let error = fcp_async_core::time::timeout(
+                    Duration::from_secs(1),
+                    egress_governance_request(
+                        Arc::clone(&state),
+                        protocol,
+                        addr,
+                        credential_id,
+                        &token,
+                    ),
+                )
+                .await
+                .expect("inventory refusal must precede credential selection")
+                .expect_err("a signed token cannot override managed inventory");
+                assert!(error.1.contains(expected), "{protocol}/{case}: {error:?}");
+                assert_eq!(introspections.load(Ordering::SeqCst), 0);
+                assert_eq!(
+                    listener.accept().unwrap_err().kind(),
+                    std::io::ErrorKind::WouldBlock
+                );
+                assert!(!error.1.contains("governance-credential-sentinel"));
+                assert!(
+                    pools
+                        .redacted_views(Utc::now())
+                        .iter()
+                        .flat_map(|pool| &pool.entries)
+                        .all(|entry| entry.active_leases == 0)
+                );
+            }
+        }
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn host_egress_manifest_authority_denies_http_and_tcp_before_provider_contact() {
+        for protocol in ["http", "tcp"] {
+            for (case, expected) in [
+                ("undeclared", "does not declare operation"),
+                ("capability", "runtime capability"),
+                ("safety_tier", "runtime safety_tier"),
+                ("approval", "runtime requires_approval"),
+                ("duplicate", "ambiguous"),
+            ] {
+                let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+                listener.set_nonblocking(true).unwrap();
+                let addr = listener.local_addr().unwrap();
+                let introspections = Arc::new(AtomicU64::new(0));
+                let mut manifest = egress_governance_manifest();
+                let mut catalog = dispatcher_introspection_with_input_schema(
+                    EGRESS_GOVERNANCE_OPERATION,
+                    "cap.test.egress",
+                    SafetyTier::Safe,
+                    manifest.operation_authorities[EGRESS_GOVERNANCE_OPERATION]
+                        .input_schema
+                        .clone(),
+                );
+                if case == "duplicate" {
+                    catalog.operations.push(catalog.operations[0].clone());
+                } else if case == "undeclared" {
+                    Arc::make_mut(&mut manifest.operation_authorities)
+                        .remove(EGRESS_GOVERNANCE_OPERATION);
+                } else {
+                    let authority = Arc::make_mut(&mut manifest.operation_authorities)
+                        .get_mut(EGRESS_GOVERNANCE_OPERATION)
+                        .unwrap();
+                    match case {
+                        "capability" => {
+                            authority.capability = CapabilityId::from_static("cap.test.stronger");
+                        }
+                        "safety_tier" => authority.safety_tier = SafetyTier::Dangerous,
+                        _ => authority.approval_mode = ApprovalMode::Interactive,
+                    }
+                }
+                let registry = d9us6_host_egress_registry_with_catalog(
+                    EGRESS_GOVERNANCE_CONNECTOR,
+                    EGRESS_GOVERNANCE_OPERATION,
+                    d9us6_loopback_constraints(addr.port()),
+                    catalog,
+                    Arc::clone(&introspections),
+                );
+                registry
+                    .state
+                    .write()
+                    .await
+                    .connectors
+                    .get_mut(&ConnectorId::from_static(EGRESS_GOVERNANCE_CONNECTOR))
+                    .unwrap()
+                    .manifest_constraints = manifest;
+                let credential_id =
+                    CredentialId::parse("eee20000-1111-4111-8111-111111111111").unwrap();
+                let (state, signing_key) = d9us6_host_egress_state_with_registry(
+                    EGRESS_GOVERNANCE_CONNECTOR,
+                    EGRESS_GOVERNANCE_OPERATION,
+                    registry,
+                    credential_id,
+                    json!({
+                        "host_allow": ["127.0.0.1"],
+                        "http": {"bearer_token": "governance-credential-sentinel"},
+                        "tcp": {"auth": "governance-credential-sentinel"}
+                    }),
+                )
+                .await;
+                let token = d9us6_token_with_credentials(
+                    &signing_key,
+                    EGRESS_GOVERNANCE_OPERATION,
+                    vec![credential_id],
+                );
+                let _pools = state.credential_pools.lock().await;
+                let error = fcp_async_core::time::timeout(
+                    Duration::from_secs(1),
+                    egress_governance_request(
+                        Arc::clone(&state),
+                        protocol,
+                        addr,
+                        credential_id,
+                        &token,
+                    ),
+                )
+                .await
+                .expect("manifest refusal must precede credential selection")
+                .expect_err("runtime introspection cannot redefine admitted authority");
+                assert!(error.1.contains(expected), "{protocol}/{case}: {error:?}");
+                assert_eq!(
+                    introspections.load(Ordering::SeqCst),
+                    u64::from(case != "undeclared")
+                );
+                assert_eq!(
+                    listener.accept().unwrap_err().kind(),
+                    std::io::ErrorKind::WouldBlock
+                );
+                assert!(!error.1.contains("governance-credential-sentinel"));
+            }
+        }
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn host_egress_governance_preserves_loopbacks_and_fences_policy_updates() {
+        for protocol in ["http", "tcp"] {
+            let observed_http = Arc::new(StdMutex::new(None));
+            let observed_tcp = Arc::new(StdMutex::new(Vec::new()));
+            let (addr, server) = if protocol == "http" {
+                d9us6_one_shot_http_server(Arc::clone(&observed_http)).await
+            } else {
+                d9us6_one_shot_tcp_server(Arc::clone(&observed_tcp)).await
+            };
+            let manifest = egress_governance_manifest();
+            let registry = d9us6_host_egress_registry_with_catalog(
+                EGRESS_GOVERNANCE_CONNECTOR,
+                EGRESS_GOVERNANCE_OPERATION,
+                d9us6_loopback_constraints(addr.port()),
+                dispatcher_introspection_with_input_schema(
+                    EGRESS_GOVERNANCE_OPERATION,
+                    "cap.test.egress",
+                    SafetyTier::Safe,
+                    manifest.operation_authorities[EGRESS_GOVERNANCE_OPERATION]
+                        .input_schema
+                        .clone(),
+                ),
+                Arc::new(AtomicU64::new(0)),
+            );
+            {
+                let mut inventory = registry.state.write().await;
+                let entry = inventory
+                    .connectors
+                    .get_mut(&ConnectorId::from_static(EGRESS_GOVERNANCE_CONNECTOR))
+                    .unwrap();
+                entry.config.allowed_operations = vec![EGRESS_GOVERNANCE_OPERATION.to_owned()];
+                entry.config.enforce_empty_allow_lists = true;
+                entry.manifest_constraints = manifest;
+            }
+            let credential_id =
+                CredentialId::parse("eee30000-1111-4111-8111-111111111111").unwrap();
+            let (state, signing_key) = d9us6_host_egress_state_with_registry(
+                EGRESS_GOVERNANCE_CONNECTOR,
+                EGRESS_GOVERNANCE_OPERATION,
+                registry,
+                credential_id,
+                json!({
+                    "host_allow": ["127.0.0.1"],
+                    "http": {"bearer_token": "governance-credential-sentinel"},
+                    "tcp": {"auth": "governance-credential-sentinel"}
+                }),
+            )
+            .await;
+            let token = d9us6_token_with_credentials(
+                &signing_key,
+                EGRESS_GOVERNANCE_OPERATION,
+                vec![credential_id],
+            );
+            let context = d9us6_host_egress_context(
+                EGRESS_GOVERNANCE_CONNECTOR,
+                EGRESS_GOVERNANCE_OPERATION,
+                "req-egress-governance",
+                "corr-egress-governance",
+                &token,
+            );
+            let resource = if protocol == "http" {
+                format!("http://{addr}/governed")
+            } else {
+                format!("tcp://{addr}")
+            };
+            let admitted = authorize_host_egress_context(&state, &context, &resource)
+                .await
+                .expect("matching inventory and manifest admit transport");
+            // The manifest requires a connector input object with a message.
+            // Provider bytes are a different wire contract and remain opaque.
+            fcp_async_core::time::timeout(
+                Duration::from_secs(4),
+                egress_governance_request(Arc::clone(&state), protocol, addr, credential_id, &token),
+            )
+            .await
+            .expect("governed loopback is bounded")
+            .expect("matching manifest and explicit operation allow-list permit egress");
+            fcp_async_core::time::timeout(Duration::from_secs(1), server)
+                .await
+                .expect("provider exits after the observed request")
+                .unwrap();
+            if protocol == "http" {
+                let observed = observed_http.lock().unwrap();
+                let request = observed.as_ref().expect("provider observed HTTP request");
+                assert!(request.starts_with("POST /governed HTTP/1.1"));
+                assert!(
+                    request
+                        .to_ascii_lowercase()
+                        .contains("authorization: bearer governance-credential-sentinel")
+                );
+            } else {
+                assert_eq!(
+                    observed_tcp.lock().unwrap().as_slice(),
+                    b"governance-credential-sentinelPING"
+                );
+            }
+
+            {
+                let mut inventory = state.registry.state.write().await;
+                inventory
+                    .connectors
+                    .get_mut(&ConnectorId::from_static(EGRESS_GOVERNANCE_CONNECTOR))
+                    .unwrap()
+                    .config
+                    .allowed_operations = vec!["test.other".to_owned()];
+                state.registry.version.fetch_add(1, Ordering::SeqCst);
+            }
+            admitted
+                .require_current()
+                .expect_err("a policy-only update revokes previously admitted transport");
+            let _pools = state.credential_pools.lock().await;
+            let error = fcp_async_core::time::timeout(
+                Duration::from_secs(1),
+                egress_governance_request(Arc::clone(&state), protocol, addr, credential_id, &token),
+            )
+            .await
+            .expect("updated policy rejects before credential selection")
+            .expect_err("a retained runtime cannot bypass an operation revocation");
+            assert!(error.1.contains("does not allow operation"));
+        }
     }
 
     async fn d9us6_one_shot_http_server(
