@@ -25,6 +25,18 @@ use crate::{
 /// Default API base URL.
 pub const DEFAULT_BASE_URL: &str = "https://api.github.com";
 
+fn build_github_http_transport(builder: reqwest::ClientBuilder) -> GitHubResult<Client> {
+    // Only the SDK may decide whether an operation is safe to replay.
+    // Redirects can forward credential-reference headers or repeat a mutation
+    // under a repository that was never authorized. Apply these restrictions
+    // last, after all other transport settings.
+    builder
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
+        .build()
+        .map_err(GitHubError::Http)
+}
+
 /// Characters that are NOT percent-encoded when encoding a single path segment.
 /// We keep alphanumerics, hyphens, underscores, dots, and tildes (RFC 3986 unreserved).
 /// Slashes are NOT included — they delimit path segments.
@@ -36,10 +48,10 @@ const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC
 
 /// Validate that a GitHub owner or repo name contains only safe characters
 /// (alphanumeric, hyphens, dots, underscores). Returns an error on invalid input.
-fn validate_owner_repo(value: &str, label: &str) -> GitHubResult<()> {
-    if value.is_empty() {
+pub(crate) fn validate_owner_repo(value: &str, label: &str) -> GitHubResult<()> {
+    if value.is_empty() || matches!(value, "." | "..") {
         return Err(GitHubError::ValidationError {
-            message: format!("{label} must not be empty"),
+            message: format!("{label} must not be empty or a dot path segment"),
         });
     }
     if !value
@@ -50,6 +62,38 @@ fn validate_owner_repo(value: &str, label: &str) -> GitHubResult<()> {
             message: format!(
                 "{label} contains invalid characters (only alphanumeric, hyphens, dots, underscores allowed): {value:?}"
             ),
+        });
+    }
+    Ok(())
+}
+
+/// Require a repository-relative path whose URL and capability namespaces agree.
+/// The empty path selects the repository root. Percent signs are literal filename
+/// bytes and are escaped again by `encode_path`, never decoded as input escapes.
+pub(crate) fn validate_content_path(path: &str) -> GitHubResult<()> {
+    if !path.is_empty()
+        && (path
+            .split('/')
+            .any(|segment| segment.is_empty() || matches!(segment, "." | ".."))
+            || path.contains('\\')
+            || path.chars().any(char::is_control))
+    {
+        return Err(GitHubError::ValidationError {
+            message: "path must be repository-relative without empty, dot, or parent segments, backslashes, or control characters".into(),
+        });
+    }
+    Ok(())
+}
+
+/// A workflow selector is one ID or filename, never a relative URL path.
+pub(crate) fn validate_workflow_id(workflow_id: &str) -> GitHubResult<()> {
+    if workflow_id.is_empty()
+        || matches!(workflow_id, "." | "..")
+        || workflow_id.contains(['/', '\\'])
+        || workflow_id.chars().any(char::is_control)
+    {
+        return Err(GitHubError::ValidationError {
+            message: "workflow_id must be one nonempty workflow ID or filename".into(),
         });
     }
     Ok(())
@@ -134,11 +178,11 @@ impl GitHubClient {
     /// # Errors
     /// Returns [`GitHubError`] if the HTTP client cannot be constructed.
     pub fn new_with_auth(auth: GitHubAuth) -> GitHubResult<Self> {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(30))
-            .user_agent("fcp-github/0.1.0")
-            .build()
-            .map_err(GitHubError::Http)?;
+        let client = build_github_http_transport(
+            Client::builder()
+                .timeout(Duration::from_secs(30))
+                .user_agent("fcp-github/0.1.0"),
+        )?;
 
         Ok(Self {
             client,
@@ -381,6 +425,7 @@ impl GitHubClient {
     ) -> GitHubResult<()> {
         validate_owner_repo(owner, "owner")?;
         validate_owner_repo(repo, "repo")?;
+        validate_workflow_id(workflow_id)?;
         let encoded_workflow_id =
             utf8_percent_encode(workflow_id, PATH_SEGMENT_ENCODE_SET).to_string();
         let mut body = serde_json::json!({ "ref": git_ref });
@@ -482,6 +527,7 @@ impl GitHubClient {
     ) -> GitHubResult<RepositoryContent> {
         validate_owner_repo(owner, "owner")?;
         validate_owner_repo(repo, "repo")?;
+        validate_content_path(path)?;
         let encoded_path = encode_path(path);
         let mut endpoint = format!("/repos/{owner}/{repo}/contents/{encoded_path}");
         if let Some(git_ref) = git_ref {
@@ -606,7 +652,7 @@ impl GitHubClient {
         .await
     }
 
-    /// Make a PUT request with retries via [`RetryLoop`].
+    /// Merge through PUT without replaying a possibly applied mutation.
     async fn put<T, R>(&self, endpoint: &str, body: &T) -> GitHubResult<R>
     where
         T: serde::Serialize + Sync,
@@ -632,17 +678,23 @@ impl GitHubClient {
                 {
                     Ok(response) => match self.handle_response(response).await {
                         Ok(data) => AttemptOutcome::Success(data),
-                        Err(e) if e.is_retryable() => AttemptOutcome::Retryable {
-                            retry_after: e.retry_after(),
-                            error: e,
-                        },
+                        // HTTP PUT does not establish replay safety for the
+                        // merge operation. The manifest declares no idempotency
+                        // guarantee, and a lost response may follow a merge.
+                        Err(e) if e.is_retryable() => {
+                            let retry_after = e.retry_after();
+                            AttemptOutcome::retryable_if_replayable(e, retry_after, false)
+                        }
                         Err(e) => AttemptOutcome::Terminal(e),
                     },
-                    Err(e) if e.is_timeout() || e.is_connect() => AttemptOutcome::Retryable {
-                        error: GitHubError::Http(e),
-                        retry_after: None,
-                    },
-                    Err(e) => AttemptOutcome::Terminal(GitHubError::Http(e)),
+                    Err(e) => {
+                        let replayable = !transport_error_reached_service(&e);
+                        AttemptOutcome::retryable_if_replayable(
+                            GitHubError::Http(e),
+                            None,
+                            replayable,
+                        )
+                    }
                 }
             }
         })
@@ -848,9 +900,23 @@ mod tests {
         fn respond(response: TestHttpResponse) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
             let base_url = format!("http://{}", listener.local_addr().expect("local address"));
+            listener.set_nonblocking(true).expect("nonblocking fixture");
             let handle = thread::spawn(move || {
                 for _ in 0..response.request_count {
-                    let (stream, _) = listener.accept().expect("accept GitHub client request");
+                    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                    let stream = loop {
+                        match listener.accept() {
+                            Ok((stream, _)) => break stream,
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                assert!(std::time::Instant::now() < deadline, "request not received");
+                                thread::sleep(Duration::from_millis(1));
+                            }
+                            Err(error) => panic!("accept GitHub client request: {error}"),
+                        }
+                    };
+                    stream
+                        .set_nonblocking(false)
+                        .expect("blocking test stream");
                     handle_test_request(stream, &response);
                 }
             });
@@ -1522,12 +1588,143 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_path_traversal_dots_preserved() {
-        // ".." segments are valid path segments in a repo file tree
-        // and are preserved after encoding. The key protection is that
-        // `/` separators are preserved but not injected into segments.
-        let encoded = encode_path("../../../etc/passwd");
-        assert_eq!(encoded, "../../../etc/passwd");
+    fn test_repository_selectors_reject_url_normalization_aliases() {
+        for value in [".", ".."] {
+            assert!(validate_owner_repo(value, "owner").is_err());
+            assert!(validate_owner_repo(value, "repo").is_err());
+        }
+        for path in [
+            ".",
+            "..",
+            "../secret",
+            "src/../secret",
+            "src/./file",
+            "/secret",
+            "src//file",
+            "src/",
+            "src\\file",
+            "src/\nfile",
+            "src/\0file",
+        ] {
+            assert!(validate_content_path(path).is_err(), "accepted {path:?}");
+        }
+        for path in [
+            "",
+            "src/main.rs",
+            ".github/workflows/ci.yml",
+            "a b/日本語#?.md",
+            "%2e%2e/file",
+        ] {
+            validate_content_path(path).expect("literal repository path");
+        }
+        for workflow in [
+            "",
+            ".",
+            "..",
+            "../ci.yml",
+            ".github/workflows/ci.yml",
+            "a\\b.yml",
+            "ci\nyml",
+        ] {
+            assert!(
+                validate_workflow_id(workflow).is_err(),
+                "accepted {workflow:?}"
+            );
+        }
+        for workflow in ["123", "ci.yml", "ci build.yml"] {
+            validate_workflow_id(workflow).expect("one workflow ID or filename");
+        }
+    }
+
+    #[test]
+    fn test_content_path_validation_stops_cross_repository_url_normalization() {
+        let input = "../../../other-owner/private-repo/contents/secret";
+        // Negative control: encoding segments alone does not stop URL
+        // normalization from selecting another repository.
+        let unsafe_url = reqwest::Url::parse(&format!(
+            "https://api.github.com/repos/octocat/hello-world/contents/{}",
+            encode_path(input)
+        ))
+        .unwrap();
+        assert_eq!(
+            unsafe_url.path(),
+            "/repos/other-owner/private-repo/contents/secret"
+        );
+        assert!(validate_content_path(input).is_err());
+
+        // Percent-encoded-looking names are ordinary filenames. Escaping the
+        // percent signs keeps them from becoming URL dot segments or slashes.
+        let literal = "%2e%2e/%2Fsecret";
+        validate_content_path(literal).unwrap();
+        let safe_url = reqwest::Url::parse(&format!(
+            "https://api.github.com/repos/octocat/hello-world/contents/{}",
+            encode_path(literal)
+        ))
+        .unwrap();
+        assert_eq!(
+            safe_url.path(),
+            "/repos/octocat/hello-world/contents/%252e%252e/%252Fsecret"
+        );
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn github_transport_never_replays_post_below_sdk_admission() {
+        let builder = || {
+            let retry = reqwest::retry::for_host("127.0.0.1")
+                .no_budget()
+                .max_retries_per_request(2)
+                .classify_fn(|response| {
+                    if response.status() == Some(StatusCode::SERVICE_UNAVAILABLE) {
+                        response.retryable()
+                    } else {
+                        response.success()
+                    }
+                });
+            Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(2))
+                .retry(retry)
+        };
+
+        // Control: reqwest can replay a POST before the application retry
+        // loop sees any intermediate provider response.
+        let control_server = TestApiServer::respond(
+            TestHttpResponse::json(
+                "POST",
+                "/mutate",
+                503,
+                serde_json::json!({"message": "busy"}),
+            )
+            .with_request_count(3),
+        );
+        let control = builder().build().unwrap();
+        let response = control
+            .post(format!("{}/mutate", control_server.uri()))
+            .body("one mutation")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        control_server.finish();
+
+        let server = TestApiServer::respond(
+            TestHttpResponse::json(
+                "POST",
+                "/mutate",
+                503,
+                serde_json::json!({"message": "busy"}),
+            )
+            .with_request_count(1),
+        );
+        let transport = build_github_http_transport(builder()).unwrap();
+        let response = transport
+            .post(format!("{}/mutate", server.uri()))
+            .body("one mutation")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        server.finish();
     }
 
     #[test]
