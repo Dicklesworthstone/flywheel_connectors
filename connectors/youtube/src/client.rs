@@ -10,6 +10,7 @@ use fcp_google_discovery::auth::GoogleMaterializedAuth;
 use fcp_google_discovery::executor::{
     GoogleApiError, GoogleExecuteRequest, GoogleExecuteResponse, GoogleResponseBody,
     GoogleResponseMode, GoogleRestError, GoogleRestExecutor, GoogleUploadPayload,
+    build_google_api_client,
 };
 use fcp_google_discovery::{DiscoveryMediaUpload, DiscoveryMethod, DiscoveryParameter};
 use fcp_sdk::migration::{AttemptOutcome, HttpRetryConfig, RetryLoop};
@@ -109,17 +110,18 @@ impl YouTubeClient {
             .default_headers(headers.clone())
             .user_agent("fcp-youtube/0.1.0")
             .timeout(Duration::from_secs(30))
+            .retry(reqwest::retry::never())
             .build()
             .map_err(YouTubeError::Http)?;
 
-        let upload_http = Client::builder()
-            .default_headers(headers)
-            .user_agent("fcp-youtube/0.1.0")
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(UPLOAD_TIMEOUT)
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(YouTubeError::Http)?;
+        let upload_http = build_google_api_client(
+            Client::builder()
+                .default_headers(headers)
+                .user_agent("fcp-youtube/0.1.0")
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(UPLOAD_TIMEOUT),
+        )
+        .map_err(YouTubeError::Http)?;
 
         let request_timeout = Duration::from_secs(30);
         Ok(Self {
@@ -866,10 +868,14 @@ impl YouTubeClient {
         request.response_mode = response_mode;
         self.apply_shared_auth(&mut request);
 
-        self.executor
-            .execute(&request)
-            .await
-            .map_err(map_rest_error)
+        // Reads may follow provider media redirects; mutations must retain
+        // their original endpoint and operation-owned retry policy.
+        let executor = if http_method == "GET" {
+            &self.executor
+        } else {
+            &self.upload_executor
+        };
+        executor.execute(&request).await.map_err(map_rest_error)
     }
 }
 
@@ -1152,6 +1158,73 @@ mod urlencoding {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[fcp_async_core::runtime::test]
+    async fn comment_mutations_refuse_redirects_while_caption_downloads_follow_them() {
+        use fcp_google_discovery::auth::GoogleAuthSourceKind;
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{header, method, path},
+        };
+
+        for status in [307, 308] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/youtube/v3/captions/caption-1"))
+                .respond_with(
+                    ResponseTemplate::new(302)
+                        .insert_header("location", format!("{}/media/caption-1", server.uri())),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/media/caption-1"))
+                .and(header("authorization", "Bearer youtube-transport-token"))
+                .respond_with(ResponseTemplate::new(200).set_body_string("caption text"))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/youtube/v3/commentThreads"))
+                .and(header("authorization", "Bearer youtube-transport-token"))
+                .respond_with(
+                    ResponseTemplate::new(status)
+                        .insert_header("location", format!("{}/redirected-comment", server.uri())),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(path("/redirected-comment"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+                .expect(0)
+                .mount(&server)
+                .await;
+            let client = YouTubeClient::new_with_auth(YouTubeAuth::GoogleShared(
+                GoogleMaterializedAuth::BearerToken {
+                    access_token: "youtube-transport-token".into(),
+                    source: GoogleAuthSourceKind::AccessToken,
+                    granted_scopes: Vec::new(),
+                    quota_project_id: None,
+                },
+            ))
+            .unwrap()
+            .with_base_url(&format!("{}/youtube/v3", server.uri()))
+            .with_retry_config(0);
+            assert_eq!(
+                client
+                    .get_caption_transcript("caption-1", None)
+                    .await
+                    .unwrap(),
+                "caption text"
+            );
+            assert!(matches!(
+                client.post_comment("video-1", "Keep this mutation at its endpoint").await,
+                Err(YouTubeError::Api { status_code: Some(code), .. }) if code == status
+            ));
+            assert_eq!(server.received_requests().await.unwrap().len(), 3);
+        }
+    }
 
     #[test]
     fn caption_upload_preserves_utf8_media_and_only_writable_metadata() {

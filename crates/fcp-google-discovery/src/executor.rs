@@ -436,6 +436,27 @@ pub enum GoogleRestError {
     },
 }
 
+/// Build a Google API client whose redirects and retries remain caller-owned.
+///
+/// Apply this after timeout, TLS, header and proxy customization. A mutation
+/// response can be uncertain, so transport-level replay must never bypass the
+/// connector's operation-specific retry decision. Redirect responses remain
+/// visible to the caller instead of forwarding credentials or request bodies.
+///
+/// Read-only media clients that intentionally follow redirects may be built
+/// separately, with automatic transport retries disabled.
+///
+/// # Errors
+/// Returns a reqwest error if the supplied client configuration is invalid.
+pub fn build_google_api_client(
+    builder: reqwest::ClientBuilder,
+) -> Result<reqwest::Client, reqwest::Error> {
+    builder
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
+        .build()
+}
+
 /// Shared Google REST executor.
 #[derive(Debug, Clone)]
 pub struct GoogleRestExecutor {
@@ -445,7 +466,10 @@ pub struct GoogleRestExecutor {
 impl Default for GoogleRestExecutor {
     fn default() -> Self {
         Self {
-            client: crate::default_http_client(),
+            client: build_google_api_client(
+                reqwest::Client::builder().timeout(crate::DEFAULT_HTTP_TIMEOUT),
+            )
+            .expect("google REST HTTP client should build"),
         }
     }
 }
@@ -458,6 +482,11 @@ impl GoogleRestExecutor {
     }
 
     /// Construct an executor with a caller-provided client.
+    ///
+    /// Build clients that may execute mutations with [`build_google_api_client`]
+    /// so redirects and transport retries cannot bypass operation policy.
+    /// A separately built client may follow redirects only on an exclusively
+    /// read-only dispatch path; its transport retries must still be disabled.
     #[must_use]
     pub fn with_client(mut self, client: reqwest::Client) -> Self {
         self.client = client;
@@ -1422,6 +1451,149 @@ pub fn parse_google_api_error(status: StatusCode, body: &[u8]) -> GoogleApiError
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[fcp_async_core::runtime::test]
+    async fn api_client_finalization_disables_custom_transport_retries() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{header, method, path},
+        };
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/mutate"))
+            .and(header("authorization", "Bearer transport-test-token"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("busy"))
+            .expect(4)
+            .mount(&server)
+            .await;
+        let builder = || {
+            let retry = reqwest::retry::for_host("127.0.0.1")
+                .no_budget()
+                .max_retries_per_request(2)
+                .classify_fn(|response| {
+                    if response.status() == Some(StatusCode::SERVICE_UNAVAILABLE) {
+                        response.retryable()
+                    } else {
+                        response.success()
+                    }
+                });
+            reqwest::Client::builder()
+                .no_proxy()
+                .timeout(std::time::Duration::from_secs(5))
+                .retry(retry)
+        };
+        let url = format!("{}/mutate", server.uri());
+        let body = "one admitted Google mutation";
+        let control = builder().build().unwrap();
+        let response = control
+            .post(&url)
+            .bearer_auth("transport-test-token")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.text().await.unwrap(), "busy");
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
+
+        let client = build_google_api_client(builder()).unwrap();
+        let response = client
+            .post(&url)
+            .bearer_auth("transport-test-token")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.text().await.unwrap(), "busy");
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 4, "strict transport must send only once");
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.body == body.as_bytes())
+        );
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn api_clients_refuse_mutation_redirects_before_forwarding_auth_or_body() {
+        use crate::auth::GoogleAuthSourceKind;
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        for status in [307, 308] {
+            for same_origin in [false, true] {
+                for customized in [false, true] {
+                    let origin = MockServer::start().await;
+                    let target = MockServer::start().await;
+                    let destination = if same_origin {
+                        origin.uri()
+                    } else {
+                        target.uri()
+                    };
+                    Mock::given(method("POST"))
+                        .and(path("/mutate"))
+                        .respond_with(
+                            ResponseTemplate::new(status)
+                                .insert_header("location", format!("{destination}/forwarded")),
+                        )
+                        .expect(1)
+                        .mount(&origin)
+                        .await;
+                    let executor = if customized {
+                        GoogleRestExecutor::new().with_client(
+                            build_google_api_client(
+                                reqwest::Client::builder()
+                                    .no_proxy()
+                                    .timeout(std::time::Duration::from_secs(5))
+                                    .redirect(reqwest::redirect::Policy::limited(5)),
+                            )
+                            .unwrap(),
+                        )
+                    } else {
+                        GoogleRestExecutor::new()
+                    };
+                    let discovery_method = method_fixture("POST", "mutate", BTreeMap::new());
+                    let schemas = BTreeMap::new();
+                    let base_url = origin.uri();
+                    let auth = GoogleMaterializedAuth::BearerToken {
+                        access_token: "redirect-test-token".into(),
+                        source: GoogleAuthSourceKind::AccessToken,
+                        granted_scopes: Vec::new(),
+                        quota_project_id: None,
+                    };
+                    let mut request =
+                        GoogleExecuteRequest::new(&discovery_method, &schemas, &base_url);
+                    request.auth = Some(&auth);
+                    request.body = Some(serde_json::json!({"private_input": "keep at origin"}));
+                    assert!(matches!(
+                        executor.execute(&request).await,
+                        Err(GoogleRestError::Api { status_code, .. }) if status_code == status
+                    ));
+                    let requests = origin.received_requests().await.unwrap();
+                    assert_eq!(requests.len(), 1, "same-origin redirects must also stop");
+                    assert_eq!(requests[0].url.path(), "/mutate");
+                    assert_eq!(
+                        requests[0]
+                            .headers
+                            .get("authorization")
+                            .unwrap()
+                            .to_str()
+                            .unwrap(),
+                        "Bearer redirect-test-token"
+                    );
+                    assert_eq!(
+                        serde_json::from_slice::<serde_json::Value>(&requests[0].body).unwrap(),
+                        request.body.unwrap()
+                    );
+                    assert!(target.received_requests().await.unwrap().is_empty());
+                }
+            }
+        }
+    }
 
     #[test]
     fn multipart_related_preserves_binary_media_and_json_metadata() {

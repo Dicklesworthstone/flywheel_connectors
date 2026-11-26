@@ -9,7 +9,7 @@ use std::time::Duration;
 use fcp_google_discovery::auth::GoogleMaterializedAuth;
 use fcp_google_discovery::executor::{
     GoogleApiError, GoogleExecuteRequest, GoogleExecuteResponse, GoogleResponseBody,
-    GoogleResponseMode, GoogleRestError, GoogleRestExecutor,
+    GoogleResponseMode, GoogleRestError, GoogleRestExecutor, build_google_api_client,
 };
 use fcp_google_discovery::{DiscoveryMethod, DiscoveryParameter};
 use fcp_sdk::migration::{AttemptOutcome, HttpRetryConfig, RetryLoop};
@@ -49,12 +49,13 @@ impl DocsClient {
         let mut headers = header::HeaderMap::new();
         headers.insert(header::ACCEPT, "application/json".parse().unwrap());
 
-        let client = Client::builder()
-            .default_headers(headers)
-            .timeout(Duration::from_secs(30))
-            .user_agent("fcp-google-docs/0.1.0")
-            .build()
-            .map_err(DocsError::Http)?;
+        let client = build_google_api_client(
+            Client::builder()
+                .default_headers(headers)
+                .timeout(Duration::from_secs(30))
+                .user_agent("fcp-google-docs/0.1.0"),
+        )
+        .map_err(DocsError::Http)?;
 
         Ok(Self {
             executor: GoogleRestExecutor::new().with_client(client),
@@ -368,6 +369,49 @@ fn map_google_api_error(error: GoogleApiError) -> DocsError {
 mod tests {
     use super::*;
 
+    #[fcp_async_core::runtime::test]
+    async fn create_document_keeps_redirects_at_the_original_endpoint() {
+        use fcp_google_discovery::auth::GoogleAuthSourceKind;
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{header, method, path},
+        };
+
+        for status in [307, 308] {
+            let origin = MockServer::start().await;
+            let target = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/documents"))
+                .and(header("authorization", "Bearer docs-transport-token"))
+                .respond_with(
+                    ResponseTemplate::new(status)
+                        .insert_header("location", format!("{}/forwarded", target.uri())),
+                )
+                .expect(1)
+                .mount(&origin)
+                .await;
+            let client = DocsClient::new_with_auth(GoogleMaterializedAuth::BearerToken {
+                access_token: "docs-transport-token".into(),
+                source: GoogleAuthSourceKind::AccessToken,
+                granted_scopes: Vec::new(),
+                quota_project_id: None,
+            })
+            .unwrap()
+            .with_base_url(origin.uri());
+            assert!(matches!(
+                client.create_document("Private document title").await,
+                Err(DocsError::Api { status_code, .. }) if status_code == status
+            ));
+            let requests = origin.received_requests().await.unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&requests[0].body).unwrap(),
+                serde_json::json!({"title": "Private document title"})
+            );
+            assert!(target.received_requests().await.unwrap().is_empty());
+        }
+    }
+
     fn replay_test_client(base_url: &str) -> DocsClient {
         let mut client = DocsClient::new_with_auth(GoogleMaterializedAuth::CredentialReference {
             credential_id: fcp_core::CredentialId::new(),
@@ -382,10 +426,7 @@ mod tests {
             jitter_enabled: false,
         };
         client.executor = GoogleRestExecutor::new().with_client(
-            Client::builder()
-                .no_proxy()
-                .timeout(Duration::from_secs(5))
-                .build()
+            build_google_api_client(Client::builder().no_proxy().timeout(Duration::from_secs(5)))
                 .unwrap(),
         );
         client

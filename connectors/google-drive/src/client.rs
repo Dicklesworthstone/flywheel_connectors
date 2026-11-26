@@ -13,7 +13,7 @@ use fcp_google_discovery::auth::GoogleMaterializedAuth;
 use fcp_google_discovery::executor::{
     GoogleApiError, GoogleExecuteRequest, GoogleExecuteResponse, GoogleResponseBody,
     GoogleResponseMode, GoogleRestError, GoogleRestExecutor, GoogleUploadMode, GoogleUploadPayload,
-    validate_upload_content_type,
+    build_google_api_client, validate_upload_content_type,
 };
 use fcp_google_discovery::{DiscoveryMediaUpload, DiscoveryMethod, DiscoveryParameter};
 use fcp_sdk::migration::{AttemptOutcome, HttpRetryConfig, RetryLoop};
@@ -92,17 +92,18 @@ impl DriveClient {
             .default_headers(headers.clone())
             .timeout(Duration::from_secs(30))
             .user_agent("fcp-google-drive/0.1.0")
+            .retry(reqwest::retry::never())
             .build()
             .map_err(DriveError::Http)?;
-        // Upload redirects can replay a file-creation request. Keep this policy
-        // isolated from ordinary media downloads, which may follow redirects.
-        let upload_client = Client::builder()
-            .default_headers(headers)
-            .timeout(Duration::from_secs(30))
-            .redirect(reqwest::redirect::Policy::none())
-            .user_agent("fcp-google-drive/0.1.0")
-            .build()
-            .map_err(DriveError::Http)?;
+        // All mutations, including metadata and permissions, use the strict
+        // transport. Ordinary media reads retain their redirect behavior.
+        let upload_client = build_google_api_client(
+            Client::builder()
+                .default_headers(headers)
+                .timeout(Duration::from_secs(30))
+                .user_agent("fcp-google-drive/0.1.0"),
+        )
+        .map_err(DriveError::Http)?;
 
         Ok(Self {
             executor: GoogleRestExecutor::new().with_client(client),
@@ -660,13 +661,19 @@ impl DriveClient {
             request.extra_headers.push(("accept".into(), "*/*".into()));
         }
 
+        let executor = if http_method == "GET" && upload.is_none() {
+            &self.executor
+        } else {
+            &self.upload_executor
+        };
+
         if upload.is_some() {
-            self.upload_executor
+            executor
                 .execute_bounded(&request, MAX_UPLOAD_RESPONSE_BYTES)
                 .await
                 .map_err(map_rest_error)
         } else if let Some(limit) = max_response_bytes {
-            self.executor
+            executor
                 .execute_bounded(&request, limit)
                 .await
                 .map_err(|error| match error {
@@ -676,10 +683,7 @@ impl DriveClient {
                     other => map_rest_error(other),
                 })
         } else {
-            self.executor
-                .execute(&request)
-                .await
-                .map_err(map_rest_error)
+            executor.execute(&request).await.map_err(map_rest_error)
         }
     }
 }
@@ -1983,6 +1987,42 @@ mod tests {
             }),
         ));
         assert_eq!(server.received_requests().await.unwrap().len(), 3);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn metadata_and_permission_mutations_do_not_follow_redirects() {
+        for status in [307, 308] {
+            let server = MockServer::start().await;
+            for endpoint in ["/drive/v3/files", "/drive/v3/files/file-1/permissions"] {
+                Mock::given(method("POST"))
+                    .and(path(endpoint))
+                    .and(header("authorization", "Bearer upload-test-token"))
+                    .respond_with(
+                        ResponseTemplate::new(status).insert_header(
+                            "location",
+                            format!("{}/redirected-mutation", server.uri()),
+                        ),
+                    )
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+            }
+            Mock::given(path("/redirected-mutation"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+                .expect(0)
+                .mount(&server)
+                .await;
+            let client = upload_client(&server);
+            assert!(matches!(
+                client.create_folder("Create only once", None).await,
+                Err(DriveError::Api { status_code, .. }) if status_code == status
+            ));
+            assert!(matches!(
+                client.share_file("file-1", "fixture@example.invalid", "reader").await,
+                Err(DriveError::Api { status_code, .. }) if status_code == status
+            ));
+            assert_eq!(server.received_requests().await.unwrap().len(), 2);
+        }
     }
 
     #[test]

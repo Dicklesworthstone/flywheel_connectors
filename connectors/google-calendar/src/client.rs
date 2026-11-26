@@ -9,7 +9,7 @@ use std::time::Duration;
 use fcp_google_discovery::auth::{GoogleAuthSourceKind, GoogleMaterializedAuth};
 use fcp_google_discovery::executor::{
     GoogleApiError, GoogleExecuteRequest, GoogleExecuteResponse, GoogleResponseBody,
-    GoogleResponseMode, GoogleRestError, GoogleRestExecutor,
+    GoogleResponseMode, GoogleRestError, GoogleRestExecutor, build_google_api_client,
 };
 use fcp_google_discovery::{DiscoveryMethod, DiscoveryParameter};
 use fcp_sdk::migration::{AttemptOutcome, HttpRetryConfig, RetryLoop};
@@ -81,12 +81,13 @@ impl GoogleCalendarClient {
         let mut headers = header::HeaderMap::new();
         headers.insert(header::ACCEPT, "application/json".parse().unwrap());
 
-        let http = Client::builder()
-            .default_headers(headers)
-            .timeout(Duration::from_secs(30))
-            .user_agent("fcp-google-calendar/0.1.0")
-            .build()
-            .map_err(GoogleCalendarError::Http)?;
+        let http = build_google_api_client(
+            Client::builder()
+                .default_headers(headers)
+                .timeout(Duration::from_secs(30))
+                .user_agent("fcp-google-calendar/0.1.0"),
+        )
+        .map_err(GoogleCalendarError::Http)?;
 
         Ok(Self {
             executor: GoogleRestExecutor::new().with_client(http),

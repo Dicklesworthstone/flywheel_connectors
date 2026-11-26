@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use fcp_google_discovery::auth::GoogleMaterializedAuth;
-use fcp_google_discovery::executor::retry_after_ms;
+use fcp_google_discovery::executor::{build_google_api_client, retry_after_ms};
 use fcp_sdk::migration::transport_error_reached_service;
 use fcp_sdk::{ConnectorRuntime, ConnectorRuntimeConfig};
 use reqwest::{Client, RequestBuilder};
@@ -40,13 +40,12 @@ impl std::fmt::Debug for SheetsClient {
 impl SheetsClient {
     /// Create a new Sheets client with the shared Google auth.
     pub fn new_with_auth(auth: GoogleMaterializedAuth) -> SheetsResult<Self> {
-        let client = Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::never())
-            .timeout(Duration::from_secs(30))
-            .user_agent("fcp-google-sheets/0.1.0")
-            .build()
-            .map_err(SheetsError::Http)?;
+        let client = build_google_api_client(
+            Client::builder()
+                .timeout(Duration::from_secs(30))
+                .user_agent("fcp-google-sheets/0.1.0"),
+        )
+        .map_err(SheetsError::Http)?;
 
         Ok(Self {
             client,
@@ -309,6 +308,47 @@ fn encode_range(range: &str) -> String {
 mod tests {
     use super::*;
     use std::future::Future;
+
+    #[fcp_async_core::runtime::test]
+    async fn append_values_keeps_redirects_at_the_original_endpoint() {
+        use fcp_google_discovery::auth::GoogleAuthSourceKind;
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{header, method},
+        };
+
+        for status in [307, 308] {
+            let origin = MockServer::start().await;
+            let target = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(header("authorization", "Bearer sheets-transport-token"))
+                .respond_with(
+                    ResponseTemplate::new(status)
+                        .insert_header("location", format!("{}/forwarded", target.uri())),
+                )
+                .expect(1)
+                .mount(&origin)
+                .await;
+            let client = SheetsClient::new_with_auth(GoogleMaterializedAuth::BearerToken {
+                access_token: "sheets-transport-token".into(),
+                source: GoogleAuthSourceKind::AccessToken,
+                granted_scopes: Vec::new(),
+                quota_project_id: None,
+            })
+            .unwrap()
+            .with_base_url(origin.uri());
+            let values = vec![vec![serde_json::json!("Private cell value")]];
+            assert!(matches!(
+                client.append_values("sheet-1", "Sheet1!A1", values.clone()).await,
+                Err(SheetsError::Api { status_code, .. }) if status_code == status
+            ));
+            let requests = origin.received_requests().await.unwrap();
+            assert_eq!(requests.len(), 1);
+            let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+            assert_eq!(body["values"], serde_json::json!(values));
+            assert!(target.received_requests().await.unwrap().is_empty());
+        }
+    }
 
     fn run_async_test<F>(future: F) -> F::Output
     where

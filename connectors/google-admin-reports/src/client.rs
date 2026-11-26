@@ -68,6 +68,7 @@ impl AdminReportsClient {
             .default_headers(headers)
             .timeout(Duration::from_secs(30))
             .user_agent("fcp-google-admin-reports/0.1.0")
+            .retry(reqwest::retry::never())
             .build()
             .map_err(AdminReportsError::Http)?;
 
