@@ -25,7 +25,10 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use tracing::{info, instrument};
 
-use crate::client::{DEFAULT_BASE_URL, GitHubAuth, GitHubClient};
+use crate::client::{
+    DEFAULT_BASE_URL, GitHubAuth, GitHubClient, validate_content_path, validate_owner_repo,
+    validate_workflow_id,
+};
 use crate::error::GitHubError;
 use crate::types::{
     CreateIssueRequest, CreatePullRequestRequest, MergePullRequestRequest, PageRequest,
@@ -1803,55 +1806,64 @@ fn resource_uris_for_operation(
     operation: &str,
     input: &serde_json::Value,
 ) -> FcpResult<Vec<String>> {
-    let repo_uri = |owner: &str, repo: &str| format!("github://{owner}/{repo}");
+    // Resource matching must see the same namespace the HTTP client will use.
+    // A raw contents/../../../other/repo URI can match an allowed prefix even
+    // though URL normalization sends the request to another repository.
+    let repo_uri = |owner: &str, repo: &str| -> FcpResult<String> {
+        validate_owner_repo(owner, "owner").map_err(|error| error.to_fcp_error())?;
+        validate_owner_repo(repo, "repo").map_err(|error| error.to_fcp_error())?;
+        Ok(format!("github://{owner}/{repo}"))
+    };
 
     let uris = match operation {
         "github.create_issue" => {
             let owner = require_str(input, "owner")?;
             let repo = require_str(input, "repo")?;
-            vec![format!("{}/issues", repo_uri(owner, repo))]
+            vec![format!("{}/issues", repo_uri(owner, repo)?)]
         }
         "github.get_issue" => {
             let owner = require_str(input, "owner")?;
             let repo = require_str(input, "repo")?;
             let issue_number = require_u32(input, "issue_number")?;
-            vec![format!("{}/issues/{issue_number}", repo_uri(owner, repo))]
+            vec![format!("{}/issues/{issue_number}", repo_uri(owner, repo)?)]
         }
         "github.create_pull_request" => {
             let owner = require_str(input, "owner")?;
             let repo = require_str(input, "repo")?;
-            vec![format!("{}/pulls", repo_uri(owner, repo))]
+            vec![format!("{}/pulls", repo_uri(owner, repo)?)]
         }
         "github.get_pull_request" | "github.merge_pull_request" => {
             let owner = require_str(input, "owner")?;
             let repo = require_str(input, "repo")?;
             let pull_number = require_u32(input, "pull_number")?;
-            vec![format!("{}/pulls/{pull_number}", repo_uri(owner, repo))]
+            vec![format!("{}/pulls/{pull_number}", repo_uri(owner, repo)?)]
         }
         "github.get_repo" => {
             let owner = require_str(input, "owner")?;
             let repo = require_str(input, "repo")?;
-            vec![repo_uri(owner, repo)]
+            vec![repo_uri(owner, repo)?]
         }
         "github.list_workflows" => {
             let owner = require_str(input, "owner")?;
             let repo = require_str(input, "repo")?;
-            vec![format!("{}/actions/workflows", repo_uri(owner, repo))]
+            vec![format!("{}/actions/workflows", repo_uri(owner, repo)?)]
         }
         "github.trigger_workflow" => {
             let owner = require_str(input, "owner")?;
             let repo = require_str(input, "repo")?;
             let workflow_id = require_str(input, "workflow_id")?;
+            validate_workflow_id(workflow_id).map_err(|error| error.to_fcp_error())?;
             vec![format!(
                 "{}/actions/workflows/{workflow_id}",
-                repo_uri(owner, repo)
+                repo_uri(owner, repo)?
             )]
         }
         "github.get_file_content" => {
             let owner = require_str(input, "owner")?;
             let repo = require_str(input, "repo")?;
             let path = require_str(input, "path")?;
-            vec![format!("{}/contents/{}", repo_uri(owner, repo), path)]
+            validate_content_path(path).map_err(|error| error.to_fcp_error())?;
+            vec![format!("{}/contents/{}", repo_uri(owner, repo)?, path)]
         }
         "github.process_webhook" => {
             let payload_value = input.get("payload").ok_or(FcpError::InvalidRequest {
