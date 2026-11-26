@@ -20,6 +20,15 @@ const DEFAULT_BASE_URL: &str = "https://chat.googleapis.com/v1";
 const DEFAULT_UPLOAD_BASE_URL: &str = "https://chat.googleapis.com/upload/v1";
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+#[derive(Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ListPage<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page_size: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page_token: Option<&'a str>,
+}
+
 /// Thread target for creating a Google Chat reply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageThreadTarget<'a> {
@@ -168,12 +177,18 @@ impl ChatClient {
         }
     }
 
-    /// List all spaces the authenticated user has access to.
+    /// List the first page of spaces visible to the authenticated user.
     #[instrument(skip(self))]
     pub async fn list_spaces(&self) -> ChatResult<Vec<Space>> {
+        Ok(self.list_spaces_page(&ListPage::default()).await?.spaces)
+    }
+
+    pub(crate) async fn list_spaces_page(
+        &self,
+        page: &ListPage<'_>,
+    ) -> ChatResult<ListSpacesResponse> {
         let url = format!("{}/spaces", self.base_url);
-        let resp: ListSpacesResponse = self.get_json(&url).await?;
-        Ok(resp.spaces)
+        self.get_json(self.client.get(url).query(page)).await
     }
 
     /// Get a specific space by resource name.
@@ -181,7 +196,7 @@ impl ChatClient {
     pub async fn get_space(&self, space_name: &str) -> ChatResult<Space> {
         validate_resource_name(space_name, "space_name")?;
         let url = format!("{}/{space_name}", self.base_url);
-        self.get_json(&url).await
+        self.get_json(self.client.get(url)).await
     }
 
     /// Create (send) a message in a space.
@@ -290,10 +305,20 @@ impl ChatClient {
     /// List messages in a space.
     #[instrument(skip(self), fields(space_name))]
     pub async fn list_messages(&self, space_name: &str) -> ChatResult<Vec<Message>> {
+        Ok(self
+            .list_messages_page(space_name, &ListPage::default())
+            .await?
+            .messages)
+    }
+
+    pub(crate) async fn list_messages_page(
+        &self,
+        space_name: &str,
+        page: &ListPage<'_>,
+    ) -> ChatResult<ListMessagesResponse> {
         validate_resource_name(space_name, "space_name")?;
         let url = format!("{}/{space_name}/messages", self.base_url);
-        let resp: ListMessagesResponse = self.get_json(&url).await?;
-        Ok(resp.messages)
+        self.get_json(self.client.get(url).query(page)).await
     }
 
     /// Get a specific message by resource name.
@@ -301,16 +326,26 @@ impl ChatClient {
     pub async fn get_message(&self, message_name: &str) -> ChatResult<Message> {
         validate_resource_name(message_name, "message_name")?;
         let url = format!("{}/{message_name}", self.base_url);
-        self.get_json(&url).await
+        self.get_json(self.client.get(url)).await
     }
 
     /// List members of a space.
     #[instrument(skip(self), fields(space_name))]
     pub async fn list_members(&self, space_name: &str) -> ChatResult<Vec<Membership>> {
+        Ok(self
+            .list_members_page(space_name, &ListPage::default())
+            .await?
+            .memberships)
+    }
+
+    pub(crate) async fn list_members_page(
+        &self,
+        space_name: &str,
+        page: &ListPage<'_>,
+    ) -> ChatResult<ListMembershipsResponse> {
         validate_resource_name(space_name, "space_name")?;
         let url = format!("{}/{space_name}/members", self.base_url);
-        let resp: ListMembershipsResponse = self.get_json(&url).await?;
-        Ok(resp.memberships)
+        self.get_json(self.client.get(url).query(page)).await
     }
 
     /// Add a Unicode emoji reaction to a Google Chat message.
@@ -351,10 +386,10 @@ impl ChatClient {
         builder
     }
 
-    async fn get_json<T: DeserializeOwned>(&self, url: &str) -> ChatResult<T> {
+    async fn get_json<T: DeserializeOwned>(&self, request: RequestBuilder) -> ChatResult<T> {
         self.total_requests.fetch_add(1, Ordering::Relaxed);
         let resp = self
-            .apply_auth_headers(self.client.get(url))
+            .apply_auth_headers(request)
             .timeout(self.runtime.request_timeout())
             .send()
             .await

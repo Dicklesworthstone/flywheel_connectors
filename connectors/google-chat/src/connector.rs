@@ -25,7 +25,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
-use crate::client::{ChatClient, MessageReplyOption, MessageThreadTarget};
+use crate::client::{ChatClient, ListPage, MessageReplyOption, MessageThreadTarget};
 use crate::types::{ChatEvent, Message, SpaceType, User};
 
 const OP_INGEST_WEBHOOK: &str = "chat.ingest_webhook";
@@ -733,17 +733,9 @@ impl ChatConnector {
                 ),
                 op_info(
                     "chat.list_spaces",
-                    "List all spaces the user has access to",
-                    json!({
-                        "type": "object",
-                        "properties": {}
-                    }),
-                    json!({
-                        "type": "object",
-                        "properties": {
-                            "spaces": { "type": "array" }
-                        }
-                    }),
+                    "List a page of spaces the user has access to",
+                    list_input_schema(false),
+                    list_output_schema("spaces"),
                     "chat.read",
                     RiskLevel::Low,
                     SafetyTier::Safe,
@@ -907,25 +899,14 @@ impl ChatConnector {
                 op_info(
                     "chat.list_messages",
                     "List messages in a space",
-                    json!({
-                        "type": "object",
-                        "required": ["space_name"],
-                        "properties": {
-                            "space_name": { "type": "string", "description": "Resource name of the space" }
-                        }
-                    }),
-                    json!({
-                        "type": "object",
-                        "properties": {
-                            "messages": { "type": "array" }
-                        }
-                    }),
+                    list_input_schema(true),
+                    list_output_schema("messages"),
                     "chat.read",
                     RiskLevel::Low,
                     SafetyTier::Safe,
                     IdempotencyClass::Strict,
                     AgentHint {
-                        when_to_use: "List recent messages in a Google Chat space.".into(),
+                        when_to_use: "Read a page of messages in a Google Chat space.".into(),
                         common_mistakes: vec![],
                         examples: vec![r#"{"space_name": "spaces/AAAA"}"#.into()],
                         related: vec![CapabilityId::from_static("chat.get_message")],
@@ -995,19 +976,8 @@ impl ChatConnector {
                 op_info(
                     "chat.list_members",
                     "List members of a space",
-                    json!({
-                        "type": "object",
-                        "required": ["space_name"],
-                        "properties": {
-                            "space_name": { "type": "string", "description": "Resource name of the space" }
-                        }
-                    }),
-                    json!({
-                        "type": "object",
-                        "properties": {
-                            "members": { "type": "array" }
-                        }
-                    }),
+                    list_input_schema(true),
+                    list_output_schema("members"),
                     "chat.read",
                     RiskLevel::Low,
                     SafetyTier::Safe,
@@ -1063,8 +1033,11 @@ impl ChatConnector {
             }
             "chat.list_spaces" => {
                 let client = self.client.as_ref().ok_or(FcpError::NotConfigured)?;
-                let spaces = client.list_spaces().await.map_err(|e| e.to_fcp_error())?;
-                Ok(json!({ "spaces": spaces }))
+                let page = client
+                    .list_spaces_page(&list_page(&input)?)
+                    .await
+                    .map_err(|e| e.to_fcp_error())?;
+                Ok(list_result("spaces", page.spaces, page.next_page_token))
             }
             "chat.get_space" => {
                 let client = self.client.as_ref().ok_or(FcpError::NotConfigured)?;
@@ -1215,11 +1188,11 @@ impl ChatConnector {
             "chat.list_messages" => {
                 let client = self.client.as_ref().ok_or(FcpError::NotConfigured)?;
                 let space_name = require_str(&input, "space_name")?;
-                let messages = client
-                    .list_messages(space_name)
+                let page = client
+                    .list_messages_page(space_name, &list_page(&input)?)
                     .await
                     .map_err(|e| e.to_fcp_error())?;
-                Ok(json!({ "messages": messages }))
+                Ok(list_result("messages", page.messages, page.next_page_token))
             }
             "chat.get_message" => {
                 let client = self.client.as_ref().ok_or(FcpError::NotConfigured)?;
@@ -1243,11 +1216,11 @@ impl ChatConnector {
             "chat.list_members" => {
                 let client = self.client.as_ref().ok_or(FcpError::NotConfigured)?;
                 let space_name = require_str(&input, "space_name")?;
-                let members = client
-                    .list_members(space_name)
+                let page = client
+                    .list_members_page(space_name, &list_page(&input)?)
                     .await
                     .map_err(|e| e.to_fcp_error())?;
-                Ok(json!({ "members": members }))
+                Ok(list_result("members", page.memberships, page.next_page_token))
             }
             _ => Err(FcpError::InvalidRequest {
                 code: 1002,
@@ -2697,6 +2670,55 @@ fn optional_u64(input: &serde_json::Value, field: &str) -> FcpResult<Option<u64>
     }
 }
 
+fn list_input_schema(requires_space: bool) -> Value {
+    let mut schema = json!({
+        "type": "object",
+        "required": [],
+        "properties": {
+            "page_size": { "type": "integer", "minimum": 1, "maximum": 1000 },
+            "page_token": { "type": "string" }
+        }
+    });
+    if requires_space {
+        schema["required"] = json!(["space_name"]);
+        schema["properties"]["space_name"] = json!({ "type": "string" });
+    }
+    schema
+}
+
+fn list_output_schema(field: &str) -> Value {
+    json!({
+        "type": "object",
+        "required": [field],
+        "properties": {
+            (field): { "type": "array" },
+            "next_page_token": { "type": "string" }
+        }
+    })
+}
+
+fn list_page(input: &Value) -> FcpResult<ListPage<'_>> {
+    let page_size = optional_u64(input, "page_size")?;
+    if page_size.is_some_and(|size| !(1..=1000).contains(&size)) {
+        return Err(FcpError::InvalidRequest {
+            code: 1001,
+            message: "'page_size' must be between 1 and 1000".into(),
+        });
+    }
+    Ok(ListPage {
+        page_size,
+        page_token: optional_str(input, "page_token")?,
+    })
+}
+
+fn list_result(field: &str, items: impl Serialize, next_page_token: String) -> Value {
+    let mut result = json!({ (field): items });
+    if !next_page_token.is_empty() {
+        result["next_page_token"] = Value::String(next_page_token);
+    }
+    result
+}
+
 fn reply_thread_target(input: &serde_json::Value) -> FcpResult<MessageThreadTarget<'_>> {
     match (
         optional_str(input, "thread_name")?,
@@ -3314,6 +3336,71 @@ mod tests {
             assert_eq!(result["spaces"][0]["name"], "spaces/AAAA");
             assert_eq!(result["spaces"][0]["displayName"], "General");
         });
+    }
+
+    #[test]
+    fn list_operations_round_trip_opaque_tokens_through_empty_pages() {
+        run_async_test(async {
+            let cursor = "a+b/&c=%2F# next";
+            for (operation, path, field, provider_field) in [
+                ("chat.list_spaces", "/v1/spaces", "spaces", "spaces"),
+                ("chat.list_messages", "/v1/spaces/A/messages", "messages", "messages"),
+                ("chat.list_members", "/v1/spaces/A/members", "members", "memberships"),
+            ] {
+                let server = HttpServer::start().await;
+                Mock::given(method("GET"))
+                    .and(path_regex(format!("^{path}$")))
+                    .and(query_param("pageSize", "1"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(json!({"nextPageToken": cursor})))
+                    .up_to_n_times(1)
+                    .expect(1)
+                    .mount(&server).await;
+                Mock::given(method("GET"))
+                    .and(path_regex(format!("^{path}$")))
+                    .and(query_param("pageSize", "1"))
+                    .and(query_param("pageToken", cursor))
+                    .and(header("Authorization", "Bearer test-token"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                        (provider_field): [{"name": "result-on-page-two"}]
+                    })))
+                    .expect(1)
+                    .mount(&server).await;
+                let mut connector = ChatConnector::new();
+                connector.handle_configure(json!({
+                    "access_token": "test-token",
+                    "base_url": format!("{}/v1", server.uri())
+                })).await.unwrap();
+                let mut input = json!({"page_size": 1});
+                if operation != "chat.list_spaces" {
+                    input["space_name"] = json!("spaces/A");
+                }
+                let first = connector.handle_invoke(json!({
+                    "operation": operation, "input": input
+                })).await.unwrap();
+                assert_eq!(first[field], json!([]));
+                assert_eq!(first["next_page_token"], cursor);
+                input["page_token"] = first["next_page_token"].clone();
+                let last = connector.handle_invoke(json!({
+                    "operation": operation, "input": input
+                })).await.unwrap();
+                assert_eq!(last[field][0]["name"], "result-on-page-two");
+                assert!(last.get("next_page_token").is_none());
+                let requests = server.received_requests().await.unwrap();
+                assert!(requests[0].url.query_pairs().all(|(key, _)| key != "pageToken"));
+            }
+        });
+    }
+
+    #[test]
+    fn list_page_validates_size_and_token_types() {
+        for input in [
+            json!({"page_size": 0}), json!({"page_size": 1001}),
+            json!({"page_size": -1}), json!({"page_size": "10"}), json!({"page_token": 123}),
+        ] {
+            assert!(matches!(list_page(&input), Err(FcpError::InvalidRequest { .. })));
+        }
+        assert_eq!(list_page(&json!({"page_size": 1000})).unwrap().page_size, Some(1000));
+        assert!(list_page(&json!({})).unwrap().page_size.is_none());
     }
 
     #[test]

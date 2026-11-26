@@ -5,7 +5,7 @@ min_mesh_version = "2.0.0"
 min_protocol = "fcp2-sym/2.0"
 protocol_features = []
 max_datagram_bytes = 65000
-interface_hash = "blake3-256:fcp.interface.v2:6660a557a9840cb3617f92eb97849a8e47ed2d87ab1a333c61db905413248d53"
+interface_hash = "blake3-256:fcp.interface.v2:4cb5f917e607171537ce5b5c08af5065591044eb893d1a167d3eb010acf23ede"
 
 [connector]
 id = "fcp.google_chat"
@@ -115,7 +115,7 @@ related = ["chat.reply_message"]
 # ------------------------------------------------------------------------------
 
 [provides.operations."chat.list_spaces"]
-description = "List all spaces the user has access to"
+description = "List a page of spaces the user has access to"
 capability = "chat.read"
 risk_level = "low"
 safety_tier = "safe"
@@ -125,12 +125,20 @@ idempotency = "strict"
 [provides.operations."chat.list_spaces".input_schema]
 required = []
 type = "object"
+[provides.operations."chat.list_spaces".input_schema.properties.page_size]
+type = "integer"
+minimum = 1
+maximum = 1000
+[provides.operations."chat.list_spaces".input_schema.properties.page_token]
+type = "string"
 
 [provides.operations."chat.list_spaces".output_schema]
 required = ["spaces"]
 type = "object"
 [provides.operations."chat.list_spaces".output_schema.properties.spaces]
 type = "array"
+[provides.operations."chat.list_spaces".output_schema.properties.next_page_token]
+type = "string"
 
 [provides.operations."chat.list_spaces".network_constraints]
 host_allow = ["chat.googleapis.com"]
@@ -385,12 +393,20 @@ required = ["space_name"]
 type = "object"
 [provides.operations."chat.list_messages".input_schema.properties.space_name]
 type = "string"
+[provides.operations."chat.list_messages".input_schema.properties.page_size]
+type = "integer"
+minimum = 1
+maximum = 1000
+[provides.operations."chat.list_messages".input_schema.properties.page_token]
+type = "string"
 
 [provides.operations."chat.list_messages".output_schema]
 required = ["messages"]
 type = "object"
 [provides.operations."chat.list_messages".output_schema.properties.messages]
 type = "array"
+[provides.operations."chat.list_messages".output_schema.properties.next_page_token]
+type = "string"
 
 [provides.operations."chat.list_messages".network_constraints]
 host_allow = ["chat.googleapis.com"]
@@ -408,7 +424,7 @@ total_timeout_ms = 60000
 max_response_bytes = 10485760
 
 [provides.operations."chat.list_messages".ai_hints]
-when_to_use = "List recent messages in a Google Chat space."
+when_to_use = "Read a page of messages in a Google Chat space."
 common_mistakes = []
 examples = ['{"space_name": "spaces/AAAA"}']
 related = ["chat.get_message"]
@@ -516,12 +532,20 @@ required = ["space_name"]
 type = "object"
 [provides.operations."chat.list_members".input_schema.properties.space_name]
 type = "string"
+[provides.operations."chat.list_members".input_schema.properties.page_size]
+type = "integer"
+minimum = 1
+maximum = 1000
+[provides.operations."chat.list_members".input_schema.properties.page_token]
+type = "string"
 
 [provides.operations."chat.list_members".output_schema]
 required = ["members"]
 type = "object"
 [provides.operations."chat.list_members".output_schema.properties.members]
 type = "array"
+[provides.operations."chat.list_members".output_schema.properties.next_page_token]
+type = "string"
 
 [provides.operations."chat.list_members".network_constraints]
 host_allow = ["chat.googleapis.com"]

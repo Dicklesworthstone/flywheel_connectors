@@ -134,6 +134,10 @@ The current Google Chat README slice documents the existing runtime surface:
 | `chat.add_reaction` | `POST /v1/{message_name}/reactions` | `chat.write` | `Risky` | `Medium` | `None` | Adds a Unicode emoji reaction. |
 | `chat.list_members` | `GET /v1/{space_name}/members` | `chat.read` | `Safe` | `Low` | `Strict` | Lists memberships in a space. |
 
+### Reading subsequent pages
+
+`chat.list_spaces`, `chat.list_messages`, and `chat.list_members` fetch one page per invocation. Set `page_size` to an integer from 1 to 1000, or omit it to use Google's default. When the result contains `next_page_token`, pass its exact value as `page_token` to the same operation with the same space and page size. Continue even if the current page is empty. The final page omits `next_page_token`.
+
 ## Host-Forwarded Webhook Contract
 
 `chat.ingest_webhook` is a host-forwarded ingress operation. It accepts:

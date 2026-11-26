@@ -159,6 +159,10 @@ async fn runtime_catalog_matches_manifest_operation_contracts() {
             serialized_str(&manifest_op.idempotency),
             "{id}"
         );
+        if matches!(id.as_str(), "chat.list_spaces" | "chat.list_messages" | "chat.list_members") {
+            assert_eq!(runtime_op["input_schema"], manifest_op.input_schema, "{id}");
+            assert_eq!(runtime_op["output_schema"], manifest_op.output_schema, "{id}");
+        }
         assert_object_schema(&runtime_op["input_schema"], id, "runtime input");
         assert_object_schema(&runtime_op["output_schema"], id, "runtime output");
         assert!(
