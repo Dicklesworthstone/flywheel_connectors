@@ -423,8 +423,10 @@ impl PoolState {
             .requests
             .saturating_add(self.config.config.burst.unwrap_or(0));
 
-        let projected = self.effective_count().saturating_add(amount);
-        if projected > effective_limit {
+        // Saturating at u32::MAX would admit every subsequent request when
+        // the configured limit is also u32::MAX. Compare in a wider type.
+        let projected = u64::from(self.effective_count()) + u64::from(amount);
+        if projected > u64::from(effective_limit) {
             let retry_after_ms = self.ms_until_reset();
             return Err(RateLimitError::for_pool(
                 &self.config,
@@ -574,28 +576,33 @@ impl RateLimitTracker {
         }
     }
 
-    /// Add a pool to the tracker.
+    /// Add a pool or update its configuration without refunding spent quota.
+    ///
+    /// Reconfiguring the same scope and pool ID preserves the live counters.
+    /// A checkpoint is loaded only for a newly registered identity, under the
+    /// same lock that orders consumption and checkpoint publication.
     ///
     /// # Panics
     /// Panics if the internal lock is poisoned (indicates a prior panic during pool access).
     pub fn add_pool(&self, pool: RateLimitPool) {
-        let checkpoint = self
-            .checkpoint_store
-            .as_ref()
-            .and_then(|store| store.load_for_pool(&pool));
-        let pool_id = pool.id.clone();
-        let pool_state = match checkpoint {
-            Some(checkpoint) => PoolState::from_checkpoint(pool, &checkpoint),
-            None => PoolState::new(pool),
-        };
-        let checkpoint_file = {
-            let mut pools = self.pools.write().expect("lock poisoned");
+        let mut pools = self.pools.write().expect("lock poisoned");
+        if let Some(state) = pools.get_mut(&pool.id)
+            && state.config.scope == pool.scope
+        {
+            state.config = pool;
+        } else {
+            let checkpoint = self
+                .checkpoint_store
+                .as_ref()
+                .and_then(|store| store.load_for_pool(&pool));
+            let pool_id = pool.id.clone();
+            let pool_state = match checkpoint {
+                Some(checkpoint) => PoolState::from_checkpoint(pool, &checkpoint),
+                None => PoolState::new(pool),
+            };
             pools.insert(pool_id, pool_state);
-            let checkpoint_file = self.checkpoint_file_for_locked(&pools);
-            drop(pools);
-            checkpoint_file
-        };
-        self.persist_checkpoint_file(checkpoint_file);
+        }
+        self.persist_locked_pools(&pools);
     }
 
     /// Try to consume requests for an operation.
@@ -619,7 +626,7 @@ impl RateLimitTracker {
     /// Panics if the internal lock is poisoned.
     pub fn try_consume(&self, operation: &str, amount: u32) -> Option<RateLimitError> {
         let pool_ids = self.operation_map.get(operation)?;
-        let checkpoint_file = {
+        {
             let mut pools = self.pools.write().expect("lock poisoned");
 
             // Fail-closed guard: reject up-front if any referenced pool is
@@ -668,11 +675,8 @@ impl RateLimitTracker {
                 }
             }
 
-            let checkpoint_file = self.checkpoint_file_for_locked(&pools);
-            drop(pools);
-            checkpoint_file
-        };
-        self.persist_checkpoint_file(checkpoint_file);
+            self.persist_locked_pools(&pools);
+        }
 
         None
     }
@@ -745,35 +749,26 @@ impl RateLimitTracker {
     /// # Panics
     /// Panics if the internal lock is poisoned.
     pub fn reset_all(&self) {
-        let checkpoint_file = {
-            let mut pools = self.pools.write().expect("lock poisoned");
-            for state in pools.values_mut() {
-                state.prev_count = 0;
-                state.curr_count = 0;
-                state.window_start = Instant::now();
-            }
-            let checkpoint_file = self.checkpoint_file_for_locked(&pools);
-            drop(pools);
-            checkpoint_file
-        };
-        self.persist_checkpoint_file(checkpoint_file);
+        let mut pools = self.pools.write().expect("lock poisoned");
+        for state in pools.values_mut() {
+            state.prev_count = 0;
+            state.curr_count = 0;
+            state.window_start = Instant::now();
+        }
+        self.persist_locked_pools(&pools);
     }
 
-    fn checkpoint_file_for_locked(
+    /// Publish while retaining the mutation lock. Serializing file writes
+    /// alone is insufficient: an older snapshot could otherwise wait behind
+    /// a newer one and overwrite it, refunding quota after restart.
+    fn persist_locked_pools(
         &self,
-        pools: &HashMap<String, PoolState>,
-    ) -> Option<RateLimitCheckpointFile> {
-        self.checkpoint_store.as_ref()?;
-        Some(RateLimitCheckpointFile::from_pools(pools))
-    }
-
-    fn persist_checkpoint_file(&self, checkpoint_file: Option<RateLimitCheckpointFile>) {
-        let Some(checkpoint_file) = checkpoint_file else {
-            return;
-        };
+        pools: &std::sync::RwLockWriteGuard<'_, HashMap<String, PoolState>>,
+    ) {
         let Some(store) = &self.checkpoint_store else {
             return;
         };
+        let checkpoint_file = RateLimitCheckpointFile::from_pools(pools);
         if let Err(err) = store.persist_file(&checkpoint_file) {
             tracing::warn!(
                 error = %err,
@@ -2482,6 +2477,31 @@ mod tests {
         assert!(tracker.try_consume("op", u32::MAX).is_none());
         let status = tracker.pool_status("big").unwrap();
         assert_eq!(status.remaining, 0);
+        assert!(tracker.try_consume("op", 0).is_none());
+        assert!(tracker.try_consume("op", 1).is_some());
+        assert!(tracker.try_consume("op", u32::MAX).is_some());
+    }
+
+    #[test]
+    fn tracker_overflow_refusal_does_not_charge_other_pools() {
+        let decls = RateLimitDeclarations {
+            limits: vec![
+                test_pool("first", u32::MAX, 60),
+                test_pool("full", u32::MAX, 60),
+            ],
+            tool_pool_map: HashMap::from([
+                ("fill".to_string(), vec!["full".to_string()]),
+                (
+                    "both".to_string(),
+                    vec!["first".to_string(), "full".to_string()],
+                ),
+            ]),
+        };
+        let tracker = RateLimitTracker::from_declarations(&decls);
+        assert!(tracker.try_consume("fill", u32::MAX).is_none());
+        assert!(tracker.try_consume("both", 1).is_some());
+        assert_eq!(tracker.pool_status("first").unwrap().remaining, u32::MAX);
+        assert_eq!(tracker.pool_status("full").unwrap().remaining, 0);
     }
 
     // ── NEW: RateLimitError enforcement variants are preserved ──────────
@@ -2747,7 +2767,7 @@ mod tests {
 
         let state_dir = unique_state_dir("concurrent-persist");
         let decls = RateLimitDeclarations {
-            limits: vec![test_pool("api", 1_000_000, 60)],
+            limits: vec![test_pool("api", 1_000_000, 3600)],
             tool_pool_map: HashMap::from([("op".to_string(), vec!["api".to_string()])]),
         };
         let tracker = Arc::new(RateLimitTracker::from_declarations_with_state_dir(
@@ -2803,7 +2823,11 @@ mod tests {
                     .next()
                     .expect("expected one pool in checkpoint");
                 let total = u64::from(pool.prev_count) + u64::from(pool.curr_count);
-                observed_max_total = observed_max_total.max(total);
+                assert!(
+                    total >= observed_max_total,
+                    "persisted quota moved backwards from {observed_max_total} to {total}"
+                );
+                observed_max_total = total;
             }
             observed_max_total
         });
@@ -2842,6 +2866,70 @@ mod tests {
             "reader observed total {observed_max_total} exceeding the expected {expected}; \
              that would indicate uninitialized data leaked into the parsed JSON"
         );
+        let restarted = RateLimitTracker::from_declarations_with_state_dir(&decls, &state_dir);
+        assert_eq!(
+            restarted.pool_status("api").unwrap().remaining,
+            1_000_000 - u32::try_from(expected).unwrap(),
+            "restart must retain every concurrent debit"
+        );
+    }
+
+    #[test]
+    fn tracker_reconfiguration_preserves_live_quota_with_and_without_persistence() {
+        for persisted in [false, true] {
+            let state_dir = unique_state_dir("reconfigure");
+            let decls = RateLimitDeclarations {
+                limits: vec![test_pool("api", 5, 3600)],
+                tool_pool_map: HashMap::from([("op".to_string(), vec!["api".to_string()])]),
+            };
+            let store = persisted.then(|| RateLimitCheckpointStore::from_state_dir(&state_dir));
+            let tracker = RateLimitTracker::from_declarations_with_store(&decls, store);
+            assert!(tracker.try_consume("op", 3).is_none());
+
+            let updated = test_pool("api", 4, 3600);
+            tracker.clone().add_pool(updated.clone());
+            assert_eq!(tracker.pool_status("api").unwrap().remaining, 1);
+            assert!(tracker.try_consume("op", 1).is_none());
+            tracker.add_pool(updated.clone());
+            assert!(tracker.try_consume("op", 1).is_some());
+
+            if persisted {
+                let updated_decls = RateLimitDeclarations {
+                    limits: vec![updated],
+                    tool_pool_map: decls.tool_pool_map.clone(),
+                };
+                let restarted =
+                    RateLimitTracker::from_declarations_with_state_dir(&updated_decls, &state_dir);
+                assert!(restarted.try_consume("op", 1).is_some());
+            }
+
+            tracker.reset_all();
+            assert!(tracker.try_consume("op", 4).is_none());
+            assert!(tracker.try_consume("op", 1).is_some());
+        }
+    }
+
+    #[test]
+    fn tracker_reconfiguration_does_not_replace_live_usage_with_a_stale_checkpoint() {
+        let state_dir = unique_state_dir("stale-reconfigure");
+        let decls = RateLimitDeclarations {
+            limits: vec![test_pool("api", 5, 3600)],
+            tool_pool_map: HashMap::from([("op".to_string(), vec!["api".to_string()])]),
+        };
+        let tracker = RateLimitTracker::from_declarations_with_state_dir(&decls, &state_dir);
+        assert!(tracker.try_consume("op", 1).is_none());
+        let path = state_dir.join(RATE_LIMIT_CHECKPOINT_FILE);
+        let stale_checkpoint = fs::read(&path).unwrap();
+        assert!(tracker.try_consume("op", 3).is_none());
+
+        // A previously captured disk snapshot is never more authoritative
+        // than the counters already held by this live tracker.
+        fs::write(&path, stale_checkpoint).unwrap();
+        tracker.add_pool(test_pool("api", 5, 3600));
+        assert_eq!(tracker.pool_status("api").unwrap().remaining, 1);
+
+        let restarted = RateLimitTracker::from_declarations_with_state_dir(&decls, &state_dir);
+        assert_eq!(restarted.pool_status("api").unwrap().remaining, 1);
     }
 
     // ── br-flywheel_connectors-83xt1: fail-closed on unregistered pool ──
