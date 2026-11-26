@@ -58,12 +58,13 @@ pub fn openai_error_to_fcp(error: &OpenAiError) -> FcpError {
             retryable: true,
             retry_after: None,
         },
-        OpenAiError::Network(NetworkError::Cancelled { message }) => {
-            FcpError::ConnectorUnavailable {
-                code: 5000,
-                message: format!("Cerebras request cancelled: {message}"),
-            }
-        }
+        OpenAiError::Network(NetworkError::Cancelled { .. }) => FcpError::External {
+            service: "cerebras".into(),
+            message: "Cerebras request cancelled; provider outcome may be unknown".into(),
+            status_code: None,
+            retryable: false,
+            retry_after: None,
+        },
         OpenAiError::Network(NetworkError::DeadlineExceeded { timeout_ms }) => FcpError::External {
             service: "cerebras".into(),
             message: format!(
@@ -117,4 +118,32 @@ fn duration_millis(duration: Option<Duration>) -> u64 {
     duration.map_or(0, |duration| {
         u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancelled_request_is_not_retryable_and_does_not_expose_cancellation_reason() {
+        let error = openai_error_to_fcp(&OpenAiError::Network(NetworkError::Cancelled {
+            message: "Bearer private-test-token; sensitive prompt content".into(),
+        }));
+
+        assert!(!error.is_retryable());
+        assert!(matches!(
+            &error,
+            FcpError::External {
+                service,
+                status_code: None,
+                retryable: false,
+                retry_after: None,
+                ..
+            } if service == "cerebras"
+        ));
+        let message = error.to_string();
+        assert!(message.contains("provider outcome may be unknown"));
+        assert!(!message.contains("private-test-token"));
+        assert!(!message.contains("sensitive prompt"));
+    }
 }

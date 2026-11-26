@@ -567,3 +567,79 @@ async fn local_non_mock_wrong_capability_fails_before_egress() {
     });
     println!("{artifact}");
 }
+
+#[fcp_async_core::runtime::test]
+async fn local_non_mock_stream_body_deadline_drops_socket_and_withholds_partial_output() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind stalled SSE provider");
+    listener.set_nonblocking(true).unwrap();
+    let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let configured = setup_connector(&base_url, &[CAP_CHAT]).await;
+    let provider = thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    assert!(std::time::Instant::now() < deadline, "SSE accept deadline");
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("SSE accept failed: {error}"),
+            }
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let request = read_complete_request(&mut stream);
+        assert!(request.starts_with(b"POST /v1/chat/completions HTTP/1.1\r\n"));
+        let prefix = concat!(
+            "HTTP/1.1 200 OK\r\n",
+            "content-type: text/event-stream\r\n",
+            "content-length: 1000000\r\n",
+            "connection: close\r\n\r\n",
+            "data: {\"id\":\"partial\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"llama3.1-8b\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"must not escape\"},\"finish_reason\":null}]}\n\n",
+        );
+        stream.write_all(prefix.as_bytes()).unwrap();
+        stream.flush().unwrap();
+        let mut byte = [0_u8; 1];
+        let closed = matches!(stream.read(&mut byte), Ok(0));
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == ErrorKind::WouldBlock),
+            "timed-out stream was silently retried"
+        );
+        closed
+    });
+
+    let operation = "cerebras.chat.completions_stream";
+    let token = valid_grant(
+        &configured.signing_key,
+        configured.connector.instance_id(),
+        CAP_CHAT,
+        operation,
+    );
+    let mut request = test_invoke_request(
+        "stream-body-deadline",
+        operation,
+        json!({"messages":[{"role":"user","content":"hello"}]}),
+        token,
+    );
+    request.deadline_ms = Some(300);
+    let started = std::time::Instant::now();
+    let error = configured
+        .connector
+        .invoke(request)
+        .await
+        .expect_err("a partial stream cannot complete after its invocation deadline");
+    assert!(matches!(
+        error,
+        FcpError::External {
+            retryable: false,
+            ..
+        }
+    ));
+    assert!(!error.to_string().contains("must not escape"));
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(
+        provider.join().unwrap(),
+        "deadline did not close provider socket"
+    );
+}

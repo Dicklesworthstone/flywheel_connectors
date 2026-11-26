@@ -102,7 +102,9 @@ impl CerebrasClient {
         Self {
             inner: OpenAiCompatClient::new_with_config(
                 provider,
-                HttpClientBuilder::new().build(),
+                HttpClientBuilder::new()
+                    .max_body_size(10 * 1024 * 1024)
+                    .build(),
                 OpenAiCompatClientConfig {
                     request_timeout,
                     model_cache_ttl,
