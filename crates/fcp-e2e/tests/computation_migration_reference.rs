@@ -13,7 +13,7 @@ use fcp_core::{
     CheckpointHandoffArtifact, CheckpointTransferEncoding, ComputationCheckpoint,
     DuplicateDeliveryClass, HandoffArtifactInputs, Lease, LeaseHandoff, LeaseId, LeaseParams,
     LeasePurpose, MigratableComputation, MigrationCapabilityContext, ObjectHeader, ObjectId,
-    Provenance, ResumeCause, ResumeDisposition, ResumeEvidence, ResumeEvidenceInputs,
+    Provenance, ResumeCause, ResumeDisposition, ResumeEvidenceInputs,
     ResumeOutcome as CoreResumeOutcome, SignatureSet, TailscaleNodeId, Uuid, ZoneId,
     current_timestamp,
 };
@@ -271,8 +271,7 @@ async fn migrate_resume_whisper_transcribe_criu_checkpoint_migration_resume_comp
         "target replay must match source in-flight progress"
     );
 
-    let resume_evidence = ResumeEvidence::evaluate(
-        &computation,
+    let resume_evidence = computation.resume_with_evidence(
         &checkpoint,
         checkpoint_object_id,
         target_lease_id,
@@ -291,13 +290,6 @@ async fn migrate_resume_whisper_transcribe_criu_checkpoint_migration_resume_comp
     assert!(resume_evidence.validation_error.is_none());
     assert!(resume_evidence.freshness.allows_resume());
 
-    computation.resume(
-        &checkpoint,
-        checkpoint_object_id,
-        target_lease_id,
-        &target_lease,
-        now,
-    )?;
     assert_eq!(computation.current_holder, target_holder);
 
     target_state.complete_remaining();

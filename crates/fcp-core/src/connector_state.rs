@@ -1580,7 +1580,32 @@ impl MigratableComputation {
         Ok(())
     }
 
+    /// Classify prior effects and validate the target lease before applying a resume.
+    /// A denied or reconciliation-only decision preserves the suspended or transferring state.
+    ///
+    /// # Errors
+    /// Returns a binding error if the checkpoint cannot describe this computation.
+    /// Recoverable denials are recorded in the returned evidence.
+    pub fn resume_with_evidence(
+        &mut self,
+        checkpoint: &ComputationCheckpoint,
+        checkpoint_object_id: ObjectId,
+        resumed_lease_id: LeaseId,
+        resumed_lease: &Lease,
+        now: u64,
+        inputs: &ResumeEvidenceInputs,
+    ) -> Result<ResumeEvidence, ComputationMigrationError> {
+        let (evidence, attempt) = ResumeEvidence::assess(
+            self, checkpoint, checkpoint_object_id, resumed_lease_id, resumed_lease, now, inputs,
+        )?;
+        if evidence.outcome == ResumeOutcome::Accepted {
+            *self = attempt;
+        }
+        Ok(evidence)
+    }
+
     /// Resume a suspended or transferred computation using a validated lease.
+    /// Call [`Self::resume_with_evidence`] when deciding whether to reissue or attach to prior work.
     ///
     /// # Errors
     /// Returns a [`ComputationMigrationError`] if checkpoint bindings fail, the
@@ -1907,6 +1932,15 @@ pub enum DuplicateDeliveryClass {
 }
 
 impl DuplicateDeliveryClass {
+    // FCP V3 §11.4.2 permits replay only for fresh or proven retry-safe work.
+    const fn permits(self, disposition: ResumeDisposition) -> bool {
+        matches!(
+            (self, disposition),
+            (Self::Fresh | Self::ReplaySafeRetry, ResumeDisposition::Retry)
+                | (Self::DuplicateCommitted, ResumeDisposition::Attach)
+        )
+    }
+
     /// Stable label for logs and evidence.
     #[must_use]
     pub const fn label(self) -> &'static str {
@@ -2355,7 +2389,6 @@ impl ResumeEvidence {
     /// # Errors
     /// Returns a [`ComputationMigrationError`] when the checkpoint does not bind to the current
     /// computation state at all. Lease validation failures are encoded into the returned evidence.
-    #[allow(clippy::too_many_lines)]
     pub fn evaluate(
         computation: &MigratableComputation,
         checkpoint: &ComputationCheckpoint,
@@ -2365,6 +2398,22 @@ impl ResumeEvidence {
         now: u64,
         inputs: &ResumeEvidenceInputs,
     ) -> Result<Self, ComputationMigrationError> {
+        Self::assess(
+            computation, checkpoint, checkpoint_object_id, resumed_lease_id, resumed_lease, now, inputs,
+        )
+        .map(|(evidence, _)| evidence)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn assess(
+        computation: &MigratableComputation,
+        checkpoint: &ComputationCheckpoint,
+        checkpoint_object_id: ObjectId,
+        resumed_lease_id: LeaseId,
+        resumed_lease: &Lease,
+        now: u64,
+        inputs: &ResumeEvidenceInputs,
+    ) -> Result<(Self, MigratableComputation), ComputationMigrationError> {
         computation.validate_checkpoint_binding(checkpoint, checkpoint_object_id)?;
         let boundary = ResumeBoundary::from_checkpoint(
             checkpoint,
@@ -2389,6 +2438,23 @@ impl ResumeEvidence {
 
         let (outcome, disposition, validation_error, outcome_reason_code, outcome_explanation) =
             match resume_result {
+                Ok(()) if !inputs.duplicate_delivery_class.permits(inputs.disposition) => {
+                    let disposition = match inputs.disposition {
+                        ResumeDisposition::Reconcile => ResumeDisposition::Reconcile,
+                        _ => ResumeDisposition::Deny,
+                    };
+                    let reason = format!(
+                        "automatic resume withheld: classification {} with requested disposition {}",
+                        inputs.duplicate_delivery_class.label(),
+                        inputs.disposition.label(),
+                    );
+                    let reason_code = if inputs.duplicate_delivery_class == DuplicateDeliveryClass::EvidenceConflict {
+                        ResumeReasonCode::EvidenceConflict
+                    } else {
+                        ResumeReasonCode::ResumeDenied
+                    };
+                    (ResumeOutcome::Denied, disposition, Some(reason.clone()), reason_code, reason)
+                }
                 Ok(()) => (
                     ResumeOutcome::Accepted,
                     inputs.disposition,
@@ -2467,7 +2533,7 @@ impl ResumeEvidence {
             },
         ];
 
-        Ok(Self {
+        let evidence = Self {
             zone_id: computation.zone_id.clone(),
             subject_id: computation.computation_id,
             boundary,
@@ -2487,7 +2553,8 @@ impl ResumeEvidence {
             audit_event_id: checkpoint.capability_context.audit_event_id,
             validation_error,
             timeline,
-        })
+        };
+        Ok((evidence, attempt))
     }
 }
 
@@ -7610,6 +7677,77 @@ mod tests {
             ]
         );
         assert!(evidence.validation_error.is_none());
+    }
+
+    #[test]
+    fn evidence_gated_resume_applies_only_the_disposition_allowed_by_prior_effects() {
+        let source = test_object_id("lease-source");
+        let checkpoint = test_computation_checkpoint("holder", source, 7, 1);
+        let id = checkpoint.object_id().unwrap();
+        let lease = test_migration_lease("holder", 7, 2_000);
+        let mut suspended = MigratableComputation::new(
+            test_object_id("computation"),
+            ZoneId::work(),
+            test_node_id("holder"),
+            source,
+            7,
+            test_migration_context(0),
+        );
+        suspended.suspend(&checkpoint, id).unwrap();
+        let original = serde_json::to_value(&suspended).unwrap();
+
+        for (class, allowed) in [
+            (DuplicateDeliveryClass::Fresh, Some(ResumeDisposition::Retry)),
+            (DuplicateDeliveryClass::ReplaySafeRetry, Some(ResumeDisposition::Retry)),
+            (DuplicateDeliveryClass::DuplicateCommitted, Some(ResumeDisposition::Attach)),
+            (DuplicateDeliveryClass::AmbiguousExternal, None),
+            (DuplicateDeliveryClass::EvidenceConflict, None),
+        ] {
+            for disposition in [
+                ResumeDisposition::Retry,
+                ResumeDisposition::Attach,
+                ResumeDisposition::Deny,
+                ResumeDisposition::Reconcile,
+            ] {
+                let mut computation = suspended.clone();
+                let inputs = ResumeEvidenceInputs {
+                    state_object_id: None,
+                    receipt_head: Some(test_object_id("receipt")),
+                    resume_cause: ResumeCause::CrashRecovery,
+                    duplicate_delivery_class: class,
+                    disposition,
+                    observed_at_ms: 1_500_000,
+                };
+                let preview = ResumeEvidence::evaluate(
+                    &computation, &checkpoint, id, source, &lease, 1_500, &inputs,
+                )
+                .unwrap();
+                let evidence = computation
+                    .resume_with_evidence(&checkpoint, id, source, &lease, 1_500, &inputs)
+                    .unwrap();
+                assert_eq!(preview, evidence);
+                if allowed == Some(disposition) {
+                    assert_eq!(computation.state, MigratableComputationState::Running);
+                    assert_eq!(evidence.outcome, ResumeOutcome::Accepted);
+                    assert_eq!(evidence.disposition, disposition);
+                    assert!(evidence.validation_error.is_none());
+                } else {
+                    assert_eq!(serde_json::to_value(&computation).unwrap(), original);
+                    assert_eq!(evidence.outcome, ResumeOutcome::Denied);
+                    assert_eq!(evidence.disposition, if disposition == ResumeDisposition::Reconcile {
+                        ResumeDisposition::Reconcile
+                    } else {
+                        ResumeDisposition::Deny
+                    });
+                    assert!(evidence.validation_error.is_some());
+                    let last = evidence.timeline.last().unwrap();
+                    assert_eq!(last.operation, "resume.denied");
+                    if class == DuplicateDeliveryClass::EvidenceConflict {
+                        assert_eq!(last.reason_code, ResumeReasonCode::EvidenceConflict);
+                    }
+                }
+            }
+        }
     }
 
     #[test]
