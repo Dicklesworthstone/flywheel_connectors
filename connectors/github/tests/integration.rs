@@ -40,6 +40,15 @@ fn generate_valid_bound_token(
     connector: &GitHubConnector,
     op: &str,
 ) -> fcp_core::CapabilityToken {
+    generate_bound_token_with_resources(signing_key, connector, op, &["*"])
+}
+
+fn generate_bound_token_with_resources(
+    signing_key: &Ed25519SigningKey,
+    connector: &GitHubConnector,
+    op: &str,
+    resources: &[&str],
+) -> fcp_core::CapabilityToken {
     let cap = match op {
         "github.create_issue" | "github.create_pull_request" => "github.write",
         "github.merge_pull_request" | "github.trigger_workflow" => "github.admin",
@@ -48,7 +57,10 @@ fn generate_valid_bound_token(
     };
     let now = Utc::now();
     let constraints = CapabilityConstraints {
-        resource_allow: vec!["*".into()],
+        resource_allow: resources
+            .iter()
+            .map(|resource| (*resource).to_owned())
+            .collect(),
         ..Default::default()
     };
     let mut cbor = Vec::new();
@@ -111,6 +123,64 @@ async fn setup_configure(connector: &mut GitHubConnector, base_url: &str) {
         }))
         .await
         .expect("configure should succeed");
+}
+
+async fn invoke_boundary_mutation(
+    client: &GitHubClient,
+    operation: &str,
+) -> fcp_github::error::GitHubResult<()> {
+    use fcp_github::types::{
+        CreateIssueRequest, CreatePullRequestRequest, MergePullRequestRequest,
+    };
+
+    match operation {
+        "issue" => client
+            .create_issue(
+                "octocat",
+                "hello-world",
+                &CreateIssueRequest {
+                    title: "Boundary fixture".into(),
+                    body: Some("Private fixture payload".into()),
+                    assignees: None,
+                    labels: None,
+                    milestone: None,
+                },
+            )
+            .await
+            .map(|_| ()),
+        "pull" => client
+            .create_pull_request(
+                "octocat",
+                "hello-world",
+                &CreatePullRequestRequest {
+                    title: "Boundary fixture".into(),
+                    head: "feature".into(),
+                    base: "main".into(),
+                    body: Some("Private fixture payload".into()),
+                    draft: Some(false),
+                },
+            )
+            .await
+            .map(|_| ()),
+        "merge" => client
+            .merge_pull_request(
+                "octocat",
+                "hello-world",
+                1,
+                &MergePullRequestRequest {
+                    commit_title: Some("Boundary fixture".into()),
+                    commit_message: Some("Private fixture payload".into()),
+                    merge_method: Some("squash".into()),
+                    sha: Some("fixture-head".into()),
+                },
+            )
+            .await
+            .map(|_| ()),
+        "workflow" => client
+            .trigger_workflow("octocat", "hello-world", "ci.yml", "main", None)
+            .await,
+        other => panic!("unknown boundary fixture operation: {other}"),
+    }
 }
 
 /// Standard GitHub issue response.
@@ -636,6 +706,310 @@ async fn workflow_dispatch_does_not_replay_ambiguous_provider_failure() {
 // ============================================================================
 // Content Tests
 // ============================================================================
+
+/// A signed prefix grant must never become authority over a normalized URL.
+#[fcp_async_core::test]
+async fn scoped_content_rejects_aliases_before_preflight_or_dispatch() {
+    let server = MockServer::start().await;
+    let mut connector = GitHubConnector::new();
+    setup_configure(&mut connector, &server.uri()).await;
+    let signing_key = setup_handshake(&mut connector, &["github.get_file_content"]).await;
+
+    for (owner, repo, input_path) in [
+        (
+            "octocat",
+            "hello-world",
+            "../../../other-owner/private-repo/contents/secret",
+        ),
+        ("octocat", "hello-world", "src/../secret"),
+        ("octocat", "hello-world", "./secret"),
+        ("octocat", "hello-world", "../secret"),
+        ("octocat", "hello-world", "/secret"),
+        ("octocat", "hello-world", "src//secret"),
+        ("octocat", "hello-world", "src\\secret"),
+        (".", "hello-world", "secret"),
+        ("..", "hello-world", "secret"),
+        ("octocat", ".", "secret"),
+        ("octocat", "..", "secret"),
+    ] {
+        let grant = format!("github://{owner}/{repo}/contents/*");
+        let token = generate_bound_token_with_resources(
+            &signing_key,
+            &connector,
+            "github.get_file_content",
+            &[grant.as_str()],
+        );
+        let input = json!({
+            "owner": owner,
+            "repo": repo,
+            "path": input_path
+        });
+        let simulate = fcp_core::SimulateRequest::new(
+            fcp_core::ConnectorId::from_static("fcp.github"),
+            fcp_core::OperationId::from_static("github.get_file_content"),
+            fcp_core::ZoneId::work(),
+            input.clone(),
+            token.clone(),
+        );
+        let preflight = connector
+            .handle_simulate(serde_json::to_value(simulate).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            preflight["would_succeed"], false,
+            "preflight admitted {owner}/{repo}/{input_path}"
+        );
+        let error = connector
+            .handle_invoke(json!({
+                "operation": "github.get_file_content",
+                "input": input,
+                "capability_token": token
+            }))
+            .await
+            .expect_err("URL aliases must be rejected before HTTP");
+        assert!(
+            matches!(error, fcp_core::FcpError::InvalidRequest { .. }),
+            "expected invalid path for {owner}/{repo}/{input_path}, got {error:?}"
+        );
+    }
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[fcp_async_core::test]
+async fn direct_client_rejects_repository_and_workflow_aliases_without_http() {
+    use fcp_github::error::GitHubError;
+
+    let server = MockServer::start().await;
+    let client = GitHubClient::new("test-token")
+        .unwrap()
+        .with_base_url(server.uri());
+
+    for alias in [".", ".."] {
+        for (owner, repo) in [(alias, "hello-world"), ("octocat", alias)] {
+            assert!(matches!(
+                client.get_repo(owner, repo).await,
+                Err(GitHubError::ValidationError { .. })
+            ));
+        }
+    }
+    for workflow in [".", "..", "../deploy.yml", "deploy/ci.yml"] {
+        assert!(matches!(
+            client
+                .trigger_workflow("octocat", "hello-world", workflow, "main", None)
+                .await,
+            Err(GitHubError::ValidationError { .. })
+        ));
+    }
+    for input_path in ["../secret", "src/../../other", "src/./secret", "src//secret"] {
+        assert!(matches!(
+            client
+                .get_file_content("octocat", "hello-world", input_path, None)
+                .await,
+            Err(GitHubError::ValidationError { .. })
+        ));
+    }
+    assert_eq!(client.total_requests(), 0);
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+/// Literal filenames stay in their admitted repository, including apparent escapes.
+#[fcp_async_core::test]
+async fn scoped_content_preserves_literal_paths_and_escaped_refs() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .expect(4)
+        .mount(&server)
+        .await;
+    let mut connector = GitHubConnector::new();
+    setup_configure(&mut connector, &server.uri()).await;
+    let signing_key = setup_handshake(&mut connector, &["github.get_file_content"]).await;
+    let git_ref = "release/a &b#c?next=other";
+
+    for (literal_path, encoded_path) in [
+        ("", ""),
+        (".github/workflows/ci.yml", ".github/workflows/ci.yml"),
+        (
+            "a b/日本語#?.md",
+            "a%20b/%E6%97%A5%E6%9C%AC%E8%AA%9E%23%3F.md",
+        ),
+        ("%2e%2e/%2Fsecret", "%252e%252e/%252Fsecret"),
+    ] {
+        let grant = format!("github://octocat/hello-world/contents/{literal_path}");
+        let token = generate_bound_token_with_resources(
+            &signing_key,
+            &connector,
+            "github.get_file_content",
+            &[grant.as_str()],
+        );
+        let result = connector
+            .handle_invoke(json!({
+                "operation": "github.get_file_content",
+                "input": {
+                    "owner": "octocat",
+                    "repo": "hello-world",
+                    "path": literal_path,
+                    "ref": git_ref
+                },
+                "capability_token": token
+            }))
+            .await
+            .expect("canonical literal paths must remain usable");
+        assert_eq!(result["content"], json!([]));
+        let requests = server.received_requests().await.unwrap();
+        let request = requests.last().unwrap();
+        assert_eq!(
+            request.url.path(),
+            format!("/repos/octocat/hello-world/contents/{encoded_path}")
+        );
+        assert_eq!(
+            request.url.query_pairs().into_owned().collect::<Vec<_>>(),
+            vec![("ref".to_owned(), git_ref.to_owned())]
+        );
+    }
+    server.verify().await;
+}
+
+#[fcp_async_core::test]
+async fn redirect_control_can_forward_credential_reference_and_mutation_body() {
+    let source = MockServer::start().await;
+    let target = MockServer::start().await;
+    let payload = json!({"private": "fixture"});
+    Mock::given(method("POST"))
+        .and(path("/unadmitted"))
+        .and(header("X-FCP-Credential-ID", TEST_CREDENTIAL_ID))
+        .and(body_json(&payload))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&target)
+        .await;
+    let location = format!("{}/unadmitted", target.uri());
+    Mock::given(method("POST"))
+        .and(path("/original"))
+        .respond_with(ResponseTemplate::new(307).insert_header("Location", location.as_str()))
+        .expect(1)
+        .mount(&source)
+        .await;
+
+    // Negative control: default redirects carry this nonstandard credential
+    // reference to another origin and replay the original POST body.
+    let response = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(std::time::Duration::from_secs(5))
+        .retry(reqwest::retry::never())
+        .build()
+        .unwrap()
+        .post(format!("{}/original", source.uri()))
+        .header("X-FCP-Credential-ID", TEST_CREDENTIAL_ID)
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    source.verify().await;
+    target.verify().await;
+}
+
+#[fcp_async_core::test]
+async fn github_mutations_do_not_follow_authenticated_redirects() {
+    use fcp_github::client::GitHubAuth;
+    use fcp_github::error::GitHubError;
+
+    for status in [301, 302, 303, 307, 308] {
+        for same_origin in [true, false] {
+            for secretless in [true, false] {
+                for (operation, verb, endpoint) in [
+                    ("issue", "POST", "/repos/octocat/hello-world/issues"),
+                    ("pull", "POST", "/repos/octocat/hello-world/pulls"),
+                    ("merge", "PUT", "/repos/octocat/hello-world/pulls/1/merge"),
+                    (
+                        "workflow",
+                        "POST",
+                        "/repos/octocat/hello-world/actions/workflows/ci.yml/dispatches",
+                    ),
+                ] {
+                    let source = MockServer::start().await;
+                    let target = MockServer::start().await;
+                    let destination = if same_origin {
+                        source.uri()
+                    } else {
+                        target.uri()
+                    };
+                    let location = format!("{destination}/unadmitted");
+                    let (auth, auth_header, auth_value) = if secretless {
+                        (
+                            GitHubAuth::CredentialId(
+                                fcp_prelude::CredentialId::parse(TEST_CREDENTIAL_ID).unwrap(),
+                            ),
+                            "X-FCP-Credential-ID",
+                            TEST_CREDENTIAL_ID,
+                        )
+                    } else {
+                        (
+                            GitHubAuth::Token("boundary-test-token".into()),
+                            "Authorization",
+                            "Bearer boundary-test-token",
+                        )
+                    };
+                    Mock::given(method(verb))
+                        .and(path(endpoint))
+                        .and(header(auth_header, auth_value))
+                        .respond_with(
+                            ResponseTemplate::new(status)
+                                .insert_header("Location", location.as_str()),
+                        )
+                        .expect(1)
+                        .mount(&source)
+                        .await;
+                    let client = GitHubClient::new_with_auth(auth)
+                        .unwrap()
+                        .with_base_url(source.uri())
+                        .with_retry_config(3, 1, 1);
+                    let error = invoke_boundary_mutation(&client, operation)
+                        .await
+                        .expect_err("redirect must not authorize another provider request");
+                    assert!(
+                        matches!(
+                            error,
+                            GitHubError::Api {
+                                status_code: Some(code),
+                                ..
+                            } if code == status
+                        ),
+                        "expected original {status} for {operation}, got {error:?}"
+                    );
+                    assert_eq!(source.received_requests().await.unwrap().len(), 1);
+                    assert!(target.received_requests().await.unwrap().is_empty());
+                    source.verify().await;
+                }
+            }
+        }
+    }
+}
+
+#[fcp_async_core::test]
+async fn merge_never_replays_received_provider_failure() {
+    for status in [429, 500, 502, 503] {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/repos/octocat/hello-world/pulls/1/merge"))
+            .respond_with(
+                ResponseTemplate::new(status)
+                    .insert_header("Retry-After", "0")
+                    .set_body_json(github_error_response("ambiguous merge result")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = GitHubClient::new("test-token")
+            .unwrap()
+            .with_base_url(server.uri())
+            .with_retry_config(3, 1, 1);
+        assert!(invoke_boundary_mutation(&client, "merge").await.is_err());
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        server.verify().await;
+    }
+}
 
 /// Get file content.
 #[fcp_async_core::test]
