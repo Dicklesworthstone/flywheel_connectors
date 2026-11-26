@@ -7,7 +7,7 @@ use std::task::Poll;
 use std::time::Duration;
 use std::time::Instant;
 
-use fcp_async_core::io::{AsyncRead, ReadBuf};
+use fcp_async_core::io::{AsyncRead, AsyncWrite, ReadBuf};
 // ServerWebSocket and WebSocketAcceptor are test-server types not re-exported by
 // fcp-async-core; direct import from asupersync is acceptable for test infrastructure.
 use asupersync::net::websocket::{CloseReason, Message, ServerWebSocket, WebSocketAcceptor};
@@ -398,6 +398,50 @@ async fn close_test_websocket(ws: &mut TestServerWebSocket) {
     let _ = ws
         .close(&fcp_async_core::compatibility_cx(), CloseReason::normal())
         .await;
+}
+
+async fn accept_subscription_session(listener: &TcpListener) -> TestServerWebSocket {
+    let (socket, _) = listener.accept().await.expect("accept session");
+    let mut ws = accept_test_websocket(socket).await;
+    let _init = recv_text(&mut ws, "connection_init").await;
+    send_json(
+        &mut ws,
+        serde_json::json!({"type": "connection_ack"}),
+        "connection_ack",
+    )
+    .await;
+    let _subscribe = recv_text(&mut ws, "subscribe").await;
+    ws
+}
+
+async fn send_subscription_http_refusal(socket: &mut TcpStream, status: u16, headers: &str) {
+    let _request = read_http_headers(socket).await.expect("upgrade request");
+    let response = format!(
+        "HTTP/1.1 {status} Refused\r\nContent-Length: 0\r\nConnection: close\r\n{headers}\r\n"
+    );
+    let mut remaining = response.as_bytes();
+    while !remaining.is_empty() {
+        let written = poll_fn(|cx| Pin::new(&mut *socket).poll_write(cx, remaining))
+            .await
+            .expect("write HTTP refusal");
+        assert!(written > 0, "HTTP refusal write made progress");
+        remaining = &remaining[written..];
+    }
+}
+
+fn reconnecting_subscription_client(
+    url: String,
+    max_attempts: u32,
+    delay: Duration,
+) -> GraphqlSubscriptionClient {
+    let mut ws = WsConfig::new().with_connect_timeout(Duration::from_secs(5));
+    ws.max_reconnect_attempts = Some(max_attempts);
+    ws.reconnect_delay = delay;
+    GraphqlSubscriptionClient::new(url, "outage-test").with_config(GraphqlSubscriptionConfig {
+        ws,
+        ack_timeout: Duration::from_secs(5),
+        ..GraphqlSubscriptionConfig::default()
+    })
 }
 
 async fn subscription_wrong_id_error(frame: serde_json::Value) -> GraphqlClientError {
@@ -2113,6 +2157,320 @@ async fn subscription_full_result_buffer_handles_ping_then_closes_on_overflow() 
             "overflow_err_observed": overflow_err_observed,
         })),
     );
+}
+
+#[fcp_async_core::runtime::test]
+async fn subscription_ack_then_close_exhausts_reconnect_budget() {
+    fcp_async_core::time::timeout(Duration::from_secs(4), async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = task::spawn(async move {
+            for _ in 0..3 {
+                let mut ws = accept_subscription_session(&listener).await;
+                close_test_websocket(&mut ws).await;
+            }
+            assert!(
+                fcp_async_core::time::timeout(Duration::from_millis(200), listener.accept())
+                    .await
+                    .is_err(),
+                "ACK-only sessions must not replenish the retry budget"
+            );
+        });
+        let client = reconnecting_subscription_client(
+            format!("ws://{addr}"),
+            2,
+            Duration::from_millis(20),
+        );
+        let mut stream = client.subscribe::<ViewerQuery>(EmptyVars {}).await.expect("subscribe");
+        let error = stream.next().await.expect("terminal error").expect_err("retry exhaustion");
+        assert!(error.to_string().contains("reconnect exhausted after 2 attempts"));
+        assert!(stream.next().await.is_none());
+        server.await.expect("server");
+    })
+    .await
+    .expect("bounded reconnect attempts");
+}
+
+#[fcp_async_core::runtime::test]
+async fn subscription_delivered_events_replenish_reconnect_budget() {
+    fcp_async_core::time::timeout(Duration::from_secs(4), async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = task::spawn(async move {
+            for index in 0..4 {
+                let mut ws = accept_subscription_session(&listener).await;
+                send_json(
+                    &mut ws,
+                    serde_json::json!({
+                        "type": "next", "id": "1",
+                        "payload": {"data": {"viewer": {"id": format!("event-{index}")}}}
+                    }),
+                    "event",
+                )
+                .await;
+                if index == 3 {
+                    send_json(&mut ws, serde_json::json!({"type": "complete", "id": "1"}), "complete").await;
+                } else {
+                    close_test_websocket(&mut ws).await;
+                }
+            }
+        });
+        let client = reconnecting_subscription_client(
+            format!("ws://{addr}"),
+            1,
+            Duration::from_millis(20),
+        );
+        let mut stream = client.subscribe::<ViewerQuery>(EmptyVars {}).await.expect("subscribe");
+        for index in 0..4 {
+            let event = stream.next().await.expect("event").expect("valid event");
+            assert_eq!(event.data.expect("data").viewer.id, format!("event-{index}"));
+        }
+        assert!(stream.next().await.is_none());
+        server.await.expect("server");
+    })
+    .await
+    .expect("usable sessions remain reconnectable");
+}
+
+#[fcp_async_core::runtime::test]
+async fn subscription_reconnect_preserves_provider_retry_floor() {
+    fcp_async_core::time::timeout(Duration::from_secs(5), async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = task::spawn(async move {
+            let mut first = accept_subscription_session(&listener).await;
+            close_test_websocket(&mut first).await;
+            let (mut refused, _) = listener.accept().await.expect("first reconnect");
+            let refusal_started = Instant::now();
+            send_subscription_http_refusal(&mut refused, 429, "Retry-After: 1\r\n").await;
+            drop(refused);
+            let mut recovered = accept_subscription_session(&listener).await;
+            assert!(
+                refusal_started.elapsed() >= Duration::from_secs(1),
+                "reconnect shortened the provider's minimum delay"
+            );
+            send_json(
+                &mut recovered,
+                serde_json::json!({
+                    "type": "next", "id": "1",
+                    "payload": {"data": {"viewer": {"id": "after-provider-floor"}}}
+                }),
+                "recovered event",
+            )
+            .await;
+            send_json(&mut recovered, serde_json::json!({"type": "complete", "id": "1"}), "complete").await;
+        });
+        let client = reconnecting_subscription_client(
+            format!("ws://{addr}"),
+            3,
+            Duration::from_millis(20),
+        );
+        let mut stream = client.subscribe::<ViewerQuery>(EmptyVars {}).await.expect("subscribe");
+        let event = stream.next().await.expect("recovered event").expect("event");
+        assert_eq!(event.data.expect("data").viewer.id, "after-provider-floor");
+        assert!(stream.next().await.is_none());
+        server.await.expect("server");
+    })
+    .await
+    .expect("provider minimum is bounded and honored");
+}
+
+#[fcp_async_core::runtime::test]
+async fn subscription_reconnect_stops_on_refusal_or_unwaitable_retry_floor() {
+    fcp_async_core::time::timeout(Duration::from_secs(6), async {
+        for (status, headers) in [
+            (401, ""),
+            (403, ""),
+            (503, "X-FCP-Backpressure-Reason: budget-exhausted\r\nRetry-After: 1\r\n"),
+            (429, "Retry-After: 3600\r\n"),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let server = task::spawn(async move {
+                let mut first = accept_subscription_session(&listener).await;
+                close_test_websocket(&mut first).await;
+                let (mut refused, _) = listener.accept().await.expect("reconnect");
+                send_subscription_http_refusal(&mut refused, status, headers).await;
+                drop(refused);
+                assert!(
+                    fcp_async_core::time::timeout(Duration::from_millis(250), listener.accept())
+                        .await
+                        .is_err(),
+                    "terminal refusal must not start another connection"
+                );
+            });
+            let client = reconnecting_subscription_client(
+                format!("ws://{addr}"),
+                4,
+                Duration::from_millis(20),
+            );
+            let mut stream = client.subscribe::<ViewerQuery>(EmptyVars {}).await.expect("subscribe");
+            let error = stream.next().await.expect("terminal refusal").expect_err("refused");
+            if status == 503 {
+                assert!(!error.is_retryable(), "host budget refusal is terminal");
+                assert!(error.to_string().contains("budget-exhausted"));
+            } else {
+                match error {
+                    GraphqlClientError::HttpStatus { status: actual, retry_after, .. } => {
+                        assert_eq!(actual.as_u16(), status);
+                        assert_eq!(
+                            retry_after,
+                            (status == 429).then_some(Duration::from_secs(3600))
+                        );
+                    }
+                    other => panic!("HTTP refusal lost status or retry guidance: {other:?}"),
+                }
+            }
+            assert!(stream.next().await.is_none());
+            server.await.expect("server");
+        }
+    })
+    .await
+    .expect("refusals terminate without retry storms or oversized sleeps");
+}
+
+#[fcp_async_core::runtime::test]
+async fn subscription_drop_during_backoff_prevents_redial() {
+    fcp_async_core::time::timeout(Duration::from_secs(3), async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let (closed_tx, closed_rx) = fcp_async_core::channel::oneshot::channel();
+        let server = task::spawn(async move {
+            let mut first = accept_subscription_session(&listener).await;
+            close_test_websocket(&mut first).await;
+            closed_tx.send(()).expect("consumer");
+            assert!(
+                fcp_async_core::time::timeout(Duration::from_secs(1), listener.accept())
+                    .await
+                    .is_err(),
+                "dropped subscription must not reconnect after backoff"
+            );
+        });
+        let client = reconnecting_subscription_client(
+            format!("ws://{addr}"),
+            3,
+            Duration::from_millis(400),
+        );
+        let stream = client.subscribe::<ViewerQuery>(EmptyVars {}).await.expect("subscribe");
+        closed_rx.await.expect("initial socket closed");
+        fcp_async_core::time::sleep(Duration::from_millis(50)).await;
+        drop(stream);
+        server.await.expect("server");
+    })
+    .await
+    .expect("cancellation during backoff");
+}
+
+#[fcp_async_core::runtime::test]
+async fn subscription_drop_interrupts_reconnect_upgrade_and_ack_wait() {
+    fcp_async_core::time::timeout(Duration::from_secs(4), async {
+        for wait_for_ack in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let (started_tx, started_rx) = fcp_async_core::channel::oneshot::channel();
+            let server = task::spawn(async move {
+                let mut first = accept_subscription_session(&listener).await;
+                close_test_websocket(&mut first).await;
+                let (mut reconnect, _) = listener.accept().await.expect("reconnect");
+                if wait_for_ack {
+                    let mut ws = accept_test_websocket(reconnect).await;
+                    let _init = recv_text(&mut ws, "reconnect init").await;
+                    started_tx.send(()).expect("consumer");
+                    let closed = fcp_async_core::time::timeout(
+                        Duration::from_millis(500),
+                        ws.recv(&fcp_async_core::compatibility_cx()),
+                    )
+                    .await
+                    .expect("cancellation must interrupt the five-second ACK wait");
+                    assert!(
+                        matches!(closed, Ok(None) | Ok(Some(Message::Close(_))) | Err(_)),
+                        "cancelled reconnect must release the socket"
+                    );
+                } else {
+                    let _request = read_http_headers(&mut reconnect).await.expect("upgrade request");
+                    started_tx.send(()).expect("consumer");
+                    let mut byte = [0_u8; 1];
+                    let read = fcp_async_core::time::timeout(
+                        Duration::from_millis(500),
+                        poll_fn(|cx| {
+                            let mut buffer = ReadBuf::new(&mut byte);
+                            match Pin::new(&mut reconnect).poll_read(cx, &mut buffer) {
+                                Poll::Ready(Ok(())) => Poll::Ready(Ok(buffer.filled().len())),
+                                Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+                                Poll::Pending => Poll::Pending,
+                            }
+                        }),
+                    )
+                    .await
+                    .expect("cancellation must interrupt the five-second upgrade wait");
+                    assert!(matches!(read, Ok(0) | Err(_)), "cancelled upgrade socket remains live");
+                }
+                assert!(
+                    fcp_async_core::time::timeout(Duration::from_millis(150), listener.accept())
+                        .await
+                        .is_err(),
+                    "cancellation must not schedule another reconnect"
+                );
+            });
+            let client = reconnecting_subscription_client(
+                format!("ws://{addr}"),
+                3,
+                Duration::from_millis(20),
+            );
+            let stream = client.subscribe::<ViewerQuery>(EmptyVars {}).await.expect("subscribe");
+            started_rx.await.expect("reconnect wait started");
+            drop(stream);
+            server.await.expect("server");
+        }
+    })
+    .await
+    .expect("in-flight reconnect cancellation");
+}
+
+#[fcp_async_core::runtime::test]
+async fn subscription_malformed_payload_is_terminal_after_queued_events() {
+    fcp_async_core::time::timeout(Duration::from_secs(5), async {
+        for malformed in [
+            serde_json::json!({"type": "next", "id": "1"}),
+            serde_json::json!({"type": "next", "id": "1", "payload": null}),
+            serde_json::json!({"type": "next", "id": "1", "payload": []}),
+            serde_json::json!({"type": "error", "id": "1"}),
+            serde_json::json!({"type": "error", "id": "1", "payload": null}),
+            serde_json::json!({"type": "error", "id": "1", "payload": []}),
+            serde_json::json!({"type": "error", "id": "1", "payload": {"message": "wrong shape"}}),
+            serde_json::json!({"type": "error", "id": "1", "payload": [{"missing": "message"}]}),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let server = task::spawn(async move {
+                let mut ws = accept_subscription_session(&listener).await;
+                send_json(
+                    &mut ws,
+                    serde_json::json!({
+                        "type": "next", "id": "1",
+                        "payload": {"data": {"viewer": {"id": "queued-before-error"}}}
+                    }),
+                    "valid event",
+                )
+                .await;
+                send_json(&mut ws, malformed, "malformed frame").await;
+            });
+            let client = reconnecting_subscription_client(
+                format!("ws://{addr}"),
+                2,
+                Duration::from_millis(20),
+            );
+            let mut stream = client.subscribe::<ViewerQuery>(EmptyVars {}).await.expect("subscribe");
+            let queued = stream.next().await.expect("queued event").expect("valid event");
+            assert_eq!(queued.data.expect("data").viewer.id, "queued-before-error");
+            let error = stream.next().await.expect("terminal error").expect_err("malformed payload");
+            assert!(matches!(error, GraphqlClientError::Protocol { .. }));
+            assert!(stream.next().await.is_none());
+            server.await.expect("server");
+        }
+    })
+    .await
+    .expect("malformed payloads terminate and preserve already queued events");
 }
 
 #[fcp_async_core::runtime::test]

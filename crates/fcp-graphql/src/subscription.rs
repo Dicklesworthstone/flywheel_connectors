@@ -1,11 +1,14 @@
 //! GraphQL over WebSocket subscriptions.
 
 use std::collections::HashMap;
+use std::future::{Future, poll_fn};
 use std::sync::{Arc, Mutex};
+use std::task::Poll;
 use std::time::Duration;
 
 use fcp_async_core::{
     channel::mpsc::{self, error::TrySendError},
+    http::StatusCode,
     task, time,
 };
 use futures_util::stream::BoxStream;
@@ -33,6 +36,52 @@ struct GraphqlWsMessage {
 const GRAPHQL_WEBSOCKET_SUBPROTOCOL: &str = "graphql-transport-ws";
 const SUBSCRIPTION_ID: &str = "1";
 const SUBSCRIPTION_RESULT_BUFFER_CAPACITY: usize = 16;
+const SUBSCRIPTION_CLOSE_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Keep retry decisions attached to transport errors until they reach the caller.
+#[derive(Debug)]
+struct SubscriptionFailure {
+    error: GraphqlClientError,
+    retryable: bool,
+    retry_after: Option<Duration>,
+}
+
+impl From<GraphqlClientError> for SubscriptionFailure {
+    fn from(error: GraphqlClientError) -> Self {
+        Self {
+            error,
+            retryable: false,
+            retry_after: None,
+        }
+    }
+}
+
+impl From<StreamError> for SubscriptionFailure {
+    fn from(error: StreamError) -> Self {
+        let retry_after = error.retry_after();
+        let retryable = !error.is_terminal_backpressure()
+            && match &error {
+                StreamError::HttpError { status, .. }
+                | StreamError::HostBackpressure { status, .. } => {
+                    matches!(status, 408 | 429 | 500..=599)
+                }
+                StreamError::ConnectionClosed { code, .. } => !matches!(
+                    code,
+                    Some(1002 | 1003 | 1007 | 1008 | 1009 | 1010 | 4400 | 4401 | 4403 | 4406 | 4409 | 4429)
+                ),
+                StreamError::ConnectionFailed(_)
+                | StreamError::WebSocketError(_)
+                | StreamError::IoError(_)
+                | StreamError::Timeout(_) => true,
+                _ => false,
+            };
+        Self {
+            error: error.into(),
+            retryable,
+            retry_after,
+        }
+    }
+}
 
 /// Subscription configuration.
 #[derive(Debug, Clone)]
@@ -145,7 +194,8 @@ impl GraphqlSubscriptionClient {
             self.config.ack_timeout,
             &payload,
         ))
-        .await?;
+        .await
+        .map_err(|failure| failure.error)?;
 
         let (tx, rx) = mpsc::channel(SUBSCRIPTION_RESULT_BUFFER_CAPACITY);
         let service_name = self.service_name.clone();
@@ -173,10 +223,10 @@ impl GraphqlSubscriptionClient {
                         send_complete_and_close(&mut conn).await;
                         break;
                     },
-                    recv = conn.recv() => {
+                    recv = receive_subscription_message(&mut conn) => {
                         let message = match recv {
-                            Ok(Some(message)) => message,
-                            Ok(None) => {
+                            Ok(message) => message,
+                            Err(failure) => {
                                 match Box::pin(reconnect_connection(
                                     &client,
                                     &service_name,
@@ -184,14 +234,16 @@ impl GraphqlSubscriptionClient {
                                     ack_timeout,
                                     &payload,
                                     &mut reconnect_handler,
-                                    "connection closed",
+                                    &tx,
+                                    failure,
                                 ))
                                 .await
                                 {
-                                    Ok(new_conn) => {
+                                    Ok(Some(new_conn)) => {
                                         conn = new_conn;
                                         continue;
                                     }
+                                    Ok(None) => break,
                                     Err(err) => {
                                         let _ =
                                             deliver_subscription_item(
@@ -205,75 +257,30 @@ impl GraphqlSubscriptionClient {
                                     }
                                 }
                             }
-                            Err(err) => {
-                                match Box::pin(reconnect_connection(
-                                    &client,
-                                    &service_name,
-                                    init_payload.clone(),
-                                    ack_timeout,
-                                    &payload,
-                                    &mut reconnect_handler,
-                                    &format!("connection error: {err}"),
-                                ))
-                                .await
-                                {
-                                    Ok(new_conn) => {
-                                        conn = new_conn;
-                                        continue;
-                                    }
-                                    Err(reconnect_err) => {
-                                        let _ = deliver_subscription_item(
-                                            &tx,
-                                            &mut conn,
-                                            &producer_terminal,
-                                            Err(reconnect_err),
-                                        )
-                                        .await;
-                                        break;
-                                    }
-                                }
-                            }
                         };
 
                 match message {
                     WsMessage::Ping(payload) => {
-                        let _ = conn.send(WsMessage::Pong(payload)).await;
-                        continue;
-                    }
-                    WsMessage::Pong(_) => continue,
-                    WsMessage::Close(frame) => {
-                        let close_detail = frame
-                            .map_or_else(|| "close frame".to_string(), |f| {
-                                format!("close frame {} {}", f.code, f.reason)
-                            });
-                        match Box::pin(reconnect_connection(
-                            &client,
-                            &service_name,
-                            init_payload.clone(),
-                            ack_timeout,
-                            &payload,
-                            &mut reconnect_handler,
-                            &close_detail,
-                        ))
-                        .await
-                        {
-                            Ok(new_conn) => {
-                                conn = new_conn;
-                                continue;
+                        match while_subscribed(&tx, conn.send(WsMessage::Pong(payload))).await {
+                            Some(Ok(())) => continue,
+                            None => {
+                                send_complete_and_close(&mut conn).await;
+                                break;
                             }
-                            Err(err) => {
+                            Some(Err(err)) => {
                                 let _ = deliver_subscription_item(
                                     &tx,
                                     &mut conn,
                                     &producer_terminal,
-                                    Err(err),
+                                    Err(err.into()),
                                 )
                                 .await;
                                 break;
                             }
                         }
                     }
-                    WsMessage::Text(_) | WsMessage::Binary(_) => {}
+                    WsMessage::Pong(_) => continue,
+                    WsMessage::Text(_) | WsMessage::Binary(_) | WsMessage::Close(_) => {}
                 }
 
                 match decode_ws_message(message) {
@@ -289,35 +296,31 @@ impl GraphqlSubscriptionClient {
                                 .await;
                                 break;
                             }
-                            if let Some(payload) = ws_msg.payload {
-                                let parsed: Result<GraphqlResponse<O::ResponseData>, _> =
-                                    serde_json::from_value(payload);
-                                match parsed {
-                                    Ok(response) => {
-                                        if !deliver_subscription_item(
-                                            &tx,
-                                            &mut conn,
-                                            &producer_terminal,
-                                            Ok(response),
-                                        )
-                                        .await
-                                        {
-                                            break;
-                                        }
-                                    }
-                                    Err(err) => {
-                                        if !deliver_subscription_item(
-                                            &tx,
-                                            &mut conn,
-                                            &producer_terminal,
-                                            Err(GraphqlClientError::Json(err.to_string())),
-                                        )
-                                            .await
-                                        {
-                                            break;
-                                        }
+                            match parse_next_payload::<O::ResponseData>(ws_msg.payload) {
+                                Ok(response) => {
+                                    if !deliver_subscription_item(
+                                        &tx,
+                                        &mut conn,
+                                        &producer_terminal,
+                                        Ok(response),
+                                    )
+                                    .await
+                                    {
                                         break;
                                     }
+                                    // An ACK alone does not prove a usable subscription.
+                                    // Only delivered data replenishes the reconnect budget.
+                                    reconnect_handler.reset();
+                                }
+                                Err(err) => {
+                                    let _ = deliver_subscription_item(
+                                        &tx,
+                                        &mut conn,
+                                        &producer_terminal,
+                                        Err(err),
+                                    )
+                                    .await;
+                                    break;
                                 }
                             }
                         }
@@ -332,23 +335,15 @@ impl GraphqlSubscriptionClient {
                                 .await;
                                 break;
                             }
-                            let errors = ws_msg
-                                .payload
-                                .and_then(|value| {
-                                    if value.is_array() {
-                                        serde_json::from_value::<Vec<GraphqlError>>(value).ok()
-                                    } else {
-                                        serde_json::from_value::<GraphqlError>(value)
-                                            .ok()
-                                            .map(|err| vec![err])
-                                    }
-                                })
-                                .unwrap_or_default();
+                            let error = match parse_error_payload(ws_msg.payload) {
+                                Ok(errors) => GraphqlClientError::GraphqlErrors { errors },
+                                Err(err) => err,
+                            };
                             let _ = deliver_subscription_item(
                                 &tx,
                                 &mut conn,
                                 &producer_terminal,
-                                Err(GraphqlClientError::GraphqlErrors { errors }),
+                                Err(error),
                             )
                             .await;
                             break;
@@ -366,15 +361,22 @@ impl GraphqlSubscriptionClient {
                             break;
                         }
                         "ping" => {
-                            if let Err(err) = reply_to_ping(&mut conn, ws_msg).await {
-                                let _ = deliver_subscription_item(
-                                    &tx,
-                                    &mut conn,
-                                    &producer_terminal,
-                                    Err(err),
-                                )
-                                .await;
-                                break;
+                            match while_subscribed(&tx, reply_to_ping(&mut conn, ws_msg)).await {
+                                Some(Ok(())) => {}
+                                None => {
+                                    send_complete_and_close(&mut conn).await;
+                                    break;
+                                }
+                                Some(Err(failure)) => {
+                                    let _ = deliver_subscription_item(
+                                        &tx,
+                                        &mut conn,
+                                        &producer_terminal,
+                                        Err(failure.error),
+                                    )
+                                    .await;
+                                    break;
+                                }
                             }
                         }
                         "pong" => {
@@ -515,32 +517,26 @@ async fn establish_subscription(
     init_payload: Option<serde_json::Value>,
     ack_timeout: Duration,
     payload: &serde_json::Value,
-) -> Result<WsConnection, GraphqlClientError> {
-    let mut connection = client
-        .connect()
-        .await
-        .map_err(|err| GraphqlClientError::Protocol {
-            message: format!("{service_name} websocket connect failed: {err}"),
-        })?;
+) -> Result<WsConnection, SubscriptionFailure> {
+    let mut connection = client.connect().await?;
 
     let init = GraphqlWsMessage {
         message_type: "connection_init".to_string(),
         id: None,
         payload: init_payload,
     };
-    connection
-        .send_json(&init)
-        .await
-        .map_err(|err| GraphqlClientError::Protocol {
-            message: format!("{service_name} connection_init failed: {err}"),
-        })?;
+    connection.send_json(&init).await?;
 
     // GraphQL and WebSocket heartbeats are legal before acknowledgement.
     // Bound the whole exchange once: heartbeats must not renew the deadline.
     time::timeout(ack_timeout, receive_connection_ack(&mut connection))
         .await
-        .map_err(|_| GraphqlClientError::Protocol {
-            message: format!("{service_name} connection_ack timeout"),
+        .map_err(|_| SubscriptionFailure {
+            error: GraphqlClientError::Protocol {
+                message: format!("{service_name} connection_ack timeout"),
+            },
+            retryable: true,
+            retry_after: None,
         })??;
 
     let subscribe = GraphqlWsMessage {
@@ -548,35 +544,46 @@ async fn establish_subscription(
         id: Some(SUBSCRIPTION_ID.to_string()),
         payload: Some(payload.clone()),
     };
-    connection
-        .send_json(&subscribe)
-        .await
-        .map_err(|err| GraphqlClientError::Protocol {
-            message: format!("{service_name} subscribe failed: {err}"),
-        })?;
+    connection.send_json(&subscribe).await?;
 
     Ok(connection)
 }
 
-async fn receive_connection_ack(connection: &mut WsConnection) -> Result<(), GraphqlClientError> {
+async fn receive_subscription_message(
+    connection: &mut WsConnection,
+) -> Result<WsMessage, SubscriptionFailure> {
+    match connection.recv().await? {
+        Some(WsMessage::Close(frame)) => Err(StreamError::ConnectionClosed {
+            code: frame.as_ref().map(|frame| frame.code),
+            reason: frame.map_or_else(
+                || "websocket closed".to_owned(),
+                |frame| format!("websocket closed with code {}", frame.code),
+            ),
+        }
+        .into()),
+        Some(message) => Ok(message),
+        None => Err(StreamError::ConnectionClosed {
+            code: None,
+            reason: "connection closed".to_owned(),
+        }
+        .into()),
+    }
+}
+
+async fn receive_connection_ack(connection: &mut WsConnection) -> Result<(), SubscriptionFailure> {
     loop {
-        let Some(message) = connection.recv().await.map_err(GraphqlClientError::from)? else {
-            return Err(GraphqlClientError::Protocol {
-                message: "connection closed before ack".to_owned(),
-            });
-        };
+        let message = receive_subscription_message(connection).await?;
         match message {
             WsMessage::Ping(payload) => {
-                connection
-                    .send(WsMessage::Pong(payload))
-                    .await
-                    .map_err(GraphqlClientError::from)?;
+                connection.send(WsMessage::Pong(payload)).await?;
             }
             WsMessage::Pong(_) => {}
             message => {
                 let message = decode_ws_message(message)?;
                 match message.message_type.as_str() {
-                    "connection_ack" => return validate_control_message(&message),
+                    "connection_ack" => {
+                        return validate_control_message(&message).map_err(Into::into);
+                    }
                     "ping" => reply_to_ping(connection, message).await?,
                     "pong" => validate_control_message(&message)?,
                     _ => {
@@ -585,7 +592,8 @@ async fn receive_connection_ack(connection: &mut WsConnection) -> Result<(), Gra
                                 "expected connection_ack, got {}",
                                 message.message_type
                             ),
-                        });
+                        }
+                        .into());
                     }
                 }
             }
@@ -613,7 +621,7 @@ fn validate_control_message(message: &GraphqlWsMessage) -> Result<(), GraphqlCli
 async fn reply_to_ping(
     connection: &mut WsConnection,
     ping: GraphqlWsMessage,
-) -> Result<(), GraphqlClientError> {
+) -> Result<(), SubscriptionFailure> {
     validate_control_message(&ping)?;
     let pong = GraphqlWsMessage {
         message_type: "pong".to_owned(),
@@ -623,57 +631,86 @@ async fn reply_to_ping(
     connection
         .send_json(&pong)
         .await
-        .map_err(GraphqlClientError::from)
+        .map_err(SubscriptionFailure::from)
 }
 
-async fn reconnect_connection(
+/// Poll receiver closure first, including when both futures are already ready.
+async fn while_subscribed<T, F: Future>(tx: &mpsc::Sender<T>, future: F) -> Option<F::Output> {
+    let mut closed = std::pin::pin!(tx.closed());
+    let mut future = std::pin::pin!(future);
+    poll_fn(|cx| {
+        if closed.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(None);
+        }
+        future.as_mut().poll(cx).map(Some)
+    })
+    .await
+}
+
+async fn reconnect_connection<T>(
     client: &WsClient,
     service_name: &str,
     init_payload: Option<serde_json::Value>,
     ack_timeout: Duration,
     payload: &serde_json::Value,
     reconnect_handler: &mut ReconnectHandler,
-    disconnect_reason: &str,
-) -> Result<WsConnection, GraphqlClientError> {
+    tx: &mpsc::Sender<T>,
+    mut failure: SubscriptionFailure,
+) -> Result<Option<WsConnection>, GraphqlClientError> {
     loop {
+        if !failure.retryable {
+            return Err(failure.error);
+        }
         if !reconnect_handler.can_reconnect() {
+            if matches!(failure.error, GraphqlClientError::HttpStatus { .. }) {
+                return Err(failure.error);
+            }
             return Err(GraphqlClientError::Protocol {
                 message: format!(
-                    "{service_name} subscription disconnected ({disconnect_reason}); reconnect exhausted after {} attempts",
-                    reconnect_handler.attempts()
+                    "{service_name} subscription disconnected; reconnect exhausted after {} attempts: {}",
+                    reconnect_handler.attempts(), failure.error
                 ),
             });
         }
 
-        reconnect_handler
-            .wait_for_reconnect()
-            .await
-            .map_err(GraphqlClientError::from)?;
-
-        match Box::pin(establish_subscription(
-            client,
-            service_name,
-            init_payload.clone(),
-            ack_timeout,
-            payload,
-        ))
+        match while_subscribed(
+            tx,
+            reconnect_handler.wait_for_reconnect_after(failure.retry_after),
+        )
         .await
         {
-            Ok(connection) => {
-                reconnect_handler.reset();
+            None => return Ok(None),
+            Some(Ok(())) => {}
+            // A provider minimum outside local policy must never be shortened.
+            // Keep the upstream status and retry guidance for the caller.
+            Some(Err(_)) => return Err(failure.error),
+        }
+
+        match while_subscribed(
+            tx,
+            establish_subscription(
+                client,
+                service_name,
+                init_payload.clone(),
+                ack_timeout,
+                payload,
+            ),
+        )
+        .await
+        {
+            None => return Ok(None),
+            Some(Ok(connection)) => {
                 debug!(service = service_name, "graphql subscription reconnected");
-                return Ok(connection);
+                return Ok(Some(connection));
             }
-            Err(err) => {
+            Some(Err(next_failure)) => {
                 debug!(
                     service = service_name,
                     attempt = reconnect_handler.attempts(),
-                    error = %err,
+                    error = %next_failure.error,
                     "graphql subscription reconnect attempt failed"
                 );
-                if !reconnect_handler.can_reconnect() {
-                    return Err(err);
-                }
+                failure = next_failure;
             }
         }
     }
@@ -685,8 +722,38 @@ async fn send_complete_and_close(connection: &mut WsConnection) {
         id: Some(SUBSCRIPTION_ID.to_string()),
         payload: None,
     };
-    let _ = connection.send_json(&complete).await;
-    let _ = connection.close().await;
+    // All callers terminate and drop the connection after this best-effort
+    // cleanup; a peer that stops reading must not retain a detached producer.
+    let _ = time::timeout(SUBSCRIPTION_CLOSE_TIMEOUT, async {
+        let _ = connection.send_json(&complete).await;
+        let _ = connection.close().await;
+    })
+    .await;
+}
+
+fn parse_next_payload<T: serde::de::DeserializeOwned>(
+    payload: Option<serde_json::Value>,
+) -> Result<GraphqlResponse<T>, GraphqlClientError> {
+    let payload = payload.filter(serde_json::Value::is_object).ok_or_else(|| {
+        GraphqlClientError::Protocol {
+            message: "subscription next frame requires an object payload".to_owned(),
+        }
+    })?;
+    serde_json::from_value(payload).map_err(|err| GraphqlClientError::Json(err.to_string()))
+}
+
+fn parse_error_payload(
+    payload: Option<serde_json::Value>,
+) -> Result<Vec<GraphqlError>, GraphqlClientError> {
+    let invalid = || GraphqlClientError::Protocol {
+        message: "subscription error frame requires a non-empty GraphQL error array".to_owned(),
+    };
+    let payload = payload.filter(serde_json::Value::is_array).ok_or_else(invalid)?;
+    let errors: Vec<GraphqlError> = serde_json::from_value(payload).map_err(|_| invalid())?;
+    if errors.is_empty() {
+        return Err(invalid());
+    }
+    Ok(errors)
 }
 
 fn validate_subscription_message_id(ws_msg: &GraphqlWsMessage) -> Result<(), GraphqlClientError> {
@@ -756,8 +823,33 @@ pub mod __fuzz {
 
 impl From<StreamError> for GraphqlClientError {
     fn from(err: StreamError) -> Self {
-        Self::Protocol {
-            message: err.to_string(),
+        if err.is_terminal_backpressure() {
+            return Self::Protocol {
+                message: err.to_string(),
+            };
+        }
+        match err {
+            StreamError::HttpError {
+                status,
+                message,
+                retry_after,
+            } => Self::HttpStatus {
+                status: StatusCode(status),
+                body: message,
+                retry_after,
+            },
+            StreamError::HostBackpressure {
+                status,
+                message,
+                signal,
+            } => Self::HttpStatus {
+                status: StatusCode(status),
+                body: message,
+                retry_after: signal.retry_after(),
+            },
+            other => Self::Protocol {
+                message: other.to_string(),
+            },
         }
     }
 }
@@ -765,6 +857,135 @@ impl From<StreamError> for GraphqlClientError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subscription_retry_classification_preserves_http_guidance() {
+        for (status, retryable) in [(401, false), (403, false), (429, true), (503, true)] {
+            let failure = SubscriptionFailure::from(StreamError::HttpError {
+                status,
+                message: "upstream refusal".to_owned(),
+                retry_after: Some(Duration::from_secs(7)),
+            });
+            assert_eq!(failure.retryable, retryable, "status {status}");
+            assert_eq!(failure.retry_after, Some(Duration::from_secs(7)));
+            match failure.error {
+                GraphqlClientError::HttpStatus {
+                    status: actual,
+                    retry_after,
+                    ..
+                } => {
+                    assert_eq!(actual.as_u16(), status);
+                    assert_eq!(retry_after, Some(Duration::from_secs(7)));
+                }
+                other => panic!("HTTP refusal lost its status: {other:?}"),
+            }
+        }
+
+        let failure = SubscriptionFailure::from(StreamError::HostBackpressure {
+            status: 503,
+            message: "host refusal".to_owned(),
+            signal: fcp_streaming::HostBackpressureSignal::new(
+                "budget-exhausted",
+                Some(Duration::from_secs(7)),
+            ),
+        });
+        assert!(!failure.retryable);
+        assert!(!failure.error.is_retryable());
+        assert_eq!(failure.retry_after, Some(Duration::from_secs(7)));
+    }
+
+    #[test]
+    fn subscription_close_codes_distinguish_refusal_from_restart() {
+        for code in [1002, 1003, 1007, 1008, 1009, 1010, 4400, 4401, 4403, 4406, 4409, 4429] {
+            let failure = SubscriptionFailure::from(StreamError::ConnectionClosed {
+                code: Some(code),
+                reason: "refused".to_owned(),
+            });
+            assert!(!failure.retryable, "close code {code} must be terminal");
+        }
+        for code in [None, Some(1000), Some(1001), Some(1012), Some(1013), Some(4408)] {
+            let failure = SubscriptionFailure::from(StreamError::ConnectionClosed {
+                code,
+                reason: "restart".to_owned(),
+            });
+            assert!(failure.retryable, "close code {code:?} may reconnect");
+        }
+    }
+
+    #[test]
+    fn subscription_payloads_require_valid_protocol_shapes() {
+        for payload in [None, Some(serde_json::Value::Null), Some(serde_json::json!([])), Some(serde_json::json!(false))] {
+            assert!(parse_next_payload::<serde_json::Value>(payload).is_err());
+        }
+        let response = parse_next_payload::<serde_json::Value>(Some(serde_json::json!({
+            "errors": [{"message": "field unavailable"}]
+        })))
+        .expect("GraphQL error-only execution result is valid next payload");
+        assert_eq!(response.errors.len(), 1);
+
+        for payload in [
+            None,
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!([])),
+            Some(serde_json::json!({"message": "not an array"})),
+            Some(serde_json::json!([{"message": "valid"}, {"secret": "do-not-log"}])),
+        ] {
+            let error = parse_error_payload(payload).expect_err("malformed error payload");
+            assert!(matches!(error, GraphqlClientError::Protocol { .. }));
+            assert!(!error.to_string().contains("do-not-log"));
+        }
+        let errors = parse_error_payload(Some(serde_json::json!([{"message": "denied"}])))
+            .expect("valid GraphQL error array");
+        assert_eq!(errors[0].message, "denied");
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn consumer_drop_wins_before_ready_reconnect_work() {
+        let (tx, rx) = mpsc::channel::<()>(1);
+        drop(rx);
+        let operation = async {
+            panic!("closed receiver must prevent new reconnect work from being polled");
+        };
+        assert_eq!(while_subscribed(&tx, operation).await, None);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn consumer_drop_cancels_and_drops_in_flight_reconnect_work() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct DropSignal(Arc<AtomicBool>);
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let (tx, rx) = mpsc::channel::<()>(1);
+        let (started_tx, started_rx) = fcp_async_core::channel::oneshot::channel();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let signal = DropSignal(Arc::clone(&dropped));
+        let worker = task::spawn(async move {
+            while_subscribed(&tx, async move {
+                let _signal = signal;
+                started_tx.send(()).expect("consumer alive");
+                std::future::pending::<()>().await;
+            })
+            .await
+        });
+        time::timeout(Duration::from_secs(1), started_rx)
+            .await
+            .expect("work started promptly")
+            .expect("work start signal");
+        drop(rx);
+        assert_eq!(
+            time::timeout(Duration::from_millis(250), worker)
+                .await
+                .expect("consumer cancellation must interrupt the pending future")
+                .expect("worker joined"),
+            None
+        );
+        assert!(dropped.load(Ordering::SeqCst));
+    }
 
     // ---- GraphqlWsMessage serde ----
 
