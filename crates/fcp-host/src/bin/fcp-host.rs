@@ -6253,6 +6253,7 @@ struct HostConnectorLeaseYieldFlushContext {
     warnings: Vec<String>,
 }
 
+#[cfg(test)]
 async fn connector_lease_yield_flush_context_for_registered_connector(
     state: &AppState,
     connector_id: &ConnectorId,
@@ -8869,7 +8870,8 @@ async fn flush_singleton_writer_before_hrw_yield(
     zone_id: &ZoneId,
     reason: &fcp_mesh::planner::LeaseTransferReason,
 ) -> HostResult<HrwLeaseYieldFlushEvidence> {
-    connector_lease_yield_flush_context_for_registered_connector(state, connector_id, zone_id)
+    // A prefix observed while the writer is active cannot attest to a lease yield.
+    connector_lease_yield_flush_with_writer_policy(state, connector_id, zone_id, true)
         .await
         .map(|context| {
             metrics::record_lease_flushed_on_yield(
@@ -32919,9 +32921,6 @@ output_schema = { type = "object" }
                 panic!("initial durable connector-state append should not conflict")
             }
         };
-        drop(state_store);
-        drop(object_store);
-
         let input_schema = json!({
             "type": "object",
             "required": ["lease_seq"],
@@ -33036,6 +33035,34 @@ output_schema = { type = "object" }
         }));
 
         let routing = current_hrw_lease_routing_config().expect("routing config");
+        let blocked_forward =
+            enforce_hrw_lease_route(&state, &request, routing.as_ref(), true, Some(&expected))
+                .await
+                .expect_err("an active writer must block forwarding to the elected holder");
+        assert!(
+            blocked_forward
+                .to_string()
+                .contains("could not exclude the active object-store writer")
+        );
+
+        let mut held_request = request.clone();
+        held_request.id = RequestId::random();
+        let (held_status, held_message) = invoke_handler(
+            State(Arc::clone(&state)),
+            HeaderMap::new(),
+            Json(held_request),
+        )
+        .await
+        .expect_err("an active writer must block the automatic yield");
+        assert_eq!(held_status, StatusCode::FORBIDDEN);
+        assert!(held_message.contains(r#""code":"NotSelectedCoordinator""#));
+        assert!(held_message.contains("could not exclude the active object-store writer"));
+        assert!(!held_message.contains(r#""yield_flush""#));
+        assert!(!held_message.contains(r#""status":"flushed""#));
+        assert_eq!(invoke_count.load(Ordering::SeqCst), 0);
+
+        drop(state_store);
+        drop(object_store);
         enforce_hrw_lease_route(&state, &request, routing.as_ref(), true, Some(&expected))
             .await
             .expect("forward to elected holder must flush durable state before yielding");
