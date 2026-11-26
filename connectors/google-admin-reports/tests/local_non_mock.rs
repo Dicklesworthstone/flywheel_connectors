@@ -294,7 +294,7 @@ async fn local_non_mock_list_activities_uses_admin_reports_request_boundary() {
     assert!(observation.authorization_seen);
     assert!(observation.accept_seen);
     assert!(observation.user_agent_seen);
-    assert_eq!(result["nextPageToken"], "activity-page-2");
+    assert_eq!(result["next_page_token"], "activity-page-2");
     assert_eq!(result["items"][0]["id"]["applicationName"], "login");
     assert_eq!(result["items"][0]["actor"]["email"], "admin@example.com");
     assert_eq!(result["items"][0]["ipAddress"], "203.0.113.10");

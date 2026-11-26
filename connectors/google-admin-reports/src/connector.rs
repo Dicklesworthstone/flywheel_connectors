@@ -583,9 +583,12 @@ impl AdminReportsConnector {
                     }),
                     json!({
                         "type": "object",
+                        "required": ["items", "next_page_token"],
                         "properties": {
                             "items": { "type": "array", "items": { "type": "object" } },
-                            "next_page_token": { "type": "string" }
+                            "next_page_token": { "type": ["string", "null"] },
+                            "kind": { "type": "string" },
+                            "etag": { "type": "string" }
                         }
                     }),
                     IdempotencyClass::Strict,
@@ -623,9 +626,13 @@ impl AdminReportsConnector {
                     }),
                     json!({
                         "type": "object",
+                        "required": ["usage_reports", "next_page_token"],
                         "properties": {
                             "usage_reports": { "type": "array", "items": { "type": "object" } },
-                            "next_page_token": { "type": "string" }
+                            "next_page_token": { "type": ["string", "null"] },
+                            "kind": { "type": "string" },
+                            "etag": { "type": "string" },
+                            "warnings": { "type": "array", "items": { "type": "object" } }
                         }
                     }),
                     IdempotencyClass::Strict,
@@ -649,6 +656,7 @@ impl AdminReportsConnector {
                     json!({
                         "type": "object",
                         "required": ["date"],
+                        "not": { "required": ["max_results"] },
                         "properties": {
                             "date": { "type": "string", "description": "YYYY-MM-DD format." },
                             "customer_id": { "type": "string" },
@@ -658,9 +666,13 @@ impl AdminReportsConnector {
                     }),
                     json!({
                         "type": "object",
+                        "required": ["usage_reports", "next_page_token"],
                         "properties": {
                             "usage_reports": { "type": "array", "items": { "type": "object" } },
-                            "next_page_token": { "type": "string" }
+                            "next_page_token": { "type": ["string", "null"] },
+                            "kind": { "type": "string" },
+                            "etag": { "type": "string" },
+                            "warnings": { "type": "array", "items": { "type": "object" } }
                         }
                     }),
                     IdempotencyClass::Strict,
@@ -696,9 +708,13 @@ impl AdminReportsConnector {
                     }),
                     json!({
                         "type": "object",
+                        "required": ["usage_reports", "next_page_token"],
                         "properties": {
                             "usage_reports": { "type": "array", "items": { "type": "object" } },
-                            "next_page_token": { "type": "string" }
+                            "next_page_token": { "type": ["string", "null"] },
+                            "kind": { "type": "string" },
+                            "etag": { "type": "string" },
+                            "warnings": { "type": "array", "items": { "type": "object" } }
                         }
                     }),
                     IdempotencyClass::Strict,
@@ -818,6 +834,7 @@ impl AdminReportsConnector {
                     message: "Missing operation".into(),
                 })?;
         let input = params.get("input").cloned().unwrap_or(json!({}));
+        validate_admin_reports_input(operation, &input)?;
         self.base.check_ready()?;
 
         let token_value = params
@@ -867,11 +884,7 @@ impl AdminReportsConnector {
         let customer_id = input.get("customer_id").and_then(|v| v.as_str());
         let org_unit_id = input.get("org_unit_id").and_then(|v| v.as_str());
         let group_id_filter = input.get("group_id_filter").and_then(|v| v.as_str());
-        let max = input
-            .get("max_results")
-            .and_then(|v| v.as_u64())
-            .and_then(|v| u32::try_from(v).ok());
-        let page_cursor = input.get("page_token").and_then(|v| v.as_str());
+        let (max, page_cursor) = parse_admin_reports_pagination("admin.list_activities", &input)?;
 
         let result = client
             .list_activities(
@@ -890,9 +903,7 @@ impl AdminReportsConnector {
             .await
             .map_err(|e: AdminReportsError| e.to_fcp_error())?;
 
-        serde_json::to_value(result).map_err(|e| FcpError::Internal {
-            message: format!("Serialization error: {e}"),
-        })
+        Ok(result.into_public_response())
     }
 
     async fn invoke_list_user_usage(
@@ -907,11 +918,7 @@ impl AdminReportsConnector {
         let filters = input.get("filters").and_then(|v| v.as_str());
         let org_unit_id = input.get("org_unit_id").and_then(|v| v.as_str());
         let group_id_filter = input.get("group_id_filter").and_then(|v| v.as_str());
-        let max = input
-            .get("max_results")
-            .and_then(|v| v.as_u64())
-            .and_then(|v| u32::try_from(v).ok());
-        let page_cursor = input.get("page_token").and_then(|v| v.as_str());
+        let (max, page_cursor) = parse_admin_reports_pagination("admin.list_user_usage", &input)?;
 
         let result = client
             .list_user_usage(
@@ -928,9 +935,7 @@ impl AdminReportsConnector {
             .await
             .map_err(|e: AdminReportsError| e.to_fcp_error())?;
 
-        serde_json::to_value(result).map_err(|e| FcpError::Internal {
-            message: format!("Serialization error: {e}"),
-        })
+        Ok(result.into_public_response())
     }
 
     async fn invoke_list_customer_usage(&self, input: Value) -> FcpResult<Value> {
@@ -938,16 +943,14 @@ impl AdminReportsConnector {
         let date = require_str(&input, "date")?;
         let customer_id = input.get("customer_id").and_then(|v| v.as_str());
         let parameters = input.get("parameters").and_then(|v| v.as_str());
-        let page_cursor = input.get("page_token").and_then(|v| v.as_str());
+        let (_, page_cursor) = parse_admin_reports_pagination("admin.list_customer_usage", &input)?;
 
         let result = client
             .list_customer_usage(date, customer_id, parameters, page_cursor)
             .await
             .map_err(|e: AdminReportsError| e.to_fcp_error())?;
 
-        serde_json::to_value(result).map_err(|e| FcpError::Internal {
-            message: format!("Serialization error: {e}"),
-        })
+        Ok(result.into_public_response())
     }
 
     async fn invoke_list_entity_usage(&self, input: Value) -> FcpResult<Value> {
@@ -958,11 +961,7 @@ impl AdminReportsConnector {
         let customer_id = input.get("customer_id").and_then(|v| v.as_str());
         let parameters = input.get("parameters").and_then(|v| v.as_str());
         let filters = input.get("filters").and_then(|v| v.as_str());
-        let max = input
-            .get("max_results")
-            .and_then(|v| v.as_u64())
-            .and_then(|v| u32::try_from(v).ok());
-        let page_cursor = input.get("page_token").and_then(|v| v.as_str());
+        let (max, page_cursor) = parse_admin_reports_pagination("admin.list_entity_usage", &input)?;
 
         let result = client
             .list_entity_usage(
@@ -978,9 +977,7 @@ impl AdminReportsConnector {
             .await
             .map_err(|e: AdminReportsError| e.to_fcp_error())?;
 
-        serde_json::to_value(result).map_err(|e| FcpError::Internal {
-            message: format!("Serialization error: {e}"),
-        })
+        Ok(result.into_public_response())
     }
 
     pub async fn handle_shutdown(
@@ -1040,30 +1037,102 @@ fn admin_reports_capability_for_operation(operation: &str) -> FcpResult<Capabili
 }
 
 fn validate_admin_reports_input(operation: &str, input: &Value) -> FcpResult<()> {
-    match operation {
+    if !input.is_object() {
+        return Err(FcpError::InvalidRequest {
+            code: 1003,
+            message: "Admin Reports input must be an object".into(),
+        });
+    }
+    let optional_fields: &[&str] = match operation {
         "admin.list_activities" => {
             require_str(input, "user_key")?;
             require_str(input, "application_name")?;
+            &[
+                "start_time",
+                "end_time",
+                "event_name",
+                "filters",
+                "customer_id",
+                "org_unit_id",
+                "group_id_filter",
+            ]
         }
         "admin.list_user_usage" => {
             require_str(input, "user_key")?;
             require_str(input, "date")?;
+            &[
+                "customer_id",
+                "parameters",
+                "filters",
+                "org_unit_id",
+                "group_id_filter",
+            ]
         }
         "admin.list_customer_usage" => {
             require_str(input, "date")?;
+            &["customer_id", "parameters"]
         }
         "admin.list_entity_usage" => {
             require_str(input, "entity_type")?;
             require_str(input, "entity_key")?;
             require_str(input, "date")?;
+            &["customer_id", "parameters", "filters"]
         }
         _ => {
             return Err(FcpError::OperationNotGranted {
                 operation: operation.into(),
             });
         }
+    };
+    for field in optional_fields {
+        optional_nonempty_string(input, field)?;
     }
+    parse_admin_reports_pagination(operation, input)?;
     Ok(())
+}
+
+fn optional_nonempty_string<'a>(input: &'a Value, field: &str) -> FcpResult<Option<&'a str>> {
+    input
+        .get(field)
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| FcpError::InvalidRequest {
+                    code: 1003,
+                    message: format!("{field} must be a non-empty string when provided"),
+                })
+        })
+        .transpose()
+}
+
+fn parse_admin_reports_pagination<'a>(
+    operation: &str,
+    input: &'a Value,
+) -> FcpResult<(Option<u32>, Option<&'a str>)> {
+    let max_results = input
+        .get("max_results")
+        .map(|value| {
+            if operation == "admin.list_customer_usage" {
+                return Err(FcpError::InvalidRequest {
+                    code: 1003,
+                    message: "admin.list_customer_usage does not support max_results".into(),
+                });
+            }
+            // Google's Reports discovery document specifies 1..=1000 for each of
+            // activities.list, userUsageReport.get and entityUsageReports.get.
+            value
+                .as_u64()
+                .and_then(|value| u32::try_from(value).ok())
+                .filter(|value| (1..=1000).contains(value))
+                .ok_or_else(|| FcpError::InvalidRequest {
+                    code: 1003,
+                    message: "max_results must be an integer between 1 and 1000".into(),
+                })
+        })
+        .transpose()?;
+    let page_token = optional_nonempty_string(input, "page_token")?;
+    Ok((max_results, page_token))
 }
 
 fn encoded_input(input: &Value, field: &str) -> Option<String> {
@@ -1122,6 +1191,7 @@ fn require_str<'a>(input: &'a Value, field: &str) -> FcpResult<&'a str> {
     input
         .get(field)
         .and_then(|v| v.as_str())
+        .filter(|value| !value.trim().is_empty())
         .ok_or(FcpError::InvalidRequest {
             code: 1003,
             message: format!("Missing required field: {field}"),
@@ -1133,11 +1203,25 @@ fn policy_backed_operation_info(
     id: &'static str,
     discovery_method_key: &'static str,
     summary: &str,
-    input_schema: Value,
+    mut input_schema: Value,
     output_schema: Value,
     idempotency: IdempotencyClass,
     ai_hints: AgentHint,
 ) -> FcpResult<OperationInfo> {
+    // Required path selectors and optional query strings use the same
+    // non-empty validation. In particular, opaque cursors must never silently
+    // become a first-page request when the caller supplied a malformed value.
+    if let Some(properties) = input_schema
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+    {
+        for property in properties.values_mut() {
+            if property.get("type").and_then(Value::as_str) == Some("string") {
+                property["minLength"] = json!(1);
+                property["pattern"] = json!("\\S");
+            }
+        }
+    }
     let resolved = policy
         .classify_operation("admin", discovery_method_key)
         .ok_or(FcpError::Internal {
@@ -1206,6 +1290,8 @@ mod tests {
     use fcp_crypto::cose::CapabilityTokenBuilder;
     use fcp_crypto::ed25519::Ed25519SigningKey;
     use fcp_prelude::{CapabilityConstraints, ZoneId};
+    use wiremock::matchers::{header, method, path, query_param, query_param_is_missing};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     const AUDIT_CAPABILITY: &str = "admin.reports.audit.read";
     const USAGE_CAPABILITY: &str = "admin.reports.usage.read";
@@ -1321,6 +1407,423 @@ mod tests {
             .await
             .unwrap();
         (connector, signing_key)
+    }
+
+    async fn loopback_connector(base_url: &str) -> (AdminReportsConnector, Ed25519SigningKey) {
+        let mut connector = AdminReportsConnector::new();
+        connector
+            .handle_configure(config_with_test_bearer(&[
+                ("base_url", json!(base_url)),
+                (
+                    "required_scopes",
+                    json!([
+                        "https://www.googleapis.com/auth/admin.reports.audit.readonly",
+                        "https://www.googleapis.com/auth/admin.reports.usage.readonly"
+                    ]),
+                ),
+            ]))
+            .await
+            .unwrap();
+        let signing_key = Ed25519SigningKey::generate();
+        connector
+            .handle_handshake(json!({
+                "protocol_version": "1.0.0",
+                "zone": "z:work",
+                "host_public_key": signing_key.verifying_key().to_bytes(),
+                "nonce": vec![0u8; 32],
+                "capabilities_requested": [AUDIT_CAPABILITY, USAGE_CAPABILITY]
+            }))
+            .await
+            .unwrap();
+        (connector, signing_key)
+    }
+
+    async fn assert_two_public_pages(
+        operation: &'static str,
+        input: Value,
+        provider_path: &str,
+        expected_query: &[(&str, &str)],
+    ) {
+        let server = MockServer::start().await;
+        let cursor = "page+/=&?opaque";
+        let is_usage = operation != LIST_ACTIVITIES;
+        let warnings = json!([{
+            "code": "200",
+            "message": "Partial data is available",
+            "data": [{ "key": "application", "value": "gmail" }]
+        }]);
+        for page in 1..=2 {
+            let mut body = if is_usage {
+                json!({
+                    "usageReports": [{
+                        "date": "2026-03-13",
+                        "entity": { "userEmail": format!("user-{page}@example.test") },
+                        "parameters": [{
+                            "name": "accounts:num_logins",
+                            "intValue": page.to_string()
+                        }]
+                    }],
+                    "warnings": warnings,
+                    "etag": format!("page-{page}")
+                })
+            } else {
+                json!({
+                    "items": [{
+                        "id": { "uniqueQualifier": page.to_string(), "applicationName": "login" },
+                        "actor": { "profileId": format!("profile-{page}") },
+                        "ipAddress": "192.0.2.1"
+                    }],
+                    "etag": format!("page-{page}")
+                })
+            };
+            let mut mock = Mock::given(method("GET"))
+                .and(path(provider_path))
+                .and(header("authorization", "Bearer ya29.test"));
+            for (key, value) in expected_query {
+                mock = mock.and(query_param(*key, *value));
+            }
+            if operation == "admin.list_customer_usage" {
+                mock = mock.and(query_param_is_missing("maxResults"));
+            }
+            if page == 1 {
+                body["nextPageToken"] = json!(cursor);
+                body["kind"] = json!(if is_usage {
+                    "admin#reports#usageReports"
+                } else {
+                    "admin#reports#activities"
+                });
+                mock = mock.and(query_param_is_missing("pageToken"));
+            } else {
+                mock = mock.and(query_param("pageToken", cursor));
+            }
+            mock.respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        let (connector, signing_key) =
+            loopback_connector(&format!("{}/admin/reports/v1", server.uri())).await;
+        let capability = generate_capability_for_instance(
+            &signing_key,
+            if is_usage {
+                USAGE_CAPABILITY
+            } else {
+                AUDIT_CAPABILITY
+            },
+            operation,
+            Some(&connector.base.instance_id),
+        );
+        let first = connector
+            .handle_invoke(json!({
+                "operation": operation,
+                "input": input,
+                "capability_token": capability
+            }))
+            .await
+            .expect("fetch first report page through public invocation");
+        assert_eq!(first["next_page_token"], cursor);
+        assert_eq!(first["etag"], "page-1");
+        assert!(first["kind"].is_string());
+        assert!(first.get("nextPageToken").is_none());
+        assert!(first.get("usageReports").is_none());
+
+        let mut continued_input = input.clone();
+        continued_input["page_token"] = first["next_page_token"].clone();
+        let second = connector
+            .handle_invoke(json!({
+                "operation": operation,
+                "input": continued_input,
+                "capability_token": capability
+            }))
+            .await
+            .expect("continue using the returned public cursor");
+        assert_eq!(second.get("next_page_token"), Some(&Value::Null));
+        assert_eq!(second["etag"], "page-2");
+        assert!(second.get("kind").is_none());
+        assert!(second.get("nextPageToken").is_none());
+        assert!(second.get("usageReports").is_none());
+        if is_usage {
+            assert_eq!(
+                first["usage_reports"][0]["entity"]["userEmail"],
+                "user-1@example.test"
+            );
+            assert_eq!(
+                second["usage_reports"][0]["entity"]["userEmail"],
+                "user-2@example.test"
+            );
+            assert_eq!(second["usage_reports"][0]["parameters"][0]["intValue"], "2");
+            assert_eq!(first["warnings"], warnings);
+            assert_eq!(second["warnings"], warnings);
+        } else {
+            assert_eq!(first["items"][0]["id"]["uniqueQualifier"], "1");
+            assert_eq!(second["items"][0]["id"]["uniqueQualifier"], "2");
+            assert_eq!(second["items"][0]["actor"]["profileId"], "profile-2");
+            assert_eq!(second["items"][0]["ipAddress"], "192.0.2.1");
+        }
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn public_activity_pagination_preserves_all_filters() {
+        assert_two_public_pages(
+            LIST_ACTIVITIES,
+            json!({
+                "user_key": "all",
+                "application_name": "login",
+                "start_time": "2026-03-13T00:00:00Z",
+                "end_time": "2026-03-14T00:00:00Z",
+                "event_name": "login_success",
+                "filters": "ip_address==192.0.2.1",
+                "customer_id": "C123",
+                "org_unit_id": "id:engineering",
+                "group_id_filter": "id:abc123,id:xyz456",
+                "max_results": 1
+            }),
+            "/admin/reports/v1/activity/users/all/applications/login",
+            &[
+                ("startTime", "2026-03-13T00:00:00Z"),
+                ("endTime", "2026-03-14T00:00:00Z"),
+                ("eventName", "login_success"),
+                ("filters", "ip_address==192.0.2.1"),
+                ("customerId", "C123"),
+                ("orgUnitID", "id:engineering"),
+                ("groupIdFilter", "id:abc123,id:xyz456"),
+                ("maxResults", "1"),
+            ],
+        )
+        .await;
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn public_user_usage_pagination_preserves_all_filters() {
+        assert_two_public_pages(
+            "admin.list_user_usage",
+            json!({
+                "user_key": "all",
+                "date": "2026-03-13",
+                "customer_id": "C123",
+                "parameters": "accounts:num_logins,gmail:num_emails_sent",
+                "filters": "accounts:num_logins>=1",
+                "org_unit_id": "id:engineering",
+                "group_id_filter": "id:abc123,id:xyz456",
+                "max_results": 1
+            }),
+            "/admin/reports/v1/usage/users/all/dates/2026-03-13",
+            &[
+                ("customerId", "C123"),
+                ("parameters", "accounts:num_logins,gmail:num_emails_sent"),
+                ("filters", "accounts:num_logins>=1"),
+                ("orgUnitID", "id:engineering"),
+                ("groupIdFilter", "id:abc123,id:xyz456"),
+                ("maxResults", "1"),
+            ],
+        )
+        .await;
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn public_customer_usage_pagination_preserves_all_filters() {
+        assert_two_public_pages(
+            "admin.list_customer_usage",
+            json!({
+                "date": "2026-03-13",
+                "customer_id": "C123",
+                "parameters": "accounts:num_users,gmail:num_emails_sent"
+            }),
+            "/admin/reports/v1/usage/dates/2026-03-13",
+            &[
+                ("customerId", "C123"),
+                ("parameters", "accounts:num_users,gmail:num_emails_sent"),
+            ],
+        )
+        .await;
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn public_entity_usage_pagination_preserves_all_filters() {
+        assert_two_public_pages(
+            "admin.list_entity_usage",
+            json!({
+                "entity_type": "gplus_communities",
+                "entity_key": "all",
+                "date": "2026-03-13",
+                "customer_id": "C123",
+                "parameters": "gplus:num_total_communities",
+                "filters": "gplus:num_total_communities>=1",
+                "max_results": 1
+            }),
+            "/admin/reports/v1/usage/gplus_communities/all/dates/2026-03-13",
+            &[
+                ("customerId", "C123"),
+                ("parameters", "gplus:num_total_communities"),
+                ("filters", "gplus:num_total_communities>=1"),
+                ("maxResults", "1"),
+            ],
+        )
+        .await;
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn invalid_pagination_is_rejected_before_admission_or_provider_io() {
+        let server = MockServer::start().await;
+        let (connector, signing_key) =
+            loopback_connector(&format!("{}/admin/reports/v1", server.uri())).await;
+        for (operation, input) in [
+            (LIST_ACTIVITIES, valid_activity_input()),
+            (
+                "admin.list_user_usage",
+                json!({"user_key":"all", "date":"2026-03-13"}),
+            ),
+            ("admin.list_customer_usage", json!({"date":"2026-03-13"})),
+            (
+                "admin.list_entity_usage",
+                json!({
+                    "entity_type":"gplus_communities", "entity_key":"all", "date":"2026-03-13"
+                }),
+            ),
+        ] {
+            let capability = generate_capability_for_instance(
+                &signing_key,
+                if operation == LIST_ACTIVITIES {
+                    AUDIT_CAPABILITY
+                } else {
+                    USAGE_CAPABILITY
+                },
+                operation,
+                Some(&connector.base.instance_id),
+            );
+            let mut cases: Vec<(&str, Value)> = [
+                Value::Null,
+                json!(true),
+                json!(7),
+                json!([]),
+                json!({}),
+                json!(""),
+                json!(" \t\n"),
+            ]
+            .into_iter()
+            .map(|value| ("page_token", value))
+            .collect();
+            cases.extend(
+                [
+                    json!(0),
+                    json!(1001),
+                    json!(u64::MAX),
+                    json!(-1),
+                    json!(1.5),
+                    json!("2"),
+                    json!(true),
+                    Value::Null,
+                ]
+                .into_iter()
+                .map(|value| ("max_results", value)),
+            );
+            if operation == "admin.list_customer_usage" {
+                cases.push(("max_results", json!(1)));
+                cases.push(("parameters", json!([])));
+            } else {
+                cases.push(("filters", json!(42)));
+            }
+            for (field, value) in cases {
+                let mut malformed = input.clone();
+                malformed[field] = value;
+                // No token: input rejection must precede the admission failure.
+                let error = connector
+                    .handle_invoke(json!({
+                        "operation":operation, "input":malformed
+                    }))
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(&error, FcpError::InvalidRequest { message, .. } if message.contains(field)),
+                    "{operation}: expected {field} validation before capability admission, got {error:?}"
+                );
+                let simulation = parse_simulate_response(
+                    connector
+                        .handle_simulate(simulate_request(operation, malformed, capability.clone()))
+                        .await
+                        .unwrap(),
+                );
+                assert!(!simulation.would_succeed, "{operation}: {field}");
+                assert_eq!(
+                    simulation.denial_code,
+                    Some(error.error_code()),
+                    "{operation}: {field}"
+                );
+            }
+            let mut valid = input.clone();
+            valid["page_token"] = json!("opaque+/=&?");
+            for limit in [None, Some(1), Some(1000)] {
+                if operation == "admin.list_customer_usage" && limit.is_some() {
+                    continue;
+                }
+                if let Some(limit) = limit {
+                    valid["max_results"] = json!(limit);
+                }
+                let simulation = parse_simulate_response(
+                    connector
+                        .handle_simulate(simulate_request(
+                            operation,
+                            valid.clone(),
+                            capability.clone(),
+                        ))
+                        .await
+                        .unwrap(),
+                );
+                assert!(
+                    simulation.would_succeed,
+                    "{operation}: valid boundary {limit:?}"
+                );
+            }
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn admitted_manifest_and_introspection_have_matching_pagination_contracts() {
+        let manifest = fcp_manifest::ConnectorManifest::parse_str(MANIFEST_TOML)
+            .expect("bundled manifest must pass semantic admission");
+        let introspection = AdminReportsConnector::new()
+            .handle_introspect()
+            .await
+            .unwrap();
+        let operations = introspection["operations"].as_array().unwrap();
+        assert_eq!(manifest.provides.operations.len(), operations.len());
+        for runtime in operations {
+            let id = runtime["id"].as_str().unwrap();
+            let declared = manifest.provides.operations.get(id).unwrap();
+            assert_eq!(
+                declared.output_schema, runtime["output_schema"],
+                "{id}: output"
+            );
+            assert_eq!(
+                declared.input_schema["required"], runtime["input_schema"]["required"],
+                "{id}: required inputs"
+            );
+            assert_eq!(
+                declared.input_schema["not"], runtime["input_schema"]["not"],
+                "{id}: unsupported fields"
+            );
+            let declared_properties = declared.input_schema["properties"].as_object().unwrap();
+            let runtime_properties = runtime["input_schema"]["properties"].as_object().unwrap();
+            assert_eq!(
+                declared_properties
+                    .keys()
+                    .collect::<std::collections::BTreeSet<_>>(),
+                runtime_properties
+                    .keys()
+                    .collect::<std::collections::BTreeSet<_>>(),
+                "{id}: exposed inputs"
+            );
+            for (name, schema) in declared_properties {
+                for constraint in ["type", "minimum", "maximum", "minLength", "pattern"] {
+                    assert_eq!(
+                        schema[constraint], runtime_properties[name][constraint],
+                        "{id}: {name}.{constraint}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

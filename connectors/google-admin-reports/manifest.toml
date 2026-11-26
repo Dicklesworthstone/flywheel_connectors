@@ -5,7 +5,7 @@ min_mesh_version = "2.0.0"
 min_protocol = "fcp2-sym/2.0"
 protocol_features = []
 max_datagram_bytes = 65000
-interface_hash = "blake3-256:fcp.interface.v2:pending"
+interface_hash = "blake3-256:fcp.interface.v2:6e45159ccaffb3ec3559b050cfbe44bbc48f449df631c1304ff8dc6370681ee9"
 
 [connector]
 id = "fcp.google-admin-reports"
@@ -29,7 +29,7 @@ forbidden = ["z:public"]
 
 [capabilities]
 required = ["network.dns", "network.egress", "network.tls.sni"]
-optional = []
+optional = ["admin.reports.audit.read", "admin.reports.usage.read"]
 forbidden = ["system.exec", "network.listen"]
 
 # ── Operations ──────────────────────────────────────────────────
@@ -43,22 +43,65 @@ requires_approval = "policy"
 idempotency = "strict"
 
 [provides.operations."admin.list_activities".input_schema]
-required = ["application_name"]
+required = ["user_key", "application_name"]
 type = "object"
 [provides.operations."admin.list_activities".input_schema.properties.application_name]
 type = "string"
+minLength = 1
+pattern = "\\S"
 [provides.operations."admin.list_activities".input_schema.properties.user_key]
 type = "string"
+minLength = 1
+pattern = "\\S"
 [provides.operations."admin.list_activities".input_schema.properties.start_time]
 type = "string"
+minLength = 1
+pattern = "\\S"
 [provides.operations."admin.list_activities".input_schema.properties.end_time]
 type = "string"
+minLength = 1
+pattern = "\\S"
+[provides.operations."admin.list_activities".input_schema.properties.event_name]
+type = "string"
+minLength = 1
+pattern = "\\S"
+[provides.operations."admin.list_activities".input_schema.properties.filters]
+type = "string"
+minLength = 1
+pattern = "\\S"
+[provides.operations."admin.list_activities".input_schema.properties.customer_id]
+type = "string"
+minLength = 1
+pattern = "\\S"
+[provides.operations."admin.list_activities".input_schema.properties.org_unit_id]
+type = "string"
+minLength = 1
+pattern = "\\S"
+[provides.operations."admin.list_activities".input_schema.properties.group_id_filter]
+type = "string"
+minLength = 1
+pattern = "\\S"
+[provides.operations."admin.list_activities".input_schema.properties.max_results]
+type = "integer"
+minimum = 1
+maximum = 1000
+[provides.operations."admin.list_activities".input_schema.properties.page_token]
+type = "string"
+minLength = 1
+pattern = "\\S"
 
 [provides.operations."admin.list_activities".output_schema]
-required = ["items"]
+required = ["items", "next_page_token"]
 type = "object"
 [provides.operations."admin.list_activities".output_schema.properties.items]
 type = "array"
+items = { type = "object" }
+[provides.operations."admin.list_activities".output_schema.properties.next_page_token]
+type = ["string", "null"]
+[provides.operations."admin.list_activities".output_schema.properties.kind]
+type = "string"
+[provides.operations."admin.list_activities".output_schema.properties.etag]
+type = "string"
 
 [provides.operations."admin.list_activities".network_constraints]
 host_allow = ["admin.googleapis.com"]
@@ -92,20 +135,60 @@ requires_approval = "policy"
 idempotency = "strict"
 
 [provides.operations."admin.list_user_usage".input_schema]
-required = ["date"]
+required = ["user_key", "date"]
 type = "object"
 [provides.operations."admin.list_user_usage".input_schema.properties.date]
 type = "string"
+minLength = 1
+pattern = "\\S"
 [provides.operations."admin.list_user_usage".input_schema.properties.user_key]
 type = "string"
+minLength = 1
+pattern = "\\S"
 [provides.operations."admin.list_user_usage".input_schema.properties.parameters]
 type = "string"
+minLength = 1
+pattern = "\\S"
+[provides.operations."admin.list_user_usage".input_schema.properties.customer_id]
+type = "string"
+minLength = 1
+pattern = "\\S"
+[provides.operations."admin.list_user_usage".input_schema.properties.filters]
+type = "string"
+minLength = 1
+pattern = "\\S"
+[provides.operations."admin.list_user_usage".input_schema.properties.org_unit_id]
+type = "string"
+minLength = 1
+pattern = "\\S"
+[provides.operations."admin.list_user_usage".input_schema.properties.group_id_filter]
+type = "string"
+minLength = 1
+pattern = "\\S"
+[provides.operations."admin.list_user_usage".input_schema.properties.max_results]
+type = "integer"
+minimum = 1
+maximum = 1000
+[provides.operations."admin.list_user_usage".input_schema.properties.page_token]
+type = "string"
+minLength = 1
+pattern = "\\S"
 
 [provides.operations."admin.list_user_usage".output_schema]
-required = ["usage_reports"]
+required = ["usage_reports", "next_page_token"]
 type = "object"
 [provides.operations."admin.list_user_usage".output_schema.properties.usage_reports]
 type = "array"
+items = { type = "object" }
+[provides.operations."admin.list_user_usage".output_schema.properties.next_page_token]
+type = ["string", "null"]
+[provides.operations."admin.list_user_usage".output_schema.properties.kind]
+type = "string"
+[provides.operations."admin.list_user_usage".output_schema.properties.etag]
+type = "string"
+[provides.operations."admin.list_user_usage".output_schema.properties.warnings]
+type = "array"
+items = { type = "object" }
 
 [provides.operations."admin.list_user_usage".network_constraints]
 host_allow = ["admin.googleapis.com"]
@@ -141,16 +224,39 @@ idempotency = "strict"
 [provides.operations."admin.list_customer_usage".input_schema]
 required = ["date"]
 type = "object"
+not = { required = ["max_results"] }
 [provides.operations."admin.list_customer_usage".input_schema.properties.date]
 type = "string"
+minLength = 1
+pattern = "\\S"
 [provides.operations."admin.list_customer_usage".input_schema.properties.parameters]
 type = "string"
+minLength = 1
+pattern = "\\S"
+[provides.operations."admin.list_customer_usage".input_schema.properties.customer_id]
+type = "string"
+minLength = 1
+pattern = "\\S"
+[provides.operations."admin.list_customer_usage".input_schema.properties.page_token]
+type = "string"
+minLength = 1
+pattern = "\\S"
 
 [provides.operations."admin.list_customer_usage".output_schema]
-required = ["usage_reports"]
+required = ["usage_reports", "next_page_token"]
 type = "object"
 [provides.operations."admin.list_customer_usage".output_schema.properties.usage_reports]
 type = "array"
+items = { type = "object" }
+[provides.operations."admin.list_customer_usage".output_schema.properties.next_page_token]
+type = ["string", "null"]
+[provides.operations."admin.list_customer_usage".output_schema.properties.kind]
+type = "string"
+[provides.operations."admin.list_customer_usage".output_schema.properties.etag]
+type = "string"
+[provides.operations."admin.list_customer_usage".output_schema.properties.warnings]
+type = "array"
+items = { type = "object" }
 
 [provides.operations."admin.list_customer_usage".network_constraints]
 host_allow = ["admin.googleapis.com"]
@@ -184,22 +290,56 @@ requires_approval = "policy"
 idempotency = "strict"
 
 [provides.operations."admin.list_entity_usage".input_schema]
-required = ["entity_type", "date"]
+required = ["entity_type", "entity_key", "date"]
 type = "object"
 [provides.operations."admin.list_entity_usage".input_schema.properties.entity_type]
 type = "string"
+minLength = 1
+pattern = "\\S"
 [provides.operations."admin.list_entity_usage".input_schema.properties.date]
 type = "string"
+minLength = 1
+pattern = "\\S"
 [provides.operations."admin.list_entity_usage".input_schema.properties.entity_key]
 type = "string"
+minLength = 1
+pattern = "\\S"
 [provides.operations."admin.list_entity_usage".input_schema.properties.parameters]
 type = "string"
+minLength = 1
+pattern = "\\S"
+[provides.operations."admin.list_entity_usage".input_schema.properties.customer_id]
+type = "string"
+minLength = 1
+pattern = "\\S"
+[provides.operations."admin.list_entity_usage".input_schema.properties.filters]
+type = "string"
+minLength = 1
+pattern = "\\S"
+[provides.operations."admin.list_entity_usage".input_schema.properties.max_results]
+type = "integer"
+minimum = 1
+maximum = 1000
+[provides.operations."admin.list_entity_usage".input_schema.properties.page_token]
+type = "string"
+minLength = 1
+pattern = "\\S"
 
 [provides.operations."admin.list_entity_usage".output_schema]
-required = ["usage_reports"]
+required = ["usage_reports", "next_page_token"]
 type = "object"
 [provides.operations."admin.list_entity_usage".output_schema.properties.usage_reports]
 type = "array"
+items = { type = "object" }
+[provides.operations."admin.list_entity_usage".output_schema.properties.next_page_token]
+type = ["string", "null"]
+[provides.operations."admin.list_entity_usage".output_schema.properties.kind]
+type = "string"
+[provides.operations."admin.list_entity_usage".output_schema.properties.etag]
+type = "string"
+[provides.operations."admin.list_entity_usage".output_schema.properties.warnings]
+type = "array"
+items = { type = "object" }
 
 [provides.operations."admin.list_entity_usage".network_constraints]
 host_allow = ["admin.googleapis.com"]
@@ -219,7 +359,7 @@ max_response_bytes = 10485760
 [provides.operations."admin.list_entity_usage".ai_hints]
 when_to_use = "Get entity-level (e.g., per-app, per-device) usage statistics."
 common_mistakes = ["entity_type must be one of 'gplus_communities' or similar entity types"]
-examples = ['{"entity_type": "gplus_communities", "date": "2026-03-25"}']
+examples = ['{"entity_type": "gplus_communities", "entity_key": "all", "date": "2026-03-25"}']
 related = ["admin.list_user_usage", "admin.list_customer_usage"]
 
 # ── Sandbox ─────────────────────────────────────────────────────

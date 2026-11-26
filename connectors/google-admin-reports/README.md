@@ -42,6 +42,8 @@ Important runtime truths the contract preserves:
 - Provider 401/403, 404, 429 with `Retry-After`, retryable transport/5xx classes, malformed JSON, and API error bodies map into typed connector and FCP errors.
 - Handshake installs a `CapabilityVerifier`.
 - `simulate` and `invoke` validate operation IDs, required inputs, resource URIs, and bound capability tokens.
+- All four operations expose `page_token` and return `next_page_token`; terminal pages return an explicit `null` cursor.
+- Usage responses expose `usage_reports`, with provider warnings retained when reports are incomplete.
 
 ## Drift Visible In This Checkout
 
@@ -49,14 +51,10 @@ This README documents the runtime truth and keeps current drift visible:
 
 - Manifest connector ID is `fcp.google-admin-reports`, while runtime `BaseConnector` and requests use `google-admin-reports`.
 - Runtime handshake returns a SHA-256 hash of the bundled `manifest.toml`.
-- Manifest `interface_hash` is still `pending`.
-- Manifest optional capabilities are empty even though operation entries and runtime introspection use `admin.reports.audit.read` and `admin.reports.usage.read`.
-- Manifest input schema for `admin.list_activities` requires only `application_name`, while runtime requires both `user_key` and `application_name`.
-- Manifest input schema for `admin.list_entity_usage` omits `entity_key`, while runtime requires `entity_type`, `entity_key`, and `date`.
 - Runtime `handle_shutdown` shuts down the client runtime but does not clear config, client, verifier, session, or configured/handshaken flags.
 - There is no dedicated tracked verification shell script for this connector.
 
-A follow-up parity bead should align connector IDs, interface hash, optional capabilities, required input schemas, and shutdown state semantics.
+A follow-up parity bead should align connector IDs and shutdown state semantics. The manifest declares both operation capabilities, validates its interface hash, and matches the runtime's required inputs and pagination envelopes.
 
 ## First-Slice Scope
 
@@ -118,6 +116,38 @@ The current Google Admin Reports README slice documents the existing runtime sur
 | `admin.list_customer_usage` | `GET /usage/dates/{date}` | `admin.reports.usage.read` | `Safe` | `High` | `Strict` | Reads aggregate tenant usage metrics for a report date. |
 | `admin.list_entity_usage` | `GET /usage/{entity_type}/{entity_key}/dates/{date}` | `admin.reports.usage.read` | `Safe` | `High` | `Strict` | Reads entity-specific usage metrics for niche Admin Reports surfaces. |
 
+## Pagination And Response Contract
+
+Each invocation fetches one provider page. To continue, repeat the same operation with the same report selectors and filters, setting `page_token` to the preceding response's `next_page_token`. Treat the cursor as an opaque string; the connector preserves it and URL-encodes it for Google's `pageToken` parameter. Stop when `next_page_token` is `null`.
+
+| Operation | Required inputs | Optional page size | Public collection |
+|-----------|-----------------|--------------------|-------------------|
+| `admin.list_activities` | `user_key`, `application_name` | `max_results`: integer `1`–`1000` | `items` |
+| `admin.list_user_usage` | `user_key`, `date` | `max_results`: integer `1`–`1000` | `usage_reports` |
+| `admin.list_customer_usage` | `date` | Not supported by the provider | `usage_reports` |
+| `admin.list_entity_usage` | `entity_type`, `entity_key`, `date` | `max_results`: integer `1`–`1000` | `usage_reports` |
+
+Google documents the three supported page-size bounds in its [Reports discovery document](https://admin.googleapis.com/$discovery/rest?version=reports_v1). [Customer usage reports](https://developers.google.com/workspace/admin/reports/reference/rest/v1/customerUsageReports/get) accept a cursor but no page-size parameter; supplying `max_results` for that operation is rejected.
+
+Malformed cursors, blank selectors, non-string query filters, and invalid page sizes are rejected consistently by `invoke` and `simulate` before capability admission or provider I/O. Omitting an optional parameter uses Google's default behavior. Every supported filter is exposed in both the manifest and runtime introspection.
+
+The public collection envelope uses snake_case names. Embedded Google activity and usage resource fields retain their provider names, such as `uniqueQualifier`, `profileId`, and `intValue`. Optional provider `kind` and `etag` metadata are included when present. Usage-report `warnings` are preserved, including partial-data and unavailable-data messages; an empty report collection with warnings must not be interpreted as proof that no activity occurred.
+
+For example, a user usage page is returned as:
+
+```json
+{
+  "usage_reports": [
+    {
+      "date": "2026-03-13",
+      "entity": {"userEmail": "ada@example.com"},
+      "parameters": [{"name": "accounts:num_logins", "intValue": "4"}]
+    }
+  ],
+  "next_page_token": "opaque-provider-cursor"
+}
+```
+
 ## Explicit Non-Goals
 
 The current implementation does not include:
@@ -151,6 +181,9 @@ These are excluded on purpose:
 The deterministic integration evidence is anchored on connector-local tests covering:
 
 - activity, user usage, customer usage, entity usage, pagination, query parameters, and auth headers
+- signed public invocations across two pages for every report endpoint, with unchanged filters and opaque continuation cursors
+- public envelope names, terminal cursors, nested provider fields, and partial-data warnings
+- malformed pagination rejection before admission or I/O, plus manifest admission and runtime schema parity
 - self-check and health behavior
 - 401, 429 with retry-after, malformed JSON, timeout, cancellation, and FCP error mapping
 - operation catalog, manifest presence, network constraints, and redaction
