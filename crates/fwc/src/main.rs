@@ -136,6 +136,7 @@ mod computation_migration;
 mod confusion_workflow;
 mod connector_state;
 mod connector_state_pull_cmd;
+mod connector_lease_flush;
 mod connector_state_admin;
 #[allow(dead_code)] // Auth verify + credential backend trait.
 mod credential;
@@ -1188,6 +1189,9 @@ struct ConnectorLeaseArgs {
 enum ConnectorLeaseCommand {
     /// Show current holder hash, fencing token, expiry, and quorum signature count.
     Status(ConnectorLeaseStatusArgs),
+
+    /// Observe committed singleton-writer state with the object writer excluded during the read.
+    FlushBeforeYield(connector_lease_flush::FlushArgs),
 }
 
 #[derive(Args, Debug, Serialize)]
@@ -10981,6 +10985,7 @@ fn connector_lease_dispatch(
 ) -> Result<DispatchOutcome> {
     match &args.command {
         ConnectorLeaseCommand::Status(args) => connector_lease_status_dispatch(args, explicit_host),
+        ConnectorLeaseCommand::FlushBeforeYield(args) => connector_lease_flush::dispatch(args, explicit_host),
     }
 }
 
@@ -51114,6 +51119,7 @@ deny_ptrace = true
                         assert_eq!(args.zone.as_deref(), Some("z:work"));
                         assert_eq!(args.require_source, Some(RequiredTruthSource::MeshOrHost));
                     }
+                    command => panic!("expected lease status command, got {command:?}"),
                 },
                 command => panic!("expected connector lease command, got {command:?}"),
             },
@@ -51150,6 +51156,48 @@ deny_ptrace = true
         let mut token = tempfile::NamedTempFile::new().unwrap();
         token.write_all(b"test-owner-credential").unwrap();
         token
+    }
+
+    #[test]
+    fn lease_flush_cli_requests_writer_exclusion_and_refuses_an_older_host() {
+        let owner = connector_state_test_owner();
+        for strict in [true, false] {
+            let mut reply = json!({
+                "status": "ok", "subcommand": "connector lease flush-before-yield",
+                "schema_version": "1.0.0", "source": "host-canonical-state-flush",
+                "connector_id": "fcp.github:enterprise:v1", "zone_id": "z:work",
+                "purpose": "connector_state_write",
+                "flush": { "connector_id": "fcp.github:enterprise:v1", "zone_id": "z:work",
+                    "status_source": "fcp-store", "root_present": false },
+            });
+            if strict {
+                reply["flush"]["object_writer_excluded_during_read"] = json!(true);
+            }
+            let (host, server, requests) = spawn_mock_host_sequence_with_body_log(vec![
+                ("POST /rpc/discover".to_owned(), mock_discovery_response_json()),
+                ("POST /rpc/admin/connectors/fcp.github:enterprise:v1/lease/flush-before-yield?zone=z%3Awork&require_writer_idle=true".to_owned(), reply),
+            ]);
+            let (exit, payload) = execute_json(&[
+                "fwc", "--json", "--host", &host, "connector", "lease", "flush-before-yield",
+                "--connector", "github", "--zone", "z:work", "--admin-token-file",
+                owner.path().to_str().unwrap(),
+            ]);
+            server.join().unwrap();
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(serde_json::from_str::<Value>(&requests[1].1).unwrap(), json!({}));
+            assert!(!payload.to_string().contains("test-owner-credential"));
+            if strict {
+                assert_eq!(exit, CliExitCode::Success.into(), "{payload}");
+                assert_eq!(payload["flush"]["object_writer_excluded_during_read"], true);
+                assert_eq!(payload["flush"]["root_present"], false);
+                assert_eq!(payload["_truth_source"], "host");
+            } else {
+                assert_eq!(exit, CliExitCode::Transport.into(), "{payload}");
+                assert_eq!(payload["outcome"], "unconfirmed");
+                assert!(payload.get("flush").is_none());
+            }
+        }
     }
 
     #[test]

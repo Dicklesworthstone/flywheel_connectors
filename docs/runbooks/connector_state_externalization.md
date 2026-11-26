@@ -195,7 +195,14 @@ same read-only, MAC, object-ID, writer-pin, and instance checks described above.
 
 ### Inspect a released object writer before handoff
 
-For a singleton writer, POST to
+Inspect the exact connector and zone on the host whose writer is yielding:
+
+```bash
+fwc --host https://node-a.example.invalid connector lease flush-before-yield \
+  --connector <id> --zone z:work --admin-token-file ./host-admin.token --json
+```
+
+The CLI sends one authenticated POST to
 `/rpc/admin/connectors/{connector_id}/lease/flush-before-yield?zone=z%3Awork&require_writer_idle=true`
 using the host's owner-admin credentials. The host opens the existing durable
 object-store lock file read-only and attempts a shared lock before recovering
