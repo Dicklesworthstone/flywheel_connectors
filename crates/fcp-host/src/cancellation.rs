@@ -3,8 +3,7 @@
 //! Provides types and logic for cancelling in-flight operations with:
 //! - Reason codes explaining why cancellation was requested
 //! - Cleanup behavior control (best-effort, full, abandon, checkpoint)
-//! - Partial result capture from cancelled operations
-//! - Checkpoint/resume support for resumable operations
+//! - Runtime-reported partial results, cleanup and checkpoint evidence
 //! - Bounded in-memory history of cancellation decisions
 //!
 //! Recent completed registrations are retained for late cancellation diagnostics.
@@ -163,6 +162,25 @@ pub struct CancellationRegistration {
     identity: Arc<()>,
 }
 
+/// Evidence supplied by the runtime that owns a cancelled invocation.
+///
+/// This is an internal completion report, never an HTTP cancellation request.
+/// Producers must report only work they actually performed and checkpoints they
+/// actually persisted. Missing evidence stays absent: stopping a process does
+/// not prove provider rollback, successful cleanup, or resumability.
+///
+/// The controller retains this report against the exact registration and only
+/// exposes it after all owned runtime work has settled.
+#[derive(Debug, Clone, Default)]
+pub struct CancellationEvidence {
+    /// Actual partial output, returned only when the caller requests it.
+    pub partial_result: Option<PartialResult>,
+    /// A real persisted checkpoint, with the producer's ID and expiry.
+    pub checkpoint: Option<CheckpointInfo>,
+    /// Observed cleanup results, including any failures.
+    pub cleanup_result: Option<CleanupResult>,
+}
+
 /// Force-terminates a connector subprocess (SIGTERM grace, then SIGKILL).
 ///
 /// Enforcement primitive behind the cancellation-deadline reaper
@@ -216,6 +234,12 @@ struct TrackedOperation {
     cancel_requested_at: Option<Instant>,
     /// Original cancellation reason, replayed into the forced audit event.
     cancel_reason: Option<CancelReason>,
+    /// A runtime-owned cancellation result, hidden until settlement.
+    cancellation_evidence: Option<CancellationEvidence>,
+    /// Frozen elapsed cancellation time after the registration settles.
+    cancellation_duration_ms: Option<u64>,
+    /// A definitive non-cancellation result, recorded before runtime settlement.
+    returned_normally: bool,
     /// Whether an attempt was dispatched. Unsupported targets retain this
     /// latch; supported targets may retry after all attempt owners disappear.
     forced_cancel_sent: bool,
@@ -380,6 +404,9 @@ impl CancellationController {
                     scope: None,
                     cancel_requested_at: None,
                     cancel_reason: None,
+                    cancellation_evidence: None,
+                    cancellation_duration_ms: None,
+                    returned_normally: false,
                     forced_cancel_sent: false,
                     force_attempt: Weak::new(),
                     forced_cancel_recorded: false,
@@ -454,6 +481,9 @@ impl CancellationController {
                     scope: Some(scope),
                     cancel_requested_at: None,
                     cancel_reason: None,
+                    cancellation_evidence: None,
+                    cancellation_duration_ms: None,
+                    returned_normally: false,
                     forced_cancel_sent: false,
                     force_attempt: Weak::new(),
                     forced_cancel_recorded: false,
@@ -481,6 +511,80 @@ impl CancellationController {
     /// Panics if an internal mutex is poisoned.
     pub fn complete_registration(&self, registration: &CancellationRegistration) {
         self.complete_matching(&registration.operation_id, Some(&registration.identity));
+    }
+
+    /// Record a definitive non-cancellation result before publishing runtime
+    /// settlement. This prevents a force-termination acknowledgement racing
+    /// waiter teardown from relabeling a result that already completed normally.
+    ///
+    /// The producer must call this before its completion probe can report true.
+    /// Recording a result does not release runtime custody or complete the
+    /// registration. Stale, completed, or contradictory reports are rejected.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    #[must_use]
+    pub fn record_returned_registration(
+        &self,
+        registration: &CancellationRegistration,
+    ) -> bool {
+        let mut ops = self.operations.lock().expect("operations lock");
+        let Some(op) = ops.entries.get_mut(&registration.operation_id) else {
+            return false;
+        };
+        if !Arc::ptr_eq(&registration.identity, &op.registration)
+            || op.completed
+            || op.cancellation_evidence.is_some()
+            || op.forced_cancel_recorded
+        {
+            return false;
+        }
+        op.returned_normally = true;
+        true
+    }
+
+    /// Report that this runtime took its cancellation path, retaining its real
+    /// result until owned work and finalizers have settled.
+    ///
+    /// Merely observing a controller cancellation request is not sufficient:
+    /// the producer must have stopped or abandoned the invocation itself. A
+    /// successful response racing a cancellation request uses ordinary
+    /// completion instead, so it is never relabeled as cancelled.
+    ///
+    /// Returns false for stale, already completed, or duplicate reports, and
+    /// when no cancellation was requested for this registration. The first
+    /// accepted report cannot be replaced by a later callback. A true return
+    /// acknowledges the report, not settlement: callers continue seeing
+    /// `Pending` while the captured runtime remains live.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an internal mutex is poisoned or a runtime completion probe
+    /// panics, as with [`Self::complete_registration_when_settled`].
+    #[must_use]
+    pub fn complete_cancelled_registration_when_settled(
+        &self,
+        registration: &CancellationRegistration,
+        evidence: CancellationEvidence,
+    ) -> bool {
+        {
+            let mut ops = self.operations.lock().expect("operations lock");
+            let Some(op) = ops.entries.get_mut(&registration.operation_id) else {
+                return false;
+            };
+            if !Arc::ptr_eq(&registration.identity, &op.registration)
+                || !op.cancel_requested
+                || op.completed
+                || op.returned_normally
+                || op.cancellation_evidence.is_some()
+            {
+                return false;
+            }
+            op.cancellation_evidence = Some(evidence);
+        }
+        self.complete_registration_when_settled(registration);
+        true
     }
 
     /// Release an ended request only after its owned runtime confirms settlement.
@@ -560,6 +664,9 @@ impl CancellationController {
             }
             op.completed = true;
             op.completion_pending = false;
+            op.cancellation_duration_ms = op
+                .cancel_requested_at
+                .map(|at| u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX));
             let completed = CancellationRegistration {
                 operation_id: operation_id.to_owned(),
                 identity: Arc::clone(&op.registration),
@@ -599,8 +706,10 @@ impl CancellationController {
     /// which the HTTP handler maps to 403 Forbidden. This closes
     /// br-jdaro (cross-principal cancel via guessed operation ID).
     ///
-    /// Operations explicitly tracked without an owner remain
-    /// cancellable by any caller.
+    /// Operations explicitly tracked without an owner remain cancellable by
+    /// any caller. Accepting a request returns `Pending`; `Cancelled` requires
+    /// observed runtime cancellation and settlement. Cleanup and checkpoint
+    /// fields contain only evidence supplied by that registration's runtime.
     ///
     /// # Errors
     ///
@@ -662,7 +771,7 @@ impl CancellationController {
     ) -> HostResult<CancellationResponse> {
         let start = Instant::now();
 
-        let outcome = {
+        let (outcome, evidence, cancellation_duration_ms) = {
             let mut ops = self.operations.lock().expect("operations lock");
             match ops.entries.get_mut(&request.operation_id) {
                 None => {
@@ -695,55 +804,57 @@ impl CancellationController {
                         }
                     }
 
-                    if op.completed {
-                        CancellationOutcome::TooLate
-                    } else if op.cancel_requested {
-                        CancellationOutcome::Pending
-                    } else {
-                        op.cancel_requested = true;
-                        op.cancel_requested_at = Some(Instant::now());
-                        op.cancel_reason = Some(request.reason.clone());
+                    let outcome = if op.completed
+                        && op.cancel_requested
+                        && !op.returned_normally
+                        && (op.cancellation_evidence.is_some() || op.forced_cancel_recorded)
+                    {
                         CancellationOutcome::Cancelled
-                    }
+                    } else if op.completed {
+                        CancellationOutcome::TooLate
+                    } else {
+                        if !op.cancel_requested {
+                            op.cancel_requested = true;
+                            op.cancel_requested_at = Some(Instant::now());
+                            op.cancel_reason = Some(request.reason.clone());
+                        }
+                        CancellationOutcome::Pending
+                    };
+                    let evidence = if outcome == CancellationOutcome::Cancelled {
+                        op.cancellation_evidence.clone().unwrap_or_default()
+                    } else {
+                        CancellationEvidence::default()
+                    };
+                    let duration_ms = op.cancellation_duration_ms.or_else(|| {
+                        op.cancel_requested_at.map(|at| {
+                            u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX)
+                        })
+                    });
+                    (outcome, evidence, duration_ms)
                 }
             }
         };
 
-        let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-
-        // Build checkpoint if requested and cancellation succeeded.
-        let checkpoint = if matches!(request.cleanup, CleanupBehavior::Checkpoint)
-            && outcome == CancellationOutcome::Cancelled
-        {
-            Some(CheckpointInfo {
-                id: format!("ckpt_{}", request.operation_id),
-                resumable: true,
-                expires_at: Some(now + chrono::Duration::hours(24)),
-                state: None,
-            })
+        let duration_ms = cancellation_duration_ms
+            .unwrap_or_else(|| u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX));
+        let partial_result = if request.return_partial {
+            evidence.partial_result
+        } else {
+            None
+        };
+        let checkpoint = if matches!(request.cleanup, CleanupBehavior::Checkpoint) {
+            evidence.checkpoint
         } else {
             None
         };
 
-        // Build cleanup result.
-        let cleanup_result = match outcome {
-            CancellationOutcome::Cancelled | CancellationOutcome::Pending => Some(CleanupResult {
-                success: true,
-                cleaned: vec!["operation_state".into()],
-                failed: vec![],
-                duration_ms,
-            }),
-            _ => None,
-        };
-
-        // Record audit event.
         let audit_event = CancellationAuditEvent {
             timestamp: now,
             operation_id: request.operation_id.clone(),
             reason: request.reason.clone(),
             outcome,
             duration_ms,
-            had_partial_result: false, // Set by caller when partial data exists
+            had_partial_result: partial_result.is_some(),
             had_checkpoint: checkpoint.is_some(),
             forced: false,
         };
@@ -752,9 +863,9 @@ impl CancellationController {
         Ok(CancellationResponse {
             operation_id: request.operation_id.clone(),
             outcome,
-            partial_result: None, // Set by caller when partial data is available
+            partial_result,
             checkpoint,
-            cleanup_result,
+            cleanup_result: evidence.cleanup_result,
             duration_ms,
         })
     }
@@ -786,7 +897,11 @@ impl CancellationController {
         let mut ops = self.operations.lock().expect("operations lock");
         let mut expired = Vec::new();
         for (operation_id, op) in &mut ops.entries {
-            if !op.cancel_requested || op.completed || op.forced_cancel_recorded {
+            if !op.cancel_requested
+                || op.completed
+                || op.forced_cancel_recorded
+                || op.returned_normally
+            {
                 continue;
             }
             let Some(requested_at) = op.cancel_requested_at else {
@@ -865,6 +980,7 @@ impl CancellationController {
                 return false;
             };
             if op.forced_cancel_recorded
+                || op.returned_normally
                 || expiration.is_some_and(|expired| !op.owns_expiration(expired))
             {
                 return false;
@@ -1213,7 +1329,7 @@ mod tests {
                 .cancel_relay(&request, "new-owner", &new_binding, fixed_now())
                 .unwrap()
                 .outcome,
-            CancellationOutcome::Cancelled,
+            CancellationOutcome::Pending,
         );
         assert_eq!(controller.audit_events().len(), 1);
         controller.complete_registration(&replacement);
@@ -1605,7 +1721,7 @@ mod tests {
                 )
                 .unwrap()
                 .outcome,
-            CancellationOutcome::Cancelled,
+            CancellationOutcome::Pending,
         );
         let new_expired = controller.reap_expired(Instant::now() + Duration::from_secs(1));
         assert_eq!(new_expired.len(), 1);
@@ -1701,7 +1817,7 @@ mod tests {
                 )
                 .unwrap()
                 .outcome,
-            CancellationOutcome::Cancelled,
+            CancellationOutcome::Pending,
         );
         controller.complete_registration(&replacement);
     }
@@ -1800,7 +1916,7 @@ mod tests {
                 .cancel_relay(&request, "owner", &binding, fixed_now())
                 .unwrap()
                 .outcome,
-            CancellationOutcome::Cancelled
+            CancellationOutcome::Pending
         );
         assert_eq!(
             controller
@@ -1835,7 +1951,7 @@ mod tests {
                 .cancel_relay(&request, "owner", &next, fixed_now())
                 .unwrap()
                 .outcome,
-            CancellationOutcome::Cancelled
+            CancellationOutcome::Pending
         );
     }
 
@@ -1885,7 +2001,7 @@ mod tests {
                     )
                     .unwrap()
                     .outcome,
-                CancellationOutcome::Cancelled
+                CancellationOutcome::Pending
             );
         }
     }
@@ -2075,7 +2191,7 @@ mod tests {
         // State must be untouched after rejected attempts — the real
         // owner's cancel must still be able to run.
         let resp = ctrl.cancel(&req, Some("agent:alice"), fixed_now()).unwrap();
-        assert_eq!(resp.outcome, CancellationOutcome::Cancelled);
+        assert_eq!(resp.outcome, CancellationOutcome::Pending);
     }
 
     /// br-jdaro companion: an operation tracked WITHOUT an owner stays
@@ -2090,16 +2206,16 @@ mod tests {
         let resp = ctrl
             .cancel(&req, Some("agent:anyone"), fixed_now())
             .unwrap();
-        assert_eq!(resp.outcome, CancellationOutcome::Cancelled);
+        assert_eq!(resp.outcome, CancellationOutcome::Pending);
     }
 
     #[test]
-    fn cancel_active_operation_succeeds() {
+    fn cancel_active_operation_is_pending_until_runtime_completion() {
         let ctrl = CancellationController::new();
         ctrl.track_with_owner("op1", None);
         let req = cancel_request("op1", CancelReason::UserRequested);
         let resp = ctrl.cancel(&req, None, fixed_now()).unwrap();
-        assert_eq!(resp.outcome, CancellationOutcome::Cancelled);
+        assert_eq!(resp.outcome, CancellationOutcome::Pending);
         assert_eq!(resp.operation_id, "op1");
     }
 
@@ -2114,7 +2230,7 @@ mod tests {
     }
 
     #[test]
-    fn cancel_already_cancelled_returns_pending() {
+    fn repeated_cancel_request_remains_pending_without_runtime_completion() {
         let ctrl = CancellationController::new();
         ctrl.track_with_owner("op1", None);
         let req = cancel_request("op1", CancelReason::UserRequested);
@@ -2166,8 +2282,268 @@ mod tests {
 
     // ── Checkpoint tests ──
 
+    fn cancellation_evidence_fixture() -> CancellationEvidence {
+        CancellationEvidence {
+            partial_result: Some(PartialResult {
+                completed_items: 3,
+                total_items: Some(9),
+                data: Some(serde_json::json!({"rows": [1, 2, 3]})),
+            }),
+            checkpoint: Some(CheckpointInfo {
+                id: "persisted-object-d14c".into(),
+                resumable: true,
+                expires_at: Some(fixed_now() + chrono::Duration::minutes(17)),
+                state: Some(serde_json::json!({"cursor": "after-three"})),
+            }),
+            cleanup_result: Some(CleanupResult {
+                success: false,
+                cleaned: vec!["temporary_file".into()],
+                failed: vec!["provider_rollback".into()],
+                duration_ms: 51,
+            }),
+        }
+    }
+
     #[test]
-    fn checkpoint_created_on_checkpoint_cleanup() {
+    #[allow(clippy::too_many_lines)]
+    fn runtime_evidence_stays_hidden_until_settlement_and_replays_without_invention() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let ctrl = CancellationController::new();
+        let finished = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&finished);
+        let registration = ctrl
+            .track_operation(
+                "evidence",
+                Some("owner"),
+                CancellationScope::new("runtime", ConnectorArchetype::RequestResponse)
+                    .with_terminator(CancellationTerminator::new(
+                        || panic!("settlement must not force a cooperative runtime"),
+                        move || observed.load(Ordering::SeqCst),
+                    )),
+            )
+            .unwrap();
+        let mut request = CancellationRequest {
+            operation_id: "evidence".into(),
+            reason: CancelReason::UserRequested,
+            cleanup: CleanupBehavior::Checkpoint,
+            return_partial: true,
+            capability_token: None,
+        };
+        let accepted = ctrl.cancel(&request, Some("owner"), fixed_now()).unwrap();
+        assert_eq!(accepted.outcome, CancellationOutcome::Pending);
+        assert!(accepted.partial_result.is_none());
+        assert!(accepted.checkpoint.is_none());
+        assert!(accepted.cleanup_result.is_none());
+        let anchor = Instant::now() - Duration::from_secs(2);
+        ctrl.operations
+            .lock()
+            .unwrap()
+            .entries
+            .get_mut("evidence")
+            .unwrap()
+            .cancel_requested_at = Some(anchor);
+
+        let expected = cancellation_evidence_fixture();
+        assert!(ctrl.complete_cancelled_registration_when_settled(
+            &registration,
+            expected.clone(),
+        ));
+        // A duplicate callback cannot erase the first report or free live work.
+        assert!(!ctrl.complete_cancelled_registration_when_settled(
+            &registration,
+            CancellationEvidence::default(),
+        ));
+        assert!(!ctrl.record_returned_registration(&registration));
+        let pending = ctrl.cancel(&request, Some("owner"), fixed_now()).unwrap();
+        assert_eq!(pending.outcome, CancellationOutcome::Pending);
+        assert!(pending.partial_result.is_none());
+        assert!(pending.checkpoint.is_none());
+        assert!(pending.cleanup_result.is_none());
+        assert!(pending.duration_ms >= 2_000);
+        assert_eq!(
+            ctrl.operations.lock().unwrap().entries["evidence"].cancel_requested_at,
+            Some(anchor)
+        );
+        assert!(
+            ctrl.track_operation(
+                "evidence",
+                Some("replacement"),
+                CancellationScope::new("replacement", ConnectorArchetype::RequestResponse),
+            )
+            .is_err()
+        );
+        assert!(ctrl.audit_events().iter().all(|event| {
+            event.outcome == CancellationOutcome::Pending
+                && !event.had_partial_result
+                && !event.had_checkpoint
+        }));
+
+        finished.store(true, Ordering::SeqCst);
+        assert!(ctrl.reap_expired(Instant::now()).is_empty());
+        let settled = ctrl.cancel(&request, Some("owner"), fixed_now()).unwrap();
+        assert_eq!(settled.outcome, CancellationOutcome::Cancelled);
+        assert_eq!(
+            serde_json::to_value(&settled.partial_result).unwrap(),
+            serde_json::to_value(&expected.partial_result).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&settled.checkpoint).unwrap(),
+            serde_json::to_value(&expected.checkpoint).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&settled.cleanup_result).unwrap(),
+            serde_json::to_value(&expected.cleanup_result).unwrap()
+        );
+        let repeated = ctrl.cancel(&request, Some("owner"), fixed_now()).unwrap();
+        assert_eq!(
+            serde_json::to_value(&settled).unwrap(),
+            serde_json::to_value(&repeated).unwrap()
+        );
+        assert!(ctrl.audit_events()[0].had_partial_result);
+        assert!(ctrl.audit_events()[0].had_checkpoint);
+
+        request.return_partial = false;
+        request.cleanup = CleanupBehavior::BestEffort;
+        let limited = ctrl.cancel(&request, Some("owner"), fixed_now()).unwrap();
+        assert_eq!(limited.outcome, CancellationOutcome::Cancelled);
+        assert!(limited.partial_result.is_none());
+        assert!(limited.checkpoint.is_none());
+        assert!(limited.cleanup_result.is_some());
+        assert!(!ctrl.audit_events()[0].had_partial_result);
+        assert!(!ctrl.audit_events()[0].had_checkpoint);
+    }
+
+    #[test]
+    fn cancellation_evidence_cannot_create_authority_or_relabel_completed_success() {
+        let ctrl = CancellationController::new();
+        let scope = || CancellationScope::new("runtime", ConnectorArchetype::RequestResponse);
+        let old = ctrl
+            .track_operation("reused-evidence", Some("old-owner"), scope())
+            .unwrap();
+        assert!(!ctrl.complete_cancelled_registration_when_settled(
+            &old,
+            CancellationEvidence::default(),
+        ));
+        assert!(!ctrl.is_cancel_requested("reused-evidence"));
+        let request = cancel_request("reused-evidence", CancelReason::UserRequested);
+        ctrl.cancel(&request, Some("old-owner"), fixed_now()).unwrap();
+        ctrl.complete_registration(&old);
+        assert!(!ctrl.complete_cancelled_registration_when_settled(
+            &old,
+            CancellationEvidence::default(),
+        ));
+        assert_eq!(
+            ctrl.cancel(&request, Some("old-owner"), fixed_now()).unwrap().outcome,
+            CancellationOutcome::TooLate
+        );
+
+        let current = ctrl
+            .track_operation("reused-evidence", Some("new-owner"), scope())
+            .unwrap();
+        ctrl.cancel(&request, Some("new-owner"), fixed_now()).unwrap();
+        assert!(!ctrl.record_returned_registration(&old));
+        assert!(!ctrl.complete_cancelled_registration_when_settled(
+            &old,
+            cancellation_evidence_fixture(),
+        ));
+        assert!(ctrl.complete_cancelled_registration_when_settled(
+            &current,
+            CancellationEvidence::default(),
+        ));
+        let response = ctrl.cancel(&request, Some("new-owner"), fixed_now()).unwrap();
+        assert_eq!(response.outcome, CancellationOutcome::Cancelled);
+        assert!(response.checkpoint.is_none());
+        assert!(response.cleanup_result.is_none());
+    }
+
+    #[test]
+    fn force_acknowledgement_requires_settlement_and_does_not_claim_cleanup() {
+        let ctrl = CancellationController::new();
+        let registration = ctrl
+            .track_operation(
+                "force-evidence",
+                None,
+                CancellationScope::new("runtime", ConnectorArchetype::RequestResponse)
+                    .with_deadline_override_ms(Some(0))
+                    .with_terminator(CancellationTerminator::new(|| {}, || true)),
+            )
+            .unwrap();
+        let request = CancellationRequest {
+            operation_id: "force-evidence".into(),
+            reason: CancelReason::UserRequested,
+            cleanup: CleanupBehavior::Checkpoint,
+            return_partial: true,
+            capability_token: None,
+        };
+        ctrl.cancel(&request, None, fixed_now()).unwrap();
+        let expired = ctrl.reap_expired(Instant::now());
+        assert_eq!(expired.len(), 1);
+        let terminator = expired[0].terminator.as_ref().unwrap();
+        assert!(terminator.abort());
+        assert!(terminator.is_finished());
+        assert!(ctrl.record_forced_expiration(&expired[0], fixed_now()));
+        assert_eq!(
+            ctrl.cancel(&request, None, fixed_now()).unwrap().outcome,
+            CancellationOutcome::Pending
+        );
+        ctrl.complete_registration(&registration);
+        for _ in 0..2 {
+            let response = ctrl.cancel(&request, None, fixed_now()).unwrap();
+            assert_eq!(response.outcome, CancellationOutcome::Cancelled);
+            assert!(response.partial_result.is_none());
+            assert!(response.checkpoint.is_none());
+            assert!(response.cleanup_result.is_none());
+        }
+    }
+
+    #[test]
+    fn returned_result_fences_force_acknowledgement_before_and_after_completion() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let ctrl = CancellationController::new();
+        let finished = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&finished);
+        let registration = ctrl
+            .track_operation(
+                "returned",
+                None,
+                CancellationScope::new("runtime", ConnectorArchetype::RequestResponse)
+                    .with_deadline_override_ms(Some(0))
+                    .with_terminator(CancellationTerminator::new(
+                        || {},
+                        move || observed.load(Ordering::SeqCst),
+                    )),
+            )
+            .unwrap();
+        let request = cancel_request("returned", CancelReason::UserRequested);
+        ctrl.cancel(&request, None, fixed_now()).unwrap();
+        let expired = ctrl.reap_expired(Instant::now());
+        let terminator = expired[0].terminator.as_ref().unwrap();
+        // The result was already selected; abort wins before waiter teardown.
+        assert!(terminator.abort());
+        assert!(!terminator.is_finished());
+        assert!(ctrl.record_returned_registration(&registration));
+        assert!(!ctrl.complete_cancelled_registration_when_settled(
+            &registration,
+            cancellation_evidence_fixture(),
+        ));
+        finished.store(true, Ordering::SeqCst);
+        assert!(terminator.is_finished());
+        // Exercise the exact window before the controller is marked complete.
+        assert!(!ctrl.record_forced_expiration(&expired[0], fixed_now()));
+        ctrl.complete_registration_when_settled(&registration);
+        assert!(!ctrl.record_forced_expiration(&expired[0], fixed_now()));
+        assert_eq!(
+            ctrl.cancel(&request, None, fixed_now()).unwrap().outcome,
+            CancellationOutcome::TooLate
+        );
+        assert!(ctrl.audit_events().iter().all(|event| !event.forced));
+        assert!(ctrl.reap_expired(Instant::now()).is_empty());
+    }
+
+    #[test]
+    fn checkpoint_request_cannot_invent_resumable_state() {
         let ctrl = CancellationController::new();
         ctrl.track_with_owner("op1", None);
         let req = CancellationRequest {
@@ -2178,11 +2554,9 @@ mod tests {
             capability_token: None,
         };
         let resp = ctrl.cancel(&req, None, fixed_now()).unwrap();
-        assert_eq!(resp.outcome, CancellationOutcome::Cancelled);
-        let ckpt = resp.checkpoint.unwrap();
-        assert!(ckpt.resumable);
-        assert!(ckpt.id.contains("op1"));
-        assert!(ckpt.expires_at.is_some());
+        assert_eq!(resp.outcome, CancellationOutcome::Pending);
+        assert!(resp.checkpoint.is_none());
+        assert!(resp.cleanup_result.is_none());
     }
 
     #[test]
@@ -2214,15 +2588,12 @@ mod tests {
     // ── Cleanup result tests ──
 
     #[test]
-    fn cleanup_result_present_on_cancel() {
+    fn accepted_cancel_cannot_claim_cleanup_was_performed() {
         let ctrl = CancellationController::new();
         ctrl.track_with_owner("op1", None);
         let req = cancel_request("op1", CancelReason::UserRequested);
         let resp = ctrl.cancel(&req, None, fixed_now()).unwrap();
-        let cleanup = resp.cleanup_result.unwrap();
-        assert!(cleanup.success);
-        assert!(!cleanup.cleaned.is_empty());
-        assert!(cleanup.failed.is_empty());
+        assert!(resp.cleanup_result.is_none());
     }
 
     #[test]
@@ -2246,7 +2617,7 @@ mod tests {
         let events = ctrl.audit_events();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].operation_id, "op1");
-        assert_eq!(events[0].outcome, CancellationOutcome::Cancelled);
+        assert_eq!(events[0].outcome, CancellationOutcome::Pending);
         assert_eq!(events[0].reason.label(), "user_requested");
     }
 
@@ -2302,7 +2673,7 @@ mod tests {
     }
 
     #[test]
-    fn audit_checkpoint_flag_set() {
+    fn audit_does_not_claim_checkpoint_for_an_unfulfilled_request() {
         let ctrl = CancellationController::new();
         ctrl.track_with_owner("op1", None);
         let req = CancellationRequest {
@@ -2314,7 +2685,7 @@ mod tests {
         };
         ctrl.cancel(&req, None, fixed_now()).unwrap();
         let events = ctrl.audit_events();
-        assert!(events[0].had_checkpoint);
+        assert!(!events[0].had_checkpoint);
     }
 
     #[test]
@@ -2472,7 +2843,7 @@ mod tests {
             ctrl.track_with_owner(&id, None);
             let req = cancel_request(&id, reason);
             let resp = ctrl.cancel(&req, None, fixed_now()).unwrap();
-            assert_eq!(resp.outcome, CancellationOutcome::Cancelled);
+            assert_eq!(resp.outcome, CancellationOutcome::Pending);
         }
         assert_eq!(ctrl.audit_events().len(), 6);
     }
@@ -2487,7 +2858,7 @@ mod tests {
         assert_eq!(ctrl.tracked_count(), 1);
         let req = cancel_request(op_id.as_str(), CancelReason::UserRequested);
         let resp = ctrl.cancel(&req, None, fixed_now()).unwrap();
-        assert_eq!(resp.outcome, CancellationOutcome::Cancelled);
+        assert_eq!(resp.outcome, CancellationOutcome::Pending);
     }
 
     // ── CancelReason serialization (extended) ──
@@ -2988,7 +3359,7 @@ mod tests {
         for i in (0..20).step_by(2) {
             let req = cancel_request(&format!("op_{i}"), CancelReason::UserRequested);
             let resp = ctrl.cancel(&req, None, fixed_now()).unwrap();
-            assert_eq!(resp.outcome, CancellationOutcome::Cancelled);
+            assert_eq!(resp.outcome, CancellationOutcome::Pending);
         }
         // Odd operations should not be cancel-requested.
         for i in (1..20).step_by(2) {
@@ -3013,11 +3384,11 @@ mod tests {
             capability_token: None,
         };
         let resp = ctrl.cancel(&req, None, fixed_now()).unwrap();
-        assert_eq!(resp.outcome, CancellationOutcome::Cancelled);
+        assert_eq!(resp.outcome, CancellationOutcome::Pending);
         // No checkpoint because cleanup is Full, not Checkpoint.
         assert!(resp.checkpoint.is_none());
-        // Cleanup result should be present because outcome is Cancelled.
-        assert!(resp.cleanup_result.is_some());
+        // Requesting full cleanup is not evidence that any cleanup happened.
+        assert!(resp.cleanup_result.is_none());
     }
 
     #[test]
@@ -3034,10 +3405,10 @@ mod tests {
             capability_token: None,
         };
         let resp = ctrl.cancel(&req, None, fixed_now()).unwrap();
-        assert_eq!(resp.outcome, CancellationOutcome::Cancelled);
+        assert_eq!(resp.outcome, CancellationOutcome::Pending);
         // No checkpoint on Abandon.
         assert!(resp.checkpoint.is_none());
-        assert!(resp.cleanup_result.is_some());
+        assert!(resp.cleanup_result.is_none());
     }
 
     #[test]
@@ -3057,9 +3428,9 @@ mod tests {
         assert_eq!(ctrl.tracked_count(), 1);
         assert!(!ctrl.is_cancel_requested("op_reuse"));
 
-        // Cancelling again should succeed (not Pending).
+        // The fresh invocation accepts its own cancellation request.
         let resp = ctrl.cancel(&req, None, fixed_now()).unwrap();
-        assert_eq!(resp.outcome, CancellationOutcome::Cancelled);
+        assert_eq!(resp.outcome, CancellationOutcome::Pending);
     }
 
     #[test]
@@ -3116,7 +3487,7 @@ mod tests {
         assert_eq!(ctrl.tracked_count(), 1);
         let req = cancel_request("lifecycle_op", CancelReason::UserRequested);
         let resp = ctrl.cancel(&req, None, fixed_now()).unwrap();
-        assert_eq!(resp.outcome, CancellationOutcome::Cancelled);
+        assert_eq!(resp.outcome, CancellationOutcome::Pending);
         assert!(ctrl.is_cancel_requested("lifecycle_op"));
 
         // Phase 2: Remove.
@@ -3149,7 +3520,7 @@ mod tests {
         assert_eq!(ctrl.tracked_count(), 1);
         let req = cancel_request("", CancelReason::UserRequested);
         let resp = ctrl.cancel(&req, None, fixed_now()).unwrap();
-        assert_eq!(resp.outcome, CancellationOutcome::Cancelled);
+        assert_eq!(resp.outcome, CancellationOutcome::Pending);
         assert_eq!(resp.operation_id, "");
         ctrl.remove("");
         assert_eq!(ctrl.tracked_count(), 0);
@@ -3162,7 +3533,7 @@ mod tests {
         ctrl.track_with_owner(&long_id, None);
         let req = cancel_request(&long_id, CancelReason::UserRequested);
         let resp = ctrl.cancel(&req, None, fixed_now()).unwrap();
-        assert_eq!(resp.outcome, CancellationOutcome::Cancelled);
+        assert_eq!(resp.outcome, CancellationOutcome::Pending);
         assert_eq!(resp.operation_id, long_id);
     }
 
@@ -3173,7 +3544,7 @@ mod tests {
             ctrl.track_with_owner("repeated", None);
             let req = cancel_request("repeated", CancelReason::UserRequested);
             let resp = ctrl.cancel(&req, None, fixed_now()).unwrap();
-            assert_eq!(resp.outcome, CancellationOutcome::Cancelled);
+            assert_eq!(resp.outcome, CancellationOutcome::Pending);
             ctrl.remove("repeated");
         }
         assert_eq!(ctrl.tracked_count(), 0);
@@ -3201,21 +3572,26 @@ mod tests {
     }
 
     #[test]
-    fn cancel_pending_has_cleanup_result() {
+    fn repeated_pending_cancellation_has_no_cleanup_evidence() {
         let ctrl = CancellationController::new();
         ctrl.track_with_owner("op_pending", None);
         let req = cancel_request("op_pending", CancelReason::UserRequested);
-        ctrl.cancel(&req, None, fixed_now()).unwrap(); // First: Cancelled
+        ctrl.cancel(&req, None, fixed_now()).unwrap(); // First: Pending
         let resp = ctrl.cancel(&req, None, fixed_now()).unwrap(); // Second: Pending
         assert_eq!(resp.outcome, CancellationOutcome::Pending);
-        // Pending also gets a cleanup result per the controller logic.
-        assert!(resp.cleanup_result.is_some());
+        assert!(resp.cleanup_result.is_none());
     }
 
     #[test]
-    fn checkpoint_id_format_includes_operation_id() {
+    fn checkpoint_id_is_supplied_by_the_runtime() {
         let ctrl = CancellationController::new();
-        ctrl.track_with_owner("my_special_op", None);
+        let registration = ctrl
+            .track_operation(
+                "my_special_op",
+                None,
+                CancellationScope::new("connector", ConnectorArchetype::RequestResponse),
+            )
+            .unwrap();
         let req = CancellationRequest {
             operation_id: "my_special_op".into(),
             reason: CancelReason::UserRequested,
@@ -3223,16 +3599,28 @@ mod tests {
             return_partial: false,
             capability_token: None,
         };
+        assert!(ctrl.cancel(&req, None, fixed_now()).unwrap().checkpoint.is_none());
+        assert!(ctrl.complete_cancelled_registration_when_settled(
+            &registration,
+            cancellation_evidence_fixture(),
+        ));
         let resp = ctrl.cancel(&req, None, fixed_now()).unwrap();
         let ckpt = resp.checkpoint.unwrap();
-        assert_eq!(ckpt.id, "ckpt_my_special_op");
+        assert_eq!(ckpt.id, "persisted-object-d14c");
+        assert_eq!(ckpt.state, Some(serde_json::json!({"cursor": "after-three"})));
     }
 
     #[test]
-    fn checkpoint_expires_24h_from_now() {
+    fn checkpoint_expiry_is_supplied_by_the_runtime() {
         let now = fixed_now();
         let ctrl = CancellationController::new();
-        ctrl.track_with_owner("op_expiry", None);
+        let registration = ctrl
+            .track_operation(
+                "op_expiry",
+                None,
+                CancellationScope::new("connector", ConnectorArchetype::RequestResponse),
+            )
+            .unwrap();
         let req = CancellationRequest {
             operation_id: "op_expiry".into(),
             reason: CancelReason::UserRequested,
@@ -3240,10 +3628,14 @@ mod tests {
             return_partial: false,
             capability_token: None,
         };
+        ctrl.cancel(&req, None, now).unwrap();
+        assert!(ctrl.complete_cancelled_registration_when_settled(
+            &registration,
+            cancellation_evidence_fixture(),
+        ));
         let resp = ctrl.cancel(&req, None, now).unwrap();
         let ckpt = resp.checkpoint.unwrap();
-        let expected_expiry = now + chrono::Duration::hours(24);
-        assert_eq!(ckpt.expires_at, Some(expected_expiry));
+        assert_eq!(ckpt.expires_at, Some(now + chrono::Duration::minutes(17)));
     }
 
     #[test]
@@ -3286,8 +3678,7 @@ mod tests {
 
     #[test]
     fn response_partial_result_is_none_from_controller() {
-        // The controller always sets partial_result to None.
-        // Callers are responsible for attaching partial results.
+        // A request cannot create partial output that the runtime never supplied.
         let ctrl = CancellationController::new();
         ctrl.track_with_owner("op_no_partial", None);
         let req = CancellationRequest {
@@ -3302,8 +3693,7 @@ mod tests {
     }
 
     #[test]
-    fn audit_had_partial_result_always_false_from_controller() {
-        // The controller always sets had_partial_result to false.
+    fn audit_had_partial_result_is_false_without_runtime_evidence() {
         let ctrl = CancellationController::new();
         ctrl.track_with_owner("op_audit_partial", None);
         let req = CancellationRequest {
@@ -3345,7 +3735,7 @@ mod tests {
         // Re-track resets; cancel should now succeed.
         ctrl.track_with_owner("op_reset", None);
         let resp2 = ctrl.cancel(&req, None, fixed_now()).unwrap();
-        assert_eq!(resp2.outcome, CancellationOutcome::Cancelled);
+        assert_eq!(resp2.outcome, CancellationOutcome::Pending);
     }
 
     #[test]
@@ -3417,14 +3807,14 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_result_on_pending_contains_operation_state() {
+    fn pending_cleanup_does_not_claim_operation_state_was_removed() {
         let ctrl = CancellationController::new();
         ctrl.track_with_owner("op_pending_cleanup", None);
         let req = cancel_request("op_pending_cleanup", CancelReason::UserRequested);
-        ctrl.cancel(&req, None, fixed_now()).unwrap(); // Cancelled
+        ctrl.cancel(&req, None, fixed_now()).unwrap(); // Pending
         let resp = ctrl.cancel(&req, None, fixed_now()).unwrap(); // Pending
-        let cleanup = resp.cleanup_result.unwrap();
-        assert!(cleanup.cleaned.contains(&"operation_state".to_string()));
+        assert!(resp.cleanup_result.is_none());
+        assert_eq!(ctrl.tracked_count(), 1);
     }
 
     #[test]
@@ -3438,13 +3828,10 @@ mod tests {
             return_partial: false,
             capability_token: None,
         };
-        // First cancel: Cancelled, should have checkpoint.
+        // Both calls only request cancellation; neither persists a checkpoint.
         let resp1 = ctrl.cancel(&req, None, fixed_now()).unwrap();
-        assert_eq!(resp1.outcome, CancellationOutcome::Cancelled);
-        assert!(resp1.checkpoint.is_some());
-
-        // Second cancel: Pending, cancel_requested is already true.
-        // Outcome is Pending, and checkpoint is only created when outcome == Cancelled.
+        assert_eq!(resp1.outcome, CancellationOutcome::Pending);
+        assert!(resp1.checkpoint.is_none());
         let resp2 = ctrl.cancel(&req, None, fixed_now()).unwrap();
         assert_eq!(resp2.outcome, CancellationOutcome::Pending);
         assert!(resp2.checkpoint.is_none());
@@ -4266,7 +4653,7 @@ mod tests {
                 fixed_now(),
             )
             .unwrap();
-        assert_eq!(resp_a.outcome, CancellationOutcome::Cancelled);
+        assert_eq!(resp_a.outcome, CancellationOutcome::Pending);
 
         let resp_b = ctrl
             .cancel(
@@ -4300,7 +4687,7 @@ mod tests {
         for id in &ids {
             let req = cancel_request(id, CancelReason::SessionClosing);
             let resp = ctrl.cancel(&req, None, fixed_now()).unwrap();
-            assert_eq!(resp.outcome, CancellationOutcome::Cancelled);
+            assert_eq!(resp.outcome, CancellationOutcome::Pending);
             assert_eq!(resp.operation_id, *id);
         }
         assert_eq!(ctrl.audit_events().len(), 4);
@@ -4326,7 +4713,7 @@ mod tests {
         ctrl.track_with_owner("op_reborn", None);
         let req = cancel_request("op_reborn", CancelReason::UserRequested);
         let resp = ctrl.cancel(&req, None, fixed_now()).unwrap();
-        assert_eq!(resp.outcome, CancellationOutcome::Cancelled);
+        assert_eq!(resp.outcome, CancellationOutcome::Pending);
     }
 
     #[test]
@@ -4417,15 +4804,28 @@ mod tests {
     }
 
     #[test]
-    fn controller_cleanup_result_cleaned_contains_operation_state() {
+    fn controller_preserves_real_cleanup_failure_instead_of_claiming_success() {
         let ctrl = CancellationController::new();
-        ctrl.track_with_owner("op_verify_cleanup", None);
+        let registration = ctrl
+            .track_operation(
+                "op_verify_cleanup",
+                None,
+                CancellationScope::new("connector", ConnectorArchetype::RequestResponse),
+            )
+            .unwrap();
         let req = cancel_request("op_verify_cleanup", CancelReason::UserRequested);
+        ctrl.cancel(&req, None, fixed_now()).unwrap();
+        assert!(ctrl.complete_cancelled_registration_when_settled(
+            &registration,
+            cancellation_evidence_fixture(),
+        ));
         let resp = ctrl.cancel(&req, None, fixed_now()).unwrap();
+        assert_eq!(resp.outcome, CancellationOutcome::Cancelled);
         let cleanup = resp.cleanup_result.unwrap();
-        assert_eq!(cleanup.cleaned, vec!["operation_state"]);
-        assert!(cleanup.failed.is_empty());
-        assert!(cleanup.success);
+        assert_eq!(cleanup.cleaned, vec!["temporary_file"]);
+        assert_eq!(cleanup.failed, vec!["provider_rollback"]);
+        assert_eq!(cleanup.duration_ms, 51);
+        assert!(!cleanup.success);
     }
     // ── flywheel_connectors-861lx: cancellation deadlines ──
 
