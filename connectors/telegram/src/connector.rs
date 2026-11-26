@@ -3608,7 +3608,7 @@ impl TelegramConnector {
             );
 
             let outcome = supervisor
-                .run(
+                .run_recovering(
                     shutdown_rx,
                     0,
                     |offset| {
@@ -3695,10 +3695,7 @@ impl TelegramConnector {
                                     }
                                     PollResult::success(updates)
                                 }
-                                Err(err) if err.is_retryable() => {
-                                    PollResult::recoverable(err.to_string())
-                                }
-                                Err(err) => PollResult::fatal(err.to_string()),
+                                Err(err) => polling_error_result(err),
                             }
                         };
                         async move {
@@ -3745,6 +3742,23 @@ impl TelegramConnector {
 
         self.poll_task = Some(task);
         Ok(())
+    }
+}
+
+/// Preserve provider retry restrictions before supervised polling recovery.
+fn polling_error_result(error: TelegramError) -> PollResult<Update> {
+    if !error.is_retryable() {
+        return PollResult::fatal(error.to_string());
+    }
+    match error.retry_after() {
+        Some(delay) => {
+            let millis = delay
+                .as_secs()
+                .saturating_mul(1000)
+                .saturating_add(u64::from(delay.subsec_nanos()).div_ceil(1_000_000));
+            PollResult::rate_limited(error.to_string(), millis)
+        }
+        None => PollResult::recoverable(error.to_string()),
     }
 }
 
@@ -4337,6 +4351,53 @@ mod tests {
     use crate::types::{Chat, User};
     use fcp_sdk::prelude::JsonlWriter;
     use serde_json::json;
+
+    #[test]
+    fn polling_recovery_preserves_retry_floors_and_terminal_errors() {
+        let limited = polling_error_result(TelegramError::Api {
+            code: 429,
+            description: "rate limited".into(),
+        });
+        assert!(matches!(
+            limited,
+            PollResult::RecoverableError {
+                retry_after_ms: Some(30_000),
+                ..
+            }
+        ));
+        let unavailable = polling_error_result(TelegramError::Api {
+            code: 503,
+            description: "temporarily unavailable".into(),
+        });
+        assert!(matches!(
+            unavailable,
+            PollResult::RecoverableError {
+                retry_after_ms: None,
+                ..
+            }
+        ));
+        for error in [
+            TelegramError::Api {
+                code: 401,
+                description: "unauthorized".into(),
+            },
+            TelegramError::InvalidRequest("invalid polling request".into()),
+            TelegramError::PartialSend {
+                sent_chunks: 1,
+                failed_chunk_index: 1,
+                sent_message_ids: vec![7],
+                source: Box::new(TelegramError::Api {
+                    code: 503,
+                    description: "uncertain effect".into(),
+                }),
+            },
+        ] {
+            assert!(matches!(
+                polling_error_result(error),
+                PollResult::FatalError { .. }
+            ));
+        }
+    }
 
     struct NativeTestTransport {
         stream: JsonlEventStream,

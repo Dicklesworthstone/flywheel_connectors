@@ -483,8 +483,9 @@ pub struct SupervisorConfig {
 
     /// Cooldown period after max failures (milliseconds).
     ///
-    /// After hitting `max_consecutive_failures`, wait this long before
-    /// attempting recovery. This prevents rapid retry storms.
+    /// `PollingSupervisor::run_recovering` waits at least this long after
+    /// hitting `max_consecutive_failures` before another recovery cycle. The
+    /// bounded `run` entry points instead return `MaxFailuresReached`.
     /// Default: 300000ms (5 minutes).
     pub cooldown_after_failure_ms: u64,
 
@@ -2984,13 +2985,61 @@ impl<C: PollingCursor> PollingSupervisor<C> {
     /// A provider retry hint above `max_backoff_ms` stops the supervisor with
     /// `FatalError` and unhealthy status after persisting the cursor. It is
     /// never shortened into an earlier retry or reported as successful polling.
-    #[allow(clippy::too_many_lines)]
     pub async fn run<T, F, Fut, P>(
+        &mut self,
+        shutdown: watch::Receiver<bool>,
+        poll_interval_ms: u64,
+        poll_fn: F,
+        process_fn: P,
+    ) -> SupervisorOutcome
+    where
+        F: Fn(Option<i64>) -> Fut,
+        Fut: std::future::Future<Output = PollResult<T>>,
+        P: FnMut(Vec<T>, &mut C) -> Result<(), Box<dyn std::error::Error + Send + Sync>>,
+    {
+        self.run_inner(shutdown, poll_interval_ms, poll_fn, process_fn, false)
+            .await
+    }
+
+    /// Recover a long-lived poller after bounded cycles of upstream failures.
+    ///
+    /// Only `RecoverableError` can start another cycle. At the failure threshold,
+    /// persist the unchanged cursor and wait at least `cooldown_after_failure_ms`
+    /// before polling again. Retry-After is checked before that threshold and
+    /// can never be shortened or bypassed by recovery. The same task owns every
+    /// attempt and shutdown-aware wait; cursor restoration happens only once.
+    /// Health stays unhealthy during cooldown, until a subsequent success.
+    ///
+    /// Processing failures, fatal errors, checkpoint failures and uncertain
+    /// interrupted work fence this supervisor against reuse. No automatic
+    /// recovery is attempted for them. Callers must classify authorization,
+    /// ownership and partial-effect failures as `FatalError` and revalidate
+    /// authority before each poll. Cooldown grants no permission to use an
+    /// expired subscription or a superseded writer lease.
+    pub async fn run_recovering<T, F, Fut, P>(
+        &mut self,
+        shutdown: watch::Receiver<bool>,
+        poll_interval_ms: u64,
+        poll_fn: F,
+        process_fn: P,
+    ) -> SupervisorOutcome
+    where
+        F: Fn(Option<i64>) -> Fut,
+        Fut: std::future::Future<Output = PollResult<T>>,
+        P: FnMut(Vec<T>, &mut C) -> Result<(), Box<dyn std::error::Error + Send + Sync>>,
+    {
+        self.run_inner(shutdown, poll_interval_ms, poll_fn, process_fn, true)
+            .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn run_inner<T, F, Fut, P>(
         &mut self,
         mut shutdown: watch::Receiver<bool>,
         poll_interval_ms: u64,
         poll_fn: F,
         mut process_fn: P,
+        recover: bool,
     ) -> SupervisorOutcome
     where
         F: Fn(Option<i64>) -> Fut,
@@ -3018,6 +3067,12 @@ impl<C: PollingCursor> PollingSupervisor<C> {
         // Keep this fence across every await and synchronous callback so an
         // abandoned run cannot silently resume after uncertain effects.
         self.run_state = StreamingRunState::Running;
+        if recover && let Err(errors) = self.config.validate() {
+            return self.fail_run(format!(
+                "Invalid polling recovery configuration: {}",
+                errors.join("; ")
+            ));
+        }
         // An unreadable checkpoint is not an absent checkpoint. Starting from
         // a fresh or uncommitted in-memory offset can lose or duplicate work.
         if let Err(error) = self.cursor.restore() {
@@ -3085,6 +3140,14 @@ impl<C: PollingCursor> PollingSupervisor<C> {
                         self.health.record_failure(&message);
                         self.health.evaluate(&self.config);
 
+                        if recover {
+                            // A failed handoff can have partial downstream
+                            // effects. Do not extend its retry budget or commit
+                            // provisional cursor state during automatic recovery.
+                            return self.fail_run(
+                                "Polling result processing failed; reconcile its effects before restarting".to_owned(),
+                            );
+                        }
                         if shutdown_requested || *shutdown.borrow() {
                             return self.finish_run(SupervisorOutcome::Shutdown);
                         }
@@ -3172,18 +3235,9 @@ impl<C: PollingCursor> PollingSupervisor<C> {
                     if shutdown_requested || *shutdown.borrow() {
                         return self.finish_run(SupervisorOutcome::Shutdown);
                     }
-                    if consecutive_failures >= self.config.max_consecutive_failures {
-                        tracing::error!(
-                            failures = consecutive_failures,
-                            max = self.config.max_consecutive_failures,
-                            "Maximum consecutive failures reached"
-                        );
-                        return self.finish_run(SupervisorOutcome::MaxFailuresReached {
-                            failures: consecutive_failures,
-                        });
-                    }
-
-                    let Some(delay) = self.compute_delay(consecutive_failures - 1, retry_after_ms)
+                    // A cycle boundary must not hide a provider's minimum wait.
+                    let Some(mut delay) =
+                        self.compute_delay(consecutive_failures - 1, retry_after_ms)
                     else {
                         let message = format!(
                             "Upstream Retry-After exceeds maximum retry delay of {} ms; polling stopped",
@@ -3193,10 +3247,36 @@ impl<C: PollingCursor> PollingSupervisor<C> {
                         self.health.transition(HealthTransition::ToUnhealthy {
                             reason: message.clone(),
                         });
+                        if recover {
+                            return self.fail_run(message);
+                        }
                         return self.finish_run(SupervisorOutcome::FatalError { message });
                     };
-                    self.stats.backoff_time_ms +=
-                        u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+                    if consecutive_failures >= self.config.max_consecutive_failures {
+                        if !recover {
+                            return self.finish_run(SupervisorOutcome::MaxFailuresReached {
+                                failures: consecutive_failures,
+                            });
+                        }
+                        if !self.health.is_unhealthy() {
+                            self.health
+                                .transition(HealthTransition::ToUnhealthy { reason: message });
+                        }
+                        if let Err(failure) = self.persist_cursor() {
+                            return failure;
+                        }
+                        delay = delay.max(self.config.cooldown_duration());
+                        tracing::warn!(
+                            failures = consecutive_failures,
+                            cooldown_ms = delay.as_millis(),
+                            "Polling failure cycle exhausted; waiting before recovery"
+                        );
+                        consecutive_failures = 0;
+                    }
+                    self.stats.backoff_time_ms = self
+                        .stats
+                        .backoff_time_ms
+                        .saturating_add(u64::try_from(delay.as_millis()).unwrap_or(u64::MAX));
 
                     tracing::info!(
                         delay_ms = delay.as_millis(),
@@ -3215,6 +3295,9 @@ impl<C: PollingCursor> PollingSupervisor<C> {
                 PollResult::FatalError { message } => {
                     self.cursor.record_poll(Instant::now(), 0);
                     tracing::error!(error = %message, "Poll failed with fatal error");
+                    if recover {
+                        return self.fail_run(message);
+                    }
                     self.health.transition(HealthTransition::ToUnhealthy {
                         reason: message.clone(),
                     });
@@ -7790,10 +7873,7 @@ deny_ptrace = true
                             match result_kind {
                                 "processing" => PollResult::success(vec![41_i64]),
                                 "fatal" => PollResult::fatal("provider refused the poll"),
-                                _ => PollResult::rate_limited(
-                                    "provider asks us to wait",
-                                    u64::MAX,
-                                ),
+                                _ => PollResult::rate_limited("provider asks us to wait", u64::MAX),
                             }
                         }
                     },
@@ -7899,7 +7979,12 @@ deny_ptrace = true
                 panic!("processor panicked after a provisional cursor change")
             },
         );
-        assert!(std::panic::AssertUnwindSafe(run).catch_unwind().await.is_err());
+        assert!(
+            std::panic::AssertUnwindSafe(run)
+                .catch_unwind()
+                .await
+                .is_err()
+        );
         assert_eq!(supervisor.cursor().offset(), Some(42));
 
         let retry = supervisor
@@ -8054,7 +8139,7 @@ deny_ptrace = true
     }
 
     #[fcp_async_core::runtime::test]
-    async fn polling_supervisor_exhausted_budget_never_schedules_retry_after() {
+    async fn polling_supervisor_exhausted_budget_preserves_retry_refusal() {
         let config = SupervisorConfig::default().with_max_consecutive_failures(1);
         let mut supervisor = PollingSupervisor::new(config, InMemoryPollingCursor::new());
         let (_shutdown_tx, shutdown_rx) = fcp_async_core::channel::watch::channel(false);
@@ -8069,12 +8154,303 @@ deny_ptrace = true
 
         assert!(matches!(
             outcome,
-            SupervisorOutcome::MaxFailuresReached { failures: 1 }
+            SupervisorOutcome::FatalError { message } if message.contains("Retry-After")
         ));
         assert_eq!(supervisor.stats().total_polls, 1);
         assert_eq!(supervisor.stats().successful_polls, 0);
         assert_eq!(supervisor.stats().backoff_time_ms, 0);
         assert!(supervisor.health().is_unhealthy());
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn polling_supervisor_recovery_waits_and_retains_one_cursor_session() {
+        let checkpoint = Arc::new(Mutex::new(FaultyPollingCheckpoint {
+            committed_offset: Some(40),
+            ..Default::default()
+        }));
+        let config = SupervisorConfig {
+            base_backoff_ms: 1,
+            max_backoff_ms: 10,
+            jitter_enabled: false,
+            max_consecutive_failures: 2,
+            cooldown_after_failure_ms: 20,
+            ..SupervisorConfig::default()
+        };
+        let mut supervisor = PollingSupervisor::new(
+            config,
+            FaultInjectingPollingCursor::new(Arc::clone(&checkpoint)),
+        );
+        let times = Mutex::new(Vec::new());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let outcome = fcp_async_core::time::timeout(
+            Duration::from_secs(2),
+            supervisor.run_recovering(
+                shutdown_rx,
+                0,
+                |offset| {
+                    assert_eq!(offset, Some(40));
+                    let mut times = times.lock().unwrap();
+                    times.push(Instant::now());
+                    std::future::ready(if times.len() <= 2 {
+                        PollResult::recoverable("temporary outage")
+                    } else {
+                        assert_eq!(times.len(), 3);
+                        assert_eq!(checkpoint.lock().unwrap().persist_calls, 1);
+                        PollResult::success(vec![42_i64])
+                    })
+                },
+                |items, cursor| {
+                    cursor.advance_if_newer(items[0]);
+                    shutdown_tx.send(true).unwrap();
+                    Ok(())
+                },
+            ),
+        )
+        .await
+        .expect("recovery must finish after the successful handoff");
+        assert!(matches!(outcome, SupervisorOutcome::Shutdown));
+        let times = times.lock().unwrap();
+        assert!(times[2].duration_since(times[1]) >= Duration::from_millis(20));
+        assert_eq!(supervisor.stats().total_polls, 3);
+        assert_eq!(supervisor.stats().failed_polls, 2);
+        assert_eq!(supervisor.stats().successful_polls, 1);
+        assert_eq!(supervisor.stats().backoff_time_ms, 21);
+        assert!(supervisor.health().is_healthy());
+        let checkpoint = checkpoint.lock().unwrap();
+        assert_eq!(checkpoint.restore_calls, 1);
+        assert_eq!(checkpoint.persist_calls, 3);
+        assert_eq!(checkpoint.committed_offset, Some(43));
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn polling_supervisor_recovery_never_shortens_retry_after() {
+        let config = SupervisorConfig {
+            base_backoff_ms: 1,
+            max_backoff_ms: 50,
+            jitter_enabled: false,
+            max_consecutive_failures: 1,
+            cooldown_after_failure_ms: 5,
+            ..SupervisorConfig::default()
+        };
+        let mut supervisor = PollingSupervisor::new(config, InMemoryPollingCursor::new());
+        let times = Mutex::new(Vec::new());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let outcome = fcp_async_core::time::timeout(
+            Duration::from_secs(2),
+            supervisor.run_recovering(
+                shutdown_rx,
+                0,
+                |_| {
+                    let mut times = times.lock().unwrap();
+                    times.push(Instant::now());
+                    std::future::ready(if times.len() == 1 {
+                        PollResult::<i64>::rate_limited("429", 50)
+                    } else {
+                        shutdown_tx.send(true).unwrap();
+                        PollResult::empty()
+                    })
+                },
+                |_, _| panic!("no batch to process"),
+            ),
+        )
+        .await
+        .expect("bounded recovery test");
+        assert!(matches!(outcome, SupervisorOutcome::Shutdown));
+        let times = times.lock().unwrap();
+        assert_eq!(times.len(), 2);
+        assert!(times[1].duration_since(times[0]) >= Duration::from_millis(50));
+        assert_eq!(supervisor.stats().backoff_time_ms, 50);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn polling_supervisor_recovery_cooldown_observes_shutdown_and_sender_loss() {
+        for sender_closed in [false, true] {
+            let checkpoint = Arc::new(Mutex::new(FaultyPollingCheckpoint::default()));
+            let config = SupervisorConfig {
+                max_consecutive_failures: 1,
+                cooldown_after_failure_ms: 60_000,
+                ..SupervisorConfig::default()
+            };
+            let mut supervisor = PollingSupervisor::new(
+                config,
+                FaultInjectingPollingCursor::new(Arc::clone(&checkpoint)),
+            );
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let (started_tx, mut started_rx) = watch::channel(false);
+            {
+                let mut run = std::pin::pin!(supervisor.run_recovering(
+                    shutdown_rx,
+                    0,
+                    |_| {
+                        started_tx.send(true).unwrap();
+                        std::future::ready(PollResult::<i64>::recoverable("offline"))
+                    },
+                    |_, _| panic!("no batch to process"),
+                ));
+                fcp_async_core::select! {
+                    _ = fcp_async_core::shutdown::wait_for_shutdown(&mut started_rx) => {},
+                    outcome = run.as_mut() => panic!("cooldown should be pending: {outcome:?}"),
+                }
+                assert_eq!(checkpoint.lock().unwrap().persist_calls, 1);
+                if sender_closed {
+                    drop(shutdown_tx);
+                } else {
+                    shutdown_tx.send(true).unwrap();
+                }
+                let outcome = fcp_async_core::time::timeout(Duration::from_secs(1), run)
+                    .await
+                    .expect("shutdown must interrupt cooldown");
+                assert!(matches!(outcome, SupervisorOutcome::Shutdown));
+            }
+            assert_eq!(supervisor.stats().total_polls, 1);
+            assert!(supervisor.health().is_unhealthy());
+            assert_eq!(checkpoint.lock().unwrap().persist_calls, 2);
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn polling_supervisor_recovery_refuses_excessive_provider_delay_at_threshold() {
+        let config = SupervisorConfig {
+            max_consecutive_failures: 1,
+            cooldown_after_failure_ms: u64::MAX,
+            ..SupervisorConfig::default()
+        };
+        let mut supervisor = PollingSupervisor::new(config, InMemoryPollingCursor::new());
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let calls = AtomicUsize::new(0);
+        for _ in 0..2 {
+            let outcome = supervisor
+                .run_recovering(
+                    shutdown_rx.clone(),
+                    0,
+                    |_| {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        std::future::ready(PollResult::<i64>::rate_limited("429", u64::MAX))
+                    },
+                    |_, _| panic!("a rejected retry cannot process a batch"),
+                )
+                .await;
+            assert!(
+                matches!(outcome, SupervisorOutcome::FatalError { message } if message.contains("Retry-After"))
+            );
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(supervisor.stats().backoff_time_ms, 0);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn polling_supervisor_recovery_fences_fatal_processing_and_state_failures() {
+        for failure in ["fatal", "processing", "restore", "persist"] {
+            let checkpoint = Arc::new(Mutex::new(FaultyPollingCheckpoint {
+                committed_offset: Some(40),
+                fail_restore: failure == "restore",
+                fail_persist: failure == "persist",
+                ..Default::default()
+            }));
+            let config = SupervisorConfig {
+                max_consecutive_failures: 1,
+                ..SupervisorConfig::default()
+            };
+            let mut supervisor = PollingSupervisor::new(
+                config,
+                FaultInjectingPollingCursor::new(Arc::clone(&checkpoint)),
+            );
+            let calls = AtomicUsize::new(0);
+            let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+            for _ in 0..2 {
+                let outcome = supervisor
+                    .run_recovering(
+                        shutdown_rx.clone(),
+                        0,
+                        |_| {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            std::future::ready(match failure {
+                                "fatal" => PollResult::fatal("authority expired"),
+                                "processing" => PollResult::success(vec![42_i64]),
+                                _ => PollResult::recoverable("offline"),
+                            })
+                        },
+                        |items, cursor| {
+                            cursor.advance_if_newer(items[0]);
+                            Err("partial downstream effects".into())
+                        },
+                    )
+                    .await;
+                assert!(
+                    matches!(outcome, SupervisorOutcome::FatalError { .. }),
+                    "{failure}"
+                );
+                // An external repair alone cannot erase this run's fence.
+                let mut checkpoint = checkpoint.lock().unwrap();
+                checkpoint.fail_restore = false;
+                checkpoint.fail_persist = false;
+            }
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                usize::from(failure != "restore")
+            );
+            assert!(supervisor.health().is_unhealthy());
+            let checkpoint = checkpoint.lock().unwrap();
+            assert_eq!(checkpoint.restore_calls, 1);
+            assert_eq!(checkpoint.persist_calls, usize::from(failure == "persist"));
+            assert_eq!(checkpoint.committed_offset, Some(40));
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn polling_supervisor_recovery_fences_dropped_poll_and_cooldown() {
+        for pending_poll in [false, true] {
+            let checkpoint = Arc::new(Mutex::new(FaultyPollingCheckpoint::default()));
+            let config = SupervisorConfig {
+                max_consecutive_failures: 1,
+                ..SupervisorConfig::default()
+            };
+            let mut supervisor = PollingSupervisor::new(
+                config,
+                FaultInjectingPollingCursor::new(Arc::clone(&checkpoint)),
+            );
+            let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+            let (started_tx, mut started_rx) = watch::channel(false);
+            {
+                let mut run = std::pin::pin!(supervisor.run_recovering(
+                    shutdown_rx.clone(),
+                    0,
+                    |_| {
+                        let started_tx = started_tx.clone();
+                        async move {
+                            started_tx.send(true).unwrap();
+                            if pending_poll {
+                                std::future::pending::<PollResult<i64>>().await
+                            } else {
+                                PollResult::<i64>::recoverable("offline")
+                            }
+                        }
+                    },
+                    |_, _| panic!("no batch to process"),
+                ));
+                fcp_async_core::select! {
+                    _ = fcp_async_core::shutdown::wait_for_shutdown(&mut started_rx) => {},
+                    outcome = run.as_mut() => panic!("run must still be pending: {outcome:?}"),
+                }
+            }
+            let outcome = supervisor
+                .run_recovering(
+                    shutdown_rx,
+                    0,
+                    |_| -> std::future::Ready<PollResult<i64>> {
+                        panic!("an interrupted run must not resume")
+                    },
+                    |_, _| panic!("an interrupted run must not process another batch"),
+                )
+                .await;
+            assert!(
+                matches!(outcome, SupervisorOutcome::FatalError { message } if message.contains("interrupted"))
+            );
+            assert_eq!(supervisor.stats().total_polls, 1);
+            let checkpoint = checkpoint.lock().unwrap();
+            assert_eq!(checkpoint.restore_calls, 1);
+            assert_eq!(checkpoint.persist_calls, usize::from(!pending_poll));
+        }
     }
 
     #[fcp_async_core::runtime::test]
