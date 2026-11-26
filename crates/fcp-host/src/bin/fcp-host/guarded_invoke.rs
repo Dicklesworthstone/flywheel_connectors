@@ -19,6 +19,7 @@ use fcp_host::{HostError, HostGuardedInvokeRequest, HostResult, PreflightRespons
 use fcp_kernel::{InvokeRequest, InvokeResponse};
 
 use super::AppState;
+use super::mesh_forward_intake::RpcJson;
 
 const MAX_SAFETY_TIER_TAG: &str = "fcp.host.max_safety_tier";
 
@@ -175,7 +176,10 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
 async fn preflight_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(envelope): Json<HostGuardedInvokeRequest>,
+    RpcJson {
+        value: envelope,
+        permit: _permit,
+    }: RpcJson<HostGuardedInvokeRequest>,
 ) -> Json<PreflightResponse> {
     let request = match constrain_request(envelope) {
         Ok(request) => request,
@@ -260,13 +264,22 @@ async fn preflight_handler(
 async fn invoke_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(envelope): Json<HostGuardedInvokeRequest>,
+    RpcJson {
+        value: envelope,
+        permit,
+    }: RpcJson<HostGuardedInvokeRequest>,
 ) -> Result<Json<InvokeResponse>, (StatusCode, String)> {
     let request = constrain_request(envelope).map_err(super::map_host_error)?;
     let asserted_principal = super::extract_principal_header(&headers);
-    Box::pin(super::route_invoke(&state, request, asserted_principal))
-        .await
-        .map(Json)
+    Box::pin(super::route_invoke_with_intake(
+        &state,
+        request,
+        asserted_principal,
+        None,
+        Some(permit),
+    ))
+    .await
+    .map(Json)
 }
 
 #[cfg(test)]
@@ -563,14 +576,18 @@ mod tests {
         let Json(preflight) = preflight_handler(
             State(Arc::clone(&fixture.state)),
             HeaderMap::new(),
-            Json(envelope.clone()),
+            RpcJson::for_test(envelope.clone()),
         )
         .await;
         assert!(preflight.allowed, "{:?}", preflight.reason);
         assert_eq!(fixture.invoke_count.load(Ordering::SeqCst), 0);
-        let Json(response) = invoke_handler(State(fixture.state), HeaderMap::new(), Json(envelope))
-            .await
-            .expect("safe guarded invocation");
+        let Json(response) = invoke_handler(
+            State(fixture.state),
+            HeaderMap::new(),
+            RpcJson::for_test(envelope),
+        )
+        .await
+        .expect("safe guarded invocation");
         assert_eq!(response.status, fcp_kernel::InvokeStatus::Ok);
         assert_eq!(fixture.invoke_count.load(Ordering::SeqCst), 1);
     }
@@ -585,7 +602,7 @@ mod tests {
         let Json(preflight) = preflight_handler(
             State(Arc::clone(&fixture.state)),
             HeaderMap::new(),
-            Json(envelope.clone()),
+            RpcJson::for_test(envelope.clone()),
         )
         .await;
         assert!(preflight.allowed, "{:?}", preflight.reason);
@@ -593,13 +610,17 @@ mod tests {
         let error = invoke_handler(
             State(Arc::clone(&fixture.state)),
             HeaderMap::new(),
-            Json(envelope.clone()),
+            RpcJson::for_test(envelope.clone()),
         )
         .await
         .expect_err("a ceiling cannot be widened by metadata changes");
         assert!(error.1.contains("safety ceiling"), "{error:?}");
-        let Json(rechecked) =
-            preflight_handler(State(fixture.state), HeaderMap::new(), Json(envelope)).await;
+        let Json(rechecked) = preflight_handler(
+            State(fixture.state),
+            HeaderMap::new(),
+            RpcJson::for_test(envelope),
+        )
+        .await;
         assert!(!rechecked.allowed);
         assert!(rechecked.reason.unwrap().contains("safety ceiling"));
         assert_eq!(fixture.invoke_count.load(Ordering::SeqCst), 0);
@@ -616,7 +637,7 @@ mod tests {
         let Json(preflight) = preflight_handler(
             State(Arc::clone(&fixture.state)),
             HeaderMap::new(),
-            Json(envelope.clone()),
+            RpcJson::for_test(envelope.clone()),
         )
         .await;
         assert!(!preflight.allowed);
@@ -627,9 +648,13 @@ mod tests {
                 .contains("capability token rejected")
         );
         assert!(
-            invoke_handler(State(fixture.state), HeaderMap::new(), Json(envelope))
-                .await
-                .is_err()
+            invoke_handler(
+                State(fixture.state),
+                HeaderMap::new(),
+                RpcJson::for_test(envelope)
+            )
+            .await
+            .is_err()
         );
         assert_eq!(fixture.invoke_count.load(Ordering::SeqCst), 0);
     }

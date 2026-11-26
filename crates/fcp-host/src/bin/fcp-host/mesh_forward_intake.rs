@@ -1,9 +1,10 @@
-//! Bound untrusted mesh envelopes before JSON decoding and replay admission.
+//! Bound untrusted RPC envelopes before JSON decoding and admission.
 //!
 //! Each admitted request reserves one complete wire-body allowance. The permit
-//! remains live through signature verification and durable replay admission;
-//! the handler releases it before running the authenticated operation. These
-//! limits bound pending envelopes, not process RSS or already admitted work.
+//! remains live until authentication or bounded host ownership takes over.
+//! Mesh and public RPC routes use independent lanes, with route-specific
+//! redacted errors. These limits bound pending envelopes, not process RSS or
+//! already admitted work.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -16,7 +17,7 @@ use axum::http::{StatusCode, header::CONTENT_LENGTH};
 use futures_util::StreamExt;
 use serde::de::DeserializeOwned;
 
-/// Four 24 MiB wire bodies may be pending at once (96 MiB of wire data).
+/// Four complete wire bodies may be pending in each independent lane.
 /// Decoded JSON, framing, and allocator overhead are additional to that bound.
 const MAX_PENDING_ENVELOPES: usize = 4;
 /// A total upload deadline: receiving another chunk does not reset this clock.
@@ -26,6 +27,36 @@ const CHUNKS_BEFORE_YIELD: usize = 64;
 
 type Rejection = (StatusCode, &'static str);
 
+struct Diagnostics {
+    unavailable: &'static str,
+    capacity: &'static str,
+    invalid_length: &'static str,
+    too_large: &'static str,
+    timeout: &'static str,
+    unreadable: &'static str,
+    invalid_json: &'static str,
+}
+
+const MESH_DIAGNOSTICS: Diagnostics = Diagnostics {
+    unavailable: "mesh forward intake is unavailable",
+    capacity: "mesh forward intake is at capacity",
+    invalid_length: "mesh forward body length is invalid",
+    too_large: "mesh forward body exceeds the wire limit",
+    timeout: "mesh forward body read timed out",
+    unreadable: "mesh forward body could not be read",
+    invalid_json: "mesh forward envelope is invalid",
+};
+
+const RPC_DIAGNOSTICS: Diagnostics = Diagnostics {
+    unavailable: "RPC intake is unavailable",
+    capacity: "RPC intake is at capacity",
+    invalid_length: "RPC body length is invalid",
+    too_large: "RPC body exceeds the wire limit",
+    timeout: "RPC body read timed out",
+    unreadable: "RPC body could not be read",
+    invalid_json: "RPC envelope is invalid",
+};
+
 #[derive(Clone)]
 pub(super) struct Intake(Arc<Runtime>);
 
@@ -34,6 +65,7 @@ struct Runtime {
     maximum_pending: usize,
     maximum_body_bytes: usize,
     body_read_timeout: Duration,
+    diagnostics: &'static Diagnostics,
 }
 
 impl Default for Intake {
@@ -48,12 +80,57 @@ impl Default for Intake {
 
 impl Intake {
     fn new(maximum_body_bytes: usize, maximum_pending: usize, body_read_timeout: Duration) -> Self {
+        Self::with_diagnostics(
+            maximum_body_bytes,
+            maximum_pending,
+            body_read_timeout,
+            &MESH_DIAGNOSTICS,
+        )
+    }
+
+    /// A separately owned public lane. Clones share its four reservations;
+    /// constructing another lane keeps control traffic independently available.
+    pub(super) fn for_rpc(maximum_body_bytes: usize) -> Self {
+        Self::with_diagnostics(
+            maximum_body_bytes,
+            MAX_PENDING_ENVELOPES,
+            BODY_READ_TIMEOUT,
+            &RPC_DIAGNOSTICS,
+        )
+    }
+
+    fn with_diagnostics(
+        maximum_body_bytes: usize,
+        maximum_pending: usize,
+        body_read_timeout: Duration,
+        diagnostics: &'static Diagnostics,
+    ) -> Self {
         Self(Arc::new(Runtime {
             active: AtomicUsize::new(0),
             maximum_pending,
             maximum_body_bytes,
             body_read_timeout,
+            diagnostics,
         }))
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_rpc_test(
+        maximum_body_bytes: usize,
+        maximum_pending: usize,
+        body_read_timeout: Duration,
+    ) -> Self {
+        Self::with_diagnostics(
+            maximum_body_bytes,
+            maximum_pending,
+            body_read_timeout,
+            &RPC_DIAGNOSTICS,
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn active_for_test(&self) -> usize {
+        self.0.active.load(Ordering::Acquire)
     }
 
     fn acquire(&self) -> Result<Permit, Rejection> {
@@ -62,12 +139,7 @@ impl Intake {
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
                 (active < self.0.maximum_pending).then(|| active + 1)
             })
-            .map_err(|_| {
-                (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "mesh forward intake is at capacity",
-                )
-            })?;
+            .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, self.0.diagnostics.capacity))?;
         Ok(Permit(Arc::clone(&self.0)))
     }
 }
@@ -85,6 +157,25 @@ impl Drop for Permit {
 pub(super) struct AdmittedJson<T> {
     pub(super) value: T,
     pub(super) permit: Permit,
+}
+
+/// Public JSON retains its reservation through authorization and bounded job
+/// admission. The caller must release it before awaiting an owned invocation.
+pub(super) struct RpcJson<T> {
+    pub(super) value: T,
+    pub(super) permit: Permit,
+}
+
+#[cfg(test)]
+impl<T> RpcJson<T> {
+    pub(super) fn for_test(value: T) -> Self {
+        Self {
+            value,
+            permit: Intake::for_rpc(super::LOCAL_INVOCATION_HTTP_BODY_LIMIT_BYTES)
+                .acquire()
+                .expect("fresh test RPC intake"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -107,60 +198,89 @@ where
     type Rejection = Rejection;
 
     async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
-        let intake = request.extensions().get::<Intake>().cloned().ok_or((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "mesh forward intake is unavailable",
-        ))?;
-        // Never queue: body collection and JSON allocation start only when
-        // capacity for the entire envelope is available.
-        let permit = intake.acquire()?;
-        if let Some(length) = request.headers().get(CONTENT_LENGTH) {
-            let length = length
-                .to_str()
-                .ok()
-                .and_then(|value| value.parse::<u64>().ok())
-                .ok_or((
-                    StatusCode::BAD_REQUEST,
-                    "mesh forward body length is invalid",
-                ))?;
-            if length > intake.0.maximum_body_bytes as u64 {
-                return Err(payload_too_large());
-            }
-        }
-
-        let (parts, body) = request.into_parts();
-        let read_deadline = Instant::now() + intake.0.body_read_timeout;
-        let bytes = fcp_async_core::time::timeout(
-            intake.0.body_read_timeout,
-            read_body(body, intake.0.maximum_body_bytes, read_deadline),
-        )
-        .await
-        .map_err(|_| body_read_timeout())??;
-        let request = Request::from_parts(parts, Body::from(bytes));
-        let Json(value) = Json::<T>::from_request(request, state)
-            .await
-            // Detailed serde rejections can contain untrusted field contents.
-            // Keep the HTTP status, but never echo the envelope or its tokens.
-            .map_err(|error| (error.status(), "mesh forward envelope is invalid"))?;
+        let (value, permit) = read_json(request, state, &MESH_DIAGNOSTICS).await?;
         Ok(Self { value, permit })
     }
 }
 
-fn payload_too_large() -> Rejection {
-    (
-        StatusCode::PAYLOAD_TOO_LARGE,
-        "mesh forward body exceeds the wire limit",
-    )
+impl<S, T> FromRequest<S> for RpcJson<T>
+where
+    S: Send + Sync,
+    T: DeserializeOwned + Send,
+{
+    type Rejection = Rejection;
+
+    async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let (value, permit) = read_json(request, state, &RPC_DIAGNOSTICS).await?;
+        Ok(Self { value, permit })
+    }
 }
 
-fn body_read_timeout() -> Rejection {
-    (
-        StatusCode::REQUEST_TIMEOUT,
-        "mesh forward body read timed out",
+async fn read_json<S, T>(
+    request: Request,
+    state: &S,
+    missing: &Diagnostics,
+) -> Result<(T, Permit), Rejection>
+where
+    S: Send + Sync,
+    T: DeserializeOwned + Send,
+{
+    let intake = request
+        .extensions()
+        .get::<Intake>()
+        .cloned()
+        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, missing.unavailable))?;
+    let diagnostics = intake.0.diagnostics;
+    // Never queue: body collection and JSON allocation start only when
+    // capacity for the entire envelope is available.
+    let permit = intake.acquire()?;
+    if let Some(length) = request.headers().get(CONTENT_LENGTH) {
+        let length = length
+            .to_str()
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or((StatusCode::BAD_REQUEST, diagnostics.invalid_length))?;
+        if length > intake.0.maximum_body_bytes as u64 {
+            return Err(payload_too_large(diagnostics));
+        }
+    }
+
+    let (parts, body) = request.into_parts();
+    let read_deadline = Instant::now() + intake.0.body_read_timeout;
+    let bytes = fcp_async_core::time::timeout(
+        intake.0.body_read_timeout,
+        read_body(
+            body,
+            intake.0.maximum_body_bytes,
+            read_deadline,
+            diagnostics,
+        ),
     )
+    .await
+    .map_err(|_| body_read_timeout(diagnostics))??;
+    let request = Request::from_parts(parts, Body::from(bytes));
+    let Json(value) = Json::<T>::from_request(request, state)
+        .await
+        // Detailed serde rejections can contain untrusted field contents.
+        // Keep the HTTP status, but never echo the envelope or its tokens.
+        .map_err(|error| (error.status(), diagnostics.invalid_json))?;
+    Ok((value, permit))
 }
 
-async fn read_body(body: Body, maximum: usize, deadline: Instant) -> Result<Vec<u8>, Rejection> {
+fn payload_too_large(diagnostics: &Diagnostics) -> Rejection {
+    (StatusCode::PAYLOAD_TOO_LARGE, diagnostics.too_large)
+}
+
+fn body_read_timeout(diagnostics: &Diagnostics) -> Rejection {
+    (StatusCode::REQUEST_TIMEOUT, diagnostics.timeout)
+}
+
+async fn read_body(
+    body: Body,
+    maximum: usize,
+    deadline: Instant,
+    diagnostics: &Diagnostics,
+) -> Result<Vec<u8>, Rejection> {
     let mut stream = body.into_data_stream();
     let mut bytes = Vec::new();
     let mut chunks_since_yield = 0;
@@ -168,23 +288,18 @@ async fn read_body(body: Body, maximum: usize, deadline: Instant) -> Result<Vec<
         // A stream that stays ready need not yield to the timeout's timer.
         // Check the same monotonic deadline inside the collector as well.
         if Instant::now() >= deadline {
-            return Err(body_read_timeout());
+            return Err(body_read_timeout(diagnostics));
         }
         let next = stream.next().await;
         if Instant::now() >= deadline {
-            return Err(body_read_timeout());
+            return Err(body_read_timeout(diagnostics));
         }
         let Some(chunk) = next else {
             break;
         };
-        let chunk = chunk.map_err(|_| {
-            (
-                StatusCode::BAD_REQUEST,
-                "mesh forward body could not be read",
-            )
-        })?;
+        let chunk = chunk.map_err(|_| (StatusCode::BAD_REQUEST, diagnostics.unreadable))?;
         if chunk.len() > maximum.saturating_sub(bytes.len()) {
-            return Err(payload_too_large());
+            return Err(payload_too_large(diagnostics));
         }
         let next_length = bytes.len() + chunk.len();
         if next_length > bytes.capacity() {
@@ -192,12 +307,7 @@ async fn read_body(body: Body, maximum: usize, deadline: Instant) -> Result<Vec<
             let capacity = next_length.max(bytes.capacity().saturating_mul(2).min(maximum));
             bytes
                 .try_reserve_exact(capacity - bytes.len())
-                .map_err(|_| {
-                    (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "mesh forward intake is unavailable",
-                    )
-                })?;
+                .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, diagnostics.unavailable))?;
         }
         bytes.extend_from_slice(&chunk);
         chunks_since_yield += 1;

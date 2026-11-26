@@ -5652,7 +5652,11 @@ async fn open_configured_connector_state_reader(
     object_store_dir: &StdPath,
 ) -> Result<Option<HostCanonicalStateReader>, String> {
     open_configured_connector_state_reader_with_writer_policy(
-        config, connector_id, zone, object_store_dir, false,
+        config,
+        connector_id,
+        zone,
+        object_store_dir,
+        false,
     )
     .await
 }
@@ -10555,18 +10559,27 @@ fn invoke_audit_unavailable(phase: &'static str, error: fcp_audit::AuditError) -
     ))
 }
 
-/// Apply the larger media envelope budget to ordinary and guarded local
-/// invocation surfaces. Administrative, webhook, and mesh routes retain their
-/// own limits.
+/// Share four complete media-envelope reservations across ordinary and guarded
+/// RPCs. Administrative, cancellation, webhook, and mesh routes have independent
+/// admission, so saturated uploads cannot prevent control-plane progress.
 fn local_invocation_routes() -> Router<Arc<AppState>> {
+    local_invocation_routes_with_intake(mesh_forward_intake::Intake::for_rpc(
+        LOCAL_INVOCATION_HTTP_BODY_LIMIT_BYTES,
+    ))
+}
+
+fn local_invocation_routes_with_intake(
+    intake: mesh_forward_intake::Intake,
+) -> Router<Arc<AppState>> {
     Router::new()
-        .route("/rpc/invoke", post(invoke_handler))
-        .route("/rpc/preflight", post(preflight_handler))
-        .route("/rpc/simulate", post(simulate_handler))
+        .route("/rpc/invoke", post(invoke_admitted_handler))
+        .route("/rpc/preflight", post(preflight_admitted_handler))
+        .route("/rpc/simulate", post(simulate_admitted_handler))
         .merge(guarded_invoke::routes())
         .layer(axum::extract::DefaultBodyLimit::max(
             LOCAL_INVOCATION_HTTP_BODY_LIMIT_BYTES,
         ))
+        .layer(axum::Extension(intake))
 }
 
 async fn async_main(telemetry_config: TelemetryConfig) -> HostResult<()> {
@@ -14829,6 +14842,26 @@ async fn connector_config_rollback_handler(
     Ok(Json(response))
 }
 
+async fn preflight_admitted_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    mesh_forward_intake::RpcJson {
+        value: request,
+        permit,
+    }: mesh_forward_intake::RpcJson<HostPreflightRequest>,
+) -> Json<PreflightResponse> {
+    // This query has no retained job owner. Keep the reservation until it
+    // finishes, with the same finite admission budget as ordinary invocations.
+    let result = before_invoke_route_deadline(
+        invocation_deadline(Instant::now(), None),
+        preflight_handler(State(state), headers, Json(request)),
+        "preflight",
+    )
+    .await;
+    drop(permit);
+    result.unwrap_or_else(|error| Json(preflight_response_from_error(error)))
+}
+
 async fn preflight_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -14937,6 +14970,25 @@ async fn local_preflight(
         "preflight request complete"
     );
     response
+}
+
+async fn simulate_admitted_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    mesh_forward_intake::RpcJson {
+        value: request,
+        permit,
+    }: mesh_forward_intake::RpcJson<HostSimulateRequest>,
+) -> Result<Json<HostSimulateResponse>, (StatusCode, String)> {
+    let deadline = invocation_deadline(Instant::now(), Some(request.deadline_ms));
+    let result = before_invoke_route_deadline(
+        deadline,
+        simulate_handler(State(state), headers, Json(request)),
+        "simulation",
+    )
+    .await;
+    drop(permit);
+    result.map_err(map_host_error)?
 }
 
 async fn simulate_handler(
@@ -17898,6 +17950,27 @@ async fn perform_host_tcp_egress(
 ///     principal_id claim.
 ///   - Absent the header, behavior is unchanged: the token's claim
 ///     set drives the principal (br-flywheel_connectors-t623k).
+async fn invoke_admitted_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    mesh_forward_intake::RpcJson {
+        value: request,
+        permit,
+    }: mesh_forward_intake::RpcJson<InvokeRequest>,
+) -> Result<Json<InvokeResponse>, (StatusCode, String)> {
+    let asserted_principal = extract_principal_header(&headers);
+    Box::pin(route_invoke_with_intake(
+        &state,
+        request,
+        asserted_principal,
+        None,
+        Some(permit),
+    ))
+    .await
+    .map(Json)
+}
+
+/// In-process callers have already passed their transport admission boundary.
 async fn invoke_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -17929,14 +18002,26 @@ async fn route_invoke(
 /// routing budget after dependency or capacity waits. Single calls use None.
 async fn route_invoke_with_deadline(
     state: &Arc<AppState>,
+    request: InvokeRequest,
+    asserted_principal: Option<String>,
+    parent_deadline: Option<Instant>,
+) -> Result<InvokeResponse, (StatusCode, String)> {
+    route_invoke_with_intake(state, request, asserted_principal, parent_deadline, None).await
+}
+
+/// Keep HTTP intake bounded through discovery and authorization, then release
+/// the wire reservation only after local or forwarded host ownership succeeds.
+async fn route_invoke_with_intake(
+    state: &Arc<AppState>,
     mut request: InvokeRequest,
     asserted_principal: Option<String>,
     parent_deadline: Option<Instant>,
+    intake: Option<mesh_forward_intake::Permit>,
 ) -> Result<InvokeResponse, (StatusCode, String)> {
     let deadline = http_batch::route_deadline(Instant::now(), request.deadline_ms, parent_deadline);
     let Some(router) = state.mesh.clone() else {
         constrain_invoke_deadline(&mut request, deadline);
-        return invoke_jobs::execute(
+        return invoke_jobs::execute_with_intake(
             state,
             request,
             asserted_principal,
@@ -17944,6 +18029,7 @@ async fn route_invoke_with_deadline(
             None,
             None,
             None,
+            intake,
         )
         .await
         .map_err(map_host_error);
@@ -18013,11 +18099,12 @@ async fn route_invoke_with_deadline(
             decision,
             deadline,
             execution_fence,
+            intake,
         )
         .await;
     }
     constrain_invoke_deadline(&mut request, deadline);
-    let mut response = invoke_jobs::execute(
+    let mut response = invoke_jobs::execute_with_intake(
         state,
         request,
         asserted_principal,
@@ -18025,6 +18112,7 @@ async fn route_invoke_with_deadline(
         None,
         Some(execution_fence),
         None,
+        intake,
     )
     .await
     .map_err(map_host_error)?;
@@ -18341,11 +18429,12 @@ async fn mesh_forward_invoke(
         decision,
         deadline,
         execution_fence,
+        None,
     )
     .await
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn mesh_forward_invoke_with_fence(
     state: &Arc<AppState>,
     router: &Arc<fcp_host::mesh_routing::MeshRouter>,
@@ -18354,6 +18443,7 @@ async fn mesh_forward_invoke_with_fence(
     decision: fcp_mesh::invoke_route::InvokeRouteDecision,
     deadline: Instant,
     execution_fence: fcp_host::ConnectorExecutionFence,
+    intake: Option<mesh_forward_intake::Permit>,
 ) -> Result<InvokeResponse, (StatusCode, String)> {
     let started_at = Instant::now();
     let fcp_mesh::invoke_route::InvokeRouteDecision::Forward {
@@ -18453,6 +18543,9 @@ async fn mesh_forward_invoke_with_fence(
             ),
         )
         .map_err(map_host_error)?;
+    // The bounded host owner now retains the complete forwarded request and
+    // its original deadline. Waiting for the peer needs no upload reservation.
+    drop(intake);
     response_rx.await.map_err(|_| {
         (
             StatusCode::BAD_GATEWAY,
@@ -22579,12 +22672,49 @@ output_schema = {{ type = "object" }}
         let mut retry = request.clone();
         retry.id = RequestId::new("owned-disconnect-retry");
         let retry_id = retry.id.to_string();
-        let http_state = Arc::clone(&state);
-        let http_waiter = task::spawn(async move {
-            invoke_handler(State(http_state), HeaderMap::new(), Json(request)).await
-        });
+        let intake = mesh_forward_intake::Intake::for_rpc_test(
+            LOCAL_INVOCATION_HTTP_BODY_LIMIT_BYTES,
+            1,
+            Duration::from_secs(5),
+        );
+        let app =
+            local_invocation_routes_with_intake(intake.clone()).with_state(Arc::clone(&state));
+        let registry_guard = state.registry.state.write().await;
+        let http_request = Request::builder()
+            .method("POST")
+            .uri("/rpc/invoke")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&request).unwrap()))
+            .unwrap();
+        let mut http_waiter = Box::pin(app.clone().oneshot(http_request));
+        assert!(futures_util::poll!(http_waiter.as_mut()).is_pending());
+        assert_eq!(
+            intake.active_for_test(),
+            1,
+            "decoded requests must retain intake while admission is blocked"
+        );
+        assert!(!state.invoke_jobs.is_active("owned-disconnect"));
+        let saturated =
+            send_json_request(app, axum::http::Method::POST, "/rpc/invoke", json!({}), &[])
+                .await
+                .unwrap();
+        assert_eq!(saturated.status(), StatusCode::SERVICE_UNAVAILABLE);
+        drop(registry_guard);
+        let http_waiter = task::spawn(http_waiter);
         let ticket = started_rx.await.expect("connector dispatched");
         assert!(state.invoke_jobs.is_active(&ticket.operation_id));
+        fcp_async_core::time::timeout(Duration::from_secs(2), async {
+            while intake.active_for_test() != 0 {
+                task::yield_now().await;
+            }
+        })
+        .await
+        .expect("successful host admission must release the upload reservation");
+        assert_eq!(
+            intake.active_for_test(),
+            0,
+            "bounded host ownership releases the wire slot before a held connector result"
+        );
         let retry_error = fcp_async_core::time::timeout(
             Duration::from_secs(2),
             invoke_handler(State(Arc::clone(&state)), HeaderMap::new(), Json(retry)),
@@ -44593,7 +44723,13 @@ while IFS= read -r request; do exit 2; done
     async fn local_media_http_limit_rejects_unbounded_streams_before_dispatch() {
         let state = cancel_route_test_state();
         let app = local_invocation_routes().with_state(state);
-        for path in ["/rpc/invoke", "/rpc/preflight", "/rpc/simulate"] {
+        for path in [
+            "/rpc/invoke",
+            "/rpc/preflight",
+            "/rpc/simulate",
+            "/rpc/invoke/guarded",
+            "/rpc/preflight/guarded",
+        ] {
             // No Content-Length: the body must remain bounded while streaming.
             // Shared Bytes chunks avoid allocating a second oversized fixture.
             let chunk = Bytes::from(vec![b'x'; 64 * 1024]);
@@ -44625,6 +44761,149 @@ while IFS= read -r request; do exit 2; done
         .await
         .unwrap();
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn local_rpc_intake_is_shared_and_leaves_cancellation_available() {
+        let state = cancel_route_test_state();
+        state
+            .cancellation
+            .track_with_owner("intake-cancel", Some("user:test"));
+        let token = issue_cancel_self_test_token(state.lifecycle.as_ref(), "user:test").await;
+        let intake = mesh_forward_intake::Intake::for_rpc_test(
+            LOCAL_INVOCATION_HTTP_BODY_LIMIT_BYTES,
+            4,
+            Duration::from_secs(5),
+        );
+        let app = local_invocation_routes_with_intake(intake.clone())
+            .with_state(Arc::clone(&state))
+            .merge(cancel_test_app(Arc::clone(&state)));
+        let paths = [
+            "/rpc/invoke",
+            "/rpc/preflight",
+            "/rpc/simulate",
+            "/rpc/preflight/guarded",
+            "/rpc/invoke/guarded",
+        ];
+        let mut uploads = Vec::new();
+        for path in &paths[..4] {
+            let request = Request::builder()
+                .method("POST")
+                .uri(*path)
+                .header("content-type", "application/json")
+                .body(Body::from_stream(futures_util::stream::pending::<
+                    Result<Bytes, std::convert::Infallible>,
+                >()))
+                .unwrap();
+            let mut upload = Box::pin(app.clone().oneshot(request));
+            assert!(futures_util::poll!(upload.as_mut()).is_pending());
+            uploads.push(upload);
+        }
+        assert_eq!(intake.active_for_test(), 4);
+        for path in paths {
+            let body = Body::from_stream(futures_util::stream::poll_fn(
+                |_| -> std::task::Poll<Option<Result<Bytes, std::convert::Infallible>>> {
+                    panic!("saturated intake must reject before polling another body")
+                },
+            ));
+            let request = Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", "application/json")
+                .body(body)
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
+        }
+        let cancelled = send_cancel_request(
+            app.clone(),
+            "/rpc/cancel-self",
+            serde_json::to_value(CancellationRequest {
+                operation_id: "intake-cancel".to_owned(),
+                reason: CancelReason::UserRequested,
+                cleanup: CleanupBehavior::BestEffort,
+                return_partial: false,
+                capability_token: Some(token),
+            })
+            .unwrap(),
+            &[],
+        )
+        .await;
+        assert_eq!(cancelled.status(), StatusCode::OK);
+        assert!(state.cancellation.is_cancel_requested("intake-cancel"));
+        assert_eq!(intake.active_for_test(), 4);
+
+        drop(uploads.pop());
+        assert_eq!(intake.active_for_test(), 3);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/rpc/invoke/guarded")
+            .header("content-type", "application/json")
+            .body(Body::from("{\"rpc-intake-secret-canary\":"))
+            .unwrap();
+        let recovered = app.oneshot(request).await.unwrap();
+        assert_eq!(recovered.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            axum::body::to_bytes(recovered.into_body(), 256)
+                .await
+                .unwrap(),
+            "RPC envelope is invalid"
+        );
+        assert_eq!(intake.active_for_test(), 3);
+        drop(uploads);
+        assert_eq!(intake.active_for_test(), 0);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn local_rpc_uploads_share_a_total_deadline_and_recover_after_timeout() {
+        let intake = mesh_forward_intake::Intake::for_rpc_test(4096, 1, Duration::from_millis(40));
+        let app = local_invocation_routes_with_intake(intake.clone())
+            .with_state(cancel_route_test_state());
+        for path in [
+            "/rpc/invoke",
+            "/rpc/preflight",
+            "/rpc/simulate",
+            "/rpc/invoke/guarded",
+            "/rpc/preflight/guarded",
+        ] {
+            let chunks = futures_util::stream::unfold((), |()| async {
+                fcp_async_core::time::sleep(Duration::from_millis(5)).await;
+                Some((
+                    Ok::<_, std::convert::Infallible>(Bytes::from_static(b" ")),
+                    (),
+                ))
+            });
+            let request = Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", "application/json")
+                .body(Body::from_stream(chunks))
+                .unwrap();
+            let response =
+                fcp_async_core::time::timeout(Duration::from_secs(1), app.clone().oneshot(request))
+                    .await
+                    .expect("receiving another chunk must not renew the upload deadline")
+                    .unwrap();
+            assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT, "{path}");
+            assert_eq!(
+                axum::body::to_bytes(response.into_body(), 256)
+                    .await
+                    .unwrap(),
+                "RPC body read timed out"
+            );
+            assert_eq!(intake.active_for_test(), 0);
+        }
+        let recovered = send_json_request(
+            app,
+            axum::http::Method::POST,
+            "/rpc/preflight",
+            json!({}),
+            &[],
+        )
+        .await
+        .unwrap();
+        assert_eq!(recovered.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(intake.active_for_test(), 0);
     }
 
     struct HostOAuthLoopbackExpectedRequest {
@@ -47281,13 +47560,21 @@ while IFS= read -r request; do exit 2; done
         ];
         let post = axum::http::Method::POST;
         let held = send_json_request(
-            app.clone(), post.clone(), &strict_route, serde_json::json!({}), &headers,
+            app.clone(),
+            post.clone(),
+            &strict_route,
+            serde_json::json!({}),
+            &headers,
         )
         .await?;
         assert_eq!(held.status(), axum::http::StatusCode::FORBIDDEN);
 
         let prefix = send_json_request(
-            app.clone(), post.clone(), route, serde_json::json!({}), &headers,
+            app.clone(),
+            post.clone(),
+            route,
+            serde_json::json!({}),
+            &headers,
         )
         .await?;
         assert_eq!(prefix.status(), axum::http::StatusCode::OK);
@@ -47298,7 +47585,8 @@ while IFS= read -r request; do exit 2; done
         drop(state_store);
         drop(object_store);
 
-        let response = send_json_request(app, post, &strict_route, serde_json::json!({}), &headers).await?;
+        let response =
+            send_json_request(app, post, &strict_route, serde_json::json!({}), &headers).await?;
         assert_eq!(response.status(), axum::http::StatusCode::OK);
         let payload = response_body_json(response).await?;
         assert_eq!(payload["flush"]["object_writer_excluded_during_read"], true);

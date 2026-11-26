@@ -429,6 +429,32 @@ pub(super) fn execute<'a>(
     execution_fence: Option<ConnectorExecutionFence>,
     origin: Option<MeshInvokeOrigin>,
 ) -> std::pin::Pin<Box<dyn Future<Output = HostResult<InvokeResponse>> + Send + 'a>> {
+    execute_with_intake(
+        state,
+        request,
+        asserted_principal,
+        parent_deadline,
+        relay,
+        execution_fence,
+        origin,
+        None,
+    )
+}
+
+/// Public uploads retain their reservation until this bounded owner accepts
+/// the invocation. Internal and authenticated mesh callers already have their
+/// own admission boundary and enter through `execute` without a wire permit.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn execute_with_intake<'a>(
+    state: &'a std::sync::Arc<super::AppState>,
+    request: fcp_kernel::InvokeRequest,
+    asserted_principal: Option<String>,
+    parent_deadline: Option<Instant>,
+    relay: Option<fcp_host::RelayCancellationBinding>,
+    execution_fence: Option<ConnectorExecutionFence>,
+    origin: Option<MeshInvokeOrigin>,
+    intake: Option<super::mesh_forward_intake::Permit>,
+) -> std::pin::Pin<Box<dyn Future<Output = HostResult<InvokeResponse>> + Send + 'a>> {
     Box::pin(async move {
         request.validate_idempotency_key().map_err(|error| {
             HostError::InvalidFilter(format!("invalid invoke request: {error}"))
@@ -568,6 +594,10 @@ pub(super) fn execute<'a>(
                 return Err(error);
             }
         };
+        // The host now owns this job within MAX_OWNED_INVOCATIONS. Its client
+        // retains only a receiver, so long execution must not occupy an upload
+        // slot or prevent new callers from reaching admission.
+        drop(intake);
         receiver.await.map_err(|_| {
             HostError::Unavailable(
                 "owned invocation ended without a response; inspect its invocation record before retrying"

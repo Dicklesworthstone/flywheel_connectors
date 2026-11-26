@@ -1283,6 +1283,193 @@ async fn missing_capability_and_oversized_body_never_reach_custody_or_connector(
 }
 
 #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn saturated_stream_work_intake_keeps_acknowledgement_and_close_available() {
+    use std::convert::Infallible;
+
+    use axum::body::Bytes;
+    use futures_util::{poll, stream};
+
+    let fixture = fixture().await;
+    let (token, _) = issue(&fixture, issuance("agent:alice")).await;
+    let work = mesh_forward_intake::Intake::for_rpc_test(REQUEST_BYTES, 1, Duration::from_secs(2));
+    let control = mesh_forward_intake::Intake::for_rpc(REQUEST_BYTES);
+    let app = routes_with_intakes(Arc::clone(&fixture.host), work.clone(), control)
+        .with_state(Arc::clone(&fixture.host));
+    let read = json!({"auth":auth(&token),"stream_id":STREAM});
+    let (status, body) = send(app.clone(), "/rpc/streams/poll", read.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let stalled_request = || {
+        Request::builder()
+            .method("POST")
+            .uri("/rpc/streams/open")
+            .header("content-type", "application/json")
+            .body(Body::from_stream(stream::pending::<
+                Result<Bytes, Infallible>,
+            >()))
+            .unwrap()
+    };
+    let mut stalled = Box::pin(app.clone().oneshot(stalled_request()));
+    assert!(poll!(stalled.as_mut()).is_pending());
+    assert_eq!(work.active_for_test(), 1);
+
+    let polls = Arc::new(AtomicU64::new(0));
+    let observed = Arc::clone(&polls);
+    let rejected_body = stream::poll_fn(move |_| {
+        observed.fetch_add(1, Ordering::SeqCst);
+        std::task::Poll::<Option<Result<Bytes, Infallible>>>::Pending
+    });
+    let rejected = Request::builder()
+        .method("POST")
+        .uri("/rpc/streams/poll")
+        .header("content-type", "application/json")
+        .body(Body::from_stream(rejected_body))
+        .unwrap();
+    let response =
+        fcp_async_core::time::timeout(Duration::from_millis(500), app.clone().oneshot(rejected))
+            .await
+            .expect("a saturated lane must reject without waiting for the body")
+            .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(polls.load(Ordering::SeqCst), 0);
+
+    let (status, body) = send(
+        app.clone(),
+        "/rpc/streams/ack",
+        json!({"auth":auth(&token),"stream_id":STREAM,"ack":acknowledgement()}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(fixture.journal.describe(STREAM).unwrap().pending_events, 0);
+    assert_eq!(work.active_for_test(), 1);
+
+    drop(stalled);
+    assert_eq!(work.active_for_test(), 0);
+    let (status, body) = send(app.clone(), "/rpc/streams/poll", read.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut stalled = Box::pin(app.clone().oneshot(stalled_request()));
+    assert!(poll!(stalled.as_mut()).is_pending());
+    let (status, body) = send(app, "/rpc/streams/close", read).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(fixture.journal.describe(STREAM).unwrap().closed);
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    drop(stalled);
+    assert_eq!(work.active_for_test(), 0);
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn stream_control_keeps_intake_custody_during_authority_wait_and_releases_on_drop() {
+    use futures_util::poll;
+
+    let fixture = fixture().await;
+    let (token, _) = issue(&fixture, issuance("agent:alice")).await;
+    let control =
+        mesh_forward_intake::Intake::for_rpc_test(REQUEST_BYTES, 1, Duration::from_secs(2));
+    let app = routes_with_intakes(
+        Arc::clone(&fixture.host),
+        mesh_forward_intake::Intake::for_rpc(REQUEST_BYTES),
+        control.clone(),
+    )
+    .with_state(Arc::clone(&fixture.host));
+    let retained = json!({"auth":auth(&token),"stream_id":STREAM});
+    let registry_guard = fixture.host.registry.state.write().await;
+    let request = Request::builder()
+        .method("POST")
+        .uri("/rpc/streams/close")
+        .header("content-type", "application/json")
+        .body(Body::from(retained.to_string()))
+        .unwrap();
+    let mut waiting = Box::pin(app.clone().oneshot(request));
+    assert!(poll!(waiting.as_mut()).is_pending());
+    assert_eq!(control.active_for_test(), 1);
+    let (status, _) = send(
+        app.clone(),
+        "/rpc/streams/ack",
+        json!({"auth":auth(&token),"stream_id":STREAM,"ack":acknowledgement()}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    // The work lane remains independently usable even while control admission
+    // is occupied. Malformed input must reach its decoder, not a full lane.
+    let (status, _) = send(app.clone(), "/rpc/streams/poll", json!({})).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(!fixture.journal.describe(STREAM).unwrap().closed);
+    drop(waiting);
+    assert_eq!(control.active_for_test(), 0);
+    drop(registry_guard);
+
+    let (status, body) = send(app, "/rpc/streams/close", retained).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(fixture.journal.describe(STREAM).unwrap().closed);
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(control.active_for_test(), 0);
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn native_stream_upload_deadline_and_chunked_byte_limit_recover_capacity() {
+    use std::convert::Infallible;
+
+    use axum::body::Bytes;
+    use futures_util::stream;
+
+    let fixture = fixture().await;
+    let (token, _) = issue(&fixture, issuance("agent:alice")).await;
+    let work =
+        mesh_forward_intake::Intake::for_rpc_test(REQUEST_BYTES, 1, Duration::from_millis(50));
+    let app = routes_with_intakes(
+        Arc::clone(&fixture.host),
+        work.clone(),
+        mesh_forward_intake::Intake::for_rpc(REQUEST_BYTES),
+    )
+    .with_state(Arc::clone(&fixture.host));
+    let request = |body| {
+        Request::builder()
+            .method("POST")
+            .uri("/rpc/streams/poll")
+            .header("content-type", "application/json")
+            .body(body)
+            .unwrap()
+    };
+    let stalled = request(Body::from_stream(stream::pending::<
+        Result<Bytes, Infallible>,
+    >()));
+    let response =
+        fcp_async_core::time::timeout(Duration::from_secs(1), app.clone().oneshot(stalled))
+            .await
+            .expect("a silent upload must hit the total body deadline")
+            .unwrap();
+    assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+    assert_eq!(work.active_for_test(), 0);
+
+    let mut exact = json!({"auth":auth(&token),"stream_id":STREAM}).to_string();
+    exact.extend(std::iter::repeat_n(' ', REQUEST_BYTES - exact.len()));
+    let chunks = vec![
+        Ok::<_, Infallible>(Bytes::copy_from_slice(&exact.as_bytes()[..100])),
+        Ok(Bytes::copy_from_slice(&exact.as_bytes()[100..])),
+    ];
+    let response = app
+        .clone()
+        .oneshot(request(Body::from_stream(stream::iter(chunks))))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(work.active_for_test(), 0);
+
+    let oversized = vec![
+        Ok::<_, Infallible>(Bytes::from(exact)),
+        Ok(Bytes::from_static(b" ")),
+    ];
+    let response = app
+        .oneshot(request(Body::from_stream(stream::iter(oversized))))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(work.active_for_test(), 0);
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.journal.describe(STREAM).unwrap().pending_events, 1);
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
 async fn instance_bound_consumer_token_is_checked_against_durable_current_instance() {
     let fixture = fixture().await;
     let (original, _) = issue(&fixture, issuance("agent:alice")).await;

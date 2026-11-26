@@ -189,11 +189,34 @@ pub(super) fn open_journal() -> HostResult<Option<Arc<NativeEventJournal>>> {
 }
 
 pub(super) fn routes(host: Arc<AppState>) -> Router<Arc<AppState>> {
-    Router::new()
+    routes_with_intakes(
+        host,
+        mesh_forward_intake::Intake::for_rpc(REQUEST_BYTES),
+        mesh_forward_intake::Intake::for_rpc(REQUEST_BYTES),
+    )
+}
+
+fn routes_with_intakes(
+    host: Arc<AppState>,
+    work: mesh_forward_intake::Intake,
+    control: mesh_forward_intake::Intake,
+) -> Router<Arc<AppState>> {
+    // An open can wait on the connector, while polling adds consumer work.
+    // Neither may consume the reservations needed to acknowledge retained
+    // events or close a stream. Both lanes bound uploads before decoding and
+    // retain their permit through the bounded dispatch, including authority
+    // waits and peer forwarding; there is no separate stream-control job queue.
+    let work_routes = Router::new()
         .route("/rpc/streams/open", post(open_handler))
         .route("/rpc/streams/poll", post(poll_handler))
+        .layer(axum::Extension(work));
+    let control_routes = Router::new()
         .route("/rpc/streams/ack", post(ack_handler))
         .route("/rpc/streams/close", post(close_handler))
+        .layer(axum::Extension(control));
+    Router::new()
+        .merge(work_routes)
+        .merge(control_routes)
         .layer(axum::extract::DefaultBodyLimit::max(REQUEST_BYTES))
         .with_state(host)
 }
@@ -979,7 +1002,10 @@ impl EventService {
 
 async fn open_handler(
     State(host): State<Arc<AppState>>,
-    Json(request): Json<OpenRequest>,
+    mesh_forward_intake::RpcJson {
+        value: request,
+        permit: _permit,
+    }: mesh_forward_intake::RpcJson<OpenRequest>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     mesh::dispatch(
         &host.native_events,
@@ -993,7 +1019,10 @@ async fn open_handler(
 
 async fn poll_handler(
     State(host): State<Arc<AppState>>,
-    Json(request): Json<PollRequest>,
+    mesh_forward_intake::RpcJson {
+        value: request,
+        permit: _permit,
+    }: mesh_forward_intake::RpcJson<PollRequest>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     mesh::dispatch(
         &host.native_events,
@@ -1007,7 +1036,10 @@ async fn poll_handler(
 
 async fn ack_handler(
     State(host): State<Arc<AppState>>,
-    Json(request): Json<AckRequest>,
+    mesh_forward_intake::RpcJson {
+        value: request,
+        permit: _permit,
+    }: mesh_forward_intake::RpcJson<AckRequest>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     mesh::dispatch(
         &host.native_events,
@@ -1021,7 +1053,10 @@ async fn ack_handler(
 
 async fn close_handler(
     State(host): State<Arc<AppState>>,
-    Json(request): Json<CloseRequest>,
+    mesh_forward_intake::RpcJson {
+        value: request,
+        permit: _permit,
+    }: mesh_forward_intake::RpcJson<CloseRequest>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     mesh::dispatch(
         &host.native_events,
