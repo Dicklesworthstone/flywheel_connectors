@@ -472,15 +472,22 @@ impl YouTubeConnector {
                         "required": ["query"],
                         "properties": {
                             "query": { "type": "string" },
-                            "max_results": { "type": "integer" },
-                            "type": { "type": "string" }
+                            "max_results": { "type": "integer", "minimum": 0, "maximum": 50, "default": 5 },
+                            "type": { "type": "string" },
+                            "page_token": {
+                                "type": "string",
+                                "minLength": 1,
+                                "description": "Nonblank opaque cursor returned as next_page_token; reuse the same query options."
+                            }
                         }
                     }),
                     json!({
                         "type": "object",
+                        "required": ["items", "total_results"],
                         "properties": {
                             "items": { "type": "array" },
-                            "total_results": { "type": "integer" }
+                            "total_results": { "type": "integer" },
+                            "next_page_token": { "type": ["string", "null"] }
                         }
                     }),
                     "youtube.read",
@@ -668,13 +675,20 @@ impl YouTubeConnector {
                         "required": ["video_id"],
                         "properties": {
                             "video_id": { "type": "string" },
-                            "max_results": { "type": "integer" }
+                            "max_results": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 },
+                            "page_token": {
+                                "type": "string",
+                                "minLength": 1,
+                                "description": "Nonblank opaque cursor returned as next_page_token; reuse the same query options."
+                            }
                         }
                     }),
                     json!({
                         "type": "object",
+                        "required": ["items"],
                         "properties": {
-                            "items": { "type": "array" }
+                            "items": { "type": "array" },
+                            "next_page_token": { "type": ["string", "null"] }
                         }
                     }),
                     "youtube.read",
@@ -1101,6 +1115,9 @@ impl YouTubeConnector {
             message: "Invalid operation ID format".into(),
         })?;
         let cap_id = youtube_capability_for_operation(operation)?;
+        if matches!(operation, "youtube.search" | "youtube.list_comments") {
+            validate_youtube_input(operation, &input)?;
+        }
         let resource_uris = youtube_resource_uris(operation, &input);
         self.base.check_ready()?;
 
@@ -1133,14 +1150,11 @@ impl YouTubeConnector {
     async fn invoke_search(&self, input: serde_json::Value) -> FcpResult<serde_json::Value> {
         let client = self.client.as_ref().ok_or(FcpError::NotConfigured)?;
         let query = require_str(&input, "query")?;
-        let max_results = input
-            .get("max_results")
-            .and_then(|v| v.as_u64())
-            .and_then(|v| u32::try_from(v).ok());
+        let (max_results, page_token) = youtube_list_pagination(&input, 0, 50)?;
         let result_type = input.get("type").and_then(|v| v.as_str());
 
         let results = client
-            .search(query, max_results, result_type)
+            .search(query, max_results, result_type, page_token)
             .await
             .map_err(|e: YouTubeError| e.to_fcp_error())?;
 
@@ -1151,7 +1165,8 @@ impl YouTubeConnector {
 
         Ok(json!({
             "items": results.items,
-            "total_results": total_results
+            "total_results": total_results,
+            "next_page_token": results.next_page_token
         }))
     }
 
@@ -1264,17 +1279,17 @@ impl YouTubeConnector {
     async fn invoke_list_comments(&self, input: serde_json::Value) -> FcpResult<serde_json::Value> {
         let client = self.client.as_ref().ok_or(FcpError::NotConfigured)?;
         let video_id = require_str(&input, "video_id")?;
-        let max_results = input
-            .get("max_results")
-            .and_then(|v| v.as_u64())
-            .and_then(|v| u32::try_from(v).ok());
+        let (max_results, page_token) = youtube_list_pagination(&input, 1, 100)?;
 
         let results = client
-            .list_comments(video_id, max_results)
+            .list_comments(video_id, max_results, page_token)
             .await
             .map_err(|e: YouTubeError| e.to_fcp_error())?;
 
-        Ok(json!({ "items": results.items }))
+        Ok(json!({
+            "items": results.items,
+            "next_page_token": results.next_page_token
+        }))
     }
 
     async fn invoke_post_comment(&self, input: serde_json::Value) -> FcpResult<serde_json::Value> {
@@ -2071,12 +2086,58 @@ fn parse_video_upload_input(input: &serde_json::Value) -> FcpResult<VideoUploadI
     })
 }
 
+fn youtube_list_pagination(
+    input: &serde_json::Value,
+    minimum: u32,
+    maximum: u32,
+) -> FcpResult<(Option<u32>, Option<&str>)> {
+    if !input.is_object() {
+        return Err(FcpError::InvalidRequest {
+            code: 1003,
+            message: "Input must be an object".into(),
+        });
+    }
+    let max_results = input
+        .get("max_results")
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|value| u32::try_from(value).ok())
+                .filter(|value| (minimum..=maximum).contains(value))
+                .ok_or_else(|| FcpError::InvalidRequest {
+                    code: 1003,
+                    message: format!(
+                        "max_results must be an integer between {minimum} and {maximum}"
+                    ),
+                })
+        })
+        .transpose()?;
+    let page_token = input
+        .get("page_token")
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| FcpError::InvalidRequest {
+                    code: 1003,
+                    message: "page_token must be a nonblank string".into(),
+                })
+        })
+        .transpose()?;
+    Ok((max_results, page_token))
+}
+
 fn validate_youtube_input(operation: &str, input: &serde_json::Value) -> FcpResult<()> {
     match operation {
         "youtube.search" => {
             require_str(input, "query")?;
+            youtube_list_pagination(input, 0, 50)?;
         }
-        "youtube.get_video" | "youtube.list_comments" | "youtube.get_captions" => {
+        "youtube.list_comments" => {
+            require_str(input, "video_id")?;
+            youtube_list_pagination(input, 1, 100)?;
+        }
+        "youtube.get_video" | "youtube.get_captions" => {
             require_str(input, "video_id")?;
         }
         "youtube.list_videos" => {

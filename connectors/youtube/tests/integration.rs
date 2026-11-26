@@ -23,7 +23,7 @@ use fcp_testkit::AsyncTestContext;
 use serde_json::json;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
-    matchers::{method, path, path_regex, query_param},
+    matchers::{bearer_token, method, path, path_regex, query_param, query_param_is_missing},
 };
 
 use fcp_youtube::{
@@ -199,6 +199,107 @@ async fn search_happy_path() {
     let items = result["items"].as_array().expect("items array");
     assert_eq!(items.len(), 2);
     assert_eq!(result["total_results"], 2);
+}
+
+#[fcp_async_core::runtime::test]
+async fn search_continues_with_an_opaque_cursor_and_preserves_query_options() {
+    let server = MockServer::start().await;
+    let query = "rust | cargo & 雪";
+    let cursor = "search-page-2+/=&?雪%";
+    for (page, video_id) in [(1, "video-first"), (2, "video-second")] {
+        let mut response = json!({
+            "kind": "youtube#searchListResponse",
+            "etag": format!("search-page-{page}"),
+            "pageInfo": { "totalResults": 42, "resultsPerPage": 1 },
+            "items": [{
+                "kind": "youtube#searchResult",
+                "etag": video_id,
+                "id": { "kind": "youtube#video", "videoId": video_id },
+                "snippet": {
+                    "title": format!("Rust tutorial {page}"),
+                    "description": "Provider search result",
+                    "channelId": "channel-fixture"
+                }
+            }]
+        });
+        if page == 1 {
+            response["nextPageToken"] = json!(cursor);
+        }
+        let mock = Mock::given(method("GET"))
+            .and(path("/search"))
+            .and(query_param("part", "snippet"))
+            .and(query_param("q", query))
+            .and(query_param("type", "video"))
+            .and(query_param("maxResults", "50"))
+            .and(query_param("key", "test-api-key-xyz"));
+        let mock = if page == 1 {
+            mock.and(query_param_is_missing("pageToken"))
+        } else {
+            mock.and(query_param("pageToken", cursor))
+        };
+        mock.respond_with(ResponseTemplate::new(200).set_body_json(response))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+
+    let mut connector = YouTubeConnector::new();
+    setup_configure(&mut connector, &server.uri()).await;
+    let key = setup_handshake(&mut connector, &["youtube.read"]).await;
+    let token = generate_valid_token(&key, &connector, "youtube.search");
+    let mut input = json!({ "query": query, "type": "video", "max_results": 50 });
+    let first = connector
+        .handle_invoke(json!({
+            "operation": "youtube.search", "input": input, "capability_token": token
+        }))
+        .await
+        .unwrap();
+    assert_eq!(first["items"][0]["id"]["videoId"], "video-first");
+    assert_eq!(first["items"][0]["snippet"]["channelId"], "channel-fixture");
+    assert_eq!(first["total_results"], 42);
+    assert_eq!(first["next_page_token"], cursor);
+    assert!(first.get("nextPageToken").is_none());
+
+    input["page_token"] = first["next_page_token"].clone();
+    let second = connector
+        .handle_invoke(json!({
+            "operation": "youtube.search", "input": input, "capability_token": token
+        }))
+        .await
+        .unwrap();
+    assert_eq!(second["items"][0]["id"]["videoId"], "video-second");
+    assert_eq!(second["total_results"], 42);
+    assert_eq!(
+        second.get("next_page_token"),
+        Some(&serde_json::Value::Null)
+    );
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    let without_cursor = |request: &wiremock::Request| {
+        request
+            .url
+            .query_pairs()
+            .filter(|(name, _)| name != "pageToken")
+            .map(|(name, value)| (name.into_owned(), value.into_owned()))
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    assert_eq!(without_cursor(&requests[0]), without_cursor(&requests[1]));
+    server.verify().await;
+
+    let manifest = fcp_manifest::ConnectorManifest::parse_str(include_str!("../manifest.toml"))
+        .expect("updated YouTube interface hash must validate");
+    let introspection = connector.handle_introspect().await.unwrap();
+    for operation in ["youtube.search", "youtube.list_comments"] {
+        let declared = &manifest.provides.operations[operation];
+        let runtime = introspection["operations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["id"] == operation)
+            .unwrap();
+        assert_eq!(declared.input_schema, runtime["input_schema"]);
+        assert_eq!(declared.output_schema, runtime["output_schema"]);
+    }
 }
 
 #[fcp_async_core::runtime::test]
@@ -498,6 +599,104 @@ async fn list_comments_happy_path() {
 
     let items = result["items"].as_array().expect("items array");
     assert_eq!(items.len(), 1);
+}
+
+#[fcp_async_core::runtime::test]
+async fn comment_threads_continue_with_an_opaque_cursor_and_preserve_video_scope() {
+    let server = MockServer::start().await;
+    let video_id = "dQw4w9WgXcQ";
+    let cursor = "comments-page-2+/=&?opaque%";
+    for (page, thread_id) in [(1, "thread-first"), (2, "thread-second")] {
+        let mut response = json!({
+            "kind": "youtube#commentThreadListResponse",
+            "etag": format!("comments-page-{page}"),
+            "pageInfo": { "totalResults": 2, "resultsPerPage": 1 },
+            "items": [{
+                "kind": "youtube#commentThread",
+                "etag": thread_id,
+                "id": thread_id,
+                "snippet": {
+                    "videoId": video_id,
+                    "topLevelComment": {
+                        "id": format!("comment-{page}"),
+                        "snippet": {
+                            "textDisplay": format!("Comment on page {page}"),
+                            "authorDisplayName": "Fixture author"
+                        }
+                    },
+                    "totalReplyCount": 3
+                }
+            }]
+        });
+        if page == 1 {
+            response["nextPageToken"] = json!(cursor);
+        }
+        let mock = Mock::given(method("GET"))
+            .and(path("/commentThreads"))
+            .and(bearer_token("fixture-comment-token"))
+            .and(query_param("part", "snippet"))
+            .and(query_param("videoId", video_id))
+            .and(query_param("maxResults", "100"))
+            .and(query_param_is_missing("key"));
+        let mock = if page == 1 {
+            mock.and(query_param_is_missing("pageToken"))
+        } else {
+            mock.and(query_param("pageToken", cursor))
+        };
+        mock.respond_with(ResponseTemplate::new(200).set_body_json(response))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    let mut connector = YouTubeConnector::new();
+    connector
+        .handle_configure(json!({
+            "access_token": "fixture-comment-token", "base_url": server.uri()
+        }))
+        .await
+        .unwrap();
+    let key = setup_handshake(&mut connector, &["youtube.read"]).await;
+    let token = generate_valid_token(&key, &connector, "youtube.list_comments");
+    let mut input = json!({ "video_id": video_id, "max_results": 100 });
+    let first = connector
+        .handle_invoke(json!({
+            "operation": "youtube.list_comments", "input": input, "capability_token": token
+        }))
+        .await
+        .unwrap();
+    assert_eq!(first["items"][0]["id"], "thread-first");
+    assert_eq!(first["items"][0]["snippet"]["totalReplyCount"], 3);
+    assert_eq!(first["next_page_token"], cursor);
+    assert!(first.get("nextPageToken").is_none());
+
+    input["page_token"] = first["next_page_token"].clone();
+    let second = connector
+        .handle_invoke(json!({
+            "operation": "youtube.list_comments", "input": input, "capability_token": token
+        }))
+        .await
+        .unwrap();
+    assert_eq!(second["items"][0]["id"], "thread-second");
+    assert_eq!(
+        second["items"][0]["snippet"]["topLevelComment"]["snippet"]["textDisplay"],
+        "Comment on page 2"
+    );
+    assert_eq!(
+        second.get("next_page_token"),
+        Some(&serde_json::Value::Null)
+    );
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    let without_cursor = |request: &wiremock::Request| {
+        request
+            .url
+            .query_pairs()
+            .filter(|(name, _)| name != "pageToken")
+            .map(|(name, value)| (name.into_owned(), value.into_owned()))
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    assert_eq!(without_cursor(&requests[0]), without_cursor(&requests[1]));
+    server.verify().await;
 }
 
 #[fcp_async_core::runtime::test]
@@ -1483,6 +1682,149 @@ async fn shutdown_succeeds() {
 // ============================================================================
 // Input validation edge cases
 // ============================================================================
+
+#[fcp_async_core::runtime::test]
+async fn pagination_validation_matches_simulation_and_prevents_provider_io() {
+    for (operation, endpoint, minimum, maximum, kind) in [
+        (
+            "youtube.search",
+            "/search",
+            0_u32,
+            50_u32,
+            "youtube#searchListResponse",
+        ),
+        (
+            "youtube.list_comments",
+            "/commentThreads",
+            1_u32,
+            100_u32,
+            "youtube#commentThreadListResponse",
+        ),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(endpoint))
+            .and(query_param("key", "test-api-key-xyz"))
+            .and(query_param_is_missing("pageToken"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "kind": kind, "etag": "empty-page", "items": []
+            })))
+            .expect(3)
+            .mount(&server)
+            .await;
+        let mut connector = YouTubeConnector::new();
+        setup_configure(&mut connector, &server.uri()).await;
+        let key = setup_handshake(&mut connector, &["youtube.read"]).await;
+        let token = generate_valid_token(&key, &connector, operation);
+        let base = if operation == "youtube.search" {
+            json!({ "query": "rust" })
+        } else {
+            json!({ "video_id": "dQw4w9WgXcQ" })
+        };
+        let mut invalid_inputs = vec![json!(null), json!([]), json!({})];
+        for (field, value) in [
+            ("page_token", json!(null)),
+            ("page_token", json!(false)),
+            ("page_token", json!(1)),
+            ("page_token", json!([])),
+            ("page_token", json!({})),
+            ("page_token", json!("")),
+            ("page_token", json!(" \t")),
+            ("page_token", json!("\u{2003}")),
+            ("max_results", json!(null)),
+            ("max_results", json!(false)),
+            ("max_results", json!("1")),
+            ("max_results", json!([])),
+            ("max_results", json!({})),
+            ("max_results", json!(-1)),
+            ("max_results", json!(1.5)),
+            ("max_results", json!(maximum + 1)),
+            ("max_results", json!(u64::MAX)),
+        ] {
+            let mut input = base.clone();
+            input[field] = value;
+            invalid_inputs.push(input);
+        }
+        if minimum != 0 {
+            let mut input = base.clone();
+            input["max_results"] = json!(0);
+            invalid_inputs.push(input);
+        }
+        for input in invalid_inputs {
+            let error = connector
+                .handle_invoke(json!({
+                    "operation": operation, "input": input, "capability_token": token
+                }))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, fcp_core::FcpError::InvalidRequest { .. }),
+                "{operation}: {input}: {error:?}"
+            );
+            let request = SimulateRequest::new(
+                ConnectorId::from_static("youtube"),
+                OperationId::from_static(operation),
+                fcp_core::ZoneId::work(),
+                input,
+                token.clone(),
+            );
+            let preview: SimulateResponse = serde_json::from_value(
+                connector
+                    .handle_simulate(serde_json::to_value(request).unwrap())
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(!preview.would_succeed);
+            assert_eq!(preview.denial_code, Some(error.error_code()));
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
+
+        for max_results in [Some(minimum), Some(maximum), None] {
+            let mut input = base.clone();
+            if let Some(max_results) = max_results {
+                input["max_results"] = json!(max_results);
+            }
+            let request = SimulateRequest::new(
+                ConnectorId::from_static("youtube"),
+                OperationId::from_static(operation),
+                fcp_core::ZoneId::work(),
+                input.clone(),
+                token.clone(),
+            );
+            let preview: SimulateResponse = serde_json::from_value(
+                connector
+                    .handle_simulate(serde_json::to_value(request).unwrap())
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(preview.would_succeed);
+            let result = connector
+                .handle_invoke(json!({
+                    "operation": operation, "input": input, "capability_token": token
+                }))
+                .await
+                .unwrap();
+            assert_eq!(result["items"], json!([]));
+            assert_eq!(
+                result.get("next_page_token"),
+                Some(&serde_json::Value::Null)
+            );
+        }
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 3);
+        for (request, expected) in requests.iter().zip([Some(minimum), Some(maximum), None]) {
+            let actual = request
+                .url
+                .query_pairs()
+                .find(|(name, _)| name == "maxResults")
+                .map(|(_, value)| value.into_owned());
+            assert_eq!(actual, expected.map(|value| value.to_string()));
+        }
+        server.verify().await;
+    }
+}
 
 #[fcp_async_core::runtime::test]
 async fn search_missing_query_fails() {

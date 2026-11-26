@@ -5,7 +5,7 @@ min_mesh_version = "2.0.0"
 min_protocol = "fcp2-sym/2.0"
 protocol_features = []
 max_datagram_bytes = 65000
-interface_hash = "blake3-256:fcp.interface.v2:0f1660224c325988a81d99b0f312361caa7210334a3cab83561010dba0f258b2"
+interface_hash = "blake3-256:fcp.interface.v2:185d1773c07055ac9978c4e2e73195852d579d1abd587e7f7e07adbd665b6717"
 
 [connector]
 id = "fcp.youtube"
@@ -48,8 +48,15 @@ type = "object"
 type = "string"
 [provides.operations."youtube.search".input_schema.properties.max_results]
 type = "integer"
+minimum = 0
+maximum = 50
+default = 5
 [provides.operations."youtube.search".input_schema.properties.type]
 type = "string"
+[provides.operations."youtube.search".input_schema.properties.page_token]
+type = "string"
+minLength = 1
+description = "Nonblank opaque cursor returned as next_page_token; reuse the same query options."
 
 [provides.operations."youtube.search".output_schema]
 required = ["items", "total_results"]
@@ -58,6 +65,8 @@ type = "object"
 type = "array"
 [provides.operations."youtube.search".output_schema.properties.total_results]
 type = "integer"
+[provides.operations."youtube.search".output_schema.properties.next_page_token]
+type = ["string", "null"]
 
 [provides.operations."youtube.search".network_constraints]
 host_allow = ["www.googleapis.com"]
@@ -320,12 +329,23 @@ required = ["video_id"]
 type = "object"
 [provides.operations."youtube.list_comments".input_schema.properties.video_id]
 type = "string"
+[provides.operations."youtube.list_comments".input_schema.properties.max_results]
+type = "integer"
+minimum = 1
+maximum = 100
+default = 20
+[provides.operations."youtube.list_comments".input_schema.properties.page_token]
+type = "string"
+minLength = 1
+description = "Nonblank opaque cursor returned as next_page_token; reuse the same query options."
 
 [provides.operations."youtube.list_comments".output_schema]
 required = ["items"]
 type = "object"
 [provides.operations."youtube.list_comments".output_schema.properties.items]
 type = "array"
+[provides.operations."youtube.list_comments".output_schema.properties.next_page_token]
+type = ["string", "null"]
 
 [provides.operations."youtube.list_comments".network_constraints]
 host_allow = ["www.googleapis.com"]

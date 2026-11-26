@@ -206,12 +206,13 @@ impl YouTubeClient {
 
     // ── API Methods ──────────────────────────────────────────────
 
-    /// Search for videos, channels, or playlists.
+    /// Search one page of videos, channels, or playlists.
     pub async fn search(
         &self,
         query: &str,
         max_results: Option<u32>,
         result_type: Option<&str>,
+        page_token: Option<&str>,
     ) -> YouTubeResult<SearchListResponse> {
         let mut base = format!(
             "{}/search?part=snippet&q={}",
@@ -224,6 +225,13 @@ impl YouTubeClient {
         }
         if let Some(t) = result_type {
             let _ = write!(base, "&type={}", urlencoding::encode(t));
+        }
+        if let Some(token) = page_token {
+            let _ = write!(
+                base,
+                "{PAGE_CURSOR_PARAM_PREFIX}{}",
+                urlencoding::encode(token)
+            );
         }
 
         let url = self.url_with_key(&base);
@@ -322,11 +330,12 @@ impl YouTubeClient {
         self.get_json(&self.url_with_key(&base)).await
     }
 
-    /// List comment threads on a video.
+    /// List one page of comment threads on a video.
     pub async fn list_comments(
         &self,
         video_id: &str,
         max_results: Option<u32>,
+        page_token: Option<&str>,
     ) -> YouTubeResult<CommentThreadListResponse> {
         let mut base = format!(
             "{}/commentThreads?part=snippet&videoId={}",
@@ -336,6 +345,14 @@ impl YouTubeClient {
 
         if let Some(max) = max_results {
             let _ = write!(base, "&maxResults={max}");
+        }
+
+        if let Some(token) = page_token {
+            let _ = write!(
+                base,
+                "{PAGE_CURSOR_PARAM_PREFIX}{}",
+                urlencoding::encode(token)
+            );
         }
 
         self.get_json(&self.url_with_key(&base)).await

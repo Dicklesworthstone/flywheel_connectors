@@ -137,13 +137,13 @@ The current YouTube README slice documents the existing runtime surface:
 
 | Operation | Endpoint shape | Capability | SafetyTier | RiskLevel | Idempotency | Required input |
 |-----------|----------------|------------|------------|-----------|-------------|----------------|
-| `youtube.search` | `GET /search?part=snippet&q=...` | `youtube.read` | `Safe` | `Low` | `Strict` | `query`; optional `max_results`, `type`. |
+| `youtube.search` | `GET /search?part=snippet&q=...` | `youtube.read` | `Safe` | `Low` | `Strict` | `query`; optional `max_results`, `type`, `page_token`. |
 | `youtube.get_video` | `GET /videos?id=...` | `youtube.read` | `Safe` | `Low` | `Strict` | `video_id`. |
 | `youtube.list_videos` | `GET /videos?id=a,b` | `youtube.read` | `Safe` | `Low` | `Strict` | Non-empty `video_ids`. |
 | `youtube.get_channel` | `GET /channels?id=...` | `youtube.read` | `Safe` | `Low` | `Strict` | `channel_id`. |
 | `youtube.list_playlists` | `GET /playlists?channelId=...` | `youtube.read` | `Safe` | `Low` | `Strict` | `channel_id`; optional `max_results`, `page_token`. |
 | `youtube.list_playlist_items` | `GET /playlistItems?playlistId=...` | `youtube.read` | `Safe` | `Low` | `Strict` | `playlist_id`; optional `max_results`, `page_token`. |
-| `youtube.list_comments` | `GET /commentThreads?videoId=...` | `youtube.read` | `Safe` | `Low` | `Strict` | `video_id`; optional `max_results`. |
+| `youtube.list_comments` | `GET /commentThreads?videoId=...` | `youtube.read` | `Safe` | `Low` | `Strict` | `video_id`; optional `max_results`, `page_token`. |
 | `youtube.post_comment` | `POST /commentThreads` | `youtube.write` | `Dangerous` | `High` | `None` | `video_id`, `text`. |
 | `youtube.get_captions` | `GET /captions?videoId=...` | `youtube.read` | `Safe` | `Low` | `Strict` | `video_id`. |
 | `youtube.get_caption_transcript` | `GET /captions/{caption_id}?tfmt=...` | `youtube.read` | `Safe` | `Low` | `Strict` | `caption_id`; optional `format` (`srt`, `vtt`, `ttml`). |
@@ -151,6 +151,14 @@ The current YouTube README slice documents the existing runtime surface:
 | `youtube.upload_caption` | `POST /upload/youtube/v3/captions?uploadType=multipart&part=snippet` | `youtube.write` | `Dangerous` | `High` | `None` | `video_id`, `language`, `transcript`; optional `name`. OAuth required; at most 5 MiB of UTF-8 caption file bytes. |
 | `youtube.get_analytics` | `GET /channels`, `GET /playlistItems`, `GET /videos` summary chain | `youtube.read` | `Safe` | `Low` | `Strict` | `channel_id`; optional `max_videos`. |
 | `youtube.upload_video` | `POST /upload/youtube/v3/videos?uploadType=multipart&part=snippet,status` | `youtube.write` | `Dangerous` | `High` | `None` | `title`, `description`, `video_data_base64`; optional `privacy`, `tags`, `category_id`. OAuth required; at most 16 MiB decoded. |
+
+### Search And Comment Pagination
+
+`youtube.search` and `youtube.list_comments` return one provider page per invocation. Both preserve the existing `items` array and return `next_page_token`, which is `null` when there is no next page. Search also preserves `total_results`.
+
+Pass the returned token unchanged as `page_token` in the next invocation, keeping the same query or video ID, filters, and page size. Tokens are opaque and are encoded as a single query parameter. Continue while a token is present, even if a page contains fewer items than requested. Each page is a separate bounded request and consumes provider quota.
+
+The provider's [`search.list`](https://developers.google.com/youtube/v3/docs/search/list) limit is `max_results` from 0 through 50, with a default of 5. [`commentThreads.list`](https://developers.google.com/youtube/v3/docs/commentThreads/list) accepts 1 through 100, with a default of 20. Supplied page sizes must be integers in these ranges, and supplied tokens must be nonblank strings. Invoke and simulate reject invalid pagination before provider I/O or capability verification. Comment pagination enumerates top-level comment threads; it does not fetch all replies within a thread.
 
 ### Caption Upload Contract
 
