@@ -682,15 +682,19 @@ impl GoogleCalendarConnector {
             operations: vec![
                 op_info(
                     "gcal.list_calendars",
-                    "List all calendars for the authenticated user",
+                    "List one page of calendars for the authenticated user",
                     json!({
                         "type": "object",
-                        "properties": {}
+                        "properties": {
+                            "max_results": { "type": "integer", "minimum": 1, "maximum": 250, "description": "Calendars per page; Google defaults to 100." },
+                            "page_token": { "type": "string", "minLength": 1, "description": "Continuation token returned by the previous page." }
+                        }
                     }),
                     json!({
                         "type": "object",
                         "properties": {
-                            "calendars": { "type": "array", "items": { "type": "object" } }
+                            "calendars": { "type": "array", "items": { "type": "object" } },
+                            "next_page_token": { "type": ["string", "null"] }
                         }
                     }),
                     "gcal.read",
@@ -698,9 +702,9 @@ impl GoogleCalendarConnector {
                     SafetyTier::Safe,
                     IdempotencyClass::Strict,
                     AgentHint {
-                        when_to_use: "List all calendars accessible by the authenticated user."
+                        when_to_use: "Enumerate calendars accessible by the authenticated user, one page at a time."
                             .into(),
-                        common_mistakes: vec![],
+                        common_mistakes: vec!["Pass next_page_token as page_token with the same max_results until the token is null; the first page may be incomplete.".into()],
                         examples: vec!["{}".into()],
                         related: vec![CapabilityId::from_static("gcal.list_events")],
                     },
@@ -1134,7 +1138,7 @@ impl GoogleCalendarConnector {
         let admission = authority.admit_bounded(&request, &resources, MAX_INVOKE_RESPONSE_BYTES)?;
         let input = request.input;
         let result = match operation {
-            "gcal.list_calendars" => self.invoke_list_calendars().await,
+            "gcal.list_calendars" => self.invoke_list_calendars(input).await,
             "gcal.get_event" => self.invoke_get_event(input).await,
             "gcal.list_events" => self.invoke_list_events(input).await,
             "gcal.create_event" => self.invoke_create_event(input).await,
@@ -1161,15 +1165,22 @@ impl GoogleCalendarConnector {
 
     // ── Operation implementations ─────────────────────────────────
 
-    async fn invoke_list_calendars(&self) -> FcpResult<serde_json::Value> {
+    async fn invoke_list_calendars(
+        &self,
+        input: serde_json::Value,
+    ) -> FcpResult<serde_json::Value> {
         let client = self.client.as_ref().ok_or(FcpError::NotConfigured)?;
+        let (max_results, page_token) = calendar_list_pagination(&input)?;
 
         let result = client
-            .list_calendars()
+            .list_calendars(max_results, page_token)
             .await
             .map_err(|e: GoogleCalendarError| e.to_fcp_error())?;
 
-        Ok(json!({ "calendars": result.items }))
+        Ok(json!({
+            "calendars": result.items,
+            "next_page_token": result.next_page_token
+        }))
     }
 
     async fn invoke_get_event(&self, input: serde_json::Value) -> FcpResult<serde_json::Value> {
@@ -1484,6 +1495,35 @@ fn calendar_freebusy_items(input: &serde_json::Value) -> FcpResult<Vec<FreeBusyR
     Ok(items)
 }
 
+fn calendar_list_pagination(input: &serde_json::Value) -> FcpResult<(Option<u32>, Option<&str>)> {
+    let max_results = input
+        .get("max_results")
+        .map(|value| {
+            value
+                .as_u64()
+                .filter(|size| (1..=250).contains(size))
+                .and_then(|size| u32::try_from(size).ok())
+                .ok_or_else(|| FcpError::InvalidRequest {
+                    code: 1003,
+                    message: "Field max_results must be an integer between 1 and 250".into(),
+                })
+        })
+        .transpose()?;
+    let page_token = input
+        .get("page_token")
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|token| !token.trim().is_empty())
+                .ok_or_else(|| FcpError::InvalidRequest {
+                    code: 1003,
+                    message: "Field page_token must be a non-empty string".into(),
+                })
+        })
+        .transpose()?;
+    Ok((max_results, page_token))
+}
+
 fn validate_calendar_input(operation: &str, input: &serde_json::Value) -> FcpResult<()> {
     if !input.is_object() {
         return Err(FcpError::InvalidRequest {
@@ -1492,7 +1532,7 @@ fn validate_calendar_input(operation: &str, input: &serde_json::Value) -> FcpRes
         });
     }
     match operation {
-        "gcal.list_calendars" => return Ok(()),
+        "gcal.list_calendars" => return calendar_list_pagination(input).map(|_| ()),
         "gcal.freebusy" => {
             require_str(input, "time_min")?;
             require_str(input, "time_max")?;

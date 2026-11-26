@@ -14,7 +14,9 @@ use fcp_google_calendar::{
 };
 use fcp_prelude::{CapabilityConstraints, CapabilityToken, FcpError, InstanceId};
 use serde_json::json;
-use wiremock::matchers::{bearer_token, body_json, header, method, path};
+use wiremock::matchers::{
+    bearer_token, body_json, header, method, path, query_param, query_param_is_missing,
+};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -606,7 +608,7 @@ async fn client_list_calendars() {
     let client = GoogleCalendarClient::new("test_tok")
         .unwrap()
         .with_base_url(server.uri());
-    let result = client.list_calendars().await.unwrap();
+    let result = client.list_calendars(None, None).await.unwrap();
     assert_eq!(result.items.len(), 2);
 }
 
@@ -1072,7 +1074,7 @@ async fn client_unauthorized() {
     let client = GoogleCalendarClient::new("bad_token")
         .unwrap()
         .with_base_url(server.uri());
-    let result = client.list_calendars().await;
+    let result = client.list_calendars(None, None).await;
     assert!(result.is_err());
     assert!(matches!(
         result.unwrap_err(),
@@ -1093,7 +1095,7 @@ async fn client_rate_limited_no_retry() {
         .unwrap()
         .with_base_url(server.uri())
         .with_retry_config(0, 100, 100);
-    let result = client.list_calendars().await;
+    let result = client.list_calendars(None, None).await;
     assert!(result.is_err(), "rate-limited request must fail");
     // With RetryLoop and zero retries, the error surfaces as either
     // RateLimited (if the policy exhausts immediately) or Api/timeout
@@ -1140,6 +1142,162 @@ async fn invoke_list_calendars_through_connector() {
         .unwrap();
 
     assert!(result["calendars"].as_array().is_some());
+    assert!(result["next_page_token"].is_null());
+}
+
+#[fcp_async_core::runtime::test]
+async fn invoke_list_calendars_continues_with_an_opaque_cursor() {
+    let server = MockServer::start().await;
+    let cursor = "calendar-page-2+/=&?opaque";
+    for (page_token, calendar_id, next_page_token) in [
+        (None, "first@example.com", Some(cursor)),
+        (Some(cursor), "second@example.com", None),
+    ] {
+        let mock = Mock::given(method("GET"))
+            .and(path("/users/me/calendarList"))
+            .and(bearer_token("ya29.test-oauth-token"))
+            .and(query_param("maxResults", "1"));
+        let mock = if let Some(page_token) = page_token {
+            mock.and(query_param("pageToken", page_token))
+        } else {
+            mock.and(query_param_is_missing("pageToken"))
+        };
+        let mut response = json!({
+            "kind": "calendar#calendarList",
+            "items": [{
+                "id": calendar_id,
+                "summary": "Shared calendar",
+                "timeZone": "America/New_York"
+            }]
+        });
+        if let Some(next_page_token) = next_page_token {
+            response["nextPageToken"] = json!(next_page_token);
+        }
+        mock.respond_with(ResponseTemplate::new(200).set_body_json(response))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+
+    let mut connector = GoogleCalendarConnector::new();
+    let signing_key = Ed25519SigningKey::generate();
+    setup_configure(&mut connector, &server.uri()).await;
+    let instance = setup_handshake(&mut connector, &signing_key, &["gcal.read"]).await;
+    let token = generate_valid_token(&signing_key, &instance, "gcal.list_calendars");
+    let first = connector
+        .handle_invoke(native_request(
+            "gcal.list_calendars",
+            json!({ "max_results": 1 }),
+            token.clone(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first["calendars"][0]["id"], "first@example.com");
+    assert_eq!(first["calendars"][0]["timeZone"], "America/New_York");
+    assert_eq!(first["next_page_token"], cursor);
+    assert!(first.get("nextPageToken").is_none());
+
+    let mut request = native_request(
+        "gcal.list_calendars",
+        json!({ "max_results": 1, "page_token": first["next_page_token"] }),
+        token,
+    );
+    request["id"] = json!("calendar-second-page");
+    let second = connector.handle_invoke(request).await.unwrap();
+    assert_eq!(second["calendars"][0]["id"], "second@example.com");
+    assert!(second["next_page_token"].is_null());
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    server.verify().await;
+
+    let manifest = fcp_manifest::ConnectorManifest::parse_str(include_str!("../manifest.toml"))
+        .expect("updated calendar interface hash must validate");
+    let declared = &manifest.provides.operations["gcal.list_calendars"];
+    let introspection = connector.handle_introspect().await.unwrap();
+    let runtime = introspection["operations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|operation| operation["id"] == "gcal.list_calendars")
+        .unwrap();
+    for field in ["max_results", "page_token"] {
+        assert_eq!(
+            declared.input_schema["properties"][field],
+            runtime["input_schema"]["properties"][field]
+        );
+    }
+    assert_eq!(
+        declared.output_schema["properties"]["next_page_token"],
+        runtime["output_schema"]["properties"]["next_page_token"]
+    );
+}
+
+#[fcp_async_core::runtime::test]
+async fn calendar_pagination_rejects_invalid_input_without_io_or_spending_call_budget() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/users/me/calendarList"))
+        .and(query_param("maxResults", "250"))
+        .and(query_param_is_missing("pageToken"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "items": [] })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut connector = GoogleCalendarConnector::new();
+    let signing_key = Ed25519SigningKey::generate();
+    setup_configure(&mut connector, &server.uri()).await;
+    let instance = setup_handshake(&mut connector, &signing_key, &["gcal.read"]).await;
+    let token = scoped_token(
+        &signing_key,
+        instance.as_str(),
+        "gcal.list_calendars",
+        "gcal.read",
+        &CapabilityConstraints {
+            resource_allow: vec!["gcal://calendars".into()],
+            max_calls: Some(1),
+            ..Default::default()
+        },
+    );
+    for input in [
+        json!(null),
+        json!([]),
+        json!({ "page_token": null }),
+        json!({ "page_token": false }),
+        json!({ "page_token": 1 }),
+        json!({ "page_token": [] }),
+        json!({ "page_token": {} }),
+        json!({ "page_token": "" }),
+        json!({ "page_token": " \t" }),
+        json!({ "max_results": null }),
+        json!({ "max_results": false }),
+        json!({ "max_results": "1" }),
+        json!({ "max_results": 0 }),
+        json!({ "max_results": -1 }),
+        json!({ "max_results": 1.5 }),
+        json!({ "max_results": 251 }),
+        json!({ "max_results": u64::MAX }),
+    ] {
+        let request = native_request("gcal.list_calendars", input.clone(), token.clone());
+        let error = connector.handle_invoke(request.clone()).await.unwrap_err();
+        assert!(matches!(error, FcpError::InvalidRequest { .. }), "{input}");
+        let mut simulation = request;
+        simulation["type"] = json!("simulate");
+        let preview = connector.handle_simulate(simulation).await.unwrap();
+        assert_eq!(preview["would_succeed"], false, "{input}");
+    }
+    assert!(server.received_requests().await.unwrap().is_empty());
+
+    let request = native_request("gcal.list_calendars", json!({ "max_results": 250 }), token);
+    let mut simulation = request.clone();
+    simulation["type"] = json!("simulate");
+    assert_eq!(
+        connector.handle_simulate(simulation).await.unwrap()["would_succeed"],
+        true
+    );
+    let response = connector.handle_invoke(request).await.unwrap();
+    assert_eq!(response["calendars"], json!([]));
+    assert!(response["next_page_token"].is_null());
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    server.verify().await;
 }
 
 #[fcp_async_core::runtime::test]

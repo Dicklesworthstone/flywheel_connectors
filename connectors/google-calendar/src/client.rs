@@ -147,11 +147,25 @@ impl GoogleCalendarClient {
 
     // ── Calendar operations ─────────────────────────────────────
 
-    /// List all calendars for the authenticated user.
-    #[instrument(skip(self))]
-    pub async fn list_calendars(&self) -> GCalResult<CalendarListResponse> {
+    /// List one page of calendars for the authenticated user.
+    ///
+    /// Pass the returned continuation token with the same page size to read
+    /// another page. Google defaults to 100 calendars and allows at most 250.
+    #[instrument(skip(self, page_token))]
+    pub async fn list_calendars(
+        &self,
+        max_results: Option<u32>,
+        page_token: Option<&str>,
+    ) -> GCalResult<CalendarListResponse> {
         let url = format!("{}/users/me/calendarList", self.base_url);
-        self.get(&url).await
+        let mut params = Vec::new();
+        if let Some(max) = max_results {
+            params.push(("maxResults", max.to_string()));
+        }
+        if let Some(token) = page_token {
+            params.push(("pageToken", token.to_string()));
+        }
+        self.get_with_params(&url, &params).await
     }
 
     /// Get a specific calendar by ID from the user's calendar list.

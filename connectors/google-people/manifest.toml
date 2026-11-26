@@ -5,7 +5,7 @@ min_mesh_version = "2.0.0"
 min_protocol = "fcp2-sym/2.0"
 protocol_features = []
 max_datagram_bytes = 65000
-interface_hash = "blake3-256:fcp.interface.v2:cd03549985da67e28955bec8320cbf1eae5ea9fb1f0ef6eca6bff996c1b0bb4e"
+interface_hash = "blake3-256:fcp.interface.v2:be474502d87bd60aec758d9532f2f99583a44622117980173dc641d32285c84b"
 
 [connector]
 id = "fcp.google-people"

@@ -135,7 +135,7 @@ The current Google Calendar README slice documents the existing runtime surface:
 
 | Operation | Endpoint shape | Capability | SafetyTier | RiskLevel | Idempotency | Rationale |
 |-----------|----------------|------------|------------|-----------|-------------|-----------|
-| `gcal.list_calendars` | `GET /users/me/calendarList` | `gcal.read` | `Safe` | `Low` | `Strict` | Lists calendars visible to the authenticated principal. |
+| `gcal.list_calendars` | `GET /users/me/calendarList` | `gcal.read` | `Safe` | `Low` | `Strict` | Lists one page of calendars visible to the authenticated principal and exposes a continuation token. |
 | `gcal.get_calendar` | `GET /users/me/calendarList/{calendar_id}` | `gcal.read` | `Safe` | `Low` | `Strict` | Reads one calendar-list entry. |
 | `gcal.list_events` | `GET /calendars/{calendar_id}/events` | `gcal.read` | `Safe` | `Low` | `Strict` | Reads event pages for one calendar and optional time window. |
 | `gcal.get_event` | `GET /calendars/{calendar_id}/events/{event_id}` | `gcal.read` | `Safe` | `Low` | `Strict` | Reads one event by provider ID. |
@@ -146,6 +146,12 @@ The current Google Calendar README slice documents the existing runtime surface:
 | `gcal.freebusy` | `POST /freeBusy` | `gcal.read` | `Safe` | `Low` | `Strict` | Reads busy blocks for requested calendars. |
 | `gcal.list_event_instances` | `GET /calendars/{calendar_id}/events/{event_id}/instances` | `gcal.read` | `Safe` | `Low` | `Strict` | Lists concrete instances of a recurring event. |
 | `gcal.sync_events` | `GET /calendars/{calendar_id}/events?syncToken={token}` | `gcal.read` | `Safe` | `Low` | `Strict` | Reads incremental event changes using a provider sync token. |
+
+## Calendar List Pagination
+
+`gcal.list_calendars` returns one page in `calendars` and an opaque `next_page_token`. Pass that token as `page_token`, retaining the same `max_results`, until `next_page_token` is null. `max_results` accepts integers from 1 through 250; omitting it uses Google's default of 100. Both `invoke` and `simulate` reject invalid sizes and empty or incorrectly typed page tokens before provider execution. Each call reads a single page, so callers control the overall work budget.
+
+The provider contract is documented in [CalendarList: list](https://developers.google.com/workspace/calendar/api/v3/reference/calendarList/list).
 
 ## Explicit Non-Goals
 

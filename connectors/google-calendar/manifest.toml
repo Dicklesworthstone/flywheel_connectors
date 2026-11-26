@@ -5,7 +5,7 @@ min_mesh_version = "2.0.0"
 min_protocol = "fcp2-sym/2.0"
 protocol_features = []
 max_datagram_bytes = 65000
-interface_hash = "blake3-256:fcp.interface.v2:f2295fee7762e1dfa7d1a2c79330d200d1da62cd1ba57359715172847aa069e6"
+interface_hash = "blake3-256:fcp.interface.v2:167e4023d6fdee5497b13580b10c8fabd7037bcf4b5fc41f384cdeb29e83a8b1"
 
 [connector]
 id = "fcp.google-calendar"
@@ -311,7 +311,7 @@ related = ["gcal.get_event", "gcal.create_event"]
 # ────────────────────────────────────────────────────────────────
 
 [provides.operations."gcal.list_calendars"]
-description = "List available calendars"
+description = "List one page of available calendars"
 capability = "gcal.read"
 risk_level = "low"
 safety_tier = "safe"
@@ -321,12 +321,23 @@ idempotency = "strict"
 [provides.operations."gcal.list_calendars".input_schema]
 required = []
 type = "object"
+[provides.operations."gcal.list_calendars".input_schema.properties.max_results]
+type = "integer"
+minimum = 1
+maximum = 250
+description = "Calendars per page; Google defaults to 100."
+[provides.operations."gcal.list_calendars".input_schema.properties.page_token]
+type = "string"
+minLength = 1
+description = "Continuation token returned by the previous page."
 
 [provides.operations."gcal.list_calendars".output_schema]
 required = ["calendars"]
 type = "object"
 [provides.operations."gcal.list_calendars".output_schema.properties.calendars]
 type = "array"
+[provides.operations."gcal.list_calendars".output_schema.properties.next_page_token]
+type = ["string", "null"]
 
 [provides.operations."gcal.list_calendars".network_constraints]
 host_allow = ["www.googleapis.com"]
@@ -344,8 +355,8 @@ total_timeout_ms = 30000
 max_response_bytes = 5242880
 
 [provides.operations."gcal.list_calendars".ai_hints]
-when_to_use = "List calendars the user has access to."
-common_mistakes = ["The 'primary' keyword refers to the user's main calendar but is not returned as an ID in the list — match by the 'primary' boolean field instead", "Shared calendars with read-only access are included in the list but will fail on write operations"]
+when_to_use = "Enumerate calendars the user has access to, one page at a time."
+common_mistakes = ["The 'primary' keyword refers to the user's main calendar but is not returned as an ID in the list — match by the 'primary' boolean field instead", "Shared calendars with read-only access are included in the list but will fail on write operations", "Pass next_page_token as page_token with the same max_results until the token is null; the first page may be incomplete."]
 examples = ['{}']
 related = ["gcal.list_events"]
 

@@ -4746,6 +4746,7 @@ dependencies = [
  "fcp-core",
  "fcp-crypto",
  "fcp-google-discovery",
+ "fcp-manifest",
  "fcp-prelude",
  "fcp-sdk",
  "hex",

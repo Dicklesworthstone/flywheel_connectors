@@ -109,6 +109,12 @@ fn manifest_capability_section() -> &'static str {
 }
 
 #[test]
+fn bundled_manifest_passes_admission_validation() {
+    fcp_manifest::ConnectorManifest::parse_str(include_str!("../manifest.toml"))
+        .expect("People operation schemas and their interface hash must pass host admission");
+}
+
+#[test]
 fn manifest_ai_hints_cover_all_operations() {
     let manifest: toml::Value = toml::from_str(include_str!("../manifest.toml"))
         .expect("Google People manifest should parse");

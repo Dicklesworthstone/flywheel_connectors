@@ -95,6 +95,8 @@ pub struct Attendee {
 pub struct CalendarListResponse {
     #[serde(default)]
     pub items: Vec<CalendarEntry>,
+    #[serde(default)]
+    pub next_page_token: Option<String>,
 }
 
 /// Response from the events list endpoint.
@@ -831,7 +833,8 @@ mod tests {
             "items": [
                 {"id": "primary", "summary": "Primary", "primary": true},
                 {"id": "secondary", "summary": "Work"}
-            ]
+            ],
+            "nextPageToken": "calendar-page-2+/=&?"
         });
         let resp: CalendarListResponse = serde_json::from_value(json).unwrap();
         assert_eq!(resp.items.len(), 2);
@@ -839,6 +842,10 @@ mod tests {
         assert!(resp.items[0].primary);
         assert_eq!(resp.items[1].id, "secondary");
         assert!(!resp.items[1].primary);
+        assert_eq!(
+            resp.next_page_token.as_deref(),
+            Some("calendar-page-2+/=&?")
+        );
     }
 
     #[test]
@@ -846,6 +853,7 @@ mod tests {
         let json = json!({});
         let resp: CalendarListResponse = serde_json::from_value(json).unwrap();
         assert!(resp.items.is_empty());
+        assert!(resp.next_page_token.is_none());
     }
 
     #[test]
@@ -853,6 +861,7 @@ mod tests {
         let json = json!({"items": []});
         let resp: CalendarListResponse = serde_json::from_value(json).unwrap();
         assert!(resp.items.is_empty());
+        assert!(resp.next_page_token.is_none());
     }
 
     #[test]
@@ -865,16 +874,21 @@ mod tests {
                 time_zone: None,
                 primary: false,
             }],
+            next_page_token: Some("calendar-page-2".into()),
         };
         let cloned = resp.clone();
         assert_eq!(cloned.items.len(), 1);
         assert_eq!(cloned.items[0].id, "x");
         assert_eq!(resp.items.len(), 1);
+        assert_eq!(cloned.next_page_token, resp.next_page_token);
     }
 
     #[test]
     fn calendar_list_response_debug() {
-        let resp = CalendarListResponse { items: vec![] };
+        let resp = CalendarListResponse {
+            items: vec![],
+            next_page_token: None,
+        };
         let dbg = format!("{resp:?}");
         assert!(dbg.contains("CalendarListResponse"), "got: {dbg}");
     }

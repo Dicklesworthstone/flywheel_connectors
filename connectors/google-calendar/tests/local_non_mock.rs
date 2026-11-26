@@ -361,6 +361,7 @@ async fn local_non_mock_list_calendars_uses_calendar_request_boundary() {
     assert!(observation.body.is_empty());
     assert_eq!(result["calendars"][0]["id"], "primary");
     assert_eq!(result["calendars"][1]["summary"], "Team Calendar");
+    assert!(result["next_page_token"].is_null());
     assert!(!result.to_string().contains(LOOPBACK_AUTH_VALUE));
 
     let artifact = json!({

@@ -42,5 +42,6 @@ tracing-subscriber.workspace = true
 chrono.workspace = true
 ciborium.workspace = true
 fcp-crypto = { path = "../../crates/fcp-crypto" }
+fcp-manifest = { path = "../../crates/fcp-manifest" }
 toml.workspace = true
 wiremock.workspace = true
