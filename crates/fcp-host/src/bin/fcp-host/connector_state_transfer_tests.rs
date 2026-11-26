@@ -81,6 +81,7 @@ fn store_config(
         trusted_writer_keys_hex: vec![hex::encode(writer)],
         source_objects_dir: source,
         source_mac_key_hex: None,
+        source_max_recovery_bytes: None,
         retain_replica,
         max_store_bytes: STORE_QUOTA,
     }
@@ -727,6 +728,107 @@ fn state_transfer_refuses_public_plaintext_before_creating_replica_storage() {
         require_private_ingress(&BindTarget::Tcp("[::1]:0".parse().expect("IPv6 loopback")))
             .is_ok()
     );
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn state_transfer_donor_enforces_combined_disk_and_live_object_budgets() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path();
+    let mac = [0x76; 32];
+    let mut config = DurableObjectStoreConfig::new(path);
+    config.mac_key = Some(mac);
+    config.checkpoint_after_ops = 0;
+    let source = DurableObjectStore::open(config).unwrap();
+    let (root, _) = seed_source(&source).await;
+    source.checkpoint().await.unwrap();
+    // Charge WAL input even when replay does not grow the recovered objects.
+    source
+        .set_retention(&root, RetentionClass::Pinned)
+        .await
+        .unwrap();
+    let files = directory_bytes(path);
+    let snapshot = files["objects.snapshot.json"].len() as u64;
+    let wal = files["objects.wal.jsonl"].len() as u64;
+    assert!(snapshot > 0 && wal > 0);
+    let encoded = snapshot + wal;
+    let live = source.storage_used().await;
+    assert!(live > 1);
+
+    let donor = |recovery_bytes, live_bytes, mac_key| {
+        let mut store = store_config(Some(path.to_owned()), false, writer_pin());
+        store.source_max_recovery_bytes = recovery_bytes;
+        store.max_store_bytes = live_bytes;
+        store.source_mac_key_hex = Some(hex::encode(mac_key));
+        open_service(
+            TransferConfig {
+                replica_root: None,
+                stores: vec![store],
+                grants: vec![grant(
+                    ConnectorStateTransferDirection::Export,
+                    "recipient",
+                    root,
+                )],
+            },
+            &private_bind(),
+        )
+    };
+    for (budget, quota, key) in [
+        (encoded - 1, live, mac),
+        (encoded, live - 1, mac),
+        (encoded, live, [0x77; 32]),
+    ] {
+        assert!(matches!(
+            donor(Some(budget), quota, key),
+            Err(HostError::Unavailable(_))
+        ));
+    }
+    let request = ConnectorStateExportRequest {
+        grant_id: GRANT.to_owned(),
+        scope: transfer_scope(),
+        root_object_id: root,
+        limits: transfer_limits(),
+    };
+    for budget in [Some(encoded), None] {
+        let service =
+            donor(budget, live, mac).expect("exact limits and legacy default admit the source");
+        let wire = service
+            .export_for_peer("recipient", &request, || Ok(()))
+            .await
+            .unwrap();
+        let response: serde_json::Value = serde_json::from_str(&wire).unwrap();
+        assert_eq!(response["request"]["root_object_id"], json!(root));
+        assert_eq!(response["bundle"]["objects"].as_array().unwrap().len(), 3);
+    }
+    assert_eq!(directory_bytes(path), files);
+}
+
+#[test]
+fn state_transfer_donor_rejects_invalid_or_misplaced_recovery_limits() {
+    let directory = tempfile::tempdir().unwrap();
+    let source_dir = directory.path().join("missing-source");
+    let replica_root = directory.path().join("replica");
+    for (source, limit) in [
+        (Some(source_dir.clone()), 0),
+        (Some(source_dir), 1024 * 1024 * 1024 + 1),
+        (None, 1),
+    ] {
+        let mut store = store_config(source, true, writer_pin());
+        store.source_max_recovery_bytes = Some(limit);
+        let error = open_service(
+            TransferConfig {
+                replica_root: Some(replica_root.clone()),
+                stores: vec![store],
+                grants: vec![],
+            },
+            &private_bind(),
+        )
+        .err()
+        .expect("invalid source budget");
+        assert!(
+            matches!(error, HostError::InvalidFilter(reason) if reason.contains("source_max_recovery_bytes"))
+        );
+        assert!(!replica_root.exists());
+    }
 }
 
 #[fcp_async_core::runtime::test(flavor = "multi_thread")]

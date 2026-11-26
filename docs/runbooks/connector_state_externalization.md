@@ -234,6 +234,7 @@ Donor `node-a`, exporting only the selected root to `node-b`:
     "trusted_writer_keys_hex": ["<TRUSTED_WRITER_PUBLIC_KEY_64_HEX>"],
     "source_objects_dir": "/srv/fcp/canonical/slack/objects",
     "source_mac_key_hex": "<REDACTED_SOURCE_MAC_KEY_64_HEX>",
+    "source_max_recovery_bytes": 67108864,
     "retain_replica": false,
     "max_store_bytes": 67108864
   }],
@@ -266,6 +267,16 @@ objects, and their referenced payloads must already be present in that captured
 view. Missing objects fail
 the transfer; subsequent source writes do not refresh the view. Restart the
 host to reload source state, grants, expiry, or writer pins.
+
+Donor startup charges the encoded snapshot and WAL together against
+`source_max_recovery_bytes`, including historical records. The default is
+64 MiB. Set a value from 1 byte through 1 GiB for a larger or smaller source.
+During replay the live canonical objects must also fit `max_store_bytes`.
+Both limits apply to the entire captured source directory, including objects
+outside the granted root. If recovery exceeds either limit, startup refuses
+the source. To reduce a long WAL, checkpoint the canonical writer before
+restarting the donor. Only set `source_max_recovery_bytes` on stores that
+specify a source directory.
 
 Recipient `node-b`, importing the same root only from `node-a`:
 
@@ -309,8 +320,9 @@ Keep the grant ID, scope and root identical across these two configurations;
 the direction and peer binding intentionally reverse. Each host enforces its
 own expiry and limits. Omit `instance_id` on both hosts and the CLI only for
 state that is explicitly instance-unscoped. A store requires at least one
-trusted writer pin and a positive `max_store_bytes`; this is the retained
-store's write quota, independent of the transfer budgets.
+trusted writer pin and a positive `max_store_bytes`. This bounds live objects
+during donor recovery and is the retained store's write quota. Each grant
+separately limits the objects and bytes permitted in a transfer.
 
 `retain_replica: true` requires an absolute `replica_root`. The host retains
 exclusive store ownership under

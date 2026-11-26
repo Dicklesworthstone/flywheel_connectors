@@ -66,9 +66,11 @@ struct TransferStoreConfig {
     source_objects_dir: Option<PathBuf>,
     /// Optional MAC key matching the source's durable envelope format.
     source_mac_key_hex: Option<String>,
+    /// Total encoded snapshot and WAL input for this read-only donor view.
+    source_max_recovery_bytes: Option<u64>,
     #[serde(default)]
     retain_replica: bool,
-    /// Write quota for the retained store; source recovery has its own bounds.
+    /// Live canonical object bytes per store, including during source replay.
     max_store_bytes: u64,
 }
 
@@ -171,6 +173,14 @@ fn open_service(
 
         let mut source = None;
         if let Some(path) = &configured.source_objects_dir {
+            let recovery_bytes = configured
+                .source_max_recovery_bytes
+                .unwrap_or_else(|| ConnectorStateReadLimits::default().max_recovery_bytes);
+            if !(1..=1024 * 1024 * 1024).contains(&recovery_bytes) {
+                return Err(invalid(
+                    "state-transfer source_max_recovery_bytes must be in 1..=1073741824",
+                ));
+            }
             if !path.is_absolute() {
                 return Err(invalid(
                     "state-transfer source_objects_dir must be an absolute path",
@@ -186,11 +196,15 @@ fn open_service(
             // A source may contain several zones. The state adapter verifies
             // keyed IDs and writer pins for the requested scope during export.
             // Never acquire another writer or repair a live connector's WAL.
-            let objects = DurableObjectStore::open_read_only(durable)
-                .map_err(|_| unavailable("state-transfer source snapshot could not be opened"))?;
+            let objects = DurableObjectStore::open_read_only_bounded(durable, recovery_bytes)
+                .map_err(|_| unavailable("state-transfer source could not be recovered within its configured limits; check the snapshot, WAL, and source MAC configuration"))?;
             source = Some(adapter(Arc::new(objects), key, &configured.scope, &writers));
         } else if configured.source_mac_key_hex.is_some() {
             return Err(invalid("a source MAC key requires source_objects_dir"));
+        } else if configured.source_max_recovery_bytes.is_some() {
+            return Err(invalid(
+                "source_max_recovery_bytes requires source_objects_dir",
+            ));
         }
 
         if configured.retain_replica {
