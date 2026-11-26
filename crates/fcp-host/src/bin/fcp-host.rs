@@ -12187,8 +12187,8 @@ struct AuthOAuthAuthCodeCompleteResponse {
 }
 
 #[derive(Debug, Clone)]
-struct BlockingOAuthTransport {
-    client: reqwest::blocking::Client,
+struct HostOAuthTransport {
+    client: reqwest::Client,
 }
 
 // Token and device-code responses are small protocol objects. Apply the same
@@ -12393,9 +12393,9 @@ fn oauth_challenge_from_value(
     .map_err(|error| invalid_oauth_provider_response("oauth_device", error.to_string()))
 }
 
-impl BlockingOAuthTransport {
+impl HostOAuthTransport {
     fn new() -> Result<Self, AuthError> {
-        let client = reqwest::blocking::Client::builder()
+        let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .user_agent(concat!("fcp-host/", env!("CARGO_PKG_VERSION")))
             // These POST bodies carry single-use grants and credentials. A
@@ -12410,24 +12410,31 @@ impl BlockingOAuthTransport {
         Ok(Self { client })
     }
 
-    fn post_form_json(
+    async fn post_form_json(
         &self,
         method: &'static str,
         url: &str,
         form: &[(String, String)],
     ) -> Result<Value, AuthError> {
-        use std::io::Read as _;
-
-        let response = self.client.post(url).form(form).send().map_err(|error| {
-            let reason = if error.is_timeout() {
-                "OAuth provider request timed out"
-            } else if error.is_connect() {
-                "could not connect to OAuth provider endpoint"
-            } else {
-                "OAuth provider request failed"
-            };
-            invalid_oauth_provider_response(method, reason)
-        })?;
+        // Keep provider I/O owned by this request future. Dropping the handler
+        // cancels its pending HTTP work instead of leaving a blocking worker
+        // holding a single-use grant. The client timeout covers the full body.
+        let mut response = self
+            .client
+            .post(url)
+            .form(form)
+            .send()
+            .await
+            .map_err(|error| {
+                let reason = if error.is_timeout() {
+                    "OAuth provider request timed out"
+                } else if error.is_connect() {
+                    "could not connect to OAuth provider endpoint"
+                } else {
+                    "OAuth provider request failed"
+                };
+                invalid_oauth_provider_response(method, reason)
+            })?;
         let status = response.status();
         if status.is_redirection() {
             return Err(invalid_oauth_provider_response(
@@ -12450,17 +12457,18 @@ impl BlockingOAuthTransport {
             ));
         }
         let mut body = zeroize::Zeroizing::new(Vec::new());
-        response
-            .take(size_limit + 1)
-            .read_to_end(&mut body)
-            .map_err(|_| {
-                invalid_oauth_provider_response(method, "could not read OAuth provider response")
-            })?;
-        if body.len() > MAX_HOST_OAUTH_RESPONSE_BYTES {
-            return Err(invalid_oauth_provider_response(
-                method,
-                "OAuth provider response exceeds size limit",
-            ));
+        while let Some(chunk) = response.chunk().await.map_err(|_| {
+            invalid_oauth_provider_response(method, "could not read OAuth provider response")
+        })? {
+            // Bound decoded bytes even for chunked or compressed responses.
+            // Check before extending so no oversized body is retained.
+            if chunk.len() > MAX_HOST_OAUTH_RESPONSE_BYTES.saturating_sub(body.len()) {
+                return Err(invalid_oauth_provider_response(
+                    method,
+                    "OAuth provider response exceeds size limit",
+                ));
+            }
+            body.extend_from_slice(&chunk);
         }
         let value: Value = serde_json::from_slice(body.as_slice()).map_err(|_| {
             invalid_oauth_provider_response(method, "OAuth provider response is not valid JSON")
@@ -12482,7 +12490,7 @@ impl BlockingOAuthTransport {
 }
 
 #[async_trait::async_trait]
-impl OAuthDeviceCodeTransport for BlockingOAuthTransport {
+impl OAuthDeviceCodeTransport for HostOAuthTransport {
     async fn start(
         &self,
         config: &OAuthDeviceCodeConfig,
@@ -12491,7 +12499,9 @@ impl OAuthDeviceCodeTransport for BlockingOAuthTransport {
         if !config.scope.trim().is_empty() {
             form.push(("scope".to_owned(), config.scope.clone()));
         }
-        let value = self.post_form_json("oauth_device", &config.device_code_url, &form)?;
+        let value = self
+            .post_form_json("oauth_device", &config.device_code_url, &form)
+            .await?;
         if value.get("error").is_some() {
             return Err(oauth_provider_rejection("oauth_device", &value, None));
         }
@@ -12514,7 +12524,9 @@ impl OAuthDeviceCodeTransport for BlockingOAuthTransport {
             ),
             ("client_id".to_owned(), config.client_id.clone()),
         ];
-        let value = self.post_form_json("oauth_device", &config.token_url, &form)?;
+        let value = self
+            .post_form_json("oauth_device", &config.token_url, &form)
+            .await?;
         if value.get("error").is_some() {
             let (code, reason) = oauth_provider_error_parts(&value, None);
             return match code.as_str() {
@@ -12538,7 +12550,7 @@ impl OAuthDeviceCodeTransport for BlockingOAuthTransport {
 }
 
 #[async_trait::async_trait]
-impl OAuthAuthCodeTransport for BlockingOAuthTransport {
+impl OAuthAuthCodeTransport for HostOAuthTransport {
     async fn exchange(
         &self,
         config: &OAuthAuthCodeConfig,
@@ -12563,7 +12575,9 @@ impl OAuthAuthCodeTransport for BlockingOAuthTransport {
                 pkce.verifier.expose_secret().to_owned(),
             ));
         }
-        let value = self.post_form_json("oauth_auth_code", &config.token_url, &form)?;
+        let value = self
+            .post_form_json("oauth_auth_code", &config.token_url, &form)
+            .await?;
         if value.get("error").is_some() {
             let (code, reason) = oauth_provider_error_parts(&value, None);
             return Ok(OAuthAuthCodeProviderResponse::Rejected { code, reason });
@@ -12575,7 +12589,7 @@ impl OAuthAuthCodeTransport for BlockingOAuthTransport {
 }
 
 #[async_trait::async_trait]
-impl OAuthRefreshTokenTransport for BlockingOAuthTransport {
+impl OAuthRefreshTokenTransport for HostOAuthTransport {
     async fn refresh(
         &self,
         config: &OAuthRefreshTokenConfig,
@@ -12598,7 +12612,9 @@ impl OAuthRefreshTokenTransport for BlockingOAuthTransport {
         if let Some(scope) = &config.scope {
             form.push(("scope".to_owned(), scope.clone()));
         }
-        let value = self.post_form_json("oauth_refresh", &config.token_url, &form)?;
+        let value = self
+            .post_form_json("oauth_refresh", &config.token_url, &form)
+            .await?;
         if value.get("error").is_some() {
             let (code, reason) = oauth_provider_error_parts(&value, None);
             return Ok(OAuthRefreshProviderResponse::Rejected { code, reason });
@@ -12879,7 +12895,7 @@ async fn auth_refresh_profile_snapshot_with_transport(
         return TokenRefreshOutcome::Skipped(decision);
     }
 
-    let transport = match BlockingOAuthTransport::new() {
+    let transport = match HostOAuthTransport::new() {
         Ok(transport) => transport,
         Err(error) => return TokenRefreshOutcome::Failed { decision, error },
     };
@@ -13041,7 +13057,7 @@ async fn auth_profile_oauth_device_start_handler(
 ) -> Result<Json<AuthOAuthDeviceStartResponse>, (StatusCode, String)> {
     let store = auth_profile_store();
     let pending_store = auth_oauth_pending_store();
-    let transport = BlockingOAuthTransport::new().map_err(map_auth_profile_error)?;
+    let transport = HostOAuthTransport::new().map_err(map_auth_profile_error)?;
     let login_id = next_auth_oauth_login_id("oauth-device");
     let claim = Arc::new(());
     let (profile, config) = {
@@ -13098,7 +13114,7 @@ async fn auth_profile_oauth_device_poll_handler(
     Json(request): Json<AuthOAuthPollRequest>,
 ) -> Result<Json<AuthOAuthDevicePollResponse>, (StatusCode, String)> {
     let pending_store = auth_oauth_pending_store();
-    let transport = BlockingOAuthTransport::new().map_err(map_auth_profile_error)?;
+    let transport = HostOAuthTransport::new().map_err(map_auth_profile_error)?;
     let (profile, mut flow, claim) =
         pending_store
             .lock()
@@ -13243,7 +13259,7 @@ async fn auth_profile_oauth_auth_code_complete_handler(
             .ok_or_else(auth_oauth_login_conflict)?;
         (pending, grant)
     };
-    let transport = BlockingOAuthTransport::new().map_err(map_auth_profile_error)?;
+    let transport = HostOAuthTransport::new().map_err(map_auth_profile_error)?;
     let tokens = pending
         .flow
         .exchange(&fcp_async_core::compatibility_cx(), &transport, &grant)
@@ -44844,7 +44860,7 @@ while IFS= read -r request; do exit 2; done
         flow: &str,
         base_url: &str,
     ) -> Result<(), AuthError> {
-        let transport = BlockingOAuthTransport::new()?;
+        let transport = HostOAuthTransport::new()?;
         let token_url = format!("{base_url}/token?secret=host-query-secret");
         let cx = fcp_async_core::compatibility_cx();
         match flow {
@@ -45006,9 +45022,62 @@ while IFS= read -r request; do exit 2; done
         }
     }
 
-    #[test]
-    fn host_oauth_transport_bounds_fixed_and_chunked_responses_at_the_same_limit() {
-        let transport = BlockingOAuthTransport::new().unwrap();
+    #[fcp_async_core::runtime::test]
+    async fn host_oauth_transport_yields_while_provider_response_is_pending() {
+        let transport = HostOAuthTransport::new().expect("async OAuth transport");
+        let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}/token", listener.local_addr().unwrap());
+        let (observed_tx, observed_rx) = oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let worker = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut stream = loop {
+                assert!(Instant::now() < deadline, "OAuth request was not sent");
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("OAuth test accept: {error}"),
+                }
+            };
+            let request =
+                read_host_oauth_loopback_request(&mut stream).expect("complete OAuth request");
+            observed_tx.send(()).expect("request observer is alive");
+            // A blocking send monopolizes the executor and cannot poll the
+            // sibling future that releases this provider response.
+            let released = release_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+            if released {
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                stream
+                    .write_all(&host_oauth_success_http_response())
+                    .unwrap();
+            }
+            (released, request)
+        });
+
+        let (response, release_result) = futures_util::future::join(
+            transport.post_form_json("oauth_refresh", &url, &[]),
+            async {
+                observed_rx.await.expect("provider observed the request");
+                release_tx.send(())
+            },
+        )
+        .await;
+        let (released, request) = worker.join().expect("provider worker completed");
+        assert!(released, "OAuth transport blocked its sibling future");
+        release_result.expect("provider was waiting for the release signal");
+        assert_eq!(response.unwrap()["access_token"], "host-access-secret");
+        assert_eq!(request.0, "POST");
+        assert_eq!(request.1, "/token");
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn host_oauth_transport_bounds_fixed_and_chunked_responses_at_the_same_limit() {
+        let transport = HostOAuthTransport::new().unwrap();
         for chunked in [false, true] {
             for extra in [0, 1] {
                 let body = serde_json::to_vec(&json!({
@@ -45019,7 +45088,9 @@ while IFS= read -r request; do exit 2; done
                 let provider = HostOAuthTransportTestServer::start(|_| {
                     host_oauth_http_response(200, "", &body, chunked)
                 });
-                let result = transport.post_form_json("oauth_refresh", &provider.base_url, &[]);
+                let result = transport
+                    .post_form_json("oauth_refresh", &provider.base_url, &[])
+                    .await;
                 if extra == 0 {
                     assert!(result.unwrap()["pad"].is_string());
                 } else {
@@ -45030,9 +45101,9 @@ while IFS= read -r request; do exit 2; done
         }
     }
 
-    #[test]
-    fn host_oauth_transport_refuses_malformed_and_non_success_token_responses() {
-        let transport = BlockingOAuthTransport::new().unwrap();
+    #[fcp_async_core::runtime::test]
+    async fn host_oauth_transport_refuses_malformed_and_non_success_token_responses() {
+        let transport = HostOAuthTransport::new().unwrap();
         for (status, body, expected) in [
             (200, "host-body-secret", "not valid JSON"),
             (200, "[\"host-body-secret\"]", "JSON object"),
@@ -45048,6 +45119,7 @@ while IFS= read -r request; do exit 2; done
             });
             let error = transport
                 .post_form_json("oauth_refresh", &provider.base_url, &[])
+                .await
                 .unwrap_err()
                 .to_string();
             assert!(error.contains(expected));
@@ -45056,6 +45128,7 @@ while IFS= read -r request; do exit 2; done
         }
         let error = transport
             .post_form_json("oauth_refresh", "http://[host-url-secret", &[])
+            .await
             .unwrap_err()
             .to_string();
         assert!(!error.contains("host-url-secret"));
