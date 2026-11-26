@@ -1572,6 +1572,55 @@ struct AdmissionControl {
     decision: BackpressureDecision,
 }
 
+/// Own the recovery admission across every suspension, including queue waits.
+/// Dropping a caller is not a successful or failed recovery observation. It
+/// releases only that caller's probe so another request can establish health.
+struct CallReservations<'a> {
+    circuit: &'a CircuitBreaker,
+    circuit_reservation: Option<CircuitReservation>,
+    health_router: &'a HealthRouter,
+    connector_id: &'a ConnectorId,
+    health: HealthReservation,
+}
+
+impl CallReservations<'_> {
+    fn complete(&mut self, failed: bool, observation: HealthObservation<'_>) -> Option<bool> {
+        let reservation = self.circuit_reservation.take()?;
+        self.circuit.record_outcome(&reservation, failed, || {
+            if self.health_router.record_observation(
+                self.connector_id,
+                Some(&self.health.epoch),
+                observation,
+            ) {
+                // Completed observations keep the health probe spacing.
+                self.health.probe = None;
+            }
+        })
+    }
+
+    fn record_queue_failure(&self, reason: &str) {
+        if let Some(reservation) = &self.circuit_reservation {
+            self.circuit.if_current(reservation, || {
+                self.health_router.record_observation(
+                    self.connector_id,
+                    Some(&self.health.epoch),
+                    HealthObservation::Failure(reason),
+                );
+            });
+        }
+    }
+}
+
+impl Drop for CallReservations<'_> {
+    fn drop(&mut self) {
+        if let Some(reservation) = self.circuit_reservation.take() {
+            self.circuit.cancel_reservation(&reservation);
+        }
+        self.health_router
+            .cancel_probe_reservation(self.health.probe.take());
+    }
+}
+
 impl ResilienceLayer {
     /// Create a resilience layer with the supplied configuration.
     #[must_use]
@@ -1741,12 +1790,15 @@ impl ResilienceLayer {
             effective_load,
             fairness,
         )?;
-        let probe_reservation = self.check_routing(connector_id, operation)?;
-        if let Err(error) = Self::check_circuit(&state, connector_id, operation) {
-            self.health_router
-                .cancel_probe_reservation(probe_reservation);
-            return Err(error);
-        }
+        let mut reservations = CallReservations {
+            circuit: &state.circuit,
+            circuit_reservation: None,
+            health_router: &self.health_router,
+            connector_id,
+            health: self.check_routing(connector_id, operation)?,
+        };
+        reservations.circuit_reservation =
+            Some(Self::check_circuit(&state, connector_id, operation)?);
         if let Some(delay) = admission.delay {
             // br-6bgp1: actually apply the controller's `Delay`
             // before claiming a bulkhead permit. The sleep is bounded
@@ -1756,11 +1808,13 @@ impl ResilienceLayer {
             // unbounded-queueing path).
             time::sleep(delay).await;
         }
-        let permit = match self.acquire_bulkhead(&state, connector_id, operation).await {
+        let permit = match Self::acquire_bulkhead(&state, connector_id, operation).await {
             Ok(permit) => permit,
             Err(error) => {
-                self.health_router
-                    .cancel_probe_reservation(probe_reservation);
+                reservations.record_queue_failure(match &error {
+                    ResilienceError::BulkheadFull => "bulkhead queue full",
+                    _ => "bulkhead queue timeout",
+                });
                 return Err(error);
             }
         };
@@ -1775,7 +1829,7 @@ impl ResilienceLayer {
             effective_load,
             &admission,
         );
-        if probe_reservation.is_some() {
+        if reservations.health.probe.is_some() {
             state.metrics.probe_requests.fetch_add(1, Ordering::Relaxed);
         }
         let started_at = Instant::now();
@@ -1783,7 +1837,7 @@ impl ResilienceLayer {
             .run_operation(&state, connector_id, operation, future, started_at)
             .await;
         drop(permit);
-        self.record_completion(&state, connector_id, started_at.elapsed(), &result);
+        self.record_completion(&state, started_at.elapsed(), &result, &mut reservations);
         result
     }
 
@@ -1897,10 +1951,9 @@ impl ResilienceLayer {
         &self,
         connector_id: &ConnectorId,
         operation: &str,
-    ) -> Result<Option<ProbeReservation>, ResilienceError<E>> {
+    ) -> Result<HealthReservation, ResilienceError<E>> {
         match self.health_router.reserve_route(connector_id) {
-            RouteReservation::Allow => Ok(None),
-            RouteReservation::AllowProbe(reservation) => Ok(Some(reservation)),
+            RouteReservation::Allow(reservation) => Ok(reservation),
             RouteReservation::Reject { reason } => {
                 tracing::warn!(
                     connector_id = %connector_id,
@@ -1917,9 +1970,9 @@ impl ResilienceLayer {
         state: &ConnectorState,
         connector_id: &ConnectorId,
         operation: &str,
-    ) -> Result<(), ResilienceError<E>> {
+    ) -> Result<CircuitReservation, ResilienceError<E>> {
         match state.circuit.before_call() {
-            Ok(CircuitPermit::Regular | CircuitPermit::Probe) => Ok(()),
+            Ok(reservation) => Ok(reservation),
             Err(CircuitReject::Open { retry_after }) => {
                 state
                     .metrics
@@ -1949,7 +2002,6 @@ impl ResilienceLayer {
     }
 
     async fn acquire_bulkhead<E>(
-        &self,
         state: &ConnectorState,
         connector_id: &ConnectorId,
         operation: &str,
@@ -1957,13 +2009,10 @@ impl ResilienceLayer {
         match state.bulkhead.acquire().await {
             Ok(permit) => Ok(permit),
             Err(BulkheadAcquireError::QueueFull) => {
-                state.circuit.cancel_inflight_probe();
                 state
                     .metrics
                     .bulkhead_rejections
                     .fetch_add(1, Ordering::Relaxed);
-                self.health_router
-                    .record_failure(connector_id, "bulkhead queue full");
                 tracing::warn!(
                     connector_id = %connector_id,
                     operation,
@@ -1972,13 +2021,10 @@ impl ResilienceLayer {
                 Err(ResilienceError::BulkheadFull)
             }
             Err(BulkheadAcquireError::QueueTimeout { timeout }) => {
-                state.circuit.cancel_inflight_probe();
                 state
                     .metrics
                     .bulkhead_rejections
                     .fetch_add(1, Ordering::Relaxed);
-                self.health_router
-                    .record_failure(connector_id, "bulkhead queue timeout");
                 tracing::warn!(
                     connector_id = %connector_id,
                     operation,
@@ -2003,23 +2049,21 @@ impl ResilienceLayer {
         E: std::fmt::Debug,
     {
         if let Some(timeout) = self.config.operation_timeout {
-            return self
-                .run_operation_with_timeout(
-                    state,
-                    connector_id,
-                    operation,
-                    future,
-                    started_at,
-                    timeout,
-                )
-                .await;
+            return Self::run_operation_with_timeout(
+                state,
+                connector_id,
+                operation,
+                future,
+                started_at,
+                timeout,
+            )
+            .await;
         }
 
         future.await.map_err(ResilienceError::Inner)
     }
 
     async fn run_operation_with_timeout<F, T, E>(
-        &self,
         state: &ConnectorState,
         connector_id: &ConnectorId,
         operation: &str,
@@ -2035,7 +2079,7 @@ impl ResilienceLayer {
             return inner.map_err(ResilienceError::Inner);
         }
 
-        self.record_timeout(
+        Self::record_timeout(
             state,
             connector_id,
             operation,
@@ -2046,7 +2090,6 @@ impl ResilienceLayer {
     }
 
     fn record_timeout(
-        &self,
         state: &ConnectorState,
         connector_id: &ConnectorId,
         operation: &str,
@@ -2054,13 +2097,11 @@ impl ResilienceLayer {
         latency: Duration,
     ) {
         state.metrics.timeouts.fetch_add(1, Ordering::Relaxed);
-        self.apply_circuit_outcome(state, OutcomeKind::TimedOut, latency);
-        self.health_router
-            .record_timeout(connector_id, timeout, latency);
         tracing::warn!(
             connector_id = %connector_id,
             operation,
             timeout_ms = timeout.as_millis(),
+            latency_ms = latency.as_millis(),
             "connector operation timed out"
         );
     }
@@ -2068,43 +2109,45 @@ impl ResilienceLayer {
     fn record_completion<T, E>(
         &self,
         state: &ConnectorState,
-        connector_id: &ConnectorId,
         latency: Duration,
         result: &Result<T, ResilienceError<E>>,
+        reservations: &mut CallReservations<'_>,
     ) {
-        match result {
+        let outcome = match result {
             Ok(_) => {
                 state.metrics.successes.fetch_add(1, Ordering::Relaxed);
-                self.health_router.record_success(connector_id, latency);
-                self.apply_circuit_outcome(state, OutcomeKind::Success, latency);
+                OutcomeKind::Success
             }
             Err(ResilienceError::Inner(_)) => {
                 state.metrics.failures.fetch_add(1, Ordering::Relaxed);
-                self.health_router
-                    .record_failure(connector_id, "connector operation failed");
-                self.apply_circuit_outcome(state, OutcomeKind::Failure, latency);
+                OutcomeKind::Failure
             }
-            Err(_) => {}
-        }
-    }
-
-    fn apply_circuit_outcome(
-        &self,
-        state: &ConnectorState,
-        outcome: OutcomeKind,
-        latency: Duration,
-    ) {
-        if self
+            Err(ResilienceError::TimedOut { .. }) => OutcomeKind::TimedOut,
+            Err(_) => return,
+        };
+        let failed = self
             .config
             .circuit_breaker
             .failure_predicate
-            .matches(outcome, latency)
-        {
-            if state.circuit.record_failure() {
-                state.metrics.circuit_opened.fetch_add(1, Ordering::Relaxed);
+            .matches(outcome, latency);
+        let observation = match result {
+            Ok(_) => HealthObservation::Success(latency),
+            Err(ResilienceError::Inner(_)) => {
+                HealthObservation::Failure("connector operation failed")
             }
-        } else {
-            state.circuit.record_success();
+            Err(ResilienceError::TimedOut { timeout }) => HealthObservation::Timeout {
+                timeout: *timeout,
+                latency,
+            },
+            Err(_) => return,
+        };
+        let Some(opened) = reservations.complete(failed, observation) else {
+            // The real result remains observable in metrics, but a response
+            // from before the circuit opened cannot prove recovery afterward.
+            return;
+        };
+        if opened {
+            state.metrics.circuit_opened.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -2231,6 +2274,30 @@ enum CircuitPermit {
     Probe,
 }
 
+/// Opaque identities avoid counter wraparound and distinguish successive
+/// probes even when both belong to the same half-open recovery epoch.
+#[derive(Debug)]
+struct CircuitReservation {
+    kind: CircuitPermit,
+    epoch: Arc<()>,
+    probe: Option<Arc<()>>,
+}
+
+impl CircuitReservation {
+    fn is_current(&self, inner: &CircuitInner) -> bool {
+        if !Arc::ptr_eq(&self.epoch, &inner.epoch) {
+            return false;
+        }
+        match (self.kind, inner.state, &self.probe, &inner.probe_in_flight) {
+            (CircuitPermit::Regular, CircuitState::Closed, None, _) => true,
+            (CircuitPermit::Probe, CircuitState::HalfOpen, Some(ours), Some(current)) => {
+                Arc::ptr_eq(ours, current)
+            }
+            _ => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CircuitReject {
     Open { retry_after: Duration },
@@ -2250,7 +2317,8 @@ struct CircuitInner {
     successes: u32,
     window_started_at: Instant,
     opened_until: Option<Instant>,
-    probe_in_flight: bool,
+    epoch: Arc<()>,
+    probe_in_flight: Option<Arc<()>>,
 }
 
 impl CircuitBreaker {
@@ -2263,7 +2331,8 @@ impl CircuitBreaker {
                 successes: 0,
                 window_started_at: Instant::now(),
                 opened_until: None,
-                probe_in_flight: false,
+                epoch: Arc::new(()),
+                probe_in_flight: None,
             }),
         }
     }
@@ -2272,7 +2341,7 @@ impl CircuitBreaker {
         lock_unpoisoned(&self.inner).state
     }
 
-    fn before_call(&self) -> Result<CircuitPermit, CircuitReject> {
+    fn before_call(&self) -> Result<CircuitReservation, CircuitReject> {
         let now = Instant::now();
         let mut inner = lock_unpoisoned(&self.inner);
         let decision = match inner.state {
@@ -2286,93 +2355,137 @@ impl CircuitBreaker {
                     } else {
                         inner.state = CircuitState::HalfOpen;
                         inner.failures = 0;
-                        inner.probe_in_flight = true;
                         Ok(CircuitPermit::Probe)
                     }
                 } else {
                     inner.state = CircuitState::HalfOpen;
                     inner.failures = 0;
-                    inner.probe_in_flight = true;
                     Ok(CircuitPermit::Probe)
                 }
             }
             CircuitState::HalfOpen => {
-                if inner.probe_in_flight {
+                if inner.probe_in_flight.is_some() {
                     Err(CircuitReject::HalfOpenLimited)
                 } else {
-                    inner.probe_in_flight = true;
                     Ok(CircuitPermit::Probe)
                 }
             }
         };
+        let decision = decision.map(|kind| {
+            let probe = (kind == CircuitPermit::Probe).then(|| Arc::new(()));
+            if let Some(probe) = &probe {
+                inner.probe_in_flight = Some(Arc::clone(probe));
+            }
+            CircuitReservation {
+                kind,
+                epoch: Arc::clone(&inner.epoch),
+                probe,
+            }
+        });
         drop(inner);
         decision
     }
 
-    fn cancel_inflight_probe(&self) {
+    fn cancel_reservation(&self, reservation: &CircuitReservation) {
         let mut inner = lock_unpoisoned(&self.inner);
-        if inner.state == CircuitState::HalfOpen {
-            inner.probe_in_flight = false;
+        if reservation.kind == CircuitPermit::Probe && reservation.is_current(&inner) {
+            inner.probe_in_flight = None;
         }
     }
 
+    /// Return `None` for an obsolete call, otherwise whether this outcome
+    /// opened the circuit. Validity and mutation share the same lock.
+    fn record_outcome(
+        &self,
+        reservation: &CircuitReservation,
+        failed: bool,
+        observe: impl FnOnce(),
+    ) -> Option<bool> {
+        let mut inner = lock_unpoisoned(&self.inner);
+        if !reservation.is_current(&inner) {
+            return None;
+        }
+        let opened = if failed {
+            record_circuit_failure(&mut inner, &self.config)
+        } else {
+            record_circuit_success(&mut inner, &self.config);
+            false
+        };
+        // Circuit -> health is the only nested lock order. Keep the matching
+        // health observation in this settlement before admitting a new epoch.
+        observe();
+        Some(opened)
+    }
+
+    fn if_current(&self, reservation: &CircuitReservation, observe: impl FnOnce()) {
+        let inner = lock_unpoisoned(&self.inner);
+        if reservation.is_current(&inner) {
+            observe();
+        }
+    }
+
+    // State-machine tests inject observations directly. Production callers
+    // must supply the exact reservation through `record_outcome`.
+    #[cfg(test)]
     fn record_success(&self) {
         let mut inner = lock_unpoisoned(&self.inner);
-        match inner.state {
-            CircuitState::Closed => {
-                inner.failures = 0;
-                inner.window_started_at = Instant::now();
-            }
-            CircuitState::HalfOpen => {
-                inner.probe_in_flight = false;
-                inner.successes = inner.successes.saturating_add(1);
-                if inner.successes >= self.config.success_threshold {
-                    inner.state = CircuitState::Closed;
-                    inner.failures = 0;
-                    inner.successes = 0;
-                    inner.opened_until = None;
-                    inner.window_started_at = Instant::now();
-                }
-            }
-            CircuitState::Open => {}
-        }
+        record_circuit_success(&mut inner, &self.config);
     }
 
+    #[cfg(test)]
     fn record_failure(&self) -> bool {
         let mut inner = lock_unpoisoned(&self.inner);
-        let now = Instant::now();
+        record_circuit_failure(&mut inner, &self.config)
+    }
+}
 
-        if now.saturating_duration_since(inner.window_started_at) > self.config.window_duration {
+fn record_circuit_success(inner: &mut CircuitInner, config: &CircuitBreakerConfig) {
+    match inner.state {
+        CircuitState::Closed => {
             inner.failures = 0;
-            inner.window_started_at = now;
+            inner.window_started_at = Instant::now();
         }
-
-        inner.probe_in_flight = false;
-        inner.successes = 0;
-
-        let opened = match inner.state {
-            // A failure from a request that was admitted while Closed can complete
-            // *after* other concurrent failures have already tripped the breaker.
-            // The breaker is already open — such a straggler must not re-run
-            // `open_circuit` (which would reset `opened_until`, pushing the first
-            // recovery probe later than the configured `open_duration`, and
-            // double-count `circuit_opened`). Mirror `record_success`, which also
-            // no-ops in the Open state.
-            CircuitState::Open => false,
-            CircuitState::HalfOpen => open_circuit(&mut inner, &self.config),
-            CircuitState::Closed => {
-                inner.failures = inner.failures.saturating_add(1);
-                inner.failures >= self.config.failure_threshold
-                    && open_circuit(&mut inner, &self.config)
+        CircuitState::HalfOpen => {
+            inner.probe_in_flight = None;
+            inner.successes = inner.successes.saturating_add(1);
+            if inner.successes >= config.success_threshold {
+                inner.state = CircuitState::Closed;
+                inner.epoch = Arc::new(());
+                inner.failures = 0;
+                inner.successes = 0;
+                inner.opened_until = None;
+                inner.window_started_at = Instant::now();
             }
-        };
-        drop(inner);
-        opened
+        }
+        CircuitState::Open => {}
+    }
+}
+
+fn record_circuit_failure(inner: &mut CircuitInner, config: &CircuitBreakerConfig) -> bool {
+    if inner.state == CircuitState::Open {
+        return false;
+    }
+    let now = Instant::now();
+    if now.saturating_duration_since(inner.window_started_at) > config.window_duration {
+        inner.failures = 0;
+        inner.window_started_at = now;
+    }
+    inner.probe_in_flight = None;
+    inner.successes = 0;
+    match inner.state {
+        CircuitState::Open => false,
+        CircuitState::HalfOpen => open_circuit(inner, config),
+        CircuitState::Closed => {
+            inner.failures = inner.failures.saturating_add(1);
+            inner.failures >= config.failure_threshold && open_circuit(inner, config)
+        }
     }
 }
 
 fn open_circuit(inner: &mut CircuitInner, config: &CircuitBreakerConfig) -> bool {
     inner.state = CircuitState::Open;
+    inner.epoch = Arc::new(());
+    inner.probe_in_flight = None;
     inner.failures = 0;
     inner.successes = 0;
     inner.opened_until = Some(Instant::now() + config.open_duration);
@@ -2468,6 +2581,7 @@ struct HealthRouter {
 
 #[derive(Debug)]
 struct HealthEntry {
+    epoch: Arc<()>,
     status: ConnectorHealth,
     consecutive_failures: u32,
     consecutive_successes: u32,
@@ -2480,20 +2594,36 @@ struct HealthEntry {
 #[derive(Debug)]
 struct ProbeReservation {
     connector_id: ConnectorId,
+    epoch: Arc<()>,
     reserved_at: Instant,
     previous_last_probe_at: Option<Instant>,
 }
 
 #[derive(Debug)]
+struct HealthReservation {
+    epoch: Arc<()>,
+    probe: Option<ProbeReservation>,
+}
+
+enum HealthObservation<'a> {
+    Success(Duration),
+    Failure(&'a str),
+    Timeout {
+        timeout: Duration,
+        latency: Duration,
+    },
+}
+
+#[derive(Debug)]
 enum RouteReservation {
-    Allow,
-    AllowProbe(ProbeReservation),
+    Allow(HealthReservation),
     Reject { reason: String },
 }
 
 impl HealthEntry {
     fn new(config: &HealthRouterConfig) -> Self {
         Self {
+            epoch: Arc::new(()),
             status: ConnectorHealth::Healthy,
             consecutive_failures: 0,
             consecutive_successes: 0,
@@ -2521,7 +2651,10 @@ impl HealthRouter {
                 .or_insert_with(|| HealthEntry::new(&self.config));
             match &entry.status {
                 ConnectorHealth::Healthy | ConnectorHealth::Degraded { .. } => {
-                    RouteReservation::Allow
+                    RouteReservation::Allow(HealthReservation {
+                        epoch: Arc::clone(&entry.epoch),
+                        probe: None,
+                    })
                 }
                 ConnectorHealth::Unavailable { reason, .. } => {
                     let now = Instant::now();
@@ -2532,10 +2665,14 @@ impl HealthRouter {
                         let reserved_at = now;
                         let previous_last_probe_at = entry.last_probe_at;
                         entry.last_probe_at = Some(reserved_at);
-                        RouteReservation::AllowProbe(ProbeReservation {
-                            connector_id: connector_id.clone(),
-                            reserved_at,
-                            previous_last_probe_at,
+                        RouteReservation::Allow(HealthReservation {
+                            epoch: Arc::clone(&entry.epoch),
+                            probe: Some(ProbeReservation {
+                                connector_id: connector_id.clone(),
+                                epoch: Arc::clone(&entry.epoch),
+                                reserved_at,
+                                previous_last_probe_at,
+                            }),
                         })
                     } else {
                         RouteReservation::Reject {
@@ -2588,6 +2725,7 @@ impl HealthRouter {
 
         let mut entries = lock_unpoisoned(&self.entries);
         if let Some(entry) = entries.get_mut(&reservation.connector_id)
+            && Arc::ptr_eq(&entry.epoch, &reservation.epoch)
             && matches!(entry.status, ConnectorHealth::Unavailable { .. })
             && entry.last_probe_at == Some(reservation.reserved_at)
         {
@@ -2595,51 +2733,63 @@ impl HealthRouter {
         }
     }
 
+    fn record_observation(
+        &self,
+        connector_id: &ConnectorId,
+        admitted_epoch: Option<&Arc<()>>,
+        observation: HealthObservation<'_>,
+    ) -> bool {
+        let mut entries = lock_unpoisoned(&self.entries);
+        let entry = entries
+            .entry(connector_id.clone())
+            .or_insert_with(|| HealthEntry::new(&self.config));
+        if admitted_epoch.is_some_and(|epoch| !Arc::ptr_eq(epoch, &entry.epoch)) {
+            return false;
+        }
+        let reason = match observation {
+            HealthObservation::Success(latency) => {
+                entry.consecutive_failures = 0;
+                entry.consecutive_successes = entry.consecutive_successes.saturating_add(1);
+                entry.avg_latency.record(latency);
+                entry.error_window.record_success();
+                "successful probe"
+            }
+            HealthObservation::Failure(reason) => {
+                entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+                entry.consecutive_successes = 0;
+                entry.error_window.record_failure();
+                reason
+            }
+            HealthObservation::Timeout { timeout, latency } => {
+                entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+                entry.consecutive_successes = 0;
+                entry.avg_latency.record(latency.max(timeout));
+                entry.error_window.record_failure();
+                "operation timed out"
+            }
+        };
+        recalculate_health(entry, &self.config, Some(reason));
+        drop(entries);
+        true
+    }
+
+    #[cfg(test)]
     fn record_success(&self, connector_id: &ConnectorId, latency: Duration) {
-        let mut entries = lock_unpoisoned(&self.entries);
-        {
-            let entry = entries
-                .entry(connector_id.clone())
-                .or_insert_with(|| HealthEntry::new(&self.config));
-
-            entry.consecutive_failures = 0;
-            entry.consecutive_successes = entry.consecutive_successes.saturating_add(1);
-            entry.avg_latency.record(latency);
-            entry.error_window.record_success();
-            recalculate_health(entry, &self.config, Some("successful probe"));
-        }
-        drop(entries);
+        self.record_observation(connector_id, None, HealthObservation::Success(latency));
     }
 
+    #[cfg(test)]
     fn record_failure(&self, connector_id: &ConnectorId, reason: &str) {
-        let mut entries = lock_unpoisoned(&self.entries);
-        {
-            let entry = entries
-                .entry(connector_id.clone())
-                .or_insert_with(|| HealthEntry::new(&self.config));
-
-            entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
-            entry.consecutive_successes = 0;
-            entry.error_window.record_failure();
-            recalculate_health(entry, &self.config, Some(reason));
-        }
-        drop(entries);
+        self.record_observation(connector_id, None, HealthObservation::Failure(reason));
     }
 
+    #[cfg(test)]
     fn record_timeout(&self, connector_id: &ConnectorId, timeout: Duration, latency: Duration) {
-        let mut entries = lock_unpoisoned(&self.entries);
-        {
-            let entry = entries
-                .entry(connector_id.clone())
-                .or_insert_with(|| HealthEntry::new(&self.config));
-
-            entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
-            entry.consecutive_successes = 0;
-            entry.avg_latency.record(latency.max(timeout));
-            entry.error_window.record_failure();
-            recalculate_health(entry, &self.config, Some("operation timed out"));
-        }
-        drop(entries);
+        self.record_observation(
+            connector_id,
+            None,
+            HealthObservation::Timeout { timeout, latency },
+        );
     }
 
     fn health(&self, connector_id: &ConnectorId) -> ConnectorHealth {
@@ -2659,6 +2809,7 @@ fn recalculate_health(
         let reason = failure_reason.unwrap_or("consecutive failures");
         let since = entry.unavailable_since.unwrap_or_else(Utc::now);
         if entry.unavailable_since.is_none() {
+            entry.epoch = Arc::new(());
             entry.last_probe_at = Some(Instant::now());
         }
         entry.unavailable_since = Some(since);
@@ -2682,6 +2833,10 @@ fn recalculate_health(
             since: entry.unavailable_since.unwrap_or_else(Utc::now),
         };
         return;
+    }
+
+    if entry.unavailable_since.is_some() {
+        entry.epoch = Arc::new(());
     }
 
     if slow || error_prone || entry.consecutive_failures > 0 {
@@ -3686,6 +3841,388 @@ mod tests {
             .await;
         assert!(second_probe.is_ok());
         assert_eq!(layer.circuit_state(&connector_id), CircuitState::Closed);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn cancelled_recovery_probe_releases_circuit_and_health_admission() {
+        let layer = ResilienceLayer::new(ResilienceConfig {
+            circuit_breaker: CircuitBreakerConfig {
+                failure_threshold: 1,
+                success_threshold: 1,
+                open_duration: Duration::ZERO,
+                ..CircuitBreakerConfig::default()
+            },
+            health: HealthRouterConfig {
+                unhealthy_threshold: 1,
+                recovery_success_threshold: 1,
+                probe_interval: Duration::from_secs(60),
+                ..HealthRouterConfig::default()
+            },
+            ..ResilienceConfig::default()
+        });
+        let connector_id = test_connector_id();
+        let failed = layer
+            .execute(&connector_id, RequestPriority::Critical, "invoke", async {
+                Err::<(), _>("down")
+            })
+            .await;
+        assert!(matches!(failed, Err(ResilienceError::Inner("down"))));
+        let previous_probe = Instant::now() - Duration::from_secs(120);
+        lock_unpoisoned(&layer.health_router.entries)
+            .get_mut(&connector_id)
+            .unwrap()
+            .last_probe_at = Some(previous_probe);
+
+        let mut probe = Box::pin(layer.execute(
+            &connector_id,
+            RequestPriority::Critical,
+            "invoke",
+            std::future::pending::<Result<(), &str>>(),
+        ));
+        assert!(futures_util::poll!(probe.as_mut()).is_pending());
+        assert_eq!(layer.circuit_state(&connector_id), CircuitState::HalfOpen);
+        assert_eq!(layer.metrics(&connector_id).probe_requests, 1);
+        drop(probe);
+        assert_eq!(
+            lock_unpoisoned(&layer.health_router.entries)[&connector_id].last_probe_at,
+            Some(previous_probe),
+            "abandoned work must not charge the next health-probe interval"
+        );
+
+        layer
+            .execute(&connector_id, RequestPriority::Critical, "invoke", async {
+                Ok::<(), &str>(())
+            })
+            .await
+            .expect("a replacement recovery probe must be admitted immediately");
+        assert_eq!(layer.circuit_state(&connector_id), CircuitState::Closed);
+        assert!(!matches!(
+            layer.connector_health(&connector_id),
+            ConnectorHealth::Unavailable { .. }
+        ));
+        let metrics = layer.metrics(&connector_id);
+        assert_eq!(metrics.successes, 1);
+        assert_eq!(metrics.failures, 1);
+        assert_eq!(metrics.timeouts, 0);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn cancelled_queued_probe_releases_ownership_without_polling_operation() {
+        let layer = ResilienceLayer::new(ResilienceConfig {
+            circuit_breaker: CircuitBreakerConfig {
+                failure_threshold: 1,
+                success_threshold: 1,
+                open_duration: Duration::ZERO,
+                ..CircuitBreakerConfig::default()
+            },
+            bulkhead: BulkheadConfig {
+                max_concurrent: 1,
+                max_queued: 2,
+                queue_timeout: Duration::from_secs(10),
+            },
+            ..ResilienceConfig::default()
+        });
+        let connector_id = test_connector_id();
+        let state = layer.connector_state(&connector_id);
+        state.circuit.record_failure();
+        let held = state.bulkhead.acquire().await.expect("occupy bulkhead");
+        let started = std::sync::atomic::AtomicBool::new(false);
+        let mut probe =
+            Box::pin(
+                layer.execute(&connector_id, RequestPriority::Critical, "invoke", async {
+                    started.store(true, Ordering::SeqCst);
+                    Ok::<(), &str>(())
+                }),
+            );
+        time::timeout(
+            Duration::from_secs(1),
+            std::future::poll_fn(|cx| {
+                assert!(probe.as_mut().poll(cx).is_pending());
+                if state.bulkhead.queued.load(Ordering::SeqCst) == 1 {
+                    std::task::Poll::Ready(())
+                } else {
+                    std::task::Poll::Pending
+                }
+            }),
+        )
+        .await
+        .expect("probe reaches bulkhead queue");
+        assert_eq!(state.circuit.state(), CircuitState::HalfOpen);
+        drop(probe);
+        assert!(!started.load(Ordering::SeqCst));
+        assert_eq!(state.bulkhead.queued.load(Ordering::SeqCst), 0);
+        drop(held);
+        layer
+            .execute(&connector_id, RequestPriority::Critical, "invoke", async {
+                Ok::<(), &str>(())
+            })
+            .await
+            .expect("queued cancellation must not strand the half-open circuit");
+        assert_eq!(state.circuit.state(), CircuitState::Closed);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn panicked_recovery_probe_releases_its_admission() {
+        use futures_util::FutureExt;
+
+        let layer = ResilienceLayer::new(ResilienceConfig {
+            circuit_breaker: CircuitBreakerConfig {
+                failure_threshold: 1,
+                success_threshold: 1,
+                open_duration: Duration::ZERO,
+                ..CircuitBreakerConfig::default()
+            },
+            ..ResilienceConfig::default()
+        });
+        let connector_id = test_connector_id();
+        layer
+            .connector_state(&connector_id)
+            .circuit
+            .record_failure();
+        let panicked = std::panic::AssertUnwindSafe(layer.execute::<_, (), &str>(
+            &connector_id,
+            RequestPriority::Critical,
+            "invoke",
+            async { panic!("recovery operation panicked") },
+        ))
+        .catch_unwind()
+        .await;
+        assert!(panicked.is_err());
+        layer
+            .execute(&connector_id, RequestPriority::Critical, "invoke", async {
+                Ok::<(), &str>(())
+            })
+            .await
+            .expect("unwinding releases recovery ownership");
+        assert_eq!(layer.circuit_state(&connector_id), CircuitState::Closed);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn old_regular_outcomes_cannot_settle_a_new_half_open_probe() {
+        for old_fails in [false, true] {
+            let layer = ResilienceLayer::new(ResilienceConfig {
+                circuit_breaker: CircuitBreakerConfig {
+                    failure_threshold: 1,
+                    success_threshold: 2,
+                    open_duration: Duration::ZERO,
+                    ..CircuitBreakerConfig::default()
+                },
+                ..ResilienceConfig::default()
+            });
+            let connector_id = test_connector_id();
+            let finish = std::sync::atomic::AtomicBool::new(false);
+            let mut old = Box::pin(layer.execute(
+                &connector_id,
+                RequestPriority::Critical,
+                "old",
+                std::future::poll_fn(|_| {
+                    if finish.load(Ordering::SeqCst) {
+                        std::task::Poll::Ready(if old_fails {
+                            Err("old failure")
+                        } else {
+                            Ok(())
+                        })
+                    } else {
+                        std::task::Poll::Pending
+                    }
+                }),
+            ));
+            assert!(futures_util::poll!(old.as_mut()).is_pending());
+            let failure = layer
+                .execute(&connector_id, RequestPriority::Critical, "trip", async {
+                    Err::<(), _>("new failure")
+                })
+                .await;
+            assert!(matches!(
+                failure,
+                Err(ResilienceError::Inner("new failure"))
+            ));
+            let mut probe = Box::pin(layer.execute(
+                &connector_id,
+                RequestPriority::Critical,
+                "probe",
+                std::future::pending::<Result<(), &str>>(),
+            ));
+            assert!(futures_util::poll!(probe.as_mut()).is_pending());
+            finish.store(true, Ordering::SeqCst);
+            assert_eq!(old.await.is_err(), old_fails);
+            assert_eq!(layer.circuit_state(&connector_id), CircuitState::HalfOpen);
+            let rejected = layer
+                .execute(
+                    &connector_id,
+                    RequestPriority::Critical,
+                    "contender",
+                    async {
+                        panic!("old completion released another request's probe");
+                        #[allow(unreachable_code)]
+                        Ok::<(), &str>(())
+                    },
+                )
+                .await;
+            assert!(matches!(rejected, Err(ResilienceError::HalfOpenLimited)));
+            drop(probe);
+            for expected in [CircuitState::HalfOpen, CircuitState::Closed] {
+                layer
+                    .execute(&connector_id, RequestPriority::Critical, "recover", async {
+                        Ok::<(), &str>(())
+                    })
+                    .await
+                    .expect("each fresh probe contributes exactly one success");
+                assert_eq!(layer.circuit_state(&connector_id), expected);
+            }
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn stale_queue_timeout_cannot_release_or_degrade_a_new_recovery_probe() {
+        let layer = ResilienceLayer::new(ResilienceConfig {
+            circuit_breaker: CircuitBreakerConfig {
+                failure_threshold: 1,
+                open_duration: Duration::ZERO,
+                ..CircuitBreakerConfig::default()
+            },
+            bulkhead: BulkheadConfig {
+                max_concurrent: 1,
+                max_queued: 2,
+                queue_timeout: Duration::from_millis(50),
+            },
+            health: HealthRouterConfig {
+                unhealthy_threshold: 1,
+                probe_interval: Duration::ZERO,
+                ..HealthRouterConfig::default()
+            },
+            ..ResilienceConfig::default()
+        });
+        let connector_id = test_connector_id();
+        let state = layer.connector_state(&connector_id);
+        let _held = state.bulkhead.acquire().await.expect("occupy bulkhead");
+        let mut queued = Box::pin(layer.execute(
+            &connector_id,
+            RequestPriority::Critical,
+            "old queued",
+            async { Ok::<(), &str>(()) },
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(queued.as_mut().poll(cx).is_pending());
+            if state.bulkhead.queued.load(Ordering::SeqCst) == 1 {
+                std::task::Poll::Ready(())
+            } else {
+                std::task::Poll::Pending
+            }
+        })
+        .await;
+        state.circuit.record_failure();
+        layer
+            .health_router
+            .record_failure(&connector_id, "new outage");
+        let probe = state.circuit.before_call().expect("new circuit probe");
+        let health = layer
+            .check_routing::<&str>(&connector_id, "new probe")
+            .unwrap();
+        let previous_health = serde_json::to_value(layer.connector_health(&connector_id)).unwrap();
+        assert!(matches!(
+            queued.await,
+            Err(ResilienceError::QueueTimeout { .. })
+        ));
+        assert_eq!(state.circuit.state(), CircuitState::HalfOpen);
+        assert!(matches!(
+            state.circuit.before_call(),
+            Err(CircuitReject::HalfOpenLimited)
+        ));
+        assert_eq!(
+            serde_json::to_value(layer.connector_health(&connector_id)).unwrap(),
+            previous_health
+        );
+        let entries = lock_unpoisoned(&layer.health_router.entries);
+        assert_eq!(entries[&connector_id].consecutive_failures, 1);
+        assert_eq!(
+            entries[&connector_id].last_probe_at,
+            health
+                .probe
+                .as_ref()
+                .map(|reservation| reservation.reserved_at)
+        );
+        drop(entries);
+        state.circuit.cancel_reservation(&probe);
+        layer.health_router.cancel_probe_reservation(health.probe);
+    }
+
+    #[test]
+    fn stale_probe_identity_cannot_settle_or_cancel_its_replacement() {
+        let circuit = CircuitBreaker::new(CircuitBreakerConfig {
+            failure_threshold: 1,
+            success_threshold: 1,
+            open_duration: Duration::ZERO,
+            ..CircuitBreakerConfig::default()
+        });
+        circuit.record_failure();
+        let first = circuit.before_call().unwrap();
+        circuit.cancel_reservation(&first);
+        let replacement = circuit.before_call().unwrap();
+        circuit.cancel_reservation(&first);
+        assert_eq!(
+            circuit.record_outcome(&first, false, || panic!("stale observation")),
+            None
+        );
+        assert_eq!(
+            circuit.record_outcome(&first, true, || panic!("stale observation")),
+            None
+        );
+        assert!(matches!(
+            circuit.before_call(),
+            Err(CircuitReject::HalfOpenLimited)
+        ));
+        assert_eq!(
+            circuit.record_outcome(&replacement, false, || {}),
+            Some(false)
+        );
+        assert_eq!(circuit.state(), CircuitState::Closed);
+    }
+
+    #[test]
+    fn health_recovery_rejects_observations_from_before_the_outage() {
+        let router = HealthRouter::new(HealthRouterConfig {
+            unhealthy_threshold: 1,
+            recovery_success_threshold: 1,
+            probe_interval: Duration::ZERO,
+            ..HealthRouterConfig::default()
+        });
+        let connector_id = test_connector_id();
+        let RouteReservation::Allow(old) = router.reserve_route(&connector_id) else {
+            panic!("healthy route admitted");
+        };
+        router.record_failure(&connector_id, "outage");
+        let RouteReservation::Allow(current) = router.reserve_route(&connector_id) else {
+            panic!("recovery probe admitted");
+        };
+        for observation in [
+            HealthObservation::Success(Duration::ZERO),
+            HealthObservation::Failure("old queue timeout"),
+            HealthObservation::Timeout {
+                timeout: Duration::ZERO,
+                latency: Duration::ZERO,
+            },
+        ] {
+            assert!(!router.record_observation(&connector_id, Some(&old.epoch), observation));
+        }
+        assert!(matches!(
+            router.health(&connector_id),
+            ConnectorHealth::Unavailable { .. }
+        ));
+        assert!(router.record_observation(
+            &connector_id,
+            Some(&current.epoch),
+            HealthObservation::Success(Duration::ZERO),
+        ));
+        assert!(!matches!(
+            router.health(&connector_id),
+            ConnectorHealth::Unavailable { .. }
+        ));
+        assert!(!router.record_observation(
+            &connector_id,
+            Some(&current.epoch),
+            HealthObservation::Failure("late recovery failure"),
+        ));
     }
 
     #[fcp_async_core::runtime::test]
@@ -4866,7 +5403,10 @@ mod tests {
     #[test]
     fn closed_breaker_returns_regular_permit() {
         let cb = CircuitBreaker::new(CircuitBreakerConfig::default());
-        assert_eq!(cb.before_call(), Ok(CircuitPermit::Regular));
+        assert_eq!(
+            cb.before_call().map(|permit| permit.kind),
+            Ok(CircuitPermit::Regular)
+        );
     }
 
     #[test]
@@ -4901,11 +5441,11 @@ mod tests {
         });
         cb.record_failure(); // Opens
         // Transition to HalfOpen via before_call (open_duration = 0)
-        let first = cb.before_call();
+        let first = cb.before_call().map(|permit| permit.kind);
         assert_eq!(first, Ok(CircuitPermit::Probe));
         assert_eq!(cb.state(), CircuitState::HalfOpen);
         // Second call should be rejected
-        let second = cb.before_call();
+        let second = cb.before_call().map(|permit| permit.kind);
         assert_eq!(second, Err(CircuitReject::HalfOpenLimited));
     }
 
@@ -4917,7 +5457,7 @@ mod tests {
             ..CircuitBreakerConfig::default()
         });
         cb.record_failure();
-        let permit = cb.before_call();
+        let permit = cb.before_call().map(|permit| permit.kind);
         assert_eq!(permit, Ok(CircuitPermit::Probe));
         assert_eq!(cb.state(), CircuitState::HalfOpen);
     }
@@ -4931,7 +5471,7 @@ mod tests {
         });
         cb.record_failure();
         assert_eq!(cb.state(), CircuitState::Open);
-        let result = cb.before_call();
+        let result = cb.before_call().map(|permit| permit.kind);
         assert!(
             matches!(result, Err(CircuitReject::Open { retry_after }) if retry_after > Duration::ZERO)
         );
@@ -4947,7 +5487,7 @@ mod tests {
         cb.record_failure();
         assert_eq!(cb.state(), CircuitState::Open);
         // open_duration is zero so it should immediately transition
-        let result = cb.before_call();
+        let result = cb.before_call().map(|permit| permit.kind);
         assert_eq!(result, Ok(CircuitPermit::Probe));
         assert_eq!(cb.state(), CircuitState::HalfOpen);
     }
@@ -5051,20 +5591,27 @@ mod tests {
             ..CircuitBreakerConfig::default()
         });
         cb.record_failure();
-        let _ = cb.before_call(); // HalfOpen, probe_in_flight = true
+        let probe = cb.before_call().expect("half-open probe");
         assert_eq!(cb.state(), CircuitState::HalfOpen);
         // Would normally reject
-        assert_eq!(cb.before_call(), Err(CircuitReject::HalfOpenLimited));
-        cb.cancel_inflight_probe();
+        assert_eq!(
+            cb.before_call().map(|permit| permit.kind),
+            Err(CircuitReject::HalfOpenLimited)
+        );
+        cb.cancel_reservation(&probe);
         // Now probe should be allowed again
-        assert_eq!(cb.before_call(), Ok(CircuitPermit::Probe));
+        assert_eq!(
+            cb.before_call().map(|permit| permit.kind),
+            Ok(CircuitPermit::Probe)
+        );
     }
 
     #[test]
     fn cancel_inflight_probe_is_noop_in_closed() {
         let cb = CircuitBreaker::new(CircuitBreakerConfig::default());
         assert_eq!(cb.state(), CircuitState::Closed);
-        cb.cancel_inflight_probe(); // Should not panic or change state
+        let regular = cb.before_call().expect("regular permit");
+        cb.cancel_reservation(&regular);
         assert_eq!(cb.state(), CircuitState::Closed);
     }
 
@@ -5078,7 +5625,7 @@ mod tests {
             inner.state = CircuitState::Open;
             inner.opened_until = None;
         }
-        let result = cb.before_call();
+        let result = cb.before_call().map(|permit| permit.kind);
         assert_eq!(result, Ok(CircuitPermit::Probe));
         assert_eq!(cb.state(), CircuitState::HalfOpen);
     }
@@ -6049,11 +6596,11 @@ mod tests {
         cb.record_failure();
         assert_eq!(cb.state(), CircuitState::Open);
         // Transition to HalfOpen with first probe
-        let first = cb.before_call();
+        let first = cb.before_call().map(|permit| permit.kind);
         assert_eq!(first, Ok(CircuitPermit::Probe));
         assert_eq!(cb.state(), CircuitState::HalfOpen);
         // Second call should be HalfOpenLimited
-        let second = cb.before_call();
+        let second = cb.before_call().map(|permit| permit.kind);
         assert_eq!(second, Err(CircuitReject::HalfOpenLimited));
     }
 
@@ -6637,9 +7184,10 @@ mod tests {
             open_duration: Duration::from_mins(10),
             ..CircuitBreakerConfig::default()
         });
+        let regular = cb.before_call().expect("regular permit");
         cb.record_failure();
         assert_eq!(cb.state(), CircuitState::Open);
-        cb.cancel_inflight_probe(); // noop since state is Open, not HalfOpen
+        cb.cancel_reservation(&regular);
         assert_eq!(cb.state(), CircuitState::Open);
     }
 
