@@ -50,9 +50,11 @@ Important runtime truths the contract preserves:
 - Runtime request timeout is 30 seconds.
 - HTTP requests include `Accept: application/vnd.github+json` and `X-GitHub-Api-Version: 2022-11-28`.
 - The client uses the shared retry loop with `max_retries = 3`, `initial_delay_ms = 1000`, and `max_delay_ms = 60000`.
-- The client retries connect/timeout errors and retryable API errors; 429 and secondary-rate-limit 403 responses map to `RateLimited`.
-- Owner and repository names are validated locally before URL construction.
-- File paths are percent-encoded by path segment before content lookup.
+- Read requests may retry connect/timeout errors and retryable API errors; 429 and secondary-rate-limit 403 responses map to `RateLimited`.
+- Mutations, including pull request merges, retry only when the transport proves that submission did not reach the service. A timeout, lost response, or retryable HTTP response after submission does not justify replay.
+- The HTTP transport does not follow redirects or perform automatic retries beneath the shared retry loop. A renamed or moved repository requires a new explicit request with authority for the intended target.
+- Owner and repository names are validated before resource authorization and URL construction; `.` and `..` are rejected.
+- File paths must be repository-relative, with no empty, dot, or parent segments, backslashes, or control characters. The empty path selects the root. Valid path segments are percent-encoded before content lookup; percent signs in input are literal filename characters.
 - Runtime handshake accepts FCP `2.0` / `2.0.0`, installs an instance-bound `CapabilityVerifier`, and grants only the requested capability classes that implemented operations actually use.
 - Runtime handshake returns a SHA-256 hash of the bundled `manifest.toml`.
 - Native `invoke` requires the complete `InvokeRequest`: `type = "invoke"`, a non-empty string `id`, `connector_id = "fcp.github"`, the negotiated `zone_id`, `operation`, `input`, and `capability_token`. The dispatcher validates the envelope and idempotency-key shape before provider execution; operation admission then validates input, derives resource URIs, and verifies the bound token and negotiated grant.
@@ -199,8 +201,10 @@ provided, and `html_url` may be `null` for external submodules. GitHub limits a
 directory response to `1000` entries; the Contents API does not paginate those
 entries.
 
-`github.trigger_workflow` accepts a workflow ID or YAML filename, the required
-`ref`, and an optional `inputs` object with at most `25` properties. Input values
+`github.trigger_workflow` accepts a single workflow ID or YAML filename, the required
+`ref`, and an optional `inputs` object with at most `25` properties. Supply `deploy.yml`,
+not `.github/workflows/deploy.yml`; slashes, backslashes, dot segments, and control
+characters are rejected. Input values
 are forwarded without coercion and must satisfy the workflow's declared inputs:
 
 ```json
@@ -325,6 +329,8 @@ scripts/e2e/github_connector_verification.sh
 - If configuration fails, provide a valid `credential_id` and remove any raw token material from config.
 - If credential-reference self-check degrades, materialize host credentials through the egress proxy before invoking provider operations.
 - If provider returns 403 with no rate-limit budget remaining, treat it as rate-limited and honor retry guidance.
+- After an uncertain issue creation, pull request creation, merge, or workflow dispatch, inspect the repository before submitting again. Provider errors do not prove that a mutation had no effect.
+- If a repository request returns a redirect, resolve its intended target and obtain matching capability authority before making a new request; the connector never follows it automatically.
 - If `github.process_webhook` fails, verify `signature_validated = true`, repository context, and a fresh delivery ID before inspecting payload shape.
 - If search operations are denied unexpectedly, inspect both the runtime `github.read` capability and the manifest/rate-limit `github.search` drift.
 
