@@ -9,11 +9,10 @@
 //! 1. **State machine (br-2653).** `track` registers an operation,
 //!    `complete` marks it finished, `cancel` requests cancellation.
 //!    The outcome MUST be:
-//!    - `Cancelled` on first cancel of a tracked, not-yet-completed,
-//!      not-yet-cancelled operation,
-//!    - `Pending` on a second cancel of an already-cancel-requested
-//!      operation (idempotent),
-//!    - `TooLate` when called after `complete`.
+//!    - `Pending` while an accepted cancellation awaits runtime settlement,
+//!      including repeated requests,
+//!    - `Cancelled` only after runtime-owned cancellation evidence settles,
+//!    - `TooLate` after ordinary completion without cancellation evidence.
 //! 2. **Principal-mismatch defense (br-jdaro).** When `track` was
 //!    called with `Some(owner)`, `cancel` MUST reject any caller
 //!    whose `asserted_principal` does not match the recorded owner —
@@ -41,7 +40,7 @@ fn user_request(operation_id: &str) -> CancellationRequest {
 }
 
 #[test]
-fn cancel_of_tracked_operation_returns_cancelled_outcome() {
+fn cancel_of_tracked_operation_returns_pending_outcome() {
     let ctrl = CancellationController::new();
     ctrl.track_with_owner("op-1", Some("user:alice"));
 
@@ -50,8 +49,8 @@ fn cancel_of_tracked_operation_returns_cancelled_outcome() {
         .expect("cancel must succeed for owner");
     assert_eq!(
         response.outcome,
-        CancellationOutcome::Cancelled,
-        "first cancel by owner MUST yield Cancelled outcome"
+        CancellationOutcome::Pending,
+        "accepting cancellation MUST NOT claim runtime completion"
     );
 
     assert!(
@@ -62,9 +61,7 @@ fn cancel_of_tracked_operation_returns_cancelled_outcome() {
 
 #[test]
 fn second_cancel_returns_pending_outcome() {
-    // Idempotency: a duplicate cancel MUST return Pending rather
-    // than Cancelled (the first cancel already accepted; the
-    // second is a no-op).
+    // Duplicate requests preserve Pending until the runtime confirms settlement.
     let ctrl = CancellationController::new();
     ctrl.track_with_owner("op-2", Some("user:alice"));
 
@@ -135,8 +132,8 @@ fn br_jdaro_principal_mismatch_rejects_before_state_mutation() {
         .expect("legitimate owner cancel must succeed after rejected attempt");
     assert_eq!(
         r.outcome,
-        CancellationOutcome::Cancelled,
-        "legitimate cancel after a rejected impostor attempt MUST still yield Cancelled"
+        CancellationOutcome::Pending,
+        "legitimate cancellation must still be accepted after an impostor is rejected"
     );
 }
 
@@ -167,7 +164,7 @@ fn legacy_none_owner_is_permissive_for_any_caller() {
     let r = ctrl
         .cancel(&user_request("op-legacy"), Some("user:anyone"), Utc::now())
         .expect("None-owner accepts any caller");
-    assert_eq!(r.outcome, CancellationOutcome::Cancelled);
+    assert_eq!(r.outcome, CancellationOutcome::Pending);
 }
 
 #[test]
@@ -183,8 +180,8 @@ fn audit_log_records_every_successful_cancel() {
         events
             .iter()
             .any(|e| e.operation_id == "op-audit"
-                && matches!(e.outcome, CancellationOutcome::Cancelled)),
-        "audit log MUST contain a Cancelled entry for op-audit; got {events:?}"
+                && matches!(e.outcome, CancellationOutcome::Pending)),
+        "audit log MUST contain a Pending entry for op-audit; got {events:?}"
     );
 }
 
