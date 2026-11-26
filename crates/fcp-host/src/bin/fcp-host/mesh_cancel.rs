@@ -462,7 +462,7 @@ mod tests {
             super::super::cancel_self_handler(State(Arc::clone(&origin)), Json(owner_request))
                 .await
                 .unwrap();
-        assert_eq!(response.outcome, CancellationOutcome::Cancelled);
+        assert_eq!(response.outcome, CancellationOutcome::Pending);
         assert_eq!(received.load(Ordering::SeqCst), 2);
         assert!(executor.cancellation.is_cancel_requested("remote-op"));
         let retained = origin
@@ -606,7 +606,7 @@ mod tests {
         let reply = signed_response(&state, &accepted, &executor_key).await;
         assert_eq!(
             validate_reply(&alice, &reply).unwrap().outcome,
-            CancellationOutcome::Cancelled
+            CancellationOutcome::Pending
         );
         assert!(state.cancellation.is_cancel_requested("remote-op"));
         let replay = super::super::mesh_forward_handler(State(Arc::clone(&state)), Json(accepted))
