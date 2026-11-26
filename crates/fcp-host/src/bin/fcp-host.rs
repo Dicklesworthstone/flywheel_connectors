@@ -10613,9 +10613,7 @@ fn host_egress_routes() -> Router<Arc<AppState>> {
     ))
 }
 
-fn host_egress_routes_with_intake(
-    intake: mesh_forward_intake::Intake,
-) -> Router<Arc<AppState>> {
+fn host_egress_routes_with_intake(intake: mesh_forward_intake::Intake) -> Router<Arc<AppState>> {
     Router::new()
         .route("/rpc/egress/http", post(host_egress_http_admitted_handler))
         .route("/rpc/egress/tcp", post(host_egress_tcp_admitted_handler))
@@ -10637,6 +10635,51 @@ fn self_cancellation_routes_with_intake(
 ) -> Router<Arc<AppState>> {
     Router::new()
         .route("/rpc/cancel-self", post(cancel_self_admitted_handler))
+        .layer(axum::extract::DefaultBodyLimit::max(
+            PUBLIC_RPC_HTTP_BODY_LIMIT_BYTES,
+        ))
+        .layer(axum::Extension(intake))
+}
+
+/// Discovery and diagnostics must not provide an alternate unbounded upload
+/// path. Their query reservations remain independent of execution and control.
+fn public_inspection_routes() -> Router<Arc<AppState>> {
+    public_inspection_routes_with_intake(mesh_forward_intake::Intake::for_rpc(
+        PUBLIC_RPC_HTTP_BODY_LIMIT_BYTES,
+    ))
+}
+
+fn public_inspection_routes_with_intake(
+    intake: mesh_forward_intake::Intake,
+) -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/doctor", post(doctor_admitted_handler))
+        .route("/rpc/discover", post(discover_admitted_handler))
+        .layer(axum::extract::DefaultBodyLimit::max(
+            PUBLIC_RPC_HTTP_BODY_LIMIT_BYTES,
+        ))
+        .layer(axum::Extension(intake))
+}
+
+/// The legacy provider endpoints also collect bodies before configuration or
+/// authentication. Bound their uploads together while preserving raw payloads
+/// and keeping cancellation capacity independent of webhook traffic.
+fn legacy_webhook_routes() -> Router<Arc<AppState>> {
+    legacy_webhook_routes_with_intake(mesh_forward_intake::Intake::for_rpc(
+        PUBLIC_RPC_HTTP_BODY_LIMIT_BYTES,
+    ))
+}
+
+fn legacy_webhook_routes_with_intake(intake: mesh_forward_intake::Intake) -> Router<Arc<AppState>> {
+    Router::new()
+        .route(
+            BLUEBUBBLES_INGRESS_ROUTE,
+            post(bluebubbles_webhook_admitted_handler),
+        )
+        .route(
+            TELEGRAM_WEBHOOK_INGRESS_ROUTE,
+            post(telegram_webhook_admitted_handler),
+        )
         .layer(axum::extract::DefaultBodyLimit::max(
             PUBLIC_RPC_HTTP_BODY_LIMIT_BYTES,
         ))
@@ -11018,16 +11061,8 @@ async fn async_main(telemetry_config: TelemetryConfig) -> HostResult<()> {
             Arc::clone(&state),
             webhook_ingress_config,
         ))
-        .route(
-            BLUEBUBBLES_INGRESS_ROUTE,
-            post(bluebubbles_webhook_ingress_handler),
-        )
-        .route(
-            TELEGRAM_WEBHOOK_INGRESS_ROUTE,
-            post(telegram_webhook_ingress_handler),
-        )
-        .route("/doctor", post(doctor_handler))
-        .route("/rpc/discover", post(discover_handler))
+        .merge(legacy_webhook_routes())
+        .merge(public_inspection_routes())
         .route("/rpc/connectors/{connector_id}", get(connector_handler))
         .route(
             "/rpc/connectors/{connector_id}/status",
@@ -11451,6 +11486,16 @@ async fn reload_connectors(state: &AppState, published: &AtomicBool) -> Result<u
     log_startup_reconciliation(&reconciliation);
 
     Ok(count)
+}
+
+async fn doctor_admitted_handler(
+    State(state): State<Arc<AppState>>,
+    mesh_forward_intake::RpcJson {
+        value: request,
+        permit: _permit,
+    }: mesh_forward_intake::RpcJson<DoctorRequest>,
+) -> Result<Json<DoctorReport>, (StatusCode, String)> {
+    doctor_handler(State(state), Json(request)).await
 }
 
 async fn doctor_handler(
@@ -13441,6 +13486,17 @@ fn discovery_origin_headers(mut headers: HeaderMap, mesh_backed: bool) -> Header
         }),
     );
     headers
+}
+
+async fn discover_admitted_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    mesh_forward_intake::RpcJson {
+        value: payload,
+        permit: _permit,
+    }: mesh_forward_intake::RpcJson<DiscoverPayload>,
+) -> (HeaderMap, Json<DiscoveryResponse>) {
+    discover_handler(State(state), headers, Json(payload)).await
 }
 
 async fn discover_handler(
@@ -15798,6 +15854,18 @@ struct BlueBubblesIngressConfig {
     load_shed: bool,
 }
 
+async fn bluebubbles_webhook_admitted_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    uri: Uri,
+    mesh_forward_intake::RpcBytes {
+        value: body,
+        permit: _permit,
+    }: mesh_forward_intake::RpcBytes,
+) -> Result<(StatusCode, Json<Value>), (StatusCode, String)> {
+    bluebubbles_webhook_ingress_handler(State(state), headers, uri, body).await
+}
+
 #[allow(clippy::too_many_lines)]
 async fn bluebubbles_webhook_ingress_handler(
     State(state): State<Arc<AppState>>,
@@ -16078,6 +16146,17 @@ struct TelegramWebhookIngressConfig {
     capability_token: fcp_core::CapabilityToken,
     max_body_bytes: usize,
     timeout_ms: u64,
+}
+
+async fn telegram_webhook_admitted_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    mesh_forward_intake::RpcBytes {
+        value: body,
+        permit: _permit,
+    }: mesh_forward_intake::RpcBytes,
+) -> Result<(StatusCode, Json<Value>), (StatusCode, String)> {
+    telegram_webhook_ingress_handler(State(state), headers, body).await
 }
 
 async fn telegram_webhook_ingress_handler(
@@ -44847,7 +44926,7 @@ while IFS= read -r request; do exit 2; done
     #[fcp_async_core::runtime::test]
     async fn local_media_http_limit_does_not_expand_other_route_budgets() {
         let app = local_invocation_routes()
-            .route("/rpc/discover", post(discover_handler))
+            .merge(public_inspection_routes())
             .with_state(cancel_route_test_state());
         let response = send_json_request(
             app,
@@ -45075,7 +45154,11 @@ while IFS= read -r request; do exit 2; done
         )
         .await;
         assert_eq!(cancelled.status(), StatusCode::OK);
-        assert!(state.cancellation.is_cancel_requested("egress-intake-cancel"));
+        assert!(
+            state
+                .cancellation
+                .is_cancel_requested("egress-intake-cancel")
+        );
         assert_eq!(control.active_for_test(), 0);
         assert_eq!(egress.active_for_test(), 1);
         drop(stalled);
@@ -45090,7 +45173,9 @@ while IFS= read -r request; do exit 2; done
         let response = app.clone().oneshot(malformed).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(
-            axum::body::to_bytes(response.into_body(), 256).await.unwrap(),
+            axum::body::to_bytes(response.into_body(), 256)
+                .await
+                .unwrap(),
             "RPC envelope is invalid"
         );
         assert_eq!(egress.active_for_test(), 0);
@@ -45173,16 +45258,8 @@ while IFS= read -r request; do exit 2; done
 
     #[fcp_async_core::runtime::test]
     async fn public_egress_and_self_cancel_uploads_have_one_total_deadline() {
-        let egress = mesh_forward_intake::Intake::for_rpc_test(
-            4096,
-            1,
-            Duration::from_millis(40),
-        );
-        let control = mesh_forward_intake::Intake::for_rpc_test(
-            4096,
-            1,
-            Duration::from_millis(40),
-        );
+        let egress = mesh_forward_intake::Intake::for_rpc_test(4096, 1, Duration::from_millis(40));
+        let control = mesh_forward_intake::Intake::for_rpc_test(4096, 1, Duration::from_millis(40));
         let app = host_egress_routes_with_intake(egress.clone())
             .merge(self_cancellation_routes_with_intake(control.clone()))
             .with_state(cancel_route_test_state());
@@ -45200,16 +45277,300 @@ while IFS= read -r request; do exit 2; done
                 .header("content-type", "application/json")
                 .body(Body::from_stream(chunks))
                 .unwrap();
-            let response = fcp_async_core::time::timeout(
-                Duration::from_secs(1),
-                app.clone().oneshot(request),
-            )
-            .await
-            .expect("new chunks must not renew the upload deadline")
-            .unwrap();
+            let response =
+                fcp_async_core::time::timeout(Duration::from_secs(1), app.clone().oneshot(request))
+                    .await
+                    .expect("new chunks must not renew the upload deadline")
+                    .unwrap();
             assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT, "{path}");
             assert_eq!(egress.active_for_test(), 0);
             assert_eq!(control.active_for_test(), 0);
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn inspection_uploads_share_capacity_without_blocking_authenticated_cancellation() {
+        let state = cancel_route_test_state();
+        state
+            .cancellation
+            .track_with_owner("inspection-intake-cancel", Some("user:test"));
+        let token = issue_cancel_self_test_token(state.lifecycle.as_ref(), "user:test").await;
+        let intake = mesh_forward_intake::Intake::for_rpc_test(
+            PUBLIC_RPC_HTTP_BODY_LIMIT_BYTES,
+            1,
+            Duration::from_secs(5),
+        );
+        let app = public_inspection_routes_with_intake(intake.clone())
+            .merge(self_cancellation_routes())
+            .with_state(Arc::clone(&state));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/rpc/discover")
+            .header("content-type", "application/json")
+            .body(Body::from_stream(futures_util::stream::pending::<
+                Result<Bytes, std::convert::Infallible>,
+            >()))
+            .unwrap();
+        let mut stalled = Box::pin(app.clone().oneshot(request));
+        assert!(futures_util::poll!(stalled.as_mut()).is_pending());
+        assert_eq!(intake.active_for_test(), 1);
+        for path in ["/doctor", "/rpc/discover"] {
+            let request = Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", "application/json")
+                .body(Body::from_stream(futures_util::stream::poll_fn(
+                    |_| -> std::task::Poll<Option<Result<Bytes, std::convert::Infallible>>> {
+                        panic!("saturated inspection intake must reject before body polling")
+                    },
+                )))
+                .unwrap();
+            assert_eq!(
+                app.clone().oneshot(request).await.unwrap().status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{path}"
+            );
+        }
+        let response = send_cancel_request(
+            app.clone(),
+            "/rpc/cancel-self",
+            serde_json::to_value(CancellationRequest {
+                operation_id: "inspection-intake-cancel".to_owned(),
+                reason: CancelReason::UserRequested,
+                cleanup: CleanupBehavior::BestEffort,
+                return_partial: false,
+                capability_token: Some(token),
+            })
+            .unwrap(),
+            &[],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            state
+                .cancellation
+                .is_cancel_requested("inspection-intake-cancel")
+        );
+        assert_eq!(intake.active_for_test(), 1);
+        drop(stalled);
+        assert_eq!(intake.active_for_test(), 0);
+
+        for path in ["/doctor", "/rpc/discover"] {
+            let request = Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", "application/json")
+                .body(Body::from("{\"inspection-secret-canary\":"))
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                axum::body::to_bytes(response.into_body(), 256)
+                    .await
+                    .unwrap(),
+                "RPC envelope is invalid"
+            );
+            assert_eq!(intake.active_for_test(), 0);
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn inspection_uploads_cannot_renew_their_total_read_deadline() {
+        let intake = mesh_forward_intake::Intake::for_rpc_test(
+            PUBLIC_RPC_HTTP_BODY_LIMIT_BYTES,
+            1,
+            Duration::from_millis(40),
+        );
+        let app = public_inspection_routes_with_intake(intake.clone())
+            .with_state(cancel_route_test_state());
+        for path in ["/doctor", "/rpc/discover"] {
+            let chunks = futures_util::stream::unfold((), |()| async {
+                fcp_async_core::time::sleep(Duration::from_millis(5)).await;
+                Some((
+                    Ok::<_, std::convert::Infallible>(Bytes::from_static(b" ")),
+                    (),
+                ))
+            });
+            let request = Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", "application/json")
+                .body(Body::from_stream(chunks))
+                .unwrap();
+            let response =
+                fcp_async_core::time::timeout(Duration::from_secs(1), app.clone().oneshot(request))
+                    .await
+                    .expect("a stream of chunks must not renew the upload deadline")
+                    .unwrap();
+            assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT, "{path}");
+            assert_eq!(intake.active_for_test(), 0);
+        }
+        let recovered = send_json_request(
+            app,
+            axum::http::Method::POST,
+            "/rpc/discover",
+            Value::Null,
+            &[],
+        )
+        .await
+        .unwrap();
+        assert_eq!(recovered.status(), StatusCode::OK);
+        assert_eq!(intake.active_for_test(), 0);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn legacy_webhook_uploads_share_capacity_without_blocking_cancellation() {
+        let state = cancel_route_test_state();
+        state
+            .cancellation
+            .track_with_owner("webhook-intake-cancel", Some("user:test"));
+        let token = issue_cancel_self_test_token(state.lifecycle.as_ref(), "user:test").await;
+        let intake = mesh_forward_intake::Intake::for_rpc_test(
+            PUBLIC_RPC_HTTP_BODY_LIMIT_BYTES,
+            1,
+            Duration::from_secs(5),
+        );
+        let app = legacy_webhook_routes_with_intake(intake.clone())
+            .merge(self_cancellation_routes())
+            .with_state(Arc::clone(&state));
+        let request = Request::builder()
+            .method("POST")
+            .uri(BLUEBUBBLES_INGRESS_ROUTE)
+            .body(Body::from_stream(futures_util::stream::pending::<
+                Result<Bytes, std::convert::Infallible>,
+            >()))
+            .unwrap();
+        let mut stalled = Box::pin(app.clone().oneshot(request));
+        assert!(futures_util::poll!(stalled.as_mut()).is_pending());
+        assert_eq!(intake.active_for_test(), 1);
+        for path in [BLUEBUBBLES_INGRESS_ROUTE, TELEGRAM_WEBHOOK_INGRESS_ROUTE] {
+            let request = Request::builder()
+                .method("POST")
+                .uri(path)
+                .body(Body::from_stream(futures_util::stream::poll_fn(
+                    |_| -> std::task::Poll<Option<Result<Bytes, std::convert::Infallible>>> {
+                        panic!("saturated webhook intake must reject before body polling")
+                    },
+                )))
+                .unwrap();
+            assert_eq!(
+                app.clone().oneshot(request).await.unwrap().status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{path}"
+            );
+        }
+        let cancelled = send_cancel_request(
+            app.clone(),
+            "/rpc/cancel-self",
+            serde_json::to_value(CancellationRequest {
+                operation_id: "webhook-intake-cancel".to_owned(),
+                reason: CancelReason::UserRequested,
+                cleanup: CleanupBehavior::BestEffort,
+                return_partial: false,
+                capability_token: Some(token),
+            })
+            .unwrap(),
+            &[],
+        )
+        .await;
+        assert_eq!(cancelled.status(), StatusCode::OK);
+        assert!(
+            state
+                .cancellation
+                .is_cancel_requested("webhook-intake-cancel")
+        );
+        assert_eq!(intake.active_for_test(), 1);
+        drop(stalled);
+        assert_eq!(intake.active_for_test(), 0);
+
+        for path in [BLUEBUBBLES_INGRESS_ROUTE, TELEGRAM_WEBHOOK_INGRESS_ROUTE] {
+            let body = Body::from_stream(futures_util::stream::iter([Err::<Bytes, _>(
+                std::io::Error::other("provider-secret-canary"),
+            )]));
+            let request = Request::builder()
+                .method("POST")
+                .uri(path)
+                .body(body)
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                axum::body::to_bytes(response.into_body(), 256)
+                    .await
+                    .unwrap(),
+                "RPC body could not be read"
+            );
+            assert_eq!(intake.active_for_test(), 0);
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn legacy_webhook_uploads_bound_declared_and_actual_wire_bytes() {
+        let intake = mesh_forward_intake::Intake::for_rpc(PUBLIC_RPC_HTTP_BODY_LIMIT_BYTES);
+        let app =
+            legacy_webhook_routes_with_intake(intake.clone()).with_state(cancel_route_test_state());
+        for path in [BLUEBUBBLES_INGRESS_ROUTE, TELEGRAM_WEBHOOK_INGRESS_ROUTE] {
+            let declared = Request::builder()
+                .method("POST")
+                .uri(path)
+                .header(
+                    "content-length",
+                    (PUBLIC_RPC_HTTP_BODY_LIMIT_BYTES + 1).to_string(),
+                )
+                .body(Body::from_stream(futures_util::stream::poll_fn(
+                    |_| -> std::task::Poll<Option<Result<Bytes, std::convert::Infallible>>> {
+                        panic!("oversized webhook declaration must reject before body polling")
+                    },
+                )))
+                .unwrap();
+            assert_eq!(
+                app.clone().oneshot(declared).await.unwrap().status(),
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "{path}"
+            );
+            assert_eq!(intake.active_for_test(), 0);
+            let chunk = Bytes::from(vec![b'x'; 64 * 1024]);
+            let chunks = (0..=PUBLIC_RPC_HTTP_BODY_LIMIT_BYTES / chunk.len())
+                .map(move |_| Ok::<_, std::convert::Infallible>(chunk.clone()));
+            let streamed = Request::builder()
+                .method("POST")
+                .uri(path)
+                .body(Body::from_stream(futures_util::stream::iter(chunks)))
+                .unwrap();
+            assert_eq!(
+                app.clone().oneshot(streamed).await.unwrap().status(),
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "{path}"
+            );
+            assert_eq!(intake.active_for_test(), 0);
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn legacy_webhook_uploads_cannot_renew_the_total_read_deadline() {
+        let intake = mesh_forward_intake::Intake::for_rpc_test(4096, 1, Duration::from_millis(40));
+        let app =
+            legacy_webhook_routes_with_intake(intake.clone()).with_state(cancel_route_test_state());
+        for path in [BLUEBUBBLES_INGRESS_ROUTE, TELEGRAM_WEBHOOK_INGRESS_ROUTE] {
+            let chunks = futures_util::stream::unfold((), |()| async {
+                fcp_async_core::time::sleep(Duration::from_millis(5)).await;
+                Some((
+                    Ok::<_, std::convert::Infallible>(Bytes::from_static(b" ")),
+                    (),
+                ))
+            });
+            let request = Request::builder()
+                .method("POST")
+                .uri(path)
+                .body(Body::from_stream(chunks))
+                .unwrap();
+            let response =
+                fcp_async_core::time::timeout(Duration::from_secs(1), app.clone().oneshot(request))
+                    .await
+                    .expect("another provider chunk must not renew the upload deadline")
+                    .unwrap();
+            assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT, "{path}");
+            assert_eq!(intake.active_for_test(), 0);
         }
     }
 
@@ -50229,7 +50590,9 @@ while IFS= read -r request; do exit 2; done
             let response =
                 send_cancel_request(app.clone(), "/rpc/cancel-self", request.clone(), &[]).await;
             assert_eq!(response.status(), StatusCode::OK);
-            let bytes = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+            let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
             let cancelled: CancellationResponse = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(cancelled.operation_id, operation_id);
             assert_eq!(cancelled.outcome, fcp_host::CancellationOutcome::Pending);
@@ -50244,7 +50607,9 @@ while IFS= read -r request; do exit 2; done
         state.cancellation.complete(operation_id);
         let response = send_cancel_request(app, "/rpc/cancel-self", request, &[]).await;
         assert_eq!(response.status(), StatusCode::OK);
-        let bytes = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
         let completed: CancellationResponse = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(completed.outcome, fcp_host::CancellationOutcome::TooLate);
         assert!(completed.checkpoint.is_none());
