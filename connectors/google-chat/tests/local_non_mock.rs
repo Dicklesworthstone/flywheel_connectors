@@ -511,3 +511,74 @@ async fn local_non_mock_wrong_capability_fails_before_loopback_egress() {
     });
     println!("{artifact}");
 }
+
+#[fcp_async_core::runtime::test]
+async fn send_message_lost_receipt_exposes_a_terminal_unknown_outcome() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}/v1", listener.local_addr().unwrap());
+    let (mut connector, signer, instance) = setup_connector(&base).await;
+    let peer = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        read_http_request(&mut stream)
+    });
+    let error = connector.handle_invoke(json!({
+        "operation": OP_SEND_MESSAGE,
+        "input": { "space_name": SPACE_NAME, "text": SEND_TEXT },
+        "capability_token": capability_token(&signer, &instance, WRITE_CAPABILITY, OP_SEND_MESSAGE)
+    })).await.unwrap_err();
+    let request = peer.join().unwrap();
+    assert_request_boundary(&request.request_line, "POST", EXPECTED_SEND_PATH);
+    assert_eq!(serde_json::from_str::<Value>(&request.body).unwrap()["text"], SEND_TEXT);
+    assert!(matches!(error, FcpError::External { retryable: false, retry_after: None, message, .. }
+        if message.contains("message creation outcome unknown")));
+}
+
+#[fcp_async_core::runtime::test]
+async fn compound_media_send_records_which_write_completed() {
+    use wiremock::{MockServer, Mock, ResponseTemplate, matchers::{method, path}};
+
+    let op = "chat.send_media_message";
+    let token = "opaque-upload-token";
+    for (upload_status, send_status, expected_count) in [(429, 0, 1), (500, 0, 1), (200, 429, 2), (200, 500, 2), (200, 200, 2)] {
+        let server = MockServer::start().await;
+        let upload = if upload_status == 200 {
+            json!({"attachmentDataRef": {"attachmentUploadToken": token}})
+        } else {
+            json!({"error": {"code": if upload_status == 500 { 429 } else { 500 }, "message": "rejected"}})
+        };
+        Mock::given(method("POST"))
+            .and(path("/adapter/upload/v1/spaces/AAAA/attachments:upload"))
+            .respond_with(ResponseTemplate::new(upload_status).insert_header("Retry-After", "121").set_body_json(upload))
+            .expect(1).mount(&server).await;
+        if send_status != 0 {
+            Mock::given(method("POST"))
+                .and(path("/adapter/spaces/AAAA/messages"))
+                .respond_with(ResponseTemplate::new(send_status).set_body_json(json!({"error":{"code":429,"message":token}})))
+                .expect(1).mount(&server).await;
+        }
+        // The configured prefix deliberately does not end in /v1. Upload
+        // and send must both use the explicitly configured origin and prefix.
+        let (mut connector, signer, instance) = setup_connector(&format!("{}/adapter", server.uri())).await;
+        let error = connector.handle_invoke(json!({
+            "operation": op,
+            "input": {"space_name": SPACE_NAME, "filename":"a.txt", "content_type":"text/plain", "content_base64":"YQ=="},
+            "capability_token": capability_token(&signer, &instance, WRITE_CAPABILITY, op)
+        })).await.unwrap_err();
+        if upload_status == 429 {
+            assert!(matches!(error, FcpError::RateLimited { retry_after_ms: 121_000, .. }));
+        } else {
+            assert!(!error.is_retryable());
+            let diagnostic = error.to_string();
+            assert!(!diagnostic.contains(token));
+            if upload_status == 500 {
+                assert!(diagnostic.contains("attachment upload outcome unknown"));
+            } else {
+                assert!(diagnostic.contains("accepted the attachment upload"));
+                assert!(diagnostic.contains(if send_status == 429 { "message was not sent" } else { "delivery is unknown" }));
+            }
+        }
+        assert_eq!(server.received_requests().await.unwrap().len(), expected_count);
+        server.verify().await;
+    }
+}

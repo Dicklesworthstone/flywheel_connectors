@@ -20,6 +20,18 @@ pub enum ChatError {
     #[error("Chat API error ({status_code}): {message}")]
     Api { status_code: u16, message: String },
 
+    /// A provider write may have taken effect even though its receipt was unavailable.
+    #[error("Google Chat {operation} outcome unknown. Check the space before retrying.")]
+    WriteOutcomeUnknown { operation: &'static str, status_code: Option<u16> },
+
+    /// The connector uploaded media before message creation failed.
+    #[error("Google Chat accepted the attachment upload. {message}")]
+    IncompleteMediaSend { message: &'static str, status_code: Option<u16> },
+
+    /// A replayable read received a server error with a minimum retry delay.
+    #[error("Chat API error ({status_code}): {message}")]
+    TransientApi { status_code: u16, message: String, retry_after_ms: u64 },
+
     /// Rate limited
     #[error("Rate limited, retry after {retry_after_ms}ms")]
     RateLimited { retry_after_ms: u64 },
@@ -41,7 +53,7 @@ impl ChatError {
     #[must_use]
     pub const fn is_retryable(&self) -> bool {
         match self {
-            Self::Http(_) | Self::RateLimited { .. } => true,
+            Self::Http(_) | Self::RateLimited { .. } | Self::TransientApi { .. } => true,
             Self::Api { status_code, .. } => matches!(status_code, 500..=599 | 429),
             _ => false,
         }
@@ -50,8 +62,32 @@ impl ChatError {
     #[must_use]
     pub const fn retry_after(&self) -> Option<Duration> {
         match self {
-            Self::RateLimited { retry_after_ms } => Some(Duration::from_millis(*retry_after_ms)),
+            Self::RateLimited { retry_after_ms } | Self::TransientApi { retry_after_ms, .. } => Some(Duration::from_millis(*retry_after_ms)),
             _ => None,
+        }
+    }
+
+    /// Retrying the whole media operation would upload the same bytes again.
+    pub(crate) fn after_media_upload(self) -> Self {
+        let uncertain = matches!(self, Self::WriteOutcomeUnknown { .. });
+        let status_code = match self {
+            Self::Http(ref error) => error.status().map(|status| status.as_u16()),
+            Self::Api { status_code, .. } if status_code != 0 => Some(status_code),
+            Self::WriteOutcomeUnknown { status_code, .. } => status_code,
+            Self::RateLimited { .. } => Some(429),
+            Self::Unauthorized => Some(401),
+            Self::Forbidden { .. } => Some(403),
+            Self::SpaceNotFound { .. } => Some(404),
+            _ => None,
+        };
+        // A provider diagnostic may echo the upload token or the message.
+        Self::IncompleteMediaSend {
+            status_code,
+            message: if uncertain {
+                "Message delivery is unknown. Check the space before submitting the media again."
+            } else {
+                "The message was not sent. Restarting this operation would upload the attachment again."
+            },
         }
     }
 
@@ -64,6 +100,9 @@ impl ChatError {
                 status_code: e.status().map(|s| s.as_u16()),
                 retryable: self.is_retryable(),
                 retry_after: self.retry_after(),
+            },
+            Self::WriteOutcomeUnknown { status_code, .. } | Self::IncompleteMediaSend { status_code, .. } => FcpError::External {
+                service: "google_chat".into(), message: self.to_string(), status_code: *status_code, retryable: false, retry_after: None,
             },
             Self::Json(e) => FcpError::Internal {
                 message: format!("JSON error: {e}"),
@@ -87,15 +126,12 @@ impl ChatError {
                 retry_after_ms: 60_000,
                 violation: None,
             },
-            Self::Api {
-                status_code,
-                message,
-            } => FcpError::External {
+            Self::Api { status_code, message } | Self::TransientApi { status_code, message, .. } => FcpError::External {
                 service: "google_chat".into(),
                 message: message.clone(),
                 status_code: Some(*status_code),
                 retryable: self.is_retryable(),
-                retry_after: None,
+                retry_after: self.retry_after(),
             },
             Self::RateLimited { retry_after_ms } => FcpError::RateLimited {
                 retry_after_ms: *retry_after_ms,

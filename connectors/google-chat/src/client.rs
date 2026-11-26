@@ -4,15 +4,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use fcp_google_discovery::auth::GoogleMaterializedAuth;
-use fcp_sdk::migration::HttpRetryConfig;
+use fcp_google_discovery::executor::retry_after_ms;
+use fcp_sdk::migration::transport_error_reached_service;
 use fcp_sdk::{ConnectorRuntime, ConnectorRuntimeConfig};
 use reqwest::{Client, RequestBuilder};
 use serde::de::DeserializeOwned;
-use tracing::{instrument, warn};
+use tracing::instrument;
 
 use crate::error::{ChatError, ChatResult};
 use crate::types::{
-    ApiErrorDetail, ApiErrorResponse, AttachmentUpload, ListMembershipsResponse,
+    ApiErrorResponse, AttachmentUpload, ListMembershipsResponse,
     ListMessagesResponse, ListSpacesResponse, Membership, Message, Reaction, Space,
 };
 
@@ -107,7 +108,6 @@ pub struct ChatClient {
     upload_base_url: String,
     total_requests: AtomicU64,
     runtime: ConnectorRuntime,
-    retry_config: HttpRetryConfig,
 }
 
 impl std::fmt::Debug for ChatClient {
@@ -125,6 +125,8 @@ impl ChatClient {
     /// Create a new Chat client with the shared Google auth.
     pub fn new_with_auth(auth: GoogleMaterializedAuth) -> ChatResult<Self> {
         let client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
             .timeout(DEFAULT_REQUEST_TIMEOUT)
             .user_agent("fcp-google-chat/0.1.0")
             .build()
@@ -139,10 +141,6 @@ impl ChatClient {
             runtime: ConnectorRuntime::new(
                 ConnectorRuntimeConfig::default().with_request_timeout(DEFAULT_REQUEST_TIMEOUT),
             ),
-            retry_config: HttpRetryConfig {
-                max_retries: 2,
-                ..HttpRetryConfig::default()
-            },
         })
     }
 
@@ -200,16 +198,16 @@ impl ChatClient {
     }
 
     /// Create (send) a message in a space.
-    #[instrument(skip(self), fields(space_name))]
+    #[instrument(skip(self, text), fields(space_name))]
     pub async fn create_message(&self, space_name: &str, text: &str) -> ChatResult<Message> {
         validate_resource_name(space_name, "space_name")?;
         let url = format!("{}/{space_name}/messages", self.base_url);
         let body = serde_json::json!({ "text": text });
-        self.post_json(&url, &body).await
+        self.post_message(&url, &body).await
     }
 
     /// Create a reply in a Google Chat message thread.
-    #[instrument(skip(self), fields(space_name))]
+    #[instrument(skip(self, text), fields(space_name))]
     pub async fn reply_message(
         &self,
         space_name: &str,
@@ -237,7 +235,7 @@ impl ChatClient {
             "text": text,
             "thread": thread_body
         });
-        self.post_json(&url, &body).await
+        self.post_message(&url, &body).await
     }
 
     /// Upload media bytes to a Google Chat space and return the upload token wrapper.
@@ -258,11 +256,31 @@ impl ChatClient {
             "{}/{space_name}/attachments:upload?uploadType=multipart",
             self.upload_base_url
         );
-        self.post_multipart_upload(&url, &boundary, body).await
+        let request = self.client.post(url).header("Content-Type", format!("multipart/related; boundary={boundary}")).body(body);
+        let upload: AttachmentUpload = self.send_json(request, Some("attachment upload")).await?;
+        if validate_upload_token(&upload.attachment_data_ref.attachment_upload_token).is_err() {
+            return Err(ChatError::WriteOutcomeUnknown { operation: "attachment upload", status_code: None });
+        }
+        Ok(upload)
+    }
+
+    /// Send one attachment after the caller has acquired its send claim.
+    pub(crate) async fn send_media_message(
+        &self, space_name: &str, filename: &str, content_type: &str, media: &[u8],
+        text: Option<&str>, thread: Option<MessageThreadTarget<'_>>, reply_option: MessageReplyOption,
+    ) -> ChatResult<Message> {
+        // Reject an invalid message target before uploading any bytes.
+        if let Some(target) = thread {
+            thread_json(target)?;
+        }
+        let upload = self.upload_attachment(space_name, filename, content_type, media).await?;
+        self.create_message_with_attachment(space_name, text, thread, reply_option,
+            &upload.attachment_data_ref.attachment_upload_token, filename)
+            .await.map_err(ChatError::after_media_upload)
     }
 
     /// Send a Google Chat message with one previously uploaded attachment.
-    #[instrument(skip(self), fields(space_name))]
+    #[instrument(skip(self, text, attachment_upload_token), fields(space_name))]
     pub async fn create_message_with_attachment(
         &self,
         space_name: &str,
@@ -299,7 +317,7 @@ impl ChatClient {
             );
         }
 
-        self.post_json(&url, &body).await
+        self.post_message(&url, &body).await
     }
 
     /// List messages in a space.
@@ -363,7 +381,11 @@ impl ChatClient {
                 "unicode": unicode_emoji
             }
         });
-        self.post_json(&url, &body).await
+        let reaction: Reaction = self.send_json(self.client.post(url).json(&body), Some("reaction creation")).await?;
+        if reaction.name.is_empty() {
+            return Err(ChatError::WriteOutcomeUnknown { operation: "reaction creation", status_code: None });
+        }
+        Ok(reaction)
     }
 
     /// Shut down the runtime.
@@ -387,79 +409,47 @@ impl ChatClient {
     }
 
     async fn get_json<T: DeserializeOwned>(&self, request: RequestBuilder) -> ChatResult<T> {
-        self.total_requests.fetch_add(1, Ordering::Relaxed);
-        let resp = self
-            .apply_auth_headers(request)
-            .timeout(self.runtime.request_timeout())
-            .send()
-            .await
-            .map_err(ChatError::Http)?;
-        self.handle_response(resp).await
+        self.send_json(request, None).await
     }
 
-    async fn post_json<T: DeserializeOwned, B: serde::Serialize>(
-        &self,
-        url: &str,
-        body: &B,
-    ) -> ChatResult<T> {
-        self.total_requests.fetch_add(1, Ordering::Relaxed);
-        let resp = self
-            .apply_auth_headers(self.client.post(url))
-            .json(body)
-            .timeout(self.runtime.request_timeout())
-            .send()
-            .await
-            .map_err(ChatError::Http)?;
-        self.handle_response(resp).await
+    async fn post_message(&self, url: &str, body: &serde_json::Value) -> ChatResult<Message> {
+        let message: Message = self.send_json(self.client.post(url).json(body), Some("message creation")).await?;
+        if message.name.is_empty() {
+            return Err(ChatError::WriteOutcomeUnknown { operation: "message creation", status_code: None });
+        }
+        Ok(message)
     }
 
-    async fn post_multipart_upload<T: DeserializeOwned>(
-        &self,
-        url: &str,
-        boundary: &str,
-        body: Vec<u8>,
-    ) -> ChatResult<T> {
+    async fn send_json<T: DeserializeOwned>(&self, request: RequestBuilder, write: Option<&'static str>) -> ChatResult<T> {
         self.total_requests.fetch_add(1, Ordering::Relaxed);
-        let resp = self
-            .apply_auth_headers(self.client.post(url))
-            .header(
-                "Content-Type",
-                format!("multipart/related; boundary={boundary}"),
-            )
-            .body(body)
-            .timeout(self.runtime.request_timeout())
-            .send()
-            .await
-            .map_err(ChatError::Http)?;
-        self.handle_response(resp).await
-    }
-
-    async fn handle_response<T: DeserializeOwned>(&self, resp: reqwest::Response) -> ChatResult<T> {
+        let resp = self.apply_auth_headers(request).timeout(self.runtime.request_timeout()).send().await.map_err(|error| {
+            if let Some(operation) = write.filter(|_| transport_error_reached_service(&error)) {
+                ChatError::WriteOutcomeUnknown { operation, status_code: error.status().map(|s| s.as_u16()) }
+            } else {
+                ChatError::Http(error)
+            }
+        })?;
         let status = resp.status();
-        if status.is_success() {
-            return resp.json().await.map_err(ChatError::Http);
-        }
         let code = status.as_u16();
-        let body = resp.text().await.unwrap_or_default();
-        if let Ok(api_err) = serde_json::from_str::<ApiErrorResponse>(&body) {
-            Err(map_api_error(api_err.error))
-        } else {
-            let preview: String = body.chars().take(200).collect();
-            warn!(status = code, body_preview = %preview, "Chat API error");
-            Err(ChatError::Api {
-                status_code: code,
-                message: body,
-            })
+        if status.is_success() {
+            return resp.json().await.map_err(|error| match write {
+                Some(operation) => ChatError::WriteOutcomeUnknown { operation, status_code: Some(code) },
+                None => ChatError::Http(error),
+            });
         }
+        if let Some(operation) = write.filter(|_| status.is_server_error() || code == 408) {
+            return Err(ChatError::WriteOutcomeUnknown { operation, status_code: Some(code) });
+        }
+        let retry_floor = retry_after_ms(resp.headers().get_all(reqwest::header::RETRY_AFTER).iter().filter_map(|v| v.to_str().ok()));
+        let body = resp.text().await.unwrap_or_default();
+        let message = serde_json::from_str::<ApiErrorResponse>(&body).map_or_else(|_| body, |api_err| api_err.error.message);
+        Err(map_api_error(code, message, retry_floor))
     }
 }
 
 fn derive_upload_base_url(base_url: &str) -> String {
-    if let Some(prefix) = base_url.strip_suffix("/v1") {
-        format!("{prefix}/upload/v1")
-    } else {
-        DEFAULT_UPLOAD_BASE_URL.to_string()
-    }
+    let prefix = base_url.strip_suffix("/v1").unwrap_or(base_url);
+    format!("{prefix}/upload/v1")
 }
 
 fn thread_json(thread: MessageThreadTarget<'_>) -> ChatResult<serde_json::Value> {
@@ -549,22 +539,14 @@ fn multipart_upload_body(
     body
 }
 
-fn map_api_error(error: ApiErrorDetail) -> ChatError {
-    match error.code {
-        401 => ChatError::Unauthorized,
-        403 => ChatError::Forbidden {
-            message: error.message,
-        },
-        404 => ChatError::SpaceNotFound {
-            space_name: error.message,
-        },
-        429 => ChatError::RateLimited {
-            retry_after_ms: 60_000,
-        },
-        code => ChatError::Api {
-            status_code: code,
-            message: error.message,
-        },
+fn map_api_error(status: u16, message: String, retry_floor: Option<u64>) -> ChatError {
+    match (status, retry_floor) {
+        (401, _) => ChatError::Unauthorized,
+        (403, _) => ChatError::Forbidden { message },
+        (404, _) => ChatError::SpaceNotFound { space_name: message },
+        (429, _) => ChatError::RateLimited { retry_after_ms: retry_floor.unwrap_or(60_000) },
+        (500..=599, Some(retry_after_ms)) => ChatError::TransientApi { status_code: status, message, retry_after_ms },
+        _ => ChatError::Api { status_code: status, message },
     }
 }
 
@@ -583,46 +565,31 @@ mod tests {
 
     #[test]
     fn map_api_error_401() {
-        let err = map_api_error(ApiErrorDetail {
-            code: 401,
-            message: "bad token".into(),
-        });
+        let err = map_api_error(401, "bad token".into(), None);
         assert!(matches!(err, ChatError::Unauthorized));
     }
 
     #[test]
     fn map_api_error_403() {
-        let err = map_api_error(ApiErrorDetail {
-            code: 403,
-            message: "forbidden".into(),
-        });
+        let err = map_api_error(403, "forbidden".into(), None);
         assert!(matches!(err, ChatError::Forbidden { .. }));
     }
 
     #[test]
     fn map_api_error_404() {
-        let err = map_api_error(ApiErrorDetail {
-            code: 404,
-            message: "not found".into(),
-        });
+        let err = map_api_error(404, "not found".into(), None);
         assert!(matches!(err, ChatError::SpaceNotFound { .. }));
     }
 
     #[test]
     fn map_api_error_429() {
-        let err = map_api_error(ApiErrorDetail {
-            code: 429,
-            message: "rate limited".into(),
-        });
+        let err = map_api_error(429, "rate limited".into(), None);
         assert!(matches!(err, ChatError::RateLimited { .. }));
     }
 
     #[test]
     fn map_api_error_500() {
-        let err = map_api_error(ApiErrorDetail {
-            code: 500,
-            message: "internal".into(),
-        });
+        let err = map_api_error(500, "internal".into(), None);
         assert!(matches!(
             err,
             ChatError::Api {

@@ -1143,29 +1143,9 @@ impl ChatConnector {
                     );
                     return Err(error.clone());
                 }
-                let upload = client
-                    .upload_attachment(space_name, filename, content_type, &media)
-                    .await
-                    .map_err(|e| e.to_fcp_error())?;
-                let attachment_ref = upload.attachment_data_ref.attachment_upload_token;
-                if attachment_ref.is_empty() {
-                    return Err(FcpError::External {
-                        service: "google_chat.upload".into(),
-                        message: "Google Chat upload response did not include an attachment token"
-                            .into(),
-                        status_code: None,
-                        retryable: false,
-                        retry_after: None,
-                    });
-                }
                 let message = client
-                    .create_message_with_attachment(
-                        space_name,
-                        text.filter(|value| !value.is_empty()),
-                        thread,
-                        reply_option,
-                        &attachment_ref,
-                        filename,
+                    .send_media_message(
+                        space_name, filename, content_type, &media, text, thread, reply_option,
                     )
                     .await
                     .map_err(|e| e.to_fcp_error())?;
