@@ -66,6 +66,15 @@ pub struct TelegramResponse<T> {
     pub result: Option<T>,
     pub description: Option<String>,
     pub error_code: Option<i32>,
+    pub parameters: Option<ResponseParameters>,
+}
+
+/// Additional information returned with a failed Telegram Bot API request.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ResponseParameters {
+    pub migrate_to_chat_id: Option<i64>,
+    /// Minimum number of seconds before the rejected request may be repeated.
+    pub retry_after: Option<u64>,
 }
 
 /// Telegram Update object.
@@ -1204,6 +1213,20 @@ mod tests {
         assert!(!resp.ok);
         assert_eq!(resp.error_code, Some(404));
         assert_eq!(resp.description.as_deref(), Some("Not Found"));
+        assert!(resp.parameters.is_none());
+    }
+
+    #[test]
+    fn telegram_response_retains_native_error_parameters() {
+        let response: TelegramResponse<serde_json::Value> = serde_json::from_value(json!({
+            "ok": false,
+            "error_code": 429,
+            "parameters": {"retry_after": 95, "migrate_to_chat_id": -1001234567890_i64}
+        }))
+        .unwrap();
+        let parameters = response.parameters.unwrap();
+        assert_eq!(parameters.retry_after, Some(95));
+        assert_eq!(parameters.migrate_to_chat_id, Some(-1001234567890));
     }
 
     // ---- User ----

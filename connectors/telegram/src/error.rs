@@ -17,12 +17,20 @@ pub type TelegramResult<T> = Result<T, TelegramError>;
 /// token embedded in every Telegram API path. Both `Display` and `Debug`
 /// route the HTTP error through `redact_telegram_bot_token_segments`.
 #[derive(Error)]
-pub enum TelegramError {
-    #[error("HTTP error: {}", redacted_http_error(.0))]
+pub enum TelegramError {    #[error("HTTP error: {}", redacted_http_error(.0))]
     Http(#[from] reqwest::Error),
 
     #[error("Telegram API error ({code}): {description}")]
     Api { code: i32, description: String },
+
+    #[error("Telegram rate limit: {description} (retry after {retry_after:?})")]
+    RateLimited {
+        description: String,
+        retry_after: Duration,
+    },
+
+    #[error("Telegram mutation may already have been applied; automatic retry refused: {source}")]
+    UncertainMutation { source: Box<TelegramError> },
 
     #[error("Invalid chat ID: {0}")]
     InvalidChatId(String),
@@ -56,6 +64,18 @@ impl std::fmt::Debug for TelegramError {
                 .field("code", code)
                 .field("description", description)
                 .finish(),
+            Self::RateLimited {
+                description,
+                retry_after,
+            } => f
+                .debug_struct("RateLimited")
+                .field("description", description)
+                .field("retry_after", retry_after)
+                .finish(),
+            Self::UncertainMutation { source } => f
+                .debug_struct("UncertainMutation")
+                .field("source", source)
+                .finish(),
             Self::InvalidChatId(value) => f.debug_tuple("InvalidChatId").field(value).finish(),
             Self::InvalidFilePath(value) => f.debug_tuple("InvalidFilePath").field(value).finish(),
             Self::InvalidRequest(value) => f.debug_tuple("InvalidRequest").field(value).finish(),
@@ -82,6 +102,8 @@ impl TelegramError {
         match self {
             Self::Http(error) => error.is_timeout() || error.is_connect(),
             Self::Api { code, .. } => *code == 429 || *code >= 500,
+            Self::RateLimited { .. } => true,
+            Self::UncertainMutation { .. } => false,
             Self::InvalidChatId(_) => false,
             Self::InvalidFilePath(_) => false,
             Self::InvalidRequest(_) => false,
@@ -93,6 +115,7 @@ impl TelegramError {
     #[must_use]
     pub fn retry_after(&self) -> Option<Duration> {
         match self {
+            Self::RateLimited { retry_after, .. } => Some(*retry_after),
             Self::Api { code, .. } if *code == 429 => Some(Duration::from_secs(30)),
             _ => None,
         }
@@ -135,6 +158,23 @@ impl TelegramError {
                     }
                 }
             }
+            Self::RateLimited { retry_after, .. } => FcpError::RateLimited {
+                // Round up so conversion never shortens a provider's minimum.
+                retry_after_ms: u64::try_from(retry_after.as_nanos().div_ceil(1_000_000))
+                    .unwrap_or(u64::MAX),
+                violation: None,
+            },
+            Self::UncertainMutation { source } => FcpError::External {
+                service: "telegram".into(),
+                message: self.to_string(),
+                status_code: match source.as_ref() {
+                    Self::Api { code, .. } => u16::try_from(*code).ok(),
+                    Self::Http(error) => error.status().map(|status| status.as_u16()),
+                    _ => None,
+                },
+                retryable: false,
+                retry_after: None,
+            },
             Self::InvalidChatId(message) => FcpError::InvalidRequest {
                 code: 1003,
                 message: format!("Invalid chat ID: {message}"),
@@ -237,6 +277,71 @@ mod tests {
     const BOT_TOKEN: &str = "123456:SECRET_secret-SECRET_secret";
 
     #[test]
+    fn rate_limit_delay_survives_error_mapping_without_shortening() {
+        for (retry_after, expected_ms) in [
+            (Duration::ZERO, 0),
+            (Duration::from_secs(95), 95_000),
+            (Duration::from_nanos(1), 1),
+            (Duration::MAX, u64::MAX),
+        ] {
+            let error = TelegramError::RateLimited {
+                description: "flood control".into(),
+                retry_after,
+            };
+            assert!(error.is_retryable());
+            assert_eq!(error.retry_after(), Some(retry_after));
+            assert!(matches!(
+                error.to_fcp_error(),
+                FcpError::RateLimited { retry_after_ms, .. } if retry_after_ms == expected_ms
+            ));
+        }
+    }
+
+    #[test]
+    fn uncertain_mutation_is_terminal_through_error_mapping() {
+        let error = TelegramError::UncertainMutation {
+            source: Box::new(TelegramError::Api {
+                code: 503,
+                description: "service unavailable".into(),
+            }),
+        };
+        assert!(!error.is_retryable());
+        assert_eq!(error.retry_after(), None);
+        assert!(matches!(
+            error.to_fcp_error(),
+            FcpError::External {
+                status_code: Some(503),
+                retryable: false,
+                retry_after: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn partial_send_remains_terminal_with_nested_rate_limit() {
+        let error = TelegramError::PartialSend {
+            sent_chunks: 1,
+            failed_chunk_index: 1,
+            sent_message_ids: vec![42],
+            source: Box::new(TelegramError::RateLimited {
+                description: "flood control".into(),
+                retry_after: Duration::from_secs(95),
+            }),
+        };
+        assert!(!error.is_retryable());
+        assert_eq!(error.retry_after(), None);
+        assert!(matches!(
+            error.to_fcp_error(),
+            FcpError::External {
+                retryable: false,
+                retry_after: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn redacts_bot_token_url_segments() {
         let message = format!(
             "error sending request for url (https://api.telegram.org/bot{BOT_TOKEN}/sendMessage)"
@@ -272,6 +377,15 @@ mod tests {
             !debug.contains(BOT_TOKEN),
             "Debug leaked bot token: {debug}"
         );
+        let uncertain = TelegramError::UncertainMutation {
+            source: Box::new(telegram_error),
+        };
+        assert!(!uncertain.to_string().contains(BOT_TOKEN));
+        assert!(!format!("{uncertain:?}").contains(BOT_TOKEN));
+        let TelegramError::UncertainMutation { source } = uncertain else {
+            unreachable!();
+        };
+        let telegram_error = *source;
         let nested_debug = format!(
             "{:?}",
             TelegramError::PartialSend {

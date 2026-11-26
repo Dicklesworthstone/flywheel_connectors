@@ -93,7 +93,13 @@ impl TelegramClient {
     {
         let url = self.api_url(endpoint);
         let ctx = self.runtime.request_context();
-        let policy = self.retry_config.to_retry_policy();
+        let mut policy = self.retry_config.to_retry_policy();
+        if endpoint == "getUpdates" {
+            // PollingSupervisor owns retries for long polling and rechecks
+            // subscription/lease authority before each request. An inner
+            // retry must not send after that admission has expired.
+            policy.max_attempts = Some(1);
+        }
 
         // Telegram's Bot API has no idempotency key, so a replayed `sendMessage`
         // posts a second message to the chat. The HTTP verb is NOT a usable
@@ -144,55 +150,40 @@ impl TelegramClient {
                                 let status = response.status();
 
                                 if status == StatusCode::TOO_MANY_REQUESTS {
-                                    // Try HTTP header first
-                                    let header_val = response
-                                        .headers()
-                                        .get("retry-after")
-                                        .and_then(|v| v.to_str().ok())
-                                        .and_then(|v| v.parse::<u64>().ok());
-
-                                    // If no header, parse the JSON body for
-                                    // parameters.retry_after (Telegram's native format)
-                                    let retry_after_secs = if let Some(s) = header_val {
-                                        s
-                                    } else {
-                                        let body_val = response
-                                            .json::<serde_json::Value>()
-                                            .await
-                                            .ok()
-                                            .and_then(|v| {
-                                                v.get("parameters")?.get("retry_after")?.as_u64()
-                                            });
-                                        body_val.unwrap_or(5)
-                                    };
-
+                                    let error = http_rate_limit_error(response).await;
                                     return AttemptOutcome::Retryable {
-                                        error: TelegramError::Api {
-                                            code: 429,
-                                            description: "Too Many Requests".into(),
-                                        },
-                                        retry_after: Some(Duration::from_secs(retry_after_secs)),
+                                        retry_after: error.retry_after(),
+                                        error,
                                     };
                                 }
 
                                 if status.is_server_error() {
                                     // A 5xx means Telegram RECEIVED the request;
                                     // the message may already have been posted.
-                                    return AttemptOutcome::retryable_if_replayable(
+                                    return retryable_request_error(
                                         TelegramError::Api {
                                             code: i32::from(status.as_u16()),
                                             description: format!("Server error: {status}"),
                                         },
-                                        None,
                                         replay_safe,
                                     );
                                 }
 
                                 // Parse the Telegram response wrapper
+                                let header_retry_after = retry_after_header(response.headers());
                                 let tg_response: TelegramResponse<T> = match response.json().await {
                                     Ok(r) => r,
                                     Err(e) => {
-                                        return AttemptOutcome::Terminal(TelegramError::Http(e));
+                                        // A body timeout or unreadable result
+                                        // occurs after the mutation was sent.
+                                        let error = TelegramError::Http(e);
+                                        return AttemptOutcome::Terminal(if replay_safe {
+                                            error
+                                        } else {
+                                            TelegramError::UncertainMutation {
+                                                source: Box::new(error),
+                                            }
+                                        });
                                     }
                                 };
 
@@ -207,19 +198,20 @@ impl TelegramClient {
                                 }
 
                                 // Handle logical API errors
-                                let err = TelegramError::Api {
-                                    code: tg_response.error_code.unwrap_or(0),
-                                    description: tg_response
-                                        .description
-                                        .clone()
-                                        .unwrap_or_default(),
-                                };
+                                let err = telegram_api_error(
+                                    tg_response.error_code.unwrap_or(0),
+                                    tg_response.description.unwrap_or_default(),
+                                    tg_response.parameters,
+                                    header_retry_after,
+                                );
 
                                 if err.is_retryable() {
-                                    AttemptOutcome::Retryable {
-                                        retry_after: err.retry_after(),
-                                        error: err,
-                                    }
+                                    // A definite flood-control rejection did not
+                                    // apply the mutation. Other transient API
+                                    // errors have the same ambiguity as HTTP 5xx.
+                                    let replayable = replay_safe
+                                        || matches!(&err, TelegramError::RateLimited { .. });
+                                    retryable_request_error(err, replayable)
                                 } else {
                                     AttemptOutcome::Terminal(err)
                                 }
@@ -231,11 +223,7 @@ impl TelegramClient {
                             Err(e) if e.is_timeout() || e.is_connect() => {
                                 let replayable =
                                     replay_safe || !transport_error_reached_service(&e);
-                                AttemptOutcome::retryable_if_replayable(
-                                    TelegramError::Http(e),
-                                    None,
-                                    replayable,
-                                )
+                                retryable_request_error(TelegramError::Http(e), replayable)
                             }
                             Err(e) => AttemptOutcome::Terminal(TelegramError::Http(e)),
                         }
@@ -376,14 +364,17 @@ impl TelegramClient {
         // Simpler: Just manual impl for get_file or change request() to take an enum for body/query.
         // Let's manually invoke client for get_file to keep request() simple for JSON-RPC style calls.
         let url = self.api_url("getFile");
-        let response: TelegramResponse<File> = self
+        let response = self
             .client
             .get(&url)
             .query(&[("file_id", &file_id)])
             .send()
-            .await?
-            .json()
             .await?;
+        if response.status() == StatusCode::TOO_MANY_REQUESTS {
+            return Err(http_rate_limit_error(response).await);
+        }
+        let header_retry_after = retry_after_header(response.headers());
+        let response: TelegramResponse<File> = response.json().await?;
 
         if response.ok {
             response.result.ok_or_else(|| TelegramError::Api {
@@ -391,10 +382,12 @@ impl TelegramClient {
                 description: "Empty result".into(),
             })
         } else {
-            Err(TelegramError::Api {
-                code: response.error_code.unwrap_or(0),
-                description: response.description.unwrap_or_default(),
-            })
+            Err(telegram_api_error(
+                response.error_code.unwrap_or(0),
+                response.description.unwrap_or_default(),
+                response.parameters,
+                header_retry_after,
+            ))
         }
     }
 
@@ -572,6 +565,97 @@ impl TelegramClient {
 
         self.request("POST", "answerCallbackQuery", Some(&request), None)
             .await
+    }
+}
+
+fn retry_after_header(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let value = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim();
+    if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Some(
+            value
+                .parse::<u64>()
+                .map_or(Duration::MAX, Duration::from_secs),
+        );
+    }
+
+    // Retry-After also permits an HTTP date. Preserve the remaining wait
+    // instead of replacing a valid future date with the default delay.
+    let deadline = chrono::DateTime::parse_from_rfc2822(value).ok()?;
+    Some(
+        deadline
+            .signed_duration_since(chrono::Utc::now())
+            .to_std()
+            .unwrap_or(Duration::ZERO),
+    )
+}
+
+fn telegram_api_error(
+    code: i32,
+    description: String,
+    parameters: Option<ResponseParameters>,
+    header_retry_after: Option<Duration>,
+) -> TelegramError {
+    if code == 429 {
+        let body_retry_after = parameters
+            .and_then(|parameters| parameters.retry_after)
+            .map(Duration::from_secs);
+        TelegramError::RateLimited {
+            description,
+            // Both hints are minimum waits. Neither may shorten the other.
+            // Keep the delay on the error as well as the attempt so outer
+            // supervisors retain it when the inner retry budget is exhausted.
+            retry_after: header_retry_after
+                .max(body_retry_after)
+                .unwrap_or(Duration::from_secs(30)),
+        }
+    } else {
+        TelegramError::Api { code, description }
+    }
+}
+
+async fn http_rate_limit_error(response: reqwest::Response) -> TelegramError {
+    let header_retry_after = retry_after_header(response.headers());
+    // HTTP 429 is already authoritative. Read its hint even if a proxy
+    // omits unrelated Telegram envelope fields such as `ok` or `result`.
+    let body = response.json::<serde_json::Value>().await.ok();
+    let description = body
+        .as_ref()
+        .and_then(|body| body.get("description")?.as_str())
+        .map(str::to_owned);
+    let parameters = body.as_ref().and_then(|body| {
+        let retry_after = body.get("parameters")?.get("retry_after")?.as_u64()?;
+        Some(ResponseParameters {
+            retry_after: Some(retry_after),
+            ..ResponseParameters::default()
+        })
+    });
+    telegram_api_error(
+        429,
+        description.unwrap_or_else(|| "Too Many Requests".into()),
+        parameters,
+        header_retry_after,
+    )
+}
+
+fn retryable_request_error<T>(
+    error: TelegramError,
+    replayable: bool,
+) -> AttemptOutcome<T, TelegramError> {
+    if replayable {
+        AttemptOutcome::Retryable {
+            retry_after: error.retry_after(),
+            error,
+        }
+    } else {
+        // Refuse replay at every layer, including FCP callers and the
+        // connector's plaintext fallback, not only inside this retry loop.
+        AttemptOutcome::Terminal(TelegramError::UncertainMutation {
+            source: Box::new(error),
+        })
     }
 }
 
@@ -1034,9 +1118,287 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.is_retryable());
-        assert!(matches!(err, TelegramError::Api { .. }));
-        if let TelegramError::Api { code, .. } = err {
-            assert_eq!(code, 429);
+        assert!(matches!(err, TelegramError::RateLimited { .. }));
+        assert_eq!(err.retry_after(), Some(Duration::ZERO));
+        assert_eq!(server._requests.lock().unwrap().len(), 3);
+    }
+
+    fn assert_rate_limit_delay(error: &TelegramError, expected: Duration) {
+        assert!(matches!(error, TelegramError::RateLimited { .. }));
+        assert!(error.is_retryable());
+        assert_eq!(error.retry_after(), Some(expected));
+        assert!(matches!(
+            error.to_fcp_error(),
+            FcpError::RateLimited { retry_after_ms, .. }
+                if u128::from(retry_after_ms) == expected.as_millis()
+        ));
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn rate_limit_floor_above_inner_cap_survives_http_and_logical_errors() {
+        for (status, header, body_delay) in [(429, "0", 95), (429, "95", 1), (200, "0", 95)] {
+            let server = StructuredTestHttpServer::spawn(1, move |_idx, _request| {
+                let mut response = StructuredHttpResponse::json(
+                    status,
+                    &serde_json::json!({
+                        "ok": false,
+                        "error_code": 429,
+                        "parameters": {"retry_after": body_delay}
+                    }),
+                );
+                response.headers.push(("retry-after".into(), header.into()));
+                response
+            });
+            let error = test_client(&server)
+                .send_message("123456", "Test", SendMessageOptions::default())
+                .await
+                .unwrap_err();
+            assert_rate_limit_delay(&error, Duration::from_secs(95));
+            assert_eq!(server._requests.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn rate_limit_hint_survives_exhausted_retry_budget() {
+        let server = StructuredTestHttpServer::spawn(2, |idx, _request| {
+            StructuredHttpResponse::json(
+                429,
+                &serde_json::json!({
+                    "ok": false,
+                    "error_code": 429,
+                    "parameters": {"retry_after": if idx == 0 { 0 } else { 17 }}
+                }),
+            )
+        });
+        let mut client = test_client(&server);
+        client.retry_config.max_retries = 1;
+        let error = client
+            .send_message("123456", "Test", SendMessageOptions::default())
+            .await
+            .unwrap_err();
+        assert_rate_limit_delay(&error, Duration::from_secs(17));
+        assert_eq!(server._requests.lock().unwrap().len(), 2);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn rate_limit_hint_survives_disabled_retries() {
+        let server = StructuredTestHttpServer::spawn(1, |_idx, _request| {
+            StructuredHttpResponse::json(
+                200,
+                &serde_json::json!({
+                    "ok": false,
+                    "error_code": 429,
+                    "parameters": {"retry_after": 7}
+                }),
+            )
+        });
+        let mut client = test_client(&server);
+        client.retry_config.max_retries = 0;
+        let error = client.get_me().await.unwrap_err();
+        assert_rate_limit_delay(&error, Duration::from_secs(7));
+        assert_eq!(server._requests.lock().unwrap().len(), 1);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn http_rate_limit_retains_hint_without_full_telegram_envelope() {
+        let server = StructuredTestHttpServer::spawn(1, |_idx, _request| {
+            StructuredHttpResponse::json(
+                429,
+                &serde_json::json!({
+                    "parameters": {"retry_after": 95}
+                }),
+            )
+        });
+        let error = test_client(&server).get_me().await.unwrap_err();
+        assert_rate_limit_delay(&error, Duration::from_secs(95));
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn http_date_rate_limit_survives_a_non_json_response() {
+        let server = StructuredTestHttpServer::spawn(1, |_idx, _request| {
+            let deadline = chrono::Utc::now() + chrono::Duration::hours(2);
+            StructuredHttpResponse {
+                status: 429,
+                headers: vec![(
+                    "retry-after".into(),
+                    deadline.format("%a, %d %b %Y %H:%M:%S GMT").to_string(),
+                )],
+                body: b"upstream rate limit".to_vec(),
+            }
+        });
+        let error = test_client(&server).get_me().await.unwrap_err();
+        let delay = error.retry_after().expect("HTTP date is retained");
+        assert!(delay > Duration::from_secs(7_000));
+        assert!(delay <= Duration::from_secs(7_200));
+        assert_eq!(server._requests.lock().unwrap().len(), 1);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn mutation_server_errors_are_terminal_inside_and_outside_client() {
+        for status in [500, 200] {
+            let server = StructuredTestHttpServer::spawn(1, move |_idx, request| {
+                assert_eq!(request.path, "/bottest_token_12345/sendMessage");
+                StructuredHttpResponse::json(
+                    status,
+                    &serde_json::json!({
+                        "ok": false,
+                        "error_code": 500,
+                        "description": "internal failure: can't parse entities"
+                    }),
+                )
+            });
+            let error = test_client(&server)
+                .send_message("123456", "Test", SendMessageOptions::default())
+                .await
+                .unwrap_err();
+            assert!(matches!(error, TelegramError::UncertainMutation { .. }));
+            assert!(!error.is_retryable());
+            assert_eq!(error.retry_after(), None);
+            assert!(matches!(
+                error.to_fcp_error(),
+                FcpError::External {
+                    status_code: Some(500),
+                    retryable: false,
+                    retry_after: None,
+                    ..
+                }
+            ));
+            assert_eq!(server._requests.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn replay_safe_read_retries_logical_server_error() {
+        let server = StructuredTestHttpServer::spawn(2, |idx, request| {
+            assert_eq!(request.path, "/bottest_token_12345/getMe");
+            if idx == 0 {
+                StructuredHttpResponse::json(
+                    200,
+                    &serde_json::json!({
+                        "ok": false, "error_code": 500, "description": "temporary failure"
+                    }),
+                )
+            } else {
+                StructuredHttpResponse::json(
+                    200,
+                    &serde_json::json!({
+                        "ok": true, "result": {"id": 42, "is_bot": true, "first_name": "Bot"}
+                    }),
+                )
+            }
+        });
+        let mut client = test_client(&server);
+        client.retry_config.initial_delay_ms = 1;
+        client.retry_config.jitter_enabled = false;
+        assert_eq!(client.get_me().await.unwrap().id, 42);
+        assert_eq!(server._requests.lock().unwrap().len(), 2);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn get_updates_returns_retryable_error_before_a_new_admission() {
+        for code in [429, 500] {
+            let server = StructuredTestHttpServer::spawn(2, move |idx, request| {
+                assert_eq!(request.path, "/bottest_token_12345/getUpdates");
+                if idx == 0 {
+                    StructuredHttpResponse::json(
+                        200,
+                        &serde_json::json!({
+                            "ok": false, "error_code": code, "parameters": {"retry_after": 0}
+                        }),
+                    )
+                } else {
+                    StructuredHttpResponse::json(
+                        200,
+                        &serde_json::json!({
+                            "ok": true, "result": []
+                        }),
+                    )
+                }
+            });
+            let client = test_client(&server);
+            let request = || GetUpdatesRequest {
+                offset: None,
+                limit: None,
+                timeout: None,
+                allowed_updates: None,
+            };
+            let error = client.get_updates(request()).await.unwrap_err();
+            assert!(error.is_retryable());
+            if code == 429 {
+                assert_rate_limit_delay(&error, Duration::ZERO);
+            }
+            assert_eq!(server._requests.lock().unwrap().len(), 1);
+            assert!(client.get_updates(request()).await.unwrap().is_empty());
+            assert_eq!(server._requests.lock().unwrap().len(), 2);
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn get_file_retains_http_and_logical_rate_limit_hints() {
+        for status in [429, 200] {
+            let server = StructuredTestHttpServer::spawn(1, move |_idx, request| {
+                assert!(request.path.starts_with("/bottest_token_12345/getFile?"));
+                StructuredHttpResponse::json(
+                    status,
+                    &serde_json::json!({
+                        "ok": false, "error_code": 429, "parameters": {"retry_after": 95}
+                    }),
+                )
+            });
+            let error = test_client(&server).get_file("file-id").await.unwrap_err();
+            assert_rate_limit_delay(&error, Duration::from_secs(95));
+            assert_eq!(server._requests.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn overflowing_retry_after_header_never_becomes_a_short_default() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            "184467440737095516160".parse().unwrap(),
+        );
+        assert_eq!(retry_after_header(&headers), Some(Duration::MAX));
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn mutation_transport_and_body_timeouts_remain_terminal() {
+        for send_headers in [false, true] {
+            let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_structured_http_request(&mut stream);
+                assert_eq!(request.path, "/bottest_token_12345/sendMessage");
+                if send_headers {
+                    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{").unwrap();
+                }
+                // The request reached the provider; its response never finishes.
+                thread::sleep(Duration::from_millis(150));
+            });
+            let mut client = TelegramClient::new("test_token_12345")
+                .unwrap()
+                .with_base_url(format!("http://{address}"));
+            client.client = Client::builder()
+                .timeout(Duration::from_millis(50))
+                .build()
+                .unwrap();
+            let error = client
+                .send_message("123456", "Test", SendMessageOptions::default())
+                .await
+                .unwrap_err();
+            assert!(matches!(error, TelegramError::UncertainMutation { .. }));
+            assert!(!error.is_retryable());
+            assert_eq!(error.retry_after(), None);
+            assert!(matches!(
+                error.to_fcp_error(),
+                FcpError::External {
+                    retryable: false,
+                    retry_after: None,
+                    ..
+                }
+            ));
+            server.join().unwrap();
         }
     }
 

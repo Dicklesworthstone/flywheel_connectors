@@ -2606,7 +2606,11 @@ impl TelegramConnector {
             Ok(messages) => messages,
             Err(err) => {
                 if options.parse_mode.is_some() {
-                    if let TelegramError::Api { description, .. } = &err {
+                    if let TelegramError::Api {
+                        code: 400,
+                        description,
+                    } = &err
+                    {
                         if classify_error_message(description) == ErrorClass::ParseError {
                             warn!(
                                 parse_mode = ?requested_mode,
@@ -4365,6 +4369,17 @@ mod tests {
                 ..
             }
         ));
+        let provider_limited = polling_error_result(TelegramError::RateLimited {
+            description: "provider requires a longer wait".into(),
+            retry_after: StdDuration::from_secs(95),
+        });
+        assert!(matches!(
+            provider_limited,
+            PollResult::RecoverableError {
+                retry_after_ms: Some(95_000),
+                ..
+            }
+        ));
         let unavailable = polling_error_result(TelegramError::Api {
             code: 503,
             description: "temporarily unavailable".into(),
@@ -4382,6 +4397,12 @@ mod tests {
                 description: "unauthorized".into(),
             },
             TelegramError::InvalidRequest("invalid polling request".into()),
+            TelegramError::UncertainMutation {
+                source: Box::new(TelegramError::Api {
+                    code: 503,
+                    description: "mutation outcome is unknown".into(),
+                }),
+            },
             TelegramError::PartialSend {
                 sent_chunks: 1,
                 failed_chunk_index: 1,
@@ -8064,6 +8085,39 @@ mod tests {
             Err(FcpError::External { .. }) => {}
             Err(e) => assert!(matches!(e, FcpError::External { .. })),
         }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn test_send_message_does_not_fallback_for_non_parse_rejection() {
+        let (connector, token, server) = setup_connector_with_token("telegram.send_message").await;
+        server.respond(TestTelegramRoute::new(
+            "POST",
+            token_path("sendMessage"),
+            serde_json::json!({
+                "ok": false,
+                "error_code": 403,
+                "description": "Forbidden: can't parse entities"
+            }),
+        ));
+
+        let result = connector
+            .handle_invoke(serde_json::json!({
+                "operation": "telegram.send_message",
+                "input": {
+                    "chat_id": "123456789",
+                    "text": "<b>Hello</b>",
+                    "parse_mode": "HTML"
+                },
+                "capability_token": token
+            }))
+            .await;
+
+        assert!(matches!(result, Err(FcpError::CapabilityDenied { .. })));
+        assert_eq!(
+            count_requests_for_path(&server.requests(), &token_path("sendMessage")),
+            1,
+            "an authorization rejection must not trigger another mutation"
+        );
     }
 
     #[fcp_async_core::runtime::test]
