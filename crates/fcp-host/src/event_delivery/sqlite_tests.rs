@@ -432,55 +432,103 @@ fn migration_never_reconstructs_native_mappings_invalidated_before_restart() {
 }
 
 #[test]
-fn full_database_fences_without_credit_and_larger_budget_recovers_exact_custody() {
+fn full_database_refuses_new_events_but_retained_custody_can_drain_and_resume() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("events.json");
     let journal =
         NativeEventJournal::open_with_max_database_bytes(path.clone(), MIN_DATABASE_BYTES).unwrap();
     register(&journal, 16);
-    let mut accepted = 0;
-    for sequence in 1..=16 {
+    let large_event = |sequence| {
         let mut event = event(sequence);
         event.data.payload = json!({"text":"x".repeat(200_000), "sequence":sequence});
-        if ingest(&journal, event).is_err() {
+        event
+    };
+    let mut accepted = 0;
+    for sequence in 1..=16 {
+        if let Err(error) = ingest(&journal, large_event(sequence)) {
+            assert!(error.to_string().contains("capacity exhausted"));
             break;
         }
         accepted += 1;
-    }
-    assert!((1..16).contains(&accepted));
-    assert!(journal.describe("stream-1").is_err());
-    assert!(
+        // These events were delivered before storage pressure. New intake
+        // must not strand their consumer acknowledgements behind a restart.
         journal
             .poll("stream-1", &binding(), &instance_id(), 16)
-            .is_err()
-    );
+            .unwrap();
+    }
+    assert!((1..16).contains(&accepted));
+    let stream = journal.describe("stream-1").unwrap();
+    assert_eq!(stream.pending_events, accepted);
+    assert_eq!(stream.acknowledged_events, 0);
+    let rejected_sequence = accepted as u64 + 1;
+    // A rolled-back intake must never create custody or authorize credit.
     assert!(
         journal
-            .acknowledge("stream-1", &binding(), &instance_id(), &ack(1))
+            .acknowledge(
+                "stream-1",
+                &binding(),
+                &instance_id(),
+                &ack(rejected_sequence)
+            )
             .is_err()
+    );
+    assert_eq!(
+        journal
+            .poll("stream-1", &binding(), &instance_id(), 16)
+            .unwrap()
+            .events
+            .iter()
+            .map(|event| event.seq)
+            .collect::<Vec<_>>(),
+        (1..=accepted as u64).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        journal
+            .acknowledge("stream-1", &binding(), &instance_id(), &ack(1))
+            .unwrap()
+            .seqs,
+        vec![1]
+    );
+    // Freeing the acknowledged payload permits new admission in the same
+    // journal and disk budget, without discarding its exact cursor receipt.
+    assert!(matches!(
+        ingest(&journal, large_event(rejected_sequence)).unwrap(),
+        NativeEventAdmission::Accepted
+    ));
+    assert!(matches!(
+        ingest(&journal, large_event(1)).unwrap(),
+        NativeEventAdmission::AlreadyAcknowledged(_)
+    ));
+    assert!(std::fs::metadata(database(&path)).unwrap().len() <= MIN_DATABASE_BYTES);
+    drop(journal);
+    let journal =
+        NativeEventJournal::open_with_max_database_bytes(path.clone(), MIN_DATABASE_BYTES).unwrap();
+    let stream = journal.describe("stream-1").unwrap();
+    assert_eq!(
+        (stream.pending_events, stream.acknowledged_events),
+        (accepted, 1)
+    );
+    assert!(matches!(
+        ingest(&journal, large_event(1)).unwrap(),
+        NativeEventAdmission::AlreadyAcknowledged(_)
+    ));
+    assert!(
+        journal
+            .acknowledge(
+                "stream-1",
+                &binding(),
+                &instance_id(),
+                &ack(rejected_sequence)
+            )
+            .is_err(),
+        "the subsequently admitted event has not been delivered"
     );
     drop(journal);
     let journal =
         NativeEventJournal::open_with_max_database_bytes(path.clone(), 4 * MIN_DATABASE_BYTES)
             .unwrap();
-    let stream = journal.describe("stream-1").unwrap();
-    assert_eq!(stream.pending_events, accepted);
-    assert_eq!(stream.acknowledged_events, 0);
-    assert!(
-        journal
-            .acknowledge("stream-1", &binding(), &instance_id(), &ack(1))
-            .is_err()
-    );
-    journal
-        .poll("stream-1", &binding(), &instance_id(), 16)
-        .unwrap();
-    journal
-        .acknowledge("stream-1", &binding(), &instance_id(), &ack(1))
-        .unwrap();
-    for sequence in accepted as u64 + 1..=accepted as u64 + 4 {
-        let mut event = event(sequence);
-        event.data.payload = json!({"text":"x".repeat(200_000), "sequence":sequence});
-        ingest(&journal, event).unwrap();
+    for sequence in rejected_sequence + 1..=rejected_sequence + 4 {
+        ingest(&journal, large_event(sequence)).unwrap();
     }
     assert!(std::fs::metadata(database(&path)).unwrap().len() > MIN_DATABASE_BYTES);
     drop(journal);
@@ -492,6 +540,111 @@ fn full_database_fences_without_credit_and_larger_budget_recovers_exact_custody(
     let journal =
         NativeEventJournal::open_with_max_database_bytes(path, 4 * MIN_DATABASE_BYTES).unwrap();
     assert_eq!(journal.describe("stream-1").unwrap().acknowledged_events, 1);
+}
+
+#[test]
+fn capacity_refusal_rolls_back_all_prior_changes_in_the_failed_transaction() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("events.json");
+    let journal =
+        NativeEventJournal::open_with_max_database_bytes(path, MIN_DATABASE_BYTES).unwrap();
+    register(&journal, 16);
+    let mut event = event(1);
+    event.data.payload = json!({"text":"x".repeat(200_000)});
+    ingest(&journal, event).unwrap();
+    let result: HostResult<()> = journal.with_sqlite(|sqlite| {
+        sqlite.transaction(|transaction| {
+            transaction.execute("UPDATE streams SET closed = 1", [])?;
+            for sequence in 2..=16 {
+                transaction.execute(
+                    "INSERT INTO events(stream_id, cursor, delivery_seq, native_seq, native_instance, native_epoch, digest, event_json, payload_bytes, delivered) SELECT stream_id, ?1, delivery_seq, native_seq, native_instance, native_epoch, digest, event_json, payload_bytes, delivered FROM events WHERE cursor = 'update:1'",
+                    [format!("pressure:{sequence}")],
+                )?;
+            }
+            panic!("the transaction must exhaust its 1 MiB budget");
+        })
+    });
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("capacity exhausted")
+    );
+    let stream = journal.describe("stream-1").unwrap();
+    assert!(!stream.closed, "the preceding mutation must be rolled back");
+    assert_eq!((stream.pending_events, stream.acknowledged_events), (1, 0));
+    let batch = journal
+        .poll("stream-1", &binding(), &instance_id(), 16)
+        .unwrap();
+    assert_eq!(batch.events.len(), 1);
+    assert_eq!(batch.events[0].cursor, "update:1");
+    journal
+        .acknowledge("stream-1", &binding(), &instance_id(), &ack(1))
+        .unwrap();
+}
+
+#[test]
+fn failed_commit_still_fences_the_journal_and_preserves_prior_custody() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("events.json");
+    let journal = NativeEventJournal::open(path.clone()).unwrap();
+    register(&journal, 1);
+    ingest(&journal, event(1)).unwrap();
+    let result: HostResult<()> = journal.with_sqlite(|sqlite| {
+        sqlite.transaction(|transaction| {
+            // This constraint is checked by COMMIT, not by the operation.
+            // A successful operation closure never proves publication.
+            transaction.pragma_update(None, "defer_foreign_keys", true)?;
+            transaction.execute(
+                "UPDATE events SET stream_id = 'missing-stream' WHERE cursor = 'update:1'",
+                [],
+            )?;
+            Ok(())
+        })
+    });
+    assert!(result.is_err());
+    assert!(journal.describe("stream-1").is_err());
+    assert!(
+        journal
+            .acknowledge("stream-1", &binding(), &instance_id(), &ack(1))
+            .is_err()
+    );
+    drop(journal);
+    let journal = NativeEventJournal::open(path).unwrap();
+    assert_eq!(journal.describe("stream-1").unwrap().pending_events, 1);
+    assert_eq!(
+        journal
+            .poll("stream-1", &binding(), &instance_id(), 1)
+            .unwrap()
+            .events[0]
+            .cursor,
+        "update:1"
+    );
+}
+
+#[test]
+fn file_identity_failure_after_capacity_rollback_still_fences() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("events.json");
+    let journal = NativeEventJournal::open(path.clone()).unwrap();
+    register(&journal, 1);
+    ingest(&journal, event(1)).unwrap();
+    let moved = directory.path().join("retained-marker.json");
+    let result: HostResult<()> = journal.with_sqlite(|sqlite| {
+        sqlite.transaction(|transaction| {
+            transaction.execute("UPDATE streams SET closed = 1", [])?;
+            std::fs::rename(&path, &moved).unwrap();
+            Err(Failure::Full)
+        })
+    });
+    assert!(result.is_err());
+    std::fs::rename(&moved, &path).unwrap();
+    assert!(journal.describe("stream-1").is_err());
+    drop(journal);
+    let journal = NativeEventJournal::open(path).unwrap();
+    let stream = journal.describe("stream-1").unwrap();
+    assert!(!stream.closed);
+    assert_eq!(stream.pending_events, 1);
 }
 
 #[test]

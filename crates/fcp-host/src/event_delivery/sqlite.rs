@@ -76,6 +76,9 @@ CREATE INDEX pending_event ON events(stream_id, ordinal) WHERE event_json IS NOT
 #[derive(Debug)]
 pub(super) enum Failure {
     Rejected(HostError),
+    // Only transaction() may turn this into a recoverable capacity refusal,
+    // after proving that the failed operation's writes were rolled back.
+    Full,
     Storage,
 }
 
@@ -86,8 +89,12 @@ impl From<HostError> for Failure {
 }
 
 impl From<rusqlite::Error> for Failure {
-    fn from(_: rusqlite::Error) -> Self {
-        Self::Storage
+    fn from(error: rusqlite::Error) -> Self {
+        if error.sqlite_error_code() == Some(rusqlite::ErrorCode::DiskFull) {
+            Self::Full
+        } else {
+            Self::Storage
+        }
     }
 }
 
@@ -96,7 +103,9 @@ pub(super) type SqlResult<T> = Result<T, Failure>;
 fn open_error(error: Failure) -> HostError {
     match error {
         Failure::Rejected(error) => error,
-        Failure::Storage => unavailable("event journal database could not be safely opened"),
+        Failure::Full | Failure::Storage => {
+            unavailable("event journal database could not be safely opened")
+        }
     }
 }
 
@@ -310,17 +319,35 @@ impl SqliteJournal {
         self.guard_files()?;
         let transaction = self
             .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| Failure::Storage)?;
         match operation(&transaction) {
             Ok(result) => {
-                transaction.commit()?;
+                // Even SQLITE_FULL during COMMIT is a publication failure,
+                // not an ordinary admission refusal. Never authorize credit
+                // or continue from an uncertain commit.
+                transaction.commit().map_err(|_| Failure::Storage)?;
                 self.guard_files()?;
                 Ok(result)
             }
             Err(error) => {
-                // A failed rollback fences even an ordinary validation denial.
-                transaction.rollback()?;
-                Err(error)
+                // SQLITE_FULL can roll back the transaction automatically.
+                // SQLite documents autocommit as the way to distinguish this
+                // from an active transaction that still needs ROLLBACK.
+                // A rollback failure always fences, including another FULL.
+                if transaction.is_autocommit() {
+                    drop(transaction);
+                } else {
+                    transaction.rollback().map_err(|_| Failure::Storage)?;
+                }
+                self.guard_files()?;
+                match error {
+                    Failure::Full => Err(unavailable(
+                        "event journal storage capacity exhausted; operation rolled back without changing custody",
+                    )
+                    .into()),
+                    other => Err(other),
+                }
             }
         }
     }

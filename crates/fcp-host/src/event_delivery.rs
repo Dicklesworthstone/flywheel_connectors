@@ -165,8 +165,10 @@ struct JournalState {
 /// Single-writer journal for native stream custody and consumer decisions.
 ///
 /// Mutations perform no async suspension between validation and publication.
-/// A failed or uncertain write fences the whole instance until reopened so an
-/// old in-memory snapshot cannot erase a potentially committed acknowledgement.
+/// Uncertain writes and storage faults fence the whole instance until reopened
+/// so stale state cannot erase a potentially committed acknowledgement. A full
+/// database leaves prior custody available only after the refused operation is
+/// proved to have rolled back; subsequent acknowledgements still must commit.
 pub struct NativeEventJournal {
     state: Mutex<JournalState>,
     path: Option<PathBuf>,
@@ -604,7 +606,7 @@ impl NativeEventJournal {
         match operation(backend) {
             Ok(result) => Ok(result),
             Err(sqlite::Failure::Rejected(error)) => Err(error),
-            Err(sqlite::Failure::Storage) => {
+            Err(sqlite::Failure::Full | sqlite::Failure::Storage) => {
                 state.persistence_failed = true;
                 Err(unavailable(
                     "event journal storage failed; reopen before authorizing upstream acknowledgement",
