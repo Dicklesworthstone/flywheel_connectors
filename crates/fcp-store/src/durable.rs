@@ -877,6 +877,33 @@ impl DurableObjectStore {
         Self::open_with_access(config, verifier, DurableAccess::ReadWrite)
     }
 
+    /// Open an exclusive writer with verified object IDs and bounded recovery.
+    ///
+    /// The snapshot and WAL share an encoded input budget, including historical
+    /// records and a torn final append. Live objects must fit `config.max_bytes`
+    /// throughout replay. Recovery may repair a torn tail only after the budget,
+    /// envelope, and object checks succeed. The verifier also checks future puts.
+    /// The input budget applies at open time, independently of future WAL growth.
+    ///
+    /// # Errors
+    /// Returns writer-open or verification errors, or rejects a zero input
+    /// budget, excessive encoded input, or a recovered state over quota.
+    pub fn open_with_verifier_bounded(
+        config: DurableObjectStoreConfig,
+        verifier: Arc<dyn ObjectIdVerifier>,
+        max_recovery_bytes: u64,
+    ) -> Result<Self, ObjectStoreError> {
+        if max_recovery_bytes == 0 {
+            return Err(object_io("writer recovery byte budget must be nonzero"));
+        }
+        Self::open_with_recovery_budget(
+            config,
+            Some(verifier),
+            DurableAccess::ReadWrite,
+            Some(max_recovery_bytes),
+        )
+    }
+
     /// Read a fixed, validated view of an existing durable object store.
     ///
     /// This never creates directories or files, acquires writer ownership,

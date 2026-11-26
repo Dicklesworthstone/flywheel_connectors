@@ -70,6 +70,8 @@ struct TransferStoreConfig {
     source_max_recovery_bytes: Option<u64>,
     #[serde(default)]
     retain_replica: bool,
+    /// Total encoded snapshot and WAL input when reopening the retained replica.
+    replica_max_recovery_bytes: Option<u64>,
     /// Live canonical object bytes per store, including during source replay.
     max_store_bytes: u64,
 }
@@ -159,6 +161,12 @@ fn open_service(
                 "state-transfer store needs a source or replica, a nonzero quota, and 1..64 pinned writers",
             ));
         }
+        if configured.replica_max_recovery_bytes.is_some() && !configured.retain_replica {
+            return Err(invalid("replica_max_recovery_bytes requires retain_replica"));
+        }
+        if configured.replica_max_recovery_bytes == Some(0) {
+            return Err(invalid("replica_max_recovery_bytes must be positive"));
+        }
         let key = ObjectIdKey::from_bytes(parse_key(&configured.object_id_key_hex)?);
         let writers: Vec<[u8; 32]> = configured
             .trusted_writer_keys_hex
@@ -226,8 +234,12 @@ fn open_service(
                 key,
             )]))
             .into_arc();
-            let objects = DurableObjectStore::open_with_verifier(durable, Some(verifier))
-                .map_err(|_| unavailable("state-transfer replica store could not acquire durable ownership or recover"))?;
+            let recovery_bytes = configured
+                .replica_max_recovery_bytes
+                .unwrap_or_else(|| ConnectorStateReadLimits::default().max_recovery_bytes);
+            let objects =
+                DurableObjectStore::open_with_verifier_bounded(durable, verifier, recovery_bytes)
+                    .map_err(|_| unavailable("state-transfer replica store could not acquire durable ownership or recover within its configured limits"))?;
             let replica = adapter(Arc::new(objects), key, &configured.scope, &writers);
             service.register_store(
                 ConnectorStateTransferDirection::Import,

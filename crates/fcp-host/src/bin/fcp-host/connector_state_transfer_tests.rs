@@ -83,6 +83,7 @@ fn store_config(
         source_mac_key_hex: None,
         source_max_recovery_bytes: None,
         retain_replica,
+        replica_max_recovery_bytes: None,
         max_store_bytes: STORE_QUOTA,
     }
 }
@@ -826,6 +827,112 @@ fn state_transfer_donor_rejects_invalid_or_misplaced_recovery_limits() {
         .expect("invalid source budget");
         assert!(
             matches!(error, HostError::InvalidFilter(reason) if reason.contains("source_max_recovery_bytes"))
+        );
+        assert!(!replica_root.exists());
+    }
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn replica_restart_checks_recovery_limits_and_ids_before_repairing_wal() {
+    use std::io::Write;
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = replica_objects_dir(directory.path(), &transfer_scope()).unwrap();
+    let mut durable = DurableObjectStoreConfig::new(&path);
+    durable.mac_key = Some(blake3::derive_key(
+        "fcp.host.connector-state-replica.wal.v1",
+        object_key().as_bytes(),
+    ));
+    durable.checkpoint_after_ops = 0;
+    let writer = DurableObjectStore::open(durable.clone()).unwrap();
+    let (root, _) = seed_source(&writer).await;
+    writer.checkpoint().await.unwrap();
+    writer
+        .set_retention(&root, RetentionClass::Pinned)
+        .await
+        .unwrap();
+    let live = writer.storage_used().await;
+    let valid = directory_bytes(&path);
+    let reopen = |budget, quota| {
+        let mut config = recipient_config(directory.path(), root, writer_pin());
+        config.stores[0].replica_max_recovery_bytes = Some(budget);
+        config.stores[0].max_store_bytes = quota;
+        open_service(config, &private_bind())
+    };
+    assert!(matches!(
+        reopen(u64::MAX, live),
+        Err(HostError::Unavailable(_))
+    ));
+    drop(writer);
+
+    let wal = path.join("objects.wal.jsonl");
+    let append_torn_tail = || {
+        let mut file = std::fs::OpenOptions::new().append(true).open(&wal).unwrap();
+        file.write_all(b"{\"version\":").unwrap();
+        file.sync_all().unwrap();
+    };
+    append_torn_tail();
+    let torn = directory_bytes(&path);
+    let encoded = (torn["objects.snapshot.json"].len() + torn["objects.wal.jsonl"].len()) as u64;
+    for (budget, quota) in [(encoded - 1, live), (encoded, live - 1)] {
+        assert!(matches!(
+            reopen(budget, quota),
+            Err(HostError::Unavailable(_))
+        ));
+        assert_eq!(directory_bytes(&path), torn);
+    }
+    let recovered = reopen(encoded, live).expect("admitted recovery repairs only the torn tail");
+    assert_eq!(directory_bytes(&path), valid);
+    let inspection = recovered
+        .inspect_replica(&ConnectorStatePullRequest {
+            peer_node: "donor".to_owned(),
+            request: ConnectorStateExportRequest {
+                grant_id: GRANT.to_owned(),
+                scope: transfer_scope(),
+                root_object_id: root,
+                limits: transfer_limits(),
+            },
+        })
+        .await
+        .unwrap();
+    assert_eq!(inspection.object_count, 3);
+    assert!(DurableObjectStore::open(durable.clone()).is_err());
+    drop(recovered);
+
+    // A valid WAL MAC does not establish that an object's ID matches its contents.
+    let writer = DurableObjectStore::open(durable).unwrap();
+    let mut forged = writer.get(&root).await.unwrap();
+    forged.object_id = ObjectId::from_bytes([0xfa; 32]);
+    writer.put(forged).await.unwrap();
+    drop(writer);
+    append_torn_tail();
+    let invalid = directory_bytes(&path);
+    assert!(matches!(
+        reopen(u64::MAX, STORE_QUOTA),
+        Err(HostError::Unavailable(_))
+    ));
+    assert_eq!(directory_bytes(&path), invalid);
+}
+
+#[test]
+fn replica_recovery_limit_requires_a_retained_store_and_a_positive_budget() {
+    let directory = tempfile::tempdir().unwrap();
+    let replica_root = directory.path().join("replica");
+    for (retain, budget) in [(false, 10), (true, 0)] {
+        let mut store = store_config(Some(directory.path().join("missing-source")), retain, writer_pin());
+        store.replica_max_recovery_bytes = Some(budget);
+        let error = open_service(
+            TransferConfig {
+                replica_root: Some(replica_root.clone()),
+                stores: vec![store],
+                grants: vec![],
+            },
+            &private_bind(),
+        )
+        .err()
+        .expect("invalid replica budget");
+        assert!(
+            matches!(error, HostError::InvalidFilter(reason) if reason.contains("replica_max_recovery_bytes"))
         );
         assert!(!replica_root.exists());
     }

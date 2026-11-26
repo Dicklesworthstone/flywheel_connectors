@@ -294,6 +294,7 @@ Recipient `node-b`, importing the same root only from `node-a`:
     "source_objects_dir": null,
     "source_mac_key_hex": null,
     "retain_replica": true,
+    "replica_max_recovery_bytes": 67108864,
     "max_store_bytes": 67108864
   }],
   "grants": [{
@@ -321,8 +322,8 @@ the direction and peer binding intentionally reverse. Each host enforces its
 own expiry and limits. Omit `instance_id` on both hosts and the CLI only for
 state that is explicitly instance-unscoped. A store requires at least one
 trusted writer pin and a positive `max_store_bytes`. This bounds live objects
-during donor recovery and is the retained store's write quota. Each grant
-separately limits the objects and bytes permitted in a transfer.
+during donor and recipient recovery and is the retained store's write quota.
+Each grant separately limits the objects and bytes permitted in a transfer.
 
 `retain_replica: true` requires an absolute `replica_root`. The host retains
 exclusive store ownership under
@@ -333,6 +334,15 @@ configured zone object-ID key under the
 configured, explicit export grants can also serve this retained replica,
 sharing the same backing store, append lock and cache invalidation state.
 No connector process or local installation is required to retain a replica.
+
+On recipient startup, `replica_max_recovery_bytes` limits the combined
+encoded snapshot and WAL for each retained store. It defaults to 64 MiB and
+accepts a positive byte count. The host verifies the durable envelopes and
+object IDs while holding the exclusive writer lock. It may truncate an
+incomplete final WAL append only after admitting the full input and validating
+the preceding records. If a valid store outgrows its startup budget, raise
+`replica_max_recovery_bytes` to cover the two file lengths before restarting.
+If its live objects exceed `max_store_bytes`, raise that quota as well.
 
 ### Pull the Configured Root
 
