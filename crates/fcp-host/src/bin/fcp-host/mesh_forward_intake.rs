@@ -11,9 +11,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use axum::Json;
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::extract::{FromRequest, Request};
-use axum::http::{StatusCode, header::CONTENT_LENGTH};
+use axum::http::{StatusCode, header::CONTENT_LENGTH, request::Parts};
 use futures_util::StreamExt;
 use serde::de::DeserializeOwned;
 
@@ -166,6 +166,15 @@ pub(super) struct RpcJson<T> {
     pub(super) permit: Permit,
 }
 
+/// Provider payloads retain their exact wire bytes; other extractors receive
+/// the original request parts.
+/// Authentication may depend on whitespace, duplicate keys, or non-JSON data;
+/// this extractor performs no decoding or content-type validation.
+pub(super) struct RpcBytes {
+    pub(super) value: Bytes,
+    pub(super) permit: Permit,
+}
+
 #[cfg(test)]
 impl<T> RpcJson<T> {
     pub(super) fn for_test(value: T) -> Self {
@@ -216,6 +225,18 @@ where
     }
 }
 
+impl<S> FromRequest<S> for RpcBytes
+where
+    S: Send + Sync,
+{
+    type Rejection = Rejection;
+
+    async fn from_request(request: Request, _state: &S) -> Result<Self, Self::Rejection> {
+        let (_, value, permit) = read_admitted_body(request, &RPC_DIAGNOSTICS).await?;
+        Ok(Self { value, permit })
+    }
+}
+
 async fn read_json<S, T>(
     request: Request,
     state: &S,
@@ -225,6 +246,21 @@ where
     S: Send + Sync,
     T: DeserializeOwned + Send,
 {
+    let (parts, bytes, permit) = read_admitted_body(request, missing).await?;
+    let diagnostics = permit.0.diagnostics;
+    let request = Request::from_parts(parts, Body::from(bytes));
+    let Json(value) = Json::<T>::from_request(request, state)
+        .await
+        // Detailed serde rejections can contain untrusted field contents.
+        // Keep the HTTP status, but never echo the envelope or its tokens.
+        .map_err(|error| (error.status(), diagnostics.invalid_json))?;
+    Ok((value, permit))
+}
+
+async fn read_admitted_body(
+    request: Request,
+    missing: &Diagnostics,
+) -> Result<(Parts, Bytes, Permit), Rejection> {
     let intake = request
         .extensions()
         .get::<Intake>()
@@ -258,13 +294,7 @@ where
     )
     .await
     .map_err(|_| body_read_timeout(diagnostics))??;
-    let request = Request::from_parts(parts, Body::from(bytes));
-    let Json(value) = Json::<T>::from_request(request, state)
-        .await
-        // Detailed serde rejections can contain untrusted field contents.
-        // Keep the HTTP status, but never echo the envelope or its tokens.
-        .map_err(|error| (error.status(), diagnostics.invalid_json))?;
-    Ok((value, permit))
+    Ok((parts, Bytes::from(bytes), permit))
 }
 
 fn payload_too_large(diagnostics: &Diagnostics) -> Rejection {
@@ -367,6 +397,81 @@ mod tests {
 
     fn active(intake: &Intake) -> usize {
         intake.0.active.load(Ordering::Acquire)
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn raw_intake_preserves_signed_bytes_headers_and_uri_without_json_decoding() {
+        use axum::http::{HeaderMap, Uri};
+        use fcp_crypto::ed25519::{Ed25519Signature, Ed25519SigningKey};
+
+        let signing_key = Ed25519SigningKey::generate();
+        let verifying_key = signing_key.verifying_key();
+        let intake = Intake::for_rpc_test(4096, 1, Duration::from_secs(1));
+        let app = Router::new()
+            .route(
+                "/raw-webhook",
+                post(
+                    move |headers: HeaderMap, uri: Uri, RpcBytes { value, permit }: RpcBytes| {
+                        let verifying_key = verifying_key.clone();
+                        async move {
+                            assert_eq!(uri, "/raw-webhook?token=a%2Fb&tag=one&tag=two");
+                            assert_eq!(
+                                headers
+                                    .get_all("x-provider-metadata")
+                                    .iter()
+                                    .map(|value| value.to_str().unwrap())
+                                    .collect::<Vec<_>>(),
+                                ["first", "second"]
+                            );
+                            let signature =
+                                hex::decode(headers["x-provider-signature"].to_str().unwrap())
+                                    .unwrap();
+                            let signature = Ed25519Signature::try_from_slice(&signature).unwrap();
+                            verifying_key
+                                .verify(&value, &signature)
+                                .expect("exact wire signature must survive raw intake");
+                            drop(permit);
+                            value
+                        }
+                    },
+                ),
+            )
+            .layer(Extension(intake.clone()));
+        for (payload, content_type) in [
+            (
+                Bytes::from_static(b" \n{\"update_id\":7, \"update_id\": 8}\t\r\n"),
+                Some("application/json"),
+            ),
+            (Bytes::from_static(b"\xff\x00\xfe\x80not-utf8"), None),
+            (
+                Bytes::from_static(b"\x00\x01\x02\r\nprovider=data&value=%2F"),
+                Some("application/octet-stream"),
+            ),
+        ] {
+            let signature = signing_key.sign(&payload).to_hex();
+            let middle = payload.len() / 2;
+            let chunks = stream::iter([
+                Ok::<_, Infallible>(payload.slice(..middle)),
+                Ok(payload.slice(middle..)),
+            ]);
+            let mut request = Request::builder()
+                .method("POST")
+                .uri("/raw-webhook?token=a%2Fb&tag=one&tag=two")
+                .header("x-provider-signature", signature)
+                .header("x-provider-metadata", "first")
+                .header("x-provider-metadata", "second");
+            if let Some(content_type) = content_type {
+                request = request.header("content-type", content_type);
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::from_stream(chunks)).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(to_bytes(response.into_body(), 4096).await.unwrap(), payload);
+            assert_eq!(active(&intake), 0);
+        }
     }
 
     #[fcp_async_core::runtime::test]
