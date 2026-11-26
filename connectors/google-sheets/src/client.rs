@@ -4,16 +4,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use fcp_google_discovery::auth::GoogleMaterializedAuth;
-use fcp_sdk::migration::HttpRetryConfig;
+use fcp_google_discovery::executor::retry_after_ms;
+use fcp_sdk::migration::transport_error_reached_service;
 use fcp_sdk::{ConnectorRuntime, ConnectorRuntimeConfig};
 use reqwest::{Client, RequestBuilder};
 use serde::de::DeserializeOwned;
-use tracing::{instrument, warn};
+use tracing::instrument;
 
 use crate::error::{SheetsError, SheetsResult};
 use crate::types::{
-    ApiErrorDetail, ApiErrorResponse, AppendValuesResponse, Spreadsheet, UpdateValuesResponse,
-    ValueRange,
+    ApiErrorResponse, AppendValuesResponse, Spreadsheet, UpdateValuesResponse, ValueRange,
 };
 
 const DEFAULT_BASE_URL: &str = "https://sheets.googleapis.com/v4";
@@ -24,7 +24,6 @@ pub struct SheetsClient {
     auth: GoogleMaterializedAuth,
     base_url: String,
     runtime: ConnectorRuntime,
-    retry_config: HttpRetryConfig,
     total_requests: AtomicU64,
 }
 
@@ -42,6 +41,8 @@ impl SheetsClient {
     /// Create a new Sheets client with the shared Google auth.
     pub fn new_with_auth(auth: GoogleMaterializedAuth) -> SheetsResult<Self> {
         let client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
             .timeout(Duration::from_secs(30))
             .user_agent("fcp-google-sheets/0.1.0")
             .build()
@@ -54,12 +55,6 @@ impl SheetsClient {
             runtime: ConnectorRuntime::new(
                 ConnectorRuntimeConfig::default().with_request_timeout(Duration::from_secs(30)),
             ),
-            retry_config: HttpRetryConfig {
-                max_retries: 2,
-                initial_delay_ms: 500,
-                max_delay_ms: 30_000,
-                jitter_enabled: true,
-            },
             total_requests: AtomicU64::new(0),
         })
     }
@@ -93,7 +88,7 @@ impl SheetsClient {
     pub async fn get_spreadsheet(&self, spreadsheet_id: &str) -> SheetsResult<Spreadsheet> {
         let spreadsheet_id = sanitize_path_segment(spreadsheet_id, "spreadsheet_id")?;
         let url = format!("{}/spreadsheets/{spreadsheet_id}", self.base_url);
-        self.get_json(&url).await
+        self.send_json(self.client.get(url), true).await
     }
 
     /// Read values from a range.
@@ -105,7 +100,7 @@ impl SheetsClient {
             "{}/spreadsheets/{spreadsheet_id}/values/{encoded_range}",
             self.base_url
         );
-        self.get_json(&url).await
+        self.send_json(self.client.get(url), true).await
     }
 
     /// Update values in a range.
@@ -127,7 +122,7 @@ impl SheetsClient {
             major_dimension: "ROWS".to_string(),
             values,
         };
-        self.put_json(&url, &body).await
+        self.send_json(self.client.put(url).json(&body), false).await
     }
 
     /// Append values to a sheet.
@@ -149,7 +144,8 @@ impl SheetsClient {
             major_dimension: "ROWS".to_string(),
             values,
         };
-        self.post_json(&url, &body).await
+        self.send_json(self.client.post(url).json(&body), false)
+            .await
     }
 
     /// Clear values in a range.
@@ -165,7 +161,7 @@ impl SheetsClient {
             "{}/spreadsheets/{spreadsheet_id}/values/{encoded_range}:clear",
             self.base_url
         );
-        self.post_json::<serde_json::Value, serde_json::Value>(&url, &serde_json::json!({}))
+        self.send_json(self.client.post(url).json(&serde_json::json!({})), true)
             .await
     }
 
@@ -189,84 +185,82 @@ impl SheetsClient {
         builder
     }
 
-    async fn get_json<T: DeserializeOwned>(&self, url: &str) -> SheetsResult<T> {
-        self.total_requests.fetch_add(1, Ordering::Relaxed);
-        let resp = self
-            .apply_auth_headers(self.client.get(url))
-            .send()
-            .await
-            .map_err(SheetsError::Http)?;
-        self.handle_response(resp).await
-    }
-
-    async fn put_json<T: DeserializeOwned, B: serde::Serialize>(
+    // Only reads and the manifest's strictly idempotent clear operation can
+    // be replayed after an uncertain result. Reapplying a best-effort update
+    // can overwrite intervening edits, and repeating an append duplicates rows.
+    async fn send_json<T: DeserializeOwned>(
         &self,
-        url: &str,
-        body: &B,
+        request: RequestBuilder,
+        replay_safe: bool,
     ) -> SheetsResult<T> {
         self.total_requests.fetch_add(1, Ordering::Relaxed);
-        let resp = self
-            .apply_auth_headers(self.client.put(url))
-            .json(body)
+        let response = self
+            .apply_auth_headers(request)
             .send()
             .await
-            .map_err(SheetsError::Http)?;
-        self.handle_response(resp).await
-    }
-
-    async fn post_json<T: DeserializeOwned, B: serde::Serialize>(
-        &self,
-        url: &str,
-        body: &B,
-    ) -> SheetsResult<T> {
-        self.total_requests.fetch_add(1, Ordering::Relaxed);
-        let resp = self
-            .apply_auth_headers(self.client.post(url))
-            .json(body)
-            .send()
-            .await
-            .map_err(SheetsError::Http)?;
-        self.handle_response(resp).await
-    }
-
-    async fn handle_response<T: DeserializeOwned>(
-        &self,
-        resp: reqwest::Response,
-    ) -> SheetsResult<T> {
-        let status = resp.status();
+            .map_err(|error| {
+                if !replay_safe && transport_error_reached_service(&error) {
+                    SheetsError::WriteOutcomeUnknown {
+                        status_code: error.status().map(|status| status.as_u16()),
+                        message: error.without_url().to_string(),
+                    }
+                } else {
+                    SheetsError::Http(error)
+                }
+            })?;
+        let status = response.status();
         if status.is_success() {
-            return resp.json().await.map_err(SheetsError::Http);
+            return response.json().await.map_err(|error| {
+                if replay_safe {
+                    SheetsError::Http(error)
+                } else {
+                    SheetsError::WriteOutcomeUnknown {
+                        status_code: Some(status.as_u16()),
+                        message: error.without_url().to_string(),
+                    }
+                }
+            });
         }
-        let code = status.as_u16();
-        let body = resp.text().await.unwrap_or_default();
-        if let Ok(api_err) = serde_json::from_str::<ApiErrorResponse>(&body) {
-            Err(map_api_error(api_err.error))
-        } else {
-            let preview: String = body.chars().take(200).collect();
-            warn!(status = code, body_preview = %preview, "Sheets API error");
-            Err(SheetsError::Api {
-                status_code: code,
-                message: body,
-            })
+        let retry_floor = retry_after_ms(
+            response
+                .headers()
+                .get_all(reqwest::header::RETRY_AFTER)
+                .iter()
+                .filter_map(|value| value.to_str().ok()),
+        );
+        let body = response.text().await.unwrap_or_default();
+        let message = serde_json::from_str::<ApiErrorResponse>(&body)
+            .map_or_else(|_| body, |api_err| api_err.error.message);
+        if !replay_safe
+            && (status.is_server_error() || status == reqwest::StatusCode::REQUEST_TIMEOUT)
+        {
+            return Err(SheetsError::WriteOutcomeUnknown {
+                status_code: Some(status.as_u16()),
+                message,
+            });
         }
+        Err(map_api_error(status.as_u16(), message, retry_floor))
     }
 }
 
-fn map_api_error(error: ApiErrorDetail) -> SheetsError {
-    match error.code {
-        401 => SheetsError::Unauthorized,
-        403 => SheetsError::Forbidden {
-            message: error.message,
+fn map_api_error(status: u16, message: String, retry_floor: Option<u64>) -> SheetsError {
+    match (status, retry_floor) {
+        (401, _) => SheetsError::Unauthorized,
+        (403, _) => SheetsError::Forbidden { message },
+        (404, _) => SheetsError::SpreadsheetNotFound {
+            spreadsheet_id: message,
         },
-        404 => SheetsError::SpreadsheetNotFound {
-            spreadsheet_id: error.message,
+        (429, _) => SheetsError::RateLimited {
+            retry_after_ms: retry_floor.unwrap_or(60_000),
         },
-        429 => SheetsError::RateLimited {
-            retry_after_ms: 60_000,
+        (500..=599, Some(retry_after_ms)) => SheetsError::TransientApi {
+            status_code: status,
+            message,
+            retry_after_ms,
         },
-        code => SheetsError::Api {
-            status_code: code,
-            message: error.message,
+        _ => SheetsError::Api {
+            status_code: status,
+            message,
         },
     }
 }
@@ -395,46 +389,31 @@ mod tests {
 
     #[test]
     fn map_api_error_401() {
-        let err = map_api_error(ApiErrorDetail {
-            code: 401,
-            message: "bad token".into(),
-        });
+        let err = map_api_error(401, "bad token".into(), None);
         assert!(matches!(err, SheetsError::Unauthorized));
     }
 
     #[test]
     fn map_api_error_403() {
-        let err = map_api_error(ApiErrorDetail {
-            code: 403,
-            message: "forbidden".into(),
-        });
+        let err = map_api_error(403, "forbidden".into(), None);
         assert!(matches!(err, SheetsError::Forbidden { .. }));
     }
 
     #[test]
     fn map_api_error_404() {
-        let err = map_api_error(ApiErrorDetail {
-            code: 404,
-            message: "not found".into(),
-        });
+        let err = map_api_error(404, "not found".into(), None);
         assert!(matches!(err, SheetsError::SpreadsheetNotFound { .. }));
     }
 
     #[test]
     fn map_api_error_429() {
-        let err = map_api_error(ApiErrorDetail {
-            code: 429,
-            message: "rate limited".into(),
-        });
+        let err = map_api_error(429, "rate limited".into(), None);
         assert!(matches!(err, SheetsError::RateLimited { .. }));
     }
 
     #[test]
     fn map_api_error_500() {
-        let err = map_api_error(ApiErrorDetail {
-            code: 500,
-            message: "internal".into(),
-        });
+        let err = map_api_error(500, "internal".into(), None);
         assert!(matches!(
             err,
             SheetsError::Api {

@@ -20,6 +20,21 @@ pub enum SheetsError {
     #[error("Sheets API error ({status_code}): {message}")]
     Api { status_code: u16, message: String },
 
+    /// A temporary provider failure carrying a minimum wait for a safe retry.
+    #[error("Sheets API error ({status_code}): {message}")]
+    TransientApi {
+        status_code: u16,
+        message: String,
+        retry_after_ms: u64,
+    },
+
+    /// The write may have taken effect even though its result was unavailable.
+    #[error("Sheets write outcome unknown. Check the affected range before retrying. {message}")]
+    WriteOutcomeUnknown {
+        status_code: Option<u16>,
+        message: String,
+    },
+
     /// Rate limited
     #[error("Rate limited, retry after {retry_after_ms}ms")]
     RateLimited { retry_after_ms: u64 },
@@ -45,7 +60,7 @@ impl SheetsError {
     #[must_use]
     pub const fn is_retryable(&self) -> bool {
         match self {
-            Self::Http(_) | Self::RateLimited { .. } => true,
+            Self::Http(_) | Self::RateLimited { .. } | Self::TransientApi { .. } => true,
             Self::Api { status_code, .. } => matches!(status_code, 500..=599 | 429),
             _ => false,
         }
@@ -54,7 +69,9 @@ impl SheetsError {
     #[must_use]
     pub const fn retry_after(&self) -> Option<Duration> {
         match self {
-            Self::RateLimited { retry_after_ms } => Some(Duration::from_millis(*retry_after_ms)),
+            Self::RateLimited { retry_after_ms } | Self::TransientApi { retry_after_ms, .. } => {
+                Some(Duration::from_millis(*retry_after_ms))
+            }
             _ => None,
         }
     }
@@ -68,6 +85,13 @@ impl SheetsError {
                 status_code: e.status().map(|s| s.as_u16()),
                 retryable: self.is_retryable(),
                 retry_after: self.retry_after(),
+            },
+            Self::WriteOutcomeUnknown { status_code, .. } => FcpError::External {
+                service: "google_sheets".into(),
+                message: self.to_string(),
+                status_code: *status_code,
+                retryable: false,
+                retry_after: None,
             },
             Self::Json(e) => FcpError::Internal {
                 message: format!("JSON error: {e}"),
@@ -94,12 +118,17 @@ impl SheetsError {
             Self::Api {
                 status_code,
                 message,
+            }
+            | Self::TransientApi {
+                status_code,
+                message,
+                ..
             } => FcpError::External {
                 service: "google_sheets".into(),
                 message: message.clone(),
                 status_code: Some(*status_code),
                 retryable: self.is_retryable(),
-                retry_after: None,
+                retry_after: self.retry_after(),
             },
             Self::RateLimited { retry_after_ms } => FcpError::RateLimited {
                 retry_after_ms: *retry_after_ms,

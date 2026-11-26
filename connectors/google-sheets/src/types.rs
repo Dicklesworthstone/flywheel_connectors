@@ -114,7 +114,6 @@ pub(crate) struct ApiErrorResponse {
 /// Error detail from the API.
 #[derive(Debug, Deserialize)]
 pub(crate) struct ApiErrorDetail {
-    pub code: u16,
     pub message: String,
 }
 
@@ -197,7 +196,7 @@ mod tests {
     fn api_error_response_serde() {
         let json = r#"{"error": {"code": 404, "message": "not found"}}"#;
         let er: ApiErrorResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(er.error.code, 404);
+        assert_eq!(er.error.message, "not found");
     }
 
     #[test]

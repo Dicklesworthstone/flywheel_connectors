@@ -531,3 +531,38 @@ async fn local_non_mock_wrong_capability_fails_before_loopback_egress() {
     });
     println!("{artifact}");
 }
+
+#[fcp_async_core::runtime::test]
+async fn lost_append_acknowledgement_is_terminal_at_signed_invoke_boundary() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base_url = format!("http://{}/v4", listener.local_addr().unwrap());
+    let (mut connector, signing_key, instance_id) = setup_connector(&base_url).await;
+    let receiver = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        // The provider accepted the complete write, then lost its connection
+        // before the caller could observe the result.
+        read_http_request(&mut stream)
+    });
+    let operation = "sheets.append_values";
+    let error = connector
+        .handle_invoke(json!({
+            "operation": operation,
+            "input": update_values_input(),
+            "capability_token": capability_token(&signing_key, &instance_id, WRITE_CAPABILITY, operation)
+        }))
+        .await
+        .unwrap_err();
+    let (headers, body) = receiver.join().unwrap();
+    assert!(headers.starts_with("POST ") && headers.contains(":append?"));
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["values"],
+        update_values_input()["values"]
+    );
+    assert!(
+        matches!(error, FcpError::External { retryable: false, retry_after: None, message, .. }
+        if message.contains("write outcome unknown"))
+    );
+}

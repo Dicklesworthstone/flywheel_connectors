@@ -1261,25 +1261,33 @@ fn multipart_related_body(
 ///
 /// Supports integer delta-seconds and HTTP-date values (RFC 7231 §7.1.3).
 fn parse_retry_after_header(headers: &[(String, String)]) -> Option<u64> {
-    let value = headers
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
-        .map(|(_, value)| value.trim())?;
+    retry_after_ms(headers.iter().filter_map(|(name, value)| {
+        name.eq_ignore_ascii_case("retry-after")
+            .then_some(value.as_str())
+    }))
+}
 
-    if let Ok(secs) = value.parse::<u64>() {
-        return Some(secs.saturating_mul(1000));
-    }
-
-    let retry_at = chrono::DateTime::parse_from_rfc2822(value)
-        .ok()?
-        .with_timezone(&chrono::Utc);
+/// Longest valid Retry-After field, expressed in milliseconds. Accepts both
+/// delta-seconds and HTTP dates. Unrepresentable delays saturate rather than
+/// falling back to a shorter wait.
+pub fn retry_after_ms<'a>(values: impl Iterator<Item = &'a str>) -> Option<u64> {
     let now = chrono::Utc::now();
-    if retry_at <= now {
-        return Some(0);
-    }
-
-    let delay_ms = retry_at.signed_duration_since(now).num_milliseconds();
-    Some(u64::try_from(delay_ms).unwrap_or(u64::MAX))
+    values
+        .filter_map(|value| {
+            let value = value.trim();
+            if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
+                return Some(
+                    value
+                        .parse::<u64>()
+                        .unwrap_or(u64::MAX)
+                        .saturating_mul(1000),
+                );
+            }
+            let retry_at = chrono::DateTime::parse_from_rfc2822(value).ok()?.to_utc();
+            let delay = (retry_at - now).to_std().unwrap_or_default();
+            Some(u64::try_from(delay.as_nanos().div_ceil(1_000_000)).unwrap_or(u64::MAX))
+        })
+        .max()
 }
 
 fn collect_headers(headers: &reqwest::header::HeaderMap) -> Vec<(String, String)> {
@@ -2476,6 +2484,19 @@ mod tests {
             ("Retry-After".to_string(), "30".to_string()),
         ];
         assert_eq!(parse_retry_after_header(&headers), Some(30_000));
+    }
+
+    #[test]
+    fn retry_after_fields_use_longest_valid_floor_and_saturate_overflow() {
+        assert_eq!(
+            retry_after_ms(["2", "invalid", "90", "1"].into_iter()),
+            Some(90_000)
+        );
+        assert_eq!(
+            retry_after_ms(["7", "18446744073709551616"].into_iter()),
+            Some(u64::MAX)
+        );
+        assert_eq!(retry_after_ms(["-1", "+1", "1.5"].into_iter()), None);
     }
 
     #[test]
