@@ -36,13 +36,29 @@ use fcp_youtube::{
 // Helpers
 // ============================================================================
 
+macro_rules! invoke_request {
+    ({ $($fields:tt)* }) => {{
+        let request: fcp_core::InvokeRequest = serde_json::from_value(json!({
+            "type": "invoke",
+            "id": "youtube-fixture-request",
+            "connector_id": "fcp.youtube",
+            "zone_id": "z:work",
+            $($fields)*
+        }))
+        .expect("fixture must be a canonical InvokeRequest");
+        serde_json::to_value(request).expect("serialize invocation")
+    }};
+}
+
 fn generate_valid_token(
     signing_key: &Ed25519SigningKey,
     connector: &YouTubeConnector,
     op: &str,
 ) -> fcp_core::CapabilityToken {
     let cap = match op {
-        "youtube.post_comment" | "youtube.upload_caption" => "youtube.write",
+        "youtube.post_comment" | "youtube.upload_caption" | "youtube.upload_video" => {
+            "youtube.write"
+        }
         _ => "youtube.read",
     };
     generate_token_for_capability(signing_key, connector, op, cap)
@@ -79,11 +95,20 @@ fn generate_token_for_capability(
 
 async fn setup_handshake(connector: &mut YouTubeConnector, caps: &[&str]) -> Ed25519SigningKey {
     let signing_key = Ed25519SigningKey::generate();
+    handshake_with_key(connector, &signing_key, caps).await;
+    signing_key
+}
+
+async fn handshake_with_key(
+    connector: &mut YouTubeConnector,
+    signing_key: &Ed25519SigningKey,
+    caps: &[&str],
+) -> serde_json::Value {
     let verifying_key = signing_key.verifying_key();
 
-    connector
+    let response = connector
         .handle_handshake(json!({
-            "protocol_version": "1.0.0",
+            "protocol_version": "2.0.0",
             "zone": "z:work",
             "host_public_key": verifying_key.to_bytes(),
             "nonce": vec![0u8; 32],
@@ -91,8 +116,19 @@ async fn setup_handshake(connector: &mut YouTubeConnector, caps: &[&str]) -> Ed2
         }))
         .await
         .expect("handshake should succeed");
+    assert_eq!(response["connector_id"], "fcp.youtube");
+    assert_eq!(response["protocol_version"], "2.0");
+    assert_eq!(
+        response["instance_id"].as_str(),
+        Some(connector.instance_id())
+    );
+    assert!(
+        response["session_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty())
+    );
 
-    signing_key
+    response
 }
 
 async fn setup_configure(connector: &mut YouTubeConnector, base_url: &str) {
@@ -103,6 +139,65 @@ async fn setup_configure(connector: &mut YouTubeConnector, base_url: &str) {
         }))
         .await
         .expect("configure should succeed");
+}
+
+fn scoped_token(
+    signing_key: &Ed25519SigningKey,
+    connector: &YouTubeConnector,
+    operations: &[&str],
+    capability: &str,
+    constraints: &CapabilityConstraints,
+    token_id: &[u8],
+) -> fcp_core::CapabilityToken {
+    let now = Utc::now();
+    let mut cbor = Vec::new();
+    ciborium::into_writer(constraints, &mut cbor).unwrap();
+    fcp_core::CapabilityToken::from_raw(
+        CapabilityTokenBuilder::new()
+            .capability_id(capability)
+            .zone_id("z:work")
+            .principal("user:youtube-admission")
+            .operations(operations)
+            .issuer("node:youtube-admission")
+            .target_instance(connector.instance_id())
+            .token_id(token_id)
+            .validity(now, now + Duration::hours(1))
+            .try_constraints_cbor(&cbor)
+            .unwrap()
+            .sign(signing_key)
+            .unwrap(),
+    )
+}
+
+fn native_request(
+    id: &str,
+    operation: &str,
+    input: serde_json::Value,
+    capability_token: &fcp_core::CapabilityToken,
+) -> serde_json::Value {
+    let mut request = invoke_request!({
+        "operation": operation,
+        "input": input,
+        "capability_token": capability_token,
+    });
+    request["id"] = json!(id);
+    request
+}
+
+async fn preview_request(
+    connector: &YouTubeConnector,
+    request: &serde_json::Value,
+) -> SimulateResponse {
+    let mut preview = request.clone();
+    preview["type"] = json!("simulate");
+    let typed: SimulateRequest = serde_json::from_value(preview).unwrap();
+    serde_json::from_value(
+        connector
+            .handle_simulate(serde_json::to_value(typed).unwrap())
+            .await
+            .unwrap(),
+    )
+    .unwrap()
 }
 
 async fn setup_caption_upload(connector: &mut YouTubeConnector, base_url: &str) {
@@ -136,6 +231,10 @@ fn caption_upload_response() -> serde_json::Value {
             "name": "Uploaded transcript", "isDraft": false, "status": "syncing",
         },
     })
+}
+
+fn empty_search_page() -> serde_json::Value {
+    json!({ "kind": "youtube#searchListResponse", "etag": "empty-page", "items": [] })
 }
 
 const CAPTION_FILE: &str =
@@ -184,11 +283,11 @@ async fn search_happy_path() {
 
     let mut connector = YouTubeConnector::new();
     setup_configure(&mut connector, &mock_server.uri()).await;
-    let signing_key = setup_handshake(&mut connector, &["youtube.search"]).await;
+    let signing_key = setup_handshake(&mut connector, &["youtube.read"]).await;
     let capability = generate_valid_token(&signing_key, &connector, "youtube.search");
 
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "youtube.search",
             "input": { "query": "rust programming", "max_results": 5, "type": "video" },
             "capability_token": capability
@@ -249,7 +348,7 @@ async fn search_continues_with_an_opaque_cursor_and_preserves_query_options() {
     let token = generate_valid_token(&key, &connector, "youtube.search");
     let mut input = json!({ "query": query, "type": "video", "max_results": 50 });
     let first = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "youtube.search", "input": input, "capability_token": token
         }))
         .await
@@ -262,7 +361,7 @@ async fn search_continues_with_an_opaque_cursor_and_preserves_query_options() {
 
     input["page_token"] = first["next_page_token"].clone();
     let second = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "youtube.search", "input": input, "capability_token": token
         }))
         .await
@@ -331,11 +430,11 @@ async fn get_video_happy_path() {
 
     let mut connector = YouTubeConnector::new();
     setup_configure(&mut connector, &mock_server.uri()).await;
-    let signing_key = setup_handshake(&mut connector, &["youtube.get_video"]).await;
+    let signing_key = setup_handshake(&mut connector, &["youtube.read"]).await;
     let capability = generate_valid_token(&signing_key, &connector, "youtube.get_video");
 
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "youtube.get_video",
             "input": { "video_id": "dQw4w9WgXcQ" },
             "capability_token": capability
@@ -381,11 +480,11 @@ async fn list_videos_happy_path() {
 
     let mut connector = YouTubeConnector::new();
     setup_configure(&mut connector, &mock_server.uri()).await;
-    let signing_key = setup_handshake(&mut connector, &["youtube.list_videos"]).await;
+    let signing_key = setup_handshake(&mut connector, &["youtube.read"]).await;
     let capability = generate_valid_token(&signing_key, &connector, "youtube.list_videos");
 
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "youtube.list_videos",
             "input": { "video_ids": ["vid001", "vid002"] },
             "capability_token": capability
@@ -425,11 +524,11 @@ async fn get_channel_happy_path() {
 
     let mut connector = YouTubeConnector::new();
     setup_configure(&mut connector, &mock_server.uri()).await;
-    let signing_key = setup_handshake(&mut connector, &["youtube.get_channel"]).await;
+    let signing_key = setup_handshake(&mut connector, &["youtube.read"]).await;
     let capability = generate_valid_token(&signing_key, &connector, "youtube.get_channel");
 
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "youtube.get_channel",
             "input": { "channel_id": "UCuAXFkgsw1L7xaCfnd5JJOw" },
             "capability_token": capability
@@ -485,11 +584,11 @@ async fn list_playlists_happy_path() {
 
     let mut connector = YouTubeConnector::new();
     setup_configure(&mut connector, &mock_server.uri()).await;
-    let signing_key = setup_handshake(&mut connector, &["youtube.list_playlists"]).await;
+    let signing_key = setup_handshake(&mut connector, &["youtube.read"]).await;
     let capability = generate_valid_token(&signing_key, &connector, "youtube.list_playlists");
 
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "youtube.list_playlists",
             "input": { "channel_id": "UCtest", "max_results": 10 },
             "capability_token": capability
@@ -535,11 +634,11 @@ async fn list_playlist_items_happy_path() {
 
     let mut connector = YouTubeConnector::new();
     setup_configure(&mut connector, &mock_server.uri()).await;
-    let signing_key = setup_handshake(&mut connector, &["youtube.list_playlist_items"]).await;
+    let signing_key = setup_handshake(&mut connector, &["youtube.read"]).await;
     let capability = generate_valid_token(&signing_key, &connector, "youtube.list_playlist_items");
 
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "youtube.list_playlist_items",
             "input": { "playlist_id": "PLtest123", "max_results": 5 },
             "capability_token": capability
@@ -585,11 +684,11 @@ async fn list_comments_happy_path() {
 
     let mut connector = YouTubeConnector::new();
     setup_configure(&mut connector, &mock_server.uri()).await;
-    let signing_key = setup_handshake(&mut connector, &["youtube.list_comments"]).await;
+    let signing_key = setup_handshake(&mut connector, &["youtube.read"]).await;
     let capability = generate_valid_token(&signing_key, &connector, "youtube.list_comments");
 
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "youtube.list_comments",
             "input": { "video_id": "dQw4w9WgXcQ", "max_results": 20 },
             "capability_token": capability
@@ -659,7 +758,7 @@ async fn comment_threads_continue_with_an_opaque_cursor_and_preserve_video_scope
     let token = generate_valid_token(&key, &connector, "youtube.list_comments");
     let mut input = json!({ "video_id": video_id, "max_results": 100 });
     let first = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "youtube.list_comments", "input": input, "capability_token": token
         }))
         .await
@@ -671,7 +770,7 @@ async fn comment_threads_continue_with_an_opaque_cursor_and_preserve_video_scope
 
     input["page_token"] = first["next_page_token"].clone();
     let second = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "youtube.list_comments", "input": input, "capability_token": token
         }))
         .await
@@ -720,11 +819,11 @@ async fn post_comment_happy_path() {
 
     let mut connector = YouTubeConnector::new();
     setup_configure(&mut connector, &mock_server.uri()).await;
-    let signing_key = setup_handshake(&mut connector, &["youtube.post_comment"]).await;
+    let signing_key = setup_handshake(&mut connector, &["youtube.write"]).await;
     let capability = generate_valid_token(&signing_key, &connector, "youtube.post_comment");
 
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "youtube.post_comment",
             "input": { "video_id": "dQw4w9WgXcQ", "text": "Great tutorial!" },
             "capability_token": capability
@@ -762,11 +861,11 @@ async fn get_captions_happy_path() {
 
     let mut connector = YouTubeConnector::new();
     setup_configure(&mut connector, &mock_server.uri()).await;
-    let signing_key = setup_handshake(&mut connector, &["youtube.get_captions"]).await;
+    let signing_key = setup_handshake(&mut connector, &["youtube.read"]).await;
     let capability = generate_valid_token(&signing_key, &connector, "youtube.get_captions");
 
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "youtube.get_captions",
             "input": { "video_id": "dQw4w9WgXcQ" },
             "capability_token": capability
@@ -793,12 +892,12 @@ async fn get_caption_transcript_happy_path() {
 
     let mut connector = YouTubeConnector::new();
     setup_configure(&mut connector, &mock_server.uri()).await;
-    let signing_key = setup_handshake(&mut connector, &["youtube.get_caption_transcript"]).await;
+    let signing_key = setup_handshake(&mut connector, &["youtube.read"]).await;
     let capability =
         generate_valid_token(&signing_key, &connector, "youtube.get_caption_transcript");
 
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "youtube.get_caption_transcript",
             "input": { "caption_id": "cap1", "format": "srt" },
             "capability_token": capability
@@ -866,11 +965,11 @@ async fn get_transcript_url_language_fallback_happy_path() {
 
     let mut connector = YouTubeConnector::new();
     setup_configure(&mut connector, &mock_server.uri()).await;
-    let signing_key = setup_handshake(&mut connector, &["youtube.get_transcript"]).await;
+    let signing_key = setup_handshake(&mut connector, &["youtube.read"]).await;
     let capability = generate_valid_token(&signing_key, &connector, "youtube.get_transcript");
 
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "youtube.get_transcript",
             "input": {
                 "video_url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
@@ -924,11 +1023,11 @@ async fn get_transcript_no_caption_track_fails() {
 
     let mut connector = YouTubeConnector::new();
     setup_configure(&mut connector, &mock_server.uri()).await;
-    let signing_key = setup_handshake(&mut connector, &["youtube.get_transcript"]).await;
+    let signing_key = setup_handshake(&mut connector, &["youtube.read"]).await;
     let capability = generate_valid_token(&signing_key, &connector, "youtube.get_transcript");
 
     let error = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "youtube.get_transcript",
             "input": { "video_id": "dQw4w9WgXcQ" },
             "capability_token": capability
@@ -978,11 +1077,11 @@ async fn get_transcript_rejects_oversized_transcript() {
 
     let mut connector = YouTubeConnector::new();
     setup_configure(&mut connector, &mock_server.uri()).await;
-    let signing_key = setup_handshake(&mut connector, &["youtube.get_transcript"]).await;
+    let signing_key = setup_handshake(&mut connector, &["youtube.read"]).await;
     let capability = generate_valid_token(&signing_key, &connector, "youtube.get_transcript");
 
     let error = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "youtube.get_transcript",
             "input": {
                 "video_id": "dQw4w9WgXcQ",
@@ -1041,7 +1140,7 @@ async fn upload_caption_happy_path() {
         if !credential_mode {
             input["name"] = json!(name);
         }
-        let denied = connector.handle_invoke(json!({
+        let denied = connector.handle_invoke(invoke_request!({
             "operation": "youtube.upload_caption", "input": input,
             "capability_token": generate_token_for_capability(&key, &connector, "youtube.upload_caption", "youtube.read"),
         })).await.unwrap_err();
@@ -1051,7 +1150,7 @@ async fn upload_caption_happy_path() {
                 | fcp_core::FcpError::CapabilityDenied { .. }
         ));
         assert!(server.received_requests().await.unwrap().is_empty());
-        let result = connector.handle_invoke(json!({
+        let result = connector.handle_invoke(invoke_request!({
             "operation": "youtube.upload_caption", "input": input,
             "capability_token": generate_valid_token(&key, &connector, "youtube.upload_caption"),
         })).await.expect("upload_caption invoke should succeed");
@@ -1148,7 +1247,7 @@ async fn caption_upload_validation_and_api_key_denials_do_not_contact_google() {
         let mut input = base.clone();
         input[field] = value;
         let error = connector
-            .handle_invoke(json!({
+            .handle_invoke(invoke_request!({
                 "operation":"youtube.upload_caption", "input":input,
                 "capability_token":generate_valid_token(&key, &connector, "youtube.upload_caption"),
             }))
@@ -1159,7 +1258,7 @@ async fn caption_upload_validation_and_api_key_denials_do_not_contact_google() {
             "{field}: {error:?}"
         );
         let request = SimulateRequest::new(
-            ConnectorId::from_static("youtube"),
+            ConnectorId::from_static("fcp.youtube"),
             OperationId::from_static("youtube.upload_caption"),
             fcp_core::ZoneId::work(),
             input,
@@ -1178,7 +1277,7 @@ async fn caption_upload_validation_and_api_key_denials_do_not_contact_google() {
     setup_configure(&mut connector, &server.uri()).await;
     let key = setup_handshake(&mut connector, &["youtube.write"]).await;
     let error = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation":"youtube.upload_caption", "input":base,
             "capability_token":generate_valid_token(&key, &connector, "youtube.upload_caption"),
         }))
@@ -1188,7 +1287,7 @@ async fn caption_upload_validation_and_api_key_denials_do_not_contact_google() {
     assert!(error.to_string().contains("youtube.force-ssl"));
     assert!(!error.to_string().contains("test-api-key-xyz"));
     let request = SimulateRequest::new(
-        ConnectorId::from_static("youtube"),
+        ConnectorId::from_static("fcp.youtube"),
         OperationId::from_static("youtube.upload_caption"),
         fcp_core::ZoneId::work(),
         base,
@@ -1420,11 +1519,11 @@ async fn unauthorized_maps_to_fcp_error() {
 
     let mut connector = YouTubeConnector::new();
     setup_configure(&mut connector, &mock_server.uri()).await;
-    let signing_key = setup_handshake(&mut connector, &["youtube.get_video"]).await;
+    let signing_key = setup_handshake(&mut connector, &["youtube.read"]).await;
     let capability = generate_valid_token(&signing_key, &connector, "youtube.get_video");
 
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "youtube.get_video",
             "input": { "video_id": "dQw4w9WgXcQ" },
             "capability_token": capability
@@ -1453,11 +1552,11 @@ async fn not_found_maps_to_fcp_error() {
 
     let mut connector = YouTubeConnector::new();
     setup_configure(&mut connector, &mock_server.uri()).await;
-    let signing_key = setup_handshake(&mut connector, &["youtube.get_channel"]).await;
+    let signing_key = setup_handshake(&mut connector, &["youtube.read"]).await;
     let capability = generate_valid_token(&signing_key, &connector, "youtube.get_channel");
 
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "youtube.get_channel",
             "input": { "channel_id": "UCnonexistent" },
             "capability_token": capability
@@ -1486,11 +1585,11 @@ async fn quota_exceeded_maps_to_fcp_error() {
 
     let mut connector = YouTubeConnector::new();
     setup_configure(&mut connector, &mock_server.uri()).await;
-    let signing_key = setup_handshake(&mut connector, &["youtube.search"]).await;
+    let signing_key = setup_handshake(&mut connector, &["youtube.read"]).await;
     let capability = generate_valid_token(&signing_key, &connector, "youtube.search");
 
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "youtube.search",
             "input": { "query": "test" },
             "capability_token": capability
@@ -1518,7 +1617,7 @@ async fn rate_limited_maps_to_fcp_error() {
 
     let mut connector = YouTubeConnector::new();
     setup_configure(&mut connector, &mock_server.uri()).await;
-    let signing_key = setup_handshake(&mut connector, &["youtube.get_video"]).await;
+    let signing_key = setup_handshake(&mut connector, &["youtube.read"]).await;
     let capability = generate_valid_token(&signing_key, &connector, "youtube.get_video");
 
     // The YouTube client hardcodes a 60-second retry-after for 429 responses,
@@ -1527,7 +1626,7 @@ async fn rate_limited_maps_to_fcp_error() {
     // for the full 30-second request context deadline.
     let result = fcp_async_core::time::timeout(
         std::time::Duration::from_secs(2),
-        connector.handle_invoke(json!({
+        connector.handle_invoke(invoke_request!({
             "operation": "youtube.get_video",
             "input": { "video_id": "dQw4w9WgXcQ" },
             "capability_token": capability
@@ -1548,14 +1647,503 @@ async fn rate_limited_maps_to_fcp_error() {
 // ============================================================================
 
 #[fcp_async_core::runtime::test]
+async fn native_admission_meters_calls_across_operations_without_spending_previews_or_denials() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/search"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(empty_search_page()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut connector = YouTubeConnector::new();
+    setup_configure(&mut connector, &server.uri()).await;
+    let key = setup_handshake(&mut connector, &["youtube.read"]).await;
+    let token = scoped_token(
+        &key,
+        &connector,
+        &["youtube.search", "youtube.get_video", "youtube.list_videos"],
+        "youtube.read",
+        &CapabilityConstraints {
+            resource_allow: vec!["youtube:search".into(), "youtube:video:allowed".into()],
+            max_calls: Some(1),
+            ..Default::default()
+        },
+        b"youtube-shared-call-grant",
+    );
+    let request = native_request(
+        "call-first",
+        "youtube.search",
+        json!({ "query": "rust" }),
+        &token,
+    );
+    let mut denied_requests = vec![
+        native_request("missing-query", "youtube.search", json!({}), &token),
+        native_request(
+            "bad-cursor",
+            "youtube.search",
+            json!({ "query": "rust", "page_token": null }),
+            &token,
+        ),
+        native_request(
+            "wrong-resource",
+            "youtube.get_video",
+            json!({ "video_id": "other" }),
+            &token,
+        ),
+        native_request(
+            "ambiguous-resource",
+            "youtube.get_video",
+            json!({ "video_id": "allowed,other" }),
+            &token,
+        ),
+        native_request(
+            "mixed-batch",
+            "youtube.list_videos",
+            json!({ "video_ids": ["allowed", "other"] }),
+            &token,
+        ),
+    ];
+    for (field, value) in [
+        ("connector_id", json!("fcp.github")),
+        ("zone_id", json!("z:private")),
+    ] {
+        let mut forged = request.clone();
+        forged[field] = value;
+        denied_requests.push(forged);
+    }
+    for denied in denied_requests {
+        assert!(connector.handle_invoke(denied.clone()).await.is_err());
+        assert!(!preview_request(&connector, &denied).await.would_succeed);
+    }
+    for (field, value) in [
+        ("type", json!("response")),
+        ("id", json!("")),
+        ("deadline_ms", json!(0)),
+    ] {
+        let mut malformed = request.clone();
+        malformed[field] = value;
+        assert!(matches!(
+            connector.handle_invoke(malformed).await.unwrap_err(),
+            fcp_core::FcpError::InvalidRequest { .. }
+        ));
+    }
+    for _ in 0..3 {
+        assert!(preview_request(&connector, &request).await.would_succeed);
+    }
+    assert!(server.received_requests().await.unwrap().is_empty());
+    assert_eq!(
+        connector.handle_invoke(request.clone()).await.unwrap()["items"],
+        json!([])
+    );
+
+    let mut changed_id = request.clone();
+    changed_id["id"] = json!("call-second");
+    for replay in [
+        request.clone(),
+        changed_id,
+        native_request(
+            "cross-operation",
+            "youtube.get_video",
+            json!({ "video_id": "allowed" }),
+            &token,
+        ),
+    ] {
+        assert!(matches!(
+            connector.handle_invoke(replay).await.unwrap_err(),
+            fcp_core::FcpError::CapabilityDenied { .. }
+        ));
+    }
+    assert!(!preview_request(&connector, &request).await.would_succeed);
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    server.verify().await;
+}
+
+#[fcp_async_core::runtime::test]
+async fn native_byte_budget_accepts_exact_typed_message_bytes_then_denies_replay() {
+    const BYTE_LIMIT: u64 = 4096;
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/search"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(empty_search_page()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut connector = YouTubeConnector::new();
+    setup_configure(&mut connector, &server.uri()).await;
+    let key = setup_handshake(&mut connector, &["youtube.read"]).await;
+    let token = scoped_token(
+        &key,
+        &connector,
+        &["youtube.search"],
+        "youtube.read",
+        &CapabilityConstraints {
+            resource_allow: vec!["youtube:search".into()],
+            max_bytes: Some(BYTE_LIMIT),
+            ..Default::default()
+        },
+        b"youtube-exact-byte-grant",
+    );
+    let mut request: fcp_core::InvokeRequest = serde_json::from_value(native_request(
+        "byte-exact",
+        "youtube.search",
+        json!({ "query": "x" }),
+        &token,
+    ))
+    .unwrap();
+    let expected = json!({ "items": [], "total_results": 0, "next_page_token": null });
+    let response = fcp_core::InvokeResponse::ok(request.id.clone(), expected.clone());
+    let response_bytes = serde_json::to_vec(&response).unwrap().len();
+    let request_bytes = serde_json::to_vec(&request).unwrap().len();
+    let padding = usize::try_from(BYTE_LIMIT)
+        .unwrap()
+        .checked_sub(request_bytes + response_bytes)
+        .expect("fixture grant must fit both complete typed messages");
+    request.input["query"] = json!("x".repeat(padding + 1));
+    assert_eq!(
+        serde_json::to_vec(&request).unwrap().len() + response_bytes,
+        usize::try_from(BYTE_LIMIT).unwrap()
+    );
+    let request = serde_json::to_value(request).unwrap();
+    assert!(preview_request(&connector, &request).await.would_succeed);
+    assert_eq!(
+        connector.handle_invoke(request.clone()).await.unwrap(),
+        expected
+    );
+    assert!(matches!(
+        connector.handle_invoke(request.clone()).await.unwrap_err(),
+        fcp_core::FcpError::CapabilityDenied { .. }
+    ));
+    assert!(!preview_request(&connector, &request).await.would_succeed);
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    server.verify().await;
+}
+
+#[fcp_async_core::runtime::test]
+async fn native_byte_reservations_settle_successes_but_keep_provider_failures_spent() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/search"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(empty_search_page()))
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/videos"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+            "error": { "code": 404, "message": "Video is unavailable" }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut connector = YouTubeConnector::new();
+    setup_configure(&mut connector, &server.uri()).await;
+    let key = setup_handshake(&mut connector, &["youtube.read"]).await;
+    let token = scoped_token(
+        &key,
+        &connector,
+        &["youtube.search", "youtube.get_video"],
+        "youtube.read",
+        &CapabilityConstraints {
+            resource_allow: vec!["youtube:search".into(), "youtube:video:missing".into()],
+            max_bytes: Some(65_536),
+            ..Default::default()
+        },
+        b"youtube-byte-reservation-grant",
+    );
+    for id in ["settled-first", "settled-second"] {
+        let request = native_request(id, "youtube.search", json!({ "query": "rust" }), &token);
+        assert_eq!(
+            connector.handle_invoke(request).await.unwrap()["items"],
+            json!([])
+        );
+    }
+    let failure = native_request(
+        "provider-failure",
+        "youtube.get_video",
+        json!({ "video_id": "missing" }),
+        &token,
+    );
+    let error = connector.handle_invoke(failure).await.unwrap_err();
+    assert!(!matches!(
+        error,
+        fcp_core::FcpError::CapabilityDenied { .. }
+    ));
+    let retry = native_request(
+        "after-failure",
+        "youtube.search",
+        json!({ "query": "rust" }),
+        &token,
+    );
+    assert!(matches!(
+        connector.handle_invoke(retry.clone()).await.unwrap_err(),
+        fcp_core::FcpError::CapabilityDenied { .. }
+    ));
+    assert!(!preview_request(&connector, &retry).await.would_succeed);
+    assert_eq!(server.received_requests().await.unwrap().len(), 3);
+    server.verify().await;
+}
+
+#[fcp_async_core::runtime::test]
+async fn native_oversized_result_is_withheld_without_refunding_or_replaying() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/search"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "kind": "youtube#searchListResponse", "etag": "large-page",
+            "items": [{
+                "kind": "youtube#searchResult", "etag": "video",
+                "id": { "kind": "youtube#video", "videoId": "large-video" },
+                "snippet": { "title": "x".repeat(4096), "description": "Large provider result" }
+            }]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut connector = YouTubeConnector::new();
+    setup_configure(&mut connector, &server.uri()).await;
+    let key = setup_handshake(&mut connector, &["youtube.read"]).await;
+    let token = scoped_token(
+        &key,
+        &connector,
+        &["youtube.search"],
+        "youtube.read",
+        &CapabilityConstraints {
+            resource_allow: vec!["youtube:search".into()],
+            max_bytes: Some(4096),
+            ..Default::default()
+        },
+        b"youtube-withheld-result-grant",
+    );
+    let request = native_request(
+        "oversized",
+        "youtube.search",
+        json!({ "query": "rust" }),
+        &token,
+    );
+    assert!(matches!(
+        connector.handle_invoke(request.clone()).await.unwrap_err(),
+        fcp_core::FcpError::External { service, retryable: false, retry_after: None, message, .. }
+            if service == "standalone" && message.contains("outcome is unknown")
+    ));
+    assert!(matches!(
+        connector.handle_invoke(request).await.unwrap_err(),
+        fcp_core::FcpError::CapabilityDenied { .. }
+    ));
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    server.verify().await;
+}
+
+#[fcp_async_core::runtime::test]
+async fn native_lifecycle_replaces_authority_even_when_reconfiguration_or_handshake_fails() {
+    for action in [
+        "rehandshake",
+        "malformed-handshake",
+        "legacy-protocol",
+        "zone-rebind",
+        "failed-configure",
+        "shutdown",
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty_search_page()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut connector = YouTubeConnector::new();
+        setup_configure(&mut connector, &server.uri()).await;
+        let key = Ed25519SigningKey::generate();
+        let original = handshake_with_key(&mut connector, &key, &["youtube.read"]).await;
+        let token = generate_valid_token(&key, &connector, "youtube.search");
+        let request = native_request(
+            "before-lifecycle",
+            "youtube.search",
+            json!({ "query": "rust" }),
+            &token,
+        );
+        assert!(preview_request(&connector, &request).await.would_succeed);
+        match action {
+            "rehandshake" => {
+                let replacement = handshake_with_key(&mut connector, &key, &["youtube.read"]).await;
+                assert_ne!(replacement["instance_id"], original["instance_id"]);
+                assert_ne!(replacement["session_id"], original["session_id"]);
+            }
+            "malformed-handshake" => {
+                assert!(
+                    connector
+                        .handle_handshake(json!({ "protocol_version": null }))
+                        .await
+                        .is_err()
+                );
+            }
+            "legacy-protocol" | "zone-rebind" => {
+                assert!(connector.handle_handshake(json!({
+                    "protocol_version": if action == "legacy-protocol" { "1.0.0" } else { "2.0.0" },
+                    "zone": if action == "zone-rebind" { "z:private" } else { "z:work" },
+                    "host_public_key": key.verifying_key().to_bytes(),
+                    "nonce": vec![0_u8; 32], "capabilities_requested": ["youtube.read"],
+                })).await.is_err());
+            }
+            "failed-configure" => {
+                assert!(connector.handle_configure(json!({})).await.is_err());
+            }
+            "shutdown" => {
+                connector.handle_shutdown(json!({})).await.unwrap();
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            connector.handle_invoke(request.clone()).await.is_err(),
+            "{action}"
+        );
+        assert!(
+            !preview_request(&connector, &request).await.would_succeed,
+            "{action}"
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
+
+        setup_configure(&mut connector, &server.uri()).await;
+        // Reuse the same signing key: rotation must invalidate the old instance,
+        // even when cryptographic signature verification would still succeed.
+        let replacement = handshake_with_key(&mut connector, &key, &["youtube.read"]).await;
+        assert_ne!(replacement["instance_id"], original["instance_id"]);
+        assert_ne!(replacement["session_id"], original["session_id"]);
+        assert!(connector.handle_invoke(request).await.is_err());
+        let fresh = generate_valid_token(&key, &connector, "youtube.search");
+        let recovered = native_request(
+            "after-lifecycle",
+            "youtube.search",
+            json!({ "query": "rust" }),
+            &fresh,
+        );
+        assert_eq!(
+            connector.handle_invoke(recovered).await.unwrap()["items"],
+            json!([])
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        server.verify().await;
+    }
+}
+
+#[fcp_async_core::runtime::test]
+async fn native_cancelled_invocation_keeps_its_byte_reservation_without_replay() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/search"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(empty_search_page())
+                .set_delay(std::time::Duration::from_secs(3)),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut connector = YouTubeConnector::new();
+    setup_configure(&mut connector, &server.uri()).await;
+    let key = setup_handshake(&mut connector, &["youtube.read"]).await;
+    let token = scoped_token(
+        &key,
+        &connector,
+        &["youtube.search"],
+        "youtube.read",
+        &CapabilityConstraints {
+            resource_allow: vec!["youtube:search".into()],
+            max_bytes: Some(65_536),
+            ..Default::default()
+        },
+        b"youtube-cancelled-grant",
+    );
+    let request = native_request(
+        "cancelled",
+        "youtube.search",
+        json!({ "query": "rust" }),
+        &token,
+    );
+    let connector = std::sync::Arc::new(connector);
+    let worker_connector = std::sync::Arc::clone(&connector);
+    let worker_request = request.clone();
+    let mut operation =
+        fcp_async_core::task::spawn(
+            async move { worker_connector.handle_invoke(worker_request).await },
+        );
+    let observed = fcp_async_core::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if !server.received_requests().await.unwrap().is_empty() {
+                break;
+            }
+            fcp_async_core::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    })
+    .await;
+    operation.abort();
+    let completed =
+        fcp_async_core::time::timeout(std::time::Duration::from_secs(1), &mut operation).await;
+    observed.expect("provider must observe admitted invocation before cancellation");
+    assert!(completed.expect("aborted invocation must stop").is_err());
+    assert!(matches!(
+        connector.handle_invoke(request).await.unwrap_err(),
+        fcp_core::FcpError::CapabilityDenied { .. }
+    ));
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    server.verify().await;
+}
+
+#[fcp_async_core::runtime::test]
+async fn native_uncertain_caption_write_retains_byte_reservation_and_never_replays() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/upload/youtube/v3/captions"))
+        .respond_with(ResponseTemplate::new(503).set_body_json(json!({
+            "error": { "code": 503, "message": "Completion could not be confirmed" }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut connector = YouTubeConnector::new();
+    setup_caption_upload(&mut connector, &format!("{}/youtube/v3", server.uri())).await;
+    let key = setup_handshake(&mut connector, &["youtube.write"]).await;
+    let token = scoped_token(
+        &key,
+        &connector,
+        &["youtube.upload_caption"],
+        "youtube.write",
+        &CapabilityConstraints {
+            resource_allow: vec!["youtube:video:dQw4w9WgXcQ".into()],
+            max_bytes: Some(65_536),
+            ..Default::default()
+        },
+        b"youtube-uncertain-write-grant",
+    );
+    let request = native_request(
+        "uncertain-write",
+        "youtube.upload_caption",
+        json!({
+            "video_id": "dQw4w9WgXcQ", "language": "en", "transcript": CAPTION_FILE
+        }),
+        &token,
+    );
+    assert!(matches!(
+        connector.handle_invoke(request.clone()).await.unwrap_err(),
+        fcp_core::FcpError::External { retryable: false, retry_after: None, message, .. }
+            if message.to_ascii_lowercase().contains("unknown")
+    ));
+    assert!(matches!(
+        connector.handle_invoke(request).await.unwrap_err(),
+        fcp_core::FcpError::CapabilityDenied { .. }
+    ));
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    server.verify().await;
+}
+
+#[fcp_async_core::runtime::test]
 async fn invoke_without_configure_fails() {
     let _ctx = AsyncTestContext::for_scenario("youtube.deny.not_configured");
-    let mut connector = YouTubeConnector::new();
-    let signing_key = setup_handshake(&mut connector, &["youtube.get_video"]).await;
+    let connector = YouTubeConnector::new();
+    let signing_key = Ed25519SigningKey::generate();
     let capability = generate_valid_token(&signing_key, &connector, "youtube.get_video");
 
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "youtube.get_video",
             "input": { "video_id": "dQw4w9WgXcQ" },
             "capability_token": capability
@@ -1576,12 +2164,12 @@ async fn invoke_with_wrong_capability_denied() {
 
     let mut connector = YouTubeConnector::new();
     setup_configure(&mut connector, &mock_server.uri()).await;
-    // Handshake grants youtube.search but we invoke youtube.get_video
-    let signing_key = setup_handshake(&mut connector, &["youtube.search"]).await;
+    // The negotiated read capability does not widen the token's operation grant.
+    let signing_key = setup_handshake(&mut connector, &["youtube.read"]).await;
     let capability = generate_valid_token(&signing_key, &connector, "youtube.search");
 
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "youtube.get_video",
             "input": { "video_id": "dQw4w9WgXcQ" },
             "capability_token": capability
@@ -1598,11 +2186,11 @@ async fn invoke_unknown_operation_denied() {
 
     let mut connector = YouTubeConnector::new();
     setup_configure(&mut connector, &mock_server.uri()).await;
-    let signing_key = setup_handshake(&mut connector, &["youtube.nonexistent"]).await;
+    let signing_key = setup_handshake(&mut connector, &["youtube.read"]).await;
     let capability = generate_valid_token(&signing_key, &connector, "youtube.nonexistent");
 
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "youtube.nonexistent",
             "input": {},
             "capability_token": capability
@@ -1671,7 +2259,7 @@ async fn introspect_lists_all_operations() {
 #[fcp_async_core::runtime::test]
 async fn shutdown_succeeds() {
     let _ctx = AsyncTestContext::for_scenario("youtube.lifecycle.shutdown");
-    let connector = YouTubeConnector::new();
+    let mut connector = YouTubeConnector::new();
     let result = connector
         .handle_shutdown(json!({}))
         .await
@@ -1752,7 +2340,7 @@ async fn pagination_validation_matches_simulation_and_prevents_provider_io() {
         }
         for input in invalid_inputs {
             let error = connector
-                .handle_invoke(json!({
+                .handle_invoke(invoke_request!({
                     "operation": operation, "input": input, "capability_token": token
                 }))
                 .await
@@ -1762,7 +2350,7 @@ async fn pagination_validation_matches_simulation_and_prevents_provider_io() {
                 "{operation}: {input}: {error:?}"
             );
             let request = SimulateRequest::new(
-                ConnectorId::from_static("youtube"),
+                ConnectorId::from_static("fcp.youtube"),
                 OperationId::from_static(operation),
                 fcp_core::ZoneId::work(),
                 input,
@@ -1786,7 +2374,7 @@ async fn pagination_validation_matches_simulation_and_prevents_provider_io() {
                 input["max_results"] = json!(max_results);
             }
             let request = SimulateRequest::new(
-                ConnectorId::from_static("youtube"),
+                ConnectorId::from_static("fcp.youtube"),
                 OperationId::from_static(operation),
                 fcp_core::ZoneId::work(),
                 input.clone(),
@@ -1801,7 +2389,7 @@ async fn pagination_validation_matches_simulation_and_prevents_provider_io() {
             .unwrap();
             assert!(preview.would_succeed);
             let result = connector
-                .handle_invoke(json!({
+                .handle_invoke(invoke_request!({
                     "operation": operation, "input": input, "capability_token": token
                 }))
                 .await
@@ -1833,11 +2421,11 @@ async fn search_missing_query_fails() {
 
     let mut connector = YouTubeConnector::new();
     setup_configure(&mut connector, &mock_server.uri()).await;
-    let signing_key = setup_handshake(&mut connector, &["youtube.search"]).await;
+    let signing_key = setup_handshake(&mut connector, &["youtube.read"]).await;
     let capability = generate_valid_token(&signing_key, &connector, "youtube.search");
 
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "youtube.search",
             "input": {},
             "capability_token": capability
@@ -1859,11 +2447,11 @@ async fn get_video_missing_video_id_fails() {
 
     let mut connector = YouTubeConnector::new();
     setup_configure(&mut connector, &mock_server.uri()).await;
-    let signing_key = setup_handshake(&mut connector, &["youtube.get_video"]).await;
+    let signing_key = setup_handshake(&mut connector, &["youtube.read"]).await;
     let capability = generate_valid_token(&signing_key, &connector, "youtube.get_video");
 
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "youtube.get_video",
             "input": {},
             "capability_token": capability
@@ -1885,11 +2473,11 @@ async fn list_videos_empty_video_ids_fails() {
 
     let mut connector = YouTubeConnector::new();
     setup_configure(&mut connector, &mock_server.uri()).await;
-    let signing_key = setup_handshake(&mut connector, &["youtube.list_videos"]).await;
+    let signing_key = setup_handshake(&mut connector, &["youtube.read"]).await;
     let capability = generate_valid_token(&signing_key, &connector, "youtube.list_videos");
 
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "youtube.list_videos",
             "input": { "video_ids": [] },
             "capability_token": capability
@@ -1911,11 +2499,11 @@ async fn list_playlists_missing_channel_id_fails() {
 
     let mut connector = YouTubeConnector::new();
     setup_configure(&mut connector, &mock_server.uri()).await;
-    let signing_key = setup_handshake(&mut connector, &["youtube.list_playlists"]).await;
+    let signing_key = setup_handshake(&mut connector, &["youtube.read"]).await;
     let capability = generate_valid_token(&signing_key, &connector, "youtube.list_playlists");
 
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "youtube.list_playlists",
             "input": {},
             "capability_token": capability
@@ -1939,12 +2527,12 @@ async fn get_caption_transcript_missing_caption_id_fails() {
 
     let mut connector = YouTubeConnector::new();
     setup_configure(&mut connector, &mock_server.uri()).await;
-    let signing_key = setup_handshake(&mut connector, &["youtube.get_caption_transcript"]).await;
+    let signing_key = setup_handshake(&mut connector, &["youtube.read"]).await;
     let capability =
         generate_valid_token(&signing_key, &connector, "youtube.get_caption_transcript");
 
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "youtube.get_caption_transcript",
             "input": {},
             "capability_token": capability
@@ -1967,11 +2555,11 @@ async fn upload_caption_missing_transcript_fails() {
 
     let mut connector = YouTubeConnector::new();
     setup_caption_upload(&mut connector, &mock_server.uri()).await;
-    let signing_key = setup_handshake(&mut connector, &["youtube.upload_caption"]).await;
+    let signing_key = setup_handshake(&mut connector, &["youtube.write"]).await;
     let capability = generate_valid_token(&signing_key, &connector, "youtube.upload_caption");
 
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "youtube.upload_caption",
             "input": {
                 "video_id": "dQw4w9WgXcQ",
@@ -1996,11 +2584,11 @@ async fn post_comment_missing_text_fails() {
 
     let mut connector = YouTubeConnector::new();
     setup_configure(&mut connector, &mock_server.uri()).await;
-    let signing_key = setup_handshake(&mut connector, &["youtube.post_comment"]).await;
+    let signing_key = setup_handshake(&mut connector, &["youtube.write"]).await;
     let capability = generate_valid_token(&signing_key, &connector, "youtube.post_comment");
 
     let result = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation": "youtube.post_comment",
             "input": { "video_id": "dQw4w9WgXcQ" },
             "capability_token": capability

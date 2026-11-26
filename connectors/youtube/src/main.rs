@@ -178,7 +178,7 @@ mod tests {
         assert_eq!(response["error"]["code"], "FCP-1003");
         assert_eq!(
             response["error"]["message"],
-            "Invalid request: Missing operation"
+            "Invalid request: Invalid FCP invoke request"
         );
     }
 }

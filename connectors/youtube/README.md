@@ -49,12 +49,12 @@ Important runtime truths the contract preserves:
 - Direct API-key mode appends `key` as a query parameter.
 - Shared Google auth mode uses the shared Google executor and may be bearer-token backed or secretless `credential_id` backed.
 - `credential_id` mode performs no local live provider check; `self_check()` degrades with `credential_injection_required` until the host egress proxy injects credentials.
-- Runtime request-context budgets are `30 seconds` for ordinary requests, `120 seconds` for caption uploads, and `600 seconds` for bounded video uploads. Host invocation deadlines can impose a shorter budget.
+- Runtime request-context budgets are `30 seconds` for ordinary requests, `120 seconds` for caption uploads, and `600 seconds` for bounded video uploads. The connector rejects `deadline_ms = 0`; it does not yet propagate a positive invocation deadline into these client contexts.
 - Runtime retry policy uses `max_retries = 2`.
 - Runtime handshake returns a SHA-256 hash of the bundled `manifest.toml`.
 - Runtime handshake advertises no streaming and no replay.
-- Runtime verifies a bound capability token before provider dispatch.
-- Runtime `invoke` uses `operation`, not `operation_id`.
+- Runtime negotiates declared capabilities and admits each invocation against its bound token, actual resource targets, and signed call and byte allowances before provider dispatch.
+- Runtime `invoke` requires a complete FCP `InvokeRequest`, including `type`, `id`, `connector_id`, `zone_id`, `operation`, `input`, and `capability_token`. The connector identity is `fcp.youtube`.
 - `health()` is local configuration/metrics state.
 - `self_check()` calls `search?part=id&maxResults=1&q=test` in direct-checkable auth modes.
 - Transcript operations return taint/provenance metadata because captions and transcripts are provider/user-generated content.
@@ -80,7 +80,7 @@ The current YouTube README slice documents the existing runtime surface:
 - direct API-key and shared Google auth configuration
 - service-selector validation, base URL policy, timeout, retry, provider error, and secretless credential-injection behavior
 - Data API search, video, channel, playlist, comments, captions, transcript, summary analytics, caption upload, comment post, and video upload operations
-- bound capability-token verification and resource URI derivation during `invoke` and `simulate`
+- negotiated session authority, resource URI derivation, and bounded invocation accounting; simulation previews authorization without spending allowances
 - doctor, health, self-check, simulate, introspect, shutdown, redaction posture, and deterministic tests
 - drift around OAuth-only mutations, quota cost, upload protocol, and the analytics summary facade
 
@@ -97,6 +97,27 @@ The current YouTube README slice documents the existing runtime surface:
   - `youtube.read`
   - `youtube.write`
 - YouTube search results, comments, captions, transcripts, channel metadata, video metadata, analytics summaries, uploaded captions, uploaded video bytes, and provider errors can expose public but hostile content, private account state, or PII. Do not log API keys, bearer tokens, credential IDs, raw uploaded videos, raw transcripts/comments in shared artifacts, provider response bodies, or Google account identifiers.
+
+### Session And Invocation Budgets
+
+Configure before handshaking with protocol `2.0` or `2.0.0`. Request the capability families `youtube.read` and/or `youtube.write`; the handshake grants only declared families. Bind subsequent tokens to the returned `instance_id`, and send the negotiated zone and `fcp.youtube` identity in every invocation. A new handshake rotates the instance even when the signing key is unchanged. Every configure or handshake attempt revokes the previous authority, including failed attempts; shutdown revokes it as well. Moving configured credentials to another zone requires reconfiguration.
+
+Each admitted invocation consumes one signed `max_calls` allowance when present. Signed `max_bytes` measures the compact JSON bytes of the complete typed FCP request and response, including their metadata and capability token. It does not measure provider HTTP traffic or outer transport framing. The connector reserves response space before provider work, settles unused space after a successful response, and retains the full reservation on failure, cancellation, or an unknown outcome. A response that exceeds its allowance is withheld and produces a nonretryable outcome-unknown error; the connector does not replay the operation to obtain a smaller response.
+
+Runtime response ceilings are 16 MiB for ordinary operations, 128 MiB for `youtube.get_caption_transcript`, and 256 MiB for `youtube.get_transcript`. The larger transcript ceilings account for JSON escaping and repeated text representations within the existing download and transcript bounds. These ceilings do not preallocate buffers, and a signed byte allowance can impose a smaller limit. Simulation checks authorization and exhausted allowances without consuming them; an allowed preview does not reserve capacity or guarantee a later invocation will fit.
+
+Resource scopes come from the actual operation input. Caller-supplied resource lists cannot replace these checks. Batch video reads authorize every distinct requested video; transcript URLs resolve to the canonical 11-character video ID. Composite transcript and analytics reads retain the selected video or channel scope.
+
+| Operation target | Capability resource URI |
+| --- | --- |
+| Search | `youtube:search` |
+| Video reads, comments, caption listing/upload, derived transcripts | `youtube:video:<id>` |
+| Channel reads, channel playlists, analytics summary | `youtube:channel:<id>` |
+| Playlist items | `youtube:playlist:<id>` |
+| Direct caption download | `youtube:caption:<id>` |
+| Video upload | `youtube:uploads` |
+
+Opaque identifiers are limited to 1024 UTF-8 bytes and must be nonblank, contain no comma or control character, and differ from `.` and `..`. Reserved bytes are percent-encoded in resource URI components; ordinary alphanumeric, hyphen, underscore, period, and tilde bytes retain their spelling. Operation-specific restrictions, such as caption upload's narrower video-ID format, still apply. Derived transcripts accept up to 32 distinct normalized language tags of at most 64 bytes each; repeated tags are deduplicated. A supplied direct-caption `format` must be a nonblank string of at most 64 bytes.
 
 ## Network And Runtime Invariants
 
@@ -224,14 +245,14 @@ These are excluded on purpose:
 - direct-auth self-check through `GET /search?part=id&maxResults=1&q=test`
 - degraded credential-reference self-check until an egress proxy injects credentials
 - operation metadata, schemas, capabilities, risk levels, safety tiers, idempotency classes, and agent hints
-- bound capability-token verification during `invoke` and `simulate`
+- negotiated capability and resource checks during `invoke` and `simulate`, with atomic call and byte admission for actual invocations
 - provider/FCP error mapping and secret redaction
 
 The deterministic integration evidence is anchored on connector-local tests covering:
 
 - search, video, channel, playlist, comments, captions, transcript, and real multipart caption/video upload wire contracts
 - provider 401, 403, 404, 429, transport, retryable, and input-validation behavior
-- default-deny capability tokens, wrong capability rejection, missing constraints, resource URI derivation, simulation, unknown operation rejection, and lifecycle handlers
+- default-deny capability tokens, negotiated capability rejection, missing constraints, actual resource derivation, call and byte exhaustion, non-consuming simulation, session rotation, and lifecycle revocation
 - transcript parsing, video URL parsing, max segment/byte bounds, credential-reference degradation, doctor, health, self-check, introspection, and shutdown behavior
 
 ## Source Notes

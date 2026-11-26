@@ -18,6 +18,20 @@ use wiremock::{
     matchers::{method, path, query_param},
 };
 
+macro_rules! invoke_request {
+    ({ $($fields:tt)* }) => {{
+        let request: fcp_core::InvokeRequest = serde_json::from_value(json!({
+            "type": "invoke",
+            "id": "youtube-upload-fixture-request",
+            "connector_id": "fcp.youtube",
+            "zone_id": "z:work",
+            $($fields)*
+        }))
+        .expect("fixture must be a canonical InvokeRequest");
+        serde_json::to_value(request).expect("serialize invocation")
+    }};
+}
+
 fn video_response() -> Value {
     json!({
         "id": "video_12345",
@@ -41,15 +55,20 @@ fn oauth_client(server: &MockServer) -> YouTubeClient {
 
 async fn handshake(connector: &mut YouTubeConnector) -> Ed25519SigningKey {
     let key = Ed25519SigningKey::generate();
-    connector
+    let response = connector
         .handle_handshake(json!({
-            "protocol_version": "1.0.0", "zone": "z:work",
+            "protocol_version": "2.0.0", "zone": "z:work",
             "host_public_key": key.verifying_key().to_bytes(),
             "nonce": vec![0_u8; 32],
             "capabilities_requested": ["youtube.read", "youtube.write"],
         }))
         .await
         .unwrap();
+    assert_eq!(
+        response["instance_id"].as_str(),
+        Some(connector.instance_id())
+    );
+    assert_eq!(response["connector_id"], "fcp.youtube");
     key
 }
 
@@ -114,7 +133,7 @@ async fn authorized_invocation_sends_real_binary_multipart_with_oauth_or_credent
             "tags": ["demo", "雪"],
         });
         let denied = connector
-            .handle_invoke(json!({
+            .handle_invoke(invoke_request!({
                 "operation": "youtube.upload_video", "input": input,
                 "capability_token": token(&key, &connector, "youtube.read"),
             }))
@@ -127,7 +146,7 @@ async fn authorized_invocation_sends_real_binary_multipart_with_oauth_or_credent
         ));
         assert!(server.received_requests().await.unwrap().is_empty());
         let output = connector
-            .handle_invoke(json!({
+            .handle_invoke(invoke_request!({
                 "operation": "youtube.upload_video", "input": input,
                 "capability_token": token(&key, &connector, "youtube.write"),
             }))
@@ -228,7 +247,7 @@ async fn invalid_upload_inputs_and_api_key_mode_fail_before_http() {
         let mut input = base.clone();
         input[field] = value;
         let error = connector
-            .handle_invoke(json!({
+            .handle_invoke(invoke_request!({
                 "operation":"youtube.upload_video", "input":input,
                 "capability_token":token(&key, &connector, "youtube.write"),
             }))
@@ -245,7 +264,7 @@ async fn invalid_upload_inputs_and_api_key_mode_fail_before_http() {
         .unwrap();
     let key = handshake(&mut connector).await;
     let error = connector
-        .handle_invoke(json!({
+        .handle_invoke(invoke_request!({
             "operation":"youtube.upload_video", "input":base,
             "capability_token":token(&key, &connector, "youtube.write"),
         }))
@@ -254,7 +273,7 @@ async fn invalid_upload_inputs_and_api_key_mode_fail_before_http() {
     assert!(matches!(error, fcp_core::FcpError::Unauthorized { .. }));
     assert!(!error.to_string().contains("private-api-key"));
     let request = SimulateRequest::new(
-        ConnectorId::from_static("youtube"),
+        ConnectorId::from_static("fcp.youtube"),
         OperationId::from_static("youtube.upload_video"),
         fcp_core::ZoneId::work(),
         base,

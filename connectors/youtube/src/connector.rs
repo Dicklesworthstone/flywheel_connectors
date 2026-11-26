@@ -1,14 +1,15 @@
 //! FCP YouTube Connector implementation.
 
-use std::sync::Arc;
+use std::{fmt::Write as _, sync::Arc};
 
 use fcp_google_discovery::{ServiceAliasRegistry, auth::GoogleAuthSelection};
 use fcp_prelude::{
-    AgentHint, BaseConnector, CapabilityGrant, CapabilityId, CapabilityToken, CapabilityVerifier,
-    ConnectorId, EventCaps, FcpError, FcpResult, HandshakeRequest, HandshakeResponse,
-    IdempotencyClass, Introspection, OperationId, OperationInfo, RiskLevel, SafetyTier,
-    SelfCheckReport, SessionId, SimulateRequest, SimulateResponse,
+    AgentHint, BaseConnector, CapabilityId, ConnectorId, EventCaps, FcpError, FcpResult,
+    HandshakeRequest, IdempotencyClass, Introspection, InvokeRequest, InvokeResponse, OperationId,
+    OperationInfo, RiskLevel, SafetyTier, SelfCheckReport, SimulateRequest, SimulateResponse,
+    ZoneId,
 };
+use fcp_sdk::prelude::StandaloneSession;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -26,6 +27,18 @@ const DEFAULT_TRANSCRIPT_MAX_BYTES: usize = 262_144;
 const HARD_TRANSCRIPT_MAX_BYTES: usize = 10 * 1024 * 1024;
 const DEFAULT_TRANSCRIPT_MAX_SEGMENTS: usize = 1_000;
 const HARD_TRANSCRIPT_MAX_SEGMENTS: usize = 10_000;
+const MAX_RESOURCE_ID_BYTES: usize = 1_024;
+const MAX_TRANSCRIPT_LANGUAGES: usize = 32;
+const MAX_LANGUAGE_TAG_BYTES: usize = 64;
+const MAX_INVOKE_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
+// Caption downloads already have a 16 MiB provider-body ceiling. JSON string
+// escaping can expand each byte sixfold; include the FCP/provenance envelope.
+const MAX_CAPTION_INVOKE_RESPONSE_BYTES: u64 = 128 * 1024 * 1024;
+// A parsed transcript contains up to 10 MiB of text in three representations.
+// Worst-case JSON escaping consumes 180 MiB, plus metadata from the bounded
+// 16 MiB caption listing, 10,000 segment envelopes, and bounded language tags.
+// These are serialization ceilings, never preallocated buffers.
+const MAX_DERIVED_TRANSCRIPT_RESPONSE_BYTES: u64 = 256 * 1024 * 1024;
 const MANIFEST_TOML: &str = include_str!("../manifest.toml");
 
 /// Parsed and validated YouTube connector configuration.
@@ -184,8 +197,8 @@ pub struct YouTubeConnector {
     base: Arc<BaseConnector>,
     config: Option<YouTubeConfig>,
     client: Option<YouTubeClient>,
-    verifier: Option<CapabilityVerifier>,
-    session_id: Option<SessionId>,
+    authority: Option<StandaloneSession>,
+    bound_zone: Option<ZoneId>,
 }
 
 impl YouTubeConnector {
@@ -193,18 +206,28 @@ impl YouTubeConnector {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            base: Arc::new(BaseConnector::new(ConnectorId::from_static("youtube"))),
+            base: Arc::new(BaseConnector::new(ConnectorId::from_static("fcp.youtube"))),
             config: None,
             client: None,
-            verifier: None,
-            session_id: None,
+            authority: None,
+            bound_zone: None,
         }
     }
 
     /// Return this connector instance identifier for bound capability tokens.
     #[must_use]
     pub fn instance_id(&self) -> &str {
-        self.base.instance_id.as_str()
+        self.authority.as_ref().map_or_else(
+            || self.base.instance_id.as_str(),
+            |authority| authority.instance_id().as_str(),
+        )
+    }
+
+    fn invalidate_authority(&mut self) {
+        if let Some(authority) = &mut self.authority {
+            authority.invalidate();
+        }
+        self.base.set_handshaken(false);
     }
 
     #[must_use]
@@ -220,6 +243,14 @@ impl YouTubeConnector {
         &mut self,
         params: serde_json::Value,
     ) -> FcpResult<serde_json::Value> {
+        // A rejected credential replacement must revoke the old session too.
+        self.invalidate_authority();
+        self.base.set_configured(false);
+        self.config = None;
+        self.bound_zone = None;
+        if let Some(client) = self.client.take() {
+            client.shutdown();
+        }
         let config = YouTubeConfig::from_params(&params).await?;
 
         let mut client =
@@ -245,50 +276,45 @@ impl YouTubeConnector {
         &mut self,
         params: serde_json::Value,
     ) -> FcpResult<serde_json::Value> {
+        self.invalidate_authority();
+        if self.config.is_none() || self.client.is_none() {
+            return Err(FcpError::NotConfigured);
+        }
         let req: HandshakeRequest =
             serde_json::from_value(params).map_err(|e| FcpError::InvalidRequest {
                 code: 1003,
                 message: format!("Invalid handshake request: {e}"),
             })?;
 
-        self.verifier = Some(CapabilityVerifier::new(
-            req.host_public_key,
-            req.zone.clone(),
-            self.base.instance_id.clone(),
-        ));
-
-        let session_id = SessionId::new();
-        self.session_id = Some(session_id.clone());
-        self.base.set_handshaken(true);
-
-        let capabilities_granted: Vec<CapabilityGrant> = req
-            .capabilities_requested
-            .into_iter()
-            .map(|cap| CapabilityGrant {
-                capability: cap,
-                operation: None,
-            })
-            .collect();
-
-        let response = HandshakeResponse {
-            status: "accepted".into(),
-            capabilities_granted,
-            session_id,
-            manifest_hash: Self::manifest_hash(),
-            nonce: req.nonce,
-            event_caps: Some(EventCaps {
-                streaming: false,
-                replay: false,
-                min_buffer_events: 0,
-                requires_ack: false,
-            }),
-            auth_caps: None,
-            op_catalog_hash: None,
-        };
-
-        serde_json::to_value(response).map_err(|e| FcpError::Internal {
+        if self
+            .bound_zone
+            .as_ref()
+            .is_some_and(|zone| zone != &req.zone)
+        {
+            return Err(FcpError::CapabilityDenied {
+                capability: "youtube.handshake".into(),
+                reason: "Reconfigure before binding YouTube credentials to another zone".into(),
+            });
+        }
+        let zone = req.zone.clone();
+        let mut authority = StandaloneSession::new(MANIFEST_TOML)?;
+        let mut response = authority.handshake(req)?;
+        response.event_caps = Some(EventCaps {
+            streaming: false,
+            replay: false,
+            min_buffer_events: 0,
+            requires_ack: false,
+        });
+        let mut result = serde_json::to_value(response).map_err(|e| FcpError::Internal {
             message: format!("Failed to serialize response: {e}"),
-        })
+        })?;
+        result["instance_id"] = json!(authority.instance_id());
+        result["connector_id"] = json!("fcp.youtube");
+        result["protocol_version"] = json!("2.0");
+        self.authority = Some(authority);
+        self.bound_zone = Some(zone);
+        self.base.set_handshaken(true);
+        Ok(result)
     }
 
     /// Handle health check.
@@ -992,70 +1018,31 @@ impl YouTubeConnector {
                 message: format!("Invalid simulate request: {e}"),
             })?;
 
-        let capability = match youtube_capability_for_operation(req.operation.as_str()) {
-            Ok(capability) => capability,
-            Err(error) => {
-                let response =
-                    SimulateResponse::denied(req.id, error.to_string(), error.error_code());
-                return serde_json::to_value(response).map_err(|e| FcpError::Internal {
-                    message: format!("Failed to serialize response: {e}"),
+        let checked = (|| {
+            self.base.check_ready()?;
+            if req.r#type != "simulate" || req.id.0.is_empty() {
+                return Err(FcpError::InvalidRequest {
+                    code: 1003,
+                    message: "Simulation requires type simulate and a non-empty ID".into(),
                 });
             }
-        };
-
-        if let Some(client) = &self.client {
-            let auth_check = match req.operation.as_str() {
-                "youtube.upload_video" => client.require_video_upload_auth(),
-                "youtube.upload_caption" => client.require_caption_upload_auth(),
-                _ => Ok(()),
-            };
-            if let Err(error) = auth_check {
-                let error = error.to_fcp_error();
-                let response =
-                    SimulateResponse::denied(req.id, error.to_string(), error.error_code());
-                return serde_json::to_value(response).map_err(|e| FcpError::Internal {
-                    message: format!("Failed to serialize response: {e}"),
-                });
-            }
-        }
-
-        if let Err(error) = validate_youtube_input(req.operation.as_str(), &req.input) {
-            let response = SimulateResponse::denied(req.id, error.to_string(), error.error_code());
-            return serde_json::to_value(response).map_err(|e| FcpError::Internal {
-                message: format!("Failed to serialize response: {e}"),
-            });
-        }
-
-        if self.config.is_none() || self.client.is_none() {
-            let response = SimulateResponse::denied(
-                req.id,
-                "Connector is not configured",
-                FcpError::NotConfigured.error_code(),
-            );
-            return serde_json::to_value(response).map_err(|e| FcpError::Internal {
-                message: format!("Failed to serialize response: {e}"),
-            });
-        }
-
-        let Some(verifier) = &self.verifier else {
-            let response = SimulateResponse::denied(
-                req.id,
-                "Connector handshake not completed",
-                FcpError::NotHandshaken.error_code(),
-            );
-            return serde_json::to_value(response).map_err(|e| FcpError::Internal {
-                message: format!("Failed to serialize response: {e}"),
-            });
-        };
-
-        let resource_uris = youtube_resource_uris(req.operation.as_str(), &req.input);
-        let response = match verifier.verify_bound(
-            req.capability_token,
-            &capability,
-            &req.operation,
-            &resource_uris,
-        ) {
-            Ok(_) => SimulateResponse::allowed(req.id),
+            validate_youtube_input(req.operation.as_str(), &req.input)?;
+            self.validate_operation_auth(req.operation.as_str())?;
+            let resources = youtube_resource_uris(req.operation.as_str(), &req.input)?;
+            self.authority
+                .as_ref()
+                .ok_or(FcpError::NotHandshaken)?
+                .authorize(
+                    &req.connector_id,
+                    &req.zone_id,
+                    &req.operation,
+                    req.capability_token,
+                    &resources,
+                )?;
+            Ok(())
+        })();
+        let response = match checked {
+            Ok(()) => SimulateResponse::allowed(req.id),
             Err(error) => {
                 let is_grant_mismatch = matches!(
                     error,
@@ -1063,7 +1050,9 @@ impl YouTubeConnector {
                 );
                 let mut response =
                     SimulateResponse::denied(req.id, error.to_string(), error.error_code());
-                if is_grant_mismatch {
+                if is_grant_mismatch
+                    && let Ok(capability) = youtube_capability_for_operation(req.operation.as_str())
+                {
                     response = response.with_missing_capabilities(vec![capability.as_str().into()]);
                 }
                 response
@@ -1085,46 +1074,29 @@ impl YouTubeConnector {
         &self,
         params: serde_json::Value,
     ) -> FcpResult<serde_json::Value> {
-        let operation =
-            params
-                .get("operation")
-                .and_then(|v| v.as_str())
-                .ok_or(FcpError::InvalidRequest {
-                    code: 1003,
-                    message: "Missing operation".into(),
-                })?;
-
-        let input = params.get("input").cloned().unwrap_or(json!({}));
-
-        // Extract and verify capability token
-        let token_value = params
-            .get("capability_token")
-            .ok_or(FcpError::InvalidRequest {
+        let request: InvokeRequest =
+            serde_json::from_value(params).map_err(|_| FcpError::InvalidRequest {
                 code: 1003,
-                message: "Missing capability_token".into(),
+                message: "Invalid FCP invoke request".into(),
             })?;
-
-        let parsed_capability = serde_json::from_value::<CapabilityToken>(token_value.clone())
-            .map_err(|e| FcpError::InvalidRequest {
-                code: 1003,
-                message: format!("Invalid capability_token format: {e}"),
-            })?;
-
-        let op_id: OperationId = operation.parse().map_err(|_| FcpError::InvalidRequest {
-            code: 1003,
-            message: "Invalid operation ID format".into(),
-        })?;
-        let cap_id = youtube_capability_for_operation(operation)?;
-        if matches!(operation, "youtube.search" | "youtube.list_comments") {
-            validate_youtube_input(operation, &input)?;
-        }
-        let resource_uris = youtube_resource_uris(operation, &input);
         self.base.check_ready()?;
-
-        let verifier = self.verifier.as_ref().ok_or(FcpError::NotHandshaken)?;
-        verifier.verify_bound(parsed_capability, &cap_id, &op_id, &resource_uris)?;
-
-        match operation {
+        if request.deadline_ms == Some(0) {
+            return Err(FcpError::InvalidRequest {
+                code: 1003,
+                message: "Invocation deadline has expired".into(),
+            });
+        }
+        let operation = request.operation.as_str();
+        validate_youtube_input(operation, &request.input)?;
+        self.validate_operation_auth(operation)?;
+        let resources = youtube_resource_uris(operation, &request.input)?;
+        let admission = self
+            .authority
+            .as_ref()
+            .ok_or(FcpError::NotHandshaken)?
+            .admit_bounded(&request, &resources, youtube_response_limit(operation))?;
+        let input = request.input;
+        let result = match operation {
             "youtube.search" => self.invoke_search(input).await,
             "youtube.get_video" => self.invoke_get_video(input).await,
             "youtube.list_videos" => self.invoke_list_videos(input).await,
@@ -1142,7 +1114,33 @@ impl YouTubeConnector {
             _ => Err(FcpError::OperationNotGranted {
                 operation: operation.into(),
             }),
+        };
+        // Meter the exact successful envelope emitted by dispatch_raw_invoke,
+        // without cloning large transcript output. A provider failure retains
+        // its full reservation and original retry/unknown-outcome semantics.
+        match result {
+            Ok(value) => {
+                let mut response = InvokeResponse::ok(request.id, value);
+                admission.finish_response(&response)?;
+                response.result.take().ok_or_else(|| FcpError::Internal {
+                    message: "Completed invocation is missing its result".into(),
+                })
+            }
+            Err(error) => {
+                admission.finish_response(&InvokeResponse::error(request.id, error.clone()))?;
+                Err(error)
+            }
         }
+    }
+
+    fn validate_operation_auth(&self, operation: &str) -> FcpResult<()> {
+        let client = self.client.as_ref().ok_or(FcpError::NotConfigured)?;
+        match operation {
+            "youtube.upload_video" => client.require_video_upload_auth(),
+            "youtube.upload_caption" => client.require_caption_upload_auth(),
+            _ => Ok(()),
+        }
+        .map_err(|error| error.to_fcp_error())
     }
 
     // ── Operation implementations ─────────────────────────────────
@@ -1515,10 +1513,14 @@ impl YouTubeConnector {
 
     /// Handle shutdown.
     pub async fn handle_shutdown(
-        &self,
+        &mut self,
         _params: serde_json::Value,
     ) -> FcpResult<serde_json::Value> {
-        if let Some(client) = &self.client {
+        self.invalidate_authority();
+        self.base.set_configured(false);
+        self.config = None;
+        self.bound_zone = None;
+        if let Some(client) = self.client.take() {
             client.shutdown();
         }
         info!("YouTube connector shutting down");
@@ -1734,7 +1736,7 @@ fn push_language_preferences(value: &str, languages: &mut Vec<String>) -> FcpRes
         if language.is_empty() {
             continue;
         }
-        if !is_valid_language_tag(language) {
+        if language.len() > MAX_LANGUAGE_TAG_BYTES || !is_valid_language_tag(language) {
             return Err(FcpError::InvalidRequest {
                 code: 1003,
                 message: format!("Invalid language tag: {language}"),
@@ -1742,6 +1744,14 @@ fn push_language_preferences(value: &str, languages: &mut Vec<String>) -> FcpRes
         }
         let normalized = language.to_ascii_lowercase();
         if !languages.iter().any(|existing| existing == &normalized) {
+            if languages.len() >= MAX_TRANSCRIPT_LANGUAGES {
+                return Err(FcpError::InvalidRequest {
+                    code: 1003,
+                    message: format!(
+                        "At most {MAX_TRANSCRIPT_LANGUAGES} distinct languages are supported"
+                    ),
+                });
+            }
             languages.push(normalized);
         }
     }
@@ -2128,38 +2138,56 @@ fn youtube_list_pagination(
 }
 
 fn validate_youtube_input(operation: &str, input: &serde_json::Value) -> FcpResult<()> {
+    if !input.is_object() {
+        return Err(FcpError::InvalidRequest {
+            code: 1003,
+            message: "YouTube input must be an object".into(),
+        });
+    }
     match operation {
         "youtube.search" => {
             require_str(input, "query")?;
             youtube_list_pagination(input, 0, 50)?;
         }
         "youtube.list_comments" => {
-            require_str(input, "video_id")?;
+            youtube_resource_identifier(input, "video_id")?;
             youtube_list_pagination(input, 1, 100)?;
         }
         "youtube.get_video" | "youtube.get_captions" => {
-            require_str(input, "video_id")?;
+            youtube_resource_identifier(input, "video_id")?;
         }
         "youtube.list_videos" => {
-            require_str_array(input, "video_ids")?;
+            for video_id in require_str_array(input, "video_ids")? {
+                validate_youtube_resource_identifier(&video_id, "video_ids")?;
+            }
         }
         "youtube.get_channel" | "youtube.list_playlists" | "youtube.get_analytics" => {
-            require_str(input, "channel_id")?;
+            youtube_resource_identifier(input, "channel_id")?;
         }
         "youtube.list_playlist_items" => {
-            require_str(input, "playlist_id")?;
+            youtube_resource_identifier(input, "playlist_id")?;
         }
         "youtube.post_comment" => {
-            require_str(input, "video_id")?;
+            youtube_resource_identifier(input, "video_id")?;
             require_str(input, "text")?;
         }
         "youtube.get_caption_transcript" => {
-            require_str(input, "caption_id")?;
+            youtube_resource_identifier(input, "caption_id")?;
+            if let Some(format) = input.get("format") {
+                format
+                    .as_str()
+                    .filter(|format| !format.trim().is_empty() && format.len() <= 64)
+                    .ok_or_else(|| FcpError::InvalidRequest {
+                        code: 1003,
+                        message: "format must be a nonblank string of at most 64 bytes".into(),
+                    })?;
+            }
         }
         "youtube.get_transcript" => {
             parse_transcript_request(input)?;
         }
         "youtube.upload_caption" => {
+            youtube_resource_identifier(input, "video_id")?;
             let upload = parse_caption_upload_input(input)?;
             crate::client::prepare_caption_upload(
                 upload.video_id,
@@ -2190,7 +2218,48 @@ fn validate_youtube_input(operation: &str, input: &serde_json::Value) -> FcpResu
     Ok(())
 }
 
-fn youtube_resource_uris(operation: &str, input: &serde_json::Value) -> Vec<String> {
+fn youtube_resource_identifier<'a>(
+    input: &'a serde_json::Value,
+    field: &str,
+) -> FcpResult<&'a str> {
+    let value = require_str(input, field)?;
+    validate_youtube_resource_identifier(value, field)?;
+    Ok(value)
+}
+
+fn validate_youtube_resource_identifier(value: &str, field: &str) -> FcpResult<()> {
+    if value.trim().is_empty()
+        || value.len() > MAX_RESOURCE_ID_BYTES
+        || matches!(value, "." | "..")
+        || value.contains(',')
+        || value.chars().any(char::is_control)
+    {
+        return Err(FcpError::InvalidRequest {
+            code: 1003,
+            message: format!(
+                "{field} must be one nonblank resource identifier of at most {MAX_RESOURCE_ID_BYTES} bytes without commas, dot segments or controls"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn youtube_resource_component(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            write!(encoded, "%{byte:02X}").expect("writing into a String cannot fail");
+        }
+    }
+    encoded
+}
+
+/// Derive every caller-selected target from the operation's actual input.
+/// Composite transcript/analytics operations retain their video/channel scope;
+/// provider-discovered child IDs are not alternate caller authorization inputs.
+fn youtube_resource_uris(operation: &str, input: &serde_json::Value) -> FcpResult<Vec<String>> {
     let mut resource_uris = Vec::new();
     let mut push_unique = |uri: String| {
         if !resource_uris.contains(&uri) {
@@ -2205,42 +2274,55 @@ fn youtube_resource_uris(operation: &str, input: &serde_json::Value) -> Vec<Stri
         | "youtube.post_comment"
         | "youtube.get_captions"
         | "youtube.upload_caption" => {
-            if let Some(video_id) = input.get("video_id").and_then(|value| value.as_str()) {
-                push_unique(format!("youtube:video:{video_id}"));
-            }
+            let video_id =
+                youtube_resource_component(youtube_resource_identifier(input, "video_id")?);
+            push_unique(format!("youtube:video:{video_id}"));
         }
         "youtube.list_videos" => {
-            if let Some(video_ids) = input.get("video_ids").and_then(|value| value.as_array()) {
-                for video_id in video_ids.iter().filter_map(|value| value.as_str()) {
-                    push_unique(format!("youtube:video:{video_id}"));
-                }
+            for video_id in require_str_array(input, "video_ids")? {
+                validate_youtube_resource_identifier(&video_id, "video_ids")?;
+                push_unique(format!(
+                    "youtube:video:{}",
+                    youtube_resource_component(&video_id)
+                ));
             }
         }
         "youtube.get_channel" | "youtube.list_playlists" | "youtube.get_analytics" => {
-            if let Some(channel_id) = input.get("channel_id").and_then(|value| value.as_str()) {
-                push_unique(format!("youtube:channel:{channel_id}"));
-            }
+            let channel_id =
+                youtube_resource_component(youtube_resource_identifier(input, "channel_id")?);
+            push_unique(format!("youtube:channel:{channel_id}"));
         }
         "youtube.list_playlist_items" => {
-            if let Some(playlist_id) = input.get("playlist_id").and_then(|value| value.as_str()) {
-                push_unique(format!("youtube:playlist:{playlist_id}"));
-            }
+            let playlist_id =
+                youtube_resource_component(youtube_resource_identifier(input, "playlist_id")?);
+            push_unique(format!("youtube:playlist:{playlist_id}"));
         }
         "youtube.get_caption_transcript" => {
-            if let Some(caption_id) = input.get("caption_id").and_then(|value| value.as_str()) {
-                push_unique(format!("youtube:caption:{caption_id}"));
-            }
+            let caption_id =
+                youtube_resource_component(youtube_resource_identifier(input, "caption_id")?);
+            push_unique(format!("youtube:caption:{caption_id}"));
         }
         "youtube.get_transcript" => {
-            if let Ok(video_id) = youtube_video_id_from_input(input) {
-                push_unique(format!("youtube:video:{video_id}"));
-            }
+            let video_id = youtube_video_id_from_input(input)?;
+            push_unique(format!("youtube:video:{video_id}"));
         }
         "youtube.upload_video" => push_unique("youtube:uploads".to_string()),
-        _ => {}
+        _ => {
+            return Err(FcpError::OperationNotGranted {
+                operation: operation.into(),
+            });
+        }
     }
 
-    resource_uris
+    Ok(resource_uris)
+}
+
+fn youtube_response_limit(operation: &str) -> u64 {
+    match operation {
+        "youtube.get_caption_transcript" => MAX_CAPTION_INVOKE_RESPONSE_BYTES,
+        "youtube.get_transcript" => MAX_DERIVED_TRANSCRIPT_RESPONSE_BYTES,
+        _ => MAX_INVOKE_RESPONSE_BYTES,
+    }
 }
 
 #[allow(clippy::fn_params_excessive_bools)]
@@ -2275,6 +2357,7 @@ fn op_info(
 mod tests {
     use super::*;
     use chrono::{Duration, Utc};
+    use fcp_core::CapabilityToken;
     use fcp_crypto::cose::CapabilityTokenBuilder;
     use fcp_crypto::ed25519::Ed25519SigningKey;
     use fcp_manifest::ConnectorManifest;
@@ -2300,7 +2383,7 @@ mod tests {
             .operations(operations)
             .issuer("node:test")
             .validity(now, now + Duration::hours(1))
-            .target_instance(connector.base.instance_id.as_str())
+            .target_instance(connector.instance_id())
             .try_constraints_cbor(&cbor)
             .expect("constraints CBOR should validate")
             .sign(signing_key)
@@ -2323,7 +2406,7 @@ mod tests {
         capability: CapabilityToken,
     ) -> serde_json::Value {
         serde_json::to_value(SimulateRequest::new(
-            ConnectorId::from_static("youtube"),
+            ConnectorId::from_static("fcp.youtube"),
             OperationId::from_static(operation),
             fcp_core::ZoneId::work(),
             input,
@@ -2354,7 +2437,7 @@ mod tests {
         let verifying_key = signing_key.verifying_key();
         connector
             .handle_handshake(json!({
-                "protocol_version": "1.0.0",
+                "protocol_version": "2.0.0",
                 "zone": "z:work",
                 "host_public_key": verifying_key.to_bytes(),
                 "nonce": vec![0u8; 32],
@@ -2367,10 +2450,10 @@ mod tests {
 
     #[fcp_async_core::runtime::test]
     async fn test_handshake() {
-        let mut connector = YouTubeConnector::new();
+        let mut connector = configured_connector().await;
         let result = connector
             .handle_handshake(json!({
-                "protocol_version": "1.0.0",
+                "protocol_version": "2.0.0",
                 "zone": "z:work",
                 "host_public_key": vec![0u8; 32],
                 "nonce": vec![0u8; 32],
@@ -2380,6 +2463,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(result["status"], "accepted");
+        assert_eq!(result["instance_id"], connector.instance_id());
+        assert_eq!(result["connector_id"], "fcp.youtube");
+        assert_eq!(result["manifest_hash"], YouTubeConnector::manifest_hash());
     }
 
     #[test]
@@ -2409,21 +2495,24 @@ mod tests {
         let signing_key = Ed25519SigningKey::generate();
         let verifying_key = signing_key.verifying_key();
 
-        connector
+        let handshake_error = connector
             .handle_handshake(json!({
-                "protocol_version": "1.0.0",
+                "protocol_version": "2.0.0",
                 "zone": "z:work",
                 "host_public_key": verifying_key.to_bytes(),
                 "nonce": vec![0u8; 32],
-                "capabilities_requested": ["youtube.get_video"]
+                "capabilities_requested": ["youtube.read"]
             }))
             .await
-            .unwrap();
+            .unwrap_err();
+        assert!(matches!(handshake_error, FcpError::NotConfigured));
 
         let capability = generate_valid_token(&signing_key, &connector, "youtube.get_video");
 
         let result = connector
             .handle_invoke(json!({
+                "type": "invoke", "id": "unconfigured-video",
+                "connector_id": "fcp.youtube", "zone_id": "z:work",
                 "operation": "youtube.get_video",
                 "input": { "video_id": "dQw4w9WgXcQ" },
                 "capability_token": capability
@@ -2450,11 +2539,11 @@ mod tests {
 
         connector
             .handle_handshake(json!({
-                "protocol_version": "1.0.0",
+                "protocol_version": "2.0.0",
                 "zone": "z:work",
                 "host_public_key": verifying_key.to_bytes(),
                 "nonce": vec![0u8; 32],
-                "capabilities_requested": ["youtube.search"]
+                "capabilities_requested": ["youtube.read"]
             }))
             .await
             .unwrap();
@@ -2463,6 +2552,8 @@ mod tests {
 
         let result = connector
             .handle_invoke(json!({
+                "type": "invoke", "id": "invalid-search-input",
+                "connector_id": "fcp.youtube", "zone_id": "z:work",
                 "operation": "youtube.search",
                 "input": {},
                 "capability_token": capability
@@ -2622,6 +2713,8 @@ mod tests {
         let capability = generate_valid_token(&signing_key, &connector, "youtube.search");
         let error = connector
             .handle_invoke(json!({
+                "type": "invoke", "id": "unhandshaken-search",
+                "connector_id": "fcp.youtube", "zone_id": "z:work",
                 "operation": "youtube.search",
                 "input": { "query": "rust" },
                 "capability_token": capability
@@ -2659,45 +2752,184 @@ mod tests {
     #[test]
     fn youtube_resource_uris_bind_operation_targets() {
         assert_eq!(
-            youtube_resource_uris("youtube.search", &json!({ "query": "rust" })),
+            youtube_resource_uris("youtube.search", &json!({ "query": "rust" })).unwrap(),
             vec!["youtube:search"]
         );
         assert_eq!(
             youtube_resource_uris(
                 "youtube.list_videos",
                 &json!({ "video_ids": ["v1", "v2", "v1"] })
-            ),
+            )
+            .unwrap(),
             vec!["youtube:video:v1", "youtube:video:v2"]
         );
         assert_eq!(
-            youtube_resource_uris("youtube.list_playlists", &json!({ "channel_id": "c1" })),
+            youtube_resource_uris("youtube.list_playlists", &json!({ "channel_id": "c1" }))
+                .unwrap(),
             vec!["youtube:channel:c1"]
         );
         assert_eq!(
             youtube_resource_uris(
                 "youtube.list_playlist_items",
                 &json!({ "playlist_id": "pl1" })
-            ),
+            )
+            .unwrap(),
             vec!["youtube:playlist:pl1"]
         );
         assert_eq!(
             youtube_resource_uris(
                 "youtube.get_caption_transcript",
                 &json!({ "caption_id": "cap1" })
-            ),
+            )
+            .unwrap(),
             vec!["youtube:caption:cap1"]
         );
         assert_eq!(
             youtube_resource_uris(
                 "youtube.get_transcript",
                 &json!({ "video_url": "https://youtu.be/dQw4w9WgXcQ" })
-            ),
+            )
+            .unwrap(),
             vec!["youtube:video:dQw4w9WgXcQ"]
         );
         assert_eq!(
-            youtube_resource_uris("youtube.upload_video", &json!({})),
+            youtube_resource_uris("youtube.upload_video", &json!({})).unwrap(),
             vec!["youtube:uploads"]
         );
+    }
+
+    #[test]
+    fn resource_derivation_rejects_ambiguous_ids_and_escapes_opaque_segments() {
+        for invalid in ["", " \t", ".", "..", "allowed,denied", "video\nother"] {
+            for (operation, field) in [
+                ("youtube.get_video", "video_id"),
+                ("youtube.get_channel", "channel_id"),
+                ("youtube.list_playlist_items", "playlist_id"),
+                ("youtube.get_caption_transcript", "caption_id"),
+            ] {
+                let mut input = json!({});
+                input[field] = json!(invalid);
+                assert!(
+                    youtube_resource_uris(operation, &input).is_err(),
+                    "{operation}: {invalid:?}"
+                );
+            }
+            assert!(
+                youtube_resource_uris(
+                    "youtube.list_videos",
+                    &json!({ "video_ids": ["allowed", invalid] })
+                )
+                .is_err()
+            );
+        }
+        assert!(youtube_resource_uris("youtube.list_videos", &json!({ "video_ids": [] })).is_err());
+        assert!(youtube_resource_uris("youtube.get_video", &json!({})).is_err());
+        assert!(
+            youtube_resource_uris(
+                "youtube.get_video",
+                &json!({ "video_id": "x".repeat(MAX_RESOURCE_ID_BYTES + 1) })
+            )
+            .is_err()
+        );
+        assert_eq!(
+            youtube_resource_uris(
+                "youtube.get_caption_transcript",
+                &json!({ "caption_id": "opaque/a:*?雪" })
+            )
+            .unwrap(),
+            vec!["youtube:caption:opaque%2Fa%3A%2A%3F%E9%9B%AA"]
+        );
+        assert_eq!(
+            youtube_resource_uris(
+                "youtube.get_video",
+                &json!({ "video_id": "video-with_opaque~id" })
+            )
+            .unwrap(),
+            vec!["youtube:video:video-with_opaque~id"]
+        );
+    }
+
+    #[test]
+    fn transcript_language_metadata_has_a_finite_echo_bound() {
+        let exact: Vec<String> = (0..MAX_TRANSCRIPT_LANGUAGES)
+            .map(|index| format!("x-{index}"))
+            .collect();
+        let (accepted, explicit) =
+            parse_language_preferences(&json!({ "languages": exact })).unwrap();
+        assert!(explicit);
+        assert_eq!(accepted.len(), MAX_TRANSCRIPT_LANGUAGES);
+        let (duplicates, _) = parse_language_preferences(&json!({
+            "languages": vec!["en"; MAX_TRANSCRIPT_LANGUAGES + 1]
+        }))
+        .unwrap();
+        assert_eq!(duplicates, vec!["en"]);
+        assert!(
+            parse_language_preferences(&json!({
+                "language": "a".repeat(MAX_LANGUAGE_TAG_BYTES + 1)
+            }))
+            .is_err()
+        );
+        assert!(
+            parse_language_preferences(&json!({
+                "languages": exact, "language": "another"
+            }))
+            .is_err()
+        );
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn derived_transcript_response_preserves_the_advertised_ten_mib_text_limit() {
+        let (connector, signing_key) = handshaken_connector().await;
+        let capability = generate_valid_token(&signing_key, &connector, "youtube.get_transcript");
+        let request: InvokeRequest = serde_json::from_value(json!({
+            "type": "invoke", "id": "large-derived-transcript",
+            "connector_id": "fcp.youtube", "zone_id": "z:work",
+            "operation": "youtube.get_transcript",
+            "input": { "video_id": "dQw4w9WgXcQ", "max_bytes": HARD_TRANSCRIPT_MAX_BYTES },
+            "capability_token": capability
+        }))
+        .unwrap();
+        let resources = youtube_resource_uris(request.operation.as_str(), &request.input).unwrap();
+        let authority = connector.authority.as_ref().unwrap();
+        let ordinary = authority
+            .admit_bounded(&request, &resources, MAX_INVOKE_RESPONSE_BYTES)
+            .unwrap();
+        let transcript = authority
+            .admit_bounded(
+                &request,
+                &resources,
+                youtube_response_limit(request.operation.as_str()),
+            )
+            .unwrap();
+        // The operation returns the same text in all three fields. A general
+        // 16 MiB response limit would reject a supported 10 MiB transcript.
+        let mut output = serde_json::Map::new();
+        output.insert(
+            "full_text".into(),
+            serde_json::Value::String("x".repeat(HARD_TRANSCRIPT_MAX_BYTES)),
+        );
+        output.insert(
+            "timestamped_text".into(),
+            serde_json::Value::String("x".repeat(HARD_TRANSCRIPT_MAX_BYTES)),
+        );
+        let mut segment = serde_json::Map::new();
+        segment.insert(
+            "text".into(),
+            serde_json::Value::String("x".repeat(HARD_TRANSCRIPT_MAX_BYTES)),
+        );
+        output.insert(
+            "segments".into(),
+            serde_json::Value::Array(vec![serde_json::Value::Object(segment)]),
+        );
+        let response = InvokeResponse::ok(request.id, serde_json::Value::Object(output));
+        assert!(matches!(
+            ordinary.finish_response(&response),
+            Err(FcpError::External {
+                retryable: false,
+                ..
+            })
+        ));
+        transcript.finish_response(&response).unwrap();
     }
 
     #[test]
