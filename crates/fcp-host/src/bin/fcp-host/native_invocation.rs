@@ -50,6 +50,8 @@ impl NativeInvocationTermination {
         let waiter = NativeInvocationWaiter {
             invocation: invocation.clone(),
             returned: false,
+            cancelled: false,
+            returned_normally: false,
         };
         async move {
             let mut waiter = waiter;
@@ -62,20 +64,31 @@ impl NativeInvocationTermination {
                 // Retain one cancellation/deadline waiter and the same pinned
                 // operation. No polling timer, detached task, or retry is added.
                 match select(cancelled.as_mut(), guarded.as_mut()).await {
-                    Either::Left(_) => Err(stopped()),
-                    Either::Right((result, _)) => result,
+                    Either::Left(_) => {
+                        waiter.cancelled = true;
+                        Err(stopped())
+                    }
+                    Either::Right((result, _)) => {
+                        waiter.cancelled = invocation.is_cancel_requested();
+                        result
+                    }
                 }
             };
             // Drop the operation before examining its RPCs. Retirement may
             // outlive this waiter, but its registration must retain custody.
             let settlement = invocation.ensure_settled().await;
             waiter.returned = true;
+            // Cancellation may first arrive while draining. Preserve that
+            // observation even if retirement remains pending after its grace.
+            waiter.cancelled |= invocation.is_cancel_requested();
             settlement?;
             // Draining selected work is part of the invocation boundary, not
             // a grace period in which an expired result becomes valid again.
             if invocation.is_cancel_requested() {
+                waiter.cancelled = true;
                 Err(stopped())
             } else {
+                waiter.returned_normally = true;
                 result
             }
         }
@@ -228,6 +241,103 @@ mod tests {
         assert_eq!(diagnostic, stopped().to_string());
         assert!(!diagnostic.contains("private-response-marker"));
         assert!(!diagnostic.contains("private-error-marker"));
+    }
+
+
+    fn cancellation_request(id: &str) -> fcp_host::CancellationRequest {
+        fcp_host::CancellationRequest {
+            operation_id: id.to_owned(),
+            reason: fcp_host::CancelReason::UserRequested,
+            cleanup: fcp_host::CleanupBehavior::Checkpoint,
+            return_partial: true,
+            capability_token: None,
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn actual_native_cancellation_is_reported_only_after_runtime_settlement() {
+        let (controller, invocation) = tracked("reported-cancel");
+        let request = cancellation_request("reported-cancel");
+        let accepted = controller
+            .cancel(&request, Some("owner"), chrono::Utc::now())
+            .unwrap();
+        assert_eq!(accepted.outcome, fcp_host::CancellationOutcome::Pending);
+        let result = invocation
+            .invoke(async {
+                invocation.cancel();
+                Ok(response())
+            })
+            .await;
+        assert_stopped(result);
+        assert!(invocation.is_finished());
+        let completed = controller
+            .cancel(&request, Some("owner"), chrono::Utc::now())
+            .unwrap();
+        assert_eq!(completed.outcome, fcp_host::CancellationOutcome::Cancelled);
+        assert!(completed.partial_result.is_none());
+        assert!(completed.checkpoint.is_none());
+        assert!(completed.cleanup_result.is_none());
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn request_flag_cannot_relabel_a_normally_returned_native_response() {
+        let (controller, invocation) = tracked("returned-success");
+        let request = cancellation_request("returned-success");
+        let result = invocation
+            .invoke(async {
+                let accepted = controller
+                    .cancel(&request, Some("owner"), chrono::Utc::now())
+                    .unwrap();
+                assert_eq!(accepted.outcome, fcp_host::CancellationOutcome::Pending);
+                // The request has not yet stopped this invocation. Its known
+                // successful response must remain authoritative.
+                Ok(response())
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.status, fcp_kernel::InvokeStatus::Ok);
+        let completed = controller
+            .cancel(&request, Some("owner"), chrono::Utc::now())
+            .unwrap();
+        assert_eq!(completed.outcome, fcp_host::CancellationOutcome::TooLate);
+        assert!(completed.cleanup_result.is_none());
+        assert!(completed.checkpoint.is_none());
+    }
+
+    #[test]
+    fn late_abort_after_normal_result_selection_cannot_publish_a_forced_outcome() {
+        let (controller, invocation) = tracked("late-return");
+        let request = cancellation_request("late-return");
+        controller
+            .cancel(&request, Some("owner"), chrono::Utc::now())
+            .unwrap();
+        let expired = controller.reap_expired(Instant::now() + Duration::from_secs(2));
+        assert_eq!(expired.len(), 1);
+        let terminator = expired[0].terminator.as_ref().unwrap();
+
+        // Reproduce the final return selection followed by an abort before
+        // waiter Drop publishes settlement. No scheduler timing is required.
+        let selected_response = response();
+        let waiter = NativeInvocationWaiter {
+            invocation: invocation.clone(),
+            returned: true,
+            cancelled: false,
+            returned_normally: true,
+        };
+        assert!(terminator.abort());
+        assert!(!terminator.is_finished());
+        drop(waiter);
+        assert!(terminator.is_finished());
+        assert!(!controller.record_forced_expiration(&expired[0], chrono::Utc::now()));
+        assert_eq!(selected_response.status, fcp_kernel::InvokeStatus::Ok);
+        let completed = controller
+            .cancel(&request, Some("owner"), chrono::Utc::now())
+            .unwrap();
+        assert_eq!(completed.outcome, fcp_host::CancellationOutcome::TooLate);
+        assert!(controller.audit_events().iter().all(|event| !event.forced));
+        assert!(completed.partial_result.is_none());
+        assert!(completed.checkpoint.is_none());
+        assert!(completed.cleanup_result.is_none());
     }
 
     #[fcp_async_core::runtime::test]
