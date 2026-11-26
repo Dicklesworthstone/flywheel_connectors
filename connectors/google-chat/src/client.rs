@@ -437,7 +437,7 @@ impl ChatClient {
                 None => ChatError::Http(error),
             });
         }
-        if let Some(operation) = write.filter(|_| status.is_server_error() || code == 408) {
+        if let Some(operation) = write.filter(|_| status.is_redirection() || status.is_server_error() || code == 408) {
             return Err(ChatError::WriteOutcomeUnknown { operation, status_code: Some(code) });
         }
         let retry_floor = retry_after_ms(resp.headers().get_all(reqwest::header::RETRY_AFTER).iter().filter_map(|v| v.to_str().ok()));

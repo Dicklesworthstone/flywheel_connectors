@@ -540,7 +540,7 @@ async fn compound_media_send_records_which_write_completed() {
 
     let op = "chat.send_media_message";
     let token = "opaque-upload-token";
-    for (upload_status, send_status, expected_count) in [(429, 0, 1), (500, 0, 1), (200, 429, 2), (200, 500, 2), (200, 200, 2)] {
+    for (upload_status, send_status, expected_count) in [(429, 0, 1), (500, 0, 1), (200, 429, 2), (200, 303, 2), (200, 500, 2), (200, 200, 2)] {
         let server = MockServer::start().await;
         let upload = if upload_status == 200 {
             json!({"attachmentDataRef": {"attachmentUploadToken": token}})
@@ -554,7 +554,9 @@ async fn compound_media_send_records_which_write_completed() {
         if send_status != 0 {
             Mock::given(method("POST"))
                 .and(path("/adapter/spaces/AAAA/messages"))
-                .respond_with(ResponseTemplate::new(send_status).set_body_json(json!({"error":{"code":429,"message":token}})))
+                .respond_with(ResponseTemplate::new(send_status)
+                    .insert_header("Location", format!("{}/redirected", server.uri()))
+                    .set_body_json(json!({"error":{"code":429,"message":token}})))
                 .expect(1).mount(&server).await;
         }
         // The configured prefix deliberately does not end in /v1. Upload
