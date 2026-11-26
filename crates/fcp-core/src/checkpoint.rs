@@ -13,7 +13,7 @@
 //! 5. **Finalization**: Once n-f signatures collected, checkpoint published
 //! 6. **Fork Detection**: Same `zone_id` + same seq + different `checkpoint_id` = fork
 
-use std::{collections::BTreeSet, fmt};
+use std::{borrow::Cow, collections::BTreeSet, fmt};
 
 use fcp_cbor::{CanonicalSerializer, SchemaId, SerializationError};
 use semver::Version;
@@ -371,6 +371,23 @@ pub enum CheckpointTransferEncoding {
 }
 
 impl CheckpointTransferEncoding {
+    /// Check the wire payload against its content IDs before decoding or attesting to it.
+    pub(crate) fn verified_payload(&self) -> Result<Cow<'_, [u8]>, CheckpointChunkError> {
+        match self {
+            Self::Inline { object_id, canonical_bytes } => {
+                let derived = ObjectId::from_unscoped_bytes(canonical_bytes);
+                if derived != *object_id {
+                    return Err(CheckpointChunkError::PayloadIntegrityMismatch {
+                        expected: *object_id,
+                        got: derived,
+                    });
+                }
+                Ok(Cow::Borrowed(canonical_bytes))
+            }
+            Self::Chunked(chunked) => reconstruct_chunked_payload(chunked).map(Cow::Owned),
+        }
+    }
+
     /// Get the content-addressed identifier for the full checkpoint payload.
     #[must_use]
     pub const fn object_id(&self) -> ObjectId {
@@ -491,22 +508,7 @@ impl ComputationCheckpoint {
     pub fn from_transfer_encoding(
         encoding: &CheckpointTransferEncoding,
     ) -> Result<Self, CheckpointChunkError> {
-        let canonical_bytes = match encoding {
-            CheckpointTransferEncoding::Inline {
-                object_id,
-                canonical_bytes,
-            } => {
-                let derived_object_id = ObjectId::from_unscoped_bytes(canonical_bytes);
-                if &derived_object_id != object_id {
-                    return Err(CheckpointChunkError::PayloadIntegrityMismatch {
-                        expected: *object_id,
-                        got: derived_object_id,
-                    });
-                }
-                canonical_bytes.clone()
-            }
-            CheckpointTransferEncoding::Chunked(chunked) => reconstruct_chunked_payload(chunked)?,
-        };
+        let canonical_bytes = encoding.verified_payload()?;
 
         Ok(CanonicalSerializer::deserialize(
             &canonical_bytes,
@@ -530,6 +532,8 @@ pub enum CheckpointChunkError {
     ChunkCountMismatch { expected: usize, got: usize },
     #[error("checkpoint payload length mismatch: expected {expected}, got {got}")]
     PayloadLengthMismatch { expected: usize, got: usize },
+    #[error("checkpoint chunk {index} length mismatch: expected {expected}, got {got}")]
+    ChunkLengthMismatch { index: usize, expected: usize, got: usize },
     #[error("checkpoint chunk {index} failed integrity validation")]
     ChunkIntegrityMismatch {
         index: usize,
@@ -586,6 +590,18 @@ pub fn reconstruct_chunked_payload(
         });
     }
 
+    let chunk_size = chunked.manifest.chunk_size_bytes as usize;
+    if chunk_size == 0 {
+        return Err(CheckpointChunkError::InvalidChunkSize);
+    }
+    let count = expected_total_bytes.div_ceil(chunk_size);
+    if count != expected_chunks {
+        return Err(CheckpointChunkError::ChunkCountMismatch {
+            expected: count,
+            got: expected_chunks,
+        });
+    }
+
     let mut payload = Vec::with_capacity(expected_total_bytes);
     for (index, (chunk, expected_object_id)) in chunked
         .chunks
@@ -593,6 +609,14 @@ pub fn reconstruct_chunked_payload(
         .zip(&chunked.manifest.chunk_object_ids)
         .enumerate()
     {
+        let expected = chunk_size.min(expected_total_bytes - payload.len());
+        if chunk.len() != expected {
+            return Err(CheckpointChunkError::ChunkLengthMismatch {
+                index,
+                expected,
+                got: chunk.len(),
+            });
+        }
         let derived_object_id = ObjectId::from_unscoped_bytes(chunk);
         if &derived_object_id != expected_object_id {
             return Err(CheckpointChunkError::ChunkIntegrityMismatch {

@@ -2160,19 +2160,13 @@ impl CheckpointExportArtifact {
             });
         }
 
-        let (encoding, total_bytes, chunk_count) = match transfer_encoding {
-            CheckpointTransferEncoding::Inline {
-                canonical_bytes, ..
-            } => (
-                CheckpointExportEncoding::Inline,
-                u64::try_from(canonical_bytes.len()).unwrap_or(u64::MAX),
-                1,
-            ),
-            CheckpointTransferEncoding::Chunked(chunked) => (
-                CheckpointExportEncoding::Chunked,
-                chunked.manifest.total_bytes,
-                chunked.manifest.chunk_count(),
-            ),
+        let verified = transfer_encoding.verified_payload()?;
+        let total_bytes = u64::try_from(verified.len()).unwrap_or(u64::MAX);
+        let (encoding, chunk_count) = match transfer_encoding {
+            CheckpointTransferEncoding::Inline { .. } => (CheckpointExportEncoding::Inline, 1),
+            CheckpointTransferEncoding::Chunked(chunked) => {
+                (CheckpointExportEncoding::Chunked, chunked.manifest.chunk_count())
+            }
         };
 
         Ok(Self {
@@ -2617,6 +2611,8 @@ pub enum ComputationMigrationError {
     ResumeFenceMismatch { expected: u64, got: u64 },
     #[error(transparent)]
     CheckpointEncoding(#[from] SerializationError),
+    #[error(transparent)]
+    CheckpointTransfer(#[from] crate::checkpoint::CheckpointChunkError),
     #[error(transparent)]
     LeaseValidation(#[from] LeaseValidationError),
     #[error(transparent)]
@@ -7526,6 +7522,48 @@ mod tests {
             }
         ));
         assert!(!freshness.allows_resume());
+    }
+
+    #[test]
+    fn checkpoint_export_certifies_the_transmitted_bytes_and_chunk_layout() {
+        let checkpoint = test_computation_checkpoint("holder", test_object_id("lease"), 7, 1);
+        let checkpoint_id = checkpoint.object_id().unwrap();
+        let export = |wire: &CheckpointTransferEncoding| {
+            CheckpointExportArtifact::from_transfer_encoding(&checkpoint, checkpoint_id, wire, None, None)
+        };
+
+        let mut inline = checkpoint.to_transfer_encoding(usize::MAX, 32).unwrap();
+        assert!(export(&inline).is_ok());
+        let CheckpointTransferEncoding::Inline { canonical_bytes, .. } = &mut inline else {
+            unreachable!()
+        };
+        canonical_bytes[0] ^= 1;
+        assert!(export(&inline).is_err());
+
+        let chunked = checkpoint.to_transfer_encoding(0, 32).unwrap();
+        let evidence = export(&chunked).unwrap();
+        assert_eq!(evidence.encoding, CheckpointExportEncoding::Chunked);
+        assert!(evidence.chunk_count > 1);
+        for corruption in 0..4 {
+            let mut wire = chunked.clone();
+            let CheckpointTransferEncoding::Chunked(parts) = &mut wire else { unreachable!() };
+            match corruption {
+                0 => parts.chunks[0][0] ^= 1,
+                1 => parts.manifest.total_bytes += 1,
+                2 => parts.manifest.chunk_size_bytes = 0,
+                _ => {
+                    // Preserve the entire payload and its digest, and recompute every
+                    // affected chunk ID, but move the declared segment boundary.
+                    let moved = parts.chunks[0].pop().unwrap();
+                    parts.chunks[1].insert(0, moved);
+                    for (id, bytes) in parts.manifest.chunk_object_ids.iter_mut().zip(&parts.chunks) {
+                        *id = ObjectId::from_unscoped_bytes(bytes);
+                    }
+                }
+            }
+            assert!(export(&wire).is_err());
+            assert!(ComputationCheckpoint::from_transfer_encoding(&wire).is_err());
+        }
     }
 
     #[test]
