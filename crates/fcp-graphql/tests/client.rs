@@ -363,6 +363,7 @@ async fn accept_test_websocket(mut stream: TcpStream) -> TestServerWebSocket {
         .await
         .expect("read websocket handshake");
     WebSocketAcceptor::new()
+        .protocol("graphql-transport-ws")
         .accept(&fcp_async_core::compatibility_cx(), &request, stream)
         .await
         .expect("accept websocket")
@@ -493,6 +494,261 @@ async fn subscription_rejects_wrong_id_complete_frame() {
             assert!(message.contains("stale-99"));
         }
         other => panic!("expected Protocol error, got {other:?}"),
+    }
+}
+
+#[fcp_async_core::runtime::test]
+async fn subscription_negotiates_protocol_and_handles_heartbeats_before_and_after_ack() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let server = task::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept");
+        let request = read_http_headers(&mut socket).await.expect("headers");
+        assert!(String::from_utf8_lossy(&request).lines().any(|line| {
+            line.split_once(':').is_some_and(|(name, value)| {
+                name.eq_ignore_ascii_case("sec-websocket-protocol")
+                    && value.trim() == "graphql-transport-ws"
+            })
+        }));
+        let mut ws = WebSocketAcceptor::new()
+            .protocol("graphql-transport-ws")
+            .accept(&fcp_async_core::compatibility_cx(), &request, socket)
+            .await
+            .expect("accept websocket");
+        let init: serde_json::Value =
+            serde_json::from_str(&recv_text(&mut ws, "init").await).expect("init JSON");
+        assert_eq!(init, serde_json::json!({"type": "connection_init"}));
+
+        send_json(
+            &mut ws,
+            serde_json::json!({"type": "ping", "payload": {"nonce": 19}}),
+            "pre-ack ping",
+        )
+        .await;
+        let pong: serde_json::Value =
+            serde_json::from_str(&recv_text(&mut ws, "pong").await).expect("pong JSON");
+        assert_eq!(
+            pong,
+            serde_json::json!({"type": "pong", "payload": {"nonce": 19}})
+        );
+        send_json(
+            &mut ws,
+            serde_json::json!({"type": "pong"}),
+            "unsolicited pre-ack pong",
+        )
+        .await;
+        ws.send(
+            &fcp_async_core::compatibility_cx(),
+            Message::Ping(vec![7, 9].into()),
+        )
+        .await
+        .expect("websocket ping");
+        let pong = ws
+            .recv(&fcp_async_core::compatibility_cx())
+            .await
+            .expect("websocket pong")
+            .expect("pong present");
+        assert!(matches!(pong, Message::Pong(bytes) if bytes.as_ref() == [7, 9]));
+        send_json(
+            &mut ws,
+            serde_json::json!({"type": "connection_ack", "payload": {"ready": true}}),
+            "ack",
+        )
+        .await;
+        let subscribe: serde_json::Value =
+            serde_json::from_str(&recv_text(&mut ws, "subscribe").await).expect("subscribe JSON");
+        assert_eq!(subscribe["type"], "subscribe");
+        assert_eq!(subscribe["id"], "1");
+        send_json(
+            &mut ws,
+            serde_json::json!({"type": "pong", "payload": {"alive": true}}),
+            "active unsolicited pong",
+        )
+        .await;
+        send_json(
+            &mut ws,
+            serde_json::json!({"type": "ping"}),
+            "active ping",
+        )
+        .await;
+        let pong: serde_json::Value =
+            serde_json::from_str(&recv_text(&mut ws, "active pong").await).expect("pong JSON");
+        assert_eq!(pong, serde_json::json!({"type": "pong"}));
+        send_json(
+            &mut ws,
+            serde_json::json!({
+                "type": "next", "id": "1",
+                "payload": {"data": {"viewer": {"id": "heartbeat-safe"}}}
+            }),
+            "next",
+        )
+        .await;
+        send_json(
+            &mut ws,
+            serde_json::json!({"type": "complete", "id": "1"}),
+            "complete",
+        )
+        .await;
+    });
+    let client = GraphqlSubscriptionClient::new(format!("ws://{addr}"), "test");
+    let run = async {
+        let mut events = client.subscribe::<ViewerQuery>(EmptyVars {}).await?;
+        let response = events.next().await.expect("one result")?;
+        assert_eq!(response.data.expect("data").viewer.id, "heartbeat-safe");
+        assert!(events.next().await.is_none());
+        Ok::<_, GraphqlClientError>(())
+    };
+    fcp_async_core::time::timeout(Duration::from_secs(3), run)
+        .await
+        .expect("bounded subscription")
+        .expect("valid protocol");
+    server.await.expect("server");
+}
+
+#[fcp_async_core::runtime::test]
+async fn subscription_requires_server_subprotocol_selection_before_authentication() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let server = task::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept");
+        let request = read_http_headers(&mut socket).await.expect("headers");
+        // An ordinary WebSocket upgrade deliberately selects no subprotocol.
+        let mut ws = WebSocketAcceptor::new()
+            .accept(&fcp_async_core::compatibility_cx(), &request, socket)
+            .await
+            .expect("accept websocket");
+        let cx = fcp_async_core::compatibility_cx();
+        let incoming = fcp_async_core::time::timeout(Duration::from_secs(2), ws.recv(&cx))
+            .await
+            .expect("client drops unnegotiated socket");
+        assert!(!matches!(
+            incoming,
+            Ok(Some(Message::Text(_) | Message::Binary(_)))
+        ));
+    });
+    let client = GraphqlSubscriptionClient::new(format!("ws://{addr}"), "test")
+        .with_config(GraphqlSubscriptionConfig {
+            init_payload: Some(serde_json::json!({"token": "never-send-this"})),
+            ..GraphqlSubscriptionConfig::default()
+        });
+    let error = match client.subscribe::<ViewerQuery>(EmptyVars {}).await {
+        Ok(_) => panic!("unnegotiated subprotocol must be rejected"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("subprotocol"));
+    server.await.expect("server");
+}
+
+#[fcp_async_core::runtime::test]
+async fn subscription_heartbeat_does_not_extend_ack_deadline() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let server = task::spawn(async move {
+        let (socket, _) = listener.accept().await.expect("accept");
+        let mut ws = accept_test_websocket(socket).await;
+        let _ = recv_text(&mut ws, "init").await;
+        let cx = fcp_async_core::compatibility_cx();
+        for _ in 0..30 {
+            if ws
+                .send(&cx, Message::text(r#"{"type":"ping"}"#))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            match ws.recv(&cx).await {
+                Ok(Some(Message::Text(text))) => {
+                    let value: serde_json::Value = serde_json::from_str(&text).expect("pong JSON");
+                    assert_eq!(value["type"], "pong", "must not subscribe before ack");
+                }
+                Ok(None) | Err(_) | Ok(Some(Message::Close(_))) => return,
+                other => panic!("unexpected heartbeat response {other:?}"),
+            }
+            fcp_async_core::time::sleep(Duration::from_millis(10)).await;
+        }
+    });
+    let client = GraphqlSubscriptionClient::new(format!("ws://{addr}"), "test")
+        .with_config(GraphqlSubscriptionConfig {
+            ack_timeout: Duration::from_millis(60),
+            ..GraphqlSubscriptionConfig::default()
+        });
+    let started = Instant::now();
+    let result = fcp_async_core::time::timeout(
+        Duration::from_secs(1),
+        client.subscribe::<ViewerQuery>(EmptyVars {}),
+    )
+    .await
+    .expect("handshake has one bounded deadline");
+    let error = match result {
+        Ok(_) => panic!("heartbeats cannot substitute for acknowledgement"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("connection_ack timeout"));
+    assert!(started.elapsed() < Duration::from_millis(500));
+    server.await.expect("server");
+}
+
+#[fcp_async_core::runtime::test]
+async fn subscription_rejects_malformed_ack_and_early_operation_frames() {
+    for frame in [
+        serde_json::json!({"type": "connection_ack", "payload": [1]}),
+        serde_json::json!({"type": "connection_ack", "id": "1"}),
+        serde_json::json!({"type": "ping", "payload": "bad"}),
+        serde_json::json!({"type": "pong", "payload": 42}),
+        serde_json::json!({"type": "next", "id": "1", "payload": {"data": {}}}),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = task::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("accept");
+            let mut ws = accept_test_websocket(socket).await;
+            let _ = recv_text(&mut ws, "init").await;
+            send_json(&mut ws, frame, "invalid handshake frame").await;
+            let cx = fcp_async_core::compatibility_cx();
+            let response = fcp_async_core::time::timeout(Duration::from_secs(2), ws.recv(&cx))
+                .await
+                .expect("client closes invalid handshake");
+            assert!(!matches!(
+                response,
+                Ok(Some(Message::Text(_) | Message::Binary(_)))
+            ));
+        });
+        let client = GraphqlSubscriptionClient::new(format!("ws://{addr}"), "test");
+        assert!(matches!(
+            client.subscribe::<ViewerQuery>(EmptyVars {}).await,
+            Err(GraphqlClientError::Protocol { .. })
+        ));
+        server.await.expect("server");
+    }
+}
+
+#[fcp_async_core::runtime::test]
+async fn subscription_rejects_invalid_local_handshake_before_connecting() {
+    let configs = [
+        GraphqlSubscriptionConfig {
+            ws: WsConfig::new().with_required_subprotocol("graphql-ws"),
+            ..GraphqlSubscriptionConfig::default()
+        },
+        GraphqlSubscriptionConfig {
+            init_payload: Some(serde_json::json!(["not-an-object"])),
+            ..GraphqlSubscriptionConfig::default()
+        },
+    ];
+    for config in configs {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let client = GraphqlSubscriptionClient::new(format!("ws://{addr}"), "test")
+            .with_config(config);
+        assert!(matches!(
+            client.subscribe::<ViewerQuery>(EmptyVars {}).await,
+            Err(GraphqlClientError::Protocol { .. })
+        ));
+        assert!(
+            fcp_async_core::time::timeout(Duration::from_millis(30), listener.accept())
+                .await
+                .is_err(),
+            "invalid local settings must not open a socket"
+        );
     }
 }
 

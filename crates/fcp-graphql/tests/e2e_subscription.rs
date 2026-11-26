@@ -101,6 +101,7 @@ async fn accept_websocket(mut stream: TcpStream) -> TestServerWebSocket {
         .await
         .expect("read websocket handshake");
     WebSocketAcceptor::new()
+        .protocol("graphql-transport-ws")
         .accept(&fcp_async_core::compatibility_cx(), &request, stream)
         .await
         .expect("accept websocket")

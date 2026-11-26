@@ -24,12 +24,13 @@ use crate::operation::{GraphqlOperation, GraphqlQueryLimits, GraphqlResponse};
 struct GraphqlWsMessage {
     #[serde(rename = "type")]
     message_type: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     id: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     payload: Option<serde_json::Value>,
 }
 
+const GRAPHQL_WEBSOCKET_SUBPROTOCOL: &str = "graphql-transport-ws";
 const SUBSCRIPTION_ID: &str = "1";
 const SUBSCRIPTION_RESULT_BUFFER_CAPACITY: usize = 16;
 
@@ -107,6 +108,27 @@ impl GraphqlSubscriptionClient {
         self.config.query_limits.validate(O::QUERY)?;
 
         let mut ws_config = self.config.ws.clone();
+        if ws_config
+            .required_subprotocol
+            .as_deref()
+            .is_some_and(|protocol| protocol != GRAPHQL_WEBSOCKET_SUBPROTOCOL)
+        {
+            return Err(GraphqlClientError::Protocol {
+                message: "GraphQL subscriptions require the graphql-transport-ws subprotocol"
+                    .to_owned(),
+            });
+        }
+        ws_config.required_subprotocol = Some(GRAPHQL_WEBSOCKET_SUBPROTOCOL.to_owned());
+        if self
+            .config
+            .init_payload
+            .as_ref()
+            .is_some_and(|payload| !payload.is_object() && !payload.is_null())
+        {
+            return Err(GraphqlClientError::Protocol {
+                message: "connection_init payload must be an object or null".to_owned(),
+            });
+        }
         for (key, value) in &self.headers {
             ws_config.headers.insert(key.clone(), value.clone());
         }
@@ -344,12 +366,28 @@ impl GraphqlSubscriptionClient {
                             break;
                         }
                         "ping" => {
-                            let pong = GraphqlWsMessage {
-                                message_type: "pong".to_string(),
-                                id: ws_msg.id.clone(),
-                                payload: ws_msg.payload.clone(),
-                            };
-                            let _ = conn.send_json(&pong).await;
+                            if let Err(err) = reply_to_ping(&mut conn, ws_msg).await {
+                                let _ = deliver_subscription_item(
+                                    &tx,
+                                    &mut conn,
+                                    &producer_terminal,
+                                    Err(err),
+                                )
+                                .await;
+                                break;
+                            }
+                        }
+                        "pong" => {
+                            if let Err(err) = validate_control_message(&ws_msg) {
+                                let _ = deliver_subscription_item(
+                                    &tx,
+                                    &mut conn,
+                                    &producer_terminal,
+                                    Err(err),
+                                )
+                                .await;
+                                break;
+                            }
                         }
                         _ => {
                             let _ = deliver_subscription_item(
@@ -497,32 +535,13 @@ async fn establish_subscription(
             message: format!("{service_name} connection_init failed: {err}"),
         })?;
 
-    let ack = Box::pin(time::timeout(ack_timeout, connection.recv())).await;
-    match ack {
-        Ok(Ok(Some(message))) => {
-            let ack_msg = decode_ws_message(message)?;
-            if ack_msg.message_type != "connection_ack" {
-                return Err(GraphqlClientError::Protocol {
-                    message: format!("expected connection_ack, got {}", ack_msg.message_type),
-                });
-            }
-        }
-        Ok(Ok(None)) => {
-            return Err(GraphqlClientError::Protocol {
-                message: "connection closed before ack".to_string(),
-            });
-        }
-        Ok(Err(err)) => {
-            return Err(GraphqlClientError::Protocol {
-                message: format!("{service_name} connection error: {err}"),
-            });
-        }
-        Err(_) => {
-            return Err(GraphqlClientError::Protocol {
-                message: format!("{service_name} connection_ack timeout"),
-            });
-        }
-    }
+    // GraphQL and WebSocket heartbeats are legal before acknowledgement.
+    // Bound the whole exchange once: heartbeats must not renew the deadline.
+    time::timeout(ack_timeout, receive_connection_ack(&mut connection))
+        .await
+        .map_err(|_| GraphqlClientError::Protocol {
+            message: format!("{service_name} connection_ack timeout"),
+        })??;
 
     let subscribe = GraphqlWsMessage {
         message_type: "subscribe".to_string(),
@@ -537,6 +556,74 @@ async fn establish_subscription(
         })?;
 
     Ok(connection)
+}
+
+async fn receive_connection_ack(connection: &mut WsConnection) -> Result<(), GraphqlClientError> {
+    loop {
+        let Some(message) = connection.recv().await.map_err(GraphqlClientError::from)? else {
+            return Err(GraphqlClientError::Protocol {
+                message: "connection closed before ack".to_owned(),
+            });
+        };
+        match message {
+            WsMessage::Ping(payload) => {
+                connection
+                    .send(WsMessage::Pong(payload))
+                    .await
+                    .map_err(GraphqlClientError::from)?;
+            }
+            WsMessage::Pong(_) => {}
+            message => {
+                let message = decode_ws_message(message)?;
+                match message.message_type.as_str() {
+                    "connection_ack" => return validate_control_message(&message),
+                    "ping" => reply_to_ping(connection, message).await?,
+                    "pong" => validate_control_message(&message)?,
+                    _ => {
+                        return Err(GraphqlClientError::Protocol {
+                            message: format!(
+                                "expected connection_ack, got {}",
+                                message.message_type
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn validate_control_message(message: &GraphqlWsMessage) -> Result<(), GraphqlClientError> {
+    if message.id.is_some()
+        || message
+            .payload
+            .as_ref()
+            .is_some_and(|payload| !payload.is_object() && !payload.is_null())
+    {
+        return Err(GraphqlClientError::Protocol {
+            message: format!(
+                "invalid {} control message: expected no operation id and an optional object payload",
+                message.message_type
+            ),
+        });
+    }
+    Ok(())
+}
+
+async fn reply_to_ping(
+    connection: &mut WsConnection,
+    ping: GraphqlWsMessage,
+) -> Result<(), GraphqlClientError> {
+    validate_control_message(&ping)?;
+    let pong = GraphqlWsMessage {
+        message_type: "pong".to_owned(),
+        id: None,
+        payload: ping.payload,
+    };
+    connection
+        .send_json(&pong)
+        .await
+        .map_err(GraphqlClientError::from)
 }
 
 async fn reconnect_connection(
@@ -690,8 +777,41 @@ mod tests {
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains(r#""type":"connection_init"#));
-        // None fields serialize as null (no skip_serializing_if on this struct)
-        assert!(json.contains("null"));
+        assert_eq!(json, r#"{"type":"connection_init"}"#);
+    }
+
+    #[test]
+    fn control_messages_reject_operation_ids_and_non_object_payloads() {
+        for kind in ["connection_ack", "ping", "pong"] {
+            for payload in [
+                None,
+                Some(serde_json::json!({})),
+                Some(serde_json::Value::Null),
+            ] {
+                let mut message = GraphqlWsMessage {
+                    message_type: kind.to_owned(),
+                    id: None,
+                    payload,
+                };
+                assert!(validate_control_message(&message).is_ok());
+                message.id = Some(SUBSCRIPTION_ID.to_owned());
+                assert!(validate_control_message(&message).is_err());
+            }
+            for payload in [
+                serde_json::json!([]),
+                serde_json::json!("secret-value"),
+                serde_json::json!(42),
+                serde_json::json!(true),
+            ] {
+                let message = GraphqlWsMessage {
+                    message_type: kind.to_owned(),
+                    id: None,
+                    payload: Some(payload),
+                };
+                let error = validate_control_message(&message).expect_err("invalid control shape");
+                assert!(!error.to_string().contains("secret-value"));
+            }
+        }
     }
 
     #[test]
