@@ -1442,17 +1442,43 @@ impl MigratableComputation {
         checkpoint_object_id: ObjectId,
     ) -> Result<(), ComputationMigrationError> {
         self.validate_checkpoint_contents(checkpoint, checkpoint_object_id)?;
-        if self
-            .checkpoint_object_id
-            .is_some_and(|expected| expected != checkpoint_object_id)
-        {
+        let expected = match &self.state {
+            MigratableComputationState::Suspended | MigratableComputationState::Transferring { .. } => {
+                Some(self.suspended_checkpoint()?)
+            }
+            _ => self.checkpoint_object_id,
+        };
+        if expected.is_some_and(|id| id != checkpoint_object_id) {
             return Err(ComputationMigrationError::CheckpointObjectMismatch {
-                expected: self.checkpoint_object_id,
+                expected,
                 got: checkpoint_object_id,
             });
         }
 
         Ok(())
+    }
+
+    // Older records can omit the capability-context pin. When both persisted
+    // pins exist, they must identify one boundary before it can be advanced.
+    fn validate_recorded_checkpoint_pins(&self) -> Result<(), ComputationMigrationError> {
+        let context = self.capability_context.checkpoint_id;
+        if let (Some(recorded), Some(bound)) = (self.checkpoint_object_id, context)
+            && recorded != bound
+        {
+            return Err(ComputationMigrationError::CheckpointObjectMismatch {
+                expected: Some(recorded),
+                got: bound,
+            });
+        }
+        Ok(())
+    }
+
+    fn suspended_checkpoint(&self) -> Result<ObjectId, ComputationMigrationError> {
+        let recorded = self
+            .checkpoint_object_id
+            .ok_or(ComputationMigrationError::MissingSuspendedCheckpoint)?;
+        self.validate_recorded_checkpoint_pins()?;
+        Ok(recorded)
     }
 
     /// Suspend a running computation onto a durable checkpoint.
@@ -1475,6 +1501,7 @@ impl MigratableComputation {
         self.validate_checkpoint_contents(checkpoint, checkpoint_object_id)?;
         // The last checkpoint remains pinned after resume. New work must extend
         // that boundary; an exact re-suspension can retain the same checkpoint.
+        self.validate_recorded_checkpoint_pins()?;
         let previous = self.checkpoint_object_id.or(self.capability_context.checkpoint_id);
         let advances = previous.is_some_and(|id| id != checkpoint_object_id);
         if advances && checkpoint.capability_context.checkpoint_id != previous {
@@ -1533,9 +1560,7 @@ impl MigratableComputation {
                 got: handoff.previous_lease_id,
             });
         }
-        let checkpoint = self
-            .checkpoint_object_id
-            .ok_or(ComputationMigrationError::MissingSuspendedCheckpoint)?;
+        let checkpoint = self.suspended_checkpoint()?;
         if handoff.checkpoint_object_id != Some(checkpoint) {
             return Err(ComputationMigrationError::HandoffCheckpointMismatch {
                 expected: checkpoint,
@@ -1574,6 +1599,33 @@ impl MigratableComputation {
             return Err(LeaseTransferValidationError::PreviousFenceMismatch {
                 expected: self.lease_fencing_token,
                 got: handoff.previous_fencing_token,
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    // Transferring is deserializable. A restored target must satisfy the
+    // same ownership changes that validate_lease_handoff checks at admission.
+    fn validate_restored_transfer_target(
+        &self,
+        holder: &TailscaleNodeId,
+        lease_id: LeaseId,
+        fencing_token: u64,
+    ) -> Result<(), ComputationMigrationError> {
+        if lease_id == self.execution_lease_id {
+            return Err(LeaseTransferValidationError::LeaseIdReused { lease_id }.into());
+        }
+        if holder == &self.current_holder {
+            return Err(LeaseTransferValidationError::SelfTransfer {
+                holder: holder.clone(),
+            }
+            .into());
+        }
+        if fencing_token <= self.lease_fencing_token {
+            return Err(LeaseTransferValidationError::NonMonotonicFence {
+                previous: self.lease_fencing_token,
+                next: fencing_token,
             }
             .into());
         }
@@ -1696,6 +1748,7 @@ impl MigratableComputation {
                     });
                 }
 
+                self.validate_restored_transfer_target(target_holder, *next_lease_id, *next_fencing_token)?;
                 self.current_holder = target_holder.clone();
                 self.execution_lease_id = *next_lease_id;
                 self.lease_fencing_token = *next_fencing_token;
@@ -2272,6 +2325,8 @@ impl CheckpointHandoffArtifact {
                 got: handoff.next_fencing_token,
             });
         }
+
+        computation.validate_restored_transfer_target(target_holder, *next_lease_id, *next_fencing_token)?;
 
         let timeline = vec![
             ResumeTimelineEvent {
@@ -7010,6 +7065,112 @@ mod tests {
         let resume2 = test_migration_lease("holder", 7, 3_000);
         comp.resume(&cp, cp_oid, lease_id, &resume2, 2_500).unwrap();
         assert_eq!(comp.state, MigratableComputationState::Running);
+    }
+
+    #[test]
+    fn restored_resumable_records_require_a_consistent_checkpoint_pin() {
+        let source = test_object_id("lease-source");
+        let target = test_object_id("lease-target");
+        let checkpoint = test_computation_checkpoint("holder", source, 7, 1);
+        let id = checkpoint.object_id().unwrap();
+        let mut suspended = MigratableComputation::new(
+            checkpoint.computation_id, ZoneId::work(), test_node_id("holder"), source, 7,
+            test_migration_context(0),
+        );
+        suspended.suspend(&checkpoint, id).unwrap();
+        let active = test_migration_lease("holder", 7, 2_000);
+        let target_lease = test_migration_lease("target", 8, 2_000);
+        let handoff = test_migration_handoff_with_checkpoint(
+            source, target, "holder", "target", 7, 8, Some(id),
+        );
+        let mut transferring = suspended.clone();
+        transferring.begin_transfer(&active, &handoff, 1_500).unwrap();
+        for (original, lease_id, lease) in [
+            (suspended, source, &active), (transferring, target, &target_lease),
+        ] {
+            let persisted = serde_json::to_value(&original).unwrap();
+            let mut missing = persisted.clone();
+            missing.as_object_mut().unwrap().remove("checkpoint_object_id").unwrap();
+            let mut conflicting = persisted.clone();
+            conflicting["capability_context"]["checkpoint_id"] =
+                serde_json::to_value(test_object_id("different-boundary")).unwrap();
+            for record in [missing, conflicting] {
+                let mut restored: MigratableComputation = serde_json::from_value(record).unwrap();
+                let before = serde_json::to_value(&restored).unwrap();
+                assert!(matches!(
+                    restored.resume(&checkpoint, id, lease_id, lease, 1_500),
+                    Err(ComputationMigrationError::MissingSuspendedCheckpoint
+                        | ComputationMigrationError::CheckpointObjectMismatch { .. })
+                ));
+                assert_eq!(serde_json::to_value(&restored).unwrap(), before);
+            }
+
+            let mut legacy = persisted;
+            legacy["capability_context"].as_object_mut().unwrap().remove("checkpoint_id").unwrap();
+            let mut restored: MigratableComputation = serde_json::from_value(legacy).unwrap();
+            restored.resume(&checkpoint, id, lease_id, lease, 1_500).unwrap();
+            assert_eq!(restored.state, MigratableComputationState::Running);
+            assert_eq!(restored.capability_context.checkpoint_id, Some(id));
+        }
+    }
+
+    #[test]
+    fn restored_transfer_requires_distinct_ownership_and_a_newer_fence() {
+        let source = test_object_id("lease-source");
+        let target = test_object_id("lease-target");
+        let checkpoint = test_computation_checkpoint("holder", source, 7, 1);
+        let id = checkpoint.object_id().unwrap();
+        let encoding = checkpoint.to_transfer_encoding(4096, 1024).unwrap();
+        let mut original = MigratableComputation::new(
+            checkpoint.computation_id, ZoneId::work(), test_node_id("holder"), source, 7,
+            test_migration_context(0),
+        );
+        original.suspend(&checkpoint, id).unwrap();
+        let active = test_migration_lease("holder", 7, 2_000);
+        let legitimate = test_migration_handoff_with_checkpoint(
+            source, target, "holder", "target", 7, 8, Some(id),
+        );
+        original.begin_transfer(&active, &legitimate, 1_500).unwrap();
+
+        for (holder, lease_id, fence) in [
+            ("holder", target, 8), ("target", source, 8),
+            ("target", target, 7), ("target", target, 6),
+        ] {
+            let mut record = serde_json::to_value(&original).unwrap();
+            record["state"] = serde_json::to_value(MigratableComputationState::Transferring {
+                target_holder: test_node_id(holder),
+                next_lease_id: lease_id,
+                next_fencing_token: fence,
+            }).unwrap();
+            let mut restored: MigratableComputation = serde_json::from_value(record).unwrap();
+            let before = serde_json::to_value(&restored).unwrap();
+            let supplied = test_migration_lease(holder, fence, 2_000);
+            let handoff = test_migration_handoff_with_checkpoint(
+                source, lease_id, "holder", holder, 7, fence, Some(id),
+            );
+            assert!(matches!(
+                CheckpointHandoffArtifact::capture(
+                    &restored, &checkpoint, id, &encoding, &handoff,
+                    &HandoffArtifactInputs {
+                        state_object_id: None, receipt_head: None,
+                        resume_cause: ResumeCause::PlannedHandoff, observed_at_ms: 1_500_000,
+                    },
+                ),
+                Err(ComputationMigrationError::LeaseTransfer(_))
+            ));
+            let evidence = restored.resume_with_evidence(
+                &checkpoint, id, lease_id, &supplied, 1_500,
+                &ResumeEvidenceInputs {
+                    state_object_id: None, receipt_head: None,
+                    resume_cause: ResumeCause::PlannedHandoff,
+                    duplicate_delivery_class: DuplicateDeliveryClass::Fresh,
+                    disposition: ResumeDisposition::Retry, observed_at_ms: 1_500_000,
+                },
+            ).unwrap();
+            assert_eq!(evidence.outcome, ResumeOutcome::Denied);
+            assert_eq!(evidence.disposition, ResumeDisposition::Deny);
+            assert_eq!(serde_json::to_value(&restored).unwrap(), before);
+        }
     }
 
     // --- begin_transfer with expired active lease ---
