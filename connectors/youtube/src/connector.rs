@@ -1,7 +1,12 @@
 //! FCP YouTube Connector implementation.
 
-use std::{fmt::Write as _, sync::Arc};
+use std::{
+    fmt::Write as _,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
+use fcp_async_core::Deadline;
 use fcp_google_discovery::{ServiceAliasRegistry, auth::GoogleAuthSelection};
 use fcp_prelude::{
     AgentHint, BaseConnector, CapabilityId, ConnectorId, EventCaps, FcpError, FcpResult,
@@ -9,7 +14,7 @@ use fcp_prelude::{
     OperationInfo, RiskLevel, SafetyTier, SelfCheckReport, SimulateRequest, SimulateResponse,
     ZoneId,
 };
-use fcp_sdk::prelude::StandaloneSession;
+use fcp_sdk::prelude::{StandaloneInvocation, StandaloneSession};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -1065,7 +1070,9 @@ impl YouTubeConnector {
 
     /// Handle invoke method.
     pub async fn handle_invoke(&self, params: serde_json::Value) -> FcpResult<serde_json::Value> {
-        let result = self.handle_invoke_internal(params).await;
+        // Capture before decoding/validation so each phase shares one budget.
+        let entered_at = Instant::now();
+        let result = self.handle_invoke_internal(params, entered_at).await;
         self.base.record_request(result.is_ok());
         result
     }
@@ -1073,47 +1080,61 @@ impl YouTubeConnector {
     async fn handle_invoke_internal(
         &self,
         params: serde_json::Value,
+        entered_at: Instant,
     ) -> FcpResult<serde_json::Value> {
         let request: InvokeRequest =
             serde_json::from_value(params).map_err(|_| FcpError::InvalidRequest {
                 code: 1003,
                 message: "Invalid FCP invoke request".into(),
             })?;
+        let deadline = youtube_invocation_deadline(entered_at, request.deadline_ms)?;
         self.base.check_ready()?;
-        if request.deadline_ms == Some(0) {
-            return Err(FcpError::InvalidRequest {
-                code: 1003,
-                message: "Invocation deadline has expired".into(),
-            });
-        }
         let operation = request.operation.as_str();
         validate_youtube_input(operation, &request.input)?;
         self.validate_operation_auth(operation)?;
         let resources = youtube_resource_uris(operation, &request.input)?;
+        require_youtube_dispatch_deadline(deadline)?;
         let admission = self
             .authority
             .as_ref()
             .ok_or(FcpError::NotHandshaken)?
             .admit_bounded(&request, &resources, youtube_response_limit(operation))?;
+        // Admission can perform substantial synchronous request counting. No
+        // operation future has been polled yet; an expired budget here cannot
+        // have caused provider effects, although the admission stays charged.
+        require_youtube_dispatch_deadline(deadline)?;
         let input = request.input;
-        let result = match operation {
-            "youtube.search" => self.invoke_search(input).await,
-            "youtube.get_video" => self.invoke_get_video(input).await,
-            "youtube.list_videos" => self.invoke_list_videos(input).await,
-            "youtube.get_channel" => self.invoke_get_channel(input).await,
-            "youtube.list_playlists" => self.invoke_list_playlists(input).await,
-            "youtube.list_playlist_items" => self.invoke_list_playlist_items(input).await,
-            "youtube.list_comments" => self.invoke_list_comments(input).await,
-            "youtube.post_comment" => self.invoke_post_comment(input).await,
-            "youtube.get_captions" => self.invoke_get_captions(input).await,
-            "youtube.get_caption_transcript" => self.invoke_get_caption_transcript(input).await,
-            "youtube.get_transcript" => self.invoke_get_transcript(input).await,
-            "youtube.upload_caption" => self.invoke_upload_caption(input).await,
-            "youtube.get_analytics" => self.invoke_get_analytics(input).await,
-            "youtube.upload_video" => self.invoke_upload_video(input).await,
-            _ => Err(FcpError::OperationNotGranted {
-                operation: operation.into(),
-            }),
+        let invocation = async {
+            match operation {
+                "youtube.search" => self.invoke_search(input).await,
+                "youtube.get_video" => self.invoke_get_video(input).await,
+                "youtube.list_videos" => self.invoke_list_videos(input).await,
+                "youtube.get_channel" => self.invoke_get_channel(input).await,
+                "youtube.list_playlists" => self.invoke_list_playlists(input).await,
+                "youtube.list_playlist_items" => self.invoke_list_playlist_items(input).await,
+                "youtube.list_comments" => self.invoke_list_comments(input).await,
+                "youtube.post_comment" => self.invoke_post_comment(input).await,
+                "youtube.get_captions" => self.invoke_get_captions(input).await,
+                "youtube.get_caption_transcript" => self.invoke_get_caption_transcript(input).await,
+                "youtube.get_transcript" => self.invoke_get_transcript(input).await,
+                "youtube.upload_caption" => self.invoke_upload_caption(input).await,
+                "youtube.get_analytics" => self.invoke_get_analytics(input).await,
+                "youtube.upload_video" => self.invoke_upload_video(input).await,
+                _ => Err(FcpError::OperationNotGranted {
+                    operation: operation.into(),
+                }),
+            }
+        };
+        // One absolute deadline covers composite calls, provider decoding and
+        // retries. Dropping the losing future stops that operation; no replay
+        // is introduced here. Once this wrapper starts, writes are treated as
+        // potentially dispatched even if the timer wins on its first poll.
+        let result = match deadline {
+            Some(deadline) => Deadline::at(deadline)
+                .run(invocation)
+                .await
+                .map_err(|_| youtube_dispatched_deadline_error(operation))?,
+            None => invocation.await,
         };
         // Meter the exact successful envelope emitted by dispatch_raw_invoke,
         // without cloning large transcript output. A provider failure retains
@@ -1121,13 +1142,18 @@ impl YouTubeConnector {
         match result {
             Ok(value) => {
                 let mut response = InvokeResponse::ok(request.id, value);
-                admission.finish_response(&response)?;
+                finish_youtube_response(admission, &response, deadline, operation)?;
                 response.result.take().ok_or_else(|| FcpError::Internal {
                     message: "Completed invocation is missing its result".into(),
                 })
             }
             Err(error) => {
-                admission.finish_response(&InvokeResponse::error(request.id, error.clone()))?;
+                finish_youtube_response(
+                    admission,
+                    &InvokeResponse::error(request.id, error.clone()),
+                    deadline,
+                    operation,
+                )?;
                 Err(error)
             }
         }
@@ -2325,6 +2351,95 @@ fn youtube_response_limit(operation: &str) -> u64 {
     }
 }
 
+fn youtube_invocation_deadline(
+    entered_at: Instant,
+    timeout_ms: Option<u64>,
+) -> FcpResult<Option<Instant>> {
+    let Some(timeout_ms) = timeout_ms else {
+        return Ok(None);
+    };
+    if timeout_ms == 0 {
+        return Err(FcpError::InvalidRequest {
+            code: 1003,
+            message: "Invocation deadline has expired before provider dispatch".into(),
+        });
+    }
+    let duration = Duration::from_millis(timeout_ms);
+    // Instant can represent durations that overflow a timer's signed total
+    // nanoseconds. Reject those instead of relying on downstream saturation.
+    if i64::try_from(duration.as_nanos()).is_err() {
+        return Err(FcpError::InvalidRequest {
+            code: 1003,
+            message: "Invocation deadline exceeds the supported timer range".into(),
+        });
+    }
+    let deadline = entered_at
+        .checked_add(duration)
+        .ok_or_else(|| FcpError::InvalidRequest {
+            code: 1003,
+            message: "Invocation deadline overflows the monotonic clock".into(),
+        })?;
+    require_youtube_dispatch_deadline(Some(deadline))?;
+    Ok(Some(deadline))
+}
+
+fn require_youtube_dispatch_deadline(deadline: Option<Instant>) -> FcpResult<()> {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err(FcpError::InvalidRequest {
+            code: 1003,
+            message: "Invocation deadline has expired before provider dispatch".into(),
+        });
+    }
+    Ok(())
+}
+
+fn youtube_dispatched_deadline_error(operation: &str) -> FcpError {
+    let reconciliation = match operation {
+        "youtube.post_comment" => {
+            "inspect the video's comments before resubmitting to avoid duplicate comments"
+        }
+        "youtube.upload_caption" => {
+            "inspect the video's caption tracks with youtube.get_captions before resubmitting to avoid duplicate tracks"
+        }
+        "youtube.upload_video" => {
+            "inspect the authenticated channel before resubmitting to avoid duplicate videos"
+        }
+        _ => {
+            return FcpError::UpstreamTimeout {
+                service: "youtube".into(),
+            };
+        }
+    };
+    FcpError::External {
+        service: "youtube".into(),
+        message: format!(
+            "YouTube invocation deadline expired; outcome is unknown; {reconciliation}"
+        ),
+        status_code: None,
+        retryable: false,
+        retry_after: None,
+    }
+}
+
+fn finish_youtube_response(
+    admission: StandaloneInvocation,
+    response: &InvokeResponse,
+    deadline: Option<Instant>,
+    operation: &str,
+) -> FcpResult<()> {
+    match deadline {
+        None => admission.finish_response(response),
+        Some(deadline) => match admission.finish_response_before_deadline(response, deadline) {
+            Err(_) if Instant::now() >= deadline => {
+                Err(youtube_dispatched_deadline_error(operation))
+            }
+            // Successful settlement is release authorization. A later clock
+            // check or outer timeout must not turn refunded success into failure.
+            result => result,
+        },
+    }
+}
+
 #[allow(clippy::fn_params_excessive_bools)]
 fn op_info(
     id: &'static str,
@@ -2930,6 +3045,45 @@ mod tests {
             })
         ));
         transcript.finish_response(&response).unwrap();
+    }
+
+    #[test]
+    fn invocation_deadline_starts_at_entry_and_rejects_invalid_timer_budgets() {
+        let entered_at = Instant::now();
+        let budget = std::time::Duration::from_secs(1);
+        assert_eq!(
+            youtube_invocation_deadline(entered_at, Some(1_000)).unwrap(),
+            entered_at.checked_add(budget)
+        );
+        for timeout_ms in [0, u64::MAX] {
+            assert!(matches!(
+                youtube_invocation_deadline(entered_at, Some(timeout_ms)),
+                Err(FcpError::InvalidRequest { code: 1003, .. })
+            ));
+        }
+        let earlier_entry = entered_at.checked_sub(budget).unwrap();
+        assert!(youtube_invocation_deadline(earlier_entry, Some(1)).is_err());
+        assert_eq!(
+            youtube_invocation_deadline(earlier_entry, None).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn admitted_mutation_deadlines_are_unknown_and_never_retryable() {
+        for operation in [
+            "youtube.post_comment",
+            "youtube.upload_caption",
+            "youtube.upload_video",
+        ] {
+            let error = youtube_dispatched_deadline_error(operation);
+            assert!(!error.is_retryable());
+            assert!(error.to_string().contains("outcome is unknown"));
+            assert!(error.to_string().contains("before resubmitting"));
+        }
+        let read = youtube_dispatched_deadline_error("youtube.get_transcript");
+        assert!(read.is_retryable());
+        assert!(matches!(read, FcpError::UpstreamTimeout { service } if service == "youtube"));
     }
 
     #[test]

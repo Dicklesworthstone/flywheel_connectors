@@ -11,6 +11,7 @@
 
 use std::io::{self, Write};
 use std::sync::Arc;
+use std::time::Instant;
 
 use fcp_core::{
     BoundVerified, CapabilityToken, FcpError, FcpResult, InvokeRequest, InvokeResponse,
@@ -107,8 +108,36 @@ impl StandaloneInvocation {
     /// settlement accounting, returns a non-retryable outcome-unknown error.
     /// Its payload is withheld and the full reservation remains charged.
     pub fn finish_response(self, response: &InvokeResponse) -> FcpResult<()> {
+        self.finish_response_inner(response, None)
+    }
+
+    /// Release a response only within the original invocation deadline.
+    ///
+    /// Counting checks the deadline without allocating another response. For
+    /// a successful finite-byte admission, the final check occurs with the
+    /// ledger locked, immediately before refunding unused response capacity.
+    /// That commit authorizes release: callers must not race this method with
+    /// another timeout or overturn its successful result with a later check.
+    /// Expiry never refunds a call, request bytes, or response reservation.
+    ///
+    /// # Errors
+    /// Returns the same errors as [`Self::finish_response`]. An expired deadline
+    /// returns a non-retryable outcome-unknown error and retains the reservation.
+    pub fn finish_response_before_deadline(
+        self,
+        response: &InvokeResponse,
+        deadline: Instant,
+    ) -> FcpResult<()> {
+        self.finish_response_inner(response, Some(deadline))
+    }
+
+    fn finish_response_inner(
+        self,
+        response: &InvokeResponse,
+        deadline: Option<Instant>,
+    ) -> FcpResult<()> {
         let Some(completion) = self.completion else {
-            return Ok(());
+            return require_response_deadline(deadline);
         };
         if response.r#type != "response" || response.id != completion.request_id {
             return Err(output_unknown());
@@ -122,15 +151,16 @@ impl StandaloneInvocation {
             }
             _ => {}
         }
-        let actual = json_bytes(response, completion.limit).map_err(|()| output_unknown())?;
+        let actual = json_bytes_before_deadline(response, completion.limit, deadline)
+            .map_err(|()| response_completion_error(deadline))?;
         // A bounded error response may be released, but failure is not proof
         // of zero effects/transfer. Keep its entire reservation charged.
         if response.status == InvokeStatus::Ok
             && let Some(reservation) = completion.reservation
         {
-            reservation.settle(actual)?;
+            return reservation.settle(actual, deadline);
         }
-        Ok(())
+        require_response_deadline(deadline)
     }
 }
 
@@ -240,7 +270,7 @@ impl UsageLedger {
 }
 
 impl Reservation {
-    fn settle(self, actual: u64) -> FcpResult<()> {
+    fn settle(self, actual: u64, deadline: Option<Instant>) -> FcpResult<()> {
         let unused = self.bytes.checked_sub(actual).ok_or_else(output_unknown)?;
         let mut entries = self.entries.lock().map_err(|_| output_unknown())?;
         let account = entries.get_mut(&self.key).ok_or_else(output_unknown)?;
@@ -249,10 +279,14 @@ impl Reservation {
         }
         // Each reservation was fully charged at admission. Removing only its
         // own unused portion cannot free another concurrent invocation's bytes.
-        account.bytes = account
+        let next_bytes = account
             .bytes
             .checked_sub(unused)
             .ok_or_else(output_unknown)?;
+        // Mutex wait time is part of the invocation budget. Check only after
+        // validating the pending subtraction, at the release commit itself.
+        require_response_deadline(deadline)?;
+        account.bytes = next_bytes;
         Ok(())
     }
 }
@@ -260,12 +294,27 @@ impl Reservation {
 /// Count the actual serializer output without allocating a second payload.
 /// Stop serialization immediately when the limit is exceeded.
 fn json_bytes(value: &impl Serialize, limit: u64) -> Result<u64, ()> {
+    json_bytes_before_deadline(value, limit, None)
+}
+
+fn json_bytes_before_deadline(
+    value: &impl Serialize,
+    limit: u64,
+    deadline: Option<Instant>,
+) -> Result<u64, ()> {
     struct Counter {
         used: u64,
         limit: u64,
+        deadline: Option<Instant>,
     }
     impl Write for Counter {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self
+                .deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "response deadline"));
+            }
             let length = u64::try_from(bytes.len()).map_err(|_| io::Error::other("byte limit"))?;
             let next = self
                 .used
@@ -279,9 +328,41 @@ fn json_bytes(value: &impl Serialize, limit: u64) -> Result<u64, ()> {
             Ok(())
         }
     }
-    let mut counter = Counter { used: 0, limit };
+    let mut counter = Counter {
+        used: 0,
+        limit,
+        deadline,
+    };
     serde_json::to_writer(&mut counter, value).map_err(|_| ())?;
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err(());
+    }
     Ok(counter.used)
+}
+
+fn require_response_deadline(deadline: Option<Instant>) -> FcpResult<()> {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err(response_deadline_expired());
+    }
+    Ok(())
+}
+
+fn response_completion_error(deadline: Option<Instant>) -> FcpError {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        response_deadline_expired()
+    } else {
+        output_unknown()
+    }
+}
+
+fn response_deadline_expired() -> FcpError {
+    FcpError::External {
+        service: "standalone".into(),
+        message: "Invocation deadline expired before response release; outcome is unknown; reconcile external effects before retry".into(),
+        status_code: None,
+        retryable: false,
+        retry_after: None,
+    }
 }
 
 fn invalid(message: &str) -> FcpError {

@@ -506,3 +506,81 @@ fn settling_one_response_does_not_release_another_in_flight_reservation() {
         2 * request_bytes + response_bytes + 1_000
     );
 }
+
+#[test]
+fn expired_response_deadline_retains_calls_and_complete_byte_reservations() {
+    for is_error in [false, true] {
+        let (session, _, request) = fixture(Some(1), Some(LIMIT));
+        let reply = if is_error {
+            InvokeResponse::error(request.id.clone(), invalid("provider failed"))
+        } else {
+            response(&request)
+        };
+        let permit = session.admit_bounded(&request, &[], 1_000).unwrap();
+        let charged = totals(&session);
+        let error = permit
+            .finish_response_before_deadline(&reply, Instant::now())
+            .unwrap_err();
+        assert!(error.to_string().contains("deadline"));
+        assert_unknown(error);
+        assert_eq!(totals(&session), charged);
+        assert!(session.admit_bounded(&request, &[], 1_000).is_err());
+    }
+    let (session, _, request) = fixture(None, None);
+    let permit = session.admit_bounded(&request, &[], 1_000).unwrap();
+    assert_unknown(
+        permit
+            .finish_response_before_deadline(&response(&request), Instant::now())
+            .unwrap_err(),
+    );
+}
+
+#[test]
+fn deadline_counter_detects_expiry_during_synchronous_serialization() {
+    struct SlowValue;
+    impl serde::Serialize for SlowValue {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            serializer.serialize_str("ready")
+        }
+    }
+    let deadline = Instant::now() + std::time::Duration::from_millis(5);
+    assert!(json_bytes_before_deadline(&SlowValue, 64, Some(deadline)).is_err());
+    assert_eq!(json_bytes(&SlowValue, 64), Ok(7));
+}
+
+#[test]
+fn deadline_expiring_while_waiting_for_ledger_lock_cannot_refund() {
+    let (session, _, request) = fixture(Some(1), Some(LIMIT));
+    let permit = session.admit_bounded(&request, &[], 1_000).unwrap();
+    let charged = totals(&session);
+    let actual = json_bytes(&response(&request), LIMIT).unwrap();
+    let reservation = permit.completion.unwrap().reservation.unwrap();
+    let entries = Arc::clone(&ledger(&session).entries);
+    let held = entries.lock().unwrap();
+    let deadline = Instant::now() + std::time::Duration::from_millis(20);
+    // Invoke the commit step directly: even a thread scheduled only after the
+    // lock is released must enforce the deadline before subtracting bytes.
+    let worker = std::thread::spawn(move || reservation.settle(actual, Some(deadline)));
+    std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+    drop(held);
+    let error = worker.join().unwrap().unwrap_err();
+    assert!(error.to_string().contains("deadline"));
+    assert_unknown(error);
+    assert_eq!(totals(&session), charged);
+}
+
+#[test]
+fn timely_guarded_completion_matches_existing_settlement_accounting() {
+    let (session, _, request) = fixture(Some(2), Some(LIMIT));
+    let reply = response(&request);
+    let cost = json_bytes(&request, LIMIT).unwrap() + json_bytes(&reply, LIMIT).unwrap();
+    let permit = session.admit_bounded(&request, &[], 1_000).unwrap();
+    permit
+        .finish_response_before_deadline(&reply, Instant::now() + std::time::Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(totals(&session), (1, cost));
+    let permit = session.admit_bounded(&request, &[], 1_000).unwrap();
+    permit.finish_response(&reply).unwrap();
+    assert_eq!(totals(&session), (2, 2 * cost));
+}

@@ -200,6 +200,19 @@ async fn preview_request(
     .unwrap()
 }
 
+async fn wait_for_provider_requests(server: &MockServer, count: usize) {
+    fcp_async_core::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if server.received_requests().await.unwrap().len() >= count {
+                break;
+            }
+            fcp_async_core::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("provider must observe the admitted requests");
+}
+
 async fn setup_caption_upload(connector: &mut YouTubeConnector, base_url: &str) {
     connector
         .handle_configure(json!({
@@ -2079,7 +2092,10 @@ async fn native_cancelled_invocation_keeps_its_byte_reservation_without_replay()
     let completed =
         fcp_async_core::time::timeout(std::time::Duration::from_secs(1), &mut operation).await;
     observed.expect("provider must observe admitted invocation before cancellation");
-    assert!(completed.expect("aborted invocation must stop").is_err());
+    let aborted = completed
+        .expect("aborted invocation must stop")
+        .expect_err("invocation must be cancelled before provider completion");
+    assert!(aborted.is_cancelled());
     assert!(matches!(
         connector.handle_invoke(request).await.unwrap_err(),
         fcp_core::FcpError::CapabilityDenied { .. }
@@ -2132,6 +2148,238 @@ async fn native_uncertain_caption_write_retains_byte_reservation_and_never_repla
         fcp_core::FcpError::CapabilityDenied { .. }
     ));
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    server.verify().await;
+}
+
+#[fcp_async_core::runtime::test]
+async fn positive_deadline_interrupts_reads_and_writes_without_refunding_or_replaying() {
+    for write in [false, true] {
+        let server = MockServer::start().await;
+        let (operation_id, capability, resource, endpoint, input, response) = if write {
+            (
+                "youtube.upload_caption",
+                "youtube.write",
+                "youtube:video:dQw4w9WgXcQ",
+                "/upload/youtube/v3/captions",
+                json!({ "video_id": "dQw4w9WgXcQ", "language": "en", "transcript": CAPTION_FILE }),
+                caption_upload_response(),
+            )
+        } else {
+            (
+                "youtube.search",
+                "youtube.read",
+                "youtube:search",
+                "/search",
+                json!({ "query": "rust" }),
+                empty_search_page(),
+            )
+        };
+        Mock::given(method(if write { "POST" } else { "GET" }))
+            .and(path(endpoint))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(response)
+                    .set_delay(std::time::Duration::from_secs(4)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut connector = YouTubeConnector::new();
+        if write {
+            setup_caption_upload(&mut connector, &format!("{}/youtube/v3", server.uri())).await;
+        } else {
+            setup_configure(&mut connector, &server.uri()).await;
+        }
+        let key = setup_handshake(&mut connector, &[capability]).await;
+        let token = scoped_token(
+            &key,
+            &connector,
+            &[operation_id],
+            capability,
+            &CapabilityConstraints {
+                resource_allow: vec![resource.into()],
+                max_bytes: Some(65_536),
+                ..Default::default()
+            },
+            b"youtube-positive-deadline-grant",
+        );
+        let mut request = native_request("deadline-first", operation_id, input, &token);
+        request["deadline_ms"] = json!(250);
+        let connector = std::sync::Arc::new(connector);
+        let worker_connector = std::sync::Arc::clone(&connector);
+        let worker_request = request.clone();
+        let mut operation = fcp_async_core::task::spawn(async move {
+            worker_connector.handle_invoke(worker_request).await
+        });
+        wait_for_provider_requests(&server, 1).await;
+        // Even including the observation barrier, this watchdog expires before
+        // the provider can return success. The deadline must interrupt its wait.
+        let completed =
+            fcp_async_core::time::timeout(std::time::Duration::from_secs(2), &mut operation).await;
+        operation.abort();
+        let error = completed
+            .expect("positive deadline must bound the operation")
+            .expect("invocation task")
+            .unwrap_err();
+        if write {
+            assert!(matches!(
+                error,
+                fcp_core::FcpError::External {
+                    service, status_code: None, retryable: false, retry_after: None, message,
+                } if service == "youtube"
+                    && message.contains("deadline")
+                    && message.contains("outcome is unknown")
+            ));
+        } else {
+            assert!(
+                matches!(error, fcp_core::FcpError::UpstreamTimeout { service } if service == "youtube")
+            );
+        }
+        request["id"] = json!("deadline-retry");
+        request["deadline_ms"] = json!(5000);
+        assert!(matches!(
+            connector.handle_invoke(request).await.unwrap_err(),
+            fcp_core::FcpError::CapabilityDenied { .. }
+        ));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        server.verify().await;
+    }
+}
+
+#[fcp_async_core::runtime::test]
+async fn invalid_deadlines_reject_before_provider_io_or_call_budget_admission() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/search"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(empty_search_page()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut connector = YouTubeConnector::new();
+    setup_configure(&mut connector, &server.uri()).await;
+    let key = setup_handshake(&mut connector, &["youtube.read"]).await;
+    let token = scoped_token(
+        &key,
+        &connector,
+        &["youtube.search"],
+        "youtube.read",
+        &CapabilityConstraints {
+            resource_allow: vec!["youtube:search".into()],
+            max_calls: Some(1),
+            ..Default::default()
+        },
+        b"youtube-zero-deadline-grant",
+    );
+    let mut request = native_request(
+        "zero-deadline",
+        "youtube.search",
+        json!({ "query": "rust" }),
+        &token,
+    );
+    for deadline_ms in [0_u64, u64::MAX] {
+        request["deadline_ms"] = json!(deadline_ms);
+        assert!(matches!(
+            connector.handle_invoke(request.clone()).await.unwrap_err(),
+            fcp_core::FcpError::InvalidRequest { .. }
+        ));
+    }
+    assert!(server.received_requests().await.unwrap().is_empty());
+    request["id"] = json!("valid-deadline");
+    request["deadline_ms"] = json!(1000);
+    assert_eq!(
+        connector.handle_invoke(request.clone()).await.unwrap()["items"],
+        json!([])
+    );
+    assert!(matches!(
+        connector.handle_invoke(request).await.unwrap_err(),
+        fcp_core::FcpError::CapabilityDenied { .. }
+    ));
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    server.verify().await;
+}
+
+#[fcp_async_core::runtime::test]
+async fn composite_transcript_listing_and_download_share_one_request_deadline() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/captions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({
+                    "kind": "youtube#captionListResponse", "etag": "deadline-listing",
+                    "items": [{
+                        "kind": "youtube#caption", "etag": "deadline-track", "id": "cap-en",
+                        "snippet": {
+                            "videoId": "dQw4w9WgXcQ", "language": "en",
+                            "trackKind": "standard", "status": "serving"
+                        }
+                    }]
+                }))
+                .set_delay(std::time::Duration::from_millis(600)),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/captions/cap-en"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("1\n00:00:00,000 --> 00:00:01,000\nDeadline fixture\n")
+                .set_delay(std::time::Duration::from_millis(600)),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut connector = YouTubeConnector::new();
+    setup_configure(&mut connector, &server.uri()).await;
+    let key = setup_handshake(&mut connector, &["youtube.read"]).await;
+    let token = scoped_token(
+        &key,
+        &connector,
+        &["youtube.get_transcript"],
+        "youtube.read",
+        &CapabilityConstraints {
+            resource_allow: vec!["youtube:video:dQw4w9WgXcQ".into()],
+            max_bytes: Some(65_536),
+            ..Default::default()
+        },
+        b"youtube-composite-deadline-grant",
+    );
+    let mut request = native_request(
+        "transcript-deadline",
+        "youtube.get_transcript",
+        json!({
+            "video_id": "dQw4w9WgXcQ", "language": "en"
+        }),
+        &token,
+    );
+    request["deadline_ms"] = json!(1000);
+    let connector = std::sync::Arc::new(connector);
+    let worker_connector = std::sync::Arc::clone(&connector);
+    let worker_request = request.clone();
+    let mut operation =
+        fcp_async_core::task::spawn(
+            async move { worker_connector.handle_invoke(worker_request).await },
+        );
+    wait_for_provider_requests(&server, 2).await;
+    let completed =
+        fcp_async_core::time::timeout(std::time::Duration::from_secs(3), &mut operation).await;
+    operation.abort();
+    assert!(matches!(
+        completed.expect("composite request must finish within one deadline")
+            .expect("invocation task").unwrap_err(),
+        fcp_core::FcpError::UpstreamTimeout { service } if service == "youtube"
+    ));
+    request["id"] = json!("transcript-retry");
+    request["deadline_ms"] = json!(5000);
+    assert!(matches!(
+        connector.handle_invoke(request).await.unwrap_err(),
+        fcp_core::FcpError::CapabilityDenied { .. }
+    ));
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].url.path(), "/captions");
+    assert_eq!(requests[1].url.path(), "/captions/cap-en");
     server.verify().await;
 }
 
