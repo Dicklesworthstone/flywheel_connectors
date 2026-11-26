@@ -182,6 +182,25 @@ therefore occupy a slot after the response deadline, but cannot create an
 unbounded queue of replacement workers. Successful recovery preserves the
 same read-only, MAC, object-ID, writer-pin, and instance checks described above.
 
+### Inspect a released object writer before handoff
+
+For a singleton writer, POST to
+`/rpc/admin/connectors/{connector_id}/lease/flush-before-yield?zone=z%3Awork&require_writer_idle=true`
+using the host's owner-admin credentials. The host opens the existing durable
+object-store lock file read-only and attempts a shared lock before recovering
+the snapshot and WAL. An active object writer, missing lock file, torn WAL or
+failed authority check prevents a successful strict observation.
+
+A successful response includes `flush.object_writer_excluded_during_read: true`
+alongside the verified root, head and lease sequence, if present. The lock
+spans local recovery and canonical ancestry verification and is released by the
+time the caller receives the response. It does not establish that a connector
+process stopped, that symbol writers drained, that the lease transferred, or
+that a writer cannot reopen afterward. Keep the old writer fenced before using
+the observed root in a transfer. Requests omitting `require_writer_idle`
+continue to inspect a committed prefix alongside an active writer and return
+`flush.object_writer_excluded_during_read: false`.
+
 ## Retain an Exact Root on Another Host
 
 Singleton state history preserves writer ownership across recovery. A state

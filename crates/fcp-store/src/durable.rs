@@ -901,6 +901,7 @@ impl DurableObjectStore {
             Some(verifier),
             DurableAccess::ReadWrite,
             Some(max_recovery_bytes),
+            None,
         )
     }
 
@@ -946,6 +947,34 @@ impl DurableObjectStore {
             None,
             DurableAccess::ReadOnly,
             Some(max_recovery_bytes),
+            None,
+        )
+    }
+
+    /// Read a bounded view while excluding cooperating object-store writers.
+    ///
+    /// The existing writer-lock file is opened read-only. A nonblocking shared
+    /// lock spans recovery and remains held until the returned store is dropped.
+    /// Multiple observers may coexist. This only covers the local object store
+    /// and proves nothing about connector work outside it or subsequent writes.
+    ///
+    /// # Errors
+    /// Returns an error for an absent or busy lock, or any bounded recovery
+    /// failure. Does not create files or repair an incomplete WAL.
+    pub fn open_read_only_writer_excluded_bounded(
+        config: DurableObjectStoreConfig,
+        max_recovery_bytes: u64,
+    ) -> Result<Self, ObjectStoreError> {
+        if max_recovery_bytes == 0 {
+            return Err(object_io("read-only recovery byte budget must be nonzero"));
+        }
+        let lock = acquire_object_observer_lock(&config.root_dir).map_err(object_io)?;
+        Self::open_with_recovery_budget(
+            config,
+            None,
+            DurableAccess::ReadOnly,
+            Some(max_recovery_bytes),
+            Some(lock),
         )
     }
 
@@ -967,7 +996,7 @@ impl DurableObjectStore {
         verifier: Option<Arc<dyn ObjectIdVerifier>>,
         access: DurableAccess,
     ) -> Result<Self, ObjectStoreError> {
-        Self::open_with_recovery_budget(config, verifier, access, None)
+        Self::open_with_recovery_budget(config, verifier, access, None, None)
     }
 
     fn open_with_recovery_budget(
@@ -975,6 +1004,7 @@ impl DurableObjectStore {
         verifier: Option<Arc<dyn ObjectIdVerifier>>,
         access: DurableAccess,
         max_recovery_bytes: Option<u64>,
+        observer_lock: Option<File>,
     ) -> Result<Self, ObjectStoreError> {
         let writer_lock = if access == DurableAccess::ReadWrite {
             fs::create_dir_all(&config.root_dir).map_err(object_io)?;
@@ -985,7 +1015,7 @@ impl DurableObjectStore {
             )
         } else {
             require_store_directory(&config.root_dir).map_err(object_io)?;
-            None
+            observer_lock
         };
 
         let snapshot_path = config.root_dir.join("objects.snapshot.json");
@@ -1693,8 +1723,31 @@ fn acquire_writer_lock(root: &Path, lock_file: &str, kind: &str) -> Result<File,
             root.display()
         )
     })?;
+    validate_locked_path(&path, &opened, kind)?;
+    if created {
+        file.sync_all().map_err(|error| error.to_string())?;
+        sync_parent_dir(&path).map_err(|error| error.to_string())?;
+    }
+    Ok(file)
+}
+
+fn acquire_object_observer_lock(root: &Path) -> Result<File, String> {
+    let path = root.join(OBJECT_WRITER_LOCK_FILE);
     let named = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
-    if !named.is_file() || named.file_type().is_symlink() {
+    if !named.is_file() {
+        return Err("object-store writer lock must be an existing regular file".to_owned());
+    }
+    let file = File::open(&path).map_err(|error| error.to_string())?;
+    let opened = file.metadata().map_err(|error| error.to_string())?;
+    file.try_lock_shared()
+        .map_err(|error| format!("could not exclude the active object-store writer: {error}"))?;
+    validate_locked_path(&path, &opened, "object")?;
+    Ok(file)
+}
+
+fn validate_locked_path(path: &Path, opened: &fs::Metadata, kind: &str) -> Result<(), String> {
+    let named = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    if !opened.is_file() || !named.is_file() {
         return Err(format!("{kind}-store writer lock path changed during open"));
     }
     #[cfg(unix)]
@@ -1704,11 +1757,7 @@ fn acquire_writer_lock(root: &Path, lock_file: &str, kind: &str) -> Result<File,
             return Err(format!("{kind}-store writer lock was replaced during open"));
         }
     }
-    if created {
-        file.sync_all().map_err(|error| error.to_string())?;
-        sync_parent_dir(&path).map_err(|error| error.to_string())?;
-    }
-    Ok(file)
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2942,6 +2991,36 @@ mod tests {
             let fresh = DurableObjectStore::open_read_only_bounded(config, grown_bytes).unwrap();
             assert!(fresh.exists(&test_object_id(3)).await);
         }
+    }
+
+    #[test]
+    fn writer_excluded_observers_hold_the_lock_until_the_last_view_drops() {
+        let directory = TempDir::new().unwrap();
+        let config = DurableObjectStoreConfig::new(directory.path());
+        let observe = || DurableObjectStore::open_read_only_writer_excluded_bounded(config.clone(), 1024);
+        assert!(observe().is_err());
+        assert!(stored_file_bytes(directory.path()).is_empty());
+
+        let writer = DurableObjectStore::open(config.clone()).unwrap();
+        assert!(observe().is_err());
+        drop(writer);
+
+        let first = observe().unwrap();
+        let second = observe().unwrap();
+        assert!(DurableObjectStore::open(config.clone()).is_err());
+        drop(first);
+        assert!(DurableObjectStore::open(config.clone()).is_err());
+        drop(second);
+        let writer = DurableObjectStore::open(config.clone()).unwrap();
+        drop(writer);
+
+        // A failed observational recovery cannot repair the WAL or retain the lock.
+        let wal = directory.path().join("objects.wal.jsonl");
+        fs::write(&wal, b"{").unwrap();
+        assert!(observe().is_err());
+        assert_eq!(fs::read(&wal).unwrap(), b"{");
+        let _writer = DurableObjectStore::open(config).unwrap();
+        assert!(fs::read(&wal).unwrap().is_empty());
     }
 
     #[test]

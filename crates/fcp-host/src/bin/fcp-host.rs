@@ -5651,6 +5651,19 @@ async fn open_configured_connector_state_reader(
     zone: &ZoneId,
     object_store_dir: &StdPath,
 ) -> Result<Option<HostCanonicalStateReader>, String> {
+    open_configured_connector_state_reader_with_writer_policy(
+        config, connector_id, zone, object_store_dir, false,
+    )
+    .await
+}
+
+async fn open_configured_connector_state_reader_with_writer_policy(
+    config: &ConnectorConfig,
+    connector_id: &ConnectorId,
+    zone: &ZoneId,
+    object_store_dir: &StdPath,
+    require_writer_idle: bool,
+) -> Result<Option<HostCanonicalStateReader>, String> {
     let limits = configured_connector_state_read_limits(config)?;
     let permit = ConnectorStateReadPermit::acquire(
         connector_state_read_capacity(),
@@ -5677,10 +5690,15 @@ async fn open_configured_connector_state_reader(
         let mut store_config =
             configured_connector_state_object_store_config(&config, &object_store_dir)?;
         store_config.max_bytes = limits.max_live_bytes;
-        let object_store = fcp_store::DurableObjectStore::open_read_only_bounded(
-            store_config,
-            limits.max_recovery_bytes,
-        ).map_err(|error| format!("Canonical fcp-store object recovery was refused: {error}"))?;
+        let object_store = if require_writer_idle {
+            fcp_store::DurableObjectStore::open_read_only_writer_excluded_bounded(
+                store_config,
+                limits.max_recovery_bytes,
+            )
+        } else {
+            fcp_store::DurableObjectStore::open_read_only_bounded(store_config, limits.max_recovery_bytes)
+        }
+        .map_err(|error| format!("Canonical fcp-store object recovery was refused: {error}"))?;
         let object_store: Arc<dyn fcp_store::ObjectStore> = Arc::new(HostCanonicalObjectReader {
             inner: object_store,
             remaining_reads: AtomicU64::new(limits.max_object_reads),
@@ -6240,6 +6258,15 @@ async fn connector_lease_yield_flush_context_for_registered_connector(
     connector_id: &ConnectorId,
     zone: &ZoneId,
 ) -> Result<HostConnectorLeaseYieldFlushContext, String> {
+    connector_lease_yield_flush_with_writer_policy(state, connector_id, zone, false).await
+}
+
+async fn connector_lease_yield_flush_with_writer_policy(
+    state: &AppState,
+    connector_id: &ConnectorId,
+    zone: &ZoneId,
+    require_writer_idle: bool,
+) -> Result<HostConnectorLeaseYieldFlushContext, String> {
     let (config, state_policy) = state
         .registry
         .state_policy_snapshot(connector_id)
@@ -6254,11 +6281,12 @@ async fn connector_lease_yield_flush_context_for_registered_connector(
     let state_root =
         configured_connector_state_root(&config).unwrap_or_else(connector_state_root_dir);
     let object_store_dir = connector_state_canonical_object_store_dir(&state_root, connector_id);
-    let reader = open_configured_connector_state_reader(
+    let reader = open_configured_connector_state_reader_with_writer_policy(
         &config,
         connector_id,
         zone,
         &object_store_dir,
+        require_writer_idle,
     )
     .await?
     .ok_or_else(|| {
@@ -6620,6 +6648,8 @@ struct ConnectorLeaseStatusQuery {
 #[derive(Debug, Default, Deserialize)]
 struct ConnectorLeaseFlushBeforeYieldQuery {
     zone: Option<String>,
+    #[serde(default)]
+    require_writer_idle: bool,
 }
 
 fn sanitize_state_path_segment(value: &str) -> String {
@@ -8573,6 +8603,7 @@ fn connector_lease_flush_before_yield_payload(
     state_root: &StdPath,
     flush: &fcp_store::ConnectorStateLeaseYieldFlush,
     warnings: Vec<String>,
+    object_writer_excluded_during_read: bool,
 ) -> Value {
     json!({
         "status": "ok",
@@ -8588,6 +8619,7 @@ fn connector_lease_flush_before_yield_payload(
         },
         "purpose": CoreLeasePurpose::ConnectorStateWrite,
         "flush": {
+            "object_writer_excluded_during_read": object_writer_excluded_during_read,
             "root_present": flush.root_object_id.is_some(),
             "connector_id": flush.connector_id.to_string(),
             "zone_id": flush.zone_id.as_str(),
@@ -13824,10 +13856,11 @@ async fn connector_lease_flush_before_yield_handler(
         state_root,
         flush,
         warnings,
-    } = match connector_lease_yield_flush_context_for_registered_connector(
+    } = match connector_lease_yield_flush_with_writer_policy(
         &state,
         &connector_id,
         &zone,
+        query.require_writer_idle,
     )
     .await
     {
@@ -13847,6 +13880,7 @@ async fn connector_lease_flush_before_yield_handler(
         &state_root,
         &flush,
         warnings,
+        query.require_writer_idle,
     );
     tracing::debug!(
         event = "connector_lease_flush_before_yield_response",
@@ -47185,8 +47219,6 @@ while IFS= read -r request; do exit 2; done
                 panic!("initial durable connector-state append should not conflict")
             }
         };
-        drop(state_store);
-        drop(object_store);
 
         let (runner_tx, mut runner_rx) = mpsc::channel::<ConnectorRpcRequest>(1);
         let runner_task = task::spawn(async move { while runner_rx.recv().await.is_some() {} });
@@ -47214,20 +47246,35 @@ while IFS= read -r request; do exit 2; done
         });
         let app = connector_lease_flush_before_yield_test_app(state);
 
-        let response = send_json_request(
-            app,
-            axum::http::Method::POST,
-            "/rpc/admin/connectors/fcp.test.lease-flush:utility:1.0.0/lease/flush-before-yield?zone=z%3Awork",
-            serde_json::json!({}),
-            &[
-                ("Authorization", "Bearer topsecret"),
-                (ADMIN_ZONE_HEADER, "z:owner"),
-            ],
+        let route = "/rpc/admin/connectors/fcp.test.lease-flush:utility:1.0.0/lease/flush-before-yield?zone=z%3Awork";
+        let strict_route = format!("{route}&require_writer_idle=true");
+        let headers = [
+            ("Authorization", "Bearer topsecret"),
+            (ADMIN_ZONE_HEADER, "z:owner"),
+        ];
+        let post = axum::http::Method::POST;
+        let held = send_json_request(
+            app.clone(), post.clone(), &strict_route, serde_json::json!({}), &headers,
         )
         .await?;
+        assert_eq!(held.status(), axum::http::StatusCode::FORBIDDEN);
 
+        let prefix = send_json_request(
+            app.clone(), post.clone(), route, serde_json::json!({}), &headers,
+        )
+        .await?;
+        assert_eq!(prefix.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            response_body_json(prefix).await?["flush"]["object_writer_excluded_during_read"],
+            false
+        );
+        drop(state_store);
+        drop(object_store);
+
+        let response = send_json_request(app, post, &strict_route, serde_json::json!({}), &headers).await?;
         assert_eq!(response.status(), axum::http::StatusCode::OK);
         let payload = response_body_json(response).await?;
+        assert_eq!(payload["flush"]["object_writer_excluded_during_read"], true);
         assert_eq!(payload["schema_version"], "1.0.0");
         assert_eq!(payload["source"], "host-canonical-state-flush");
         assert_eq!(payload["connector_id"], connector_key.to_string());
