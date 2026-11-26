@@ -2855,7 +2855,9 @@ impl RegistryEntry {
             allowed_zones: self.config.allowed_zones.clone(),
             allowed_operations: self.config.allowed_operations.clone(),
             singleton_writer: self.state_policy.is_singleton_writer(),
-            enforce_operation_network_constraints: self.config.enforce_operation_network_constraints,
+            enforce_operation_network_constraints: self
+                .config
+                .enforce_operation_network_constraints,
             enforce_empty_allow_lists: self.config.enforce_empty_allow_lists,
             manifest_constraints: self.manifest_constraints.clone(),
         }
@@ -28786,7 +28788,13 @@ output_schema = { type = "object" }
             // Provider bytes are a different wire contract and remain opaque.
             fcp_async_core::time::timeout(
                 Duration::from_secs(4),
-                egress_governance_request(Arc::clone(&state), protocol, addr, credential_id, &token),
+                egress_governance_request(
+                    Arc::clone(&state),
+                    protocol,
+                    addr,
+                    credential_id,
+                    &token,
+                ),
             )
             .await
             .expect("governed loopback is bounded")
@@ -28827,7 +28835,13 @@ output_schema = { type = "object" }
             let _pools = state.credential_pools.lock().await;
             let error = fcp_async_core::time::timeout(
                 Duration::from_secs(1),
-                egress_governance_request(Arc::clone(&state), protocol, addr, credential_id, &token),
+                egress_governance_request(
+                    Arc::clone(&state),
+                    protocol,
+                    addr,
+                    credential_id,
+                    &token,
+                ),
             )
             .await
             .expect("updated policy rejects before credential selection")

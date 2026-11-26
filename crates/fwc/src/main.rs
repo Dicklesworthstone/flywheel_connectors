@@ -134,10 +134,10 @@ mod checkpoint;
 mod computation_migration;
 #[allow(dead_code)] // Workflow confusion corpus for task/session/pipeline cases.
 mod confusion_workflow;
-mod connector_state;
-mod connector_state_pull_cmd;
 mod connector_lease_flush;
+mod connector_state;
 mod connector_state_admin;
+mod connector_state_pull_cmd;
 #[allow(dead_code)] // Auth verify + credential backend trait.
 mod credential;
 #[allow(dead_code)]
@@ -2939,7 +2939,7 @@ struct InvokeArgs {
     #[arg(long)]
     lease_seq: Option<u64>,
 
-    /// Optional deadline in milliseconds.
+    /// Total setup and execution budget in milliseconds. Simulation defaults to 5000.
     #[arg(long)]
     deadline_ms: Option<u64>,
 
@@ -10985,7 +10985,9 @@ fn connector_lease_dispatch(
 ) -> Result<DispatchOutcome> {
     match &args.command {
         ConnectorLeaseCommand::Status(args) => connector_lease_status_dispatch(args, explicit_host),
-        ConnectorLeaseCommand::FlushBeforeYield(args) => connector_lease_flush::dispatch(args, explicit_host),
+        ConnectorLeaseCommand::FlushBeforeYield(args) => {
+            connector_lease_flush::dispatch(args, explicit_host)
+        }
     }
 }
 
@@ -11085,8 +11087,7 @@ fn connector_lease_status_host_dispatch(
     };
     let (zone, effective_target) =
         host_connector_lease_status_zone(args.zone.as_deref(), connector, &args.connector)?;
-    let mut payload =
-        connector_state_admin::read(
+    let mut payload = connector_state_admin::read(
         &client,
         connector_state_admin::ReadKind::Lease,
         connector.summary.id.as_str(),
@@ -27154,6 +27155,47 @@ fn invoke_dispatch_host(
     invoke_dispatch_host_controlled(command, args, host, simulation, None, None, None)
 }
 
+/// This outcome is only used before sending an invocation or simulation. Once
+/// dispatch starts, a late response or transport failure keeps its existing
+/// completion/unknown semantics and response-finalization allowance.
+fn invoke_setup_deadline_dispatch(
+    command: &str,
+    phase: &str,
+    reserved_request_id: Option<&RequestId>,
+) -> DispatchOutcome {
+    let mut payload = json!({
+        "status": "error",
+        "command": command,
+        "phase": phase,
+        "invoke_attempted": false,
+        "simulation_attempted": false,
+        "automatic_retry_allowed": false,
+        "error": {
+            "type": "execution-deadline-exceeded",
+            "message": "The setup and execution deadline expired before dispatch. No invocation or simulation was sent by this attempt; any existing execution fence remains in force.",
+            "recoverable": false,
+        },
+        "next_actions": [
+            "Check host responsiveness and the requested --deadline-ms budget before starting another attempt.",
+            "If a saved task owns this attempt, inspect its retained execution state before retrying.",
+        ],
+    });
+    if let Some(request_id) = reserved_request_id {
+        // A durable reservation requires a matching receipt identity even when
+        // the budget expires before send. Retain its fence explicitly instead
+        // of making receipt validation fail or reporting an unknown outcome.
+        payload["request_id"] = json!(request_id);
+        payload["execution_fence_retained"] = json!(true);
+    }
+    let mut envelope = CommandEnvelope::new(CommandAvailability::Unknown, command);
+    envelope.recoverable = false;
+    envelope.inject_into(&mut payload);
+    DispatchOutcome {
+        payload,
+        exit_code: CliExitCode::Transport,
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn invoke_dispatch_host_controlled(
     command: &str,
@@ -27172,6 +27214,22 @@ fn invoke_dispatch_host_controlled(
         task.is_none() || (simulation.is_none() && control.is_none() && guard.is_none()),
         "saved task invocation cannot share a simulation, MCP or rule execution owner"
     );
+    // Guarded rules already own a parent deadline; never replace it with a
+    // fresh child clock. Ordinary calls charge credentials, discovery, input
+    // preparation and preflight to the same budget forwarded to the host.
+    let execution_budget = guard.is_none().then(|| {
+        pipe::budget::ExecutionBudget::start(
+            args.deadline_ms.or_else(|| simulation.map(|_| 5_000)),
+            std::time::Instant::now(),
+        )
+    });
+    let deadline_expired = || {
+        execution_budget
+            .is_some_and(|budget| budget.remaining_ms(std::time::Instant::now()).is_err())
+    };
+    if deadline_expired() {
+        return Ok(invoke_setup_deadline_dispatch(command, "preparation", None));
+    }
     if let Some(control) = control {
         control.checkpoint()?;
     }
@@ -27200,17 +27258,29 @@ fn invoke_dispatch_host_controlled(
         }
     };
 
+    if deadline_expired() {
+        return Ok(invoke_setup_deadline_dispatch(command, "credentials", None));
+    }
     let mut client = if let Some(guard) = guard.as_deref() {
         guard.client.clone()
     } else {
         HostAdminClient::new(&host.endpoint)?
     };
+    if let Some(budget) = execution_budget {
+        client = client.with_read_budget(budget);
+    }
     if let Some(control) = control {
         control.checkpoint()?;
         // MCP shutdown must be able to drain preparation as well as invocation.
         client.read_timeout = client.read_timeout.min(DEFAULT_HOST_READ_TIMEOUT);
     }
-    let (catalog, _) = client.catalog(None)?;
+    let (catalog, _) = match client.catalog(None) {
+        Ok(catalog) => catalog,
+        Err(_) if deadline_expired() => {
+            return Ok(invoke_setup_deadline_dispatch(command, "discovery", None));
+        }
+        Err(error) => return Err(error),
+    };
     let connector = match catalog.resolve_connector(&args.connector) {
         Ok(connector) => connector,
         Err(error) => {
@@ -27233,10 +27303,21 @@ fn invoke_dispatch_host_controlled(
     }
     let introspection = if control.is_some() {
         client
-            .introspect_with_provenance(connector.summary.id.as_str())?
-            .0
+            .introspect_with_provenance(connector.summary.id.as_str())
+            .map(|(introspection, _)| introspection)
     } else {
-        client.introspect(connector.summary.id.as_str())?
+        client.introspect(connector.summary.id.as_str())
+    };
+    let introspection = match introspection {
+        Ok(introspection) => introspection,
+        Err(_) if deadline_expired() => {
+            return Ok(invoke_setup_deadline_dispatch(
+                command,
+                "introspection",
+                None,
+            ));
+        }
+        Err(error) => return Err(error),
     };
     let operation = match resolve_host_tool(&introspection.tools, &args.operation) {
         Ok(operation) => operation,
@@ -27423,8 +27504,20 @@ fn invoke_dispatch_host_controlled(
     }
 
     let holder_proof = auth.holder_proof_for(&request_id, &operation.name)?;
+    let deadline_ms = match execution_budget.map_or(Ok(args.deadline_ms), |budget| {
+        budget.invocation_timeout_ms(std::time::Instant::now())
+    }) {
+        Ok(remaining) => remaining,
+        Err(_) => {
+            return Ok(invoke_setup_deadline_dispatch(
+                command,
+                "input-authoring",
+                None,
+            ));
+        }
+    };
     if let Some(simulation) = simulation {
-        let request = HostSimulateRequest {
+        let mut request = HostSimulateRequest {
             holder_proof,
             request_id: request_id.to_string(),
             connector_id: connector_id.to_string(),
@@ -27437,10 +27530,16 @@ fn invoke_dispatch_host_controlled(
             approval_tokens: auth.approval_tokens,
             estimate_cost: simulation.estimate_cost,
             check_availability: simulation.check_availability,
-            deadline_ms: args.deadline_ms.unwrap_or(5000),
+            deadline_ms: deadline_ms.unwrap_or(5_000),
         };
         // The simulation endpoint performs admission before asking the
         // connector. A separate preflight could observe different state.
+        request.deadline_ms = match execution_budget.map_or(Ok(deadline_ms), |budget| {
+            budget.invocation_timeout_ms(std::time::Instant::now())
+        }) {
+            Ok(remaining) => remaining.unwrap_or(5_000),
+            Err(_) => return Ok(invoke_setup_deadline_dispatch(command, "dispatch", None)),
+        };
         let started_at = std::time::Instant::now();
         let response = client.simulate(&request)?;
         let latency_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -27535,7 +27634,7 @@ fn invoke_dispatch_host_controlled(
         return Ok(DispatchOutcome { payload, exit_code });
     }
 
-    let invoke_request = InvokeRequest {
+    let mut invoke_request = InvokeRequest {
         r#type: "invoke".to_owned(),
         id: request_id.clone(),
         connector_id: connector_id.clone(),
@@ -27547,7 +27646,7 @@ fn invoke_dispatch_host_controlled(
         context: None,
         idempotency_key: idempotency_key.clone(),
         lease_seq: args.lease_seq,
-        deadline_ms: args.deadline_ms,
+        deadline_ms,
         correlation_id: None,
         provenance: guard.as_deref().and_then(|guard| guard.provenance.cloned()),
         approval_tokens: auth.approval_tokens.clone(),
@@ -27568,16 +27667,26 @@ fn invoke_dispatch_host_controlled(
         capability_token: Some(auth.capability_token.clone()),
         approval_tokens: auth.approval_tokens.clone(),
     };
-    let preflight: HostPreflightResponse = if let Some(request) = &guarded_request {
+    let preflight = if let Some(request) = &guarded_request {
         guard
             .as_deref()
             .context("guarded preflight is missing its rule authority")?
-            .preflight(request)?
-    } else if let Some(control) = control {
-        control.checkpoint()?;
-        client.post_json_with_timeout("/rpc/preflight", &preflight_request, client.read_timeout)?
+            .preflight(request)
     } else {
-        client.preflight(&preflight_request)?
+        if let Some(control) = control {
+            control.checkpoint()?;
+        }
+        execution_budget.map_or_else(
+            || client.preflight(&preflight_request),
+            |budget| client.workflow_preflight(&preflight_request, budget),
+        )
+    };
+    let preflight = match preflight {
+        Ok(preflight) => preflight,
+        Err(_) if deadline_expired() => {
+            return Ok(invoke_setup_deadline_dispatch(command, "preflight", None));
+        }
+        Err(error) => return Err(error),
     };
     payload["preflight"] = serde_json::to_value(&preflight)?;
 
@@ -27637,6 +27746,23 @@ fn invoke_dispatch_host_controlled(
             effective_principal.as_deref(),
         )?;
     }
+    // Durable admission can itself take time. Recheck after it, before the
+    // first effectful request, and never renew time spent in preflight. A task
+    // whose reservation outlives its budget keeps its conservative fence.
+    invoke_request.deadline_ms = match execution_budget
+        .map_or(Ok(invoke_request.deadline_ms), |budget| {
+            budget.invocation_timeout_ms(std::time::Instant::now())
+        }) {
+        Ok(remaining) => remaining,
+        Err(_) => {
+            return Ok(invoke_setup_deadline_dispatch(
+                command,
+                "dispatch",
+                task.map(|_| &invoke_request.id),
+            ));
+        }
+    };
+    payload["request"]["deadline_ms"] = json!(invoke_request.deadline_ms);
     let started_at = std::time::Instant::now();
     let invocation = if let Some(request) = &guarded_request {
         guard
@@ -51178,14 +51304,27 @@ deny_ptrace = true
                 ("POST /rpc/admin/connectors/fcp.github:enterprise:v1/lease/flush-before-yield?zone=z%3Awork&require_writer_idle=true".to_owned(), reply),
             ]);
             let (exit, payload) = execute_json(&[
-                "fwc", "--json", "--host", &host, "connector", "lease", "flush-before-yield",
-                "--connector", "github", "--zone", "z:work", "--admin-token-file",
+                "fwc",
+                "--json",
+                "--host",
+                &host,
+                "connector",
+                "lease",
+                "flush-before-yield",
+                "--connector",
+                "github",
+                "--zone",
+                "z:work",
+                "--admin-token-file",
                 owner.path().to_str().unwrap(),
             ]);
             server.join().unwrap();
             let requests = requests.lock().unwrap();
             assert_eq!(requests.len(), 2);
-            assert_eq!(serde_json::from_str::<Value>(&requests[1].1).unwrap(), json!({}));
+            assert_eq!(
+                serde_json::from_str::<Value>(&requests[1].1).unwrap(),
+                json!({})
+            );
             assert!(!payload.to_string().contains("test-owner-credential"));
             if strict {
                 assert_eq!(exit, CliExitCode::Success.into(), "{payload}");
@@ -51430,7 +51569,8 @@ deny_ptrace = true
                 "connector",
                 "state",
                 "explain",
-                "--admin-token-file", owner.path().to_str().unwrap(),
+                "--admin-token-file",
+                owner.path().to_str().unwrap(),
                 "--connector",
                 "github",
                 "--require-source",
@@ -51524,7 +51664,8 @@ deny_ptrace = true
                     "connector",
                     family,
                     action,
-                    "--admin-token-file", owner.path().to_str().unwrap(),
+                    "--admin-token-file",
+                    owner.path().to_str().unwrap(),
                     "--connector",
                     "github",
                     "--zone",
@@ -51689,7 +51830,8 @@ deny_ptrace = true
             "connector",
             "state",
             "explain",
-            "--admin-token-file", owner.path().to_str().unwrap(),
+            "--admin-token-file",
+            owner.path().to_str().unwrap(),
             "--connector",
             "github",
             "--zone",
@@ -51829,7 +51971,8 @@ deny_ptrace = true
             "connector",
             "state",
             "explain",
-            "--admin-token-file", owner.path().to_str().unwrap(),
+            "--admin-token-file",
+            owner.path().to_str().unwrap(),
             "--connector",
             "github",
             "--zone",
@@ -52058,7 +52201,8 @@ deny_ptrace = true
             "connector",
             "lease",
             "status",
-            "--admin-token-file", owner.path().to_str().unwrap(),
+            "--admin-token-file",
+            owner.path().to_str().unwrap(),
             "--connector",
             "github",
             "--zone",
@@ -52196,7 +52340,8 @@ deny_ptrace = true
             "connector",
             "lease",
             "status",
-            "--admin-token-file", owner.path().to_str().unwrap(),
+            "--admin-token-file",
+            owner.path().to_str().unwrap(),
             "--connector",
             "github",
         ]);
@@ -63951,7 +64096,9 @@ depends_on = ["missing"]
         assert_eq!(sent["request_id"], response["request_id"]);
         assert_eq!(sent["estimate_cost"], true);
         assert_eq!(sent["check_availability"], true);
-        assert_eq!(sent["deadline_ms"], 1200);
+        let remaining = sent["deadline_ms"].as_u64().unwrap();
+        assert!((1..1_200).contains(&remaining));
+        assert_eq!(payload["request"]["deadline_ms"], remaining);
         assert!(!sent["capability_token"].is_null());
     }
 
@@ -64865,6 +65012,425 @@ depends_on = ["missing"]
     }
 
     // ── invoke host success round-trip ────────────────────────────
+
+    #[test]
+    fn invoke_deadline_zero_refuses_before_credentials_input_or_host_io() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let host = format!("http://{}", listener.local_addr().unwrap());
+        for command in ["invoke", "simulate"] {
+            let (exit, payload) = execute_json(&[
+                "fwc",
+                "--json",
+                "--host",
+                &host,
+                command,
+                "github",
+                "issues.create",
+                "--file",
+                "/missing/private-input.json",
+                "--capability-token-file",
+                "/missing/private-capability.cbor",
+                "--deadline-ms",
+                "0",
+            ]);
+            assert_eq!(exit, CliExitCode::Transport.into(), "{payload}");
+            assert_eq!(payload["error"]["type"], "execution-deadline-exceeded");
+            assert_eq!(payload["phase"], "preparation");
+            assert_eq!(payload["invoke_attempted"], false);
+            assert_eq!(payload["simulation_attempted"], false);
+            assert_eq!(payload["automatic_retry_allowed"], false);
+            assert!(!payload.to_string().contains("private-capability"));
+            assert!(!payload.to_string().contains("private-input"));
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        }
+    }
+
+    #[test]
+    fn invoke_deadline_bounds_discovery_introspection_and_preflight() {
+        let token = test_capability_token_arg();
+        for command in ["invoke", "simulate"] {
+            for (phase_index, phase) in ["discovery", "introspection", "preflight"]
+                .into_iter()
+                .enumerate()
+            {
+                if command == "simulate" && phase == "preflight" {
+                    // Simulation performs its own admission on /rpc/simulate.
+                    continue;
+                }
+                let routes = [
+                    ("POST /rpc/discover", mock_discovery_response_json()),
+                    (
+                        "GET /rpc/introspect/fcp.github:enterprise:v1",
+                        mock_introspection_response_json(),
+                    ),
+                    ("POST /rpc/preflight", mock_preflight_response_json(true)),
+                ]
+                .into_iter()
+                .take(phase_index + 1)
+                .enumerate()
+                .map(|(index, (route, body))| {
+                    (
+                        route.to_owned(),
+                        body,
+                        if index == phase_index {
+                            Duration::from_millis(600)
+                        } else {
+                            Duration::ZERO
+                        },
+                    )
+                })
+                .collect();
+                let (host, server, log, stop) =
+                    spawn_mock_host_sequence_with_observer(routes, |_, _| {});
+                let (exit, payload) = execute_json(&[
+                    "fwc",
+                    "--json",
+                    "--host",
+                    &host,
+                    command,
+                    "github",
+                    "issues.create",
+                    "--input",
+                    r#"{"owner":"octocat","repo":"hello-world","title":"private-deadline-input"}"#,
+                    "--capability-token",
+                    &token,
+                    "--deadline-ms",
+                    "300",
+                ]);
+                drop(stop);
+                server.join().unwrap();
+                assert_eq!(
+                    exit,
+                    CliExitCode::Transport.into(),
+                    "{command}/{phase}: {payload}"
+                );
+                assert_eq!(payload["error"]["type"], "execution-deadline-exceeded");
+                assert_eq!(payload["phase"], phase);
+                assert_eq!(payload["invoke_attempted"], false);
+                assert_eq!(payload["simulation_attempted"], false);
+                assert_eq!(payload["automatic_retry_allowed"], false);
+                assert!(!payload.to_string().contains(&token));
+                assert!(!payload.to_string().contains("private-deadline-input"));
+                let log = log.lock().unwrap();
+                assert_eq!(log.len(), phase_index + 1);
+                assert!(log.iter().all(|(route, _)| {
+                    route != "POST /rpc/invoke" && route != "POST /rpc/simulate"
+                }));
+            }
+        }
+    }
+
+    #[test]
+    fn invoke_deadline_forwards_only_time_remaining_after_setup_and_preflight() {
+        let tempdir = TempDir::new().unwrap();
+        let _history = super::install_test_history_path(tempdir.path().join("history.jsonl"));
+        let token = test_capability_token_arg();
+        let input = json!({
+            "owner": "octocat",
+            "repo": "hello-world",
+            "title": "Budgeted call",
+        });
+        for command in ["invoke", "simulate"] {
+            let mut routes = vec![
+                (
+                    "POST /rpc/discover".to_owned(),
+                    mock_discovery_response_json(),
+                    Duration::from_millis(150),
+                ),
+                (
+                    "GET /rpc/introspect/fcp.github:enterprise:v1".to_owned(),
+                    mock_introspection_response_json(),
+                    Duration::from_millis(150),
+                ),
+            ];
+            if command == "invoke" {
+                routes.push((
+                    "POST /rpc/preflight".to_owned(),
+                    mock_preflight_response_json(true),
+                    Duration::from_millis(150),
+                ));
+            }
+            let response = if command == "invoke" {
+                mock_invoke_response_json(json!({"number": 77}))
+            } else {
+                let mut response =
+                    mock_simulate_response_json(&input, SimulatePhase::ConnectorReached, true);
+                response["request_id"] = json!(
+                    derive_live_request_id(
+                        "fcp.github:enterprise:v1",
+                        "issues.create",
+                        "z:work",
+                        &input,
+                        Some("budgeted-call"),
+                        None,
+                    )
+                    .unwrap()
+                    .to_string()
+                );
+                response
+            };
+            routes.push((format!("POST /rpc/{command}"), response, Duration::ZERO));
+            let (host, server, log) = spawn_mock_host_sequence_with_timing(routes);
+            let (exit, payload) = execute_json(&[
+                "fwc",
+                "--json",
+                "--host",
+                &host,
+                command,
+                "github",
+                "issues.create",
+                "--input",
+                &input.to_string(),
+                "--capability-token",
+                &token,
+                "--idempotency-key",
+                "budgeted-call",
+                "--deadline-ms",
+                "3000",
+            ]);
+            server.join().unwrap();
+            assert_eq!(exit, CliExitCode::Success.into(), "{command}: {payload}");
+            let log = log.lock().unwrap();
+            let sent: Value = serde_json::from_str(&log.last().unwrap().1).unwrap();
+            let remaining = sent["deadline_ms"].as_u64().unwrap();
+            let maximum = if command == "invoke" { 2_550 } else { 2_700 };
+            assert!((1..=maximum).contains(&remaining), "{sent}");
+            assert_eq!(payload["request"]["deadline_ms"], remaining);
+            assert_eq!(sent["input"], input);
+            if command == "invoke" {
+                let preflight: Value = serde_json::from_str(&log[2].1).unwrap();
+                assert_eq!(preflight["request_id"], sent["id"]);
+                assert_eq!(preflight["params"], sent["input"]);
+                assert_eq!(preflight["capability_token"], sent["capability_token"]);
+                assert_eq!(preflight["holder_proof"], sent["holder_proof"]);
+                let mut request: super::InvokeRequest = serde_json::from_value(sent).unwrap();
+                let binding =
+                    fcp_host::InvocationIdempotency::from_relay_request(&request, None).unwrap();
+                assert!(binding.is_some());
+                request.deadline_ms = Some(3_000);
+                assert_eq!(
+                    fcp_host::InvocationIdempotency::from_relay_request(&request, None).unwrap(),
+                    binding,
+                    "narrowing the deadline must preserve a saved task's effect binding"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn invoke_deadline_preserves_terminal_and_unknown_outcomes_after_dispatch() {
+        let tempdir = TempDir::new().unwrap();
+        let _history = super::install_test_history_path(tempdir.path().join("history.jsonl"));
+        let token = test_capability_token_arg();
+        let input = json!({
+            "owner": "octocat",
+            "repo": "hello-world",
+            "title": "Finalized call",
+        });
+        for (command, uncertain) in [("invoke", false), ("simulate", false), ("invoke", true)] {
+            let mut routes = vec![
+                (
+                    "POST /rpc/discover".to_owned(),
+                    mock_discovery_response_json(),
+                    Duration::ZERO,
+                ),
+                (
+                    "GET /rpc/introspect/fcp.github:enterprise:v1".to_owned(),
+                    mock_introspection_response_json(),
+                    Duration::ZERO,
+                ),
+            ];
+            if command == "invoke" {
+                routes.push((
+                    "POST /rpc/preflight".to_owned(),
+                    mock_preflight_response_json(true),
+                    Duration::ZERO,
+                ));
+            }
+            let response = if uncertain {
+                json!({"unusable_proxy_response": input, "reflected_credential": token})
+            } else if command == "invoke" {
+                mock_invoke_response_json(json!({"number": 77}))
+            } else {
+                mock_simulate_response_json(&input, SimulatePhase::ConnectorReached, true)
+            };
+            routes.push((
+                format!("POST /rpc/{command}"),
+                response,
+                Duration::from_millis(600),
+            ));
+            let (host, server, log) = spawn_mock_host_sequence_with_timing(routes);
+            let (exit, payload) = execute_json(&[
+                "fwc",
+                "--json",
+                "--host",
+                &host,
+                command,
+                "github",
+                "issues.create",
+                "--input",
+                &input.to_string(),
+                "--capability-token",
+                &token,
+                "--deadline-ms",
+                "300",
+            ]);
+            server.join().unwrap();
+            let log = log.lock().unwrap();
+            assert_eq!(log.len(), if command == "invoke" { 4 } else { 3 });
+            if uncertain {
+                let sent: Value = serde_json::from_str(&log.last().unwrap().1).unwrap();
+                assert_eq!(exit, CliExitCode::Transport.into(), "{payload}");
+                assert_eq!(payload["outcome"], "outcome_unknown");
+                assert_eq!(payload["error"]["type"], "invoke-outcome-unknown");
+                assert_eq!(payload["request_id"], sent["id"]);
+                assert_eq!(payload["automatic_retry_allowed"], false);
+                assert!(!payload.to_string().contains(&token));
+                assert!(!payload.to_string().contains("Finalized call"));
+                continue;
+            }
+            assert_eq!(exit, CliExitCode::Success.into(), "{command}: {payload}");
+            assert_eq!(payload["status"], "ok");
+            if command == "invoke" {
+                assert_eq!(payload["response"]["result"]["number"], 77);
+            } else {
+                assert_eq!(payload["simulation"]["would_succeed"], true);
+            }
+        }
+    }
+
+    #[test]
+    fn invoke_deadline_saved_reservation_keeps_a_valid_receipt_and_fence() {
+        for reserved in [false, true] {
+            let temp = TempDir::new().unwrap();
+            let store = super::workflow::TaskStore::at_path(temp.path().join("task-state"));
+            let task = task_journal_fixture(&store);
+            let lease = store.lock_task(&task.id).unwrap();
+            let ticket = lease.begin_execution("run", "approve").unwrap();
+            let compiled = task_journal_repeated_invoke_plan(&store, &task);
+            let step = &compiled.steps[0];
+            lease.record_step_started(&ticket, step.ordinal).unwrap();
+            let task_invocation = super::TaskInvocationContext {
+                lease: &lease,
+                ticket: &ticket,
+                ordinal: step.ordinal,
+            };
+            let request = super::InvokeRequest {
+                r#type: "invoke".to_owned(),
+                id: RequestId::new("reserved-deadline-fixture"),
+                connector_id: "fcp.github:enterprise:v1".parse().unwrap(),
+                operation: compiled.operation_hint.as_deref().unwrap().parse().unwrap(),
+                zone_id: ZoneId::work(),
+                input: json!({"query": "private-reservation-input"}),
+                capability_token: super::CapabilityToken::test_token(),
+                holder_proof: None,
+                context: None,
+                idempotency_key: Some(task_invocation.scope_salt()),
+                lease_seq: None,
+                deadline_ms: Some(1),
+                correlation_id: None,
+                provenance: None,
+                approval_tokens: Vec::new(),
+            };
+            if reserved {
+                task_invocation
+                    .reserve("http://127.0.0.1:43210", &request, Some("test-principal"))
+                    .unwrap();
+            }
+
+            // Exercise expiry after the durable boundary without timing a
+            // filesystem write or allowing a provider request.
+            let deadline = super::invoke_setup_deadline_dispatch(
+                "invoke",
+                "dispatch",
+                reserved.then_some(&request.id),
+            );
+            assert_eq!(deadline.exit_code, CliExitCode::Transport);
+            assert_eq!(
+                deadline.payload["error"]["type"],
+                "execution-deadline-exceeded"
+            );
+            assert_eq!(deadline.payload["invoke_attempted"], false);
+            assert_eq!(deadline.payload["automatic_retry_allowed"], false);
+            if reserved {
+                assert_eq!(deadline.payload["request_id"], request.id.to_string());
+                assert_eq!(deadline.payload["execution_fence_retained"], true);
+            } else {
+                assert!(deadline.payload.get("request_id").is_none());
+                assert!(deadline.payload.get("execution_fence_retained").is_none());
+            }
+            let receipt = json!({
+                "ordinal": step.ordinal,
+                "command": step.command,
+                "side_effecting": step.side_effecting,
+                "primitive_dispatched": true,
+                "status": "failed",
+                "exit_code": deadline.exit_code.as_u8(),
+                "result": deadline.payload,
+            });
+            lease
+                .record_step_finished(&ticket, step.ordinal, receipt.clone())
+                .expect("deadline refusal must be a valid durable primitive receipt");
+            let saved = lease
+                .finish_execution(
+                    &ticket,
+                    json!({
+                        "status": "stopped-on-primitive-error",
+                        "executed_steps": [receipt.clone()],
+                        "executed_count": 1,
+                        "withheld_steps": [],
+                        "withheld_count": 0,
+                        "stopped_before_side_effect": true,
+                        "automatic_retry_allowed": false,
+                    }),
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                saved.execution_history.last().unwrap().execution["executed_steps"][0],
+                receipt
+            );
+            assert_eq!(
+                saved.execution_blocker(),
+                reserved.then_some(super::workflow::TaskExecutionState::NeedsReview)
+            );
+            if reserved {
+                let steps = &saved
+                    .execution_fence
+                    .as_ref()
+                    .unwrap()
+                    .journal
+                    .as_ref()
+                    .unwrap()
+                    .steps;
+                assert_eq!(steps[0].receipt.as_ref(), Some(&receipt));
+                assert_eq!(
+                    steps[0].invocation.as_ref().unwrap().request_id,
+                    request.id.to_string()
+                );
+                assert!(steps[1].started_at.is_none());
+                assert!(steps[1].invocation.is_none());
+            }
+            let persisted =
+                fs::read_to_string(task_journal_fixture_path(&store, &task.id)).unwrap();
+            assert!(!persisted.contains("private-reservation-input"));
+            assert!(!persisted.contains("\"capability_token\""));
+            drop(lease);
+            assert_eq!(
+                store
+                    .lock_task(&task.id)
+                    .unwrap()
+                    .begin_execution("run", "approve")
+                    .is_err(),
+                reserved,
+                "only the durably reserved deadline refusal must retain the replay fence"
+            );
+        }
+    }
 
     #[test]
     fn invoke_host_success_reports_execution_phase() {

@@ -1924,7 +1924,12 @@ fn execution_fence_after(execution: &Value) -> Option<TaskExecutionState> {
     }
     for step in steps {
         let result = &step["result"];
-        if result["error"]["type"] == "invoke-outcome-unknown" || result["outcome"] == "unknown" {
+        // A deadline refusal after durable reservation keeps its exact
+        // identity and fence even though this attempt sent no invocation.
+        if result["execution_fence_retained"] == true
+            || result["error"]["type"] == "invoke-outcome-unknown"
+            || result["outcome"] == "unknown"
+        {
             return Some(TaskExecutionState::NeedsReview);
         }
         if step["primitive_dispatched"] == false {
