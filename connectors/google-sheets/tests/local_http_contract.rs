@@ -82,6 +82,32 @@ fn loopback_client(server: &MockServer) -> SheetsClient {
 }
 
 #[fcp_async_core::runtime::test]
+async fn shutdown_prevents_every_operation_before_dispatch() {
+    let server = MockServer::start().await;
+    let client = loopback_client(&server);
+    client.shutdown();
+    let values = vec![vec![json!("must not be written")]];
+    let results = [
+        client.get_spreadsheet("id").await.map(|_| ()),
+        client.get_values("id", "A1").await.map(|_| ()),
+        client
+            .update_values("id", "A1", values.clone())
+            .await
+            .map(|_| ()),
+        client.append_values("id", "A1", values).await.map(|_| ()),
+        client.clear_values("id", "A1").await.map(|_| ()),
+    ];
+    for result in results {
+        let error = result.unwrap_err();
+        assert!(!error.is_retryable());
+        assert!(error.to_string().contains("cancelled"));
+        assert!(!error.to_string().contains("outcome unknown"));
+    }
+    assert_eq!(client.total_requests(), 0);
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[fcp_async_core::runtime::test]
 async fn writes_with_unknown_outcomes_never_advertise_a_retry() {
     for (method_name, status, body) in [
         (

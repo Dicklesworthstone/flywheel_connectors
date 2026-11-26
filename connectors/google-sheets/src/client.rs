@@ -1,10 +1,12 @@
 //! Google Sheets API v4 client.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::time::Duration;
 
 use fcp_google_discovery::auth::GoogleMaterializedAuth;
-use fcp_google_discovery::executor::{build_google_api_client, retry_after_ms};
+use fcp_google_discovery::executor::{
+    DEFAULT_MAX_RESPONSE_BYTES, build_google_api_client, retry_after_ms,
+};
 use fcp_sdk::migration::transport_error_reached_service;
 use fcp_sdk::{ConnectorRuntime, ConnectorRuntimeConfig};
 use reqwest::{Client, RequestBuilder};
@@ -17,6 +19,7 @@ use crate::types::{
 };
 
 const DEFAULT_BASE_URL: &str = "https://sheets.googleapis.com/v4";
+const MAX_ERROR_RESPONSE_BYTES: usize = 64 * 1024;
 
 /// Google Sheets API client.
 pub struct SheetsClient {
@@ -121,7 +124,8 @@ impl SheetsClient {
             major_dimension: "ROWS".to_string(),
             values,
         };
-        self.send_json(self.client.put(url).json(&body), false).await
+        self.send_json(self.client.put(url).json(&body), false)
+            .await
     }
 
     /// Append values to a sheet.
@@ -192,7 +196,57 @@ impl SheetsClient {
         request: RequestBuilder,
         replay_safe: bool,
     ) -> SheetsResult<T> {
+        let context = self.runtime.request_context();
+        let started = AtomicBool::new(false);
+        let response_status = AtomicU16::new(0);
+        // One context owns sending, body reads and decoding. In particular,
+        // shutdown must wake a request even while a provider withholds its body.
+        let result = context
+            .run(self.send_json_in_context(request, replay_safe, &started, &response_status))
+            .await;
+        // JSON decoding is synchronous: recheck before publishing its result
+        // so decoding cannot return success after shutdown or the same deadline.
+        let succeeded = matches!(&result, Ok(Ok(_)));
+        let result = if succeeded && context.is_cancelled() {
+            Err(fcp_async_core::AsyncError::Cancelled)
+        } else if succeeded
+            && context
+                .deadline()
+                .is_some_and(|deadline| deadline.is_expired())
+        {
+            Err(fcp_async_core::AsyncError::Timeout {
+                timeout_ms: u64::try_from(self.runtime.request_timeout().as_millis())
+                    .unwrap_or(u64::MAX),
+            })
+        } else {
+            result
+        };
+        result.unwrap_or_else(|error| {
+            let status = response_status.load(Ordering::Relaxed);
+            if (400..500).contains(&status) && status != 408 {
+                // The provider already refused the request. An interrupted
+                // error body must not turn that refusal into an unknown write.
+                Err(map_api_error(status, error.to_string(), None))
+            } else if !replay_safe && started.load(Ordering::Relaxed) {
+                Err(SheetsError::WriteOutcomeUnknown {
+                    status_code: (status != 0).then_some(status),
+                    message: error.to_string(),
+                })
+            } else {
+                Err(<SheetsError as fcp_sdk::ConnectorErrorMapping>::from_async_error(error))
+            }
+        })
+    }
+
+    async fn send_json_in_context<T: DeserializeOwned>(
+        &self,
+        request: RequestBuilder,
+        replay_safe: bool,
+        started: &AtomicBool,
+        response_status: &AtomicU16,
+    ) -> SheetsResult<T> {
         self.total_requests.fetch_add(1, Ordering::Relaxed);
+        started.store(true, Ordering::Relaxed);
         let response = self
             .apply_auth_headers(request)
             .send()
@@ -208,15 +262,21 @@ impl SheetsClient {
                 }
             })?;
         let status = response.status();
+        response_status.store(status.as_u16(), Ordering::Relaxed);
         if status.is_success() {
-            return response.json().await.map_err(|error| {
-                if replay_safe {
-                    SheetsError::Http(error)
-                } else {
+            let decoded = async {
+                let bytes = read_bounded_response(response, DEFAULT_MAX_RESPONSE_BYTES).await?;
+                serde_json::from_slice(&bytes).map_err(SheetsError::Json)
+            }
+            .await;
+            return decoded.map_err(|error| {
+                if !replay_safe {
                     SheetsError::WriteOutcomeUnknown {
                         status_code: Some(status.as_u16()),
-                        message: error.without_url().to_string(),
+                        message: error.to_string(),
                     }
+                } else {
+                    error
                 }
             });
         }
@@ -227,9 +287,20 @@ impl SheetsClient {
                 .iter()
                 .filter_map(|value| value.to_str().ok()),
         );
-        let body = response.text().await.unwrap_or_default();
-        let message = serde_json::from_str::<ApiErrorResponse>(&body)
-            .map_or_else(|_| body, |api_err| api_err.error.message);
+        if matches!(status.as_u16(), 401 | 429) {
+            // Neither classification uses the body. Do not let an irrelevant
+            // body stall hide a known refusal or the provider's retry minimum.
+            return Err(map_api_error(status.as_u16(), String::new(), retry_floor));
+        }
+        // Error bodies receive a smaller bound. Authoritative HTTP status and
+        // Retry-After survive malformed, oversized or interrupted error bodies.
+        let message = match read_bounded_response(response, MAX_ERROR_RESPONSE_BYTES).await {
+            Ok(body) => serde_json::from_slice::<ApiErrorResponse>(&body).map_or_else(
+                |_| String::from_utf8_lossy(&body).into_owned(),
+                |api_err| api_err.error.message,
+            ),
+            Err(error) => error.to_string(),
+        };
         if !replay_safe
             && (status.is_server_error() || status == reqwest::StatusCode::REQUEST_TIMEOUT)
         {
@@ -240,6 +311,26 @@ impl SheetsClient {
         }
         Err(map_api_error(status.as_u16(), message, retry_floor))
     }
+}
+
+async fn read_bounded_response(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> SheetsResult<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > u64::try_from(limit).unwrap_or(u64::MAX))
+    {
+        return Err(SheetsError::ResponseTooLarge { limit });
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(SheetsError::Http)? {
+        if chunk.len() > limit.saturating_sub(bytes.len()) {
+            return Err(SheetsError::ResponseTooLarge { limit });
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 fn map_api_error(status: u16, message: String, retry_floor: Option<u64>) -> SheetsError {
@@ -355,6 +446,290 @@ mod tests {
         F: Future,
     {
         fcp_async_core::runtime::block_on_sync(future).expect("test runtime")
+    }
+
+    /// A real provider that accepts a complete request and retains its socket
+    /// after writing a selected prefix. All waits, including cleanup, are bounded.
+    struct PausedProvider {
+        url: String,
+        observed: Option<fcp_async_core::channel::oneshot::Receiver<()>>,
+        release: Option<std::sync::mpsc::Sender<()>>,
+        worker: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl PausedProvider {
+        fn start(prefix: Vec<u8>) -> Self {
+            use std::io::{Read, Write};
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let (observed_tx, observed) = fcp_async_core::channel::oneshot::channel();
+            let (release, release_rx) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(3);
+                let mut stream = loop {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "provider accept timed out"
+                    );
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(error) => panic!("provider accept: {error}"),
+                    }
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 1024];
+                loop {
+                    let read = stream.read(&mut buffer).unwrap();
+                    assert_ne!(read, 0, "client closed an incomplete request");
+                    request.extend_from_slice(&buffer[..read]);
+                    assert!(request.len() <= 8192, "unexpected fixture request size");
+                    if let Some(header_end) =
+                        request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+                    {
+                        let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+                        let body_length = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= header_end + 4 + body_length {
+                            break;
+                        }
+                    }
+                }
+                stream.write_all(&prefix).unwrap();
+                let _ = observed_tx.send(());
+                let _ = release_rx.recv_timeout(Duration::from_secs(2));
+            });
+            Self {
+                url,
+                observed: Some(observed),
+                release: Some(release),
+                worker: Some(worker),
+            }
+        }
+
+        async fn wait_for_request(&mut self) {
+            fcp_async_core::time::timeout(
+                Duration::from_secs(1),
+                self.observed.take().unwrap(),
+            )
+            .await
+            .expect("provider saw request")
+            .expect("provider observer");
+        }
+    }
+
+    impl Drop for PausedProvider {
+        fn drop(&mut self) {
+            if let Some(release) = self.release.take() {
+                let _ = release.send(());
+            }
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+        }
+    }
+
+    fn paused_provider_client(provider: &PausedProvider) -> SheetsClient {
+        let mut client = SheetsClient::new_with_auth(GoogleMaterializedAuth::CredentialReference {
+            credential_id: fcp_core::CredentialId::new(),
+            quota_project_id: None,
+        })
+        .unwrap()
+        .with_base_url(&provider.url);
+        client.client = build_google_api_client(
+            Client::builder().no_proxy().timeout(Duration::from_secs(3)),
+        )
+        .unwrap();
+        client
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn shutdown_wakes_silent_or_partial_provider_replies_without_replaying_writes() {
+        for prefix in [
+            Vec::new(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{".to_vec(),
+        ] {
+            for write in [false, true] {
+                let mut provider = PausedProvider::start(prefix.clone());
+                let client = std::sync::Arc::new(paused_provider_client(&provider));
+                let worker_client = std::sync::Arc::clone(&client);
+                let mut operation = fcp_async_core::task::spawn(async move {
+                    if write {
+                        worker_client
+                            .append_values("id", "A1", vec![vec![serde_json::json!(1)]])
+                            .await
+                            .map(|_| ())
+                    } else {
+                        worker_client.get_values("id", "A1").await.map(|_| ())
+                    }
+                });
+                provider.wait_for_request().await;
+                client.shutdown();
+                let completed =
+                    fcp_async_core::time::timeout(Duration::from_millis(500), &mut operation).await;
+                operation.abort();
+                let error = completed
+                    .expect("shutdown must wake pending I/O")
+                    .expect("operation task")
+                    .unwrap_err();
+                assert!(!error.is_retryable());
+                if write {
+                    assert!(matches!(error, SheetsError::WriteOutcomeUnknown { .. }));
+                } else {
+                    assert!(error.to_string().contains("cancelled"));
+                }
+                assert_eq!(client.total_requests(), 1);
+            }
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn one_request_deadline_covers_the_full_response_body() {
+        let mut provider = PausedProvider::start(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{".to_vec(),
+        );
+        let mut client = paused_provider_client(&provider);
+        client.runtime = ConnectorRuntime::new(
+            ConnectorRuntimeConfig::default().with_request_timeout(Duration::from_secs(1)),
+        );
+        let mut operation = fcp_async_core::task::spawn(async move {
+            client
+                .append_values("id", "A1", vec![vec![serde_json::json!(1)]])
+                .await
+        });
+        provider.wait_for_request().await;
+        let completed =
+            fcp_async_core::time::timeout(Duration::from_millis(1500), &mut operation).await;
+        operation.abort();
+        let error = completed
+            .expect("body read must share request deadline")
+            .expect("operation task")
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            SheetsError::WriteOutcomeUnknown {
+                status_code: Some(200),
+                ..
+            }
+        ));
+        assert!(!error.is_retryable());
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn bounded_body_accepts_exact_limit_and_rejects_declared_or_chunked_overflow() {
+        for (prefix, accepted) in [
+            (
+                b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\n12345678".to_vec(),
+                true,
+            ),
+            (
+                b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\n".to_vec(),
+                false,
+            ),
+            (
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\n12345\r\n4\r\n6789\r\n0\r\n\r\n".to_vec(),
+                false,
+            ),
+        ] {
+            let provider = PausedProvider::start(prefix);
+            let response = build_google_api_client(
+                Client::builder().no_proxy().timeout(Duration::from_secs(3)),
+            )
+            .unwrap()
+            .get(&provider.url)
+            .send()
+            .await
+            .unwrap();
+            let result = read_bounded_response(response, 8).await;
+            if accepted {
+                assert_eq!(result.unwrap(), b"12345678");
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(SheetsError::ResponseTooLarge { limit: 8 })
+                ));
+            }
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn oversized_write_receipt_remains_an_unknown_nonretryable_outcome() {
+        let provider = PausedProvider::start(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                DEFAULT_MAX_RESPONSE_BYTES + 1,
+            )
+            .into_bytes(),
+        );
+        let client = paused_provider_client(&provider);
+        let error = client
+            .append_values("id", "A1", vec![vec![serde_json::json!(1)]])
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            SheetsError::WriteOutcomeUnknown {
+                status_code: Some(200),
+                ..
+            }
+        ));
+        assert!(!error.is_retryable());
+        assert_eq!(client.total_requests(), 1);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn known_refusals_do_not_wait_for_or_lose_authority_to_error_bodies() {
+        for (status, expected_wait) in [(401, None), (429, Some(125_000))] {
+            let provider = PausedProvider::start(
+                format!(
+                    "HTTP/1.1 {status} Refused\r\nRetry-After: 125\r\nContent-Length: 999999999\r\nConnection: close\r\n\r\n",
+                )
+                .into_bytes(),
+            );
+            let client = paused_provider_client(&provider);
+            let result = fcp_async_core::time::timeout(
+                Duration::from_millis(500),
+                client.append_values("id", "A1", vec![vec![serde_json::json!(1)]]),
+            )
+            .await
+            .expect("known refusal must not wait for its body");
+            let error = result.unwrap_err();
+            if let Some(wait) = expected_wait {
+                assert!(
+                    matches!(error, SheetsError::RateLimited { retry_after_ms } if retry_after_ms == wait)
+                );
+            } else {
+                assert!(matches!(error, SheetsError::Unauthorized));
+            }
+        }
+        let provider = PausedProvider::start(
+            b"HTTP/1.1 403 Forbidden\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{".to_vec(),
+        );
+        let mut client = paused_provider_client(&provider);
+        client.runtime = ConnectorRuntime::new(
+            ConnectorRuntimeConfig::default().with_request_timeout(Duration::from_secs(1)),
+        );
+        let error = client
+            .append_values("id", "A1", vec![vec![serde_json::json!(1)]])
+            .await
+            .unwrap_err();
+        assert!(matches!(error, SheetsError::Forbidden { .. }));
+        assert!(!error.is_retryable());
     }
 
     #[test]

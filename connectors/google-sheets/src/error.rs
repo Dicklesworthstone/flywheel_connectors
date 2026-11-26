@@ -35,6 +35,10 @@ pub enum SheetsError {
         message: String,
     },
 
+    /// Response exceeded the bounded decoded-body budget.
+    #[error("Sheets response exceeds {limit} bytes; request a smaller range")]
+    ResponseTooLarge { limit: usize },
+
     /// Rate limited
     #[error("Rate limited, retry after {retry_after_ms}ms")]
     RateLimited { retry_after_ms: u64 },
@@ -90,6 +94,13 @@ impl SheetsError {
                 service: "google_sheets".into(),
                 message: self.to_string(),
                 status_code: *status_code,
+                retryable: false,
+                retry_after: None,
+            },
+            Self::ResponseTooLarge { .. } => FcpError::External {
+                service: "google_sheets".into(),
+                message: self.to_string(),
+                status_code: None,
                 retryable: false,
                 retry_after: None,
             },
