@@ -525,10 +525,7 @@ impl CancellationController {
     ///
     /// Panics if the internal mutex is poisoned.
     #[must_use]
-    pub fn record_returned_registration(
-        &self,
-        registration: &CancellationRegistration,
-    ) -> bool {
+    pub fn record_returned_registration(&self, registration: &CancellationRegistration) -> bool {
         let mut ops = self.operations.lock().expect("operations lock");
         let Some(op) = ops.entries.get_mut(&registration.operation_id) else {
             return false;
@@ -826,9 +823,8 @@ impl CancellationController {
                         CancellationEvidence::default()
                     };
                     let duration_ms = op.cancellation_duration_ms.or_else(|| {
-                        op.cancel_requested_at.map(|at| {
-                            u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX)
-                        })
+                        op.cancel_requested_at
+                            .map(|at| u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX))
                     });
                     (outcome, evidence, duration_ms)
                 }
@@ -1247,7 +1243,10 @@ mod tests {
         for index in 0..MAX_COMPLETED_OPERATION_HISTORY * 2 {
             retain_completed_history(&controller, &format!("history-{index}"));
         }
-        assert_eq!(controller.tracked_count(), MAX_COMPLETED_OPERATION_HISTORY + 2);
+        assert_eq!(
+            controller.tracked_count(),
+            MAX_COMPLETED_OPERATION_HISTORY + 2
+        );
         for operation_id in ["live", "settling"] {
             assert!(
                 controller
@@ -1269,7 +1268,10 @@ mod tests {
         }
         finished.store(true, Ordering::SeqCst);
         assert!(controller.reap_expired(Instant::now()).is_empty());
-        assert_eq!(controller.tracked_count(), MAX_COMPLETED_OPERATION_HISTORY + 1);
+        assert_eq!(
+            controller.tracked_count(),
+            MAX_COMPLETED_OPERATION_HISTORY + 1
+        );
         controller.complete_registration(&active);
         assert_eq!(controller.tracked_count(), MAX_COMPLETED_OPERATION_HISTORY);
         assert!(controller.audit_events().is_empty());
@@ -1283,13 +1285,16 @@ mod tests {
             origin_attempt_id: 7,
         };
         let scope_for = |relay: RelayCancellationBinding| {
-            let mut scope =
-                CancellationScope::new("native", ConnectorArchetype::RequestResponse);
+            let mut scope = CancellationScope::new("native", ConnectorArchetype::RequestResponse);
             scope.relay = Some(relay);
             scope
         };
         let old = controller
-            .track_operation("reused-history", Some("old-owner"), scope_for(old_binding.clone()))
+            .track_operation(
+                "reused-history",
+                Some("old-owner"),
+                scope_for(old_binding.clone()),
+            )
             .unwrap();
         controller.complete_registration(&old);
         for index in 0..MAX_COMPLETED_OPERATION_HISTORY {
@@ -1349,7 +1354,11 @@ mod tests {
         }
         assert!(controller.record_forced_expiration(&expired, fixed_now()));
         assert_eq!(
-            controller.audit_events().iter().filter(|event| event.forced).count(),
+            controller
+                .audit_events()
+                .iter()
+                .filter(|event| event.forced)
+                .count(),
             1,
         );
         for index in 0..MAX_COMPLETED_OPERATION_HISTORY {
@@ -1382,7 +1391,10 @@ mod tests {
             controller.complete_registration(registration);
         }
         // Every extra entry is pinned by real outstanding attempt ownership.
-        assert_eq!(controller.tracked_count(), MAX_COMPLETED_OPERATION_HISTORY + 1);
+        assert_eq!(
+            controller.tracked_count(),
+            MAX_COMPLETED_OPERATION_HISTORY + 1
+        );
         drop(expired);
         assert!(controller.reap_expired(Instant::now()).is_empty());
         assert_eq!(controller.tracked_count(), MAX_COMPLETED_OPERATION_HISTORY);
@@ -1409,7 +1421,10 @@ mod tests {
                 });
             }
         });
-        assert_eq!(controller.tracked_count(), MAX_COMPLETED_OPERATION_HISTORY + 1);
+        assert_eq!(
+            controller.tracked_count(),
+            MAX_COMPLETED_OPERATION_HISTORY + 1
+        );
         let tracker = controller.operations.lock().unwrap();
         assert_eq!(tracker.completed.len(), MAX_COMPLETED_OPERATION_HISTORY);
         assert!(!tracker.entries["still-live"].completed);
@@ -1443,7 +1458,10 @@ mod tests {
         );
         controller.record_forced_cancellation("audit-retention", fixed_now());
         assert!(controller.audit_events()[0].forced);
-        assert_eq!(controller.audit_events().len(), MAX_CANCELLATION_AUDIT_HISTORY);
+        assert_eq!(
+            controller.audit_events().len(),
+            MAX_CANCELLATION_AUDIT_HISTORY
+        );
         assert_eq!(controller.discarded_audit_event_count(), 8);
         // Repeated acknowledgement must not consume history capacity again.
         controller.record_forced_cancellation("audit-retention", fixed_now());
@@ -1976,8 +1994,7 @@ mod tests {
             origin_node: "entry".to_owned(),
             origin_attempt_id: 1,
         };
-        let mut scope =
-            CancellationScope::new("connector", ConnectorArchetype::RequestResponse);
+        let mut scope = CancellationScope::new("connector", ConnectorArchetype::RequestResponse);
         scope.relay = Some(binding.clone());
         controller.track_operation("unowned", None, scope).unwrap();
         controller.track_with_owner("local", Some("owner"));
@@ -2345,10 +2362,9 @@ mod tests {
             .cancel_requested_at = Some(anchor);
 
         let expected = cancellation_evidence_fixture();
-        assert!(ctrl.complete_cancelled_registration_when_settled(
-            &registration,
-            expected.clone(),
-        ));
+        assert!(
+            ctrl.complete_cancelled_registration_when_settled(&registration, expected.clone(),)
+        );
         // A duplicate callback cannot erase the first report or free live work.
         assert!(!ctrl.complete_cancelled_registration_when_settled(
             &registration,
@@ -2421,37 +2437,49 @@ mod tests {
         let old = ctrl
             .track_operation("reused-evidence", Some("old-owner"), scope())
             .unwrap();
-        assert!(!ctrl.complete_cancelled_registration_when_settled(
-            &old,
-            CancellationEvidence::default(),
-        ));
+        assert!(
+            !ctrl.complete_cancelled_registration_when_settled(
+                &old,
+                CancellationEvidence::default(),
+            )
+        );
         assert!(!ctrl.is_cancel_requested("reused-evidence"));
         let request = cancel_request("reused-evidence", CancelReason::UserRequested);
-        ctrl.cancel(&request, Some("old-owner"), fixed_now()).unwrap();
+        ctrl.cancel(&request, Some("old-owner"), fixed_now())
+            .unwrap();
         ctrl.complete_registration(&old);
-        assert!(!ctrl.complete_cancelled_registration_when_settled(
-            &old,
-            CancellationEvidence::default(),
-        ));
+        assert!(
+            !ctrl.complete_cancelled_registration_when_settled(
+                &old,
+                CancellationEvidence::default(),
+            )
+        );
         assert_eq!(
-            ctrl.cancel(&request, Some("old-owner"), fixed_now()).unwrap().outcome,
+            ctrl.cancel(&request, Some("old-owner"), fixed_now())
+                .unwrap()
+                .outcome,
             CancellationOutcome::TooLate
         );
 
         let current = ctrl
             .track_operation("reused-evidence", Some("new-owner"), scope())
             .unwrap();
-        ctrl.cancel(&request, Some("new-owner"), fixed_now()).unwrap();
+        ctrl.cancel(&request, Some("new-owner"), fixed_now())
+            .unwrap();
         assert!(!ctrl.record_returned_registration(&old));
-        assert!(!ctrl.complete_cancelled_registration_when_settled(
-            &old,
-            cancellation_evidence_fixture(),
-        ));
+        assert!(
+            !ctrl.complete_cancelled_registration_when_settled(
+                &old,
+                cancellation_evidence_fixture(),
+            )
+        );
         assert!(ctrl.complete_cancelled_registration_when_settled(
             &current,
             CancellationEvidence::default(),
         ));
-        let response = ctrl.cancel(&request, Some("new-owner"), fixed_now()).unwrap();
+        let response = ctrl
+            .cancel(&request, Some("new-owner"), fixed_now())
+            .unwrap();
         assert_eq!(response.outcome, CancellationOutcome::Cancelled);
         assert!(response.checkpoint.is_none());
         assert!(response.cleanup_result.is_none());
@@ -3599,7 +3627,12 @@ mod tests {
             return_partial: false,
             capability_token: None,
         };
-        assert!(ctrl.cancel(&req, None, fixed_now()).unwrap().checkpoint.is_none());
+        assert!(
+            ctrl.cancel(&req, None, fixed_now())
+                .unwrap()
+                .checkpoint
+                .is_none()
+        );
         assert!(ctrl.complete_cancelled_registration_when_settled(
             &registration,
             cancellation_evidence_fixture(),
@@ -3607,7 +3640,10 @@ mod tests {
         let resp = ctrl.cancel(&req, None, fixed_now()).unwrap();
         let ckpt = resp.checkpoint.unwrap();
         assert_eq!(ckpt.id, "persisted-object-d14c");
-        assert_eq!(ckpt.state, Some(serde_json::json!({"cursor": "after-three"})));
+        assert_eq!(
+            ckpt.state,
+            Some(serde_json::json!({"cursor": "after-three"}))
+        );
     }
 
     #[test]
@@ -5046,9 +5082,14 @@ mod tests {
         let controller = CancellationController::new();
         let registration = cancellable_attempt(&controller, "lost");
         let requested_at = controller.operations.lock().unwrap().entries["lost"]
-            .cancel_requested_at.unwrap();
+            .cancel_requested_at
+            .unwrap();
         let at_deadline = requested_at + Duration::from_millis(500);
-        assert!(controller.reap_expired(at_deadline - Duration::from_nanos(1)).is_empty());
+        assert!(
+            controller
+                .reap_expired(at_deadline - Duration::from_nanos(1))
+                .is_empty()
+        );
         let original = controller.reap_expired(at_deadline).pop().unwrap();
         let retained = original.clone();
         let old_attempt = Arc::downgrade(&original.attempt);
@@ -5059,11 +5100,21 @@ mod tests {
         assert!(!Weak::ptr_eq(&old_attempt, &Arc::downgrade(&retry.attempt)));
         assert!(Arc::ptr_eq(&registration.identity, &retry.registration));
         assert_eq!(retry.deadline, Duration::from_millis(500));
-        assert_eq!(controller.operations.lock().unwrap().entries["lost"].cancel_requested_at, Some(requested_at));
+        assert_eq!(
+            controller.operations.lock().unwrap().entries["lost"].cancel_requested_at,
+            Some(requested_at)
+        );
         assert!(controller.audit_events().iter().all(|event| !event.forced));
-        assert!(controller.track_operation(
-            "lost", None, CancellationScope::new("replacement", ConnectorArchetype::RequestResponse),
-        ).is_err(), "losing a reaper is not completion of the invocation");
+        assert!(
+            controller
+                .track_operation(
+                    "lost",
+                    None,
+                    CancellationScope::new("replacement", ConnectorArchetype::RequestResponse),
+                )
+                .is_err(),
+            "losing a reaper is not completion of the invocation"
+        );
     }
 
     #[test]
@@ -5121,7 +5172,14 @@ mod tests {
         assert!(controller.reap_expired(now).is_empty());
         assert!(!controller.record_forced_expiration(&old, fixed_now()));
         assert!(controller.record_forced_expiration(&current, fixed_now()));
-        assert_eq!(controller.audit_events().iter().filter(|event| event.forced).count(), 1);
+        assert_eq!(
+            controller
+                .audit_events()
+                .iter()
+                .filter(|event| event.forced)
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -5143,19 +5201,40 @@ mod tests {
         barrier.wait();
         let results = workers.map(|worker| worker.join().unwrap());
         assert_eq!(results.into_iter().filter(|recorded| *recorded).count(), 1);
-        assert_eq!(controller.audit_events().iter().filter(|event| event.forced).count(), 1);
+        assert_eq!(
+            controller
+                .audit_events()
+                .iter()
+                .filter(|event| event.forced)
+                .count(),
+            1
+        );
         controller.rearm_expiration(&expired);
         controller.rearm_force_terminate("ack-once");
         controller.record_forced_cancellation("ack-once", fixed_now());
-        assert_eq!(controller.audit_events().iter().filter(|event| event.forced).count(), 1);
+        assert_eq!(
+            controller
+                .audit_events()
+                .iter()
+                .filter(|event| event.forced)
+                .count(),
+            1
+        );
         controller.clear_audit_log();
         assert!(!controller.record_forced_expiration(&expired, fixed_now()));
         drop(expired);
         assert!(controller.reap_expired(now).is_empty());
         assert!(controller.audit_events().is_empty());
-        assert!(controller.track_operation(
-            "ack-once", None, CancellationScope::new("replacement", ConnectorArchetype::RequestResponse),
-        ).is_err(), "acknowledging termination must not release the operation ID");
+        assert!(
+            controller
+                .track_operation(
+                    "ack-once",
+                    None,
+                    CancellationScope::new("replacement", ConnectorArchetype::RequestResponse),
+                )
+                .is_err(),
+            "acknowledging termination must not release the operation ID"
+        );
     }
 
     #[test]
@@ -5167,12 +5246,17 @@ mod tests {
         let now = Instant::now() + Duration::from_secs(1);
         let mut expired = controller.reap_expired(now);
         assert_eq!(expired.len(), 3);
-        let retained_index = expired.iter().position(|entry| entry.operation_id == "kept").unwrap();
+        let retained_index = expired
+            .iter()
+            .position(|entry| entry.operation_id == "kept")
+            .unwrap();
         let retained = expired.swap_remove(retained_index);
         drop(expired);
         let retries = controller.reap_expired(now);
-        let ids: std::collections::BTreeSet<_> = retries.iter()
-            .map(|entry| entry.operation_id.as_str()).collect();
+        let ids: std::collections::BTreeSet<_> = retries
+            .iter()
+            .map(|entry| entry.operation_id.as_str())
+            .collect();
         assert_eq!(ids, std::collections::BTreeSet::from(["lost-a", "lost-b"]));
         assert!(controller.reap_expired(now).is_empty());
         drop(retained);
@@ -5208,22 +5292,37 @@ mod tests {
     #[test]
     fn unsupported_target_is_not_automatically_redispatched_after_handle_loss() {
         let controller = CancellationController::new();
-        controller.track_operation(
-            "unsupported", None,
-            CancellationScope::new("unsupported", ConnectorArchetype::RequestResponse)
-                .with_deadline_override_ms(Some(1)),
-        ).unwrap();
-        controller.cancel(
-            &cancel_request("unsupported", CancelReason::UserRequested), None, fixed_now(),
-        ).unwrap();
+        controller
+            .track_operation(
+                "unsupported",
+                None,
+                CancellationScope::new("unsupported", ConnectorArchetype::RequestResponse)
+                    .with_deadline_override_ms(Some(1)),
+            )
+            .unwrap();
+        controller
+            .cancel(
+                &cancel_request("unsupported", CancelReason::UserRequested),
+                None,
+                fixed_now(),
+            )
+            .unwrap();
         let now = Instant::now() + Duration::from_secs(1);
         let expired = controller.reap_expired(now);
         assert_eq!(expired.len(), 1);
         assert!(expired[0].terminator.is_none());
         drop(expired);
-        assert!(controller.reap_expired(now + Duration::from_secs(60)).is_empty());
+        assert!(
+            controller
+                .reap_expired(now + Duration::from_secs(60))
+                .is_empty()
+        );
         assert!(controller.audit_events().iter().all(|event| !event.forced));
         controller.rearm_force_terminate("unsupported");
-        assert_eq!(controller.reap_expired(now).len(), 1, "explicit legacy retry remains available");
+        assert_eq!(
+            controller.reap_expired(now).len(),
+            1,
+            "explicit legacy retry remains available"
+        );
     }
 }
