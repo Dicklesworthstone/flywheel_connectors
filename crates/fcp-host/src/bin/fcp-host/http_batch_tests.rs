@@ -4,6 +4,7 @@ use std::rc::Rc;
 use std::task::{Poll, Waker};
 
 use futures_util::poll;
+use tower::ServiceExt;
 
 use super::*;
 
@@ -871,4 +872,210 @@ fn streaming_batch_body_is_send_for_owned_send_callbacks() {
         })
         .unwrap(),
     );
+}
+
+fn http_request(path: &str, operations: Vec<HttpBatchOperation>) -> axum::http::Request<Body> {
+    // The public request types intentionally expose Deserialize, not Serialize.
+    // Build the same wire envelope accepted by ordinary HTTP clients.
+    let operations = operations
+        .into_iter()
+        .map(|operation| {
+            json!({
+                "id": operation.id,
+                "request": operation.request,
+                "depends_on": operation.depends_on,
+            })
+        })
+        .collect::<Vec<_>>();
+    axum::http::Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("content-type", "application/json")
+        .body(Body::from(json!({"operations": operations}).to_string()))
+        .unwrap()
+}
+
+#[fcp_async_core::runtime::test]
+async fn streaming_http_batch_retains_shared_intake_through_http_200_and_body_drop() {
+    use futures_util::StreamExt;
+
+    let intake = mesh_forward_intake::Intake::for_rpc_test(
+        PUBLIC_RPC_HTTP_BODY_LIMIT_BYTES,
+        1,
+        Duration::from_secs(5),
+    );
+    let app = batch_invocation_routes_with_intake(intake.clone())
+        .with_state(crate::tests::cancel_route_test_state());
+    let response = app
+        .clone()
+        .oneshot(http_request("/rpc/batch/stream", vec![member("a", &[])]))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        intake.active_for_test(),
+        1,
+        "an unpolled response still owns its unscheduled batch"
+    );
+    for path in ["/rpc/batch", "/rpc/batch-invoke", "/rpc/batch/stream"] {
+        let body = Body::from_stream(futures_util::stream::poll_fn(
+            |_| -> Poll<Option<Result<Bytes, std::convert::Infallible>>> {
+                panic!("shared batch saturation must reject before polling another upload")
+            },
+        ));
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("content-type", "application/json")
+            .body(body)
+            .unwrap();
+        let refused = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
+    }
+    let mut body = response.into_body().into_data_stream();
+    let first = body.next().await.unwrap().unwrap();
+    let record: Value = serde_json::from_slice(&first).unwrap();
+    assert_eq!(record["type"], "result");
+    assert_eq!(
+        intake.active_for_test(),
+        1,
+        "incremental delivery must retain queued terminal accounting"
+    );
+    drop(body);
+    assert_eq!(intake.active_for_test(), 0);
+
+    let cold = app
+        .oneshot(http_request("/rpc/batch/stream", vec![member("b", &[])]))
+        .await
+        .unwrap();
+    assert_eq!(cold.status(), StatusCode::OK);
+    assert_eq!(intake.active_for_test(), 1);
+    drop(cold);
+    assert_eq!(intake.active_for_test(), 0);
+}
+
+#[fcp_async_core::runtime::test]
+async fn streaming_http_batch_releases_intake_at_eof_without_dropping_stream() {
+    use futures_util::StreamExt;
+
+    let intake = mesh_forward_intake::Intake::for_rpc_test(
+        PUBLIC_RPC_HTTP_BODY_LIMIT_BYTES,
+        1,
+        Duration::from_secs(5),
+    );
+    let app = batch_invocation_routes_with_intake(intake.clone())
+        .with_state(crate::tests::cancel_route_test_state());
+    let response = app
+        .clone()
+        .oneshot(http_request("/rpc/batch/stream", vec![member("a", &[])]))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body().into_data_stream();
+    let first = body.next().await.unwrap().unwrap();
+    let first: Value = serde_json::from_slice(&first).unwrap();
+    assert_eq!(first["type"], "result");
+    assert_eq!(intake.active_for_test(), 1);
+    let terminal = body.next().await.unwrap().unwrap();
+    let terminal: Value = serde_json::from_slice(&terminal).unwrap();
+    assert_eq!(terminal["type"], "complete");
+    assert_eq!(intake.active_for_test(), 1);
+    assert!(body.next().await.is_none());
+    assert_eq!(
+        intake.active_for_test(),
+        0,
+        "EOF releases capacity while the exhausted body object is still live"
+    );
+    let recovered = app
+        .oneshot(http_request("/rpc/batch", vec![member("b", &[])]))
+        .await
+        .unwrap();
+    assert_eq!(recovered.status(), StatusCode::OK);
+    assert_eq!(intake.active_for_test(), 0);
+}
+
+#[fcp_async_core::runtime::test]
+async fn batch_http_validation_failures_release_shared_intake() {
+    let intake = mesh_forward_intake::Intake::for_rpc_test(
+        PUBLIC_RPC_HTTP_BODY_LIMIT_BYTES,
+        1,
+        Duration::from_secs(5),
+    );
+    let app = batch_invocation_routes_with_intake(intake.clone())
+        .with_state(crate::tests::cancel_route_test_state());
+    for path in ["/rpc/batch", "/rpc/batch-invoke", "/rpc/batch/stream"] {
+        let invalid = app
+            .clone()
+            .oneshot(http_request(path, vec![member("a", &["missing"])]))
+            .await
+            .unwrap();
+        assert!(invalid.status().is_client_error(), "{path}");
+        assert_eq!(intake.active_for_test(), 0, "{path}");
+
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("content-type", "application/json")
+            .body(Body::from("{\"batch-intake-secret-canary\":"))
+            .unwrap();
+        let invalid = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST, "{path}");
+        assert_eq!(
+            axum::body::to_bytes(invalid.into_body(), 256)
+                .await
+                .unwrap(),
+            "RPC envelope is invalid"
+        );
+        assert_eq!(intake.active_for_test(), 0, "{path}");
+    }
+}
+
+#[fcp_async_core::runtime::test]
+async fn batch_http_intake_bounds_actual_chunks_on_all_aliases() {
+    let intake = mesh_forward_intake::Intake::for_rpc(PUBLIC_RPC_HTTP_BODY_LIMIT_BYTES);
+    let app = batch_invocation_routes_with_intake(intake.clone())
+        .with_state(crate::tests::cancel_route_test_state());
+    for path in ["/rpc/batch", "/rpc/batch-invoke", "/rpc/batch/stream"] {
+        let chunk = Bytes::from(vec![b'x'; 64 * 1024]);
+        let chunks = (0..=PUBLIC_RPC_HTTP_BODY_LIMIT_BYTES / chunk.len())
+            .map(move |_| Ok::<_, std::convert::Infallible>(chunk.clone()));
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("content-type", "application/json")
+            .body(Body::from_stream(futures_util::stream::iter(chunks)))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE, "{path}");
+        assert_eq!(intake.active_for_test(), 0);
+    }
+}
+
+#[fcp_async_core::runtime::test]
+async fn batch_http_uploads_cannot_extend_the_total_read_deadline() {
+    let intake = mesh_forward_intake::Intake::for_rpc_test(4096, 1, Duration::from_millis(40));
+    let app = batch_invocation_routes_with_intake(intake.clone())
+        .with_state(crate::tests::cancel_route_test_state());
+    for path in ["/rpc/batch", "/rpc/batch-invoke", "/rpc/batch/stream"] {
+        let chunks = futures_util::stream::unfold((), |()| async {
+            fcp_async_core::time::sleep(Duration::from_millis(5)).await;
+            Some((
+                Ok::<_, std::convert::Infallible>(Bytes::from_static(b" ")),
+                (),
+            ))
+        });
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("content-type", "application/json")
+            .body(Body::from_stream(chunks))
+            .unwrap();
+        let response =
+            fcp_async_core::time::timeout(Duration::from_secs(1), app.clone().oneshot(request))
+                .await
+                .expect("batch uploads must have one total read budget")
+                .unwrap();
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT, "{path}");
+        assert_eq!(intake.active_for_test(), 0);
+    }
 }
