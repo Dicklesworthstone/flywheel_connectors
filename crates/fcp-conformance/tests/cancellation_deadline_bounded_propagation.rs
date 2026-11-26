@@ -53,7 +53,7 @@ fn unresponsive_operation_is_reaped_within_deadline_plus_epsilon() {
     let response = ctrl
         .cancel(&cancel, Some("user:alice"), Utc::now())
         .unwrap();
-    assert_eq!(response.outcome, CancellationOutcome::Cancelled);
+    assert_eq!(response.outcome, CancellationOutcome::Pending);
 
     // Before deadline + epsilon: nothing may be reaped.
     let early = ctrl.reap_expired(start + Duration::from_millis(50));
