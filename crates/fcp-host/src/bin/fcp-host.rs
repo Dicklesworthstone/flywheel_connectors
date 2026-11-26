@@ -240,6 +240,8 @@ const LOCAL_PLACEMENT_OPERATION: &str = "fcp.host.placement/launch";
 /// Keep a hard HTTP bound while allowing a 16 MiB payload plus its encoding.
 /// Mesh forwarding and connector/provider limits are enforced independently.
 const LOCAL_INVOCATION_HTTP_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
+// Preserve Axum's ordinary JSON budget for public control, batch and egress RPCs.
+const PUBLIC_RPC_HTTP_BODY_LIMIT_BYTES: usize = 2 * 1024 * 1024;
 const HYBRID_OWNER_CONTEXT_FILE_ENV: &str = "FCP_HOST_HYBRID_OWNER_CONTEXT_FILE";
 const BLUEBUBBLES_INGRESS_ROUTE: &str = "/bluebubbles-webhook";
 const BLUEBUBBLES_INGRESS_OPERATION: &str = "imessage.ingest_webhook_request";
@@ -10582,6 +10584,65 @@ fn local_invocation_routes_with_intake(
         .layer(axum::Extension(intake))
 }
 
+/// Batch input and its pending schedule remain bounded until the response is
+/// finished. Streaming responses transfer their permit into the body.
+fn batch_invocation_routes() -> Router<Arc<AppState>> {
+    batch_invocation_routes_with_intake(mesh_forward_intake::Intake::for_rpc(
+        PUBLIC_RPC_HTTP_BODY_LIMIT_BYTES,
+    ))
+}
+
+fn batch_invocation_routes_with_intake(
+    intake: mesh_forward_intake::Intake,
+) -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/rpc/batch", post(batch_invoke_admitted_handler))
+        .route("/rpc/batch-invoke", post(batch_invoke_admitted_handler))
+        .route("/rpc/batch/stream", post(http_batch::stream_handler))
+        .layer(axum::extract::DefaultBodyLimit::max(
+            PUBLIC_RPC_HTTP_BODY_LIMIT_BYTES,
+        ))
+        .layer(axum::Extension(intake))
+}
+
+/// HTTP and TCP share one bounded lane through authorization and completion.
+/// These requests have no separate bounded job owner to receive the permit.
+fn host_egress_routes() -> Router<Arc<AppState>> {
+    host_egress_routes_with_intake(mesh_forward_intake::Intake::for_rpc(
+        PUBLIC_RPC_HTTP_BODY_LIMIT_BYTES,
+    ))
+}
+
+fn host_egress_routes_with_intake(
+    intake: mesh_forward_intake::Intake,
+) -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/rpc/egress/http", post(host_egress_http_admitted_handler))
+        .route("/rpc/egress/tcp", post(host_egress_tcp_admitted_handler))
+        .layer(axum::extract::DefaultBodyLimit::max(
+            PUBLIC_RPC_HTTP_BODY_LIMIT_BYTES,
+        ))
+        .layer(axum::Extension(intake))
+}
+
+/// Cancellation must not compete with uploads or pending work for capacity.
+fn self_cancellation_routes() -> Router<Arc<AppState>> {
+    self_cancellation_routes_with_intake(mesh_forward_intake::Intake::for_rpc(
+        PUBLIC_RPC_HTTP_BODY_LIMIT_BYTES,
+    ))
+}
+
+fn self_cancellation_routes_with_intake(
+    intake: mesh_forward_intake::Intake,
+) -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/rpc/cancel-self", post(cancel_self_admitted_handler))
+        .layer(axum::extract::DefaultBodyLimit::max(
+            PUBLIC_RPC_HTTP_BODY_LIMIT_BYTES,
+        ))
+        .layer(axum::Extension(intake))
+}
+
 async fn async_main(telemetry_config: TelemetryConfig) -> HostResult<()> {
     let bind_target = resolve_bind_target()?;
     let webhook_ingress_config = webhook_ingress::from_env()?;
@@ -10980,17 +11041,14 @@ async fn async_main(telemetry_config: TelemetryConfig) -> HostResult<()> {
         .route("/rpc/introspect/{connector_id}", get(introspect_handler))
         .merge(local_invocation_routes())
         .merge(native_events::routes(Arc::clone(&state)))
-        .route("/rpc/egress/http", post(host_egress_http_handler))
-        .route("/rpc/egress/tcp", post(host_egress_tcp_handler))
+        .merge(host_egress_routes())
         // /rpc/cancel and /rpc/operations/cancel moved into
         // protected_routes (br-71lku — see comment there). Public
         // owner-scoped self-cancel now lives at /rpc/cancel-self and
         // authenticates from a verified capability token rather than
         // X-Principal.
-        .route("/rpc/cancel-self", post(cancel_self_handler))
-        .route("/rpc/batch", post(batch_invoke_handler))
-        .route("/rpc/batch-invoke", post(batch_invoke_handler))
-        .route("/rpc/batch/stream", post(http_batch::stream_handler))
+        .merge(self_cancellation_routes())
+        .merge(batch_invocation_routes())
         .route("/rpc/mesh/cutover-gates", get(mesh_cutover_gates_handler))
         // Peer-facing mesh routes. They are authenticated by the peer
         // directory's Ed25519 keys (signed envelopes / signed
@@ -15657,6 +15715,16 @@ async fn cancel_handler(
     Ok(Json(response))
 }
 
+async fn cancel_self_admitted_handler(
+    State(state): State<Arc<AppState>>,
+    mesh_forward_intake::RpcJson {
+        value: request,
+        permit: _permit,
+    }: mesh_forward_intake::RpcJson<CancellationRequest>,
+) -> Result<Json<CancellationResponse>, (StatusCode, String)> {
+    cancel_self_handler(State(state), Json(request)).await
+}
+
 async fn cancel_self_handler(
     State(state): State<Arc<AppState>>,
     Json(request): Json<CancellationRequest>,
@@ -16807,6 +16875,16 @@ impl CredentialInjector for HostCredentialInjector {
     }
 }
 
+async fn host_egress_http_admitted_handler(
+    State(state): State<Arc<AppState>>,
+    mesh_forward_intake::RpcJson {
+        value: request,
+        permit: _permit,
+    }: mesh_forward_intake::RpcJson<HostEgressHttpRequest>,
+) -> Result<Json<HostEgressHttpResponse>, (StatusCode, String)> {
+    host_egress_http_handler(State(state), Json(request)).await
+}
+
 async fn host_egress_http_handler(
     State(state): State<Arc<AppState>>,
     Json(request): Json<HostEgressHttpRequest>,
@@ -17736,6 +17814,16 @@ async fn host_egress_tcp_io(
         ))
     })?;
     Ok(Box::new(tls))
+}
+
+async fn host_egress_tcp_admitted_handler(
+    State(state): State<Arc<AppState>>,
+    mesh_forward_intake::RpcJson {
+        value: request,
+        permit: _permit,
+    }: mesh_forward_intake::RpcJson<HostEgressTcpRequest>,
+) -> Result<Json<HostEgressTcpResponse>, (StatusCode, String)> {
+    host_egress_tcp_handler(State(state), Json(request)).await
 }
 
 async fn host_egress_tcp_handler(
@@ -19906,6 +19994,17 @@ async fn execute_batch_operation(
             duration_ms,
         },
     }
+}
+
+async fn batch_invoke_admitted_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    mesh_forward_intake::RpcJson {
+        value: request,
+        permit: _permit,
+    }: mesh_forward_intake::RpcJson<HttpBatchInvokeRequest>,
+) -> Result<Json<BatchInvokeResponse>, (StatusCode, String)> {
+    batch_invoke_handler(State(state), headers, Json(request)).await
 }
 
 async fn batch_invoke_handler(
@@ -44331,8 +44430,7 @@ while IFS= read -r request; do exit 2; done
                 Arc::clone(&state),
                 admin_auth_middleware,
             ));
-        axum::Router::new()
-            .route("/rpc/cancel-self", post(cancel_self_handler))
+        self_cancellation_routes()
             .merge(protected)
             .with_state(Arc::clone(&state))
     }
@@ -44904,6 +45002,215 @@ while IFS= read -r request; do exit 2; done
         .unwrap();
         assert_eq!(recovered.status(), StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(intake.active_for_test(), 0);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn public_egress_intake_is_shared_and_keeps_authenticated_self_cancel_available() {
+        let state = cancel_route_test_state();
+        state
+            .cancellation
+            .track_with_owner("egress-intake-cancel", Some("user:test"));
+        let token = issue_cancel_self_test_token(state.lifecycle.as_ref(), "user:test").await;
+        let egress = mesh_forward_intake::Intake::for_rpc_test(
+            PUBLIC_RPC_HTTP_BODY_LIMIT_BYTES,
+            1,
+            Duration::from_secs(5),
+        );
+        let control = mesh_forward_intake::Intake::for_rpc_test(
+            PUBLIC_RPC_HTTP_BODY_LIMIT_BYTES,
+            1,
+            Duration::from_secs(5),
+        );
+        let app = host_egress_routes_with_intake(egress.clone())
+            .merge(self_cancellation_routes_with_intake(control.clone()))
+            .merge(batch_invocation_routes())
+            .with_state(Arc::clone(&state));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/rpc/egress/http")
+            .header("content-type", "application/json")
+            .body(Body::from_stream(futures_util::stream::pending::<
+                Result<Bytes, std::convert::Infallible>,
+            >()))
+            .unwrap();
+        let mut stalled = Box::pin(app.clone().oneshot(request));
+        assert!(futures_util::poll!(stalled.as_mut()).is_pending());
+        assert_eq!(egress.active_for_test(), 1);
+        let rejected = Request::builder()
+            .method("POST")
+            .uri("/rpc/egress/tcp")
+            .header("content-type", "application/json")
+            .body(Body::from_stream(futures_util::stream::poll_fn(
+                |_| -> std::task::Poll<Option<Result<Bytes, std::convert::Infallible>>> {
+                    panic!("saturated HTTP/TCP admission must not poll another body")
+                },
+            )))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(rejected).await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let independent = send_json_request(
+            app.clone(),
+            axum::http::Method::POST,
+            "/rpc/batch",
+            json!({}),
+            &[],
+        )
+        .await
+        .unwrap();
+        assert_eq!(independent.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let cancelled = send_cancel_request(
+            app.clone(),
+            "/rpc/cancel-self",
+            serde_json::to_value(CancellationRequest {
+                operation_id: "egress-intake-cancel".to_owned(),
+                reason: CancelReason::UserRequested,
+                cleanup: CleanupBehavior::BestEffort,
+                return_partial: false,
+                capability_token: Some(token),
+            })
+            .unwrap(),
+            &[],
+        )
+        .await;
+        assert_eq!(cancelled.status(), StatusCode::OK);
+        assert!(state.cancellation.is_cancel_requested("egress-intake-cancel"));
+        assert_eq!(control.active_for_test(), 0);
+        assert_eq!(egress.active_for_test(), 1);
+        drop(stalled);
+        assert_eq!(egress.active_for_test(), 0);
+
+        let malformed = Request::builder()
+            .method("POST")
+            .uri("/rpc/egress/tcp")
+            .header("content-type", "application/json")
+            .body(Body::from("{\"egress-private-canary\":"))
+            .unwrap();
+        let response = app.clone().oneshot(malformed).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 256).await.unwrap(),
+            "RPC envelope is invalid"
+        );
+        assert_eq!(egress.active_for_test(), 0);
+        for path in ["/rpc/egress/http", "/rpc/egress/tcp", "/rpc/cancel-self"] {
+            let chunk = Bytes::from(vec![b' '; 64 * 1024]);
+            let chunks = (0..=PUBLIC_RPC_HTTP_BODY_LIMIT_BYTES / chunk.len())
+                .map(move |_| Ok::<_, std::convert::Infallible>(chunk.clone()));
+            let request = Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", "application/json")
+                .body(Body::from_stream(futures_util::stream::iter(chunks)))
+                .unwrap();
+            assert_eq!(
+                app.clone().oneshot(request).await.unwrap().status(),
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "{path}"
+            );
+            assert_eq!(egress.active_for_test(), 0);
+            assert_eq!(control.active_for_test(), 0);
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn self_cancel_intake_bounds_its_own_uploads_and_releases_abandoned_waiters() {
+        let state = cancel_route_test_state();
+        let intake = mesh_forward_intake::Intake::for_rpc_test(
+            PUBLIC_RPC_HTTP_BODY_LIMIT_BYTES,
+            1,
+            Duration::from_secs(5),
+        );
+        let app = self_cancellation_routes_with_intake(intake.clone())
+            .merge(host_egress_routes())
+            .with_state(state);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/rpc/cancel-self")
+            .header("content-type", "application/json")
+            .body(Body::from_stream(futures_util::stream::pending::<
+                Result<Bytes, std::convert::Infallible>,
+            >()))
+            .unwrap();
+        let mut stalled = Box::pin(app.clone().oneshot(request));
+        assert!(futures_util::poll!(stalled.as_mut()).is_pending());
+        assert_eq!(intake.active_for_test(), 1);
+        let response = send_json_request(
+            app.clone(),
+            axum::http::Method::POST,
+            "/rpc/cancel-self",
+            json!({}),
+            &[],
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let independent = send_json_request(
+            app.clone(),
+            axum::http::Method::POST,
+            "/rpc/egress/http",
+            json!({}),
+            &[],
+        )
+        .await
+        .unwrap();
+        assert_eq!(independent.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        drop(stalled);
+        assert_eq!(intake.active_for_test(), 0);
+        let recovered = send_json_request(
+            app,
+            axum::http::Method::POST,
+            "/rpc/cancel-self",
+            json!({}),
+            &[],
+        )
+        .await
+        .unwrap();
+        assert_eq!(recovered.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(intake.active_for_test(), 0);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn public_egress_and_self_cancel_uploads_have_one_total_deadline() {
+        let egress = mesh_forward_intake::Intake::for_rpc_test(
+            4096,
+            1,
+            Duration::from_millis(40),
+        );
+        let control = mesh_forward_intake::Intake::for_rpc_test(
+            4096,
+            1,
+            Duration::from_millis(40),
+        );
+        let app = host_egress_routes_with_intake(egress.clone())
+            .merge(self_cancellation_routes_with_intake(control.clone()))
+            .with_state(cancel_route_test_state());
+        for path in ["/rpc/egress/http", "/rpc/egress/tcp", "/rpc/cancel-self"] {
+            let chunks = futures_util::stream::unfold((), |()| async {
+                fcp_async_core::time::sleep(Duration::from_millis(5)).await;
+                Some((
+                    Ok::<_, std::convert::Infallible>(Bytes::from_static(b" ")),
+                    (),
+                ))
+            });
+            let request = Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", "application/json")
+                .body(Body::from_stream(chunks))
+                .unwrap();
+            let response = fcp_async_core::time::timeout(
+                Duration::from_secs(1),
+                app.clone().oneshot(request),
+            )
+            .await
+            .expect("new chunks must not renew the upload deadline")
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT, "{path}");
+            assert_eq!(egress.active_for_test(), 0);
+            assert_eq!(control.active_for_test(), 0);
+        }
     }
 
     struct HostOAuthLoopbackExpectedRequest {
