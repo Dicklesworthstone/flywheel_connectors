@@ -332,7 +332,10 @@ enum HttpBatchStreamRecord {
 pub(super) async fn stream_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(request): Json<HttpBatchInvokeRequest>,
+    mesh_forward_intake::RpcJson {
+        value: request,
+        permit,
+    }: mesh_forward_intake::RpcJson<HttpBatchInvokeRequest>,
 ) -> Result<Response, (StatusCode, String)> {
     use futures_util::StreamExt;
 
@@ -347,6 +350,10 @@ pub(super) async fn stream_handler(
         )
     })
     .map_err(map_host_error)?;
+    // Members are admitted on demand as the body is polled. HTTP 200 is not an
+    // ownership handoff: the body must retain the aggregate batch reservation
+    // through execution, queued results and terminal delivery.
+    let records = retain_stream_intake(records, permit);
     let mut response = Response::new(Body::from_stream(records.map(encode_stream_record)));
     response.headers_mut().insert(
         axum::http::header::CONTENT_TYPE,
@@ -356,6 +363,27 @@ pub(super) async fn stream_handler(
         .headers_mut()
         .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
     Ok(response)
+}
+
+/// Retain cold and paused response bodies too. EOF releases the slot even when
+/// the caller keeps the exhausted stream object; dropping any unfinished body
+/// drops both its scheduler and its reservation without detaching a producer.
+fn retain_stream_intake<S>(
+    records: S,
+    permit: mesh_forward_intake::Permit,
+) -> impl futures_util::Stream<Item = S::Item>
+where
+    S: futures_util::Stream,
+{
+    use futures_util::StreamExt;
+
+    futures_util::stream::unfold(
+        (Box::pin(records), permit),
+        |(mut records, permit)| async move {
+            let record = records.next().await?;
+            Some((record, (records, permit)))
+        },
+    )
 }
 
 /// The body owns both the scheduler and its capacity-one delivery channel.
