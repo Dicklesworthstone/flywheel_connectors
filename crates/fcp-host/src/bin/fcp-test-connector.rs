@@ -893,6 +893,66 @@ impl TestConnector {
         })
     }
 
+    /// Explicit fixture for the host's local Telegram polling custody protocol.
+    /// A real child and the ordinary JSON-RPC actor exercise physical retirement.
+    fn handle_polling_state(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, FcpError> {
+        let invalid = |message: &str| FcpError::InvalidRequest {
+            code: 1003,
+            message: message.to_owned(),
+        };
+        if self.id.as_str() != "fcp.telegram" {
+            return Err(invalid("polling handoff fixture requires fcp.telegram"));
+        }
+        if !self.configured {
+            return Err(FcpError::NotConfigured);
+        }
+        let zone = self
+            .handshaken_zone
+            .as_ref()
+            .ok_or(FcpError::NotHandshaken)?;
+        let encoded = std::env::var("FCP_TEST_CONNECTOR_TELEGRAM_CHECKPOINT")
+            .map_err(|_| invalid("polling handoff fixture was not explicitly configured"))?;
+        let checkpoint: serde_json::Value = serde_json::from_str(&encoded)
+            .map_err(|_| invalid("invalid polling checkpoint fixture"))?;
+        if checkpoint["state"]["zone_id"].as_str() != Some(zone.as_str())
+            || checkpoint["state"]["connector_id"].as_str() != Some(self.id.as_str())
+        {
+            return Err(invalid(
+                "polling checkpoint fixture is outside the handshaken scope",
+            ));
+        }
+        if method == "state.checkpoint" {
+            return Ok(checkpoint);
+        }
+        if params.get("checkpoint") != Some(&checkpoint) {
+            return Err(invalid(
+                "restore did not receive the exact exported checkpoint",
+            ));
+        }
+        if let Ok(ready) = std::env::var("FCP_TEST_CONNECTOR_RESTORE_READY") {
+            let release = std::env::var("FCP_TEST_CONNECTOR_RESTORE_RELEASE")
+                .map_err(|_| invalid("restore fixture requires a release path"))?;
+            std::fs::write(ready, b"ready")
+                .map_err(|_| invalid("restore fixture could not publish its barrier"))?;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !std::path::Path::new(&release).exists() {
+                if Instant::now() >= deadline {
+                    return Err(invalid("restore fixture barrier timed out"));
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+        Ok(json!({
+            "status": "restored",
+            "checkpoint_id": checkpoint["checkpoint_id"],
+            "offset": checkpoint["state"]["offset"],
+        }))
+    }
+
     fn handle_shutdown(&self, params: serde_json::Value) -> Result<serde_json::Value, FcpError> {
         let _req: ShutdownRequest =
             serde_json::from_value(params).map_err(|err| FcpError::InvalidRequest {
@@ -935,6 +995,7 @@ fn handle_message(connector: &mut TestConnector, message: &str) -> serde_json::V
         "introspect" => connector.handle_introspect(),
         "invoke" => connector.handle_invoke(params),
         "simulate" => connector.handle_simulate(params),
+        "state.checkpoint" | "state.restore" => connector.handle_polling_state(method, params),
         "shutdown" => connector.handle_shutdown(params),
         _ => Err(FcpError::InvalidRequest {
             code: 1002,

@@ -362,7 +362,7 @@ pub(super) async fn retire_selected(
     publish_entry(registry, connector_id, dormant, generation, None, deadline).await
 }
 
-fn validate_activation(entry: &RegistryEntry) -> HostResult<ValidatedConnectorConfig> {
+pub(super) fn validate_activation(entry: &RegistryEntry) -> HostResult<ValidatedConnectorConfig> {
     let retained_component = entry.admitted_wasi_component();
     let retained_executable = entry.admitted_native_executable();
     if retained_component.is_some() || retained_executable.is_some() {
@@ -474,6 +474,40 @@ async fn transition_before(
     request: &LifecycleTransitionRequest,
     deadline: Instant,
 ) -> HostResult<LifecycleTransitionResponse> {
+    // A newer operator denial must be able to revoke a pending Telegram
+    // handoff while that handoff owns the inventory transaction. Persist it
+    // before waiting for the gate, then retire under the ordinary guard.
+    let pending_telegram_custody = if !request.dry_run
+        && connector_id.as_str() == "fcp.telegram"
+        && matches!(
+            request.action,
+            LifecycleAction::Disable | LifecycleAction::Uninstall
+        ) {
+        state
+            .lifecycle
+            .connector_state(connector_id)
+            .await
+            .and_then(|record| {
+                record
+                    .telegram_polling_restart
+                    .map(|custody| custody.custody_id)
+            })
+    } else {
+        None
+    };
+    let early_telegram_denial = if let Some(custody_id) = pending_telegram_custody {
+        require_deadline(deadline)?;
+        Some((
+            custody_id,
+            state
+                .lifecycle
+                .execute_lifecycle_transition(connector_id, request)
+                .await
+                .map_err(map_lifecycle_host_error)?,
+        ))
+    } else {
+        None
+    };
     let _transaction = state.registry.inventory_transaction.lock().await;
     require_deadline(deadline)?;
     let (entry, generation) = selected_entry(&state.registry, connector_id).await?;
@@ -482,12 +516,59 @@ async fn transition_before(
         .connector_status(connector_id)
         .await
         .map_err(map_lifecycle_host_error)?;
+    if let Some((custody_id, denial)) = &early_telegram_denial {
+        let current = state.lifecycle.connector_state(connector_id).await;
+        if previous.desired_state != denial.current_desired_state
+            || previous.last_journal_sequence != denial.journal_sequence
+            || !current.is_some_and(|record| {
+                record.desired_state == denial.current_desired_state
+                    && record.last_journal_sequence == denial.journal_sequence
+                    && record
+                        .telegram_polling_restart
+                        .as_ref()
+                        .is_some_and(|custody| custody.custody_id == *custody_id)
+            })
+        {
+            // The generic lifecycle response reads its sequence after mutation.
+            // Also bind the exact attempt: a fresh restart always rotates this
+            // ID even if a racing response reports its newer Disabled revision.
+            return Err(HostError::Unavailable(
+                "Telegram lifecycle denial was superseded while waiting for runtime custody; inspect current state before retrying"
+                    .to_owned(),
+            ));
+        }
+    }
 
     if request.action == LifecycleAction::Reload {
         return Err(HostError::Unavailable(
             "in-place connector reload is unavailable; apply managed configuration or explicitly restart a stateless native or WASI connector"
                 .to_owned(),
         ));
+    }
+    // One local stateful handoff has an explicit durable custody protocol.
+    // Its pending marker may only be resumed by an explicit Enable/Restart;
+    // every other stateful replacement continues through the refusal below.
+    let resume_telegram = connector_id.as_str() == "fcp.telegram"
+        && request.action == LifecycleAction::Enable
+        && state
+            .lifecycle
+            .connector_state(connector_id)
+            .await
+            .is_some_and(|record| record.telegram_polling_restart.is_some());
+    if connector_id.as_str() == "fcp.telegram"
+        && ((request.action == LifecycleAction::Restart && entry.state_policy.is_stateful())
+            || resume_telegram)
+    {
+        return telegram_restart::transition_selected(
+            state,
+            connector_id,
+            &entry,
+            generation,
+            &previous,
+            request,
+            deadline,
+        )
+        .await;
     }
     if request.action == LifecycleAction::Restart {
         restart_supported(&entry)?;
@@ -544,11 +625,15 @@ async fn transition_before(
         LifecycleAction::Disable | LifecycleAction::Uninstall => {
             // Deny new/queued effects durably before waiting for a process. An
             // unsupported or timed-out retirement must never lift this denial.
-            let response = state
-                .lifecycle
-                .execute_lifecycle_transition(connector_id, request)
-                .await
-                .map_err(map_lifecycle_host_error)?;
+            let response = if let Some((_, response)) = early_telegram_denial {
+                response
+            } else {
+                state
+                    .lifecycle
+                    .execute_lifecycle_transition(connector_id, request)
+                    .await
+                    .map_err(map_lifecycle_host_error)?
+            };
             retire_selected(
                 &state.registry,
                 connector_id,

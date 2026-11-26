@@ -34,9 +34,11 @@ use crate::{
 
 mod capability_usage;
 mod mesh_invocations;
+mod telegram_restart;
 mod usage_budget;
 use capability_usage::{CapabilityUsageLedger, CapabilityUsageScope};
 pub use mesh_invocations::*;
+pub use telegram_restart::*;
 
 const HOST_ADMIN_STATE_SNAPSHOT_VERSION: u32 = 1;
 const REDACTED_CONFIG_VALUE: &str = "[REDACTED]";
@@ -2861,6 +2863,27 @@ pub enum AdminStateMutation {
         /// Execution intent after restoring the target.
         desired_state: DesiredRuntimeState,
     },
+    /// Durable execution denial began a local Telegram polling restart.
+    TelegramPollingRestartStarted {
+        /// Digest of the exact admitted managed configuration.
+        config_digest: String,
+    },
+    /// The native checkpoint is durable before retiring its source process.
+    TelegramPollingRestartCheckpointed {
+        /// Native Telegram checkpoint content identity.
+        checkpoint_id: String,
+    },
+    /// The exact source child exited after its checkpoint became durable.
+    TelegramPollingRestartSourceExited,
+    /// A replacement may exist; recorded before spawning the process.
+    TelegramPollingRestartCandidateStarting,
+    /// The exact retained replacement child has physically exited.
+    TelegramPollingRestartCandidateExited,
+    /// A restored replacement was published before enabling execution.
+    TelegramPollingRestartCompleted {
+        /// Native checkpoint restored into the replacement.
+        checkpoint_id: String,
+    },
     /// Desired runtime state changed.
     DesiredStateSet {
         /// New desired runtime target.
@@ -2940,6 +2963,9 @@ pub struct ConnectorAdminState {
     /// Optional persisted runtime artifact/admin provenance metadata.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact: Option<ConnectorArtifactMetadata>,
+    /// Pending native Telegram state custody independently denies execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telegram_polling_restart: Option<TelegramPollingRestartCustody>,
     /// Last journal sequence that mutated this connector.
     #[serde(default)]
     pub last_journal_sequence: u64,
@@ -3051,6 +3077,9 @@ pub struct ConnectorAdminStatus {
     /// Persisted runtime artifact/admin provenance metadata, when available.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub artifact: Option<ConnectorArtifactMetadata>,
+    /// Pending local Telegram restart phase, without deployment or cursor payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telegram_polling_restart: Option<TelegramPollingRestartStatus>,
     /// Total config revisions tracked for this connector.
     pub config_revision_count: usize,
     /// Latest journal sequence touching this connector.
@@ -3222,6 +3251,10 @@ fn connector_admin_status_from_state(
         pinned_version: state.pinned_version.clone(),
         active_config_revision_id: state.active_config_revision_id,
         artifact: state.artifact.clone(),
+        telegram_polling_restart: state
+            .telegram_polling_restart
+            .as_ref()
+            .map(TelegramPollingRestartStatus::from),
         config_revision_count: state.config_revisions.len(),
         last_journal_sequence: state.last_journal_sequence,
         drift: connector_drift_status(state, now),
@@ -3731,6 +3764,17 @@ fn snapshot_desired_state(
         })
 }
 
+fn snapshot_allows_connector_execution(
+    snapshot: &HostAdminStateSnapshot,
+    connector_id: &ConnectorId,
+) -> bool {
+    desired_state_allows_execution(snapshot_desired_state(snapshot, connector_id))
+        && snapshot
+            .connectors
+            .get(connector_id)
+            .is_none_or(|state| state.telegram_polling_restart.is_none())
+}
+
 /// Durable host-side admin-state store.
 pub struct HostAdminStateStore {
     state: RwLock<HostAdminStateSnapshot>,
@@ -3814,6 +3858,7 @@ impl HostAdminStateStore {
         };
         state.capability_usage.validate()?;
         state.zone_budget_usage.validate_persisted()?;
+        telegram_restart::validate_persisted_restarts(&state)?;
         // No executor job survives constructing a fresh store. Never silently
         // replay an admission that has no committed terminal observation.
         if state.recover_invocations_after_restart(Utc::now())? {
@@ -3862,9 +3907,9 @@ impl HostAdminStateStore {
                     .to_string(),
             ));
         }
-        if !desired_state_allows_execution(snapshot_desired_state(&state, connector_id)) {
+        if !snapshot_allows_connector_execution(&state, connector_id) {
             return Err(HostError::PreflightFailed(format!(
-                "connector `{connector_id}` is disabled or uninstalled"
+                "connector `{connector_id}` is disabled, uninstalled, or awaiting a durable polling restart"
             )));
         }
         let mut generations = self.connector_execution_generations.lock().map_err(|_| {
@@ -3899,7 +3944,10 @@ impl HostAdminStateStore {
         let mut publications = Vec::new();
         for (connector_id, weak) in generations.iter() {
             let desired = snapshot_desired_state(next, connector_id);
-            if desired == snapshot_desired_state(previous, connector_id) {
+            let allows_execution = snapshot_allows_connector_execution(next, connector_id);
+            if desired == snapshot_desired_state(previous, connector_id)
+                && allows_execution == snapshot_allows_connector_execution(previous, connector_id)
+            {
                 continue;
             }
             let Some(generation) = weak.upgrade() else {
@@ -3918,7 +3966,7 @@ impl HostAdminStateStore {
             // Retire old admissions before any persistence begins. Publication
             // of newly enabled authority waits for durable commit below.
             generation.store(retired, Ordering::Release);
-            let published = if desired_state_allows_execution(desired) {
+            let published = if allows_execution {
                 retired | 1
             } else {
                 retired
@@ -3960,6 +4008,7 @@ impl HostAdminStateStore {
         }
         let mut snapshot = state.clone();
         let result = mutate(&mut snapshot)?;
+        telegram_restart::revoke_changed_restart_intent(&state, &mut snapshot);
 
         if revokes_authority
             && self
@@ -4243,6 +4292,16 @@ impl HostAdminStateStore {
         initiated_by: Option<String>,
     ) -> Result<(), LifecycleError> {
         self.apply_mutation(|snapshot| {
+            if desired_state_allows_execution(desired_state)
+                && snapshot
+                    .connectors
+                    .get(connector_id)
+                    .is_some_and(|state| state.telegram_polling_restart.is_some())
+            {
+                return Err(invocation_state_error(
+                    "restore the pending Telegram polling checkpoint before enabling execution",
+                ));
+            }
             let sequence = snapshot.append_journal(
                 connector_id,
                 AdminStateMutation::DesiredStateSet { desired_state },
@@ -9462,6 +9521,7 @@ mod tests {
             active_config_revision_id: None,
             last_journal_sequence: 0,
             artifact: None,
+            telegram_polling_restart: None,
         };
         let install_drift =
             connector_drift_status(&install_state, now).expect("install should be stuck");
@@ -9491,6 +9551,7 @@ mod tests {
             active_config_revision_id: None,
             last_journal_sequence: 0,
             artifact: None,
+            telegram_polling_restart: None,
         };
         let canary_drift =
             connector_drift_status(&canary_state, now).expect("canary should be stuck");
@@ -14078,6 +14139,7 @@ mod tests {
             active_config_revision_id: None,
             last_journal_sequence: 0,
             artifact: None,
+            telegram_polling_restart: None,
         };
         let drift = connector_drift_status(&state, Utc::now()).expect("should drift");
         assert_eq!(drift.kind, ConnectorDriftKind::EnabledButNotRunning);
@@ -14095,6 +14157,7 @@ mod tests {
             active_config_revision_id: None,
             last_journal_sequence: 0,
             artifact: None,
+            telegram_polling_restart: None,
         };
         let drift = connector_drift_status(&state, Utc::now()).expect("should drift");
         assert_eq!(drift.kind, ConnectorDriftKind::EnabledButDegraded);
@@ -14112,6 +14175,7 @@ mod tests {
             active_config_revision_id: None,
             last_journal_sequence: 0,
             artifact: None,
+            telegram_polling_restart: None,
         };
         let drift = connector_drift_status(&state, Utc::now()).expect("should drift");
         assert_eq!(drift.kind, ConnectorDriftKind::EnabledButMissing);
@@ -14129,6 +14193,7 @@ mod tests {
             active_config_revision_id: None,
             last_journal_sequence: 0,
             artifact: None,
+            telegram_polling_restart: None,
         };
         assert!(connector_drift_status(&state, Utc::now()).is_none());
     }
@@ -14144,6 +14209,7 @@ mod tests {
             active_config_revision_id: None,
             last_journal_sequence: 0,
             artifact: None,
+            telegram_polling_restart: None,
         };
         let drift = connector_drift_status(&state, Utc::now()).expect("should drift");
         assert_eq!(drift.kind, ConnectorDriftKind::DisabledButRunning);
@@ -14161,6 +14227,7 @@ mod tests {
             active_config_revision_id: None,
             last_journal_sequence: 0,
             artifact: None,
+            telegram_polling_restart: None,
         };
         let drift = connector_drift_status(&state, Utc::now()).expect("should drift");
         assert_eq!(drift.kind, ConnectorDriftKind::DisabledButRunning);
@@ -14177,6 +14244,7 @@ mod tests {
             active_config_revision_id: None,
             last_journal_sequence: 0,
             artifact: None,
+            telegram_polling_restart: None,
         };
         assert!(connector_drift_status(&state, Utc::now()).is_none());
     }
@@ -14192,6 +14260,7 @@ mod tests {
             active_config_revision_id: None,
             last_journal_sequence: 0,
             artifact: None,
+            telegram_polling_restart: None,
         };
         let drift = connector_drift_status(&state, Utc::now()).expect("should drift");
         assert_eq!(drift.kind, ConnectorDriftKind::UninstalledButPresent);
@@ -14209,6 +14278,7 @@ mod tests {
             active_config_revision_id: None,
             last_journal_sequence: 0,
             artifact: None,
+            telegram_polling_restart: None,
         };
         assert!(connector_drift_status(&state, Utc::now()).is_none());
     }
@@ -14230,6 +14300,7 @@ mod tests {
                 active_config_revision_id: None,
                 last_journal_sequence: 0,
                 artifact: None,
+                telegram_polling_restart: None,
             };
             assert!(
                 connector_drift_status(&state, Utc::now()).is_none(),

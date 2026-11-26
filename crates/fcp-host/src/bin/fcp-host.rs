@@ -204,6 +204,8 @@ mod native_rpc;
 mod native_stream;
 #[path = "fcp-host/session.rs"]
 mod session;
+#[path = "fcp-host/telegram_restart.rs"]
+mod telegram_restart;
 #[path = "fcp-host/verified_rollback.rs"]
 mod verified_rollback;
 #[path = "fcp-host/wasi_connector.rs"]

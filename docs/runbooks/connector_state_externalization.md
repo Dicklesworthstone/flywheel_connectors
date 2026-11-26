@@ -56,13 +56,14 @@ runtime retained after an incomplete disable also requires retirement and fresh
 preparation. Each transition has a 30-second deadline including transaction
 queueing; inspect desired and observed status after a timeout before retrying.
 
-Live stateful handoff, whole warm-pool retirement, and whole WASI-runtime
-retirement remain unavailable. A requested disable still persists execution
-denial when retirement is unsupported or times out, but returns an error and
-does not report the retained runtime as stopped. Stateful restart refuses before
-changing intent. Do not treat a disabled dispatch gate as proof of a canonical
-state flush or completed ownership transfer. A retained stateful runtime cannot
-be re-enabled through this lifecycle path without a supported handoff.
+General stateful handoff, whole warm-pool retirement, and whole WASI-runtime
+retirement remain unavailable. The local Telegram polling restart described
+below has its own supported custody protocol. Other stateful restarts refuse
+before changing intent. A requested disable still persists execution denial
+when retirement is unsupported or times out, but returns an error and does not
+report the retained runtime as stopped. A disabled dispatch gate alone does not
+prove a canonical state flush or completed ownership transfer. Re-enabling a
+retained stateful runtime requires a supported handoff.
 
 In-place lifecycle `reload` returns an explicit unavailable error. Use managed
 configuration preview/apply for supported inventory changes; their existing
@@ -71,6 +72,57 @@ a lifecycle transition is reported as degraded rather than treated as proof of
 process exit. Runtime preparation still observes the host's resilience policy;
 an open circuit can refuse replacement configuration and leave the connector
 disabled until a later retry succeeds.
+
+### Restart a local Telegram polling writer
+
+The owner-authenticated lifecycle endpoint supports a local restart of
+`fcp.telegram` when all of the following are configured:
+
+- A Linux native runtime admitted as `singleton_writer`, with `on_demand`
+  prewarming and an explicit 64-digit `binary_sha256` pin.
+- Exactly one allowed zone, the host capability verification key, and normal
+  singleton ownership admission for that zone.
+- Inline `config.credential` bot credentials and `receive_mode` omitted or set
+  to `polling`.
+- An explicit absolute `env.FCP_CONNECTOR_STATE` directory and persistent host
+  admin state with synchronized durable writes.
+
+Preview through `POST /rpc/lifecycle/fcp.telegram` with
+`{"action":"restart","dry_run":true}`. Submit the same request with
+`dry_run` set to `false` to perform the restart. The existing lifecycle deadline
+covers transaction queueing, checkpoint capture, retirement, restoration, and
+activation.
+
+The host durably disables execution before asking the connector to quiesce its
+poller and export its acknowledged cursor. It validates and persists that
+checkpoint before retiring the exact source process. Once physical exit is
+confirmed, it prepares the pinned replacement and restores the cursor before
+publishing the runtime. Execution becomes enabled only after the final custody
+check commits durably. Accepted event payloads and acknowledgement receipts
+remain in the host event journal. This protocol preserves local polling state;
+it does not perform mesh migration or replace canonical object-store handoff.
+
+Failures and cancellation retain the checkpoint custody and deny execution.
+An explicit `{"action":"enable"}` or `{"action":"restart"}` can resume an
+interrupted attempt for the same configuration, manifest, binary, bot, zone,
+and state directory. Recovery after a host restart additionally requires a
+saved checkpoint, durable proof that the source exited, and no unresolved
+replacement process. A missing process handle is insufficient evidence of exit.
+Changed deployment bindings and unresolved orphan processes refuse automatic
+recovery while preserving the saved cursor.
+
+`GET /rpc/lifecycle/fcp.telegram` includes `telegram_polling_restart` while
+custody is pending. Its `custody_id`, optional `checkpoint_id`, `source_exited`,
+`candidate_may_exist`, and `intent_revoked` fields identify the interrupted
+phase without exposing credentials, deployment bindings, paths, or cursor
+payloads. Successful completion removes this pending status.
+
+Disable or Uninstall during an active handoff records its denial before waiting
+for the inventory transaction. The older restart cannot subsequently enable the
+replacement. A successful restart response identifies the durable completion
+journal entry; observed state remains `degraded` until ordinary health
+observation assesses the new runtime. Inspect desired and observed status after
+a timeout before deciding whether another explicit attempt is appropriate.
 
 ## Inspect Authenticated Canonical Stores
 
