@@ -11603,7 +11603,7 @@ output_schema = { type = "object" }
     #[test]
     fn golden_classification_count() {
         // Pinned count — if commands are added/removed, update this.
-        assert_eq!(COMMAND_FAMILY_CLASSIFICATION.len(), 59);
+        assert_eq!(COMMAND_FAMILY_CLASSIFICATION.len(), 60);
     }
 
     #[test]

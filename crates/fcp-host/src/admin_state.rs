@@ -8671,7 +8671,7 @@ mod tests {
                 },
             )
             .unwrap();
-        record.update_health(false, 25);
+        record.update_health(false, Some(25));
         store.save(&record).await.unwrap();
         store.pin(&connector_id, record.version).await.unwrap();
         (directory, store, connector_id)
@@ -8884,7 +8884,7 @@ mod tests {
                     .unwrap(),
                 "rollout" => {
                     let mut record = store.get(&connector_id).await.unwrap().unwrap();
-                    record.update_health(true, 10);
+                    record.update_health(true, Some(10));
                     store.save(&record).await.unwrap();
                 }
                 _ => unreachable!(),
