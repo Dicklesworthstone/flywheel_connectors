@@ -183,6 +183,8 @@ impl AnthropicClient {
     ) -> AnthropicResult<Self> {
         let client = Client::builder()
             .timeout(Duration::from_secs(120))
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
             .build()
             .map_err(AnthropicError::Http)?;
 
@@ -285,27 +287,46 @@ impl AnthropicClient {
     ///
     /// Returns an error on HTTP failures, authentication errors, or rate limiting.
     pub async fn health_check(&self) -> AnthropicResult<()> {
-        // The Anthropic API doesn't have a /v1/models list endpoint like OpenAI,
-        // so we send a minimal messages request with max_tokens=1 to validate
-        // auth. This is the cheapest possible validation call.
-        let url = format!("{}/v1/messages", self.base_url);
+        // The Models API validates provider access without dispatching generation.
+        // https://platform.claude.com/docs/en/api/models/list
+        let url = format!("{}/v1/models", self.base_url);
         let request = self
             .client
-            .post(&url)
+            .get(&url)
+            .query(&[("limit", "1")])
             .header("anthropic-version", &self.api_version)
-            .header("content-type", "application/json");
+            .header("accept", "application/json");
         let request = self.apply_auth(request)?;
-        let request = request.json(&serde_json::json!({
-            "model": Model::default().as_str(),
-            "max_tokens": 1,
-            "messages": [{"role": "user", "content": "hi"}]
-        }));
 
         let response = request.send().await?;
         let status = response.status();
         let retry_after = extract_retry_after(&response);
         let bytes = read_bounded_body(response).await?;
         if status.is_success() {
+            let page: serde_json::Value = serde_json::from_slice(&bytes)?;
+            let valid_models = page
+                .get("data")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|models| {
+                    models.iter().all(|model| {
+                        model.get("type").and_then(serde_json::Value::as_str) == Some("model")
+                            && model
+                                .get("id")
+                                .and_then(serde_json::Value::as_str)
+                                .is_some_and(|id| !id.is_empty())
+                    })
+                });
+            if !valid_models
+                || !page
+                    .get("has_more")
+                    .is_some_and(serde_json::Value::is_boolean)
+            {
+                return Err(AnthropicError::Api {
+                    error_type: "invalid_health_response".into(),
+                    message: "Anthropic model discovery returned an invalid page".into(),
+                    status_code: Some(status.as_u16()),
+                });
+            }
             Ok(())
         } else {
             Err(parse_error_response(status, &bytes, retry_after))
@@ -508,7 +529,7 @@ impl AnthropicClient {
         Ok(parse_sse_stream(response))
     }
 
-    /// Make a POST request with automatic retry via [`RetryLoop`].
+    /// Make a POST request with bounded retry after explicit HTTP 429 refusal.
     async fn post<T, R>(&self, endpoint: &str, body: &T) -> AnthropicResult<R>
     where
         T: serde::Serialize + Sync,
@@ -533,9 +554,13 @@ impl AnthropicClient {
         // enclosing invocation can impose an earlier deadline across all attempts.
         let ctx = self.invocation_context(None);
         let policy = self.retry_config.to_retry_policy();
+        // Serialize before dispatch: local encoding failures do not imply an
+        // uncertain provider outcome and must never enter the retry loop.
+        let body = serde_json::to_vec(body)?;
 
         RetryLoop::execute(&ctx, &policy, |attempt| {
             let url = &url;
+            let body = &body;
             async move {
                 debug!(attempt, endpoint, "Making Anthropic API request");
 
@@ -553,7 +578,7 @@ impl AnthropicClient {
                     Err(error) => return AttemptOutcome::Terminal(error),
                 };
 
-                match request.json(body).send().await {
+                match request.body(body.clone()).send().await {
                     Ok(response) => match self.handle_response(response).await {
                         Ok(data) => AttemptOutcome::Success(data),
                         Err(e) if e.is_retryable() => AttemptOutcome::Retryable {
@@ -562,11 +587,9 @@ impl AnthropicClient {
                         },
                         Err(e) => AttemptOutcome::Terminal(e),
                     },
-                    Err(e) if e.is_timeout() || e.is_connect() => AttemptOutcome::Retryable {
-                        error: AnthropicError::Http(e),
-                        retry_after: None,
-                    },
-                    Err(e) => AttemptOutcome::Terminal(AnthropicError::Http(e)),
+                    Err(e) => AttemptOutcome::Terminal(
+                        AnthropicError::Http(e).for_dispatched_generation(None),
+                    ),
                 }
             }
         })
@@ -600,13 +623,21 @@ impl AnthropicClient {
             .header("content-type", "application/json");
         let request = apply_beta_headers(request, betas)?;
         let request = self.apply_auth(request)?;
-        let response = request.json(body).send().await?;
+        let body = serde_json::to_vec(body)?;
+        let response = request
+            .body(body)
+            .send()
+            .await
+            .map_err(|error| AnthropicError::Http(error).for_dispatched_generation(None))?;
 
         let status = response.status();
         if !status.is_success() {
             let retry_after = extract_retry_after(&response);
-            let bytes = read_bounded_body(response).await?;
-            return Err(parse_error_response(status, &bytes, retry_after));
+            let bytes = read_bounded_body(response)
+                .await
+                .map_err(|error| error.for_dispatched_generation(Some(status.as_u16())))?;
+            return Err(parse_error_response(status, &bytes, retry_after)
+                .for_dispatched_generation(Some(status.as_u16())));
         }
 
         Ok(response)
@@ -619,12 +650,17 @@ impl AnthropicClient {
     {
         let status = response.status();
         let retry_after = extract_retry_after(&response);
-        let bytes = read_bounded_body(response).await?;
+        let bytes = read_bounded_body(response)
+            .await
+            .map_err(|error| error.for_dispatched_generation(Some(status.as_u16())))?;
 
         if status.is_success() {
-            serde_json::from_slice(&bytes).map_err(AnthropicError::from)
+            serde_json::from_slice(&bytes).map_err(|error| {
+                AnthropicError::from(error).for_dispatched_generation(Some(status.as_u16()))
+            })
         } else {
-            Err(parse_error_response(status, &bytes, retry_after))
+            Err(parse_error_response(status, &bytes, retry_after)
+                .for_dispatched_generation(Some(status.as_u16())))
         }
     }
 }
@@ -711,6 +747,14 @@ pub(crate) fn parse_error_response(
     bytes: &[u8],
     retry_after_ms: Option<u64>,
 ) -> AnthropicError {
+    // An actual HTTP 429 is an explicit refusal even when a gateway replaces
+    // the JSON body. Preserve the provider's retry floor without trusting labels.
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        return AnthropicError::RateLimited {
+            retry_after_ms: retry_after_ms.unwrap_or(30_000),
+        };
+    }
+
     // Try to parse as API error
     #[derive(Deserialize)]
     struct ErrorWrapper {
@@ -721,12 +765,6 @@ pub(crate) fn parse_error_response(
         let error = wrapper.error;
 
         // Check for specific error types
-        if status == StatusCode::TOO_MANY_REQUESTS {
-            return AnthropicError::RateLimited {
-                retry_after_ms: retry_after_ms.unwrap_or(30_000),
-            };
-        }
-
         if status.as_u16() == 529 {
             return AnthropicError::Overloaded {
                 retry_after_ms: retry_after_ms.unwrap_or(60_000),
@@ -763,7 +801,17 @@ pub(crate) fn parse_error_response(
 pub(crate) const MAX_SSE_BUFFER_BYTES: usize = 1024 * 1024;
 
 fn parse_sse_stream(response: Response) -> impl Stream<Item = AnthropicResult<StreamEvent>> {
-    parse_sse_chunks(response.bytes_stream())
+    let status_code = response.status().as_u16();
+    parse_sse_chunks(response.bytes_stream()).map(move |event| {
+        event.map_err(|error| match error {
+            AnthropicError::OutcomeUnknown { status_code: None } => {
+                AnthropicError::OutcomeUnknown {
+                    status_code: Some(status_code),
+                }
+            }
+            other => other.for_dispatched_generation(Some(status_code)),
+        })
+    })
 }
 
 fn parse_sse_chunks<S>(stream: S) -> impl Stream<Item = AnthropicResult<StreamEvent>>
@@ -778,7 +826,7 @@ where
             let chunk = match chunk {
                 Ok(c) => c,
                 Err(e) => {
-                    yield Err(AnthropicError::Http(e));
+                    yield Err(AnthropicError::Http(e).for_dispatched_generation(None));
                     return;
                 }
             };
@@ -805,7 +853,14 @@ where
                         }
                     };
                     if let Some(event) = parse_sse_event_bytes(&event_bytes) {
+                        let terminal = matches!(
+                            &event,
+                            Ok(StreamEvent::MessageStop | StreamEvent::Error { .. }) | Err(_)
+                        );
                         yield event;
+                        if terminal {
+                            return;
+                        }
                     }
                 }
 
@@ -816,12 +871,21 @@ where
             }
         }
 
-        // Process any remaining buffer
+        // EOF alone never establishes generation completion. A final complete
+        // message_stop or provider error may be emitted without another chunk.
         if !buffer.is_empty() {
             if let Some(event) = parse_sse_event_bytes(&buffer) {
+                let terminal = matches!(
+                    &event,
+                    Ok(StreamEvent::MessageStop | StreamEvent::Error { .. }) | Err(_)
+                );
                 yield event;
+                if terminal {
+                    return;
+                }
             }
         }
+        yield Err(AnthropicError::OutcomeUnknown { status_code: None });
     }
 }
 
@@ -1182,6 +1246,59 @@ mod tests {
     }
 
     #[fcp_async_core::runtime::test]
+    async fn local_serialization_failure_never_opens_a_provider_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let client = AnthropicClient::new("test-key")
+            .unwrap()
+            .with_base_url(format!("http://{}", listener.local_addr().unwrap()));
+        let body = std::collections::BTreeMap::from([(vec![1_u8, 2], "invalid JSON key")]);
+        let result: AnthropicResult<serde_json::Value> = client.post("/v1/messages", &body).await;
+        assert!(matches!(result, Err(AnthropicError::Json(_))));
+        assert!(matches!(
+            listener.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn sse_eof_is_terminal_once_and_message_stop_discards_trailing_frames() {
+        for payload in [
+            "",
+            "event: ping\ndata: {\"type\":\"ping\"}\n\n",
+            "event: content_block_delta\ndata: {",
+        ] {
+            let mut events = Box::pin(parse_sse_chunks(stream::iter(vec![Ok(Bytes::from(
+                payload.to_owned(),
+            ))])));
+            let mut terminal_errors = 0;
+            while let Some(event) = events.next().await {
+                if let Err(error) = event {
+                    terminal_errors += 1;
+                    assert!(!error.is_retryable());
+                    assert!(!error.to_fcp_error().is_retryable());
+                }
+            }
+            assert_eq!(terminal_errors, 1);
+            assert!(events.next().await.is_none());
+        }
+
+        let payload = concat!(
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+            "event: ping\ndata: {\"type\":\"ping\"}\n\n",
+            "event: error\ndata: {\"type\":\"error\",\"error\":{",
+            "\"type\":\"api_error\",\"message\":\"after completion\"}}\n\n"
+        );
+        let events: Vec<_> = parse_sse_chunks(stream::iter(vec![Ok(Bytes::from_static(
+            payload.as_bytes(),
+        ))]))
+        .collect()
+        .await;
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events.first(), Some(Ok(StreamEvent::MessageStop))));
+    }
+
+    #[fcp_async_core::runtime::test]
     async fn test_chat_success() {
         let server = TestHttpServer::respond(vec![
             TestHttpResponse::json(
@@ -1299,7 +1416,9 @@ mod tests {
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
-            AnthropicError::Overloaded { .. }
+            AnthropicError::OutcomeUnknown {
+                status_code: Some(529)
+            }
         ));
     }
 
@@ -1545,31 +1664,51 @@ mod tests {
             .collect()
             .await;
 
-        assert_eq!(events.len(), 1, "expected only the delimited ping event");
-        let event = events.into_iter().next().unwrap().unwrap();
-        assert!(matches!(event, StreamEvent::Ping));
+        assert_eq!(
+            events.len(),
+            2,
+            "ping must be followed by a terminal EOF error"
+        );
+        assert!(matches!(&events[0], Ok(StreamEvent::Ping)));
+        assert!(matches!(
+            &events[1],
+            Err(AnthropicError::OutcomeUnknown { status_code: None })
+        ));
     }
 
     #[fcp_async_core::runtime::test]
     async fn bounded_sse_parser_preserves_large_batches_of_small_events() {
-        let event = format!(":{}\nevent: ping\ndata: {{\"type\":\"ping\"}}\n\n", "x".repeat(4096));
+        let event = format!(
+            ":{}\nevent: ping\ndata: {{\"type\":\"ping\"}}\n\n",
+            "x".repeat(4096)
+        );
         let count = MAX_SSE_BUFFER_BYTES / event.len() + 2;
-        let chunk = event.repeat(count).into_bytes();
+        let mut chunk = event.repeat(count).into_bytes();
         assert!(chunk.len() > MAX_SSE_BUFFER_BYTES);
-        let received = parse_sse_chunks(stream::iter(vec![Ok(Bytes::from(chunk))]))
-            .fold(0_usize, |count, event| async move {
-                assert!(matches!(event.unwrap(), StreamEvent::Ping));
-                count + 1
-            })
+        chunk.extend_from_slice(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+        let received: Vec<_> = parse_sse_chunks(stream::iter(vec![Ok(Bytes::from(chunk))]))
+            .collect()
             .await;
-        assert_eq!(received, count);
+        assert_eq!(received.len(), count + 1);
+        assert!(
+            received[..count]
+                .iter()
+                .all(|event| matches!(event, Ok(StreamEvent::Ping)))
+        );
+        assert!(matches!(
+            received.last(),
+            Some(Ok(StreamEvent::MessageStop))
+        ));
     }
 
     #[fcp_async_core::runtime::test]
     async fn bounded_sse_parser_allows_exact_limit_with_split_crlf_delimiter() {
         let suffix = "\r\nevent: ping\r\ndata: {\"type\":\"ping\"}";
-        let mut payload = format!(":{}{suffix}", "x".repeat(MAX_SSE_BUFFER_BYTES - suffix.len() - 1))
-            .into_bytes();
+        let mut payload = format!(
+            ":{}{suffix}",
+            "x".repeat(MAX_SSE_BUFFER_BYTES - suffix.len() - 1)
+        )
+        .into_bytes();
         assert_eq!(payload.len(), MAX_SSE_BUFFER_BYTES);
         payload.extend_from_slice(b"\r\n\r\n");
         for delimiter_bytes in 1..=3 {
@@ -1580,8 +1719,12 @@ mod tests {
             ]))
             .collect()
             .await;
-            assert_eq!(events.len(), 1);
-            assert!(matches!(events.into_iter().next().unwrap().unwrap(), StreamEvent::Ping));
+            assert_eq!(events.len(), 2);
+            assert!(matches!(&events[0], Ok(StreamEvent::Ping)));
+            assert!(matches!(
+                &events[1],
+                Err(AnthropicError::OutcomeUnknown { .. })
+            ));
         }
     }
 
@@ -1593,11 +1736,9 @@ mod tests {
                 ":{}{suffix}{delimiter}",
                 "x".repeat(MAX_SSE_BUFFER_BYTES - suffix.len())
             );
-            let events: Vec<_> = parse_sse_chunks(stream::iter(vec![
-                Ok(Bytes::from(payload)),
-            ]))
-            .collect()
-            .await;
+            let events: Vec<_> = parse_sse_chunks(stream::iter(vec![Ok(Bytes::from(payload))]))
+                .collect()
+                .await;
             assert_eq!(events.len(), 1);
             let error = events.into_iter().next().unwrap().unwrap_err();
             assert!(

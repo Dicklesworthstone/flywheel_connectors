@@ -26,6 +26,11 @@ pub enum AnthropicError {
         status_code: Option<u16>,
     },
 
+    /// Generation was dispatched, but the provider's outcome cannot be established.
+    /// Contains no provider payload, request URL, prompt, or credential material.
+    #[error("Anthropic generation outcome is unknown after dispatch; do not automatically retry")]
+    OutcomeUnknown { status_code: Option<u16> },
+
     /// Rate limited
     #[error("Rate limited, retry after {retry_after_ms}ms")]
     RateLimited { retry_after_ms: u64 },
@@ -44,6 +49,28 @@ pub enum AnthropicError {
 }
 
 impl AnthropicError {
+    /// Bind an error to an effectful request using its actual wire status.
+    ///
+    /// A server failure, lost connection, or malformed success does not prove
+    /// that generation never ran. Only an observed HTTP 429 refusal retains
+    /// its retry classification. Ordinary terminal 4xx rejections keep their
+    /// useful authentication and validation details.
+    #[must_use]
+    pub(crate) fn for_dispatched_generation(self, status_code: Option<u16>) -> Self {
+        if matches!(&self, Self::OutcomeUnknown { .. }) || status_code == Some(429) {
+            return self;
+        }
+        if status_code.is_some_and(|status| (400..500).contains(&status) && status != 408)
+            && (matches!(
+                &self,
+                Self::InvalidApiCredential | Self::ContextLengthExceeded { .. }
+            ) || matches!(&self, Self::Api { status_code: mapped, .. } if *mapped == status_code))
+        {
+            return self;
+        }
+        Self::OutcomeUnknown { status_code }
+    }
+
     /// Check if this error is retryable.
     #[must_use]
     pub const fn is_retryable(&self) -> bool {
@@ -73,6 +100,13 @@ impl AnthropicError {
     #[must_use]
     pub fn to_fcp_error(&self) -> FcpError {
         match self {
+            Self::OutcomeUnknown { status_code } => FcpError::External {
+                service: "anthropic".into(),
+                message: self.to_string(),
+                status_code: *status_code,
+                retryable: false,
+                retry_after: None,
+            },
             Self::Http(e) => FcpError::External {
                 service: "anthropic".into(),
                 message: e.to_string(),
@@ -171,6 +205,86 @@ pub type AnthropicResult<T> = Result<T, AnthropicError>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dispatched_generation_errors_never_infer_retry_from_provider_labels() {
+        for status_code in [None, Some(200), Some(408), Some(409), Some(500), Some(529)] {
+            let error = AnthropicError::RateLimited { retry_after_ms: 1 }
+                .for_dispatched_generation(status_code);
+            assert!(matches!(
+                error,
+                AnthropicError::OutcomeUnknown { status_code: observed }
+                    if observed == status_code
+            ));
+            assert!(!error.is_retryable());
+            assert_eq!(error.retry_after(), None);
+            assert!(matches!(
+                error.to_fcp_error(),
+                FcpError::External {
+                    status_code: observed,
+                    retryable: false,
+                    retry_after: None,
+                    ..
+                } if observed == status_code
+            ));
+        }
+    }
+
+    #[test]
+    fn dispatched_generation_keeps_only_observed_refusals_and_terminal_taxonomy() {
+        let refused = AnthropicError::RateLimited {
+            retry_after_ms: 7_000,
+        }
+        .for_dispatched_generation(Some(429));
+        assert!(refused.is_retryable());
+        assert_eq!(refused.retry_after(), Some(Duration::from_secs(7)));
+        assert!(matches!(
+            AnthropicError::InvalidApiCredential.for_dispatched_generation(Some(401)),
+            AnthropicError::InvalidApiCredential
+        ));
+        let rejected = AnthropicError::Api {
+            error_type: "permission_error".into(),
+            message: "denied".into(),
+            status_code: Some(403),
+        }
+        .for_dispatched_generation(Some(403));
+        assert!(matches!(
+            rejected,
+            AnthropicError::Api {
+                status_code: Some(403),
+                ..
+            }
+        ));
+        assert!(!rejected.is_retryable());
+
+        let misleading = AnthropicError::Api {
+            error_type: "private label".into(),
+            message: "private provider response".into(),
+            status_code: Some(503),
+        }
+        .for_dispatched_generation(Some(409));
+        assert!(matches!(
+            misleading,
+            AnthropicError::OutcomeUnknown {
+                status_code: Some(409)
+            }
+        ));
+        assert!(!format!("{misleading:?} {misleading}").contains("private"));
+        assert!(!misleading.to_fcp_error().to_string().contains("private"));
+    }
+
+    #[test]
+    fn runtime_interruption_errors_remain_terminal() {
+        for interruption in [
+            AsyncError::Cancelled,
+            AsyncError::Timeout { timeout_ms: 10 },
+        ] {
+            let error = AnthropicError::from_async_error(interruption);
+            assert!(!error.is_retryable());
+            assert_eq!(error.retry_after(), None);
+            assert!(!error.to_fcp_error().is_retryable());
+        }
+    }
 
     // ---- Display ----
 

@@ -21,7 +21,7 @@ use futures_util::StreamExt;
 use serde_json::json;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
-    matchers::{header, method, path},
+    matchers::{header, method, path, query_param},
 };
 
 // ──────────────── re-export the connector under test ────────────────
@@ -813,10 +813,9 @@ async fn error_429_maps_to_rate_limited() {
     );
 }
 
-/// 529 Overloaded maps to `FcpError::External` with retryable=true.
-/// Uses client directly with minimal retry config to avoid slow backoff.
+/// A dispatched generation with HTTP 529 has an unknown, nonretryable outcome.
 #[fcp_async_core::test]
-async fn error_529_maps_to_external_retryable() {
+async fn error_529_maps_to_terminal_unknown_outcome() {
     let _ctx = AsyncTestContext::for_scenario("anthropic.error.529");
     let mock_server = MockServer::start().await;
 
@@ -839,8 +838,13 @@ async fn error_529_maps_to_external_retryable() {
 
     // Client-level error
     assert!(
-        matches!(err, fcp_anthropic::error::AnthropicError::Overloaded { .. }),
-        "expected Overloaded, got: {err:?}"
+        matches!(
+            err,
+            fcp_anthropic::error::AnthropicError::OutcomeUnknown {
+                status_code: Some(529)
+            }
+        ),
+        "expected terminal unknown outcome, got: {err:?}"
     );
 
     // Verify FCP mapping
@@ -853,7 +857,10 @@ async fn error_529_maps_to_external_retryable() {
             ..
         } => {
             assert_eq!(service, "anthropic");
-            assert!(retryable, "529 should be retryable");
+            assert!(
+                !retryable,
+                "a 529 generation outcome must not authorize replay"
+            );
             assert_eq!(*status_code, Some(529));
         }
         other => assert!(
@@ -1937,9 +1944,9 @@ async fn error_404_maps_to_external() {
     }
 }
 
-/// 502 Bad Gateway maps to retryable FcpError::External.
+/// A gateway failure cannot prove that generation was never dispatched.
 #[fcp_async_core::test]
-async fn error_502_maps_to_retryable_external() {
+async fn error_502_maps_to_terminal_external() {
     let mock_server = MockServer::start().await;
 
     Mock::given(method("POST"))
@@ -1966,7 +1973,10 @@ async fn error_502_maps_to_retryable_external() {
             ..
         } => {
             assert_eq!(*status_code, Some(502));
-            assert!(retryable, "502 should be retryable");
+            assert!(
+                !retryable,
+                "a 502 generation outcome must not authorize replay"
+            );
         }
         other => assert!(
             matches!(other, fcp_core::FcpError::External { .. }),
@@ -2000,10 +2010,9 @@ async fn error_non_json_response_body() {
     let fcp_err = err.to_fcp_error();
     match &fcp_err {
         fcp_core::FcpError::External { message, .. } => {
-            assert!(
-                message.contains("upstream timeout") || message.contains("Internal Server Error"),
-                "error message should contain the raw body text: {message}"
-            );
+            assert!(message.contains("outcome is unknown"));
+            assert!(!message.contains("upstream timeout"));
+            assert!(!message.contains("Internal Server Error"));
         }
         other => assert!(
             matches!(other, fcp_core::FcpError::External { .. }),
@@ -2054,7 +2063,10 @@ async fn error_529_via_connector_invoke() {
             ..
         } => {
             assert_eq!(service, "anthropic");
-            assert!(retryable, "529 should be retryable");
+            assert!(
+                !retryable,
+                "a 529 generation outcome must not authorize replay"
+            );
             assert_eq!(*status_code, Some(529));
         }
         other => assert!(
@@ -2443,17 +2455,15 @@ async fn self_check_credential_id_degraded() {
 async fn self_check_healthy_api_returns_ok() {
     let mock_server = MockServer::start().await;
 
-    // Health check sends a minimal message request
-    Mock::given(method("POST"))
-        .and(path("/v1/messages"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(anthropic_success_response(
-                "msg_health",
-                "ok",
-                1,
-                1,
-            )),
-        )
+    // Self-check must never dispatch billable generation.
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .and(query_param("limit", "1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"type": "model", "id": "claude-fixture"}],
+            "has_more": false
+        })))
+        .expect(1)
         .mount(&mock_server)
         .await;
 
@@ -2475,8 +2485,8 @@ async fn self_check_healthy_api_returns_ok() {
 async fn self_check_failing_api_returns_failed() {
     let mock_server = MockServer::start().await;
 
-    Mock::given(method("POST"))
-        .and(path("/v1/messages"))
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
         .respond_with(
             ResponseTemplate::new(401)
                 .set_body_json(anthropic_error("authentication_error", "Invalid API key")),
@@ -3532,4 +3542,310 @@ async fn canonical_model_denials_cover_aliases_and_unnegotiated_capabilities() {
         json!(["anthropic.message"])
     );
     assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+/// Neither SDK retry policy nor FCP conversion may replay ambiguous generation.
+#[fcp_async_core::test]
+async fn generation_ambiguity_is_dispatched_once_and_remains_terminal() {
+    for streaming in [false, true] {
+        for (status, body) in [
+            (
+                503,
+                r#"{"error":{"type":"rate_limit_error","message":"private provider body"}}"#,
+            ),
+            (500, "private upstream response"),
+            (
+                529,
+                r#"{"error":{"type":"overloaded_error","message":"private provider body"}}"#,
+            ),
+            (
+                408,
+                r#"{"error":{"type":"timeout_error","message":"private provider body"}}"#,
+            ),
+            (200, "private malformed success"),
+            (200, "event: message_stop\ndata: private malformed SSE\n\n"),
+            (
+                200,
+                "event: message_start\ndata: {\"type\":\"message_stop\"}\n\n",
+            ),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/messages"))
+                .respond_with(
+                    ResponseTemplate::new(status)
+                        .insert_header("retry-after", "0")
+                        .set_body_string(body),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            let client = AnthropicClient::new("private-api-key")
+                .unwrap()
+                .with_base_url(server.uri())
+                .with_retry_config(3, 1, 1);
+            let result = fcp_async_core::time::timeout(std::time::Duration::from_secs(2), async {
+                if streaming {
+                    let messages = vec![fcp_anthropic::types::Message {
+                        role: fcp_anthropic::types::Role::User,
+                        content: "private prompt".into(),
+                    }];
+                    match client
+                        .message_stream(Model::default(), messages, 16, None, None, None, None)
+                        .await
+                    {
+                        Err(error) => error,
+                        Ok(events) => {
+                            let mut events = Box::pin(events);
+                            let error = events
+                                .next()
+                                .await
+                                .expect("invalid successful stream must report a terminal error")
+                                .expect_err("invalid payload cannot be a successful stream event");
+                            assert!(events.next().await.is_none());
+                            error
+                        }
+                    }
+                } else {
+                    client
+                        .chat(Model::default(), "private prompt", None, 16)
+                        .await
+                        .expect_err("ambiguous generation must fail")
+                }
+            })
+            .await;
+            let error = result.expect("an ambiguous response must not wait for a retry");
+            assert!(
+                matches!(
+                    error,
+                    fcp_anthropic::error::AnthropicError::OutcomeUnknown {
+                        status_code: Some(observed)
+                    } if observed == status
+                ),
+                "{error:?}"
+            );
+            assert!(!error.is_retryable());
+            assert_eq!(error.retry_after(), None);
+            assert!(!format!("{error:?} {error}").contains("private"));
+            assert!(matches!(
+                error.to_fcp_error(),
+                FcpError::External {
+                    status_code: Some(observed),
+                    retryable: false,
+                    retry_after: None,
+                    ..
+                } if observed == status
+            ));
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        }
+    }
+}
+
+/// A real rate-limit refusal remains retryable even without a JSON error body.
+#[fcp_async_core::test]
+async fn explicit_non_json_rate_limit_refusal_keeps_its_bounded_retry() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("retry-after", "0")
+                .set_body_string("gateway refusal"),
+        )
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(anthropic_success_response(
+                "msg_retry",
+                "ok",
+                1,
+                1,
+            )),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = AnthropicClient::new("test-key")
+        .unwrap()
+        .with_base_url(server.uri())
+        .with_retry_config(1, 1, 1);
+    let result = client
+        .chat(Model::default(), "hello", None, 16)
+        .await
+        .unwrap();
+    assert_eq!(result, "ok");
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+}
+
+/// Health checks read bounded model metadata and never generate a message.
+#[fcp_async_core::test]
+async fn health_check_validates_model_pages_without_generation() {
+    for (body, valid) in [
+        (json!({"data": [], "has_more": false}), true),
+        (
+            json!({"data": [{"type": "model", "id": "claude-fixture"}], "has_more": false}),
+            true,
+        ),
+        (json!({"data": [{}], "has_more": false}), false),
+        (json!({"data": [], "has_more": "false"}), false),
+        (json!({"message": "private invalid health payload"}), false),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .and(query_param("limit", "1"))
+            .and(header("x-api-key", "test-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = AnthropicClient::new("test-key")
+            .unwrap()
+            .with_base_url(server.uri());
+        let result = client.health_check().await;
+        assert_eq!(result.is_ok(), valid);
+        if let Err(error) = result {
+            assert!(!error.is_retryable());
+            assert!(!error.to_string().contains("private"));
+        }
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].body.is_empty());
+        assert_eq!(client.total_input_tokens(), 0);
+        assert_eq!(client.total_output_tokens(), 0);
+    }
+}
+
+/// Redirect responses cannot move credentials or generation to another endpoint.
+#[fcp_async_core::test]
+async fn generation_redirects_never_follow_or_authorize_replay() {
+    let origin = MockServer::start().await;
+    let redirected = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(307)
+                .insert_header("location", format!("{}/v1/messages", redirected.uri())),
+        )
+        .expect(2)
+        .mount(&origin)
+        .await;
+    let client = AnthropicClient::new("private-api-key")
+        .unwrap()
+        .with_base_url(origin.uri())
+        .with_retry_config(3, 1, 1);
+    let error = client
+        .chat(Model::default(), "hello", None, 16)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        fcp_anthropic::error::AnthropicError::OutcomeUnknown {
+            status_code: Some(307)
+        }
+    ));
+    let messages = vec![fcp_anthropic::types::Message {
+        role: fcp_anthropic::types::Role::User,
+        content: "hello".into(),
+    }];
+    match client
+        .message_stream(Model::default(), messages, 16, None, None, None, None)
+        .await
+    {
+        Err(fcp_anthropic::error::AnthropicError::OutcomeUnknown {
+            status_code: Some(307),
+        }) => {}
+        Err(error) => panic!("unexpected redirect classification: {error}"),
+        Ok(_) => panic!("a generation redirect must be refused"),
+    }
+    assert_eq!(origin.received_requests().await.unwrap().len(), 2);
+    assert!(redirected.received_requests().await.unwrap().is_empty());
+}
+
+/// A request accepted before a socket close has an unknown provider outcome.
+#[fcp_async_core::test]
+async fn lost_generation_response_never_reopens_the_provider_request() {
+    use std::io::{BufRead, BufReader, Read};
+    use std::net::{Shutdown, TcpListener};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+    use std::time::{Duration as StdDuration, Instant};
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = format!("http://{}", listener.local_addr().unwrap());
+    let stopped = Arc::new(AtomicBool::new(false));
+    let requests = Arc::new(AtomicUsize::new(0));
+    let server_stop = Arc::clone(&stopped);
+    let server_requests = Arc::clone(&requests);
+    let server = std::thread::spawn(move || {
+        let deadline = Instant::now() + StdDuration::from_secs(5);
+        while !server_stop.load(Ordering::Acquire) && Instant::now() < deadline {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream
+                        .set_read_timeout(Some(StdDuration::from_secs(1)))
+                        .unwrap();
+                    let mut reader = BufReader::new(stream);
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    assert!(line.starts_with("POST /v1/messages "));
+                    let mut content_length = 0;
+                    let mut header_bytes = line.len();
+                    loop {
+                        line.clear();
+                        let read = reader.read_line(&mut line).unwrap();
+                        assert!(read > 0, "provider request ended inside its headers");
+                        header_bytes += read;
+                        assert!(header_bytes < 16 * 1024);
+                        if line == "\r\n" {
+                            break;
+                        }
+                        if let Some((name, value)) = line.split_once(':') {
+                            if name.eq_ignore_ascii_case("content-length") {
+                                content_length = value.trim().parse::<usize>().unwrap();
+                            }
+                        }
+                    }
+                    assert!(content_length < 16 * 1024);
+                    let mut body = vec![0; content_length];
+                    reader.read_exact(&mut body).unwrap();
+                    server_requests.fetch_add(1, Ordering::AcqRel);
+                    reader.into_inner().shutdown(Shutdown::Both).unwrap();
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(StdDuration::from_millis(2));
+                }
+                Err(error) => panic!("loopback server failed: {error}"),
+            }
+        }
+    });
+    let client = AnthropicClient::new("private-api-key")
+        .unwrap()
+        .with_base_url(address.clone())
+        .with_retry_config(3, 1, 1);
+    let result = fcp_async_core::time::timeout(
+        StdDuration::from_secs(2),
+        client.chat(Model::default(), "private prompt", None, 16),
+    )
+    .await;
+    stopped.store(true, Ordering::Release);
+    server.join().unwrap();
+    let error = result
+        .expect("ambiguous transport must finish promptly")
+        .expect_err("connection close cannot be successful generation");
+    assert!(matches!(
+        error,
+        fcp_anthropic::error::AnthropicError::OutcomeUnknown { status_code: None }
+    ));
+    assert!(!error.to_fcp_error().is_retryable());
+    assert!(!error.to_string().contains(&address));
+    assert!(!format!("{error:?}").contains("private"));
+    assert_eq!(requests.load(Ordering::Acquire), 1);
 }

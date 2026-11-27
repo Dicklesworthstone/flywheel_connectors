@@ -3000,17 +3000,12 @@ mod tests {
     async fn test_self_check_api_key_valid() {
         let server = TestHttpServer::respond(vec![
             TestHttpResponse::json(
-                "POST",
-                "/v1/messages",
+                "GET",
+                "/v1/models",
                 200,
                 json!({
-                "id": "msg_health",
-                "type": "message",
-                "role": "assistant",
-                "content": [{"type": "text", "text": "h"}],
-                "model": "claude-3-5-haiku-20241022",
-                "stop_reason": "max_tokens",
-                "usage": { "input_tokens": 1, "output_tokens": 1 }
+                    "data": [{"type": "model", "id": "claude-fixture"}],
+                    "has_more": false
                 }),
             )
             .with_required_header("x-api-key", "sk-valid"),
@@ -3034,8 +3029,8 @@ mod tests {
     #[fcp_async_core::runtime::test]
     async fn test_self_check_api_key_invalid() {
         let server = TestHttpServer::respond(vec![TestHttpResponse::json(
-            "POST",
-            "/v1/messages",
+            "GET",
+            "/v1/models",
             401,
             json!({
                 "error": {
@@ -3065,8 +3060,8 @@ mod tests {
     #[fcp_async_core::runtime::test]
     async fn test_self_check_rate_limited() {
         let server = TestHttpServer::respond(vec![TestHttpResponse::json(
-            "POST",
-            "/v1/messages",
+            "GET",
+            "/v1/models",
             429,
             json!({
                 "error": {
