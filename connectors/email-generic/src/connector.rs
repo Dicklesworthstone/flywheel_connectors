@@ -20,10 +20,9 @@ use fcp_sdk::runtime::SupervisorConfig;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::client::EmailGenericClient;
+use crate::client::{EmailGenericClient, EmailInboundBatch, EmailInboundCursor};
 use crate::types::{
-    EmailGenericConfig, EmailInboundMessage, EmailInboundPolicyDecision, EmailSeenUidCache,
-    normalize_sender_address,
+    EmailGenericConfig, EmailInboundPolicyDecision, EmailSeenUidCache, normalize_sender_address,
 };
 
 const MANIFEST_TOML: &str = include_str!("../manifest.toml");
@@ -92,11 +91,50 @@ struct EmailInboundMonitorTaskState {
     shutdown_tx: Option<watch::Sender<bool>>,
 }
 
+#[derive(Debug, Clone)]
+struct InboundPollSnapshot {
+    generation: u64,
+    cursor: Option<EmailInboundCursor>,
+}
+
+#[derive(Debug, Default)]
+struct EmailInboundProgress {
+    generation: u64,
+    active_poll: Option<u64>,
+    cursor: Option<EmailInboundCursor>,
+}
+
+impl EmailInboundProgress {
+    fn begin_poll(&mut self) -> Result<InboundPollSnapshot, String> {
+        self.active_poll = None;
+        self.generation = self
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| "inbound poll generation exhausted".to_owned())?;
+        self.active_poll = Some(self.generation);
+        Ok(InboundPollSnapshot {
+            generation: self.generation,
+            cursor: self.cursor.clone(),
+        })
+    }
+
+    fn fence(&mut self) {
+        self.active_poll = None;
+    }
+
+    fn reset(&mut self) {
+        self.fence();
+        self.cursor = None;
+        // Never rewind generation: a cancelled worker can still finish later.
+    }
+}
+
 struct EmailInboundMonitorRuntime {
     event_tx: broadcast::Sender<FcpResult<EventEnvelope>>,
     state: Mutex<EmailInboundMonitorTaskState>,
     stats: Arc<Mutex<EmailInboundMonitorStats>>,
     next_event_seq: Arc<Mutex<u64>>,
+    progress: Arc<Mutex<EmailInboundProgress>>,
 }
 
 impl std::fmt::Debug for EmailInboundMonitorRuntime {
@@ -121,6 +159,7 @@ impl EmailInboundMonitorRuntime {
             state: Mutex::new(EmailInboundMonitorTaskState::default()),
             stats: Arc::new(Mutex::new(EmailInboundMonitorStats::default())),
             next_event_seq: Arc::new(Mutex::new(1)),
+            progress: Arc::new(Mutex::new(EmailInboundProgress::default())),
         }
     }
 
@@ -163,6 +202,7 @@ impl EmailInboundMonitorRuntime {
         let event_tx = self.event_tx.clone();
         let monitor_stats = Arc::clone(&self.stats);
         let next_event_seq = Arc::clone(&self.next_event_seq);
+        let progress = Arc::clone(&self.progress);
         let task = fcp_async_core::task::spawn(async move {
             run_email_inbound_monitor(
                 client,
@@ -172,6 +212,7 @@ impl EmailInboundMonitorRuntime {
                 instance_id,
                 event_tx,
                 next_event_seq,
+                progress,
                 monitor_stats,
                 shutdown_rx,
             )
@@ -197,6 +238,12 @@ impl EmailInboundMonitorRuntime {
             };
             if let Some(shutdown_tx) = state.shutdown_tx.take() {
                 let _ = shutdown_tx.send(true);
+            }
+            // Fence while holding the lifecycle lock, before a new subscribe
+            // can install another monitor. Successful in-flight publication
+            // finishes under this same progress lock before the fence wins.
+            if let Ok(mut progress) = self.progress.lock() {
+                progress.fence();
             }
             state.task.take()
         };
@@ -225,6 +272,16 @@ impl EmailInboundMonitorRuntime {
                 stats.reason = "supervised inbound monitor stopped cleanly".into();
             }
         });
+    }
+
+    fn reset_progress(&self) -> FcpResult<()> {
+        self.progress
+            .lock()
+            .map_err(|_| FcpError::Internal {
+                message: "email inbound progress lock poisoned".into(),
+            })?
+            .reset();
+        Ok(())
     }
 }
 
@@ -392,11 +449,12 @@ impl EmailGenericConnector {
     fn inbound_event_schema() -> serde_json::Value {
         json!({
             "type": "object",
-            "required": ["mailbox", "uid", "sender", "policy_decision", "preview"],
+            "required": ["mailbox", "uid", "uid_validity", "sender", "policy_decision", "preview"],
             "additionalProperties": false,
             "properties": {
                 "mailbox": { "type": "string", "minLength": 1 },
                 "uid": { "type": "string", "minLength": 1 },
+                "uid_validity": { "type": "integer", "minimum": 1, "maximum": u32::MAX },
                 "sender": { "type": ["string", "null"] },
                 "policy_decision": { "type": "string", "enum": ["accept"] },
                 "preview": { "type": "object" }
@@ -469,6 +527,21 @@ impl EmailGenericConnector {
         })
     }
 
+    fn inbound_cursor_schema() -> serde_json::Value {
+        json!({
+            "type": ["object", "null"],
+            "required": ["version", "account_fingerprint", "mailbox", "uid_validity", "last_uid"],
+            "additionalProperties": false,
+            "properties": {
+                "version": { "type": "integer", "enum": [1] },
+                "account_fingerprint": { "type": "string", "pattern": "^[0-9a-f]{64}$", "minLength": 64, "maxLength": 64 },
+                "mailbox": { "type": "string", "minLength": 1, "maxLength": 1024 },
+                "uid_validity": { "type": "integer", "minimum": 1, "maximum": u32::MAX },
+                "last_uid": { "type": "integer", "minimum": 0, "maximum": u32::MAX }
+            }
+        })
+    }
+
     fn poll_inbound_once_input_schema() -> serde_json::Value {
         json!({
             "type": "object",
@@ -476,6 +549,7 @@ impl EmailGenericConnector {
             "additionalProperties": false,
             "properties": {
                 "mailbox": { "type": "string", "minLength": 1 },
+                "cursor": Self::inbound_cursor_schema(),
                 "seen_uids": {
                     "type": "array",
                     "items": { "type": "string", "minLength": 1 }
@@ -566,6 +640,7 @@ impl EmailGenericConnector {
                 "fetched_count",
                 "accepted_count",
                 "dropped_count",
+                "cursor",
                 "seen_uids",
                 "messages"
             ],
@@ -575,6 +650,7 @@ impl EmailGenericConnector {
                 "fetched_count": { "type": "integer", "minimum": 0 },
                 "accepted_count": { "type": "integer", "minimum": 0 },
                 "dropped_count": { "type": "integer", "minimum": 0 },
+                "cursor": Self::inbound_cursor_schema(),
                 "seen_uids": {
                     "type": "array",
                     "items": { "type": "string", "minLength": 1 }
@@ -775,10 +851,10 @@ impl EmailGenericConnector {
                     when_to_use: "Use this to run one bounded inbound mailbox check without starting a subscription.".into(),
                     common_mistakes: vec![
                         "Treating this one-shot read operation as a durable subscription or replay buffer.".into(),
-                        "Dropping the returned seen_uids state before the next poll, which can repeat message previews.".into(),
+                        "Dropping the returned cursor before the next poll, or using legacy seen_uids as an epoch checkpoint.".into(),
                     ],
                     examples: vec![
-                        "{\"mailbox\":\"INBOX\",\"seen_uids\":[\"101\",\"102\"]}".into(),
+                        "{\"mailbox\":\"INBOX\",\"cursor\":null}".into(),
                     ],
                     related: vec![CapabilityId::from_static(OP_SEARCH_MESSAGES)],
                 },
@@ -846,6 +922,24 @@ impl EmailGenericConnector {
         Ok(seen_uids)
     }
 
+    fn inbound_cursor_from_input(input: &Value) -> FcpResult<(bool, Option<EmailInboundCursor>)> {
+        let modern = input.get("cursor").is_some() || input.get("seen_uids").is_none();
+        let cursor =
+            match input.get("cursor") {
+                None | Some(Value::Null) => None,
+                Some(value) => {
+                    let cursor: EmailInboundCursor = serde_json::from_value(value.clone())
+                        .map_err(|_| FcpError::InvalidRequest {
+                            code: 1005,
+                            message: "Invalid inbound cursor".into(),
+                        })?;
+                    cursor.validate().map_err(|error| error.to_fcp_error())?;
+                    Some(cursor)
+                }
+            };
+        Ok((modern, cursor))
+    }
+
     fn invoke_inner(&self, req: InvokeRequest) -> FcpResult<InvokeResponse> {
         self.base.check_ready()?;
         let verifier = self.verifier.as_ref().ok_or(FcpError::NotHandshaken)?;
@@ -899,44 +993,65 @@ impl EmailGenericConnector {
             }
             OP_POLL_INBOUND_ONCE => {
                 let mailbox = Self::required_string_input(&req.input, "mailbox")?;
-                let mut seen_uids = Self::seen_uid_cache_from_input(
+                let legacy_seen = Self::seen_uid_cache_from_input(
                     &req.input,
                     config.monitor_policy.seen_uid_cap,
                 )?;
-                let messages = client
-                    .fetch_unseen_inbound_messages(mailbox, &seen_uids)
-                    .map_err(|error| error.to_fcp_error())?;
+                let (modern, input_cursor) = Self::inbound_cursor_from_input(&req.input)?;
+                let mut seen_uids = if modern {
+                    EmailSeenUidCache::new(config.monitor_policy.seen_uid_cap)?
+                } else {
+                    legacy_seen
+                };
+                let (messages, mut cursor) = if modern {
+                    let batch = client
+                        .fetch_inbound_batch(mailbox, input_cursor.as_ref())
+                        .map_err(|error| error.to_fcp_error())?;
+                    (batch.messages, Some(batch.cursor))
+                } else {
+                    (
+                        client
+                            .fetch_unseen_inbound_messages(mailbox, &seen_uids)
+                            .map_err(|error| error.to_fcp_error())?,
+                        None,
+                    )
+                };
                 let mut accepted_count = 0_usize;
                 let mut dropped_count = 0_usize;
-                let messages = messages
-                    .iter()
-                    .map(|message| {
-                        let preview = config.monitor_policy.prepare_inbound_message(message);
-                        if preview.decision == EmailInboundPolicyDecision::Accept {
-                            accepted_count += 1;
-                        } else {
-                            dropped_count += 1;
-                        }
-                        // This cache is returned with the one-shot result; fetching
-                        // alone never acknowledges a message.
-                        seen_uids.observe(message.uid.clone());
-                        json!({
-                            "uid": &message.uid,
-                            "decision": preview.decision,
-                            "tainted": preview.tainted,
-                            "text": preview.text,
-                            "attachments": preview.attachments,
-                            "thread": preview.thread,
-                        })
-                    })
-                    .collect::<Vec<_>>();
+                let mut previews = Vec::with_capacity(messages.len());
+                for message in messages {
+                    let preview = config.monitor_policy.prepare_inbound_message(&message);
+                    if preview.decision == EmailInboundPolicyDecision::Accept {
+                        accepted_count += 1;
+                    } else {
+                        dropped_count += 1;
+                    }
+                    if let Some(cursor) = &mut cursor {
+                        cursor.last_uid =
+                            message.uid.parse::<u32>().map_err(|_| FcpError::Internal {
+                                message: "inbound fetch returned an invalid UID".into(),
+                            })?;
+                    }
+                    // Both checkpoints are local to this completed response.
+                    // A failed invoke never changes caller-owned resume state.
+                    seen_uids.observe(message.uid.clone());
+                    previews.push(json!({
+                        "uid": &message.uid,
+                        "decision": preview.decision,
+                        "tainted": preview.tainted,
+                        "text": preview.text,
+                        "attachments": preview.attachments,
+                        "thread": preview.thread,
+                    }));
+                }
                 json!({
                     "mailbox": mailbox,
-                    "fetched_count": messages.len(),
+                    "fetched_count": previews.len(),
                     "accepted_count": accepted_count,
                     "dropped_count": dropped_count,
+                    "cursor": cursor,
                     "seen_uids": seen_uids.uids(),
-                    "messages": messages,
+                    "messages": previews,
                 })
             }
             OP_SEND_MESSAGE => {
@@ -1012,6 +1127,7 @@ impl FcpConnector for EmailGenericConnector {
         let client =
             EmailGenericClient::from_config(&config).map_err(|error| error.to_fcp_error())?;
         self.monitor.stop().await;
+        self.monitor.reset_progress()?;
         self.config = Some(config);
         self.client = Some(client);
         self.base.set_configured(true);
@@ -1088,6 +1204,7 @@ impl FcpConnector for EmailGenericConnector {
 
     async fn shutdown(&mut self, _req: ShutdownRequest) -> FcpResult<()> {
         self.monitor.stop().await;
+        self.monitor.reset_progress()?;
         self.config = None;
         self.client = None;
         self.verifier = None;
@@ -1250,6 +1367,7 @@ async fn run_email_inbound_monitor(
     instance_id: InstanceId,
     event_tx: broadcast::Sender<FcpResult<EventEnvelope>>,
     next_event_seq: Arc<Mutex<u64>>,
+    progress: Arc<Mutex<EmailInboundProgress>>,
     stats: Arc<Mutex<EmailInboundMonitorStats>>,
     mut shutdown: watch::Receiver<bool>,
 ) {
@@ -1261,17 +1379,6 @@ async fn run_email_inbound_monitor(
     };
     let poll_interval = Duration::from_secs(config.monitor_policy.poll_interval_secs);
     let mailbox = config.monitor_policy.mailbox().to_owned();
-    let mut seen_uids = match EmailSeenUidCache::new(config.monitor_policy.seen_uid_cap) {
-        Ok(cache) => cache,
-        Err(error) => {
-            update_monitor_stats(&stats, |stats| {
-                stats.status = "error".into();
-                stats.reason = "failed to initialize inbound UID cache".into();
-                stats.last_error = Some(error.to_string());
-            });
-            return;
-        }
-    };
     let mut consecutive_failures = 0_u32;
 
     loop {
@@ -1283,13 +1390,38 @@ async fn run_email_inbound_monitor(
             return;
         }
 
+        let snapshot = {
+            let Ok(mut progress) = progress.lock() else {
+                update_monitor_stats(&stats, |stats| {
+                    stats.status = "error".into();
+                    stats.last_error = Some("inbound progress lock poisoned".into());
+                });
+                return;
+            };
+            // stop() sets shutdown before taking this lock. An old monitor
+            // cannot install a new poll generation after its stop fence.
+            if *shutdown.borrow() {
+                return;
+            }
+            match progress.begin_poll() {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    update_monitor_stats(&stats, |stats| {
+                        stats.status = "error".into();
+                        stats.last_error = Some(error);
+                    });
+                    return;
+                }
+            }
+        };
+
         update_monitor_stats(&stats, |stats| {
             stats.status = "running".into();
             stats.polls_started = stats.polls_started.saturating_add(1);
         });
 
         let poll =
-            poll_inbound_on_blocking_thread(client.clone(), mailbox.clone(), seen_uids.clone());
+            poll_inbound_on_blocking_thread(client.clone(), mailbox.clone(), snapshot.clone());
         let poll_result = fcp_async_core::select! {
             biased;
             _ = shutdown.changed() => {
@@ -1307,7 +1439,7 @@ async fn run_email_inbound_monitor(
         };
 
         match poll_result {
-            Ok(messages) => {
+            Ok(batch) => {
                 consecutive_failures = 0;
                 let (emitted, dropped, publication_failed) = emit_inbound_preview_events(
                     &InboundEventEmitContext {
@@ -1319,8 +1451,9 @@ async fn run_email_inbound_monitor(
                         next_event_seq: &next_event_seq,
                         mailbox: &mailbox,
                     },
-                    messages,
-                    &mut seen_uids,
+                    batch,
+                    &snapshot,
+                    &progress,
                 );
                 update_monitor_stats(&stats, |stats| {
                     stats.polls_completed = stats.polls_completed.saturating_add(1);
@@ -1394,16 +1527,16 @@ where
 async fn poll_inbound_on_blocking_thread(
     client: EmailGenericClient,
     mailbox: String,
-    seen_uids: EmailSeenUidCache,
-) -> Result<Vec<EmailInboundMessage>, String> {
+    snapshot: InboundPollSnapshot,
+) -> Result<EmailInboundBatch, String> {
     let (tx, rx) = oneshot::channel();
     thread::Builder::new()
         .name("email-generic-inbound-poll".into())
         .spawn(move || {
-            // A cancelled worker owns only a snapshot. Dropping its result
-            // cannot consume UIDs from the monitor's committed cache.
+            // A cancelled worker owns only a snapshot. It cannot advance or
+            // reset the monitor's epoch, even if the provider session finishes.
             let result = client
-                .fetch_unseen_inbound_messages(&mailbox, &seen_uids)
+                .fetch_inbound_batch(&mailbox, snapshot.cursor.as_ref())
                 .map_err(|error| error.to_string());
             let _ = tx.send(result);
         })
@@ -1424,28 +1557,95 @@ struct InboundEventEmitContext<'a> {
 
 fn emit_inbound_preview_events(
     context: &InboundEventEmitContext<'_>,
-    messages: Vec<EmailInboundMessage>,
-    seen_uids: &mut EmailSeenUidCache,
+    batch: EmailInboundBatch,
+    snapshot: &InboundPollSnapshot,
+    progress: &Mutex<EmailInboundProgress>,
 ) -> (usize, usize, bool) {
+    emit_inbound_preview_events_with(context, batch, snapshot, progress, |envelope| {
+        context.event_tx.send(Ok(envelope)).is_ok()
+    })
+}
+
+fn emit_inbound_preview_events_with<F>(
+    context: &InboundEventEmitContext<'_>,
+    batch: EmailInboundBatch,
+    snapshot: &InboundPollSnapshot,
+    progress: &Mutex<EmailInboundProgress>,
+    mut publish: F,
+) -> (usize, usize, bool)
+where
+    F: FnMut(EventEnvelope) -> bool,
+{
+    let Ok(mut progress) = progress.lock() else {
+        return (0, 0, true);
+    };
+    if progress.active_poll != Some(snapshot.generation)
+        || progress.cursor != snapshot.cursor
+        || batch.requested_cursor != snapshot.cursor
+        || batch.cursor.validate().is_err()
+        || batch.cursor.mailbox != context.mailbox
+        || batch.cursor.account_fingerprint
+            != EmailGenericClient::inbound_account_fingerprint(context.config, context.mailbox)
+    {
+        return (0, 0, true);
+    }
+    if let Some(requested) = &snapshot.cursor
+        && (requested.account_fingerprint != batch.cursor.account_fingerprint
+            || requested.mailbox != batch.cursor.mailbox)
+    {
+        return (0, 0, true);
+    }
+    let expected_start = snapshot
+        .cursor
+        .as_ref()
+        .filter(|cursor| cursor.uid_validity == batch.cursor.uid_validity)
+        .map_or(0, |cursor| cursor.last_uid);
+    if batch.cursor.last_uid != expected_start {
+        return (0, 0, true);
+    }
+
+    // Validate the complete ordered batch before committing any prefix. A
+    // cancelled or older worker cannot reopen a prior epoch through this path.
+    let mut previous_uid = batch.cursor.last_uid;
+    let mut uids = Vec::with_capacity(batch.messages.len());
+    for message in &batch.messages {
+        let Some(uid) = message
+            .uid
+            .parse::<u32>()
+            .ok()
+            .filter(|uid| *uid > previous_uid && uid.to_string() == message.uid)
+        else {
+            return (0, 0, true);
+        };
+        previous_uid = uid;
+        uids.push(uid);
+    }
+    progress.active_poll = None;
+    let mut committed = batch.cursor;
+    if batch.messages.is_empty() {
+        // Establish a verified empty epoch, without treating UIDNEXT or a
+        // searched-but-unhandled UID as acknowledged progress.
+        progress.cursor = Some(committed);
+        return (0, 0, false);
+    }
     let mut emitted = 0_usize;
     let mut dropped = 0_usize;
-    for message in messages {
+    for (message, uid) in batch.messages.into_iter().zip(uids) {
         let preview = context
             .config
             .monitor_policy
             .prepare_inbound_message(&message);
         if preview.decision != EmailInboundPolicyDecision::Accept {
-            // A policy rejection is an intentional, completed disposition.
-            // Transport, parsing, cancellation, and publication failures are not.
-            seen_uids.observe(message.uid);
+            committed.last_uid = uid;
+            progress.cursor = Some(committed.clone());
             dropped = dropped.saturating_add(1);
             continue;
         }
-        let cursor = format!("{}:{}", context.mailbox, message.uid);
         let sender = normalize_sender_address(&message.sender);
         let payload = json!({
             "mailbox": context.mailbox,
             "uid": &message.uid,
+            "uid_validity": committed.uid_validity,
             "sender": sender.clone(),
             "policy_decision": "accept",
             "preview": preview,
@@ -1463,9 +1663,8 @@ fn emit_inbound_preview_events(
             principal,
             payload,
         );
-        // Serialize publication with sequence assignment even if an old
-        // monitor is draining while a new subscription starts. No await occurs
-        // under this lock, and a failed enqueue consumes neither UID nor seq.
+        // The progress lock remains held across generation validation, enqueue,
+        // and both commits. stop/reconfigure cannot fence between these steps.
         let Ok(mut next_event_seq) = context.next_event_seq.lock() else {
             return (emitted, dropped, true);
         };
@@ -1473,17 +1672,20 @@ fn emit_inbound_preview_events(
         let Some(following_seq) = seq.checked_add(1) else {
             return (emitted, dropped, true);
         };
+        let mut event_cursor = committed.clone();
+        event_cursor.last_uid = uid;
         let envelope = EventEnvelope::new(EVENT_INBOUND_PREVIEW, data)
             .with_seq(seq)
-            .with_cursor(cursor)
+            .with_cursor(event_cursor.event_cursor())
             .with_stream_key(context.mailbox)
             .with_ordering(OrderingPolicy::PerKey);
-        if context.event_tx.send(Ok(envelope)).is_err() {
+        if !publish(envelope) {
             return (emitted, dropped, true);
         }
         *next_event_seq = following_seq;
         drop(next_event_seq);
-        seen_uids.observe(message.uid);
+        committed = event_cursor;
+        progress.cursor = Some(committed.clone());
         emitted = emitted.saturating_add(1);
     }
     (emitted, dropped, false)
@@ -1514,23 +1716,58 @@ mod tests {
         }
     }
 
+    fn inbound_test_config() -> EmailGenericConfig {
+        EmailGenericConfig::from_value(json!({
+            "imap": { "host": "imap.example.com", "username": "user@example.com", "password": "secret" },
+            "smtp": { "host": "smtp.example.com", "username": "user@example.com", "password": "secret", "from_address": "user@example.com" },
+            "monitor_policy": { "allowed_senders": ["human@example.com"] }
+        })).expect("monitor config")
+    }
+
+    fn inbound_test_cursor(
+        config: &EmailGenericConfig,
+        epoch: u32,
+        last_uid: u32,
+    ) -> EmailInboundCursor {
+        EmailInboundCursor {
+            version: 1,
+            account_fingerprint: EmailGenericClient::inbound_account_fingerprint(config, "Alerts"),
+            mailbox: "Alerts".into(),
+            uid_validity: epoch,
+            last_uid,
+        }
+    }
+
+    fn inbound_test_batch(
+        config: &EmailGenericConfig,
+        snapshot: &InboundPollSnapshot,
+        epoch: u32,
+        uids: &[u32],
+    ) -> EmailInboundBatch {
+        let last_uid = snapshot
+            .cursor
+            .as_ref()
+            .filter(|cursor| cursor.uid_validity == epoch)
+            .map_or(0, |cursor| cursor.last_uid);
+        EmailInboundBatch {
+            requested_cursor: snapshot.cursor.clone(),
+            cursor: inbound_test_cursor(config, epoch, last_uid),
+            messages: uids
+                .iter()
+                .map(|uid| {
+                    EmailGenericClient::parse_inbound_message(
+                        uid.to_string(),
+                        b"From: human@example.com\r\nSubject: ready\r\n\r\nbody\r\n",
+                    )
+                    .expect("message")
+                })
+                .collect(),
+        }
+    }
+
     #[fcp_async_core::runtime::test]
     async fn inbound_publication_commits_sequences_only_on_success_and_serializes_producers() {
-        let config = EmailGenericConfig::from_value(json!({
-            "imap": {
-                "host": "imap.example.com",
-                "username": "user@example.com",
-                "password": "secret"
-            },
-            "smtp": {
-                "host": "smtp.example.com",
-                "username": "user@example.com",
-                "password": "secret",
-                "from_address": "user@example.com"
-            },
-            "monitor_policy": { "allowed_senders": ["human@example.com"] }
-        }))
-        .expect("monitor config");
+        let config = inbound_test_config();
         let connector = EmailGenericConnector::new();
         let zone = ZoneId::private();
         let (event_tx, receiver) = broadcast::channel(INBOUND_EVENT_BUFFER_CAPACITY);
@@ -1545,39 +1782,42 @@ mod tests {
             next_event_seq: &next_event_seq,
             mailbox: "Alerts",
         };
-        let raw = b"From: human@example.com\r\nSubject: ready\r\n\r\nbody\r\n";
-        let mut seen = EmailSeenUidCache::new(8).expect("UID cache");
-        let message = EmailGenericClient::parse_inbound_message("99", raw).expect("message");
+        let progress = Mutex::new(EmailInboundProgress::default());
+        let snapshot = progress.lock().unwrap().begin_poll().unwrap();
+        let batch = inbound_test_batch(&config, &snapshot, 42, &[99]);
         assert_eq!(
-            emit_inbound_preview_events(&context, vec![message], &mut seen),
+            emit_inbound_preview_events(&context, batch, &snapshot, &progress),
             (0, 0, true)
         );
-        assert!(seen.is_empty());
-        assert_eq!(*next_event_seq.lock().expect("event sequence"), 1);
+        assert!(progress.lock().unwrap().cursor.is_none());
+        assert_eq!(*next_event_seq.lock().unwrap(), 1);
 
         let mut events = event_tx.subscribe();
         let barrier = std::sync::Barrier::new(4);
+        let cx = fcp_async_core::compatibility_cx();
         thread::scope(|scope| {
             for worker in 0..4 {
                 let context = &context;
+                let config = &config;
                 let barrier = &barrier;
+                let cx = cx.clone();
                 scope.spawn(move || {
-                    let messages = (0..8)
-                        .map(|offset| {
-                            EmailGenericClient::parse_inbound_message(
-                                (worker * 8 + offset + 1).to_string(),
-                                raw,
-                            )
-                            .expect("message")
-                        })
-                        .collect();
-                    let mut seen = EmailSeenUidCache::new(8).expect("UID cache");
+                    let _current = fcp_async_core::Cx::set_current(Some(cx));
+                    let progress = Mutex::new(EmailInboundProgress::default());
+                    let snapshot = progress.lock().unwrap().begin_poll().unwrap();
+                    let uids = (1..=8)
+                        .map(|offset| worker * 8 + offset)
+                        .collect::<Vec<u32>>();
+                    let batch = inbound_test_batch(config, &snapshot, 42, &uids);
                     barrier.wait();
                     assert_eq!(
-                        emit_inbound_preview_events(context, messages, &mut seen),
+                        emit_inbound_preview_events(context, batch, &snapshot, &progress),
                         (8, 0, false)
                     );
-                    assert_eq!(seen.len(), 8);
+                    assert_eq!(
+                        progress.lock().unwrap().cursor.as_ref().unwrap().last_uid,
+                        worker * 8 + 8
+                    );
                 });
             }
         });
@@ -1591,7 +1831,238 @@ mod tests {
             sequences.push(event.seq);
         }
         assert_eq!(sequences, (1..=32).collect::<Vec<_>>());
-        assert_eq!(*next_event_seq.lock().expect("event sequence"), 33);
+        assert_eq!(*next_event_seq.lock().unwrap(), 33);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn stale_epoch_and_cancelled_poll_results_cannot_publish_or_restore_old_progress() {
+        let config = inbound_test_config();
+        let connector = EmailGenericConnector::new();
+        let zone = ZoneId::private();
+        let (event_tx, _receiver) = broadcast::channel(INBOUND_EVENT_BUFFER_CAPACITY);
+        let next_event_seq = Mutex::new(1);
+        let context = InboundEventEmitContext {
+            config: &config,
+            zone: &zone,
+            connector_id: &connector.base.id,
+            instance_id: &connector.base.instance_id,
+            event_tx: &event_tx,
+            next_event_seq: &next_event_seq,
+            mailbox: "Alerts",
+        };
+        let progress = Mutex::new(EmailInboundProgress {
+            cursor: Some(inbound_test_cursor(&config, 42, 500)),
+            ..EmailInboundProgress::default()
+        });
+        let old = progress.lock().unwrap().begin_poll().unwrap();
+        let new = progress.lock().unwrap().begin_poll().unwrap();
+        let stale = inbound_test_batch(&config, &old, 42, &[501]);
+        assert_eq!(
+            emit_inbound_preview_events(&context, stale, &old, &progress),
+            (0, 0, true)
+        );
+        assert_eq!(progress.lock().unwrap().active_poll, Some(new.generation));
+
+        let changed_epoch = inbound_test_batch(&config, &new, 43, &[1]);
+        assert_eq!(
+            emit_inbound_preview_events(&context, changed_epoch, &new, &progress),
+            (1, 0, false)
+        );
+        assert_eq!(
+            progress.lock().unwrap().cursor,
+            Some(inbound_test_cursor(&config, 43, 1))
+        );
+        let stale = inbound_test_batch(&config, &old, 42, &[501]);
+        assert_eq!(
+            emit_inbound_preview_events(&context, stale, &old, &progress),
+            (0, 0, true)
+        );
+
+        let cancelled = progress.lock().unwrap().begin_poll().unwrap();
+        progress.lock().unwrap().fence();
+        let abandoned = inbound_test_batch(&config, &cancelled, 43, &[2]);
+        assert_eq!(
+            emit_inbound_preview_events(&context, abandoned, &cancelled, &progress),
+            (0, 0, true)
+        );
+        assert_eq!(
+            progress.lock().unwrap().cursor,
+            Some(inbound_test_cursor(&config, 43, 1))
+        );
+        assert_eq!(*next_event_seq.lock().unwrap(), 2);
+
+        progress.lock().unwrap().reset();
+        assert!(progress.lock().unwrap().cursor.is_none());
+        let restarted = progress.lock().unwrap().begin_poll().unwrap();
+        assert!(restarted.generation > cancelled.generation);
+        let abandoned = inbound_test_batch(&config, &cancelled, 43, &[2]);
+        assert_eq!(
+            emit_inbound_preview_events(&context, abandoned, &cancelled, &progress),
+            (0, 0, true)
+        );
+        let empty_new_epoch = inbound_test_batch(&config, &restarted, 44, &[]);
+        assert_eq!(
+            emit_inbound_preview_events(&context, empty_new_epoch, &restarted, &progress),
+            (0, 0, false)
+        );
+        assert_eq!(
+            progress.lock().unwrap().cursor,
+            Some(inbound_test_cursor(&config, 44, 0))
+        );
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn publication_failure_commits_only_the_successful_prefix_and_retries_the_tail() {
+        let config = inbound_test_config();
+        let connector = EmailGenericConnector::new();
+        let zone = ZoneId::private();
+        let (event_tx, receiver) = broadcast::channel(INBOUND_EVENT_BUFFER_CAPACITY);
+        let mut receiver = Some(receiver);
+        let next_event_seq = Mutex::new(1);
+        let context = InboundEventEmitContext {
+            config: &config,
+            zone: &zone,
+            connector_id: &connector.base.id,
+            instance_id: &connector.base.instance_id,
+            event_tx: &event_tx,
+            next_event_seq: &next_event_seq,
+            mailbox: "Alerts",
+        };
+        let progress = Mutex::new(EmailInboundProgress::default());
+        let snapshot = progress.lock().unwrap().begin_poll().unwrap();
+        let batch = inbound_test_batch(&config, &snapshot, 42, &[11, 12, 13]);
+        let mut successful_sends = 0;
+        let outcome =
+            emit_inbound_preview_events_with(&context, batch, &snapshot, &progress, |envelope| {
+                let sent = event_tx.send(Ok(envelope)).is_ok();
+                if sent {
+                    successful_sends += 1;
+                    // A real broadcast receiver disappears immediately after the
+                    // first successful enqueue; the second send must fail.
+                    drop(receiver.take());
+                }
+                sent
+            });
+        assert_eq!(outcome, (1, 0, true));
+        assert_eq!(successful_sends, 1);
+        assert_eq!(
+            progress.lock().unwrap().cursor,
+            Some(inbound_test_cursor(&config, 42, 11))
+        );
+        assert_eq!(*next_event_seq.lock().unwrap(), 2);
+
+        let _receiver = event_tx.subscribe();
+        let retry = progress.lock().unwrap().begin_poll().unwrap();
+        assert_eq!(retry.cursor.as_ref().unwrap().last_uid, 11);
+        let mut tail = inbound_test_batch(&config, &retry, 42, &[12, 13]);
+        tail.messages[1].sender = "outsider@example.net".into();
+        assert_eq!(
+            emit_inbound_preview_events(&context, tail, &retry, &progress),
+            (1, 1, false)
+        );
+        assert_eq!(
+            progress.lock().unwrap().cursor,
+            Some(inbound_test_cursor(&config, 42, 13))
+        );
+        assert_eq!(*next_event_seq.lock().unwrap(), 3);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn monitor_stop_retains_progress_but_configure_and_shutdown_reset_it() {
+        let mut connector = EmailGenericConnector::new();
+        let config = inbound_test_config();
+        let value = serde_json::to_value(&config).unwrap();
+        connector.configure(value.clone()).await.unwrap();
+        let snapshot = {
+            let mut progress = connector.monitor.progress.lock().unwrap();
+            progress.cursor = Some(inbound_test_cursor(&config, 42, 99));
+            progress.begin_poll().unwrap()
+        };
+        connector.monitor.stop().await;
+        {
+            let progress = connector.monitor.progress.lock().unwrap();
+            assert_eq!(progress.cursor.as_ref().unwrap().last_uid, 99);
+            assert!(progress.active_poll.is_none());
+        }
+        connector.configure(value).await.unwrap();
+        {
+            let mut progress = connector.monitor.progress.lock().unwrap();
+            assert!(progress.cursor.is_none());
+            let next = progress.begin_poll().unwrap();
+            assert!(next.generation > snapshot.generation);
+            progress.cursor = Some(inbound_test_cursor(&config, 43, 1));
+        }
+        connector
+            .shutdown(ShutdownRequest {
+                r#type: "shutdown".into(),
+                deadline_ms: 1000,
+                drain: true,
+                reason: None,
+            })
+            .await
+            .unwrap();
+        let progress = connector.monitor.progress.lock().unwrap();
+        assert!(progress.cursor.is_none());
+        assert!(progress.active_poll.is_none());
+    }
+
+    #[test]
+    fn cursor_mode_does_not_infer_progress_from_legacy_seen_uids() -> Result<(), String> {
+        for input in [
+            json!({}),
+            json!({"cursor": null}),
+            json!({"cursor": null, "seen_uids": ["4294967295"]}),
+        ] {
+            let (modern, cursor) =
+                EmailGenericConnector::inbound_cursor_from_input(&input).unwrap();
+            assert!(modern);
+            assert!(cursor.is_none());
+        }
+        let (modern, cursor) =
+            EmailGenericConnector::inbound_cursor_from_input(&json!({"seen_uids": ["4294967295"]}))
+                .unwrap();
+        assert!(!modern);
+        assert!(cursor.is_none());
+        let cursor =
+            serde_json::to_value(inbound_test_cursor(&inbound_test_config(), 42, 99)).unwrap();
+        assert_schema_accepts(&EmailGenericConnector::inbound_cursor_schema(), &cursor)?;
+        assert_schema_accepts(
+            &EmailGenericConnector::inbound_cursor_schema(),
+            &Value::Null,
+        )?;
+        for (field, value) in [
+            ("version", json!(2)),
+            ("uid_validity", json!(0)),
+            ("last_uid", json!(4294967296_u64)),
+            ("last_uid", json!(-1)),
+            ("mailbox", json!("x".repeat(1025))),
+            ("unexpected", json!(true)),
+        ] {
+            let mut invalid = cursor.clone();
+            invalid[field] = value;
+            assert_schema_rejects(&EmailGenericConnector::inbound_cursor_schema(), &invalid)?;
+            assert!(
+                EmailGenericConnector::inbound_cursor_from_input(&json!({"cursor": invalid}))
+                    .is_err()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn exhausted_poll_generation_cannot_revalidate_an_old_worker() {
+        let mut progress = EmailInboundProgress {
+            generation: u64::MAX,
+            active_poll: Some(u64::MAX),
+            cursor: None,
+        };
+        assert!(progress.begin_poll().is_err());
+        assert!(progress.active_poll.is_none());
+        progress.reset();
+        assert!(
+            progress.begin_poll().is_err(),
+            "reset must never rewind the generation"
+        );
     }
 
     fn test_constraints_cbor() -> Vec<u8> {
@@ -1736,6 +2207,7 @@ mod tests {
             "accepted_count": 1,
             "dropped_count": 1,
             "seen_uids": ["11", "12"],
+            "cursor": null,
             "messages": [
                 {
                     "uid": "11",

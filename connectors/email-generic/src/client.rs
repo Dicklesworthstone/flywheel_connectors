@@ -9,7 +9,9 @@ use lettre::transport::smtp::authentication::Credentials;
 use lettre::{Message, SmtpTransport, Transport};
 use mailparse::{DispositionType, MailHeaderMap, ParsedMail};
 use native_tls::{TlsConnector, TlsStream};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::error::{EmailGenericError, EmailGenericResult};
 use crate::types::{
@@ -21,6 +23,60 @@ const MAX_IMAP_RESPONSE_BYTES: usize = 1_048_576;
 const MAX_IMAP_RESPONSE_LINES: usize = 4_096;
 const MAX_INBOUND_POLL_BYTES: usize = 8 * MAX_IMAP_LITERAL_BYTES;
 const MAX_INBOUND_POLL_MESSAGES: usize = 128;
+const MAX_CURSOR_MAILBOX_CHARS: usize = 1_024;
+
+/// A caller-owned checkpoint for one account, mailbox, and IMAP UID epoch.
+/// It records handled messages, never a fetched-but-unpublished batch tail.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EmailInboundCursor {
+    pub version: u8,
+    pub account_fingerprint: String,
+    pub mailbox: String,
+    pub uid_validity: u32,
+    pub last_uid: u32,
+}
+
+impl EmailInboundCursor {
+    pub fn validate(&self) -> EmailGenericResult<()> {
+        if self.version != 1
+            || self.account_fingerprint.len() != 64
+            || !self
+                .account_fingerprint
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            || self.mailbox.trim().is_empty()
+            || self.mailbox.chars().count() > MAX_CURSOR_MAILBOX_CHARS
+            || self
+                .mailbox
+                .bytes()
+                .any(|byte| matches!(byte, b'\r' | b'\n' | 0))
+            || self.uid_validity == 0
+        {
+            return Err(EmailGenericError::Config(
+                "Invalid inbound cursor fields or version".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn event_cursor(&self) -> String {
+        format!(
+            "v{}:{}:{}:{}",
+            self.version, self.account_fingerprint, self.uid_validity, self.last_uid
+        )
+    }
+}
+
+/// An immutable fetch result. `cursor` describes the observed epoch and starting
+/// position, not the last message in `messages`; only the caller can commit it.
+#[derive(Debug)]
+pub struct EmailInboundBatch {
+    pub requested_cursor: Option<EmailInboundCursor>,
+    pub cursor: EmailInboundCursor,
+    pub messages: Vec<EmailInboundMessage>,
+}
 
 enum ImapStream {
     Plain(TcpStream),
@@ -506,26 +562,146 @@ impl EmailGenericClient {
             let examine = format!("EXAMINE {}", Self::quote_imap(mailbox)?);
             Self::run_imap_command(reader, "a2", &examine)?;
             let search_lines = Self::run_imap_command(reader, "a3", "UID SEARCH UNSEEN")?;
-
-            let mut messages = Vec::new();
-            let mut fetched_bytes = 0_usize;
-            for uid in Self::parse_search_uids(&search_lines)? {
-                let uid_text = uid.to_string();
-                if seen_uids.contains(&uid_text) {
-                    continue;
-                }
-                let fetch = format!("UID FETCH {uid} (UID BODY.PEEK[])");
-                let raw = Self::run_imap_fetch_literal(reader, &format!("f{uid}"), &fetch, uid)?;
-                fetched_bytes = fetched_bytes.saturating_add(raw.len());
-                messages.push(Self::parse_inbound_message(uid_text, &raw)?);
-                if fetched_bytes >= MAX_INBOUND_POLL_BYTES
-                    || messages.len() >= MAX_INBOUND_POLL_MESSAGES
-                {
-                    break;
-                }
-            }
-            Ok(messages)
+            Self::fetch_inbound_candidates(reader, &search_lines, 0, Some(seen_uids))
         })
+    }
+
+    /// Bind progress to non-secret logical account identity. Password rotation
+    /// must not change the identity, and credential material never enters it.
+    pub(crate) fn inbound_account_fingerprint(
+        config: &EmailGenericConfig,
+        mailbox: &str,
+    ) -> String {
+        let identity = json!([
+            "fcp.email-generic.inbound",
+            1,
+            config.imap.host.to_ascii_lowercase(),
+            config.imap.port,
+            config.imap.tls,
+            config.imap.username,
+            mailbox,
+        ]);
+        hex::encode(Sha256::digest(identity.to_string().as_bytes()))
+    }
+
+    fn parse_uid_validity(lines: &[String]) -> EmailGenericResult<u32> {
+        let invalid = || EmailGenericError::Imap("Missing or invalid IMAP UIDVALIDITY".into());
+        let mut uid_validity = None;
+        for line in lines {
+            let mut atoms = line.split_ascii_whitespace();
+            let _tag = atoms.next();
+            let status = atoms.next();
+            let Some(code) = atoms.next() else {
+                continue;
+            };
+            if !code.to_ascii_uppercase().starts_with("[UIDVALIDITY") {
+                continue;
+            }
+            if !code.eq_ignore_ascii_case("[UIDVALIDITY")
+                || !status.is_some_and(|status| status.eq_ignore_ascii_case("OK"))
+            {
+                return Err(invalid());
+            }
+            let value = atoms
+                .next()
+                .and_then(|value| value.strip_suffix(']'))
+                .ok_or_else(invalid)?;
+            if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(invalid());
+            }
+            let value = value.parse::<u32>().map_err(|_| invalid())?;
+            if value == 0 || uid_validity.replace(value).is_some() {
+                return Err(invalid());
+            }
+        }
+        uid_validity.ok_or_else(invalid)
+    }
+
+    /// Read one bounded batch after a verified epoch checkpoint. A changed
+    /// UIDVALIDITY restarts the scan; fetching never advances the checkpoint.
+    pub fn fetch_inbound_batch(
+        &self,
+        mailbox: &str,
+        cursor: Option<&EmailInboundCursor>,
+    ) -> EmailGenericResult<EmailInboundBatch> {
+        if mailbox.trim().is_empty() || mailbox.chars().count() > MAX_CURSOR_MAILBOX_CHARS {
+            return Err(EmailGenericError::Config(
+                "Invalid inbound cursor mailbox".into(),
+            ));
+        }
+        let quoted_mailbox = Self::quote_imap(mailbox)?;
+        let account_fingerprint = Self::inbound_account_fingerprint(&self.config, mailbox);
+        if let Some(cursor) = cursor {
+            cursor.validate()?;
+            if cursor.mailbox != mailbox || cursor.account_fingerprint != account_fingerprint {
+                return Err(EmailGenericError::Config(
+                    "Inbound cursor belongs to a different account or mailbox".into(),
+                ));
+            }
+        }
+        self.imap_login_and_read(|reader| {
+            let lines = Self::run_imap_command(reader, "a2", &format!("EXAMINE {quoted_mailbox}"))?;
+            let uid_validity = Self::parse_uid_validity(&lines)?;
+            let last_uid = cursor
+                .filter(|cursor| cursor.uid_validity == uid_validity)
+                .map_or(0, |cursor| cursor.last_uid);
+            let starting_cursor = EmailInboundCursor {
+                version: 1,
+                account_fingerprint,
+                mailbox: mailbox.to_owned(),
+                uid_validity,
+                last_uid,
+            };
+            let messages = if let Some(next_uid) = last_uid.checked_add(1) {
+                let search = if last_uid == 0 {
+                    "UID SEARCH UNSEEN".to_owned()
+                } else {
+                    format!("UID SEARCH UNSEEN UID {next_uid}:*")
+                };
+                let lines = Self::run_imap_command(reader, "a3", &search)?;
+                Self::fetch_inbound_candidates(reader, &lines, last_uid, None)?
+            } else {
+                // The epoch has exhausted its UID space. EXAMINE above still
+                // detects a changed epoch before this no-op path is selected.
+                Vec::new()
+            };
+            Ok(EmailInboundBatch {
+                requested_cursor: cursor.cloned(),
+                cursor: starting_cursor,
+                messages,
+            })
+        })
+    }
+
+    fn fetch_inbound_candidates(
+        reader: &mut BufReader<ImapStream>,
+        search_lines: &[String],
+        after_uid: u32,
+        seen_uids: Option<&EmailSeenUidCache>,
+    ) -> EmailGenericResult<Vec<EmailInboundMessage>> {
+        let mut messages = Vec::new();
+        let mut fetched_bytes = 0_usize;
+        for uid in Self::parse_search_uids(search_lines)? {
+            // IMAP n:* includes the highest existing UID even when n is larger.
+            // Enforce the lower bound independently of the server's SEARCH.
+            if uid <= after_uid {
+                continue;
+            }
+            let uid_text = uid.to_string();
+            if seen_uids.is_some_and(|seen| seen.contains(&uid_text)) {
+                continue;
+            }
+            let fetch = format!("UID FETCH {uid} (UID BODY.PEEK[])");
+            let raw = Self::run_imap_fetch_literal(reader, &format!("f{uid}"), &fetch, uid)?;
+            fetched_bytes = fetched_bytes.saturating_add(raw.len());
+            messages.push(Self::parse_inbound_message(uid_text, &raw)?);
+            if fetched_bytes >= MAX_INBOUND_POLL_BYTES
+                || messages.len() >= MAX_INBOUND_POLL_MESSAGES
+            {
+                break;
+            }
+        }
+        Ok(messages)
     }
 
     pub fn parse_inbound_message(
@@ -856,6 +1032,107 @@ mod tests {
         assert_eq!(
             EmailGenericClient::quote_imap("ab\\\"cd").unwrap(),
             "\"ab\\\\\\\"cd\""
+        );
+    }
+
+    #[test]
+    fn uid_validity_requires_one_complete_nonzero_epoch() {
+        for line in [
+            "* OK [UIDVALIDITY 42] stable",
+            "* ok [uidvalidity 4294967295] stable",
+        ] {
+            assert!(EmailGenericClient::parse_uid_validity(&[line.into()]).is_ok());
+        }
+        for lines in [
+            vec!["a2 OK [READ-ONLY] opened".into()],
+            vec!["* OK [UIDVALIDITY 0] invalid".into()],
+            vec!["* OK [UIDVALIDITY 4294967296] overflow".into()],
+            vec!["* OK [UIDVALIDITY +42] invalid".into()],
+            vec!["* OK [UIDVALIDITY 42 missing bracket".into()],
+            vec![
+                "* OK [UIDVALIDITY 42] stable".into(),
+                "* OK [UIDVALIDITY 42] duplicate".into(),
+            ],
+            vec![
+                "* OK [UIDVALIDITY42] malformed".into(),
+                "* OK [UIDVALIDITY 42] stable".into(),
+            ],
+            vec![
+                "* NO [UIDVALIDITY 42] invalid status".into(),
+                "* OK [UIDVALIDITY 42] stable".into(),
+            ],
+        ] {
+            assert!(
+                EmailGenericClient::parse_uid_validity(&lines).is_err(),
+                "accepted {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cursor_identity_binds_nonsecret_account_and_mailbox_but_not_passwords() {
+        let config = config();
+        let fingerprint = EmailGenericClient::inbound_account_fingerprint(&config, "INBOX");
+        let mut rotated = config.clone();
+        rotated.imap.password = "rotated IMAP secret".into();
+        rotated.smtp.password = "rotated SMTP secret".into();
+        assert_eq!(
+            fingerprint,
+            EmailGenericClient::inbound_account_fingerprint(&rotated, "INBOX")
+        );
+        assert_ne!(
+            fingerprint,
+            EmailGenericClient::inbound_account_fingerprint(&config, "Archive")
+        );
+        for variant in 0..4 {
+            let mut different = config.clone();
+            match variant {
+                0 => different.imap.host = "other.example.com".into(),
+                1 => different.imap.port = 143,
+                2 => different.imap.username = "other@example.com".into(),
+                _ => different.imap.tls = false,
+            }
+            assert_ne!(
+                fingerprint,
+                EmailGenericClient::inbound_account_fingerprint(&different, "INBOX")
+            );
+        }
+    }
+
+    #[test]
+    fn cursor_fields_are_versioned_bounded_and_reject_unknown_data() {
+        let cursor = EmailInboundCursor {
+            version: 1,
+            account_fingerprint: EmailGenericClient::inbound_account_fingerprint(
+                &config(),
+                "INBOX",
+            ),
+            mailbox: "INBOX".into(),
+            uid_validity: 42,
+            last_uid: u32::MAX,
+        };
+        cursor.validate().expect("maximum handled UID is valid");
+        assert!(cursor.event_cursor().ends_with(":42:4294967295"));
+        for (field, value) in [
+            ("version", json!(2)),
+            ("account_fingerprint", json!("g".repeat(64))),
+            ("mailbox", json!("x".repeat(1025))),
+            ("mailbox", json!("INBOX\r\nLOGOUT")),
+            ("uid_validity", json!(0)),
+        ] {
+            let mut value_cursor = serde_json::to_value(&cursor).unwrap();
+            value_cursor[field] = value;
+            let invalid: EmailInboundCursor = serde_json::from_value(value_cursor).unwrap();
+            assert!(invalid.validate().is_err());
+        }
+        let mut unknown = serde_json::to_value(&cursor).unwrap();
+        unknown["password"] = json!("must not enter a checkpoint");
+        assert!(serde_json::from_value::<EmailInboundCursor>(unknown).is_err());
+        let mut unicode = cursor;
+        unicode.mailbox = "é".repeat(1024);
+        assert!(
+            unicode.validate().is_ok(),
+            "mailbox bound matches JSON Schema character count"
         );
     }
 

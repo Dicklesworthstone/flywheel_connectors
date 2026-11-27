@@ -24,9 +24,9 @@ The current crate exposes these runtime operation IDs:
 - `email_generic.poll_inbound_once`
 - `email_generic.send_message`
 
-Subscribing to `email.inbound.preview` starts a supervised poller over the configured `monitor_policy.mailbox` on the IMAP account. Accepted messages are emitted through a bounded event fan-out channel after sender allowlist, automated-message suppression, UID dedupe, body bounding, attachment classification, and thread metadata shaping.
+Subscribing to `email.inbound.preview` starts a supervised poller over the configured `monitor_policy.mailbox` on the IMAP account. Accepted messages are emitted through a bounded event fan-out channel after sender allowlist, automated-message suppression, account and mailbox epoch checks, body bounding, attachment classification, and thread metadata shaping.
 
-The inbound poll-once surface is a read-only FCP invoke operation over the same bounded RFC822 parsing and monitor-policy preparation path. It is not a subscription stream, does not own durable UID state, and requires callers to pass the returned `seen_uids` into later polls when duplicate suppression matters.
+The inbound poll-once surface is a read-only FCP invoke operation over the same bounded RFC822 parsing and monitor-policy preparation path. It returns a caller-owned `cursor` for account- and UIDVALIDITY-bound progress; pass that complete cursor into later polls. It does not own durable UID state. The legacy `seen_uids` input remains available as a bounded compatibility mode.
 
 Important runtime truths the contract preserves:
 
@@ -40,8 +40,8 @@ Important runtime truths the contract preserves:
 - `smtp.from_name` is optional.
 - `request_timeout_ms` defaults to `15000` and must be greater than zero.
 - Debug output redacts IMAP and SMTP passwords.
-- The IMAP client uses a direct TCP stream, optional TLS, explicit read/write timeouts, `LOGIN`, `LIST`, `SELECT`, `UID SEARCH TEXT`, `UID SEARCH UNSEEN`, bounded `UID FETCH <uid> (RFC822)`, and `LOGOUT`.
-- `email_generic.poll_inbound_once` applies the configured monitor policy and returns bounded message previews, sender-policy decisions, attachment metadata only, thread reply metadata, and updated seen UID state.
+- The IMAP client uses a direct TCP stream, optional TLS, explicit read/write timeouts, `LOGIN`, `LIST`, `EXAMINE`, `UID SEARCH TEXT`, `UID SEARCH UNSEEN` with a cursor range when resuming, bounded `UID FETCH <uid> (UID BODY.PEEK[])`, and `LOGOUT`.
+- `email_generic.poll_inbound_once` applies the configured monitor policy and returns bounded message previews, sender-policy decisions, attachment metadata only, thread reply metadata, an epoch cursor, and compatibility `seen_uids` state.
 - Inbound RFC822 parsing uses `mailparse`, prefers `text/plain`, falls back to stripped `text/html`, records thread headers, and extracts attachment metadata without exposing attachment bytes.
 - The SMTP client uses `lettre`, configured credentials, optional STARTTLS relay mode, and plain message bodies.
 - `health()` is local readiness state and does not prove IMAP reachability.
@@ -104,9 +104,10 @@ The current Generic Email README slice documents the existing runtime surface:
 - `list_mailboxes` sends `LIST "" "*"`.
 - `search_messages` sends `EXAMINE "<mailbox>"` followed by `UID SEARCH TEXT "<query>"`.
 - `search_messages` rejects blank mailbox or query before sending IMAP commands.
-- Inbound polling opens the mailbox with `EXAMINE`, then sends `UID SEARCH UNSEEN` and per-UID `UID FETCH <uid> (UID BODY.PEEK[])`. These reads preserve the provider's `\Seen` flags. The monitor uses the explicit `monitor_policy.mailbox`; `poll_inbound_once` uses its requested mailbox and caller-provided `seen_uids`.
+- Inbound polling opens the mailbox with `EXAMINE`, then sends `UID SEARCH UNSEEN` and per-UID `UID FETCH <uid> (UID BODY.PEEK[])`. These reads preserve the provider's `\Seen` flags. The monitor uses the explicit `monitor_policy.mailbox`; `poll_inbound_once` uses its requested mailbox and cursor, or legacy UID list when explicitly selected.
 - A complete FETCH response must identify the requested UID, close its attribute list, and finish with the exact successful tagged status. Failed fetches, malformed MIME, truncated responses, and oversized literals abort the connection and leave all candidates from that poll unacknowledged for a fresh-session retry.
-- Retrieval never updates the UID cache. One-shot results return the processed UIDs with their previews; the supervised monitor records a UID only after successful event enqueue or an intentional policy rejection. A failed enqueue consumes neither that UID nor an event sequence. The UID cache still has a bounded deduplication window: older unread messages can be re-emitted after eviction, and a large unread backlog can fill successive batches with older UIDs before newer messages are reached. An epoch-aware UIDVALIDITY cursor remains necessary for reliable progress beyond that window. The existing bounded broadcast buffer remains best-effort delivery and does not provide durable acknowledgements or replay.
+- Retrieval never advances a cursor. One-shot results return a checkpoint with the completed response; the supervised monitor advances it only after successful event enqueue or intentional policy rejection. Failed publication retains the successful prefix and leaves the failed UID and tail retryable, without consuming an event sequence. The existing bounded broadcast buffer remains best-effort delivery and does not provide durable acknowledgements or replay.
+- Modern polls require exactly one valid nonzero `UIDVALIDITY` from `EXAMINE`. A changed epoch restarts at UID zero; within the same epoch, both the server query and an independent client-side filter select UIDs above the committed high-water. This filter also handles IMAP's reversed `n:*` range behavior. An exhausted `u32::MAX` UID still checks the epoch and performs no overflowing range query.
 - RFC822 literals and response metadata are each capped at `1048576` bytes. A poll returns at most 128 messages and stops after reaching 8 MiB of raw message data (with at most one additional 1 MiB message); remaining UIDs can be fetched on the next poll.
 - `send_message` requires at least one `to` recipient.
 - `send_message` parses `smtp.from_address`, `to`, and `cc` through `lettre` address parsing before dispatch.
@@ -115,6 +116,18 @@ The current Generic Email README slice documents the existing runtime surface:
 - TLS errors currently map to internal FCP errors.
 - Sandbox profile is `strict`, with `96 MB` memory, `25%` CPU, `30000 ms` wall-clock timeout, no exec, and no ptrace.
 - The connector does not open inbound sockets.
+
+## Resuming Inbound Polls
+
+Start a modern one-shot scan with `{"mailbox":"INBOX","cursor":null}`, or omit both `cursor` and `seen_uids`. Each successful response includes a structured cursor containing `version`, a non-secret `account_fingerprint`, `mailbox`, `uid_validity`, and `last_uid`. Send that complete value as `cursor` in the next request. The fingerprint binds the IMAP endpoint, port, TLS mode, username, mailbox, and cursor version; passwords and token bytes are never included. Cursor objects reject unknown fields, unsupported versions, invalid identifiers, and oversized mailbox names.
+
+Explicit `cursor:null` starts a fresh scan even when `seen_uids` is also supplied. A non-null cursor takes precedence over legacy UID lists. Modern retrieval ignores those unscoped lists and returns compatibility `seen_uids` for the current batch only. A request that supplies `seen_uids` without a `cursor` retains the old bounded-cache behavior and returns `cursor:null`; no high-water is inferred from those entries. That legacy mode can repeat old unread messages and can stall newer messages once its cache window is exceeded, so use the cursor mode for ongoing polling.
+
+The cursor tracks new message UIDs, not flag changes. Marking an older message unread again does not replay it below the committed high-water. A mailbox rebuild that changes `UIDVALIDITY` does restart the scan, including reused lower UIDs. Event cursors include the account fingerprint and epoch, and event payloads include `uid_validity`, so a reused UID in a new epoch has a distinct identity.
+
+The supervised monitor retains its in-memory cursor across unsubscribe/resubscribe. Reconfiguration, shutdown, and process restart clear that monitor-owned progress; caller-persisted one-shot cursors remain subject to account/mailbox/epoch validation when reused. Poll generations fence cancelled workers and old sessions before enqueue, including when an epoch changes while a previous poll is still finishing. Progress follows only the successfully published or deliberately rejected prefix of an ordered batch.
+
+These checkpoints do not add durable event acknowledgements, replay buffers, or exactly-once delivery. A successful enqueue is the monitor's commit boundary; consumers must still handle the existing bounded broadcast behavior.
 
 ## Inbound Monitor Policy Helpers
 
@@ -127,11 +140,11 @@ The supervised inbound monitor uses these poll-once and policy helpers before ev
 - `allow_attachments` defaults to `false`.
 - `poll_interval_secs` defaults to `15` and must be between `1` and `3600`.
 - `max_body_chars` defaults to `50000` and must be between `1` and `1000000`.
-- `seen_uid_cap` defaults to `2000` and must be between `1` and `100000`.
+- `seen_uid_cap` defaults to `2000` and must be between `1` and `100000`. It bounds the legacy cache and compatibility output; supervised progress uses an epoch cursor and continues past that cache size.
 - `allowed_senders` is capped at `512` entries and rejects duplicates after normalization.
 - Automated sender detection checks sender patterns and common automated-message headers.
 - Prepared inbound previews are marked `tainted`, bound body length, classify attachments, and carry thread reply metadata only when policy accepts the message.
-- Poll-once fetches are idempotent for caller-carried `seen_uids` and return an updated `seen_uids` list for the next call.
+- Poll-once fetches are read-only and return the cursor that callers should retain for the next call. Fetch or projection failure changes no caller-owned checkpoint.
 
 ## Capability Families
 
@@ -146,8 +159,8 @@ The supervised inbound monitor uses these poll-once and policy helpers before ev
 |-----------|----------------|------------|------------|-----------|-------------|----------------|
 | `email_generic.health` | local readiness plus monitor policy metadata | `email_generic.read` | `Safe` | `Low` | `Strict` | None. |
 | `email_generic.list_mailboxes` | IMAP `LIST "" "*"` | `email_generic.read` | `Safe` | `Low` | `Strict` | None. |
-| `email_generic.search_messages` | IMAP `SELECT` plus `UID SEARCH TEXT` | `email_generic.read` | `Safe` | `Low` | `Strict` | `mailbox`, `query`. |
-| `email_generic.poll_inbound_once` | IMAP `SELECT`, `UID SEARCH UNSEEN`, bounded `UID FETCH`, monitor-policy preview | `email_generic.read` | `Safe` | `Low` | `Strict` | `mailbox`; optional `seen_uids`. |
+| `email_generic.search_messages` | IMAP `EXAMINE` plus `UID SEARCH TEXT` | `email_generic.read` | `Safe` | `Low` | `Strict` | `mailbox`, `query`. |
+| `email_generic.poll_inbound_once` | IMAP `EXAMINE`, epoch-bound `UID SEARCH UNSEEN`, bounded PEEK fetch, monitor-policy preview | `email_generic.read` | `Safe` | `Low` | `Strict` | `mailbox`; optional `cursor`, or legacy `seen_uids`. |
 | `email_generic.send_message` | SMTP message submission | `email_generic.write` | `Risky` | `Medium` | `None` | `to`, `subject`, `body`; optional `cc`. |
 
 ## Explicit Non-Goals

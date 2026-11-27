@@ -98,6 +98,9 @@ async fn local_non_mock_invokes_imap_read_and_smtp_write_paths() {
     assert_eq!(poll_result["accepted_count"], 1);
     assert_eq!(poll_result["dropped_count"], 2);
     assert_eq!(poll_result["seen_uids"], json!(["11", "12", "13"]));
+    assert_eq!(poll_result["cursor"]["version"], 1);
+    assert_eq!(poll_result["cursor"]["uid_validity"], 42);
+    assert_eq!(poll_result["cursor"]["last_uid"], 13);
     let messages = poll_result["messages"].as_array().expect("poll messages");
     assert_eq!(messages[0]["uid"], "11");
     assert_eq!(messages[0]["decision"], "accept");
@@ -463,6 +466,7 @@ fn handle_imap(mut stream: TcpStream, commands: &Arc<Mutex<Vec<String>>>) {
             write_response(&mut stream, &format!("{tag} OK LIST completed"));
         } else if command.contains("EXAMINE ") {
             write_response(&mut stream, "* 3 EXISTS");
+            write_response(&mut stream, "* OK [UIDVALIDITY 42] stable UID epoch");
             write_response(
                 &mut stream,
                 &format!("{tag} OK [READ-ONLY] EXAMINE completed"),
