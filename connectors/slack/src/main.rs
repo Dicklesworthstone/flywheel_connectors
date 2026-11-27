@@ -525,7 +525,7 @@ mod tests {
         let response: fcp_core::InvokeResponse =
             serde_json::from_value(completed["result"].clone()).unwrap();
         assert_eq!(response.r#type, "response");
-        assert_eq!(response.id.as_str(), "callback-native");
+        assert_eq!(response.id.0.as_str(), "callback-native");
         assert_eq!(response.status, fcp_core::InvokeStatus::Ok);
         let result = response.result.unwrap();
         assert_eq!(result["acknowledged"], true);
