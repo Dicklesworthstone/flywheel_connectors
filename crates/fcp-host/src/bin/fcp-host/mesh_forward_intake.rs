@@ -372,7 +372,7 @@ mod tests {
 
     fn app(intake: Intake) -> Router {
         let maximum = intake.0.maximum_body_bytes;
-        Router::new()
+        Router::<()>::new()
             .route(
                 ROUTE,
                 post(
