@@ -3,7 +3,8 @@ use std::fs::{OpenOptions, create_dir_all};
 use std::io::{Read as _, Write as _};
 use std::net::TcpListener;
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -12,7 +13,7 @@ use fcp_openai_compat::{
     ChatCompletionStream, ChatCompletionsRequest, ChatMessage, CompletionsRequest, EmbeddingInput,
     EmbeddingsRequest, ErrorMapper, HeaderList, HttpRequest, ModelInfo, NetworkError,
     OpenAiCompatClient, OpenAiCompatClientConfig, OpenAiCompatProvider, OpenAiError, PromptInput,
-    RateLimitConfig, RateLimitPolicy, RateLimitSnapshot,
+    RateLimitConfig, RateLimitPolicy, RateLimitSnapshot, collect_chat_stream,
 };
 use futures_util::StreamExt as _;
 use serde_json::json;
@@ -192,6 +193,109 @@ impl Drop for StalledServer {
             thread.join().expect("stalled server thread should exit");
         }
     }
+}
+
+/// Supplies scripted raw HTTP responses and counts fully received requests.
+/// Unexpected retries receive the last response again so they cannot hide behind
+/// a closed listener or a request timeout.
+struct ReplayServer {
+    base_url: String,
+    requests: Arc<AtomicUsize>,
+    release: Option<mpsc::Sender<()>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl ReplayServer {
+    fn start(responses: Vec<Vec<u8>>) -> Self {
+        assert!(!responses.is_empty());
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind replay server");
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let received = Arc::clone(&requests);
+        let (release, released) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            loop {
+                let mut socket = match listener.accept() {
+                    Ok((socket, _)) => socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if !matches!(
+                            released.recv_timeout(Duration::from_millis(5)),
+                            Err(mpsc::RecvTimeoutError::Timeout)
+                        ) {
+                            return;
+                        }
+                        continue;
+                    }
+                    Err(error) => panic!("accept replay request: {error}"),
+                };
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                socket
+                    .set_write_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = Vec::new();
+                loop {
+                    if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                        let headers = std::str::from_utf8(&request[..end]).unwrap();
+                        let body_len = headers
+                            .lines()
+                            .filter_map(|line| line.split_once(':'))
+                            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                            .map_or(0, |(_, value)| value.trim().parse::<usize>().unwrap());
+                        if request.len() >= end + 4 + body_len {
+                            break;
+                        }
+                    }
+                    let mut buffer = [0_u8; 4096];
+                    let count = socket.read(&mut buffer).expect("read replay request");
+                    assert_ne!(count, 0, "request ended before its complete body arrived");
+                    request.extend_from_slice(&buffer[..count]);
+                    assert!(request.len() <= 65536, "unexpected oversized test request");
+                }
+                let attempt = received.fetch_add(1, Ordering::SeqCst);
+                let response = &responses[attempt.min(responses.len() - 1)];
+                socket.write_all(response).expect("send replay response");
+            }
+        });
+        Self {
+            base_url,
+            requests,
+            release: Some(release),
+            thread: Some(thread),
+        }
+    }
+
+    fn provider(&self) -> FixtureProvider {
+        FixtureProvider {
+            id: "replay-provider",
+            base_url: self.base_url.clone(),
+        }
+    }
+
+    fn request_count(&self) -> usize {
+        self.requests.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for ReplayServer {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            thread.join().expect("replay server thread should exit");
+        }
+    }
+}
+
+fn replay_response(status: u16, content_type: &str, body: &str) -> Vec<u8> {
+    format!(
+        "HTTP/1.1 {status} Test\r\nContent-Type: {content_type}\r\nRetry-After: 0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .into_bytes()
 }
 
 async fn collect_stream(stream: ChatCompletionStream) -> Result<String, OpenAiError> {
@@ -447,12 +551,12 @@ async fn streaming_rejection_preserves_structured_provider_error_and_redaction()
 }
 
 #[fcp_async_core::runtime::test]
-async fn streaming_provider_error_type_can_trigger_one_bounded_retry() {
+async fn streaming_explicit_http_rate_limit_can_trigger_one_bounded_retry() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(
-            ResponseTemplate::new(409)
+            ResponseTemplate::new(429)
                 .insert_header("retry-after", "0")
                 .set_body_json(json!({"error": {
                     "type": "rate_limit_error", "message": "provider rate limit"
@@ -474,7 +578,7 @@ async fn streaming_provider_error_type_can_trigger_one_bounded_retry() {
             ChatCompletionsRequest::new("fixture", vec![ChatMessage::user_text("hello")]),
         )
         .await
-        .expect("body-based rate limit mapping should allow a retry");
+        .expect("an explicit HTTP 429 refusal should allow a retry");
     assert!(collect_stream(stream).await.unwrap().is_empty());
 }
 
@@ -648,9 +752,13 @@ async fn provider_service_error_maps_without_prompt_or_token_leakage() {
             ChatCompletionsRequest::new("fixture", vec![ChatMessage::user_text("hello")]),
         )
         .await
-        .expect_err("503 should map to service unavailable");
+        .expect_err("503 cannot establish the outcome of a generation POST");
 
-    assert!(matches!(err, OpenAiError::ServiceUnavailable { .. }));
+    assert!(matches!(
+        err,
+        OpenAiError::OutcomeUnknown { status: Some(503) }
+    ));
+    assert!(!err.is_retryable());
     let display = err.to_string();
     assert!(!display.contains("should-not-leak"));
     assert!(!display.contains("private prompt"));
@@ -929,4 +1037,234 @@ fn custom_mapper_can_preserve_provider_specific_status() {
         RateLimitSnapshot::default(),
     );
     assert!(matches!(err, OpenAiError::Provider { status: 599, .. }));
+}
+
+#[fcp_async_core::runtime::test]
+async fn effectful_json_operations_do_not_replay_ambiguous_responses() {
+    for operation in ["chat", "embeddings", "completions"] {
+        for (status, body) in [
+            (503, r#"{"error":{"type":"service_unavailable"}}"#),
+            (409, r#"{"error":{"type":"rate_limit_error"}}"#),
+            (200, "malformed private response"),
+        ] {
+            let server =
+                ReplayServer::start(vec![replay_response(status, "application/json", body)]);
+            let client = client(server.provider(), RateLimitPolicy::WaitForever);
+            let cx = fcp_async_core::compatibility_cx();
+            let error = match operation {
+                "chat" => client
+                    .chat_completions(
+                        &cx,
+                        ChatCompletionsRequest::new(
+                            "fixture",
+                            vec![ChatMessage::user_text("hello")],
+                        ),
+                    )
+                    .await
+                    .expect_err("ambiguous chat outcome must fail"),
+                "embeddings" => client
+                    .embeddings(
+                        &cx,
+                        EmbeddingsRequest {
+                            model: "fixture".into(),
+                            input: EmbeddingInput::Single("hello".into()),
+                            encoding_format: None,
+                            dimensions: None,
+                            provider_extensions: BTreeMap::default(),
+                        },
+                    )
+                    .await
+                    .expect_err("ambiguous embedding outcome must fail"),
+                "completions" => client
+                    .legacy_completions(
+                        &cx,
+                        CompletionsRequest {
+                            model: "fixture".into(),
+                            prompt: PromptInput::Single("hello".into()),
+                            max_tokens: None,
+                            temperature: None,
+                            provider_extensions: BTreeMap::default(),
+                        },
+                    )
+                    .await
+                    .expect_err("ambiguous completion outcome must fail"),
+                _ => unreachable!(),
+            };
+            assert!(
+                matches!(error, OpenAiError::OutcomeUnknown { status: Some(observed) } if observed == status),
+                "{operation}: {error}"
+            );
+            assert!(!error.is_retryable());
+            assert!(error.retry_after().is_none());
+            assert!(!error.to_string().contains("private response"));
+            assert_eq!(server.request_count(), 1, "{operation} HTTP {status}");
+        }
+    }
+}
+
+#[fcp_async_core::runtime::test]
+async fn disconnected_json_generation_is_terminal_and_dispatched_once() {
+    for response in [
+        Vec::new(),
+        b"HTTP/1.1 200 OK\r\nContent-Length: 4096\r\nConnection: close\r\n\r\n{\"id\":\"partial"
+            .to_vec(),
+    ] {
+        let server = ReplayServer::start(vec![response]);
+        let error = client(server.provider(), RateLimitPolicy::WaitForever)
+            .chat_completions(
+                &fcp_async_core::compatibility_cx(),
+                ChatCompletionsRequest::new("fixture", vec![ChatMessage::user_text("hello")]),
+            )
+            .await
+            .expect_err("an interrupted POST cannot safely be replayed");
+        assert!(matches!(error, OpenAiError::OutcomeUnknown { .. }));
+        assert!(!error.is_retryable());
+        assert_eq!(server.request_count(), 1);
+    }
+}
+
+#[fcp_async_core::runtime::test]
+async fn streaming_ambiguous_dispatch_does_not_replay() {
+    for status in [409, 503] {
+        let server = ReplayServer::start(vec![replay_response(
+            status,
+            "application/json",
+            r#"{"error":{"type":"rate_limit_error","message":"private provider detail"}}"#,
+        )]);
+        let error = client(server.provider(), RateLimitPolicy::WaitForever)
+            .chat_completions_stream(
+                &fcp_async_core::compatibility_cx(),
+                ChatCompletionsRequest::new("fixture", vec![ChatMessage::user_text("hello")]),
+            )
+            .await
+            .err()
+            .expect("an HTTP error label cannot establish a safe POST retry");
+        assert!(
+            matches!(error, OpenAiError::OutcomeUnknown { status: Some(observed) } if observed == status)
+        );
+        assert!(!error.is_retryable());
+        assert!(!error.to_string().contains("private provider detail"));
+        assert_eq!(server.request_count(), 1);
+    }
+}
+
+#[fcp_async_core::runtime::test]
+async fn explicit_rate_limit_refusal_and_model_get_keep_one_bounded_retry() {
+    for operation in ["chat", "stream", "models"] {
+        let status = if operation == "models" { 503 } else { 429 };
+        let (content_type, success_body) = match operation {
+            "chat" => (
+                "application/json",
+                r#"{"id":"retry","object":"chat.completion","created":1,"model":"fixture","choices":[]}"#,
+            ),
+            "stream" => ("text/event-stream", "data: [DONE]\n\n"),
+            "models" => (
+                "application/json",
+                r#"{"object":"list","data":[{"id":"fixture","object":"model"}]}"#,
+            ),
+            _ => unreachable!(),
+        };
+        let server = ReplayServer::start(vec![
+            replay_response(
+                status,
+                "application/json",
+                r#"{"error":{"message":"wait"}}"#,
+            ),
+            replay_response(200, content_type, success_body),
+        ]);
+        let client = client(server.provider(), RateLimitPolicy::WaitForever);
+        let cx = fcp_async_core::compatibility_cx();
+        match operation {
+            "chat" => {
+                client
+                    .chat_completions(
+                        &cx,
+                        ChatCompletionsRequest::new(
+                            "fixture",
+                            vec![ChatMessage::user_text("hello")],
+                        ),
+                    )
+                    .await
+                    .expect("an explicit HTTP 429 refusal permits retry");
+            }
+            "stream" => {
+                let stream = client
+                    .chat_completions_stream(
+                        &cx,
+                        ChatCompletionsRequest::new(
+                            "fixture",
+                            vec![ChatMessage::user_text("hello")],
+                        ),
+                    )
+                    .await
+                    .expect("an explicit HTTP 429 refusal permits streaming retry");
+                assert!(collect_stream(stream).await.unwrap().is_empty());
+            }
+            "models" => {
+                assert_eq!(
+                    client.list_models(&cx).await.expect("GET may retry")[0].id,
+                    "fixture"
+                );
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(server.request_count(), 2, "{operation}");
+    }
+}
+
+#[fcp_async_core::runtime::test]
+async fn incomplete_streams_never_publish_a_buffered_completion_or_authorize_retry() {
+    let chunk = json!({
+        "id": "partial", "object": "chat.completion.chunk", "created": 1,
+        "model": "fixture", "choices": [{
+            "index": 0, "delta": {"content": "partial output"}, "finish_reason": null
+        }]
+    });
+    for terminal in ["", "data: [DONE]\n\n"] {
+        let server = ReplayServer::start(vec![replay_response(
+            200,
+            "text/event-stream",
+            &format!("data: {chunk}\n\n{terminal}"),
+        )]);
+        let stream = client(server.provider(), RateLimitPolicy::WaitForever)
+            .chat_completions_stream(
+                &fcp_async_core::compatibility_cx(),
+                ChatCompletionsRequest::new("fixture", vec![ChatMessage::user_text("hello")]),
+            )
+            .await
+            .expect("stream headers arrive");
+        let error = collect_chat_stream(stream)
+            .await
+            .expect_err("missing DONE or finish reason cannot publish partial output");
+        assert!(matches!(
+            error,
+            OpenAiError::Network(NetworkError::ConnectionDropped)
+        ));
+        assert!(!error.is_retryable());
+        assert_eq!(server.request_count(), 1);
+    }
+}
+
+#[fcp_async_core::runtime::test]
+async fn stream_eof_yields_one_terminal_nonretryable_error() {
+    let server = ReplayServer::start(vec![replay_response(200, "text/event-stream", "")]);
+    let mut stream = client(server.provider(), RateLimitPolicy::WaitForever)
+        .chat_completions_stream(
+            &fcp_async_core::compatibility_cx(),
+            ChatCompletionsRequest::new("fixture", vec![ChatMessage::user_text("hello")]),
+        )
+        .await
+        .expect("stream headers arrive");
+    let error = stream
+        .next()
+        .await
+        .expect("EOF without DONE yields an error")
+        .expect_err("EOF is not a completion");
+    assert!(matches!(
+        error,
+        OpenAiError::Network(NetworkError::ConnectionDropped)
+    ));
+    assert!(!error.is_retryable());
+    assert!(stream.next().await.is_none());
+    assert_eq!(server.request_count(), 1);
 }

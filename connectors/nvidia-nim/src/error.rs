@@ -41,6 +41,13 @@ pub fn openai_error_to_fcp(error: &OpenAiError) -> FcpError {
             retry_after_ms: duration_millis(*retry_after),
             violation: None,
         },
+        OpenAiError::OutcomeUnknown { status } => FcpError::External {
+            service: "nvidia_nim".into(),
+            message: error.to_string(),
+            status_code: *status,
+            retryable: false,
+            retry_after: None,
+        },
         OpenAiError::ServiceUnavailable {
             message,
             retry_after,
@@ -58,12 +65,13 @@ pub fn openai_error_to_fcp(error: &OpenAiError) -> FcpError {
             retryable: true,
             retry_after: None,
         },
-        OpenAiError::Network(NetworkError::Cancelled { message }) => {
-            FcpError::ConnectorUnavailable {
-                code: 5000,
-                message: format!("NVIDIA NIM request cancelled: {message}"),
-            }
-        }
+        OpenAiError::Network(NetworkError::Cancelled { .. }) => FcpError::External {
+            service: "nvidia_nim".into(),
+            message: "request cancelled; provider outcome may be unknown".into(),
+            status_code: None,
+            retryable: false,
+            retry_after: None,
+        },
         OpenAiError::Network(NetworkError::DeadlineExceeded { timeout_ms }) => FcpError::External {
             service: "nvidia-nim".into(),
             message: format!(
@@ -75,9 +83,9 @@ pub fn openai_error_to_fcp(error: &OpenAiError) -> FcpError {
         },
         OpenAiError::Network(NetworkError::ConnectionDropped) => FcpError::External {
             service: "nvidia_nim".into(),
-            message: "stream connection dropped before completion".into(),
+            message: "stream incomplete; provider outcome may be unknown".into(),
             status_code: None,
-            retryable: true,
+            retryable: false,
             retry_after: None,
         },
         OpenAiError::Network(NetworkError::Http { message }) => FcpError::External {
@@ -185,7 +193,13 @@ mod tests {
         let cancelled = openai_error_to_fcp(&OpenAiError::Network(NetworkError::Cancelled {
             message: "cancelled by caller".into(),
         }));
-        assert!(matches!(cancelled, FcpError::ConnectorUnavailable { .. }));
+        assert!(matches!(
+            cancelled,
+            FcpError::External {
+                retryable: false,
+                ..
+            }
+        ));
 
         let http = openai_error_to_fcp(&OpenAiError::Network(NetworkError::Http {
             message: "connection failed".into(),
@@ -231,5 +245,35 @@ mod tests {
             assert_eq!(message, "NVIDIA NIM provider returned HTTP 502");
             assert!(!message.contains("secret-token"));
         }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn interrupted_provider_work_never_authorizes_automatic_replay() {
+    for error in [
+        OpenAiError::OutcomeUnknown { status: None },
+        OpenAiError::OutcomeUnknown { status: Some(503) },
+        OpenAiError::Network(NetworkError::ConnectionDropped),
+        OpenAiError::Network(NetworkError::DeadlineExceeded { timeout_ms: 10 }),
+        OpenAiError::Network(NetworkError::Cancelled {
+            message: "private cancellation detail".into(),
+        }),
+    ] {
+        let mapped = openai_error_to_fcp(&error);
+        assert!(matches!(
+            &mapped,
+            FcpError::External {
+                retryable: false,
+                retry_after: None,
+                ..
+            }
+        ));
+        if let OpenAiError::OutcomeUnknown { status } = error {
+            assert!(
+                matches!(&mapped, FcpError::External { status_code, .. } if *status_code == status)
+            );
+        }
+        assert!(!mapped.to_string().contains("private cancellation detail"));
     }
 }

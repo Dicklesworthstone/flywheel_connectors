@@ -27,8 +27,8 @@ pub enum NetworkError {
         /// Effective timeout after narrowing against the caller's context.
         timeout_ms: u64,
     },
-    /// Stream ended before `[DONE]`.
-    #[error("stream connection dropped before completion")]
+    /// A generation stream ended before completion. Replaying may bill twice.
+    #[error("stream connection dropped before completion; provider outcome may be unknown")]
     ConnectionDropped,
 }
 
@@ -97,6 +97,14 @@ pub enum OpenAiError {
         /// Message.
         message: String,
     },
+    /// An effectful request was dispatched, but its outcome cannot be established.
+    ///
+    /// This error never permits automatic replay. It contains no provider body,
+    /// request URL, prompt, completion, or credential material.
+    OutcomeUnknown {
+        /// Observed HTTP status, when a complete response was received.
+        status: Option<u16>,
+    },
     /// Transport failure.
     Network(NetworkError),
     /// Streaming failure.
@@ -121,8 +129,47 @@ impl OpenAiError {
             Self::RateLimited { .. }
                 | Self::ServiceUnavailable { .. }
                 | Self::InternalError { .. }
-                | Self::Network(NetworkError::Http { .. } | NetworkError::ConnectionDropped)
+                | Self::Network(NetworkError::Http { .. })
         )
+    }
+
+    /// Bind a received error to the replay safety of the dispatched operation.
+    ///
+    /// `status` must be the actual HTTP status, not a status inferred by a
+    /// provider error mapper. A generation or embedding POST may already have
+    /// incurred cost when a server failure, transport interruption, or malformed
+    /// success response arrives. Only an explicit HTTP 429 refusal can retain
+    /// a retryable classification for those requests. Ordinary terminal 4xx
+    /// rejections retain their useful authentication/validation taxonomy.
+    ///
+    /// Cancellation and deadlines retain their own terminal taxonomy. Streaming
+    /// truncation is independently terminal, including accumulator-only use.
+    #[must_use]
+    pub fn for_dispatched_request(self, replay_safe: bool, status: Option<u16>) -> Self {
+        if replay_safe
+            || matches!(
+                &self,
+                Self::OutcomeUnknown { .. }
+                    | Self::Network(
+                        NetworkError::Cancelled { .. } | NetworkError::DeadlineExceeded { .. }
+                    )
+            )
+            || status == Some(429)
+        {
+            return self;
+        }
+        if status.is_some_and(|status| (400..500).contains(&status) && status != 408)
+            && (matches!(
+                &self,
+                Self::InvalidRequest { .. }
+                    | Self::Authentication { .. }
+                    | Self::PermissionDenied { .. }
+                    | Self::NotFound { .. }
+            ) || matches!(&self, Self::Provider { status: mapped, .. } if Some(*mapped) == status))
+        {
+            return self;
+        }
+        Self::OutcomeUnknown { status }
     }
 
     /// Provider retry hint.
@@ -197,6 +244,13 @@ impl fmt::Display for OpenAiError {
                     "internal provider error: {}",
                     redact_sensitive_text(message)
                 )
+            }
+            Self::OutcomeUnknown { status } => {
+                write!(f, "provider outcome is unknown after dispatch")?;
+                if let Some(status) = status {
+                    write!(f, " (HTTP {status})")?;
+                }
+                write!(f, "; do not automatically retry")
             }
             Self::Network(error) => write!(f, "network error: {error}"),
             Self::Streaming(error) => write!(f, "streaming error: {error}"),
@@ -337,6 +391,89 @@ mod tests {
         assert!(!redacted.contains("private trace"));
         assert!(!redacted.contains("final"));
         assert!(redacted.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn effectful_dispatch_errors_require_an_observed_rate_limit_refusal() {
+        for status in [None, Some(200), Some(408), Some(409), Some(500), Some(503)] {
+            let error = OpenAiError::RateLimited {
+                message: "private provider body".into(),
+                retry_after: Some(Duration::ZERO),
+            }
+            .for_dispatched_request(false, status);
+            assert_eq!(error, OpenAiError::OutcomeUnknown { status });
+            assert!(!error.is_retryable());
+            assert_eq!(error.retry_after(), None);
+            assert!(!error.to_string().contains("private provider body"));
+        }
+
+        let limited = OpenAiError::RateLimited {
+            message: "rate limit refusal".into(),
+            retry_after: Some(Duration::from_secs(1)),
+        };
+        assert_eq!(
+            limited.clone().for_dispatched_request(false, Some(429)),
+            limited
+        );
+        let unavailable = OpenAiError::ServiceUnavailable {
+            message: "maintenance".into(),
+            retry_after: Some(Duration::ZERO),
+        };
+        assert_eq!(
+            unavailable.clone().for_dispatched_request(true, Some(503)),
+            unavailable
+        );
+        let denied = OpenAiError::Authentication {
+            message: "unauthorized".into(),
+        };
+        assert_eq!(
+            denied.clone().for_dispatched_request(false, Some(401)),
+            denied
+        );
+    }
+
+    #[test]
+    fn a_mapper_cannot_replace_a_terminal_wire_status_with_a_retryable_provider_status() {
+        for observed in [400, 404, 409] {
+            let error = OpenAiError::Provider {
+                provider: "fixture".into(),
+                status: 503,
+                body: "private provider body".into(),
+            }
+            .for_dispatched_request(false, Some(observed));
+            assert_eq!(
+                error,
+                OpenAiError::OutcomeUnknown {
+                    status: Some(observed)
+                }
+            );
+            assert!(!error.is_retryable());
+        }
+        let rejected = OpenAiError::Provider {
+            provider: "fixture".into(),
+            status: 409,
+            body: "rejected".into(),
+        };
+        assert_eq!(
+            rejected.clone().for_dispatched_request(false, Some(409)),
+            rejected
+        );
+    }
+
+    #[test]
+    fn cancellation_and_incomplete_streams_remain_terminal() {
+        for error in [
+            OpenAiError::Network(NetworkError::Cancelled {
+                message: "cancelled".into(),
+            }),
+            OpenAiError::Network(NetworkError::DeadlineExceeded { timeout_ms: 10 }),
+        ] {
+            assert_eq!(error.clone().for_dispatched_request(false, None), error);
+            assert!(!error.is_retryable());
+        }
+        let dropped = OpenAiError::Network(NetworkError::ConnectionDropped);
+        assert!(!dropped.is_retryable());
+        assert_eq!(dropped.retry_after(), None);
     }
 
     #[test]

@@ -475,7 +475,10 @@ impl<P: OpenAiCompatProvider> OpenAiCompatClient<P> {
         R: DeserializeOwned,
     {
         budget.checkpoint()?;
-        let body_bytes = if matches!(method, Method::Get) {
+        // Only the model-catalog GET is replay-safe. Even logically read-only
+        // generation and embedding POSTs can incur provider cost.
+        let replay_safe = matches!(method, Method::Get);
+        let body_bytes = if replay_safe {
             Vec::new()
         } else {
             serde_json::to_vec(body).map_err(|err| OpenAiError::InvalidRequest {
@@ -492,10 +495,9 @@ impl<P: OpenAiCompatProvider> OpenAiCompatClient<P> {
             let request =
                 self.http_client
                     .request(cx, method.clone(), &url, headers, body_bytes.clone());
-            let response = budget
-                .run(request)
-                .await?
-                .map_err(|err| OpenAiError::Network(err.into()))?;
+            let response = budget.run(request).await?.map_err(|err| {
+                OpenAiError::Network(err.into()).for_dispatched_request(replay_safe, None)
+            })?;
 
             let status = response.status_code();
             let rate_limits = parse_rate_limit_headers(
@@ -503,13 +505,17 @@ impl<P: OpenAiCompatProvider> OpenAiCompatClient<P> {
                 self.provider.rate_limit_overrides().as_ref(),
             );
             if !status.is_success() {
-                let mapped = self.provider.error_mapper().map_response(
-                    self.provider.provider_name(),
-                    status.as_u16(),
-                    &response.headers,
-                    &response.body,
-                    rate_limits,
-                );
+                let mapped = self
+                    .provider
+                    .error_mapper()
+                    .map_response(
+                        self.provider.provider_name(),
+                        status.as_u16(),
+                        &response.headers,
+                        &response.body,
+                        rate_limits,
+                    )
+                    .for_dispatched_request(replay_safe, Some(status.as_u16()));
                 if !attempted_rate_limit_retry {
                     if let Some(delay) =
                         retry_delay_for_policy(&mapped, self.config.rate_limit_policy)
@@ -530,6 +536,7 @@ impl<P: OpenAiCompatProvider> OpenAiCompatClient<P> {
                     param: None,
                     code: Some("decode_response".to_string()),
                 }
+                .for_dispatched_request(replay_safe, Some(status.as_u16()))
             });
         }
     }
@@ -564,7 +571,9 @@ impl<P: OpenAiCompatProvider> OpenAiCompatClient<P> {
                     body_bytes.clone(),
                 ))
                 .await?
-                .map_err(|err| OpenAiError::Network(err.into()))?;
+                .map_err(|err| {
+                    OpenAiError::Network(err.into()).for_dispatched_request(false, None)
+                })?;
             if !(200..300).contains(&response.head.status) {
                 let rate_limits = parse_rate_limit_headers(
                     &response.head.headers,
@@ -575,13 +584,17 @@ impl<P: OpenAiCompatProvider> OpenAiCompatClient<P> {
                 // the same structured response as the JSON request path, under
                 // the original operation deadline and a small allocation cap.
                 let body = budget.run(read_stream_error_body(response.body)).await?;
-                let error = self.provider.error_mapper().map_response(
-                    self.provider.provider_name(),
-                    response.head.status,
-                    &response.head.headers,
-                    body.as_deref().unwrap_or_default(),
-                    rate_limits,
-                );
+                let error = self
+                    .provider
+                    .error_mapper()
+                    .map_response(
+                        self.provider.provider_name(),
+                        response.head.status,
+                        &response.head.headers,
+                        body.as_deref().unwrap_or_default(),
+                        rate_limits,
+                    )
+                    .for_dispatched_request(false, Some(response.head.status));
                 // The body (and its connection) has already been dropped before
                 // backoff. An oversized or incomplete error body falls back to
                 // the received HTTP status and retry headers, never a
