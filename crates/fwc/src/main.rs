@@ -6648,12 +6648,12 @@ impl HostAdminClient {
     }
 
     fn config_snapshot(&self, connector_id: &str) -> Result<ConnectorConfigSnapshot> {
-        self.get_json(&format!("/rpc/connectors/{connector_id}/config"))
+        self.get_connector_config_json(&format!("/rpc/connectors/{connector_id}/config"))
     }
 
     #[allow(dead_code)]
     fn config_revisions(&self, connector_id: &str) -> Result<ConnectorConfigRevisionsResponse> {
-        self.get_json(&format!("/rpc/connectors/{connector_id}/config/revisions"))
+        self.get_connector_config_json(&format!("/rpc/connectors/{connector_id}/config/revisions"))
     }
 
     #[allow(dead_code)]
@@ -6662,7 +6662,7 @@ impl HostAdminClient {
         connector_id: &str,
         revision_id: u64,
     ) -> Result<ConfigRevisionRecord> {
-        self.get_json(&format!(
+        self.get_connector_config_json(&format!(
             "/rpc/connectors/{connector_id}/config/revisions/{revision_id}"
         ))
     }
@@ -6673,7 +6673,7 @@ impl HostAdminClient {
         connector_id: &str,
         request: &ConnectorConfigDiffRequest,
     ) -> Result<ConnectorConfigDiffResponse> {
-        self.post_json(
+        self.post_connector_config_json(
             &format!("/rpc/connectors/{connector_id}/config/diff"),
             request,
         )
@@ -6684,7 +6684,7 @@ impl HostAdminClient {
         connector_id: &str,
         request: &ConnectorConfigValidateRequest,
     ) -> Result<ConnectorConfigValidateResponse> {
-        self.post_json(
+        self.post_connector_config_json(
             &format!("/rpc/connectors/{connector_id}/config/validate"),
             request,
         )
@@ -6695,7 +6695,7 @@ impl HostAdminClient {
         connector_id: &str,
         request: &ConnectorConfigPatchRequest,
     ) -> Result<ConnectorConfigValidateResponse> {
-        self.post_config_patch_json(
+        self.post_connector_config_json(
             &format!("/rpc/connectors/{connector_id}/config/patch/validate"),
             request,
         )
@@ -6706,46 +6706,119 @@ impl HostAdminClient {
         connector_id: &str,
         request: &ConnectorConfigPatchRequest,
     ) -> Result<ConnectorConfigApplyResponse> {
-        self.post_config_patch_json(
+        self.post_connector_config_json(
             &format!("/rpc/connectors/{connector_id}/config/patch"),
             request,
         )
     }
 
-    fn post_config_patch_json<T: DeserializeOwned>(
+    fn get_connector_config_json<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
+        self.connector_config_json(
+            self.client.get(format!("{}{}", self.base_url, path)),
+            "GET",
+            path,
+        )
+    }
+
+    fn post_connector_config_json<B: Serialize, T: DeserializeOwned>(
         &self,
         path: &str,
-        request: &ConnectorConfigPatchRequest,
+        request: &B,
     ) -> Result<T> {
-        // A patch can set a secret. Neither an error body nor a JSON decoder
-        // diagnostic may echo it, and an ambiguous write is never retried.
+        self.connector_config_json(
+            self.client
+                .post(format!("{}{}", self.base_url, path))
+                .json(request),
+            "POST",
+            path,
+        )
+    }
+
+    fn connector_config_json<T: DeserializeOwned>(
+        &self,
+        request: reqwest::blocking::RequestBuilder,
+        method: &'static str,
+        path: &str,
+    ) -> Result<T> {
+        // Configuration may contain secrets. Keep all transport, HTTP, metadata,
+        // body-read and decoder diagnostics independent of request/response data.
+        // The owner client disables redirects and retries, including for writes.
         const MAX_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
-        let response = self
-            .client
-            .post(format!("{}{}", self.base_url, path))
-            .json(request)
-            .timeout(self.read_timeout)
-            .send()
-            .map_err(|_| anyhow::anyhow!("host config patch request failed; inspect current configuration before retrying"))?;
-        let status = response.status();
-        if !status.is_success() {
-            bail!(
-                "host config patch returned HTTP {}; inspect current configuration before retrying",
-                status.as_u16()
-            );
+        let limit = self
+            .response_limit_bytes
+            .unwrap_or(MAX_RESPONSE_BYTES)
+            .min(MAX_RESPONSE_BYTES);
+        let started = std::time::Instant::now();
+        let timeout = self.read_budget.map_or(Ok(self.read_timeout), |budget| {
+            budget.preflight_timeout(self.read_timeout, started)
+        })?;
+        let timeout_error = || {
+            anyhow::Error::new(HostReadTimeout {
+                method,
+                path: path.to_owned(),
+                timeout,
+            })
+        };
+        let result = (|| {
+            let response = request.timeout(timeout).send().map_err(|error| {
+                if error.is_timeout() {
+                    timeout_error()
+                } else {
+                    anyhow::anyhow!(
+                        "host config request failed; inspect current configuration before retrying"
+                    )
+                }
+            })?;
+            let status = response.status();
+            if !status.is_success() {
+                bail!(
+                    "host config returned HTTP {}; inspect current configuration before retrying",
+                    status.as_u16()
+                );
+            }
+            // Preserve the read metadata validation previously used by snapshots.
+            HostReadProvenance::from_headers(response.headers())
+                .map_err(|_| anyhow::anyhow!("host config returned invalid response metadata; inspect current configuration before retrying"))?;
+            if response
+                .content_length()
+                .is_some_and(|length| length > limit)
+            {
+                bail!(
+                    "host config response exceeded its byte limit; inspect current configuration before retrying"
+                );
+            }
+            let mut bytes = zeroize::Zeroizing::new(Vec::new());
+            response
+                .take(limit + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|error| {
+                    let timed_out = error.kind() == std::io::ErrorKind::TimedOut;
+                    let error = anyhow::Error::new(error);
+                    if timed_out || error.chain().any(|cause| {
+                        cause.downcast_ref::<reqwest::Error>().is_some_and(reqwest::Error::is_timeout)
+                    }) {
+                        timeout_error()
+                    } else {
+                        anyhow::anyhow!("host config response could not be read; inspect current configuration before retrying")
+                    }
+                })?;
+            if bytes.len() as u64 > limit {
+                bail!(
+                    "host config response exceeded its byte limit; inspect current configuration before retrying"
+                );
+            }
+            serde_json::from_slice(&bytes)
+                .map_err(|_| anyhow::anyhow!("host config returned an invalid response; inspect current configuration before retrying"))
+        })();
+        // A late successful validation must not authorize a subsequent apply.
+        // Include body consumption and JSON parsing in the effective deadline.
+        if let Some(budget) = self.read_budget {
+            budget.remaining_ms(std::time::Instant::now())?;
         }
-        let mut bytes = Vec::new();
-        response
-            .take(MAX_RESPONSE_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|_| anyhow::anyhow!("host config patch response could not be read; inspect current configuration before retrying"))?;
-        if bytes.len() as u64 > MAX_RESPONSE_BYTES {
-            bail!(
-                "host config patch response exceeded 16 MiB; inspect current configuration before retrying"
-            );
+        if result.is_ok() && started.elapsed() >= timeout {
+            return Err(timeout_error());
         }
-        serde_json::from_slice(&bytes)
-            .map_err(|_| anyhow::anyhow!("host config patch returned an invalid response; inspect current configuration before retrying"))
+        result
     }
 
     fn config_apply(
@@ -6753,7 +6826,7 @@ impl HostAdminClient {
         connector_id: &str,
         request: &ConnectorConfigApplyRequest,
     ) -> Result<ConnectorConfigApplyResponse> {
-        self.post_json(
+        self.post_connector_config_json(
             &format!("/rpc/connectors/{connector_id}/config/apply"),
             request,
         )
@@ -6765,7 +6838,7 @@ impl HostAdminClient {
         connector_id: &str,
         request: &ConnectorConfigRollbackRequest,
     ) -> Result<ConnectorConfigApplyResponse> {
-        self.post_json(
+        self.post_connector_config_json(
             &format!("/rpc/connectors/{connector_id}/config/rollback"),
             request,
         )
@@ -50497,7 +50570,7 @@ deny_ptrace = true
             }
             if subcommand == "import" {
                 routes.push((
-                    "POST /rpc/connectors/fcp.github:enterprise:v1/config".to_owned(),
+                    "POST /rpc/connectors/fcp.github:enterprise:v1/config/apply".to_owned(),
                     mock_config_apply_response_json(candidate.clone(), current.clone()),
                 ));
             }
@@ -50761,6 +50834,360 @@ deny_ptrace = true
             assert!(!message.contains("private-request-value"));
             assert_eq!(request_log.lock().unwrap().len(), 1);
         }
+    }
+
+    struct ConfigResponseFixture {
+        host: String,
+        server: thread::JoinHandle<()>,
+        requests: Arc<StdMutex<Vec<Value>>>,
+        stop: std::sync::mpsc::Sender<()>,
+    }
+
+    fn spawn_config_response_fixture(route: String, response: String) -> ConfigResponseFixture {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let host = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let captured = Arc::clone(&requests);
+        let (stop, stopped) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                match stopped.try_recv() {
+                    Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "config response fixture was not released"
+                );
+                let mut stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("config response fixture accept failed: {error}"),
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                assert!(reader.read_line(&mut request_line).unwrap() > 0);
+                assert_eq!(
+                    request_line
+                        .split_whitespace()
+                        .take(2)
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    route
+                );
+                let mut headers = StdBTreeMap::new();
+                loop {
+                    let mut line = String::new();
+                    assert!(reader.read_line(&mut line).unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    let (name, value) = line.split_once(':').unwrap();
+                    assert!(
+                        headers
+                            .insert(name.to_ascii_lowercase(), value.trim().to_owned())
+                            .is_none()
+                    );
+                }
+                assert_eq!(headers["authorization"], "Bearer config-patch-admin-token");
+                assert_eq!(headers["x-fcp-zone"], "z:owner");
+                let length = headers
+                    .get("content-length")
+                    .map(|value| value.parse::<usize>().unwrap())
+                    .unwrap_or(0);
+                assert!(length <= 65_536);
+                let mut body = vec![0_u8; length];
+                reader.read_exact(&mut body).unwrap();
+                captured.lock().unwrap().push(if body.is_empty() {
+                    Value::Null
+                } else {
+                    serde_json::from_slice(&body).unwrap()
+                });
+                // An oversized header may let the client close before the body.
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        ConfigResponseFixture {
+            host,
+            server,
+            requests,
+            stop,
+        }
+    }
+
+    fn failed_config_response_request(
+        client: &super::HostAdminClient,
+        operation: &str,
+    ) -> anyhow::Error {
+        let connector_id = "fcp.github:enterprise:v1";
+        let payload = json!({ "api_key": "private-request-value" });
+        match operation {
+            "snapshot" => client.config_snapshot(connector_id).unwrap_err(),
+            "revisions" => client.config_revisions(connector_id).unwrap_err(),
+            "revision" => client.config_revision(connector_id, 41).unwrap_err(),
+            "diff" => client
+                .config_diff(
+                    connector_id,
+                    &super::ConnectorConfigDiffRequest {
+                        payload,
+                        revision_id: Some(41),
+                    },
+                )
+                .unwrap_err(),
+            "validate" => client
+                .config_validate(
+                    connector_id,
+                    &super::ConnectorConfigValidateRequest {
+                        payload,
+                        expected_active_revision_id: Some(41),
+                    },
+                )
+                .unwrap_err(),
+            "apply" => client
+                .config_apply(
+                    connector_id,
+                    &super::ConnectorConfigApplyRequest {
+                        payload,
+                        expected_active_revision_id: Some(41),
+                        created_by: None,
+                        change_reason: None,
+                    },
+                )
+                .unwrap_err(),
+            "rollback" => client
+                .config_rollback(
+                    connector_id,
+                    &super::ConnectorConfigRollbackRequest {
+                        revision_id: 40,
+                        expected_active_revision_id: Some(41),
+                        created_by: None,
+                        change_reason: Some("private-request-value".into()),
+                    },
+                )
+                .unwrap_err(),
+            "patch" | "patch/validate" => {
+                let request = super::ConnectorConfigPatchRequest {
+                    expected_payload_digest: "blake3-256:current".to_owned(),
+                    expected_active_revision_id: Some(41),
+                    operation: super::ConnectorConfigPatchOperation::Set {
+                        path: vec![super::ConnectorConfigPathSegment::Field("api_key".into())],
+                        value: json!("private-request-value"),
+                    },
+                    created_by: None,
+                    change_reason: None,
+                };
+                if operation == "patch" {
+                    client.config_patch(connector_id, &request).unwrap_err()
+                } else {
+                    client
+                        .config_patch_validate(connector_id, &request)
+                        .unwrap_err()
+                }
+            }
+            _ => panic!("unknown config fixture operation"),
+        }
+    }
+
+    #[test]
+    fn config_responses_preserve_wire_status_and_sanitize_all_typed_endpoints_without_retry() {
+        let (_credential_dir, admin_file) = config_patch_test_admin_token_file();
+        for (operation, method, suffix) in [
+            ("snapshot", "GET", ""),
+            ("revisions", "GET", "/revisions"),
+            ("revision", "GET", "/revisions/41"),
+            ("diff", "POST", "/diff"),
+            ("validate", "POST", "/validate"),
+            ("patch/validate", "POST", "/patch/validate"),
+            ("patch", "POST", "/patch"),
+            ("apply", "POST", "/apply"),
+            ("rollback", "POST", "/rollback"),
+        ] {
+            for rejected in [false, true] {
+                let (status, body) = if rejected {
+                    (
+                        "409 Conflict",
+                        r#"{"status":429,"error":"private-request-value private-response-value"}"#,
+                    )
+                } else {
+                    ("200 OK", r#""private-response-value""#)
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let fixture = spawn_config_response_fixture(
+                    format!("{method} /rpc/connectors/fcp.github:enterprise:v1/config{suffix}"),
+                    response,
+                );
+                let client =
+                    super::HostAdminClient::for_connector_config(&fixture.host, Some(&admin_file))
+                        .unwrap();
+                let error = failed_config_response_request(&client, operation);
+                fixture.stop.send(()).unwrap();
+                fixture
+                    .server
+                    .join()
+                    .expect("config response fixture should finish");
+                let diagnostic = format!("{error:#}");
+                assert!(diagnostic.contains(if rejected {
+                    "HTTP 409"
+                } else {
+                    "invalid response"
+                }));
+                assert!(!diagnostic.contains("429"));
+                assert!(!diagnostic.contains("private-request-value"));
+                assert!(!diagnostic.contains("private-response-value"));
+                assert!(!diagnostic.contains("config-patch-admin-token"));
+                assert!(!diagnostic.contains(&fixture.host));
+                let requests = fixture.requests.lock().unwrap();
+                assert_eq!(requests.len(), 1, "{operation} must dispatch exactly once");
+                if method == "POST" {
+                    assert!(requests[0].to_string().contains("private-request-value"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn config_response_limits_cover_declared_and_streamed_bodies() {
+        let (_credential_dir, admin_file) = config_patch_test_admin_token_file();
+        let cases = [
+            (
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    16 * 1024 * 1024 + 1
+                ),
+                u64::MAX,
+            ),
+            (
+                format!(
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{}",
+                    " ".repeat(128)
+                ),
+                64,
+            ),
+        ];
+        for (response, limit) in cases {
+            let fixture = spawn_config_response_fixture(
+                "GET /rpc/connectors/fcp.github:enterprise:v1/config".into(),
+                response,
+            );
+            let client =
+                super::HostAdminClient::for_connector_config(&fixture.host, Some(&admin_file))
+                    .unwrap()
+                    .with_response_limit(limit);
+            let error = client
+                .config_snapshot("fcp.github:enterprise:v1")
+                .unwrap_err();
+            fixture.stop.send(()).unwrap();
+            fixture.server.join().unwrap();
+            assert!(error.to_string().contains("byte limit"));
+            assert_eq!(fixture.requests.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn config_response_transport_and_truncation_errors_do_not_echo_private_data() {
+        let (_credential_dir, admin_file) = config_patch_test_admin_token_file();
+        let fixture = spawn_config_response_fixture(
+            "GET /rpc/connectors/fcp.github:enterprise:v1/config".into(),
+            "HTTP/1.1 200 OK\r\nContent-Length: 512\r\nConnection: close\r\n\r\nprivate-response-value".into(),
+        );
+        let client =
+            super::HostAdminClient::for_connector_config(&fixture.host, Some(&admin_file)).unwrap();
+        let error = client
+            .config_snapshot("fcp.github:enterprise:v1")
+            .unwrap_err();
+        fixture.stop.send(()).unwrap();
+        fixture.server.join().unwrap();
+        assert_eq!(fixture.requests.lock().unwrap().len(), 1);
+        let diagnostic = format!("{error:#}");
+        assert!(diagnostic.contains("could not be read"));
+        assert!(!diagnostic.contains("private-response-value"));
+
+        let closed = TcpListener::bind("127.0.0.1:0").unwrap();
+        let host = format!("http://{}", closed.local_addr().unwrap());
+        drop(closed);
+        let client =
+            super::HostAdminClient::for_connector_config(&host, Some(&admin_file)).unwrap();
+        let error = client
+            .config_snapshot("fcp.github:enterprise:v1")
+            .unwrap_err();
+        let diagnostic = format!("{error:#}");
+        assert!(diagnostic.contains("request failed"));
+        assert!(!diagnostic.contains(&host));
+        assert!(!diagnostic.contains("config-patch-admin-token"));
+    }
+
+    #[test]
+    fn config_reads_and_writes_keep_typed_deadlines_for_headers_and_bodies() {
+        for (write, hold_body) in [(false, false), (false, true), (true, false), (true, true)] {
+            let held =
+                hold_host_response_json(hold_body, json!({"api_key": "private-response-value"}));
+            let started = Instant::now();
+            let error = if write {
+                held.client
+                    .config_apply(
+                        "fcp.github:enterprise:v1",
+                        &super::ConnectorConfigApplyRequest {
+                            payload: json!({"api_key": "private-request-value"}),
+                            expected_active_revision_id: Some(41),
+                            created_by: None,
+                            change_reason: None,
+                        },
+                    )
+                    .unwrap_err()
+            } else {
+                held.client
+                    .config_snapshot("fcp.github:enterprise:v1")
+                    .unwrap_err()
+            };
+            let elapsed = started.elapsed();
+            let _ = held.release.send(());
+            held.server.join().unwrap();
+            let timeout = error
+                .downcast_ref::<super::HostReadTimeout>()
+                .expect("config request must keep its typed deadline");
+            assert_eq!(timeout.method, if write { "POST" } else { "GET" });
+            assert_eq!(timeout.timeout, Duration::from_millis(250));
+            assert!(elapsed < Duration::from_secs(2));
+            let diagnostic = format!("{error:#}");
+            assert!(!diagnostic.contains("private-request-value"));
+            assert!(!diagnostic.contains("private-response-value"));
+            assert!(!diagnostic.contains("127.0.0.1"));
+        }
+    }
+
+    #[test]
+    fn config_response_budget_expiry_remains_authoritative_after_a_read_failure() {
+        let held = hold_host_response_json(true, json!({"api_key": "private-response-value"}));
+        let client = held
+            .client
+            .with_read_budget(super::pipe::budget::ExecutionBudget::start(
+                Some(200),
+                Instant::now(),
+            ));
+        let error = client
+            .config_snapshot("fcp.github:enterprise:v1")
+            .unwrap_err();
+        let _ = held.release.send(());
+        held.server.join().unwrap();
+        assert!(held.observed.recv_timeout(Duration::from_secs(1)).is_ok());
+        assert!(error.is::<super::pipe::budget::DeadlineExpired>());
+        assert!(!format!("{error:#}").contains("private-response-value"));
     }
 
     #[test]
