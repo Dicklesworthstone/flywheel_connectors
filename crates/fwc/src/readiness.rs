@@ -10128,7 +10128,7 @@ output_schema = { type = "object" }
             .iter()
             .filter(|e| e.mode == CommandTruthMode::Hybrid)
             .count();
-        assert_eq!(count, 18, "Expected 18 hybrid commands, got {count}");
+        assert_eq!(count, 19, "Expected 19 hybrid commands, got {count}");
     }
 
     #[test]
