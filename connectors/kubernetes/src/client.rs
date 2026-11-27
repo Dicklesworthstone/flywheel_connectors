@@ -113,7 +113,6 @@ impl KubernetesClient {
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
             .redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::Policy::never())
             .user_agent("fcp-kubernetes/0.1.0 (FCP connector)")
             .build()?;
 
