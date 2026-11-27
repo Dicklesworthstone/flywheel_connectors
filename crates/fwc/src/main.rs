@@ -2734,6 +2734,11 @@ struct ConfigArgs {
     #[arg(long, env = "FCP_HOST_CONNECTORS_FILE")]
     connectors_file: Option<PathBuf>,
 
+    /// Host admin bearer token file for live config access (or use FCP_HOST_ADMIN_BEARER_TOKEN).
+    #[arg(long, value_name = "PATH", global = true)]
+    #[serde(skip_serializing)]
+    admin_token_file: Option<PathBuf>,
+
     #[command(subcommand)]
     command: ConfigCommand,
 }
@@ -2773,11 +2778,6 @@ struct ConfigSetArgs {
 
     /// New value.
     value: String,
-
-    /// Host admin bearer token file (or use FCP_HOST_ADMIN_BEARER_TOKEN).
-    #[arg(long, value_name = "PATH")]
-    #[serde(skip_serializing)]
-    admin_token_file: Option<PathBuf>,
 }
 
 #[derive(Args, Debug, Serialize)]
@@ -2787,11 +2787,6 @@ struct ConfigUnsetArgs {
 
     /// Configuration key path to remove.
     key: String,
-
-    /// Host admin bearer token file (or use FCP_HOST_ADMIN_BEARER_TOKEN).
-    #[arg(long, value_name = "PATH")]
-    #[serde(skip_serializing)]
-    admin_token_file: Option<PathBuf>,
 }
 
 #[derive(Args, Debug, Serialize)]
@@ -6376,15 +6371,15 @@ impl HostAdminClient {
         Self::new_with_admin_credential(endpoint, token.as_ref().map(|value| value.as_str()))
     }
 
-    fn for_config_patch(endpoint: &str, token_file: Option<&Path>) -> Result<Self> {
+    fn for_connector_config(endpoint: &str, token_file: Option<&Path>) -> Result<Self> {
         let token = mesh_inventory_credential(token_file).map_err(|_| {
             anyhow::anyhow!(
-                "config changes require --admin-token-file or FCP_HOST_ADMIN_BEARER_TOKEN containing a bounded ASCII token"
+                "live config access requires --admin-token-file or FCP_HOST_ADMIN_BEARER_TOKEN containing a bounded ASCII token"
             )
         })?;
         Self::new_with_transport(endpoint, Some(token.as_str()), true).map_err(|_| {
             anyhow::anyhow!(
-                "config changes require HTTPS, literal loopback HTTP, or a Unix socket with a valid host read deadline"
+                "live config access requires HTTPS, literal loopback HTTP, or a Unix socket with a valid host read deadline"
             )
         })
     }
@@ -21883,6 +21878,10 @@ fn config_dispatch(args: &ConfigArgs, explicit_host: Option<&str>) -> Result<Dis
                     ));
                 }
             };
+            let client = HostAdminClient::for_connector_config(
+                &host.endpoint,
+                args.admin_token_file.as_deref(),
+            )?;
             let snapshot = client.config_snapshot(connector.summary.id.as_str())?;
             let replayable = snapshot.current.is_replayable();
             let config = snapshot.current.payload.clone();
@@ -21970,9 +21969,9 @@ fn config_dispatch(args: &ConfigArgs, explicit_host: Option<&str>) -> Result<Dis
                     ));
                 }
             };
-            let client = HostAdminClient::for_config_patch(
+            let client = HostAdminClient::for_connector_config(
                 &host.endpoint,
-                set_args.admin_token_file.as_deref(),
+                args.admin_token_file.as_deref(),
             )?;
             let snapshot = client.config_snapshot(connector.summary.id.as_str())?;
             let path = parse_invoke_path(&set_args.key).map_err(|error| {
@@ -22092,9 +22091,9 @@ fn config_dispatch(args: &ConfigArgs, explicit_host: Option<&str>) -> Result<Dis
                     ));
                 }
             };
-            let client = HostAdminClient::for_config_patch(
+            let client = HostAdminClient::for_connector_config(
                 &host.endpoint,
-                unset_args.admin_token_file.as_deref(),
+                args.admin_token_file.as_deref(),
             )?;
             let snapshot = client.config_snapshot(connector.summary.id.as_str())?;
             let path = parse_invoke_path(&unset_args.key).map_err(|error| {
@@ -22207,6 +22206,10 @@ fn config_dispatch(args: &ConfigArgs, explicit_host: Option<&str>) -> Result<Dis
                     ));
                 }
             };
+            let client = HostAdminClient::for_connector_config(
+                &host.endpoint,
+                args.admin_token_file.as_deref(),
+            )?;
             let snapshot = client.config_snapshot(connector.summary.id.as_str())?;
             let imported = read_json_file(import_path)?;
             let placeholder_paths =
@@ -22327,6 +22330,10 @@ fn config_dispatch(args: &ConfigArgs, explicit_host: Option<&str>) -> Result<Dis
                     ));
                 }
             };
+            let client = HostAdminClient::for_connector_config(
+                &host.endpoint,
+                args.admin_token_file.as_deref(),
+            )?;
             let snapshot = client.config_snapshot(connector.summary.id.as_str())?;
             let replayable = snapshot.current.is_replayable();
             let config = snapshot.current.payload.clone();
@@ -22431,6 +22438,10 @@ fn config_dispatch(args: &ConfigArgs, explicit_host: Option<&str>) -> Result<Dis
                     ));
                 }
             };
+            let client = HostAdminClient::for_connector_config(
+                &host.endpoint,
+                args.admin_token_file.as_deref(),
+            )?;
             let snapshot = client.config_snapshot(connector.summary.id.as_str())?;
             let replayable = snapshot.current.is_replayable();
             let validation = if replayable {
@@ -50006,6 +50017,7 @@ deny_ptrace = true
 
     #[test]
     fn execute_config_get_reads_live_host_snapshot() {
+        let (_credential_dir, admin_file) = config_patch_test_admin_token_file();
         let (host, server) = spawn_mock_host(
             StdBTreeMap::from([
                 (
@@ -50023,8 +50035,17 @@ deny_ptrace = true
             2,
         );
 
-        let (exit_code, payload) =
-            execute_json(&["fwc", "--json", "--host", &host, "config", "get", "github"]);
+        let (exit_code, payload) = execute_json(&[
+            "fwc",
+            "--json",
+            "--host",
+            &host,
+            "config",
+            "get",
+            "github",
+            "--admin-token-file",
+            admin_file.to_str().unwrap(),
+        ]);
 
         server.join().expect("mock host thread should complete");
         assert_eq!(exit_code, CliExitCode::Success.into());
@@ -50040,6 +50061,7 @@ deny_ptrace = true
 
     #[test]
     fn execute_config_export_redacted_snapshot_is_marked_non_replayable() {
+        let (_credential_dir, admin_file) = config_patch_test_admin_token_file();
         let (host, server) = spawn_mock_host(
             StdBTreeMap::from([
                 (
@@ -50058,7 +50080,15 @@ deny_ptrace = true
         );
 
         let (exit_code, payload) = execute_json(&[
-            "fwc", "--json", "--host", &host, "config", "export", "github",
+            "fwc",
+            "--json",
+            "--host",
+            &host,
+            "config",
+            "export",
+            "github",
+            "--admin-token-file",
+            admin_file.to_str().unwrap(),
         ]);
 
         server.join().expect("mock host thread should complete");
@@ -50330,6 +50360,262 @@ deny_ptrace = true
     }
 
     #[test]
+    fn config_admin_token_file_is_global_and_excluded_from_serialized_arguments() {
+        for arguments in [
+            vec![
+                "fwc",
+                "config",
+                "--admin-token-file",
+                "private-token-path",
+                "get",
+                "github",
+            ],
+            vec![
+                "fwc",
+                "config",
+                "get",
+                "github",
+                "--admin-token-file",
+                "private-token-path",
+            ],
+            vec![
+                "fwc",
+                "config",
+                "set",
+                "github",
+                "profile",
+                "work",
+                "--admin-token-file",
+                "private-token-path",
+            ],
+            vec![
+                "fwc",
+                "config",
+                "unset",
+                "github",
+                "profile",
+                "--admin-token-file",
+                "private-token-path",
+            ],
+            vec![
+                "fwc",
+                "config",
+                "import",
+                "github",
+                "--file",
+                "config.json",
+                "--admin-token-file",
+                "private-token-path",
+            ],
+            vec![
+                "fwc",
+                "config",
+                "export",
+                "github",
+                "--admin-token-file",
+                "private-token-path",
+            ],
+            vec![
+                "fwc",
+                "config",
+                "doctor",
+                "github",
+                "--admin-token-file",
+                "private-token-path",
+            ],
+        ] {
+            let arguments = arguments.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            let prepared = prepare_cli(&arguments).expect("global config credential should parse");
+            let Commands::Config(config) = prepared.cli.command else {
+                panic!("expected config command");
+            };
+            assert_eq!(
+                config.admin_token_file.as_deref(),
+                Some(Path::new("private-token-path"))
+            );
+            let serialized = serde_json::to_string(&config).unwrap();
+            assert!(!serialized.contains("admin_token_file"));
+            assert!(!serialized.contains("private-token-path"));
+        }
+    }
+
+    #[test]
+    fn config_schema_does_not_load_owner_credentials_or_contact_the_host() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing_token = directory.path().join("nonexistent-admin-token");
+        let (exit_code, payload) = execute_json(&[
+            "fwc",
+            "--json",
+            "--host",
+            "http://config-schema-must-not-contact.example",
+            "config",
+            "--admin-token-file",
+            missing_token.to_str().unwrap(),
+            "schema",
+            "github",
+        ]);
+        assert!(
+            exit_code == CliExitCode::Success.into() || exit_code == CliExitCode::Validation.into()
+        );
+        assert_eq!(payload["command"], "config");
+        assert_eq!(payload["subcommand"], "schema");
+        assert_eq!(payload["source"], "workspace-discovery");
+        assert_eq!(payload["connector"]["slug"], "github");
+    }
+
+    #[test]
+    fn live_config_reads_and_import_send_owner_authority_only_after_discovery() {
+        let (_credential_dir, admin_file) = config_patch_test_admin_token_file();
+        let directory = tempfile::tempdir().unwrap();
+        for subcommand in ["get", "export", "doctor", "import"] {
+            let current = json!({ "profile": "work" });
+            let candidate = json!({ "profile": "prod" });
+            let mut routes = vec![
+                (
+                    "POST /rpc/discover".to_owned(),
+                    mock_discovery_response_json(),
+                ),
+                (
+                    "GET /rpc/connectors/fcp.github:enterprise:v1/config".to_owned(),
+                    mock_config_snapshot_json(current.clone()),
+                ),
+            ];
+            if matches!(subcommand, "doctor" | "import") {
+                routes.push((
+                    "POST /rpc/connectors/fcp.github:enterprise:v1/config/validate".to_owned(),
+                    mock_config_validation_response_json(
+                        true,
+                        current.clone(),
+                        if subcommand == "import" {
+                            candidate.clone()
+                        } else {
+                            current.clone()
+                        },
+                        None,
+                    ),
+                ));
+            }
+            if subcommand == "import" {
+                routes.push((
+                    "POST /rpc/connectors/fcp.github:enterprise:v1/config".to_owned(),
+                    mock_config_apply_response_json(candidate.clone(), current.clone()),
+                ));
+            }
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let host = format!("http://{}", listener.local_addr().unwrap());
+            let server = thread::spawn(move || {
+                for (index, (route, response)) in routes.into_iter().enumerate() {
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let mut stream = loop {
+                        match listener.accept() {
+                            Ok((stream, _)) => break stream,
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                assert!(Instant::now() < deadline, "missing request: {route}");
+                                thread::sleep(Duration::from_millis(5));
+                            }
+                            Err(error) => panic!("config host accept failed: {error}"),
+                        }
+                    };
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut request_line = String::new();
+                    assert!(reader.read_line(&mut request_line).unwrap() > 0);
+                    assert_eq!(
+                        request_line
+                            .split_whitespace()
+                            .take(2)
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                        route
+                    );
+                    let mut headers = StdBTreeMap::new();
+                    loop {
+                        let mut line = String::new();
+                        assert!(reader.read_line(&mut line).unwrap() > 0);
+                        if line == "\r\n" {
+                            break;
+                        }
+                        let (name, value) = line.split_once(':').unwrap();
+                        assert!(
+                            headers
+                                .insert(name.to_ascii_lowercase(), value.trim().to_owned())
+                                .is_none()
+                        );
+                    }
+                    if index == 0 {
+                        assert!(!headers.contains_key("authorization"));
+                        assert!(!headers.contains_key("x-fcp-zone"));
+                    } else {
+                        assert_eq!(headers["authorization"], "Bearer config-patch-admin-token");
+                        assert_eq!(headers["x-fcp-zone"], "z:owner");
+                    }
+                    let length = headers
+                        .get("content-length")
+                        .map(|length| length.parse::<usize>().unwrap())
+                        .unwrap_or(0);
+                    assert!(length <= 65_536);
+                    let mut body = vec![0_u8; length];
+                    reader.read_exact(&mut body).unwrap();
+                    let response = serde_json::to_string(&response).unwrap();
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                        response.len()
+                    ).unwrap();
+                    stream.flush().unwrap();
+                }
+            });
+            let config_file = directory.path().join(format!("{subcommand}-config.json"));
+            if subcommand == "import" {
+                fs::write(&config_file, serde_json::to_vec(&candidate).unwrap()).unwrap();
+            }
+            let mut arguments = vec![
+                "fwc",
+                "--json",
+                "--host",
+                &host,
+                "config",
+                "--admin-token-file",
+                admin_file.to_str().unwrap(),
+                subcommand,
+                "github",
+            ];
+            if matches!(subcommand, "export" | "import") {
+                arguments.extend(["--file", config_file.to_str().unwrap()]);
+            }
+            let (exit_code, payload) = execute_json(&arguments);
+            server.join().expect("owner config host should finish");
+            assert_eq!(
+                exit_code,
+                CliExitCode::Success.into(),
+                "{subcommand}: {payload}"
+            );
+            assert_eq!(payload["subcommand"], subcommand);
+            assert_eq!(
+                payload["config"],
+                if subcommand == "import" {
+                    candidate
+                } else {
+                    current.clone()
+                }
+            );
+            assert!(!payload.to_string().contains("config-patch-admin-token"));
+            if subcommand == "export" {
+                let exported: Value =
+                    serde_json::from_slice(&fs::read(config_file).unwrap()).unwrap();
+                assert_eq!(exported, current);
+            }
+        }
+    }
+
+    #[test]
     fn config_patch_client_sends_owner_authority_and_sanitizes_http_errors() {
         let (_credential_dir, admin_file) = config_patch_test_admin_token_file();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -50390,7 +50676,8 @@ deny_ptrace = true
             ).unwrap();
             stream.flush().unwrap();
         });
-        let client = super::HostAdminClient::for_config_patch(&host, Some(&admin_file)).unwrap();
+        let client =
+            super::HostAdminClient::for_connector_config(&host, Some(&admin_file)).unwrap();
         let request = super::ConnectorConfigPatchRequest {
             expected_payload_digest: "blake3-256:current".to_owned(),
             expected_active_revision_id: Some(41),
@@ -50413,14 +50700,14 @@ deny_ptrace = true
         assert!(!message.contains("private-response-value"));
         assert!(!message.contains("config-patch-admin-token"));
 
-        let error = super::HostAdminClient::for_config_patch(
+        let error = super::HostAdminClient::for_connector_config(
             "http://untrusted-config-host.example",
             Some(&admin_file),
         )
         .err()
         .expect("owner credential transport must be confidential");
         assert!(error.to_string().contains("HTTPS"));
-        let error = super::HostAdminClient::for_config_patch(
+        let error = super::HostAdminClient::for_connector_config(
             &host,
             Some(&admin_file.with_file_name("missing-token")),
         )
@@ -50444,7 +50731,7 @@ deny_ptrace = true
                 |_, _| {},
             );
             let client =
-                super::HostAdminClient::for_config_patch(&host, Some(&admin_file)).unwrap();
+                super::HostAdminClient::for_connector_config(&host, Some(&admin_file)).unwrap();
             let request = super::ConnectorConfigPatchRequest {
                 expected_payload_digest: "blake3-256:current".to_owned(),
                 expected_active_revision_id: Some(41),
@@ -50478,6 +50765,7 @@ deny_ptrace = true
 
     #[test]
     fn execute_config_doctor_reads_live_host_validation() {
+        let (_credential_dir, admin_file) = config_patch_test_admin_token_file();
         let current = json!({ "profile": "work" });
         let (host, server) = spawn_mock_host_sequence(vec![
             (
@@ -50495,7 +50783,15 @@ deny_ptrace = true
         ]);
 
         let (exit_code, payload) = execute_json(&[
-            "fwc", "--json", "--host", &host, "config", "doctor", "github",
+            "fwc",
+            "--json",
+            "--host",
+            &host,
+            "config",
+            "doctor",
+            "github",
+            "--admin-token-file",
+            admin_file.to_str().unwrap(),
         ]);
 
         server.join().expect("mock host thread should complete");
@@ -50511,6 +50807,7 @@ deny_ptrace = true
 
     #[test]
     fn execute_config_import_rejects_redacted_placeholder_payload() {
+        let (_credential_dir, admin_file) = config_patch_test_admin_token_file();
         let tempdir = tempfile::tempdir().expect("temp config dir");
         let input_path = tempdir.path().join("github-config.json");
         std::fs::write(
@@ -50543,6 +50840,8 @@ deny_ptrace = true
             "github",
             "--file",
             &input_path,
+            "--admin-token-file",
+            admin_file.to_str().unwrap(),
         ]);
 
         server.join().expect("mock host thread should complete");
@@ -50570,6 +50869,7 @@ deny_ptrace = true
 
     #[test]
     fn execute_config_import_allows_literal_redacted_strings_outside_secret_paths() {
+        let (_credential_dir, admin_file) = config_patch_test_admin_token_file();
         let tempdir = tempfile::tempdir().expect("temp config dir");
         let input_path = tempdir.path().join("github-config.json");
         std::fs::write(
@@ -50616,6 +50916,8 @@ deny_ptrace = true
             "github",
             "--file",
             &input_path,
+            "--admin-token-file",
+            admin_file.to_str().unwrap(),
         ]);
 
         server.join().expect("mock host thread should complete");
@@ -50640,6 +50942,7 @@ deny_ptrace = true
 
     #[test]
     fn execute_config_import_applies_live_host_mutation() {
+        let (_credential_dir, admin_file) = config_patch_test_admin_token_file();
         let tempdir = tempfile::tempdir().expect("temp config dir");
         let input_path = tempdir.path().join("github-config.json");
         std::fs::write(
@@ -50684,6 +50987,8 @@ deny_ptrace = true
             "github",
             "--file",
             &input_path,
+            "--admin-token-file",
+            admin_file.to_str().unwrap(),
         ]);
 
         server.join().expect("mock host thread should complete");
@@ -70591,6 +70896,7 @@ require_attestation_types = ["in-toto"]"#,
 
     #[test]
     fn config_get_host_redacted_snapshot() {
+        let (_credential_dir, admin_file) = config_patch_test_admin_token_file();
         let (host, server) = spawn_mock_host(
             StdBTreeMap::from([
                 (
@@ -70608,8 +70914,17 @@ require_attestation_types = ["in-toto"]"#,
             2,
         );
 
-        let (exit_code, payload) =
-            execute_json(&["fwc", "--json", "--host", &host, "config", "get", "github"]);
+        let (exit_code, payload) = execute_json(&[
+            "fwc",
+            "--json",
+            "--host",
+            &host,
+            "config",
+            "get",
+            "github",
+            "--admin-token-file",
+            admin_file.to_str().unwrap(),
+        ]);
 
         server.join().expect("mock host thread should complete");
         assert_eq!(exit_code, CliExitCode::Success.into());
@@ -70757,6 +71072,7 @@ require_attestation_types = ["in-toto"]"#,
 
     #[test]
     fn config_doctor_host_invalid_config() {
+        let (_credential_dir, admin_file) = config_patch_test_admin_token_file();
         let current = json!({ "profile": "broken" });
         let (host, server) = spawn_mock_host_sequence(vec![
             (
@@ -70779,7 +71095,15 @@ require_attestation_types = ["in-toto"]"#,
         ]);
 
         let (exit_code, payload) = execute_json(&[
-            "fwc", "--json", "--host", &host, "config", "doctor", "github",
+            "fwc",
+            "--json",
+            "--host",
+            &host,
+            "config",
+            "doctor",
+            "github",
+            "--admin-token-file",
+            admin_file.to_str().unwrap(),
         ]);
 
         server.join().expect("mock host thread should complete");
@@ -70814,6 +71138,7 @@ require_attestation_types = ["in-toto"]"#,
 
     #[test]
     fn config_doctor_host_redacted_skips_validation() {
+        let (_credential_dir, admin_file) = config_patch_test_admin_token_file();
         let (host, server) = spawn_mock_host_sequence(vec![
             (
                 "POST /rpc/discover".to_owned(),
@@ -70829,7 +71154,15 @@ require_attestation_types = ["in-toto"]"#,
         ]);
 
         let (exit_code, payload) = execute_json(&[
-            "fwc", "--json", "--host", &host, "config", "doctor", "github",
+            "fwc",
+            "--json",
+            "--host",
+            &host,
+            "config",
+            "doctor",
+            "github",
+            "--admin-token-file",
+            admin_file.to_str().unwrap(),
         ]);
 
         server.join().expect("mock host thread should complete");
@@ -70860,6 +71193,7 @@ require_attestation_types = ["in-toto"]"#,
 
     #[test]
     fn config_export_host_replayable_snapshot() {
+        let (_credential_dir, admin_file) = config_patch_test_admin_token_file();
         let (host, server) = spawn_mock_host(
             StdBTreeMap::from([
                 (
@@ -70878,7 +71212,15 @@ require_attestation_types = ["in-toto"]"#,
         );
 
         let (exit_code, payload) = execute_json(&[
-            "fwc", "--json", "--host", &host, "config", "export", "github",
+            "fwc",
+            "--json",
+            "--host",
+            &host,
+            "config",
+            "export",
+            "github",
+            "--admin-token-file",
+            admin_file.to_str().unwrap(),
         ]);
 
         server.join().expect("mock host thread should complete");
@@ -72392,6 +72734,7 @@ require_attestation_types = ["in-toto"]"#,
 
     #[test]
     fn config_get_next_actions_include_doctor_and_export() {
+        let (_credential_dir, admin_file) = config_patch_test_admin_token_file();
         let (host, server) = spawn_mock_host(
             StdBTreeMap::from([
                 (
@@ -72409,8 +72752,17 @@ require_attestation_types = ["in-toto"]"#,
             2,
         );
 
-        let (exit_code, payload) =
-            execute_json(&["fwc", "--json", "--host", &host, "config", "get", "github"]);
+        let (exit_code, payload) = execute_json(&[
+            "fwc",
+            "--json",
+            "--host",
+            &host,
+            "config",
+            "get",
+            "github",
+            "--admin-token-file",
+            admin_file.to_str().unwrap(),
+        ]);
 
         server.join().expect("mock host thread should complete");
         assert_eq!(exit_code, CliExitCode::Success.into());
