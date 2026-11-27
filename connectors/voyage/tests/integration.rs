@@ -480,3 +480,127 @@ fn valid_token(
         .expect("capability grant should sign");
     CapabilityToken::from_raw(cose)
 }
+
+#[fcp_async_core::runtime::test]
+async fn ambiguous_direct_inference_posts_are_never_replayed() {
+    for multimodal in [false, true] {
+        for (status, body) in [
+            (503, r#"{"error":{"type":"service_unavailable"}}"#),
+            (409, r#"{"error":{"type":"rate_limit_error"}}"#),
+            (200, "private malformed response"),
+        ] {
+            let server = MockServer::start().await;
+            let endpoint = if multimodal {
+                "/v1/multimodalembeddings"
+            } else {
+                "/v1/rerank"
+            };
+            Mock::given(method("POST"))
+                .and(path(endpoint))
+                .respond_with(
+                    ResponseTemplate::new(status)
+                        .insert_header("retry-after", "0")
+                        .set_body_string(body),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            let client = VoyageClient::new(
+                VoyageProvider::new(
+                    format!("{}/v1", server.uri()),
+                    VoyageAuth::ApiKey("key".into()),
+                ),
+                Duration::from_secs(5),
+                Duration::from_secs(60),
+                RateLimitPolicy::WaitForever,
+            );
+            let cx = fcp_async_core::compatibility_cx();
+            let error = if multimodal {
+                client
+                    .multimodal_embeddings(
+                        &cx,
+                        multimodal_request_from_value(
+                            json!({"inputs": [{"content": [{"type": "text", "text": "chart"}]}]}),
+                            DEFAULT_MULTIMODAL_MODEL,
+                        )
+                        .unwrap(),
+                    )
+                    .await
+                    .expect_err("ambiguous multimodal embedding outcome must fail")
+            } else {
+                client
+                    .rerank(
+                        &cx,
+                        rerank_request_from_value(
+                            json!({"query": "query", "documents": ["document"]}),
+                            DEFAULT_RERANK_MODEL,
+                        )
+                        .unwrap(),
+                    )
+                    .await
+                    .expect_err("ambiguous rerank outcome must fail")
+            };
+            assert_eq!(
+                error,
+                fcp_openai_compat::OpenAiError::OutcomeUnknown {
+                    status: Some(status)
+                }
+            );
+            let mapped = fcp_voyage::error::openai_error_to_fcp(&error);
+            assert!(matches!(
+                mapped,
+                FcpError::External {
+                    retryable: false,
+                    retry_after: None,
+                    status_code: Some(observed),
+                    ..
+                } if observed == status
+            ));
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        }
+    }
+}
+
+#[fcp_async_core::runtime::test]
+async fn explicit_rerank_rate_limit_refusal_still_permits_one_retry() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/rerank"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("retry-after", "0")
+                .set_body_json(json!({"detail": "rate limited"})),
+        )
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/rerank"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": []})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = VoyageClient::new(
+        VoyageProvider::new(
+            format!("{}/v1", server.uri()),
+            VoyageAuth::ApiKey("key".into()),
+        ),
+        Duration::from_secs(5),
+        Duration::from_secs(60),
+        RateLimitPolicy::WaitForever,
+    );
+    let response = client
+        .rerank(
+            &fcp_async_core::compatibility_cx(),
+            rerank_request_from_value(
+                json!({"query": "query", "documents": ["document"]}),
+                DEFAULT_RERANK_MODEL,
+            )
+            .unwrap(),
+        )
+        .await
+        .expect("HTTP 429 is an explicit refusal");
+    assert_eq!(response, json!({"data": []}));
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+}

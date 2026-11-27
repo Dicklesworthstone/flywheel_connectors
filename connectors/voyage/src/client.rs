@@ -292,20 +292,23 @@ impl VoyageClient {
                 self.headers_for(model),
                 body_bytes,
             );
-            let response = budget
-                .run(request)
-                .await?
-                .map_err(|err| OpenAiError::Network(err.into()))?;
+            let response = budget.run(request).await?.map_err(|err| {
+                OpenAiError::Network(err.into()).for_dispatched_request(false, None)
+            })?;
             let status = response.status_code();
             let rate_limits = parse_rate_limit_headers(&response.headers, None);
             if !status.is_success() {
-                let mapped = self.provider.error_mapper().map_response(
-                    self.provider.provider_name(),
-                    status.as_u16(),
-                    &response.headers,
-                    &response.body,
-                    rate_limits,
-                );
+                let mapped = self
+                    .provider
+                    .error_mapper()
+                    .map_response(
+                        self.provider.provider_name(),
+                        status.as_u16(),
+                        &response.headers,
+                        &response.body,
+                        rate_limits,
+                    )
+                    .for_dispatched_request(false, Some(status.as_u16()));
                 if !attempted_rate_limit_retry {
                     if let Some(delay) = retry_delay_for_policy(&mapped, self.rate_limit_policy) {
                         attempted_rate_limit_retry = true;
@@ -324,6 +327,7 @@ impl VoyageClient {
                     param: None,
                     code: Some("decode_response".to_string()),
                 }
+                .for_dispatched_request(false, Some(status.as_u16()))
             });
         }
     }

@@ -1405,3 +1405,60 @@ async fn xai_connector_live_smoke_e2e() {
 fn connector_id_matches_manifest_contract() {
     assert_eq!(CONNECTOR_ID, "fcp.xai");
 }
+
+#[fcp_async_core::runtime::test]
+async fn ambiguous_responses_posts_are_never_replayed_or_exposed_as_retryable() {
+    for (status, body) in [
+        (503, r#"{"error":{"type":"service_unavailable"}}"#),
+        (409, r#"{"error":{"type":"rate_limit_error"}}"#),
+        (200, "private malformed response"),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(
+                ResponseTemplate::new(status)
+                    .insert_header("retry-after", "0")
+                    .set_body_string(body),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = XaiClient::new(
+            XaiProvider::new(
+                format!("{}/v1", server.uri()),
+                XaiAuth::ApiKey("key".into()),
+            ),
+            Duration::from_secs(5),
+            Duration::from_secs(60),
+            RateLimitPolicy::WaitForever,
+        );
+        let request = responses_request_from_value(
+            json!({"input": "hello", "tools": [{"type": "web_search"}]}),
+            "grok-4.3",
+        )
+        .expect("request should build");
+        let error = client
+            .responses_create(&fcp_async_core::compatibility_cx(), request)
+            .await
+            .expect_err("an ambiguous provider response must not authorize replay");
+        assert_eq!(
+            error,
+            OpenAiError::OutcomeUnknown {
+                status: Some(status)
+            }
+        );
+        let mapped = fcp_xai::error::openai_error_to_fcp(&error);
+        assert!(matches!(
+            mapped,
+            FcpError::External {
+                retryable: false,
+                retry_after: None,
+                status_code: Some(observed),
+                ..
+            } if observed == status
+        ));
+        assert!(!mapped.to_string().contains("private malformed response"));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+}

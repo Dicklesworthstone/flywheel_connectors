@@ -913,3 +913,60 @@ fn emit_jsonl(
     }
     println!("NVIDIA_NIM_E2E_JSONL {}", Value::Object(record));
 }
+
+#[fcp_async_core::runtime::test]
+async fn ambiguous_rerank_posts_are_never_replayed_or_exposed_as_retryable() {
+    for (status, body) in [
+        (503, r#"{"error":{"message":"unavailable"}}"#),
+        (502, r#"{"error":{"message":"upstream outcome unknown"}}"#),
+        (200, "private malformed response"),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/ranking"))
+            .respond_with(
+                ResponseTemplate::new(status)
+                    .insert_header("retry-after", "0")
+                    .set_body_string(body),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = NvidiaNimClient::new(
+            NvidiaNimProvider::new(format!("{}/v1", server.uri()), NvidiaNimAuth::None),
+            format!("{}/v1", server.uri()),
+            "/ranking",
+            StdDuration::from_secs(5),
+            StdDuration::from_secs(60),
+            RateLimitPolicy::WaitForever,
+        );
+        let error = client
+            .rerank(
+                &fcp_async_core::compatibility_cx(),
+                rerank_request_from_value(
+                    json!({"query": "query", "passages": ["document"]}),
+                    DEFAULT_RERANK_MODEL,
+                )
+                .unwrap(),
+            )
+            .await
+            .expect_err("an ambiguous rerank outcome must not authorize replay");
+        assert_eq!(
+            error,
+            fcp_openai_compat::OpenAiError::OutcomeUnknown {
+                status: Some(status)
+            }
+        );
+        let mapped = fcp_nvidia_nim::error::openai_error_to_fcp(&error);
+        assert!(matches!(
+            mapped,
+            FcpError::External {
+                retryable: false,
+                retry_after: None,
+                status_code: Some(observed),
+                ..
+            } if observed == status
+        ));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+}

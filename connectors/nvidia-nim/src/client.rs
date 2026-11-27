@@ -254,12 +254,15 @@ impl NvidiaNimClient {
                     body,
                 ))
                 .await?
-                .map_err(|err| OpenAiError::Network(err.into()))?;
+                .map_err(|err| {
+                    OpenAiError::Network(err.into()).for_dispatched_request(false, None)
+                })?;
 
             let status = response.status_code();
             let rate_limits = parse_rate_limit_headers(&response.headers, None);
             if !status.is_success() {
-                let mapped = map_rerank_response(status.as_u16(), &response.body, rate_limits);
+                let mapped = map_rerank_response(status.as_u16(), &response.body, rate_limits)
+                    .for_dispatched_request(false, Some(status.as_u16()));
                 if !attempted_rate_limit_retry {
                     if let Some(delay) = retry_delay_for_policy(&mapped, self.rate_limit_policy) {
                         attempted_rate_limit_retry = true;
@@ -278,6 +281,7 @@ impl NvidiaNimClient {
                     param: None,
                     code: Some("decode_response".into()),
                 }
+                .for_dispatched_request(false, Some(status.as_u16()))
             });
         }
     }

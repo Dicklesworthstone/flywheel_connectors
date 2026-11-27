@@ -753,3 +753,112 @@ async fn microsoft_foundry_live_smoke_e2e() {
 fn connector_id_matches_manifest_contract() {
     assert_eq!(CONNECTOR_ID, "fcp.microsoft-foundry");
 }
+
+#[fcp_async_core::runtime::test]
+async fn ambiguous_responses_mutations_are_never_replayed() {
+    for cancel in [false, true] {
+        for (status, body) in [
+            (503, r#"{"error":{"type":"service_unavailable"}}"#),
+            (409, r#"{"error":{"type":"rate_limit_error"}}"#),
+            (200, "private malformed response"),
+        ] {
+            let server = MockServer::start().await;
+            let endpoint = if cancel {
+                "/openai/v1/responses/resp_fixture/cancel"
+            } else {
+                "/openai/v1/responses"
+            };
+            Mock::given(method("POST"))
+                .and(path(endpoint))
+                .respond_with(
+                    ResponseTemplate::new(status)
+                        .insert_header("retry-after", "0")
+                        .set_body_string(body),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            let client = MicrosoftFoundryClient::new(
+                MicrosoftFoundryProvider::new(
+                    format!("{}/openai/v1", server.uri()),
+                    MicrosoftFoundryEndpointClass::Loopback,
+                    MicrosoftFoundryAuth::ApiKey("key".into()),
+                ),
+                Duration::from_secs(5),
+                Duration::from_secs(60),
+                RateLimitPolicy::WaitForever,
+            );
+            let cx = fcp_async_core::compatibility_cx();
+            let error = if cancel {
+                client
+                    .responses_cancel(&cx, "resp_fixture")
+                    .await
+                    .expect_err("ambiguous cancellation must fail")
+            } else {
+                client
+                    .responses_create(
+                        &cx,
+                        responses_request_from_value(json!({"input": "hello"}), "prod-gpt4o")
+                            .unwrap(),
+                    )
+                    .await
+                    .expect_err("ambiguous response creation must fail")
+            };
+            assert_eq!(
+                error,
+                OpenAiError::OutcomeUnknown {
+                    status: Some(status)
+                }
+            );
+            let mapped = fcp_microsoft_foundry::error::openai_error_to_fcp(&error);
+            assert!(matches!(
+                mapped,
+                FcpError::External {
+                    retryable: false,
+                    retry_after: None,
+                    status_code: Some(observed),
+                    ..
+                } if observed == status
+            ));
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        }
+    }
+}
+
+#[fcp_async_core::runtime::test]
+async fn responses_input_items_get_keeps_its_bounded_service_retry() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/openai/v1/responses/resp_fixture/input_items"))
+        .respond_with(
+            ResponseTemplate::new(503)
+                .insert_header("retry-after", "0")
+                .set_body_json(json!({"error": {"message": "temporary unavailable"}})),
+        )
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/openai/v1/responses/resp_fixture/input_items"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": []})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = MicrosoftFoundryClient::new(
+        MicrosoftFoundryProvider::new(
+            format!("{}/openai/v1", server.uri()),
+            MicrosoftFoundryEndpointClass::Loopback,
+            MicrosoftFoundryAuth::ApiKey("key".into()),
+        ),
+        Duration::from_secs(5),
+        Duration::from_secs(60),
+        RateLimitPolicy::WaitForever,
+    );
+    let response = client
+        .responses_input_items(&fcp_async_core::compatibility_cx(), "resp_fixture")
+        .await
+        .expect("reading prior input items is safe to retry");
+    assert_eq!(response, json!({"data": []}));
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+}
