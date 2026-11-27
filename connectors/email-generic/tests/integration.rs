@@ -7,6 +7,7 @@
     clippy::unwrap_used
 )]
 
+use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
@@ -92,6 +93,107 @@ fn imap_loopback_lists_mailboxes_searches_uids_and_emits_redacted_jsonl() {
 }
 
 #[test]
+fn failed_inbound_fetch_preserves_read_state_and_retries_every_uid_on_a_fresh_session() {
+    for failure in [
+        ImapMode::InboundRejectedFetch,
+        ImapMode::InboundTruncatedFetch,
+        ImapMode::InboundOversizedFetch,
+        ImapMode::InboundWrongUid,
+        ImapMode::InboundMalformedMessage,
+        ImapMode::InboundMissingTrailer,
+    ] {
+        let fixture = ImapFixture::start_sessions(vec![failure, ImapMode::InboundFetch]);
+        let config = config_with_ports(fixture.port(), 2525, false, false);
+        let client = EmailGenericClient::from_config(&config).expect("client");
+        let mut seen = EmailSeenUidCache::new(8).expect("UID cache");
+        seen.observe("99");
+
+        client
+            .fetch_unseen_inbound_messages("Alerts", &seen)
+            .expect_err("failed fetch must abort the poll");
+        assert_eq!(seen.uids(), vec!["99"], "{failure:?} consumed a UID");
+        assert!(
+            fixture.seen_flags().is_empty(),
+            "{failure:?} marked provider messages read"
+        );
+        let failed_commands = fixture.command_snapshot();
+        assert_eq!(
+            failed_commands,
+            vec![
+                "a1 LOGIN \"user@example.com\" \"secret\"",
+                "a2 EXAMINE \"Alerts\"",
+                "a3 UID SEARCH UNSEEN",
+                "f11 UID FETCH 11 (UID BODY.PEEK[])",
+                "f12 UID FETCH 12 (UID BODY.PEEK[])",
+            ],
+            "{failure:?} must not dispatch another FETCH or LOGOUT on the failed session"
+        );
+
+        let messages = client
+            .fetch_unseen_inbound_messages("Alerts", &seen)
+            .expect("fresh session must recover all unacknowledged messages");
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.uid.as_str())
+                .collect::<Vec<_>>(),
+            vec!["11", "12", "13"]
+        );
+        assert_eq!(
+            seen.uids(),
+            vec!["99"],
+            "retrieval alone cannot acknowledge recovery"
+        );
+        assert!(fixture.seen_flags().is_empty());
+        let commands = fixture.join();
+        assert_eq!(
+            &commands[..failed_commands.len()],
+            failed_commands.as_slice()
+        );
+        assert_eq!(
+            &commands[failed_commands.len()..],
+            [
+                "a1 LOGIN \"user@example.com\" \"secret\"",
+                "a2 EXAMINE \"Alerts\"",
+                "a3 UID SEARCH UNSEEN",
+                "f11 UID FETCH 11 (UID BODY.PEEK[])",
+                "f12 UID FETCH 12 (UID BODY.PEEK[])",
+                "f13 UID FETCH 13 (UID BODY.PEEK[])",
+                "az LOGOUT",
+            ]
+        );
+    }
+}
+
+#[test]
+fn inbound_fetch_accepts_uid_after_literal_without_marking_messages_read() {
+    let fixture = ImapFixture::start(ImapMode::InboundUidAfterLiteral);
+    let config = config_with_ports(fixture.port(), 2525, false, false);
+    let client = EmailGenericClient::from_config(&config).expect("client");
+    let seen = EmailSeenUidCache::new(8).expect("UID cache");
+    let messages = client
+        .fetch_unseen_inbound_messages("Alerts", &seen)
+        .expect("UID may follow the BODY[] literal");
+    assert_eq!(
+        messages
+            .iter()
+            .map(|message| message.uid.as_str())
+            .collect::<Vec<_>>(),
+        vec!["11", "12", "13"]
+    );
+    assert!(seen.is_empty());
+    assert!(fixture.seen_flags().is_empty());
+    let commands = fixture.join();
+    assert_eq!(
+        commands
+            .iter()
+            .filter(|line| line.contains("BODY.PEEK[]"))
+            .count(),
+        3
+    );
+}
+
+#[test]
 fn imap_loopback_fetches_unseen_inbound_previews_with_policy_and_uid_cache() {
     let fixture = ImapFixture::start(ImapMode::InboundFetch);
     let config = EmailGenericConfig::from_value(json!({
@@ -125,12 +227,14 @@ fn imap_loopback_fetches_unseen_inbound_previews_with_policy_and_uid_cache() {
     let started_at = Instant::now();
 
     let messages = client
-        .fetch_unseen_inbound_messages("Alerts", &mut seen_uids)
+        .fetch_unseen_inbound_messages("Alerts", &seen_uids)
         .expect("UID FETCH fixture should return inbound messages");
     assert_eq!(messages.len(), 3);
-    assert!(seen_uids.contains("11"));
-    assert!(seen_uids.contains("12"));
-    assert!(seen_uids.contains("13"));
+    assert!(seen_uids.is_empty(), "retrieval must not acknowledge UIDs");
+    assert!(
+        fixture.seen_flags().is_empty(),
+        "retrieval must preserve provider read flags"
+    );
 
     let previews = messages
         .iter()
@@ -178,9 +282,12 @@ fn imap_loopback_fetches_unseen_inbound_previews_with_policy_and_uid_cache() {
         "attachment bytes must not leak into preview JSON"
     );
 
+    for message in &messages {
+        seen_uids.observe(message.uid.clone());
+    }
     let commands = fixture.join();
     assert!(
-        commands.iter().any(|line| line == "a2 SELECT \"Alerts\""),
+        commands.iter().any(|line| line == "a2 EXAMINE \"Alerts\""),
         "fixture should observe mailbox binding"
     );
     assert!(
@@ -196,7 +303,7 @@ fn imap_loopback_fetches_unseen_inbound_previews_with_policy_and_uid_cache() {
     let repeat_config = config_with_ports(repeat_fixture.port(), 2525, false, false);
     let repeat_client = EmailGenericClient::from_config(&repeat_config).expect("client config");
     let repeat_messages = repeat_client
-        .fetch_unseen_inbound_messages("Alerts", &mut seen_uids)
+        .fetch_unseen_inbound_messages("Alerts", &seen_uids)
         .expect("seen cache should suppress repeated UIDs");
     assert!(repeat_messages.is_empty());
     let repeat_commands = repeat_fixture.join();
@@ -561,6 +668,159 @@ async fn inbound_monitor_supervises_polling_fanout_and_shutdown() {
     });
 }
 
+#[fcp_async_core::runtime::test]
+async fn inbound_monitor_retries_failed_fetch_without_losing_earlier_messages() {
+    let fixture =
+        ImapFixture::start_sessions(vec![ImapMode::InboundRejectedFetch, ImapMode::InboundFetch]);
+    let mut connector = configured_monitor(fixture.port(), 60).await;
+    let mut events = connector.subscribe_events();
+    start_monitor(&connector).await;
+    let event = fcp_async_core::time::timeout(Duration::from_secs(5), events.recv())
+        .await
+        .expect("recovery event timeout")
+        .expect("event receiver")
+        .expect("inbound event");
+    assert_eq!(event.data.payload["uid"], "11");
+    assert_eq!(event.seq, 1);
+    assert_eq!(event.cursor, "Alerts:11");
+    let details = wait_monitor_polls(&connector, 1).await;
+    assert_eq!(details["inbound_monitor"]["polls_started"], 2);
+    assert_eq!(details["inbound_monitor"]["polls_completed"], 1);
+    assert_eq!(details["inbound_monitor"]["emitted_events"], 1);
+    assert_eq!(details["inbound_monitor"]["dropped_events"], 2);
+    assert!(fixture.seen_flags().is_empty());
+    stop_monitor(&mut connector).await;
+    let commands = fixture.join();
+    assert_eq!(
+        commands
+            .iter()
+            .filter(|line| *line == "f11 UID FETCH 11 (UID BODY.PEEK[])")
+            .count(),
+        2,
+        "a successful early fetch from the failed batch must be retrieved again"
+    );
+    assert_eq!(
+        commands
+            .iter()
+            .filter(|line| *line == "f13 UID FETCH 13 (UID BODY.PEEK[])")
+            .count(),
+        1,
+        "the failed session must stop before the next UID"
+    );
+}
+
+#[fcp_async_core::runtime::test]
+async fn inbound_monitor_retries_unpublished_messages_without_consuming_event_sequence() {
+    let fixture = ImapFixture::start_sessions(vec![
+        ImapMode::InboundFetch,
+        ImapMode::InboundFetch,
+        ImapMode::InboundFetch,
+    ]);
+    let mut connector = configured_monitor(fixture.port(), 1).await;
+    // Start polling without any event receiver so the first send must fail.
+    start_monitor(&connector).await;
+    let details = wait_monitor_polls(&connector, 1).await;
+    assert_eq!(details["inbound_monitor"]["emitted_events"], 0);
+    assert_eq!(details["inbound_monitor"]["dropped_events"], 0);
+    assert!(details["inbound_monitor"]["last_error"].is_string());
+
+    let mut events = connector.subscribe_events();
+    let event = fcp_async_core::time::timeout(Duration::from_secs(5), events.recv())
+        .await
+        .expect("publication recovery timeout")
+        .expect("event receiver")
+        .expect("inbound event");
+    assert_eq!(event.data.payload["uid"], "11");
+    assert_eq!(
+        event.seq, 1,
+        "a failed send cannot consume an event sequence"
+    );
+    assert_eq!(event.cursor, "Alerts:11");
+    // A third poll must skip both delivered and deliberately rejected UIDs.
+    let details = wait_monitor_polls(&connector, 3).await;
+    assert_eq!(details["inbound_monitor"]["emitted_events"], 1);
+    assert_eq!(details["inbound_monitor"]["dropped_events"], 2);
+    assert!(details["inbound_monitor"]["last_error"].is_null());
+    assert!(fixture.seen_flags().is_empty());
+    stop_monitor(&mut connector).await;
+    let commands = fixture.join();
+    for uid in [11, 12, 13] {
+        let fetch = format!("f{uid} UID FETCH {uid} (UID BODY.PEEK[])");
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|line| line.as_str() == fetch.as_str())
+                .count(),
+            2
+        );
+    }
+}
+
+async fn wait_monitor_polls(connector: &EmailGenericConnector, expected: u64) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let details = connector.health().await.details.expect("health details");
+        if details["inbound_monitor"]["polls_completed"]
+            .as_u64()
+            .unwrap_or(0)
+            >= expected
+        {
+            return details;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "monitor did not finish {expected} polls"
+        );
+        fcp_async_core::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn configured_monitor(imap_port: u16, poll_interval_secs: u64) -> EmailGenericConnector {
+    let mut value = config_json(imap_port, 2525, false, false);
+    value["monitor_policy"] = json!({
+        "mailbox": "Alerts",
+        "allowed_senders": ["human@example.com"],
+        "seen_uid_cap": 8,
+        "poll_interval_secs": poll_interval_secs
+    });
+    let mut connector = EmailGenericConnector::new();
+    connector.configure(value).await.expect("configure monitor");
+    let key = Ed25519SigningKey::generate();
+    connector
+        .handshake(handshake_request(key.verifying_key().to_bytes()))
+        .await
+        .expect("handshake monitor");
+    connector
+}
+
+async fn start_monitor(connector: &EmailGenericConnector) {
+    connector
+        .subscribe(SubscribeRequest {
+            r#type: "subscribe".into(),
+            id: RequestId::new("inbound-recovery"),
+            topics: vec!["email.inbound.preview".into()],
+            since: None,
+            max_events_per_sec: None,
+            batch_ms: None,
+            window_size: None,
+            capability_token: None,
+        })
+        .await
+        .expect("start inbound monitor");
+}
+
+async fn stop_monitor(connector: &mut EmailGenericConnector) {
+    connector
+        .shutdown(ShutdownRequest {
+            r#type: "shutdown".into(),
+            deadline_ms: 1_000,
+            drain: true,
+            reason: Some("inbound recovery proof complete".into()),
+        })
+        .await
+        .expect("stop inbound monitor");
+}
+
 fn config_with_ports(
     imap_port: u16,
     smtp_port: u16,
@@ -638,37 +898,73 @@ fn capability_token(
     CapabilityToken::from_raw(raw)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum ImapMode {
     Ok,
     InboundFetch,
+    InboundRejectedFetch,
+    InboundTruncatedFetch,
+    InboundOversizedFetch,
+    InboundWrongUid,
+    InboundMalformedMessage,
+    InboundMissingTrailer,
+    InboundUidAfterLiteral,
 }
 
 struct ImapFixture {
     port: u16,
     commands: Arc<Mutex<Vec<String>>>,
+    provider_seen: Arc<Mutex<BTreeSet<u32>>>,
     handle: JoinHandle<()>,
 }
 
 impl ImapFixture {
     fn start(mode: ImapMode) -> Self {
+        Self::start_sessions(vec![mode])
+    }
+
+    fn start_sessions(modes: Vec<ImapMode>) -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind IMAP fixture");
         let port = listener.local_addr().expect("fixture addr").port();
         let commands = Arc::new(Mutex::new(Vec::new()));
         let command_log = Arc::clone(&commands);
+        let provider_seen = Arc::new(Mutex::new(BTreeSet::new()));
+        let seen_flags = Arc::clone(&provider_seen);
         let handle = thread::spawn(move || {
-            let (stream, _) = listener.accept().expect("accept IMAP client");
-            handle_imap(stream, mode, &command_log);
+            for mode in modes {
+                let (stream, _) = listener.accept().expect("accept IMAP client");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .expect("fixture read timeout");
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .expect("fixture write timeout");
+                handle_imap(stream, mode, &command_log, &seen_flags);
+            }
         });
         Self {
             port,
             commands,
+            provider_seen,
             handle,
         }
     }
 
     const fn port(&self) -> u16 {
         self.port
+    }
+
+    fn seen_flags(&self) -> Vec<u32> {
+        self.provider_seen
+            .lock()
+            .expect("provider seen flags")
+            .iter()
+            .copied()
+            .collect()
+    }
+
+    fn command_snapshot(&self) -> Vec<String> {
+        self.commands.lock().expect("command log").clone()
     }
 
     fn join(self) -> Vec<String> {
@@ -680,14 +976,23 @@ impl ImapFixture {
     }
 }
 
-fn handle_imap(mut stream: TcpStream, mode: ImapMode, commands: &Arc<Mutex<Vec<String>>>) {
+fn handle_imap(
+    mut stream: TcpStream,
+    mode: ImapMode,
+    commands: &Arc<Mutex<Vec<String>>>,
+    provider_seen: &Arc<Mutex<BTreeSet<u32>>>,
+) {
     write_response(&mut stream, "* OK fcp email generic fixture ready");
     let mut reader = BufReader::new(stream.try_clone().expect("clone IMAP stream"));
     let mut line = String::new();
+    let mut read_only = false;
     loop {
         line.clear();
-        if reader.read_line(&mut line).expect("read IMAP line") == 0 {
-            break;
+        match reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => break,
+            Err(error) => panic!("read IMAP line: {error}"),
         }
         let command = line.trim_end_matches(['\r', '\n']).to_owned();
         commands
@@ -696,47 +1001,106 @@ fn handle_imap(mut stream: TcpStream, mode: ImapMode, commands: &Arc<Mutex<Vec<S
             .push(command.clone());
         let tag = command.split_whitespace().next().unwrap_or("zz");
 
-        match mode {
-            ImapMode::Ok | ImapMode::InboundFetch if command.contains(" LOGIN ") => {
-                write_response(&mut stream, &format!("{tag} OK LOGIN completed"));
+        if command.contains(" LOGIN ") {
+            write_response(&mut stream, &format!("{tag} OK LOGIN completed"));
+        } else if matches!(mode, ImapMode::Ok) && command.contains("LIST \"\" \"*\"") {
+            write_response(&mut stream, "* LIST (\\HasNoChildren) \"/\" \"INBOX\"");
+            write_response(&mut stream, "* LIST (\\HasNoChildren) \"/\" \"Archive\"");
+            write_response(&mut stream, &format!("{tag} OK LIST completed"));
+        } else if command.contains(" EXAMINE ") || command.contains(" SELECT ") {
+            read_only = command.contains(" EXAMINE ");
+            write_response(&mut stream, "* 3 EXISTS");
+            let access = if read_only { "READ-ONLY" } else { "READ-WRITE" };
+            write_response(&mut stream, &format!("{tag} OK [{access}] mailbox opened"));
+        } else if matches!(mode, ImapMode::Ok) && command.contains("UID SEARCH TEXT") {
+            write_response(&mut stream, "* SEARCH 2 5 8");
+            write_response(&mut stream, &format!("{tag} OK SEARCH completed"));
+        } else if !matches!(mode, ImapMode::Ok) && command.contains("UID SEARCH UNSEEN") {
+            let seen = provider_seen.lock().expect("provider flags");
+            let unseen = [11, 12, 13]
+                .into_iter()
+                .filter(|uid| !seen.contains(uid))
+                .map(|uid| uid.to_string())
+                .collect::<Vec<_>>()
+                .join(" ");
+            write_response(&mut stream, &format!("* SEARCH {unseen}"));
+            write_response(&mut stream, &format!("{tag} OK SEARCH completed"));
+        } else if !matches!(mode, ImapMode::Ok) && command.contains("UID FETCH ") {
+            let uid = command
+                .split_whitespace()
+                .nth(3)
+                .expect("FETCH UID")
+                .parse::<u32>()
+                .expect("numeric FETCH UID");
+            if !read_only && !command.contains("BODY.PEEK[]") {
+                provider_seen.lock().expect("provider flags").insert(uid);
             }
-            ImapMode::Ok if command.contains("LIST \"\" \"*\"") => {
-                write_response(&mut stream, "* LIST (\\HasNoChildren) \"/\" \"INBOX\"");
-                write_response(&mut stream, "* LIST (\\HasNoChildren) \"/\" \"Archive\"");
-                write_response(&mut stream, &format!("{tag} OK LIST completed"));
+            let raw = match uid {
+                11 => inbound_allowed_message(),
+                12 => inbound_denied_sender_message(),
+                13 => inbound_automated_message(),
+                _ => panic!("unexpected fixture UID"),
+            };
+            if uid == 12 {
+                match mode {
+                    ImapMode::InboundRejectedFetch => {
+                        write_response(
+                            &mut stream,
+                            &format!("{tag} NO FETCH failed; other commands are OK"),
+                        );
+                        continue;
+                    }
+                    ImapMode::InboundTruncatedFetch => {
+                        write_response(&mut stream, "* 2 FETCH (UID 12 BODY[] {500}");
+                        stream.write_all(b"From: partial").expect("partial literal");
+                        stream.flush().expect("partial literal flush");
+                        return;
+                    }
+                    ImapMode::InboundOversizedFetch => {
+                        write_response(&mut stream, "* 2 FETCH (UID 12 BODY[] {1048577}");
+                        continue;
+                    }
+                    ImapMode::InboundWrongUid => {
+                        write_fetch_literal(&mut stream, 2, 999, raw);
+                        write_response(&mut stream, &format!("{tag} OK FETCH completed"));
+                        continue;
+                    }
+                    ImapMode::InboundMalformedMessage => {
+                        write_fetch_literal(
+                            &mut stream,
+                            2,
+                            uid,
+                            "Subject: missing sender\r\n\r\nbody\r\n",
+                        );
+                        write_response(&mut stream, &format!("{tag} OK FETCH completed"));
+                        continue;
+                    }
+                    ImapMode::InboundMissingTrailer => {
+                        write_response(
+                            &mut stream,
+                            &format!("* 2 FETCH (UID 12 BODY[] {{{}}}", raw.len()),
+                        );
+                        stream.write_all(raw.as_bytes()).expect("literal body");
+                        write_response(&mut stream, &format!("{tag} OK FETCH completed"));
+                        continue;
+                    }
+                    _ => {}
+                }
             }
-            ImapMode::Ok | ImapMode::InboundFetch if command.contains("SELECT ") => {
-                write_response(&mut stream, "* 3 EXISTS");
-                write_response(&mut stream, &format!("{tag} OK SELECT completed"));
+            if matches!(mode, ImapMode::InboundUidAfterLiteral) {
+                write_response(&mut stream, &format!("* 1 FETCH (BODY[] {{{}}}", raw.len()));
+                stream.write_all(raw.as_bytes()).expect("literal body");
+                write_response(&mut stream, &format!(" UID {uid} FLAGS ())"));
+            } else {
+                write_fetch_literal(&mut stream, uid - 10, uid, raw);
             }
-            ImapMode::Ok if command.contains("UID SEARCH TEXT") => {
-                write_response(&mut stream, "* SEARCH 2 5 8");
-                write_response(&mut stream, &format!("{tag} OK SEARCH completed"));
-            }
-            ImapMode::InboundFetch if command.contains("UID SEARCH UNSEEN") => {
-                write_response(&mut stream, "* SEARCH 11 12 13");
-                write_response(&mut stream, &format!("{tag} OK SEARCH completed"));
-            }
-            ImapMode::InboundFetch if command.contains("UID FETCH 11") => {
-                write_fetch_literal(&mut stream, 1, 11, inbound_allowed_message());
-                write_response(&mut stream, &format!("{tag} OK FETCH completed"));
-            }
-            ImapMode::InboundFetch if command.contains("UID FETCH 12") => {
-                write_fetch_literal(&mut stream, 2, 12, inbound_denied_sender_message());
-                write_response(&mut stream, &format!("{tag} OK FETCH completed"));
-            }
-            ImapMode::InboundFetch if command.contains("UID FETCH 13") => {
-                write_fetch_literal(&mut stream, 3, 13, inbound_automated_message());
-                write_response(&mut stream, &format!("{tag} OK FETCH completed"));
-            }
-            ImapMode::Ok | ImapMode::InboundFetch if command.contains("LOGOUT") => {
-                write_response(&mut stream, "* BYE fixture closing");
-                write_response(&mut stream, &format!("{tag} OK LOGOUT completed"));
-                break;
-            }
-            ImapMode::Ok | ImapMode::InboundFetch => {
-                write_response(&mut stream, &format!("{tag} BAD unsupported command"));
-            }
+            write_response(&mut stream, &format!("{tag} OK FETCH completed"));
+        } else if command.contains("LOGOUT") {
+            write_response(&mut stream, "* BYE fixture closing");
+            write_response(&mut stream, &format!("{tag} OK LOGOUT completed"));
+            break;
+        } else {
+            write_response(&mut stream, &format!("{tag} BAD unsupported command"));
         }
     }
 }
@@ -745,7 +1109,7 @@ fn write_fetch_literal(stream: &mut TcpStream, sequence: u32, uid: u32, body: &s
     stream
         .write_all(
             format!(
-                "* {sequence} FETCH (UID {uid} RFC822 {{{}}}\r\n",
+                "* {sequence} FETCH (UID {uid} BODY[] {{{}}}\r\n",
                 body.len()
             )
             .as_bytes(),

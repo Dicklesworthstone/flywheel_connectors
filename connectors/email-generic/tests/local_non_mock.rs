@@ -150,7 +150,7 @@ async fn local_non_mock_invokes_imap_read_and_smtp_write_paths() {
     assert!(
         imap_commands
             .iter()
-            .any(|line| line == "a2 SELECT \"INBOX\""),
+            .any(|line| line == "a2 EXAMINE \"INBOX\""),
         "IMAP fixture should observe selected mailbox; observed {imap_commands:?}"
     );
     assert!(
@@ -183,7 +183,7 @@ async fn local_non_mock_invokes_imap_read_and_smtp_write_paths() {
     let artifact_details = json!({
         "request_response_boundary": {
             "imap": {
-                "commands_seen": ["LOGIN", "LIST", "SELECT", "UID SEARCH", "LOGOUT"],
+                "commands_seen": ["LOGIN", "LIST", "EXAMINE", "UID SEARCH", "LOGOUT"],
                 "mailboxes": ["INBOX", "Archive"],
                 "uids": [2, 5, 8],
                 "inbound_poll_once": {
@@ -461,9 +461,12 @@ fn handle_imap(mut stream: TcpStream, commands: &Arc<Mutex<Vec<String>>>) {
             write_response(&mut stream, "* LIST (\\HasNoChildren) \"/\" \"INBOX\"");
             write_response(&mut stream, "* LIST (\\HasNoChildren) \"/\" \"Archive\"");
             write_response(&mut stream, &format!("{tag} OK LIST completed"));
-        } else if command.contains("SELECT ") {
+        } else if command.contains("EXAMINE ") {
             write_response(&mut stream, "* 3 EXISTS");
-            write_response(&mut stream, &format!("{tag} OK SELECT completed"));
+            write_response(
+                &mut stream,
+                &format!("{tag} OK [READ-ONLY] EXAMINE completed"),
+            );
         } else if command.contains("UID SEARCH TEXT") {
             write_response(&mut stream, "* SEARCH 2 5 8");
             write_response(&mut stream, &format!("{tag} OK SEARCH completed"));
@@ -476,7 +479,14 @@ fn handle_imap(mut stream: TcpStream, commands: &Arc<Mutex<Vec<String>>>) {
                 .find(|part| part.chars().all(|ch| ch.is_ascii_digit()))
                 .unwrap_or("11");
             let raw = inbound_message(uid);
-            write_response(&mut stream, &format!("* 1 FETCH (RFC822 {{{}}}", raw.len()));
+            assert!(
+                command.contains("(UID BODY.PEEK[])"),
+                "read-only full message fetch"
+            );
+            write_response(
+                &mut stream,
+                &format!("* 1 FETCH (UID {uid} BODY[] {{{}}}", raw.len()),
+            );
             stream
                 .write_all(raw.as_bytes())
                 .expect("write IMAP RFC822 literal");

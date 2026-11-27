@@ -102,11 +102,12 @@ The current Generic Email README slice documents the existing runtime surface:
 - SMTP plaintext builder mode is used only when `smtp.starttls=false`.
 - IMAP values are quoted and backslash/quote escaped before command construction.
 - `list_mailboxes` sends `LIST "" "*"`.
-- `search_messages` sends `SELECT "<mailbox>"` followed by `UID SEARCH TEXT "<query>"`.
+- `search_messages` sends `EXAMINE "<mailbox>"` followed by `UID SEARCH TEXT "<query>"`.
 - `search_messages` rejects blank mailbox or query before sending IMAP commands.
-- `fetch_unseen_inbound_messages` sends `SELECT "<mailbox>"`, `UID SEARCH UNSEEN`, and per-UID `UID FETCH <uid> (RFC822)` for the explicit `monitor_policy.mailbox` binding when used by the monitor.
-- `poll_inbound_once` sends `SELECT "<mailbox>"`, `UID SEARCH UNSEEN`, and per-UID `UID FETCH <uid> (RFC822)` for UIDs not present in the caller-provided `seen_uids`.
-- RFC822 literals are capped at `1048576` bytes before MIME parsing.
+- Inbound polling opens the mailbox with `EXAMINE`, then sends `UID SEARCH UNSEEN` and per-UID `UID FETCH <uid> (UID BODY.PEEK[])`. These reads preserve the provider's `\Seen` flags. The monitor uses the explicit `monitor_policy.mailbox`; `poll_inbound_once` uses its requested mailbox and caller-provided `seen_uids`.
+- A complete FETCH response must identify the requested UID, close its attribute list, and finish with the exact successful tagged status. Failed fetches, malformed MIME, truncated responses, and oversized literals abort the connection and leave all candidates from that poll unacknowledged for a fresh-session retry.
+- Retrieval never updates the UID cache. One-shot results return the processed UIDs with their previews; the supervised monitor records a UID only after successful event enqueue or an intentional policy rejection. A failed enqueue consumes neither that UID nor an event sequence. The UID cache still has a bounded deduplication window: older unread messages can be re-emitted after eviction, and a large unread backlog can fill successive batches with older UIDs before newer messages are reached. An epoch-aware UIDVALIDITY cursor remains necessary for reliable progress beyond that window. The existing bounded broadcast buffer remains best-effort delivery and does not provide durable acknowledgements or replay.
+- RFC822 literals and response metadata are each capped at `1048576` bytes. A poll returns at most 128 messages and stops after reaching 8 MiB of raw message data (with at most one additional 1 MiB message); remaining UIDs can be fetched on the next poll.
 - `send_message` requires at least one `to` recipient.
 - `send_message` parses `smtp.from_address`, `to`, and `cc` through `lettre` address parsing before dispatch.
 - `send_message` sends plain body text and does not include attachments.

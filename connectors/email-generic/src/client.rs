@@ -17,6 +17,10 @@ use crate::types::{
 };
 
 const MAX_IMAP_LITERAL_BYTES: usize = 1_048_576;
+const MAX_IMAP_RESPONSE_BYTES: usize = 1_048_576;
+const MAX_IMAP_RESPONSE_LINES: usize = 4_096;
+const MAX_INBOUND_POLL_BYTES: usize = 8 * MAX_IMAP_LITERAL_BYTES;
+const MAX_INBOUND_POLL_MESSAGES: usize = 128;
 
 enum ImapStream {
     Plain(TcpStream),
@@ -115,10 +119,77 @@ impl EmailGenericClient {
         }
     }
 
-    fn read_line(reader: &mut BufReader<ImapStream>) -> EmailGenericResult<String> {
-        let mut line = String::new();
-        reader.read_line(&mut line)?;
-        Ok(line)
+    fn read_line<R: BufRead>(reader: &mut R) -> EmailGenericResult<String> {
+        let mut line = Vec::new();
+        reader
+            .take((MAX_IMAP_RESPONSE_BYTES + 1) as u64)
+            .read_until(b'\n', &mut line)?;
+        if line.len() > MAX_IMAP_RESPONSE_BYTES {
+            return Err(EmailGenericError::Imap(
+                "IMAP response line exceeds byte limit".into(),
+            ));
+        }
+        if line
+            .strip_suffix(b"\r\n")
+            .is_none_or(|frame| frame.contains(&b'\r'))
+        {
+            return Err(EmailGenericError::Imap(
+                "IMAP response is truncated or lacks CRLF framing".into(),
+            ));
+        }
+        if line.contains(&0) {
+            return Err(EmailGenericError::Imap(
+                "IMAP response line contains NUL".into(),
+            ));
+        }
+        String::from_utf8(line)
+            .map_err(|_| EmailGenericError::Imap("IMAP response line is not UTF-8".into()))
+    }
+
+    fn account_response_bytes(total: &mut usize, additional: usize) -> EmailGenericResult<()> {
+        *total = total.saturating_add(additional);
+        if *total > MAX_IMAP_RESPONSE_BYTES {
+            return Err(EmailGenericError::Imap(
+                "IMAP response exceeds byte limit".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Only the tagged status atom completes a command. Human-readable response
+    /// text may contain "OK" even when the actual command status is NO or BAD.
+    fn command_completed(tag: &str, line: &str) -> EmailGenericResult<bool> {
+        let mut atoms = line.split_ascii_whitespace();
+        match atoms.next() {
+            Some(response_tag) if response_tag == tag => match atoms.next() {
+                Some(status) if status.eq_ignore_ascii_case("OK") => Ok(true),
+                Some(status)
+                    if status.eq_ignore_ascii_case("NO") || status.eq_ignore_ascii_case("BAD") =>
+                {
+                    Err(EmailGenericError::Imap(
+                        "IMAP server rejected the command".into(),
+                    ))
+                }
+                _ => Err(EmailGenericError::Imap(
+                    "Invalid IMAP command completion status".into(),
+                )),
+            },
+            Some("*") => {
+                if tag != "az"
+                    && atoms
+                        .next()
+                        .is_some_and(|atom| atom.eq_ignore_ascii_case("BYE"))
+                {
+                    return Err(EmailGenericError::Imap(
+                        "IMAP server closed the session".into(),
+                    ));
+                }
+                Ok(false)
+            }
+            _ => Err(EmailGenericError::Imap(
+                "Unexpected IMAP response tag or continuation".into(),
+            )),
+        }
     }
 
     fn run_imap_command(
@@ -131,59 +202,156 @@ impl EmailGenericClient {
             .write_all(format!("{tag} {command}\r\n").as_bytes())?;
         reader.get_mut().flush()?;
         let mut lines = Vec::new();
-        loop {
+        let mut response_bytes = 0;
+        for _ in 0..MAX_IMAP_RESPONSE_LINES {
             let line = Self::read_line(reader)?;
-            if line.is_empty() {
+            Self::account_response_bytes(&mut response_bytes, line.len())?;
+            let trimmed = line.trim_end_matches(['\r', '\n']).to_owned();
+            let done = Self::command_completed(tag, &trimmed)?;
+            if !done && Self::parse_imap_literal_len(&trimmed)?.is_some() {
                 return Err(EmailGenericError::Imap(
-                    "Unexpected EOF from IMAP server".into(),
+                    "Unexpected literal in IMAP command response".into(),
                 ));
             }
-            let trimmed = line.trim_end().to_string();
-            let done = trimmed.starts_with(&format!("{tag} "));
             lines.push(trimmed);
             if done {
-                break;
+                return Ok(lines);
             }
         }
-        Ok(lines)
+        Err(EmailGenericError::Imap(
+            "IMAP command response exceeds line limit".into(),
+        ))
     }
 
     fn run_imap_fetch_literal(
         reader: &mut BufReader<ImapStream>,
         tag: &str,
         command: &str,
+        expected_uid: u32,
     ) -> EmailGenericResult<Vec<u8>> {
         reader
             .get_mut()
             .write_all(format!("{tag} {command}\r\n").as_bytes())?;
         reader.get_mut().flush()?;
         let mut literal = None;
-        loop {
+        let mut response_bytes = 0;
+        for _ in 0..MAX_IMAP_RESPONSE_LINES {
             let line = Self::read_line(reader)?;
-            if line.is_empty() {
-                return Err(EmailGenericError::Imap(
-                    "Unexpected EOF from IMAP server".into(),
-                ));
+            Self::account_response_bytes(&mut response_bytes, line.len())?;
+            let trimmed = line.trim_end_matches(['\r', '\n']);
+            if Self::command_completed(tag, trimmed)? {
+                return literal.ok_or_else(|| {
+                    EmailGenericError::Imap("IMAP FETCH did not include an RFC822 literal".into())
+                });
             }
-            let trimmed = line.trim_end();
             if let Some(len) = Self::parse_imap_literal_len(trimmed)? {
                 if len > MAX_IMAP_LITERAL_BYTES {
                     return Err(EmailGenericError::Imap(format!(
                         "IMAP FETCH literal exceeds {MAX_IMAP_LITERAL_BYTES} byte limit"
                     )));
                 }
+                if literal.is_some() {
+                    return Err(EmailGenericError::Imap(
+                        "IMAP FETCH returned multiple message literals".into(),
+                    ));
+                }
                 let mut body = vec![0_u8; len];
                 reader.read_exact(&mut body)?;
-                literal = Some(body);
-                continue;
-            }
-            if trimmed.starts_with(&format!("{tag} ")) {
-                if !trimmed.contains(" OK") {
-                    return Err(EmailGenericError::Imap(trimmed.to_owned()));
+                // The rest of this FETCH response follows the literal bytes, not
+                // a new response. UID may legally appear before or after BODY[].
+                let trailer = Self::read_line(reader)?;
+                Self::account_response_bytes(&mut response_bytes, trailer.len())?;
+                if Self::parse_fetch_literal_uid(trimmed, &trailer)? != expected_uid {
+                    return Err(EmailGenericError::Imap(
+                        "IMAP FETCH returned a different UID".into(),
+                    ));
                 }
-                return literal.ok_or_else(|| {
-                    EmailGenericError::Imap("IMAP FETCH did not include an RFC822 literal".into())
-                });
+                literal = Some(body);
+            }
+        }
+        Err(EmailGenericError::Imap(
+            "IMAP FETCH response exceeds line limit".into(),
+        ))
+    }
+
+    fn take_imap_atom(input: &str) -> EmailGenericResult<(&str, &str)> {
+        let input = input.trim_start();
+        let end = input
+            .find(|ch: char| ch.is_ascii_whitespace() || matches!(ch, '(' | ')'))
+            .unwrap_or(input.len());
+        if end == 0 {
+            return Err(EmailGenericError::Imap(
+                "Malformed IMAP FETCH attributes".into(),
+            ));
+        }
+        Ok(input.split_at(end))
+    }
+
+    /// Parse only the response attributes requested by our UID/BODY.PEEK[]
+    /// fetch, plus unsolicited FLAGS. Never infer a UID from message bytes or
+    /// from a nested flag name, and require the FETCH list to close completely.
+    fn parse_fetch_literal_uid(header: &str, trailer: &str) -> EmailGenericResult<u32> {
+        let invalid = || EmailGenericError::Imap("Malformed IMAP FETCH literal response".into());
+        let (marker, rest) = Self::take_imap_atom(header)?;
+        let (sequence, rest) = Self::take_imap_atom(rest)?;
+        let (kind, attributes) = Self::take_imap_atom(rest)?;
+        if marker != "*"
+            || sequence
+                .parse::<u32>()
+                .ok()
+                .is_none_or(|sequence| sequence == 0)
+            || !kind.eq_ignore_ascii_case("FETCH")
+        {
+            return Err(invalid());
+        }
+        let (prefix, _) = attributes.rsplit_once('{').ok_or_else(invalid)?;
+        if !prefix
+            .split_ascii_whitespace()
+            .last()
+            .is_some_and(|name| name.trim_start_matches('(').eq_ignore_ascii_case("BODY[]"))
+        {
+            return Err(invalid());
+        }
+        // NIL is a placeholder for the one literal already read by the caller.
+        let metadata = format!("{prefix}NIL{trailer}");
+        let mut remaining = metadata.trim().strip_prefix('(').ok_or_else(invalid)?;
+        let mut uid = None;
+        let mut body_seen = false;
+        loop {
+            remaining = remaining.trim_start();
+            if let Some(tail) = remaining.strip_prefix(')') {
+                if !tail.trim().is_empty() || !body_seen {
+                    return Err(invalid());
+                }
+                return uid.ok_or_else(invalid);
+            }
+            let (name, rest) = Self::take_imap_atom(remaining)?;
+            remaining = rest.trim_start();
+            if name.eq_ignore_ascii_case("UID") {
+                let (value, rest) = Self::take_imap_atom(remaining)?;
+                let value = value.parse::<u32>().map_err(|_| invalid())?;
+                if value == 0 || uid.replace(value).is_some() {
+                    return Err(invalid());
+                }
+                remaining = rest;
+            } else if name.eq_ignore_ascii_case("BODY[]") {
+                let (value, rest) = Self::take_imap_atom(remaining)?;
+                if value != "NIL" || body_seen {
+                    return Err(invalid());
+                }
+                body_seen = true;
+                remaining = rest;
+            } else if name.eq_ignore_ascii_case("FLAGS") {
+                let (flags, rest) = remaining
+                    .strip_prefix('(')
+                    .and_then(|flags| flags.split_once(')'))
+                    .ok_or_else(invalid)?;
+                if flags.chars().any(|ch| matches!(ch, '(' | '"' | '{')) {
+                    return Err(invalid());
+                }
+                remaining = rest;
+            } else {
+                return Err(invalid());
             }
         }
     }
@@ -195,12 +363,15 @@ impl EmailGenericClient {
         if !line.ends_with('}') {
             return Ok(None);
         }
-        line[start + 1..line.len() - 1]
-            .parse::<usize>()
-            .map(Some)
-            .map_err(|error| {
-                EmailGenericError::Imap(format!("Invalid IMAP literal length: {error}"))
-            })
+        let length = &line[start + 1..line.len() - 1];
+        if length.is_empty() || !length.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(EmailGenericError::Imap(
+                "Invalid IMAP literal length".into(),
+            ));
+        }
+        length.parse::<usize>().map(Some).map_err(|error| {
+            EmailGenericError::Imap(format!("Invalid IMAP literal length: {error}"))
+        })
     }
 
     fn imap_login_and_read<F, T>(&self, f: F) -> EmailGenericResult<T>
@@ -209,7 +380,12 @@ impl EmailGenericClient {
     {
         let mut reader = self.connect_imap()?;
         let greeting = Self::read_line(&mut reader)?;
-        if !greeting.starts_with('*') {
+        let mut greeting_atoms = greeting.split_ascii_whitespace();
+        if greeting_atoms.next() != Some("*")
+            || !greeting_atoms
+                .next()
+                .is_some_and(|status| status.eq_ignore_ascii_case("OK"))
+        {
             return Err(EmailGenericError::Imap("Invalid IMAP greeting".into()));
         }
         let login = format!(
@@ -217,10 +393,7 @@ impl EmailGenericClient {
             Self::quote_imap(&self.config.imap.username)?,
             Self::quote_imap(&self.config.imap.password)?
         );
-        let login_lines = Self::run_imap_command(&mut reader, "a1", &login)?;
-        if !login_lines.last().is_some_and(|line| line.contains(" OK")) {
-            return Err(EmailGenericError::Imap(login_lines.join("\n")));
-        }
+        Self::run_imap_command(&mut reader, "a1", &login)?;
         let result = f(&mut reader)?;
         let _ = Self::run_imap_command(&mut reader, "az", "LOGOUT");
         let _ = reader.get_mut().shutdown();
@@ -249,17 +422,34 @@ impl EmailGenericClient {
             .collect()
     }
 
-    fn parse_search_uids(lines: &[String]) -> Vec<u32> {
-        lines
-            .iter()
-            .find_map(|line| line.strip_prefix("* SEARCH "))
-            .map(|payload| {
-                payload
-                    .split_whitespace()
-                    .filter_map(|part| part.parse::<u32>().ok())
-                    .collect()
-            })
-            .unwrap_or_default()
+    fn parse_search_uids(lines: &[String]) -> EmailGenericResult<Vec<u32>> {
+        let mut result = None;
+        for line in lines {
+            let mut atoms = line.split_ascii_whitespace();
+            if atoms.next() != Some("*")
+                || !atoms
+                    .next()
+                    .is_some_and(|atom| atom.eq_ignore_ascii_case("SEARCH"))
+            {
+                continue;
+            }
+            if result.is_some() {
+                return Err(EmailGenericError::Imap(
+                    "IMAP command returned multiple SEARCH results".into(),
+                ));
+            }
+            let mut uids = std::collections::BTreeSet::new();
+            for atom in atoms {
+                let uid = atom
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|uid| *uid != 0)
+                    .ok_or_else(|| EmailGenericError::Imap("Invalid IMAP SEARCH UID".into()))?;
+                uids.insert(uid);
+            }
+            result = Some(uids.into_iter().collect());
+        }
+        result.ok_or_else(|| EmailGenericError::Imap("IMAP command omitted SEARCH result".into()))
     }
 
     pub fn health(&self) -> EmailGenericResult<Value> {
@@ -275,9 +465,6 @@ impl EmailGenericClient {
     pub fn list_mailboxes(&self) -> EmailGenericResult<Value> {
         self.imap_login_and_read(|reader| {
             let lines = Self::run_imap_command(reader, "a2", "LIST \"\" \"*\"")?;
-            if !lines.last().is_some_and(|line| line.contains(" OK")) {
-                return Err(EmailGenericError::Imap(lines.join("\n")));
-            }
             Ok(json!({ "mailboxes": Self::parse_mailboxes(&lines) }))
         })
     }
@@ -289,28 +476,26 @@ impl EmailGenericClient {
             ));
         }
         self.imap_login_and_read(|reader| {
-            let select = format!("SELECT {}", Self::quote_imap(mailbox)?);
-            let select_lines = Self::run_imap_command(reader, "a2", &select)?;
-            if !select_lines.last().is_some_and(|line| line.contains(" OK")) {
-                return Err(EmailGenericError::Imap(select_lines.join("\n")));
-            }
+            let examine = format!("EXAMINE {}", Self::quote_imap(mailbox)?);
+            Self::run_imap_command(reader, "a2", &examine)?;
             let search = format!("UID SEARCH TEXT {}", Self::quote_imap(query)?);
             let lines = Self::run_imap_command(reader, "a3", &search)?;
-            if !lines.last().is_some_and(|line| line.contains(" OK")) {
-                return Err(EmailGenericError::Imap(lines.join("\n")));
-            }
             Ok(json!({
                 "mailbox": mailbox,
                 "query": query,
-                "uids": Self::parse_search_uids(&lines),
+                "uids": Self::parse_search_uids(&lines)?,
             }))
         })
     }
 
+    /// Retrieve candidates without acknowledging them or setting provider
+    /// \Seen flags. Callers observe UIDs only after publication or an explicit
+    /// policy rejection. Any failed fetch aborts this session and leaves every
+    /// candidate retryable on a fresh connection.
     pub fn fetch_unseen_inbound_messages(
         &self,
         mailbox: &str,
-        seen_uids: &mut EmailSeenUidCache,
+        seen_uids: &EmailSeenUidCache,
     ) -> EmailGenericResult<Vec<EmailInboundMessage>> {
         if mailbox.trim().is_empty() {
             return Err(EmailGenericError::Config(
@@ -318,36 +503,26 @@ impl EmailGenericClient {
             ));
         }
         self.imap_login_and_read(|reader| {
-            let select = format!("SELECT {}", Self::quote_imap(mailbox)?);
-            let select_lines = Self::run_imap_command(reader, "a2", &select)?;
-            if !select_lines.last().is_some_and(|line| line.contains(" OK")) {
-                return Err(EmailGenericError::Imap(select_lines.join("\n")));
-            }
+            let examine = format!("EXAMINE {}", Self::quote_imap(mailbox)?);
+            Self::run_imap_command(reader, "a2", &examine)?;
             let search_lines = Self::run_imap_command(reader, "a3", "UID SEARCH UNSEEN")?;
-            if !search_lines.last().is_some_and(|line| line.contains(" OK")) {
-                return Err(EmailGenericError::Imap(search_lines.join("\n")));
-            }
 
             let mut messages = Vec::new();
-            for uid in Self::parse_search_uids(&search_lines) {
-                let uid = uid.to_string();
-                if seen_uids.contains(&uid) {
+            let mut fetched_bytes = 0_usize;
+            for uid in Self::parse_search_uids(&search_lines)? {
+                let uid_text = uid.to_string();
+                if seen_uids.contains(&uid_text) {
                     continue;
                 }
-                let fetch = format!("UID FETCH {uid} (RFC822)");
-                let raw = match Self::run_imap_fetch_literal(reader, &format!("f{uid}"), &fetch) {
-                    Ok(raw) => raw,
-                    Err(e) => {
-                        tracing::warn!("Failed to fetch message UID {}: {}", uid, e);
-                        seen_uids.observe(uid);
-                        continue;
-                    }
-                };
-                match Self::parse_inbound_message(uid.clone(), &raw) {
-                    Ok(message) => messages.push(message),
-                    Err(e) => tracing::warn!("Failed to parse message UID {}: {}", uid, e),
+                let fetch = format!("UID FETCH {uid} (UID BODY.PEEK[])");
+                let raw = Self::run_imap_fetch_literal(reader, &format!("f{uid}"), &fetch, uid)?;
+                fetched_bytes = fetched_bytes.saturating_add(raw.len());
+                messages.push(Self::parse_inbound_message(uid_text, &raw)?);
+                if fetched_bytes >= MAX_INBOUND_POLL_BYTES
+                    || messages.len() >= MAX_INBOUND_POLL_MESSAGES
+                {
+                    break;
                 }
-                seen_uids.observe(uid);
             }
             Ok(messages)
         })
@@ -585,8 +760,94 @@ mod tests {
         let uids = EmailGenericClient::parse_search_uids(&[
             "* SEARCH 2 5 8".into(),
             "a3 OK SEARCH completed".into(),
-        ]);
+        ])
+        .expect("valid SEARCH result");
         assert_eq!(uids, vec![2, 5, 8]);
+    }
+
+    #[test]
+    fn search_results_reject_invalid_or_missing_uids_and_deduplicate() {
+        for lines in [
+            vec!["* SEARCH 0".into()],
+            vec!["* SEARCH 11 invalid 12".into()],
+            vec!["* SEARCH 4294967296".into()],
+            vec!["a3 OK completed without SEARCH".into()],
+            vec!["* SEARCH 11".into(), "* SEARCH 12".into()],
+        ] {
+            assert!(EmailGenericClient::parse_search_uids(&lines).is_err());
+        }
+        assert!(
+            EmailGenericClient::parse_search_uids(&["* SEARCH".into()])
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            EmailGenericClient::parse_search_uids(&["* SEARCH 12 11 12".into()]).unwrap(),
+            vec![11, 12]
+        );
+    }
+
+    #[test]
+    fn imap_completion_requires_the_exact_tag_and_status_atom() {
+        assert!(EmailGenericClient::command_completed("f11", "f11 OK completed").unwrap());
+        assert!(EmailGenericClient::command_completed("f11", "f11 ok completed").unwrap());
+        assert!(!EmailGenericClient::command_completed("f11", "* 3 EXISTS").unwrap());
+        for line in [
+            "f11 NO FETCH failed, other commands are OK",
+            "f11 BAD not OK",
+            "f11 OKAY",
+            "f12 OK completed",
+            "+ continue",
+            "* BYE closing",
+        ] {
+            assert!(EmailGenericClient::command_completed("f11", line).is_err());
+        }
+    }
+
+    #[test]
+    fn imap_fetch_uid_is_bound_to_the_complete_literal_response() {
+        for (header, trailer) in [
+            ("* 1 FETCH (UID 11 BODY[] {42}", ")\r\n"),
+            ("* 1 FETCH (BODY[] {42}", " UID 11)\r\n"),
+            ("* 1 FETCH (FLAGS (\\Seen) UID 11 BODY[] {42}", ")\r\n"),
+            ("* 1 FETCH (BODY[] {42}", " FLAGS (UID) UID 11)\r\n"),
+        ] {
+            assert_eq!(
+                EmailGenericClient::parse_fetch_literal_uid(header, trailer).unwrap(),
+                11
+            );
+        }
+        for (header, trailer) in [
+            ("* 1 FETCH (BODY[] {42}", ")\r\n"),
+            ("* 1 FETCH (UID 0 BODY[] {42}", ")\r\n"),
+            ("* 1 FETCH (UID 11 BODY[] {42}", " UID 12)\r\n"),
+            ("* 1 FETCH (UID 11 BODY[HEADER] {42}", ")\r\n"),
+            ("* 1 FETCH (UID 11 BODY[] {42}", "f11 OK completed\r\n"),
+            ("* 1 FETCH (UID 11 BODY[] {42}", ") unexpected\r\n"),
+            ("* 1 FETCH (FLAGS (UID 11) BODY[] {42}", ")\r\n"),
+            ("* 0 FETCH (UID 11 BODY[] {42}", ")\r\n"),
+        ] {
+            assert!(EmailGenericClient::parse_fetch_literal_uid(header, trailer).is_err());
+        }
+    }
+
+    #[test]
+    fn imap_lines_require_bounded_complete_crlf_frames() {
+        for bytes in [
+            b"".as_slice(),
+            b"* OK missing terminator",
+            b"* OK bare newline\n",
+            b"* OK embedded\rcarriage return\r\n",
+            b"* OK nul\0byte\r\n",
+        ] {
+            assert!(EmailGenericClient::read_line(&mut std::io::Cursor::new(bytes)).is_err());
+        }
+        let oversized = vec![b'x'; MAX_IMAP_RESPONSE_BYTES + 1];
+        assert!(EmailGenericClient::read_line(&mut std::io::Cursor::new(oversized)).is_err());
+        assert_eq!(
+            EmailGenericClient::read_line(&mut std::io::Cursor::new(b"* OK ready\r\n")).unwrap(),
+            "* OK ready\r\n"
+        );
     }
 
     #[test]

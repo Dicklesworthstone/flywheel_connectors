@@ -1,7 +1,6 @@
 //! Generic email connector implementation.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -97,7 +96,7 @@ struct EmailInboundMonitorRuntime {
     event_tx: broadcast::Sender<FcpResult<EventEnvelope>>,
     state: Mutex<EmailInboundMonitorTaskState>,
     stats: Arc<Mutex<EmailInboundMonitorStats>>,
-    next_event_seq: Arc<AtomicU64>,
+    next_event_seq: Arc<Mutex<u64>>,
 }
 
 impl std::fmt::Debug for EmailInboundMonitorRuntime {
@@ -121,7 +120,7 @@ impl EmailInboundMonitorRuntime {
             event_tx,
             state: Mutex::new(EmailInboundMonitorTaskState::default()),
             stats: Arc::new(Mutex::new(EmailInboundMonitorStats::default())),
-            next_event_seq: Arc::new(AtomicU64::new(1)),
+            next_event_seq: Arc::new(Mutex::new(1)),
         }
     }
 
@@ -905,7 +904,7 @@ impl EmailGenericConnector {
                     config.monitor_policy.seen_uid_cap,
                 )?;
                 let messages = client
-                    .fetch_unseen_inbound_messages(mailbox, &mut seen_uids)
+                    .fetch_unseen_inbound_messages(mailbox, &seen_uids)
                     .map_err(|error| error.to_fcp_error())?;
                 let mut accepted_count = 0_usize;
                 let mut dropped_count = 0_usize;
@@ -918,6 +917,9 @@ impl EmailGenericConnector {
                         } else {
                             dropped_count += 1;
                         }
+                        // This cache is returned with the one-shot result; fetching
+                        // alone never acknowledges a message.
+                        seen_uids.observe(message.uid.clone());
                         json!({
                             "uid": &message.uid,
                             "decision": preview.decision,
@@ -1247,7 +1249,7 @@ async fn run_email_inbound_monitor(
     connector_id: ConnectorId,
     instance_id: InstanceId,
     event_tx: broadcast::Sender<FcpResult<EventEnvelope>>,
-    next_event_seq: Arc<AtomicU64>,
+    next_event_seq: Arc<Mutex<u64>>,
     stats: Arc<Mutex<EmailInboundMonitorStats>>,
     mut shutdown: watch::Receiver<bool>,
 ) {
@@ -1259,8 +1261,8 @@ async fn run_email_inbound_monitor(
     };
     let poll_interval = Duration::from_secs(config.monitor_policy.poll_interval_secs);
     let mailbox = config.monitor_policy.mailbox().to_owned();
-    let seen_uids = match EmailSeenUidCache::new(config.monitor_policy.seen_uid_cap) {
-        Ok(cache) => Arc::new(Mutex::new(cache)),
+    let mut seen_uids = match EmailSeenUidCache::new(config.monitor_policy.seen_uid_cap) {
+        Ok(cache) => cache,
         Err(error) => {
             update_monitor_stats(&stats, |stats| {
                 stats.status = "error".into();
@@ -1286,11 +1288,8 @@ async fn run_email_inbound_monitor(
             stats.polls_started = stats.polls_started.saturating_add(1);
         });
 
-        let poll = poll_inbound_on_blocking_thread(
-            client.clone(),
-            mailbox.clone(),
-            Arc::clone(&seen_uids),
-        );
+        let poll =
+            poll_inbound_on_blocking_thread(client.clone(), mailbox.clone(), seen_uids.clone());
         let poll_result = fcp_async_core::select! {
             biased;
             _ = shutdown.changed() => {
@@ -1310,7 +1309,7 @@ async fn run_email_inbound_monitor(
         match poll_result {
             Ok(messages) => {
                 consecutive_failures = 0;
-                let (emitted, dropped) = emit_inbound_preview_events(
+                let (emitted, dropped, publication_failed) = emit_inbound_preview_events(
                     &InboundEventEmitContext {
                         config: &config,
                         zone: &zone,
@@ -1321,6 +1320,7 @@ async fn run_email_inbound_monitor(
                         mailbox: &mailbox,
                     },
                     messages,
+                    &mut seen_uids,
                 );
                 update_monitor_stats(&stats, |stats| {
                     stats.polls_completed = stats.polls_completed.saturating_add(1);
@@ -1330,8 +1330,14 @@ async fn run_email_inbound_monitor(
                     stats.dropped_events = stats
                         .dropped_events
                         .saturating_add(u64::try_from(dropped).unwrap_or(u64::MAX));
-                    stats.reason = "last supervised inbound poll completed".into();
-                    stats.last_error = None;
+                    if publication_failed {
+                        stats.reason =
+                            "event publication failed; unacknowledged UIDs will be retried".into();
+                        stats.last_error = Some("inbound event could not be enqueued".into());
+                    } else {
+                        stats.reason = "last supervised inbound poll completed".into();
+                        stats.last_error = None;
+                    }
                 });
                 if fcp_async_core::shutdown::sleep_or_shutdown(poll_interval, &mut shutdown)
                     .await
@@ -1388,20 +1394,17 @@ where
 async fn poll_inbound_on_blocking_thread(
     client: EmailGenericClient,
     mailbox: String,
-    seen_uids: Arc<Mutex<EmailSeenUidCache>>,
+    seen_uids: EmailSeenUidCache,
 ) -> Result<Vec<EmailInboundMessage>, String> {
     let (tx, rx) = oneshot::channel();
     thread::Builder::new()
         .name("email-generic-inbound-poll".into())
         .spawn(move || {
-            let result = seen_uids
-                .lock()
-                .map_err(|_| "seen UID cache lock poisoned".to_owned())
-                .and_then(|mut seen| {
-                    client
-                        .fetch_unseen_inbound_messages(&mailbox, &mut seen)
-                        .map_err(|error| error.to_string())
-                });
+            // A cancelled worker owns only a snapshot. Dropping its result
+            // cannot consume UIDs from the monitor's committed cache.
+            let result = client
+                .fetch_unseen_inbound_messages(&mailbox, &seen_uids)
+                .map_err(|error| error.to_string());
             let _ = tx.send(result);
         })
         .map_err(|error| format!("failed to spawn blocking IMAP poll worker: {error}"))?;
@@ -1415,14 +1418,15 @@ struct InboundEventEmitContext<'a> {
     connector_id: &'a ConnectorId,
     instance_id: &'a InstanceId,
     event_tx: &'a broadcast::Sender<FcpResult<EventEnvelope>>,
-    next_event_seq: &'a AtomicU64,
+    next_event_seq: &'a Mutex<u64>,
     mailbox: &'a str,
 }
 
 fn emit_inbound_preview_events(
     context: &InboundEventEmitContext<'_>,
     messages: Vec<EmailInboundMessage>,
-) -> (usize, usize) {
+    seen_uids: &mut EmailSeenUidCache,
+) -> (usize, usize, bool) {
     let mut emitted = 0_usize;
     let mut dropped = 0_usize;
     for message in messages {
@@ -1431,15 +1435,17 @@ fn emit_inbound_preview_events(
             .monitor_policy
             .prepare_inbound_message(&message);
         if preview.decision != EmailInboundPolicyDecision::Accept {
+            // A policy rejection is an intentional, completed disposition.
+            // Transport, parsing, cancellation, and publication failures are not.
+            seen_uids.observe(message.uid);
             dropped = dropped.saturating_add(1);
             continue;
         }
-        let seq = context.next_event_seq.fetch_add(1, Ordering::SeqCst);
         let cursor = format!("{}:{}", context.mailbox, message.uid);
         let sender = normalize_sender_address(&message.sender);
         let payload = json!({
             "mailbox": context.mailbox,
-            "uid": message.uid,
+            "uid": &message.uid,
             "sender": sender.clone(),
             "policy_decision": "accept",
             "preview": preview,
@@ -1457,15 +1463,30 @@ fn emit_inbound_preview_events(
             principal,
             payload,
         );
+        // Serialize publication with sequence assignment even if an old
+        // monitor is draining while a new subscription starts. No await occurs
+        // under this lock, and a failed enqueue consumes neither UID nor seq.
+        let Ok(mut next_event_seq) = context.next_event_seq.lock() else {
+            return (emitted, dropped, true);
+        };
+        let seq = *next_event_seq;
+        let Some(following_seq) = seq.checked_add(1) else {
+            return (emitted, dropped, true);
+        };
         let envelope = EventEnvelope::new(EVENT_INBOUND_PREVIEW, data)
             .with_seq(seq)
             .with_cursor(cursor)
             .with_stream_key(context.mailbox)
             .with_ordering(OrderingPolicy::PerKey);
-        let _ = context.event_tx.send(Ok(envelope));
+        if context.event_tx.send(Ok(envelope)).is_err() {
+            return (emitted, dropped, true);
+        }
+        *next_event_seq = following_seq;
+        drop(next_event_seq);
+        seen_uids.observe(message.uid);
         emitted = emitted.saturating_add(1);
     }
-    (emitted, dropped)
+    (emitted, dropped, false)
 }
 
 #[cfg(test)]
@@ -1491,6 +1512,86 @@ mod tests {
             transport_caps: None,
             requested_instance_id: None,
         }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn inbound_publication_commits_sequences_only_on_success_and_serializes_producers() {
+        let config = EmailGenericConfig::from_value(json!({
+            "imap": {
+                "host": "imap.example.com",
+                "username": "user@example.com",
+                "password": "secret"
+            },
+            "smtp": {
+                "host": "smtp.example.com",
+                "username": "user@example.com",
+                "password": "secret",
+                "from_address": "user@example.com"
+            },
+            "monitor_policy": { "allowed_senders": ["human@example.com"] }
+        }))
+        .expect("monitor config");
+        let connector = EmailGenericConnector::new();
+        let zone = ZoneId::private();
+        let (event_tx, receiver) = broadcast::channel(INBOUND_EVENT_BUFFER_CAPACITY);
+        drop(receiver);
+        let next_event_seq = Mutex::new(1_u64);
+        let context = InboundEventEmitContext {
+            config: &config,
+            zone: &zone,
+            connector_id: &connector.base.id,
+            instance_id: &connector.base.instance_id,
+            event_tx: &event_tx,
+            next_event_seq: &next_event_seq,
+            mailbox: "Alerts",
+        };
+        let raw = b"From: human@example.com\r\nSubject: ready\r\n\r\nbody\r\n";
+        let mut seen = EmailSeenUidCache::new(8).expect("UID cache");
+        let message = EmailGenericClient::parse_inbound_message("99", raw).expect("message");
+        assert_eq!(
+            emit_inbound_preview_events(&context, vec![message], &mut seen),
+            (0, 0, true)
+        );
+        assert!(seen.is_empty());
+        assert_eq!(*next_event_seq.lock().expect("event sequence"), 1);
+
+        let mut events = event_tx.subscribe();
+        let barrier = std::sync::Barrier::new(4);
+        thread::scope(|scope| {
+            for worker in 0..4 {
+                let context = &context;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    let messages = (0..8)
+                        .map(|offset| {
+                            EmailGenericClient::parse_inbound_message(
+                                (worker * 8 + offset + 1).to_string(),
+                                raw,
+                            )
+                            .expect("message")
+                        })
+                        .collect();
+                    let mut seen = EmailSeenUidCache::new(8).expect("UID cache");
+                    barrier.wait();
+                    assert_eq!(
+                        emit_inbound_preview_events(context, messages, &mut seen),
+                        (8, 0, false)
+                    );
+                    assert_eq!(seen.len(), 8);
+                });
+            }
+        });
+        let mut sequences = Vec::new();
+        for _ in 0..32 {
+            let event = fcp_async_core::time::timeout(Duration::from_secs(1), events.recv())
+                .await
+                .expect("event timeout")
+                .expect("event receiver")
+                .expect("inbound event");
+            sequences.push(event.seq);
+        }
+        assert_eq!(sequences, (1..=32).collect::<Vec<_>>());
+        assert_eq!(*next_event_seq.lock().expect("event sequence"), 33);
     }
 
     fn test_constraints_cbor() -> Vec<u8> {
