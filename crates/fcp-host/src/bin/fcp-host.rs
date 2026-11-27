@@ -68,9 +68,9 @@ use fcp_host::{
     ConnectorArtifactMetadataResponse, ConnectorArtifactRegistrationRequest,
     ConnectorArtifactRegistrationResponse, ConnectorConfigApplyRequest,
     ConnectorConfigApplyResponse, ConnectorConfigDiffRequest, ConnectorConfigDiffResponse,
-    ConnectorConfigRevisionsResponse, ConnectorConfigRollbackRequest, ConnectorConfigSnapshot,
-    ConnectorConfigSnapshotSource, ConnectorConfigValidateRequest, ConnectorConfigValidateResponse,
-    ConnectorInventoryApplyReport, ConnectorInventoryMutationKind,
+    ConnectorConfigPatchRequest, ConnectorConfigRevisionsResponse, ConnectorConfigRollbackRequest,
+    ConnectorConfigSnapshot, ConnectorConfigSnapshotSource, ConnectorConfigValidateRequest,
+    ConnectorConfigValidateResponse, ConnectorInventoryApplyReport, ConnectorInventoryMutationKind,
     ConnectorInventoryMutationRequest, ConnectorInventoryMutationResponse,
     ConnectorInventoryResponse, ConnectorRegistry, ConnectorSummary, CredentialCooldown,
     CredentialLease, CredentialLeaseGuard, CredentialMutationOutcome, CredentialPayload,
@@ -10908,6 +10908,7 @@ async fn async_main(telemetry_config: TelemetryConfig) -> HostResult<()> {
             "/rpc/connectors/{connector_id}/config/apply",
             post(connector_config_apply_handler),
         )
+        .merge(connector_config_patch_routes())
         .route(
             "/rpc/connectors/{connector_id}/config/rollback",
             post(connector_config_rollback_handler),
@@ -14576,12 +14577,45 @@ async fn apply_connector_config_payload(
     change_reason: Option<String>,
 ) -> Result<ConnectorConfigApplyResponse, HostError> {
     let _transaction = state.registry.inventory_transaction.lock().await;
-    let current_context = load_connector_config_context(state, connector_id).await?;
-    ensure_expected_config_revision(
+    apply_connector_config_payload_locked(
+        state,
         connector_id,
+        payload,
         expected_active_revision_id,
-        current_config_revision_id(&current_context),
-    )?;
+        created_by,
+        change_reason,
+        None,
+    )
+    .await
+}
+
+// The caller holds inventory_transaction from precondition validation through
+// persistence and publication. The patch path additionally guards the raw
+// payload and the complete managed-file inventory.
+async fn apply_connector_config_payload_locked(
+    state: &AppState,
+    connector_id: &ConnectorId,
+    payload: Value,
+    expected_active_revision_id: Option<u64>,
+    created_by: Option<String>,
+    change_reason: Option<String>,
+    expected_payload_digest: Option<&str>,
+) -> Result<ConnectorConfigApplyResponse, HostError> {
+    let current_context = load_connector_config_context(state, connector_id).await?;
+    if let Some(digest) = expected_payload_digest {
+        ensure_config_patch_precondition(&current_context, digest, expected_active_revision_id)?;
+    } else {
+        ensure_expected_config_revision(
+            connector_id,
+            expected_active_revision_id,
+            current_config_revision_id(&current_context),
+        )?;
+    }
+    let patch_inventory = if expected_payload_digest.is_some() {
+        Some(current_managed_config_patch_inventory(state).await?)
+    } else {
+        None
+    };
 
     let candidate = SanitizedConnectorConfig::from_payload(payload.clone())
         .map_err(map_lifecycle_host_error)?;
@@ -14608,7 +14642,10 @@ async fn apply_connector_config_payload(
                 .to_string(),
         )
     })?;
-    let previous_configs = read_connector_configs_file(&connectors_file)?;
+    let previous_configs = match patch_inventory {
+        Some(configs) => configs,
+        None => read_connector_configs_file(&connectors_file)?,
+    };
     let next_configs = next_inventory_with_config(previous_configs.clone(), connector_id, payload)?;
 
     write_connector_configs_file(&connectors_file, &next_configs)?;
@@ -14693,6 +14730,205 @@ async fn apply_connector_config_payload(
         apply: Some(apply),
         admin_state: Some(admin_state),
     })
+}
+
+const CONFIG_PATCH_STALE: &str =
+    "configuration changed since the snapshot; read current configuration before patching";
+const CONFIG_PATCH_FILE_STALE: &str =
+    "managed connector file differs from live inventory; reconcile it before patching";
+
+fn ensure_config_patch_precondition(
+    context: &ConnectorConfigContext,
+    expected_payload_digest: &str,
+    expected_active_revision_id: Option<u64>,
+) -> HostResult<()> {
+    if expected_payload_digest != context.current.payload_digest
+        || expected_active_revision_id
+            .is_some_and(|expected| current_config_revision_id(context) != Some(expected))
+    {
+        return Err(HostError::InvalidFilter(CONFIG_PATCH_STALE.to_owned()));
+    }
+    Ok(())
+}
+
+fn ensure_config_patch_inventory_matches(
+    live: &[ConnectorConfig],
+    persisted: &[ConnectorConfig],
+) -> HostResult<()> {
+    // File order is not authoritative, but every entry and all launch/policy
+    // fields are. Never fold an unadmitted external file edit into a patch.
+    let live_by_id = live
+        .iter()
+        .map(|config| (&config.id, config))
+        .collect::<BTreeMap<_, _>>();
+    let persisted_by_id = persisted
+        .iter()
+        .map(|config| (&config.id, config))
+        .collect::<BTreeMap<_, _>>();
+    if live_by_id.len() != live.len()
+        || persisted_by_id.len() != persisted.len()
+        || live_by_id != persisted_by_id
+    {
+        return Err(HostError::InvalidFilter(CONFIG_PATCH_FILE_STALE.to_owned()));
+    }
+    Ok(())
+}
+
+async fn current_managed_config_patch_inventory(
+    state: &AppState,
+) -> HostResult<Vec<ConnectorConfig>> {
+    let path = state.connectors_file.as_ref().ok_or_else(|| {
+        HostError::Unavailable(
+            "live connector config mutation requires FCP_HOST_CONNECTORS_FILE to be configured"
+                .to_owned(),
+        )
+    })?;
+    let persisted = read_connector_configs_file(path)?;
+    ensure_config_patch_inventory_matches(&state.registry.inventory().await, &persisted)?;
+    Ok(persisted)
+}
+
+fn map_config_patch_error(error: HostError) -> (StatusCode, String) {
+    match &error {
+        HostError::InvalidFilter(message)
+            if message == CONFIG_PATCH_STALE || message == CONFIG_PATCH_FILE_STALE =>
+        {
+            return (StatusCode::CONFLICT, message.clone());
+        }
+        _ => {}
+    }
+    // Validation and startup errors can contain values from the private
+    // configuration. The patch RPC must never turn those into a secret read.
+    let message = match &error {
+        HostError::ConnectorNotFound(_) => "connector was not found",
+        HostError::InvalidFilter(_) => "configuration patch path or value failed host validation",
+        HostError::PreflightFailed(_) | HostError::ZoneEnvelopeRequired(_) => {
+            "configuration patch was refused by host policy"
+        }
+        HostError::CacheError(_) | HostError::Unavailable(_) => {
+            "configuration patch is unavailable for the current host or connector state"
+        }
+        HostError::RegistryError(_) | HostError::Internal(_) => {
+            "configuration patch was not completed; inspect current configuration before retrying"
+        }
+    };
+    (host_error_status(&error), message.to_owned())
+}
+
+fn decode_config_patch_request(
+    request: Result<Json<ConnectorConfigPatchRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<ConnectorConfigPatchRequest, (StatusCode, String)> {
+    request.map(|Json(request)| request).map_err(|error| {
+        // Serde's diagnostic can echo a supplied string (including a secret).
+        (
+            error.status(),
+            "invalid configuration patch request".to_owned(),
+        )
+    })
+}
+
+fn connector_config_patch_routes() -> Router<Arc<AppState>> {
+    Router::new()
+        .route(
+            "/rpc/connectors/{connector_id}/config/patch/validate",
+            post(connector_config_patch_validate_handler),
+        )
+        .route(
+            "/rpc/connectors/{connector_id}/config/patch",
+            post(connector_config_patch_handler),
+        )
+        .layer(axum::extract::DefaultBodyLimit::max(2 * 1024 * 1024))
+}
+
+// Called only with inventory_transaction held. Both endpoints rebuild the
+// candidate from the host's private payload and check the same exact snapshot.
+async fn prepare_connector_config_patch(
+    state: &AppState,
+    connector_id: &ConnectorId,
+    request: &ConnectorConfigPatchRequest,
+) -> HostResult<(ConnectorConfigContext, Value, Vec<ConnectorConfig>)> {
+    let context = load_connector_config_context(state, connector_id).await?;
+    ensure_config_patch_precondition(
+        &context,
+        &request.expected_payload_digest,
+        request.expected_active_revision_id,
+    )?;
+    let candidate = request.operation.apply_to(&context.raw_payload)?;
+    let inventory = current_managed_config_patch_inventory(state).await?;
+    let next_inventory = next_inventory_with_config(inventory, connector_id, candidate.clone())?;
+    Ok((context, candidate, next_inventory))
+}
+
+async fn connector_config_patch_validate_handler(
+    State(state): State<Arc<AppState>>,
+    Path(connector_id): Path<String>,
+    request: Result<Json<ConnectorConfigPatchRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<ConnectorConfigValidateResponse>, (StatusCode, String)> {
+    let connector_id = parse_connector_id(&connector_id)?;
+    let request = decode_config_patch_request(request)?;
+    let _transaction = state.registry.inventory_transaction.lock().await;
+    let (context, payload, inventory) =
+        prepare_connector_config_patch(&state, &connector_id, &request)
+            .await
+            .map_err(map_config_patch_error)?;
+    let candidate = SanitizedConnectorConfig::from_payload(payload.clone())
+        .map_err(map_lifecycle_host_error)
+        .map_err(map_config_patch_error)?;
+    let diff = diff_sanitized_config_values(&context.raw_payload, &payload)
+        .map_err(map_lifecycle_host_error)
+        .map_err(map_config_patch_error)?;
+    // This performs the existing static admission checks without preparing,
+    // configuring, executing, publishing, or persisting a connector.
+    let (valid, preview, error) = match state
+        .registry
+        .preview_configs_with_lifecycle(inventory, &state.lifecycle)
+        .await
+    {
+        Ok(preview) => (true, Some(preview), None),
+        Err(error) => (false, None, Some(map_config_patch_error(error).1)),
+    };
+    Ok(Json(ConnectorConfigValidateResponse {
+        connector_id,
+        valid,
+        current_active_revision_id: current_config_revision_id(&context),
+        current: context.current,
+        candidate,
+        diff,
+        preview,
+        error,
+    }))
+}
+
+async fn connector_config_patch_handler(
+    State(state): State<Arc<AppState>>,
+    Path(connector_id): Path<String>,
+    request: Result<Json<ConnectorConfigPatchRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<ConnectorConfigApplyResponse>, (StatusCode, String)> {
+    let connector_id = parse_connector_id(&connector_id)?;
+    let request = decode_config_patch_request(request)?;
+    let _transaction = state.registry.inventory_transaction.lock().await;
+    let (_, payload, inventory) = prepare_connector_config_patch(&state, &connector_id, &request)
+        .await
+        .map_err(map_config_patch_error)?;
+    // Preview is advisory: applying independently repeats admission under the
+    // transaction, even when the client did not call the preview endpoint.
+    state
+        .registry
+        .preview_configs_with_lifecycle(inventory, &state.lifecycle)
+        .await
+        .map_err(map_config_patch_error)?;
+    let response = apply_connector_config_payload_locked(
+        &state,
+        &connector_id,
+        payload,
+        request.expected_active_revision_id,
+        request.created_by,
+        request.change_reason,
+        Some(&request.expected_payload_digest),
+    )
+    .await
+    .map_err(map_config_patch_error)?;
+    Ok(Json(response))
 }
 
 async fn connector_config_snapshot_handler(
@@ -40150,6 +40386,474 @@ done"#;
             Some(newer.revision_id)
         );
         assert!(registry.inventory_transaction.try_lock().is_some());
+    }
+
+    async fn config_patch_fixture(
+        payload: Value,
+    ) -> (tempfile::TempDir, Arc<AppState>, ConnectorId) {
+        let directory = tempfile::tempdir().unwrap();
+        let id = "fcp.test.config-patch:utility:1.0.0";
+        let connector_id = ConnectorId::from_static(id);
+        let mut config = dispatcher_test_config(id);
+        // There is deliberately no executable: preview and disabled config
+        // edits must not attempt to start a connector.
+        config.binary = directory
+            .path()
+            .join("must-not-execute")
+            .display()
+            .to_string();
+        config.config = Some(payload.clone());
+        let path = directory.path().join("connectors.json");
+        write_connector_configs_file(&path, std::slice::from_ref(&config)).unwrap();
+        let base = cancel_route_test_state();
+        base.registry
+            .publish_configs(registry_publication_fixture(&base.registry, vec![config]).await)
+            .await
+            .unwrap();
+        base.lifecycle
+            .reconcile_registered_connectors(&base.registry.list().await)
+            .await
+            .unwrap();
+        base.lifecycle
+            .set_desired_state(&connector_id, fcp_host::DesiredRuntimeState::Disabled, None)
+            .await
+            .unwrap();
+        base.lifecycle
+            .append_config_revision(&connector_id, payload, None, None)
+            .await
+            .unwrap();
+        let state = Arc::new(AppState {
+            connectors_file: Some(path),
+            ..(*base).clone()
+        });
+        (directory, state, connector_id)
+    }
+
+    async fn config_patch_test_request(
+        state: &AppState,
+        connector_id: &ConnectorId,
+        operation: fcp_host::ConnectorConfigPatchOperation,
+    ) -> ConnectorConfigPatchRequest {
+        let context = load_connector_config_context(state, connector_id)
+            .await
+            .unwrap();
+        ConnectorConfigPatchRequest {
+            expected_payload_digest: context.current.payload_digest.clone(),
+            expected_active_revision_id: current_config_revision_id(&context),
+            operation,
+            created_by: Some("config-patch-test".to_owned()),
+            change_reason: None,
+        }
+    }
+
+    fn config_patch_set_field(name: &str, value: Value) -> fcp_host::ConnectorConfigPatchOperation {
+        fcp_host::ConnectorConfigPatchOperation::Set {
+            path: vec![fcp_host::ConnectorConfigPathSegment::Field(name.to_owned())],
+            value,
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn config_patch_preview_is_read_only_and_apply_preserves_private_siblings() {
+        let original = json!({
+            "api_key": "private-key-must-stay-on-host",
+            "settings": {"client_secret": "nested-private-value", "timeout": 10}
+        });
+        let (_directory, state, connector_id) = config_patch_fixture(original.clone()).await;
+        let request = config_patch_test_request(
+            &state,
+            &connector_id,
+            fcp_host::ConnectorConfigPatchOperation::Set {
+                path: vec![
+                    fcp_host::ConnectorConfigPathSegment::Field("settings".to_owned()),
+                    fcp_host::ConnectorConfigPathSegment::Field("timeout".to_owned()),
+                ],
+                value: json!(30),
+            },
+        )
+        .await;
+        let path = state.connectors_file.as_ref().unwrap();
+        let file_before = std::fs::read(path).unwrap();
+        let version_before = state.registry.version();
+        let admin_before = state
+            .lifecycle
+            .connector_state(&connector_id)
+            .await
+            .unwrap();
+        let Json(preview) = connector_config_patch_validate_handler(
+            State(Arc::clone(&state)),
+            Path(connector_id.to_string()),
+            Ok(Json(request.clone())),
+        )
+        .await
+        .unwrap();
+        assert!(preview.valid, "{:?}", preview.error);
+        assert_eq!(preview.candidate.payload["settings"]["timeout"], 30);
+        assert_eq!(std::fs::read(path).unwrap(), file_before);
+        assert_eq!(state.registry.version(), version_before);
+        assert_eq!(
+            state
+                .lifecycle
+                .connector_state(&connector_id)
+                .await
+                .unwrap()
+                .last_journal_sequence,
+            admin_before.last_journal_sequence
+        );
+        let encoded = serde_json::to_string(&preview).unwrap();
+        assert!(!encoded.contains("private-key-must-stay-on-host"));
+        assert!(!encoded.contains("nested-private-value"));
+
+        let Json(applied) = connector_config_patch_handler(
+            State(Arc::clone(&state)),
+            Path(connector_id.to_string()),
+            Ok(Json(request)),
+        )
+        .await
+        .unwrap();
+        assert!(applied.changed);
+        let persisted = read_connector_configs_file(path).unwrap();
+        let raw = connector_config_payload(&persisted[0]);
+        assert_eq!(raw["api_key"], original["api_key"]);
+        assert_eq!(
+            raw["settings"]["client_secret"],
+            original["settings"]["client_secret"]
+        );
+        assert_eq!(raw["settings"]["timeout"], 30);
+        assert_eq!(state.registry.inventory().await, persisted);
+        assert!(matches!(
+            &state.registry.state.read().await.connectors[&connector_id].connector,
+            ConnectorRuntime::Dormant(_)
+        ));
+        assert_eq!(
+            state
+                .lifecycle
+                .connector_state(&connector_id)
+                .await
+                .unwrap()
+                .desired_state,
+            fcp_host::DesiredRuntimeState::Disabled
+        );
+        let encoded = serde_json::to_string(&applied).unwrap();
+        assert!(!encoded.contains("private-key-must-stay-on-host"));
+        assert!(!encoded.contains("nested-private-value"));
+        assert_eq!(applied.revision.unwrap().payload["settings"]["timeout"], 30);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn config_patch_rechecks_raw_digest_after_preview_and_waiting_for_transaction() {
+        let (_directory, state, connector_id) =
+            config_patch_fixture(json!({"api_key": "old-private", "timeout": 10})).await;
+        let mut request = config_patch_test_request(
+            &state,
+            &connector_id,
+            config_patch_set_field("timeout", json!(20)),
+        )
+        .await;
+        // The mandatory digest also protects callers with no revision history.
+        request.expected_active_revision_id = None;
+        let Json(preview) = connector_config_patch_validate_handler(
+            State(Arc::clone(&state)),
+            Path(connector_id.to_string()),
+            Ok(Json(request.clone())),
+        )
+        .await
+        .unwrap();
+        assert!(preview.valid);
+        let preceding = state.registry.inventory_transaction.lock().await;
+        let mut pending = Box::pin(connector_config_patch_handler(
+            State(Arc::clone(&state)),
+            Path(connector_id.to_string()),
+            Ok(Json(request)),
+        ));
+        assert!(futures_util::poll!(pending.as_mut()).is_pending());
+        let mut newer = state.registry.inventory().await;
+        newer[0].config = Some(json!({"api_key": "rotated-private", "timeout": 10}));
+        write_connector_configs_file(state.connectors_file.as_ref().unwrap(), &newer).unwrap();
+        state
+            .registry
+            .publish_configs(registry_publication_fixture(&state.registry, newer.clone()).await)
+            .await
+            .unwrap();
+        // Do not append a revision: a secret rotation in managed inventory
+        // must still invalidate the old sanitized snapshot.
+        drop(preceding);
+        let (status, message) = pending.await.unwrap_err();
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(message, CONFIG_PATCH_STALE);
+        assert_eq!(state.registry.inventory().await, newer);
+        assert_eq!(
+            read_connector_configs_file(state.connectors_file.as_ref().unwrap()).unwrap(),
+            newer
+        );
+        assert!(state.registry.inventory_transaction.try_lock().is_some());
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn config_patch_rejects_managed_file_drift_without_overwriting_it() {
+        let (_directory, state, connector_id) =
+            config_patch_fixture(json!({"api_key": "private-original", "timeout": 10})).await;
+        let request = config_patch_test_request(
+            &state,
+            &connector_id,
+            config_patch_set_field("timeout", json!(20)),
+        )
+        .await;
+        let live = state.registry.inventory().await;
+        let path = state.connectors_file.as_ref().unwrap();
+        let version = state.registry.version();
+        for drift in ["payload", "launch", "unrelated", "duplicate"] {
+            let mut external = live.clone();
+            match drift {
+                "payload" => {
+                    external[0].config = Some(json!({"api_key": "external-private", "timeout": 10}))
+                }
+                "launch" => {
+                    external[0]
+                        .env
+                        .insert("EXTERNAL_EDIT".to_owned(), "private-env".to_owned());
+                }
+                "unrelated" => {
+                    external.push(dispatcher_test_config("fcp.test.unrelated:utility:1.0.0"))
+                }
+                "duplicate" => external.push(external[0].clone()),
+                _ => unreachable!(),
+            }
+            write_connector_configs_file(path, &external).unwrap();
+            let bytes = std::fs::read(path).unwrap();
+            let error = connector_config_patch_handler(
+                State(Arc::clone(&state)),
+                Path(connector_id.to_string()),
+                Ok(Json(request.clone())),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                error,
+                (StatusCode::CONFLICT, CONFIG_PATCH_FILE_STALE.to_owned())
+            );
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+            assert_eq!(state.registry.inventory().await, live);
+            assert_eq!(state.registry.version(), version);
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn config_patch_unset_compacts_arrays_and_missing_field_is_noop() {
+        let (_directory, state, connector_id) = config_patch_fixture(json!({
+            "api_key": "private-original", "items": ["first", "second", "third"], "obsolete": true
+        }))
+        .await;
+        for path in [
+            vec![
+                fcp_host::ConnectorConfigPathSegment::Field("items".to_owned()),
+                fcp_host::ConnectorConfigPathSegment::Index(1),
+            ],
+            vec![fcp_host::ConnectorConfigPathSegment::Field(
+                "obsolete".to_owned(),
+            )],
+        ] {
+            let request = config_patch_test_request(
+                &state,
+                &connector_id,
+                fcp_host::ConnectorConfigPatchOperation::Unset { path },
+            )
+            .await;
+            let Json(applied) = connector_config_patch_handler(
+                State(Arc::clone(&state)),
+                Path(connector_id.to_string()),
+                Ok(Json(request)),
+            )
+            .await
+            .unwrap();
+            assert!(applied.changed);
+        }
+        let current = load_connector_config_context(&state, &connector_id)
+            .await
+            .unwrap();
+        assert_eq!(current.raw_payload["items"], json!(["first", "third"]));
+        assert!(current.raw_payload.get("obsolete").is_none());
+        assert_eq!(current.raw_payload["api_key"], "private-original");
+        let request = config_patch_test_request(
+            &state,
+            &connector_id,
+            fcp_host::ConnectorConfigPatchOperation::Unset {
+                path: vec![fcp_host::ConnectorConfigPathSegment::Field(
+                    "missing".to_owned(),
+                )],
+            },
+        )
+        .await;
+        let version = state.registry.version();
+        let sequence = current.connector_state.unwrap().last_journal_sequence;
+        let bytes = std::fs::read(state.connectors_file.as_ref().unwrap()).unwrap();
+        let Json(applied) = connector_config_patch_handler(
+            State(Arc::clone(&state)),
+            Path(connector_id.to_string()),
+            Ok(Json(request)),
+        )
+        .await
+        .unwrap();
+        assert!(!applied.changed);
+        assert!(applied.revision.is_none());
+        assert_eq!(state.registry.version(), version);
+        assert_eq!(
+            state
+                .lifecycle
+                .connector_state(&connector_id)
+                .await
+                .unwrap()
+                .last_journal_sequence,
+            sequence
+        );
+        assert_eq!(
+            std::fs::read(state.connectors_file.as_ref().unwrap()).unwrap(),
+            bytes
+        );
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn config_patch_write_failure_retains_registry_file_and_revision() {
+        let (_directory, state, connector_id) =
+            config_patch_fixture(json!({"api_key": "private-original", "timeout": 10})).await;
+        let request = config_patch_test_request(
+            &state,
+            &connector_id,
+            config_patch_set_field("timeout", json!(20)),
+        )
+        .await;
+        let path = state.connectors_file.as_ref().unwrap();
+        let mut blocked = path.as_os_str().to_os_string();
+        blocked.push(".tmp");
+        std::fs::create_dir(PathBuf::from(blocked)).unwrap();
+        let bytes = std::fs::read(path).unwrap();
+        let inventory = state.registry.inventory().await;
+        let version = state.registry.version();
+        let admin = state
+            .lifecycle
+            .connector_state(&connector_id)
+            .await
+            .unwrap();
+        let (status, message) = connector_config_patch_handler(
+            State(Arc::clone(&state)),
+            Path(connector_id.to_string()),
+            Ok(Json(request)),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!message.contains("private-original"));
+        assert!(!message.contains(&path.display().to_string()));
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+        assert_eq!(state.registry.inventory().await, inventory);
+        assert_eq!(state.registry.version(), version);
+        assert_eq!(
+            state
+                .lifecycle
+                .connector_state(&connector_id)
+                .await
+                .unwrap()
+                .last_journal_sequence,
+            admin.last_journal_sequence
+        );
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn config_patch_validation_and_revision_failures_are_sanitized_and_atomic() {
+        let (_directory, state, connector_id) =
+            config_patch_fixture(json!({"api_key": "private-original", "timeout": 10})).await;
+        let request = config_patch_test_request(
+            &state,
+            &connector_id,
+            config_patch_set_field("state_model", json!("private-invalid-model")),
+        )
+        .await;
+        let path = state.connectors_file.as_ref().unwrap();
+        let bytes = std::fs::read(path).unwrap();
+        let inventory = state.registry.inventory().await;
+        let version = state.registry.version();
+        let Json(preview) = connector_config_patch_validate_handler(
+            State(Arc::clone(&state)),
+            Path(connector_id.to_string()),
+            Ok(Json(request.clone())),
+        )
+        .await
+        .unwrap();
+        assert!(!preview.valid);
+        assert!(!preview.error.unwrap().contains("private-invalid-model"));
+        let (status, message) = connector_config_patch_handler(
+            State(Arc::clone(&state)),
+            Path(connector_id.to_string()),
+            Ok(Json(request)),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(!message.contains("private-invalid-model"));
+
+        let mut stale_revision = config_patch_test_request(
+            &state,
+            &connector_id,
+            config_patch_set_field("timeout", json!(10)),
+        )
+        .await;
+        stale_revision.expected_active_revision_id = Some(u64::MAX);
+        let (status, _) = connector_config_patch_handler(
+            State(Arc::clone(&state)),
+            Path(connector_id.to_string()),
+            Ok(Json(stale_revision)),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+        assert_eq!(state.registry.inventory().await, inventory);
+        assert_eq!(state.registry.version(), version);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn config_patch_routes_require_admin_auth_and_sanitize_json_rejections() {
+        use tower::ServiceExt;
+
+        let (_directory, state, connector_id) = config_patch_fixture(json!({"timeout": 10})).await;
+        let app = connector_config_patch_routes()
+            .route_layer(from_fn_with_state(
+                Arc::clone(&state),
+                admin_auth_middleware,
+            ))
+            .with_state(Arc::clone(&state));
+        for suffix in ["patch", "patch/validate"] {
+            let uri = format!("/rpc/connectors/{connector_id}/config/{suffix}");
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(&uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+            let response = app.clone().oneshot(
+                Request::builder().method("POST").uri(&uri)
+                    .header("authorization", "Bearer topsecret")
+                    .header("x-fcp-zone", "z:owner")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&json!({
+                        "expected_payload_digest": "unused",
+                        "operation": {"op": "unset", "path": [{"index": "private-invalid-index"}]}
+                    })).unwrap())).unwrap(),
+            ).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            assert_eq!(&body[..], b"invalid configuration patch request");
+        }
     }
 
     #[cfg(unix)]

@@ -335,6 +335,7 @@ use fcp_host::{
     CancellationResponse as HostCancellationResponse, CleanupBehavior, ConfigRevisionRecord,
     ConnectorAdminStatus as HostConnectorAdminStatus, ConnectorConfigApplyRequest,
     ConnectorConfigApplyResponse, ConnectorConfigDiffRequest, ConnectorConfigDiffResponse,
+    ConnectorConfigPatchOperation, ConnectorConfigPatchRequest, ConnectorConfigPathSegment,
     ConnectorConfigRevisionsResponse, ConnectorConfigRollbackRequest, ConnectorConfigSnapshot,
     ConnectorConfigValidateRequest, ConnectorConfigValidateResponse,
     ConnectorInventoryMutationKind as HostConnectorInventoryMutationKind,
@@ -2772,6 +2773,11 @@ struct ConfigSetArgs {
 
     /// New value.
     value: String,
+
+    /// Host admin bearer token file (or use FCP_HOST_ADMIN_BEARER_TOKEN).
+    #[arg(long, value_name = "PATH")]
+    #[serde(skip_serializing)]
+    admin_token_file: Option<PathBuf>,
 }
 
 #[derive(Args, Debug, Serialize)]
@@ -2781,6 +2787,11 @@ struct ConfigUnsetArgs {
 
     /// Configuration key path to remove.
     key: String,
+
+    /// Host admin bearer token file (or use FCP_HOST_ADMIN_BEARER_TOKEN).
+    #[arg(long, value_name = "PATH")]
+    #[serde(skip_serializing)]
+    admin_token_file: Option<PathBuf>,
 }
 
 #[derive(Args, Debug, Serialize)]
@@ -6365,6 +6376,19 @@ impl HostAdminClient {
         Self::new_with_admin_credential(endpoint, token.as_ref().map(|value| value.as_str()))
     }
 
+    fn for_config_patch(endpoint: &str, token_file: Option<&Path>) -> Result<Self> {
+        let token = mesh_inventory_credential(token_file).map_err(|_| {
+            anyhow::anyhow!(
+                "config changes require --admin-token-file or FCP_HOST_ADMIN_BEARER_TOKEN containing a bounded ASCII token"
+            )
+        })?;
+        Self::new_with_transport(endpoint, Some(token.as_str()), true).map_err(|_| {
+            anyhow::anyhow!(
+                "config changes require HTTPS, literal loopback HTTP, or a Unix socket with a valid host read deadline"
+            )
+        })
+    }
+
     fn for_invocation_inspection(endpoint: &str) -> Result<Self> {
         Self::new_with_transport(endpoint, None, true).map_err(|_| {
             anyhow::anyhow!(
@@ -6669,6 +6693,64 @@ impl HostAdminClient {
             &format!("/rpc/connectors/{connector_id}/config/validate"),
             request,
         )
+    }
+
+    fn config_patch_validate(
+        &self,
+        connector_id: &str,
+        request: &ConnectorConfigPatchRequest,
+    ) -> Result<ConnectorConfigValidateResponse> {
+        self.post_config_patch_json(
+            &format!("/rpc/connectors/{connector_id}/config/patch/validate"),
+            request,
+        )
+    }
+
+    fn config_patch(
+        &self,
+        connector_id: &str,
+        request: &ConnectorConfigPatchRequest,
+    ) -> Result<ConnectorConfigApplyResponse> {
+        self.post_config_patch_json(
+            &format!("/rpc/connectors/{connector_id}/config/patch"),
+            request,
+        )
+    }
+
+    fn post_config_patch_json<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        request: &ConnectorConfigPatchRequest,
+    ) -> Result<T> {
+        // A patch can set a secret. Neither an error body nor a JSON decoder
+        // diagnostic may echo it, and an ambiguous write is never retried.
+        const MAX_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
+        let response = self
+            .client
+            .post(format!("{}{}", self.base_url, path))
+            .json(request)
+            .timeout(self.read_timeout)
+            .send()
+            .map_err(|_| anyhow::anyhow!("host config patch request failed; inspect current configuration before retrying"))?;
+        let status = response.status();
+        if !status.is_success() {
+            bail!(
+                "host config patch returned HTTP {}; inspect current configuration before retrying",
+                status.as_u16()
+            );
+        }
+        let mut bytes = Vec::new();
+        response
+            .take(MAX_RESPONSE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| anyhow::anyhow!("host config patch response could not be read; inspect current configuration before retrying"))?;
+        if bytes.len() as u64 > MAX_RESPONSE_BYTES {
+            bail!(
+                "host config patch response exceeded 16 MiB; inspect current configuration before retrying"
+            );
+        }
+        serde_json::from_slice(&bytes)
+            .map_err(|_| anyhow::anyhow!("host config patch returned an invalid response; inspect current configuration before retrying"))
     }
 
     fn config_apply(
@@ -21888,17 +21970,11 @@ fn config_dispatch(args: &ConfigArgs, explicit_host: Option<&str>) -> Result<Dis
                     ));
                 }
             };
+            let client = HostAdminClient::for_config_patch(
+                &host.endpoint,
+                set_args.admin_token_file.as_deref(),
+            )?;
             let snapshot = client.config_snapshot(connector.summary.id.as_str())?;
-            if !snapshot.current.is_replayable() {
-                return Ok(config_non_replayable_live_config_dispatch(
-                    "set",
-                    &host,
-                    &connector,
-                    &snapshot,
-                    json!({ "updated_path": &set_args.key }),
-                ));
-            }
-
             let path = parse_invoke_path(&set_args.key).map_err(|error| {
                 anyhow::anyhow!("invalid config path `{}`: {error:?}", set_args.key)
             })?;
@@ -21906,21 +21982,21 @@ fn config_dispatch(args: &ConfigArgs, explicit_host: Option<&str>) -> Result<Dis
             let schema_at_path = schema
                 .as_ref()
                 .and_then(|schema| invoke_schema_at_path(schema, &path));
-            let value = coerce_invoke_value(&set_args.value, schema_at_path)
-                .map_err(|error| anyhow::anyhow!("failed to parse config value: {error}"))?;
-
-            let mut candidate = snapshot.current.payload.clone();
-            apply_invoke_binding(&mut candidate, &path, value).map_err(|error| {
-                anyhow::anyhow!("failed to set config path `{}`: {error}", set_args.key)
+            let value = coerce_invoke_value(&set_args.value, schema_at_path).map_err(|_| {
+                anyhow::anyhow!("failed to parse config value for the requested field")
             })?;
-
-            let validation = client.config_validate(
-                connector.summary.id.as_str(),
-                &ConnectorConfigValidateRequest {
-                    payload: candidate.clone(),
-                    expected_active_revision_id: snapshot.active_revision_id,
+            let request = ConnectorConfigPatchRequest {
+                expected_payload_digest: snapshot.current.payload_digest.clone(),
+                expected_active_revision_id: snapshot.active_revision_id,
+                operation: ConnectorConfigPatchOperation::Set {
+                    path: connector_config_patch_path(path),
+                    value,
                 },
-            )?;
+                created_by: Some("fwc".to_owned()),
+                change_reason: Some(format!("fwc config set {}", set_args.key)),
+            };
+            let validation =
+                client.config_patch_validate(connector.summary.id.as_str(), &request)?;
             if !validation.valid {
                 return Ok(config_live_validation_dispatch(
                     "set",
@@ -21931,15 +22007,7 @@ fn config_dispatch(args: &ConfigArgs, explicit_host: Option<&str>) -> Result<Dis
                 ));
             }
 
-            let applied = client.config_apply(
-                connector.summary.id.as_str(),
-                &ConnectorConfigApplyRequest {
-                    payload: candidate,
-                    expected_active_revision_id: snapshot.active_revision_id,
-                    created_by: Some("fwc".to_owned()),
-                    change_reason: Some(format!("fwc config set {}", set_args.key)),
-                },
-            )?;
+            let applied = client.config_patch(connector.summary.id.as_str(), &request)?;
             let config = applied.current.payload.clone();
             let evidence_handles = vec![
                 config_apply_evidence_handle(
@@ -22024,32 +22092,25 @@ fn config_dispatch(args: &ConfigArgs, explicit_host: Option<&str>) -> Result<Dis
                     ));
                 }
             };
+            let client = HostAdminClient::for_config_patch(
+                &host.endpoint,
+                unset_args.admin_token_file.as_deref(),
+            )?;
             let snapshot = client.config_snapshot(connector.summary.id.as_str())?;
-            if !snapshot.current.is_replayable() {
-                return Ok(config_non_replayable_live_config_dispatch(
-                    "unset",
-                    &host,
-                    &connector,
-                    &snapshot,
-                    json!({ "updated_path": &unset_args.key }),
-                ));
-            }
-
             let path = parse_invoke_path(&unset_args.key).map_err(|error| {
                 anyhow::anyhow!("invalid config path `{}`: {error:?}", unset_args.key)
             })?;
-            let mut candidate = snapshot.current.payload.clone();
-            remove_invoke_binding(&mut candidate, &path).map_err(|error| {
-                anyhow::anyhow!("failed to unset config path `{}`: {error}", unset_args.key)
-            })?;
-
-            let validation = client.config_validate(
-                connector.summary.id.as_str(),
-                &ConnectorConfigValidateRequest {
-                    payload: candidate.clone(),
-                    expected_active_revision_id: snapshot.active_revision_id,
+            let request = ConnectorConfigPatchRequest {
+                expected_payload_digest: snapshot.current.payload_digest.clone(),
+                expected_active_revision_id: snapshot.active_revision_id,
+                operation: ConnectorConfigPatchOperation::Unset {
+                    path: connector_config_patch_path(path),
                 },
-            )?;
+                created_by: Some("fwc".to_owned()),
+                change_reason: Some(format!("fwc config unset {}", unset_args.key)),
+            };
+            let validation =
+                client.config_patch_validate(connector.summary.id.as_str(), &request)?;
             if !validation.valid {
                 return Ok(config_live_validation_dispatch(
                     "unset",
@@ -22060,15 +22121,7 @@ fn config_dispatch(args: &ConfigArgs, explicit_host: Option<&str>) -> Result<Dis
                 ));
             }
 
-            let applied = client.config_apply(
-                connector.summary.id.as_str(),
-                &ConnectorConfigApplyRequest {
-                    payload: candidate,
-                    expected_active_revision_id: snapshot.active_revision_id,
-                    created_by: Some("fwc".to_owned()),
-                    change_reason: Some(format!("fwc config unset {}", unset_args.key)),
-                },
-            )?;
+            let applied = client.config_patch(connector.summary.id.as_str(), &request)?;
             let config = applied.current.payload.clone();
             let evidence_handles = vec![
                 config_apply_evidence_handle(
@@ -22569,76 +22622,6 @@ fn config_missing_host_dispatch(
     DispatchOutcome {
         payload,
         exit_code: CliExitCode::Transport,
-    }
-}
-
-fn config_non_replayable_live_config_dispatch(
-    subcommand: &str,
-    host: &ResolvedHostConfig,
-    connector: &HostConnectorRecord,
-    snapshot: &ConnectorConfigSnapshot,
-    details: Value,
-) -> DispatchOutcome {
-    let scope = format!("config-{subcommand}");
-    let evidence_handles = vec![
-        config_snapshot_evidence_handles(
-            connector.summary.id.as_str(),
-            &host.endpoint,
-            snapshot,
-            false,
-        )
-        .into_iter()
-        .next()
-        .unwrap_or(Value::Null),
-        config_mutation_target_handle(
-            connector.summary.id.as_str(),
-            &host.endpoint,
-            subcommand,
-            details.clone(),
-        ),
-    ];
-    let mut payload = json!({
-        "status": "error",
-        "command": "config",
-        "subcommand": subcommand,
-        "source": "host-admin-api",
-        "error": {
-            "type": "non-replayable-live-config",
-            "message": format!(
-                "The live config snapshot for `{}` contains redacted inline secrets, so `fwc config {subcommand}` cannot safely construct a partial mutation from the sanitized payload.",
-                connector.slug
-            ),
-            "recoverable": true,
-        },
-        "connector": host_connector_descriptor_json(connector),
-        "snapshot": snapshot,
-        "details": details,
-        "next_actions": [
-            format!("fwc config get {} --host {}", connector.slug, host.endpoint),
-            format!("fwc config doctor {} --host {}", connector.slug, host.endpoint),
-            "Construct a complete replacement config document with all required secrets before attempting an import; the redacted live snapshot is intentionally not replayable as-is."
-                .to_owned(),
-            "Move inline secrets into credential references so future incremental edits remain replayable."
-                .to_owned(),
-        ],
-    });
-    attach_install_contract(
-        &mut payload,
-        "config",
-        "host-admin-api",
-        "node-local-root-app",
-        &scope,
-        Some(&host.endpoint),
-        false,
-        true,
-        false,
-        "Live config mutation previews remain authoritative for the current node even when sanitized snapshots make partial mutation unsafe. The rejected mutation target is recorded explicitly for automation.",
-        evidence_handles,
-    );
-    inject_truth_source_metadata(&mut payload, KnowledgeState::HostBacked);
-    DispatchOutcome {
-        payload,
-        exit_code: CliExitCode::Validation,
     }
 }
 
@@ -24862,45 +24845,13 @@ fn package_output_json(artifact: &PreparedPackageArtifact) -> Value {
     })
 }
 
-fn remove_invoke_binding(
-    target: &mut Value,
-    path: &[InvokePathSegment],
-) -> std::result::Result<(), String> {
-    if path.is_empty() {
-        *target = Value::Null;
-        return Ok(());
-    }
-
-    match &path[0] {
-        InvokePathSegment::Field(name) => {
-            let Some(object) = target.as_object_mut() else {
-                return Err(format!("Cannot remove `{name}` from a non-object value."));
-            };
-            if path.len() == 1 {
-                object.remove(name);
-                return Ok(());
-            }
-            let Some(next) = object.get_mut(name) else {
-                return Ok(());
-            };
-            remove_invoke_binding(next, &path[1..])
-        }
-        InvokePathSegment::Index(index) => {
-            let Some(array) = target.as_array_mut() else {
-                return Err(format!(
-                    "Cannot remove index [{index}] from a non-array value."
-                ));
-            };
-            if *index >= array.len() {
-                return Ok(());
-            }
-            if path.len() == 1 {
-                array.remove(*index);
-                return Ok(());
-            }
-            remove_invoke_binding(&mut array[*index], &path[1..])
-        }
-    }
+fn connector_config_patch_path(path: Vec<InvokePathSegment>) -> Vec<ConnectorConfigPathSegment> {
+    path.into_iter()
+        .map(|segment| match segment {
+            InvokePathSegment::Field(name) => ConnectorConfigPathSegment::Field(name),
+            InvokePathSegment::Index(index) => ConnectorConfigPathSegment::Index(index),
+        })
+        .collect()
 }
 
 fn export_tools_dispatch(args: &ExportToolsArgs, host: Option<&str>) -> Result<DispatchOutcome> {
@@ -50132,8 +50083,16 @@ deny_ptrace = true
         );
     }
 
+    fn config_patch_test_admin_token_file() -> (TempDir, PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("admin-token");
+        fs::write(&path, "config-patch-admin-token").unwrap();
+        (directory, path)
+    }
+
     #[test]
     fn execute_config_set_applies_live_host_mutation() {
+        let (_credential_dir, admin_file) = config_patch_test_admin_token_file();
         let current = json!({ "profile": "work" });
         let candidate = json!({ "profile": "prod" });
         let (host, server) = spawn_mock_host_sequence(vec![
@@ -50146,7 +50105,7 @@ deny_ptrace = true
                 mock_config_snapshot_json(current.clone()),
             ),
             (
-                "POST /rpc/connectors/fcp.github:enterprise:v1/config/validate".to_owned(),
+                "POST /rpc/connectors/fcp.github:enterprise:v1/config/patch/validate".to_owned(),
                 mock_config_validation_response_json(
                     true,
                     current.clone(),
@@ -50155,13 +50114,23 @@ deny_ptrace = true
                 ),
             ),
             (
-                "POST /rpc/connectors/fcp.github:enterprise:v1/config/apply".to_owned(),
+                "POST /rpc/connectors/fcp.github:enterprise:v1/config/patch".to_owned(),
                 mock_config_apply_response_json(candidate, current),
             ),
         ]);
 
         let (exit_code, payload) = execute_json(&[
-            "fwc", "--json", "--host", &host, "config", "set", "github", "profile", "prod",
+            "fwc",
+            "--json",
+            "--host",
+            &host,
+            "config",
+            "set",
+            "github",
+            "profile",
+            "prod",
+            "--admin-token-file",
+            admin_file.to_str().unwrap(),
         ]);
 
         server.join().expect("mock host thread should complete");
@@ -50189,6 +50158,7 @@ deny_ptrace = true
 
     #[test]
     fn execute_config_unset_applies_live_host_mutation() {
+        let (_credential_dir, admin_file) = config_patch_test_admin_token_file();
         let current = json!({ "profile": "work", "region": "us-east-1" });
         let candidate = json!({ "region": "us-east-1" });
         let (host, server) = spawn_mock_host_sequence(vec![
@@ -50201,7 +50171,7 @@ deny_ptrace = true
                 mock_config_snapshot_json(current.clone()),
             ),
             (
-                "POST /rpc/connectors/fcp.github:enterprise:v1/config/validate".to_owned(),
+                "POST /rpc/connectors/fcp.github:enterprise:v1/config/patch/validate".to_owned(),
                 mock_config_validation_response_json(
                     true,
                     current.clone(),
@@ -50210,13 +50180,22 @@ deny_ptrace = true
                 ),
             ),
             (
-                "POST /rpc/connectors/fcp.github:enterprise:v1/config/apply".to_owned(),
+                "POST /rpc/connectors/fcp.github:enterprise:v1/config/patch".to_owned(),
                 mock_config_apply_response_json(candidate, current),
             ),
         ]);
 
         let (exit_code, payload) = execute_json(&[
-            "fwc", "--json", "--host", &host, "config", "unset", "github", "profile",
+            "fwc",
+            "--json",
+            "--host",
+            &host,
+            "config",
+            "unset",
+            "github",
+            "profile",
+            "--admin-token-file",
+            admin_file.to_str().unwrap(),
         ]);
 
         server.join().expect("mock host thread should complete");
@@ -50243,54 +50222,258 @@ deny_ptrace = true
     }
 
     #[test]
-    fn execute_config_set_refuses_partial_mutation_when_live_snapshot_is_redacted() {
-        let (host, server) = spawn_mock_host_sequence(vec![
-            (
-                "POST /rpc/discover".to_owned(),
-                mock_discovery_response_json(),
-            ),
-            (
-                "GET /rpc/connectors/fcp.github:enterprise:v1/config".to_owned(),
-                mock_redacted_config_snapshot_json(json!({
+    fn execute_config_set_and_unset_patch_redacted_snapshots_without_replaying_them() {
+        let (_credential_dir, admin_file) = config_patch_test_admin_token_file();
+        for subcommand in ["set", "unset"] {
+            let current = json!({
+                "profile": "work",
+                "client_secret": "<redacted>",
+                "servers": [{"label": "first"}, {"label": "second"}]
+            });
+            let candidate = if subcommand == "set" {
+                json!({
                     "profile": "work",
-                    "client_secret": "<redacted>"
-                })),
-            ),
-        ]);
+                    "client_secret": "<redacted>",
+                    "servers": [{"label": "first"}, {"label": "updated"}]
+                })
+            } else {
+                json!({
+                    "profile": "work",
+                    "client_secret": "<redacted>",
+                    "servers": [{"label": "second"}]
+                })
+            };
+            let mut validation = mock_config_validation_response_json(
+                true,
+                current.clone(),
+                candidate.clone(),
+                None,
+            );
+            validation["current"] = mock_sanitized_config_json(current.clone(), true);
+            validation["candidate"] = mock_sanitized_config_json(candidate.clone(), true);
+            let mut applied = mock_config_apply_response_json(candidate.clone(), current.clone());
+            applied["previous"] = mock_sanitized_config_json(current.clone(), true);
+            applied["current"] = mock_sanitized_config_json(candidate.clone(), true);
+            applied["revision"]["payload"] = candidate.clone();
+            applied["revision"]["contains_inline_secrets"] = json!(true);
+            applied["revision"]["redacted_fields"] = json!(["/client_secret"]);
+            let (host, server, request_log) = spawn_mock_host_sequence_with_body_log(vec![
+                (
+                    "POST /rpc/discover".to_owned(),
+                    mock_discovery_response_json(),
+                ),
+                (
+                    "GET /rpc/connectors/fcp.github:enterprise:v1/config".to_owned(),
+                    mock_redacted_config_snapshot_json(current),
+                ),
+                (
+                    "POST /rpc/connectors/fcp.github:enterprise:v1/config/patch/validate"
+                        .to_owned(),
+                    validation,
+                ),
+                (
+                    "POST /rpc/connectors/fcp.github:enterprise:v1/config/patch".to_owned(),
+                    applied,
+                ),
+            ]);
+            let key = if subcommand == "set" {
+                "servers[1].label"
+            } else {
+                "servers[0]"
+            };
+            let mut args = vec![
+                "fwc", "--json", "--host", &host, "config", subcommand, "github", key,
+            ];
+            if subcommand == "set" {
+                args.push("updated");
+            }
+            args.extend(["--admin-token-file", admin_file.to_str().unwrap()]);
+            let (exit_code, payload) = execute_json(&args);
+            server.join().expect("mock host thread should complete");
+            assert_eq!(exit_code, CliExitCode::Success.into());
+            assert_eq!(payload["config"], candidate);
+            assert_eq!(
+                payload["response"]["current"]["contains_inline_secrets"],
+                true
+            );
+            let requests = request_log.lock().unwrap();
+            assert_eq!(requests.len(), 4);
+            let preview: Value = serde_json::from_str(&requests[2].1).unwrap();
+            let apply: Value = serde_json::from_str(&requests[3].1).unwrap();
+            assert_eq!(
+                preview, apply,
+                "preview and apply must share the original precondition"
+            );
+            assert_eq!(
+                apply["expected_payload_digest"],
+                "blake3-256:mock-config-redacted"
+            );
+            assert_eq!(apply["expected_active_revision_id"], 41);
+            assert_eq!(apply["operation"]["op"], subcommand);
+            assert!(apply.get("payload").is_none());
+            assert!(!requests[3].1.contains("<redacted>"));
+            assert!(!requests[3].1.contains("client_secret"));
+            if subcommand == "set" {
+                assert_eq!(
+                    apply["operation"]["path"],
+                    json!([{"field": "servers"}, {"index": 1}, {"field": "label"}])
+                );
+                assert_eq!(apply["operation"]["value"], "updated");
+            } else {
+                assert_eq!(
+                    apply["operation"]["path"],
+                    json!([{"field": "servers"}, {"index": 0}])
+                );
+                assert!(apply["operation"].get("value").is_none());
+            }
+        }
+    }
 
-        let (exit_code, payload) = execute_json(&[
-            "fwc", "--json", "--host", &host, "config", "set", "github", "profile", "prod",
-        ]);
+    #[test]
+    fn config_patch_client_sends_owner_authority_and_sanitizes_http_errors() {
+        let (_credential_dir, admin_file) = config_patch_test_admin_token_file();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let host = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "config patch request did not arrive"
+                        );
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("config patch accept failed: {error}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
+            assert!(
+                request_line
+                    .starts_with("POST /rpc/connectors/fcp.github:enterprise:v1/config/patch ")
+            );
+            let mut headers = StdBTreeMap::new();
+            loop {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+                let (name, value) = line.split_once(':').unwrap();
+                headers.insert(name.to_ascii_lowercase(), value.trim().to_owned());
+            }
+            assert_eq!(headers["authorization"], "Bearer config-patch-admin-token");
+            assert_eq!(headers["x-fcp-zone"], "z:owner");
+            let length = headers["content-length"].parse::<usize>().unwrap();
+            assert!(length <= 4096);
+            let mut body = vec![0_u8; length];
+            reader.read_exact(&mut body).unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["operation"]["value"], "private-request-value");
+            let response = r#"{"error":"private-request-value private-response-value"}"#;
+            write!(
+                stream,
+                "HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                response.len()
+            ).unwrap();
+            stream.flush().unwrap();
+        });
+        let client = super::HostAdminClient::for_config_patch(&host, Some(&admin_file)).unwrap();
+        let request = super::ConnectorConfigPatchRequest {
+            expected_payload_digest: "blake3-256:current".to_owned(),
+            expected_active_revision_id: Some(41),
+            operation: super::ConnectorConfigPatchOperation::Set {
+                path: vec![super::ConnectorConfigPathSegment::Field(
+                    "api_key".to_owned(),
+                )],
+                value: json!("private-request-value"),
+            },
+            created_by: None,
+            change_reason: None,
+        };
+        let error = client
+            .config_patch("fcp.github:enterprise:v1", &request)
+            .unwrap_err();
+        server.join().unwrap();
+        let message = format!("{error:#}");
+        assert!(message.contains("HTTP 409"));
+        assert!(!message.contains("private-request-value"));
+        assert!(!message.contains("private-response-value"));
+        assert!(!message.contains("config-patch-admin-token"));
 
-        server.join().expect("mock host thread should complete");
-        assert_eq!(exit_code, CliExitCode::Validation.into());
-        assert_eq!(payload["command"], "config");
-        assert_eq!(payload["subcommand"], "set");
-        assert_eq!(payload["error"]["type"], "non-replayable-live-config");
-        assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
-        assert_eq!(payload["_truth_source"], "host");
-        assert_install_contract(
-            &payload,
-            "host-admin-api",
-            "node-local-root-app",
-            "config-set",
-            false,
-            true,
-            false,
-        );
-        assert_eq!(
-            payload["snapshot"]["current"]["contains_inline_secrets"],
-            true
-        );
-        assert_evidence_handle(&payload, "config-snapshot");
-        assert_evidence_handle(&payload, "config-mutation-target");
-        assert!(
-            payload["next_actions"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|entry| !entry.as_str().unwrap().contains("fwc config import"))
-        );
+        let error = super::HostAdminClient::for_config_patch(
+            "http://untrusted-config-host.example",
+            Some(&admin_file),
+        )
+        .err()
+        .expect("owner credential transport must be confidential");
+        assert!(error.to_string().contains("HTTPS"));
+        let error = super::HostAdminClient::for_config_patch(
+            &host,
+            Some(&admin_file.with_file_name("missing-token")),
+        )
+        .err()
+        .expect("an invalid explicit credential must fail before network");
+        assert!(error.to_string().contains("--admin-token-file"));
+    }
+
+    #[test]
+    fn config_patch_client_sanitizes_invalid_response_diagnostics_without_retrying() {
+        let (_credential_dir, admin_file) = config_patch_test_admin_token_file();
+        for validate in [false, true] {
+            let suffix = if validate { "patch/validate" } else { "patch" };
+            let route = format!("POST /rpc/connectors/fcp.github:enterprise:v1/config/{suffix}");
+            let (host, server, request_log, stop) = spawn_mock_host_sequence_with_observer(
+                vec![(
+                    route,
+                    json!({"connector_id": "private-response-value"}),
+                    Duration::ZERO,
+                )],
+                |_, _| {},
+            );
+            let client =
+                super::HostAdminClient::for_config_patch(&host, Some(&admin_file)).unwrap();
+            let request = super::ConnectorConfigPatchRequest {
+                expected_payload_digest: "blake3-256:current".to_owned(),
+                expected_active_revision_id: Some(41),
+                operation: super::ConnectorConfigPatchOperation::Set {
+                    path: vec![super::ConnectorConfigPathSegment::Field(
+                        "api_key".to_owned(),
+                    )],
+                    value: json!("private-request-value"),
+                },
+                created_by: None,
+                change_reason: None,
+            };
+            let error = if validate {
+                client
+                    .config_patch_validate("fcp.github:enterprise:v1", &request)
+                    .unwrap_err()
+            } else {
+                client
+                    .config_patch("fcp.github:enterprise:v1", &request)
+                    .unwrap_err()
+            };
+            stop.send(()).unwrap();
+            server.join().expect("mock host thread should complete");
+            let message = format!("{error:#}");
+            assert!(message.contains("invalid response"));
+            assert!(!message.contains("private-response-value"));
+            assert!(!message.contains("private-request-value"));
+            assert_eq!(request_log.lock().unwrap().len(), 1);
+        }
     }
 
     #[test]
@@ -55318,7 +55501,7 @@ deny_ptrace = true
 
         match prepared.cli.command {
             Commands::Config(super::ConfigArgs {
-                command: super::ConfigCommand::Unset(super::ConfigUnsetArgs { connector, key }),
+                command: super::ConfigCommand::Unset(super::ConfigUnsetArgs { connector, key, .. }),
                 ..
             }) => {
                 assert_eq!(connector, "github");
@@ -70458,6 +70641,7 @@ require_attestation_types = ["in-toto"]"#,
 
     #[test]
     fn config_set_host_validation_failure() {
+        let (_credential_dir, admin_file) = config_patch_test_admin_token_file();
         let current = json!({ "profile": "work" });
         let candidate = json!({ "profile": "invalid!" });
         let (host, server) = spawn_mock_host_sequence(vec![
@@ -70470,7 +70654,7 @@ require_attestation_types = ["in-toto"]"#,
                 mock_config_snapshot_json(current.clone()),
             ),
             (
-                "POST /rpc/connectors/fcp.github:enterprise:v1/config/validate".to_owned(),
+                "POST /rpc/connectors/fcp.github:enterprise:v1/config/patch/validate".to_owned(),
                 mock_config_validation_response_json(
                     false,
                     current,
@@ -70481,7 +70665,17 @@ require_attestation_types = ["in-toto"]"#,
         ]);
 
         let (exit_code, payload) = execute_json(&[
-            "fwc", "--json", "--host", &host, "config", "set", "github", "profile", "invalid!",
+            "fwc",
+            "--json",
+            "--host",
+            &host,
+            "config",
+            "set",
+            "github",
+            "profile",
+            "invalid!",
+            "--admin-token-file",
+            admin_file.to_str().unwrap(),
         ]);
 
         server.join().expect("mock host thread should complete");

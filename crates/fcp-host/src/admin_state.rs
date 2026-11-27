@@ -36,8 +36,8 @@ mod capability_usage;
 mod mesh_invocations;
 mod telegram_restart;
 mod usage_budget;
-use capability_usage::{CapabilityUsageLedger, CapabilityUsageScope};
 pub use capability_usage::InvocationResponseBudget;
+use capability_usage::{CapabilityUsageLedger, CapabilityUsageScope};
 pub use mesh_invocations::*;
 pub use telegram_restart::*;
 
@@ -2638,6 +2638,383 @@ pub struct ConnectorConfigApplyRequest {
     pub change_reason: Option<String>,
 }
 
+/// One typed component of an incremental connector-config path.
+///
+/// Field names are literal, including names containing dots or slashes. Array
+/// indices are distinct from numeric object keys.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectorConfigPathSegment {
+    /// A literal JSON object key.
+    Field(String),
+    /// A zero-based JSON array index.
+    Index(usize),
+}
+
+/// A single mutation applied to the host's private configuration payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ConnectorConfigPatchOperation {
+    /// Set a field or array element, creating missing containers as needed.
+    /// Arrays may be appended to at their current length; sparse growth is rejected.
+    Set {
+        /// Nonempty typed path, with at most 64 components.
+        path: Vec<ConnectorConfigPathSegment>,
+        /// The new value. Other values, including private siblings, are retained.
+        value: Value,
+    },
+    /// Remove a field or array element. A missing path is an unchanged result.
+    Unset {
+        /// Nonempty typed path, with at most 64 components.
+        path: Vec<ConnectorConfigPathSegment>,
+    },
+}
+
+impl ConnectorConfigPatchOperation {
+    /// Apply one bounded mutation without modifying the input on any error.
+    /// Existing scalar values are never implicitly converted into containers.
+    ///
+    /// # Errors
+    ///
+    /// Rejects empty/deep paths, oversized fields or payloads, sparse array
+    /// growth and container-type mismatches. Errors contain no payload values.
+    pub fn apply_to(&self, current: &Value) -> HostResult<Value> {
+        let path = match self {
+            Self::Set { path, .. } | Self::Unset { path } => path,
+        };
+        if path.is_empty() || path.len() > 64 {
+            return Err(invalid_config_patch(
+                "config patch requires between 1 and 64 path components",
+            ));
+        }
+        for segment in path {
+            match segment {
+                ConnectorConfigPathSegment::Field(name) if name.len() > 1024 => {
+                    return Err(invalid_config_patch(
+                        "config patch field exceeds 1024 bytes",
+                    ));
+                }
+                ConnectorConfigPathSegment::Index(index) if *index > 4095 => {
+                    return Err(invalid_config_patch(
+                        "config patch array index exceeds 4095",
+                    ));
+                }
+                _ => {}
+            }
+        }
+        let mut candidate = current.clone();
+        match self {
+            Self::Set { value, .. } => set_config_patch_value(&mut candidate, path, value)?,
+            Self::Unset { .. } => unset_config_patch_value(&mut candidate, path)?,
+        }
+        let encoded = serde_json::to_vec(&candidate)
+            .map_err(|_| invalid_config_patch("config patch result cannot be serialized"))?;
+        if encoded.len() > 2 * 1024 * 1024 {
+            return Err(invalid_config_patch("config patch result exceeds 2 MiB"));
+        }
+        Ok(candidate)
+    }
+}
+
+fn invalid_config_patch(message: &str) -> HostError {
+    HostError::InvalidFilter(message.to_owned())
+}
+
+fn new_config_patch_container(next: &ConnectorConfigPathSegment) -> Value {
+    match next {
+        ConnectorConfigPathSegment::Field(_) => Value::Object(serde_json::Map::new()),
+        ConnectorConfigPathSegment::Index(_) => Value::Array(Vec::new()),
+    }
+}
+
+fn set_config_patch_value(
+    target: &mut Value,
+    path: &[ConnectorConfigPathSegment],
+    value: &Value,
+) -> HostResult<()> {
+    let (first, rest) = path
+        .split_first()
+        .ok_or_else(|| invalid_config_patch("config patch path is empty"))?;
+    match first {
+        ConnectorConfigPathSegment::Field(name) => {
+            let object = target.as_object_mut().ok_or_else(|| {
+                invalid_config_patch("config patch field requires an object container")
+            })?;
+            if rest.is_empty() {
+                object.insert(name.clone(), value.clone());
+            } else {
+                let child = object
+                    .entry(name.clone())
+                    .or_insert_with(|| new_config_patch_container(&rest[0]));
+                set_config_patch_value(child, rest, value)?;
+            }
+        }
+        ConnectorConfigPathSegment::Index(index) => {
+            let array = target.as_array_mut().ok_or_else(|| {
+                invalid_config_patch("config patch index requires an array container")
+            })?;
+            if *index > array.len() {
+                return Err(invalid_config_patch(
+                    "config patch cannot create sparse array elements",
+                ));
+            }
+            if rest.is_empty() {
+                if *index == array.len() {
+                    array.push(value.clone());
+                } else {
+                    array[*index] = value.clone();
+                }
+            } else {
+                if *index == array.len() {
+                    array.push(new_config_patch_container(&rest[0]));
+                }
+                set_config_patch_value(&mut array[*index], rest, value)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn unset_config_patch_value(
+    target: &mut Value,
+    path: &[ConnectorConfigPathSegment],
+) -> HostResult<()> {
+    let (first, rest) = path
+        .split_first()
+        .ok_or_else(|| invalid_config_patch("config patch path is empty"))?;
+    match first {
+        ConnectorConfigPathSegment::Field(name) => {
+            let object = target.as_object_mut().ok_or_else(|| {
+                invalid_config_patch("config patch field requires an object container")
+            })?;
+            if rest.is_empty() {
+                object.remove(name);
+            } else if let Some(child) = object.get_mut(name) {
+                unset_config_patch_value(child, rest)?;
+            }
+        }
+        ConnectorConfigPathSegment::Index(index) => {
+            let array = target.as_array_mut().ok_or_else(|| {
+                invalid_config_patch("config patch index requires an array container")
+            })?;
+            if *index < array.len() {
+                if rest.is_empty() {
+                    array.remove(*index);
+                } else {
+                    unset_config_patch_value(&mut array[*index], rest)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Preview or apply an incremental mutation without fetching private config.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectorConfigPatchRequest {
+    /// Required exact digest from the current sanitized host snapshot. The
+    /// digest covers the raw payload, so secret rotations also invalidate it.
+    pub expected_payload_digest: String,
+    /// Optional additional revision guard; the payload guard is always required.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_active_revision_id: Option<u64>,
+    /// Exactly one typed mutation. All other private values stay on the host.
+    pub operation: ConnectorConfigPatchOperation,
+    /// Optional actor/subsystem label recorded in revision history.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_by: Option<String>,
+    /// Optional change summary recorded in revision history.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub change_reason: Option<String>,
+}
+
+#[cfg(test)]
+mod config_patch_tests {
+    use super::*;
+
+    fn field(name: &str) -> ConnectorConfigPathSegment {
+        ConnectorConfigPathSegment::Field(name.to_owned())
+    }
+
+    fn index(value: usize) -> ConnectorConfigPathSegment {
+        ConnectorConfigPathSegment::Index(value)
+    }
+
+    #[test]
+    fn config_patch_set_preserves_private_siblings_and_literal_keys() {
+        let original = serde_json::json!({
+            "api_key": "private-original",
+            "settings": {"secret": "private-nested", "timeout": 10},
+            "literal.key/with~escapes": false
+        });
+        let candidate = ConnectorConfigPatchOperation::Set {
+            path: vec![field("settings"), field("timeout")],
+            value: serde_json::json!(30),
+        }
+        .apply_to(&original)
+        .unwrap();
+        assert_eq!(candidate["api_key"], "private-original");
+        assert_eq!(candidate["settings"]["secret"], "private-nested");
+        assert_eq!(candidate["settings"]["timeout"], 30);
+        assert_eq!(original["settings"]["timeout"], 10);
+
+        let candidate = ConnectorConfigPatchOperation::Set {
+            path: vec![field("literal.key/with~escapes")],
+            value: serde_json::json!(true),
+        }
+        .apply_to(&candidate)
+        .unwrap();
+        assert_eq!(candidate["literal.key/with~escapes"], true);
+        assert_eq!(candidate["api_key"], original["api_key"]);
+    }
+
+    #[test]
+    fn config_patch_set_builds_missing_containers_and_appends_contiguous_arrays() {
+        let candidate = ConnectorConfigPatchOperation::Set {
+            path: vec![field("regions"), index(0), field("name")],
+            value: serde_json::json!("west"),
+        }
+        .apply_to(&serde_json::json!({}))
+        .unwrap();
+        assert_eq!(
+            candidate,
+            serde_json::json!({"regions": [{"name": "west"}]})
+        );
+        let candidate = ConnectorConfigPatchOperation::Set {
+            path: vec![field("regions"), index(1)],
+            value: serde_json::json!({"name": "east"}),
+        }
+        .apply_to(&candidate)
+        .unwrap();
+        assert_eq!(candidate["regions"].as_array().unwrap().len(), 2);
+        assert_eq!(candidate["regions"][1]["name"], "east");
+    }
+
+    #[test]
+    fn config_patch_type_errors_and_sparse_growth_are_atomic_and_sanitized() {
+        for original in [
+            serde_json::json!({"settings": "sensitive-scalar"}),
+            serde_json::json!({"settings": null}),
+            serde_json::json!({"settings": []}),
+        ] {
+            let before = original.clone();
+            let error = ConnectorConfigPatchOperation::Set {
+                path: vec![field("settings"), field("child")],
+                value: serde_json::json!("sensitive-new-value"),
+            }
+            .apply_to(&original)
+            .unwrap_err();
+            assert_eq!(original, before);
+            assert!(!error.to_string().contains("sensitive"));
+        }
+        let original = serde_json::json!({});
+        let error = ConnectorConfigPatchOperation::Set {
+            path: vec![field("new"), field("array"), index(2)],
+            value: serde_json::json!(1),
+        }
+        .apply_to(&original)
+        .unwrap_err();
+        assert!(error.to_string().contains("sparse"));
+        assert_eq!(original, serde_json::json!({}));
+    }
+
+    #[test]
+    fn config_patch_unset_removes_fields_and_compacts_arrays() {
+        let original = serde_json::json!({
+            "api_key": "private-original",
+            "items": [{"label": "first"}, {"label": "second"}, {"label": "third"}],
+            "options": {"enabled": true, "keep": 7}
+        });
+        let candidate = ConnectorConfigPatchOperation::Unset {
+            path: vec![field("items"), index(1)],
+        }
+        .apply_to(&original)
+        .unwrap();
+        assert_eq!(
+            candidate["items"],
+            serde_json::json!([{"label": "first"}, {"label": "third"}])
+        );
+        let candidate = ConnectorConfigPatchOperation::Unset {
+            path: vec![field("options"), field("enabled")],
+        }
+        .apply_to(&candidate)
+        .unwrap();
+        assert_eq!(candidate["options"], serde_json::json!({"keep": 7}));
+        assert_eq!(candidate["api_key"], "private-original");
+        assert_eq!(original["items"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn config_patch_unset_missing_paths_is_unchanged_but_wrong_types_fail() {
+        let original = serde_json::json!({"items": [1], "scalar": "private-value"});
+        for path in [
+            vec![field("missing"), field("child")],
+            vec![field("items"), index(3), field("child")],
+        ] {
+            assert_eq!(
+                ConnectorConfigPatchOperation::Unset { path }
+                    .apply_to(&original)
+                    .unwrap(),
+                original
+            );
+        }
+        let error = ConnectorConfigPatchOperation::Unset {
+            path: vec![field("scalar"), field("child")],
+        }
+        .apply_to(&original)
+        .unwrap_err();
+        assert!(!error.to_string().contains("private-value"));
+    }
+
+    #[test]
+    fn config_patch_rejects_unbounded_paths_and_results() {
+        for path in [
+            Vec::new(),
+            vec![field("nested"); 65],
+            vec![field(&"x".repeat(1025))],
+            vec![index(4096)],
+        ] {
+            assert!(
+                ConnectorConfigPatchOperation::Unset { path }
+                    .apply_to(&serde_json::json!({}))
+                    .is_err()
+            );
+        }
+        assert!(
+            ConnectorConfigPatchOperation::Set {
+                path: vec![field("large")],
+                value: Value::String("x".repeat(2 * 1024 * 1024)),
+            }
+            .apply_to(&serde_json::json!({}))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn config_patch_request_requires_digest_and_rejects_unknown_fields() {
+        let request = serde_json::json!({
+            "expected_payload_digest": "blake3-256:current",
+            "operation": {"op": "set", "path": [{"field": "timeout"}], "value": 30}
+        });
+        let parsed: ConnectorConfigPatchRequest = serde_json::from_value(request.clone()).unwrap();
+        assert_eq!(parsed.expected_active_revision_id, None);
+        assert_eq!(
+            parsed.operation.apply_to(&serde_json::json!({})).unwrap(),
+            serde_json::json!({"timeout": 30})
+        );
+        let mut missing = request.clone();
+        missing
+            .as_object_mut()
+            .unwrap()
+            .remove("expected_payload_digest");
+        assert!(serde_json::from_value::<ConnectorConfigPatchRequest>(missing).is_err());
+        let mut unknown = request;
+        unknown["operation"]["unexpected"] = serde_json::json!("private-value");
+        assert!(serde_json::from_value::<ConnectorConfigPatchRequest>(unknown).is_err());
+    }
+}
+
 /// Apply response for a host-backed config mutation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectorConfigApplyResponse {
@@ -2778,11 +3155,21 @@ fn sanitize_diff_value(path: &str, value: Option<Value>) -> Result<Option<Value>
 
 fn sanitize_diff_value_inner(path: &str, value: Value) -> Result<Value, LifecycleError> {
     if path != "/" {
-        let key = path.rsplit('/').next().unwrap_or_default();
-        if should_redact_config_key(key) {
+        // A diff may descend into a secret object/array even though the
+        // snapshot redacts that whole subtree. Every ancestor must therefore
+        // retain the same secrecy boundary, including escaped literal keys.
+        let keys = path
+            .split('/')
+            .skip(1)
+            .map(|key| key.replace("~1", "/").replace("~0", "~"))
+            .collect::<Vec<_>>();
+        if keys.iter().any(|key| should_redact_config_key(key)) {
             return Ok(Value::String(REDACTED_CONFIG_VALUE.to_string()));
         }
-        if is_credential_reference_key(key) {
+        if keys
+            .last()
+            .is_some_and(|key| is_credential_reference_key(key))
+        {
             return Ok(value);
         }
     }
@@ -3384,7 +3771,8 @@ impl HostAdminStateSnapshot {
                     })
                 {
                     return Err(HostError::Internal(
-                        "persisted response settlement has no definite source observation".to_owned(),
+                        "persisted response settlement has no definite source observation"
+                            .to_owned(),
                     ));
                 }
             }
@@ -5240,7 +5628,10 @@ impl HostAdminStateStore {
                         .rposition(|event| event.event_id == cursor)
                 })
         });
-        let cursor_found = request.after_event_id.as_ref().map(|_| cursor_index.is_some());
+        let cursor_found = request
+            .after_event_id
+            .as_ref()
+            .map(|_| cursor_index.is_some());
         if cursor_found == Some(false) {
             return EventPageQueryResponse {
                 events: Vec::new(),
@@ -6069,7 +6460,9 @@ impl HostAdminStateStore {
                 finalization: None,
                 budget_requests_reserved,
                 budget_usage_digest: None,
-                capability_response: usage.as_ref().and_then(CapabilityUsageScope::response_budget),
+                capability_response: usage
+                    .as_ref()
+                    .and_then(CapabilityUsageScope::response_budget),
                 durable,
             });
             snapshot.next_invocation_attempt_id = next_attempt_id;
@@ -9251,6 +9644,42 @@ mod tests {
     }
 
     #[test]
+    fn config_patch_diff_redacts_changes_beneath_secret_objects_and_arrays() {
+        let before = serde_json::json!({
+            "client_secret": {"value": "old-private", "credential_id": "old-private-id"},
+            "api_key/escaped": ["old-key"],
+            "options": {"timeout": 10}
+        });
+        let after = serde_json::json!({
+            "client_secret": {"value": "new-private", "credential_id": "new-private-id"},
+            "api_key/escaped": ["new-key"],
+            "options": {"timeout": 20}
+        });
+        let diff = diff_sanitized_config_values(&before, &after).unwrap();
+        assert_eq!(diff.len(), 4);
+        let encoded = serde_json::to_string(&diff).unwrap();
+        for secret in ["old-private", "new-private", "old-key", "new-key"] {
+            assert!(!encoded.contains(secret), "{encoded}");
+        }
+        let public = diff
+            .iter()
+            .find(|entry| entry.path == "/options/timeout")
+            .unwrap();
+        assert_eq!(public.before, Some(serde_json::json!(10)));
+        assert_eq!(public.after, Some(serde_json::json!(20)));
+        for entry in diff.iter().filter(|entry| entry.path != "/options/timeout") {
+            assert_eq!(
+                entry.before,
+                Some(Value::String(REDACTED_CONFIG_VALUE.to_string()))
+            );
+            assert_eq!(
+                entry.after,
+                Some(Value::String(REDACTED_CONFIG_VALUE.to_string()))
+            );
+        }
+    }
+
+    #[test]
     fn diff_sanitized_config_values_redacts_secrets_without_hiding_changes() {
         let before = serde_json::json!({
             "profile": "work",
@@ -10674,7 +11103,11 @@ mod tests {
 
         let first = store.query_events_page(&event_page_request(2, None)).await;
         assert_eq!(
-            first.events.iter().map(|event| event.summary.as_str()).collect::<Vec<_>>(),
+            first
+                .events
+                .iter()
+                .map(|event| event.summary.as_str())
+                .collect::<Vec<_>>(),
             vec!["first", "second"]
         );
         assert!(first.has_more);
@@ -10691,7 +11124,11 @@ mod tests {
             .query_events_page(&event_page_request(2, first.next_cursor.as_deref()))
             .await;
         assert_eq!(
-            second.events.iter().map(|event| event.summary.as_str()).collect::<Vec<_>>(),
+            second
+                .events
+                .iter()
+                .map(|event| event.summary.as_str())
+                .collect::<Vec<_>>(),
             vec!["third", "fourth"]
         );
         assert_eq!(second.after_event_id.as_deref(), Some("evt-2"));
@@ -10743,10 +11180,20 @@ mod tests {
         // It remains valid, and prior matching history is not replayed.
         request.after_event_id = first.next_cursor;
         store
-            .emit_event(HostEventKind::HealthCheck, Some("beta"), "skip".to_owned(), None)
+            .emit_event(
+                HostEventKind::HealthCheck,
+                Some("beta"),
+                "skip".to_owned(),
+                None,
+            )
             .await;
         store
-            .emit_event(HostEventKind::HealthCheck, Some("alpha"), "new".to_owned(), None)
+            .emit_event(
+                HostEventKind::HealthCheck,
+                Some("alpha"),
+                "new".to_owned(),
+                None,
+            )
             .await;
         let second = store.query_events_page(&request).await;
         assert_eq!(second.cursor_found, Some(true));
@@ -10789,7 +11236,9 @@ mod tests {
             HostEventKind::HealthCheck,
             HostEventKind::LifecycleTransition,
         ] {
-            store.emit_event(kind, None, "observed".to_owned(), None).await;
+            store
+                .emit_event(kind, None, "observed".to_owned(), None)
+                .await;
         }
         let mut request = event_page_request(1, None);
         request.query.kind = Some(HostEventKind::HealthCheck);
@@ -10805,7 +11254,12 @@ mod tests {
 
         request.after_event_id = second.next_cursor;
         store
-            .emit_event(HostEventKind::LifecycleTransition, None, "filtered".to_owned(), None)
+            .emit_event(
+                HostEventKind::LifecycleTransition,
+                None,
+                "filtered".to_owned(),
+                None,
+            )
             .await;
         let empty = store.query_events_page(&request).await;
         assert!(empty.events.is_empty());
