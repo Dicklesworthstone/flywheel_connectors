@@ -312,10 +312,12 @@ impl OpenAIClient {
     /// Rejects unsafe or mismatched IDs and propagates provider/I/O failures.
     #[instrument(skip(self))]
     pub async fn cancel_response(&self, response_id: &str) -> OpenAIResult<ResponsesResponse> {
-        let (_, bytes) = self
+        let (status, bytes) = self
             .response_resource_request(reqwest::Method::POST, response_id, "/cancel", &[])
             .await?;
-        let response = serde_json::from_slice(&bytes)?;
+        let response = serde_json::from_slice(&bytes)
+            .map_err(OpenAIError::from)
+            .map_err(|error| error.after_effectful_dispatch(Some(status.as_u16())))?;
         validate_response_identity(&response, Some(response_id))?;
         Ok(response)
     }
@@ -336,7 +338,9 @@ impl OpenAIClient {
                 deleted: true,
             }
         } else {
-            serde_json::from_slice(&bytes)?
+            serde_json::from_slice(&bytes)
+                .map_err(OpenAIError::from)
+                .map_err(|error| error.after_effectful_dispatch(Some(status.as_u16())))?
         };
         if response.id != response_id || response.object != "response.deleted" || !response.deleted
         {
@@ -372,14 +376,32 @@ impl OpenAIClient {
                 if !selectors.is_empty() {
                     request = request.query(&selectors);
                 }
-                let response = self.apply_auth(request).send().await?;
+                let request = self.apply_auth(request);
+                let response = if method == reqwest::Method::GET {
+                    request.send().await?
+                } else {
+                    self.send_effectful_request(request).await?
+                };
                 let status = response.status();
                 let headers = response.headers().clone();
-                let bytes = read_bounded_response(response, MAX_JSON_RESPONSE_BYTES).await?;
+                let bytes = read_bounded_response(response, MAX_JSON_RESPONSE_BYTES)
+                    .await
+                    .map_err(|error| {
+                        if method == reqwest::Method::GET {
+                            error
+                        } else {
+                            error.after_effectful_dispatch(Some(status.as_u16()))
+                        }
+                    })?;
                 if status.is_success() {
                     Ok((status, bytes))
                 } else {
-                    Err(parse_error_response(status, &headers, &bytes))
+                    let error = parse_error_response(status, &headers, &bytes);
+                    Err(if method == reqwest::Method::GET {
+                        error
+                    } else {
+                        error.after_effectful_dispatch(Some(status.as_u16()))
+                    })
                 }
             }
             .await;
@@ -592,8 +614,14 @@ impl OpenAIClient {
                 status_code: None,
             })?;
 
-        let completed = self.poll_video_until_complete(&video_id, polling).await?;
-        let (bytes, mime_type) = self.download_video(&video_id).await?;
+        let completed = self
+            .poll_video_until_complete(&video_id, polling)
+            .await
+            .map_err(OpenAIError::after_accepted_generation)?;
+        let (bytes, mime_type) = self
+            .download_video(&video_id)
+            .await
+            .map_err(OpenAIError::after_accepted_generation)?;
         let VideoGenerationResponse {
             model: completed_model,
             status: completed_status,
@@ -720,16 +748,9 @@ impl OpenAIClient {
         let request = self.client.post(&url);
         let request = self.apply_auth(request);
 
-        let response = request.multipart(form).send().await?;
-        let status = response.status();
-        let headers = response.headers().clone();
-        let bytes = read_bounded_response(response, MAX_JSON_RESPONSE_BYTES).await?;
-
-        if status.is_success() {
-            serde_json::from_slice(&bytes).map_err(OpenAIError::from)
-        } else {
-            Err(parse_error_response(status, &headers, &bytes))
-        }
+        let response = self.send_effectful_request(request.multipart(form)).await?;
+        self.handle_effectful_response(response, MAX_JSON_RESPONSE_BYTES)
+            .await
     }
 
     /// Generate speech audio from text using TTS models.
@@ -765,15 +786,20 @@ impl OpenAIClient {
             .header("Content-Type", "application/json");
         let request = self.apply_auth(request);
 
-        let response = request.json(&request_body).send().await?;
+        let response = self
+            .send_effectful_request(request.json(&request_body))
+            .await?;
         let status = response.status();
         let headers = response.headers().clone();
-        let bytes = read_bounded_response(response, MAX_AUDIO_RESPONSE_BYTES).await?;
+        let bytes = read_bounded_response(response, MAX_AUDIO_RESPONSE_BYTES)
+            .await
+            .map_err(|error| error.after_effectful_dispatch(Some(status.as_u16())))?;
 
         if status.is_success() {
             Ok(bytes)
         } else {
-            Err(parse_error_response(status, &headers, &bytes))
+            Err(parse_error_response(status, &headers, &bytes)
+                .after_effectful_dispatch(Some(status.as_u16())))
         }
     }
 
@@ -796,16 +822,11 @@ impl OpenAIClient {
             .header("Content-Type", "application/json");
         let request = self.apply_auth(request);
 
-        let response = request.json(request_body).send().await?;
-        let status = response.status();
-        let headers = response.headers().clone();
-        let bytes = read_bounded_response(response, MAX_JSON_RESPONSE_BYTES).await?;
-
-        if status.is_success() {
-            serde_json::from_slice(&bytes).map_err(OpenAIError::from)
-        } else {
-            Err(parse_error_response(status, &headers, &bytes))
-        }
+        let response = self
+            .send_effectful_request(request.json(request_body))
+            .await?;
+        self.handle_effectful_response(response, MAX_JSON_RESPONSE_BYTES)
+            .await
     }
 
     /// Create a fine-tuning job.
@@ -888,16 +909,9 @@ impl OpenAIClient {
             .header("Content-Type", "application/json");
         let request = self.apply_auth(request);
 
-        let response = request.send().await?;
-        let status = response.status();
-        let headers = response.headers().clone();
-        let bytes = read_bounded_response(response, MAX_JSON_RESPONSE_BYTES).await?;
-
-        if status.is_success() {
-            serde_json::from_slice(&bytes).map_err(OpenAIError::from)
-        } else {
-            Err(parse_error_response(status, &headers, &bytes))
-        }
+        let response = self.send_effectful_request(request).await?;
+        self.handle_effectful_response(response, MAX_JSON_RESPONSE_BYTES)
+            .await
     }
 
     /// List events for a fine-tuning job.
@@ -976,23 +990,23 @@ impl OpenAIClient {
 
                 let request = self.apply_auth(request);
 
-                match request.json(body).send().await {
-                    Ok(response) => match self.handle_response(response, response_limit).await {
-                        Ok(data) => AttemptOutcome::Success(data),
-                        Err(e) if e.is_retryable() => AttemptOutcome::Retryable {
-                            retry_after: e.retry_after(),
-                            error: e,
-                        },
-                        Err(e) => AttemptOutcome::Terminal(e),
-                    },
-                    // A timeout can occur after the provider accepted a billed
-                    // generation or mutation. Only a connection failure proves
-                    // the request did not reach the provider.
-                    Err(e) if e.is_connect() => AttemptOutcome::Retryable {
-                        error: OpenAIError::Http(e),
-                        retry_after: None,
-                    },
-                    Err(e) => AttemptOutcome::Terminal(OpenAIError::Http(e)),
+                match self.send_effectful_request(request.json(body)).await {
+                    Ok(response) => {
+                        match self
+                            .handle_effectful_response(response, response_limit)
+                            .await
+                        {
+                            Ok(data) => AttemptOutcome::Success(data),
+                            Err(error @ OpenAIError::RateLimited { .. }) => {
+                                AttemptOutcome::Retryable {
+                                    retry_after: error.retry_after(),
+                                    error,
+                                }
+                            }
+                            Err(error) => AttemptOutcome::Terminal(error),
+                        }
+                    }
+                    Err(error) => AttemptOutcome::Terminal(error),
                 }
             }
         })
@@ -1013,13 +1027,16 @@ impl OpenAIClient {
 
         let request = self.apply_auth(request);
 
-        let response = request.json(body).send().await?;
+        let response = self.send_effectful_request(request.json(body)).await?;
 
         let status = response.status();
         if !status.is_success() {
             let headers = response.headers().clone();
-            let bytes = read_bounded_response(response, MAX_JSON_RESPONSE_BYTES).await?;
-            return Err(parse_error_response(status, &headers, &bytes));
+            let bytes = read_bounded_response(response, MAX_JSON_RESPONSE_BYTES)
+                .await
+                .map_err(|error| error.after_effectful_dispatch(Some(status.as_u16())))?;
+            return Err(parse_error_response(status, &headers, &bytes)
+                .after_effectful_dispatch(Some(status.as_u16())));
         }
 
         Ok(response)
@@ -1041,6 +1058,33 @@ impl OpenAIClient {
         }
     }
 
+    /// Dispatch a billed request or mutation without allowing transport errors
+    /// to authorize an outer retry. Request-builder errors are still local.
+    async fn send_effectful_request(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> OpenAIResult<Response> {
+        request
+            .send()
+            .await
+            .map_err(OpenAIError::from)
+            .map_err(|error| error.after_effectful_dispatch(None))
+    }
+
+    async fn handle_effectful_response<R>(
+        &self,
+        response: Response,
+        response_limit: usize,
+    ) -> OpenAIResult<R>
+    where
+        R: serde::de::DeserializeOwned + Send,
+    {
+        let status_code = response.status().as_u16();
+        self.handle_response(response, response_limit)
+            .await
+            .map_err(|error| error.after_effectful_dispatch(Some(status_code)))
+    }
+
     /// Make a DELETE request with Assistants API v2 header.
     async fn delete_v2<R>(&self, url: &str) -> OpenAIResult<R>
     where
@@ -1052,16 +1096,9 @@ impl OpenAIClient {
             .header("OpenAI-Beta", "assistants=v2");
         let request = self.apply_auth(request);
 
-        let response = request.send().await?;
-        let status = response.status();
-        let headers = response.headers().clone();
-        let bytes = read_bounded_response(response, MAX_JSON_RESPONSE_BYTES).await?;
-
-        if status.is_success() {
-            serde_json::from_slice(&bytes).map_err(OpenAIError::from)
-        } else {
-            Err(parse_error_response(status, &headers, &bytes))
-        }
+        let response = self.send_effectful_request(request).await?;
+        self.handle_effectful_response(response, MAX_JSON_RESPONSE_BYTES)
+            .await
     }
 
     /// Make a GET request with Assistants API v2 header.
@@ -1096,16 +1133,9 @@ impl OpenAIClient {
             .header("OpenAI-Beta", "assistants=v2");
         let request = self.apply_auth(request);
 
-        let response = request.send().await?;
-        let status = response.status();
-        let headers = response.headers().clone();
-        let bytes = read_bounded_response(response, MAX_JSON_RESPONSE_BYTES).await?;
-
-        if status.is_success() {
-            serde_json::from_slice(&bytes).map_err(OpenAIError::from)
-        } else {
-            Err(parse_error_response(status, &headers, &bytes))
-        }
+        let response = self.send_effectful_request(request).await?;
+        self.handle_effectful_response(response, MAX_JSON_RESPONSE_BYTES)
+            .await
     }
 
     // ─────────────────────── Assistants ───────────────────────
@@ -1379,16 +1409,9 @@ impl OpenAIClient {
             .header("OpenAI-Beta", "assistants=v2");
         let request = self.apply_auth(request);
 
-        let response = request.json(body).send().await?;
-        let status = response.status();
-        let headers = response.headers().clone();
-        let bytes = read_bounded_response(response, MAX_JSON_RESPONSE_BYTES).await?;
-
-        if status.is_success() {
-            serde_json::from_slice(&bytes).map_err(OpenAIError::from)
-        } else {
-            Err(parse_error_response(status, &headers, &bytes))
-        }
+        let response = self.send_effectful_request(request.json(body)).await?;
+        self.handle_effectful_response(response, MAX_JSON_RESPONSE_BYTES)
+            .await
     }
 }
 
@@ -1520,24 +1543,27 @@ fn parse_error_response(
         }
     }
 
-    // Try to parse as API error
+    // The observed HTTP refusal is authoritative even when its body is empty
+    // or malformed. Body text cannot turn another status into a rate limit.
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        return OpenAIError::RateLimited { retry_after_ms };
+    }
+
+    if status == StatusCode::UNAUTHORIZED {
+        return OpenAIError::InvalidApiKey;
+    }
+
+    // Keep the safe-read classification; mutation paths contextualize this
+    // as an unknown outcome before it reaches a retry loop or FCP caller.
+    if status == StatusCode::SERVICE_UNAVAILABLE {
+        return OpenAIError::Overloaded {
+            retry_after_ms: 60_000,
+        };
+    }
+
+    // Try to parse as API error.
     if let Ok(api_error) = serde_json::from_slice::<ApiError>(bytes) {
         let details = api_error.error;
-
-        // Check for specific error types
-        if status == StatusCode::TOO_MANY_REQUESTS {
-            return OpenAIError::RateLimited { retry_after_ms };
-        }
-
-        if status == StatusCode::SERVICE_UNAVAILABLE {
-            return OpenAIError::Overloaded {
-                retry_after_ms: 60_000, // Default 60s
-            };
-        }
-
-        if status == StatusCode::UNAUTHORIZED {
-            return OpenAIError::InvalidApiKey;
-        }
 
         // Check for context length errors
         if details.error_type == "invalid_request_error"
@@ -1655,60 +1681,99 @@ fn video_failure_message(response: &VideoGenerationResponse) -> String {
         .unwrap_or_else(|| "OpenAI video generation failed".to_string())
 }
 
-/// Parse SSE stream into chunks.
+/// Parse SSE stream into chunks, requiring the provider's completion marker.
 fn parse_sse_stream(response: Response) -> impl Stream<Item = OpenAIResult<ChatCompletionChunk>> {
+    let status_code = response.status().as_u16();
     async_stream::stream! {
         let mut stream = response.bytes_stream();
-        let mut buffer = String::new();
+        let mut buffer = Vec::new();
 
         while let Some(chunk) = stream.next().await {
             let chunk = match chunk {
-                Ok(c) => c,
-                Err(e) => {
-                    yield Err(OpenAIError::Http(e));
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    yield Err(OpenAIError::Http(error).after_effectful_dispatch(Some(status_code)));
                     return;
                 }
             };
 
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
+            // Retain at most one bounded event. Assemble bytes before decoding
+            // UTF-8 so a network boundary cannot corrupt a multi-byte delta.
+            for byte in chunk.iter().copied() {
+                if buffer.len() >= MAX_JSON_RESPONSE_BYTES {
+                    yield Err(OpenAIError::Api {
+                        error_type: "stream_event_too_large".into(),
+                        message: "OpenAI stream event exceeded its byte limit; automatic replay is disabled".into(),
+                        status_code: Some(status_code),
+                    });
+                    return;
+                }
+                buffer.push(byte);
+                let frame_len = if buffer.ends_with(b"\r\n\r\n") {
+                    Some(buffer.len() - 4)
+                } else if buffer.ends_with(b"\n\n") {
+                    Some(buffer.len() - 2)
+                } else {
+                    None
+                };
+                let Some(frame_len) = frame_len else {
+                    continue;
+                };
 
-            // Process complete SSE events
-            while let Some(pos) = buffer.find("\n\n") {
-                let event_str = buffer[..pos].to_string();
-                buffer = buffer[pos + 2..].to_string();
-
-                if let Some(chunk) = parse_sse_event(&event_str) {
-                    yield chunk;
+                let event = match std::str::from_utf8(&buffer[..frame_len]) {
+                    Ok(frame) => parse_sse_event(frame),
+                    Err(_) => Some(Err(OpenAIError::Api {
+                        error_type: "stream_invalid_utf8".into(),
+                        message: "OpenAI stream contained invalid UTF-8; automatic replay is disabled".into(),
+                        status_code: Some(status_code),
+                    })),
+                };
+                buffer.clear();
+                match event {
+                    Some(Ok(OpenAiSseEvent::Chunk(chunk))) => yield Ok(chunk),
+                    Some(Ok(OpenAiSseEvent::Done)) => return,
+                    Some(Err(error)) => {
+                        yield Err(error.after_effectful_dispatch(Some(status_code)));
+                        return;
+                    }
+                    None => {}
                 }
             }
         }
 
-        // Process any remaining buffer
-        if !buffer.is_empty() {
-            if let Some(chunk) = parse_sse_event(&buffer) {
-                yield chunk;
-            }
-        }
+        yield Err(OpenAIError::Api {
+            error_type: "stream_incomplete".into(),
+            message: "OpenAI stream ended before [DONE]; provider outcome is unknown and automatic replay is disabled".into(),
+            status_code: Some(status_code),
+        });
     }
 }
 
-/// Parse a single SSE event.
-fn parse_sse_event(event_str: &str) -> Option<OpenAIResult<ChatCompletionChunk>> {
-    for line in event_str.lines() {
-        if let Some(data) = line.strip_prefix("data: ") {
-            let data = data.trim();
+enum OpenAiSseEvent {
+    Chunk(ChatCompletionChunk),
+    Done,
+}
 
-            // Check for stream end
-            if data == "[DONE]" {
-                return None;
-            }
-
-            return Some(
-                serde_json::from_str::<ChatCompletionChunk>(data).map_err(OpenAIError::from),
-            );
-        }
+/// Parse one complete SSE event, including the provider completion marker.
+fn parse_sse_event(event_str: &str) -> Option<OpenAIResult<OpenAiSseEvent>> {
+    let data = event_str
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .map(|data| data.strip_prefix(' ').unwrap_or(data))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let data = data.trim();
+    if data.is_empty() {
+        return None;
     }
-    None
+    if data == "[DONE]" {
+        return Some(Ok(OpenAiSseEvent::Done));
+    }
+    Some(
+        serde_json::from_str::<ChatCompletionChunk>(data)
+            .map(OpenAiSseEvent::Chunk)
+            .map_err(OpenAIError::from),
+    )
 }
 
 #[cfg(test)]
@@ -1836,7 +1901,10 @@ mod tests {
         }))
         .unwrap();
         let error = client.create_response(&request).await.unwrap_err();
-        assert!(matches!(&error, OpenAIError::Http(error) if error.is_timeout()));
+        assert!(matches!(
+            &error,
+            OpenAIError::OutcomeUnknown { status_code: None }
+        ));
         assert!(matches!(
             error.to_fcp_error(),
             fcp_prelude::FcpError::External {
@@ -1874,6 +1942,407 @@ mod tests {
         assert!(client.create_response(&request).await.is_err());
         assert!(destination.received_requests().await.unwrap().is_empty());
         assert_eq!(origin.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn billed_posts_do_not_replay_server_or_decode_failures() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        for (status, body) in [
+            (
+                500,
+                r#"{"error":{"message":"unknown","type":"server_error"}}"#,
+            ),
+            (
+                500,
+                r#"{"error":{"message":"maximum context length","type":"invalid_request_error"}}"#,
+            ),
+            (
+                500,
+                r#"{"error":{"message":"filtered","type":"invalid_request_error","code":"content_filter"}}"#,
+            ),
+            (503, r#"{"error":{"message":"busy","type":"server_error"}}"#),
+            (503, "upstream unavailable"),
+            (408, "request timed out"),
+            (200, "{malformed success"),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/responses"))
+                .respond_with(ResponseTemplate::new(status).set_body_string(body))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let client = OpenAIClient::new("test-key")
+                .unwrap()
+                .with_base_url(server.uri())
+                .with_retry_config(3, 1, 1);
+            let error = client
+                .post::<_, serde_json::Value>("/v1/responses", &serde_json::json!({}))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, OpenAIError::OutcomeUnknown { status_code: Some(observed) } if observed == status)
+            );
+            assert!(!error.is_retryable());
+            assert!(matches!(
+                error.to_fcp_error(),
+                fcp_prelude::FcpError::External {
+                    retryable: false,
+                    ..
+                }
+            ));
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn actual_rate_limit_refusals_retry_but_local_serialization_does_not_dispatch() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "0")
+                    .set_body_string("not JSON"),
+            )
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = OpenAIClient::new("test-key")
+            .unwrap()
+            .with_base_url(server.uri())
+            .with_retry_config(1, 1, 1);
+        let value: serde_json::Value = client
+            .post("/v1/responses", &serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(value["ok"], true);
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+
+        struct InvalidBody;
+        impl serde::Serialize for InvalidBody {
+            fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                Err(serde::ser::Error::custom("local serialization failure"))
+            }
+        }
+        let error = client
+            .post::<_, serde_json::Value>("/v1/responses", &InvalidBody)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, OpenAIError::Http(ref error) if error.is_builder()));
+        assert!(!error.is_retryable());
+        assert!(matches!(
+            error.to_fcp_error(),
+            fcp_prelude::FcpError::External {
+                retryable: false,
+                ..
+            }
+        ));
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn video_read_failures_do_not_authorize_replaying_the_accepted_job() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        for download_failure in [false, true] {
+            for status in [429, 503] {
+                let server = MockServer::start().await;
+                Mock::given(method("POST"))
+                    .and(path("/v1/videos"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "id": "video_accepted", "model": "sora-2", "status": "queued"
+                    })))
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                let poll_response = if download_failure {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "id": "video_accepted", "status": "completed"
+                    }))
+                } else {
+                    ResponseTemplate::new(status)
+                        .insert_header("retry-after", "0")
+                        .set_body_string("busy")
+                };
+                Mock::given(method("GET"))
+                    .and(path("/v1/videos/video_accepted"))
+                    .respond_with(poll_response)
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                Mock::given(method("GET"))
+                    .and(path("/v1/videos/video_accepted/content"))
+                    .respond_with(
+                        ResponseTemplate::new(status)
+                            .insert_header("retry-after", "0")
+                            .set_body_string("busy"),
+                    )
+                    .expect(if download_failure { 1 } else { 0 })
+                    .mount(&server)
+                    .await;
+                let client = OpenAIClient::new("test-key")
+                    .unwrap()
+                    .with_base_url(server.uri())
+                    .with_retry_config(3, 1, 1);
+                let error = client
+                    .generate_video(
+                        VideoModel::Sora2,
+                        "prompt",
+                        None,
+                        None,
+                        VideoPollingOptions {
+                            poll_interval_ms: 0,
+                            max_poll_attempts: 3,
+                        },
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(error, OpenAIError::OutcomeUnknown { status_code: Some(observed) } if observed == status)
+                );
+                assert!(!error.is_retryable());
+                assert_eq!(error.retry_after(), None);
+                assert!(matches!(
+                    error.to_fcp_error(),
+                    fcp_prelude::FcpError::External {
+                        retryable: false,
+                        retry_after: None,
+                        ..
+                    }
+                ));
+                let requests = server.received_requests().await.unwrap();
+                assert_eq!(
+                    requests
+                        .iter()
+                        .filter(|request| request.method.as_str() == "POST")
+                        .count(),
+                    1
+                );
+                assert_eq!(requests.len(), if download_failure { 3 } else { 2 });
+            }
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn custom_mutations_are_terminal_while_safe_reads_keep_overload_classification() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(503).set_body_string("busy"))
+            .expect(10)
+            .mount(&server)
+            .await;
+        let client = OpenAIClient::new("test-key")
+            .unwrap()
+            .with_base_url(server.uri())
+            .with_retry_config(3, 1, 1);
+        let body = serde_json::json!({});
+        let mutations = [
+            client
+                .create_transcription(WhisperModel::Whisper1, vec![1], "voice.wav", None)
+                .await
+                .map(|_| ()),
+            client
+                .create_speech(TtsModel::Tts1, "hello", TtsVoice::Alloy, None, None)
+                .await
+                .map(|_| ()),
+            client
+                .create_realtime_client_secret(&body)
+                .await
+                .map(|_| ()),
+            client.cancel_fine_tune("ft-test").await.map(|_| ()),
+            client
+                .post_json::<_, serde_json::Value>(
+                    &format!("{}/v1/assistants", server.uri()),
+                    &body,
+                )
+                .await
+                .map(|_| ()),
+            client
+                .post_empty_v2::<serde_json::Value>(&format!(
+                    "{}/v1/threads/thread_test/runs/run_test/cancel",
+                    server.uri()
+                ))
+                .await
+                .map(|_| ()),
+            client
+                .delete_v2::<serde_json::Value>(&format!(
+                    "{}/v1/assistants/asst_test",
+                    server.uri()
+                ))
+                .await
+                .map(|_| ()),
+            client.cancel_response("resp_test").await.map(|_| ()),
+            client
+                .post_stream("/v1/chat/completions", &body)
+                .await
+                .map(|_| ()),
+        ];
+        for result in mutations {
+            let error = result.unwrap_err();
+            assert!(matches!(
+                error,
+                OpenAIError::OutcomeUnknown {
+                    status_code: Some(503)
+                }
+            ));
+            assert!(matches!(
+                error.to_fcp_error(),
+                fcp_prelude::FcpError::External {
+                    retryable: false,
+                    ..
+                }
+            ));
+        }
+        let read_error = client.health_check().await.unwrap_err();
+        assert!(matches!(read_error, OpenAIError::Overloaded { .. }));
+        assert!(read_error.is_retryable());
+        assert_eq!(server.received_requests().await.unwrap().len(), 10);
+    }
+
+    fn chunked_stream_server(body: Vec<u8>) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = [0_u8; 4096];
+            assert!(stream.read(&mut request).unwrap() > 0);
+            stream.write_all(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n"
+            ).unwrap();
+            for byte in body {
+                // One-byte HTTP chunks force UTF-8, CRLF and event delimiters
+                // across body chunks without timer-dependent fragmentation.
+                if stream
+                    .write_all(&[b'1', b'\r', b'\n', byte, b'\r', b'\n'])
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            let _ = stream.write_all(b"0\r\n\r\n");
+        });
+        (url, worker)
+    }
+
+    fn test_stream_chunk(content: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": "test-model",
+            "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": null}]
+        })
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn streaming_preserves_split_utf8_crlf_and_stops_at_done() {
+        let first = test_stream_chunk("hé🦀");
+        let second = test_stream_chunk("!");
+        let body = format!(
+            ": keepalive\r\n\r\ndata:{first}\r\n\r\ndata: {second}\n\ndata: [DONE]\r\n\r\ndata: {{not JSON}}\n\n"
+        );
+        let (url, worker) = chunked_stream_server(body.into_bytes());
+        let response = Client::new().get(url).send().await.unwrap();
+        let events: Vec<_> = parse_sse_stream(response).collect().await;
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0].as_ref().unwrap().choices[0]
+                .delta
+                .content
+                .as_deref(),
+            Some("hé🦀")
+        );
+        assert_eq!(
+            events[1].as_ref().unwrap().choices[0]
+                .delta
+                .content
+                .as_deref(),
+            Some("!")
+        );
+        worker.join().unwrap();
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn streaming_eof_invalid_payload_and_oversize_are_terminal_once() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        let complete_chunk = format!("data: {}\n\n", test_stream_chunk("partial"));
+        for (body, good_chunks) in [
+            (complete_chunk.clone(), 1),
+            (
+                format!("data: {{bad JSON}}\n\n{complete_chunk}data: [DONE]\n\n"),
+                0,
+            ),
+            (format!("data: {}", "x".repeat(MAX_JSON_RESPONSE_BYTES)), 0),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/chat/completions"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(body))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let client = OpenAIClient::new("test-key")
+                .unwrap()
+                .with_base_url(server.uri())
+                .with_retry_config(3, 1, 1);
+            let response = client
+                .post_stream("/v1/chat/completions", &serde_json::json!({}))
+                .await
+                .unwrap();
+            let events: Vec<_> = parse_sse_stream(response).collect().await;
+            assert_eq!(events.len(), good_chunks + 1);
+            assert_eq!(events.iter().filter(|event| event.is_err()).count(), 1);
+            let error = events.last().unwrap().as_ref().unwrap_err();
+            assert!(!error.is_retryable());
+            assert!(matches!(
+                error.to_fcp_error(),
+                fcp_prelude::FcpError::External {
+                    retryable: false,
+                    ..
+                }
+            ));
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        }
+
+        let (url, worker) = raw_response_server(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nshort",
+        );
+        let response = Client::new().get(url).send().await.unwrap();
+        let events: Vec<_> = parse_sse_stream(response).collect().await;
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            Err(OpenAIError::OutcomeUnknown { .. })
+        ));
+        worker.join().unwrap();
     }
 
     #[test]
@@ -2014,7 +2483,7 @@ mod tests {
     #[test]
     fn test_parse_sse_event_done() {
         let event = parse_sse_event("data: [DONE]\n");
-        assert!(event.is_none());
+        assert!(matches!(event, Some(Ok(OpenAiSseEvent::Done))));
     }
 
     #[test]

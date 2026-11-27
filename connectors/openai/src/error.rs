@@ -64,6 +64,13 @@ pub enum OpenAIError {
         status_code: Option<u16>,
     },
 
+    /// A dispatched mutation may have completed, so replay is not authorized.
+    #[error("OpenAI operation outcome is unknown; automatic replay is disabled")]
+    OutcomeUnknown {
+        /// Observed HTTP status, when the provider returned one.
+        status_code: Option<u16>,
+    },
+
     /// Caller-supplied input rejected before any request was sent
     /// (e.g. an id carrying path-traversal characters or a pagination
     /// cursor that would smuggle additional query parameters).
@@ -75,6 +82,57 @@ pub enum OpenAIError {
 }
 
 impl OpenAIError {
+    /// Preserve uncertainty after dispatching a billed request or mutation.
+    ///
+    /// A transport failure, malformed success body, or server failure does not
+    /// prove that the provider rejected the operation. Builder errors remain
+    /// local failures, and an observed rate-limit refusal remains retryable.
+    pub(crate) fn after_effectful_dispatch(self, status_code: Option<u16>) -> Self {
+        if status_code.is_none()
+            && matches!(
+                &self,
+                Self::Http(error) if error.is_builder()
+            )
+        {
+            return self;
+        }
+        if status_code.is_none() && matches!(&self, Self::InvalidInput { .. }) {
+            return self;
+        }
+        if status_code == Some(429) {
+            return self;
+        }
+        if status_code.is_some_and(|status| (400..500).contains(&status) && status != 408)
+            && (matches!(
+                &self,
+                Self::InvalidApiKey
+                    | Self::ContextLengthExceeded { .. }
+                    | Self::ContentFiltered { .. }
+            ) || matches!(&self, Self::Api { status_code: mapped, .. } if *mapped == status_code))
+        {
+            return self;
+        }
+        Self::OutcomeUnknown { status_code }
+    }
+
+    /// A read failure after an accepted generation cannot authorize repeating
+    /// the earlier billed submission. Preserve definitive terminal job failures.
+    pub(crate) fn after_accepted_generation(self) -> Self {
+        match self {
+            Self::RateLimited { .. } => Self::OutcomeUnknown {
+                status_code: Some(429),
+            },
+            Self::Overloaded { .. } => Self::OutcomeUnknown {
+                status_code: Some(503),
+            },
+            Self::Http(error) => Self::OutcomeUnknown {
+                status_code: error.status().map(|status| status.as_u16()),
+            },
+            Self::Json(_) => Self::OutcomeUnknown { status_code: None },
+            other => other,
+        }
+    }
+
     /// Check if this error is retryable.
     #[must_use]
     pub const fn is_retryable(&self) -> bool {
@@ -127,12 +185,19 @@ impl OpenAIError {
                 retryable: false,
                 retry_after: None,
             },
+            Self::OutcomeUnknown { status_code } => FcpError::External {
+                service: "openai".into(),
+                message: self.to_string(),
+                status_code: *status_code,
+                retryable: false,
+                retry_after: None,
+            },
             Self::Http(e) => FcpError::External {
                 service: "openai".into(),
                 message: e.to_string(),
                 status_code: e.status().map(|s| s.as_u16()),
-                // A timeout or broken response does not prove that a mutation
-                // failed. Preserve that uncertainty for the caller.
+                // Mutation paths contextualize dispatched failures before
+                // mapping. Standalone transport errors here can be safe reads.
                 retryable: e.is_connect(),
                 retry_after: None,
             },
@@ -199,6 +264,129 @@ impl ConnectorErrorMapping for OpenAIError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dispatched_mutations_keep_uncertain_failures_terminal() {
+        for (error, status_code) in [
+            (
+                OpenAIError::Overloaded {
+                    retry_after_ms: 60_000,
+                },
+                Some(503),
+            ),
+            (
+                OpenAIError::Api {
+                    error_type: "server_error".into(),
+                    message: "provider details".into(),
+                    status_code: Some(502),
+                },
+                Some(502),
+            ),
+            (
+                OpenAIError::Api {
+                    error_type: "request_timeout".into(),
+                    message: "provider details".into(),
+                    status_code: Some(408),
+                },
+                Some(408),
+            ),
+            (
+                OpenAIError::ContextLengthExceeded {
+                    message: "provider details".into(),
+                },
+                Some(500),
+            ),
+            (
+                OpenAIError::ContentFiltered {
+                    message: "provider details".into(),
+                },
+                Some(500),
+            ),
+            (
+                OpenAIError::Json(serde_json::from_str::<serde_json::Value>("{").unwrap_err()),
+                Some(200),
+            ),
+        ] {
+            let error = error.after_effectful_dispatch(status_code);
+            assert!(
+                matches!(error, OpenAIError::OutcomeUnknown { status_code: observed } if observed == status_code)
+            );
+            assert!(!error.is_retryable());
+            assert!(!ConnectorErrorMapping::is_retryable(&error));
+            assert_eq!(error.retry_after(), None);
+            assert!(matches!(
+                error.to_fcp_error(),
+                FcpError::External {
+                    retryable: false,
+                    retry_after: None,
+                    ..
+                }
+            ));
+            assert!(!error.to_string().contains("provider details"));
+        }
+    }
+
+    #[test]
+    fn dispatch_classification_preserves_refusals_and_local_failures() {
+        assert!(matches!(
+            OpenAIError::RateLimited { retry_after_ms: 7 }.after_effectful_dispatch(Some(429)),
+            OpenAIError::RateLimited { retry_after_ms: 7 }
+        ));
+        assert!(matches!(
+            OpenAIError::InvalidApiKey.after_effectful_dispatch(Some(401)),
+            OpenAIError::InvalidApiKey
+        ));
+        assert!(matches!(
+            OpenAIError::InvalidInput {
+                message: "invalid".into()
+            }
+            .after_effectful_dispatch(None),
+            OpenAIError::InvalidInput { .. }
+        ));
+        assert!(matches!(
+            OpenAIError::Api {
+                error_type: "invalid_request_error".into(),
+                message: "invalid".into(),
+                status_code: Some(400),
+            }
+            .after_effectful_dispatch(Some(400)),
+            OpenAIError::Api {
+                status_code: Some(400),
+                ..
+            }
+        ));
+        assert!(OpenAIError::Overloaded { retry_after_ms: 7 }.is_retryable());
+    }
+
+    #[test]
+    fn accepted_generation_does_not_inherit_read_retry_permission() {
+        for error in [
+            OpenAIError::RateLimited { retry_after_ms: 5 },
+            OpenAIError::Overloaded { retry_after_ms: 5 },
+        ] {
+            let error = error.after_accepted_generation();
+            assert!(matches!(error, OpenAIError::OutcomeUnknown { .. }));
+            assert!(!error.is_retryable());
+            assert!(matches!(
+                error.to_fcp_error(),
+                FcpError::External {
+                    retryable: false,
+                    retry_after: None,
+                    ..
+                }
+            ));
+        }
+        let failed = OpenAIError::Api {
+            error_type: "video_failed".into(),
+            message: "provider job failed".into(),
+            status_code: None,
+        }
+        .after_accepted_generation();
+        assert!(
+            matches!(failed, OpenAIError::Api { ref error_type, .. } if error_type == "video_failed")
+        );
+        assert!(!failed.is_retryable());
+    }
 
     // ---- is_retryable ----
 

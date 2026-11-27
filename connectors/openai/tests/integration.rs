@@ -617,7 +617,7 @@ async fn client_rate_limited_maps_retryable_error() {
 }
 
 #[fcp_async_core::runtime::test]
-async fn client_overloaded_maps_retryable_error() {
+async fn client_overloaded_generation_is_terminal_without_replay() {
     let mock_server = MockServer::start().await;
 
     Mock::given(method("POST"))
@@ -630,21 +630,34 @@ async fn client_overloaded_maps_retryable_error() {
                 "code": null
             }
         })))
+        .expect(1)
         .mount(&mock_server)
         .await;
 
     let client = OpenAIClient::new("test_key")
         .unwrap()
         .with_base_url(mock_server.uri())
-        .with_retry_config(1, 10, 100);
+        .with_retry_config(3, 1, 1);
 
-    let result = client.chat(Model::Gpt4o, "Hi", None, Some(1024)).await;
-
-    assert!(result.is_err());
+    let error = client
+        .chat(Model::Gpt4o, "Hi", None, Some(1024))
+        .await
+        .unwrap_err();
     assert!(matches!(
-        result.unwrap_err(),
-        OpenAIError::Overloaded { .. }
+        error,
+        OpenAIError::OutcomeUnknown {
+            status_code: Some(503)
+        }
     ));
+    assert!(!error.is_retryable());
+    assert!(matches!(
+        error.to_fcp_error(),
+        FcpError::External {
+            retryable: false,
+            ..
+        }
+    ));
+    assert_eq!(mock_server.received_requests().await.unwrap().len(), 1);
 }
 
 #[fcp_async_core::runtime::test]
