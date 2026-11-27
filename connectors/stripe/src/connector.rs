@@ -3463,7 +3463,7 @@ mod tests {
         let mut request: InvokeRequest = serde_json::from_value(invoke_request!({
             "operation": "stripe.create_customer",
             "input": {"email": "fixture@example.test", "idempotency_key": "provider-key"},
-            "capability_token": CapabilityToken::from_raw(Vec::new()),
+            "capability_token": CapabilityToken::test_token(),
         }))
         .unwrap();
         prepare_idempotency_key(&mut request).unwrap();
@@ -3476,7 +3476,7 @@ mod tests {
             "operation": "stripe.create_customer",
             "input": {"email": "fixture@example.test", "idempotency_key": "provider-key"},
             "idempotency_key": "signed-key",
-            "capability_token": CapabilityToken::from_raw(Vec::new()),
+            "capability_token": CapabilityToken::test_token(),
         }))
         .unwrap();
         assert!(prepare_idempotency_key(&mut request).is_err());
