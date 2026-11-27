@@ -3939,6 +3939,23 @@ A separate enum in `crates/fcp-core/src/connector_descriptors.rs` carries the ru
 
 These map to `DescriptorStatus::{ Ready, Degraded, Unavailable }` for the agent-facing discovery surface. `fwc status <connector>` surfaces both lifecycle state and health, plus the last 5 transitions.
 
+### Checkpointed Telegram stop and resume
+
+For an admitted Linux native Telegram polling deployment, `Disable` now saves the
+acknowledged polling cursor before retiring the exact writer process. The host
+reports `Stopped` only after process exit and dormant inventory publication; it
+keeps the checkpoint in durable admin state while execution remains disabled.
+A later explicit `Enable` restores that checkpoint before granting execution
+authority, including after a host restart.
+
+This path requires an on-demand singleton writer, exactly one zone, inline bot
+credentials, a pinned binary and admitted manifest, an explicit absolute
+`FCP_CONNECTOR_STATE` directory, persistent host admin state, and host capability
+verification. The checkpoint remains bound to the same deployment and polling
+identity. A rejected checkpoint, unconfirmed process exit, or superseding
+lifecycle action keeps execution denied. A dry-run validates admission without
+checkpointing, stopping, or launching a process.
+
 ### JSON-RPC Method Surface
 
 Connectors implement a closed set of JSON-RPC methods. The supervisor invokes these during state transitions; agents invoke `invoke` / `simulate` / `introspect` while the connector is `Running`:

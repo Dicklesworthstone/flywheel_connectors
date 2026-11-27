@@ -490,23 +490,34 @@ async fn transition_before(
             .and_then(|record| {
                 record
                     .telegram_polling_restart
-                    .map(|custody| custody.custody_id)
+                    .map(|custody| (custody, record.last_journal_sequence))
             })
     } else {
         None
     };
-    let early_telegram_denial = if let Some(custody_id) = pending_telegram_custody {
-        require_deadline(deadline)?;
-        Some((
-            custody_id,
-            state
-                .lifecycle
-                .execute_lifecycle_transition(connector_id, request)
-                .await
-                .map_err(map_lifecycle_host_error)?,
-        ))
-    } else {
-        None
+    let early_telegram_denial = match pending_telegram_custody {
+        Some((custody, journal_sequence)) => {
+            require_deadline(deadline)?;
+            let denial = if request.action == LifecycleAction::Disable {
+                state
+                    .lifecycle
+                    .deny_telegram_polling_stop(
+                        connector_id,
+                        journal_sequence,
+                        Some(&custody),
+                        request,
+                    )
+                    .await
+            } else {
+                state
+                    .lifecycle
+                    .execute_lifecycle_transition(connector_id, request)
+                    .await
+            }
+            .map_err(map_lifecycle_host_error)?;
+            Some((custody.custody_id, denial))
+        }
+        None => None,
     };
     let _transaction = state.registry.inventory_transaction.lock().await;
     require_deadline(deadline)?;
@@ -529,9 +540,9 @@ async fn transition_before(
                         .is_some_and(|custody| custody.custody_id == *custody_id)
             })
         {
-            // The generic lifecycle response reads its sequence after mutation.
-            // Also bind the exact attempt: a fresh restart always rotates this
-            // ID even if a racing response reports its newer Disabled revision.
+            // Disable returns its exact committed revision. Uninstall still
+            // uses the generic lifecycle API, so also bind the exact custody:
+            // an intervening restart always rotates the attempt identity.
             return Err(HostError::Unavailable(
                 "Telegram lifecycle denial was superseded while waiting for runtime custody; inspect current state before retrying"
                     .to_owned(),
@@ -600,7 +611,23 @@ async fn transition_before(
     if recover_retained {
         restart_supported(&entry)?;
     }
+    let stop_telegram = connector_id.as_str() == "fcp.telegram"
+        && request.action == LifecycleAction::Disable
+        && entry.state_policy.is_stateful()
+        && matches!(&entry.connector, ConnectorRuntime::Native(_));
     if request.dry_run {
+        if stop_telegram {
+            return telegram_restart::transition_selected(
+                state,
+                connector_id,
+                &entry,
+                generation,
+                &previous,
+                request,
+                deadline,
+            )
+            .await;
+        }
         if matches!(
             request.action,
             LifecycleAction::Disable | LifecycleAction::Uninstall
@@ -627,6 +654,17 @@ async fn transition_before(
             // unsupported or timed-out retirement must never lift this denial.
             let response = if let Some((_, response)) = early_telegram_denial {
                 response
+            } else if stop_telegram {
+                state
+                    .lifecycle
+                    .deny_telegram_polling_stop(
+                        connector_id,
+                        previous.last_journal_sequence,
+                        None,
+                        request,
+                    )
+                    .await
+                    .map_err(map_lifecycle_host_error)?
             } else {
                 state
                     .lifecycle
@@ -634,6 +672,35 @@ async fn transition_before(
                     .await
                     .map_err(map_lifecycle_host_error)?
             };
+            if stop_telegram {
+                // Denial is already durable even if checkpoint admission or
+                // quiescence fails. Never turn that failure back into authority.
+                let denied = state
+                    .lifecycle
+                    .connector_status(connector_id)
+                    .await
+                    .map_err(map_lifecycle_host_error)?;
+                if denied.desired_state != DesiredRuntimeState::Disabled
+                    || denied.last_journal_sequence != response.journal_sequence
+                {
+                    return Err(HostError::Unavailable(
+                        "Telegram disable intent changed before checkpoint admission; inspect current state before retrying"
+                            .to_owned(),
+                    ));
+                }
+                let mut stopped = telegram_restart::transition_selected(
+                    state,
+                    connector_id,
+                    &entry,
+                    generation,
+                    &denied,
+                    request,
+                    deadline,
+                )
+                .await?;
+                stopped.previous_desired_state = response.previous_desired_state;
+                return Ok(stopped);
+            }
             retire_selected(
                 &state.registry,
                 connector_id,

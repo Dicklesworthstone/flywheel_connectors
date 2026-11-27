@@ -1,4 +1,4 @@
-//! Durable custody for the narrowly admitted local Telegram polling restart.
+//! Durable custody for local Telegram polling restart and checkpointed stop.
 //!
 //! This is not a generic connector state handoff. The host keeps a validated
 //! native Telegram checkpoint while ordinary execution is independently denied.
@@ -330,6 +330,95 @@ impl HostAdminStateStore {
         Ok(())
     }
 
+    /// Disable Telegram and return the exact committed denial revision.
+    ///
+    /// The caller captures the prior revision before waiting on any runtime.
+    /// An early denial may follow normal phase progress in the same unrevoked
+    /// custody, but cannot follow a new operator/configuration intent. Unlike a
+    /// read after mutation, this receipt cannot attribute a later edit to the
+    /// older stop request.
+    /// Denial remains available even when persistent checkpoint custody cannot
+    /// be admitted; attempting a stop never restores execution authority.
+    ///
+    /// # Errors
+    /// Refuses a different connector, dry-run/non-disable request, superseded
+    /// revision, exhausted journal or failed persistence.
+    pub async fn deny_telegram_polling_stop(
+        &self,
+        connector_id: &ConnectorId,
+        expected_journal_sequence: u64,
+        expected_custody: Option<&TelegramPollingRestartCustody>,
+        request: &LifecycleTransitionRequest,
+    ) -> Result<LifecycleTransitionResponse, LifecycleError> {
+        require_connector(connector_id)?;
+        if request.dry_run || request.action != LifecycleAction::Disable {
+            return Err(invalid(
+                "Telegram stop denial requires a live Disable request",
+            ));
+        }
+        self.apply_mutation(|snapshot| {
+            let state = snapshot
+                .connectors
+                .get(connector_id)
+                .ok_or_else(|| invalid("Telegram polling stop state is missing"))?;
+            let same_custody = expected_custody.is_some_and(|expected| {
+                state
+                    .telegram_polling_restart
+                    .as_ref()
+                    .is_some_and(|current| {
+                        current.custody_id == expected.custody_id
+                            && current.binding == expected.binding
+                    })
+            });
+            if expected_custody.is_some() && !same_custody {
+                return Err(invalid("Telegram stop custody was superseded"));
+            }
+            if state.last_journal_sequence != expected_journal_sequence {
+                let phase_progress_only = same_custody
+                    && state.last_journal_sequence > expected_journal_sequence
+                    && state.desired_state == DesiredRuntimeState::Disabled
+                    && expected_custody.is_some_and(|expected| {
+                        !expected.intent_revoked && expected_journal_sequence >= expected.custody_id
+                    })
+                    && state
+                        .telegram_polling_restart
+                        .as_ref()
+                        .is_some_and(|current| !current.intent_revoked);
+                if !phase_progress_only {
+                    return Err(invalid("Telegram stop denial was superseded"));
+                }
+            }
+            let now = Utc::now();
+            let previous = connector_admin_status_from_state(connector_id, state, now);
+            require_sequence(snapshot)?;
+            let sequence = snapshot.append_journal(
+                connector_id,
+                AdminStateMutation::DesiredStateSet {
+                    desired_state: DesiredRuntimeState::Disabled,
+                },
+                request
+                    .initiated_by
+                    .clone()
+                    .or_else(|| Some("admin-api".to_owned())),
+            );
+            let state = snapshot.connector_state_mut(connector_id);
+            state.desired_state = DesiredRuntimeState::Disabled;
+            state.last_journal_sequence = sequence;
+            Ok(LifecycleTransitionResponse {
+                connector_id: connector_id.to_string(),
+                action: LifecycleAction::Disable,
+                dry_run: false,
+                previous_desired_state: previous.desired_state,
+                current_desired_state: DesiredRuntimeState::Disabled,
+                observed_state: previous.observed_state,
+                lifecycle_status: previous.lifecycle,
+                journal_sequence: sequence,
+                transitioned_at: now,
+            })
+        })
+        .await
+    }
+
     /// Capture operator intent before inspecting or quiescing the runtime.
     ///
     /// # Errors
@@ -588,6 +677,55 @@ impl HostAdminStateStore {
         require_custody(&snapshot, connector_id, custody)
     }
 
+    /// Record a checkpointed stop after the caller publishes a dormant runtime.
+    ///
+    /// Custody remains durable and execution remains disabled. Only an explicit
+    /// later Enable or Restart may restore the same deployment and release it.
+    /// The callback must prove dormant publication under the inventory lock and
+    /// the original deadline; merely requesting shutdown is not an exit proof.
+    ///
+    /// # Errors
+    /// Refuses missing checkpoint/exit evidence, unresolved replacement custody,
+    /// changed intent, failed runtime guard or failed durable persistence.
+    pub async fn record_telegram_polling_stop_guarded<F>(
+        &self,
+        connector_id: &ConnectorId,
+        custody: &TelegramPollingRestartCustody,
+        validate: F,
+    ) -> Result<u64, LifecycleError>
+    where
+        F: FnOnce() -> Result<(), LifecycleError>,
+    {
+        self.require_telegram_restart_persistence()?;
+        custody
+            .checkpoint
+            .as_ref()
+            .ok_or_else(|| invalid("Telegram polling stop has no durable checkpoint"))?
+            .validate(&custody.binding)?;
+        if !custody.source_exited || custody.candidate_may_exist {
+            return Err(invalid(
+                "Telegram polling stop has unresolved process ownership",
+            ));
+        }
+        self.apply_mutation(|snapshot| {
+            require_custody(snapshot, connector_id, custody)?;
+            validate()?;
+            require_sequence(snapshot)?;
+            let sequence = snapshot.append_journal(
+                connector_id,
+                AdminStateMutation::ObservedStateSet {
+                    observed_state: ObservedRuntimeState::Stopped,
+                },
+                Some("telegram-polling-stop".to_owned()),
+            );
+            let state = snapshot.connector_state_mut(connector_id);
+            state.observed_state = ObservedRuntimeState::Stopped;
+            state.last_journal_sequence = sequence;
+            Ok(sequence)
+        })
+        .await
+    }
+
     /// Enable the already-published, successfully restored replacement.
     ///
     /// # Errors
@@ -727,6 +865,320 @@ mod tests {
             .mark_telegram_polling_candidate_starting(&connector_id(), &custody)
             .await
             .unwrap()
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn stop_denial_returns_its_own_revision_and_rejects_superseded_admission() {
+        let (_directory, store) = persistent_store().await;
+        let request = LifecycleTransitionRequest {
+            action: LifecycleAction::Disable,
+            reason: None,
+            initiated_by: Some("test-stop".to_owned()),
+            dry_run: false,
+        };
+        let previous = store.connector_status(&connector_id()).await.unwrap();
+        let denial = store
+            .deny_telegram_polling_stop(
+                &connector_id(),
+                previous.last_journal_sequence,
+                None,
+                &request,
+            )
+            .await
+            .unwrap();
+        assert_eq!(denial.previous_desired_state, DesiredRuntimeState::Enabled);
+        assert_eq!(denial.current_desired_state, DesiredRuntimeState::Disabled);
+        let preparation = store
+            .prepare_telegram_polling_restart(&connector_id())
+            .await
+            .unwrap();
+        assert_eq!(
+            preparation.expected_journal_sequence,
+            denial.journal_sequence
+        );
+
+        store
+            .append_config_revision(
+                &connector_id(),
+                serde_json::json!({"poll_interval_ms": 25}),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let changed = store.connector_status(&connector_id()).await.unwrap();
+        assert!(changed.last_journal_sequence > denial.journal_sequence);
+        assert!(
+            store
+                .begin_telegram_polling_restart(&connector_id(), &preparation, binding())
+                .await
+                .is_err(),
+            "a newer config cannot become part of an older stop admission"
+        );
+        assert!(
+            store
+                .deny_telegram_polling_stop(
+                    &connector_id(),
+                    denial.journal_sequence,
+                    None,
+                    &request,
+                )
+                .await
+                .is_err()
+        );
+
+        let fresh = store
+            .prepare_telegram_polling_restart(&connector_id())
+            .await
+            .unwrap();
+        store
+            .set_desired_state(&connector_id(), DesiredRuntimeState::Uninstalled, None)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .deny_telegram_polling_stop(
+                    &connector_id(),
+                    fresh.expected_journal_sequence,
+                    None,
+                    &request,
+                )
+                .await
+                .is_err(),
+            "a stale Disable cannot replace a newer Uninstall"
+        );
+        let final_state = store.connector_state(&connector_id()).await.unwrap();
+        assert_eq!(final_state.desired_state, DesiredRuntimeState::Uninstalled);
+        assert!(final_state.telegram_polling_restart.is_none());
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn early_stop_denial_follows_phase_progress_but_not_new_intent() {
+        for source_exited in [false, true] {
+            let (_directory, store) = persistent_store().await;
+            let expected = begin(&store).await;
+            let expected_sequence = store
+                .connector_state(&connector_id())
+                .await
+                .unwrap()
+                .last_journal_sequence;
+            let progressed = store
+                .record_telegram_polling_checkpoint(&connector_id(), &expected, checkpoint())
+                .await
+                .unwrap();
+            if source_exited {
+                store
+                    .mark_telegram_polling_source_exited(&connector_id(), &progressed)
+                    .await
+                    .unwrap();
+            }
+            let request = LifecycleTransitionRequest {
+                action: LifecycleAction::Disable,
+                reason: None,
+                initiated_by: None,
+                dry_run: false,
+            };
+            let denial = store
+                .deny_telegram_polling_stop(
+                    &connector_id(),
+                    expected_sequence,
+                    Some(&expected),
+                    &request,
+                )
+                .await
+                .unwrap();
+            let denied = store.connector_state(&connector_id()).await.unwrap();
+            assert_eq!(denied.last_journal_sequence, denial.journal_sequence);
+            assert_eq!(denied.desired_state, DesiredRuntimeState::Disabled);
+            let custody = denied.telegram_polling_restart.unwrap();
+            assert_eq!(custody.custody_id, expected.custody_id);
+            assert_eq!(custody.checkpoint, Some(checkpoint()));
+            assert_eq!(custody.source_exited, source_exited);
+            assert!(custody.intent_revoked);
+        }
+
+        for rotate_custody in [false, true] {
+            let (_directory, store) = persistent_store().await;
+            let expected = begin(&store).await;
+            let expected_sequence = store
+                .connector_state(&connector_id())
+                .await
+                .unwrap()
+                .last_journal_sequence;
+            if rotate_custody {
+                let next = begin(&store).await;
+                assert_ne!(next.custody_id, expected.custody_id);
+            } else {
+                store
+                    .append_config_revision(
+                        &connector_id(),
+                        serde_json::json!({"poll_interval_ms": 25}),
+                        None,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+            }
+            let current = store.connector_state(&connector_id()).await.unwrap();
+            let request = LifecycleTransitionRequest {
+                action: LifecycleAction::Disable,
+                reason: None,
+                initiated_by: None,
+                dry_run: false,
+            };
+            assert!(
+                store
+                    .deny_telegram_polling_stop(
+                        &connector_id(),
+                        expected_sequence,
+                        Some(&expected),
+                        &request,
+                    )
+                    .await
+                    .is_err(),
+                "normal phase progress must not hide a new config or restart intent"
+            );
+            let unchanged = store.connector_state(&connector_id()).await.unwrap();
+            assert_eq!(
+                unchanged.last_journal_sequence,
+                current.last_journal_sequence
+            );
+            assert_eq!(
+                unchanged.telegram_polling_restart,
+                current.telegram_polling_restart
+            );
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn checkpointed_stop_requires_exit_and_preserves_custody_across_reopen() {
+        let (directory, store) = persistent_store().await;
+        let custody = begin(&store).await;
+        assert!(
+            store
+                .record_telegram_polling_stop_guarded(&connector_id(), &custody, || Ok(()))
+                .await
+                .is_err(),
+            "a stop needs a committed checkpoint"
+        );
+        let custody = store
+            .record_telegram_polling_checkpoint(&connector_id(), &custody, checkpoint())
+            .await
+            .unwrap();
+        assert!(
+            store
+                .record_telegram_polling_stop_guarded(&connector_id(), &custody, || Ok(()))
+                .await
+                .is_err()
+        );
+        let custody = store
+            .mark_telegram_polling_source_exited(&connector_id(), &custody)
+            .await
+            .unwrap();
+        let before = store.connector_state(&connector_id()).await.unwrap();
+        assert!(
+            store
+                .record_telegram_polling_stop_guarded(&connector_id(), &custody, || {
+                    Err(invalid("dormant runtime was not published"))
+                })
+                .await
+                .is_err()
+        );
+        let unchanged = store.connector_state(&connector_id()).await.unwrap();
+        assert_eq!(
+            unchanged.last_journal_sequence,
+            before.last_journal_sequence
+        );
+        assert_eq!(unchanged.telegram_polling_restart, Some(custody.clone()));
+        let sequence = store
+            .record_telegram_polling_stop_guarded(&connector_id(), &custody, || Ok(()))
+            .await
+            .unwrap();
+        assert!(sequence > before.last_journal_sequence);
+
+        let reopened =
+            HostAdminStateStore::with_state_path(directory.path().join("admin.json")).unwrap();
+        let stopped = reopened.connector_state(&connector_id()).await.unwrap();
+        assert_eq!(stopped.desired_state, DesiredRuntimeState::Disabled);
+        assert_eq!(stopped.observed_state, ObservedRuntimeState::Stopped);
+        assert_eq!(stopped.telegram_polling_restart, Some(custody.clone()));
+        reopened
+            .require_telegram_polling_restart(&connector_id(), &custody)
+            .await
+            .unwrap();
+        assert!(
+            reopened
+                .connector_execution_fence(&connector_id())
+                .await
+                .is_err()
+        );
+        assert!(
+            reopened
+                .set_desired_state(&connector_id(), DesiredRuntimeState::Enabled, None)
+                .await
+                .is_err(),
+            "Enable cannot bypass the retained restore boundary"
+        );
+        let preparation = reopened
+            .prepare_telegram_polling_restart(&connector_id())
+            .await
+            .unwrap();
+        let resumed = reopened
+            .begin_telegram_polling_restart(&connector_id(), &preparation, binding())
+            .await
+            .unwrap();
+        assert_eq!(resumed.checkpoint, Some(checkpoint()));
+        assert!(resumed.source_exited && !resumed.candidate_may_exist);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn checkpointed_stop_rejects_unresolved_replacement_and_revoked_intent() {
+        let (_directory, store) = persistent_store().await;
+        let custody = candidate(&store).await;
+        let before = store.connector_state(&connector_id()).await.unwrap();
+        assert!(
+            store
+                .record_telegram_polling_stop_guarded(&connector_id(), &custody, || Ok(()))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .connector_state(&connector_id())
+                .await
+                .unwrap()
+                .last_journal_sequence,
+            before.last_journal_sequence
+        );
+        let custody = store
+            .mark_telegram_polling_candidate_exited(&connector_id(), &custody)
+            .await
+            .unwrap();
+        store
+            .set_desired_state(&connector_id(), DesiredRuntimeState::Disabled, None)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .record_telegram_polling_stop_guarded(&connector_id(), &custody, || Ok(()))
+                .await
+                .is_err(),
+            "a newer Disable invalidates the old stop attempt"
+        );
+        let revoked = store
+            .connector_state(&connector_id())
+            .await
+            .unwrap()
+            .telegram_polling_restart
+            .unwrap();
+        assert!(revoked.intent_revoked);
+        assert!(
+            store
+                .record_telegram_polling_stop_guarded(&connector_id(), &revoked, || Ok(()))
+                .await
+                .is_err(),
+            "current but revoked custody does not authorize finalization"
+        );
     }
 
     #[test]

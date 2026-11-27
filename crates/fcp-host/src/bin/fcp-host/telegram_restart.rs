@@ -1,10 +1,11 @@
-//! Restart one admitted local Telegram polling writer without losing its cursor.
+//! Stop or restart one admitted Telegram polling writer without losing its cursor.
 //!
 //! This is deliberately narrower than generic stateful replacement. The durable
 //! admin-state custody record denies execution through every asynchronous phase.
 //! Only a committed checkpoint and an observed exit of the exact source permit
-//! a replacement. Its restore acknowledgement precedes registry publication,
-//! and publication precedes the guarded, durable grant of execution authority.
+//! a replacement. Disable instead retains that checkpoint in a dormant runtime.
+//! A later Enable restores it before registry publication and the guarded,
+//! durable grant of execution authority.
 
 use fcp_host::{
     DesiredRuntimeState, HostTelegramPollingCheckpoint, LifecycleAction, ObservedRuntimeState,
@@ -185,8 +186,10 @@ fn validate_recovery(
     preparation: &TelegramPollingRestartPreparation,
     binding: &TelegramPollingRestartBinding,
 ) -> HostResult<()> {
-    if !matches!(action, LifecycleAction::Restart | LifecycleAction::Enable)
-        || (action == LifecycleAction::Enable && preparation.pending.is_none())
+    if !matches!(
+        action,
+        LifecycleAction::Restart | LifecycleAction::Enable | LifecycleAction::Disable
+    ) || (action == LifecycleAction::Enable && preparation.pending.is_none())
     {
         return Err(unavailable(
             "Telegram polling recovery requires an existing restart custody record",
@@ -310,16 +313,22 @@ pub(super) async fn transition_selected(
         ));
     }
     let (binding, admitted) = validate_admission(state, entry, &preparation, request.action)?;
-    // Reserve both inventory publications before quiescing a source.
+    let stop_only = request.action == LifecycleAction::Disable;
+    // Disable publishes only the dormant source; restart also publishes the
+    // restored replacement. Reserve the full generation range before quiescing.
     generation
-        .checked_add(2)
+        .checked_add(if stop_only { 1 } else { 2 })
         .ok_or_else(|| unavailable("connector inventory generation is exhausted"))?;
     let mut response = LifecycleTransitionResponse {
         connector_id: connector_id.to_string(),
         action: request.action,
         dry_run: request.dry_run,
         previous_desired_state: preparation.previous_desired_state,
-        current_desired_state: DesiredRuntimeState::Enabled,
+        current_desired_state: if stop_only {
+            DesiredRuntimeState::Disabled
+        } else {
+            DesiredRuntimeState::Enabled
+        },
         observed_state: previous.observed_state,
         lifecycle_status: previous.lifecycle.clone(),
         journal_sequence: preparation.expected_journal_sequence,
@@ -425,6 +434,40 @@ pub(super) async fn transition_selected(
     }
 
     require_custody(state, connector_id, entry, &custody, generation, deadline).await?;
+    if stop_only {
+        // A source exit proof alone is not enough: publish the dormant runtime
+        // first, then durably report Stopped without discarding restore custody.
+        let (published, published_generation) =
+            lifecycle_runtime::selected_entry(&state.registry, connector_id).await?;
+        if published_generation != generation
+            || !matches!(&published.connector, ConnectorRuntime::Dormant(_))
+        {
+            return Err(unavailable(
+                "Telegram polling stop has no current dormant runtime",
+            ));
+        }
+        let sequence = state
+            .lifecycle
+            .record_telegram_polling_stop_guarded(connector_id, &custody, || {
+                require_current(&state.registry, generation, deadline).map_err(|error| {
+                    LifecycleError::Persistence {
+                        reason: error.to_string(),
+                    }
+                })?;
+                entry
+                    .state_policy
+                    .require_admitted_manifest(&entry.config)
+                    .map_err(|error| LifecycleError::Persistence {
+                        reason: error.to_string(),
+                    })
+            })
+            .await
+            .map_err(map_lifecycle_host_error)?;
+        response.observed_state = ObservedRuntimeState::Stopped;
+        response.journal_sequence = sequence;
+        response.transitioned_at = Utc::now();
+        return Ok(response);
+    }
     let checkpoint = custody
         .checkpoint
         .clone()
@@ -747,13 +790,21 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    async fn fixture() -> (
+    type PollingFixture = (
         tempfile::TempDir,
         Arc<AppState>,
         Arc<SubprocessConnector>,
         HostTelegramPollingCheckpoint,
         TestHrwLeaseRoutingOverrideGuard,
-    ) {
+    );
+
+    #[cfg(target_os = "linux")]
+    async fn fixture() -> PollingFixture {
+        fixture_with_checkpoint(None).await
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn fixture_with_checkpoint(checkpoint_override: Option<Value>) -> PollingFixture {
         let connector_id = ConnectorId::from_static(CONNECTOR);
         let eligible_nodes = vec![
             TailscaleNodeId::new("telegram-restart-a"),
@@ -794,7 +845,9 @@ mod tests {
             ),
             (
                 "FCP_TEST_CONNECTOR_TELEGRAM_CHECKPOINT",
-                serde_json::to_string(&checkpoint).unwrap(),
+                checkpoint_override
+                    .unwrap_or_else(|| serde_json::to_value(&checkpoint).unwrap())
+                    .to_string(),
             ),
             (
                 "FCP_TEST_CONNECTOR_RESTORE_READY",
@@ -911,6 +964,196 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(entry.connector, ConnectorRuntime::Dormant(_)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn real_native_disable_retains_checkpoint_until_explicit_enable_restores() {
+        let (directory, state, source, checkpoint, _routing) = fixture().await;
+        let connector_id = ConnectorId::from_static(CONNECTOR);
+        let generation = state.registry.version();
+        let original = state
+            .lifecycle
+            .connector_state(&connector_id)
+            .await
+            .unwrap();
+        let mut preview = request(LifecycleAction::Disable);
+        preview.dry_run = true;
+        let preview_response = lifecycle_runtime::transition(&state, &connector_id, &preview)
+            .await
+            .unwrap();
+        assert_eq!(
+            preview_response.current_desired_state,
+            DesiredRuntimeState::Disabled
+        );
+        assert_eq!(state.registry.version(), generation);
+        assert!(!source.runtime_retirement.is_exited());
+        let unchanged = state
+            .lifecycle
+            .connector_state(&connector_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            unchanged.last_journal_sequence,
+            original.last_journal_sequence
+        );
+        assert!(unchanged.telegram_polling_restart.is_none());
+
+        let response = lifecycle_runtime::transition(
+            &state,
+            &connector_id,
+            &request(LifecycleAction::Disable),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.action, LifecycleAction::Disable);
+        assert_eq!(
+            response.previous_desired_state,
+            DesiredRuntimeState::Enabled
+        );
+        assert_eq!(
+            response.current_desired_state,
+            DesiredRuntimeState::Disabled
+        );
+        assert_eq!(response.observed_state, ObservedRuntimeState::Stopped);
+        assert_eq!(state.registry.version(), generation + 1);
+        assert!(source.runtime_retirement.is_exited());
+        assert!(!directory.path().join("restore-ready").exists());
+
+        let stopped = state
+            .lifecycle
+            .connector_state(&connector_id)
+            .await
+            .unwrap();
+        let custody = stopped.telegram_polling_restart.as_ref().unwrap();
+        assert_eq!(custody.checkpoint.as_ref(), Some(&checkpoint));
+        assert!(custody.source_exited && !custody.candidate_may_exist);
+        assert!(!custody.intent_revoked);
+        assert_eq!(stopped.observed_state, ObservedRuntimeState::Stopped);
+        assert_eq!(stopped.last_journal_sequence, response.journal_sequence);
+        assert!(
+            state
+                .lifecycle
+                .connector_execution_fence(&connector_id)
+                .await
+                .is_err()
+        );
+        let (dormant, _) = lifecycle_runtime::selected_entry(&state.registry, &connector_id)
+            .await
+            .unwrap();
+        assert!(matches!(dormant.connector, ConnectorRuntime::Dormant(_)));
+
+        // Repeated Disable uses the ordinary dormant path. It revokes the old
+        // attempt but must preserve the checkpoint for a later explicit Enable.
+        let repeated = lifecycle_runtime::transition(
+            &state,
+            &connector_id,
+            &request(LifecycleAction::Disable),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            repeated.current_desired_state,
+            DesiredRuntimeState::Disabled
+        );
+        assert_eq!(repeated.observed_state, ObservedRuntimeState::Stopped);
+        let repeated_custody = state
+            .lifecycle
+            .connector_state(&connector_id)
+            .await
+            .unwrap()
+            .telegram_polling_restart
+            .unwrap();
+        assert_eq!(repeated_custody.custody_id, custody.custody_id);
+        assert_eq!(repeated_custody.checkpoint.as_ref(), Some(&checkpoint));
+        assert!(repeated_custody.source_exited && !repeated_custody.candidate_may_exist);
+        assert!(repeated_custody.intent_revoked);
+        assert!(!directory.path().join("restore-ready").exists());
+
+        let enable = start_transition(&state, LifecycleAction::Enable);
+        wait_for_restore(directory.path()).await;
+        assert_restore_is_denied(&state, &source, &checkpoint).await;
+        std::fs::write(directory.path().join("restore-release"), b"continue").unwrap();
+        let enabled = enable.await.unwrap().unwrap();
+        assert_eq!(enabled.current_desired_state, DesiredRuntimeState::Enabled);
+        assert!(
+            state
+                .lifecycle
+                .connector_state(&connector_id)
+                .await
+                .unwrap()
+                .telegram_polling_restart
+                .is_none()
+        );
+        state
+            .lifecycle
+            .connector_execution_fence(&connector_id)
+            .await
+            .unwrap();
+        let (entry, _) = lifecycle_runtime::selected_entry(&state.registry, &connector_id)
+            .await
+            .unwrap();
+        let ConnectorRuntime::Native(replacement) = entry.connector else {
+            panic!("Enable must publish the restored native runtime");
+        };
+        assert!(!Arc::ptr_eq(&source, &replacement));
+        state
+            .registry
+            .shutdown(Instant::now() + Duration::from_secs(3))
+            .await
+            .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn native_disable_failure_keeps_authority_denied_without_claiming_stop() {
+        for reject_checkpoint in [true, false] {
+            let mut invalid = serde_json::to_value(checkpoint(Some(1001))).unwrap();
+            invalid["checkpoint_id"] = json!("sha256:invalid");
+            let (directory, state, source, _checkpoint, _routing) =
+                fixture_with_checkpoint(reject_checkpoint.then_some(invalid)).await;
+            if !reject_checkpoint {
+                std::fs::write(directory.path().join("manifest.toml"), b"invalid manifest")
+                    .unwrap();
+            }
+            let connector_id = ConnectorId::from_static(CONNECTOR);
+            let generation = state.registry.version();
+            let result = lifecycle_runtime::transition(
+                &state,
+                &connector_id,
+                &request(LifecycleAction::Disable),
+            )
+            .await;
+            assert!(result.is_err());
+            assert_eq!(state.registry.version(), generation);
+            assert!(!source.runtime_retirement.is_exited());
+            assert!(!directory.path().join("restore-ready").exists());
+            let denied = state
+                .lifecycle
+                .connector_state(&connector_id)
+                .await
+                .unwrap();
+            assert_eq!(denied.desired_state, DesiredRuntimeState::Disabled);
+            if reject_checkpoint {
+                let custody = denied.telegram_polling_restart.as_ref().unwrap();
+                assert!(custody.checkpoint.is_none());
+                assert!(!custody.source_exited && !custody.candidate_may_exist);
+            } else {
+                assert!(denied.telegram_polling_restart.is_none());
+            }
+            assert!(
+                state
+                    .lifecycle
+                    .connector_execution_fence(&connector_id)
+                    .await
+                    .is_err()
+            );
+            state
+                .registry
+                .shutdown(Instant::now() + Duration::from_secs(3))
+                .await
+                .unwrap();
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -1051,43 +1294,29 @@ mod tests {
             .await
             .unwrap();
         let config = entry.config.clone();
-        let binding = binding_for_config(&config, entry.state_policy).unwrap();
-        let preparation = state
-            .lifecycle
-            .prepare_telegram_polling_restart(&connector_id)
-            .await
-            .unwrap();
-        let custody = state
-            .lifecycle
-            .begin_telegram_polling_restart(&connector_id, &preparation, binding.clone())
-            .await
-            .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let termination = NativeInvocationTermination::new(deadline);
-        let exported = source
-            .rpc_in_handshaken_zone_with_termination(
-                &ZoneId::work(),
-                "state.checkpoint",
-                json!({ "deadline_ms": 4000 }),
-                Some(&termination),
-            )
-            .await
-            .unwrap();
-        let checkpoint = HostTelegramPollingCheckpoint::from_value(exported, &binding).unwrap();
-        assert_eq!(checkpoint, expected_checkpoint);
-        let custody = state
-            .lifecycle
-            .record_telegram_polling_checkpoint(&connector_id, &custody, checkpoint)
-            .await
-            .unwrap();
-        source.retire_runtime(deadline).await.unwrap();
+        let stopped = lifecycle_runtime::transition(
+            &state,
+            &connector_id,
+            &request(LifecycleAction::Disable),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stopped.observed_state, ObservedRuntimeState::Stopped);
         assert!(source.runtime_retirement.is_exited());
-        state
+        let retained = state
             .lifecycle
-            .mark_telegram_polling_source_exited(&connector_id, &custody)
+            .connector_state(&connector_id)
+            .await
+            .unwrap()
+            .telegram_polling_restart
+            .unwrap();
+        assert_eq!(retained.checkpoint, Some(expected_checkpoint));
+        assert!(retained.source_exited && !retained.candidate_may_exist);
+        state
+            .registry
+            .shutdown(Instant::now() + Duration::from_secs(3))
             .await
             .unwrap();
-        state.registry.shutdown(deadline).await.unwrap();
         let verifying_key = state.capability_verifying_key.clone();
         let key_bytes = state.registry.capability_verifying_key;
         drop(state);
