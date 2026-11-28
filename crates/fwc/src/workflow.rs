@@ -33,6 +33,7 @@ const TASK_SUBCOMMANDS: &[&str] = &[
     "bind",
     "approve",
     "run",
+    "resume",
     "reconcile",
 ];
 
@@ -93,6 +94,14 @@ pub struct TaskExecutionFence {
     pub mode: String,
     pub revision: u64,
     pub state: TaskExecutionState,
+    /// Resume never starts a new attempt. This generation fences tickets held
+    /// before an explicit continuation of the same durable execution.
+    #[serde(default)]
+    pub resume_generation: u64,
+    /// A resume contract is established before the first primitive. Older
+    /// attempts remain inspectable but cannot infer a contract after dispatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_binding: Option<TaskResumeBinding>,
     /// Older capsules retain their fence without inventing a recoverable
     /// identity for requests that may already have reached a host.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -111,6 +120,8 @@ impl TaskExecutionFence {
             "mode": self.mode,
             "revision": self.revision,
             "state": self.state,
+            "resume_generation": self.resume_generation,
+            "resume_binding": self.resume_binding,
         });
         if let Some(journal) = &self.journal {
             value["journal"] = json!({
@@ -118,6 +129,49 @@ impl TaskExecutionFence {
             });
         }
         value
+    }
+}
+
+/// Payload-free commitment to the execution plan, snapshotted input, selected
+/// host and zone. Runtime credentials are supplied afresh, never retained here.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskResumeBinding {
+    pub version: u32,
+    pub plan_digest: String,
+    pub host: String,
+    pub default_zone: String,
+}
+
+impl TaskResumeBinding {
+    pub fn new(plan: &Value, host: String, default_zone: String) -> Result<Self> {
+        let bytes = zeroize::Zeroizing::new(serde_json::to_vec(plan)?);
+        let mut hasher = blake3::Hasher::new_derive_key("fcp.fwc.task-resume-plan.v1");
+        hasher.update(&bytes);
+        let binding = Self {
+            version: 1,
+            plan_digest: hasher.finalize().to_hex().to_string(),
+            host,
+            default_zone,
+        };
+        binding.validate()?;
+        Ok(binding)
+    }
+
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            self.version == 1
+                && self.plan_digest.len() == 64
+                && self
+                    .plan_digest
+                    .bytes()
+                    .all(|byte| { byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte) })
+                && crate::normalize_host_endpoint(&self.host)
+                    .is_ok_and(|normalized| normalized == self.host)
+                && self.default_zone.parse::<fcp_core::ZoneId>().is_ok(),
+            "workflow resume contract is invalid"
+        );
+        Ok(())
     }
 }
 
@@ -275,7 +329,7 @@ impl std::fmt::Display for TaskAccessError {
                 "this workflow capsule has already executed; inspect its evidence and explicitly create a new task for new work",
             ),
             Self::ExecutionBlocked(_) => formatter.write_str(
-                "this workflow capsule may have dispatched effects; reconcile its retained evidence before explicitly creating a new task",
+                "this workflow capsule may have dispatched effects; reconcile its retained evidence before explicitly resuming untouched remaining work or creating a new task",
             ),
         }
     }
@@ -289,12 +343,19 @@ impl std::error::Error for TaskAccessError {}
 pub struct TaskExecutionTicket {
     attempt_id: String,
     revision: u64,
+    resume_generation: u64,
+    completed_prefix: Vec<TaskStepExecution>,
 }
 
 impl TaskExecutionTicket {
     #[must_use]
     pub fn attempt_id(&self) -> &str {
         &self.attempt_id
+    }
+
+    #[must_use]
+    pub fn completed_prefix(&self) -> &[TaskStepExecution] {
+        &self.completed_prefix
     }
 }
 
@@ -562,6 +623,13 @@ impl TaskStore {
             ensure!(
                 fence.revision == task.revision && !fence.attempt_id.is_empty(),
                 "workflow execution fence does not match its capsule revision"
+            );
+            if let Some(binding) = &fence.resume_binding {
+                binding.validate()?;
+            }
+            ensure!(
+                fence.resume_generation == 0 || fence.resume_binding.is_some(),
+                "resumed workflow execution is missing its original contract"
             );
             if let Some(journal) = &fence.journal {
                 validate_execution_journal(journal)?;
@@ -1091,6 +1159,8 @@ impl TaskLease<'_> {
         let ticket = TaskExecutionTicket {
             attempt_id: Uuid::new_v4().to_string(),
             revision: task.revision,
+            resume_generation: 0,
+            completed_prefix: Vec::new(),
         };
         task.execution_fence = Some(TaskExecutionFence {
             attempt_id: ticket.attempt_id.clone(),
@@ -1099,6 +1169,8 @@ impl TaskLease<'_> {
             mode: mode.to_owned(),
             revision: task.revision,
             state: TaskExecutionState::Pending,
+            resume_generation: 0,
+            resume_binding: None,
             journal: Some(TaskExecutionJournal {
                 steps: task
                     .compiled
@@ -1124,6 +1196,130 @@ impl TaskLease<'_> {
         Ok(ticket)
     }
 
+    /// Establish the full resume contract before any work can start. A resumed
+    /// caller must match it exactly; an interrupted legacy attempt cannot add
+    /// one retroactively to authorize its remaining effects.
+    pub fn bind_execution_context(
+        &self,
+        ticket: &TaskExecutionTicket,
+        binding: &TaskResumeBinding,
+    ) -> Result<()> {
+        binding.validate()?;
+        let mut task = self.pending_execution(ticket)?;
+        let fence = task
+            .execution_fence
+            .as_mut()
+            .expect("pending fence checked");
+        if let Some(original) = &fence.resume_binding {
+            ensure!(original == binding, "workflow execution context changed");
+            return Ok(());
+        }
+        ensure!(
+            fence.resume_generation == 0
+                && fence.journal.as_ref().is_some_and(|journal| {
+                    journal.steps.iter().all(|step| step.started_at.is_none())
+                }),
+            "workflow resume contract must precede every primitive"
+        );
+        fence.resume_binding = Some(binding.clone());
+        self.store.save(&task)
+    }
+
+    /// Continue only the untouched suffix after a proven successful prefix.
+    /// The task lease, original attempt and immutable plan remain in force.
+    /// No started primitive, including a known failure, is ever sent again.
+    pub fn resume_execution(&self, binding: &TaskResumeBinding) -> Result<TaskExecutionTicket> {
+        binding.validate()?;
+        let mut task = self
+            .load()?
+            .context("workflow capsule disappeared before resume")?;
+        ensure!(
+            task.compiled.status == "ready"
+                && task.unresolved_bindings.is_empty()
+                && task.resolution.pending_question.is_none(),
+            "workflow capsule is not ready to continue"
+        );
+        ensure!(
+            !task.has_side_effects() || task.approval.workflow,
+            "workflow capsule requires its original approval before continuation"
+        );
+        let fence = task
+            .execution_fence
+            .as_mut()
+            .context("workflow capsule has no execution to resume")?;
+        ensure!(
+            fence.state != TaskExecutionState::Completed
+                && fence.mode == "approve"
+                && fence.revision == task.revision
+                && fence.resume_binding.as_ref() == Some(binding),
+            "workflow resume requires an unfinished approved attempt with an unchanged original plan, input, host and zone"
+        );
+        let journal = fence
+            .journal
+            .as_ref()
+            .context("legacy workflow execution cannot resume")?;
+        ensure!(
+            journal.steps.len() == task.compiled.steps.len()
+                && journal
+                    .steps
+                    .iter()
+                    .zip(&task.compiled.steps)
+                    .all(|(saved, planned)| {
+                        saved.ordinal == planned.ordinal
+                            && saved.command == planned.command
+                            && saved.side_effecting == planned.side_effecting
+                    }),
+            "workflow continuation no longer matches its retained primitive plan"
+        );
+        let prefix_len = journal
+            .steps
+            .iter()
+            .take_while(|step| step.is_complete())
+            .count();
+        ensure!(
+            prefix_len > 0 && prefix_len < journal.steps.len(),
+            "workflow resume requires a completed prefix and unstarted remaining work"
+        );
+        ensure!(
+            journal.steps[prefix_len..].iter().all(|step| {
+                step.started_at.is_none()
+                    && step.invocation.is_none()
+                    && step.observed_attempt.is_none()
+                    && step.reconciliation.is_none()
+                    && step.output_recovery.is_none()
+                    && step.finished_at.is_none()
+                    && step.receipt.is_none()
+            }),
+            "workflow resume cannot repeat a started, failed or uncertain primitive; reconcile its exact outcome first"
+        );
+        fence.resume_generation = fence
+            .resume_generation
+            .checked_add(1)
+            .context("workflow resume generation exhausted")?;
+        fence.state = TaskExecutionState::Pending;
+        let ticket = TaskExecutionTicket {
+            attempt_id: fence.attempt_id.clone(),
+            revision: fence.revision,
+            resume_generation: fence.resume_generation,
+            completed_prefix: journal.steps[..prefix_len].to_vec(),
+        };
+        append_execution_receipt(
+            &mut task,
+            "resume",
+            "approve",
+            json!({
+                "status": "execution-pending",
+                "attempt_id": ticket.attempt_id,
+                "resume_generation": ticket.resume_generation,
+                "completed_prefix_count": prefix_len,
+                "automatic_retry_allowed": false,
+            }),
+        );
+        recompute_task(&mut task, true);
+        self.store.save(&task)?;
+        Ok(ticket)
+    }
+
     /// Sync the next primitive's identity before even a non-invoke primitive
     /// can run. An interrupted unsupported effect remains visible and fenced.
     pub fn record_step_started(&self, ticket: &TaskExecutionTicket, ordinal: usize) -> Result<()> {
@@ -1135,7 +1331,9 @@ impl TaskLease<'_> {
             .position(|step| step.ordinal == ordinal)
             .context("workflow primitive is not in the retained execution plan")?;
         ensure!(
-            journal.steps[..index].iter().all(step_succeeded),
+            journal.steps[..index]
+                .iter()
+                .all(TaskStepExecution::is_complete),
             "workflow primitive cannot run before earlier receipts are durably successful"
         );
         let step = &mut journal.steps[index];
@@ -1223,6 +1421,7 @@ impl TaskLease<'_> {
             fence.state == TaskExecutionState::Pending
                 && fence.attempt_id == ticket.attempt_id
                 && fence.revision == ticket.revision
+                && fence.resume_generation == ticket.resume_generation
                 && task.revision == ticket.revision,
             "workflow execution attempt no longer owns the capsule"
         );
@@ -1522,6 +1721,7 @@ impl TaskLease<'_> {
             fence.state == TaskExecutionState::Pending
                 && fence.attempt_id == ticket.attempt_id
                 && fence.revision == ticket.revision
+                && fence.resume_generation == ticket.resume_generation
                 && task.revision == ticket.revision,
             "workflow execution attempt no longer owns the capsule"
         );
@@ -1530,13 +1730,16 @@ impl TaskLease<'_> {
         let mut next_state = execution_fence_after(&execution);
         if let Some(journal) = &fence.journal
             && ((next_state == Some(TaskExecutionState::Completed)
-                && (!journal.steps.iter().all(step_succeeded)
+                && (!journal.steps.iter().all(TaskStepExecution::is_complete)
                     || !journal_matches_execution(journal, &execution)))
                 || (journal.steps.iter().any(|step| step.started_at.is_some())
                     && !journal_matches_execution(journal, &execution)))
         {
             // A lost incremental receipt or contradictory aggregate must not
             // hide already-dispatched work or falsely complete a partial plan.
+            next_state = Some(TaskExecutionState::NeedsReview);
+        }
+        if next_state.is_none() && ticket.resume_generation > 0 {
             next_state = Some(TaskExecutionState::NeedsReview);
         }
         if let Some(state) = next_state {
@@ -1547,7 +1750,16 @@ impl TaskLease<'_> {
         } else {
             task.execution_fence = None;
         }
-        append_execution_receipt(&mut task, &trigger, &mode, execution);
+        append_execution_receipt(
+            &mut task,
+            if ticket.resume_generation > 0 {
+                "resume"
+            } else {
+                &trigger
+            },
+            &mode,
+            execution,
+        );
         recompute_task(&mut task, true);
         self.store.save(&task)?;
         Ok(Some(task))
@@ -1834,7 +2046,7 @@ fn journal_matches_execution(journal: &TaskExecutionJournal, execution: &Value) 
     if journal
         .steps
         .iter()
-        .any(|step| step.started_at.is_some() && step.receipt.is_none())
+        .any(|step| step.started_at.is_some() && step.receipt.is_none() && !step.is_complete())
     {
         return false;
     }
@@ -2252,6 +2464,16 @@ fn build_task_next_actions(task: &WorkflowTask) -> Vec<String> {
                 "Inspect completion without repeating work with `fwc task reconcile {} --host <original-host> --admin-token-file <path>`.",
                 task.id
             ));
+            if task
+                .execution_fence
+                .as_ref()
+                .is_some_and(|fence| fence.resume_binding.is_some())
+            {
+                actions.push(format!(
+                    "After every started primitive is confirmed successful, continue only unstarted work with `fwc task resume {}` and fresh runtime credentials. Keep the original payload, selected host/context and zone unchanged; use --host only if it preserves the original zone selection.",
+                    task.id
+                ));
+            }
         }
         return actions;
     }
@@ -2879,6 +3101,199 @@ mod tests {
         }
     }
 
+    fn resume_binding(task: &super::WorkflowTask) -> super::TaskResumeBinding {
+        super::TaskResumeBinding::new(
+            &json!({ "compiled": task.compiled, "bindings": super::effective_bindings(task) }),
+            "https://host.example.test".to_owned(),
+            "z:work".to_owned(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn task_resume_preserves_attempt_and_receipts_and_fences_older_tickets() {
+        let store = store();
+        let task = ready_task(&store);
+        let lease = store.lock_task(&task.id).unwrap();
+        let original = lease.begin_execution("run", "approve").unwrap();
+        let binding = resume_binding(&task);
+        lease.bind_execution_context(&original, &binding).unwrap();
+        let journal = lease
+            .load()
+            .unwrap()
+            .unwrap()
+            .execution_fence
+            .unwrap()
+            .journal
+            .unwrap();
+        let first = &journal.steps[0];
+        lease.record_step_started(&original, first.ordinal).unwrap();
+        let receipt = successful_step_receipt(first);
+        lease
+            .record_step_finished(&original, first.ordinal, receipt.clone())
+            .unwrap();
+        let resumed = lease.resume_execution(&binding).unwrap();
+        assert_eq!(resumed.attempt_id(), original.attempt_id());
+        assert_eq!(resumed.resume_generation, 1);
+        assert_eq!(resumed.completed_prefix().len(), 1);
+        assert_eq!(
+            resumed.completed_prefix()[0].receipt.as_ref(),
+            Some(&receipt)
+        );
+        assert!(
+            lease
+                .record_step_started(&original, journal.steps[1].ordinal)
+                .is_err()
+        );
+        assert!(lease.record_step_started(&resumed, first.ordinal).is_err());
+        let repeated = lease.resume_execution(&binding).unwrap();
+        assert_eq!(repeated.resume_generation, 2);
+        assert!(
+            lease
+                .record_step_started(&resumed, journal.steps[1].ordinal)
+                .is_err()
+        );
+        let mut receipts = vec![receipt];
+        for step in &journal.steps[1..] {
+            lease.record_step_started(&repeated, step.ordinal).unwrap();
+            let receipt = successful_step_receipt(step);
+            lease
+                .record_step_finished(&repeated, step.ordinal, receipt.clone())
+                .unwrap();
+            receipts.push(receipt);
+        }
+        let finished = lease.finish_execution(&repeated, json!({
+            "status":"materialized", "executed_count":receipts.len(), "executed_steps":receipts,
+        })).unwrap().unwrap();
+        assert_eq!(
+            finished.execution_fence.as_ref().unwrap().state,
+            super::TaskExecutionState::Completed
+        );
+        assert!(lease.resume_execution(&binding).is_err());
+        assert!(lease.begin_execution("run", "approve").is_err());
+        assert_eq!(finished.execution_history.last().unwrap().trigger, "resume");
+    }
+
+    #[test]
+    fn task_resume_refuses_changed_context_legacy_and_any_started_suffix() {
+        for change in [
+            "legacy", "digest", "host", "zone", "started", "failed", "simulate",
+        ] {
+            let store = store();
+            let task = ready_task(&store);
+            let lease = store.lock_task(&task.id).unwrap();
+            let original = lease
+                .begin_execution(
+                    "run",
+                    if change == "simulate" {
+                        "simulate"
+                    } else {
+                        "approve"
+                    },
+                )
+                .unwrap();
+            let binding = resume_binding(&task);
+            if change != "legacy" {
+                lease.bind_execution_context(&original, &binding).unwrap();
+            }
+            let journal = lease
+                .load()
+                .unwrap()
+                .unwrap()
+                .execution_fence
+                .unwrap()
+                .journal
+                .unwrap();
+            lease
+                .record_step_started(&original, journal.steps[0].ordinal)
+                .unwrap();
+            lease
+                .record_step_finished(
+                    &original,
+                    journal.steps[0].ordinal,
+                    successful_step_receipt(&journal.steps[0]),
+                )
+                .unwrap();
+            if matches!(change, "started" | "failed") {
+                let next = &journal.steps[1];
+                lease.record_step_started(&original, next.ordinal).unwrap();
+                if change == "failed" {
+                    let mut failure = successful_step_receipt(next);
+                    failure["status"] = json!("failed");
+                    failure["exit_code"] = json!(1);
+                    lease
+                        .record_step_finished(&original, next.ordinal, failure)
+                        .unwrap();
+                }
+            }
+            let mut candidate = binding.clone();
+            match change {
+                "digest" => candidate.plan_digest = "d".repeat(64),
+                "host" => candidate.host = "https://other.example.test".to_owned(),
+                "zone" => candidate.default_zone = "z:other".to_owned(),
+                _ => {}
+            }
+            let before = fs::read(store.task_path(&task.id)).unwrap();
+            assert!(lease.resume_execution(&candidate).is_err(), "{change}");
+            assert_eq!(
+                fs::read(store.task_path(&task.id)).unwrap(),
+                before,
+                "{change}"
+            );
+            if change == "legacy" {
+                assert!(lease.bind_execution_context(&original, &binding).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn task_resume_never_clears_original_progress_on_a_definite_suffix_refusal() {
+        let store = store();
+        let task = ready_task(&store);
+        let lease = store.lock_task(&task.id).unwrap();
+        let original = lease.begin_execution("run", "approve").unwrap();
+        let binding = resume_binding(&task);
+        lease.bind_execution_context(&original, &binding).unwrap();
+        let journal = lease
+            .load()
+            .unwrap()
+            .unwrap()
+            .execution_fence
+            .unwrap()
+            .journal
+            .unwrap();
+        let first = &journal.steps[0];
+        lease.record_step_started(&original, first.ordinal).unwrap();
+        let receipt = successful_step_receipt(first);
+        lease
+            .record_step_finished(&original, first.ordinal, receipt.clone())
+            .unwrap();
+        let resumed = lease.resume_execution(&binding).unwrap();
+        let next = &journal.steps[1];
+        lease.record_step_started(&resumed, next.ordinal).unwrap();
+        let mut failure = successful_step_receipt(next);
+        failure["status"] = json!("failed");
+        failure["exit_code"] = json!(1);
+        failure["primitive_dispatched"] = json!(false);
+        failure["result"] = json!({"invoke_attempted":false, "phase":"preflight"});
+        lease
+            .record_step_finished(&resumed, next.ordinal, failure.clone())
+            .unwrap();
+        let finished = lease.finish_execution(&resumed, json!({
+            "status":"stopped-on-primitive-error", "executed_count":2, "executed_steps":[receipt,failure],
+        })).unwrap().unwrap();
+        assert_eq!(
+            finished.execution_fence.as_ref().unwrap().state,
+            super::TaskExecutionState::NeedsReview
+        );
+        assert_eq!(
+            finished.execution_fence.as_ref().unwrap().attempt_id,
+            original.attempt_id()
+        );
+        assert!(lease.resume_execution(&binding).is_err());
+        assert!(lease.begin_execution("run", "approve").is_err());
+    }
+
     #[test]
     fn task_reconcile_recovers_lost_response_and_preserves_original_evidence() {
         let store = store();
@@ -3049,6 +3464,119 @@ mod tests {
         );
         assert!(lease.approve().is_err());
         assert!(lease.begin_execution("run", "approve").is_err());
+    }
+
+    #[test]
+    fn resumed_journal_finishes_after_reconciled_prefix_without_original_receipt() {
+        let store = store();
+        let (task, lease, original, mut suffix) = pending_invoke(&store);
+        let invoke_ordinal = suffix.ordinal;
+        let original_binding = resume_binding(&task);
+        suffix.ordinal += 1;
+        suffix.command = "show".to_owned();
+        suffix.side_effecting = false;
+        let mut interrupted = lease.load().unwrap().unwrap();
+        interrupted
+            .execution_fence
+            .as_mut()
+            .unwrap()
+            .journal
+            .as_mut()
+            .unwrap()
+            .steps
+            .push(suffix.clone());
+        store.save(&interrupted).unwrap();
+        assert!(
+            lease
+                .record_step_started(&original, suffix.ordinal)
+                .is_err(),
+            "an uncertain predecessor must fence the suffix"
+        );
+        let proof = completion_proof(7);
+        lease
+            .record_invocation_observation(original.attempt_id(), invoke_ordinal, proof.attempt())
+            .unwrap();
+        let mut reconciled = lease
+            .record_invocation_completion(original.attempt_id(), invoke_ordinal, proof.clone())
+            .unwrap();
+        assert_eq!(
+            resume_binding(&reconciled),
+            original_binding,
+            "recomputation after receipts/reconciliation must preserve the compiled plan digest"
+        );
+
+        // The current intent compiler puts its sole invoke last. This synthetic
+        // post-admission journal exercises aggregation for a multi-operation
+        // plan without weakening production resume admission or introducing a
+        // test-only dispatch path. CLI admission and wire counts have separate
+        // coverage using the compiler's real natural-intent plan.
+        let fence = reconciled.execution_fence.as_mut().unwrap();
+        fence.resume_binding = Some(original_binding);
+        fence.resume_generation = 1;
+        fence.state = super::TaskExecutionState::Pending;
+        let journal = fence.journal.as_ref().unwrap();
+        let prefix = journal.steps[..journal.steps.len() - 1].to_vec();
+        let resumed = super::TaskExecutionTicket {
+            attempt_id: original.attempt_id().to_owned(),
+            revision: original.revision,
+            resume_generation: 1,
+            completed_prefix: prefix,
+        };
+        store.save(&reconciled).unwrap();
+        let completed_invoke = resumed.completed_prefix().last().unwrap();
+        assert_eq!(completed_invoke.command, "invoke");
+        assert!(completed_invoke.receipt.is_none());
+        assert!(completed_invoke.finished_at.is_none());
+        assert!(completed_invoke.is_complete());
+        assert_eq!(completed_invoke.reconciliation.as_ref(), Some(&proof));
+        assert!(
+            lease.record_step_started(&resumed, invoke_ordinal).is_err(),
+            "reconciliation never permits a second dispatch of the completed invoke"
+        );
+        assert!(
+            lease
+                .record_step_started(&original, suffix.ordinal)
+                .is_err(),
+            "the pre-resume ticket must remain fenced"
+        );
+        lease.record_step_started(&resumed, suffix.ordinal).unwrap();
+        let suffix_receipt = successful_step_receipt(&suffix);
+        lease
+            .record_step_finished(&resumed, suffix.ordinal, suffix_receipt.clone())
+            .unwrap();
+        let mut receipts = resumed
+            .completed_prefix()
+            .iter()
+            .filter_map(|step| step.receipt.clone())
+            .collect::<Vec<_>>();
+        receipts.push(suffix_receipt);
+        let finished = lease.finish_execution(&resumed, json!({
+            "status":"materialized", "executed_count":receipts.len(), "executed_steps":receipts,
+            "resumed_count":resumed.completed_prefix().len(), "newly_executed_count":1,
+            "retained_completed_steps":[{"ordinal":invoke_ordinal,"completion":proof,"replayed":false}],
+        })).unwrap().unwrap();
+        let fence = finished.execution_fence.as_ref().unwrap();
+        assert_eq!(fence.state, super::TaskExecutionState::Completed);
+        assert_eq!(fence.attempt_id, original.attempt_id());
+        let retained = fence
+            .journal
+            .as_ref()
+            .unwrap()
+            .steps
+            .iter()
+            .find(|step| step.ordinal == invoke_ordinal)
+            .unwrap();
+        assert!(
+            retained.receipt.is_none(),
+            "never fabricate the lost result body"
+        );
+        assert!(retained.finished_at.is_none());
+        assert_eq!(retained.reconciliation.as_ref(), Some(&proof));
+        assert_eq!(retained.observed_attempt, Some(proof.attempt()));
+        assert_eq!(
+            finished.last_execution().unwrap().execution["retained_completed_steps"][0]["completion"],
+            json!(proof)
+        );
     }
 
     #[test]
@@ -3236,6 +3764,8 @@ mod tests {
         let foreign = super::TaskExecutionTicket {
             attempt_id: "a-different-attempt".to_owned(),
             revision: ticket.revision,
+            resume_generation: ticket.resume_generation,
+            completed_prefix: Vec::new(),
         };
         assert!(lease.record_step_started(&foreign, first.ordinal).is_err());
         lease.record_step_started(&ticket, first.ordinal).unwrap();
@@ -6415,6 +6945,7 @@ mod tests {
             "bind",
             "approve",
             "run",
+            "resume",
             "reconcile",
         ] {
             assert!(subs.contains(expected), "missing subcommand '{}'", expected);
@@ -6422,8 +6953,8 @@ mod tests {
     }
 
     #[test]
-    fn task_subcommands_count_is_ten() {
-        assert_eq!(super::task_subcommands().len(), 10);
+    fn task_subcommands_count_is_eleven() {
+        assert_eq!(super::task_subcommands().len(), 11);
     }
 
     // ── TaskStore::bind — zone override path ─────────────────────────

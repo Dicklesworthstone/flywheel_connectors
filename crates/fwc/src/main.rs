@@ -1334,6 +1334,9 @@ enum TaskCommand {
     /// Execute the workflow capsule according to its current approvals and bindings.
     Run(TaskExecutionArgs),
 
+    /// Continue an unchanged approved task after its completed prefix, without replaying steps.
+    Resume(TaskExecutionArgs),
+
     /// Reconcile retained host completion evidence without invoking or replaying a step.
     Reconcile(task_reconcile_cmd::TaskReconcileArgs),
 }
@@ -36936,6 +36939,7 @@ fn task_dispatch(args: &TaskArgs, explicit_host: Option<&str>) -> Result<Dispatc
         TaskCommand::Bind(args) => task_bind_dispatch(args),
         TaskCommand::Approve(args) => task_approve_dispatch(args),
         TaskCommand::Run(args) => task_run_dispatch(args, explicit_host),
+        TaskCommand::Resume(args) => task_resume_dispatch(args, explicit_host),
         TaskCommand::Reconcile(args) => task_reconcile_cmd::dispatch(args, explicit_host),
     };
     match result {
@@ -36958,6 +36962,7 @@ fn task_access_failure(args: &TaskArgs, error: &workflow::TaskAccessError) -> Di
         TaskCommand::Bind(args) => ("bind", Some(args.task_id.as_str())),
         TaskCommand::Approve(args) => ("approve", Some(args.task_id.as_str())),
         TaskCommand::Run(args) => ("run", Some(args.task_id.as_str())),
+        TaskCommand::Resume(args) => ("resume", Some(args.task_id.as_str())),
         TaskCommand::Reconcile(args) => ("reconcile", Some(args.task_id.as_str())),
         TaskCommand::Create(_) => ("create", None),
         TaskCommand::List(_) => ("list", None),
@@ -37493,6 +37498,121 @@ fn task_run_dispatch(
     })
 }
 
+fn task_resume_dispatch(
+    args: &TaskExecutionArgs,
+    explicit_host: Option<&str>,
+) -> Result<DispatchOutcome> {
+    let store = workflow::TaskStore::discover()?;
+    let lease = store.lock_task(&args.task_id)?;
+    let Some(task) = lease.load()? else {
+        return Ok(missing_task_dispatch(&args.task_id));
+    };
+    let bindings = workflow::effective_bindings(&task);
+    // Resolve the operator-selected destination and snapshot external input
+    // before opening any runtime authority or changing the durable fence.
+    let prepared =
+        match prepare_compiled_input(&task.compiled, Some(&bindings), explicit_host, true) {
+            Ok(prepared) => prepared,
+            Err(_) => return Ok(task_resume_refusal(&task)),
+        };
+    let Some(binding) = prepared.task_binding.as_ref() else {
+        return Ok(task_resume_refusal(&task));
+    };
+    let ticket = match lease.resume_execution(binding) {
+        Ok(ticket) => ticket,
+        Err(_) => return Ok(task_resume_refusal(&task)),
+    };
+    let pending_task = lease
+        .load()?
+        .context("workflow capsule disappeared before continuation")?;
+    let mut execution = materialize_prepared_compiled_steps(
+        &task.compiled,
+        true,
+        Some(&bindings),
+        explicit_host,
+        Some(&args.auth),
+        Some((&lease, &ticket)),
+        prepared,
+    );
+    let retained_receipts = ticket
+        .completed_prefix()
+        .iter()
+        .filter(|step| step.receipt.is_some())
+        .count();
+    execution.payload["resumed_count"] = json!(ticket.completed_prefix().len());
+    execution.payload["newly_executed_count"] = json!(
+        execution.payload["executed_count"]
+            .as_u64()
+            .unwrap_or(0)
+            .saturating_sub(retained_receipts as u64)
+    );
+    execution.payload["retained_completed_steps"] = json!(
+        ticket
+            .completed_prefix()
+            .iter()
+            .map(|step| json!({
+                "ordinal": step.ordinal,
+                "command": step.command,
+                "original_receipt_retained": step.receipt.is_some(),
+                "completion": step.reconciliation,
+                "replayed": false,
+            }))
+            .collect::<Vec<_>>()
+    );
+    execution.payload["automatic_retry_allowed"] = json!(false);
+    let task = match task_receipt_or_failure(
+        lease.finish_execution(&ticket, execution.payload.clone()),
+        &pending_task,
+        "resume",
+        &execution,
+    ) {
+        Ok(task) => task,
+        Err(failure) => return Ok(failure),
+    };
+    let envelope = CommandEnvelope::new(CommandAvailability::OfflineArtifact, "task");
+    let mut payload = json!({
+        "status": task.capsule_status,
+        "command": "task",
+        "subcommand": "resume",
+        "message": if execution.exit_code.is_success() {
+            "Continued the unchanged task after its completed prefix. Previously completed primitives were not dispatched again."
+        } else {
+            "Task continuation stopped. Original evidence and newly dispatched work remain in the same fenced attempt."
+        },
+        "execution": execution.payload,
+        "task": task_payload_view(&task),
+    });
+    envelope.inject_into(&mut payload);
+    attach_compiled_execution_failure(&mut payload, &execution);
+    Ok(DispatchOutcome {
+        payload,
+        exit_code: execution.exit_code,
+    })
+}
+
+fn task_resume_refusal(task: &workflow::WorkflowTask) -> DispatchOutcome {
+    DispatchOutcome {
+        payload: json!({
+            "status": "error",
+            "command": "task",
+            "subcommand": "resume",
+            "task_id": task.id,
+            "invoke_attempted": false,
+            "automatic_retry_allowed": false,
+            "error": {
+                "type": "task-resume-refused",
+                "message": "Continuation requires the original approved plan, unchanged payload, host and zone, a confirmed completed prefix, and entirely unstarted remaining steps. Legacy, completed, failed or unresolved attempts remain fenced.",
+                "recoverable": false,
+            },
+            "next_actions": [
+                format!("Inspect `fwc task show {}` and reconcile any uncertain invocation against its original host before continuing.", task.id),
+                "Keep the original payload, selected host/context and zone unchanged; explicit --host must preserve that zone selection. Supply fresh runtime capability, holder and approval credentials. Resume never repeats a started primitive.".to_owned(),
+            ],
+        }),
+        exit_code: CliExitCode::Validation,
+    }
+}
+
 fn task_receipt_or_failure<T>(
     result: Result<Option<T>>,
     task: &workflow::WorkflowTask,
@@ -37907,6 +38027,94 @@ fn compiled_workflow_input_error(command: &str, error: InvokeInputError) -> Disp
     }
 }
 
+struct PreparedCompiledInput {
+    payload: Option<String>,
+    task_binding: Option<workflow::TaskResumeBinding>,
+}
+
+fn prepare_compiled_input(
+    compiled: &intent::CompiledIntent,
+    bindings: Option<&BTreeMap<String, String>>,
+    explicit_host: Option<&str>,
+    saved_task: bool,
+) -> std::result::Result<PreparedCompiledInput, InvokeInputError> {
+    let payload = load_compiled_workflow_payload(bindings)?;
+    let task_binding = if saved_task {
+        compiled_task_resume_binding(compiled, bindings, explicit_host, payload.as_deref())
+    } else {
+        None
+    };
+    Ok(PreparedCompiledInput {
+        payload,
+        task_binding,
+    })
+}
+
+/// Only the intent compiler's fixed connector primitives can continue. Their
+/// input is snapshotted once and no predecessor output is evaluated as code or
+/// substituted into a later step. Other plans still run normally, but do not
+/// acquire a resume contract that could re-read arbitrary files or commands.
+fn compiled_task_resume_binding(
+    compiled: &intent::CompiledIntent,
+    bindings: Option<&BTreeMap<String, String>>,
+    explicit_host: Option<&str>,
+    payload: Option<&str>,
+) -> Option<workflow::TaskResumeBinding> {
+    let host = resolve_host_config(explicit_host).ok()??;
+    let endpoint = normalize_host_endpoint(&host.endpoint).ok()?;
+    let default_zone = resolved_zone(compiled.zone.as_deref(), &host);
+    if compiled.steps.is_empty() {
+        return None;
+    }
+    for step in &compiled.steps {
+        let (mut argv, _) = resolve_step_argv(step, bindings);
+        let mut parsed = parse_compiled_step_cli(&mut argv, Some(&endpoint)).ok()?;
+        if parsed
+            .host
+            .as_deref()
+            .and_then(|host| normalize_host_endpoint(host).ok())
+            .as_deref()
+            != Some(endpoint.as_str())
+        {
+            return None;
+        }
+        inherit_compiled_operation_payload(&mut parsed, compiled, Some(&endpoint), payload).ok()?;
+        match &parsed.command {
+            Commands::Invoke(request) | Commands::Simulate(SimulateArgs { request, .. }) => {
+                if request.stdin || request.file.is_some() || request.auth.is_present() {
+                    return None;
+                }
+                validate_compiled_operation_target(
+                    &request.connector,
+                    parsed.host.as_deref(),
+                    compiled,
+                    Some(&endpoint),
+                    true,
+                )
+                .ok()?;
+            }
+            Commands::List(_)
+            | Commands::Search(_)
+            | Commands::Show(_)
+            | Commands::Ops(_)
+            | Commands::Schema(_)
+            | Commands::Examples(_)
+                if !step.side_effecting => {}
+            _ => return None,
+        }
+    }
+    workflow::TaskResumeBinding::new(
+        &json!({
+            "compiled": compiled,
+            "bindings": bindings,
+            "payload": payload,
+        }),
+        endpoint,
+        default_zone,
+    )
+    .ok()
+}
+
 fn materialize_compiled_steps(
     compiled: &intent::CompiledIntent,
     approve: bool,
@@ -37917,15 +38125,68 @@ fn materialize_compiled_steps(
 ) -> DispatchOutcome {
     // Validate and snapshot bound files before the first primitive. Simulation
     // and invocation must see the same payload even if a file changes later.
-    let workflow_payload = match load_compiled_workflow_payload(bindings) {
-        Ok(payload) => payload,
-        Err(error) => return compiled_workflow_input_error("workflow", error),
-    };
-    let mut executed_steps = Vec::new();
+    let prepared =
+        match prepare_compiled_input(compiled, bindings, explicit_host, task_execution.is_some()) {
+            Ok(prepared) => prepared,
+            Err(error) => return compiled_workflow_input_error("workflow", error),
+        };
+    materialize_prepared_compiled_steps(
+        compiled,
+        approve,
+        bindings,
+        explicit_host,
+        runtime_auth,
+        task_execution,
+        prepared,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn materialize_prepared_compiled_steps(
+    compiled: &intent::CompiledIntent,
+    approve: bool,
+    bindings: Option<&BTreeMap<String, String>>,
+    explicit_host: Option<&str>,
+    runtime_auth: Option<&LiveAuthArgs>,
+    task_execution: Option<(&workflow::TaskLease<'_>, &workflow::TaskExecutionTicket)>,
+    prepared: PreparedCompiledInput,
+) -> DispatchOutcome {
+    let completed_prefix = task_execution.map_or(&[][..], |(_, ticket)| ticket.completed_prefix());
+    let mut executed_steps = completed_prefix
+        .iter()
+        .filter_map(|step| step.receipt.clone())
+        .collect::<Vec<_>>();
     let mut withheld_steps = Vec::new();
     let mut stopped_before_side_effect = false;
+    if let Some((lease, ticket)) = task_execution
+        && let Some(binding) = &prepared.task_binding
+        && lease.bind_execution_context(ticket, binding).is_err()
+    {
+        return task_step_journal_failure(executed_steps, withheld_steps, 0, "before-plan");
+    }
+    // Freeze context-derived host/zone for this execution, as well as its input.
+    // A later context-file edit cannot redirect an unstarted task primitive.
+    let explicit_host = prepared
+        .task_binding
+        .as_ref()
+        .map(|binding| binding.host.as_str())
+        .or(explicit_host);
 
-    for step in &compiled.steps {
+    for (index, step) in compiled.steps.iter().enumerate() {
+        if let Some(completed) = completed_prefix.get(index) {
+            if completed.ordinal != step.ordinal
+                || completed.command != step.command
+                || completed.side_effecting != step.side_effecting
+            {
+                return task_step_journal_failure(
+                    executed_steps,
+                    withheld_steps,
+                    step.ordinal,
+                    "before-resume",
+                );
+            }
+            continue;
+        }
         let (mut resolved_argv, _) = resolve_step_argv(step, bindings);
         let parsed = parse_compiled_step_cli(&mut resolved_argv, explicit_host);
         let recorded_argv = redact_sensitive_args(&resolved_argv);
@@ -37971,11 +38232,22 @@ fn materialize_compiled_steps(
         let mut primitive_dispatched = false;
         let mut primitive = match parsed {
             Ok(mut parsed) => {
+                if let Some(binding) = &prepared.task_binding {
+                    match &mut parsed.command {
+                        Commands::Invoke(request)
+                        | Commands::Simulate(SimulateArgs { request, .. })
+                            if request.zone.is_none() =>
+                        {
+                            request.zone = Some(binding.default_zone.clone());
+                        }
+                        _ => {}
+                    }
+                }
                 if let Err(error) = inherit_compiled_operation_payload(
                     &mut parsed,
                     compiled,
                     explicit_host,
-                    workflow_payload.as_deref(),
+                    prepared.payload.as_deref(),
                 ) {
                     compiled_workflow_input_error(&step.command, error)
                 } else {
@@ -46663,7 +46935,7 @@ deny_ptrace = true
 
     #[test]
     fn compiled_workflow_commands_accept_runtime_credentials_without_serializing_them() {
-        for command in ["do", "run", "advance"] {
+        for command in ["do", "run", "advance", "resume"] {
             let mut argv = if command == "do" {
                 vec!["fwc", "do", "search GitHub issues for auth"]
             } else {
@@ -46683,7 +46955,10 @@ deny_ptrace = true
             let (auth, serialized) = match &parsed.command {
                 super::Commands::Do(args) => (&args.auth, serde_json::to_string(args).unwrap()),
                 super::Commands::Task(super::TaskArgs {
-                    command: super::TaskCommand::Run(args) | super::TaskCommand::Advance(args),
+                    command:
+                        super::TaskCommand::Run(args)
+                        | super::TaskCommand::Advance(args)
+                        | super::TaskCommand::Resume(args),
                 }) => (&args.auth, serde_json::to_string(args).unwrap()),
                 _ => panic!("expected a workflow execution command"),
             };
@@ -47403,6 +47678,229 @@ deny_ptrace = true
             ]);
         }
         routes
+    }
+
+    #[test]
+    fn execute_task_resume_skips_durable_prefix_and_rechecks_live_authority() {
+        for allowed in [true, false] {
+            let store = super::workflow::TaskStore::discover().unwrap();
+            let task = task_journal_fixture(&store);
+            let mut routes = task_journal_host_routes(&task.compiled, 1);
+            if !allowed {
+                routes[2].1 = mock_preflight_response_json(false);
+                routes.pop();
+            }
+            let (host, server, requests, stop) =
+                spawn_mock_host_sequence_with_observer(routes, |_, _| {});
+            let bindings = super::workflow::effective_bindings(&task);
+            let prepared =
+                super::prepare_compiled_input(&task.compiled, Some(&bindings), Some(&host), true)
+                    .unwrap();
+            let binding = prepared.task_binding.unwrap();
+            let lease = store.lock_task(&task.id).unwrap();
+            let ticket = lease.begin_execution("run", "approve").unwrap();
+            lease.bind_execution_context(&ticket, &binding).unwrap();
+            let journal = lease
+                .load()
+                .unwrap()
+                .unwrap()
+                .execution_fence
+                .unwrap()
+                .journal
+                .unwrap();
+            assert_eq!(journal.steps.last().unwrap().command, "invoke");
+            let mut original_receipts = Vec::new();
+            for step in &journal.steps[..journal.steps.len() - 1] {
+                lease.record_step_started(&ticket, step.ordinal).unwrap();
+                let receipt = json!({
+                    "ordinal":step.ordinal, "command":step.command, "side_effecting":step.side_effecting,
+                    "primitive_dispatched":true, "status":"executed", "exit_code":0,
+                    "result":{"status":"ok"},
+                });
+                lease
+                    .record_step_finished(&ticket, step.ordinal, receipt.clone())
+                    .unwrap();
+                original_receipts.push(receipt);
+            }
+            drop(lease);
+            let token = test_capability_token_arg();
+            let (exit, payload) = execute_json(&[
+                "fwc",
+                "--json",
+                "--host",
+                &host,
+                "task",
+                "resume",
+                &task.id,
+                "--capability-token",
+                &token,
+            ]);
+            assert_eq!(
+                exit,
+                if allowed {
+                    CliExitCode::Success.into()
+                } else {
+                    CliExitCode::PolicyDenied.into()
+                },
+                "{payload}"
+            );
+            assert_eq!(
+                payload["execution"]["resumed_count"],
+                journal.steps.len() - 1
+            );
+            assert_eq!(payload["execution"]["newly_executed_count"], 1);
+            assert_eq!(payload["execution"]["automatic_retry_allowed"], false);
+            for (index, receipt) in original_receipts.iter().enumerate() {
+                assert_eq!(&payload["execution"]["executed_steps"][index], receipt);
+            }
+            let saved = store.load(&task.id).unwrap().unwrap();
+            let fence = saved.execution_fence.as_ref().unwrap();
+            assert_eq!(fence.attempt_id, ticket.attempt_id());
+            assert_eq!(fence.resume_generation, 1);
+            assert_eq!(
+                fence.state,
+                if allowed {
+                    super::workflow::TaskExecutionState::Completed
+                } else {
+                    super::workflow::TaskExecutionState::NeedsReview
+                }
+            );
+            let (again_exit, again) = execute_json(&[
+                "fwc",
+                "--json",
+                "--host",
+                &host,
+                "task",
+                "resume",
+                &task.id,
+                "--capability-token",
+                "INVALID_SECRET_MUST_NOT_BE_OPENED",
+            ]);
+            assert_eq!(again_exit, CliExitCode::Validation.into());
+            assert_eq!(again["error"]["type"], "task-resume-refused");
+            assert_eq!(again["invoke_attempted"], false);
+            let _ = stop.send(());
+            server.join().unwrap();
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), if allowed { 4 } else { 3 });
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|(route, _)| route == "POST /rpc/invoke")
+                    .count(),
+                usize::from(allowed)
+            );
+            let preflight: Value = serde_json::from_str(&requests[2].1).unwrap();
+            assert_eq!(preflight["zone_id"], "z:work");
+            assert!(preflight.get("capability_token").is_some());
+            assert!(!serde_json::to_string(&saved).unwrap().contains(&token));
+        }
+    }
+
+    #[test]
+    fn task_resume_rejects_payload_file_drift_before_network_or_credentials() {
+        let temp = TempDir::new().unwrap();
+        let payload_file = temp.path().join("resume-query.json");
+        fs::write(&payload_file, "{\"query\":\"original\"}").unwrap();
+        let store = super::workflow::TaskStore::discover().unwrap();
+        let task = task_journal_fixture(&store);
+        let task = store
+            .bind(
+                &task.id,
+                [(
+                    "payload_file".to_owned(),
+                    payload_file.display().to_string(),
+                )],
+            )
+            .unwrap()
+            .unwrap();
+        let (host, server, requests, stop) =
+            spawn_mock_host_sequence_with_observer(Vec::new(), |_, _| {});
+        let bindings = super::workflow::effective_bindings(&task);
+        let prepared =
+            super::prepare_compiled_input(&task.compiled, Some(&bindings), Some(&host), true)
+                .unwrap();
+        let lease = store.lock_task(&task.id).unwrap();
+        let ticket = lease.begin_execution("run", "approve").unwrap();
+        lease
+            .bind_execution_context(&ticket, prepared.task_binding.as_ref().unwrap())
+            .unwrap();
+        let first = lease
+            .load()
+            .unwrap()
+            .unwrap()
+            .execution_fence
+            .unwrap()
+            .journal
+            .unwrap()
+            .steps
+            .remove(0);
+        lease.record_step_started(&ticket, first.ordinal).unwrap();
+        lease.record_step_finished(&ticket, first.ordinal, json!({
+            "ordinal":first.ordinal, "command":first.command, "side_effecting":first.side_effecting,
+            "primitive_dispatched":true, "status":"executed", "exit_code":0, "result":{"status":"ok"},
+        })).unwrap();
+        drop(lease);
+        let before = fs::read(task_journal_fixture_path(&store, &task.id)).unwrap();
+        fs::write(&payload_file, "{\"query\":\"CHANGED_PRIVATE_PAYLOAD\"}").unwrap();
+        let (exit, payload) = execute_json(&[
+            "fwc",
+            "--json",
+            "--host",
+            &host,
+            "task",
+            "resume",
+            &task.id,
+            "--capability-token-file",
+            "MISSING_SECRET_CREDENTIAL_PATH",
+        ]);
+        let _ = stop.send(());
+        server.join().unwrap();
+        assert_eq!(exit, CliExitCode::Validation.into());
+        assert_eq!(payload["error"]["type"], "task-resume-refused");
+        assert_eq!(payload["invoke_attempted"], false);
+        assert!(requests.lock().unwrap().is_empty());
+        assert_eq!(
+            fs::read(task_journal_fixture_path(&store, &task.id)).unwrap(),
+            before
+        );
+        assert!(!payload.to_string().contains("CHANGED_PRIVATE_PAYLOAD"));
+        assert!(
+            !payload
+                .to_string()
+                .contains("MISSING_SECRET_CREDENTIAL_PATH")
+        );
+    }
+
+    #[test]
+    fn task_resume_contract_excludes_dynamic_input_and_embedded_authority() {
+        let host = "http://127.0.0.1:1";
+        for argv in [
+            vec!["fwc", "invoke", "github", "issues.create", "--stdin"],
+            vec![
+                "fwc",
+                "invoke",
+                "github",
+                "issues.create",
+                "--file",
+                "other.json",
+            ],
+            vec![
+                "fwc",
+                "invoke",
+                "github",
+                "issues.create",
+                "--capability-token",
+                "secret",
+            ],
+            vec!["fwc", "do", "search GitHub issues for auth"],
+            vec!["fwc", "list", "--host", "http://127.0.0.1:2"],
+        ] {
+            let compiled = compiled_workflow_test_plan(&[&argv]);
+            assert!(
+                super::compiled_task_resume_binding(&compiled, None, Some(host), None).is_none()
+            );
+        }
     }
 
     #[test]
