@@ -73,6 +73,16 @@ impl DormantConnector {
         self.summary.clone()
     }
 
+    /// This entry owns no running actor. Its retained lifecycle intent
+    /// distinguishes a stopped installation from a removed runtime.
+    pub(super) const fn observed_state(&self) -> ObservedRuntimeState {
+        if matches!(self.desired, DesiredRuntimeState::Uninstalled) {
+            ObservedRuntimeState::Missing
+        } else {
+            ObservedRuntimeState::Stopped
+        }
+    }
+
     pub(super) fn refusal(&self) -> HostError {
         HostError::PreflightFailed(format!(
             "connector `{}` has no active runtime under persisted {:?} lifecycle intent; explicitly enable it before preparing a session or invoking it",
@@ -498,23 +508,11 @@ async fn transition_before(
     let early_telegram_denial = match pending_telegram_custody {
         Some((custody, journal_sequence)) => {
             require_deadline(deadline)?;
-            let denial = if request.action == LifecycleAction::Disable {
-                state
-                    .lifecycle
-                    .deny_telegram_polling_stop(
-                        connector_id,
-                        journal_sequence,
-                        Some(&custody),
-                        request,
-                    )
-                    .await
-            } else {
-                state
-                    .lifecycle
-                    .execute_lifecycle_transition(connector_id, request)
-                    .await
-            }
-            .map_err(map_lifecycle_host_error)?;
+            let denial = state
+                .lifecycle
+                .deny_telegram_polling_stop(connector_id, journal_sequence, Some(&custody), request)
+                .await
+                .map_err(map_lifecycle_host_error)?;
             Some((custody.custody_id, denial))
         }
         None => None,
@@ -522,32 +520,20 @@ async fn transition_before(
     let _transaction = state.registry.inventory_transaction.lock().await;
     require_deadline(deadline)?;
     let (entry, generation) = selected_entry(&state.registry, connector_id).await?;
-    let previous = state
+    let mut previous = state
         .lifecycle
         .connector_status(connector_id)
         .await
         .map_err(map_lifecycle_host_error)?;
     if let Some((custody_id, denial)) = &early_telegram_denial {
-        let current = state.lifecycle.connector_state(connector_id).await;
-        if previous.desired_state != denial.current_desired_state
-            || previous.last_journal_sequence != denial.journal_sequence
-            || !current.is_some_and(|record| {
-                record.desired_state == denial.current_desired_state
-                    && record.last_journal_sequence == denial.journal_sequence
-                    && record
-                        .telegram_polling_restart
-                        .as_ref()
-                        .is_some_and(|custody| custody.custody_id == *custody_id)
-            })
-        {
-            // Disable returns its exact committed revision. Uninstall still
-            // uses the generic lifecycle API, so also bind the exact custody:
-            // an intervening restart always rotates the attempt identity.
-            return Err(HostError::Unavailable(
-                "Telegram lifecycle denial was superseded while waiting for runtime custody; inspect current state before retrying"
-                    .to_owned(),
-            ));
-        }
+        // Exact candidate-exit settlement may advance the journal while the
+        // older restart releases the inventory gate. Accept only that monotone
+        // evidence (or health observation), never a newer lifecycle intent.
+        previous = state
+            .lifecycle
+            .require_telegram_polling_stop_denial(connector_id, *custody_id, denial)
+            .await
+            .map_err(map_lifecycle_host_error)?;
     }
 
     if request.action == LifecycleAction::Reload {
@@ -557,15 +543,33 @@ async fn transition_before(
         ));
     }
     // One local stateful handoff has an explicit durable custody protocol.
-    // Its pending marker may only be resumed by an explicit Enable/Restart;
-    // every other stateful replacement continues through the refusal below.
-    let resume_telegram = connector_id.as_str() == "fcp.telegram"
-        && request.action == LifecycleAction::Enable
-        && state
+    // A retained uninstall checkpoint is never permission to resume polling.
+    let telegram_custody = if connector_id.as_str() == "fcp.telegram" {
+        state
             .lifecycle
             .connector_state(connector_id)
             .await
-            .is_some_and(|record| record.telegram_polling_restart.is_some());
+            .and_then(|record| record.telegram_polling_restart)
+    } else {
+        None
+    };
+    let has_telegram_custody = telegram_custody.is_some();
+    if has_telegram_custody
+        && (previous.desired_state == DesiredRuntimeState::Uninstalled
+            || telegram_custody
+                .as_ref()
+                .is_some_and(|custody| custody.desired_state == DesiredRuntimeState::Uninstalled))
+        && matches!(
+            request.action,
+            LifecycleAction::Enable | LifecycleAction::Restart | LifecycleAction::Disable
+        )
+    {
+        return Err(HostError::Unavailable(
+            "uninstalled Telegram checkpoint custody cannot resume polling or be downgraded to Disabled; retain it for an explicit state migration"
+                .to_owned(),
+        ));
+    }
+    let resume_telegram = has_telegram_custody && request.action == LifecycleAction::Enable;
     if connector_id.as_str() == "fcp.telegram"
         && ((request.action == LifecycleAction::Restart && entry.state_policy.is_stateful())
             || resume_telegram)
@@ -612,9 +616,13 @@ async fn transition_before(
         restart_supported(&entry)?;
     }
     let stop_telegram = connector_id.as_str() == "fcp.telegram"
-        && request.action == LifecycleAction::Disable
-        && entry.state_policy.is_stateful()
-        && matches!(&entry.connector, ConnectorRuntime::Native(_));
+        && matches!(
+            request.action,
+            LifecycleAction::Disable | LifecycleAction::Uninstall
+        )
+        && ((entry.state_policy.is_stateful()
+            && matches!(&entry.connector, ConnectorRuntime::Native(_)))
+            || (request.action == LifecycleAction::Uninstall && has_telegram_custody));
     if request.dry_run {
         if stop_telegram {
             return telegram_restart::transition_selected(
@@ -652,6 +660,9 @@ async fn transition_before(
         LifecycleAction::Disable | LifecycleAction::Uninstall => {
             // Deny new/queued effects durably before waiting for a process. An
             // unsupported or timed-out retirement must never lift this denial.
+            let expected_denial_sequence = early_telegram_denial
+                .as_ref()
+                .map(|_| previous.last_journal_sequence);
             let response = if let Some((_, response)) = early_telegram_denial {
                 response
             } else if stop_telegram {
@@ -680,11 +691,12 @@ async fn transition_before(
                     .connector_status(connector_id)
                     .await
                     .map_err(map_lifecycle_host_error)?;
-                if denied.desired_state != DesiredRuntimeState::Disabled
-                    || denied.last_journal_sequence != response.journal_sequence
+                if denied.desired_state != response.current_desired_state
+                    || denied.last_journal_sequence
+                        != expected_denial_sequence.unwrap_or(response.journal_sequence)
                 {
                     return Err(HostError::Unavailable(
-                        "Telegram disable intent changed before checkpoint admission; inspect current state before retrying"
+                        "Telegram stop intent changed before checkpoint admission; inspect current state before retrying"
                             .to_owned(),
                     ));
                 }

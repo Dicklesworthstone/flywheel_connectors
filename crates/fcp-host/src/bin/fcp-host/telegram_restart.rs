@@ -3,9 +3,9 @@
 //! This is deliberately narrower than generic stateful replacement. The durable
 //! admin-state custody record denies execution through every asynchronous phase.
 //! Only a committed checkpoint and an observed exit of the exact source permit
-//! a replacement. Disable instead retains that checkpoint in a dormant runtime.
-//! A later Enable restores it before registry publication and the guarded,
-//! durable grant of execution authority.
+//! a replacement. Disable and Uninstall retain that checkpoint in a dormant
+//! runtime, preserving their distinct denied authority. Only a disabled
+//! deployment may later Enable and restore before the guarded durable grant.
 
 use fcp_host::{
     DesiredRuntimeState, HostTelegramPollingCheckpoint, LifecycleAction, ObservedRuntimeState,
@@ -188,7 +188,10 @@ fn validate_recovery(
 ) -> HostResult<()> {
     if !matches!(
         action,
-        LifecycleAction::Restart | LifecycleAction::Enable | LifecycleAction::Disable
+        LifecycleAction::Restart
+            | LifecycleAction::Enable
+            | LifecycleAction::Disable
+            | LifecycleAction::Uninstall
     ) || (action == LifecycleAction::Enable && preparation.pending.is_none())
     {
         return Err(unavailable(
@@ -274,15 +277,18 @@ async fn settle_unpublished_candidate(
     deadline: Instant,
 ) {
     // Even a superseded attempt owns this unpublished child and should stop it.
-    // Only confirmed physical exit under current custody may clear the marker.
-    // Cancellation or an exhausted deadline leaves the durable marker in place.
-    if candidate.retire_runtime(deadline).await.is_ok()
-        && candidate.runtime_retirement.is_exited()
-        && require_current(&state.registry, generation, deadline).is_ok()
+    // Only confirmed physical exit of this exact unpublished child may clear
+    // its marker; a newer denial remains authoritative during settlement.
+    // An expired request cannot reactivate this child. Once exit is proven,
+    // retain that monotone evidence even if its original deadline just elapsed.
+    // Cancellation before proof still leaves the durable marker in place.
+    let _ = candidate.retire_runtime(deadline).await;
+    if candidate.runtime_retirement.is_exited()
+        && state.registry.require_generation(generation).is_ok()
     {
         let _ = state
             .lifecycle
-            .mark_telegram_polling_candidate_exited(connector_id, custody)
+            .settle_telegram_polling_candidate_exited(connector_id, custody)
             .await;
     }
 }
@@ -299,11 +305,18 @@ pub(super) async fn transition_selected(
     request: &LifecycleTransitionRequest,
     deadline: Instant,
 ) -> HostResult<LifecycleTransitionResponse> {
-    let preparation = state
-        .lifecycle
-        .prepare_telegram_polling_restart(connector_id)
-        .await
-        .map_err(map_lifecycle_host_error)?;
+    let preparation = if request.action == LifecycleAction::Uninstall {
+        state
+            .lifecycle
+            .prepare_telegram_polling_uninstall(connector_id)
+            .await
+    } else {
+        state
+            .lifecycle
+            .prepare_telegram_polling_restart(connector_id)
+            .await
+    }
+    .map_err(map_lifecycle_host_error)?;
     require_current(&state.registry, generation, deadline)?;
     if preparation.expected_journal_sequence != previous.last_journal_sequence
         || preparation.previous_desired_state != previous.desired_state
@@ -313,8 +326,16 @@ pub(super) async fn transition_selected(
         ));
     }
     let (binding, admitted) = validate_admission(state, entry, &preparation, request.action)?;
-    let stop_only = request.action == LifecycleAction::Disable;
-    // Disable publishes only the dormant source; restart also publishes the
+    let stop_only = matches!(
+        request.action,
+        LifecycleAction::Disable | LifecycleAction::Uninstall
+    );
+    let denied_state = if request.action == LifecycleAction::Uninstall {
+        DesiredRuntimeState::Uninstalled
+    } else {
+        DesiredRuntimeState::Disabled
+    };
+    // Stop publishes only the dormant source; restart also publishes the
     // restored replacement. Reserve the full generation range before quiescing.
     generation
         .checked_add(if stop_only { 1 } else { 2 })
@@ -325,7 +346,7 @@ pub(super) async fn transition_selected(
         dry_run: request.dry_run,
         previous_desired_state: preparation.previous_desired_state,
         current_desired_state: if stop_only {
-            DesiredRuntimeState::Disabled
+            denied_state
         } else {
             DesiredRuntimeState::Enabled
         },
@@ -338,11 +359,18 @@ pub(super) async fn transition_selected(
     if request.dry_run {
         return Ok(response);
     }
-    let mut custody = state
-        .lifecycle
-        .begin_telegram_polling_restart(connector_id, &preparation, binding)
-        .await
-        .map_err(map_lifecycle_host_error)?;
+    let mut custody = if request.action == LifecycleAction::Uninstall {
+        state
+            .lifecycle
+            .begin_telegram_polling_uninstall(connector_id, &preparation, binding)
+            .await
+    } else {
+        state
+            .lifecycle
+            .begin_telegram_polling_restart(connector_id, &preparation, binding)
+            .await
+    }
+    .map_err(map_lifecycle_host_error)?;
     let mut generation = generation;
     let termination = NativeInvocationTermination::new(deadline);
     let zone: ZoneId = custody
@@ -421,11 +449,23 @@ pub(super) async fn transition_selected(
         generation = lifecycle_runtime::publish_entry(
             &state.registry,
             connector_id,
-            lifecycle_runtime::dormant_entry(
-                entry.config.clone(),
-                admitted.clone(),
-                DesiredRuntimeState::Disabled,
-            )?,
+            lifecycle_runtime::dormant_entry(entry.config.clone(), admitted.clone(), denied_state)?,
+            generation,
+            None,
+            deadline,
+        )
+        .await?;
+    }
+
+    // A stopped deployment may still carry a Disabled dormant entry while a
+    // later Uninstall changes its durable intent. Republish that exact retained
+    // deployment so observation and inventory agree without launching a process.
+    if stop_only && matches!(&entry.connector, ConnectorRuntime::Dormant(_)) {
+        require_custody(state, connector_id, entry, &custody, generation, deadline).await?;
+        generation = lifecycle_runtime::publish_entry(
+            &state.registry,
+            connector_id,
+            lifecycle_runtime::dormant_entry(entry.config.clone(), admitted.clone(), denied_state)?,
             generation,
             None,
             deadline,
@@ -463,7 +503,11 @@ pub(super) async fn transition_selected(
             })
             .await
             .map_err(map_lifecycle_host_error)?;
-        response.observed_state = ObservedRuntimeState::Stopped;
+        response.observed_state = if denied_state == DesiredRuntimeState::Uninstalled {
+            ObservedRuntimeState::Missing
+        } else {
+            ObservedRuntimeState::Stopped
+        };
         response.journal_sequence = sequence;
         response.transitioned_at = Utc::now();
         return Ok(response);
@@ -1107,6 +1151,280 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn real_native_uninstall_checkpoints_and_retires_without_reactivation() {
+        let (directory, state, source, checkpoint, _routing) = fixture().await;
+        let connector_id = ConnectorId::from_static(CONNECTOR);
+        let generation = state.registry.version();
+        let original = state
+            .lifecycle
+            .connector_state(&connector_id)
+            .await
+            .unwrap();
+        let mut preview = request(LifecycleAction::Uninstall);
+        preview.dry_run = true;
+        let previewed = lifecycle_runtime::transition(&state, &connector_id, &preview)
+            .await
+            .unwrap();
+        assert_eq!(
+            previewed.current_desired_state,
+            DesiredRuntimeState::Uninstalled
+        );
+        assert_eq!(state.registry.version(), generation);
+        assert!(!source.runtime_retirement.is_exited());
+        let unchanged = state
+            .lifecycle
+            .connector_state(&connector_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            unchanged.last_journal_sequence,
+            original.last_journal_sequence
+        );
+        assert!(unchanged.telegram_polling_restart.is_none());
+
+        let response = lifecycle_runtime::transition(
+            &state,
+            &connector_id,
+            &request(LifecycleAction::Uninstall),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.action, LifecycleAction::Uninstall);
+        assert_eq!(
+            response.previous_desired_state,
+            DesiredRuntimeState::Enabled
+        );
+        assert_eq!(
+            response.current_desired_state,
+            DesiredRuntimeState::Uninstalled
+        );
+        assert_eq!(response.observed_state, ObservedRuntimeState::Missing);
+        assert_eq!(state.registry.version(), generation + 1);
+        assert!(source.runtime_retirement.is_exited());
+        assert!(!directory.path().join("restore-ready").exists());
+
+        let removed = state
+            .lifecycle
+            .connector_state(&connector_id)
+            .await
+            .unwrap();
+        let custody = removed.telegram_polling_restart.as_ref().unwrap();
+        assert_eq!(custody.desired_state, DesiredRuntimeState::Uninstalled);
+        assert_eq!(custody.checkpoint.as_ref(), Some(&checkpoint));
+        assert!(custody.source_exited && !custody.candidate_may_exist);
+        assert!(!custody.intent_revoked);
+        assert_eq!(removed.observed_state, ObservedRuntimeState::Missing);
+        assert_eq!(removed.last_journal_sequence, response.journal_sequence);
+        assert!(
+            state
+                .lifecycle
+                .connector_status(&connector_id)
+                .await
+                .unwrap()
+                .drift
+                .is_none()
+        );
+        assert!(
+            state
+                .lifecycle
+                .connector_execution_fence(&connector_id)
+                .await
+                .is_err()
+        );
+        let (entry, _) = lifecycle_runtime::selected_entry(&state.registry, &connector_id)
+            .await
+            .unwrap();
+        let ConnectorRuntime::Dormant(dormant) = entry.connector else {
+            panic!("uninstall must publish a dormant runtime");
+        };
+        assert_eq!(dormant.observed_state(), ObservedRuntimeState::Missing);
+
+        // A preserved cursor is recovery evidence, not a route around the
+        // stronger Uninstalled intent. Preview and live actions agree.
+        for action in [
+            LifecycleAction::Disable,
+            LifecycleAction::Enable,
+            LifecycleAction::Restart,
+        ] {
+            for dry_run in [true, false] {
+                let mut forbidden = request(action);
+                forbidden.dry_run = dry_run;
+                assert!(
+                    lifecycle_runtime::transition(&state, &connector_id, &forbidden)
+                        .await
+                        .is_err()
+                );
+            }
+        }
+        assert_eq!(state.registry.version(), generation + 1);
+        let still_removed = state
+            .lifecycle
+            .connector_state(&connector_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            still_removed.last_journal_sequence,
+            removed.last_journal_sequence
+        );
+        assert_eq!(
+            still_removed.telegram_polling_restart,
+            removed.telegram_polling_restart
+        );
+        assert!(!directory.path().join("restore-ready").exists());
+
+        let repeated = lifecycle_runtime::transition(
+            &state,
+            &connector_id,
+            &request(LifecycleAction::Uninstall),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            repeated.current_desired_state,
+            DesiredRuntimeState::Uninstalled
+        );
+        assert_eq!(repeated.observed_state, ObservedRuntimeState::Missing);
+        let reopened =
+            HostAdminStateStore::with_state_path(directory.path().join("admin.json")).unwrap();
+        let persisted = reopened.connector_state(&connector_id).await.unwrap();
+        assert_eq!(persisted.desired_state, DesiredRuntimeState::Uninstalled);
+        assert_eq!(persisted.observed_state, ObservedRuntimeState::Missing);
+        assert_eq!(
+            persisted.telegram_polling_restart.unwrap().checkpoint,
+            Some(checkpoint),
+        );
+        assert!(
+            reopened
+                .connector_execution_fence(&connector_id)
+                .await
+                .is_err()
+        );
+        assert!(
+            reopened
+                .prepare_telegram_polling_restart(&connector_id)
+                .await
+                .is_err()
+        );
+        state
+            .registry
+            .shutdown(Instant::now() + Duration::from_secs(3))
+            .await
+            .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn uninstall_disabled_polling_runtime_republishes_exact_retained_custody() {
+        let (directory, state, source, checkpoint, _routing) = fixture().await;
+        let connector_id = ConnectorId::from_static(CONNECTOR);
+        lifecycle_runtime::transition(&state, &connector_id, &request(LifecycleAction::Disable))
+            .await
+            .unwrap();
+        let before = state
+            .lifecycle
+            .connector_state(&connector_id)
+            .await
+            .unwrap();
+        let before_custody = before.telegram_polling_restart.unwrap();
+        let generation = state.registry.version();
+        assert!(source.runtime_retirement.is_exited());
+
+        let response = lifecycle_runtime::transition(
+            &state,
+            &connector_id,
+            &request(LifecycleAction::Uninstall),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            response.previous_desired_state,
+            DesiredRuntimeState::Disabled
+        );
+        assert_eq!(
+            response.current_desired_state,
+            DesiredRuntimeState::Uninstalled
+        );
+        assert_eq!(response.observed_state, ObservedRuntimeState::Missing);
+        assert_eq!(state.registry.version(), generation + 1);
+        let removed = state
+            .lifecycle
+            .connector_state(&connector_id)
+            .await
+            .unwrap();
+        let custody = removed.telegram_polling_restart.unwrap();
+        assert!(custody.custody_id > before_custody.custody_id);
+        assert_eq!(custody.binding, before_custody.binding);
+        assert_eq!(custody.checkpoint, Some(checkpoint));
+        assert_eq!(custody.desired_state, DesiredRuntimeState::Uninstalled);
+        assert!(custody.source_exited && !custody.candidate_may_exist);
+        assert!(!directory.path().join("restore-ready").exists());
+        let (entry, _) = lifecycle_runtime::selected_entry(&state.registry, &connector_id)
+            .await
+            .unwrap();
+        let ConnectorRuntime::Dormant(dormant) = entry.connector else {
+            panic!("retained checkpoint must stay dormant");
+        };
+        assert_eq!(dormant.observed_state(), ObservedRuntimeState::Missing);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn native_uninstall_failure_preserves_denial_without_claiming_process_exit() {
+        for reject_checkpoint in [true, false] {
+            let mut invalid = serde_json::to_value(checkpoint(Some(1001))).unwrap();
+            invalid["checkpoint_id"] = json!("sha256:invalid");
+            let (directory, state, source, _checkpoint, _routing) =
+                fixture_with_checkpoint(reject_checkpoint.then_some(invalid)).await;
+            if !reject_checkpoint {
+                std::fs::write(directory.path().join("manifest.toml"), b"invalid manifest")
+                    .unwrap();
+            }
+            let connector_id = ConnectorId::from_static(CONNECTOR);
+            let generation = state.registry.version();
+            assert!(
+                lifecycle_runtime::transition(
+                    &state,
+                    &connector_id,
+                    &request(LifecycleAction::Uninstall),
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(state.registry.version(), generation);
+            assert!(!source.runtime_retirement.is_exited());
+            assert!(!directory.path().join("restore-ready").exists());
+            let denied = state
+                .lifecycle
+                .connector_state(&connector_id)
+                .await
+                .unwrap();
+            assert_eq!(denied.desired_state, DesiredRuntimeState::Uninstalled);
+            assert_ne!(denied.observed_state, ObservedRuntimeState::Missing);
+            if reject_checkpoint {
+                let custody = denied.telegram_polling_restart.as_ref().unwrap();
+                assert_eq!(custody.desired_state, DesiredRuntimeState::Uninstalled);
+                assert!(custody.checkpoint.is_none());
+                assert!(!custody.source_exited && !custody.candidate_may_exist);
+            } else {
+                assert!(denied.telegram_polling_restart.is_none());
+            }
+            assert!(
+                state
+                    .lifecycle
+                    .connector_execution_fence(&connector_id)
+                    .await
+                    .is_err()
+            );
+            state
+                .registry
+                .shutdown(Instant::now() + Duration::from_secs(3))
+                .await
+                .unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
     async fn native_disable_failure_keeps_authority_denied_without_claiming_stop() {
         for reject_checkpoint in [true, false] {
             let mut invalid = serde_json::to_value(checkpoint(Some(1001))).unwrap();
@@ -1284,6 +1602,87 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(entry.connector, ConnectorRuntime::Dormant(_)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn concurrent_uninstall_settles_pending_restore_without_resurrecting_polling() {
+        let (directory, state, source, checkpoint, _routing) = fixture().await;
+        let connector_id = ConnectorId::from_static(CONNECTOR);
+        let restart = start_transition(&state, LifecycleAction::Restart);
+        wait_for_restore(directory.path()).await;
+        assert_restore_is_denied(&state, &source, &checkpoint).await;
+        let pending = state
+            .lifecycle
+            .connector_state(&connector_id)
+            .await
+            .unwrap()
+            .telegram_polling_restart
+            .unwrap();
+
+        let uninstall = start_transition(&state, LifecycleAction::Uninstall);
+        fcp_async_core::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let record = state
+                    .lifecycle
+                    .connector_state(&connector_id)
+                    .await
+                    .unwrap();
+                if record.desired_state == DesiredRuntimeState::Uninstalled
+                    && record
+                        .telegram_polling_restart
+                        .as_ref()
+                        .is_some_and(|custody| custody.intent_revoked)
+                {
+                    break;
+                }
+                fcp_async_core::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("Uninstall must revoke the restore before waiting for inventory custody");
+        assert!(
+            state
+                .lifecycle
+                .connector_execution_fence(&connector_id)
+                .await
+                .is_err()
+        );
+        std::fs::write(directory.path().join("restore-release"), b"continue").unwrap();
+        assert!(restart.await.unwrap().is_err());
+
+        let response = uninstall.await.unwrap().unwrap();
+        assert_eq!(
+            response.current_desired_state,
+            DesiredRuntimeState::Uninstalled
+        );
+        assert_eq!(response.observed_state, ObservedRuntimeState::Missing);
+        let record = state
+            .lifecycle
+            .connector_state(&connector_id)
+            .await
+            .unwrap();
+        let custody = record.telegram_polling_restart.unwrap();
+        assert!(custody.custody_id > pending.custody_id);
+        assert_eq!(custody.desired_state, DesiredRuntimeState::Uninstalled);
+        assert_eq!(custody.checkpoint, Some(checkpoint));
+        assert!(custody.source_exited && !custody.candidate_may_exist);
+        assert!(!custody.intent_revoked);
+        assert!(source.runtime_retirement.is_exited());
+        assert!(
+            state
+                .lifecycle
+                .connector_execution_fence(&connector_id)
+                .await
+                .is_err()
+        );
+        let (entry, _) = lifecycle_runtime::selected_entry(&state.registry, &connector_id)
+            .await
+            .unwrap();
+        let ConnectorRuntime::Dormant(dormant) = entry.connector else {
+            panic!("Uninstall must retain only the checkpointed dormant deployment");
+        };
+        assert_eq!(dormant.observed_state(), ObservedRuntimeState::Missing);
     }
 
     #[cfg(target_os = "linux")]

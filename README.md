@@ -3941,14 +3941,27 @@ A separate enum in `crates/fcp-core/src/connector_descriptors.rs` carries the ru
 
 These map to `DescriptorStatus::{ Ready, Degraded, Unavailable }` for the agent-facing discovery surface. `fwc status <connector>` surfaces both lifecycle state and health, plus the last 5 transitions.
 
-### Checkpointed Telegram stop and resume
+### Checkpointed Telegram stop, removal, and resume
 
-For an admitted Linux native Telegram polling deployment, `Disable` now saves the
+For an admitted Linux native Telegram polling deployment, `Disable` saves the
 acknowledged polling cursor before retiring the exact writer process. The host
 reports `Stopped` only after process exit and dormant inventory publication; it
 keeps the checkpoint in durable admin state while execution remains disabled.
 A later explicit `Enable` restores that checkpoint before granting execution
 authority, including after a host restart.
+
+`Uninstall` uses the same checkpoint and confirmed-exit protocol while preserving
+`Uninstalled` authority throughout. It reports `Missing` after publishing the
+dormant removed runtime, and retains the checkpoint and deployment binding.
+Repeated uninstall can finish an interrupted stop when the exact process
+ownership is known. An uninstall that supersedes a pending restore revokes its
+authority before waiting for the inventory lock; confirmed replacement exit is
+recorded without undoing that revocation.
+
+Retained uninstall custody cannot be converted into polling authority by
+`Enable`, `Restart`, `Disable`, or a generic desired-state edit. Reinstalling or
+migrating that retained state requires a separate explicit state-migration path;
+the current runtime does not supply one.
 
 This path requires an on-demand singleton writer, exactly one zone, inline bot
 credentials, a pinned binary and admitted manifest, an explicit absolute
@@ -3956,7 +3969,8 @@ credentials, a pinned binary and admitted manifest, an explicit absolute
 verification. The checkpoint remains bound to the same deployment and polling
 identity. A rejected checkpoint, unconfirmed process exit, or superseding
 lifecycle action keeps execution denied. A dry-run validates admission without
-checkpointing, stopping, or launching a process.
+checkpointing, stopping, or launching a process. Other stateful connector
+replacement and removal continue to require their own canonical handoff.
 
 ### JSON-RPC Method Surface
 
